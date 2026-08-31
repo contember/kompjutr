@@ -1,9 +1,7 @@
 import { isOid } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
 import { checkRefText, hasCanonicalRefPatternSyntax, hasCanonicalRefSyntax } from "../ref-name.js";
-import { retainedStringBytes } from "../retained.js";
 import { comparePaths } from "../streams.js";
-import type { TransportOperationBudget } from "./transport-budget.js";
 
 export const MAX_REFSPEC_MAPPINGS = 1_024;
 export const MAX_REFSPEC_EXPANDED_DESTINATIONS = 1_024;
@@ -110,21 +108,11 @@ interface CompiledMapping {
 
 export interface CompiledFetchRefspecs {
   expand(refs: readonly RefspecSourceRef[]): readonly ExpandedFetchRefspec[];
-  dispose(): void;
 }
 
 export interface CompiledPushRefspecs {
   expand(refs: readonly RefspecSourceRef[]): readonly ExpandedPushRefspec[];
-  dispose(): void;
 }
-
-const COMPILED_MEMORY_PART = "refspec-compiled";
-const EXPANDED_MEMORY_PART = "refspec-expanded";
-const COMPILED_FIXED_BYTES = 192;
-const MAPPING_FIXED_BYTES = 160;
-const EXPANDED_FIXED_BYTES = 192;
-const EXPANDED_MAPPING_FIXED_BYTES = 144;
-const SOURCE_INDEX_FIXED_BYTES = 144;
 
 function malformed(message: string): GitError {
   return new GitError("EINVAL", message);
@@ -163,14 +151,6 @@ function requireForce(force: boolean | undefined, label: string): boolean {
     throw malformed(`${label} force must be boolean`);
   }
   return force === true;
-}
-
-function mappingBytes(source: string | null, destination: string): number {
-  return (
-    MAPPING_FIXED_BYTES +
-    retainedStringBytes(destination) +
-    (source === null ? 0 : retainedStringBytes(source))
-  );
 }
 
 function validateMappingCount(refspecs: readonly unknown[]): void {
@@ -222,61 +202,44 @@ function compileMapping(
 
 function compile(
   refspecs: readonly FetchRefspec[] | readonly PushRefspec[],
-  budget: TransportOperationBudget,
   direction: "fetch" | "push",
 ): CompiledMapping[] {
   validateMappingCount(refspecs);
-  if (budget.memory(COMPILED_MEMORY_PART) !== 0 || budget.memory(EXPANDED_MEMORY_PART) !== 0) {
-    throw malformed("transport operation already owns compiled refspec state");
-  }
-  let retained = COMPILED_FIXED_BYTES;
-  budget.setMemory(COMPILED_MEMORY_PART, retained);
   const compiled: CompiledMapping[] = [];
   const exactDestinations = new Set<string>();
-  try {
-    for (let index = 0; index < refspecs.length; index++) {
-      const refspec = refspecs[index];
-      if (refspec === undefined || typeof refspec !== "object" || refspec === null) {
-        throw malformed(`refspec ${index + 1} must be an object`);
-      }
-      const source = refspec.source;
-      const destination = refspec.destination;
-      const force = requireForce(refspec.force, `refspec ${index + 1}`);
-      if (typeof destination !== "string") {
-        throw malformed("refspec destination must be a string");
-      }
-      if (source !== null && typeof source !== "string") {
-        throw malformed("refspec source must be a string or null");
-      }
-      if (direction === "fetch" && source === null) {
-        throw malformed("fetch refspec source must be a string");
-      }
-      if (direction === "push" && source === null && refspec.force !== undefined) {
-        throw malformed("deletion refspec cannot set force");
-      }
-      const additional = mappingBytes(source, destination);
-      retained += additional;
-      budget.setMemory(COMPILED_MEMORY_PART, retained);
-      const mapping = compileMapping(source, destination, force, direction === "push");
-      if (mapping.destinationStar < 0) {
-        if (exactDestinations.has(mapping.destination)) {
-          throw malformed(`duplicate exact refspec destination ${mapping.destination}`);
-        }
-        exactDestinations.add(mapping.destination);
-      }
-      compiled.push(mapping);
+  for (let index = 0; index < refspecs.length; index++) {
+    const refspec = refspecs[index];
+    if (refspec === undefined || typeof refspec !== "object" || refspec === null) {
+      throw malformed(`refspec ${index + 1} must be an object`);
     }
-    return compiled;
-  } catch (error) {
-    budget.clearMemory(COMPILED_MEMORY_PART);
-    throw error;
+    const source = refspec.source;
+    const destination = refspec.destination;
+    const force = requireForce(refspec.force, `refspec ${index + 1}`);
+    if (typeof destination !== "string") {
+      throw malformed("refspec destination must be a string");
+    }
+    if (source !== null && typeof source !== "string") {
+      throw malformed("refspec source must be a string or null");
+    }
+    if (direction === "fetch" && source === null) {
+      throw malformed("fetch refspec source must be a string");
+    }
+    if (direction === "push" && source === null && refspec.force !== undefined) {
+      throw malformed("deletion refspec cannot set force");
+    }
+    const mapping = compileMapping(source, destination, force, direction === "push");
+    if (mapping.destinationStar < 0) {
+      if (exactDestinations.has(mapping.destination)) {
+        throw malformed(`duplicate exact refspec destination ${mapping.destination}`);
+      }
+      exactDestinations.add(mapping.destination);
+    }
+    compiled.push(mapping);
   }
+  return compiled;
 }
 
-function actualSourceRefs(
-  refs: readonly RefspecSourceRef[],
-  expansion: ExpansionBudget,
-): Map<string, string> {
+function actualSourceRefs(refs: readonly RefspecSourceRef[]): Map<string, string> {
   const actual = new Map<string, string>();
   const seen = new Set<string>();
   for (const ref of refs) {
@@ -285,15 +248,12 @@ function actualSourceRefs(
     }
     const checked = checkRefText(ref.name);
     if (checked.problem !== null) throw new CorruptError(`invalid refspec source ${ref.name}`);
-    expansion.addSource();
     let metadata = ref.name === "HEAD";
     if (ref.name.endsWith("^{}")) {
-      expansion.prechargeTransient(ref.name.length - 3);
       const base = ref.name.slice(0, -3);
       if (!base.startsWith("refs/tags/") || !hasCanonicalRefSyntax(base)) {
         throw new CorruptError(`invalid peeled refspec source ${ref.name}`);
       }
-      expansion.clearTransient();
       metadata = true;
     } else if (!metadata && (!ref.name.startsWith("refs/") || !hasCanonicalRefSyntax(ref.name))) {
       throw new CorruptError(`invalid refspec source ${ref.name}`);
@@ -344,68 +304,27 @@ function requireExpandedDestination(value: string): void {
   }
 }
 
-function expandedBytes(destination: string, ownsDestination: boolean): number {
-  return EXPANDED_MAPPING_FIXED_BYTES + (ownsDestination ? retainedStringBytes(destination) : 0);
-}
-
 class ExpansionBudget {
-  #retained = EXPANDED_FIXED_BYTES;
   #destinations = 0;
 
-  constructor(private readonly budget: TransportOperationBudget) {
-    budget.setMemory(EXPANDED_MEMORY_PART, this.#retained);
-  }
-
-  addSource(): void {
-    this.#retained += SOURCE_INDEX_FIXED_BYTES;
-    this.budget.setMemory(EXPANDED_MEMORY_PART, this.#retained);
-  }
-
-  prechargeTransient(units: number): void {
-    this.budget.setMemory(EXPANDED_MEMORY_PART, this.#retained + retainedStringUnits(units));
-  }
-
-  clearTransient(): void {
-    this.budget.setMemory(EXPANDED_MEMORY_PART, this.#retained);
-  }
-
-  add(
-    _source: string | null,
-    destination: string,
-    _oid: string | null,
-    ownsDestination = false,
-  ): void {
+  add(): void {
     if (this.#destinations >= MAX_REFSPEC_EXPANDED_DESTINATIONS) {
       throw new GitError(
         "E2BIG",
         `expanded refspec set exceeds ${MAX_REFSPEC_EXPANDED_DESTINATIONS} destinations`,
       );
     }
-    this.#retained += expandedBytes(destination, ownsDestination);
-    this.budget.setMemory(EXPANDED_MEMORY_PART, this.#retained);
     this.#destinations++;
   }
 
-  prechargeDerived(pattern: string, star: number, capture: WildcardCapture): void {
+  prechargeDerived(): void {
     if (this.#destinations >= MAX_REFSPEC_EXPANDED_DESTINATIONS) {
       throw new GitError(
         "E2BIG",
         `expanded refspec set exceeds ${MAX_REFSPEC_EXPANDED_DESTINATIONS} destinations`,
       );
     }
-    const captureUnits = capture.end - capture.start;
-    const destinationUnits = pattern.length - 1 + captureUnits;
-    const finalBytes = EXPANDED_MAPPING_FIXED_BYTES + retainedStringUnits(destinationUnits);
-    const transientBytes =
-      retainedStringUnits(star) +
-      retainedStringUnits(captureUnits) +
-      retainedStringUnits(pattern.length - star - 1);
-    this.budget.setMemory(EXPANDED_MEMORY_PART, this.#retained + finalBytes + transientBytes);
   }
-}
-
-function retainedStringUnits(units: number): number {
-  return 48 + units * 2;
 }
 
 function destinationGuard(seen: Set<string>, destination: string): void {
@@ -416,172 +335,114 @@ function destinationGuard(seen: Set<string>, destination: string): void {
 }
 
 class FetchCompiler implements CompiledFetchRefspecs {
-  #active = true;
-
-  constructor(
-    private readonly mappings: readonly CompiledMapping[],
-    private readonly budget: TransportOperationBudget,
-  ) {}
+  constructor(private readonly mappings: readonly CompiledMapping[]) {}
 
   expand(refs: readonly RefspecSourceRef[]): readonly ExpandedFetchRefspec[] {
-    if (!this.#active) throw malformed("compiled fetch refspecs are disposed");
-    if (this.budget.memory(EXPANDED_MEMORY_PART) !== 0) {
-      throw malformed("fetch refspecs have already been expanded");
-    }
-    try {
-      const expansion = new ExpansionBudget(this.budget);
-      const sources = actualSourceRefs(refs, expansion);
-      const seen = new Set<string>();
-      const result: ExpandedFetchRefspec[] = [];
-      for (const mapping of this.mappings) {
-        const source = mapping.source;
-        if (source === null) throw new Error("compiled fetch deletion is impossible");
-        if (mapping.sourceStar < 0) {
-          const oid = sources.get(source);
-          if (oid === undefined) {
-            throw new GitError("EREFNOTFOUND", `remote ref not found: ${source}`);
-          }
-          expansion.add(source, mapping.destination, oid);
-          destinationGuard(seen, mapping.destination);
-          result.push({
-            source,
-            destination: mapping.destination,
-            oid,
-            force: mapping.force,
-          });
-          continue;
+    const expansion = new ExpansionBudget();
+    const sources = actualSourceRefs(refs);
+    const seen = new Set<string>();
+    const result: ExpandedFetchRefspec[] = [];
+    for (const mapping of this.mappings) {
+      const source = mapping.source;
+      if (source === null) throw new Error("compiled fetch deletion is impossible");
+      if (mapping.sourceStar < 0) {
+        const oid = sources.get(source);
+        if (oid === undefined) {
+          throw new GitError("EREFNOTFOUND", `remote ref not found: ${source}`);
         }
-        for (const [name, oid] of sources) {
-          const capture = wildcardCapture(name, source, mapping.sourceStar);
-          if (capture === null) continue;
-          expansion.prechargeDerived(mapping.destination, mapping.destinationStar, capture);
-          const destination = substitute(
-            mapping.destination,
-            mapping.destinationStar,
-            name,
-            capture,
-          );
-          requireExpandedDestination(destination);
-          expansion.add(name, destination, oid, true);
-          destinationGuard(seen, destination);
-          result.push({ source: name, destination, oid, force: mapping.force });
-        }
+        expansion.add();
+        destinationGuard(seen, mapping.destination);
+        result.push({
+          source,
+          destination: mapping.destination,
+          oid,
+          force: mapping.force,
+        });
+        continue;
       }
-      result.sort((left, right) => comparePaths(left.destination, right.destination));
-      return result;
-    } catch (error) {
-      this.budget.clearMemory(EXPANDED_MEMORY_PART);
-      throw error;
+      for (const [name, oid] of sources) {
+        const capture = wildcardCapture(name, source, mapping.sourceStar);
+        if (capture === null) continue;
+        expansion.prechargeDerived();
+        const destination = substitute(mapping.destination, mapping.destinationStar, name, capture);
+        requireExpandedDestination(destination);
+        expansion.add();
+        destinationGuard(seen, destination);
+        result.push({ source: name, destination, oid, force: mapping.force });
+      }
     }
-  }
-
-  dispose(): void {
-    if (!this.#active) return;
-    this.budget.clearMemory(EXPANDED_MEMORY_PART);
-    this.budget.clearMemory(COMPILED_MEMORY_PART);
-    this.#active = false;
+    result.sort((left, right) => comparePaths(left.destination, right.destination));
+    return result;
   }
 }
 
 class PushCompiler implements CompiledPushRefspecs {
-  #active = true;
-
-  constructor(
-    private readonly mappings: readonly CompiledMapping[],
-    private readonly budget: TransportOperationBudget,
-  ) {}
+  constructor(private readonly mappings: readonly CompiledMapping[]) {}
 
   expand(refs: readonly RefspecSourceRef[]): readonly ExpandedPushRefspec[] {
-    if (!this.#active) throw malformed("compiled push refspecs are disposed");
-    if (this.budget.memory(EXPANDED_MEMORY_PART) !== 0) {
-      throw malformed("push refspecs have already been expanded");
-    }
-    try {
-      const expansion = new ExpansionBudget(this.budget);
-      const sources = actualSourceRefs(refs, expansion);
-      const seen = new Set<string>();
-      const result: ExpandedPushRefspec[] = [];
-      for (const mapping of this.mappings) {
-        const source = mapping.source;
-        if (source === null) {
-          expansion.add(null, mapping.destination, null);
-          destinationGuard(seen, mapping.destination);
-          result.push({
-            source: null,
-            destination: mapping.destination,
-            oid: null,
-            force: false,
-          });
-          continue;
-        }
-        if (mapping.oidSource) {
-          expansion.add(source, mapping.destination, source);
-          destinationGuard(seen, mapping.destination);
-          result.push({
-            source,
-            destination: mapping.destination,
-            oid: source,
-            force: mapping.force,
-          });
-          continue;
-        }
-        if (mapping.sourceStar < 0) {
-          const oid = sources.get(source);
-          if (oid === undefined) {
-            throw new GitError("EREFNOTFOUND", `local ref not found: ${source}`);
-          }
-          expansion.add(source, mapping.destination, oid);
-          destinationGuard(seen, mapping.destination);
-          result.push({
-            source,
-            destination: mapping.destination,
-            oid,
-            force: mapping.force,
-          });
-          continue;
-        }
-        for (const [name, oid] of sources) {
-          const capture = wildcardCapture(name, source, mapping.sourceStar);
-          if (capture === null) continue;
-          expansion.prechargeDerived(mapping.destination, mapping.destinationStar, capture);
-          const destination = substitute(
-            mapping.destination,
-            mapping.destinationStar,
-            name,
-            capture,
-          );
-          requireExpandedDestination(destination);
-          expansion.add(name, destination, oid, true);
-          destinationGuard(seen, destination);
-          result.push({ source: name, destination, oid, force: mapping.force });
-        }
+    const expansion = new ExpansionBudget();
+    const sources = actualSourceRefs(refs);
+    const seen = new Set<string>();
+    const result: ExpandedPushRefspec[] = [];
+    for (const mapping of this.mappings) {
+      const source = mapping.source;
+      if (source === null) {
+        expansion.add();
+        destinationGuard(seen, mapping.destination);
+        result.push({
+          source: null,
+          destination: mapping.destination,
+          oid: null,
+          force: false,
+        });
+        continue;
       }
-      result.sort((left, right) => comparePaths(left.destination, right.destination));
-      return result;
-    } catch (error) {
-      this.budget.clearMemory(EXPANDED_MEMORY_PART);
-      throw error;
+      if (mapping.oidSource) {
+        expansion.add();
+        destinationGuard(seen, mapping.destination);
+        result.push({
+          source,
+          destination: mapping.destination,
+          oid: source,
+          force: mapping.force,
+        });
+        continue;
+      }
+      if (mapping.sourceStar < 0) {
+        const oid = sources.get(source);
+        if (oid === undefined) {
+          throw new GitError("EREFNOTFOUND", `local ref not found: ${source}`);
+        }
+        expansion.add();
+        destinationGuard(seen, mapping.destination);
+        result.push({
+          source,
+          destination: mapping.destination,
+          oid,
+          force: mapping.force,
+        });
+        continue;
+      }
+      for (const [name, oid] of sources) {
+        const capture = wildcardCapture(name, source, mapping.sourceStar);
+        if (capture === null) continue;
+        expansion.prechargeDerived();
+        const destination = substitute(mapping.destination, mapping.destinationStar, name, capture);
+        requireExpandedDestination(destination);
+        expansion.add();
+        destinationGuard(seen, destination);
+        result.push({ source: name, destination, oid, force: mapping.force });
+      }
     }
-  }
-
-  dispose(): void {
-    if (!this.#active) return;
-    this.budget.clearMemory(EXPANDED_MEMORY_PART);
-    this.budget.clearMemory(COMPILED_MEMORY_PART);
-    this.#active = false;
+    result.sort((left, right) => comparePaths(left.destination, right.destination));
+    return result;
   }
 }
 
-export function compileFetchRefspecs(
-  refspecs: readonly FetchRefspec[],
-  budget: TransportOperationBudget,
-): CompiledFetchRefspecs {
-  return new FetchCompiler(compile(refspecs, budget, "fetch"), budget);
+export function compileFetchRefspecs(refspecs: readonly FetchRefspec[]): CompiledFetchRefspecs {
+  return new FetchCompiler(compile(refspecs, "fetch"));
 }
 
-export function compilePushRefspecs(
-  refspecs: readonly PushRefspec[],
-  budget: TransportOperationBudget,
-): CompiledPushRefspecs {
-  return new PushCompiler(compile(refspecs, budget, "push"), budget);
+export function compilePushRefspecs(refspecs: readonly PushRefspec[]): CompiledPushRefspecs {
+  return new PushCompiler(compile(refspecs, "push"));
 }

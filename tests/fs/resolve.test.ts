@@ -1,14 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { initializeFsSchema } from "../../src/fs/schema.js";
 import { allocateInodes } from "../../src/fs/store/meta.js";
-import {
-  realpath,
-  realpathNoFollow,
-  realpathOwned,
-  realpaths,
-} from "../../src/fs/store/resolve.js";
+import { realpath, realpathNoFollow, realpaths } from "../../src/fs/store/resolve.js";
 import type { EntryType } from "../../src/fs/types.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../../src/memory.js";
 import { Database, type DurableObjectStorageLike, type SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
 
@@ -189,26 +183,6 @@ describe("ordered path resolution", () => {
     expect(target.length).toBe(4_098);
     expect(realpath(db, target)).toBe(target);
     expect(realpath(db, "/link")).toBe(target);
-  });
-
-  it("rejects aggregate owned memory before materializing a long symlink target", () => {
-    const db = setup([{ path: "/link", type: "symlink", target: `/${"x".repeat(600_000)}` }]);
-    const recording = new RecordingDatabase(db);
-    const coordinator = new MemoryCoordinator();
-    const occupied = coordinator.reserve();
-    const owner = coordinator.reserve();
-    occupied.set("other", MAX_OPERATION_MEMORY_BYTES - 1_000_000);
-
-    expect(() => realpathOwned(recording, "/link", owner)).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(recording.queries).toHaveLength(1);
-    expect(recording.queries[0]?.query).toContain("sum(length(CAST(n.link_target AS BLOB)))");
-    expect(owner.currentBytes).toBe(0);
-
-    owner.dispose();
-    occupied.dispose();
-    coordinator.assertIdle();
   });
 
   it("normalizes an engine-reported long-value failure", () => {

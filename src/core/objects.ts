@@ -5,7 +5,6 @@
 // pure: bytes in, structures out. Storage and delta resolution live
 // elsewhere.
 
-import { MemoryCoordinator, type MemoryReservation } from "../memory.js";
 import { concat, isOid, toHex, utf8, utf8Decoder } from "./bytes.js";
 import { CorruptError, GitError } from "./errors.js";
 import { Sha1 } from "./sha1.js";
@@ -341,11 +340,7 @@ class ByteField {
     return this.#length;
   }
 
-  get retainedBytes(): number {
-    return this.#bytes.length;
-  }
-
-  push(byte: number, admit: (transientBytes: number) => void, sync: () => void): void {
+  push(byte: number): void {
     if (this.limit !== null && this.#length >= this.limit) {
       throw new CorruptError(`tree ${this.label} is too long`);
     }
@@ -356,7 +351,6 @@ class ByteField {
         throw new GitError("E2BIG", `tree ${this.label} allocation exceeds the platform limit`);
       }
       let grown: Uint8Array<ArrayBuffer>;
-      admit(next);
       try {
         grown = new Uint8Array(next);
       } catch {
@@ -364,13 +358,11 @@ class ByteField {
       }
       grown.set(this.#bytes);
       this.#bytes = grown;
-      sync();
     }
     this.#bytes[this.#length++] = byte;
   }
 
-  take(admit: (transientBytes: number) => void): Uint8Array {
-    admit(this.#length);
+  take(): Uint8Array {
     const value = this.#bytes.slice(0, this.#length);
     this.#length = 0;
     return value;
@@ -382,12 +374,8 @@ class ByteField {
   }
 }
 
-const TREE_PARSER_FIXED_BYTES = 64;
-const TREE_PARSER_ENTRY_FIXED_BYTES = 256;
-
 /** Incremental raw-tree parser retaining only the entry currently crossing a chunk boundary. */
 export class TreeParser {
-  readonly #reservation: MemoryReservation;
   readonly #mode: ByteField;
   readonly #name: ByteField;
   #oid: Uint8Array;
@@ -400,23 +388,10 @@ export class TreeParser {
   #observedSize = 0;
   #finished = false;
 
-  constructor(owningReservation?: MemoryReservation) {
-    this.#reservation = owningReservation?.scope() ?? new MemoryCoordinator().reserve();
-    const initialBytes = 2 * 64 + 20 + TREE_PARSER_FIXED_BYTES;
-    try {
-      this.#reservation.set("tree", initialBytes);
-      this.#mode = new ByteField(6, "mode");
-      this.#name = new ByteField(null, "entry name");
-      this.#oid = new Uint8Array(20);
-    } catch (error) {
-      this.#reservation.dispose();
-      throw error;
-    }
-  }
-
-  get retainedBytes(): number {
-    if (this.#reservation.disposed) return 0;
-    return this.#retainedBytes();
+  constructor() {
+    this.#mode = new ByteField(6, "mode");
+    this.#name = new ByteField(null, "entry name");
+    this.#oid = new Uint8Array(20);
   }
 
   *push(chunk: Uint8Array): Generator<ParsedTreeEntry> {
@@ -429,31 +404,19 @@ export class TreeParser {
         }
         if (this.#state === "mode") {
           if (byte === 0x20) {
-            this.#modeBytes = this.#mode.take((bytes) => this.#admit(bytes));
-            this.#sync();
-            this.#admit(this.#modeBytes.length * 2);
+            this.#modeBytes = this.#mode.take();
             this.#modeText = utf8Decoder.decode(this.#modeBytes);
-            this.#sync();
             this.#state = "name";
           } else {
-            this.#mode.push(
-              byte,
-              (bytes) => this.#admit(bytes),
-              () => this.#sync(),
-            );
+            this.#mode.push(byte);
           }
         } else if (this.#state === "name") {
           if (byte === 0) {
-            this.#nameBytes = this.#name.take((bytes) => this.#admit(bytes));
-            this.#sync();
+            this.#nameBytes = this.#name.take();
             this.#state = "oid";
             this.#oidAt = 0;
           } else {
-            this.#name.push(
-              byte,
-              (bytes) => this.#admit(bytes),
-              () => this.#sync(),
-            );
+            this.#name.push(byte);
           }
         } else {
           this.#oid[this.#oidAt++] = byte;
@@ -462,12 +425,6 @@ export class TreeParser {
             const modeBytes = this.#modeBytes;
             const nameBytes = this.#nameBytes;
             const rawEntryBytes = modeBytes.length + nameBytes.length + 22;
-            const projectedEntryBytes =
-              TREE_PARSER_ENTRY_FIXED_BYTES +
-              rawEntryBytes +
-              nameBytes.length +
-              (modeText.length + nameBytes.length + 40) * 2;
-            this.#admit(projectedEntryBytes);
             const rawEntry = new Uint8Array(rawEntryBytes);
             rawEntry.set(modeBytes, 0);
             rawEntry[modeBytes.length] = 0x20;
@@ -481,25 +438,13 @@ export class TreeParser {
             this.#modeText = "";
             this.#modeBytes = new Uint8Array(0);
             this.#nameBytes = new Uint8Array(0);
-            this.#reservation.set(
-              "tree",
-              this.#retainedBytes() +
-                TREE_PARSER_ENTRY_FIXED_BYTES +
-                rawEntry.length +
-                nameBytes.length +
-                (modeText.length + name.length + oid.length) * 2,
-            );
-            try {
-              yield {
-                entry: { mode: modeText, name, oid },
-                nameBytes,
-                rawEntry,
-                ordinal,
-                observedSize: this.#observedSize,
-              };
-            } finally {
-              if (!this.#reservation.disposed) this.#sync();
-            }
+            yield {
+              entry: { mode: modeText, name, oid },
+              nameBytes,
+              rawEntry,
+              ordinal,
+              observedSize: this.#observedSize,
+            };
           }
         }
       }
@@ -523,47 +468,18 @@ export class TreeParser {
   }
 
   dispose(): void {
-    if (this.#reservation.disposed) return;
     this.#mode.dispose();
     this.#name.dispose();
     this.#oid = new Uint8Array(0);
     this.#modeBytes = new Uint8Array(0);
     this.#nameBytes = new Uint8Array(0);
     this.#modeText = "";
-    this.#reservation.dispose();
-  }
-
-  #retainedBytes(): number {
-    return (
-      this.#mode.retainedBytes +
-      this.#name.retainedBytes +
-      this.#oid.length +
-      this.#modeBytes.length +
-      this.#nameBytes.length +
-      this.#modeText.length * 2 +
-      TREE_PARSER_FIXED_BYTES
-    );
-  }
-
-  #admit(transientBytes: number): void {
-    const retained = this.#retainedBytes();
-    if (!Number.isSafeInteger(transientBytes) || transientBytes < 0) {
-      throw new GitError("E2BIG", "tree parser memory accounting overflows");
-    }
-    this.#reservation.set("tree", retained + transientBytes);
-  }
-
-  #sync(): void {
-    this.#reservation.set("tree", this.#retainedBytes());
   }
 }
 
 /** Parse raw tree chunks while retaining only the current entry. */
-export function* parseTreeStream(
-  chunks: Iterable<Uint8Array>,
-  owningReservation?: MemoryReservation,
-): Generator<ParsedTreeEntry> {
-  const parser = new TreeParser(owningReservation);
+export function* parseTreeStream(chunks: Iterable<Uint8Array>): Generator<ParsedTreeEntry> {
+  const parser = new TreeParser();
   try {
     for (const chunk of chunks) yield* parser.push(chunk);
     parser.finish();

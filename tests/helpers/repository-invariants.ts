@@ -251,10 +251,5 @@ export function assertRepositoryReadable(repo: Repository): void {
       // Iteration validates every retained dirty row.
     }
   }
-  const maintenanceMemory = repo.store.reserveMemory();
-  try {
-    readMaintenanceRunView(repo.store.db, repo.store.repoId, maintenanceMemory);
-  } finally {
-    maintenanceMemory.dispose();
-  }
+  readMaintenanceRunView(repo.store.db, repo.store.repoId);
 }

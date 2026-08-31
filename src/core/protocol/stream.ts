@@ -8,12 +8,10 @@
 
 import { utf8Decoder } from "../bytes.js";
 import { CorruptError } from "../errors.js";
-import type { TransportOperationBudget } from "../ops/transport-budget.js";
 import { MAX_PKT_FRAME_BYTES } from "./pktline.js";
 
 export { MAX_PKT_FRAME_BYTES } from "./pktline.js";
 
-const READER_FIXED_BYTES = 128;
 const EMPTY = new Uint8Array(0);
 
 export type PktKind = "line" | "flush" | "delim";
@@ -21,11 +19,6 @@ export type PktKind = "line" | "flush" | "delim";
 export interface Pkt {
   kind: PktKind;
   payload: Uint8Array;
-}
-
-interface ExactRead {
-  readonly bytes: Uint8Array;
-  readonly ownedBytes: number;
 }
 
 export function pktText(pkt: Pkt): string {
@@ -38,17 +31,10 @@ export class ByteReader {
   #chunk: Uint8Array = EMPTY;
   #offset = 0;
   #done = false;
-  #frameMemoryBytes = 0;
-  readonly #operationBase: number;
   #releasePromise: Promise<void> | null = null;
 
-  constructor(
-    source: AsyncIterable<Uint8Array>,
-    private readonly operationBudget?: TransportOperationBudget,
-    private readonly memoryPart = "protocol-pkt-reader",
-  ) {
+  constructor(source: AsyncIterable<Uint8Array>) {
     this.#source = source[Symbol.asyncIterator]();
-    this.#operationBase = operationBudget?.memory(memoryPart) ?? 0;
   }
 
   /** Finalize the source once and release the current parse frame. */
@@ -59,7 +45,6 @@ export class ByteReader {
         await this.#source.return?.();
       })
       .finally(() => {
-        this.#setFrameMemory(0);
         this.#chunk = EMPTY;
         this.#offset = 0;
         this.#done = true;
@@ -82,20 +67,18 @@ export class ByteReader {
     return false;
   }
 
-  async #takeExact(length: number, liveOwnedBytes: number): Promise<ExactRead | null> {
-    if (length === 0) return { bytes: EMPTY, ownedBytes: 0 };
+  async #takeExact(length: number): Promise<Uint8Array | null> {
+    if (length === 0) return EMPTY;
     if (this.#offset === this.#chunk.length && !(await this.#advance())) return null;
 
     const available = this.#chunk.length - this.#offset;
     if (available >= length) {
-      this.#setFrameMemory(liveOwnedBytes, true);
       const bytes = this.#chunk.subarray(this.#offset, this.#offset + length);
       this.#offset += length;
-      return { bytes, ownedBytes: 0 };
+      return bytes;
     }
 
     // A frame crossing source chunks owns only the exact bytes it needs.
-    this.#setFrameMemory(liveOwnedBytes + length, true);
     const out = new Uint8Array(length);
     let written = 0;
     while (written < length) {
@@ -110,16 +93,15 @@ export class ByteReader {
         throw new CorruptError("truncated pkt-line");
       }
     }
-    return { bytes: out, ownedBytes: length };
+    return out;
   }
 
   /** The next pkt-line, or null at end of stream. */
   async readPkt(): Promise<Pkt | null> {
     try {
-      this.#setFrameMemory(0, true);
-      let header: ExactRead | null;
+      let header: Uint8Array | null;
       try {
-        header = await this.#takeExact(4, 0);
+        header = await this.#takeExact(4);
       } catch (error) {
         if (error instanceof CorruptError) throw new CorruptError("truncated pkt-line length");
         throw error;
@@ -128,7 +110,7 @@ export class ByteReader {
         await this.release();
         return null;
       }
-      const length = parseLength(header.bytes);
+      const length = parseLength(header);
       if (length === 0) {
         return { kind: "flush", payload: EMPTY };
       }
@@ -139,10 +121,9 @@ export class ByteReader {
       if (length > MAX_PKT_FRAME_BYTES) {
         throw new CorruptError(`pkt-line exceeds ${MAX_PKT_FRAME_BYTES} bytes`);
       }
-      const payload = await this.#takeExact(length - 4, header.ownedBytes);
+      const payload = await this.#takeExact(length - 4);
       if (payload === null) throw new CorruptError("truncated pkt-line");
-      this.#setFrameMemory(header.ownedBytes + payload.ownedBytes, true);
-      return { kind: "line", payload: payload.bytes };
+      return { kind: "line", payload };
     } catch (error) {
       try {
         await this.release();
@@ -155,7 +136,6 @@ export class ByteReader {
 
   /** Everything not yet consumed, streamed on. */
   async *rest(): AsyncGenerator<Uint8Array> {
-    this.#setFrameMemory(0);
     try {
       if (this.#offset < this.#chunk.length) {
         yield this.#chunk.subarray(this.#offset);
@@ -169,13 +149,6 @@ export class ByteReader {
     } finally {
       await this.release();
     }
-  }
-
-  #setFrameMemory(ownedBytes: number, retained = false): void {
-    const bytes = retained ? READER_FIXED_BYTES + ownedBytes : ownedBytes;
-    if (bytes === this.#frameMemoryBytes) return;
-    this.operationBudget?.setMemory(this.memoryPart, this.#operationBase + bytes);
-    this.#frameMemoryBytes = bytes;
   }
 }
 

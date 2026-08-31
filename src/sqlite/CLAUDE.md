@@ -2,9 +2,8 @@
 
 > **Direction change (2026-08-30).** ADR-0018 replaced the untrusted-row
 > doctrine: validate at the boundary, trust stored rows; ADR-0017 (rewritten)
-> removes the memory-reservation ledger. The trust and reservation rules below
-> describe code the active sprint is deleting — where they conflict with the
-> ADRs or root `CLAUDE.md`, the ADRs win.
+> removed the memory-reservation ledger. The ADRs and root `CLAUDE.md` define
+> the current rules.
 
 Every table the Git side owns, plus the adapter under all of them. `src/fs/`
 keeps its own schema and shares only `Database`. `src/core/` reaches this layer
@@ -46,9 +45,8 @@ checkout state nor a maintenance root.
 - **A pack is stored verbatim, still compressed, in fixed 64 KiB chunk rows.** A
   read pulls only the chunks the object spans, so nothing inflates a whole
   repository. A new read path that widens that span is the regression to avoid.
-- **Every allocating path takes a `MemoryReservation`** from `src/memory.ts` and
-  disposes it when ownership ends. A query that retains rows without one is
-  invisible to the operation's memory budget.
+- **Bound allocation with fixed batch, row, byte, and traversal-state caps.**
+  Keep refusal paths tied to the real payload or recursive state they protect.
 - **One `maintenance()` call advances one bounded durable action.** A
   root-changing transaction bumps the repository epoch; drift restarts at the
   root seam instead of continuing on a stale mark. Sweep eligibility is fixed at

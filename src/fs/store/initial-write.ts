@@ -2,7 +2,6 @@
 // gets no overwrite semantics: eligibility is settled before the body runs,
 // and every row written by the session is a plain INSERT.
 
-import { MemoryCoordinator, type MemoryReservation } from "../../memory.js";
 import { blob, type SqlDatabase } from "../../sqlite/db.js";
 import { filesystemError } from "../errors.js";
 import { comparePaths } from "../path.js";
@@ -17,10 +16,6 @@ const MAX_PATH_SEGMENTS = 128;
 const METADATA_JSON_FLUSH_BYTES = 128 * 1024;
 const MAX_METADATA_ID_BYTES = 512 * 1024;
 const MAX_CHUNK_JSON_BYTES = 128 * 1024;
-const ROW_WRAPPER_BYTES = 256;
-const ARRAY_WRAPPER_BYTES = 64;
-const ARRAY_SLOT_BYTES = 8;
-const STRING_WRAPPER_BYTES = 48;
 
 export interface InitialWriteOptions {
   mode?: number;
@@ -33,7 +28,6 @@ export interface InitialSymlinkOptions {
 }
 
 export interface InitialWorktreeSession {
-  readonly highWaterBytes: number;
   writeSymlink(path: string, target: string, options?: InitialSymlinkOptions): void;
   writeFile(path: string, bytes: Uint8Array, options?: InitialWriteOptions): void;
   writeFileStream(
@@ -207,41 +201,6 @@ function rootAncestors(root: string): string[] {
   return ancestors;
 }
 
-function stringAllocationBytes(codeUnits: number): number {
-  return STRING_WRAPPER_BYTES + 2 * codeUnits;
-}
-
-function preflightAllocationBytes(root: string): number {
-  let count = 1;
-  let ancestorCopies = 0;
-  let resultTextCopies = 2 * stringAllocationBytes(1) + stringAllocationBytes(3);
-  let jsonCodeUnits = 2;
-  jsonCodeUnits += jsonStringCodeUnits("/");
-  if (root !== "/") {
-    let slash = root.indexOf("/", 1);
-    while (slash > 0) {
-      count++;
-      ancestorCopies += stringAllocationBytes(slash);
-      resultTextCopies += 2 * stringAllocationBytes(slash) + stringAllocationBytes(3);
-      jsonCodeUnits += 1 + jsonStringCodeUnits(root, slash);
-      slash = root.indexOf("/", slash + 1);
-    }
-    count++;
-    resultTextCopies += 2 * stringAllocationBytes(root.length) + stringAllocationBytes(3);
-    jsonCodeUnits += 1 + jsonStringCodeUnits(root);
-  }
-  return (
-    ARRAY_WRAPPER_BYTES +
-    count * ARRAY_SLOT_BYTES +
-    ancestorCopies +
-    stringAllocationBytes(jsonCodeUnits) +
-    (root === "/" ? 0 : 2 * stringAllocationBytes(root.length + 1)) +
-    ARRAY_WRAPPER_BYTES +
-    count * (ARRAY_SLOT_BYTES + ROW_WRAPPER_BYTES) +
-    resultTextCopies
-  );
-}
-
 /** Validate without allocating segment strings or an array. */
 function validateRelative(path: string): number {
   if (
@@ -269,32 +228,6 @@ function validateRelative(path: string): number {
     start = index + 1;
   }
   return segments;
-}
-
-function segmentAllocationBytes(path: string, segments: number): number {
-  return (
-    ARRAY_WRAPPER_BYTES +
-    segments * (ARRAY_SLOT_BYTES + STRING_WRAPPER_BYTES) +
-    2 * (path.length - segments + 1)
-  );
-}
-
-function codePointCount(value: string): number {
-  let count = 0;
-  for (let index = 0; index < value.length; count++) {
-    const point = value.codePointAt(index);
-    index += point !== undefined && point > 0xffff ? 2 : 1;
-  }
-  return count;
-}
-
-function pathComparisonAllocationBytes(left: string, right: string): number {
-  const points = codePointCount(left) + codePointCount(right);
-  return (
-    2 * ARRAY_WRAPPER_BYTES +
-    points * (ARRAY_SLOT_BYTES + STRING_WRAPPER_BYTES) +
-    2 * (left.length + right.length)
-  );
 }
 
 function checkedMode(mode: number | undefined, fallback: number, path: string): number {
@@ -333,12 +266,8 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
   #nodeJsonBytes = 2;
   #pathJsonBytes = 2;
   #contentIdBytes = 0;
-  #metadataRetainedBytes = 0;
   #chunkBytes = 0;
   #chunkJsonBytes = 2;
-  #assemblerBytes = 0;
-  #pathStateBytes = 0;
-  #constructionBytes = 0;
   #lastPath: string | null = null;
   #lastType: NodeRow["type"] | null = null;
   #openDirectorySegments: string[] = [];
@@ -353,16 +282,10 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     private readonly rootExists: boolean,
     private readonly timestamp: number,
     private readonly revision: number,
-    private readonly reservation: MemoryReservation,
     private readonly rootSegments: number,
     nextInode: number,
   ) {
     this.#nextInode = nextInode;
-    this.#recordState(root);
-  }
-
-  get highWaterBytes(): number {
-    return this.reservation.highWaterBytes;
   }
 
   writeSymlink(path: string, target: string, options: InitialSymlinkOptions = {}): void {
@@ -423,10 +346,7 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
         null,
         checkedContentId(options.contentId, path),
       );
-      this.#ensurePeak(CHUNK_SIZE, path);
       let buffer = new Uint8Array(CHUNK_SIZE);
-      this.#assemblerBytes = CHUNK_SIZE;
-      this.#recordState(path);
       let filled = 0;
       let observed = 0;
       let index = 0;
@@ -450,14 +370,10 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
           offset += length;
           if (filled === CHUNK_SIZE) {
             this.#prepareChunk(buffer.length);
-            this.#assemblerBytes = 0;
             this.#pushChunk(inode, index++, buffer);
             buffer = new Uint8Array(0);
             if (offset < chunk.length || observed < expected) {
-              this.#ensurePeak(CHUNK_SIZE, path);
               buffer = new Uint8Array(CHUNK_SIZE);
-              this.#assemblerBytes = CHUNK_SIZE;
-              this.#recordState(path);
             }
             filled = 0;
           }
@@ -468,14 +384,9 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
       }
       if (filled > 0) {
         this.#prepareChunk(filled);
-        this.#ensurePeak(filled, path);
         const final = buffer.slice(0, filled);
-        this.#assemblerBytes = 0;
         this.#pushChunk(inode, index, final);
-      } else {
-        this.#assemblerBytes = 0;
       }
-      this.#recordState(path);
     } catch (error) {
       this.#failed = true;
       throw error;
@@ -513,14 +424,9 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     this.#nodeJsonBytes = 2;
     this.#pathJsonBytes = 2;
     this.#contentIdBytes = 0;
-    this.#metadataRetainedBytes = 0;
     this.#chunkBytes = 0;
     this.#chunkJsonBytes = 2;
-    this.#assemblerBytes = 0;
-    this.#pathStateBytes = 0;
-    this.#constructionBytes = 0;
     this.#failed = true;
-    this.reservation.clear("other");
   }
 
   #entry(
@@ -536,7 +442,7 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     if (segmentCount > MAX_PATH_SEGMENTS - this.rootSegments) {
       throw filesystemError("E2BIG", "initial worktree path exceeds the path limit", relative);
     }
-    if (this.#lastPath !== null && this.#comparePaths(this.#lastPath, relative) >= 0) {
+    if (this.#lastPath !== null && comparePaths(this.#lastPath, relative) >= 0) {
       throw filesystemError(
         "EINVAL",
         "initial worktree entries are not strictly ordered",
@@ -556,14 +462,9 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
       );
     }
     if (!this.rootExists && this.#created === 0) {
-      this.#ensurePeak(2 * ROW_WRAPPER_BYTES, this.root);
-      this.#constructionBytes += 2 * ROW_WRAPPER_BYTES;
-      this.#createPrepared(this.root, "/", false, false, "dir", DEFAULT_DIR_MODE, 0, null, null);
+      this.#createPrepared(this.root, "/", "dir", DEFAULT_DIR_MODE, 0, null, null);
     }
 
-    const splitBytes = segmentAllocationBytes(relative, segmentCount);
-    this.#ensurePeak(splitBytes, relative);
-    this.#constructionBytes = splitBytes;
     const segments = relative.split("/");
 
     let common = 0;
@@ -596,21 +497,9 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
       contentId,
     );
     if (type !== "dir") segments.pop();
-    const openDirectories = segments;
-    const pathStateBytes =
-      2 * relative.length +
-      ARRAY_WRAPPER_BYTES +
-      openDirectories.reduce(
-        (total, segment) => total + ARRAY_SLOT_BYTES + STRING_WRAPPER_BYTES + 2 * segment.length,
-        0,
-      );
-    this.#ensurePeak(Math.max(0, pathStateBytes - this.#pathStateBytes), relative);
-    this.#openDirectorySegments = openDirectories;
+    this.#openDirectorySegments = segments;
     this.#lastPath = relative;
     this.#lastType = type;
-    this.#pathStateBytes = pathStateBytes;
-    this.#constructionBytes = 0;
-    this.#recordState(relative);
     return inode;
   }
 
@@ -623,63 +512,22 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     target: string | null,
     contentId: Uint8Array | null,
   ): number {
-    const selectedLength = end;
-    const pathLength =
-      this.root === "/" ? 1 + selectedLength : this.root.length + 1 + selectedLength;
     const parentSlash =
       this.root === "/"
         ? relative.lastIndexOf("/", end - 1) + 1
         : this.root.length + 1 + relative.lastIndexOf("/", end - 1);
     const parentLength = Math.max(1, parentSlash);
     const parentIsRoot = parentLength === this.root.length;
-    const prefixBytes = end === relative.length ? 0 : stringAllocationBytes(selectedLength);
-    const allocationBytes =
-      prefixBytes +
-      stringAllocationBytes(pathLength) +
-      (parentIsRoot ? 0 : stringAllocationBytes(parentLength)) +
-      2 * ROW_WRAPPER_BYTES +
-      (contentId?.length ?? 0);
-    this.#ensurePeak(allocationBytes, relative);
-    this.#constructionBytes += allocationBytes;
     const selected = end === relative.length ? relative : relative.slice(0, end);
     const path = this.root === "/" ? `/${selected}` : `${this.root}/${selected}`;
     const parent = parentIsRoot ? this.root : path.slice(0, parentSlash);
-    const inode = this.#createPrepared(
-      path,
-      parent,
-      true,
-      !parentIsRoot,
-      type,
-      mode,
-      size,
-      target,
-      contentId,
-    );
-    this.#constructionBytes -= prefixBytes;
-    this.#recordState(path);
+    const inode = this.#createPrepared(path, parent, type, mode, size, target, contentId);
     return inode;
-  }
-
-  #comparePaths(left: string, right: string): number {
-    const transient = this.reservation.scope();
-    try {
-      transient.set("other", pathComparisonAllocationBytes(left, right));
-      return comparePaths(left, right);
-    } catch (error) {
-      if (typeof error === "object" && error !== null && Reflect.get(error, "code") === "E2BIG") {
-        throw filesystemError("E2BIG", "initial worktree exceeds operation memory", right);
-      }
-      throw error;
-    } finally {
-      transient.dispose();
-    }
   }
 
   #createPrepared(
     path: string,
     parent: string,
-    pathAllocated: boolean,
-    parentAllocated: boolean,
     type: NodeRow["type"],
     mode: number,
     size: number,
@@ -705,12 +553,6 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     ) {
       this.#flushMetadata();
     }
-    const retainedBytes =
-      2 * ROW_WRAPPER_BYTES +
-      2 * path.length +
-      2 * parent.length +
-      (target === null ? 0 : 2 * target.length) +
-      idBytes;
     const ownedContentId = contentId?.slice() ?? null;
     const pathRow = { path, parent, inode };
     const node: NodeRow = {
@@ -727,17 +569,7 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     this.#nodeJsonBytes += nodeJsonBytes;
     this.#pathJsonBytes += pathJsonBytes;
     this.#contentIdBytes += idBytes;
-    this.#metadataRetainedBytes += retainedBytes;
-    this.#constructionBytes = Math.max(
-      0,
-      this.#constructionBytes -
-        (2 * ROW_WRAPPER_BYTES +
-          (pathAllocated ? stringAllocationBytes(path.length) : 0) +
-          (parentAllocated ? stringAllocationBytes(parent.length) : 0) +
-          idBytes),
-    );
     this.#created++;
-    this.#recordState(path);
     if (
       this.#nodeJsonBytes >= METADATA_JSON_FLUSH_BYTES ||
       this.#pathJsonBytes >= METADATA_JSON_FLUSH_BYTES ||
@@ -761,7 +593,6 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
 
   #queueCopiedChunk(inode: number, index: number, source: Uint8Array): void {
     this.#prepareChunk(source.length);
-    this.#ensurePeak(source.length, "initial worktree file");
     this.#pushChunk(inode, index, source.slice());
   }
 
@@ -769,7 +600,6 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     this.#chunks.push({ inode, index, bytes });
     this.#chunkBytes += bytes.length;
     this.#chunkJsonBytes += 192;
-    this.#recordState("initial worktree content");
     if (this.#chunkBytes >= PAYLOAD_PAGE_BYTES || this.#chunkJsonBytes >= MAX_CHUNK_JSON_BYTES) {
       this.#flushChunks();
     }
@@ -777,10 +607,6 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
 
   #flushMetadata(): void {
     if (this.#nodes.length === 0) return;
-    this.#ensurePeak(
-      this.#contentIdBytes + 2 * (this.#nodeJsonBytes + this.#pathJsonBytes),
-      "initial worktree metadata",
-    );
     const ids = new Uint8Array(this.#contentIdBytes);
     const nodeItems: string[] = [];
     const pathItems: string[] = [];
@@ -818,13 +644,10 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     this.#nodeJsonBytes = 2;
     this.#pathJsonBytes = 2;
     this.#contentIdBytes = 0;
-    this.#metadataRetainedBytes = 0;
-    this.#recordState("initial worktree metadata");
   }
 
   #flushChunks(): void {
     if (this.#chunks.length === 0) return;
-    this.#ensurePeak(this.#chunkBytes + 2 * this.#chunkJsonBytes, "initial worktree content");
     const payload = new Uint8Array(this.#chunkBytes);
     const items: string[] = [];
     let at = 0;
@@ -838,42 +661,10 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     this.#chunks = [];
     this.#chunkBytes = 0;
     this.#chunkJsonBytes = 2;
-    this.#recordState("initial worktree content");
   }
 
   #assertOpen(): void {
     if (this.#closed || this.#failed) throw new Error("initial worktree session is closed");
-  }
-
-  #ownedStateBytes(): number {
-    return (
-      2 * this.root.length +
-      this.#metadataRetainedBytes +
-      this.#chunkBytes +
-      this.#chunks.length * ROW_WRAPPER_BYTES +
-      this.#assemblerBytes +
-      this.#pathStateBytes +
-      this.#constructionBytes
-    );
-  }
-
-  #ensurePeak(extraBytes: number, path: string): void {
-    const current = this.#ownedStateBytes();
-    if (!Number.isSafeInteger(extraBytes) || extraBytes < 0) {
-      throw filesystemError("EINVAL", "initial worktree memory charge is invalid", path);
-    }
-    try {
-      this.reservation.set("other", current + extraBytes);
-    } catch (error) {
-      if (typeof error === "object" && error !== null && Reflect.get(error, "code") === "E2BIG") {
-        throw filesystemError("E2BIG", "initial worktree exceeds operation memory", path);
-      }
-      throw error;
-    }
-  }
-
-  #recordState(path: string): void {
-    this.#ensurePeak(0, path);
   }
 }
 
@@ -893,74 +684,57 @@ export class InitialWorktreeWriter {
     rootInput: string,
     body: (session: InitialWorktreeSession) => T,
     afterClose?: (value: T) => unknown,
-    parentReservation?: MemoryReservation,
   ): InitialWriteResult<T> {
-    const localReservation =
-      parentReservation === undefined ? new MemoryCoordinator().reserve() : null;
-    let reservation: MemoryReservation | null = null;
-    try {
-      const owner = parentReservation ?? localReservation;
-      if (owner === null) throw new Error("initial worktree memory reservation is missing");
-      const activeReservation = owner.scope();
-      reservation = activeReservation;
-      const rootSegments = validateCanonicalRoot(rootInput);
-      const root = rootInput;
-      return this.db.transactionSync(() => {
-        const preflight = this.#preflight(root, activeReservation);
-        if (preflight === null) return { kind: "unavailable" };
-        const timestamp = this.clock();
-        if (!Number.isSafeInteger(timestamp) || timestamp < 0) {
-          throw filesystemError("EINVAL", "initial worktree clock returned an invalid timestamp");
+    const rootSegments = validateCanonicalRoot(rootInput);
+    const root = rootInput;
+    return this.db.transactionSync(() => {
+      const preflight = this.#preflight(root);
+      if (preflight === null) return { kind: "unavailable" };
+      const timestamp = this.clock();
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0) {
+        throw filesystemError("EINVAL", "initial worktree clock returned an invalid timestamp");
+      }
+      if (preflight.revision === Number.MAX_SAFE_INTEGER) {
+        throw filesystemError("E2BIG", "filesystem revision is exhausted");
+      }
+      const revision = preflight.revision + 1;
+      let activeSession: InitialWorktreeSessionImpl | null = null;
+      try {
+        activeSession = new InitialWorktreeSessionImpl(
+          this.db,
+          root,
+          preflight.rootExists,
+          timestamp,
+          revision,
+          rootSegments,
+          preflight.nextInode,
+        );
+        const value = body(activeSession);
+        if (isThenable(value)) {
+          throw filesystemError("EINVAL", "initial worktree body must be synchronous");
         }
-        if (preflight.revision === Number.MAX_SAFE_INTEGER) {
-          throw filesystemError("E2BIG", "filesystem revision is exhausted");
-        }
-        const revision = preflight.revision + 1;
-        let activeSession: InitialWorktreeSessionImpl | null = null;
-        try {
-          activeSession = new InitialWorktreeSessionImpl(
-            this.db,
-            root,
-            preflight.rootExists,
-            timestamp,
-            revision,
-            activeReservation,
-            rootSegments,
-            preflight.nextInode,
-          );
-          const value = body(activeSession);
-          if (isThenable(value)) {
-            throw filesystemError("EINVAL", "initial worktree body must be synchronous");
+        activeSession.close(preflight.revision, preflight.nextInode);
+        if (afterClose !== undefined) {
+          const afterResult = afterClose(value);
+          if (isThenable(afterResult)) {
+            void Promise.resolve(afterResult).catch(() => {});
+            throw filesystemError("EINVAL", "initial worktree afterClose must be synchronous");
           }
-          activeSession.close(preflight.revision, preflight.nextInode);
-          if (afterClose !== undefined) {
-            const afterResult = afterClose(value);
-            if (isThenable(afterResult)) {
-              void Promise.resolve(afterResult).catch(() => {});
-              throw filesystemError("EINVAL", "initial worktree afterClose must be synchronous");
-            }
-          }
-          return { kind: "committed", value };
-        } finally {
-          activeSession?.invalidate();
         }
-      });
-    } finally {
-      reservation?.dispose();
-      localReservation?.dispose();
-    }
+        return { kind: "committed", value };
+      } finally {
+        activeSession?.invalidate();
+      }
+    });
   }
 
-  #preflight(root: string, reservation: MemoryReservation): Preflight | null {
-    const transient = reservation.scope();
-    try {
-      transient.set("other", preflightAllocationBytes(root));
-      const ancestors = rootAncestors(root);
-      const ancestorsJson = JSON.stringify(ancestors);
-      const subtreeStart = root === "/" ? "/" : `${root}/`;
-      const subtreeEnd = root === "/" ? "0" : `${root}0`;
-      const rows = this.db.all<PreflightRow>(
-        `WITH requested(ordinal, path) AS (
+  #preflight(root: string): Preflight | null {
+    const ancestors = rootAncestors(root);
+    const ancestorsJson = JSON.stringify(ancestors);
+    const subtreeStart = root === "/" ? "/" : `${root}/`;
+    const subtreeEnd = root === "/" ? "0" : `${root}0`;
+    const rows = this.db.all<PreflightRow>(
+      `WITH requested(ordinal, path) AS (
            SELECT CAST(key AS INTEGER), value FROM json_each(?)
          )
          SELECT requested.ordinal, requested.path AS requested,
@@ -969,57 +743,49 @@ export class InitialWorktreeWriter {
            LEFT JOIN fs_paths path ON path.path = requested.path
            LEFT JOIN fs_nodes node ON node.inode = path.inode
           ORDER BY requested.ordinal`,
-        ancestorsJson,
-      );
-      if (rows.length !== ancestors.length)
-        throw new Error("initial worktree preflight lost a row");
-      let rootExists = false;
-      for (let index = 0; index < rows.length; index++) {
-        const row = rows[index]!;
-        const expected = ancestors[index]!;
-        if (row.ordinal !== index || row.requested !== expected) {
-          throw new Error("initial worktree preflight returned invalid path metadata");
-        }
-        const final = index === rows.length - 1;
-        if (row.path === null) {
-          if (!final) return null;
-          continue;
-        }
-        if (row.path !== expected || row.type !== "dir") return null;
-        if (final) rootExists = true;
+      ancestorsJson,
+    );
+    if (rows.length !== ancestors.length) throw new Error("initial worktree preflight lost a row");
+    let rootExists = false;
+    for (let index = 0; index < rows.length; index++) {
+      const row = rows[index]!;
+      const expected = ancestors[index]!;
+      if (row.ordinal !== index || row.requested !== expected) {
+        throw new Error("initial worktree preflight returned invalid path metadata");
       }
-      const descendants =
-        root === "/"
-          ? this.db.scalar<number>("SELECT count(*) FROM fs_paths WHERE path > '/' AND path < '0'")
-          : this.db.scalar<number>(
-              "SELECT count(*) FROM fs_paths WHERE path >= ? AND path < ?",
-              subtreeStart,
-              subtreeEnd,
-            );
-      if (
-        typeof descendants !== "number" ||
-        !Number.isSafeInteger(descendants) ||
-        descendants < 0
-      ) {
-        throw new Error("initial worktree preflight returned an invalid subtree count");
+      const final = index === rows.length - 1;
+      if (row.path === null) {
+        if (!final) return null;
+        continue;
       }
-      if (descendants !== 0) return null;
-      const revision = this.db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'rev'");
-      const nextInode = this.db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'next_inode'");
-      if (
-        typeof revision !== "number" ||
-        !Number.isSafeInteger(revision) ||
-        revision < 0 ||
-        typeof nextInode !== "number" ||
-        !Number.isSafeInteger(nextInode) ||
-        nextInode <= 0
-      ) {
-        throw new Error("filesystem metadata is invalid");
-      }
-      return { rootExists, revision, nextInode };
-    } finally {
-      transient.dispose();
+      if (row.path !== expected || row.type !== "dir") return null;
+      if (final) rootExists = true;
     }
+    const descendants =
+      root === "/"
+        ? this.db.scalar<number>("SELECT count(*) FROM fs_paths WHERE path > '/' AND path < '0'")
+        : this.db.scalar<number>(
+            "SELECT count(*) FROM fs_paths WHERE path >= ? AND path < ?",
+            subtreeStart,
+            subtreeEnd,
+          );
+    if (typeof descendants !== "number" || !Number.isSafeInteger(descendants) || descendants < 0) {
+      throw new Error("initial worktree preflight returned an invalid subtree count");
+    }
+    if (descendants !== 0) return null;
+    const revision = this.db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'rev'");
+    const nextInode = this.db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'next_inode'");
+    if (
+      typeof revision !== "number" ||
+      !Number.isSafeInteger(revision) ||
+      revision < 0 ||
+      typeof nextInode !== "number" ||
+      !Number.isSafeInteger(nextInode) ||
+      nextInode <= 0
+    ) {
+      throw new Error("filesystem metadata is invalid");
+    }
+    return { rootExists, revision, nextInode };
   }
 }
 

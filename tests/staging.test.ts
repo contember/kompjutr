@@ -178,7 +178,6 @@ function fakeSelectedAddResult(
       },
     ],
     worktree: [{ path, stat }],
-    retainedBytes: 1_000_000,
   };
 }
 
@@ -197,7 +196,6 @@ function requireFakeWorktree(result: AvailableSelectedPathResult) {
 function fakeAncestorResult(paths: readonly string[]): SparseIndexAncestorResult {
   return {
     facts: paths.map((path) => ({ path, exact: false, descendant: false })),
-    retainedBytes: 10_000,
   };
 }
 
@@ -459,7 +457,6 @@ describe("add", () => {
           Reflect.set(result.facts[1] ?? {}, "path", first.path);
         },
       },
-      { name: "retained type", mutate: (result) => void Reflect.set(result, "retainedBytes", 1.5) },
     ];
 
     for (const corruption of corruptions) {
@@ -507,7 +504,7 @@ describe("add", () => {
           sparseWorkspace: {
             ...sparseWorkspace,
             indexAncestorFacts() {
-              return { ...fakeAncestorResult(["a.txt"]), retainedBytes: 0 };
+              return fakeAncestorResult(["a.txt"]);
             },
           },
         },
@@ -555,7 +552,7 @@ describe("add", () => {
         sparseWorkspace: {
           ...sparseWorkspace,
           indexAncestorFacts() {
-            return { facts, retainedBytes: 10_000 };
+            return { facts };
           },
         },
       },
@@ -594,7 +591,6 @@ describe("add", () => {
                 indexAncestorFacts() {
                   return {
                     facts: [{ path: "a.txt", exact: testCase.claimedExact, descendant: false }],
-                    retainedBytes: 10_000,
                   };
                 },
               },
@@ -914,12 +910,6 @@ describe("add", () => {
           Reflect.set(requireFakeIndex(result), "path", "b/file.txt");
         },
       },
-      {
-        name: "retained underreport",
-        mutate(result) {
-          result.retainedBytes = 0;
-        },
-      },
     ];
 
     for (const testCase of cases) {
@@ -1161,7 +1151,6 @@ describe("add", () => {
       })),
     );
     expect(workspace.repo.store.objectCount()).toBe(beforeObjects + 1);
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("does not charge an AddIndexPath alias as a second retained path", () => {
@@ -1190,7 +1179,6 @@ describe("add", () => {
     expect(workspace.repo.checkout.indexEntries()).toEqual([]);
     expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
     for (const path of paths) expect(workspace.worktree.stat(`/${path}`)).toBeNull();
-    workspace.repo.store.memory.assertIdle();
   });
 });
 
@@ -1259,7 +1247,6 @@ describe("rm", () => {
     expect(workspace.repo.checkout.indexEntries()).toEqual([]);
     expect(workspace.worktree.stat("/a.bin")?.size).toBe(exact.length);
     expect(workspace.worktree.stat("/b.bin")?.size).toBe(plusOne.length);
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("continues worktree safety hashing through the former 17th batch", () => {
@@ -1569,7 +1556,6 @@ describe("rm", () => {
 
     expect(lsFiles(workspace.repo)).toEqual(["file.txt"]);
     expect(utf8Decoder.decode(workspace.worktree.readFile("/file.txt"))).toBe("content\n");
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("passes an oversized singleton removal through to the filesystem", () => {
@@ -1583,7 +1569,6 @@ describe("rm", () => {
 
     expect(workspace.repo.checkout.indexGet(path)).toBeNull();
     expect(workspace.worktree.stat(`${root}/${path}`)).toBeNull();
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("reports a pathspec that is not in the index", () => {
@@ -1625,7 +1610,6 @@ describe("rm", () => {
     rm(workspace.repo, workspace.worktree, { paths: [longPath], cached: true, force: true });
     expect(workspace.repo.checkout.indexGet(longPath)).toBeNull();
     assertUnchanged();
-    workspace.repo.store.memory.assertIdle();
 
     const suffix = "y".repeat(2_080);
     expect(() =>

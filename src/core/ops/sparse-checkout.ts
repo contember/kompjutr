@@ -1,6 +1,5 @@
 // Bounded clean-workspace checkout without traversing the full tree.
 
-import type { MemoryReservation } from "../../memory.js";
 import {
   hydrateSparseWorkspaceOwned,
   selectSparsePathsOwned,
@@ -9,10 +8,9 @@ import {
 import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
-import { CorruptError, GitError, hasErrorCode } from "../errors.js";
+import { CorruptError, hasErrorCode } from "../errors.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import type {
   SelectedPathResult,
   SelectedWorktreeFact,
@@ -27,20 +25,6 @@ import type { TargetEntry } from "./tree-stream.js";
 import { hashExactWorktreePathsOwned, indexMatchesStat, type WorktreePath } from "./worktree-io.js";
 
 const SPARSE_CHECKOUT_PATHS = 1_000;
-const SPARSE_CHECKOUT_ROW_BYTES = 384;
-const SPARSE_CHECKOUT_PATH_VECTOR_BYTES = 64;
-const SPARSE_CHECKOUT_SELECTED_SPEC_BYTES = 72;
-const SPARSE_CHECKOUT_SELECTED_INDEX_BYTES = 320;
-const SPARSE_CHECKOUT_SELECTED_WORKTREE_BYTES = 512;
-const SPARSE_CHECKOUT_SELECTED_RESULT_BYTES = 64;
-const SPARSE_CHECKOUT_SELECTED_ROWS_BYTES = 64;
-const SPARSE_CHECKOUT_SELECTED_ROW_BYTES = 256;
-const SPARSE_CHECKOUT_SELECTED_INDEX_ARRAY_BYTES = 64;
-const SPARSE_CHECKOUT_SELECTED_ARRAY_SLOT_BYTES = 8;
-const SPARSE_CHECKOUT_GUARD_ROW_BYTES = 512;
-const SPARSE_CHECKOUT_CHANGE_ROW_BYTES = 128;
-const CHECKOUT_PATH_FIXED_BYTES = 96;
-const SPARSE_CHECKOUT_FIXED_BYTES = 384;
 
 interface SparseCheckoutCandidate {
   path: string;
@@ -62,57 +46,36 @@ export function trySparseCleanCheckout(
   repo: Repository,
   worktree: Worktree,
   targetTreeOid: string,
-  owningReservation: MemoryReservation,
 ): boolean {
   const source = context.sparseWorkspace;
   const tracker = context.indexTracker;
   if (source === undefined || tracker === undefined) return false;
 
-  if (!repo.store.ownsMemoryReservation(owningReservation)) {
-    throw new GitError("EINVAL", "sparse checkout reservation belongs to another repository");
-  }
-  const reservation = owningReservation.scope();
   let applying = false;
   try {
     const baselineTreeOid = repo.headTree();
     const state = source.readState(repo.checkout.checkoutId);
     if (!state.available || state.baselineTreeOid !== baselineTreeOid) return false;
-    for (const _entry of sparseDirtyPathsOwned(source, repo.checkout.checkoutId, reservation)) {
+    for (const _entry of sparseDirtyPathsOwned(source, repo.checkout.checkoutId)) {
       return false;
     }
     if (repo.checkout.hasCheckoutBlockingIndexEntries()) return false;
 
-    const candidates = sparseCheckoutCandidates(repo, baselineTreeOid, targetTreeOid, reservation);
+    const candidates = sparseCheckoutCandidates(repo, baselineTreeOid, targetTreeOid);
     if (candidates === null) return false;
     if (candidates.length === 0) return true;
 
-    const selected = selectSparseCheckoutRows(context, repo, candidates, reservation);
+    const selected = selectSparseCheckoutRows(context, repo, candidates);
     const hydrated =
       selected ??
-      hydrateSparseCheckoutRows(
-        source,
-        repo,
-        candidates,
-        baselineTreeOid,
-        targetTreeOid,
-        reservation,
-      );
+      hydrateSparseCheckoutRows(source, repo, candidates, baselineTreeOid, targetTreeOid);
     if (hydrated === null) return false;
     if (hydrated.rows.length !== candidates.length) {
       throw new CorruptError("sparse checkout hydration returned the wrong row count");
     }
-    if (!Number.isSafeInteger(hydrated.retainedBytes) || hydrated.retainedBytes < 0) {
-      throw new CorruptError("sparse checkout hydration returned an invalid retained size");
-    }
     if (!validateSparseCheckoutRows(candidates, hydrated.rows)) return false;
-    if (!sparseCheckoutWorktreeMatches(repo, worktree, hydrated.rows, reservation)) return false;
+    if (!sparseCheckoutWorktreeMatches(repo, worktree, hydrated.rows)) return false;
 
-    const changesMemory = reservation.scope();
-    changesMemory.set(
-      "other",
-      SPARSE_CHECKOUT_PATH_VECTOR_BYTES +
-        candidates.length * (SPARSE_CHECKOUT_CHANGE_ROW_BYTES + 8),
-    );
     const changes: SparseCheckoutChange[] = [];
     for (let index = 0; index < candidates.length; index++) {
       const candidate = candidates[index];
@@ -128,12 +91,10 @@ export function trySparseCleanCheckout(
       });
     }
     applying = true;
-    return checkoutSparseChanges(repo, worktree, changes, reservation);
+    return checkoutSparseChanges(repo, worktree, changes);
   } catch (error) {
     if (!applying && hasErrorCode(error, "E2BIG")) return false;
     throw error;
-  } finally {
-    reservation.dispose();
   }
 }
 
@@ -143,62 +104,33 @@ function hydrateSparseCheckoutRows(
   candidates: readonly SparseCheckoutCandidate[],
   baselineTreeOid: string | null,
   targetTreeOid: string,
-  owningReservation: MemoryReservation,
 ): AvailableSparseWorkspaceResult | null {
-  const requestMemory = owningReservation.scope();
-  try {
-    requestMemory.set("other", SPARSE_CHECKOUT_PATH_VECTOR_BYTES + candidates.length * 8);
-    const hydrated = hydrateSparseWorkspaceOwned(
-      source,
-      {
-        repoId: repo.store.repoId,
-        checkoutId: repo.checkout.checkoutId,
-        root: repo.root,
-        baselineTreeOid,
-        currentTreeOid: targetTreeOid,
-        paths: candidates.map((candidate) => candidate.path),
-      },
-      owningReservation,
-    );
-    return hydrated.available ? hydrated : null;
-  } finally {
-    requestMemory.dispose();
-  }
+  const hydrated = hydrateSparseWorkspaceOwned(source, {
+    repoId: repo.store.repoId,
+    checkoutId: repo.checkout.checkoutId,
+    root: repo.root,
+    baselineTreeOid,
+    currentTreeOid: targetTreeOid,
+    paths: candidates.map((candidate) => candidate.path),
+  });
+  return hydrated.available ? hydrated : null;
 }
 
 function selectSparseCheckoutRows(
   context: GitContext,
   repo: Repository,
   candidates: readonly SparseCheckoutCandidate[],
-  owningReservation: MemoryReservation,
 ): AvailableSparseWorkspaceResult | null {
   const source = context.selectedPaths;
   if (source === undefined || hasStructuralCandidates(candidates)) return null;
-  const requestMemory = owningReservation.scope();
-  try {
-    requestMemory.set(
-      "other",
-      SPARSE_CHECKOUT_PATH_VECTOR_BYTES +
-        candidates.length * (SPARSE_CHECKOUT_SELECTED_SPEC_BYTES + 8),
-    );
-    const selected: SelectedPathResult = selectSparsePathsOwned(
-      source,
-      {
-        repoId: repo.store.repoId,
-        checkoutId: repo.checkout.checkoutId,
-        root: repo.root,
-        specs: candidates.map((candidate) => ({ path: candidate.path, recursive: false })),
-      },
-      owningReservation,
-    );
-    if (!selected.available) return null;
-    if (!Number.isSafeInteger(selected.retainedBytes) || selected.retainedBytes < 0) {
-      throw new CorruptError("selected sparse checkout returned an invalid retained size");
-    }
-    return selectedSparseWorkspaceRows(candidates, selected, owningReservation);
-  } finally {
-    requestMemory.dispose();
-  }
+  const selected: SelectedPathResult = selectSparsePathsOwned(source, {
+    repoId: repo.store.repoId,
+    checkoutId: repo.checkout.checkoutId,
+    root: repo.root,
+    specs: candidates.map((candidate) => ({ path: candidate.path, recursive: false })),
+  });
+  if (!selected.available) return null;
+  return selectedSparseWorkspaceRows(candidates, selected);
 }
 
 function hasStructuralCandidates(candidates: readonly SparseCheckoutCandidate[]): boolean {
@@ -314,13 +246,11 @@ function validSelectedWorktreeLeaf(stat: SparseWorktreeLeaf): boolean {
 function validateSelectedFacts(
   index: readonly IndexEntry[],
   worktree: readonly SelectedWorktreeFact[],
-  retainedBytes: number,
   candidateCount: number,
 ): void {
   if (index.length > candidateCount * 4 || worktree.length > candidateCount) {
     throw new CorruptError("selected sparse checkout returned excessive facts");
   }
-  let accountedBytes = 0;
   let previousIndex: IndexEntry | undefined;
   for (let ordinal = 0; ordinal < index.length; ordinal++) {
     const entry = index[ordinal];
@@ -334,11 +264,6 @@ function validateSelectedFacts(
     ) {
       throw new CorruptError("selected sparse checkout returned unordered index entries");
     }
-    const factBytes = SPARSE_CHECKOUT_SELECTED_INDEX_BYTES + entry.path.length * 2;
-    if (accountedBytes > retainedBytes - factBytes) {
-      throw new CorruptError("selected sparse checkout underreported retained state");
-    }
-    accountedBytes += factBytes;
     previousIndex = entry;
   }
 
@@ -356,56 +281,18 @@ function validateSelectedFacts(
     if (previousPath !== undefined && comparePaths(previousPath, entry.path) >= 0) {
       throw new CorruptError("selected sparse checkout returned unordered worktree entries");
     }
-    const targetBytes = entry.stat.target === null ? 0 : entry.stat.size * 2;
-    const contentBytes = entry.stat.contentId?.byteLength ?? 0;
-    const factBytes =
-      SPARSE_CHECKOUT_SELECTED_WORKTREE_BYTES + entry.path.length * 2 + targetBytes + contentBytes;
-    if (
-      !Number.isSafeInteger(factBytes) ||
-      factBytes < 0 ||
-      accountedBytes > retainedBytes - factBytes
-    ) {
-      throw new CorruptError("selected sparse checkout underreported retained state");
-    }
-    accountedBytes += factBytes;
     previousPath = entry.path;
   }
-}
-
-function selectedMappingRetainedBytes(candidateCount: number, indexCount: number): number | null {
-  const fixed = SPARSE_CHECKOUT_SELECTED_RESULT_BYTES + SPARSE_CHECKOUT_SELECTED_ROWS_BYTES;
-  const perCandidate =
-    SPARSE_CHECKOUT_SELECTED_ROW_BYTES +
-    SPARSE_CHECKOUT_SELECTED_INDEX_ARRAY_BYTES +
-    SPARSE_CHECKOUT_SELECTED_ARRAY_SLOT_BYTES;
-  const indexSlots = indexCount * SPARSE_CHECKOUT_SELECTED_ARRAY_SLOT_BYTES;
-  if (
-    !Number.isSafeInteger(indexSlots) ||
-    candidateCount > Math.floor((Number.MAX_SAFE_INTEGER - fixed - indexSlots) / perCandidate)
-  ) {
-    return null;
-  }
-  return fixed + candidateCount * perCandidate + indexSlots;
 }
 
 function selectedSparseWorkspaceRows(
   candidates: readonly SparseCheckoutCandidate[],
   selected: Extract<SelectedPathResult, { available: true }>,
-  owningReservation: MemoryReservation,
 ): AvailableSparseWorkspaceResult | null {
   if (!Array.isArray(selected.index) || !Array.isArray(selected.worktree)) {
     throw new CorruptError("selected sparse checkout returned malformed facts");
   }
-  validateSelectedFacts(
-    selected.index,
-    selected.worktree,
-    selected.retainedBytes,
-    candidates.length,
-  );
-  const mappingBytes = selectedMappingRetainedBytes(candidates.length, selected.index.length);
-  if (mappingBytes === null) return null;
-  const mappingMemory = owningReservation.scope();
-  mappingMemory.set("other", mappingBytes);
+  validateSelectedFacts(selected.index, selected.worktree, candidates.length);
 
   const rows: SparseWorkspaceRow[] = [];
   let indexAt = 0;
@@ -445,60 +332,33 @@ function selectedSparseWorkspaceRows(
   if (worktreeAt !== selected.worktree.length) {
     throw new CorruptError("selected sparse checkout returned an unrelated worktree path");
   }
-  if (selected.retainedBytes > Number.MAX_SAFE_INTEGER - mappingBytes) {
-    throw new CorruptError("selected sparse checkout retained size overflows");
-  }
-  return { available: true, rows, retainedBytes: selected.retainedBytes + mappingBytes };
+  return { available: true, rows };
 }
 
 function sparseCheckoutCandidates(
   repo: Repository,
   baselineTreeOid: string | null,
   targetTreeOid: string,
-  owningReservation: MemoryReservation,
 ): SparseCheckoutCandidate[] | null {
-  const reservation = owningReservation.scope();
   const candidates: SparseCheckoutCandidate[] = [];
-  let retainedBytes = SPARSE_CHECKOUT_PATH_VECTOR_BYTES;
-  reservation.set("other", retainedBytes);
-  try {
-    for (const entry of repo.store.walkTreeDiff(
-      baselineTreeOid,
-      targetTreeOid,
-      owningReservation,
-    )) {
-      if (entry.beforeMode === "160000" || entry.afterMode === "160000") {
-        reservation.dispose();
-        return null;
-      }
-      if (candidates.length === SPARSE_CHECKOUT_PATHS) {
-        reservation.dispose();
-        return null;
-      }
-      const bytes =
-        SPARSE_CHECKOUT_ROW_BYTES +
-        SPARSE_CHECKOUT_SELECTED_ARRAY_SLOT_BYTES +
-        retainedStringBytes(entry.path);
-      if (!Number.isSafeInteger(bytes) || retainedBytes > Number.MAX_SAFE_INTEGER - bytes) {
-        throw new CorruptError("sparse checkout candidate memory accounting overflow");
-      }
-      reservation.set("other", retainedBytes + bytes);
-      candidates.push({
-        path: entry.path,
-        before:
-          entry.beforeMode === null || entry.beforeOid === null
-            ? undefined
-            : { path: entry.path, mode: entry.beforeMode, oid: entry.beforeOid },
-        after:
-          entry.afterMode === null || entry.afterOid === null
-            ? undefined
-            : { path: entry.path, mode: entry.afterMode, oid: entry.afterOid },
-      });
-      retainedBytes += bytes;
+  for (const entry of repo.store.walkTreeDiff(baselineTreeOid, targetTreeOid)) {
+    if (entry.beforeMode === "160000" || entry.afterMode === "160000") {
+      return null;
     }
-  } catch (error) {
-    reservation.dispose();
-    throw error;
+    if (candidates.length === SPARSE_CHECKOUT_PATHS) {
+      return null;
+    }
+    candidates.push({
+      path: entry.path,
+      before:
+        entry.beforeMode === null || entry.beforeOid === null
+          ? undefined
+          : { path: entry.path, mode: entry.beforeMode, oid: entry.beforeOid },
+      after:
+        entry.afterMode === null || entry.afterOid === null
+          ? undefined
+          : { path: entry.path, mode: entry.afterMode, oid: entry.afterOid },
+    });
   }
   return candidates;
 }
@@ -553,25 +413,18 @@ function sparseCheckoutWorktreeMatches(
   repo: Repository,
   worktree: Worktree,
   rows: readonly SparseWorkspaceRow[],
-  owningReservation: MemoryReservation,
 ): boolean {
-  const reservation = owningReservation.scope();
   const pending: Array<{ expected: TargetEntry; worktree: WorktreePath }> = [];
-  let retainedBytes = SPARSE_CHECKOUT_PATH_VECTOR_BYTES;
-  reservation.set("other", retainedBytes);
   for (const row of rows) {
     if (row.baseline === null) continue;
     const entry = row.index[0];
     if (entry === undefined || row.worktree === null || row.worktree.type === "dir") return false;
     const candidate: WorktreePath = { path: row.path, stat: row.worktree };
     if (!indexMatchesStat(entry, candidate.stat)) {
-      const bytes = SPARSE_CHECKOUT_GUARD_ROW_BYTES + SPARSE_CHECKOUT_SELECTED_ARRAY_SLOT_BYTES;
-      reservation.set("other", retainedBytes + bytes);
       pending.push({
         expected: { path: row.path, mode: row.baseline.mode, oid: row.baseline.oid },
         worktree: candidate,
       });
-      retainedBytes += bytes;
     }
   }
   const mapped = repo.store.lookupBlobIds(
@@ -589,7 +442,7 @@ function sparseCheckoutWorktreeMatches(
     unresolved.push(candidate.worktree);
     unresolvedExpected.set(candidate.expected.path, candidate.expected);
   }
-  const hashed = hashExactWorktreePathsOwned(repo, worktree, unresolved, owningReservation, {
+  const hashed = hashExactWorktreePathsOwned(repo, worktree, unresolved, {
     write: false,
   });
   for (const candidate of unresolved) {
@@ -612,40 +465,31 @@ export function checkoutSparseChanges(
   repo: Repository,
   worktree: Worktree,
   changes: readonly SparseCheckoutChange[],
-  owningReservation?: MemoryReservation,
 ): boolean {
-  if (owningReservation !== undefined && !repo.store.ownsMemoryReservation(owningReservation)) {
-    throw new GitError("EINVAL", "sparse checkout plan reservation belongs to another repository");
-  }
-  const reservation = owningReservation?.scope() ?? repo.store.reserveMemory();
   let plan: SparseCheckoutPlan;
   try {
-    try {
-      plan = prepareSparseCheckout(repo.root, changes, reservation);
-    } catch (error) {
-      if (hasErrorCode(error, "E2BIG")) return false;
-      throw error;
-    }
-
-    repo.checkout.indexApply((sink) => {
-      if (plan.structuralRoots.length > 0) {
-        worktree.removeFiles(plan.structuralRoots, { recursive: true });
-      }
-      if (plan.physicalRemovals.length > 0) {
-        worktree.removeFiles(plan.physicalRemovals);
-      }
-      for (const path of plan.indexRemovals) sink.remove(path);
-      sink.flush();
-    });
-    pruneSparseDirectories(worktree, plan.pruneGroups);
-    repo.checkout.indexApply((sink) => {
-      const written = [...plan.writes];
-      flushCheckoutWrites(repo, worktree, written, sink);
-    });
-    return true;
-  } finally {
-    reservation.dispose();
+    plan = prepareSparseCheckout(repo.root, changes);
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return false;
+    throw error;
   }
+
+  repo.checkout.indexApply((sink) => {
+    if (plan.structuralRoots.length > 0) {
+      worktree.removeFiles(plan.structuralRoots, { recursive: true });
+    }
+    if (plan.physicalRemovals.length > 0) {
+      worktree.removeFiles(plan.physicalRemovals);
+    }
+    for (const path of plan.indexRemovals) sink.remove(path);
+    sink.flush();
+  });
+  pruneSparseDirectories(worktree, plan.pruneGroups);
+  repo.checkout.indexApply((sink) => {
+    const written = [...plan.writes];
+    flushCheckoutWrites(repo, worktree, written, sink);
+  });
+  return true;
 }
 
 interface SparseCheckoutPlan {
@@ -659,23 +503,10 @@ interface SparseCheckoutPlan {
 function prepareSparseCheckout(
   root: string,
   changes: readonly SparseCheckoutChange[],
-  reservation: MemoryReservation,
 ): SparseCheckoutPlan {
-  let retainedBytes = SPARSE_CHECKOUT_FIXED_BYTES;
-  reservation.set("other", retainedBytes);
-  const retain = (path: string): void => {
-    const bytes = CHECKOUT_PATH_FIXED_BYTES + retainedStringBytes(path);
-    if (!Number.isSafeInteger(bytes) || retainedBytes > Number.MAX_SAFE_INTEGER - bytes) {
-      throw new CorruptError("sparse checkout plan memory accounting overflow");
-    }
-    reservation.set("other", retainedBytes + bytes);
-    retainedBytes += bytes;
-  };
-
   const structuralRoots: string[] = [];
   for (const change of changes) {
     if (change.after === undefined || change.worktreeType !== "dir") continue;
-    retain(change.path);
     structuralRoots.push(change.path);
   }
   structuralRoots.sort(comparePaths);
@@ -699,7 +530,6 @@ function prepareSparseCheckout(
   const writes: TargetEntry[] = [];
   const pruneDirectories = new Set<string>();
   for (const change of changes) {
-    retain(change.path);
     if (change.before !== undefined && change.after === undefined) {
       indexRemovals.push(change.path);
       if (!withinSparseRoot(change.path, minimalStructuralRoots)) {
@@ -713,20 +543,9 @@ function prepareSparseCheckout(
   for (const path of removalRoots) {
     let slash = path.lastIndexOf("/");
     while (slash > 0) {
-      const anticipated = CHECKOUT_PATH_FIXED_BYTES + 48 + slash * 2;
-      if (
-        !Number.isSafeInteger(anticipated) ||
-        retainedBytes > Number.MAX_SAFE_INTEGER - anticipated
-      ) {
-        throw new CorruptError("sparse checkout plan memory accounting overflow");
-      }
-      reservation.set("other", retainedBytes + anticipated);
       const directory = path.slice(0, slash);
       if (!pruneDirectories.has(directory)) {
-        retainedBytes += anticipated;
         pruneDirectories.add(directory);
-      } else {
-        reservation.set("other", retainedBytes);
       }
       slash = directory.lastIndexOf("/");
     }
@@ -752,32 +571,18 @@ function prepareSparseCheckout(
   }
 
   return {
-    structuralRoots: absoluteSparsePaths(root, minimalStructuralRoots, reservation),
-    physicalRemovals: absoluteSparsePaths(root, physicalRemovals, reservation),
+    structuralRoots: absoluteSparsePaths(root, minimalStructuralRoots),
+    physicalRemovals: absoluteSparsePaths(root, physicalRemovals),
     indexRemovals,
-    pruneGroups: pruneGroups.map((group) => absoluteSparsePaths(root, group, reservation)),
+    pruneGroups: pruneGroups.map((group) => absoluteSparsePaths(root, group)),
     writes,
   };
 }
 
-function absoluteSparsePaths(
-  root: string,
-  paths: readonly string[],
-  owningReservation: MemoryReservation,
-): string[] {
-  const reservation = owningReservation.scope();
-  let retainedBytes = SPARSE_CHECKOUT_PATH_VECTOR_BYTES + paths.length * 8;
-  reservation.set("other", retainedBytes);
+function absoluteSparsePaths(root: string, paths: readonly string[]): string[] {
   const result: string[] = [];
   for (const path of paths) {
-    const units = root === "/" ? 1 + path.length : root.length + 1 + path.length;
-    const bytes = retainedStringBytes("") + units * 2;
-    if (!Number.isSafeInteger(bytes) || retainedBytes > Number.MAX_SAFE_INTEGER - bytes) {
-      throw new CorruptError("sparse checkout absolute path memory accounting overflow");
-    }
-    reservation.set("other", retainedBytes + bytes);
     result.push(joinPath(root, path));
-    retainedBytes += bytes;
   }
   return result;
 }

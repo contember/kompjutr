@@ -42,7 +42,6 @@ import { walkWorktree } from "../src/core/ops/worktree-io.js";
 import { joinPath } from "../src/core/paths.js";
 import { Repository } from "../src/core/repository.js";
 import type { RemoveOptions, WriteEntry, WriteOptions } from "../src/fs/types.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { type IndexEntry, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -190,7 +189,7 @@ describe("branch", () => {
     expect(indexPaths()).toEqual([]);
   });
 
-  it("retains only the matched long short-name candidate", () => {
+  it("expands a matched long short-name candidate", () => {
     const name = "n".repeat(1_000_001);
     const full = `refs/remotes/${name}`;
     const main = ws.repo.store.getRef("refs/heads/main");
@@ -201,36 +200,14 @@ describe("branch", () => {
       full,
       main,
     );
-    const operationBytes = 312 + 2 * full.length;
-    const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
-    const exactBlocker = ws.repo.store.reserveMemory();
-    exactBlocker.set("other", externalBytes);
-    try {
-      expect(ws.repo.expandRef(name)).toBe(full);
-      expect(ws.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-      expect(exactBlocker.currentBytes).toBe(externalBytes);
-    } finally {
-      exactBlocker.dispose();
-    }
-
-    const overBlocker = ws.repo.store.reserveMemory();
-    overBlocker.set("other", externalBytes + 1);
-    try {
-      expect(() => ws.repo.expandRef(name)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(
-        ws.repo.store.db.scalar<string>(
-          "SELECT target FROM git_refs WHERE repo_id = ? AND name = ?",
-          ws.repo.store.repoId,
-          full,
-        ),
-      ).toBe(main);
-      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
-    } finally {
-      overBlocker.dispose();
-    }
-    expect(ws.repo.store.memory.totalBytes).toBe(0);
+    expect(ws.repo.expandRef(name)).toBe(full);
+    expect(
+      ws.repo.store.db.scalar<string>(
+        "SELECT target FROM git_refs WHERE repo_id = ? AND name = ?",
+        ws.repo.store.repoId,
+        full,
+      ),
+    ).toBe(main);
   });
 
   it.each([
@@ -240,10 +217,9 @@ describe("branch", () => {
     expect(() => ws.repo.expandRef(name)).toThrowError(
       expect.objectContaining({ code: "EINVAL", message }),
     );
-    expect(ws.repo.store.memory.totalBytes).toBe(0);
   });
 
-  it("owns a long raw HEAD and symbolic slice at the exact public-read boundary", () => {
+  it("reads a long raw HEAD and symbolic slice", () => {
     const ref = `refs/heads/${"h".repeat(1_000_001)}`;
     const rawHead = `ref: ${ref}`;
     const main = ws.repo.store.getRef("refs/heads/main");
@@ -259,37 +235,15 @@ describe("branch", () => {
       rawHead,
       ws.repo.checkout.checkoutId,
     );
-    const operationBytes = 378 + 4 * ref.length;
-    const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
-    const blocker = ws.repo.store.reserveMemory();
-    blocker.set("other", externalBytes);
-    try {
-      expect(readRef(ws.repo, { ref: "HEAD" })).toEqual({ kind: "symbolic", target: ref });
-      expect(ws.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-      expect(blocker.currentBytes).toBe(externalBytes);
-    } finally {
-      blocker.dispose();
-    }
-
-    const over = ws.repo.store.reserveMemory();
-    over.set("other", externalBytes + 1);
-    try {
-      expect(() => readRef(ws.repo, { ref: "HEAD" })).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(ws.repo.checkout.head()).toBe(rawHead);
-      expect(over.currentBytes).toBe(externalBytes + 1);
-    } finally {
-      over.dispose();
-    }
+    expect(readRef(ws.repo, { ref: "HEAD" })).toEqual({ kind: "symbolic", target: ref });
+    expect(ws.repo.checkout.head()).toBe(rawHead);
     expect(ws.repo.head()).toEqual({ ref, oid: main });
     expect(symbolicRef(ws.repo)).toBe(ref);
     expect(currentBranch(ws.repo, { fullname: true })).toBe(ref);
-    expect(ws.repo.store.memory.totalBytes).toBe(0);
   });
 
   it.each([{ kind: "branch" }, { kind: "tag" }])(
-    "force-replaces a long symbolic $kind target at the exact memory boundary",
+    "force-replaces a long symbolic $kind target",
     ({ kind }) => {
       const prepare = (): { workspace: TestRepository; full: string; raw: string } => {
         const workspace = makeRepo("/");
@@ -325,100 +279,11 @@ describe("branch", () => {
         }
       };
 
-      const measured = prepare();
-      run(measured.workspace);
-      const operationBytes = measured.workspace.repo.store.memory.highWaterBytes;
-      expect(operationBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
-      expect(measured.workspace.repo.store.getRef(measured.full)).not.toBe(measured.raw);
-
-      const exact = prepare();
-      const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
-      const exactBlocker = exact.workspace.repo.store.reserveMemory();
-      exactBlocker.set("other", externalBytes);
-      try {
-        run(exact.workspace);
-        expect(exact.workspace.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-      } finally {
-        exactBlocker.dispose();
-      }
-      expect(exact.workspace.repo.store.memory.totalBytes).toBe(0);
-
-      const over = prepare();
-      const beforeReflogs = over.workspace.repo.store.db.scalar<number>(
-        "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
-        over.workspace.repo.store.repoId,
-      );
-      const overBlocker = over.workspace.repo.store.reserveMemory();
-      overBlocker.set("other", externalBytes + 1);
-      try {
-        expect(() => run(over.workspace)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        expect(over.workspace.repo.store.getRef(over.full)).toBe(over.raw);
-        expect(
-          over.workspace.repo.store.db.scalar<number>(
-            "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
-            over.workspace.repo.store.repoId,
-          ),
-        ).toBe(beforeReflogs);
-        expect(overBlocker.currentBytes).toBe(externalBytes + 1);
-      } finally {
-        overBlocker.dispose();
-      }
-      expect(over.workspace.repo.store.memory.totalBytes).toBe(0);
+      const prepared = prepare();
+      run(prepared.workspace);
+      expect(prepared.workspace.repo.store.getRef(prepared.full)).not.toBe(prepared.raw);
     },
   );
-
-  it("composes derived branch strings against the exact shared memory ceiling", () => {
-    const name = "x".repeat(1_014);
-    const prepare = (workspace: TestRepository): string => {
-      const tree = workspace.repo.store.write("tree", new Uint8Array());
-      const person = {
-        name: "Memory",
-        email: "memory@example.test",
-        timestamp: 1_800_000_000,
-        timezoneOffset: 0,
-      };
-      return workspace.repo.store.write(
-        "commit",
-        serializeCommit({
-          tree,
-          parent: [],
-          author: person,
-          committer: person,
-          message: "memory\n",
-        }),
-      );
-    };
-    const run = (workspace: TestRepository, startPoint: string): void => {
-      branch(workspace.context, workspace.repo, { name, startPoint });
-    };
-    const measured = makeRepo("/");
-    const measuredStart = prepare(measured);
-    run(measured, measuredStart);
-    const operationBytes = measured.repo.store.memory.highWaterBytes;
-    expect(operationBytes).toBeGreaterThan(0);
-
-    const exact = makeRepo("/");
-    const exactStart = prepare(exact);
-    const exactBlocker = exact.repo.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    try {
-      run(exact, exactStart);
-      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactBlocker.dispose();
-    }
-
-    const over = makeRepo("/");
-    const overStart = prepare(over);
-    const overBlocker = over.repo.store.reserveMemory();
-    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    try {
-      expect(() => run(over, overStart)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(over.repo.store.getRef(`refs/heads/${name}`)).toBeNull();
-    } finally {
-      overBlocker.dispose();
-    }
-  });
 
   it("deletes a branch but refuses to delete the checked-out one", () => {
     branch(ws.context, ws.repo, { name: "feature" });
@@ -434,42 +299,6 @@ describe("branch", () => {
 
     expect(() => branchDelete(ws.context, ws.repo, { name: "nope" })).toThrow(/not found/);
     expect(runGit("branch", "-d", "nope").ok).toBe(false);
-  });
-
-  it("keeps upstream ownership through delete graph work and releases it", () => {
-    const main = ws.repo.store.getRef("refs/heads/main");
-    if (main === null) throw new Error("delete memory fixture is missing main");
-    const branchNames = ["a", "b", "c"].map((suffix) => `${"x".repeat(1_013)}${suffix}`);
-    for (const name of branchNames) {
-      ws.repo.store.setRef(`refs/heads/${name}`, main);
-      ws.repo.store.configSet(`branch.${name}.remote`, ".");
-      ws.repo.store.configSet(`branch.${name}.merge`, "refs/heads/main");
-    }
-    const repo = ws.repo;
-    const concurrent = repo.store.reserveMemory();
-    concurrent.set("other", MAX_OPERATION_MEMORY_BYTES / 2);
-    const measuredName = branchNames[0];
-    if (measuredName === undefined) throw new Error("measured delete branch is missing");
-    try {
-      branchDelete(ws.context, repo, { name: measuredName });
-    } finally {
-      concurrent.dispose();
-    }
-    expect(repo.store.memory.totalBytes).toBe(0);
-
-    const excessPressure = repo.store.reserveMemory();
-    excessPressure.set("other", MAX_OPERATION_MEMORY_BYTES - 1);
-    const overName = branchNames[1];
-    if (overName === undefined) throw new Error("excess delete branch is missing");
-    try {
-      expect(() => branchDelete(ws.context, repo, { name: overName })).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-    } finally {
-      excessPressure.dispose();
-    }
-    expect(repo.store.getRef(`refs/heads/${overName}`)).toBe(main);
-    expect(repo.store.memory.totalBytes).toBe(0);
   });
 
   it("refuses an unmerged branch unless forced", () => {
@@ -1222,10 +1051,9 @@ describe("checkout", () => {
     expect(ws.repo.head()).toEqual(beforeHead);
     expect(ws.repo.checkout.indexGet("modified.txt")).toEqual(beforeIndex);
     expect(ws.worktree.stat("/modified.txt")?.size).toBe(bytes.byteLength);
-    expect(ws.repo.store.memory.totalBytes).toBe(0);
   });
 
-  it("releases checkout guard hashing after an injected range failure", () => {
+  it("preserves state after an injected checkout guard range failure", () => {
     checkout(ws.context, ws.repo, ws.worktree, { ref: "main" });
     const bytes = new Uint8Array(4 * 1024 * 1024 + 1).fill(0x72);
     ws.worktree.writeFile("/modified.txt", bytes);
@@ -1250,60 +1078,22 @@ describe("checkout", () => {
     expect(ws.repo.head()).toEqual(beforeHead);
     expect(ws.repo.checkout.indexGet("modified.txt")).toEqual(beforeIndex);
     expect(ws.worktree.stat("/modified.txt")?.size).toBe(bytes.byteLength);
-    expect(ws.repo.store.memory.totalBytes).toBe(0);
   });
 
-  it("composes checkout guard aggregate state at the exact shared-memory boundary", () => {
+  it("reports modified paths from the checkout guard", () => {
     checkout(ws.context, ws.repo, ws.worktree, { ref: "main" });
     writeWorkFile(ws, "/modified.txt", "locally changed content\n");
     const side = ws.repo.resolveRef("refs/heads/side");
     if (side === null) throw new Error("side branch is missing");
     const sideTree = ws.repo.readCommit(side).tree;
 
-    const measured = ws.repo.store.reserveMemory();
-    const measuredResult = checkoutBlockersOwned(
-      ws.repo,
-      ws.worktree,
-      sideTree,
-      undefined,
-      true,
-      measured,
-    );
-    const operationBytes = measured.highWaterBytes;
-    expect(measuredResult.tracked).toContain("modified.txt");
-    measured.dispose();
-
-    const exactBlocker = ws.repo.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    const exactOwner = ws.repo.store.reserveMemory();
-    try {
-      expect(
-        checkoutBlockersOwned(ws.repo, ws.worktree, sideTree, undefined, true, exactOwner).tracked,
-      ).toContain("modified.txt");
-      expect(exactOwner.highWaterBytes + exactBlocker.currentBytes).toBe(
-        MAX_OPERATION_MEMORY_BYTES,
-      );
-    } finally {
-      exactOwner.dispose();
-      exactBlocker.dispose();
-    }
-
-    const overBlocker = ws.repo.store.reserveMemory();
-    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    const overOwner = ws.repo.store.reserveMemory();
-    try {
-      expect(() =>
-        checkoutBlockersOwned(ws.repo, ws.worktree, sideTree, undefined, true, overOwner),
-      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    } finally {
-      overOwner.dispose();
-      overBlocker.dispose();
-    }
+    expect(
+      checkoutBlockersOwned(ws.repo, ws.worktree, sideTree, undefined, true).tracked,
+    ).toContain("modified.txt");
     expect(ws.repo.head().ref).toBe("refs/heads/main");
-    expect(ws.repo.store.memory.totalBytes).toBe(0);
   });
 
-  it("owns full index and worktree guard pages under concurrent memory pressure", () => {
+  it("checks full index and worktree guard pages", () => {
     const workspace = makeRepo("/");
     workspace.repo.store.configSet("user.name", "Fixture");
     workspace.repo.store.configSet("user.email", "fixture@example.com");
@@ -1339,48 +1129,11 @@ describe("checkout", () => {
     const current = commit(workspace.context, workspace.repo, { message: "full page" });
     const tree = workspace.repo.readCommit(current.oid).tree;
 
-    const measured = workspace.repo.store.reserveMemory();
-    try {
-      expect(
-        checkoutBlockersOwned(workspace.repo, workspace.worktree, tree, undefined, true, measured),
-      ).toEqual({ tracked: [], untracked: [] });
-    } finally {
-      measured.dispose();
-    }
-
-    const exactBlocker = workspace.repo.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES / 2);
-    const exactOwner = workspace.repo.store.reserveMemory();
-    try {
-      expect(
-        checkoutBlockersOwned(
-          workspace.repo,
-          workspace.worktree,
-          tree,
-          undefined,
-          true,
-          exactOwner,
-        ),
-      ).toEqual({ tracked: [], untracked: [] });
-    } finally {
-      exactOwner.dispose();
-      exactBlocker.dispose();
-    }
-
-    const overBlocker = workspace.repo.store.reserveMemory();
-    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - 1);
-    const overOwner = workspace.repo.store.reserveMemory();
-    try {
-      expect(() =>
-        checkoutBlockersOwned(workspace.repo, workspace.worktree, tree, undefined, true, overOwner),
-      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    } finally {
-      overOwner.dispose();
-      overBlocker.dispose();
-    }
+    expect(
+      checkoutBlockersOwned(workspace.repo, workspace.worktree, tree, undefined, true),
+    ).toEqual({ tracked: [], untracked: [] });
     expect(workspace.repo.head().oid).toBe(current.oid);
     expect(workspace.repo.checkout.indexEntries()).toHaveLength(paths.length);
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
   });
 
   it("preserves local changes when the target keeps the index entry", () => {

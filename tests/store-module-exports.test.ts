@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { CheckoutStore } from "../src/sqlite/store/checkout.js";
 import {
   FetchPublicationToken,
-  RefMutationMemoryOwner,
   TrackingRefPublicationToken,
 } from "../src/sqlite/store/contracts.js";
 import { SqliteGitDatabase } from "../src/sqlite/store/database.js";
@@ -60,7 +59,6 @@ describe("sqlite store module exports", () => {
     expect(store.SharedRepoStore).toBe(SharedRepoStore);
     expect(store.SqliteGitDatabase).toBe(SqliteGitDatabase);
     expect(store.FetchPublicationToken).toBe(FetchPublicationToken);
-    expect(store.RefMutationMemoryOwner).toBe(RefMutationMemoryOwner);
     expect(store.TrackingRefPublicationToken).toBe(TrackingRefPublicationToken);
   });
 });

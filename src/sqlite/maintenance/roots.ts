@@ -3,7 +3,6 @@ import { CorruptError, GitError } from "../../core/errors.js";
 import type { ObjectType } from "../../core/objects.js";
 import type { OperationJournal } from "../../core/ops/operation-state.js";
 import { comparePaths } from "../../core/streams.js";
-import type { MemoryReservation } from "../../memory.js";
 import type { SqlDatabase } from "../db.js";
 import { requireRawRefTarget, requireRefName } from "../ref-validation.js";
 import { ensureMaintenanceControl } from "./control.js";
@@ -37,16 +36,12 @@ export interface MaintenanceRootInput {
   expectedType: ObjectType;
 }
 
-export type ValidatedOperationRootReader = (
-  checkoutId: number,
-  reservation: MemoryReservation,
-) => readonly MaintenanceRootInput[];
+export type ValidatedOperationRootReader = (checkoutId: number) => readonly MaintenanceRootInput[];
 
 export interface AdvanceMaintenanceRootSnapshotOptions {
   repoId: number;
   nowMs: number;
   pageRows?: number;
-  reservation: MemoryReservation;
   readOperationRoots: ValidatedOperationRootReader;
 }
 
@@ -133,20 +128,6 @@ function requireSource(value: unknown): MaintenanceRootSource {
 
 function requireNullableInteger(value: unknown, label: string): number | null {
   return value === null ? null : requireSafeInteger(value, label, 0);
-}
-
-function cursorMemoryBytes(bytes: number): number {
-  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > (Number.MAX_SAFE_INTEGER - 256) / 3) {
-    throw new CorruptError("maintenance text cursor byte metadata is invalid");
-  }
-  return 256 + 3 * bytes;
-}
-
-function publishedCursorMemoryBytes(bytes: number): number {
-  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > (Number.MAX_SAFE_INTEGER - 512) / 5) {
-    throw new CorruptError("maintenance text cursor byte metadata is invalid");
-  }
-  return 512 + 5 * bytes;
 }
 
 function requireCursorMetadata(row: Record<string, unknown>): number | null {
@@ -298,19 +279,15 @@ export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): 
   }
 }
 
-function readRun(db: SqlDatabase, repoId: number, reservation: MemoryReservation): RunState | null {
+function readRun(db: SqlDatabase, repoId: number): RunState | null {
   const metadata = db.one<Record<string, unknown>>(
     `SELECT typeof(cursor_text) AS cursor_text_type,
             length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes
        FROM git_maintenance_runs WHERE repo_id = ?`,
     repoId,
   );
-  if (metadata === undefined) {
-    reservation.clear("other");
-    return null;
-  }
+  if (metadata === undefined) return null;
   const cursorBytes = requireCursorMetadata(metadata);
-  reservation.set("other", cursorBytes === null ? 0 : cursorMemoryBytes(cursorBytes));
   const row = db.one<Record<string, unknown>>(
     `SELECT repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
             cursor_checkout_id, cursor_text, typeof(cursor_text) AS cursor_text_type,
@@ -330,7 +307,6 @@ function createRun(
   repoId: number,
   rootEpoch: number,
   startedMs: number,
-  reservation: MemoryReservation,
 ): RunState {
   const allocated = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_control
@@ -357,19 +333,14 @@ function createRun(
     rootEpoch,
     startedMs,
   );
-  const run = readRun(db, repoId, reservation);
+  const run = readRun(db, repoId);
   if (run === null || run.runId !== runId) {
     throw new CorruptError("new maintenance run was not published");
   }
   return run;
 }
 
-function restartRun(
-  db: SqlDatabase,
-  run: RunState,
-  rootEpoch: number,
-  reservation: MemoryReservation,
-): RunState {
+function restartRun(db: SqlDatabase, run: RunState, rootEpoch: number): RunState {
   db.run(
     "DELETE FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?",
     run.repoId,
@@ -397,9 +368,7 @@ function restartRun(
   if (row === undefined) throw new CorruptError("maintenance root restart lost its run");
   const cursorBytes = requireCursorMetadata(row);
   if (cursorBytes !== null) throw new CorruptError("maintenance root restart retained its cursor");
-  const restarted = requireRun(row, run.repoId, cursorBytes);
-  reservation.clear("other");
-  return restarted;
+  return requireRun(row, run.repoId, cursorBytes);
 }
 
 function utf8Bytes(value: string, maximum = Number.MAX_SAFE_INTEGER): number {
@@ -481,56 +450,6 @@ function requireRootPageMetadata(
   return { rows, textBytes };
 }
 
-function admitRootPage(
-  reservation: MemoryReservation,
-  metadata: RootPageMetadata,
-  bindingBytes = 0,
-): void {
-  if (metadata.textBytes > (Number.MAX_SAFE_INTEGER - 2_048) / 3) {
-    throw new GitError("E2BIG", "maintenance root page memory accounting overflow");
-  }
-  const textMemory = 3 * metadata.textBytes;
-  if (
-    !Number.isSafeInteger(bindingBytes) ||
-    bindingBytes < 0 ||
-    bindingBytes > Number.MAX_SAFE_INTEGER - 2_048 - textMemory ||
-    metadata.rows > (Number.MAX_SAFE_INTEGER - 2_048 - textMemory - bindingBytes) / 1_024
-  ) {
-    throw new GitError("E2BIG", "maintenance root page memory accounting overflow");
-  }
-  reservation.set("other", 2_048 + bindingBytes + metadata.rows * 1_024 + textMemory);
-}
-
-function admitFutureRootPage(reservation: MemoryReservation, maximumCandidates: number): void {
-  if (
-    !Number.isSafeInteger(maximumCandidates) ||
-    maximumCandidates < 0 ||
-    maximumCandidates > (Number.MAX_SAFE_INTEGER - 4_608) / 1_280
-  ) {
-    throw new GitError("E2BIG", "maintenance root page memory accounting overflow");
-  }
-  reservation.set(
-    "other",
-    4_096 +
-      maximumCandidates * 1_024 +
-      (maximumCandidates === 0 ? 0 : 512 + maximumCandidates * 256),
-  );
-}
-
-function textBindingMemoryBytes(value: string | null, copies: number): number {
-  if (value === null) return 0;
-  const bytes = utf8Bytes(value);
-  if (
-    bytes < 0 ||
-    !Number.isSafeInteger(copies) ||
-    copies < 1 ||
-    bytes > (Number.MAX_SAFE_INTEGER - 256 * copies) / copies
-  ) {
-    throw new GitError("E2BIG", "maintenance root binding memory accounting overflow");
-  }
-  return copies * (256 + bytes);
-}
-
 function requirePageText(
   row: Record<string, unknown>,
   valueField: string,
@@ -567,11 +486,7 @@ function rootsFromRefs(
   repoId: number,
   cursor: string | null,
   pageRows: number,
-  reservation: MemoryReservation,
-  futureReservation: MemoryReservation,
 ): RootPage {
-  const bindingBytes = textBindingMemoryBytes(cursor, 2);
-  reservation.set("other", bindingBytes);
   const metadata = requireRootPageMetadata(
     db.one<Record<string, unknown>>(
       `SELECT count(*) AS row_count,
@@ -592,8 +507,6 @@ function rootsFromRefs(
     "maintenance ref root page",
     pageRows + 1,
   );
-  admitRootPage(reservation, metadata, bindingBytes);
-  admitFutureRootPage(futureReservation, metadata.rows);
   const candidates: RootCandidate[] = [];
   let rows = 0;
   let payloadRows = 0;
@@ -654,8 +567,6 @@ function rootsFromHeads(
   repoId: number,
   cursor: number | null,
   pageRows: number,
-  reservation: MemoryReservation,
-  futureReservation: MemoryReservation,
 ): RootPage {
   const after = cursor ?? 0;
   const metadata = requireRootPageMetadata(
@@ -675,8 +586,6 @@ function rootsFromHeads(
     "maintenance HEAD root page",
     pageRows + 1,
   );
-  admitRootPage(reservation, metadata);
-  admitFutureRootPage(futureReservation, metadata.rows);
   const candidates: RootCandidate[] = [];
   let rows = 0;
   let payloadRows = 0;
@@ -731,8 +640,6 @@ function rootsFromReflogs(
   startedMs: number,
   cursor: number | null,
   pageRows: number,
-  reservation: MemoryReservation,
-  futureReservation: MemoryReservation,
 ): RootPage {
   const cutoff = Math.max(0, Math.floor(startedMs / 1_000) - RETAINED_REFLOG_SECONDS);
   const after = cursor ?? 0;
@@ -779,8 +686,6 @@ function rootsFromReflogs(
     "maintenance reflog root page",
     pageRows + 1,
   );
-  admitRootPage(reservation, metadata);
-  admitFutureRootPage(futureReservation, metadata.rows * 2);
   const candidates: RootCandidate[] = [];
   const directThresholds = new Map<string, number>();
   const checkoutThresholds = new Map<number, number>();
@@ -945,14 +850,10 @@ function rootsFromIndex(
   cursorText: string | null,
   cursorOrdinal: number | null,
   pageRows: number,
-  reservation: MemoryReservation,
-  futureReservation: MemoryReservation,
 ): RootPage {
   let checkoutId = cursorCheckoutId ?? 0;
   let path = cursorText ?? "";
   let stage = cursorOrdinal ?? -1;
-  const bindingBytes = textBindingMemoryBytes(path, 2);
-  reservation.set("other", bindingBytes);
   const metadata = requireRootPageMetadata(
     db.one<Record<string, unknown>>(
       `SELECT count(*) AS row_count,
@@ -984,8 +885,6 @@ function rootsFromIndex(
     "maintenance index root page",
     pageRows + 1,
   );
-  admitRootPage(reservation, metadata, bindingBytes);
-  admitFutureRootPage(futureReservation, metadata.rows);
   const candidates: RootCandidate[] = [];
   let rows = 0;
   let payloadRows = 0;
@@ -1081,8 +980,6 @@ function rootsFromIndexBaselines(
   repoId: number,
   cursor: number | null,
   pageRows: number,
-  reservation: MemoryReservation,
-  futureReservation: MemoryReservation,
 ): RootPage {
   const after = cursor ?? 0;
   const metadata = requireRootPageMetadata(
@@ -1106,8 +1003,6 @@ function rootsFromIndexBaselines(
     "maintenance index baseline root page",
     pageRows + 1,
   );
-  admitRootPage(reservation, metadata);
-  admitFutureRootPage(futureReservation, metadata.rows);
   const candidates: RootCandidate[] = [];
   let rows = 0;
   let payloadRows = 0;
@@ -1171,11 +1066,7 @@ function rootsFromShallow(
   repoId: number,
   cursor: string | null,
   pageRows: number,
-  reservation: MemoryReservation,
-  futureReservation: MemoryReservation,
 ): RootPage {
-  const bindingBytes = textBindingMemoryBytes(cursor, 2);
-  reservation.set("other", bindingBytes);
   const metadata = requireRootPageMetadata(
     db.one<Record<string, unknown>>(
       `SELECT count(*) AS row_count,
@@ -1195,8 +1086,6 @@ function rootsFromShallow(
     "maintenance shallow root page",
     pageRows + 1,
   );
-  admitRootPage(reservation, metadata, bindingBytes);
-  admitFutureRootPage(futureReservation, metadata.rows);
   const candidates: RootCandidate[] = [];
   let rows = 0;
   let payloadRows = 0;
@@ -1256,10 +1145,7 @@ function rootsFromOperations(
   cursorOrdinal: number | null,
   pageRows: number,
   readOperationRoots: ValidatedOperationRootReader,
-  reservation: MemoryReservation,
-  futureReservation: MemoryReservation,
 ): RootPage {
-  reservation.set("other", 512);
   const candidates: RootCandidate[] = [];
   const after = cursorCheckoutId ?? 0;
   let checkoutId: number | null = null;
@@ -1283,7 +1169,6 @@ function rootsFromOperations(
     if (cursorOrdinal !== null) {
       throw new CorruptError("operation root cursor checkout is missing");
     }
-    admitFutureRootPage(futureReservation, 0);
     return {
       candidates,
       cursorCheckoutId: null,
@@ -1292,16 +1177,12 @@ function rootsFromOperations(
       hasMore: false,
     };
   }
-  const derivedMemory = reservation.scope();
-  const roots = readOperationRoots(checkoutId, derivedMemory);
+  const roots = readOperationRoots(checkoutId);
   const offset = cursorOrdinal ?? 0;
   if (offset > roots.length) {
     throw new CorruptError("operation root cursor exceeds its validated journal");
   }
   const end = Math.min(roots.length, offset + pageRows);
-  const candidateCount = end - offset;
-  reservation.set("other", 512 + candidateCount * 1_024);
-  admitFutureRootPage(futureReservation, candidateCount);
   for (let ordinal = offset; ordinal < end; ordinal++) {
     const root = roots[ordinal];
     if (root === undefined || !isOid(root.oid)) {
@@ -1346,16 +1227,7 @@ function rootsFromOperations(
   };
 }
 
-function validateObjectRoots(
-  db: SqlDatabase,
-  repoId: number,
-  roots: RootCandidate[],
-  reservation: MemoryReservation,
-): string[] {
-  if (roots.length > (Number.MAX_SAFE_INTEGER - 4_096) / 1_024) {
-    throw new GitError("E2BIG", "maintenance root validation memory accounting overflow");
-  }
-  reservation.set("other", 4_096 + roots.length * 1_024);
+function validateObjectRoots(db: SqlDatabase, repoId: number, roots: RootCandidate[]): string[] {
   const unique = new Map<
     string,
     { oid: string; expectedType: ObjectType | null; optionalMissing: boolean }
@@ -1453,41 +1325,31 @@ function insertRoots(
   sourceMask: number,
   roots: string[],
   shallow: boolean,
-  reservation: MemoryReservation,
 ): void {
   if (roots.length === 0) return;
-  if (roots.length > (Number.MAX_SAFE_INTEGER - 512) / 256) {
-    throw new GitError("E2BIG", "maintenance root publication memory accounting overflow");
-  }
-  const publicationMemory = reservation.scope();
-  publicationMemory.set("other", 512 + roots.length * 256);
-  try {
-    const payload = JSON.stringify(roots);
-    db.run(
-      `INSERT INTO git_maintenance_objects
+  const payload = JSON.stringify(roots);
+  db.run(
+    `INSERT INTO git_maintenance_objects
        (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, physical_only, edge_cursor)
      SELECT ?, ?, value, ?, 0, ?, 0, 0 FROM json_each(?)
      WHERE true
      ON CONFLICT(repo_id, run_id, oid) DO UPDATE SET
        source_mask = source_mask | excluded.source_mask,
        shallow_boundary = max(shallow_boundary, excluded.shallow_boundary)`,
+    repoId,
+    runId,
+    sourceMask,
+    shallow ? 1 : 0,
+    payload,
+  );
+  if (shallow) {
+    db.run(
+      `INSERT OR IGNORE INTO git_maintenance_shallow (repo_id, run_id, oid)
+       SELECT ?, ?, value FROM json_each(?)`,
       repoId,
       runId,
-      sourceMask,
-      shallow ? 1 : 0,
       payload,
     );
-    if (shallow) {
-      db.run(
-        `INSERT OR IGNORE INTO git_maintenance_shallow (repo_id, run_id, oid)
-       SELECT ?, ?, value FROM json_each(?)`,
-        repoId,
-        runId,
-        payload,
-      );
-    }
-  } finally {
-    publicationMemory.dispose();
   }
 }
 
@@ -1515,32 +1377,15 @@ function pageForSource(
   run: RunState,
   pageRows: number,
   readOperationRoots: ValidatedOperationRootReader,
-  reservation: MemoryReservation,
-  futureReservation: MemoryReservation,
 ): RootPage {
   if (run.rootSource === "refs") {
-    return rootsFromRefs(db, repoId, run.cursorText, pageRows, reservation, futureReservation);
+    return rootsFromRefs(db, repoId, run.cursorText, pageRows);
   }
   if (run.rootSource === "heads") {
-    return rootsFromHeads(
-      db,
-      repoId,
-      run.cursorCheckoutId,
-      pageRows,
-      reservation,
-      futureReservation,
-    );
+    return rootsFromHeads(db, repoId, run.cursorCheckoutId, pageRows);
   }
   if (run.rootSource === "reflogs") {
-    return rootsFromReflogs(
-      db,
-      repoId,
-      run.startedMs,
-      run.cursorOrdinal,
-      pageRows,
-      reservation,
-      futureReservation,
-    );
+    return rootsFromReflogs(db, repoId, run.startedMs, run.cursorOrdinal, pageRows);
   }
   if (run.rootSource === "index") {
     return rootsFromIndex(
@@ -1550,22 +1395,13 @@ function pageForSource(
       run.cursorText,
       run.cursorOrdinal,
       pageRows,
-      reservation,
-      futureReservation,
     );
   }
   if (run.rootSource === "index-baseline") {
-    return rootsFromIndexBaselines(
-      db,
-      repoId,
-      run.cursorCheckoutId,
-      pageRows,
-      reservation,
-      futureReservation,
-    );
+    return rootsFromIndexBaselines(db, repoId, run.cursorCheckoutId, pageRows);
   }
   if (run.rootSource === "shallow") {
-    return rootsFromShallow(db, repoId, run.cursorText, pageRows, reservation, futureReservation);
+    return rootsFromShallow(db, repoId, run.cursorText, pageRows);
   }
   if (run.rootSource === "operations") {
     return rootsFromOperations(
@@ -1575,8 +1411,6 @@ function pageForSource(
       run.cursorOrdinal,
       pageRows,
       readOperationRoots,
-      reservation,
-      futureReservation,
     );
   }
   return {
@@ -1594,7 +1428,6 @@ function publishPage(
   run: RunState,
   rootEpoch: number,
   page: RootPage,
-  reservation: MemoryReservation,
 ): RunState {
   const source = page.hasMore ? run.rootSource : nextSource(run.rootSource);
   if (source === "done") {
@@ -1628,10 +1461,6 @@ function publishPage(
   const nextCursorBytes =
     nextCursor === null ? null : utf8Bytes(nextCursor, Number.MAX_SAFE_INTEGER);
   if (nextCursorBytes === -1) throw new CorruptError("maintenance text cursor is invalid");
-  reservation.set(
-    "other",
-    nextCursorBytes === null ? 0 : publishedCursorMemoryBytes(nextCursorBytes),
-  );
   const row = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_runs
         SET root_source = ?, cursor_checkout_id = ?, cursor_text = ?, cursor_ordinal = ?
@@ -1673,15 +1502,15 @@ export function advanceMaintenanceRootSnapshot(
   }
   return db.transactionSync(() => {
     const control = ensureMaintenanceControl(db, options.repoId);
-    let run = readRun(db, options.repoId, options.reservation);
+    let run = readRun(db, options.repoId);
     if (run === null) {
-      run = createRun(db, options.repoId, control.rootEpoch, options.nowMs, options.reservation);
+      run = createRun(db, options.repoId, control.rootEpoch, options.nowMs);
     }
     if (run.observedRootEpoch !== control.rootEpoch) {
       if (run.phase !== "roots" && run.phase !== "mark") {
         throw new GitError("ESTALE", MAINTENANCE_ROOT_EPOCH_DRIFTED);
       }
-      run = restartRun(db, run, control.rootEpoch, options.reservation);
+      run = restartRun(db, run, control.rootEpoch);
     }
     if (run.phase !== "roots") {
       return {
@@ -1691,48 +1520,17 @@ export function advanceMaintenanceRootSnapshot(
         restarted: run.restarted,
       };
     }
-    const pageMemory = options.reservation.scope();
-    const validationMemory = options.reservation.scope();
-    try {
-      const page = pageForSource(
-        db,
-        options.repoId,
-        run,
-        pageRows,
-        options.readOperationRoots,
-        pageMemory,
-        validationMemory,
-      );
-      const roots = validateObjectRoots(db, options.repoId, page.candidates, validationMemory);
-      insertRoots(
-        db,
-        options.repoId,
-        run.runId,
-        sourceMask(run.rootSource),
-        roots,
-        run.rootSource === "shallow",
-        validationMemory,
-      );
-      const nextRunMemory = options.reservation.scope();
-      try {
-        const nextRun = publishPage(
-          db,
-          options.repoId,
-          run,
-          control.rootEpoch,
-          page,
-          nextRunMemory,
-        );
-        options.reservation.clear("other");
-        run = nextRun;
-      } catch (error) {
-        nextRunMemory.dispose();
-        throw error;
-      }
-    } finally {
-      validationMemory.dispose();
-      pageMemory.dispose();
-    }
+    const page = pageForSource(db, options.repoId, run, pageRows, options.readOperationRoots);
+    const roots = validateObjectRoots(db, options.repoId, page.candidates);
+    insertRoots(
+      db,
+      options.repoId,
+      run.runId,
+      sourceMask(run.rootSource),
+      roots,
+      run.rootSource === "shallow",
+    );
+    run = publishPage(db, options.repoId, run, control.rootEpoch, page);
     return {
       runId: run.runId,
       rootSource: run.rootSource,
@@ -1745,24 +1543,7 @@ export function advanceMaintenanceRootSnapshot(
 /** Extract roots only from a journal already accepted by CheckoutStore validation. */
 export function validatedOperationJournalRoots(
   journal: OperationJournal,
-  reservation: MemoryReservation,
 ): readonly MaintenanceRootInput[] {
-  let rootCount = 1;
-  if (journal.state.kind === "merge") rootCount += 2;
-  else if (journal.state.kind === "rebase") rootCount += 3;
-  for (const step of journal.steps) {
-    rootCount++;
-    if (step.selectedParentOid !== null) rootCount++;
-    if (step.resultOid !== null) rootCount++;
-  }
-  for (const entry of journal.touched) {
-    if (entry.index !== null) rootCount++;
-    if (entry.worktree.kind === "file" || entry.worktree.kind === "symlink") rootCount++;
-  }
-  if (rootCount > (Number.MAX_SAFE_INTEGER - 512) / 192) {
-    throw new GitError("E2BIG", "maintenance operation root memory accounting overflow");
-  }
-  reservation.set("other", 512 + rootCount * 192);
   const roots: MaintenanceRootInput[] = [
     { oid: journal.state.originalHeadOid, expectedType: "commit" },
   ];

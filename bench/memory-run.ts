@@ -287,15 +287,15 @@ function writeReport(rows: readonly MemoryRun[]): void {
     "SQLite page cache. Raw cgroup current/peak/stat values are not process-memory claims.",
     "SQL ≤1,000 is report-only.",
     "",
-    "| operation | stage | wall ms | statements | SQL target | process transient | cgroup peak growth | cgroup file after | storage growth | cgroup max | coordinator HWM |",
-    "|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|",
+    "| operation | stage | wall ms | statements | SQL target | process transient | cgroup peak growth | cgroup file after | storage growth | cgroup max |",
+    "|---|---|---:|---:|---|---:|---:|---:|---:|---:|",
   ];
   for (const row of rows) {
     lines.push(
       `| ${row.operation} | ${row.stage} | ${row.wallMs} | ${row.statements} | ${row.statementTarget} | ` +
         `${row.processTransientBytes} | ${row.cgroupMemory.peakGrowthBytes} | ` +
         `${row.cgroupMemory.after.fileBytes} | ${row.storageFootprintGrowthBytes} | ` +
-        `${row.runtime.memoryMaxBytes ?? "max"} | ${row.coordinatorHighWaterBytes ?? "n/a"} |`,
+        `${row.runtime.memoryMaxBytes ?? "max"} |`,
     );
   }
   writeFileSync(join(RESULTS, `${stamp}.md`), `${lines.join("\n")}\n`);

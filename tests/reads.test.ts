@@ -29,7 +29,6 @@ import { treeStream } from "../src/core/ops/tree-stream.js";
 import { encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import { commitCacheBytes } from "../src/sqlite/commits.js";
 import { iterateSqlCursor, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
 import {
@@ -37,6 +36,7 @@ import {
   SqliteGitDatabase,
   WALK_TREE_SQL,
 } from "../src/sqlite/store.js";
+import { TREE_WALK_PATH_BYTES, TREE_WALK_STATE_BYTES } from "../src/sqlite/tree-walk.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -322,32 +322,9 @@ describe("rev-parse", () => {
     expect(() => repo.revParse("HEAD~33")).toThrow(expect.objectContaining({ code: "E2BIG" }));
   });
 
-  it("accepts the former expression first excess and composes its actual owner", () => {
+  it("accepts the former expression first excess", () => {
     const expression = `HEAD${" ".repeat(1_021)}`;
     expect(repo.revParse(expression)).toBe(repo.revParse("HEAD"));
-
-    const database = new SqliteGitDatabase(fixtureDb);
-    const checkout = database.findCheckout("/repo");
-    if (checkout === null) throw new Error("revision fixture checkout disappeared");
-    const measuredRepo = new Repository(database.openCheckout(checkout));
-    const headOid = measuredRepo.revParse("HEAD");
-    expect(measuredRepo.revParse(expression)).toBe(headOid);
-    const operationBytes = measuredRepo.store.memory.highWaterBytes;
-    expect(measuredRepo.store.memory.totalBytes).toBe(0);
-
-    for (const excess of [0, 1]) {
-      const blocker = measuredRepo.store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      try {
-        const resolve = () => measuredRepo.revParse(expression);
-        if (excess === 0) expect(resolve()).toBe(headOid);
-        else expect(resolve).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      } finally {
-        blocker.dispose();
-      }
-      expect(measuredRepo.store.memory.activeCount).toBe(0);
-      expect(measuredRepo.store.memory.totalBytes).toBe(0);
-    }
   });
 
   it("bounds composed traversals and parses suffix decimals without numeric overflow", () => {
@@ -435,7 +412,7 @@ describe("bounded commit graph reads", () => {
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("authenticates an unavailable deep cache through the uncached owner path", () => {
+  it("authenticates an unavailable deep cache through the uncached path", () => {
     const { db, repo, oids } = logFixture(257);
     db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oids[0]);
     db.storage.histogram = new Map();
@@ -443,7 +420,6 @@ describe("bounded commit graph reads", () => {
 
     expect(log(repo, { depth: 257 })).toHaveLength(257);
     expect([...db.storage.histogram.keys()].join("\n")).toContain("SELECT w.oid, c.seq, c.data");
-    repo.store.memory.assertIdle();
   });
 
   it("rejects a coordinated cached cycle on point and indexed log paths", () => {
@@ -585,7 +561,7 @@ describe("ls-tree and cat-file", () => {
     }
   });
 
-  it("keeps the recursive structural limit and composes result memory exactly", () => {
+  it("keeps the recursive structural limit without truncating results", () => {
     const entry = { mode: MODE_FILE, name: "leaf", oid: "1".repeat(40) };
     const rows = function* (count: number, path: string) {
       for (let index = 0; index < count; index++) yield { path, entry };
@@ -599,64 +575,19 @@ describe("ls-tree and cat-file", () => {
     );
 
     expect(collectRecursiveTreeEntries(rows(8_192, "x".repeat(900)))).toHaveLength(8_192);
-
-    const measured = new MemoryCoordinator();
-    const measuredOwner = measured.reserve();
-    expect(collectRecursiveTreeEntries(rows(2, "path"), measuredOwner)).toHaveLength(2);
-    const operationBytes = measured.highWaterBytes;
-    measuredOwner.dispose();
-    measured.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const coordinator = new MemoryCoordinator();
-      const blocker = coordinator.reserve();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = coordinator.reserve();
-      try {
-        const collect = () => collectRecursiveTreeEntries(rows(2, "path"), owner);
-        if (excess === 0) expect(collect()).toHaveLength(2);
-        else expect(collect).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      coordinator.assertIdle();
-    }
   });
 
-  it("pre-admits nonrecursive projection arrays at the aggregate boundary", () => {
+  it("projects nonrecursive entries", () => {
     const entries = [
       { mode: MODE_FILE, name: "a.txt", oid: "1".repeat(40) },
       { mode: MODE_FILE, name: "long-name.txt", oid: "2".repeat(40) },
     ];
     const expected = collectDirectTreeEntries(entries, "dir/");
 
-    const measured = new MemoryCoordinator();
-    const measuredOwner = measured.reserve();
-    expect(collectDirectTreeEntries(entries, "dir/", measuredOwner)).toEqual(expected);
-    const operationBytes = measuredOwner.highWaterBytes;
-    measuredOwner.dispose();
-    measured.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const coordinator = new MemoryCoordinator();
-      const blocker = coordinator.reserve();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = coordinator.reserve();
-      try {
-        const collect = () => collectDirectTreeEntries(entries, "dir/", owner);
-        if (excess === 0) expect(collect()).toEqual(expected);
-        else expect(collect).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        expect(owner.currentBytes).toBe(0);
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      coordinator.assertIdle();
-    }
+    expect(collectDirectTreeEntries(entries, "dir/")).toEqual(expected);
   });
 
-  it("pre-admits the authenticated nonrecursive source before materializing it", () => {
+  it("materializes an authenticated nonrecursive source", () => {
     const db = new TestDatabase();
     const store = openScale(db);
     const tree = serializeTree([
@@ -674,48 +605,9 @@ describe("ls-tree and cat-file", () => {
     expect(local.store.cacheBytes().objects).toBe(0);
     expect(store.readAuthenticatedObject(treeOid, "tree")?.data).toEqual(tree);
     expect(local.store.cacheBytes().objects).toBe(0);
-    const operationBytes = 96 + 1_024 + 5 * tree.length + Math.floor(tree.length / 22) * 808;
-    local.store.memory.assertIdle();
-
-    const foreignCoordinator = new MemoryCoordinator();
-    const foreignOwner = foreignCoordinator.reserve();
-    foreignOwner.set("other", operationBytes);
-    db.storage.resetCounters();
-    try {
-      expect(() =>
-        readAuthenticatedObjectOwned(local.store, treeOid, "tree", foreignOwner),
-      ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
-      expect(db.storage.statementCount).toBe(0);
-    } finally {
-      foreignOwner.dispose();
-    }
-    foreignCoordinator.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const blocker = local.store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const histogram = new Map<string, number>();
-      db.storage.histogram = histogram;
-      db.storage.resetCounters();
-      try {
-        const read = () => lsTree(local, treeOid);
-        const materializedSource = (): boolean =>
-          [...histogram.keys()].some((query) => query.includes("SELECT w.oid, c.seq, c.data"));
-        if (excess === 0) {
-          expect(read()).toEqual(expected);
-          expect(materializedSource()).toBe(true);
-        } else {
-          expect(read).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-          expect(materializedSource()).toBe(false);
-        }
-      } finally {
-        blocker.dispose();
-      }
-      local.store.memory.assertIdle();
-    }
   });
 
-  it("pre-admits the packed authenticated nonrecursive source before materializing it", async () => {
+  it("materializes a packed authenticated nonrecursive source", async () => {
     const db = new TestDatabase();
     const setup = openScale(db);
     const tree = serializeTree([
@@ -741,48 +633,11 @@ describe("ls-tree and cat-file", () => {
       { mode: "100644", path: "long-name.txt", oid: numberedOid(2), type: "blob" },
     ];
 
-    let objectHeaderBytes = 1;
-    for (
-      let remaining = Math.floor(tree.length / 16);
-      remaining > 0;
-      remaining = Math.floor(remaining / 128)
-    ) {
-      objectHeaderBytes++;
-    }
-    const compressedBytes = pack.length - 12 - objectHeaderBytes - 20;
-    const packedOutputBytes = 512 + 256 + tree.length;
-    const operationBytes = 96 + 2 * 1024 * 1024 + packedOutputBytes + compressedBytes + 1024 * 1024;
-
     expect(lsTree(local, treeOid)).toEqual(expected);
     expect(store.cacheBytes()).toEqual({ objects: 0, chunks: 0 });
-    store.shared.memory.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const blocker = store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const histogram = new Map<string, number>();
-      db.storage.histogram = histogram;
-      db.storage.resetCounters();
-      try {
-        const read = () => lsTree(local, treeOid);
-        const materializedSource = (): boolean =>
-          [...histogram.keys()].some((query) => query.startsWith("WITH requested(pack_id, seq)"));
-        if (excess === 0) {
-          expect(read()).toEqual(expected);
-          expect(materializedSource()).toBe(true);
-        } else {
-          expect(read).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-          expect(materializedSource()).toBe(false);
-        }
-        expect(store.cacheBytes()).toEqual({ objects: 0, chunks: 0 });
-      } finally {
-        blocker.dispose();
-      }
-      store.shared.memory.assertIdle();
-    }
   });
 
-  it("restores packed authenticated ownership after a cold corrupt-source failure", async () => {
+  it("rejects a cold corrupt packed source", async () => {
     const db = new TestDatabase();
     const setup = openScale(db);
     const tree = serializeTree([
@@ -824,26 +679,16 @@ describe("ls-tree and cat-file", () => {
     const checkout = database.findCheckout("/repo");
     if (checkout === null) throw new Error("packed corrupt-source checkout disappeared");
     const store = database.openCheckout(checkout);
-    const owner = store.reserveMemory();
-    const admittedBytes = 1_024 + 5 * tree.length + Math.floor(tree.length / 22) * 808;
-    owner.set("other", admittedBytes);
     const histogram = new Map<string, number>();
     db.storage.histogram = histogram;
     db.storage.resetCounters();
-    try {
-      expect(() => readAuthenticatedObjectOwned(store.shared, treeOid, "tree", owner)).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-      expect(
-        [...histogram.keys()].some((query) => query.startsWith("WITH requested(pack_id, seq)")),
-      ).toBe(true);
-      expect(owner.currentBytes).toBe(admittedBytes);
-      expect(store.shared.memory.totalBytes).toBe(admittedBytes);
-      expect(store.cacheBytes()).toEqual({ objects: 0, chunks: 0 });
-    } finally {
-      owner.dispose();
-    }
-    store.shared.memory.assertIdle();
+    expect(() => readAuthenticatedObjectOwned(store.shared, treeOid, "tree")).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(
+      [...histogram.keys()].some((query) => query.startsWith("WITH requested(pack_id, seq)")),
+    ).toBe(true);
+    expect(store.cacheBytes()).toEqual({ objects: 0, chunks: 0 });
   });
 
   it("lists every path in a tree", () => {
@@ -1303,7 +1148,7 @@ describe("batched tree reads", () => {
     }
   }, 30_000);
 
-  it("authenticates the former 2,201-byte excess and cleans up exact row ownership", () => {
+  it("authenticates the former 2,201-byte excess", () => {
     const { db, store, root, leafOid } = deepTree(1_099, "lea");
     db.storage.resetCounters();
     const started = performance.now();
@@ -1313,30 +1158,9 @@ describe("batched tree reads", () => {
     expect(entries).toEqual([{ path: `${"d/".repeat(1_099)}lea`, mode: MODE_FILE, oid: leafOid }]);
     expect(db.storage.statementCount).toBeLessThan(1_000);
     if (timingGate) expect(elapsed).toBeLessThan(100);
-
-    const measured = store.reserveMemory();
-    expect([...store.walkTree(root, measured)]).toEqual(entries);
-    const operationBytes = measured.highWaterBytes;
-    expect(measured.currentBytes).toBe(0);
-    measured.dispose();
-
-    for (const excess of [0, 1]) {
-      const blocker = store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = store.reserveMemory();
-      try {
-        const walk = () => [...store.walkTree(root, owner)];
-        if (excess === 0) expect(walk()).toEqual(entries);
-        else expect(walk).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        expect(owner.currentBytes).toBe(0);
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-    }
   }, 30_000);
 
-  it("pre-admits the full shallow ASCII path peak before SQL payload projection", () => {
+  it("projects a shallow ASCII path within the fixed traversal cap", () => {
     const db = new TraversalPayloadProbeDatabase();
     const store = openScale(db);
     const name = "x".repeat(512 * 1024);
@@ -1344,34 +1168,10 @@ describe("batched tree reads", () => {
     const root = store.write("tree", serializeTree([{ mode: MODE_FILE, name, oid: leafOid }]));
     const expected = [{ path: name, mode: MODE_FILE, oid: leafOid }];
 
-    const measured = store.reserveMemory();
-    expect([...store.walkTree(root, measured)]).toEqual(expected);
-    const operationBytes = measured.highWaterBytes;
-    expect(measured.currentBytes).toBe(0);
-    measured.dispose();
-
-    for (const excess of [0, 1]) {
-      const blocker = store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = store.reserveMemory();
-      db.resetTraversalProbe();
-      try {
-        const walk = () => [...store.walkTree(root, owner)];
-        if (excess === 0) {
-          expect(walk()).toEqual(expected);
-          expect(db.traversalPayloadRows).toBe(1);
-        } else {
-          expect(walk).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-          expect(db.traversalPayloadRows).toBe(0);
-        }
-        expect(db.traversalClosures).toBe(1);
-        expect(owner.currentBytes).toBe(0);
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      store.shared.memory.assertIdle();
-    }
+    db.resetTraversalProbe();
+    expect([...store.walkTree(root)]).toEqual(expected);
+    expect(db.traversalPayloadRows).toBe(1);
+    expect(db.traversalClosures).toBe(1);
   });
 
   const longQueue = (count: number) => {
@@ -1629,8 +1429,8 @@ describe("batched tree reads", () => {
         `EXPLAIN QUERY PLAN ${WALK_TREE_SQL}`,
         1,
         "0".repeat(40),
-        8 * 1024 * 1024,
-        MAX_OPERATION_MEMORY_BYTES,
+        TREE_WALK_PATH_BYTES,
+        TREE_WALK_STATE_BYTES,
         16 * 1024 * 1024,
         192,
       )

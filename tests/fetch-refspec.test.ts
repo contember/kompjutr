@@ -87,7 +87,7 @@ function withoutIncludeTag(request: GitHttpRequest): GitHttpRequest {
 }
 
 describe("mapped fetch refspecs", () => {
-  it("keeps both legacy upload exchanges in one retained-memory operation", async () => {
+  it("keeps both legacy upload exchanges in one operation", async () => {
     const workspace = makeRepo("/", { startTime: TEST_TIME, now: () => TEST_TIME });
     let posts = 0;
     const http: GitHttpClient = (request) => {
@@ -104,9 +104,6 @@ describe("mapped fetch refspecs", () => {
       fixture.git("rev-parse", "refs/tags/release"),
     );
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
-    expect(workspace.repo.store.memory.highWaterBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
-    expect(workspace.repo.store.memory.activeCount).toBe(0);
   });
 
   it("publishes exact and wildcard destinations atomically in Git byte order", async () => {
@@ -153,8 +150,6 @@ describe("mapped fetch refspecs", () => {
     expect(requestsSince(before).filter((request) => request.method === "GET")).toHaveLength(1);
     expect(requestsSince(before).filter((request) => request.method === "POST")).toHaveLength(1);
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
-    expect(workspace.repo.store.memory.activeCount).toBe(0);
   });
 
   it("returns an empty mapped result after discovery without a token or POST", async () => {
@@ -221,7 +216,6 @@ describe("mapped fetch refspecs", () => {
     expect(workspace.repo.read(oversizedBlobOid).data).toHaveLength(
       PACK_BLOB_BATCH_TARGET_BYTES + 1,
     );
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("rejects a corrupt loose peeled-target shadow during tag-chain authentication", async () => {
@@ -385,7 +379,7 @@ describe("mapped fetch refspecs", () => {
   });
 
   it("rejects mapped legacy fields and destination collisions before mutation", async () => {
-    const { workspace, git } = configured();
+    const { git } = configured();
     const before = server.requests.length;
     const mixed = {
       depth: 1,
@@ -415,11 +409,9 @@ describe("mapped fetch refspecs", () => {
     ).rejects.toMatchObject({ code: "EREFNOTFOUND" });
 
     expect(requestsSince(before).filter((request) => request.method === "POST")).toHaveLength(0);
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
-    expect(workspace.repo.store.memory.activeCount).toBe(0);
   });
 
-  it("admits exactly 1,024 mappings under the aggregate structural and memory limits", async () => {
+  it("admits exactly 1,024 mappings under the structural limit", async () => {
     const { workspace, git } = configured();
     const refspecs = Array.from({ length: 1_024 }, (_, index) => ({
       source: "refs/checkpoints/base",
@@ -434,9 +426,6 @@ describe("mapped fetch refspecs", () => {
 
     expect(workspace.repo.store.listRefs("refs/load/")).toHaveLength(1_024);
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
-    expect(workspace.repo.store.memory.highWaterBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
-    expect(workspace.repo.store.memory.activeCount).toBe(0);
 
     const before = server.requests.length;
     await expect(
@@ -450,8 +439,6 @@ describe("mapped fetch refspecs", () => {
       ]),
     ).rejects.toMatchObject({ code: "E2BIG" });
     expect(server.requests).toHaveLength(before);
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
-    expect(workspace.repo.store.memory.activeCount).toBe(0);
   });
 
   it("publishes the former first-excess ref set atomically and survives cold reopen", () => {
@@ -469,11 +456,9 @@ describe("mapped fetch refspecs", () => {
     };
     const first = rows[0];
     if (first === undefined) throw new Error("missing first publication row");
-    const reservation = workspace.repo.store.reserveMemory();
     const publication = workspace.repo.store.beginFetchPublication(
       "refs/remotes/budget-first-excess/",
       rows.map((row) => row.name),
-      reservation,
     );
     try {
       expect(
@@ -481,15 +466,12 @@ describe("mapped fetch refspecs", () => {
       ).toBe(true);
     } finally {
       publication.dispose();
-      reservation.dispose();
     }
     expect(workspace.repo.store.listRefs("refs/checkpoints/budget-first-excess/")).toEqual(rows);
     expect(workspace.repo.store.reflog(first.name)).toHaveLength(1);
     const cold = reopenTestRepository(workspace);
     expect(cold.repo.store.listRefs("refs/checkpoints/budget-first-excess/")).toEqual(rows);
     expect(cold.repo.store.reflog(first.name)).toHaveLength(1);
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
-    expect(workspace.repo.store.memory.activeCount).toBe(0);
   });
 
   it("keeps refs and reflogs unchanged after a truncated pack and cold reopen", async () => {
@@ -506,8 +488,6 @@ describe("mapped fetch refspecs", () => {
 
       expect(workspace.repo.store.getRef(destination)).toBeNull();
       expect(workspace.repo.store.reflog(destination)).toEqual([]);
-      expect(workspace.repo.store.memory.totalBytes).toBe(0);
-      expect(workspace.repo.store.memory.activeCount).toBe(0);
       const cold = reopenTestRepository(workspace);
       expect(cold.repo.store.getRef(destination)).toBeNull();
       expect(cold.repo.store.reflog(destination)).toEqual([]);

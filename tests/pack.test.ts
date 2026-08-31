@@ -3,7 +3,6 @@ import { createHash, randomBytes } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
 import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
 import { GitError } from "../src/core/errors.js";
-import { ByteLru } from "../src/core/lru.js";
 import {
   hashObject,
   MODE_FILE,
@@ -14,20 +13,14 @@ import {
   serializeCommit,
   serializeTree,
 } from "../src/core/objects.js";
-import { chunkFootprint } from "../src/core/pack/chunks.js";
 import { applyDelta, encodeDeltaHeader } from "../src/core/pack/delta.js";
 import {
   type FullObjectPackInput,
   streamFullObjectPack,
 } from "../src/core/pack/full-object-stream.js";
 import { PackWriter } from "../src/core/pack/writer.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import { COMMIT_CACHE_FLUSH_BYTES } from "../src/sqlite/commits.js";
 import { blob, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
-import {
-  PACK_INGEST_METADATA_BYTES,
-  PACK_PENDING_PAGE_ROWS,
-} from "../src/sqlite/pack-ingest-index.js";
 import {
   type CompletePackObject,
   MAX_DELTA_DEPTH,
@@ -35,14 +28,8 @@ import {
   MAX_PACK_DELTA_WORKING_BYTES,
   PACK_BLOB_BATCH_TARGET_BYTES,
   PACK_CHUNK,
-  PACK_DELTA_OBJECT_WRAPPER_BYTES,
 } from "../src/sqlite/packs.js";
-import {
-  CheckoutStore,
-  SharedRepoStore,
-  SqliteGitDatabase,
-  type StoreOptions,
-} from "../src/sqlite/store.js";
+import { SqliteGitDatabase, type StoreOptions } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 
@@ -328,18 +315,6 @@ function syntheticCommit(index: number, message = `commit ${index}\n`): Uint8Arr
     },
     message,
   });
-}
-
-function parentHeavyCommit(parentCount: number): Uint8Array {
-  const tree = utf8.encode(`tree ${"f".repeat(40)}\n`);
-  const parent = utf8.encode(`parent ${"e".repeat(40)}\n`);
-  const data = new Uint8Array(tree.length + parent.length * parentCount + 1);
-  data.set(tree);
-  for (let index = 0; index < parentCount; index++) {
-    data.set(parent, tree.length + index * parent.length);
-  }
-  data[data.length - 1] = 0x0a;
-  return data;
 }
 
 function denseIgnoredHeaderCommit(): Uint8Array {
@@ -878,65 +853,6 @@ describe("delta", () => {
 });
 
 describe("synthetic pack ingest", () => {
-  it("composes ingest memory under one repository-owned operation reservation", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db);
-    const first = database.openCheckout(
-      database.createRepository("/first", "ref: refs/heads/main"),
-    );
-    const second = database.openCheckout(
-      database.createRepository("/second", "ref: refs/heads/main"),
-    );
-    const reservation = first.reserveMemory();
-    reservation.set("protocol", 1_024);
-    reservation.set("other", 2_048);
-    const callerBytes = reservation.currentBytes;
-    const data = utf8.encode("caller-owned ingest memory\n");
-
-    try {
-      const ingested = await first.packs.ingest(slices(singleBlobPack(data), 19), {
-        reservation,
-      });
-      expect(ingested.count).toBe(1);
-      expect(first.read(hashObject("blob", data))?.data).toEqual(data);
-      expect(reservation.currentBytes).toBe(callerBytes);
-      expect(reservation.highWaterBytes).toBeGreaterThan(callerBytes);
-
-      const foreign = second.reserveMemory();
-      try {
-        await expect(
-          first.packs.ingest(slices(singleBlobPack(utf8.encode("foreign\n")), 11), {
-            reservation: foreign,
-          }),
-        ).rejects.toMatchObject({ code: "EINVAL" });
-        expect(foreign.currentBytes).toBe(0);
-      } finally {
-        foreign.dispose();
-      }
-      expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE repo_id = 1")).toBe(1);
-
-      const corrupt = singleBlobPack(utf8.encode("corrupt child scope\n"));
-      corrupt[corrupt.length - 1] = (corrupt.at(-1) ?? 0) ^ 0xff;
-      await expect(first.packs.ingest(slices(corrupt, 13), { reservation })).rejects.toThrow(
-        /checksum/,
-      );
-      expect(reservation.currentBytes).toBe(callerBytes);
-      reservation.set("metadata", 1);
-      reservation.clear("metadata");
-    } finally {
-      reservation.clear("protocol");
-      reservation.clear("other");
-      reservation.dispose();
-    }
-
-    const probe = first.reserveMemory();
-    try {
-      probe.set("other", MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      probe.dispose();
-    }
-  });
-
   it("shares and isolates one 4 MiB pack-row cache across repositories", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { chunkBytes: 16 * 1024 * 1024 });
@@ -1416,18 +1332,10 @@ describe("synthetic pack ingest", () => {
     expect(() => store.readBlobs([oid])).toThrow(/invalid chunk metadata/);
   });
 
-  it("rejects invalid, disposed, aliased, and foreign ownership before SQL", () => {
+  it("rejects invalid packed read inputs before SQL", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
     const store = database.openCheckout(database.createRepository("/one", "ref: refs/heads/main"));
-    const sibling = database.openCheckout(
-      database.createRepository("/two", "ref: refs/heads/main"),
-    );
-    const foreignDb = new TestDatabase();
-    const foreignDatabase = new SqliteGitDatabase(foreignDb);
-    const foreign = foreignDatabase.openCheckout(
-      foreignDatabase.createRepository("/foreign", "ref: refs/heads/main"),
-    );
     const oid = "a".repeat(40);
     const rejectsWithoutSql = (invoke: () => unknown, code: "EINVAL" | "E2BIG"): void => {
       db.storage.resetCounters();
@@ -1441,81 +1349,6 @@ describe("synthetic pack ingest", () => {
       () => Reflect.apply(store.packs.readObjects, store.packs, [[oid], "invalid"]),
       "EINVAL",
     );
-    rejectsWithoutSql(
-      () => Reflect.apply(store.packs.readObjects, store.packs, [[oid], null, null]),
-      "EINVAL",
-    );
-
-    const owner = store.reserveMemory();
-    const operation = owner.scope();
-    const output = owner.scope();
-    const disposedOutput = owner.scope();
-    disposedOutput.dispose();
-    const siblingOwner = sibling.reserveMemory();
-    const siblingOutput = siblingOwner.scope();
-    const foreignOwner = foreign.reserveMemory();
-    const foreignOutput = foreignOwner.scope();
-    try {
-      rejectsWithoutSql(
-        () => store.packs.readObjects([oid], null, { operation, output: operation }),
-        "EINVAL",
-      );
-      rejectsWithoutSql(
-        () => store.packs.readObjects([oid], null, { operation, output: disposedOutput }),
-        "EINVAL",
-      );
-      rejectsWithoutSql(
-        () => store.packs.readObjects([oid], null, { operation, output: siblingOutput }),
-        "EINVAL",
-      );
-      rejectsWithoutSql(
-        () => store.packs.readObjects([oid], null, { operation, output: foreignOutput }),
-        "EINVAL",
-      );
-      output.set("other", 1);
-      rejectsWithoutSql(
-        () => store.packs.readObjects([oid], null, { operation, output }),
-        "EINVAL",
-      );
-      output.clear("other");
-    } finally {
-      foreignOutput.dispose();
-      foreignOwner.dispose();
-      siblingOutput.dispose();
-      siblingOwner.dispose();
-      output.dispose();
-      operation.dispose();
-      owner.dispose();
-    }
-  });
-
-  it("restores caller scopes after a packed payload failure", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const data = deterministicBytes(128_000);
-    const oid = hashObject("blob", data);
-    await store.packs.ingest(slices(singleBlobPack(data), 64 * 1024));
-    db.run("DELETE FROM git_pack_data WHERE repo_id = ?", store.sharedRepoId);
-
-    const owner = store.reserveMemory();
-    const operation = owner.scope();
-    const output = owner.scope();
-    db.storage.resetCounters();
-    try {
-      expect(() => store.packs.readObjects([oid], "blob", { operation, output })).toThrow(
-        /missing chunk/,
-      );
-      expect(db.storage.statementCount).toBeGreaterThan(0);
-      expect(operation.currentBytes).toBe(0);
-      expect(output.currentBytes).toBe(0);
-      expect(owner.currentBytes).toBe(0);
-    } finally {
-      output.dispose();
-      operation.dispose();
-      owner.dispose();
-    }
-    store.shared.memory.assertIdle();
   });
 
   it("rejects a non-hex base object id returned by the packed graph query", async () => {
@@ -1668,52 +1501,8 @@ describe("synthetic pack ingest", () => {
     expect(packed.cachedCommit(oid)).toEqual(looseCache);
   });
 
-  it("accepts a near-limit commit with 21,843 parents under shared coordinator pressure", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db);
-    const repository = database.createRepository("/repo", "ref: refs/heads/main");
-    const coordinator = new MemoryCoordinator();
-    const blocker = coordinator.reserve();
-    blocker.set("other", 1);
-    const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
-    const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
-    const store = new CheckoutStore(
-      new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
-      repository,
-    );
-    const data = parentHeavyCommit(21_843);
-    expect(data.length).toBe(1_048_511);
-    const oid = hashObject("commit", data);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(1);
-    writer.object("commit", data);
-    writer.finish();
-
-    try {
-      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
-      expect(store.cachedCommit(oid)?.commit.parent).toHaveLength(21_843);
-      expect(coordinator.totalBytes).toBe(1);
-    } finally {
-      blocker.clear("other");
-      blocker.dispose();
-    }
-    expect(coordinator.activeCount).toBe(0);
-  });
-
   it("reports dense malformed commit headers as corruption", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db);
-    const repository = database.createRepository("/repo", "ref: refs/heads/main");
-    const coordinator = new MemoryCoordinator();
-    const blocker = coordinator.reserve();
-    blocker.set("other", 1);
-    const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
-    const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
-    const store = new CheckoutStore(
-      new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
-      repository,
-    );
+    const store = open();
     const data = denseIgnoredHeaderCommit();
     expect(data.length).toBeLessThanOrEqual(COMMIT_CACHE_FLUSH_BYTES / 4);
     const chunks: Uint8Array[] = [];
@@ -1727,66 +1516,10 @@ describe("synthetic pack ingest", () => {
       await store.packs.ingest(slices(concat(chunks), 64 * 1024));
     } catch (caught) {
       error = caught;
-    } finally {
-      blocker.clear("other");
-      blocker.dispose();
     }
     expect(error).toBeInstanceOf(GitError);
     if (!(error instanceof GitError)) throw new Error("expected GitError");
     expect(error.code).toBe("ECORRUPT");
-    expect(coordinator.activeCount).toBe(0);
-  });
-
-  it("preflights commit serialization against exact shared headroom before flush", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db);
-    const repository = database.createRepository("/repo", "ref: refs/heads/main");
-    const coordinator = new MemoryCoordinator();
-    const blocker = coordinator.reserve();
-    const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
-    const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
-    const store = new CheckoutStore(
-      new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
-      repository,
-    );
-    const data = parentHeavyCommit(27_000);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(1_024);
-    for (let index = 0; index < 1_023; index++) {
-      writer.object("blob", new Uint8Array([index & 0xff, index >>> 8]));
-    }
-    writer.object("commit", data);
-    writer.finish();
-
-    db.storage.histogram = new Map();
-    let pressured = false;
-    let error: unknown;
-    try {
-      await store.packs.ingest(slices(concat(chunks), 64 * 1024), {
-        yieldNow: async () => {
-          if (pressured) return;
-          const indexed =
-            db.scalar<number>("SELECT COUNT(*) FROM git_pack_objects WHERE repo_id = 1") ?? 0;
-          if (indexed !== 1_024) return;
-          blocker.set("other", coordinator.remainingBytes);
-          pressured = true;
-        },
-      });
-    } catch (caught) {
-      error = caught;
-    } finally {
-      blocker.clear("other");
-      blocker.dispose();
-    }
-    expect(pressured).toBe(true);
-    expect(error).toMatchObject({ code: "E2BIG" });
-    expect(
-      [...db.storage.histogram]
-        .filter(([query]) => query.startsWith("INSERT INTO git_commits"))
-        .reduce((total, [, calls]) => total + calls, 0),
-    ).toBe(0);
-    expect(coordinator.activeCount).toBe(0);
   });
 
   it("rolls pack completion back when final source validation writes short", async () => {
@@ -2590,7 +2323,7 @@ describe("pack fallback preservation", () => {
     expect(db.storage.statementCount).toBe(0);
   });
 
-  it("reads multiple objects beyond the batching target under caller ownership", async () => {
+  it("reads multiple objects beyond the batching target", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
@@ -2607,121 +2340,9 @@ describe("pack fallback preservation", () => {
     const measureCheckout = measure.findCheckout("/repo");
     if (measureCheckout === null) throw new Error("packed read repository disappeared");
     const measured = measure.openCheckout(measureCheckout);
-    const measuredOwner = measured.reserveMemory();
-    try {
-      const operation = measuredOwner.scope();
-      const output = measuredOwner.scope();
-      const read = measured.packs.readObjects(oids, "blob", { operation, output });
-      expect(read.get(oids[0]!)?.data).toEqual(objects[0]);
-      expect(read.get(oids[1]!)?.data).toEqual(objects[1]);
-      expect(output.currentBytes).toBe(512 + 2 * 256 + objects[0]!.length + objects[1]!.length);
-      output.dispose();
-      operation.dispose();
-      expect(measuredOwner.currentBytes).toBe(0);
-    } finally {
-      measuredOwner.dispose();
-    }
-  });
-
-  it("reads full, delta, requested-base, and direct-local ownership paths", async () => {
-    const db = new TestDatabase();
-    const setupDatabase = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
-    const setup = setupDatabase.openCheckout(
-      setupDatabase.createRepository("/repo", "ref: refs/heads/main"),
-    );
-    const base = deterministicBytes(128_000);
-    const target = base.slice();
-    target[target.length - 1] = target[target.length - 1]! ^ 0xff;
-    const baseOid = hashObject("blob", base);
-    const targetOid = hashObject("blob", target);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(2);
-    writer.object("blob", base);
-    writer.refDelta(baseOid, literalDelta(base.length, target));
-    writer.finish();
-    await setup.packs.ingest(slices(concat(chunks), 64 * 1024));
-
-    const reopen = () => {
-      const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
-      const checkout = database.findCheckout("/repo");
-      if (checkout === null) throw new Error("ownership fixture disappeared");
-      return database.openCheckout(checkout);
-    };
-    const runOwned = (store: ReturnType<typeof reopen>, oids: readonly string[]): void => {
-      const owner = store.reserveMemory();
-      const operation = owner.scope();
-      const output = owner.scope();
-      try {
-        const objects = store.packs.readObjects(oids, "blob", { operation, output });
-        expect(objects.get(baseOid)?.data).toEqual(oids.includes(baseOid) ? base : undefined);
-        expect(objects.get(targetOid)?.data).toEqual(oids.includes(targetOid) ? target : undefined);
-        const payloadBytes = oids.reduce(
-          (bytes, oid) => bytes + (oid === baseOid ? base.length : target.length),
-          0,
-        );
-        expect(output.currentBytes).toBe(512 + oids.length * 256 + payloadBytes);
-      } finally {
-        output.dispose();
-        operation.dispose();
-        owner.dispose();
-      }
-    };
-    const runDirect = (store: ReturnType<typeof reopen>): void => {
-      expect(store.packs.read(baseOid)?.data).toEqual(base);
-    };
-
-    for (const run of [
-      (store: ReturnType<typeof reopen>) => runOwned(store, [baseOid]),
-      (store: ReturnType<typeof reopen>) => runOwned(store, [targetOid]),
-      (store: ReturnType<typeof reopen>) => runOwned(store, [baseOid, targetOid]),
-      runDirect,
-    ]) {
-      const current = reopen();
-      run(current);
-      current.shared.memory.assertIdle();
-    }
-  });
-
-  it("pre-admits every target in a multi-level delta chain", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const base = deterministicBytes(1_500_000);
-    const middle = base.slice();
-    middle[0] = middle[0]! ^ 0xff;
-    const target = middle.slice();
-    target[target.length - 1] = target[target.length - 1]! ^ 0xff;
-    const baseOid = hashObject("blob", base);
-    const middleOid = hashObject("blob", middle);
-    const targetOid = hashObject("blob", target);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(3);
-    writer.object("blob", base);
-    writer.refDelta(baseOid, literalDelta(base.length, middle));
-    writer.refDelta(middleOid, literalDelta(middle.length, target));
-    writer.finish();
-    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
-
-    const measureDatabase = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
-    const measureCheckout = measureDatabase.findCheckout("/repo");
-    if (measureCheckout === null) throw new Error("delta pressure repository disappeared");
-    const measured = measureDatabase.openCheckout(measureCheckout);
-    const measuredOwner = measured.reserveMemory();
-    try {
-      const operation = measuredOwner.scope();
-      const output = measuredOwner.scope();
-      expect(
-        measured.packs.readObjects([targetOid], "blob", { operation, output }).get(targetOid)?.data,
-      ).toEqual(target);
-      expect(output.currentBytes).toBe(512 + 256 + target.length);
-      operation.dispose();
-      output.dispose();
-      expect(measuredOwner.currentBytes).toBe(0);
-    } finally {
-      measuredOwner.dispose();
-    }
+    const read = measured.packs.readObjects(oids, "blob");
+    expect(read.get(oids[0]!)?.data).toEqual(objects[0]);
+    expect(read.get(oids[1]!)?.data).toEqual(objects[1]);
   });
 
   it("authenticates beyond the former 180 uncached dependency-read limit", async () => {
@@ -3150,100 +2771,6 @@ describe("pack deferred resolution", () => {
     for (const target of targets) expect(store.read(target.oid)?.data).toEqual(target.data);
   });
 
-  it("fails one byte before allocating a deferred range batch", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db);
-    const repository = database.createRepository("/repo", "ref: refs/heads/main");
-    const coordinator = new MemoryCoordinator();
-    const blocker = coordinator.reserve();
-    const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
-    const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
-    const store = new CheckoutStore(
-      new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
-      repository,
-    );
-    const base = new Uint8Array(513).fill(0x61);
-    const baseOid = hashObject("blob", base);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(1_024);
-    for (let index = 0; index < 1_023; index++) {
-      const target = base.slice();
-      target[0] = index & 0xff;
-      target[1] = index >>> 8;
-      writer.refDelta(baseOid, literalDelta(base.length, target));
-    }
-    writer.object("blob", base);
-    writer.finish();
-
-    db.storage.histogram = new Map();
-    let pressured = false;
-    let error: unknown;
-    try {
-      await store.packs.ingest(slices(concat(chunks), 64 * 1024), {
-        yieldNow: async () => {
-          if (pressured) return;
-          const pending = db.all<{ data_len: number }>(
-            "SELECT data_len FROM git_pack_pending WHERE repo_id = 1 AND pack_id = 1",
-          );
-          if (pending.length !== 1_023) return;
-          const compressedBytes = pending.reduce((bytes, row) => bytes + row.data_len, 0);
-          expect(compressedBytes).toBeLessThanOrEqual(1024 * 1024);
-          const rangeBytes = compressedBytes + 256 * 1024 + pending.length * 832;
-          const pressure = MAX_OPERATION_MEMORY_BYTES - coordinator.totalBytes - rangeBytes + 1;
-          expect(pressure).toBeGreaterThan(0);
-          blocker.set("other", pressure);
-          pressured = true;
-        },
-      });
-    } catch (caught) {
-      error = caught;
-    } finally {
-      blocker.clear("other");
-      blocker.dispose();
-    }
-    expect(pressured).toBe(true);
-    expect(error).toMatchObject({ code: "E2BIG" });
-    expect(
-      [...db.storage.histogram]
-        .filter(([query]) => query.startsWith("WITH RECURSIVE /* pack-range"))
-        .reduce((count, [, calls]) => count + calls, 0),
-    ).toBe(0);
-    expect(coordinator.activeCount).toBe(0);
-  });
-
-  it("indexes a deferred tree delta within retained-memory bounds", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db, {
-      objectCacheBytes: 0,
-      maxBufferedEntry: 64 * 1024,
-    });
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const base = syntheticTree(2_000);
-    const target = syntheticTree(3_000);
-    const baseOid = hashObject("tree", base);
-    const targetOid = hashObject("tree", target);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(2);
-    writer.object("tree", base);
-    writer.refDelta(baseOid, literalDelta(base.length, target));
-    writer.finish();
-
-    db.storage.resetCounters();
-    await store.packs.ingest(slices(concat(chunks), 113));
-
-    expect(store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
-    expect(
-      db.scalar<number>(
-        "SELECT entry_count FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ? AND storage = 'pack'",
-        targetOid,
-      ),
-    ).toBe(3_000);
-    expect(store.read(targetOid)?.data).toEqual(target);
-    expect(db.storage.statementCount).toBeLessThan(1_000);
-  });
-
   it("indexes 80 deferred chunked trees", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
@@ -3277,91 +2804,6 @@ describe("pack deferred resolution", () => {
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("preflights chunked tree retention at the exact one-MiB boundary", async () => {
-    const ingest = async (extraNameByte: boolean) => {
-      const db = new TestDatabase();
-      const database = new SqliteGitDatabase(db);
-      const store = database.openCheckout(
-        database.createRepository("/repo", "ref: refs/heads/main"),
-      );
-      const base = new Uint8Array(0);
-      const suffix = serializeTree([
-        {
-          mode: MODE_FILE,
-          name: "z".repeat(extraNameByte ? 37 : 36),
-          oid: "f".repeat(40),
-        },
-      ]);
-      const target = concat([syntheticTree(29_088), suffix]);
-      expect(target.length).toBe(1_047_232 + (extraNameByte ? 1 : 0));
-      const chunks: Uint8Array[] = [];
-      const writer = new PackWriter((chunk) => chunks.push(chunk));
-      writer.header(2);
-      writer.object("tree", base);
-      writer.refDelta(hashObject("tree", base), literalDelta(0, target));
-      writer.finish();
-
-      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
-      expect(store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
-      expect(
-        db.scalar<number>(
-          "SELECT entry_count FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?",
-          hashObject("tree", target),
-        ),
-      ).toBe(29_089);
-    };
-
-    await ingest(false);
-    await ingest(true);
-  });
-
-  it("does not stage an empty commit batch under repeated reservation pressure", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db);
-    const repository = database.createRepository("/repo", "ref: refs/heads/main");
-    const coordinator = new MemoryCoordinator();
-    const blocker = coordinator.reserve();
-    blocker.set("other", 1);
-    const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
-    const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
-    const store = new CheckoutStore(
-      new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
-      repository,
-    );
-    const exactTree = concat([
-      syntheticTree(29_088),
-      serializeTree([{ mode: MODE_FILE, name: "z".repeat(36), oid: "f".repeat(40) }]),
-    ]);
-    const secondTree = exactTree.slice();
-    const lastTreeByte = secondTree.length - 1;
-    secondTree[lastTreeByte] = secondTree[lastTreeByte]! ^ 1;
-    const largeBlob = new Uint8Array(randomBytes(8 * 1024 * 1024));
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(4);
-    writer.object("tree", secondTree);
-    writer.object("blob", largeBlob);
-    writer.object("tree", exactTree);
-    writer.object("blob", largeBlob);
-    writer.finish();
-
-    db.storage.histogram = new Map();
-    db.storage.resetCounters();
-    try {
-      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
-    } finally {
-      blocker.clear("other");
-      blocker.dispose();
-    }
-
-    expect(
-      [...db.storage.histogram]
-        .filter(([query]) => query.startsWith("UPDATE git_pack_meta SET state = ?"))
-        .reduce((total, [, calls]) => total + calls, 0),
-    ).toBe(0);
-    expect(coordinator.activeCount).toBe(0);
-  });
-
   it("resolves a same-page deferred chain without one pass per delta", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
@@ -3386,116 +2828,6 @@ describe("pack deferred resolution", () => {
 
     expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(store.read(oid)?.data).toEqual(data);
-  });
-
-  it("does not charge pool-owned intermediate payload bytes twice", async () => {
-    const size = 2 * 1024 * 1024 + 1;
-    const base = deterministicBytes(size);
-    const intermediate = base.slice();
-    intermediate[intermediate.length - 1]! ^= 1;
-    const leaf = intermediate.slice();
-    leaf[leaf.length - 1]! ^= 2;
-    const baseOid = hashObject("blob", base);
-    const intermediateOid = hashObject("blob", intermediate);
-    const leafOid = hashObject("blob", leaf);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(3);
-    writer.refDelta(
-      intermediateOid,
-      repeatedCopyDelta(intermediate.length, leaf.length, leaf[leaf.length - 1]),
-    );
-    writer.refDelta(
-      baseOid,
-      repeatedCopyDelta(base.length, intermediate.length, intermediate.at(-1)),
-    );
-    writer.object("blob", base);
-    writer.finish();
-    const pack = concat(chunks);
-
-    const git = new GitFixture().init();
-    try {
-      git.write("ownership.pack", pack);
-      expect(git.git("index-pack", "--strict", "ownership.pack")).toMatch(/^[0-9a-f]{40}$/);
-    } finally {
-      git.dispose();
-    }
-
-    const openFixture = () => {
-      const db = new TestDatabase();
-      const database = new SqliteGitDatabase(db, {
-        cacheEntryLimit: 0,
-        chunkBytes: 0,
-        objectCacheBytes: 0,
-      });
-      const store = database.openCheckout(
-        database.createRepository("/repo", "ref: refs/heads/main"),
-      );
-      return { db, store };
-    };
-    const reference = openFixture();
-    const referencePack = await reference.store.packs.ingest(slices(pack, 64 * 1024));
-    const compressedDeltaBytes = reference.db.scalar<number>(
-      `SELECT SUM(data_len) FROM git_pack_entries
-        WHERE repo_id = ? AND pack_id = ? AND base_oid IS NOT NULL`,
-      reference.store.sharedRepoId,
-      referencePack.packId,
-    );
-    if (compressedDeltaBytes === undefined) throw new Error("delta payload sizes disappeared");
-    const compressedBaseBytes = reference.db.scalar<number>(
-      `SELECT data_len FROM git_pack_entries
-        WHERE repo_id = ? AND pack_id = ? AND oid = ?`,
-      reference.store.sharedRepoId,
-      referencePack.packId,
-      baseOid,
-    );
-    if (compressedBaseBytes === undefined) throw new Error("base payload size disappeared");
-
-    const membershipBytes = 3 * 49;
-    const packedBaseOutputBytes = 512 + 256 + base.length;
-    const packedBaseReadBytes = 2 * 1024 * 1024 + compressedBaseBytes;
-    const compressedRangeBytes = compressedDeltaBytes + 256 * 1024 + 2 * 832;
-    const simultaneousPoolBytes = 2 * chunkFootprint(size);
-    const exactBytes =
-      PACK_INGEST_METADATA_BYTES +
-      membershipBytes +
-      packedBaseOutputBytes +
-      packedBaseReadBytes +
-      compressedRangeBytes +
-      simultaneousPoolBytes +
-      PACK_DELTA_OBJECT_WRAPPER_BYTES;
-    const blockerBytes = MAX_OPERATION_MEMORY_BYTES - exactBytes;
-    const duplicateChargeBytes = exactBytes - PACK_DELTA_OBJECT_WRAPPER_BYTES + intermediate.length;
-    expect(blockerBytes).toBeGreaterThan(0);
-    expect(blockerBytes + exactBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    expect(blockerBytes + duplicateChargeBytes).toBeGreaterThan(MAX_OPERATION_MEMORY_BYTES);
-    expect(reference.store.packs.lastIngestMemoryHighWater).toBe(exactBytes);
-
-    for (const excess of [0, 1]) {
-      const current = openFixture();
-      const blocker = current.store.reserveMemory();
-      const owner = current.store.reserveMemory();
-      blocker.set("other", blockerBytes + excess);
-      let error: unknown;
-      try {
-        const result = await current.store.packs.ingest(slices(pack, 64 * 1024), {
-          reservation: owner,
-        });
-        expect(result.count).toBe(3);
-      } catch (caught) {
-        error = caught;
-      } finally {
-        blocker.dispose();
-        owner.dispose();
-      }
-      if (excess === 0) {
-        expect(error).toBeUndefined();
-        expect(current.store.read(leafOid)?.data).toEqual(leaf);
-      } else {
-        expect(error).toMatchObject({ code: "E2BIG" });
-      }
-      current.store.shared.memory.assertIdle();
-    }
   });
 
   it("admits aggregate branch targets beyond the per-delta working bound", async () => {
@@ -3523,24 +2855,14 @@ describe("pack deferred resolution", () => {
     writer.object("blob", base);
     writer.finish();
 
-    const owner = store.reserveMemory();
-    try {
-      db.storage.resetCounters();
-      const result = await store.packs.ingest(slices(concat(chunks), 64 * 1024), {
-        reservation: owner,
-      });
-      expect(result.count).toBe(6);
-      expect(db.storage.statementCount).toBeLessThan(1_000);
-      expect(owner.highWaterBytes).toBeGreaterThan(MAX_PACK_DELTA_WORKING_BYTES);
-      expect(owner.highWaterBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
-      expect(store.packs.completePackedEntry(largeOid)).toMatchObject({
-        type: "blob",
-        size: large.length,
-      });
-    } finally {
-      owner.dispose();
-    }
-    store.shared.memory.assertIdle();
+    db.storage.resetCounters();
+    const result = await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    expect(result.count).toBe(6);
+    expect(db.storage.statementCount).toBeLessThan(1_000);
+    expect(store.packs.completePackedEntry(largeOid)).toMatchObject({
+      type: "blob",
+      size: large.length,
+    });
   });
 
   it("resolves 999 child-before-base deltas in bounded statements", async () => {
@@ -3576,32 +2898,16 @@ describe("pack deferred resolution", () => {
     if (!(db instanceof TestDatabase)) throw new Error("expected pager test database");
     const targetOids = targets.map((target) => target.oid);
     const statements: number[] = [];
-    const owner = store.reserveMemory();
-    const operation = owner.scope();
-    const output = owner.scope();
-    try {
-      db.storage.histogram = new Map();
-      db.storage.resetCounters();
-      const objects = store.packs.readObjects(targetOids, "blob", { operation, output });
-      for (const target of targets) expect(objects.get(target.oid)?.data).toEqual(target.data);
-      expect(output.currentBytes).toBe(
-        512 +
-          targets.length * 256 +
-          targets.reduce((bytes, target) => bytes + target.data.length, 0),
-      );
-      expect(operation.currentBytes).toBe(0);
-      statements.push(db.storage.statementCount);
-      expect(
-        [...db.storage.histogram]
-          .filter(([query]) => query.includes("/* pack-graph-page */"))
-          .reduce((calls, [, count]) => calls + count, 0),
-      ).toBe(4);
-    } finally {
-      output.dispose();
-      operation.dispose();
-      owner.dispose();
-    }
-    store.shared.memory.assertIdle();
+    db.storage.histogram = new Map();
+    db.storage.resetCounters();
+    const objects = store.packs.readObjects(targetOids, "blob");
+    for (const target of targets) expect(objects.get(target.oid)?.data).toEqual(target.data);
+    statements.push(db.storage.statementCount);
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.includes("/* pack-graph-page */"))
+        .reduce((calls, [, count]) => calls + count, 0),
+    ).toBe(4);
 
     const first = targets[0]!;
     db.storage.resetCounters();
@@ -3623,7 +2929,6 @@ describe("pack deferred resolution", () => {
     ]);
     statements.push(db.storage.statementCount);
     expect(statements.every((count) => count < 1_000)).toBe(true);
-    store.shared.memory.assertIdle();
   });
 
   it("reports missing bases, cycles, and depth excess across graph pages without leaking", async () => {
@@ -3634,7 +2939,6 @@ describe("pack deferred resolution", () => {
         "tree",
       ),
     ).toThrow(/is a blob, not a tree/);
-    typed.store.shared.memory.assertIdle();
 
     const missing = await pagedUnionFixture();
     const missingBase = missing.chain[3]!;
@@ -3647,7 +2951,6 @@ describe("pack deferred resolution", () => {
     expect(() => missing.store.packs.read(missing.targets[0]!.oid)).toThrow(
       `missing delta base ${missingBase.oid} for ${missingChild.oid}`,
     );
-    missing.store.shared.memory.assertIdle();
 
     const cyclic = await pagedUnionFixture();
     cyclic.db.run(
@@ -3657,11 +2960,9 @@ describe("pack deferred resolution", () => {
       cyclic.chain[0]!.oid,
     );
     expect(() => cyclic.store.packs.read(cyclic.targets[0]!.oid)).toThrow(/cyclic delta chain/);
-    cyclic.store.shared.memory.assertIdle();
 
     const deep = await pagedUnionFixture(new TestDatabase(), { maxDeltaDepth: 12 });
     expect(() => deep.store.packs.read(deep.targets[0]!.oid)).toThrow(/delta chain deeper than 12/);
-    deep.store.shared.memory.assertIdle();
   });
 
   it("closes the graph-page cursor when row validation fails", async () => {
@@ -3674,7 +2975,6 @@ describe("pack deferred resolution", () => {
       /paged pack graph contains invalid metadata/,
     );
     expect(db.graphIteratorReturns).toBe(1);
-    store.shared.memory.assertIdle();
   });
 
   it("resolves thin deltas from every loose object type in one bounded batch", async () => {
@@ -3739,110 +3039,6 @@ describe("pack deferred resolution", () => {
     }
   });
 
-  it("pre-admits one large external base at the exact ingest boundary", async () => {
-    const base = deterministicBytes(3 * 1024 * 1024);
-    const baseOid = hashObject("blob", base);
-    const target = new Uint8Array([0x62]);
-    const targetOid = hashObject("blob", target);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(1);
-    writer.refDelta(baseOid, literalDelta(base.length, target));
-    writer.finish();
-    const pack = concat(chunks);
-    const fixture = () => {
-      const db = new TestDatabase();
-      const repository = new SqliteGitDatabase(db).createRepository(
-        "/repo",
-        "ref: refs/heads/main",
-      );
-      const coordinator = new MemoryCoordinator();
-      const objects = new ByteLru<string, RawObject>(0, (object) => object.data.length);
-      const rows = new ByteLru<string, Uint8Array>(0, (row) => row.length);
-      const store = new CheckoutStore(
-        new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
-        repository,
-      );
-      expect(store.write("blob", base)).toBe(baseOid);
-      db.run(
-        "UPDATE git_objects SET stored = 'raw' WHERE repo_id = ? AND oid = ?",
-        repository.repoId,
-        baseOid,
-      );
-      db.run(
-        "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
-        repository.repoId,
-        baseOid,
-      );
-      for (let offset = 0; offset < base.length; offset += PACK_CHUNK) {
-        db.run(
-          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-          repository.repoId,
-          baseOid,
-          offset / PACK_CHUNK,
-          blob(base.subarray(offset, offset + PACK_CHUNK)),
-        );
-      }
-      expect(coordinator.activeCount).toBe(0);
-      db.storage.histogram = new Map();
-      db.storage.resetCounters();
-      return { coordinator, db, store };
-    };
-
-    const measured = fixture();
-    const measuredOwner = measured.store.reserveMemory();
-    const membershipBytes = 49;
-    const externalOutputBytes = 512 + 256 + base.length;
-    const looseMaterializationBytes =
-      256 + 512 + (128 + 48 + 2 * 44) + (256 + 384) + (1_024 + 512 + base.length);
-    const exactBytes =
-      PACK_INGEST_METADATA_BYTES +
-      membershipBytes +
-      externalOutputBytes +
-      looseMaterializationBytes;
-    try {
-      await measured.store.packs.ingest(slices(pack, 64 * 1024), {
-        reservation: measuredOwner,
-      });
-      expect(measuredOwner.highWaterBytes).toBe(exactBytes);
-      expect(measuredOwner.currentBytes).toBe(0);
-    } finally {
-      measuredOwner.dispose();
-    }
-    expect(measured.coordinator.activeCount).toBe(0);
-    expect(measured.store.read(targetOid)?.data).toEqual(target);
-
-    for (const excess of [0, 1]) {
-      const current = fixture();
-      const blocker = current.store.reserveMemory();
-      const owner = current.store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - exactBytes + excess);
-      let error: unknown;
-      try {
-        await current.store.packs.ingest(slices(pack, 64 * 1024), { reservation: owner });
-      } catch (caught) {
-        error = caught;
-      }
-      expect(owner.currentBytes).toBe(0);
-      blocker.clear("other");
-      blocker.dispose();
-      owner.dispose();
-      expect(current.coordinator.activeCount).toBe(0);
-      if (excess === 0) {
-        expect(error).toBeUndefined();
-        expect(current.store.read(targetOid)?.data).toEqual(target);
-      } else {
-        expect(error).toMatchObject({ code: "E2BIG" });
-        expect(
-          current.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'"),
-        ).toBe(0);
-        expect(current.store.packs.reclaimPending()).toBe(1);
-        expect(current.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta")).toBe(0);
-        expect(current.store.read(baseOid)?.data).toEqual(base);
-      }
-    }
-  });
-
   it("resolves a large transitive loose base for a packed ingest base", async () => {
     const looseBase = new Uint8Array(4.5 * 1024 * 1024);
     const looseBaseOid = hashObject("blob", looseBase);
@@ -3865,15 +3061,9 @@ describe("pack deferred resolution", () => {
     const targetPack = concat(targetPackChunks);
     const fixture = async () => {
       const db = new TestDatabase();
-      const database = new SqliteGitDatabase(db);
+      const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
       const repository = database.createRepository("/repo", "ref: refs/heads/main");
-      const coordinator = new MemoryCoordinator();
-      const objects = new ByteLru<string, RawObject>(0, (object) => object.data.length);
-      const rows = new ByteLru<string, Uint8Array>(0, (row) => row.length);
-      const store = new CheckoutStore(
-        new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
-        repository,
-      );
+      const store = database.openCheckout(repository);
       expect(store.write("blob", looseBase)).toBe(looseBaseOid);
       const packed = await store.packs.ingest(slices(basePack, 64 * 1024));
       db.run(
@@ -3884,114 +3074,12 @@ describe("pack deferred resolution", () => {
       );
       expect(store.packs.completePackedEntry(looseBaseOid)).toBeNull();
       expect(store.packs.completePackedEntry(packedBaseOid)?.packId).toBe(packed.packId);
-      expect(coordinator.activeCount).toBe(0);
-      return { coordinator, db, store };
-    };
-
-    const measured = await fixture();
-    const measuredOwner = measured.store.reserveMemory();
-    try {
-      await measured.store.packs.ingest(slices(targetPack, 64 * 1024), {
-        reservation: measuredOwner,
-      });
-      expect(measuredOwner.currentBytes).toBe(0);
-    } finally {
-      measuredOwner.dispose();
-    }
-    expect(measured.coordinator.activeCount).toBe(0);
-    expect(measured.store.read(targetOid)?.data).toEqual(target);
-  });
-
-  it("charges a warm packed ingest base at the exact second-page boundary", async () => {
-    const base = deterministicBytes(128_000);
-    const baseOid = hashObject("blob", base);
-    const targets = Array.from({ length: PACK_PENDING_PAGE_ROWS + 1 }, (_, index) => {
-      const data = new Uint8Array(4);
-      new DataView(data.buffer).setUint32(0, index);
-      return { data, oid: hashObject("blob", data) };
-    });
-    const targetChunks: Uint8Array[] = [];
-    const targetWriter = new PackWriter((chunk) => targetChunks.push(chunk));
-    targetWriter.header(targets.length + 1);
-    for (const target of targets) {
-      targetWriter.refDelta(baseOid, literalDelta(base.length, target.data));
-    }
-    targetWriter.object("blob", base);
-    targetWriter.finish();
-    const targetPack = concat(targetChunks);
-
-    const fixture = async () => {
-      const db = new TestDatabase();
-      const database = new SqliteGitDatabase(db);
-      const store = database.openCheckout(
-        database.createRepository("/repo", "ref: refs/heads/main"),
-      );
       return { db, store };
     };
 
     const measured = await fixture();
-    const measuredPack = await measured.store.packs.ingest(slices(targetPack, 64 * 1024));
-    const lastEntry = measured.db.one<{ data_len: number }>(
-      `SELECT data_len FROM git_pack_entries
-        WHERE repo_id = ? AND pack_id = ? AND base_oid IS NOT NULL
-        ORDER BY offset DESC LIMIT 1`,
-      measured.store.sharedRepoId,
-      measuredPack.packId,
-    );
-    if (lastEntry === undefined) throw new Error("last deferred entry disappeared");
-    const lastTarget = targets[targets.length - 1]!;
-    const exactBytes =
-      PACK_INGEST_METADATA_BYTES +
-      (targets.length + 1) * 49 +
-      (512 + 256 + base.length) +
-      (lastEntry.data_len + 256 * 1024 + 832) +
-      chunkFootprint(lastTarget.data.length) +
-      lastTarget.data.length;
-
-    for (const excess of [0, 1]) {
-      const current = await fixture();
-      const blocker = current.store.reserveMemory();
-      const owner = current.store.reserveMemory();
-      let armed = false;
-      let error: unknown;
-      try {
-        await current.store.packs.ingest(slices(targetPack, 64 * 1024), {
-          reservation: owner,
-          yieldNow: async () => {
-            if (armed) return;
-            const pending =
-              current.db.scalar<number>(
-                "SELECT count(*) FROM git_pack_pending WHERE repo_id = ?",
-                current.store.sharedRepoId,
-              ) ?? 0;
-            const resolved =
-              current.db.scalar<number>(
-                `SELECT count(*) FROM git_pack_objects object
-                  JOIN git_pack_meta pack
-                    ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-                 WHERE object.repo_id = ? AND pack.state = 'pending'`,
-                current.store.sharedRepoId,
-              ) ?? 0;
-            if (pending !== 1 || resolved <= 1) return;
-            blocker.set("other", MAX_OPERATION_MEMORY_BYTES - exactBytes + excess);
-            armed = true;
-          },
-        });
-      } catch (caught) {
-        error = caught;
-      } finally {
-        blocker.dispose();
-        owner.dispose();
-      }
-      expect(armed).toBe(true);
-      if (excess === 0) {
-        expect(error).toBeUndefined();
-        expect(current.store.read(lastTarget.oid)?.data).toEqual(lastTarget.data);
-      } else {
-        expect(error).toMatchObject({ code: "E2BIG" });
-      }
-      current.store.shared.memory.assertIdle();
-    }
+    await measured.store.packs.ingest(slices(targetPack, 64 * 1024));
+    expect(measured.store.read(targetOid)?.data).toEqual(target);
   });
 
   it("keeps every scalar pack API blind to the pack being indexed", async () => {

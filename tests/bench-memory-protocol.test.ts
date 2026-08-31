@@ -62,9 +62,6 @@ function validRow(): Record<string, unknown> {
     verifiedChunkCount: 16,
     verificationDigest: "a".repeat(64),
     semanticStatus: "ok",
-    coordinatorHighWaterBytes: 1_024,
-    coordinatorFinalBytes: 0,
-    coordinatorActiveReservations: 0,
     cgroupMemory: {
       before: snapshot(140, 150),
       after: snapshot(200, 250),
@@ -84,9 +81,6 @@ function validRedirectRow(): Record<string, unknown> {
     formerLimitBytes: 100_663_296,
     verifiedContentBytes: 100_663_297,
     verifiedChunkCount: 193,
-    coordinatorHighWaterBytes: null,
-    coordinatorFinalBytes: null,
-    coordinatorActiveReservations: null,
   };
 }
 
@@ -117,7 +111,6 @@ describe("memory benchmark protocol", () => {
       const spec = memoryScenarioSpec(name);
       expect(spec.scenario).toBe(name);
       expect(spec.workloadBytes).toBeGreaterThan(spec.formerLimitBytes);
-      expect(spec.coordinator).toBe("required");
     }
     expect(() => memoryScenarioSpec("missing-row")).toThrow(/unknown memory scenario/);
   });
@@ -141,7 +134,7 @@ describe("memory benchmark protocol", () => {
     );
   });
 
-  it("binds source, workload, digest metadata, and coordinator ownership to the scenario", () => {
+  it("binds source, workload, and digest metadata to the scenario", () => {
     const wrongSource = validRow();
     wrongSource.source = "Filesystem.writeFileStream";
     expect(() => parseMemoryRun(JSON.stringify(wrongSource), IDENTITY)).toThrow(/source/);
@@ -154,14 +147,6 @@ describe("memory benchmark protocol", () => {
     wrongChunks.verifiedChunkCount = 15;
     expect(() => parseMemoryRun(JSON.stringify(wrongChunks), IDENTITY)).toThrow(/frozen/);
 
-    const zeroHighWater = validRow();
-    zeroHighWater.coordinatorHighWaterBytes = 0;
-    expect(() => parseMemoryRun(JSON.stringify(zeroHighWater), IDENTITY)).toThrow(/coordinator/);
-
-    const active = validRow();
-    active.coordinatorActiveReservations = 1;
-    expect(() => parseMemoryRun(JSON.stringify(active), IDENTITY)).toThrow(/coordinator/);
-
     const redirectIdentity: MemoryRunIdentity = {
       ...IDENTITY,
       scenario: "fs.redirect.stream",
@@ -169,11 +154,6 @@ describe("memory benchmark protocol", () => {
     };
     expect(parseMemoryRun(JSON.stringify(validRedirectRow()), redirectIdentity).source).toBe(
       "Filesystem.writeFileStream",
-    );
-    const falseCoordinator = validRedirectRow();
-    falseCoordinator.coordinatorHighWaterBytes = 1;
-    expect(() => parseMemoryRun(JSON.stringify(falseCoordinator), redirectIdentity)).toThrow(
-      /must not claim/,
     );
   });
 
@@ -200,7 +180,7 @@ describe("memory benchmark protocol", () => {
     expect(() => parseMemoryRun(JSON.stringify(peak), IDENTITY)).toThrow(/peakGrowthBytes/);
   });
 
-  it("reconciles exact semantic, cost, storage, source, and coordinator metadata", () => {
+  it("reconciles exact semantic, cost, storage, and source metadata", () => {
     const calibration = parsedCalibration();
     const capped = parseMemoryRun(JSON.stringify(validRow()), IDENTITY);
     reconcileMemoryRuns(calibration, capped);

@@ -11,7 +11,6 @@ import { operationRefLogMetadata } from "../src/core/ops/ref-log.js";
 import { add } from "../src/core/ops/staging.js";
 import { Repository } from "../src/core/repository.js";
 import { createGit, type Git } from "../src/git/client.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -543,35 +542,6 @@ describe("merge lifecycle", () => {
         reason: "pull: merge",
       }),
     ]);
-  });
-
-  it("admits a cold merge journal before continue and abort decode", async () => {
-    const history = cleanDivergence();
-    const workspace = await clonedFrom(history.fixture);
-    expect(
-      merge(workspace.context, workspace.repo, workspace.worktree, {
-        theirs: "topic",
-        commit: false,
-      }),
-    ).toEqual({ pendingCommit: true });
-    const cold = reopen(workspace);
-    const blocker = cold.repo.store.reserveMemory();
-    blocker.set("other", MAX_OPERATION_MEMORY_BYTES - 1);
-    try {
-      for (const action of [
-        () => mergeContinue(cold.context, cold.repo),
-        () => mergeAbort(cold.repo, workspace.worktree),
-      ]) {
-        workspace.storage.resetCounters();
-        expect(action).toThrow(expect.objectContaining({ code: "E2BIG" }));
-        expect(workspace.storage.statementCount).toBe(1);
-      }
-    } finally {
-      blocker.dispose();
-    }
-    expect(cold.repo.checkout.readMergeState()).not.toBeNull();
-    expect(cold.repo.head().oid).toBe(history.current);
-    cold.repo.store.memory.assertIdle();
   });
 
   it("rejects before publishing a pending merge that exceeds the continuation index bound", () => {

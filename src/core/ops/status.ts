@@ -6,14 +6,13 @@
 // stat data cached in `git_index` no longer holds. A repeated status over an
 // untouched tree therefore reads no file content at all.
 
-import { createRefMutationMemoryOwner, type IndexEntry } from "../../sqlite/store.js";
+import type { IndexEntry } from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
 import { CorruptError, GitError } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { boundedBranchRef, directRefOid, resolveBranchUpstream } from "./branch-upstream.js";
@@ -78,6 +77,10 @@ export interface StatusReportOptions extends StatusOptions {
 export const STATUS_RETAINED_BYTES = 16 * 1024 * 1024;
 const STATUS_WINDOW_ROWS = 1000;
 const DIRECTORY_FIXED_BYTES = 96;
+
+function statusStringBytes(value: string): number {
+  return 48 + value.length * 2;
+}
 const SET_ENTRY_BYTES = 48;
 
 interface StatusIndexSnapshot {
@@ -140,48 +143,38 @@ export function statusReport(
 
 /** Read and validate HEAD, its configured upstream, and bounded graph counts. */
 export function statusBranch(repo: Repository): StatusBranch {
-  const owner = createRefMutationMemoryOwner(repo.store);
-  try {
-    const rawHead: unknown = repo.checkout.head();
-    if (typeof rawHead !== "string") throw new CorruptError("repository HEAD is not text");
-    owner.retain(rawHead);
+  const rawHead: unknown = repo.checkout.head();
+  if (typeof rawHead !== "string") throw new CorruptError("repository HEAD is not text");
 
-    let oid: string | null;
-    let head: string | null;
-    let headRef: string | undefined;
-    if (rawHead.startsWith("ref: ")) {
-      const refUnits = rawHead.length - 5;
-      const sliced = owner.construct(refUnits, () => rawHead.slice(5));
-      const checkedHeadRef = boundedBranchRef(sliced, "status HEAD ref", owner);
-      headRef = checkedHeadRef;
-      head = owner.construct(checkedHeadRef.length - HEADS.length, () =>
-        checkedHeadRef.slice(HEADS.length),
-      );
-      oid = directRefOid(repo, checkedHeadRef, owner);
-    } else {
-      if (!isOid(rawHead)) throw new CorruptError("detached HEAD is not a full object id");
-      oid = rawHead;
-      head = null;
-    }
-    if (oid !== null && repo.typeOf(oid) !== "commit") {
-      throw new CorruptError("status HEAD does not point to a commit");
-    }
-
-    const base: StatusBranch = { oid, head };
-    if (headRef === undefined) return base;
-    const upstream = resolveBranchUpstream(repo, headRef, owner);
-    if (upstream === undefined) return base;
-    if (oid === null || upstream.oid === null) return { ...base, upstream: upstream.name };
-    const counts = countAheadBehind(repo, { currentOid: oid, incomingOid: upstream.oid });
-    return {
-      ...base,
-      upstream: upstream.name,
-      ahead: counts.ahead,
-      behind: counts.behind,
-    };
-  } finally {
-    owner.dispose();
+  let oid: string | null;
+  let head: string | null;
+  let headRef: string | undefined;
+  if (rawHead.startsWith("ref: ")) {
+    const checkedHeadRef = boundedBranchRef(rawHead.slice(5), "status HEAD ref");
+    headRef = checkedHeadRef;
+    head = checkedHeadRef.slice(HEADS.length);
+    oid = directRefOid(repo, checkedHeadRef);
+  } else {
+    if (!isOid(rawHead)) throw new CorruptError("detached HEAD is not a full object id");
+    oid = rawHead;
+    head = null;
   }
+  if (oid !== null && repo.typeOf(oid) !== "commit") {
+    throw new CorruptError("status HEAD does not point to a commit");
+  }
+
+  const base: StatusBranch = { oid, head };
+  if (headRef === undefined) return base;
+  const upstream = resolveBranchUpstream(repo, headRef);
+  if (upstream === undefined) return base;
+  if (oid === null || upstream.oid === null) return { ...base, upstream: upstream.name };
+  const counts = countAheadBehind(repo, { currentOid: oid, incomingOid: upstream.oid });
+  return {
+    ...base,
+    upstream: upstream.name,
+    ahead: counts.ahead,
+    behind: counts.behind,
+  };
 }
 
 /** Eager status with an optional same-database sparse fast path. */
@@ -202,47 +195,31 @@ export function eagerStatus(
     return status(repo, worktree, options);
   }
 
-  const reservation = repo.store.reserveMemory();
-  try {
-    const state = source.readState(repo.checkout.checkoutId);
-    if (!state.available) {
-      const baselineTreeOid = repo.headTree();
-      const seed = new FullStatusTrackerSeed(reservation);
-      try {
-        const prepass = fullStatusPrepass(repo, baselineTreeOid, options);
-        const rows = sortStatusDetails([
-          ...applyStatusRenames(
-            statusStreamInternal(repo, worktree, options, baselineTreeOid, prepass, seed),
-            prepass.renames,
-          ),
-        ]);
-        if (seed.resealable) {
-          tracker.reseal(repo.checkout.checkoutId, baselineTreeOid, seed.entries(), reservation);
-        }
-        return rows;
-      } finally {
-        seed.dispose();
-      }
+  const state = source.readState(repo.checkout.checkoutId);
+  if (!state.available) {
+    const baselineTreeOid = repo.headTree();
+    const seed = new FullStatusTrackerSeed();
+    const prepass = fullStatusPrepass(repo, baselineTreeOid, options);
+    const rows = sortStatusDetails([
+      ...applyStatusRenames(
+        statusStreamInternal(repo, worktree, options, baselineTreeOid, prepass, seed),
+        prepass.renames,
+      ),
+    ]);
+    if (seed.resealable) {
+      tracker.reseal(repo.checkout.checkoutId, baselineTreeOid, seed.entries());
     }
-
-    const sparse = sparseStatus(
-      repo,
-      worktree,
-      options,
-      context,
-      state.baselineTreeOid,
-      reservation,
-    );
-    if (sparse === null) return status(repo, worktree, options);
-    if (sparse.length === 0) {
-      renameDetectionEnabled(repo, "status", options.renames);
-      return sparse;
-    }
-    const renames = classifyStatusRenames(repo, repo.headTree(), options);
-    return sortStatusDetails([...applyStatusRenames(sparse, renames)]);
-  } finally {
-    reservation.dispose();
+    return rows;
   }
+
+  const sparse = sparseStatus(repo, worktree, options, context, state.baselineTreeOid);
+  if (sparse === null) return status(repo, worktree, options);
+  if (sparse.length === 0) {
+    renameDetectionEnabled(repo, "status", options.renames);
+    return sparse;
+  }
+  const renames = classifyStatusRenames(repo, repo.headTree(), options);
+  return sortStatusDetails([...applyStatusRenames(sparse, renames)]);
 }
 
 /**
@@ -580,14 +557,14 @@ function retainStatusIndexPath(
   for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
     const directory = path.slice(0, slash);
     if (snapshot.trackedDirs.has(directory)) continue;
-    snapshot.budget.add(DIRECTORY_FIXED_BYTES + retainedStringBytes(directory));
+    snapshot.budget.add(DIRECTORY_FIXED_BYTES + statusStringBytes(directory));
     snapshot.trackedDirs.add(directory);
   }
 }
 
 function retainTrackedPath(snapshot: StatusIndexSnapshot, path: string): void {
   if (snapshot.trackedPaths.has(path)) return;
-  snapshot.budget.add(SET_ENTRY_BYTES + retainedStringBytes(path));
+  snapshot.budget.add(SET_ENTRY_BYTES + statusStringBytes(path));
   snapshot.trackedPaths.add(path);
 }
 
@@ -599,13 +576,13 @@ export function statusIndexRetainedBytes(entry: IndexEntry): number {
     slash !== -1;
     slash = entry.path.indexOf("/", slash + 1)
   ) {
-    bytes += DIRECTORY_FIXED_BYTES + retainedStringBytes(entry.path.slice(0, slash));
+    bytes += DIRECTORY_FIXED_BYTES + statusStringBytes(entry.path.slice(0, slash));
   }
   return bytes;
 }
 
 function trackedPathRetainedBytes(path: string): number {
-  return SET_ENTRY_BYTES + retainedStringBytes(path);
+  return SET_ENTRY_BYTES + statusStringBytes(path);
 }
 
 function shallowestUntrackedDirectory(file: string, tracked: Set<string>): string | null {
@@ -793,7 +770,7 @@ function snapshotCleanWorktree(
   const protectedDirectories = excluded.map((root) => root.relative);
   let retainedBytes = 0;
   const retain = (path: string): void => {
-    retainedBytes += DIRECTORY_FIXED_BYTES + retainedStringBytes(path);
+    retainedBytes += DIRECTORY_FIXED_BYTES + statusStringBytes(path);
     if (retainedBytes > STATUS_RETAINED_BYTES) {
       throw new GitError("E2BIG", `clean retained state exceeds ${STATUS_RETAINED_BYTES} bytes`);
     }
@@ -845,14 +822,14 @@ function cleanableDirectories(directories: string[], protectedPaths: string[]): 
     for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
       const directory = path.slice(0, slash);
       if (protectedDirectories.has(directory)) continue;
-      retainedBytes += DIRECTORY_FIXED_BYTES + retainedStringBytes(directory);
+      retainedBytes += DIRECTORY_FIXED_BYTES + statusStringBytes(directory);
       if (retainedBytes > STATUS_RETAINED_BYTES) {
         throw new GitError("E2BIG", `clean retained state exceeds ${STATUS_RETAINED_BYTES} bytes`);
       }
       protectedDirectories.add(directory);
     }
     if (!protectedDirectories.has(path)) {
-      retainedBytes += DIRECTORY_FIXED_BYTES + retainedStringBytes(path);
+      retainedBytes += DIRECTORY_FIXED_BYTES + statusStringBytes(path);
       if (retainedBytes > STATUS_RETAINED_BYTES) {
         throw new GitError("E2BIG", `clean retained state exceeds ${STATUS_RETAINED_BYTES} bytes`);
       }

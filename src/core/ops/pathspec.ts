@@ -1,22 +1,11 @@
-import { MemoryCoordinator, type MemoryReservation } from "../../memory.js";
 import { utf8, utf8Decoder } from "../bytes.js";
 import { GitError } from "../errors.js";
 import { type ByteGlobPattern, compileByteGlob } from "../ignore/pattern.js";
-import { retainedStringBytes } from "../retained.js";
 import { comparePaths } from "../streams.js";
 
 export const MAX_LS_FILES_WILDCARD_TOKENS = 4_096;
 export const MAX_LS_FILES_MATCHER_WORK = 32 * 1024 * 1024;
-export const LS_FILES_RESULT_FIXED_BYTES = 128;
 export const LS_FILES_INDEX_PAGE = 256;
-const PATHSPEC_FIXED_BYTES = 512;
-const PATHSPEC_PATTERN_BYTES = 256;
-const COLLECTION_FIXED_BYTES = 128;
-const SET_ENTRY_BYTES = 96;
-const ARRAY_SLOT_BYTES = 8;
-const ENCODED_ROW_FIXED_BYTES = 64;
-const COMPILE_SEGMENT_BYTES = 48;
-const COMPILED_GLOB_TOKEN_BYTES = 96;
 
 export interface LsFilesLimits {
   maxWildcardTokens?: number;
@@ -54,106 +43,62 @@ export class CompiledReadPathspec {
   readonly #all: boolean;
   readonly #patterns: readonly ReadPathspec[];
   readonly #limits: ResolvedLimits;
-  readonly #memory: MemoryReservation;
 
   constructor(
     all: boolean,
     patterns: readonly ReadPathspec[],
     scanPrefixes: readonly string[] | null,
     limits: ResolvedLimits,
-    memory: MemoryReservation,
   ) {
     this.#all = all;
     this.#patterns = patterns;
     this.scanPrefixes = scanPrefixes;
     this.#limits = limits;
-    this.#memory = memory;
   }
 
   /** Filter bounded source rows, deduplicate conflict stages, and restore Git byte order. */
   collect(rows: Iterable<string>): string[] {
-    const resultMemory = this.#memory.scope();
-    try {
-      let retainedBytes = 2 * COLLECTION_FIXED_BYTES;
-      resultMemory.set("other", retainedBytes);
-      const unique = new Set<string>();
-      const out: string[] = [];
-      let matcherWork = 0;
+    const unique = new Set<string>();
+    const out: string[] = [];
+    let matcherWork = 0;
 
-      for (const path of rows) {
-        if (unique.has(path)) continue;
+    for (const path of rows) {
+      if (unique.has(path)) continue;
 
-        let matched = this.#all;
-        if (!matched) {
-          const rowMemory = resultMemory.scope();
-          try {
-            rowMemory.set("other", ENCODED_ROW_FIXED_BYTES + encodedUtf8Length(path));
-            const bytes = utf8.encode(path);
-            for (const pattern of this.#patterns) {
-              const result =
-                pattern.kind === "literal"
-                  ? matchLiteral(pattern, bytes, this.#limits.maxMatcherWork - matcherWork)
-                  : pattern.pattern.match(bytes, this.#limits.maxMatcherWork - matcherWork);
-              matcherWork += result.work;
-              if (matcherWork > this.#limits.maxMatcherWork) {
-                throw tooBig("matcher work", this.#limits.maxMatcherWork);
-              }
-              if (result.matched) {
-                matched = true;
-                break;
-              }
-            }
-          } finally {
-            rowMemory.dispose();
+      let matched = this.#all;
+      if (!matched) {
+        const bytes = utf8.encode(path);
+        for (const pattern of this.#patterns) {
+          const result =
+            pattern.kind === "literal"
+              ? matchLiteral(pattern, bytes, this.#limits.maxMatcherWork - matcherWork)
+              : pattern.pattern.match(bytes, this.#limits.maxMatcherWork - matcherWork);
+          matcherWork += result.work;
+          if (matcherWork > this.#limits.maxMatcherWork) {
+            throw tooBig("matcher work", this.#limits.maxMatcherWork);
+          }
+          if (result.matched) {
+            matched = true;
+            break;
           }
         }
-        if (!matched) continue;
-
-        const additional = lsFilesResultRetainedBytes(path) + SET_ENTRY_BYTES + ARRAY_SLOT_BYTES;
-        retainedBytes = checkedMemoryAdd(retainedBytes, additional, "result");
-        resultMemory.set("other", retainedBytes);
-        unique.add(path);
-        out.push(path);
       }
+      if (!matched) continue;
 
-      resultMemory.set("other", retainedBytes + out.length * ARRAY_SLOT_BYTES);
-      out.sort(comparePaths);
-      resultMemory.set("other", retainedBytes);
-      return out;
-    } finally {
-      resultMemory.dispose();
+      unique.add(path);
+      out.push(path);
     }
-  }
-
-  release(): void {
-    this.#memory.dispose();
+    out.sort(comparePaths);
+    return out;
   }
 }
 
-export function compileReadPathspec(
-  options?: LsFilesOptions,
-  owningReservation?: MemoryReservation,
-): CompiledReadPathspec {
-  const memory = owningReservation?.scope() ?? new MemoryCoordinator().reserve();
-  try {
-    return compileReadPathspecOwned(options, memory);
-  } catch (error) {
-    memory.dispose();
-    throw error;
-  }
-}
-
-function compileReadPathspecOwned(
-  options: LsFilesOptions | undefined,
-  memory: MemoryReservation,
-): CompiledReadPathspec {
-  let retainedBytes = PATHSPEC_FIXED_BYTES + COLLECTION_FIXED_BYTES;
-  memory.set("other", retainedBytes);
+export function compileReadPathspec(options?: LsFilesOptions): CompiledReadPathspec {
   const input = runtimeOptions(options);
   const limits = resolveLimits(input.limits);
   const paths = input.paths;
   if (paths === undefined || paths.length === 0) {
-    return new CompiledReadPathspec(true, [], null, limits, memory);
+    return new CompiledReadPathspec(true, [], null, limits);
   }
   const patterns: ReadPathspec[] = [];
   let all = false;
@@ -165,19 +110,11 @@ function compileReadPathspecOwned(
     if (raw === "") throw new GitError("EINVAL", "empty ls-files pathspec");
     if (raw.startsWith("/") || raw.startsWith(":")) throw unsupportedPathspec();
 
-    const rawBytes = validatedUtf8Length(raw);
-    const segments = pathSegmentCount(raw);
-    const compilePeak =
-      2 * COLLECTION_FIXED_BYTES +
-      segments * (ARRAY_SLOT_BYTES + COMPILE_SEGMENT_BYTES) +
-      raw.length * 4 +
-      rawBytes * (1 + COMPILED_GLOB_TOKEN_BYTES);
-    memory.set("other", checkedMemoryAdd(retainedBytes, compilePeak, "compiler"));
+    validatedUtf8Length(raw);
 
     const normalized = canonicalPathspec(raw);
     if (normalized === "." || normalized === "") {
       all = true;
-      memory.set("other", retainedBytes);
       continue;
     }
 
@@ -193,67 +130,26 @@ function compileReadPathspecOwned(
     });
     const escaped = normalized.includes("\\");
     if (escaped) {
-      retainedBytes = checkedMemoryAdd(
-        retainedBytes,
-        literalPatternRetainedBytes(normalized),
-        "compiled pathspec",
-      );
       addLiteral(patterns, normalized);
     }
-    if (glob === null) {
-      memory.set("other", retainedBytes);
-      continue;
-    }
+    if (glob === null) continue;
 
     if (glob.literal === null) {
-      retainedBytes = checkedMemoryAdd(
-        retainedBytes,
-        globPatternRetainedBytes(glob, rawBytes),
-        "compiled pathspec",
-      );
       patterns.push({ kind: "glob", pattern: glob });
-      memory.set("other", retainedBytes);
       continue;
     }
 
     const decoded = utf8Decoder.decode(glob.literal);
-    retainedBytes = checkedMemoryAdd(
-      retainedBytes,
-      literalPatternRetainedBytes(decoded),
-      "compiled pathspec",
-    );
     if (escaped) addExact(patterns, decoded);
     else if (addLiteral(patterns, decoded)) all = true;
-    memory.set("other", retainedBytes);
   }
 
   const hasGlob = patterns.some((pattern) => pattern.kind === "glob");
   let scanPrefixes: readonly string[] | null = null;
   if (!all && !hasGlob) {
-    let longestPathUnits = 0;
-    for (const pattern of patterns) {
-      if (pattern.kind === "literal")
-        longestPathUnits = Math.max(longestPathUnits, pattern.path.length);
-    }
-    const coalescingPeak =
-      3 * COLLECTION_FIXED_BYTES +
-      patterns.length * (3 * ARRAY_SLOT_BYTES + SET_ENTRY_BYTES) +
-      48 +
-      longestPathUnits * 2;
-    memory.set("other", checkedMemoryAdd(retainedBytes, coalescingPeak, "coalescing"));
     scanPrefixes = coalescedPaths(patterns);
-    retainedBytes = checkedMemoryAdd(
-      retainedBytes,
-      COLLECTION_FIXED_BYTES + scanPrefixes.length * ARRAY_SLOT_BYTES,
-      "scan prefixes",
-    );
   }
-  memory.set("other", retainedBytes);
-  return new CompiledReadPathspec(all, patterns, scanPrefixes, limits, memory);
-}
-
-export function lsFilesResultRetainedBytes(path: string): number {
-  return LS_FILES_RESULT_FIXED_BYTES + retainedStringBytes(path);
+  return new CompiledReadPathspec(all, patterns, scanPrefixes, limits);
 }
 
 function matchLiteral(
@@ -319,13 +215,6 @@ function resolveLimits(limits: unknown): ResolvedLimits {
   };
 }
 
-function checkedMemoryAdd(total: number, bytes: number, label: string): number {
-  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > Number.MAX_SAFE_INTEGER - total) {
-    throw new GitError("E2BIG", `ls-files ${label} memory accounting overflows`);
-  }
-  return total + bytes;
-}
-
 function limitValue(limits: unknown, key: string): number | undefined {
   if (limits === undefined) return undefined;
   if (typeof limits !== "object" || limits === null) {
@@ -371,29 +260,6 @@ function coalescedPaths(patterns: readonly ReadPathspec[]): string[] {
     out.push(path);
   }
   return out;
-}
-
-function pathSegmentCount(path: string): number {
-  let segments = 1;
-  for (let index = 0; index < path.length; index++) {
-    if (path.charCodeAt(index) === 0x2f) segments++;
-  }
-  return segments;
-}
-
-function literalPatternRetainedBytes(path: string): number {
-  return (
-    PATHSPEC_PATTERN_BYTES + ARRAY_SLOT_BYTES + retainedStringBytes(path) + encodedUtf8Length(path)
-  );
-}
-
-function globPatternRetainedBytes(pattern: ByteGlobPattern, encodedBytes: number): number {
-  return (
-    PATHSPEC_PATTERN_BYTES +
-    ARRAY_SLOT_BYTES +
-    pattern.tokenCount * COMPILED_GLOB_TOKEN_BYTES +
-    encodedBytes * 3
-  );
 }
 
 function unsupportedPathspec(): GitError {
@@ -460,26 +326,6 @@ function validatedUtf8Length(value: string): number {
     } else bytes += 3;
     if (!Number.isSafeInteger(bytes)) {
       throw new GitError("E2BIG", "ls-files pathspec byte length overflows");
-    }
-  }
-  return bytes;
-}
-
-function encodedUtf8Length(value: string): number {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
-    if (unit < 0x80) bytes++;
-    else if (unit < 0x800) bytes += 2;
-    else if (unit >= 0xd800 && unit <= 0xdbff) {
-      const low = value.charCodeAt(index + 1);
-      if (low >= 0xdc00 && low <= 0xdfff) {
-        bytes += 4;
-        index++;
-      } else bytes += 3;
-    } else bytes += 3;
-    if (!Number.isSafeInteger(bytes)) {
-      throw new GitError("E2BIG", "ls-files row encoding size overflows");
     }
   }
   return bytes;

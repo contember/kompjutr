@@ -153,7 +153,6 @@ export function tryInitialCheckout(
   }
 
   let publishing = false;
-  const reservation = repo.store.reserveMemory();
   try {
     const worktree = writer.tryRun(
       repo.root,
@@ -169,7 +168,6 @@ export function tryInitialCheckout(
           context.indexTracker.reseal(repo.checkout.checkoutId, treeOid, state.value);
         }
       },
-      reservation,
     );
     return worktree.kind === "committed" && worktree.value.available;
   } catch (error) {
@@ -177,7 +175,5 @@ export function tryInitialCheckout(
       throw INITIAL_CHECKOUT_FALLBACK;
     }
     throw error;
-  } finally {
-    reservation.dispose();
   }
 }

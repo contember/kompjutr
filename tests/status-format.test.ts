@@ -1,6 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { openRepository } from "../src/core/context.js";
-import { serializeCommit } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import type { StatusEntry } from "../src/core/ops/kinds.js";
 import {
@@ -8,7 +7,6 @@ import {
   formatPorcelainV2,
   formatShort,
   status,
-  statusBranch,
   statusReport,
 } from "../src/core/ops/status.js";
 import {
@@ -18,8 +16,6 @@ import {
 } from "../src/core/ops/status-format.js";
 import type { StatusDetail } from "../src/core/ops/status-rows.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
-import { Repository } from "../src/core/repository.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -27,39 +23,6 @@ import { importFixture } from "./helpers/import.js";
 import { makeRepo, writeWorkFile } from "./helpers/workspace.js";
 
 const fixtures: GitFixture[] = [];
-
-class GraphPressureRepository extends Repository {
-  #typeChecks = 0;
-
-  constructor(
-    repo: Repository,
-    private readonly beginGraph: () => () => void,
-  ) {
-    super(repo.checkout);
-  }
-
-  override typeOf(oid: string) {
-    this.#typeChecks++;
-    if (this.#typeChecks === 1) return super.typeOf(oid);
-    const release = this.beginGraph();
-    try {
-      return super.typeOf(oid);
-    } finally {
-      release();
-    }
-  }
-}
-
-function holdGraphPressure(repo: Repository, bytes: number): () => void {
-  const pressure = repo.store.reserveMemory();
-  try {
-    pressure.set("other", bytes);
-    return () => pressure.dispose();
-  } catch (error) {
-    pressure.dispose();
-    throw error;
-  }
-}
 
 afterAll(() => {
   for (const fixture of fixtures) fixture.dispose();
@@ -299,69 +262,6 @@ describe("status format configuration", () => {
     expect(statusReport(coldRepo, fetchWorkspace.worktree, { branch: true }).branch).toMatchObject({
       upstream: `${fetchRemote}/upstream`,
     });
-  });
-
-  it("keeps upstream ownership through status graph work at the exact shared ceiling", () => {
-    const upstreamName = "u".repeat(1_014);
-    const prepare = (
-      workspace: ReturnType<typeof makeRepo>,
-      beginGraph: () => () => void,
-    ): GraphPressureRepository => {
-      const tree = workspace.repo.store.write("tree", new Uint8Array());
-      const person = {
-        name: "Memory",
-        email: "memory@example.test",
-        timestamp: 1_800_000_000,
-        timezoneOffset: 0,
-      };
-      const main = workspace.repo.store.write(
-        "commit",
-        serializeCommit({
-          tree,
-          parent: [],
-          author: person,
-          committer: person,
-          message: "memory\n",
-        }),
-      );
-      workspace.repo.store.setRef("refs/heads/main", main);
-      const upstreamRef = `refs/heads/${upstreamName}`;
-      workspace.repo.store.setRef(upstreamRef, main);
-      workspace.repo.store.configSet("branch.main.remote", ".");
-      workspace.repo.store.configSet("branch.main.merge", upstreamRef);
-      return new GraphPressureRepository(workspace.repo, beginGraph);
-    };
-
-    const measured = makeRepo("/");
-    let operationBytes = 0;
-    const measuredRepo = prepare(measured, () => {
-      operationBytes = Math.max(operationBytes, measured.repo.store.memory.totalBytes);
-      return () => {};
-    });
-    expect(statusBranch(measuredRepo)).toMatchObject({
-      upstream: upstreamName,
-      ahead: 0,
-      behind: 0,
-    });
-    expect(operationBytes).toBeGreaterThan(0);
-    expect(measured.repo.store.memory.totalBytes).toBe(0);
-
-    const exact = makeRepo("/");
-    let exactRepo: GraphPressureRepository;
-    exactRepo = prepare(exact, () =>
-      holdGraphPressure(exactRepo, MAX_OPERATION_MEMORY_BYTES - operationBytes),
-    );
-    expect(statusBranch(exactRepo)).toMatchObject({ upstream: upstreamName, ahead: 0, behind: 0 });
-    expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    expect(exact.repo.store.memory.totalBytes).toBe(0);
-
-    const over = makeRepo("/");
-    let overRepo: GraphPressureRepository;
-    overRepo = prepare(over, () =>
-      holdGraphPressure(overRepo, MAX_OPERATION_MEMORY_BYTES - operationBytes + 1),
-    );
-    expect(() => statusBranch(overRepo)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(over.repo.store.memory.totalBytes).toBe(0);
   });
 
   it("resolves bounded Git booleans with explicit overrides taking precedence", () => {

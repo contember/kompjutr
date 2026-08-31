@@ -1,7 +1,6 @@
 import { isOid, utf8 } from "../core/bytes.js";
 import { CorruptError, hasErrorCode } from "../core/errors.js";
 import { type ParsedTreeEntry, type TreeParseResult, TreeParser } from "../core/objects.js";
-import { MemoryCoordinator, type MemoryReservation } from "../memory.js";
 import { blob, type SqlDatabase } from "./db.js";
 
 /** SQLite queue record, four integer fields, and bounded error fields. */
@@ -24,14 +23,6 @@ export interface TreeSourceInput extends TreeSource {
 const TREE_INDEX_ROWS = 2048;
 const TREE_INDEX_ENTRY_ARENA_BYTES = 704 * 1024;
 const TREE_INDEX_MARKER_JSON_BYTES = 192 * 1024;
-// The two arenas own 896 KiB; this reserve covers their wrappers and scalar state.
-const TREE_INDEX_FIXED_BYTES = 64 * 1024;
-const TREE_INDEX_ROW_FIXED_BYTES = 192;
-const TREE_INDEX_MARKER_FIXED_BYTES = 192;
-const TREE_INDEX_SOURCE_ROW_BYTES = 256;
-const TREE_INDEX_SOURCE_ROWS_ARRAY_BYTES = 64;
-const TREE_INDEX_ARRAY_SLOT_BYTES = 8;
-const TREE_INDEX_RETURNING_ROW_TRANSIENT_BYTES = 1024;
 const TREE_MODE = /^(?:0?40000|100644|100755|120000|160000)$/;
 
 function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
@@ -83,32 +74,6 @@ function validateTreeSource(source: TreeSource): void {
   ) {
     throw new CorruptError("tree source has invalid metadata");
   }
-}
-
-function decimalCharacters(value: number): number {
-  let remaining = value;
-  let characters = 1;
-  while (remaining >= 10) {
-    remaining = Math.floor(remaining / 10);
-    characters++;
-  }
-  return characters;
-}
-
-function sourcePreflightJsonCharacters(source: TreeSource): number {
-  return (
-    '{"p":'.length +
-    decimalCharacters(source.repoId) +
-    ',"t":"'.length +
-    source.treeOid.length +
-    '","s":"'.length +
-    source.storage.length +
-    '","x":'.length +
-    decimalCharacters(source.sourceId) +
-    ',"z":'.length +
-    decimalCharacters(source.objectSize) +
-    "}".length
-  );
 }
 
 class AsciiJsonArray {
@@ -211,8 +176,6 @@ class TreeEntryArena {
 class TreeIndexBatch {
   #entries: TreeEntryArena | null;
   #markers: AsciiJsonArray | null;
-  readonly #reservation: MemoryReservation;
-  #peakBytes = TREE_INDEX_ENTRY_ARENA_BYTES + TREE_INDEX_MARKER_JSON_BYTES + TREE_INDEX_FIXED_BYTES;
   #sourcesSeeded: boolean;
 
   constructor(
@@ -220,27 +183,10 @@ class TreeIndexBatch {
     sourcesSeeded = false,
     private readonly seedOnce = false,
     private readonly requireSeededSources = false,
-    owningReservation?: MemoryReservation,
   ) {
     this.#sourcesSeeded = sourcesSeeded;
-    this.#reservation = owningReservation?.scope() ?? new MemoryCoordinator().reserve();
-    try {
-      this.#reservation.set("tree", this.retainedBytes);
-      this.#entries = new TreeEntryArena();
-      this.#markers = new AsciiJsonArray(TREE_INDEX_MARKER_JSON_BYTES);
-    } catch (error) {
-      this.#reservation.dispose();
-      throw error;
-    }
-  }
-
-  get retainedBytes(): number {
-    if (this.#reservation.disposed) return 0;
-    return TREE_INDEX_ENTRY_ARENA_BYTES + TREE_INDEX_MARKER_JSON_BYTES + TREE_INDEX_FIXED_BYTES;
-  }
-
-  get peakBytes(): number {
-    return this.#peakBytes;
+    this.#entries = new TreeEntryArena();
+    this.#markers = new AsciiJsonArray(TREE_INDEX_MARKER_JSON_BYTES);
   }
 
   get retainedRows(): number {
@@ -252,15 +198,7 @@ class TreeIndexBatch {
     const payloadBytes = parsed.rawEntry.length;
     const rawAt = entries.payloadLength + 1;
     const nameAt = rawAt + parsed.entry.mode.length + 1;
-    const transientBytes =
-      TREE_INDEX_ROW_FIXED_BYTES +
-      (source.treeOid.length +
-        source.storage.length +
-        parsed.entry.mode.length +
-        parsed.entry.oid.length +
-        320) *
-        2;
-    return this.#withTransient(transientBytes, () => {
+    return (() => {
       let json = `{"p":${source.repoId},"t":"${source.treeOid}","s":"${source.storage}","x":${source.sourceId},"b":${source.objectSize},"q":${parsed.ordinal},"m":"${parsed.entry.mode}","o":"${parsed.entry.oid}","a":${nameAt},"l":${parsed.nameBytes.length},"r":${rawAt},"z":${parsed.rawEntry.length},"c":${cumulativeBase}}`;
       if (this.retainedRows >= TREE_INDEX_ROWS || !entries.canAppend(payloadBytes, json)) {
         this.flush();
@@ -272,7 +210,7 @@ class TreeIndexBatch {
       }
       entries.append(parsed.rawEntry, json);
       return true;
-    });
+    })();
   }
 
   #insertOversizedEntry(
@@ -284,40 +222,30 @@ class TreeIndexBatch {
       this.#seedSource(source);
       if (this.seedOnce) this.#sourcesSeeded = true;
     }
-    const binding = this.#reservation.scope();
     try {
-      binding.set(
-        "other",
-        parsed.nameBytes.length + parsed.rawEntry.length + TREE_INDEX_ROW_FIXED_BYTES,
-      );
-      try {
-        this.db.run(
-          `INSERT INTO git_tree_entries
+      this.db.run(
+        `INSERT INTO git_tree_entries
              (source_key, ordinal, mode, name_bytes, oid, raw_entry, cumulative_base)
            SELECT source.source_key, ?, ?, ?, ?, ?, ?
              FROM git_tree_sources source
             WHERE source.repo_id = ? AND source.tree_oid = ?
               AND source.storage = ? AND source.source_id = ?`,
-          parsed.ordinal,
-          parsed.entry.mode,
-          blob(parsed.nameBytes),
-          parsed.entry.oid,
-          blob(parsed.rawEntry),
-          cumulativeBase,
-          source.repoId,
-          source.treeOid,
-          source.storage,
-          source.sourceId,
-        );
-        return true;
-      } catch (error) {
-        if (!hasErrorCode(error, "E2BIG")) throw error;
-        this.#leaveSourceUnavailable(source);
-        return false;
-      }
-    } finally {
-      binding.dispose();
-      this.#observePeak();
+        parsed.ordinal,
+        parsed.entry.mode,
+        blob(parsed.nameBytes),
+        parsed.entry.oid,
+        blob(parsed.rawEntry),
+        cumulativeBase,
+        source.repoId,
+        source.treeOid,
+        source.storage,
+        source.sourceId,
+      );
+      return true;
+    } catch (error) {
+      if (!hasErrorCode(error, "E2BIG")) throw error;
+      this.#leaveSourceUnavailable(source);
+      return false;
     }
   }
 
@@ -357,9 +285,7 @@ class TreeIndexBatch {
   }
 
   addMarker(source: TreeSource, count: number, baseCost: number): void {
-    const transientBytes =
-      TREE_INDEX_MARKER_FIXED_BYTES + (source.treeOid.length + source.storage.length + 192) * 2;
-    this.#withTransient(transientBytes, () => {
+    (() => {
       const markers = this.#markerArena();
       const json = `{"p":${source.repoId},"t":"${source.treeOid}","s":"${source.storage}","x":${source.sourceId},"z":${source.objectSize},"n":${count},"b":${baseCost}}`;
       if (json.length + 2 > markers.bytes.length) {
@@ -369,7 +295,7 @@ class TreeIndexBatch {
         this.flush();
       }
       this.#markerArena().append(json);
-    });
+    })();
   }
 
   flush(): void {
@@ -427,10 +353,9 @@ class TreeIndexBatch {
     const markerRows = markers.rows;
     const jsonLength = markers.seal();
     if (this.requireSeededSources) {
-      this.#withTransient(TREE_INDEX_RETURNING_ROW_TRANSIENT_BYTES, () => {
-        let returnedRows = 0;
-        for (const row of this.db.iterate(
-          `INSERT INTO git_tree_sources
+      let returnedRows = 0;
+      for (const row of this.db.iterate(
+        `INSERT INTO git_tree_sources
                (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
              SELECT existing.repo_id, existing.tree_oid, existing.storage, existing.source_id,
                     1, json_extract(marker.value, '$.z'), json_extract(marker.value, '$.n'),
@@ -446,24 +371,23 @@ class TreeIndexBatch {
                complete = 1, object_size = excluded.object_size,
                entry_count = excluded.entry_count, base_cost = excluded.base_cost
              RETURNING source_key`,
-          blob(markers.bytes),
-          jsonLength,
-        )) {
-          returnedRows++;
-          if (
-            returnedRows > markerRows ||
-            typeof row.source_key !== "number" ||
-            !Number.isSafeInteger(row.source_key) ||
-            row.source_key < 1
-          ) {
-            throw new CorruptError("tree index source was not seeded");
-          }
-        }
-        if (returnedRows !== markerRows) {
+        blob(markers.bytes),
+        jsonLength,
+      )) {
+        returnedRows++;
+        if (
+          returnedRows > markerRows ||
+          typeof row.source_key !== "number" ||
+          !Number.isSafeInteger(row.source_key) ||
+          row.source_key < 1
+        ) {
           throw new CorruptError("tree index source was not seeded");
         }
-        markers.reset();
-      });
+      }
+      if (returnedRows !== markerRows) {
+        throw new CorruptError("tree index source was not seeded");
+      }
+      markers.reset();
       return;
     }
     this.db.run(
@@ -485,10 +409,9 @@ class TreeIndexBatch {
   }
 
   dispose(): void {
-    if (this.#reservation.disposed) return;
+    if (this.#entries === null) return;
     this.#entries = null;
     this.#markers = null;
-    this.#reservation.dispose();
   }
 
   #entryArena(): TreeEntryArena {
@@ -500,71 +423,31 @@ class TreeIndexBatch {
     if (this.#markers === null) throw new Error("tree index batch is disposed");
     return this.#markers;
   }
-
-  #withTransient<T>(bytes: number, body: () => T): T {
-    const transient = this.#reservation.scope();
-    try {
-      transient.set("other", bytes);
-      return body();
-    } finally {
-      transient.dispose();
-      this.#observePeak();
-    }
-  }
-
-  #observePeak(): void {
-    this.#peakBytes = Math.max(this.#peakBytes, this.#reservation.highWaterBytes);
-  }
 }
 
-function seedTreeSources(
-  db: SqlDatabase,
-  sources: readonly TreeSourceInput[],
-  owningReservation: MemoryReservation,
-): void {
+function seedTreeSources(db: SqlDatabase, sources: readonly TreeSourceInput[]): void {
   if (sources.length === 0) return;
-  let jsonCharacters = 2 + sources.length - 1;
-  for (const source of sources) {
-    validateTreeSource(source);
-    jsonCharacters += sourcePreflightJsonCharacters(source);
+  for (const source of sources) validateTreeSource(source);
+  const rows = sources.map((source) => ({
+    p: source.repoId,
+    t: source.treeOid,
+    s: source.storage,
+    x: source.sourceId,
+    z: source.objectSize,
+  }));
+  const json = JSON.stringify(rows);
+  if (utf8.encode(json).length > TREE_INDEX_ENTRY_ARENA_BYTES) {
+    throw new CorruptError("tree source preflight exceeds the index buffer limit");
   }
-  const rowBytes =
-    TREE_INDEX_SOURCE_ROWS_ARRAY_BYTES +
-    sources.length * (TREE_INDEX_SOURCE_ROW_BYTES + TREE_INDEX_ARRAY_SLOT_BYTES);
-  const preflightBytes = rowBytes + jsonCharacters * 3;
-  if (!Number.isSafeInteger(jsonCharacters) || !Number.isSafeInteger(preflightBytes)) {
-    throw new CorruptError("tree source preflight memory accounting overflows");
-  }
-  const preflight = owningReservation.scope();
-  try {
-    preflight.set("other", preflightBytes);
-    const rows = sources.map((source) => ({
-      p: source.repoId,
-      t: source.treeOid,
-      s: source.storage,
-      x: source.sourceId,
-      z: source.objectSize,
-    }));
-    const json = JSON.stringify(rows);
-    const encoded = utf8.encode(json);
-    if (json.length !== jsonCharacters || encoded.length !== jsonCharacters) {
-      throw new CorruptError("tree source preflight serialization changed size");
-    }
-    if (encoded.length > TREE_INDEX_ENTRY_ARENA_BYTES) {
-      throw new CorruptError("tree source preflight exceeds the index buffer limit");
-    }
-    db.run(
-      `INSERT OR IGNORE INTO git_tree_sources
+  db.run(
+    `INSERT OR IGNORE INTO git_tree_sources
          (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
        SELECT json_extract(value, '$.p'), json_extract(value, '$.t'),
               json_extract(value, '$.s'), json_extract(value, '$.x'),
               0, json_extract(value, '$.z'), NULL, NULL
          FROM json_each(?)`,
-      json,
-    );
-  } finally {
-    preflight.dispose();
-  }
+    json,
+  );
 }
 
 class TreeSourceIndexer {
@@ -640,25 +523,14 @@ export class TreeIndexSink {
   readonly #parser: TreeParser;
   readonly #batch: TreeIndexBatch;
   readonly #source: TreeSourceIndexer;
-  readonly #localReservation: MemoryReservation | null;
   #finished = false;
-  #peakBytes = 0;
 
-  constructor(db: SqlDatabase, source: TreeSource, owningReservation?: MemoryReservation) {
-    let owner = owningReservation;
-    if (owner === undefined) {
-      const local = new MemoryCoordinator().reserve();
-      this.#localReservation = local;
-      owner = local;
-    } else {
-      this.#localReservation = null;
-    }
-    this.#parser = new TreeParser(owner);
+  constructor(db: SqlDatabase, source: TreeSource) {
+    this.#parser = new TreeParser();
     try {
-      this.#batch = new TreeIndexBatch(db, false, true, false, owner);
+      this.#batch = new TreeIndexBatch(db, false, true, false);
     } catch (error) {
       this.#parser.dispose();
-      this.#localReservation?.dispose();
       throw error;
     }
     try {
@@ -666,22 +538,12 @@ export class TreeIndexSink {
     } catch (error) {
       this.#parser.dispose();
       this.#batch.dispose();
-      this.#localReservation?.dispose();
       throw error;
     }
-    this.#observePeak();
-  }
-
-  get retainedBytes(): number {
-    return this.#parser.retainedBytes + this.#batch.retainedBytes;
   }
 
   get retainedRows(): number {
     return this.#batch.retainedRows;
-  }
-
-  get peakBytes(): number {
-    return this.#peakBytes;
   }
 
   push(chunk: Uint8Array): void {
@@ -692,8 +554,6 @@ export class TreeIndexSink {
     } catch (error) {
       this.#dispose();
       throw error;
-    } finally {
-      this.#observePeak();
     }
   }
 
@@ -704,7 +564,6 @@ export class TreeIndexSink {
       this.#source.finish(this.#parser.finish());
       this.#batch.flush();
     } finally {
-      this.#observePeak();
       this.#dispose();
     }
   }
@@ -713,24 +572,15 @@ export class TreeIndexSink {
     this.#dispose();
   }
 
-  #observePeak(): void {
-    this.#peakBytes = Math.max(this.#peakBytes, this.#parser.retainedBytes + this.#batch.peakBytes);
-  }
-
   #dispose(): void {
     this.#finished = true;
     this.#parser.dispose();
     this.#batch.dispose();
-    this.#localReservation?.dispose();
   }
 }
 
-export function createTreeIndexSink(
-  db: SqlDatabase,
-  source: TreeSource,
-  owningReservation?: MemoryReservation,
-): TreeIndexSink {
-  return new TreeIndexSink(db, source, owningReservation);
+export function createTreeIndexSink(db: SqlDatabase, source: TreeSource): TreeIndexSink {
+  return new TreeIndexSink(db, source);
 }
 
 function indexTreePass(
@@ -738,10 +588,9 @@ function indexTreePass(
   sources: Iterable<TreeSourceInput>,
   writeEntries: boolean,
   writeMarkers: boolean,
-  owningReservation: MemoryReservation,
 ): void {
   for (const source of sources) {
-    const parser = new TreeParser(owningReservation);
+    const parser = new TreeParser();
     try {
       const indexer = new TreeSourceIndexer(source, batch, writeEntries, writeMarkers);
       for (const chunk of source.chunks) {
@@ -756,60 +605,35 @@ function indexTreePass(
   batch.flush();
 }
 
-function withTreeIndexOwner<T>(
-  owningReservation: MemoryReservation | undefined,
-  body: (owner: MemoryReservation) => T,
-): T {
-  if (owningReservation !== undefined) return body(owningReservation);
-  const local = new MemoryCoordinator().reserve();
+/** Write exact parsed-tree sources. The caller owns the transaction. */
+export function indexTreeSources(db: SqlDatabase, sources: Iterable<TreeSourceInput>): void {
+  const arraySources = Array.isArray(sources) ? sources : null;
+  if (arraySources?.every((source: TreeSourceInput) => Array.isArray(source.chunks))) {
+    seedTreeSources(db, arraySources);
+    const batch = new TreeIndexBatch(db, true, false, false);
+    try {
+      indexTreePass(batch, arraySources, true, true);
+    } finally {
+      batch.dispose();
+    }
+    return;
+  }
+  const batch = new TreeIndexBatch(db, false, false, false);
   try {
-    return body(local);
+    indexTreePass(batch, sources, true, true);
   } finally {
-    local.dispose();
+    batch.dispose();
   }
 }
 
-/** Write exact parsed-tree sources. The caller owns the transaction. */
-export function indexTreeSources(
-  db: SqlDatabase,
-  sources: Iterable<TreeSourceInput>,
-  owningReservation?: MemoryReservation,
-): void {
-  withTreeIndexOwner(owningReservation, (owner) => {
-    const arraySources = Array.isArray(sources) ? sources : null;
-    if (arraySources?.every((source: TreeSourceInput) => Array.isArray(source.chunks))) {
-      seedTreeSources(db, arraySources, owner);
-      const batch = new TreeIndexBatch(db, true, false, false, owner);
-      try {
-        indexTreePass(batch, arraySources, true, true, owner);
-      } finally {
-        batch.dispose();
-      }
-      return;
-    }
-    const batch = new TreeIndexBatch(db, false, false, false, owner);
-    try {
-      indexTreePass(batch, sources, true, true, owner);
-    } finally {
-      batch.dispose();
-    }
-  });
-}
-
 /** Index loose trees whose object insert already seeded incomplete source rows. */
-export function indexSeededTreeSources(
-  db: SqlDatabase,
-  sources: Iterable<TreeSourceInput>,
-  owningReservation?: MemoryReservation,
-): void {
-  withTreeIndexOwner(owningReservation, (owner) => {
-    const batch = new TreeIndexBatch(db, true, false, true, owner);
-    try {
-      indexTreePass(batch, sources, true, true, owner);
-    } finally {
-      batch.dispose();
-    }
-  });
+export function indexSeededTreeSources(db: SqlDatabase, sources: Iterable<TreeSourceInput>): void {
+  const batch = new TreeIndexBatch(db, true, false, true);
+  try {
+    indexTreePass(batch, sources, true, true);
+  } finally {
+    batch.dispose();
+  }
 }
 
 /** Index one loose tree whose object insert already seeded its incomplete source row. */
@@ -817,9 +641,8 @@ export function indexSeededTreeSource(
   db: SqlDatabase,
   source: TreeSource,
   chunks: Iterable<Uint8Array>,
-  owningReservation?: MemoryReservation,
 ): void {
-  indexSeededTreeSources(db, [{ ...source, chunks }], owningReservation);
+  indexSeededTreeSources(db, [{ ...source, chunks }]);
 }
 
 /** Write one exact parsed-tree source. The caller owns the transaction. */
@@ -827,9 +650,8 @@ export function indexTreeSource(
   db: SqlDatabase,
   source: TreeSource,
   chunks: Iterable<Uint8Array>,
-  owningReservation?: MemoryReservation,
 ): void {
-  const sink = createTreeIndexSink(db, source, owningReservation);
+  const sink = createTreeIndexSink(db, source);
   try {
     for (const chunk of chunks) sink.push(chunk);
     sink.finish();

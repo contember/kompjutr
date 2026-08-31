@@ -25,8 +25,6 @@ function conflictPlan(
       },
     ],
     sourceRows: 1,
-    retainedBytes: 0,
-    memoryHighWaterBytes: 0,
   };
 }
 
@@ -48,8 +46,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 1,
-      retainedBytes: 0,
-      memoryHighWaterBytes: 0,
     };
 
     expect(projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })).toEqual([
@@ -261,8 +257,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 2,
-      retainedBytes: 0,
-      memoryHighWaterBytes: 0,
     };
 
     expect(projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })).toEqual([
@@ -309,8 +303,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 2,
-      retainedBytes: 0,
-      memoryHighWaterBytes: 0,
     };
 
     expect(projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })[1]).toEqual({
@@ -346,8 +338,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 2,
-      retainedBytes: 0,
-      memoryHighWaterBytes: 0,
     };
 
     expect(projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })).toEqual([
@@ -385,8 +375,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 1,
-      retainedBytes: 0,
-      memoryHighWaterBytes: 0,
     };
 
     expect(
@@ -411,8 +399,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 1,
-      retainedBytes: 0,
-      memoryHighWaterBytes: 0,
     };
 
     expect(() =>
@@ -445,8 +431,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 2,
-      retainedBytes: 0,
-      memoryHighWaterBytes: 0,
     };
 
     expect(
@@ -469,8 +453,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 1,
-      retainedBytes: 0,
-      memoryHighWaterBytes: 0,
     };
 
     expect(() =>

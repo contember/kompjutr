@@ -12,7 +12,6 @@ import { isBinary } from "../diff/lines.js";
 import { CorruptError, GitError } from "../errors.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import type { SparseWorkspaceSource } from "../sparse-workspace.js";
 import { joinSorted, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
@@ -63,6 +62,10 @@ const DIFF_COMBINED_DIFF_LINE_BYTES = 320;
 const DIFF_COMBINED_CHANGE_BYTES = 192;
 const DIFF_COMBINED_ROW_BYTES = 128;
 const DIFF_COMBINED_FIXED_BYTES = 16 * 1024;
+
+function diffStringBytes(value: string): number {
+  return 48 + value.length * 2;
+}
 
 export type { DiffOptions } from "./diff-internal.js";
 
@@ -349,7 +352,7 @@ function preflightCombinedDiff(
       lines * DIFF_COMBINED_ROW_BYTES,
       resultInfo.lines * 2,
       outputCeiling * 2,
-      retainedStringBytes(path),
+      diffStringBytes(path),
       DIFF_COMBINED_FIXED_BYTES,
     ],
     "retained memory",
@@ -816,11 +819,11 @@ function validateDiffSummaryLimits(limits: { maxRows: number; maxRetainedBytes: 
   }
 }
 
-function diffSummaryEntryRetainedBytes(entry: DiffSummaryEntry): number {
+export function diffSummaryEntryRetainedBytes(entry: DiffSummaryEntry): number {
   return (
     DIFF_SUMMARY_ENTRY_FIXED_BYTES +
-    retainedStringBytes(entry.path) +
-    (entry.originalPath === undefined ? 0 : retainedStringBytes(entry.originalPath))
+    diffStringBytes(entry.path) +
+    (entry.originalPath === undefined ? 0 : diffStringBytes(entry.originalPath))
   );
 }
 

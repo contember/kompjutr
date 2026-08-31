@@ -34,13 +34,11 @@ export type ExactRenameClassification =
       kind: "classified";
       renames: readonly ExactRename[];
       candidateCount: number;
-      retainedBytes: number;
     }
   | {
       kind: "fallback";
       renames: readonly [];
       candidateCount: number;
-      retainedBytes: number;
     };
 
 interface RenameBucket {
@@ -100,7 +98,6 @@ export class ExactRenameClassifier {
         kind: "fallback",
         renames: [],
         candidateCount: this.#candidateCount,
-        retainedBytes: this.#retainedBytes,
       };
     }
     const renames: ExactRename[] = [];
@@ -110,7 +107,6 @@ export class ExactRenameClassifier {
       kind: "classified",
       renames,
       candidateCount: this.#candidateCount,
-      retainedBytes: this.#retainedBytes,
     };
   }
 

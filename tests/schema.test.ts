@@ -223,7 +223,6 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
       "committer_name",
       "committer_email",
       "touched_count",
-      "retained_bytes",
       "integrity_oid",
     ],
   ],
@@ -742,9 +741,9 @@ describe("git schema", () => {
         current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode, merge_origin,
         current_step, step_count, current_label, incoming_label, message,
         author_name, author_email, committer_name, committer_email,
-        touched_count, retained_bytes, integrity_oid)
+        touched_count, integrity_oid)
      VALUES (?, 'merge', 'refs/heads/main', ?, 'ready', NULL, ?, ?, NULL, NULL,
-             'no-commit', ?, 0, 0, 'HEAD', 'topic', '', NULL, NULL, NULL, NULL, 0, 0, ?)`;
+             'no-commit', ?, 0, 0, 'HEAD', 'topic', '', NULL, NULL, NULL, NULL, 0, ?)`;
     const oid = "1".repeat(40);
 
     expect(() => db.run(insert, 17, oid, oid, "2".repeat(40), null, "3".repeat(40))).toThrow();

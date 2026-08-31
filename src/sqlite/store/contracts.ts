@@ -1,7 +1,4 @@
-import { GitError } from "../../core/errors.js";
 import type { ObjectType, RawObject } from "../../core/objects.js";
-import { retainedStringBytes } from "../../core/retained.js";
-import type { MemoryReservation } from "../../memory.js";
 import type { PackCacheOptions } from "../packs.js";
 import type { CheckoutStore } from "./checkout.js";
 
@@ -62,47 +59,6 @@ export interface RefMutation {
   deletes?: Iterable<string>;
   head?: string;
   expected?: RefMutationExpected;
-}
-
-export const REF_MUTATION_MEMORY_OWNER_TOKEN = Symbol("RefMutationMemoryOwner");
-
-/** Store-issued ownership for derived strings retained through a ref operation. */
-export class RefMutationMemoryOwner {
-  readonly #reservation: MemoryReservation;
-  readonly #strings: string[] = [];
-  #retained = 256;
-
-  constructor(token: typeof REF_MUTATION_MEMORY_OWNER_TOKEN, reservation: MemoryReservation) {
-    if (token !== REF_MUTATION_MEMORY_OWNER_TOKEN) {
-      throw new GitError("EINVAL", "ref mutation memory owner must be issued by the store");
-    }
-    this.#reservation = reservation;
-    this.#reservation.set("other", this.#retained);
-  }
-
-  construct<T extends string>(units: number, construct: () => T): T {
-    this.#reservation.set("other", this.#retained + 8 + retainedStringUnits(units));
-    return this.retain(construct());
-  }
-
-  retain<T extends string>(value: T): T {
-    this.#retained += 8 + retainedStringBytes(value);
-    this.#reservation.set("other", this.#retained);
-    this.#strings.push(value);
-    return value;
-  }
-
-  memoryReservation(): MemoryReservation {
-    return this.#reservation;
-  }
-
-  owns(value: string): boolean {
-    return this.#strings.includes(value);
-  }
-
-  dispose(): void {
-    this.#reservation.dispose();
-  }
 }
 
 export interface FetchPublicationExpectedRef {
@@ -243,7 +199,6 @@ export interface BlobIdMapping {
 }
 
 export interface InitialStateSession {
-  readonly retainedBytes: number;
   put(entry: IndexEntry): void;
   addBlobId(mapping: BlobIdMapping): void;
 }
@@ -291,10 +246,6 @@ export interface ObjectBatch {
 /** Internal staged-write scope tied to an existing repository operation. */
 export interface OwnedObjectBatch extends ObjectBatch {
   dispose(): void;
-}
-
-export function retainedStringUnits(units: number): number {
-  return 48 + 2 * units;
 }
 
 /** A bounded, ordered mutation sink over the index. */

@@ -4,7 +4,6 @@
 import { CorruptError, GitError } from "../../core/errors.js";
 import type { ByteLru } from "../../core/lru.js";
 import type { ObjectType, RawObject } from "../../core/objects.js";
-import type { MemoryCoordinator, MemoryReservation } from "../../memory.js";
 import type { CommitCacheEntry, CommitCacheWriteResult, CommitGraphLimits } from "../commits.js";
 import type { SqlDatabase } from "../db.js";
 import type { PackStore } from "../packs.js";
@@ -37,19 +36,14 @@ import type {
   RefLogMetadata,
   RefLogReadOptions,
   RefMutation,
-  RefMutationMemoryOwner,
   RefRow,
   TrackingRefPublicationToken,
 } from "./contracts.js";
 
 export interface SharedRepoOwnedOperations {
-  objectBatch(reservation: MemoryReservation, options: ObjectBatchOptions): OwnedObjectBatch;
-  authenticatedObject(
-    oid: string,
-    expectedType: ObjectType,
-    reservation: MemoryReservation,
-  ): RawObject | null;
-  configValue(path: string, owner: RefMutationMemoryOwner): string | undefined;
+  objectBatch(options: ObjectBatchOptions): OwnedObjectBatch;
+  authenticatedObject(oid: string, expectedType: ObjectType): RawObject | null;
+  configValue(path: string): string | undefined;
 }
 
 interface ScratchStorageCache {
@@ -120,8 +114,6 @@ export class SharedRepoStore {
   readonly repoId: number;
   readonly objects: ByteLru<string, RawObject>;
   readonly packRows: ByteLru<string, Uint8Array>;
-  readonly memory: MemoryCoordinator;
-  readonly #memoryOwner = {};
   readonly cacheNamespace: string;
   readonly #scratchTransactions: ScratchTransactionCoordinator;
   #packs: PackStore | null = null;
@@ -137,13 +129,11 @@ export class SharedRepoStore {
     storeGeneration: number,
     objects: ByteLru<string, RawObject>,
     packRows: ByteLru<string, Uint8Array>,
-    memory: MemoryCoordinator,
   ) {
     this.db = db;
     this.repoId = repoId;
     this.objects = objects;
     this.packRows = packRows;
-    this.memory = memory;
     this.#scratchTransactions = scratchTransactionsFor(db);
     this.cacheNamespace = `${repoId}:${storeGeneration}`;
     const availability = db.one<{ has_loose: unknown }>(
@@ -158,13 +148,11 @@ export class SharedRepoStore {
       throw new CorruptError("shared store availability probe returned an invalid value");
     }
     this.#hasLoose = availability.has_loose === 1;
-    OWNED_OBJECT_BATCHES.set(this, (reservation, options) =>
-      this.#ownedOps().objectBatch(reservation, options),
+    OWNED_OBJECT_BATCHES.set(this, (options) => this.#ownedOps().objectBatch(options));
+    OWNED_AUTHENTICATED_OBJECT_READERS.set(this, (oid, expectedType) =>
+      this.#ownedOps().authenticatedObject(oid, expectedType),
     );
-    OWNED_AUTHENTICATED_OBJECT_READERS.set(this, (oid, expectedType, reservation) =>
-      this.#ownedOps().authenticatedObject(oid, expectedType, reservation),
-    );
-    OWNED_CONFIG_GETTERS.set(this, (path, owner) => this.#ownedOps().configValue(path, owner));
+    OWNED_CONFIG_GETTERS.set(this, (path) => this.#ownedOps().configValue(path));
   }
 
   installPacks(packs: PackStore): PackStore {
@@ -351,24 +339,6 @@ export class SharedRepoStore {
     return this.#ops().cacheBytes();
   }
 
-  reserveMemory(): MemoryReservation {
-    return this.memory.reserve(this.#memoryOwner);
-  }
-
-  ownsMemoryReservation(reservation: MemoryReservation): boolean {
-    return this.memory.owns(reservation, this.#memoryOwner);
-  }
-
-  scopeMemoryReservation(reservation: MemoryReservation): MemoryReservation {
-    if (reservation.disposed) {
-      throw new GitError("EINVAL", "operation memory reservation is disposed");
-    }
-    if (!this.ownsMemoryReservation(reservation)) {
-      throw new GitError("EINVAL", "operation memory reservation belongs to another repository");
-    }
-    return reservation.scope();
-  }
-
   lookupBlobIds(contentIds: Iterable<Uint8Array>): Map<string, string> {
     return this.#ops().lookupBlobIds(contentIds);
   }
@@ -417,24 +387,22 @@ export class SharedRepoStore {
     return this.#ops().readBlobs(oids, options);
   }
 
-  *walkTree(treeOid: string, owningReservation?: MemoryReservation): Generator<WalkTreeEntry> {
-    yield* this.#ops().walkTree(treeOid, owningReservation);
+  *walkTree(treeOid: string): Generator<WalkTreeEntry> {
+    yield* this.#ops().walkTree(treeOid);
   }
 
   *walkTreeDiff(
     beforeTreeOid: string | null,
     afterTreeOid: string | null,
-    owningReservation?: MemoryReservation,
   ): Generator<WalkTreeDiffEntry> {
-    yield* this.#ops().walkTreeDiff(beforeTreeOid, afterTreeOid, owningReservation);
+    yield* this.#ops().walkTreeDiff(beforeTreeOid, afterTreeOid);
   }
 
   *walkTreeDiffObjects(
     beforeTreeOid: string | null,
     afterTreeOid: string,
-    owningReservation?: MemoryReservation,
   ): Generator<WalkTreeDiffObject> {
-    yield* this.#ops().walkTreeDiffObjects(beforeTreeOid, afterTreeOid, owningReservation);
+    yield* this.#ops().walkTreeDiffObjects(beforeTreeOid, afterTreeOid);
   }
 
   write(type: ObjectType, data: Uint8Array): string {
@@ -508,29 +476,19 @@ export class SharedRepoStore {
     return this.#ops().publishTrackingRef(token, target, metadata);
   }
 
-  /** Internal owner seam: candidate aliases must be values returned by this exact owner. */
   beginFetchPublication(
     trackingPrefix: string,
     candidateExactRefs: Iterable<string> = [],
-    reservation?: MemoryReservation,
-    owner?: RefMutationMemoryOwner,
   ): FetchPublicationToken {
-    return this.#ops().beginFetchPublication(
-      trackingPrefix,
-      candidateExactRefs,
-      reservation,
-      owner,
-    );
+    return this.#ops().beginFetchPublication(trackingPrefix, candidateExactRefs);
   }
 
-  /** Internal owner seam: owned strings must be values returned by this exact owner. */
   publishFetchRefs(
     token: FetchPublicationToken,
     plan: FetchPublicationPlan,
     metadata: RefLogMetadata,
-    owner?: RefMutationMemoryOwner,
   ): boolean {
-    return this.#ops().publishFetchRefs(token, plan, metadata, owner);
+    return this.#ops().publishFetchRefs(token, plan, metadata);
   }
 
   listRefs(prefix = ""): RefRow[] {

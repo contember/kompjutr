@@ -16,7 +16,6 @@ import {
 } from "../protocol/receive-pack.js";
 import { type Advertisement, discover } from "../protocol/remote.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import {
   createRemoteAuth,
   type RemoteAuthOptions,
@@ -42,7 +41,6 @@ import {
   type RefspecSourceRef,
   type RemoteTarget,
 } from "./refspec.js";
-import { TransportOperationBudget } from "./transport-budget.js";
 
 interface MappedPushSelection {
   readonly refspecs: readonly [PushRefspec, ...PushRefspec[]];
@@ -74,34 +72,7 @@ interface JoinedAdvertisement {
   readonly updates: JoinedPushUpdate[];
   readonly remoteOids: string[];
   readonly capabilities: Set<string>;
-  readonly capabilityBytes: number;
 }
-
-const PUSH_OPTIONS_MEMORY_PART = "push-options";
-const PUSH_LOCAL_REFS_MEMORY_PART = "push-local-refs";
-const PUSH_JOIN_MEMORY_PART = "push-advertisement-join";
-const PUSH_UPDATES_MEMORY_PART = "push-updates";
-const PUSH_ACTIVE_UPDATES_MEMORY_PART = "push-active-updates";
-const PUSH_COMMANDS_MEMORY_PART = "push-commands";
-const PUSH_RESULT_MEMORY_PART = "push-result";
-const PUSH_TRACKING_MEMORY_PART = "push-tracking";
-const PROTOCOL_DISCOVERY_MEMORY_PART = "protocol-discovery";
-const PUSH_OPTIONS_FIXED_BYTES = 256;
-const PUSH_HEADER_FIXED_BYTES = 64;
-const LOCAL_REFS_FIXED_BYTES = 192;
-const LOCAL_REF_ROW_BYTES = 256;
-const LOCAL_REF_RESOLUTION_HEADROOM_BYTES = 2 * 1024;
-const JOIN_FIXED_BYTES = 256;
-const JOIN_REF_BYTES = 160;
-const JOIN_CAPABILITY_BYTES = 96;
-const UPDATE_FIXED_BYTES = 224;
-const ACTIVE_UPDATES_FIXED_BYTES = 128;
-const ACTIVE_UPDATE_BYTES = 16;
-const COMMAND_FIXED_BYTES = 128;
-const RESULT_FIXED_BYTES = 256;
-const RESULT_REF_BYTES = 128;
-const TRACKING_FIXED_BYTES = 256;
-const TRACKING_ENTRY_BYTES = 192;
 
 function emptyPushResult(): PushResult {
   return {
@@ -157,23 +128,6 @@ function validatePushOperationOptions(options: unknown): void {
       throw new GitError("EINVAL", `push ${field} must be a boolean`);
     }
   }
-}
-
-function pushStaticOptionBytes(options: PushOptions): number {
-  let bytes = PUSH_OPTIONS_FIXED_BYTES;
-  for (const value of [options.remote, options.url]) {
-    if (value !== undefined) bytes += retainedStringBytes(value);
-  }
-  if (options.pushOptions !== undefined) {
-    for (const option of options.pushOptions) bytes += retainedStringBytes(option);
-  }
-  if (options.headers !== undefined) {
-    bytes += PUSH_HEADER_FIXED_BYTES;
-    for (const [name, value] of Object.entries(options.headers)) {
-      bytes += retainedStringBytes(name) + retainedStringBytes(value);
-    }
-  }
-  return bytes;
 }
 
 function fullBranchRef(ref: string): string {
@@ -234,28 +188,18 @@ function resolveRawLocalRef(name: string, refs: ReadonlyMap<string, string>): st
   throw new CorruptError(`symbolic ref loop at ${name}`);
 }
 
-function localRefSnapshot(repo: Repository, budget: TransportOperationBudget): RefspecSourceRef[] {
-  let rawBytes = LOCAL_REFS_FIXED_BYTES + LOCAL_REF_RESOLUTION_HEADROOM_BYTES;
-  budget.setMemory(PUSH_LOCAL_REFS_MEMORY_PART, rawBytes);
+function localRefSnapshot(repo: Repository): RefspecSourceRef[] {
   const raw = new Map<string, string>();
   for (const row of repo.store.iterateRefs()) {
-    rawBytes +=
-      LOCAL_REF_ROW_BYTES + retainedStringBytes(row.name) + retainedStringBytes(row.target);
-    budget.setMemory(PUSH_LOCAL_REFS_MEMORY_PART, rawBytes);
     raw.set(row.name, row.target);
   }
 
-  let resultBytes = LOCAL_REFS_FIXED_BYTES;
   const result: RefspecSourceRef[] = [];
   for (const name of raw.keys()) {
     const oid = resolveRawLocalRef(name, raw);
     if (oid === null) continue;
-    resultBytes += LOCAL_REF_ROW_BYTES + retainedStringBytes(name) + retainedStringBytes(oid);
-    budget.setMemory(PUSH_LOCAL_REFS_MEMORY_PART, rawBytes + resultBytes);
     result.push({ name, oid });
   }
-  raw.clear();
-  budget.setMemory(PUSH_LOCAL_REFS_MEMORY_PART, resultBytes);
   return result;
 }
 
@@ -281,54 +225,31 @@ function pushTarget(
 function joinAdvertisement(
   mappings: readonly ExpandedPushRefspec[],
   advertisement: Advertisement,
-  budget: TransportOperationBudget,
 ): JoinedAdvertisement {
-  let joinBytes = JOIN_FIXED_BYTES;
-  budget.setMemory(PUSH_JOIN_MEMORY_PART, joinBytes);
   const advertised = new Map<string, string>();
   const remoteOids: string[] = [];
   for (const ref of advertisement.refs) {
-    joinBytes += JOIN_REF_BYTES;
-    budget.setMemory(PUSH_JOIN_MEMORY_PART, joinBytes);
     advertised.set(ref.name, ref.oid);
     remoteOids.push(ref.oid);
   }
   const capabilities = new Set<string>();
-  let capabilityBytes = JOIN_FIXED_BYTES;
   for (const capability of advertisement.capabilities) {
-    capabilityBytes += JOIN_CAPABILITY_BYTES + retainedStringBytes(capability);
-    budget.setMemory(PUSH_JOIN_MEMORY_PART, joinBytes + capabilityBytes);
     capabilities.add(capability);
   }
 
-  let updateBytes = JOIN_FIXED_BYTES;
-  budget.setMemory(PUSH_UPDATES_MEMORY_PART, updateBytes);
   const updates: JoinedPushUpdate[] = [];
   for (const mapping of mappings) {
     const oldOid = advertised.get(mapping.destination) ?? ZERO_OID;
     const noop = mapping.oid === null ? oldOid === ZERO_OID : mapping.oid === oldOid;
-    updateBytes +=
-      UPDATE_FIXED_BYTES +
-      retainedStringBytes(mapping.destination) +
-      (mapping.source === null ? 0 : retainedStringBytes(mapping.source));
-    budget.setMemory(PUSH_UPDATES_MEMORY_PART, updateBytes);
     updates.push({ ...mapping, oldOid, noop });
   }
-  advertised.clear();
-  return { updates, remoteOids, capabilities, capabilityBytes };
+  return { updates, remoteOids, capabilities };
 }
 
-function commandSet(
-  updates: readonly JoinedPushUpdate[],
-  budget: TransportOperationBudget,
-): ReceivePackCommand[] {
-  let retained = JOIN_FIXED_BYTES;
-  budget.setMemory(PUSH_COMMANDS_MEMORY_PART, retained);
+function commandSet(updates: readonly JoinedPushUpdate[]): ReceivePackCommand[] {
   const commands: ReceivePackCommand[] = [];
   for (const update of updates) {
     if (update.noop) continue;
-    retained += COMMAND_FIXED_BYTES + retainedStringBytes(update.destination);
-    budget.setMemory(PUSH_COMMANDS_MEMORY_PART, retained);
     commands.push({
       oldOid: update.oldOid,
       newOid: update.oid ?? ZERO_OID,
@@ -338,17 +259,10 @@ function commandSet(
   return commands;
 }
 
-function activePlanningUpdates(
-  updates: readonly JoinedPushUpdate[],
-  budget: TransportOperationBudget,
-): PushPlanningUpdate[] {
-  let retained = ACTIVE_UPDATES_FIXED_BYTES;
-  budget.setMemory(PUSH_ACTIVE_UPDATES_MEMORY_PART, retained);
+function activePlanningUpdates(updates: readonly JoinedPushUpdate[]): PushPlanningUpdate[] {
   const active: PushPlanningUpdate[] = [];
   for (const update of updates) {
     if (update.noop) continue;
-    retained += ACTIVE_UPDATE_BYTES;
-    budget.setMemory(PUSH_ACTIVE_UPDATES_MEMORY_PART, retained);
     active.push(update);
   }
   return active;
@@ -361,10 +275,7 @@ function uncertainResult(cause: unknown): GitError {
 function confirmedResult(
   updates: readonly JoinedPushUpdate[],
   wire: ReceivePackStatus | null,
-  budget: TransportOperationBudget,
 ): Omit<PushResult, "tracking"> {
-  let retained = RESULT_FIXED_BYTES;
-  budget.setMemory(PUSH_RESULT_MEMORY_PART, retained);
   const refs: PushResult["refs"][number][] = [];
   for (const update of updates) {
     const status = update.noop ? { ok: true } : wire?.refs.get(update.destination);
@@ -372,8 +283,6 @@ function confirmedResult(
       throw new CorruptError(`confirmed push result omitted ${update.destination}`);
     }
     const error = status.ok ? null : (status.error ?? "remote rejected ref");
-    retained += RESULT_REF_BYTES;
-    budget.setMemory(PUSH_RESULT_MEMORY_PART, retained);
     refs.push({ ref: update.destination, ok: status.ok, error });
   }
   const unpack: PushResult["unpack"] =
@@ -409,13 +318,10 @@ async function reconcileTracking(
   auth: ReturnType<typeof createRemoteAuth>,
   sentCommands: boolean,
   publication: FetchPublicationToken | null,
-  budget: TransportOperationBudget,
 ): Promise<PushTrackingResult> {
   if (publication === null) return { outcome: "not-applicable" };
   try {
     const successful: { readonly update: JoinedPushUpdate; readonly confirmedOid: string }[] = [];
-    let retained = TRACKING_FIXED_BYTES;
-    budget.setMemory(PUSH_TRACKING_MEMORY_PART, retained);
     for (let index = 0; index < updates.length; index++) {
       const update = updates[index];
       const status = confirmed.refs[index];
@@ -428,8 +334,6 @@ async function reconcileTracking(
         continue;
       }
       const confirmedOid = update.oid ?? ZERO_OID;
-      retained += TRACKING_ENTRY_BYTES + retainedStringBytes(update.destination);
-      budget.setMemory(PUSH_TRACKING_MEMORY_PART, retained);
       successful.push({ update, confirmedOid });
     }
     if (successful.length === 0) return { outcome: "not-applicable" };
@@ -450,18 +354,16 @@ async function reconcileTracking(
         rediscovered === null
           ? item.confirmedOid
           : advertisedTarget(rediscovered, item.update.destination);
-      retained += TRACKING_ENTRY_BYTES;
-      budget.setMemory(PUSH_TRACKING_MEMORY_PART, retained);
       targets.push({ update: item.update, oid });
       if (oid !== ZERO_OID && oid !== item.confirmedOid) changed.push(oid);
       else if (oid !== ZERO_OID && item.update.noop) noops.push(oid);
     }
     if (noops.length > 0) {
-      authenticatePushBranchTargets(repo, noops, budget);
+      authenticatePushBranchTargets(repo, noops);
     }
     if (changed.length > 0) {
       try {
-        authenticatePushBranchTargets(repo, changed, budget);
+        authenticatePushBranchTargets(repo, changed);
       } catch (error) {
         if (hasErrorCode(error, "EPUSHLOCAL") || hasErrorCode(error, "EINVALIDREF")) {
           return { outcome: "deferred" };
@@ -474,16 +376,12 @@ async function reconcileTracking(
     const puts: RefRow[] = [];
     for (const target of targets) {
       const name = trackingName(publication.trackingPrefix, target.update.destination);
-      retained += TRACKING_ENTRY_BYTES + retainedStringBytes(name);
-      budget.setMemory(PUSH_TRACKING_MEMORY_PART, retained);
       selected.add(name);
       if (target.oid !== ZERO_OID) puts.push({ name, target: target.oid });
     }
     const keep: string[] = [];
     for (const ref of publication.trackingRefs) {
       if (ref.name === `${publication.trackingPrefix}HEAD` || selected.has(ref.name)) continue;
-      retained += TRACKING_ENTRY_BYTES;
-      budget.setMemory(PUSH_TRACKING_MEMORY_PART, retained);
       keep.push(ref.name);
     }
     try {
@@ -499,9 +397,6 @@ async function reconcileTracking(
     }
   } catch (error) {
     return stableTrackingFailure(error);
-  } finally {
-    budget.clearMemory(PROTOCOL_DISCOVERY_MEMORY_PART);
-    budget.clearMemory(PUSH_TRACKING_MEMORY_PART);
   }
 }
 
@@ -511,60 +406,40 @@ export async function push(
   repo: Repository,
   options: PushOptions,
 ): Promise<PushResult> {
-  const reservation = repo.store.reserveMemory();
-  const budget = new TransportOperationBudget(reservation);
   let compiler: CompiledPushRefspecs | null = null;
   let plan: PushPlan | null = null;
   let publication: FetchPublicationToken | null = null;
   try {
     validatePushOperationOptions(options);
-    const staticOptionBytes = pushStaticOptionBytes(options);
-    budget.setMemory(PUSH_OPTIONS_MEMORY_PART, staticOptionBytes);
     const remote = options.remote ?? "origin";
     const refspecs =
       options.refspecs === undefined ? legacyRefspecs(repo, options, remote) : options.refspecs;
-    compiler = compilePushRefspecs(refspecs, budget);
-    const localRefs = needsLocalRefs(refspecs) ? localRefSnapshot(repo, budget) : [];
+    compiler = compilePushRefspecs(refspecs);
+    const localRefs = needsLocalRefs(refspecs) ? localRefSnapshot(repo) : [];
     const mappings = compiler.expand(localRefs);
     localRefs.length = 0;
-    budget.clearMemory(PUSH_LOCAL_REFS_MEMORY_PART);
     if (mappings.length === 0) return emptyPushResult();
 
     const target = pushTarget(repo, options);
-    const auth = createRemoteAuth(
-      context,
-      options,
-      target.url,
-      budget,
-      PUSH_OPTIONS_MEMORY_PART,
-      staticOptionBytes,
-    );
+    const auth = createRemoteAuth(context, options);
     let advertisement: Advertisement | null = await discover(target.url, "git-receive-pack", auth);
-    const joined = joinAdvertisement(mappings, advertisement, budget);
-    const activeUpdates = activePlanningUpdates(joined.updates, budget);
+    const joined = joinAdvertisement(mappings, advertisement);
+    const activeUpdates = activePlanningUpdates(joined.updates);
     plan =
       activeUpdates.length === 0
         ? null
-        : planPushUpdates(repo, activeUpdates, budget, { remoteOids: joined.remoteOids });
+        : planPushUpdates(repo, activeUpdates, { remoteOids: joined.remoteOids });
     activeUpdates.length = 0;
-    budget.clearMemory(PUSH_ACTIVE_UPDATES_MEMORY_PART);
     joined.remoteOids.length = 0;
-    budget.setMemory(PUSH_JOIN_MEMORY_PART, joined.capabilityBytes);
     advertisement = null;
-    budget.clearMemory(PROTOCOL_DISCOVERY_MEMORY_PART);
-    compiler.dispose();
     compiler = null;
 
-    const commands = commandSet(joined.updates, budget);
+    const commands = commandSet(joined.updates);
     if (
       target.configured &&
       joined.updates.some((update) => update.destination.startsWith("refs/heads/"))
     ) {
-      publication = repo.store.beginFetchPublication(
-        `refs/remotes/${target.remote}/`,
-        [],
-        reservation,
-      );
+      publication = repo.store.beginFetchPublication(`refs/remotes/${target.remote}/`, []);
     }
     let wire: ReceivePackStatus | null = null;
     if (commands.length > 0) {
@@ -596,7 +471,7 @@ export async function push(
 
     let confirmed: Omit<PushResult, "tracking">;
     try {
-      confirmed = confirmedResult(joined.updates, wire, budget);
+      confirmed = confirmedResult(joined.updates, wire);
     } catch (cause) {
       if (commands.length > 0) throw uncertainResult(cause);
       throw cause;
@@ -610,14 +485,10 @@ export async function push(
       auth,
       commands.length > 0,
       publication,
-      budget,
     );
     return { ...confirmed, tracking };
   } finally {
     publication?.dispose();
     if (plan !== null) disposePushPlan(plan);
-    compiler?.dispose();
-    budget.clearAllMemory();
-    reservation.dispose();
   }
 }

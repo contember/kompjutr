@@ -9,10 +9,7 @@ import { serializeCommit, serializeTree } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { commit } from "../src/core/ops/commit.js";
 import { integrationIndexMatchesTree } from "../src/core/ops/integration-worktree.js";
-import {
-  MAX_OPERATION_STEPS,
-  type OperationStepMetadata,
-} from "../src/core/ops/operation-state.js";
+import { MAX_OPERATION_STEPS } from "../src/core/ops/operation-state.js";
 import {
   type RebaseLifecycleResult,
   rebase,
@@ -20,8 +17,6 @@ import {
   rebaseContinue,
   rebaseSkip,
 } from "../src/core/ops/rebase.js";
-import { preflightRebaseReplayObjects } from "../src/core/ops/rebase-lifecycle.js";
-import type { RebasePlan } from "../src/core/ops/rebase-plan.js";
 import { preflightReplayCommitObjects } from "../src/core/ops/replay.js";
 import { add } from "../src/core/ops/staging.js";
 import { status } from "../src/core/ops/status.js";
@@ -29,7 +24,6 @@ import { worktreeAdd } from "../src/core/ops/worktrees.js";
 import { Repository } from "../src/core/repository.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -263,86 +257,11 @@ describe("rebase restart recovery", () => {
       return readObjects(oids, options);
     };
 
-    const result = preflightReplayCommitObjects(workspace.repo, sourceOids);
+    preflightReplayCommitObjects(workspace.repo, sourceOids);
 
     expect(readCalls).toBeGreaterThan(8);
-    expect(result.bytes).toBeGreaterThan(32 * 1024 * 1024);
     expect(workspace.repo.store.objectCount()).toBe(before);
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
-    workspace.repo.store.memory.assertIdle();
-  });
-
-  it("admits the replay OID vector before allocation and rejects one excess byte before objectInfo", () => {
-    const workspace = makeRepo("/");
-    const tree = workspace.repo.store.write("tree", serializeTree([]));
-    const oids = Array.from({ length: 9 }, (_, ordinal) =>
-      workspace.repo.store.write(
-        "commit",
-        serializeCommit({
-          tree,
-          parent: [],
-          author: PERSON,
-          committer: PERSON,
-          message: `vector ${ordinal}\n`,
-        }),
-      ),
-    );
-    const upstreamOid = oids[0];
-    const originalHeadOid = oids[1];
-    const baseOid = oids[2];
-    if (upstreamOid === undefined || originalHeadOid === undefined || baseOid === undefined) {
-      throw new Error("rebase vector fixture is incomplete");
-    }
-    const steps = Array.from({ length: 4 }, (_, ordinal): OperationStepMetadata => {
-      const sourceOid = oids[ordinal * 2 + 1];
-      const selectedParentOid = oids[ordinal * 2 + 2];
-      if (sourceOid === undefined || selectedParentOid === undefined) {
-        throw new Error("rebase vector step fixture is incomplete");
-      }
-      return {
-        sourceOid,
-        selectedParentOid,
-        mainline: null,
-        outcome: "pending",
-        resultOid: null,
-      };
-    });
-    const plan: RebasePlan = {
-      relation: "replay",
-      originalHeadOid,
-      upstreamOid,
-      baseOid,
-      steps,
-      retainedBytes: 0,
-      graphCommits: 0,
-      graphRetainedBytes: 0,
-    };
-    const inputCount = 1 + steps.length * 2;
-    const objectInfoBoundary = 640 + inputCount * 1_032;
-    const objectInfo = workspace.repo.store.objectInfo.bind(workspace.repo.store);
-    let objectInfoCalls = 0;
-    workspace.repo.store.objectInfo = (requested) => {
-      objectInfoCalls++;
-      return objectInfo(requested);
-    };
-
-    const exact = workspace.repo.store.reserveMemory();
-    exact.set("other", MAX_OPERATION_MEMORY_BYTES - objectInfoBoundary);
-    expect(() => preflightRebaseReplayObjects(workspace.repo, plan, exact)).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(objectInfoCalls).toBe(1);
-    exact.dispose();
-
-    objectInfoCalls = 0;
-    const excess = workspace.repo.store.reserveMemory();
-    excess.set("other", MAX_OPERATION_MEMORY_BYTES - objectInfoBoundary + 1);
-    expect(() => preflightRebaseReplayObjects(workspace.repo, plan, excess)).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(objectInfoCalls).toBe(0);
-    excess.dispose();
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("completes an actual maximum-entry replay transition", async () => {
@@ -460,8 +379,6 @@ describe("rebase restart recovery", () => {
     const journal = cold.repo.checkout.requireOperationState("rebase");
     expect(journal.steps).toHaveLength(1);
     expect(journal.touched).toHaveLength(1);
-    expect(journal.retainedBytes).toBeGreaterThan(0);
-    expect(journal.retainedBytes).toBeLessThan(1024 * 1024);
 
     rebaseAbort(cold.repo, workspace.worktree);
 
@@ -556,7 +473,6 @@ describe("rebase restart recovery", () => {
     ).toThrow("maximum replay journal seam");
     expect(workspace.repo.head().oid).toBe(current);
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("rolls the upstream baseline back when initial journal creation fails", async () => {
@@ -580,7 +496,6 @@ describe("rebase restart recovery", () => {
     expect(
       integrationIndexMatchesTree(workspace.repo, workspace.repo.readCommit(original).tree),
     ).toBe(true);
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("rolls a fast-forward checkout back when its expected-old ref update is stale", async () => {
@@ -666,7 +581,6 @@ describe("rebase restart recovery", () => {
     expect(workspace.worktree.readFile("/one.txt")).toEqual(
       new TextEncoder().encode("conflict-time staged edit\n"),
     );
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("rolls a hard abort checkout back when journal clearing fails", async () => {
@@ -724,7 +638,6 @@ describe("rebase restart recovery", () => {
       true,
     );
     expect(objectProjectionCounts(workspace)).toEqual(projectionsBefore);
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("resumes after the initial upstream baseline and journal commit", async () => {

@@ -18,11 +18,9 @@ import {
 } from "../src/core/ops/plumbing.js";
 import { add } from "../src/core/ops/staging.js";
 import { MAX_TREE_BUILD_LEAF_ENTRIES, MAX_TREE_BUILD_OBJECTS } from "../src/core/ops/tree-build.js";
-import { retainedStringBytes } from "../src/core/retained.js";
 import { comparePaths } from "../src/core/streams.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type { ScanEntry } from "../src/fs/types.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import {
   INDEX_DIRTY,
   iterateIndexTrackerDirty,
@@ -246,15 +244,13 @@ function corruptLooseObject(workspace: TestRepository, oid: string): void {
 }
 
 describe("tree and index write plumbing", () => {
-  it("keeps configured guarded-ref metadata in the exact aggregate owner", () => {
+  it("updates a guarded ref with long configured metadata", () => {
     const name = "N".repeat(128 * 1024);
     const email = `${"e".repeat(128 * 1024)}@example.test`;
-    const prepare = (configured: boolean): { workspace: TestRepository; target: string } => {
+    const prepare = (): { workspace: TestRepository; target: string } => {
       const workspace = makeRepo("/");
-      if (configured) {
-        workspace.repo.store.configSet("user.name", name);
-        workspace.repo.store.configSet("user.email", email);
-      }
+      workspace.repo.store.configSet("user.name", name);
+      workspace.repo.store.configSet("user.email", email);
       return {
         workspace,
         target: workspace.repo.store.write("blob", utf8.encode("guarded target\n")),
@@ -268,50 +264,9 @@ describe("tree and index write plumbing", () => {
       });
     };
 
-    const plain = prepare(false);
-    run(plain.workspace, plain.target);
-    const plainBytes = plain.workspace.repo.store.memory.highWaterBytes;
-    expect(plain.workspace.repo.store.memory.activeCount).toBe(0);
-    expect(plain.workspace.repo.store.memory.totalBytes).toBe(0);
-
-    const measured = prepare(true);
-    run(measured.workspace, measured.target);
-    const operationBytes = measured.workspace.repo.store.memory.highWaterBytes;
-    // Reflog JSON precharge retains two bytes for each six-unit escaped maximum.
-    expect(operationBytes - plainBytes).toBe(
-      16 +
-        retainedStringBytes(name) +
-        retainedStringBytes(email) +
-        12 * (name.length + email.length),
-    );
-    expect(measured.workspace.repo.store.memory.activeCount).toBe(0);
-    expect(measured.workspace.repo.store.memory.totalBytes).toBe(0);
-
-    const exact = prepare(true);
-    const exactBlocker = exact.workspace.repo.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    try {
-      run(exact.workspace, exact.target);
-      expect(exact.workspace.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactBlocker.dispose();
-    }
-    expect(exact.workspace.repo.store.memory.activeCount).toBe(0);
-    expect(exact.workspace.repo.store.memory.totalBytes).toBe(0);
-
-    const over = prepare(true);
-    const overBlocker = over.workspace.repo.store.reserveMemory();
-    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    try {
-      expect(() => run(over.workspace, over.target)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(over.workspace.repo.store.getRef("refs/heads/guarded-memory")).toBeNull();
-    } finally {
-      overBlocker.dispose();
-    }
-    expect(over.workspace.repo.store.memory.activeCount).toBe(0);
-    expect(over.workspace.repo.store.memory.totalBytes).toBe(0);
+    const prepared = prepare();
+    run(prepared.workspace, prepared.target);
+    expect(prepared.workspace.repo.store.getRef("refs/heads/guarded-memory")).toBe(prepared.target);
   });
 
   it("matches Git write-tree for checkout, scratch, empty, mixed-mode, and non-BMP indexes", async () => {
@@ -494,110 +449,6 @@ describe("tree and index write plumbing", () => {
 
     expect(workspace.repo.readTree(oid)).toHaveLength(4_000);
     expect(workspace.repo.store.objectCount() - beforeObjects).toBe(2);
-    expect(workspace.repo.store.memory.activeCount).toBe(0);
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
-  });
-
-  it("composes current-tree and staged-subtree allocations at the exact shared ceiling", () => {
-    const suffix = "x".repeat(1_800);
-    const prepare = (): { workspace: TestRepository; index: IndexStore } => {
-      const workspace = makeRepo("/");
-      const rows: IndexEntry[] = [];
-      for (let ordinal = 0; ordinal < 128; ordinal++) {
-        const directory = `d${ordinal.toString().padStart(3, "0")}`;
-        const blob = workspace.repo.store.write("blob", utf8.encode(`content-${ordinal}\n`));
-        rows.push(indexed(`${directory}/file-${suffix}`, blob));
-      }
-      const index = readOnlyIndex(() => rows.values());
-      return { workspace, index };
-    };
-
-    const measured = prepare();
-    const measuredObjects = measured.workspace.repo.store.objectCount();
-    writeTree(measured.workspace.repo, measured.index);
-    const operationBytes = measured.workspace.repo.store.memory.highWaterBytes;
-    expect(measured.workspace.repo.store.objectCount() - measuredObjects).toBe(129);
-    expect(measured.workspace.repo.store.memory.activeCount).toBe(0);
-
-    const exact = prepare();
-    const exactBlocker = exact.workspace.repo.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    try {
-      writeTree(exact.workspace.repo, exact.index);
-      expect(exact.workspace.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactBlocker.dispose();
-    }
-    expect(exact.workspace.repo.store.memory.activeCount).toBe(0);
-
-    const excess = prepare();
-    const beforeObjects = excess.workspace.repo.store.objectCount();
-    const excessBlocker = excess.workspace.repo.store.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    try {
-      expect(() => writeTree(excess.workspace.repo, excess.index)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(excess.workspace.repo.store.objectCount()).toBe(beforeObjects);
-    } finally {
-      excessBlocker.dispose();
-    }
-    expect(excess.workspace.repo.store.memory.activeCount).toBe(0);
-    expect(excess.workspace.repo.store.memory.totalBytes).toBe(0);
-  });
-
-  it("composes one full index page and retained unique oids at the shared ceiling", () => {
-    const prepare = (): TestRepository => {
-      const workspace = makeRepo("/");
-      const oids: string[] = [];
-      workspace.repo.store.writeObjects((batch) => {
-        for (let ordinal = 0; ordinal < 2_048; ordinal++) {
-          oids.push(batch.write("blob", utf8.encode(`unique-${ordinal}\n`)));
-        }
-      });
-      workspace.repo.checkout.indexReplace(
-        oids.map((oid, ordinal) => indexed(`file-${ordinal.toString().padStart(4, "0")}`, oid)),
-      );
-      return workspace;
-    };
-
-    const measured = prepare();
-    const calibration = measured.repo.store.reserveMemory();
-    calibration.set("other", MAX_OPERATION_MEMORY_BYTES / 2);
-    try {
-      writeTree(measured.repo);
-    } finally {
-      calibration.dispose();
-    }
-    const operationBytes =
-      measured.repo.store.memory.highWaterBytes - MAX_OPERATION_MEMORY_BYTES / 2;
-    expect(measured.repo.store.memory.activeCount).toBe(0);
-    expect(measured.repo.store.memory.totalBytes).toBe(0);
-
-    const exact = prepare();
-    const exactBlocker = exact.repo.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    try {
-      writeTree(exact.repo);
-      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactBlocker.dispose();
-    }
-    expect(exact.repo.store.memory.activeCount).toBe(0);
-    expect(exact.repo.store.memory.totalBytes).toBe(0);
-
-    const excess = prepare();
-    const beforeObjects = excess.repo.store.objectCount();
-    const excessBlocker = excess.repo.store.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    try {
-      expect(() => writeTree(excess.repo)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(excess.repo.store.objectCount()).toBe(beforeObjects);
-    } finally {
-      excessBlocker.dispose();
-    }
-    expect(excess.repo.store.memory.activeCount).toBe(0);
-    expect(excess.repo.store.memory.totalBytes).toBe(0);
   });
 
   it("matches Git commit-tree for exact messages and zero, one, and two parents", async () => {
@@ -864,10 +715,9 @@ describe("tree and index write plumbing", () => {
 
     expect(workspace.repo.readCommit(messageOid).message).toBe(message);
     expect(workspace.repo.readCommit(identityOid).author.name).toHaveLength(1_025);
-    workspace.repo.store.memory.assertIdle();
   });
 
-  it("retains a large configured commit-tree identity through exact serialization", () => {
+  it("serializes a large configured commit-tree identity", () => {
     const configuredName = `Configured ${"x".repeat(220 * 1024)}`;
     const prepare = (): { workspace: TestRepository; tree: string } => {
       const workspace = makeRepo("/");
@@ -888,39 +738,13 @@ describe("tree and index write plumbing", () => {
     };
 
     const measured = prepare();
+    const beforeObjects = measured.workspace.repo.store.objectCount();
     const measuredOid = commitTree(measured.workspace.context, measured.workspace.repo, {
       tree: measured.tree,
       message: "configured identity\n",
     });
-    const operationBytes = measured.workspace.repo.store.memory.highWaterBytes;
     expect(measured.workspace.repo.readCommit(measuredOid).author.name).toBe(configuredName);
-    measured.workspace.repo.store.memory.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const { workspace, tree } = prepare();
-      const beforeObjects = workspace.repo.store.objectCount();
-      const blocker = workspace.repo.store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      let oid: string | undefined;
-      try {
-        const write = () =>
-          commitTree(workspace.context, workspace.repo, {
-            tree,
-            message: "configured identity\n",
-          });
-        if (excess === 0) oid = write();
-        else expect(write).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      } finally {
-        blocker.dispose();
-      }
-      workspace.repo.store.memory.assertIdle();
-      if (excess === 0) {
-        expect(workspace.repo.readCommit(oid ?? "").author.name).toBe(configuredName);
-        expect(workspace.repo.store.objectCount()).toBe(beforeObjects + 1);
-      } else {
-        expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
-      }
-    }
+    expect(measured.workspace.repo.store.objectCount()).toBe(beforeObjects + 1);
   });
 
   it("resolves the maximal packed parent list below the SQL gate", async () => {

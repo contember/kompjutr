@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { initializeFsSchema } from "../src/fs/schema.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import {
   advanceIndexTrackerBaseline,
   INDEX_DIRTY,
@@ -234,39 +233,6 @@ describe("index tracker", () => {
     );
     db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() => dirty(db, 1)).toThrowError(/malformed dirty row/);
-  });
-
-  it("reseals at exact shared headroom and invalidates on first excess", () => {
-    const entry = { path: "x".repeat(2_201), flags: INDEX_DIRTY };
-    const measuredDb = setup();
-    addRepository(measuredDb, 1, "/repo");
-    const measuredCoordinator = new MemoryCoordinator();
-    const measuredOwner = measuredCoordinator.reserve();
-    expect(resealIndexTracker(measuredDb, 1, TREE, [entry], measuredOwner)).toBe(true);
-    const operationBytes = measuredOwner.highWaterBytes;
-    expect(measuredOwner.currentBytes).toBe(0);
-    measuredOwner.dispose();
-    measuredCoordinator.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const db = setup();
-      addRepository(db, 1, "/repo");
-      const coordinator = new MemoryCoordinator();
-      const blocker = coordinator.reserve();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = coordinator.reserve();
-      try {
-        expect(resealIndexTracker(db, 1, TREE, [entry], owner)).toBe(excess === 0);
-        expect(readIndexTrackerState(db, 1)).toEqual(
-          excess === 0 ? { available: true, baselineTreeOid: TREE } : { available: false },
-        );
-        expect(owner.currentBytes).toBe(0);
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      coordinator.assertIdle();
-    }
   });
 
   it("streams and reseals past the former dirty-row and page ceilings", () => {

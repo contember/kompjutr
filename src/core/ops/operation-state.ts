@@ -16,7 +16,6 @@ import {
   type MergeTouchedPath,
   mergeAlreadyActive,
   mergeJournalIntegrityOid,
-  mergeJournalRetainedBytes,
   mergeNotActive,
   validateMergeTouchedPath,
 } from "./merge-state.js";
@@ -78,7 +77,6 @@ interface OperationJournalFields<S extends OperationStateMetadata> {
   state: S;
   steps: readonly OperationStepMetadata[];
   touched: readonly MergeTouchedPath[];
-  retainedBytes: number;
   integrityOid: string;
 }
 
@@ -97,20 +95,6 @@ export type OperationJournal =
   | CherryPickJournal
   | RevertJournal
   | RebaseJournal;
-
-const REPLAY_STATE_FIXED_BYTES = 2 * 1024;
-const OPERATION_STEP_FIXED_BYTES = 256;
-
-function checkedAdd(left: number, right: number): number {
-  if (
-    !Number.isSafeInteger(left) ||
-    !Number.isSafeInteger(right) ||
-    right > Number.MAX_SAFE_INTEGER - left
-  ) {
-    throw new GitError("E2BIG", "operation journal byte accounting overflow");
-  }
-  return left + right;
-}
 
 function boundedTextBytes(
   value: string,
@@ -145,7 +129,7 @@ function control(unit: number): boolean {
   return unit === 0 || unit === 0x0a || unit === 0x0d;
 }
 
-function validateOriginalHeadRef(ref: string): number {
+function validateOriginalHeadRef(ref: string): void {
   if (
     !ref.startsWith("refs/heads/") ||
     ref.length === "refs/heads/".length ||
@@ -175,11 +159,11 @@ function validateOriginalHeadRef(ref: string): number {
       throw new CorruptError("replay original HEAD is not a valid branch ref");
     }
   }
-  return boundedTextBytes(ref, "original HEAD ref", MAX_MERGE_REF_BYTES, control);
+  boundedTextBytes(ref, "original HEAD ref", MAX_MERGE_REF_BYTES, control);
 }
 
-function validateIdentity(identity: MergeSavedIdentity | null, label: string): number {
-  if (identity === null) return 0;
+function validateIdentity(identity: MergeSavedIdentity | null, label: string): void {
+  if (identity === null) return;
   const forbidden = (unit: number): boolean => control(unit) || unit === 0x3c || unit === 0x3e;
   const name = boundedTextBytes(
     identity.name,
@@ -194,15 +178,13 @@ function validateIdentity(identity: MergeSavedIdentity | null, label: string): n
     forbidden,
   );
   if (name === 0 || email === 0) throw new CorruptError(`replay ${label} identity is incomplete`);
-  return checkedAdd(name, email);
 }
 
-function validateOperationCommonState(state: OperationCommonStateFields): number {
-  let bytes = checkedAdd(REPLAY_STATE_FIXED_BYTES, validateOriginalHeadRef(state.originalHeadRef));
+function validateOperationCommonState(state: OperationCommonStateFields): void {
+  validateOriginalHeadRef(state.originalHeadRef);
   if (!isOid(state.originalHeadOid)) {
     throw new CorruptError("replay original HEAD has an invalid object id");
   }
-  bytes = checkedAdd(bytes, 40);
   const currentLabel = boundedTextBytes(
     state.currentLabel,
     "current label",
@@ -218,28 +200,19 @@ function validateOperationCommonState(state: OperationCommonStateFields): number
   if (currentLabel === 0 || incomingLabel === 0) {
     throw new CorruptError("replay labels must not be empty");
   }
-  bytes = checkedAdd(bytes, currentLabel);
-  bytes = checkedAdd(bytes, incomingLabel);
-  bytes = checkedAdd(
-    bytes,
-    boundedTextBytes(state.message, "message", MAX_MERGE_MESSAGE_BYTES, (unit) => unit === 0),
-  );
-  bytes = checkedAdd(bytes, validateIdentity(state.author, "author"));
-  bytes = checkedAdd(bytes, validateIdentity(state.committer, "committer"));
-  return bytes;
+  boundedTextBytes(state.message, "message", MAX_MERGE_MESSAGE_BYTES, (unit) => unit === 0);
+  validateIdentity(state.author, "author");
+  validateIdentity(state.committer, "committer");
 }
 
-export function validateOperationStepMetadata(step: OperationStepMetadata): number {
-  let bytes = OPERATION_STEP_FIXED_BYTES;
+export function validateOperationStepMetadata(step: OperationStepMetadata): void {
   if (!isOid(step.sourceOid)) {
     throw new CorruptError("operation step source has an invalid object id");
   }
-  bytes = checkedAdd(bytes, 40);
   if (step.selectedParentOid !== null) {
     if (!isOid(step.selectedParentOid)) {
       throw new CorruptError("operation step selected parent has an invalid object id");
     }
-    bytes = checkedAdd(bytes, 40);
   }
   if (step.mainline !== null && (!Number.isSafeInteger(step.mainline) || step.mainline < 1)) {
     throw new CorruptError("operation step mainline is not a safe positive integer");
@@ -254,11 +227,9 @@ export function validateOperationStepMetadata(step: OperationStepMetadata): numb
     if (step.resultOid === null || !isOid(step.resultOid)) {
       throw new CorruptError("applied operation step has an invalid result object id");
     }
-    bytes = checkedAdd(bytes, 40);
   } else if (step.resultOid !== null) {
     throw new CorruptError("unapplied operation step retained a result object id");
   }
-  return bytes;
 }
 
 function replayStep(state: ReplayStateMetadata): OperationStepMetadata {
@@ -277,8 +248,8 @@ export function operationStepsForState(
   return state.kind === "merge" ? [] : [replayStep(state)];
 }
 
-function validateReplayHeader(state: ReplayStateMetadata): number {
-  const bytes = validateOperationCommonState(state);
+function validateReplayHeader(state: ReplayStateMetadata): void {
+  validateOperationCommonState(state);
   if (state.phase !== "conflicted" && state.phase !== "empty") {
     throw new CorruptError("replay journal has an invalid phase");
   }
@@ -288,14 +259,11 @@ function validateReplayHeader(state: ReplayStateMetadata): number {
   ) {
     throw new CorruptError("replay journal has an invalid empty reason");
   }
-  return bytes;
 }
 
-export function validateReplayStateMetadata(state: ReplayStateMetadata): number {
-  return checkedAdd(
-    validateReplayHeader(state),
-    validateOperationStepMetadata(replayStep(state)) - OPERATION_STEP_FIXED_BYTES,
-  );
+export function validateReplayStateMetadata(state: ReplayStateMetadata): void {
+  validateReplayHeader(state);
+  validateOperationStepMetadata(replayStep(state));
 }
 
 function sameStep(left: OperationStepMetadata, right: OperationStepMetadata): boolean {
@@ -311,7 +279,7 @@ function sameStep(left: OperationStepMetadata, right: OperationStepMetadata): bo
 function validateSequencedState(
   state: ReplayStateMetadata | RebaseStateMetadata,
   steps: readonly OperationStepMetadata[],
-): number {
+): void {
   if (steps.length > MAX_OPERATION_STEPS) {
     throw new GitError("E2BIG", `operation journal exceeds ${MAX_OPERATION_STEPS} steps`);
   }
@@ -320,10 +288,11 @@ function validateSequencedState(
     if (steps.length !== 1 || steps[0] === undefined || !sameStep(steps[0], expected)) {
       throw new CorruptError("one-commit replay journal does not contain its pending source step");
     }
-    return validateReplayHeader(state);
+    validateReplayHeader(state);
+    return;
   }
   if (steps.length === 0) throw new CorruptError("rebase journal has no replay steps");
-  let bytes = validateOperationCommonState(state);
+  validateOperationCommonState(state);
   const anchors: readonly (readonly [string, string])[] = [
     ["upstream", state.upstreamOid],
     ["base", state.baseOid],
@@ -331,7 +300,6 @@ function validateSequencedState(
   ];
   for (const [label, oid] of anchors) {
     if (!isOid(oid)) throw new CorruptError(`rebase ${label} has an invalid object id`);
-    bytes = checkedAdd(bytes, 40);
   }
   if (state.phase !== "running" && state.phase !== "conflicted") {
     throw new CorruptError("rebase journal has an invalid phase");
@@ -365,23 +333,14 @@ function validateSequencedState(
   if (state.phase === "conflicted" && state.currentStep === steps.length) {
     throw new CorruptError("completed rebase cursor cannot be conflicted");
   }
-  return bytes;
 }
 
-export function operationJournalRetainedBytes(
+function validateOperationJournal(
   state: OperationStateMetadata,
   touched: readonly MergeTouchedPath[],
-  steps?: readonly OperationStepMetadata[],
-): number {
-  if (state.kind === "merge") {
-    if (steps !== undefined && steps.length !== 0) {
-      throw new CorruptError("merge journal retained replay steps");
-    }
-    const { kind: _kind, ...mergeState } = state;
-    return mergeJournalRetainedBytes(mergeState, touched);
-  }
-  const sequence = steps ?? (state.kind === "rebase" ? undefined : operationStepsForState(state));
-  if (sequence === undefined) throw new CorruptError("rebase journal is missing its replay steps");
+  steps: readonly OperationStepMetadata[],
+): void {
+  if (state.kind === "merge") throw new CorruptError("merge journal entered replay validation");
   if (touched.length > MAX_MERGE_TOUCHED_PATHS) {
     throw new GitError(
       "E2BIG",
@@ -394,14 +353,13 @@ export function operationJournalRetainedBytes(
   if (state.kind === "rebase" && state.phase === "running" && touched.length !== 0) {
     throw new CorruptError("a running rebase journal retained touched paths");
   }
-  let bytes = validateSequencedState(state, sequence);
-  for (const step of sequence) {
-    bytes = checkedAdd(bytes, validateOperationStepMetadata(step));
+  validateSequencedState(state, steps);
+  for (const step of steps) {
+    validateOperationStepMetadata(step);
   }
   for (const entry of touched) {
-    bytes = checkedAdd(bytes, validateMergeTouchedPath(entry));
+    validateMergeTouchedPath(entry);
   }
-  return bytes;
 }
 
 function savedIdentityVector(identity: MergeSavedIdentity | null): readonly unknown[] | null {
@@ -458,13 +416,15 @@ export function operationJournalIntegrityOid(
   steps?: readonly OperationStepMetadata[],
 ): string {
   if (state.kind === "merge") {
-    operationJournalRetainedBytes(state, touched, steps);
+    if (steps !== undefined && steps.length !== 0) {
+      throw new CorruptError("merge journal retained replay steps");
+    }
     const { kind: _kind, ...mergeState } = state;
     return mergeJournalIntegrityOid(mergeState, touched);
   }
   const sequence = steps ?? (state.kind === "rebase" ? undefined : operationStepsForState(state));
   if (sequence === undefined) throw new CorruptError("rebase journal is missing its replay steps");
-  operationJournalRetainedBytes(state, touched, sequence);
+  validateOperationJournal(state, touched, sequence);
   const payload: readonly unknown[] = [
     3,
     state.kind,
@@ -481,7 +441,7 @@ export function mergeOperationState(state: MergeStateMetadata): MergeOperationSt
 
 export function mergeJournalFromOperation(journal: MergeOperationJournal): MergeJournal {
   const { kind: _kind, ...state } = journal.state;
-  return { state, touched: journal.touched, retainedBytes: journal.retainedBytes };
+  return { state, touched: journal.touched };
 }
 
 export function operationAlreadyActive(kind: OperationKind): GitError {

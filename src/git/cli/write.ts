@@ -13,7 +13,6 @@ import { eagerStatus } from "../../core/ops/status.js";
 import { formatCommitRefusalStatus, statusFormatOptions } from "../../core/ops/status-format.js";
 import { joinPath, normalizePath, relativeTo } from "../../core/paths.js";
 import type { Repository, ResolvedHead } from "../../core/repository.js";
-import type { MemoryReservation } from "../../memory.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES, type WalkTreeDiffEntry } from "../../sqlite/store.js";
 import {
   boundedGitCliResult,
@@ -68,14 +67,13 @@ interface RootSummaryRow {
 
 export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
   return {
-    add(invocation, options, reservation) {
-      const output = outputContext(options, reservation);
-      return withRepository(context, invocation.cwd, options, reservation, (repo) => {
+    add(invocation, options) {
+      const output = outputContext(options);
+      return withRepository(context, invocation.cwd, options, (repo) => {
         let paths: ResolvedAddPath[] = [];
         return runMutation(
           repo,
           options,
-          reservation,
           () => {
             paths = resolveAddPaths(repo, invocation.cwd, invocation.command.paths);
             return addLiteralPaths(
@@ -93,12 +91,11 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         );
       });
     },
-    commit(invocation, options, reservation) {
-      return withRepository(context, invocation.cwd, options, reservation, (repo) =>
+    commit(invocation, options) {
+      return withRepository(context, invocation.cwd, options, (repo) =>
         runMutation(
           repo,
           options,
-          reservation,
           () => {
             if (!repo.checkout.hasConflicts()) repo.checkout.requireNoOperationState();
             const previousHead = repo.head();
@@ -123,14 +120,13 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         ),
       );
     },
-    rebase(invocation, options, reservation) {
-      return withRepository(context, invocation.cwd, options, reservation, (repo) => {
+    rebase(invocation, options) {
+      return withRepository(context, invocation.cwd, options, (repo) => {
         requireTransactionalWorktree(context, repo);
         if (invocation.command.action === "abort") {
           return runMutation(
             repo,
             options,
-            reservation,
             () => rebaseAbortExcluding(repo, context.worktree, nestedRoots(context, repo.root)),
             () => gitCliResult("", "", 0),
             mapRebaseFailure,
@@ -139,7 +135,6 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         return runMutation(
           repo,
           options,
-          reservation,
           () => {
             const before = repo.checkout.requireOperationState("rebase");
             const result = rebaseContinueExcluding(
@@ -162,7 +157,6 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
 function runMutation<Outcome>(
   repo: Repository,
   options: ResolvedGitCliRunOptions,
-  reservation: MemoryReservation,
   operation: () => Outcome,
   formatSuccess: (outcome: Outcome) => GitCliResult,
   mapOperationFailure: (error: unknown) => GitCliResult | undefined,
@@ -175,14 +169,14 @@ function runMutation<Outcome>(
       phase = "format-success";
       const result = formatSuccess(outcome);
       phase = "preflight";
-      return boundedGitCliResult(result, options, reservation);
+      return boundedGitCliResult(result, options);
     });
   } catch (error) {
     repo.store.revalidateStorageCaches();
     if (phase !== "native-operation") throw error;
     const mapped = mapOperationFailure(error);
     if (mapped === undefined) throw error;
-    return boundedGitCliResult(mapped, options, reservation);
+    return boundedGitCliResult(mapped, options);
   }
 }
 
@@ -190,7 +184,6 @@ function withRepository(
   context: GitContext,
   cwd: string,
   options: ResolvedGitCliRunOptions,
-  reservation: MemoryReservation,
   body: (repo: Repository) => GitCliResult,
 ): GitCliResult {
   let repo: Repository;
@@ -205,7 +198,6 @@ function withRepository(
         128,
       ),
       options,
-      reservation,
     );
   }
   return body(repo);
@@ -563,8 +555,6 @@ function summarizeRoot(
   quoteNonAscii: boolean,
   maximum: number,
 ): CommitSummary {
-  const operationMemory = repo.store.reserveMemory();
-  const blobMemory = operationMemory.scope();
   const retained = new SummaryRetainedBudget(maximum);
   const details: string[] = [];
   let files = 0;
@@ -574,53 +564,43 @@ function summarizeRoot(
     if (pending.length === 0) return;
     let rows = pending;
     pending = [];
-    try {
-      while (rows.length > 0) {
-        const batch = repo.readBlobs(
-          rows.map((row) => row.oid),
-          { budgetBytes: PACK_BLOB_BATCH_TARGET_BYTES },
-        );
-        if (batch.blobs.size === 0) {
-          throw new Error("commit summary blob batch made no progress");
-        }
-        blobMemory.set("other", 256 + batch.blobs.size * 128 + batch.bytes);
-        let processed = 0;
-        while (processed < rows.length) {
-          const row = rows[processed];
-          if (row === undefined) throw new Error("commit summary blob row is missing");
-          const bytes = batch.blobs.get(row.oid);
-          if (bytes === undefined) break;
-          if (!isBinary(bytes)) insertions += diffText("", utf8Decoder.decode(bytes)).insertions;
-          pushSummaryDetail(
-            details,
-            `create mode ${row.mode} ${summaryPath(row.path, quoteNonAscii)}`,
-            retained,
-          );
-          processed++;
-        }
-        if (processed === 0) throw new Error("commit summary blob batch made no progress");
-        rows = rows.slice(processed);
-        blobMemory.clear("other");
+    while (rows.length > 0) {
+      const batch = repo.readBlobs(
+        rows.map((row) => row.oid),
+        { budgetBytes: PACK_BLOB_BATCH_TARGET_BYTES },
+      );
+      if (batch.blobs.size === 0) {
+        throw new Error("commit summary blob batch made no progress");
       }
-    } finally {
-      blobMemory.clear("other");
+      let processed = 0;
+      while (processed < rows.length) {
+        const row = rows[processed];
+        if (row === undefined) throw new Error("commit summary blob row is missing");
+        const bytes = batch.blobs.get(row.oid);
+        if (bytes === undefined) break;
+        if (!isBinary(bytes)) insertions += diffText("", utf8Decoder.decode(bytes)).insertions;
+        pushSummaryDetail(
+          details,
+          `create mode ${row.mode} ${summaryPath(row.path, quoteNonAscii)}`,
+          retained,
+        );
+        processed++;
+      }
+      if (processed === 0) throw new Error("commit summary blob batch made no progress");
+      rows = rows.slice(processed);
     }
   };
-  try {
-    for (const row of repo.walkTreeDiff(null, tree)) {
-      if (row.afterMode === null || row.afterOid === null) {
-        throw new Error("root commit summary yielded a deletion");
-      }
-      files++;
-      retained.addPath(row.path);
-      pending.push({ path: row.path, mode: row.afterMode, oid: row.afterOid });
-      if (pending.length >= SUMMARY_WINDOW_ROWS) flush();
+  for (const row of repo.walkTreeDiff(null, tree)) {
+    if (row.afterMode === null || row.afterOid === null) {
+      throw new Error("root commit summary yielded a deletion");
     }
-    flush();
-    return { files, insertions, deletions: 0, details };
-  } finally {
-    operationMemory.dispose();
+    files++;
+    retained.addPath(row.path);
+    pending.push({ path: row.path, mode: row.afterMode, oid: row.afterOid });
+    if (pending.length >= SUMMARY_WINDOW_ROWS) flush();
   }
+  flush();
+  return { files, insertions, deletions: 0, details };
 }
 
 function modeDetail(row: WalkTreeDiffEntry, quoteNonAscii: boolean): string | undefined {
@@ -864,11 +844,8 @@ function boundedFailureStderr(value: string, options: ResolvedGitCliRunOptions):
   return out.finish();
 }
 
-function outputContext(
-  options: ResolvedGitCliRunOptions,
-  reservation: MemoryReservation,
-): GitCliOutputContext {
-  return { options, reservation };
+function outputContext(options: ResolvedGitCliRunOptions): GitCliOutputContext {
+  return { options };
 }
 
 class BoundedSummaryOutput {

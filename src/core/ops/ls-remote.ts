@@ -5,10 +5,8 @@ import { discover, MAX_PROTOCOL_NEGOTIATION_ENTRIES, type RemoteRef } from "../p
 import { type GitAuth, RemoteAuthSession } from "../protocol/transport.js";
 import { checkRefText } from "../ref-name.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import { type RemoteAuthOptions, remoteUrlFor, validateRemoteAuthOptions } from "./network.js";
 import type { LsRemoteResult, RemoteTarget } from "./refspec.js";
-import { TransportOperationBudget } from "./transport-budget.js";
 
 export const MAX_LS_REMOTE_PATTERNS = 1_024;
 export const MAX_LS_REMOTE_REFS = MAX_PROTOCOL_NEGOTIATION_ENTRIES;
@@ -37,17 +35,6 @@ interface ClassAtom {
   readonly byte: number;
   readonly next: number;
 }
-
-const PATTERN_MEMORY_PART = "ls-remote-patterns";
-const RESULT_MEMORY_PART = "ls-remote-result";
-const OPTIONS_MEMORY_PART = "ls-remote-options";
-const PATTERN_FIXED_BYTES = 128;
-const PATTERN_BYTE_BYTES = 64;
-const PATTERNS_FIXED_BYTES = 192;
-const RESULT_FIXED_BYTES = 192;
-const RESULT_REF_FIXED_BYTES = 96;
-const OPTIONS_FIXED_BYTES = 192;
-const HEADER_FIXED_BYTES = 64;
 
 function invalidPattern(index: number, message: string): GitError {
   return new GitError("EINVAL", `ls-remote pattern ${index + 1} ${message}`);
@@ -131,10 +118,7 @@ function compilePattern(pattern: string, index: number): CompiledPattern {
   return { tokens };
 }
 
-function compilePatterns(
-  patterns: readonly string[] | undefined,
-  budget: TransportOperationBudget,
-): readonly CompiledPattern[] {
+function compilePatterns(patterns: readonly string[] | undefined): readonly CompiledPattern[] {
   if (patterns === undefined) return [];
   if (!Array.isArray(patterns)) throw new GitError("EINVAL", "ls-remote patterns must be an array");
   if (patterns.length === 0) return [];
@@ -142,25 +126,15 @@ function compilePatterns(
     throw new GitError("E2BIG", `ls-remote patterns exceed ${MAX_LS_REMOTE_PATTERNS} entries`);
   }
 
-  let retained = PATTERNS_FIXED_BYTES;
-  budget.setMemory(PATTERN_MEMORY_PART, retained);
   const compiled: CompiledPattern[] = [];
-  try {
-    for (let index = 0; index < patterns.length; index++) {
-      const pattern = patterns[index];
-      if (typeof pattern !== "string") throw invalidPattern(index, "must be a string");
-      const checked = checkRefText(pattern);
-      if (checked.problem !== null) throw invalidPattern(index, "contains invalid text");
-      retained +=
-        PATTERN_FIXED_BYTES + retainedStringBytes(pattern) + checked.bytes * PATTERN_BYTE_BYTES;
-      budget.setMemory(PATTERN_MEMORY_PART, retained);
-      compiled.push(compilePattern(pattern, index));
-    }
-    return compiled;
-  } catch (error) {
-    budget.clearMemory(PATTERN_MEMORY_PART);
-    throw error;
+  for (let index = 0; index < patterns.length; index++) {
+    const pattern = patterns[index];
+    if (typeof pattern !== "string") throw invalidPattern(index, "must be a string");
+    const checked = checkRefText(pattern);
+    if (checked.problem !== null) throw invalidPattern(index, "contains invalid text");
+    compiled.push(compilePattern(pattern, index));
   }
+  return compiled;
 }
 
 function classMatches(
@@ -228,10 +202,7 @@ function patternMatchesRef(pattern: CompiledPattern, candidate: Uint8Array): boo
 function selectRefs(
   refs: readonly RemoteRef[],
   patterns: readonly CompiledPattern[],
-  budget: TransportOperationBudget,
 ): readonly RemoteRef[] {
-  let retained = RESULT_FIXED_BYTES;
-  budget.setMemory(RESULT_MEMORY_PART, retained);
   const selected: RemoteRef[] = [];
   for (const ref of refs) {
     if (patterns.length > 0) {
@@ -241,9 +212,6 @@ function selectRefs(
     if (selected.length >= MAX_LS_REMOTE_REFS) {
       throw new GitError("E2BIG", `ls-remote result exceeds ${MAX_LS_REMOTE_REFS} refs`);
     }
-    // Selection retains references to advertisement-owned strings, not copies.
-    retained += RESULT_REF_FIXED_BYTES;
-    budget.setMemory(RESULT_MEMORY_PART, retained);
     selected.push({ name: ref.name, oid: ref.oid });
   }
   return selected;
@@ -270,26 +238,23 @@ function resolveRemoteUrl(repo: Repository, options: LsRemoteOptions): string {
   return url;
 }
 
-function headerBytes(
+function validateHeaders(
   headers: Record<string, string> | undefined,
   code: "EAUTH" | "EINVAL",
-): number {
-  if (headers === undefined) return 0;
+): void {
+  if (headers === undefined) return;
   if (typeof headers !== "object" || headers === null || Array.isArray(headers)) {
     throw new GitError(code, "remote authentication headers must be a string record");
   }
-  let retained = HEADER_FIXED_BYTES;
-  for (const [name, value] of Object.entries(headers)) {
+  for (const value of Object.values(headers)) {
     if (typeof value !== "string") {
       throw new GitError(code, "remote authentication headers must contain strings");
     }
-    retained += retainedStringBytes(name) + retainedStringBytes(value);
   }
-  return retained;
 }
 
-function credentialsBytes(credentials: GitAuth | undefined): number {
-  if (credentials === undefined) return 0;
+function validateCredentials(credentials: GitAuth | undefined): void {
+  if (credentials === undefined) return;
   if (typeof credentials !== "object" || credentials === null || Array.isArray(credentials)) {
     throw new GitError("EAUTH", "remote authentication callback returned invalid credentials");
   }
@@ -299,26 +264,11 @@ function credentialsBytes(credentials: GitAuth | undefined): number {
   if (credentials.password !== undefined && typeof credentials.password !== "string") {
     throw new GitError("EAUTH", "remote authentication password must be a string");
   }
-  return (
-    HEADER_FIXED_BYTES +
-    (credentials.username === undefined ? 0 : retainedStringBytes(credentials.username)) +
-    (credentials.password === undefined ? 0 : retainedStringBytes(credentials.password)) +
-    headerBytes(credentials.headers, "EAUTH")
-  );
+  validateHeaders(credentials.headers, "EAUTH");
 }
 
-async function discoverRefs(
-  context: GitContext,
-  url: string,
-  options: LsRemoteOptions,
-  budget: TransportOperationBudget,
-) {
-  const optionBytes =
-    OPTIONS_FIXED_BYTES +
-    retainedStringBytes(url) +
-    (options.remote === undefined ? 0 : retainedStringBytes(options.remote)) +
-    headerBytes(options.headers, "EINVAL");
-  budget.setMemory(OPTIONS_MEMORY_PART, optionBytes);
+async function discoverRefs(context: GitContext, url: string, options: LsRemoteOptions) {
+  validateHeaders(options.headers, "EINVAL");
   const onAuth = options.onAuth;
   const auth = {
     ...(context.http === undefined ? {} : { http: context.http }),
@@ -333,12 +283,11 @@ async function discoverRefs(
             } catch (cause) {
               throw new GitError("EAUTH", "remote authentication callback failed", { cause });
             }
-            budget.setMemory(OPTIONS_MEMORY_PART, optionBytes + credentialsBytes(credentials));
+            validateCredentials(credentials);
             return credentials;
           },
         }),
     authSession: new RemoteAuthSession(),
-    operationBudget: budget,
   };
   try {
     return await discover(url, "git-upload-pack", auth);
@@ -367,18 +316,11 @@ export async function lsRemote(
   options: LsRemoteOptions = {},
 ): Promise<LsRemoteResult> {
   validateRemoteAuthOptions(options);
-  const reservation = repo.store.reserveMemory();
-  const budget = new TransportOperationBudget(reservation);
-  try {
-    const patterns = compilePatterns(options.patterns, budget);
-    const url = resolveRemoteUrl(repo, options);
-    const advertisement = await discoverRefs(context, url, options, budget);
-    return {
-      refs: selectRefs(advertisement.refs, patterns, budget),
-      headRef: advertisement.headRef,
-    };
-  } finally {
-    budget.clearAllMemory();
-    reservation.dispose();
-  }
+  const patterns = compilePatterns(options.patterns);
+  const url = resolveRemoteUrl(repo, options);
+  const advertisement = await discoverRefs(context, url, options);
+  return {
+    refs: selectRefs(advertisement.refs, patterns),
+    headRef: advertisement.headRef,
+  };
 }

@@ -24,7 +24,7 @@ at-most-1,000-statement target. A target miss alone does not fail `--check` and
 never licenses a runtime refusal; missing rows, invalid end states, and frozen-
 baseline regressions do fail.
 `memory.ts` exercises streamed operations above retired cumulative byte limits.
-Its SQL target is report-only; semantic, coordinator, CPU-lease, and cgroup
+Its SQL target is report-only; semantic, CPU-lease, and cgroup
 validation failures are hard failures. The runner reserves its own CPU lease.
 The <100 MiB process target is reset `VmHWM` minus its same-run baseline. The
 independent 512 MiB cgroup cap includes SQLite page cache and is only a hard

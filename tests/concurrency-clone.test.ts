@@ -12,7 +12,6 @@ import { Repository } from "../src/core/repository.js";
 import type { Worktree } from "../src/core/worktree.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
 import { createGit } from "../src/git/client.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import { initializeIndexTracker } from "../src/sqlite/index-tracker.js";
 import {
@@ -344,8 +343,6 @@ describe("provisional clone publication", () => {
     owner.store.setRef("refs/heads/main", treeOid);
     expect(workspace.database.checkoutAt("/repo")).toBeNull();
     expect(workspace.worktree.stat("/repo/file.txt")).toBeNull();
-    const ingestMemoryHighWater = owner.store.packs.lastIngestMemoryHighWater;
-
     const published = workspace.database.publishProvisionalClone(
       owner,
       workspace.context.now(),
@@ -358,7 +355,6 @@ describe("provisional clone publication", () => {
     expect(workspace.database.findCheckout("/repo/file.txt")?.repoId).toBe(published.repoId);
     expect(workspace.worktree.readFile("/repo/file.txt")).toEqual(materialized);
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
-    expect(ingestMemoryHighWater).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
     expect(() => owner.store.configSet("after.publish", "forbidden")).toThrowError(
       expect.objectContaining({ code: "EWORKTREENOTFOUND" }),
     );

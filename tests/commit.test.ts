@@ -20,7 +20,6 @@ import { eagerStatus } from "../src/core/ops/status.js";
 import { buildTree } from "../src/core/ops/tree-build.js";
 import { hashWorktreePath, indexEntryFor, walkWorktree } from "../src/core/ops/worktree-io.js";
 import type { CommitTreeSnapshotSource } from "../src/core/sparse-workspace.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import {
   advanceIndexTrackerBaseline,
   invalidateIndexTracker,
@@ -107,18 +106,6 @@ function trackerOnlyContext(workspace: TestRepository): GitContext {
         advanceIndexTrackerBaseline(workspace.database.db, checkoutId, baselineTreeOid),
     },
   };
-}
-
-function publicationBoundaryWorkspace(): TestRepository {
-  const workspace = makeRepo("/");
-  useIdentity(workspace);
-  writeWorkFile(workspace, "/a.txt", "one\n");
-  stageAll(workspace);
-  commit(workspace.context, workspace.repo, { message: "base" });
-  sealCommitBaseline(workspace);
-  writeWorkFile(workspace, "/a.txt", "two\n");
-  stagePath(workspace, "a.txt");
-  return workspace;
 }
 
 function publicationState(workspace: TestRepository): object {
@@ -324,7 +311,6 @@ describe("explicit-parent commit seam", () => {
     });
 
     expect(workspace.repo.readCommit(result.oid).message).toBe(message);
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("writes an authoritative commit without changing any ref", () => {
@@ -492,82 +478,6 @@ describe("explicit-parent commit seam", () => {
     ).toBe(beforeReflog);
     expect(repo.workspace.repo.resolveRef(expectedHead.ref)).toBe(first);
   });
-
-  it("keeps commit publication atomic at the exact shared-memory boundary", () => {
-    const message = `boundary ${"x".repeat(32 * 1024)}`;
-    const measured = publicationBoundaryWorkspace();
-    commit(trackerOnlyContext(measured), measured.repo, { message });
-    const operationBytes = measured.repo.store.memory.highWaterBytes;
-    measured.repo.store.memory.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const workspace = publicationBoundaryWorkspace();
-      const before = publicationState(workspace);
-      const blocker = workspace.repo.store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      let result: ReturnType<typeof commit> | undefined;
-      try {
-        const publish = () => commit(trackerOnlyContext(workspace), workspace.repo, { message });
-        if (excess === 0) result = publish();
-        else expect(publish).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      } finally {
-        blocker.dispose();
-      }
-      workspace.repo.store.memory.assertIdle();
-      if (excess === 0) {
-        expect(result?.oid).toBe(workspace.repo.head().oid);
-        expect(publicationState(workspace)).not.toEqual(before);
-      } else {
-        expect(publicationState(workspace)).toEqual(before);
-      }
-    }
-  });
-
-  it("keeps commitIndex publication atomic at the exact shared-memory boundary", () => {
-    const message = `indexed boundary ${"x".repeat(32 * 1024)}`;
-    const publish = (workspace: TestRepository): ReturnType<typeof commitIndex> => {
-      const head = workspace.repo.head();
-      if (head.oid === null) throw new Error("boundary fixture HEAD is unborn");
-      return commitIndex(
-        workspace.repo,
-        {
-          message,
-          parent: [head.oid],
-          identities: resolveIdentity(workspace.context, workspace.repo, {}),
-          expectedHead: head,
-          refLogReason: "commit",
-        },
-        trackerOnlyContext(workspace),
-      );
-    };
-    const measured = publicationBoundaryWorkspace();
-    publish(measured);
-    const operationBytes = measured.repo.store.memory.highWaterBytes;
-    measured.repo.store.memory.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const workspace = publicationBoundaryWorkspace();
-      const before = publicationState(workspace);
-      const blocker = workspace.repo.store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      let result: ReturnType<typeof commitIndex> | undefined;
-      try {
-        if (excess === 0) result = publish(workspace);
-        else {
-          expect(() => publish(workspace)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        }
-      } finally {
-        blocker.dispose();
-      }
-      workspace.repo.store.memory.assertIdle();
-      if (excess === 0) {
-        expect(result?.oid).toBe(workspace.repo.head().oid);
-        expect(publicationState(workspace)).not.toEqual(before);
-      } else {
-        expect(publicationState(workspace)).toEqual(before);
-      }
-    }
-  });
 });
 
 describe("amend", () => {
@@ -699,7 +609,7 @@ describe("identity", () => {
     ).toThrow(/identity unknown/);
   });
 
-  it("pre-admits a long configured identity before its payload and cleans up", () => {
+  it("commits with a long configured identity", () => {
     const configuredName = `Configured ${"x".repeat(220 * 1024)}`;
     const configuredEmail = "configured@example.com";
     const prepare = (): TestRepository => {
@@ -712,66 +622,23 @@ describe("identity", () => {
       return workspace;
     };
 
-    const measured = prepare();
-    const measuredBefore = publicationState(measured);
-    const stopAfterIdentity = new Error("stop after configured identity");
-    let configPeakBytes: number | undefined;
-    const measuredContext = trackerOnlyContext(measured);
-    measuredContext.now = () => {
-      configPeakBytes = measured.repo.store.memory.totalBytes;
-      throw stopAfterIdentity;
-    };
-    expect(() => commit(measuredContext, measured.repo, { message: "configured" })).toThrow(
-      stopAfterIdentity,
+    const workspace = prepare();
+    const before = publicationState(workspace);
+    const histogram = new Map<string, number>();
+    workspace.storage.histogram = histogram;
+    workspace.storage.resetCounters();
+    const result = commit(trackerOnlyContext(workspace), workspace.repo, {
+      message: "configured",
+    });
+    const configReadStatements = [...histogram].reduce(
+      (total, [query, count]) => total + (query.includes("typeof(seq) AS seq_type") ? count : 0),
+      0,
     );
-    expect(publicationState(measured)).toEqual(measuredBefore);
-    measured.repo.store.memory.assertIdle();
-    if (configPeakBytes === undefined) throw new Error("configured identity was not resolved");
 
-    for (const blocked of [false, true]) {
-      const workspace = prepare();
-      const before = publicationState(workspace);
-      const blocker = workspace.repo.store.reserveMemory();
-      if (blocked) blocker.set("other", MAX_OPERATION_MEMORY_BYTES - configPeakBytes);
-      const histogram = new Map<string, number>();
-      workspace.storage.histogram = histogram;
-      workspace.storage.resetCounters();
-      const originalNow = workspace.context.now;
-      const context = trackerOnlyContext(workspace);
-      let releasedAtIdentity = false;
-      context.now = () => {
-        blocker.dispose();
-        releasedAtIdentity = true;
-        return originalNow();
-      };
-      const configReadStatements = (): number =>
-        [...histogram].reduce(
-          (total, [query, count]) =>
-            total + (query.includes("typeof(seq) AS seq_type") ? count : 0),
-          0,
-        );
-      let result: ReturnType<typeof commit> | undefined;
-      try {
-        const publish = () => commit(context, workspace.repo, { message: "configured" });
-        if (blocked) expect(publish).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        else result = publish();
-      } finally {
-        blocker.dispose();
-      }
-      workspace.repo.store.memory.assertIdle();
-
-      if (!blocked) {
-        expect(releasedAtIdentity).toBe(true);
-        expect(result?.oid).toBe(workspace.repo.head().oid);
-        expect(workspace.repo.readCommit(result?.oid ?? "").author.name).toBe(configuredName);
-        expect(configReadStatements()).toBe(4);
-        expect(publicationState(workspace)).not.toEqual(before);
-      } else {
-        expect(releasedAtIdentity).toBe(false);
-        expect(configReadStatements()).toBe(1);
-        expect(publicationState(workspace)).toEqual(before);
-      }
-    }
+    expect(result.oid).toBe(workspace.repo.head().oid);
+    expect(workspace.repo.readCommit(result.oid).author.name).toBe(configuredName);
+    expect(configReadStatements).toBe(4);
+    expect(publicationState(workspace)).not.toEqual(before);
   });
 });
 
@@ -1155,7 +1022,7 @@ describe("bounded commit tree acceleration", () => {
     }
   });
 
-  it("passes real shared headroom to a sparse provider before falling back", () => {
+  it("falls back to the exact plan when the sparse provider is unavailable", () => {
     const workspace = makeRepo("/");
     useIdentity(workspace);
     writeWorkFile(workspace, "/a.txt", "one\n");
@@ -1165,34 +1032,20 @@ describe("bounded commit tree acceleration", () => {
     writeWorkFile(workspace, "/a.txt", "two\n");
     stagePath(workspace, "a.txt");
 
-    const pressureBytes = 1024 * 1024;
-    const pressure = workspace.repo.store.reserveMemory();
-    pressure.set("other", pressureBytes);
-    let observedHeadroom: number | undefined;
-    let observedSharedHeadroom: number | undefined;
     const source: CommitTreeSnapshotSource = {
-      snapshot(request) {
-        observedHeadroom = request.maxRetainedBytes;
-        observedSharedHeadroom = workspace.repo.store.memory.remainingBytes;
+      snapshot() {
         return { available: false };
       },
     };
     workspace.storage.histogram = new Map();
-    try {
-      expect(
-        commit(acceleratedContext(workspace, source), workspace.repo, {
-          message: "headroom fallback",
-        }).oid,
-      ).toBe(workspace.repo.head().oid);
-      expect(observedHeadroom).toBe(observedSharedHeadroom);
-      expect(observedHeadroom).toBeLessThan(MAX_OPERATION_MEMORY_BYTES - pressureBytes);
-      expect([...workspace.storage.histogram.keys()].join("\n")).toContain(
-        "SELECT checkout.repo_id, typeof(entry.path) AS path_type",
-      );
-    } finally {
-      pressure.dispose();
-    }
-    workspace.repo.store.memory.assertIdle();
+    expect(
+      commit(acceleratedContext(workspace, source), workspace.repo, {
+        message: "headroom fallback",
+      }).oid,
+    ).toBe(workspace.repo.head().oid);
+    expect([...workspace.storage.histogram.keys()].join("\n")).toContain(
+      "SELECT checkout.repo_id, typeof(entry.path) AS path_type",
+    );
   });
 
   it("keeps the prior tracker safely usable when baseline advancement declines", () => {

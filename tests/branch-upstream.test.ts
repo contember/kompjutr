@@ -44,7 +44,6 @@ describe("branch upstream resolver", () => {
       ref: "refs/heads/release",
       oid: OID,
     });
-    expect(repo.store.memory.totalBytes).toBe(0);
   });
 
   it("returns the remote-tracking ref only for the supported direct fetch mapping", () => {
@@ -102,6 +101,5 @@ describe("branch upstream resolver", () => {
     expect(() => resolveBranchUpstream(workspace.repo, "refs/heads/main")).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
   });
 });

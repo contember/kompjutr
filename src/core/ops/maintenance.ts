@@ -1,4 +1,3 @@
-import type { MemoryReservation } from "../../memory.js";
 import { advanceMaintenanceReachability } from "../../sqlite/maintenance/reachability.js";
 import {
   advanceMaintenanceRepack,
@@ -74,15 +73,10 @@ function result(view: MaintenanceRunView): MaintenanceResult {
   };
 }
 
-function durableResult(repo: Repository, reservation: MemoryReservation): MaintenanceResult {
-  const resultMemory = reservation.scope();
-  try {
-    const view = readMaintenanceRunView(repo.store.db, repo.store.repoId, resultMemory);
-    if (view === null) throw new CorruptError("maintenance action did not publish a run");
-    return result(view);
-  } finally {
-    resultMemory.dispose();
-  }
+function durableResult(repo: Repository): MaintenanceResult {
+  const view = readMaintenanceRunView(repo.store.db, repo.store.repoId);
+  if (view === null) throw new CorruptError("maintenance action did not publish a run");
+  return result(view);
 }
 
 /** Advance one bounded durable maintenance action. */
@@ -95,60 +89,48 @@ export async function maintenance(
     throw new GitError("EINVAL", "maintenance clock must return non-negative integer milliseconds");
   }
   const repoId = repo.store.repoId;
-  const reservation = repo.store.reserveMemory();
-  try {
-    const beforeMemory = reservation.scope();
-    const before = readMaintenanceRunView(repo.store.db, repoId, beforeMemory);
-    if (before === null) {
-      advanceMaintenanceRootSnapshotOwned(context.database, repoId, { nowMs }, reservation);
-      return durableResult(repo, reservation);
-    }
-
-    if (before.phase === "finish") {
-      if (
-        before.observedRootEpoch === before.rootEpoch &&
-        before.nextEligibleMs !== null &&
-        nowMs < before.nextEligibleMs
-      ) {
-        return result(before);
-      }
-      rolloverFinishedMaintenanceRun(
-        repo.store.db,
-        repoId,
-        before.runId,
-        nowMs,
-        reservation.scope(),
-      );
-      return durableResult(repo, reservation);
-    }
-
-    if (before.observedRootEpoch !== before.rootEpoch) {
-      if (before.phase === "roots" || before.phase === "mark") {
-        advanceMaintenanceRootSnapshotOwned(context.database, repoId, { nowMs }, reservation);
-        return durableResult(repo, reservation);
-      }
-      repo.store.db.transactionSync(() => {
-        settleMaintenanceRepackForRestart(repo.store, before.runId);
-        resetMaintenanceRunForRootChange(repo.store.db, repoId, before.runId, reservation.scope());
-      });
-      return durableResult(repo, reservation);
-    }
-
-    if (before.phase === "roots") {
-      advanceMaintenanceRootSnapshotOwned(context.database, repoId, { nowMs }, reservation);
-    } else if (before.phase === "mark") {
-      advanceMaintenanceReachability(repo.store);
-    } else if (before.phase === "repack") {
-      if (context.yieldNow === undefined) {
-        await advanceMaintenanceRepack(repo.store, { nowMs });
-      } else {
-        await advanceMaintenanceRepack(repo.store, { nowMs, yieldNow: context.yieldNow });
-      }
-    } else {
-      advanceMaintenanceSweep(repo.store, { nowMs });
-    }
-    return durableResult(repo, reservation);
-  } finally {
-    reservation.dispose();
+  const before = readMaintenanceRunView(repo.store.db, repoId);
+  if (before === null) {
+    advanceMaintenanceRootSnapshotOwned(context.database, repoId, { nowMs });
+    return durableResult(repo);
   }
+
+  if (before.phase === "finish") {
+    if (
+      before.observedRootEpoch === before.rootEpoch &&
+      before.nextEligibleMs !== null &&
+      nowMs < before.nextEligibleMs
+    ) {
+      return result(before);
+    }
+    rolloverFinishedMaintenanceRun(repo.store.db, repoId, before.runId, nowMs);
+    return durableResult(repo);
+  }
+
+  if (before.observedRootEpoch !== before.rootEpoch) {
+    if (before.phase === "roots" || before.phase === "mark") {
+      advanceMaintenanceRootSnapshotOwned(context.database, repoId, { nowMs });
+      return durableResult(repo);
+    }
+    repo.store.db.transactionSync(() => {
+      settleMaintenanceRepackForRestart(repo.store, before.runId);
+      resetMaintenanceRunForRootChange(repo.store.db, repoId, before.runId);
+    });
+    return durableResult(repo);
+  }
+
+  if (before.phase === "roots") {
+    advanceMaintenanceRootSnapshotOwned(context.database, repoId, { nowMs });
+  } else if (before.phase === "mark") {
+    advanceMaintenanceReachability(repo.store);
+  } else if (before.phase === "repack") {
+    if (context.yieldNow === undefined) {
+      await advanceMaintenanceRepack(repo.store, { nowMs });
+    } else {
+      await advanceMaintenanceRepack(repo.store, { nowMs, yieldNow: context.yieldNow });
+    }
+  } else {
+    advanceMaintenanceSweep(repo.store, { nowMs });
+  }
+  return durableResult(repo);
 }

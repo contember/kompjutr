@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transport.js";
 import { createGit, type Git, type GitLsRemoteOptions, type LsRemoteResult } from "../src/index.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServer, type RequestRecord, startGitServer } from "./helpers/http-backend.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";
@@ -116,9 +115,6 @@ describe("lsRemote", () => {
     expectDiscoveryOnly(requestTail(beforeRequests), 2);
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(durableCounts(workspace)).toEqual(beforeState);
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
-    expect(workspace.repo.store.memory.activeCount).toBe(0);
-    expect(workspace.repo.store.memory.highWaterBytes).toBeGreaterThan(0);
   });
 
   it("matches exact names and Git tail wildmatch grammar with one row per ref", async () => {
@@ -289,57 +285,5 @@ describe("lsRemote", () => {
       refs: [],
     });
     expectDiscoveryOnly(requestTail(beforeFormerByteExcess));
-  });
-
-  it("shares the aggregate operation memory ceiling and releases a failed reservation", async () => {
-    const workspace = configuredWorkspace();
-    const blocker = workspace.repo.store.reserveMemory();
-    blocker.set("other", MAX_OPERATION_MEMORY_BYTES);
-    const beforeRequests = server.requests.length;
-    try {
-      await expect(gitFor(workspace).lsRemote({ patterns: ["HEAD"] })).rejects.toMatchObject({
-        code: "E2BIG",
-      });
-      expect(requestTail(beforeRequests)).toHaveLength(0);
-      expect(workspace.repo.store.memory.activeCount).toBe(1);
-      expect(workspace.repo.store.memory.totalBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      blocker.dispose();
-    }
-    expect(workspace.repo.store.memory.activeCount).toBe(0);
-    expect(workspace.repo.store.memory.totalBytes).toBe(0);
-  });
-
-  it("charges a long compiled pattern once at the exact shared memory ceiling", async () => {
-    const pattern = "x".repeat(1_025);
-    const run = async (workspace: TestRepository): Promise<void> => {
-      await gitFor(workspace).lsRemote({ patterns: [pattern] });
-    };
-
-    const measured = configuredWorkspace();
-    await run(measured);
-    const operationBytes = measured.repo.store.memory.highWaterBytes;
-    expect(operationBytes).toBeGreaterThan(0);
-
-    const exact = configuredWorkspace();
-    const exactBlocker = exact.repo.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    try {
-      await run(exact);
-      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactBlocker.dispose();
-    }
-
-    const over = configuredWorkspace();
-    const overBlocker = over.repo.store.reserveMemory();
-    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    try {
-      await expect(run(over)).rejects.toMatchObject({ code: "E2BIG" });
-    } finally {
-      overBlocker.dispose();
-    }
-    expect(over.repo.store.memory.activeCount).toBe(0);
-    expect(over.repo.store.memory.totalBytes).toBe(0);
   });
 });

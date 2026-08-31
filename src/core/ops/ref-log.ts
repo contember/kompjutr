@@ -4,14 +4,12 @@ import type {
   RefLogActor,
   RefLogEntry,
   RefLogMetadata,
-  RefMutationMemoryOwner,
   RefLogReadOptions as StoreRefLogReadOptions,
 } from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError, ObjectNotFoundError, RefNotFoundError } from "../errors.js";
 import type { Person } from "../objects.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 
 export type RefLogReason =
   | "commit (initial)"
@@ -126,7 +124,6 @@ export function operationRefLogMetadata(
   repo: Repository,
   reason: RefLogReason,
   sources: OptionalRefLogIdentity = {},
-  memoryOwner?: RefMutationMemoryOwner,
 ): RefLogMetadata {
   const env = sources.env ?? {};
   let actor = validActor(sources.identity);
@@ -134,12 +131,8 @@ export function operationRefLogMetadata(
     name: env.GIT_COMMITTER_NAME ?? env.GIT_AUTHOR_NAME,
     email: env.GIT_COMMITTER_EMAIL ?? env.GIT_AUTHOR_EMAIL,
   });
-  actor ??= configuredIdentity(repo, memoryOwner);
+  actor ??= configuredIdentity(repo);
   actor ??= validActor(context.defaultIdentity);
-  if (actor !== null && memoryOwner !== undefined) {
-    if (!memoryOwner.owns(actor.name)) memoryOwner.retain(actor.name);
-    if (!memoryOwner.owns(actor.email)) memoryOwner.retain(actor.email);
-  }
   return stampedMetadata(context, actor, reason);
 }
 
@@ -175,35 +168,11 @@ function stampedMetadata(
   };
 }
 
-function configuredIdentity(
-  repo: Repository,
-  memoryOwner?: RefMutationMemoryOwner,
-): RefLogActor | null {
-  if (memoryOwner !== undefined) {
-    const name = repo.store.configGetBounded("user.name");
-    if (name !== undefined) memoryOwner.retain(name);
-    const email = repo.store.configGetBounded("user.email");
-    if (email !== undefined) memoryOwner.retain(email);
-    return validActor({ name, email });
-  }
-  const reservation = repo.store.reserveMemory();
-  let retained = 256;
-  reservation.set("other", retained);
-  try {
-    const name = repo.store.configGetBounded("user.name");
-    if (name !== undefined) {
-      retained += retainedStringBytes(name);
-      reservation.set("other", retained);
-    }
-    const email = repo.store.configGetBounded("user.email");
-    if (email !== undefined) {
-      retained += retainedStringBytes(email);
-      reservation.set("other", retained);
-    }
-    return validActor({ name, email });
-  } finally {
-    reservation.dispose();
-  }
+function configuredIdentity(repo: Repository): RefLogActor | null {
+  return validActor({
+    name: repo.store.configGetBounded("user.name"),
+    email: repo.store.configGetBounded("user.email"),
+  });
 }
 
 function validActor(

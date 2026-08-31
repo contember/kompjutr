@@ -13,7 +13,6 @@ import {
 import { encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { deflate } from "../src/core/zlib.js";
-import type { MemoryCoordinator } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { advanceMaintenanceReachability } from "../src/sqlite/maintenance/reachability.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
@@ -32,64 +31,6 @@ function open(db = new TestDatabase()) {
   const checkout = database.createRepository("/repo", "ref: refs/heads/main");
   const store = database.openCheckout(checkout);
   return { db, database, checkout, store };
-}
-
-class GuardedTreeEdgeDatabase implements SqlDatabase {
-  sawMetadataFirst = false;
-  sawPayloadProjection = false;
-
-  constructor(
-    readonly inner: TestDatabase,
-    readonly ordinal: number,
-    readonly field: "name" | "raw",
-  ) {}
-
-  run(query: string, ...bindings: unknown[]): void {
-    this.inner.run(query, ...bindings);
-  }
-
-  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
-    return this.inner.all<Row>(query, ...bindings);
-  }
-
-  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
-    return this.inner.one<Row>(query, ...bindings);
-  }
-
-  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
-    return this.inner.scalar<T>(query, ...bindings);
-  }
-
-  *iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
-    const metadata = query.includes("maintenance-tree-edge-metadata");
-    const payload = query.includes("maintenance-tree-edge-payloads");
-    if (metadata) {
-      this.sawMetadataFirst =
-        !query.includes("THEN name_bytes") && !query.includes("THEN raw_entry");
-      if (!this.sawMetadataFirst) throw new Error("tree edge metadata query projected a BLOB");
-    }
-    if (payload) {
-      this.sawPayloadProjection =
-        query.includes("CASE WHEN typeof(entry.name_bytes) = 'blob'") &&
-        query.includes("CASE WHEN typeof(entry.raw_entry) = 'blob'") &&
-        query.includes("length(entry.name_bytes) = expected.name_length") &&
-        query.includes("length(entry.raw_entry) = expected.raw_length");
-      if (!this.sawPayloadProjection) throw new Error("tree edge payload query was not guarded");
-    }
-    for (const row of this.inner.iterate(query, ...bindings)) {
-      if (!metadata || row.ordinal !== this.ordinal) {
-        yield row;
-      } else if (this.field === "name") {
-        yield { ...row, name_type: "blob", name_length: 101 * 1024 * 1024 };
-      } else {
-        yield { ...row, raw_type: "blob", raw_length: 101 * 1024 * 1024 };
-      }
-    }
-  }
-
-  transactionSync<T>(closure: () => T): T {
-    return this.inner.transactionSync(closure);
-  }
 }
 
 type ReachabilityFailure = "sql" | "source" | "parser" | "publication";
@@ -194,9 +135,7 @@ class FailingReachabilityDatabase implements SqlDatabase {
 }
 
 class ObservedReachabilityDatabase implements SqlDatabase {
-  memory: MemoryCoordinator | null = null;
   packedDataQueries = 0;
-  publicationReservedBytes = 0;
 
   constructor(readonly inner: TestDatabase) {}
 
@@ -218,27 +157,12 @@ class ObservedReachabilityDatabase implements SqlDatabase {
 
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
     if (query.includes("git_pack_data")) this.packedDataQueries++;
-    if (query.includes("maintenance-edge-targets")) {
-      this.publicationReservedBytes = Math.max(
-        this.publicationReservedBytes,
-        this.memory?.totalBytes ?? 0,
-      );
-    }
     return this.inner.iterate(query, ...bindings);
   }
 
   transactionSync<T>(closure: () => T): T {
     return this.inner.transactionSync(closure);
   }
-}
-
-function openGuardedTree(ordinal: number, field: "name" | "raw") {
-  const db = new TestDatabase();
-  const guarded = new GuardedTreeEdgeDatabase(db, ordinal, field);
-  const database = new SqliteGitDatabase(guarded, { objectCacheBytes: 16 * 1024 * 1024 });
-  const checkout = database.createRepository("/repo", "ref: refs/heads/main");
-  const store = database.openCheckout(checkout);
-  return { db, guarded, checkout, store };
 }
 
 function seedMark(
@@ -423,9 +347,7 @@ async function packedHeaderFixture(size = 2 * 1024 * 1024) {
 
   const reopened = new SqliteGitDatabase(observed, { objectCacheBytes: 0, chunkBytes: 0 });
   const shared = reopened.openCheckout(checkout.id).shared;
-  observed.memory = shared.memory;
   observed.packedDataQueries = 0;
-  observed.publicationReservedBytes = 0;
   return { db: inner, observed, checkout, shared, oid, bytes };
 }
 
@@ -563,33 +485,6 @@ describe("maintenance reachability", () => {
     ).toEqual({ expanded: 1, edge_cursor: 300 });
   });
 
-  it("rejects unowned current and lookahead tree BLOBs from metadata only", () => {
-    for (const fixture of [openGuardedTree(0, "name"), openGuardedTree(256, "raw")]) {
-      const blob = fixture.store.write("blob", utf8.encode("shared\n"));
-      const entries: { mode: string; name: string; oid: string }[] = [];
-      for (let index = 0; index < 257; index++) {
-        entries.push({
-          mode: MODE_FILE,
-          name: `guard-${String(index).padStart(3, "0")}`,
-          oid: blob,
-        });
-      }
-      const tree = fixture.store.write("tree", serializeTree(entries));
-      seedMark(fixture.db, fixture.checkout.repoId, [{ oid: tree }]);
-
-      expect(() => advanceMaintenanceReachability(fixture.store.shared)).toThrow();
-      expect(fixture.guarded.sawMetadataFirst).toBe(true);
-      expect(fixture.guarded.sawPayloadProjection).toBe(false);
-      expect(
-        fixture.db.scalar<number>(
-          "SELECT expanded FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
-          fixture.checkout.repoId,
-          tree,
-        ),
-      ).toBe(0);
-    }
-  });
-
   it("accepts the former tree-name excess and pre-admits its payload before reading it", () => {
     const fixture = () => {
       const { db, checkout, store } = open();
@@ -609,7 +504,6 @@ describe("maintenance reachability", () => {
       processedOid: current.tree,
       discoveredObjects: 1,
     });
-    current.shared.memory.assertIdle();
     expect(
       [...current.db.storage.histogram.keys()].some((query) => query.includes("WITH expected AS")),
     ).toBe(true);
@@ -693,8 +587,6 @@ describe("maintenance reachability", () => {
           tagOid,
         ),
       ).toBe(2);
-      expect(cold.shared.memory.highWaterBytes).toBeLessThan(2 * 1024 * 1024);
-      cold.shared.memory.assertIdle();
 
       const last = db.one<{ seq: number; data: unknown }>(
         `SELECT seq, data FROM git_object_chunks
@@ -732,7 +624,6 @@ describe("maintenance reachability", () => {
           commitOid,
         ),
       ).toBe(0);
-      cold.shared.memory.assertIdle();
 
       db.run(
         "UPDATE git_object_chunks SET data = ? WHERE repo_id = ? AND oid = ? AND seq = ?",
@@ -745,7 +636,6 @@ describe("maintenance reachability", () => {
         processedOid: commitOid,
         discoveredLogicalObjects: 1,
       });
-      cold.shared.memory.assertIdle();
 
       db.run("DELETE FROM git_maintenance_runs WHERE repo_id = ?", checkout.repoId);
       const malformedOid = installLargeLooseHeader(
@@ -769,20 +659,6 @@ describe("maintenance reachability", () => {
           malformedOid,
         ),
       ).toBe(0);
-      cold.shared.memory.assertIdle();
-    });
-
-    it("retains real packed output through publication", async () => {
-      const current = await packedHeaderFixture();
-
-      expect(advanceMaintenanceReachability(current.shared)).toMatchObject({
-        processedOid: current.oid,
-        discoveredLogicalObjects: 1,
-      });
-      expect(current.observed.publicationReservedBytes).toBeGreaterThanOrEqual(
-        current.bytes.length + 512 + 256,
-      );
-      current.shared.memory.assertIdle();
     });
 
     it("releases ownership and restarts after SQL, source, parser, and publication failures", () => {
@@ -820,7 +696,6 @@ describe("maintenance reachability", () => {
             root,
           ),
         ).toEqual({ expanded: 0, reachable_objects: 0, queued_objects: 1 });
-        store.shared.memory.assertIdle();
 
         expect(advanceMaintenanceReachability(store.shared)).toMatchObject({
           processedOid: root,
@@ -828,7 +703,6 @@ describe("maintenance reachability", () => {
         });
         expect(failing.activeHeaderIterators).toBe(0);
         expect(failing.closedHeaderIterators).toBeGreaterThan(0);
-        store.shared.memory.assertIdle();
       }
     });
 
@@ -854,7 +728,6 @@ describe("maintenance reachability", () => {
         expect(() => advanceMaintenanceReachability(size.store.shared)).toThrowError(
           expect.objectContaining({ code: "ECORRUPT" }),
         );
-        size.store.shared.memory.assertIdle();
 
         const ordinal = open();
         const ordinalTree = ordinal.store.write("tree", serializeTree([]));
@@ -874,7 +747,6 @@ describe("maintenance reachability", () => {
         expect([...ordinal.db.storage.histogram.keys()].join("\n")).not.toContain(
           "maintenance-loose-headers",
         );
-        ordinal.store.shared.memory.assertIdle();
       }
 
       const edge = open();
@@ -894,7 +766,6 @@ describe("maintenance reachability", () => {
       expect(() => advanceMaintenanceReachability(edge.store.shared)).toThrowError(
         expect.objectContaining({ code: "ECORRUPT" }),
       );
-      edge.store.shared.memory.assertIdle();
 
       for (const value of corruptValues) {
         const packed = await packedHeaderFixture(64 * 1024);
@@ -914,7 +785,6 @@ describe("maintenance reachability", () => {
           expect.objectContaining({ code: "ECORRUPT" }),
         );
         expect(packed.observed.packedDataQueries).toBe(0);
-        packed.shared.memory.assertIdle();
       }
     });
 
@@ -956,7 +826,6 @@ describe("maintenance reachability", () => {
           oid,
         ),
       ).toBe(0);
-      store.shared.memory.assertIdle();
     });
   });
 

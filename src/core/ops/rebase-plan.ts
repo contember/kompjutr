@@ -1,6 +1,5 @@
 // Pure selection of one bounded linear rebase sequence.
 
-import type { MemoryReservation } from "../../memory.js";
 import { isOid } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
 import { type Repository, walkIndexedOwned } from "../repository.js";
@@ -37,9 +36,7 @@ export interface RebasePlan {
   upstreamOid: string;
   baseOid: string;
   steps: readonly OperationStepMetadata[];
-  retainedBytes: number;
   graphCommits: number;
-  graphRetainedBytes: number;
 }
 
 interface ResolvedLimits {
@@ -100,9 +97,7 @@ function zeroStepPlan(
     upstreamOid,
     baseOid,
     steps: [],
-    retainedBytes: 0,
     graphCommits: selection.commits,
-    graphRetainedBytes: selection.retainedBytes,
   };
 }
 
@@ -126,13 +121,12 @@ function selectSteps(
   currentOid: string,
   baseOid: string,
   limits: ResolvedLimits,
-  reservation: MemoryReservation,
-): { steps: readonly OperationStepMetadata[]; retainedBytes: number } {
+): readonly OperationStepMetadata[] {
   const newestFirst: OperationStepMetadata[] = [];
   let retainedBytes = 0;
   let oid = currentOid;
   let foundBase = false;
-  for (const entry of walkIndexedOwned(repo, currentOid, reservation, limits.graph)) {
+  for (const entry of walkIndexedOwned(repo, currentOid, limits.graph)) {
     if (entry.oid !== oid) {
       throw new CorruptError("rebase linear walk diverged from the selected parent chain");
     }
@@ -154,7 +148,6 @@ function selectSteps(
     if (nextRetainedBytes > limits.maxRetainedBytes) {
       throw new GitError("E2BIG", `rebase plan exceeds ${limits.maxRetainedBytes} retained bytes`);
     }
-    reservation.set("other", nextRetainedBytes);
     const step: OperationStepMetadata = {
       sourceOid: oid,
       selectedParentOid,
@@ -162,65 +155,45 @@ function selectSteps(
       outcome: "pending",
       resultOid: null,
     };
-    if (validateOperationStepMetadata(step) !== PENDING_REBASE_STEP_BYTES) {
-      throw new CorruptError("rebase pending step accounting is inconsistent");
-    }
+    validateOperationStepMetadata(step);
     newestFirst.push(step);
     retainedBytes = nextRetainedBytes;
     oid = selectedParentOid;
   }
   if (!foundBase) throw new CorruptError("rebase linear walk did not reach the selected base");
   newestFirst.reverse();
-  return { steps: newestFirst, retainedBytes };
+  return newestFirst;
 }
 
 /** Resolve an upstream and select the commits a non-interactive rebase would replay. */
-export function planRebase(
-  repo: Repository,
-  input: RebasePlanInput,
-  owningReservation?: MemoryReservation,
-): RebasePlan {
-  if (owningReservation !== undefined && !repo.store.ownsMemoryReservation(owningReservation)) {
-    throw new GitError("EINVAL", "rebase plan reservation belongs to another repository");
+export function planRebase(repo: Repository, input: RebasePlanInput): RebasePlan {
+  const limits = resolveLimits(input.limits);
+  if (!isOid(input.currentOid)) {
+    throw new GitError("EINVAL", "rebase current commit must be a full object id");
   }
-  const reservation = owningReservation?.scope() ?? repo.store.reserveMemory();
-  let succeeded = false;
-  try {
-    const limits = resolveLimits(input.limits);
-    if (!isOid(input.currentOid)) {
-      throw new GitError("EINVAL", "rebase current commit must be a full object id");
-    }
-    const upstreamOid = resolveBoundedCommitRevision(repo, input.upstream, {
-      input: "rebase upstream",
-      operation: "rebase",
-    });
-    const selection = selectMergeBases(repo, {
-      currentOid: input.currentOid,
-      incomingOid: upstreamOid,
-      limits: limits.graph,
-    });
-    const baseOid = requireUniqueBase(selection);
-    if (selection.kind === "already-merged") {
-      succeeded = true;
-      return zeroStepPlan("up-to-date", input.currentOid, upstreamOid, baseOid, selection);
-    }
-    if (selection.kind === "fast-forward") {
-      succeeded = true;
-      return zeroStepPlan("fast-forward", input.currentOid, upstreamOid, baseOid, selection);
-    }
-    const sequence = selectSteps(repo, input.currentOid, baseOid, limits, reservation);
-    succeeded = true;
-    return {
-      relation: "replay",
-      originalHeadOid: input.currentOid,
-      upstreamOid,
-      baseOid,
-      steps: sequence.steps,
-      retainedBytes: sequence.retainedBytes,
-      graphCommits: selection.commits,
-      graphRetainedBytes: selection.retainedBytes,
-    };
-  } finally {
-    if (!succeeded || owningReservation === undefined) reservation.dispose();
+  const upstreamOid = resolveBoundedCommitRevision(repo, input.upstream, {
+    input: "rebase upstream",
+    operation: "rebase",
+  });
+  const selection = selectMergeBases(repo, {
+    currentOid: input.currentOid,
+    incomingOid: upstreamOid,
+    limits: limits.graph,
+  });
+  const baseOid = requireUniqueBase(selection);
+  if (selection.kind === "already-merged") {
+    return zeroStepPlan("up-to-date", input.currentOid, upstreamOid, baseOid, selection);
   }
+  if (selection.kind === "fast-forward") {
+    return zeroStepPlan("fast-forward", input.currentOid, upstreamOid, baseOid, selection);
+  }
+  const steps = selectSteps(repo, input.currentOid, baseOid, limits);
+  return {
+    relation: "replay",
+    originalHeadOid: input.currentOid,
+    upstreamOid,
+    baseOid,
+    steps,
+    graphCommits: selection.commits,
+  };
 }

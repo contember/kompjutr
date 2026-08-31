@@ -1,13 +1,13 @@
 import { fromHex, isOid } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
 import { decodeTreeName } from "../core/objects.js";
-import type { MemoryReservation } from "../memory.js";
 import type { SqlDatabase } from "./db.js";
 import { TREE_QUEUE_ROW_FIXED_BYTES } from "./schema.js";
 
 const TREE_WALK_QUEUE_BYTES = 16 * 1024 * 1024;
-const TREE_WALK_ROW_BYTES = 256;
-const TREE_WALK_PATH_LIVE_FACTOR = 9;
+// Caller-unbounded traversal state must fail before the recursive CTE expands it.
+export const TREE_WALK_PATH_BYTES = 7_456_512;
+export const TREE_WALK_STATE_BYTES = 64 * 1024 * 1024;
 
 export interface WalkTreeEntry {
   path: string;
@@ -28,51 +28,24 @@ export interface WalkTreeDiffObject {
   type: "tree" | "blob";
 }
 
-function validateTraversalPath(
-  row: Record<string, unknown>,
-  label: string,
-  reservation: MemoryReservation,
-): number {
+function validateTraversalPath(row: Record<string, unknown>, label: string): void {
   const rawPath = row.raw_path;
   if (rawPath === null) {
-    reservation.set("other", TREE_WALK_ROW_BYTES);
     if (row.error === null) throw new CorruptError(`${label} yielded no raw path`);
-    return TREE_WALK_ROW_BYTES;
+    return;
   }
   if (typeof rawPath !== "string" || rawPath.length % 2 !== 0 || /[^0-9A-F]/.test(rawPath)) {
     throw new CorruptError(`${label} yielded an invalid raw path`);
   }
   const stateBytes = row.state_bytes;
   if (typeof stateBytes !== "number" || !Number.isSafeInteger(stateBytes) || stateBytes < 0) {
-    throw new CorruptError(`${label} yielded invalid traversal state memory`);
+    throw new CorruptError(`${label} yielded an invalid traversal state size`);
   }
-  const pathUnits = typeof row.path === "string" ? row.path.length : 0;
-  const peakBytes = TREE_WALK_ROW_BYTES + rawPath.length * 2 + rawPath.length / 2 + pathUnits * 4;
-  if (!Number.isSafeInteger(peakBytes)) {
-    throw new GitError("E2BIG", `${label} row memory accounting overflows`);
-  }
-  reservation.set("other", Math.max(peakBytes, stateBytes));
   const rawBytes = fromHex(rawPath);
   const path = decodeTreeName(rawBytes);
   if (typeof row.path !== "string" || row.path !== path) {
     throw new CorruptError(`${label} path does not match its authoritative bytes`);
   }
-  return Math.max(TREE_WALK_ROW_BYTES + rawPath.length * 2 + pathUnits * 2, stateBytes);
-}
-
-function traversalMemory(reservation: MemoryReservation): {
-  pathBytes: number;
-  stateBytes: number;
-} {
-  if (reservation.remainingBytes <= TREE_WALK_ROW_BYTES) {
-    return { pathBytes: 0, stateBytes: 0 };
-  }
-  return {
-    pathBytes: Math.floor(
-      (reservation.remainingBytes - TREE_WALK_ROW_BYTES) / TREE_WALK_PATH_LIVE_FACTOR,
-    ),
-    stateBytes: reservation.remainingBytes,
-  };
 }
 
 function throwTraversalError(row: Record<string, unknown>, label: string): void {
@@ -207,7 +180,7 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
                THEN 'tree queue metadata is inconsistent'
              WHEN length(e.name_bytes) > p.path_cap
                OR length(CAST(e.name AS BLOB)) > p.path_cap
-               THEN 'tree traversal row exceeds the operation memory headroom'
+               THEN 'tree traversal row exceeds its fixed state capacity'
              WHEN e.mode NOT IN ('40000', '040000', '100644', '100755', '120000', '160000')
                THEN 'tree entry has an invalid mode'
              WHEN length(e.name_bytes) = 0 OR instr(CAST(e.name_bytes AS TEXT), '/') != 0
@@ -228,7 +201,7 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
                OR lower(hex(substr(e.raw_entry, -20))) != e.oid
                THEN 'tree entry integrity check failed'
              WHEN length(e.name_bytes) + 41 + 8 > p.state_cap
-               THEN 'tree traversal row exceeds the operation memory headroom'
+               THEN 'tree traversal row exceeds its fixed state capacity'
              ELSE NULL
            END,
            CASE WHEN length(e.name_bytes) > p.path_cap
@@ -316,7 +289,7 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
                THEN 'tree queue metadata is inconsistent'
              WHEN length(e.name_bytes) > p.path_cap
                OR length(CAST(e.name AS BLOB)) > p.path_cap
-               THEN 'tree traversal row exceeds the operation memory headroom'
+               THEN 'tree traversal row exceeds its fixed state capacity'
              WHEN e.mode NOT IN ('40000', '040000', '100644', '100755', '120000', '160000')
                THEN 'tree entry has an invalid mode'
              WHEN length(e.name_bytes) = 0 OR instr(CAST(e.name_bytes AS TEXT), '/') != 0
@@ -337,9 +310,9 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
                OR lower(hex(substr(e.raw_entry, -20))) != e.oid
                THEN 'tree entry integrity check failed'
              WHEN w.path_bytes + 1 + length(e.name_bytes) > p.path_cap
-               THEN 'tree traversal row exceeds the operation memory headroom'
+               THEN 'tree traversal row exceeds its fixed state capacity'
              WHEN w.state_bytes + 1 + length(e.name_bytes) + 41 + 8 > p.state_cap
-               THEN 'tree traversal row exceeds the operation memory headroom'
+               THEN 'tree traversal row exceeds its fixed state capacity'
              ELSE NULL
            END,
            CASE WHEN w.path_bytes + 1 + length(e.name_bytes) > p.path_cap
@@ -472,7 +445,7 @@ function diffEntryErrorSql(entry: string, previous: string, source: string): str
       THEN 'tree queue metadata is inconsistent'
     WHEN length(${entry}.name_bytes) > p.path_cap
       OR length(CAST(CAST(${entry}.name_bytes AS TEXT) AS BLOB)) > p.path_cap
-      THEN 'tree traversal row exceeds the operation memory headroom'
+      THEN 'tree traversal row exceeds its fixed state capacity'
     WHEN ${entry}.mode NOT IN ('40000', '040000', '100644', '100755', '120000', '160000')
       THEN 'tree entry has an invalid mode'
     WHEN length(${entry}.name_bytes) = 0
@@ -648,10 +621,10 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                   ELSE ${diffEntryErrorSql("ae", "ap", "aps")} END,
              CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
                                 + length(be.name_bytes) > p.path_cap
-                    THEN 'tree traversal row exceeds the operation memory headroom'
+                    THEN 'tree traversal row exceeds its fixed state capacity'
                   WHEN w.state_bytes + 2 * (CASE WHEN w.path = '' THEN 0 ELSE 1 END
                                 + length(be.name_bytes)) + 100 > p.state_cap
-                    THEN 'tree traversal row exceeds the operation memory headroom'
+                    THEN 'tree traversal row exceeds its fixed state capacity'
                   WHEN be.mode IN ('40000', '040000')
                        AND instr(CASE WHEN w.path = '' THEN w.before_ancestry
                                       ELSE w.before_ancestry || w.before_oid || '/' END,
@@ -738,10 +711,10 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
            COALESCE(${diffEntryErrorSql("ae", "ap", "aps")},
              CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
                                 + length(ae.name_bytes) > p.path_cap
-                    THEN 'tree traversal row exceeds the operation memory headroom'
+                    THEN 'tree traversal row exceeds its fixed state capacity'
                   WHEN w.state_bytes + 2 * (CASE WHEN w.path = '' THEN 0 ELSE 1 END
                                 + length(ae.name_bytes)) + 55 > p.state_cap
-                    THEN 'tree traversal row exceeds the operation memory headroom'
+                    THEN 'tree traversal row exceeds its fixed state capacity'
                   WHEN ae.mode IN ('40000', '040000')
                        AND instr(CASE WHEN w.path = '' THEN w.after_ancestry
                                       ELSE w.after_ancestry || w.after_oid || '/' END,
@@ -812,20 +785,17 @@ export function* iterateTree(
   db: SqlDatabase,
   repoId: number,
   treeOid: string,
-  reservation: MemoryReservation,
 ): Generator<WalkTreeEntry> {
-  const memory = traversalMemory(reservation);
   for (const row of db.iterate(
     WALK_TREE_SQL,
     repoId,
     treeOid,
-    memory.pathBytes,
-    memory.stateBytes,
+    TREE_WALK_PATH_BYTES,
+    TREE_WALK_STATE_BYTES,
     TREE_WALK_QUEUE_BYTES,
     TREE_QUEUE_ROW_FIXED_BYTES,
   )) {
-    const retainedBytes = validateTraversalPath(row, "tree traversal", reservation);
-    reservation.set("other", retainedBytes);
+    validateTraversalPath(row, "tree traversal");
     throwTraversalError(row, "tree traversal");
     const path = row.path;
     const mode = row.mode;
@@ -849,24 +819,21 @@ export function* iterateTreeDiffObjects(
   repoId: number,
   beforeTreeOid: string | null,
   afterTreeOid: string,
-  reservation: MemoryReservation,
 ): Generator<WalkTreeDiffObject> {
   if (beforeTreeOid === afterTreeOid) return;
   let pendingRoot: WalkTreeDiffObject | null = null;
-  const memory = traversalMemory(reservation);
   for (const row of db.iterate(
     WALK_TREE_DIFF_SQL,
     repoId,
     beforeTreeOid,
     afterTreeOid,
-    memory.pathBytes,
-    memory.stateBytes,
+    TREE_WALK_PATH_BYTES,
+    TREE_WALK_STATE_BYTES,
     TREE_WALK_QUEUE_BYTES,
     TREE_QUEUE_ROW_FIXED_BYTES,
     1,
   )) {
-    const retainedBytes = validateTraversalPath(row, "tree diff object traversal", reservation);
-    reservation.set("other", retainedBytes);
+    validateTraversalPath(row, "tree diff object traversal");
     throwTraversalError(row, "tree diff object traversal");
     validateDiffProjection(row, "tree diff object traversal");
     const path = row.path;
@@ -907,23 +874,20 @@ export function* iterateTreeDiff(
   repoId: number,
   beforeTreeOid: string | null,
   afterTreeOid: string | null,
-  reservation: MemoryReservation,
 ): Generator<WalkTreeDiffEntry> {
   if (beforeTreeOid === afterTreeOid) return;
-  const memory = traversalMemory(reservation);
   for (const row of db.iterate(
     WALK_TREE_DIFF_SQL,
     repoId,
     beforeTreeOid,
     afterTreeOid,
-    memory.pathBytes,
-    memory.stateBytes,
+    TREE_WALK_PATH_BYTES,
+    TREE_WALK_STATE_BYTES,
     TREE_WALK_QUEUE_BYTES,
     TREE_QUEUE_ROW_FIXED_BYTES,
     0,
   )) {
-    const retainedBytes = validateTraversalPath(row, "tree diff traversal", reservation);
-    reservation.set("other", retainedBytes);
+    validateTraversalPath(row, "tree diff traversal");
     throwTraversalError(row, "tree diff traversal");
     validateDiffProjection(row, "tree diff traversal");
     const path = row.path;

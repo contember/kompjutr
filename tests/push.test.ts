@@ -2,9 +2,7 @@ import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
-import { openRepository } from "../src/core/context.js";
 import { createGit, type Git, type PushRefspec } from "../src/git/client.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -359,7 +357,7 @@ describe("push", () => {
     }
   });
 
-  it("keeps one 1,024-command public push inside aggregate budgets", async () => {
+  it("keeps one 1,024-command public push inside structural limits", async () => {
     const fixture = remoteFixture();
     const remoteOid = fixture.git("rev-parse", "refs/heads/main");
     const destinations = Array.from(
@@ -383,9 +381,6 @@ describe("push", () => {
       });
       await git.init({});
       await git.remoteAdd({ name: "origin", url: server.url });
-      const memory = openRepository(workspace.context, "/").store.memory;
-      memory.assertIdle();
-      const highWaterBefore = memory.highWaterBytes;
       const first = destinations[0];
       if (first === undefined) throw new Error("bulk push fixture is empty");
       const refspecs: [PushRefspec, ...PushRefspec[]] = [
@@ -407,9 +402,6 @@ describe("push", () => {
       expect(result.refs.every((status) => status.ok && status.error === null)).toBe(true);
       expect(result.tracking).toEqual({ outcome: "not-applicable" });
       expect(workspace.storage.statementCount).toBeLessThan(1_000);
-      expect(memory.highWaterBytes).toBeGreaterThan(highWaterBefore);
-      expect(memory.highWaterBytes).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
-      memory.assertIdle();
       expect(server.requests.slice(requestsBefore).map((request) => request.method)).toEqual([
         "GET",
         "GET",

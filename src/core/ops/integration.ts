@@ -1,17 +1,10 @@
 // Pure content resolution for a bounded three-tree integration plan.
 
-import type { MemoryReservation } from "../../memory.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../../sqlite/store.js";
-import {
-  DEFAULT_TEXT_MERGE_LIMITS,
-  estimateTextMergeMemory,
-  mergeText,
-  type TextMergeOptions,
-} from "../diff/xmerge.js";
+import { DEFAULT_TEXT_MERGE_LIMITS, mergeText, type TextMergeOptions } from "../diff/xmerge.js";
 import { CorruptError, GitError } from "../errors.js";
 import { hashObject, MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../objects.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import { comparePaths } from "../streams.js";
 import {
   type ConflictStructuralEntry,
@@ -27,12 +20,7 @@ import { treeStream } from "./tree-stream.js";
 export const MAX_INTEGRATION_SOURCE_ROWS = 200_000;
 export const MAX_INTEGRATION_PLAN_ENTRIES = 1_000;
 
-const FIXED_CALLER_BYTES = 16 * 1024;
 const INTEGRATION_ENTRY_BYTES = 512;
-const ID_VECTOR_ENTRY_BYTES = 192;
-const BLOB_MAP_ENTRY_BYTES = 128;
-const BLOB_READ_FIXED_BYTES = 640;
-const BLOB_READ_ENTRY_BYTES = 640;
 const BLOB_READ_PAGE = 4_096;
 const EMPTY_BLOB = new Uint8Array();
 const BASE_CONFLICT_MARKER_SIZE = 7;
@@ -66,17 +54,6 @@ export interface IntegrationPlan {
   /** A Git-path-ordered delta relative to the current tree. */
   entries: readonly IntegrationEntry[];
   sourceRows: number;
-  /** Conservative bytes the caller must reserve while retaining this plan. */
-  retainedBytes: number;
-  memoryHighWaterBytes: number;
-  /** Present on plans produced by the native planner. */
-  readonly reservation?: MemoryReservation;
-  release?(): void;
-}
-
-export interface OwnedIntegrationPlan extends IntegrationPlan {
-  readonly reservation: MemoryReservation;
-  release(): void;
 }
 
 export interface IntegrationLimits {
@@ -92,10 +69,6 @@ export interface IntegrationInput {
   incomingTreeOid: string | null;
   text?: TextMergeOptions;
   limits?: IntegrationLimits;
-  /** Existing operation owner whose child retains the returned plan. */
-  reservation?: MemoryReservation;
-  /** Caller-owned bytes that remain live for the full planning call. */
-  callerRetainedBytes?: number;
 }
 
 export interface VirtualAncestorIntegrationInput extends IntegrationInput {
@@ -135,18 +108,9 @@ class CollisionTrieNode {
 class RelocationAllocator {
   readonly #root = new CollisionTrieNode();
   readonly #namespaces = new Map<string, CollisionNamespace>();
-  #retainedBytes = 256;
 
-  constructor(
-    requests: readonly RelocationRequest[],
-    private readonly reservation: MemoryReservation,
-  ) {
-    this.reservation.set("other", this.#retainedBytes);
+  constructor(requests: readonly RelocationRequest[]) {
     for (const request of requests) this.#add(request.desired);
-  }
-
-  get retainedBytes(): number {
-    return this.#retainedBytes;
   }
 
   observe(path: string): void {
@@ -157,7 +121,6 @@ class RelocationAllocator {
         const suffix = path.slice(index);
         const ordinal = collisionOrdinal(suffix);
         if (ordinal !== null && !namespace.occupied.has(ordinal)) {
-          this.#retain(64);
           namespace.occupied.add(ordinal);
         }
       }
@@ -194,14 +157,12 @@ class RelocationAllocator {
   #add(desired: string): void {
     if (this.#namespaces.has(desired)) return;
     const namespace: CollisionNamespace = { occupied: new Set(), blockedByAncestor: false };
-    this.#retain(256 + desired.length * 2);
     this.#namespaces.set(desired, namespace);
     let node = this.#root;
     for (let index = 0; index < desired.length; index++) {
       const unit = desired[index]!;
       let next = node.children.get(unit);
       if (next === undefined) {
-        this.#retain(128);
         next = new CollisionTrieNode();
         node.children.set(unit, next);
       }
@@ -218,11 +179,6 @@ class RelocationAllocator {
       if (node.namespace !== null) node.namespace.blockedByAncestor = true;
       for (const child of node.children.values()) pending.push(child);
     }
-  }
-
-  #retain(bytes: number): void {
-    this.#retainedBytes += bytes;
-    this.reservation.set("other", this.#retainedBytes);
   }
 }
 
@@ -343,28 +299,22 @@ function allocateRelocations(
   input: VirtualAncestorIntegrationInput,
   requests: readonly RelocationRequest[],
   limits: ResolvedIntegrationLimits,
-  reservation: MemoryReservation,
-): { names: Map<string, string>; retainedBytes: number } {
-  if (requests.length === 0) return { names: new Map(), retainedBytes: 0 };
-  const memory = reservation.scope();
-  try {
-    const allocator = new RelocationAllocator(requests, memory);
-    let rows = 0;
-    for (const treeOid of [input.currentTreeOid, input.incomingTreeOid]) {
-      for (const entry of treeStream(repo, treeOid)) {
-        if (rows >= limits.maxSourceRows * 2) {
-          throw new GitError("E2BIG", "virtual relocation scan exceeds its source row limit");
-        }
-        rows++;
-        allocator.observe(entry.path);
+): Map<string, string> {
+  if (requests.length === 0) return new Map();
+  const allocator = new RelocationAllocator(requests);
+  let rows = 0;
+  for (const treeOid of [input.currentTreeOid, input.incomingTreeOid]) {
+    for (const entry of treeStream(repo, treeOid)) {
+      if (rows >= limits.maxSourceRows * 2) {
+        throw new GitError("E2BIG", "virtual relocation scan exceeds its source row limit");
       }
+      rows++;
+      allocator.observe(entry.path);
     }
-    const names = new Map<string, string>();
-    for (const request of requests) names.set(request.key, allocator.allocate(request.desired));
-    return { names, retainedBytes: allocator.retainedBytes };
-  } finally {
-    memory.dispose();
   }
+  const names = new Map<string, string>();
+  for (const request of requests) names.set(request.key, allocator.allocate(request.desired));
+  return names;
 }
 
 interface ResolvedIntegrationLimits {
@@ -504,18 +454,6 @@ function candidateOids(entry: ContentCandidate): readonly string[] {
     : [entry.base.oid, entry.current.oid, entry.incoming.oid];
 }
 
-function callerRetainedBytes(
-  staticBytes: number,
-  resolvedBytes: number,
-  loaded: ReadonlyMap<string, Uint8Array>,
-): number {
-  let bytes = checkedAdd(staticBytes, resolvedBytes, "caller state");
-  for (const blob of loaded.values()) {
-    bytes = checkedAdd(bytes, BLOB_MAP_ENTRY_BYTES + blob.length, "caller state");
-  }
-  return bytes;
-}
-
 function validateBlobBatch(
   requested: readonly string[],
   blobs: ReadonlyMap<string, Uint8Array>,
@@ -593,61 +531,6 @@ function virtualAddAddCandidate(entry: ConflictStructuralEntry): ContentCandidat
   };
 }
 
-function planningCollectionsAdmissionBytes(
-  entries: readonly StructuralIntegrationEntry[],
-  virtualLabels: { current: string; incoming: string } | null,
-): number {
-  let candidateCount = 0;
-  for (const entry of entries) {
-    if (entry.kind === "content") {
-      candidateCount++;
-      continue;
-    }
-    if (virtualLabels !== null && entry.kind === "conflict") {
-      const current = entry.stages.current;
-      const incoming = entry.stages.incoming;
-      if (
-        entry.conflict === "add/add" &&
-        current !== null &&
-        incoming !== null &&
-        isRegularMode(current.mode) &&
-        isRegularMode(incoming.mode)
-      ) {
-        candidateCount++;
-      }
-    }
-  }
-  let bytes = checkedAdd(
-    FIXED_CALLER_BYTES,
-    (entries.length + candidateCount * 10) * ID_VECTOR_ENTRY_BYTES,
-    "planning collections",
-  );
-  if (virtualLabels === null) return bytes;
-  visitRelocationRequests(entries, virtualLabels, (path, side, label) => {
-    const keyBytes = pathUnitsBytes(path.length + 1 + side.length);
-    const desiredBytes = pathUnitsBytes(path.length + 1 + label.length);
-    bytes = checkedAdd(
-      bytes,
-      checkedAdd(
-        INTEGRATION_ENTRY_BYTES,
-        checkedAdd(keyBytes, desiredBytes, "virtual relocation"),
-        "virtual relocation",
-      ),
-      "planning collections",
-    );
-    bytes = checkedAdd(
-      bytes,
-      checkedAdd(
-        ID_VECTOR_ENTRY_BYTES,
-        checkedAdd(desiredBytes, 8, "virtual relocation suffix"),
-        "virtual relocation map",
-      ),
-      "planning collections",
-    );
-  });
-  return bytes;
-}
-
 function cleanIdentity(
   path: string,
   before: IntegrationIdentity | null,
@@ -715,8 +598,6 @@ function resolveContentCandidate(
   entry: ContentCandidate,
   loaded: ReadonlyMap<string, Uint8Array>,
   text: TextMergeOptions,
-  reservation: MemoryReservation,
-  retainedBytes: number,
   maxContentBytes: number,
   virtualAncestor: boolean,
 ): IntegrationEntry {
@@ -727,9 +608,6 @@ function resolveContentCandidate(
     throw new CorruptError("integration blob batch omitted a required candidate object");
   }
   const boundedText = boundTextOutput(text, maxContentBytes);
-  const memory = estimateTextMergeMemory(base, current, incoming, boundedText);
-  const transientBytes = memory.peakBytes - memory.inputBytes;
-  reservation.set("other", checkedAdd(retainedBytes, transientBytes, "memory"));
   const merged = mergeText(base, current, incoming, boundedText);
   const stages = entry.stages;
   if (merged.kind === "binary") {
@@ -794,7 +672,7 @@ function resolveContentCandidate(
 }
 
 /** Build a deterministic integration delta without mutating repository state. */
-export function planIntegration(repo: Repository, input: IntegrationInput): OwnedIntegrationPlan {
+export function planIntegration(repo: Repository, input: IntegrationInput): IntegrationPlan {
   return planIntegrationInternal(repo, input, null, undefined);
 }
 
@@ -802,7 +680,7 @@ export function planIntegration(repo: Repository, input: IntegrationInput): Owne
 export function planVirtualAncestorIntegration(
   repo: Repository,
   input: VirtualAncestorIntegrationInput,
-): OwnedIntegrationPlan {
+): IntegrationPlan {
   return planIntegrationInternal(repo, input, input.labels, input.depth);
 }
 
@@ -811,290 +689,166 @@ function planIntegrationInternal(
   input: IntegrationInput,
   virtualLabels: { current: string; incoming: string } | null,
   virtualDepth: number | undefined,
-): OwnedIntegrationPlan {
-  if (input.reservation !== undefined && !repo.store.ownsMemoryReservation(input.reservation)) {
-    throw new GitError("EINVAL", "integration reservation belongs to another repository");
-  }
-  const reservation = input.reservation?.scope() ?? repo.store.reserveMemory();
-  let succeeded = false;
-  try {
-    const callerBytes = optionalLimit(input.callerRetainedBytes, "caller retained byte") ?? 0;
-    if (callerBytes > 0) {
-      const callerMemory = reservation.scope();
-      callerMemory.set("other", callerBytes);
+): IntegrationPlan {
+  const limits = resolveLimits(input.limits);
+  let text = input.text ?? {};
+  if (virtualLabels !== null) {
+    validateVirtualLabel(virtualLabels.current, "current");
+    validateVirtualLabel(virtualLabels.incoming, "incoming");
+    const markerSize = virtualMarkerSize(virtualDepth);
+    if (input.text?.markerSize !== undefined && input.text.markerSize !== markerSize) {
+      throw new GitError("EINVAL", "virtual integration marker size does not match its depth");
     }
-    const limits = resolveLimits(input.limits);
-    const labelMemory = reservation.scope();
-    let text = input.text ?? {};
-    if (virtualLabels !== null) {
-      validateVirtualLabel(virtualLabels.current, "current");
-      validateVirtualLabel(virtualLabels.incoming, "incoming");
-      labelMemory.set(
-        "other",
-        checkedAdd(
-          256,
-          checkedAdd(
-            retainedStringBytes(virtualLabels.current),
-            retainedStringBytes(virtualLabels.incoming),
-            "virtual labels",
-          ),
-          "virtual labels",
-        ),
-      );
-      const markerSize = virtualMarkerSize(virtualDepth);
-      if (input.text?.markerSize !== undefined && input.text.markerSize !== markerSize) {
-        throw new GitError("EINVAL", "virtual integration marker size does not match its depth");
-      }
-      text = {
-        ...input.text,
-        labels: {
-          ...input.text?.labels,
-          current: virtualLabels.current,
-          incoming: virtualLabels.incoming,
-        },
-        markerSize,
-      };
-    }
-    const structureMemory = reservation.scope();
-    const structure = classifyIntegrationStructure(repo, {
-      baseTreeOid: input.baseTreeOid,
-      currentTreeOid: input.currentTreeOid,
-      incomingTreeOid: input.incomingTreeOid,
-      limits: {
-        maxRows: limits.maxSourceRows,
-        maxEntries: limits.maxEntries,
-        ...(limits.maxStructureBytes === undefined
-          ? {}
-          : { maxRetainedBytes: limits.maxStructureBytes }),
+    text = {
+      ...input.text,
+      labels: {
+        ...input.text?.labels,
+        current: virtualLabels.current,
+        incoming: virtualLabels.incoming,
       },
-      reservation: structureMemory,
-    });
-    const stateMemory = reservation.scope();
-    stateMemory.set("other", planningCollectionsAdmissionBytes(structure.entries, virtualLabels));
-    const candidates: ContentCandidate[] = [];
-    for (const entry of structure.entries) {
-      if (entry.kind === "content") {
-        candidates.push(ordinaryContentCandidate(entry));
-        continue;
-      }
-      if (entry.kind === "conflict") {
-        const candidate = virtualAddAddCandidate(entry);
-        if (candidate !== null) candidates.push(candidate);
-      }
+      markerSize,
+    };
+  }
+  const structure = classifyIntegrationStructure(repo, {
+    baseTreeOid: input.baseTreeOid,
+    currentTreeOid: input.currentTreeOid,
+    incomingTreeOid: input.incomingTreeOid,
+    limits: {
+      maxRows: limits.maxSourceRows,
+      maxEntries: limits.maxEntries,
+      ...(limits.maxStructureBytes === undefined
+        ? {}
+        : { maxRetainedBytes: limits.maxStructureBytes }),
+    },
+  });
+  const candidates: ContentCandidate[] = [];
+  for (const entry of structure.entries) {
+    if (entry.kind === "content") {
+      candidates.push(ordinaryContentCandidate(entry));
+      continue;
     }
-    const candidatePaths = new Set(candidates.map((candidate) => candidate.path));
-    const relocationList =
-      virtualLabels === null ? [] : relocationRequests(structure.entries, virtualLabels);
-    const relocations =
-      virtualLabels === null
-        ? { names: new Map<string, string>(), retainedBytes: 0 }
-        : allocateRelocations(
-            repo,
-            { ...input, labels: virtualLabels },
-            relocationList,
-            limits,
-            reservation,
-          );
-    const relocationByKey = new Map(relocationList.map((request) => [request.key, request]));
-    const requestedOids = stableIdentityVector(candidates);
-    const remainingUses = identityUseCounts(candidates);
-    let staticBytes = FIXED_CALLER_BYTES;
-    staticBytes = checkedAdd(
-      staticBytes,
-      (structure.entries.length + candidates.length + requestedOids.length * 3) *
-        ID_VECTOR_ENTRY_BYTES,
-      "identity vectors",
-    );
-    for (const request of relocationList) {
-      const allocated = relocations.names.get(request.key);
-      if (allocated === undefined) throw new CorruptError("virtual relocation path is missing");
-      staticBytes = checkedAdd(
-        staticBytes,
-        checkedAdd(
-          INTEGRATION_ENTRY_BYTES,
-          checkedAdd(pathBytes(request.key), pathBytes(request.desired), "virtual relocation"),
-          "virtual relocation",
-        ),
-        "virtual relocations",
-      );
-      staticBytes = checkedAdd(
-        staticBytes,
-        checkedAdd(ID_VECTOR_ENTRY_BYTES, pathBytes(allocated), "virtual relocation map"),
-        "virtual relocation map",
-      );
+    if (entry.kind === "conflict") {
+      const candidate = virtualAddAddCandidate(entry);
+      if (candidate !== null) candidates.push(candidate);
+    }
+  }
+  const candidatePaths = new Set(candidates.map((candidate) => candidate.path));
+  const relocationList =
+    virtualLabels === null ? [] : relocationRequests(structure.entries, virtualLabels);
+  const relocations =
+    virtualLabels === null
+      ? new Map<string, string>()
+      : allocateRelocations(repo, { ...input, labels: virtualLabels }, relocationList, limits);
+  const relocationByKey = new Map(relocationList.map((request) => [request.key, request]));
+  const requestedOids = stableIdentityVector(candidates);
+  const remainingUses = identityUseCounts(candidates);
+  for (const request of relocationList) {
+    const allocated = relocations.get(request.key);
+    if (allocated === undefined) throw new CorruptError("virtual relocation path is missing");
+  }
+
+  const resolved = new Map<string, IntegrationEntry>();
+  const loaded = new Map<string, Uint8Array>();
+  const staticEntries: IntegrationEntry[] = [];
+  let passthroughBytes = 0;
+  for (const entry of structure.entries) {
+    if (candidatePaths.has(entry.path)) continue;
+    const entries =
+      virtualLabels !== null && entry.kind === "conflict"
+        ? collapseVirtualConflict(entry, relocationByKey, relocations)
+        : [passThroughEntry(entry)];
+    for (const planned of entries) {
+      staticEntries.push(planned);
+      passthroughBytes = checkedAdd(passthroughBytes, integrationEntryBytes(planned), "plan");
+    }
+  }
+  if (staticEntries.length + candidates.length > limits.maxEntries) {
+    throw new GitError("E2BIG", `integration plan exceeds ${limits.maxEntries} entries`);
+  }
+  if (limits.maxPlanBytes !== undefined && passthroughBytes > limits.maxPlanBytes) {
+    throw new GitError("E2BIG", `integration plan exceeds ${limits.maxPlanBytes} retained bytes`);
+  }
+  let resolvedBytes = 0;
+  let remaining = requestedOids;
+  let nextCandidate = 0;
+  while (nextCandidate < candidates.length) {
+    const candidate = candidates[nextCandidate]!;
+    const ready = candidateOids(candidate).every((oid) => loaded.has(oid));
+    if (!ready) {
+      if (remaining.length === 0) {
+        throw new CorruptError("integration blob batches ended before all candidates resolved");
+      }
+      const page = remaining.slice(0, BLOB_READ_PAGE);
+      const info = repo.store.objectInfo(page);
+      let selected = 0;
+      let selectedBytes = 0;
+      while (selected < info.length) {
+        const object = info[selected];
+        const oid = page[selected];
+        if (object === undefined || oid === undefined || object.oid !== oid) {
+          throw new CorruptError("integration blob metadata is incomplete");
+        }
+        if (object.type !== "blob") {
+          throw new CorruptError(`integration object ${oid} is not a blob`);
+        }
+        if (selected > 0 && object.size > PACK_BLOB_BATCH_TARGET_BYTES - selectedBytes) {
+          break;
+        }
+        selectedBytes = checkedAdd(selectedBytes, object.size, "blob read payload");
+        selected++;
+      }
+      const selectedOids = page.slice(0, selected);
+      const batch = repo.readBlobs(selectedOids, { budgetBytes: Math.max(1, selectedBytes) });
+      validateBlobBatch(selectedOids, batch.blobs, batch.remaining, batch.bytes);
+      for (const [oid, data] of batch.blobs) loaded.set(oid, data);
+      remaining = [...batch.remaining, ...remaining.slice(selected)];
+      continue;
     }
 
-    const resolved = new Map<string, IntegrationEntry>();
-    const loaded = new Map<string, Uint8Array>();
-    const staticEntries: IntegrationEntry[] = [];
-    let passthroughBytes = 0;
-    for (const entry of structure.entries) {
-      if (candidatePaths.has(entry.path)) continue;
-      const entries =
-        virtualLabels !== null && entry.kind === "conflict"
-          ? collapseVirtualConflict(entry, relocationByKey, relocations.names)
-          : [passThroughEntry(entry)];
-      for (const planned of entries) {
-        staticEntries.push(planned);
-        passthroughBytes = checkedAdd(passthroughBytes, integrationEntryBytes(planned), "plan");
-      }
-    }
-    if (staticEntries.length + candidates.length > limits.maxEntries) {
-      throw new GitError("E2BIG", `integration plan exceeds ${limits.maxEntries} entries`);
-    }
-    if (limits.maxPlanBytes !== undefined && passthroughBytes > limits.maxPlanBytes) {
+    const maxContentBytes = remainingContentCapacity(
+      limits.maxPlanBytes,
+      passthroughBytes,
+      resolvedBytes,
+      candidate.path,
+    );
+    const result = resolveContentCandidate(
+      candidate,
+      loaded,
+      text,
+      maxContentBytes,
+      virtualLabels !== null,
+    );
+    const entryBytes = integrationEntryBytes(result);
+    const nextPlanBytes = checkedAdd(
+      checkedAdd(passthroughBytes, resolvedBytes, "plan"),
+      entryBytes,
+      "plan",
+    );
+    if (limits.maxPlanBytes !== undefined && nextPlanBytes > limits.maxPlanBytes) {
       throw new GitError("E2BIG", `integration plan exceeds ${limits.maxPlanBytes} retained bytes`);
     }
-    staticBytes = checkedAdd(staticBytes, passthroughBytes, "static plan");
-    staticBytes = checkedAdd(
-      staticBytes,
-      staticEntries.length * ID_VECTOR_ENTRY_BYTES,
-      "static plan vector",
-    );
-
-    let resolvedBytes = 0;
-    let remaining = requestedOids;
-    let nextCandidate = 0;
-    stateMemory.set("other", callerRetainedBytes(staticBytes, resolvedBytes, loaded));
-    while (nextCandidate < candidates.length) {
-      const candidate = candidates[nextCandidate]!;
-      const ready = candidateOids(candidate).every((oid) => loaded.has(oid));
-      if (!ready) {
-        if (remaining.length === 0) {
-          throw new CorruptError("integration blob batches ended before all candidates resolved");
-        }
-        const page = remaining.slice(0, BLOB_READ_PAGE);
-        const info = repo.store.objectInfo(page);
-        let selected = 0;
-        let selectedBytes = 0;
-        while (selected < info.length) {
-          const object = info[selected];
-          const oid = page[selected];
-          if (object === undefined || oid === undefined || object.oid !== oid) {
-            throw new CorruptError("integration blob metadata is incomplete");
-          }
-          if (object.type !== "blob") {
-            throw new CorruptError(`integration object ${oid} is not a blob`);
-          }
-          if (selected > 0 && object.size > PACK_BLOB_BATCH_TARGET_BYTES - selectedBytes) {
-            break;
-          }
-          selectedBytes = checkedAdd(selectedBytes, object.size, "blob read payload");
-          selected++;
-        }
-        const selectedOids = page.slice(0, selected);
-        const beforeRead = callerRetainedBytes(staticBytes, resolvedBytes, loaded);
-        const mapHeadroom = selected * BLOB_MAP_ENTRY_BYTES;
-        const retainedAfterRead = checkedAdd(
-          beforeRead,
-          checkedAdd(selectedBytes, mapHeadroom, "blob read retention"),
-          "blob read retention",
-        );
-        const retainedDuringRead = checkedAdd(beforeRead, mapHeadroom, "blob read metadata");
-        const readWorkingBytes = checkedAdd(
-          selectedBytes,
-          checkedAdd(
-            BLOB_READ_FIXED_BYTES,
-            selected * BLOB_READ_ENTRY_BYTES,
-            "blob read working set",
-          ),
-          "blob read working set",
-        );
-        const admittedBytes = Math.max(
-          retainedAfterRead,
-          checkedAdd(retainedDuringRead, readWorkingBytes, "blob read admission"),
-        );
-        stateMemory.set("other", admittedBytes);
-        stateMemory.set("other", retainedDuringRead);
-        const batch = repo.readBlobs(selectedOids, { budgetBytes: Math.max(1, selectedBytes) });
-        validateBlobBatch(selectedOids, batch.blobs, batch.remaining, batch.bytes);
-        for (const [oid, data] of batch.blobs) loaded.set(oid, data);
-        remaining = [...batch.remaining, ...remaining.slice(selected)];
-        const afterRead = callerRetainedBytes(staticBytes, resolvedBytes, loaded);
-        stateMemory.set("other", afterRead);
-        continue;
+    resolved.set(candidate.path, result);
+    resolvedBytes = checkedAdd(resolvedBytes, entryBytes, "resolved plan");
+    for (const oid of new Set(candidateOids(candidate))) {
+      const uses = remainingUses.get(oid);
+      if (uses === undefined || uses <= 0) {
+        throw new CorruptError("integration blob use accounting is inconsistent");
       }
-
-      const maxContentBytes = remainingContentCapacity(
-        limits.maxPlanBytes,
-        passthroughBytes,
-        resolvedBytes,
-        candidate.path,
-      );
-      const mergeMemory = reservation.scope();
-      let result: IntegrationEntry;
-      try {
-        result = resolveContentCandidate(
-          candidate,
-          loaded,
-          text,
-          mergeMemory,
-          0,
-          maxContentBytes,
-          virtualLabels !== null,
-        );
-      } finally {
-        mergeMemory.dispose();
+      if (uses === 1) {
+        remainingUses.delete(oid);
+        loaded.delete(oid);
+      } else {
+        remainingUses.set(oid, uses - 1);
       }
-      const entryBytes = integrationEntryBytes(result);
-      const nextPlanBytes = checkedAdd(
-        checkedAdd(passthroughBytes, resolvedBytes, "plan"),
-        entryBytes,
-        "plan",
-      );
-      if (limits.maxPlanBytes !== undefined && nextPlanBytes > limits.maxPlanBytes) {
-        throw new GitError(
-          "E2BIG",
-          `integration plan exceeds ${limits.maxPlanBytes} retained bytes`,
-        );
-      }
-      resolved.set(candidate.path, result);
-      resolvedBytes = checkedAdd(resolvedBytes, entryBytes, "resolved plan");
-      for (const oid of new Set(candidateOids(candidate))) {
-        const uses = remainingUses.get(oid);
-        if (uses === undefined || uses <= 0) {
-          throw new CorruptError("integration blob use accounting is inconsistent");
-        }
-        if (uses === 1) {
-          remainingUses.delete(oid);
-          loaded.delete(oid);
-        } else {
-          remainingUses.set(oid, uses - 1);
-        }
-      }
-      nextCandidate++;
-      stateMemory.set("other", callerRetainedBytes(staticBytes, resolvedBytes, loaded));
     }
-
-    if (remaining.length !== 0 || loaded.size !== 0 || remainingUses.size !== 0) {
-      throw new CorruptError("integration content phase retained unconsumed blob objects");
-    }
-    const finalArrayBytes = (staticEntries.length + resolved.size) * ID_VECTOR_ENTRY_BYTES;
-    const finalArrayMemory = reservation.scope();
-    finalArrayMemory.set("other", finalArrayBytes);
-    const entries = [...staticEntries, ...resolved.values()].sort((left, right) =>
-      comparePaths(left.path, right.path),
-    );
-    const finalRetainedBytes = entries.reduce(
-      (bytes, entry) => checkedAdd(bytes, integrationEntryBytes(entry), "final plan"),
-      checkedAdd(FIXED_CALLER_BYTES, finalArrayBytes, "final plan"),
-    );
-    finalArrayMemory.dispose();
-    stateMemory.dispose();
-    structureMemory.dispose();
-    labelMemory.dispose();
-    reservation.set("other", finalRetainedBytes);
-    const plan: OwnedIntegrationPlan = {
-      entries,
-      sourceRows: structure.sourceRows,
-      retainedBytes: finalRetainedBytes,
-      memoryHighWaterBytes: reservation.highWaterBytes,
-      reservation,
-      release: () => reservation.dispose(),
-    };
-    succeeded = true;
-    return plan;
-  } finally {
-    if (!succeeded) reservation.dispose();
+    nextCandidate++;
   }
+
+  if (remaining.length !== 0 || loaded.size !== 0 || remainingUses.size !== 0) {
+    throw new CorruptError("integration content phase retained unconsumed blob objects");
+  }
+  const entries = [...staticEntries, ...resolved.values()].sort((left, right) =>
+    comparePaths(left.path, right.path),
+  );
+  return { entries, sourceRows: structure.sourceRows };
 }

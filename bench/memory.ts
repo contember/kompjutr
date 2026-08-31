@@ -23,10 +23,9 @@ import type {
   WriteEntry,
   WriteOptions,
 } from "../src/fs/types.js";
-import { MemoryCoordinator } from "../src/memory.js";
-import { commitGraphBytes } from "../src/sqlite/commits.js";
 import { advanceMaintenanceReachability } from "../src/sqlite/maintenance/reachability.js";
 import { type CheckoutRow, type SharedRepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { commitGraphBytes } from "./commit-graph-bytes.js";
 import type { Harness, Scenario } from "./harness.js";
 import {
   CHECKOUT_COUNT,
@@ -60,12 +59,6 @@ const BENCH_PERSON = {
   timestamp: 1_577_836_800,
   timezoneOffset: 0,
 };
-
-interface CoordinatorEvidence {
-  highWaterBytes: number;
-  finalBytes: number;
-  activeReservations: number;
-}
 
 class CountingWorktree implements Worktree {
   rangeReads = 0;
@@ -202,24 +195,9 @@ function digestParts(parts: readonly (string | number)[]): string {
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }
 
-function coordinatorEvidence(coordinator: MemoryCoordinator): CoordinatorEvidence {
-  const evidence = {
-    highWaterBytes: coordinator.highWaterBytes,
-    finalBytes: coordinator.totalBytes,
-    activeReservations: coordinator.activeCount,
-  };
-  coordinator.assertIdle();
-  return evidence;
-}
-
-function ownedEvidence(
-  spec: MemoryScenarioSpec,
-  digest: string | null,
-  coordinator: CoordinatorEvidence | null,
-): MemoryPhaseEvidence {
-  if (digest === null || coordinator === null) {
-    throw new Error("memory scenario did not publish complete semantic and coordinator evidence");
-  }
+function ownedEvidence(spec: MemoryScenarioSpec, digest: string | null): MemoryPhaseEvidence {
+  if (digest === null)
+    throw new Error("memory scenario did not publish complete semantic evidence");
   return {
     source: spec.source,
     workloadBytes: spec.workloadBytes,
@@ -227,9 +205,6 @@ function ownedEvidence(
     verifiedContentBytes: spec.verifiedContentBytes,
     verifiedChunkCount: spec.verifiedChunkCount,
     verificationDigest: digest,
-    coordinatorHighWaterBytes: coordinator.highWaterBytes,
-    coordinatorFinalBytes: coordinator.finalBytes,
-    coordinatorActiveReservations: coordinator.activeReservations,
   };
 }
 
@@ -419,7 +394,6 @@ function verifyStoredPattern(
 }
 
 function initialWriteScenario(): Scenario {
-  let coordinatorHighWaterBytes: number | null = null;
   let verificationDigest: string | null = null;
   const target = "t".repeat(INITIAL_SYMLINK_BYTES);
   return {
@@ -431,34 +405,18 @@ function initialWriteScenario(): Scenario {
       {
         name: INITIAL_SPEC.operation,
         async run({ harness }) {
-          const coordinator = new MemoryCoordinator();
-          const root = coordinator.reserve();
-          try {
-            const result = createInitialWorktreeWriter(
-              harness.workspace.filesystem.db,
-              () => 1_577_836_800_000,
-            ).tryRun(
-              "/repo",
-              (session) => {
-                session.writeSymlink("large-link", target);
-                session.writeFileStream(
-                  "z-stream.bin",
-                  INITIAL_SPEC.verifiedContentBytes,
-                  patternedChunks(INITIAL_SPEC.verifiedContentBytes, INITIAL_PATTERN_SEED),
-                );
-              },
-              undefined,
-              root,
+          const result = createInitialWorktreeWriter(
+            harness.workspace.filesystem.db,
+            () => 1_577_836_800_000,
+          ).tryRun("/repo", (session) => {
+            session.writeSymlink("large-link", target);
+            session.writeFileStream(
+              "z-stream.bin",
+              INITIAL_SPEC.verifiedContentBytes,
+              patternedChunks(INITIAL_SPEC.verifiedContentBytes, INITIAL_PATTERN_SEED),
             );
-            if (result.kind !== "committed") throw new Error("initial writer was unavailable");
-            if (root.currentBytes !== 0) {
-              throw new Error("initial writer retained memory after completion");
-            }
-          } finally {
-            coordinatorHighWaterBytes = coordinator.highWaterBytes;
-            root.dispose();
-            coordinator.assertIdle();
-          }
+          });
+          if (result.kind !== "committed") throw new Error("initial writer was unavailable");
         },
         async verify({ harness }) {
           const filesystem = harness.workspace.filesystem;
@@ -481,9 +439,8 @@ function initialWriteScenario(): Scenario {
           verificationDigest = verified.digest;
         },
         memoryEvidence(): MemoryPhaseEvidence {
-          if (coordinatorHighWaterBytes === null || verificationDigest === null) {
-            throw new Error("initial writer did not publish complete evidence");
-          }
+          if (verificationDigest === null)
+            throw new Error("initial writer did not publish evidence");
           return {
             source: INITIAL_SPEC.source,
             workloadBytes: INITIAL_SPEC.workloadBytes,
@@ -491,9 +448,6 @@ function initialWriteScenario(): Scenario {
             verifiedContentBytes: INITIAL_SPEC.verifiedContentBytes,
             verifiedChunkCount: INITIAL_SPEC.verifiedChunkCount,
             verificationDigest,
-            coordinatorHighWaterBytes,
-            coordinatorFinalBytes: 0,
-            coordinatorActiveReservations: 0,
           };
         },
       },
@@ -543,9 +497,6 @@ function redirectStreamScenario(): Scenario {
             verifiedContentBytes: REDIRECT_SPEC.verifiedContentBytes,
             verifiedChunkCount: REDIRECT_SPEC.verifiedChunkCount,
             verificationDigest,
-            coordinatorHighWaterBytes: null,
-            coordinatorFinalBytes: null,
-            coordinatorActiveReservations: null,
           };
         },
       },
@@ -559,7 +510,6 @@ function integrationGuardScenario(): Scenario {
   const expectedDigest = generatedDigest(HASH_WORKLOAD_BYTES, INTEGRATION_PATTERN_SEED);
   let repo: Repository | null = null;
   let worktree: CountingWorktree | null = null;
-  let coordinator: CoordinatorEvidence | null = null;
   let verificationDigest: string | null = null;
   return {
     name: spec.scenario,
@@ -589,7 +539,6 @@ function integrationGuardScenario(): Scenario {
         async run() {
           if (repo === null || worktree === null) throw new Error("integration fixture is missing");
           requireCleanIntegrationWorktree(repo, worktree, "merge");
-          coordinator = coordinatorEvidence(repo.store.memory);
         },
         async verify({ harness }) {
           if (repo === null || worktree === null) throw new Error("integration fixture is missing");
@@ -607,10 +556,9 @@ function integrationGuardScenario(): Scenario {
           if (stored.digest !== expectedDigest) {
             throw new Error("integration guard worktree content changed");
           }
-          repo.store.memory.assertIdle();
           verificationDigest = stored.digest;
         },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest, coordinator),
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
     ],
   };
@@ -624,7 +572,6 @@ function rebaseBaselineScenario(): Scenario {
   let worktree: LateMetadataWorktree | null = null;
   let upstreamOid: string | null = null;
   let result: RebaseLifecycleResult | null = null;
-  let coordinator: CoordinatorEvidence | null = null;
   let verificationDigest: string | null = null;
   return {
     name: spec.scenario,
@@ -671,7 +618,6 @@ function rebaseBaselineScenario(): Scenario {
             throw new Error("rebase fixture is missing");
           }
           result = rebase(context, repo, worktree, { upstream: "upstream" });
-          coordinator = coordinatorEvidence(repo.store.memory);
         },
         async verify({ harness }) {
           if (repo === null || worktree === null || upstreamOid === null || result === null) {
@@ -698,10 +644,9 @@ function rebaseBaselineScenario(): Scenario {
           );
           if (stored.digest !== targetDigest)
             throw new Error("rebase baseline wrote wrong content");
-          repo.store.memory.assertIdle();
           verificationDigest = stored.digest;
         },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest, coordinator),
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
     ],
   };
@@ -713,7 +658,6 @@ function stagingAddScenario(): Scenario {
   const expectedDigest = generatedDigest(HASH_WORKLOAD_BYTES, STAGING_PATTERN_SEED);
   let repo: Repository | null = null;
   let worktree: CountingWorktree | null = null;
-  let coordinator: CoordinatorEvidence | null = null;
   let verificationDigest: string | null = null;
   return {
     name: spec.scenario,
@@ -734,7 +678,6 @@ function stagingAddScenario(): Scenario {
         async run() {
           if (repo === null || worktree === null) throw new Error("staging fixture is missing");
           add(repo, worktree, { paths: ["large.bin"] });
-          coordinator = coordinatorEvidence(repo.store.memory);
         },
         async verify() {
           if (repo === null || worktree === null) throw new Error("staging fixture is missing");
@@ -749,10 +692,9 @@ function stagingAddScenario(): Scenario {
           if (stored.bytes !== HASH_WORKLOAD_BYTES || stored.digest !== expectedDigest) {
             throw new Error("staging add wrote the wrong loose object bytes");
           }
-          repo.store.memory.assertIdle();
           verificationDigest = stored.digest;
         },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest, coordinator),
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
     ],
   };
@@ -764,7 +706,6 @@ function maintenanceReachabilityScenario(): Scenario {
   let rootOid: string | null = null;
   let treeOid: string | null = null;
   let processedOid: string | null = null;
-  let coordinator: CoordinatorEvidence | null = null;
   let verificationDigest: string | null = null;
   return {
     name: spec.scenario,
@@ -827,7 +768,6 @@ function maintenanceReachabilityScenario(): Scenario {
           if (store === null) throw new Error("reachability fixture is missing");
           const progress = advanceMaintenanceReachability(store);
           processedOid = progress.processedOid;
-          coordinator = coordinatorEvidence(store.memory);
         },
         async verify() {
           if (store === null || rootOid === null || treeOid === null) {
@@ -848,10 +788,9 @@ function maintenanceReachabilityScenario(): Scenario {
           ) {
             throw new Error("reachability did not publish the exact large-header root edge");
           }
-          store.memory.assertIdle();
           verificationDigest = digestParts([rootOid, treeOid, processedOid, rows.length]);
         },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest, coordinator),
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
     ],
   };
@@ -864,7 +803,6 @@ function packFallbackAuditScenario(): Scenario {
   let primaryPackId: number | null = null;
   let fallbackPackId: number | null = null;
   let removed = 0;
-  let coordinator: CoordinatorEvidence | null = null;
   let verificationDigest: string | null = null;
   return {
     name: spec.scenario,
@@ -895,7 +833,6 @@ function packFallbackAuditScenario(): Scenario {
             throw new Error("fallback audit fixture is missing");
           }
           removed = store.packs.deleteCompletePacks([primaryPackId]);
-          coordinator = coordinatorEvidence(store.memory);
         },
         async verify() {
           if (store === null || primaryPackId === null || fallbackPackId === null) {
@@ -916,10 +853,9 @@ function packFallbackAuditScenario(): Scenario {
           ) {
             throw new Error("fallback audit did not authenticate and promote the exact object");
           }
-          store.memory.assertIdle();
           verificationDigest = bytesDigest(object.data);
         },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest, coordinator),
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
     ],
   };
@@ -930,7 +866,6 @@ function packAuthenticationScenario(): Scenario {
   const oid = hashObject("blob", PACK_FIXTURE_DATA);
   let store: SharedRepoStore | null = null;
   let packId: number | null = null;
-  let coordinator: CoordinatorEvidence | null = null;
   let verificationDigest: string | null = null;
   return {
     name: spec.scenario,
@@ -960,7 +895,6 @@ function packAuthenticationScenario(): Scenario {
           store.packs.authenticateCompleteSources([
             { oid, type: "blob", size: PACK_FIXTURE_DATA.length, packId },
           ]);
-          coordinator = coordinatorEvidence(store.memory);
         },
         async verify() {
           if (store === null || packId === null) {
@@ -975,10 +909,9 @@ function packAuthenticationScenario(): Scenario {
           ) {
             throw new Error("pack authentication did not preserve the exact canonical object");
           }
-          store.memory.assertIdle();
           verificationDigest = bytesDigest(object.data);
         },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest, coordinator),
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
     ],
   };
@@ -990,7 +923,6 @@ function retainedGraphScenario(): Scenario {
   let repo: Repository | null = null;
   let rootOid: string | null = null;
   let walked: { oid: string; commit: Commit }[] | null = null;
-  let coordinator: CoordinatorEvidence | null = null;
   let verificationDigest: string | null = null;
   return {
     name: spec.scenario,
@@ -1024,7 +956,6 @@ function retainedGraphScenario(): Scenario {
         async run() {
           if (repo === null || rootOid === null) throw new Error("graph fixture is missing");
           walked = [...repo.walkIndexed(rootOid)];
-          coordinator = coordinatorEvidence(repo.store.memory);
         },
         async verify() {
           if (repo === null || rootOid === null || walked === null) {
@@ -1047,10 +978,9 @@ function retainedGraphScenario(): Scenario {
           ) {
             throw new Error("retained graph walk did not return the exact commit chain");
           }
-          repo.store.memory.assertIdle();
           verificationDigest = hash.digest("hex");
         },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest, coordinator),
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
     ],
   };
@@ -1062,7 +992,6 @@ function objectSingletonScenario(): Scenario {
   let oid: string | null = null;
   let object: Uint8Array | null = null;
   let expectedDigest: string | null = null;
-  let coordinator: CoordinatorEvidence | null = null;
   let verificationDigest: string | null = null;
   return {
     name: spec.scenario,
@@ -1085,7 +1014,6 @@ function objectSingletonScenario(): Scenario {
           if (read.remaining.length !== 0 || read.bytes !== LARGE_OBJECT_BYTES) {
             throw new Error("oversized object was not returned as one singleton");
           }
-          coordinator = coordinatorEvidence(store.memory);
         },
         async verify() {
           if (store === null || oid === null || object === null || expectedDigest === null) {
@@ -1105,9 +1033,8 @@ function objectSingletonScenario(): Scenario {
           ) {
             throw new Error("oversized singleton object failed exact byte verification");
           }
-          store.memory.assertIdle();
         },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest, coordinator),
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
     ],
   };
@@ -1117,7 +1044,6 @@ function configMoveScenario(): Scenario {
   const spec = memoryScenarioSpec("sqlite.config.move");
   let store: ReturnType<SqliteGitDatabase["openCheckout"]> | null = null;
   let expectedDigest: string | null = null;
-  let coordinator: CoordinatorEvidence | null = null;
   let verificationDigest: string | null = null;
   return {
     name: spec.scenario,
@@ -1136,7 +1062,6 @@ function configMoveScenario(): Scenario {
         async run() {
           if (store === null) throw new Error("config fixture is missing");
           store.configMoveSection("branch.old.", "branch.new.");
-          coordinator = coordinatorEvidence(store.shared.memory);
         },
         async verify() {
           if (store === null || expectedDigest === null)
@@ -1153,9 +1078,8 @@ function configMoveScenario(): Scenario {
           if (verificationDigest !== expectedDigest) {
             throw new Error("config section move changed the source value bytes");
           }
-          store.shared.memory.assertIdle();
         },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest, coordinator),
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
     ],
   };
@@ -1165,7 +1089,6 @@ function checkoutListScenario(): Scenario {
   const spec = memoryScenarioSpec("sqlite.checkout.list");
   let database: SqliteGitDatabase | null = null;
   let checkouts: readonly CheckoutRow[] | null = null;
-  let coordinator: CoordinatorEvidence | null = null;
   let verificationDigest: string | null = null;
   return {
     name: spec.scenario,
@@ -1198,7 +1121,6 @@ function checkoutListScenario(): Scenario {
         async run() {
           if (database === null) throw new Error("checkout fixture is missing");
           checkouts = database.listCheckouts(1);
-          coordinator = coordinatorEvidence(database.openShared(1).memory);
         },
         async verify() {
           if (database === null || checkouts === null)
@@ -1217,10 +1139,9 @@ function checkoutListScenario(): Scenario {
           ) {
             throw new Error("checkout listing did not retain the exact frozen collection");
           }
-          database.openShared(1).memory.assertIdle();
           verificationDigest = hash.digest("hex");
         },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest, coordinator),
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
     ],
   };

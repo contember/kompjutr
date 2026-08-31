@@ -70,9 +70,9 @@ function observingWriter(
 ): InitialWorktreeWriter {
   return {
     supportsDatabase,
-    tryRun(root, body, afterClose, reservation) {
+    tryRun(root, body, afterClose) {
       onAttempt();
-      const result = writer.tryRun(root, body, afterClose, reservation);
+      const result = writer.tryRun(root, body, afterClose);
       if (result.kind === "committed") onCommit?.();
       return result;
     },

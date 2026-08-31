@@ -23,7 +23,6 @@ export const OPERATION_STATE_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_s
   committer_name TEXT,
   committer_email TEXT,
   touched_count INTEGER NOT NULL,
-  retained_bytes INTEGER NOT NULL,
   integrity_oid TEXT NOT NULL,
   CHECK (
     (kind = 'merge' AND phase IN ('conflicted', 'ready') AND empty_reason IS NULL

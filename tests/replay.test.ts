@@ -11,14 +11,10 @@ import {
 import {
   MAX_REPLAY_REVISION_CODE_UNITS,
   MAX_REPLAY_REVISION_HOPS,
-  planFixedReplayStep,
   planReplay,
   preflightReplayCommitObjects,
 } from "../src/core/ops/replay.js";
 import { Repository } from "../src/core/repository.js";
-import { retainedStringBytes } from "../src/core/retained.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
-import { commitPreparationTransientBytes } from "../src/sqlite/commits.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
@@ -84,31 +80,6 @@ function expectCode(action: () => unknown, code: string): void {
     return;
   }
   throw new Error(`expected ${code}`);
-}
-
-function commitCacheRows(db: TestDatabase): number {
-  return db.scalar<number>("SELECT COUNT(*) FROM git_commits") ?? -1;
-}
-
-function fixtureCommitRetainedBytes(
-  treeOid: string,
-  parents: readonly string[],
-  message: string,
-): number {
-  let bytes = 768;
-  for (const value of [
-    treeOid,
-    ...parents,
-    PERSON.name,
-    PERSON.email,
-    PERSON.name,
-    PERSON.email,
-    "",
-    message,
-  ]) {
-    bytes += retainedStringBytes(value);
-  }
-  return bytes;
 }
 
 describe("one-commit replay planner", () => {
@@ -422,33 +393,6 @@ describe("one-commit replay planner", () => {
     ).toThrowError(`replay source revision exceeds ${MAX_REPLAY_REVISION_CODE_UNITS} code units`);
   });
 
-  it("does not populate the derived commit cache on success or a later planning failure", () => {
-    const { db, store, repo } = harness();
-    const baseTree = tree(store, "base\n");
-    const sourceTree = tree(store, "source\n");
-    const parent = commit(store, baseTree.tree, [], "parent");
-    const source = commit(store, sourceTree.tree, [parent], "source");
-    db.run("DELETE FROM git_commits");
-    expect(commitCacheRows(db)).toBe(0);
-
-    expect(planReplay(repo, { kind: "cherry-pick", source, currentOid: parent }).sourceOid).toBe(
-      source,
-    );
-    expect(commitCacheRows(db)).toBe(0);
-
-    expectCode(
-      () =>
-        planReplay(repo, {
-          kind: "cherry-pick",
-          source,
-          currentOid: parent,
-          limits: { maxEntries: 0 },
-        }),
-      "E2BIG",
-    );
-    expect(commitCacheRows(db)).toBe(0);
-  });
-
   it("accepts the exact parent-hop ceiling and rejects the next hop and huge decimals", () => {
     const { store, repo } = harness();
     const unchanged = tree(store, "same\n");
@@ -598,7 +542,6 @@ describe("one-commit replay planner", () => {
         }),
       "ECORRUPT",
     );
-    expect(commitCacheRows(corrupt.db)).toBe(0);
   });
 
   it("accepts the exact revision bound and rejects the next code unit before lookup", () => {
@@ -637,8 +580,6 @@ describe("one-commit replay planner", () => {
     });
     expect(plan.integration.entries).toEqual([]);
     expect(plan.integration.sourceRows).toBe(0);
-    plan.integration.release();
-    store.shared.memory.assertIdle();
   });
 
   it("parses and preflights a commit above the former 1 MiB validity threshold", () => {
@@ -647,133 +588,9 @@ describe("one-commit replay planner", () => {
     const parent = commit(store, unchanged.tree, [], "parent");
     const source = commit(store, unchanged.tree, [parent], "x".repeat(1024 * 1024 + 1));
 
-    const preflight = preflightReplayCommitObjects(repo, [source]);
+    preflightReplayCommitObjects(repo, [source]);
     const plan = planReplay(repo, { kind: "cherry-pick", source, currentOid: parent });
 
-    expect(preflight.bytes).toBeGreaterThan(1024 * 1024);
     expect(plan.sourceCommit.message.length).toBeGreaterThan(1024 * 1024);
-    plan.integration.release();
-    store.shared.memory.assertIdle();
-  });
-
-  it("admits the exact first commit payload and rejects one excess byte before reading it", () => {
-    const { store, repo } = harness();
-    const unchanged = tree(store, "same\n");
-    const parent = commit(store, unchanged.tree, [], "parent");
-    const source = commit(store, unchanged.tree, [parent], "source");
-    const metadata = store.typeAndSize(parent);
-    if (metadata === null) throw new Error("current commit metadata is missing");
-    const exactCallerBytes =
-      MAX_OPERATION_MEMORY_BYTES - 1_024 - commitPreparationTransientBytes(metadata.size);
-    const originalRead = store.readAuthenticatedObject.bind(store);
-    let reads = 0;
-    store.readAuthenticatedObject = (oid, expectedType) => {
-      reads++;
-      return originalRead(oid, expectedType);
-    };
-
-    expectCode(
-      () =>
-        planReplay(repo, {
-          kind: "cherry-pick",
-          source,
-          currentOid: parent,
-          integrationCallerRetainedBytes: exactCallerBytes,
-        }),
-      "E2BIG",
-    );
-    expect(reads).toBe(1);
-    store.shared.memory.assertIdle();
-
-    reads = 0;
-    expectCode(
-      () =>
-        planReplay(repo, {
-          kind: "cherry-pick",
-          source,
-          currentOid: parent,
-          integrationCallerRetainedBytes: exactCallerBytes + 1,
-        }),
-      "E2BIG",
-    );
-    expect(reads).toBe(0);
-    store.shared.memory.assertIdle();
-  });
-
-  it("admits replay labels before construction and rejects the first excess byte", () => {
-    const { store, repo } = harness();
-    const unchanged = tree(store, "same\n");
-    const parent = commit(store, unchanged.tree, [], "parent");
-    const source = commit(store, unchanged.tree, [parent], "source");
-    const incoming = "x".repeat(1_000_000);
-    let incomingReads = 0;
-    const labels = {
-      get incoming(): string {
-        incomingReads++;
-        return incoming;
-      },
-    };
-    const retainedBytes =
-      1_024 +
-      fixtureCommitRetainedBytes(unchanged.tree, [], "parent\n") +
-      retainedStringBytes(source) +
-      fixtureCommitRetainedBytes(unchanged.tree, [parent], "source\n") +
-      retainedStringBytes(unchanged.tree) +
-      retainedStringBytes(parent) +
-      retainedStringBytes("HEAD") +
-      retainedStringBytes(parent.slice(0, 12)) +
-      retainedStringBytes(incoming);
-    const exactCallerBytes = MAX_OPERATION_MEMORY_BYTES - retainedBytes - 256;
-
-    expectCode(
-      () =>
-        planReplay(repo, {
-          kind: "cherry-pick",
-          source,
-          currentOid: parent,
-          integrationCallerRetainedBytes: exactCallerBytes,
-          text: { labels },
-        }),
-      "E2BIG",
-    );
-    expect(incomingReads).toBe(2);
-    store.shared.memory.assertIdle();
-
-    incomingReads = 0;
-    expectCode(
-      () =>
-        planReplay(repo, {
-          kind: "cherry-pick",
-          source,
-          currentOid: parent,
-          integrationCallerRetainedBytes: exactCallerBytes + 1,
-          text: { labels },
-        }),
-      "E2BIG",
-    );
-    expect(incomingReads).toBe(1);
-    store.shared.memory.assertIdle();
-  });
-
-  it("releases public replay and fixed-step metadata with their integration owner", () => {
-    const { store, repo } = harness();
-    const unchanged = tree(store, "same\n");
-    const parent = commit(store, unchanged.tree, [], "parent");
-    const source = commit(store, unchanged.tree, [parent], "source");
-
-    const replay = planReplay(repo, { kind: "cherry-pick", source, currentOid: parent });
-    expect(store.shared.memory.totalBytes).toBeGreaterThan(replay.integration.retainedBytes);
-    replay.integration.release();
-    replay.integration.release();
-    store.shared.memory.assertIdle();
-
-    const fixed = planFixedReplayStep(repo, {
-      sourceOid: source,
-      selectedParentOid: parent,
-      currentOid: parent,
-    });
-    expect(store.shared.memory.totalBytes).toBeGreaterThan(fixed.integration.retainedBytes);
-    fixed.integration.release();
-    store.shared.memory.assertIdle();
   });
 });

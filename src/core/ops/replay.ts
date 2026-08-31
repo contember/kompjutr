@@ -1,7 +1,5 @@
 // Pure one-commit replay planning shared by cherry-pick and revert.
 
-import type { MemoryReservation } from "../../memory.js";
-import { commitPreparationTransientBytes } from "../../sqlite/commits.js";
 import {
   type IndexEntry,
   type IndexStore,
@@ -12,7 +10,6 @@ import type { TextMergeOptions } from "../diff/xmerge.js";
 import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "../errors.js";
 import { type Commit, hashObject, MODE_COMMIT, parseReplayCommit, parseTag } from "../objects.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted } from "../streams.js";
 import { indexFromTree } from "./checkout.js";
 import {
@@ -20,15 +17,10 @@ import {
   type IntegrationLimits,
   type IntegrationPlan,
   MAX_INTEGRATION_SOURCE_ROWS,
-  type OwnedIntegrationPlan,
   planIntegration,
 } from "./integration.js";
 import type { IntegrationStages } from "./integration-structure.js";
-import {
-  projectedTouchedShape,
-  requireBoundedIntegrationTree,
-  reserveIntegrationPlan,
-} from "./integration-worktree.js";
+import { projectedTouchedShape, requireBoundedIntegrationTree } from "./integration-worktree.js";
 import { applyProjectedIndex, validateProjectedIndexEntries } from "./merge-apply.js";
 import { type ProjectedMergeEntry, projectMergePlan } from "./merge-projection.js";
 import { MAX_OPERATION_STEPS } from "./operation-state.js";
@@ -40,11 +32,6 @@ export const MAX_REPLAY_TAG_HOPS = 16;
 const MAX_REPLAY_PREFLIGHT_INPUT_OIDS = MAX_OPERATION_STEPS * 2 + 1;
 const MAX_REPLAY_PREFLIGHT_UNIQUE_OIDS = MAX_OPERATION_STEPS + 2;
 const MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE = 4_096;
-const REPLAY_PREFLIGHT_FIXED_BYTES = 512;
-const REPLAY_PREFLIGHT_OID_BYTES = 256;
-const REPLAY_PREFLIGHT_INFO_BYTES = 384;
-const REPLAY_PREFLIGHT_BATCH_BYTES = 512;
-const REPLAY_PREFLIGHT_BATCH_ENTRY_BYTES = 384;
 
 export type ReplayKind = "cherry-pick" | "revert";
 export type ReplayIncomingLabelStyle = "tree" | "source-subject" | "parent-of-source-subject";
@@ -58,8 +45,6 @@ export interface ReplayInput {
   limits?: IntegrationLimits;
   /** Select Git's command-specific sequencer label or the planner's tree label. */
   incomingLabelStyle?: ReplayIncomingLabelStyle;
-  /** Caller-owned bytes retained while integration planning runs. */
-  integrationCallerRetainedBytes?: number;
 }
 
 export interface ReplayLabels {
@@ -82,9 +67,7 @@ export interface ReplayPlan {
   baseTreeOid: string | null;
   incomingTreeOid: string | null;
   labels: ReplayLabels;
-  integration: OwnedIntegrationPlan;
-  /** Replay metadata retained beside the integration plan. */
-  retainedBytes: number;
+  integration: IntegrationPlan;
 }
 
 export interface ReplaySnapshotOptions {
@@ -115,7 +98,6 @@ export interface FixedReplayStepInput {
   sourceOid: string;
   selectedParentOid: string | null;
   currentOid: string;
-  callerRetainedBytes?: number;
   limits?: IntegrationLimits;
 }
 
@@ -142,96 +124,41 @@ interface RevisionTraversal {
   readonly commits: Set<string>;
 }
 
-function checkedRetainedAdd(total: number, bytes: number): number {
-  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > Number.MAX_SAFE_INTEGER - total) {
-    throw new GitError("E2BIG", "replay metadata retained-byte accounting overflow");
-  }
-  return total + bytes;
-}
-
-function commitRetainedBytes(commit: Commit): number {
-  let bytes = 768;
-  for (const value of [
-    commit.tree,
-    ...commit.parent,
-    commit.author.name,
-    commit.author.email,
-    commit.committer.name,
-    commit.committer.email,
-    commit.gpgsig ?? "",
-    commit.message,
-  ]) {
-    bytes = checkedRetainedAdd(bytes, retainedStringBytes(value));
-  }
-  return bytes;
-}
-
-function readCommit(
-  repo: Repository,
-  oid: string,
-  reservation: MemoryReservation | null = null,
-  retain?: (commit: Commit) => void,
-): Commit {
+function readCommit(repo: Repository, oid: string): Commit {
   const metadata = repo.store.typeAndSize(oid);
   if (metadata === null) throw new ObjectNotFoundError(oid);
   if (metadata.type !== "commit") {
     throw new CorruptError(`${oid} is a ${metadata.type}, not a commit`);
   }
-  const transient = reservation?.scope() ?? repo.store.reserveMemory();
-  transient.set("commit", commitPreparationTransientBytes(metadata.size));
-  try {
-    const object = repo.store.readAuthenticatedObject(oid, "commit");
-    if (object === null) throw new ObjectNotFoundError(oid);
-    if (object.type !== "commit") {
-      throw new CorruptError(`${oid} is a ${object.type}, not a commit`);
-    }
-    if (object.data.length !== metadata.size || hashObject("commit", object.data) !== oid) {
-      throw new CorruptError(`commit ${oid} does not match its authoritative object metadata`);
-    }
-    const commit = parseReplayCommit(object.data);
-    retain?.(commit);
-    return commit;
-  } finally {
-    transient.dispose();
+  const object = repo.store.readAuthenticatedObject(oid, "commit");
+  if (object === null) throw new ObjectNotFoundError(oid);
+  if (object.type !== "commit") {
+    throw new CorruptError(`${oid} is a ${object.type}, not a commit`);
   }
-}
-
-export interface ReplayCommitPreflight {
-  bytes: number;
+  if (object.data.length !== metadata.size || hashObject("commit", object.data) !== oid) {
+    throw new CorruptError(`commit ${oid} does not match its authoritative object metadata`);
+  }
+  return parseReplayCommit(object.data);
 }
 
 /** Validate every source commit before a sequencer creates durable state. */
 export function preflightReplayCommitObjects(
   repo: Repository,
   sourceOids: readonly string[],
-  owningReservation?: MemoryReservation,
-): ReplayCommitPreflight {
-  if (owningReservation !== undefined && !repo.store.ownsMemoryReservation(owningReservation)) {
-    throw new GitError("EINVAL", "replay preflight reservation belongs to another repository");
-  }
-  const reservation = owningReservation?.scope() ?? repo.store.reserveMemory();
-  try {
-    return preflightReplayCommitObjectsInternal(repo, sourceOids, reservation);
-  } finally {
-    reservation.dispose();
-  }
+): void {
+  preflightReplayCommitObjectsInternal(repo, sourceOids);
 }
 
 function preflightReplayCommitObjectsInternal(
   repo: Repository,
   sourceOids: readonly string[],
-  reservation: MemoryReservation,
-): ReplayCommitPreflight {
+): void {
   if (sourceOids.length > MAX_REPLAY_PREFLIGHT_INPUT_OIDS) {
     throw new GitError(
       "E2BIG",
       `replay commit preflight exceeds ${MAX_REPLAY_PREFLIGHT_INPUT_OIDS} inputs`,
     );
   }
-  reservation.set(
-    "other",
-    REPLAY_PREFLIGHT_FIXED_BYTES + sourceOids.length * REPLAY_PREFLIGHT_OID_BYTES,
-  );
   const unique = [...new Set(sourceOids)];
   if (unique.length > MAX_REPLAY_PREFLIGHT_UNIQUE_OIDS) {
     throw new GitError(
@@ -239,37 +166,23 @@ function preflightReplayCommitObjectsInternal(
       `replay commit preflight exceeds ${MAX_REPLAY_PREFLIGHT_UNIQUE_OIDS} commits`,
     );
   }
-  reservation.set(
-    "other",
-    REPLAY_PREFLIGHT_FIXED_BYTES +
-      unique.length * (REPLAY_PREFLIGHT_OID_BYTES + REPLAY_PREFLIGHT_INFO_BYTES),
-  );
   const sizes = new Map<string, number>();
-  let bytes = 0;
   for (let offset = 0; offset < unique.length; offset += MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE) {
     const count = Math.min(MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE, unique.length - offset);
-    const pageMemory = reservation.scope();
-    pageMemory.set("other", count * REPLAY_PREFLIGHT_INFO_BYTES);
-    try {
-      const page = unique.slice(offset, offset + count);
-      const info = repo.store.objectInfo(page);
-      for (let ordinal = 0; ordinal < info.length; ordinal++) {
-        const object = info[ordinal];
-        const oid = page[ordinal];
-        if (object === undefined || oid === undefined || object.oid !== oid) {
-          throw new CorruptError("replay commit preflight metadata is incomplete");
-        }
-        if (object.type !== "commit") throw new CorruptError(`${oid} is not a commit`);
-        bytes = checkedRetainedAdd(bytes, object.size);
-        sizes.set(oid, object.size);
+    const page = unique.slice(offset, offset + count);
+    const info = repo.store.objectInfo(page);
+    for (let ordinal = 0; ordinal < info.length; ordinal++) {
+      const object = info[ordinal];
+      const oid = page[ordinal];
+      if (object === undefined || oid === undefined || object.oid !== oid) {
+        throw new CorruptError("replay commit preflight metadata is incomplete");
       }
-    } finally {
-      pageMemory.dispose();
+      if (object.type !== "commit") throw new CorruptError(`${oid} is not a commit`);
+      sizes.set(oid, object.size);
     }
   }
   for (let offset = 0; offset < unique.length; ) {
     let batchBytes = 0;
-    let largest = 0;
     let end = offset;
     const batchEnd = Math.min(unique.length, offset + MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE);
     while (end < batchEnd) {
@@ -279,35 +192,21 @@ function preflightReplayCommitObjectsInternal(
       if (size === undefined) throw new CorruptError(`replay commit preflight lost ${oid}`);
       if (end > offset && size > PACK_BLOB_BATCH_TARGET_BYTES - batchBytes) break;
       batchBytes += size;
-      largest = Math.max(largest, size);
       end++;
     }
-    const batchMemory = reservation.scope();
-    batchMemory.set(
-      "other",
-      REPLAY_PREFLIGHT_BATCH_BYTES +
-        (end - offset) * REPLAY_PREFLIGHT_BATCH_ENTRY_BYTES +
-        batchBytes +
-        commitPreparationTransientBytes(largest),
-    );
-    try {
-      const batchOids = unique.slice(offset, end);
-      const batch = repo.readObjects(batchOids, { budgetBytes: Math.max(1, batchBytes) });
-      if (batch.objects.size !== batchOids.length || batch.remaining.length !== 0) {
-        throw new CorruptError("replay commit preflight made no progress");
+    const batchOids = unique.slice(offset, end);
+    const batch = repo.readObjects(batchOids, { budgetBytes: Math.max(1, batchBytes) });
+    if (batch.objects.size !== batchOids.length || batch.remaining.length !== 0) {
+      throw new CorruptError("replay commit preflight made no progress");
+    }
+    for (const [oid, object] of batch.objects) {
+      if (object.type !== "commit" || hashObject("commit", object.data) !== oid) {
+        throw new CorruptError(`commit ${oid} failed authoritative replay preflight`);
       }
-      for (const [oid, object] of batch.objects) {
-        if (object.type !== "commit" || hashObject("commit", object.data) !== oid) {
-          throw new CorruptError(`commit ${oid} failed authoritative replay preflight`);
-        }
-        parseReplayCommit(object.data);
-      }
-    } finally {
-      batchMemory.dispose();
+      parseReplayCommit(object.data);
     }
     offset = end;
   }
-  return { bytes };
 }
 
 function peelCommit(repo: Repository, start: string, _operation: string): string {
@@ -319,24 +218,18 @@ function peelCommit(repo: Repository, start: string, _operation: string): string
     const metadata = repo.store.objectInfo([oid])[0];
     if (metadata === undefined) throw new ObjectNotFoundError(oid);
     if (metadata.type === "commit" || metadata.type !== "tag") return oid;
-    const transient = repo.store.reserveMemory();
-    try {
-      transient.set("other", commitPreparationTransientBytes(metadata.size));
-      const object = repo.store.readAuthenticatedObject(oid, "tag");
-      if (
-        object === null ||
-        object.data.length !== metadata.size ||
-        hashObject("tag", object.data) !== oid
-      ) {
-        throw new CorruptError(`tag ${oid} does not match its authoritative object metadata`);
-      }
-      if (hops >= MAX_REPLAY_TAG_HOPS) {
-        throw new GitError("E2BIG", `tag chain exceeds ${MAX_REPLAY_TAG_HOPS} hops`);
-      }
-      oid = parseTag(object.data).object;
-    } finally {
-      transient.dispose();
+    const object = repo.store.readAuthenticatedObject(oid, "tag");
+    if (
+      object === null ||
+      object.data.length !== metadata.size ||
+      hashObject("tag", object.data) !== oid
+    ) {
+      throw new CorruptError(`tag ${oid} does not match its authoritative object metadata`);
     }
+    if (hops >= MAX_REPLAY_TAG_HOPS) {
+      throw new GitError("E2BIG", `tag chain exceeds ${MAX_REPLAY_TAG_HOPS} hops`);
+    }
+    oid = parseTag(object.data).object;
   }
 }
 
@@ -491,39 +384,6 @@ function sourceSubject(message: string): string {
   return (newline < 0 ? message.slice(start) : message.slice(start, newline)).replace(/\r$/, "");
 }
 
-function sourceSubjectUnits(message: string): number {
-  let start = 0;
-  while (message.charCodeAt(start) === 0x0a) start++;
-  let end = start;
-  while (end < message.length && message.charCodeAt(end) !== 0x0a) end++;
-  if (end > start && message.charCodeAt(end - 1) === 0x0d) end--;
-  return end - start;
-}
-
-function shortOidUnits(oid: string | null): number {
-  return oid === null ? "empty tree".length : Math.min(12, oid.length);
-}
-
-function incomingLabelUnits(
-  style: ReplayIncomingLabelStyle,
-  kind: ReplayKind,
-  sourceOid: string,
-  selectedParentOid: string | null,
-  sourceMessage: string,
-): number {
-  if (style === "source-subject") {
-    return Math.min(7, sourceOid.length) + 3 + sourceSubjectUnits(sourceMessage);
-  }
-  if (style === "parent-of-source-subject") {
-    return 10 + Math.min(7, sourceOid.length) + 3 + sourceSubjectUnits(sourceMessage);
-  }
-  return shortOidUnits(kind === "cherry-pick" ? sourceOid : selectedParentOid);
-}
-
-function retainedLabelUnits(units: number): number {
-  return 48 + units * 2;
-}
-
 function incomingLabel(
   style: ReplayIncomingLabelStyle,
   kind: ReplayKind,
@@ -542,13 +402,7 @@ function incomingLabel(
 
 /** Resolve one source commit and build its bounded integration delta without mutating state. */
 export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
-  const reservation = repo.store.reserveMemory();
-  try {
-    return retainReplayPlan(planReplayInternal(repo, input, reservation), reservation);
-  } catch (error) {
-    reservation.dispose();
-    throw error;
-  }
+  return planReplayInternal(repo, input);
 }
 
 function requireSnapshotTreesWithoutGitlinks(repo: Repository, plan: ReplayPlan): void {
@@ -610,46 +464,40 @@ function* prospectiveSnapshotIndex(
   repo: Repository,
   currentTreeOid: string,
   projected: readonly ProjectedMergeEntry[],
-  reservation: MemoryReservation,
 ): Generator<IndexEntry> {
-  const shapeMemory = reservation.scope();
-  try {
-    const owned = projectedTouchedShape(projected, shapeMemory);
-    let ownedIndex = 0;
-    for (const row of joinSorted(indexFromTree(repo, currentTreeOid), projected, {
-      left: (entry) => entry.path,
-      right: (entry) => entry.path,
-    })) {
-      if (row.right !== undefined) {
-        if (row.right.stages !== null) {
-          throw new CorruptError("clean snapshot projection retained conflict stages");
-        }
-        const identity = row.right.stageZero;
-        if (identity !== null) {
-          yield {
-            path: row.right.path,
-            stage: 0,
-            mode: Number.parseInt(identity.mode, 8),
-            oid: identity.oid,
-            size: null,
-            mtime: null,
-            ino: null,
-            rev: null,
-          };
-        }
-        continue;
+  const owned = projectedTouchedShape(projected);
+  let ownedIndex = 0;
+  for (const row of joinSorted(indexFromTree(repo, currentTreeOid), projected, {
+    left: (entry) => entry.path,
+    right: (entry) => entry.path,
+  })) {
+    if (row.right !== undefined) {
+      if (row.right.stages !== null) {
+        throw new CorruptError("clean snapshot projection retained conflict stages");
       }
-      if (row.left === undefined) continue;
-      while (
-        owned[ownedIndex] !== undefined &&
-        comparePaths(owned[ownedIndex]?.path ?? "", row.left.path) < 0
-      ) {
-        ownedIndex++;
+      const identity = row.right.stageZero;
+      if (identity !== null) {
+        yield {
+          path: row.right.path,
+          stage: 0,
+          mode: Number.parseInt(identity.mode, 8),
+          oid: identity.oid,
+          size: null,
+          mtime: null,
+          ino: null,
+          rev: null,
+        };
       }
-      if (owned[ownedIndex]?.path !== row.left.path) yield row.left;
+      continue;
     }
-  } finally {
-    shapeMemory.dispose();
+    if (row.left === undefined) continue;
+    while (
+      owned[ownedIndex] !== undefined &&
+      comparePaths(owned[ownedIndex]?.path ?? "", row.left.path) < 0
+    ) {
+      ownedIndex++;
+    }
+    if (owned[ownedIndex]?.path !== row.left.path) yield row.left;
   }
 }
 
@@ -657,14 +505,13 @@ function validateSnapshotResultObjects(
   repo: Repository,
   currentTreeOid: string,
   projected: readonly ProjectedMergeEntry[],
-  reservation: MemoryReservation,
 ): void {
   const generated = new Set<string>();
   for (const entry of projected) {
     if (entry.content !== null && entry.stageZero !== null) generated.add(entry.stageZero.oid);
   }
   const required = new Set<string>();
-  for (const entry of prospectiveSnapshotIndex(repo, currentTreeOid, projected, reservation)) {
+  for (const entry of prospectiveSnapshotIndex(repo, currentTreeOid, projected)) {
     if (entry.mode === 0o160000) {
       throw new GitError("EUNSUPPORTED", `snapshot replay rejects gitlink ${entry.path}`);
     }
@@ -714,47 +561,32 @@ export function replaySnapshot(
     currentOid,
     incomingLabelStyle: "source-subject",
   });
-  const reservation = reserveIntegrationPlan(repo, plan.integration);
-  try {
-    if (plan.sourceCommit.parent.length !== 1 || plan.selectedParentOid === null) {
-      throw new CorruptError("validated snapshot replay source lost its selected parent");
-    }
-    requireSnapshotTreesWithoutGitlinks(repo, plan);
-    const projected = projectMergePlan(plan.integration, {
-      currentLabel: plan.labels.current,
-      incomingLabel: plan.labels.incoming,
-    });
-    validateProjectedIndexEntries(projected);
-    const conflicts = snapshotConflicts(plan.integration, projected);
-    if (conflicts.length > 0) return { outcome: "conflicted", conflicts };
-
-    requireBoundedIntegrationTree(
-      repo,
-      (owner) => prospectiveSnapshotIndex(repo, plan.currentTreeOid, projected, owner),
-      reservation,
-    );
-    validateSnapshotResultObjects(repo, plan.currentTreeOid, projected, reservation);
-    return repo.store.runScratchAwareOperation(() =>
-      repo.store.db.transactionSync(() => {
-        index.indexReplace(indexFromTree(repo, plan.currentTreeOid));
-        applyProjectedIndex(repo, index, projected, reservation);
-        reservation.set(
-          "other",
-          checkedRetainedAdd(plan.retainedBytes, plan.integration.retainedBytes),
-        );
-        return { outcome: "clean", tree: writeTree(repo, index) };
-      }),
-    );
-  } finally {
-    reservation.dispose();
+  if (plan.sourceCommit.parent.length !== 1 || plan.selectedParentOid === null) {
+    throw new CorruptError("validated snapshot replay source lost its selected parent");
   }
+  requireSnapshotTreesWithoutGitlinks(repo, plan);
+  const projected = projectMergePlan(plan.integration, {
+    currentLabel: plan.labels.current,
+    incomingLabel: plan.labels.incoming,
+  });
+  validateProjectedIndexEntries(projected);
+  const conflicts = snapshotConflicts(plan.integration, projected);
+  if (conflicts.length > 0) return { outcome: "conflicted", conflicts };
+
+  requireBoundedIntegrationTree(repo, () =>
+    prospectiveSnapshotIndex(repo, plan.currentTreeOid, projected),
+  );
+  validateSnapshotResultObjects(repo, plan.currentTreeOid, projected);
+  return repo.store.runScratchAwareOperation(() =>
+    repo.store.db.transactionSync(() => {
+      index.indexReplace(indexFromTree(repo, plan.currentTreeOid));
+      applyProjectedIndex(repo, index, projected);
+      return { outcome: "clean", tree: writeTree(repo, index) };
+    }),
+  );
 }
 
-function planReplayInternal(
-  repo: Repository,
-  input: ReplayInput,
-  metadataReservation: MemoryReservation,
-): ReplayPlan {
+function planReplayInternal(repo: Repository, input: ReplayInput): ReplayPlan {
   const revisionLabels: BoundedRevisionLabels = {
     input: "replay source",
     operation: "replay",
@@ -764,21 +596,9 @@ function planReplayInternal(
     throw new GitError("EINVAL", "replay current commit must be a full object id");
   }
 
-  const callerRetainedBytes = checkedRetainedAdd(0, input.integrationCallerRetainedBytes ?? 0);
-  let retainedBytes = 1_024;
-  metadataReservation.set("other", checkedRetainedAdd(callerRetainedBytes, retainedBytes));
-  const retain = (bytes: number): void => {
-    retainedBytes = checkedRetainedAdd(retainedBytes, bytes);
-    metadataReservation.set("other", checkedRetainedAdd(callerRetainedBytes, retainedBytes));
-  };
-  const currentCommit = readCommit(repo, input.currentOid, metadataReservation, (commit) => {
-    retain(commitRetainedBytes(commit));
-  });
+  const currentCommit = readCommit(repo, input.currentOid);
   const sourceOid = resolveRevision(repo, sourceRevision, revisionLabels);
-  retain(retainedStringBytes(sourceOid));
-  const sourceCommit = readCommit(repo, sourceOid, metadataReservation, (commit) => {
-    retain(commitRetainedBytes(commit));
-  });
+  const sourceCommit = readCommit(repo, sourceOid);
   const mainline = requireMainline(input.kind, sourceCommit.parent.length, input.mainline);
   const selectedParentOid =
     sourceCommit.parent.length === 0 ? null : (sourceCommit.parent[(mainline ?? 1) - 1] ?? null);
@@ -786,76 +606,26 @@ function planReplayInternal(
     throw new GitError("ECORRUPT", "replay selected parent is missing");
   }
   const selectedParentTreeOid =
-    selectedParentOid === null
-      ? null
-      : readCommit(repo, selectedParentOid, metadataReservation, (commit) => {
-          retain(retainedStringBytes(commit.tree));
-        }).tree;
+    selectedParentOid === null ? null : readCommit(repo, selectedParentOid).tree;
 
   const baseTreeOid = input.kind === "cherry-pick" ? selectedParentTreeOid : sourceCommit.tree;
   const incomingTreeOid = input.kind === "cherry-pick" ? sourceCommit.tree : selectedParentTreeOid;
-  const currentLabelUnits = input.text?.labels?.current?.length ?? "HEAD".length;
-  const baseLabelUnits =
-    input.text?.labels?.base?.length ??
-    shortOidUnits(input.kind === "cherry-pick" ? selectedParentOid : sourceOid);
   const resolvedIncomingStyle = input.incomingLabelStyle ?? "tree";
-  const predictedIncomingLabelUnits =
-    input.text?.labels?.incoming?.length ??
-    incomingLabelUnits(
-      resolvedIncomingStyle,
-      input.kind,
-      sourceOid,
-      selectedParentOid,
-      sourceCommit.message,
-    );
-  const nextRetainedBytes = checkedRetainedAdd(
-    retainedBytes,
-    checkedRetainedAdd(
-      retainedStringBytes(input.currentOid),
-      checkedRetainedAdd(
-        retainedLabelUnits(currentLabelUnits),
-        checkedRetainedAdd(
-          retainedLabelUnits(baseLabelUnits),
-          retainedLabelUnits(predictedIncomingLabelUnits),
-        ),
+  const labels: ReplayLabels = {
+    current: input.text?.labels?.current ?? "HEAD",
+    base:
+      input.text?.labels?.base ??
+      shortOid(input.kind === "cherry-pick" ? selectedParentOid : sourceOid),
+    incoming:
+      input.text?.labels?.incoming ??
+      incomingLabel(
+        resolvedIncomingStyle,
+        input.kind,
+        sourceOid,
+        selectedParentOid,
+        sourceCommit.message,
       ),
-    ),
-  );
-  metadataReservation.set("other", checkedRetainedAdd(callerRetainedBytes, nextRetainedBytes));
-  const labelMemory = metadataReservation.scope();
-  labelMemory.set("other", 256);
-  let labels: ReplayLabels;
-  try {
-    labels = {
-      current: input.text?.labels?.current ?? "HEAD",
-      base:
-        input.text?.labels?.base ??
-        shortOid(input.kind === "cherry-pick" ? selectedParentOid : sourceOid),
-      incoming:
-        input.text?.labels?.incoming ??
-        incomingLabel(
-          resolvedIncomingStyle,
-          input.kind,
-          sourceOid,
-          selectedParentOid,
-          sourceCommit.message,
-        ),
-    };
-    const actualLabelBytes =
-      retainedStringBytes(labels.current) +
-      retainedStringBytes(labels.base) +
-      retainedStringBytes(labels.incoming);
-    const predictedLabelBytes =
-      retainedLabelUnits(currentLabelUnits) +
-      retainedLabelUnits(baseLabelUnits) +
-      retainedLabelUnits(predictedIncomingLabelUnits);
-    if (actualLabelBytes !== predictedLabelBytes) {
-      throw new CorruptError("replay label memory accounting is inconsistent");
-    }
-    retainedBytes = nextRetainedBytes;
-  } finally {
-    labelMemory.dispose();
-  }
+  };
   const integration = planIntegration(repo, {
     baseTreeOid,
     currentTreeOid: currentCommit.tree,
@@ -865,7 +635,6 @@ function planReplayInternal(
       labels,
     },
     limits: input.limits,
-    reservation: metadataReservation,
   });
 
   return {
@@ -883,95 +652,34 @@ function planReplayInternal(
     incomingTreeOid,
     labels,
     integration,
-    retainedBytes,
-  };
-}
-
-function retainReplayPlan(plan: ReplayPlan, reservation: MemoryReservation): ReplayPlan {
-  return {
-    ...plan,
-    integration: {
-      ...plan.integration,
-      memoryHighWaterBytes: reservation.highWaterBytes,
-      reservation,
-      release: () => reservation.dispose(),
-    },
   };
 }
 
 /** Build one cherry-pick plan from immutable sequencer OIDs and verify its parent selection. */
 export function planFixedReplayStep(repo: Repository, input: FixedReplayStepInput): ReplayPlan {
-  const reservation = repo.store.reserveMemory();
-  try {
-    return retainReplayPlan(planFixedReplayStepInternal(repo, input, reservation), reservation);
-  } catch (error) {
-    reservation.dispose();
-    throw error;
-  }
+  return planFixedReplayStepInternal(repo, input);
 }
 
-function planFixedReplayStepInternal(
-  repo: Repository,
-  input: FixedReplayStepInput,
-  metadataReservation: MemoryReservation,
-): ReplayPlan {
+function planFixedReplayStepInternal(repo: Repository, input: FixedReplayStepInput): ReplayPlan {
   if (!isOid(input.sourceOid) || !isOid(input.currentOid)) {
     throw new GitError("EINVAL", "rebase replay step requires full object ids");
   }
   if (input.selectedParentOid !== null && !isOid(input.selectedParentOid)) {
     throw new GitError("EINVAL", "rebase replay step selected parent is invalid");
   }
-  const plan = planReplayInternal(
-    repo,
-    {
-      kind: "cherry-pick",
-      source: input.sourceOid,
-      currentOid: input.currentOid,
-      incomingLabelStyle: "source-subject",
-      integrationCallerRetainedBytes: input.callerRetainedBytes,
-      limits: input.limits,
-    },
-    metadataReservation,
-  );
+  const plan = planReplayInternal(repo, {
+    kind: "cherry-pick",
+    source: input.sourceOid,
+    currentOid: input.currentOid,
+    incomingLabelStyle: "source-subject",
+    limits: input.limits,
+  });
   if (
     plan.sourceOid !== input.sourceOid ||
     plan.selectedParentOid !== input.selectedParentOid ||
     plan.mainline !== null
   ) {
-    plan.integration.release();
     throw new GitError("ECORRUPT", "rebase replay step differs from its authenticated queue");
   }
   return plan;
-}
-
-export interface RetainedReplayPlan {
-  plan: ReplayPlan;
-  release(): void;
-}
-
-/** Keep replay metadata coordinated from its first allocation through caller release. */
-export function planRetainedFixedReplayStep(
-  repo: Repository,
-  input: FixedReplayStepInput,
-  owningReservation?: MemoryReservation,
-): RetainedReplayPlan {
-  if (owningReservation !== undefined && !repo.store.ownsMemoryReservation(owningReservation)) {
-    throw new GitError("EINVAL", "replay reservation belongs to another repository");
-  }
-  const reservation = owningReservation?.scope() ?? repo.store.reserveMemory();
-  try {
-    const plan = retainReplayPlan(
-      planFixedReplayStepInternal(repo, input, reservation),
-      reservation,
-    );
-    return {
-      plan,
-      release(): void {
-        plan.integration.release();
-      },
-    };
-  } catch (error) {
-    reservation.dispose();
-    throw error;
-  }
 }

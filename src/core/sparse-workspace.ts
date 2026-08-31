@@ -42,19 +42,15 @@ export interface SparseWorkspaceRequest {
   baselineTreeOid: string | null;
   currentTreeOid: string | null;
   paths: string[];
-  /** Caller-owned headroom available for retained hydration state. */
-  maxRetainedBytes?: number;
 }
 
 export type SparseWorkspaceResult =
   | { available: false }
-  | { available: true; rows: SparseWorkspaceRow[]; retainedBytes: number };
+  | { available: true; rows: SparseWorkspaceRow[] };
 
 export interface SparseIndexAncestorRequest {
   checkoutId: number;
   ancestors: string[];
-  /** Caller-owned headroom available for retained lookup state. */
-  maxRetainedBytes?: number;
 }
 
 export interface SparseIndexAncestorFact {
@@ -65,7 +61,6 @@ export interface SparseIndexAncestorFact {
 
 export interface SparseIndexAncestorResult {
   facts: SparseIndexAncestorFact[];
-  retainedBytes: number;
 }
 
 export interface SelectedPathSpec {
@@ -79,7 +74,6 @@ export interface SelectedPathRequest {
   checkoutId: number;
   root: string;
   specs: SelectedPathSpec[];
-  maxRetainedBytes?: number;
 }
 
 export interface SelectedWorktreeFact {
@@ -93,7 +87,6 @@ export type SelectedPathResult =
       available: true;
       index: IndexEntry[];
       worktree: SelectedWorktreeFact[];
-      retainedBytes: number;
     };
 
 /** Optional same-database selected-subtree projection. */
@@ -106,7 +99,6 @@ export interface CommitTreeSnapshotRequest {
   checkoutId: number;
   root: string;
   baselineTreeOid: string | null;
-  maxRetainedBytes?: number;
 }
 
 export interface CommitTreeSnapshotEntry {
@@ -130,7 +122,6 @@ export type CommitTreeSnapshotResult =
       dirty: SparseWorkspaceDirty[];
       index: IndexEntry[];
       directories: CommitTreeSnapshotDirectory[];
-      retainedBytes: number;
     };
 
 /** Optional authenticated baseline projection for narrow tree rebuilds. */

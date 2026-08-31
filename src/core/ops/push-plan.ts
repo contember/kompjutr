@@ -1,6 +1,5 @@
 // Bounded outbound closure and replayable full-object pack generation.
 
-import { MAX_OPERATION_MEMORY_BYTES } from "../../memory.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../errors.js";
@@ -16,10 +15,8 @@ import { streamFullObjectPack } from "../pack/full-object-stream.js";
 import { ZERO_OID } from "../protocol/receive-pack.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../ref-name.js";
 import { type Repository, walkIndexedOwned } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import { comparePaths } from "../streams.js";
 import type { PushPlanningUpdate } from "./refspec.js";
-import type { TransportOperationBudget } from "./transport-budget.js";
 
 export const MAX_PUSH_COMMITS = 512;
 export const MAX_PUSH_OBJECTS = 100_000;
@@ -30,13 +27,12 @@ const PUSH_PLAN_FIXED_BYTES = 256;
 const OBJECT_PAGE = 4096;
 const MAX_TAG_DEPTH = 16;
 const MAX_PUSH_UPDATES = MAX_PUSH_BRANCH_TARGETS;
-const PUSH_PLAN_MEMORY_PART = "push-plan";
-const PUSH_AUTH_MEMORY_PART = "push-plan-auth";
-const PUSH_BRANCH_AUTH_MEMORY_PART = "push-branch-target-auth";
-const PUSH_BRANCH_AUTH_READ_MEMORY_PART = "push-branch-target-auth-read";
-const PUSH_PACK_PREFLIGHT_MEMORY_PART = "push-pack-preflight";
-const PUSH_PACK_FIRST_MEMORY_PART = "push-pack-first-read";
-const PUSH_PACK_REPLAY_MEMORY_PART = "push-pack-replay-read";
+// An unbounded push plan otherwise grows with remote size until the isolate OOMs.
+const MAX_PUSH_PLAN_BYTES = 64 * 1024 * 1024;
+
+function pushPlanStringBytes(value: string): number {
+  return 48 + value.length * 2;
+}
 const CONTAINER_BASE_BYTES = 64;
 const ARRAY_SLOT_BYTES = 16;
 const SET_ENTRY_BYTES = 96;
@@ -45,8 +41,6 @@ const ROOT_ENTRY_BYTES = 256;
 const TAG_ENTRY_BYTES = 192;
 const COMMIT_ENTRY_BYTES = 512;
 const COMMIT_PARENT_BYTES = 96;
-const PACK_BATCH_ENTRY_BYTES = 192;
-const PACK_STREAM_HEADROOM_BYTES = 256 * 1024;
 const NO_REMOTE_OIDS: readonly string[] = Object.freeze([]);
 
 export interface PushObject {
@@ -89,11 +83,8 @@ interface AuthenticatedTagTarget {
   readonly type: ObjectType;
 }
 
-interface PushPlanBudgetState {
-  readonly budget: TransportOperationBudget | undefined;
+interface PushPlanState {
   readonly objects: PushObject[];
-  readonly packMemoryBytes: number;
-  readonly retainedPeakBytes: number;
   openings: number;
   activeStreams: number;
   disposeRequested: boolean;
@@ -109,19 +100,13 @@ interface NormalizedPushPlanOptions {
 class PushRetainedTracker {
   readonly #parts = new Map<string, number>();
   #total = 0;
-  #peak = 0;
-
-  constructor(
-    private readonly budget: TransportOperationBudget | undefined,
-    private readonly memoryPart = PUSH_PLAN_MEMORY_PART,
-  ) {}
 
   get total(): number {
     return this.#total;
   }
 
-  get peak(): number {
-    return this.#peak;
+  get remainingBytes(): number {
+    return MAX_PUSH_PLAN_BYTES - this.#total;
   }
 
   set(part: string, bytes: number): void {
@@ -130,17 +115,12 @@ class PushRetainedTracker {
     }
     const prior = this.#parts.get(part) ?? 0;
     const next = this.#total - prior + bytes;
-    if (
-      !Number.isSafeInteger(next) ||
-      (this.budget === undefined && next > MAX_OPERATION_MEMORY_BYTES)
-    ) {
+    if (!Number.isSafeInteger(next) || next > MAX_PUSH_PLAN_BYTES) {
       throw new GitError("E2BIG", "push plan exceeds the operation memory limit");
     }
-    this.budget?.setMemory(this.memoryPart, next);
     if (bytes === 0) this.#parts.delete(part);
     else this.#parts.set(part, bytes);
     this.#total = next;
-    if (next > this.#peak) this.#peak = next;
   }
 
   transfer(from: string, fromBytes: number, to: string, toBytes: number): void {
@@ -148,21 +128,15 @@ class PushRetainedTracker {
     const currentTo = this.#parts.get(to) ?? 0;
     if (fromBytes > currentFrom) throw new CorruptError("push retained transfer underflow");
     const next = this.#total - currentFrom - currentTo + (currentFrom - fromBytes) + toBytes;
-    if (
-      !Number.isSafeInteger(next) ||
-      next < 0 ||
-      (this.budget === undefined && next > MAX_OPERATION_MEMORY_BYTES)
-    ) {
+    if (!Number.isSafeInteger(next) || next < 0 || next > MAX_PUSH_PLAN_BYTES) {
       throw new GitError("E2BIG", "push plan exceeds the operation memory limit");
     }
-    this.budget?.setMemory(this.memoryPart, next);
     const nextFrom = currentFrom - fromBytes;
     if (nextFrom === 0) this.#parts.delete(from);
     else this.#parts.set(from, nextFrom);
     if (toBytes === 0) this.#parts.delete(to);
     else this.#parts.set(to, toBytes);
     this.#total = next;
-    if (next > this.#peak) this.#peak = next;
   }
 
   clear(part: string): void {
@@ -173,7 +147,6 @@ class PushRetainedTracker {
     const firstBytes = this.#parts.get(first) ?? 0;
     const secondBytes = this.#parts.get(second) ?? 0;
     const next = firstBytes + secondBytes;
-    this.budget?.setMemory(this.memoryPart, next);
     for (const part of this.#parts.keys()) {
       if (part !== first && part !== second) this.#parts.delete(part);
     }
@@ -181,13 +154,12 @@ class PushRetainedTracker {
   }
 
   clearAll(): void {
-    this.budget?.clearMemory(this.memoryPart);
     this.#parts.clear();
     this.#total = 0;
   }
 }
 
-const stateByPlan = new WeakMap<PushPlan, PushPlanBudgetState>();
+const stateByPlan = new WeakMap<PushPlan, PushPlanState>();
 
 /** Validate the three union-wide closure bounds before retaining the next item. */
 function validatePushPlanBounds(
@@ -365,10 +337,8 @@ function validateAuthenticatedObject(
 function authenticateObjects(
   repo: Repository,
   oids: readonly string[],
-  operationBudget: TransportOperationBudget | undefined,
   state: AuthenticationState,
   tracker: PushRetainedTracker,
-  authMemoryPart = PUSH_AUTH_MEMORY_PART,
 ): void {
   tracker.set("root-auth-input", 2 * CONTAINER_BASE_BYTES + oids.length * 2 * SET_ENTRY_BYTES);
   let remaining = oids.filter((oid) => !state.types.has(oid));
@@ -385,26 +355,21 @@ function authenticateObjects(
       selectedBytes += object.size;
       selected++;
     }
-    operationBudget?.setMemory(authMemoryPart, selectedBytes + selected * 256);
-    try {
-      const batch = repo.readObjects(remaining, { budgetBytes: Math.max(1, selectedBytes) });
-      if (batch.objects.size !== selected || batch.remaining.length >= remaining.length) {
-        throw new CorruptError("push authentication made no progress");
-      }
-      for (const [oid, object] of batch.objects) {
-        const tag = validateAuthenticatedObject(oid, object);
-        tracker.set(
-          "root-auth-state",
-          (state.types.size + 1) * ROOT_ENTRY_BYTES +
-            (state.tags.size + (tag === null ? 0 : 1)) * TAG_ENTRY_BYTES,
-        );
-        state.types.set(oid, object.type);
-        if (tag !== null) state.tags.set(oid, tag);
-      }
-      remaining = batch.remaining;
-    } finally {
-      operationBudget?.clearMemory(authMemoryPart);
+    const batch = repo.readObjects(remaining, { budgetBytes: Math.max(1, selectedBytes) });
+    if (batch.objects.size !== selected || batch.remaining.length >= remaining.length) {
+      throw new CorruptError("push authentication made no progress");
     }
+    for (const [oid, object] of batch.objects) {
+      const tag = validateAuthenticatedObject(oid, object);
+      tracker.set(
+        "root-auth-state",
+        (state.types.size + 1) * ROOT_ENTRY_BYTES +
+          (state.tags.size + (tag === null ? 0 : 1)) * TAG_ENTRY_BYTES,
+      );
+      state.types.set(oid, object.type);
+      if (tag !== null) state.tags.set(oid, tag);
+    }
+    remaining = batch.remaining;
   }
 }
 
@@ -412,7 +377,6 @@ function authenticateObjects(
 export function authenticatePushBranchTargets(
   repo: Repository,
   targetOids: readonly string[],
-  operationBudget: TransportOperationBudget,
 ): void {
   if (!Array.isArray(targetOids)) {
     throw new GitError("EINVAL", "push branch target list must be an array");
@@ -423,14 +387,7 @@ export function authenticatePushBranchTargets(
       `push branch target list exceeds ${MAX_PUSH_BRANCH_TARGETS} entries`,
     );
   }
-  if (
-    operationBudget.memory(PUSH_BRANCH_AUTH_MEMORY_PART) !== 0 ||
-    operationBudget.memory(PUSH_BRANCH_AUTH_READ_MEMORY_PART) !== 0
-  ) {
-    throw new GitError("EINVAL", "push branch target authentication is already active");
-  }
-
-  const tracker = new PushRetainedTracker(operationBudget, PUSH_BRANCH_AUTH_MEMORY_PART);
+  const tracker = new PushRetainedTracker();
   try {
     tracker.set(
       "target-input",
@@ -451,14 +408,7 @@ export function authenticatePushBranchTargets(
     }
 
     const state: AuthenticationState = { types: new Map(), tags: new Map() };
-    authenticateObjects(
-      repo,
-      unique,
-      operationBudget,
-      state,
-      tracker,
-      PUSH_BRANCH_AUTH_READ_MEMORY_PART,
-    );
+    authenticateObjects(repo, unique, state, tracker);
     for (const oid of unique) {
       if (state.types.get(oid) !== "commit") {
         throw new GitError("EINVALIDREF", `push branch target ${oid} is not a direct commit`);
@@ -467,7 +417,6 @@ export function authenticatePushBranchTargets(
   } catch (error) {
     localPushError(error);
   } finally {
-    operationBudget.clearMemory(PUSH_BRANCH_AUTH_READ_MEMORY_PART);
     tracker.clearAll();
   }
 }
@@ -475,7 +424,6 @@ export function authenticatePushBranchTargets(
 function resolveRoots(
   repo: Repository,
   oids: readonly string[],
-  operationBudget: TransportOperationBudget | undefined,
   tracker: PushRetainedTracker,
   part: string,
 ): Map<string, ResolvedRoot> {
@@ -484,7 +432,7 @@ function resolveRoots(
     tracker.set("root-frontiers", 3 * CONTAINER_BASE_BYTES + oids.length * 3 * SET_ENTRY_BYTES);
     let frontier = [...new Set(oids)];
     for (let depth = 0; frontier.length > 0 && depth <= MAX_TAG_DEPTH; depth++) {
-      authenticateObjects(repo, frontier, operationBudget, state, tracker);
+      authenticateObjects(repo, frontier, state, tracker);
       const next: string[] = [];
       for (const oid of frontier) {
         if (state.types.get(oid) !== "tag") continue;
@@ -552,40 +500,6 @@ function resolveRoots(
   }
 }
 
-function packGenerationMemoryBytes(objects: readonly PushObject[]): number {
-  if (objects.length === 0) return PACK_STREAM_HEADROOM_BYTES;
-  let peak = PACK_STREAM_HEADROOM_BYTES;
-  let batchBytes = 0;
-  let batchObjects = 0;
-  const flush = (): void => {
-    const bytes = batchBytes + batchObjects * PACK_BATCH_ENTRY_BYTES + PACK_STREAM_HEADROOM_BYTES;
-    if (!Number.isSafeInteger(bytes)) {
-      throw new GitError("E2BIG", "push pack retained memory is not representable");
-    }
-    if (bytes > peak) peak = bytes;
-    batchBytes = 0;
-    batchObjects = 0;
-  };
-  for (const object of objects) {
-    if (object.size > PACK_BLOB_BATCH_TARGET_BYTES) {
-      flush();
-      if (object.source === "pack") {
-        batchBytes = object.size;
-        batchObjects = 1;
-        flush();
-      }
-      continue;
-    }
-    if (batchObjects === OBJECT_PAGE || object.size > PACK_BLOB_BATCH_TARGET_BYTES - batchBytes) {
-      flush();
-    }
-    batchBytes += object.size;
-    batchObjects++;
-  }
-  flush();
-  return peak;
-}
-
 function validatePlanningUpdates(
   updates: readonly PushPlanningUpdate[],
   tracker: PushRetainedTracker,
@@ -633,8 +547,8 @@ function validatePlanningUpdates(
         }
         updateBytes +=
           ROOT_ENTRY_BYTES +
-          retainedStringBytes(update.destination) +
-          retainedStringBytes(update.oldOid);
+          pushPlanStringBytes(update.destination) +
+          pushPlanStringBytes(update.oldOid);
         tracker.set("update-input", updateBytes);
         continue;
       }
@@ -654,10 +568,10 @@ function validatePlanningUpdates(
       }
       updateBytes +=
         ROOT_ENTRY_BYTES +
-        retainedStringBytes(update.source) +
-        retainedStringBytes(update.destination) +
-        retainedStringBytes(update.oid) +
-        retainedStringBytes(update.oldOid);
+        pushPlanStringBytes(update.source) +
+        pushPlanStringBytes(update.destination) +
+        pushPlanStringBytes(update.oid) +
+        pushPlanStringBytes(update.oldOid);
       tracker.set("update-input", updateBytes);
     }
   } finally {
@@ -676,36 +590,30 @@ function sameCommit(left: PlannedCommit, tree: string, parents: readonly string[
 function collectCommitGraphs(
   repo: Repository,
   roots: Iterable<string>,
-  operationBudget: TransportOperationBudget | undefined,
   tracker: PushRetainedTracker,
 ): Map<string, PlannedCommit> {
   tracker.set("commit-map", CONTAINER_BASE_BYTES);
   const commits = new Map<string, PlannedCommit>();
   let retainedBytes = CONTAINER_BASE_BYTES;
   for (const root of roots) {
-    const graphMemory = operationBudget?.scopeMemory() ?? repo.store.reserveMemory();
-    try {
-      const graphBytes = operationBudget?.remainingMemoryBytes ?? graphMemory.remainingBytes;
-      if (graphBytes < 1) {
-        throw new GitError("E2BIG", "push commit graph has no operation memory capacity");
-      }
-      for (const { oid, commit } of walkIndexedOwned(repo, root, graphMemory, {
-        maxBytes: graphBytes,
-      })) {
-        const prior = commits.get(oid);
-        if (prior !== undefined) {
-          if (!sameCommit(prior, commit.tree, commit.parent)) {
-            throw new CorruptError(`commit ${oid} changed between push graph walks`);
-          }
-          continue;
+    const graphBytes = tracker.remainingBytes;
+    if (graphBytes < 1) {
+      throw new GitError("E2BIG", "push commit graph has no operation memory capacity");
+    }
+    for (const { oid, commit } of walkIndexedOwned(repo, root, {
+      maxBytes: graphBytes,
+    })) {
+      const prior = commits.get(oid);
+      if (prior !== undefined) {
+        if (!sameCommit(prior, commit.tree, commit.parent)) {
+          throw new CorruptError(`commit ${oid} changed between push graph walks`);
         }
-        retainedBytes += COMMIT_ENTRY_BYTES + commit.parent.length * COMMIT_PARENT_BYTES;
-        tracker.set("commit-map", retainedBytes);
-        const planned = { oid, tree: commit.tree, parents: commit.parent };
-        commits.set(oid, planned);
+        continue;
       }
-    } finally {
-      graphMemory.dispose();
+      retainedBytes += COMMIT_ENTRY_BYTES + commit.parent.length * COMMIT_PARENT_BYTES;
+      tracker.set("commit-map", retainedBytes);
+      const planned = { oid, tree: commit.tree, parents: commit.parent };
+      commits.set(oid, planned);
     }
   }
   return commits;
@@ -715,12 +623,11 @@ function customBoundary(
   repo: Repository,
   oldOid: string,
   commits: ReadonlyMap<string, PlannedCommit>,
-  operationBudget: TransportOperationBudget | undefined,
   tracker: PushRetainedTracker,
 ): string | null {
   if (commits.has(oldOid)) return oldOid;
   try {
-    const old = resolveRoots(repo, [oldOid], operationBudget, tracker, "remote-root").get(oldOid);
+    const old = resolveRoots(repo, [oldOid], tracker, "remote-root").get(oldOid);
     if (old?.finalType !== "commit" || !commits.has(old.finalOid)) return null;
     return old.finalOid;
   } catch (error) {
@@ -778,7 +685,6 @@ function requireNamespaceRules(
   updates: readonly PushPlanningUpdate[],
   roots: ReadonlyMap<string, ResolvedRoot>,
   commits: ReadonlyMap<string, PlannedCommit>,
-  operationBudget: TransportOperationBudget | undefined,
   tracker: PushRetainedTracker,
 ): Set<string> {
   tracker.set("boundaries", CONTAINER_BASE_BYTES);
@@ -830,7 +736,7 @@ function requireNamespaceRules(
           `${update.destination} requires force for a non-commit replacement`,
         );
       }
-      const boundary = customBoundary(repo, update.oldOid, commits, operationBudget, tracker);
+      const boundary = customBoundary(repo, update.oldOid, commits, tracker);
       if (boundary === null) {
         throw new GitError(
           "ENONFASTFORWARD",
@@ -861,11 +767,10 @@ function localPushError(error: unknown): never {
 function planUpdateSet(
   repo: Repository,
   updates: readonly PushPlanningUpdate[],
-  operationBudget: TransportOperationBudget | undefined,
   requestedOptions: PushPlanOptions = {},
 ): PushPlan | null {
   const options = normalizedOptions(requestedOptions);
-  const tracker = new PushRetainedTracker(operationBudget);
+  const tracker = new PushRetainedTracker();
   try {
     validatePlanningUpdates(updates, tracker);
     tracker.set("ordered", CONTAINER_BASE_BYTES + updates.length * ARRAY_SLOT_BYTES);
@@ -911,7 +816,7 @@ function planUpdateSet(
     const uniqueSourceOids = [...new Set(sourceOids)].sort(comparePaths);
     sourceOids.length = 0;
     tracker.clear("source-oids");
-    const roots = resolveRoots(repo, uniqueSourceOids, operationBudget, tracker, "roots");
+    const roots = resolveRoots(repo, uniqueSourceOids, tracker, "roots");
     uniqueSourceOids.length = 0;
     tracker.clear("unique-source-work");
     requireNamespaceKinds(ordered, roots);
@@ -927,17 +832,10 @@ function planUpdateSet(
     }
 
     const shallow = repo.shallow();
-    const commits = collectCommitGraphs(repo, commitRootOids, operationBudget, tracker);
+    const commits = collectCommitGraphs(repo, commitRootOids, tracker);
     commitRootOids.clear();
     tracker.clear("commit-roots");
-    const boundaries = requireNamespaceRules(
-      repo,
-      ordered,
-      roots,
-      commits,
-      operationBudget,
-      tracker,
-    );
+    const boundaries = requireNamespaceRules(repo, ordered, roots, commits, tracker);
     for (const oid of options.remoteOids) {
       if (!commits.has(oid) || boundaries.has(oid)) continue;
       tracker.set("boundaries", CONTAINER_BASE_BYTES + (boundaries.size + 1) * SET_ENTRY_BYTES);
@@ -1020,15 +918,9 @@ function planUpdateSet(
     tracker.clear("update-input");
     tracker.set("plan-state", PUSH_PLAN_FIXED_BYTES);
     tracker.keepOnly("hydrated-plan", "plan-state");
-    const packMemoryBytes = packGenerationMemoryBytes(hydrated);
-    operationBudget?.setMemory(PUSH_PACK_PREFLIGHT_MEMORY_PART, packMemoryBytes);
-    operationBudget?.clearMemory(PUSH_PACK_PREFLIGHT_MEMORY_PART);
     const plan: PushPlan = Object.freeze({ newCommits: newCommitCount });
     stateByPlan.set(plan, {
-      budget: operationBudget,
       objects: hydrated,
-      packMemoryBytes,
-      retainedPeakBytes: tracker.peak,
       openings: 0,
       activeStreams: 0,
       disposeRequested: false,
@@ -1036,8 +928,6 @@ function planUpdateSet(
     });
     return plan;
   } catch (error) {
-    operationBudget?.clearMemory(PUSH_AUTH_MEMORY_PART);
-    operationBudget?.clearMemory(PUSH_PACK_PREFLIGHT_MEMORY_PART);
     tracker.clearAll();
     return localPushError(error);
   }
@@ -1047,10 +937,9 @@ function planUpdateSet(
 export function planPushUpdates(
   repo: Repository,
   updates: readonly PushPlanningUpdate[],
-  operationBudget: TransportOperationBudget,
   options: PushPlanOptions = {},
 ): PushPlan | null {
-  return planUpdateSet(repo, updates, operationBudget, options);
+  return planUpdateSet(repo, updates, options);
 }
 
 /** Plan every object absent from the advertised target branch ancestry. */
@@ -1072,7 +961,6 @@ export function planPushObjects(
         oldOid,
       },
     ],
-    undefined,
     { remoteOids },
   );
   if (plan === null) throw new CorruptError("legacy non-delete push produced no pack plan");
@@ -1087,11 +975,6 @@ export async function* openPushPack(repo: Repository, plan: PushPlan): AsyncGene
   if (state.openings >= 2) {
     throw new GitError("EPUSHLOCAL", "push pack may be opened at most twice");
   }
-  let memoryPart: string | null = null;
-  if (state.budget !== undefined) {
-    memoryPart = state.openings === 0 ? PUSH_PACK_FIRST_MEMORY_PART : PUSH_PACK_REPLAY_MEMORY_PART;
-    state.budget.setMemory(memoryPart, state.packMemoryBytes);
-  }
   state.openings++;
   state.activeStreams++;
   try {
@@ -1103,7 +986,6 @@ export async function* openPushPack(repo: Repository, plan: PushPlan): AsyncGene
     });
   } finally {
     state.activeStreams--;
-    if (memoryPart !== null) state.budget?.clearMemory(memoryPart);
     if (state.disposeRequested && state.activeStreams === 0) finalizePushPlanDisposal(state);
   }
 }
@@ -1116,14 +998,13 @@ export function disposePushPlan(plan: PushPlan): void {
   if (state.activeStreams === 0) finalizePushPlanDisposal(state);
 }
 
-function finalizePushPlanDisposal(state: PushPlanBudgetState): void {
+function finalizePushPlanDisposal(state: PushPlanState): void {
   if (state.disposed) return;
   state.objects.length = 0;
-  state.budget?.clearMemory(PUSH_PLAN_MEMORY_PART);
   state.disposed = true;
 }
 
-function requirePlanState(plan: PushPlan): PushPlanBudgetState {
+function requirePlanState(plan: PushPlan): PushPlanState {
   const state = stateByPlan.get(plan);
   if (state === undefined) throw new GitError("EINVAL", "invalid push plan");
   if (state.disposed || state.disposeRequested)
@@ -1149,11 +1030,6 @@ export function pushPlanObjectOidAt(plan: PushPlan, index: number): string | nul
     throw new GitError("EINVAL", "push plan index must be a safe nonnegative integer");
   }
   return requirePlanState(plan).objects[index]?.oid ?? null;
-}
-
-/** Conservative retained-state high-water observed while building the plan. */
-export function pushPlanRetainedPeakBytes(plan: PushPlan): number {
-  return requirePlanState(plan).retainedPeakBytes;
 }
 
 async function* generatePushPack(

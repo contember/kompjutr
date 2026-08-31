@@ -1,4 +1,3 @@
-import type { MemoryReservation } from "../memory.js";
 import type { SqliteGitDatabase } from "../sqlite/store.js";
 import { NotARepositoryError } from "./errors.js";
 import { normalizePath } from "./paths.js";
@@ -47,7 +46,6 @@ export interface InitialWorktreeWriter {
     root: string,
     body: (session: InitialWorktreeSession) => T,
     afterClose?: (value: T) => unknown,
-    reservation?: MemoryReservation,
   ): InitialWorktreeResult<T>;
 }
 
@@ -62,7 +60,6 @@ export interface IndexTrackerWriter {
     checkoutId: number,
     baselineTreeOid: string | null,
     entries: Iterable<IndexTrackerSeedEntry>,
-    owningReservation?: MemoryReservation,
   ): boolean;
   /** Move a sealed baseline without clearing its dirty journal. */
   advanceBaseline?(checkoutId: number, baselineTreeOid: string | null): boolean;

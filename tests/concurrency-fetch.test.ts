@@ -700,8 +700,6 @@ describe("fetch publication concurrency", () => {
 
       await expect(pending).rejects.toMatchObject({ code: "ESTALEFETCH" });
       expect(workspace.repo.store.getRef(mapping.destination)).toBe(tip);
-      expect(workspace.repo.store.memory.totalBytes).toBe(0);
-      expect(workspace.repo.store.memory.activeCount).toBe(0);
     } finally {
       paused.barrier.release();
       await server.close();

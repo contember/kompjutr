@@ -1,17 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import {
   Database,
   type DurableObjectStorageLike,
   type SQLCursorLike,
   type SQLStorageLike,
 } from "../src/sqlite/db.js";
-import {
-  createRefMutationMemoryOwner,
-  SqliteGitDatabase,
-  type StoreOptions,
-} from "../src/sqlite/store.js";
+import { SqliteGitDatabase, type StoreOptions } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
@@ -27,13 +22,11 @@ const metadata = {
 class CodedTooBigStorage implements DurableObjectStorageLike {
   readonly sql: SQLStorageLike;
   #queryFragment: string | null = null;
-  #queryObserver: ((query: string) => void) | null = null;
   writesBeforeFailure = 0;
 
   constructor(private readonly inner: SqliteTestStorage) {
     this.sql = {
       exec: <Row extends object>(query: string, ...bindings: unknown[]): SQLCursorLike<Row> => {
-        this.#queryObserver?.(query);
         if (this.#queryFragment !== null && query.includes(this.#queryFragment)) {
           this.#queryFragment = null;
           throw Object.assign(new Error("injected coded SQLite value failure"), {
@@ -51,10 +44,6 @@ class CodedTooBigStorage implements DurableObjectStorageLike {
   arm(queryFragment: string): void {
     this.#queryFragment = queryFragment;
     this.writesBeforeFailure = 0;
-  }
-
-  observeQueries(observer: ((query: string) => void) | null): void {
-    this.#queryObserver = observer;
   }
 
   transactionSync<T>(closure: () => T): T {
@@ -76,15 +65,6 @@ function open(options: StoreOptions = {}) {
   const database = new SqliteGitDatabase(db, options);
   const checkout = database.createRepository("/repo", "ref: refs/heads/main");
   return { db, database, store: database.openCheckout(checkout) };
-}
-
-function expectIdle(store: ReturnType<typeof open>["store"]): void {
-  const probe = store.reserveMemory();
-  try {
-    probe.set("other", MAX_OPERATION_MEMORY_BYTES);
-  } finally {
-    probe.dispose();
-  }
 }
 
 function durablePublicationState(db: TestDatabase) {
@@ -140,155 +120,6 @@ describe("exact fetch publication", () => {
     if (reopenedCheckout === null) throw new Error("reopened checkout is missing");
     const reopened = reopenedDatabase.openCheckout(reopenedCheckout);
     expect(reopened.getRef(tracking)).toBe(target);
-    expectIdle(store);
-    expectIdle(reopened);
-  });
-
-  it("owns a long singleton namespace JSON aggregate at the exact shared boundary", () => {
-    const prefix = `refs/remotes/${"p".repeat(1_500_001)}/`;
-    const prepare = (): ReturnType<typeof open> => {
-      const opened = open();
-      const seed = opened.store.beginFetchPublication(prefix);
-      seed.dispose();
-      return opened;
-    };
-    const fenceState = (db: TestDatabase): Record<string, unknown> => ({
-      repository: db.all<Record<string, unknown>>(
-        "SELECT fetch_generation FROM git_repositories WHERE id = 1",
-      ),
-      namespaces: db.all<Record<string, unknown>>(
-        `SELECT length(CAST(tracking_prefix AS BLOB)) AS prefix_bytes,
-                latest_generation, revision
-           FROM git_fetch_namespaces WHERE repo_id = 1`,
-      ),
-    });
-
-    const measured = prepare();
-    const measuredToken = measured.store.beginFetchPublication(prefix);
-    const operationBytes = measured.store.shared.memory.highWaterBytes;
-    measuredToken.dispose();
-    expect(operationBytes).toBeGreaterThan(12 * 1024 * 1024);
-    expect(operationBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
-    expectIdle(measured.store);
-
-    const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
-    const exact = prepare();
-    const exactBlocker = exact.store.reserveMemory();
-    exactBlocker.set("other", externalBytes);
-    try {
-      const token = exact.store.beginFetchPublication(prefix);
-      try {
-        expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-      } finally {
-        token.dispose();
-      }
-      expect(exactBlocker.currentBytes).toBe(externalBytes);
-    } finally {
-      exactBlocker.dispose();
-    }
-    expectIdle(exact.store);
-
-    const over = prepare();
-    const before = fenceState(over.db);
-    const overBlocker = over.store.reserveMemory();
-    overBlocker.set("other", externalBytes + 1);
-    try {
-      expect(() => over.store.beginFetchPublication(prefix)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(fenceState(over.db)).toEqual(before);
-      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
-    } finally {
-      overBlocker.dispose();
-    }
-    expectIdle(over.store);
-  });
-
-  it("owns a long tracking target row at the exact boundary and rolls back one byte over", () => {
-    const prefix = "refs/remotes/origin/";
-    const name = `${prefix}main`;
-    const target = `ref: refs/heads/${"t".repeat(1_500_001)}`;
-    const operationBytes = 1_168 + 2 * prefix.length + 2 * name.length + 3 * target.length;
-    expect(operationBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
-    const prepare = (): ReturnType<typeof open> => {
-      const opened = open();
-      opened.db.run("INSERT INTO git_refs (repo_id, name, target) VALUES (1, ?, ?)", name, target);
-      return opened;
-    };
-
-    const exact = prepare();
-    const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
-    const exactBlocker = exact.store.reserveMemory();
-    exactBlocker.set("other", externalBytes);
-    try {
-      const token = exact.store.beginTrackingRefPublication(prefix, name);
-      try {
-        expect(token.target).toBe(target);
-        expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-      } finally {
-        token.dispose();
-      }
-      expect(exactBlocker.currentBytes).toBe(externalBytes);
-    } finally {
-      exactBlocker.dispose();
-    }
-    expectIdle(exact.store);
-
-    const over = prepare();
-    const overBlocker = over.store.reserveMemory();
-    overBlocker.set("other", externalBytes + 1);
-    try {
-      expect(() => over.store.beginTrackingRefPublication(prefix, name)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(
-        over.db.scalar<number>("SELECT count(*) FROM git_tracking_ref_revisions WHERE repo_id = 1"),
-      ).toBe(0);
-      expect(over.store.getRef(name)).toBe(target);
-      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
-    } finally {
-      overBlocker.dispose();
-    }
-    expectIdle(over.store);
-  });
-
-  it("adds the exact selected tracking revision row charge before decode", () => {
-    const prefix = "refs/remotes/origin/";
-    const name = `${prefix}${"n".repeat(1_000_001)}`;
-    const initial = "1".repeat(40);
-    const updated = "2".repeat(40);
-    const { db, faultStorage, store } = openCodedTooBig();
-    db.run("INSERT INTO git_refs (repo_id, name, target) VALUES (1, ?, ?)", name, initial);
-    db.run(
-      "INSERT INTO git_tracking_ref_revisions (repo_id, ref_name, revision) VALUES (1, ?, 0)",
-      name,
-    );
-    let metadataBytes: number | null = null;
-    let payloadBytes: number | null = null;
-    faultStorage.observeQueries((query) => {
-      if (query.includes("AS max_ref_name_bytes")) {
-        metadataBytes = store.shared.memory.totalBytes;
-      } else if (query.includes("AS ref_name_bytes")) {
-        payloadBytes = store.shared.memory.totalBytes;
-      }
-    });
-    try {
-      store.setRef(name, updated);
-    } finally {
-      faultStorage.observeQueries(null);
-    }
-    if (metadataBytes === null || payloadBytes === null) {
-      throw new Error("tracking revision scan did not execute both phases");
-    }
-    expect(payloadBytes - metadataBytes).toBe(304 + 3 * name.length);
-    expect(store.getRef(name)).toBe(updated);
-    expect(
-      db.scalar<number>(
-        "SELECT revision FROM git_tracking_ref_revisions WHERE repo_id = 1 AND ref_name = ?",
-        name,
-      ),
-    ).toBe(1);
-    expectIdle(store);
   });
 
   it("publishes several namespaces with legacy tracking, tags, shallow state, and reflogs", () => {
@@ -388,8 +219,6 @@ describe("exact fetch publication", () => {
       reason: metadata.reason,
     });
     expect(durablePublicationState(reopenedDb)).toEqual(committed);
-    expectIdle(store);
-    expectIdle(reopened);
   });
 
   it("rolls every destination and shallow update back when one exact candidate is stale", () => {
@@ -428,7 +257,6 @@ describe("exact fetch publication", () => {
     } finally {
       token.dispose();
     }
-    expectIdle(store);
   });
 
   it("rolls tracking rows and namespace revisions back after coded SQLite value failure", () => {
@@ -460,11 +288,9 @@ describe("exact fetch publication", () => {
       const coldStore = coldDatabase.openCheckout(coldCheckout);
       expect(durablePublicationState(coldDb)).toEqual(before);
       expect(coldStore.getRef(tracking)).toBeNull();
-      expectIdle(coldStore);
     } finally {
       token.dispose();
     }
-    expectIdle(store);
   });
 
   it("rolls ref, reflog, and shallow writes back when final revision advancement fails", () => {
@@ -507,7 +333,6 @@ describe("exact fetch publication", () => {
     } finally {
       token.dispose();
     }
-    expectIdle(store);
   });
 
   it("accepts an idempotent exact winner and rejects a different winner", () => {
@@ -544,7 +369,6 @@ describe("exact fetch publication", () => {
       stale.dispose();
       replacement.dispose();
     }
-    expectIdle(store);
   });
 
   it("rejects invalid candidate authority and token ownership without mutation", () => {
@@ -619,7 +443,6 @@ describe("exact fetch publication", () => {
     expect(() =>
       store.beginFetchPublication("refs/remotes/corrupt/", ["refs/checkpoints/corrupt"]),
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    expectIdle(store);
   });
 
   it("fences create-attached/remove ABA with no checkout reflog evidence", () => {
@@ -642,112 +465,6 @@ describe("exact fetch publication", () => {
     } finally {
       token.dispose();
     }
-    expectIdle(store);
-  });
-
-  it("rejects foreign and disposed publication owners before SQL", () => {
-    const { db, database, store } = open();
-    const token = store.beginFetchPublication("refs/remotes/origin/");
-    const otherCheckout = database.createRepository("/other", "ref: refs/heads/main");
-    const other = database.openCheckout(otherCheckout);
-    const foreignOwner = createRefMutationMemoryOwner(other.shared);
-    const disposedOwner = createRefMutationMemoryOwner(store.shared);
-    disposedOwner.dispose();
-    try {
-      db.storage.resetCounters();
-      expect(() =>
-        store.beginFetchPublication("refs/remotes/foreign-owner/", [], undefined, foreignOwner),
-      ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
-      expect(db.storage.statementCount).toBe(0);
-
-      db.storage.resetCounters();
-      expect(() =>
-        store.beginFetchPublication("refs/remotes/disposed-owner/", [], undefined, disposedOwner),
-      ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
-      expect(db.storage.statementCount).toBe(0);
-
-      db.storage.resetCounters();
-      expect(() => store.publishFetchRefs(token, {}, metadata, foreignOwner)).toThrowError(
-        expect.objectContaining({ code: "EINVAL" }),
-      );
-      expect(db.storage.statementCount).toBe(0);
-
-      db.storage.resetCounters();
-      expect(() => store.publishFetchRefs(token, {}, metadata, disposedOwner)).toThrowError(
-        expect.objectContaining({ code: "EINVAL" }),
-      );
-      expect(db.storage.statementCount).toBe(0);
-
-      expect(store.publishFetchRefs(token, {}, metadata)).toBe(false);
-    } finally {
-      token.dispose();
-      foreignOwner.dispose();
-      disposedOwner.dispose();
-    }
-    expectIdle(store);
-    expectIdle(other);
-  });
-
-  it("binds owned candidate aliases to the issuing owner until token disposal", () => {
-    const { db, store } = open();
-    const owner = createRefMutationMemoryOwner(store.shared);
-    const candidateText = "refs/tags/owned-candidate";
-    const candidate = owner.construct(candidateText.length, () => candidateText);
-    const token = store.beginFetchPublication(
-      "refs/remotes/origin/",
-      [candidate],
-      undefined,
-      owner,
-    );
-    try {
-      db.storage.resetCounters();
-      expect(() => store.publishFetchRefs(token, {}, metadata)).toThrowError(
-        expect.objectContaining({ code: "EINVAL" }),
-      );
-      expect(db.storage.statementCount).toBe(0);
-
-      owner.dispose();
-      expect(token.disposed).toBe(true);
-      db.storage.resetCounters();
-      expect(() => store.publishFetchRefs(token, {}, metadata, owner)).toThrowError(
-        expect.objectContaining({ code: "ESTALEFETCH" }),
-      );
-      expect(db.storage.statementCount).toBe(0);
-    } finally {
-      token.dispose();
-      owner.dispose();
-    }
-    expectIdle(store);
-  });
-
-  it("charges mixed non-owned plan strings while accepting the internal owner seam", () => {
-    const { store } = open();
-    const owner = createRefMutationMemoryOwner(store.shared);
-    const candidateText = "refs/tags/mixed-owner";
-    const candidate = owner.construct(candidateText.length, () => candidateText);
-    const target = "1".repeat(40);
-    expect(owner.owns(candidate)).toBe(true);
-    expect(owner.owns(target)).toBe(false);
-    const token = store.beginFetchPublication(
-      "refs/remotes/origin/",
-      [candidate],
-      undefined,
-      owner,
-    );
-    try {
-      expect(
-        store.publishFetchRefs(
-          token,
-          { globalTagPuts: [{ name: candidate, target }] },
-          metadata,
-          owner,
-        ),
-      ).toBe(true);
-    } finally {
-      token.dispose();
-      owner.dispose();
-    }
-    expectIdle(store);
   });
 
   it("fences HEAD ABA after its retained checkout reflog evidence is deleted", () => {
@@ -775,15 +492,10 @@ describe("exact fetch publication", () => {
     } finally {
       token.dispose();
     }
-    expectIdle(store);
   });
 
-  it("shares the caller reservation and publishes exact candidates within the statement target", () => {
+  it("publishes exact candidates within the statement target", () => {
     const { db, store } = open();
-    const reservation = store.reserveMemory();
-    reservation.set("protocol", 4_096);
-    reservation.set("other", 2_048);
-    const callerBytes = 6_144;
     const branch = "refs/heads/sql-bound";
     const candidates = [
       branch,
@@ -795,10 +507,9 @@ describe("exact fetch publication", () => {
     expect(candidates).toHaveLength(MAPPED_CANDIDATE_COUNT);
     expect(store.head()).toBe("ref: refs/heads/main");
     db.storage.resetCounters();
-    const token = store.beginFetchPublication("refs/remotes/origin/", candidates, reservation);
+    const token = store.beginFetchPublication("refs/remotes/origin/", candidates);
 
     try {
-      expect(reservation.currentBytes).toBeGreaterThan(callerBytes);
       expect(
         store.publishFetchRefs(
           token,
@@ -812,15 +523,9 @@ describe("exact fetch publication", () => {
         ),
       ).toBe(true);
       expect(db.storage.statementCount).toBeLessThan(1_000);
-      expect(reservation.highWaterBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
     } finally {
       token.dispose();
     }
-    expect(reservation.currentBytes).toBe(callerBytes);
-    reservation.clear("protocol");
-    reservation.clear("other");
-    reservation.dispose();
-    expectIdle(store);
   });
 
   it("retains legacy capacity for 1,025 distinct tag candidates", () => {
@@ -836,98 +541,5 @@ describe("exact fetch publication", () => {
     } finally {
       token.dispose();
     }
-    expectIdle(store);
-  });
-
-  it("keeps sibling token and caller bytes while rejecting foreign reservations", () => {
-    const { database, store } = open();
-    const reservation = store.reserveMemory();
-    reservation.set("protocol", 4_096);
-    reservation.set("other", 2_048);
-    const callerBytes = reservation.currentBytes;
-    const first = store.beginFetchPublication("refs/remotes/first/", [], reservation);
-    const firstBytes = reservation.currentBytes;
-    const second = store.beginFetchPublication("refs/remotes/second/", [], reservation);
-    const bothBytes = reservation.currentBytes;
-    expect(firstBytes).toBeGreaterThan(callerBytes);
-    expect(bothBytes).toBeGreaterThan(firstBytes);
-
-    first.dispose();
-    expect(reservation.currentBytes).toBeGreaterThan(callerBytes);
-    expect(reservation.currentBytes).toBeLessThan(bothBytes);
-    expect(second.disposed).toBe(false);
-    const beforeFailure = reservation.currentBytes;
-    expect(() =>
-      store.beginFetchPublication(
-        "refs/remotes/duplicate/",
-        ["refs/tags/duplicate", "refs/tags/duplicate"],
-        reservation,
-      ),
-    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
-    expect(reservation.currentBytes).toBe(beforeFailure);
-
-    const otherCheckout = database.createRepository("/other", "ref: refs/heads/main");
-    const other = database.openCheckout(otherCheckout);
-    const otherReservation = other.reserveMemory();
-    try {
-      expect(() =>
-        store.beginFetchPublication("refs/remotes/foreign-repository/", [], otherReservation),
-      ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
-    } finally {
-      otherReservation.dispose();
-    }
-    const foreign = open();
-    const foreignReservation = foreign.store.reserveMemory();
-    try {
-      expect(() =>
-        store.beginFetchPublication("refs/remotes/foreign-coordinator/", [], foreignReservation),
-      ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
-    } finally {
-      foreignReservation.dispose();
-    }
-
-    second.dispose();
-    expect(reservation.currentBytes).toBe(callerBytes);
-    reservation.dispose();
-    expectIdle(store);
-    expectIdle(other);
-    expectIdle(foreign.store);
-  });
-
-  it("invalidates publication tokens when the caller disposes their parent reservation", () => {
-    const { store } = open();
-    const reservation = store.reserveMemory();
-    const token = store.beginFetchPublication(
-      "refs/remotes/origin/",
-      ["refs/tags/v1"],
-      reservation,
-    );
-    reservation.dispose();
-    expect(token.disposed).toBe(true);
-    expect(() =>
-      store.publishFetchRefs(
-        token,
-        { globalTagPuts: [{ name: "refs/tags/v1", target: "1".repeat(40) }] },
-        metadata,
-      ),
-    ).toThrowError(expect.objectContaining({ code: "ESTALEFETCH" }));
-    token.dispose();
-    expectIdle(store);
-  });
-
-  it("preserves an exactly full caller reservation after a failed child allocation", () => {
-    const excess = open();
-
-    const full = excess.store.reserveMemory();
-    full.set("protocol", MAX_OPERATION_MEMORY_BYTES);
-    try {
-      expect(() =>
-        excess.store.beginFetchPublication("refs/remotes/upstream/", [], full),
-      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(full.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      full.dispose();
-    }
-    expectIdle(excess.store);
   });
 });

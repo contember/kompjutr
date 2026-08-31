@@ -12,7 +12,6 @@ import { Repository } from "../src/core/repository.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type { ScanEntry } from "../src/fs/types.js";
 import { createGit, type Git, type GitScratchIndex } from "../src/git/client.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import {
   Database,
   type DurableObjectStorageLike,
@@ -889,16 +888,6 @@ describe("createSqliteGitClient", () => {
     await expect(coldGit.configGet({ dir, path: "remote.origin.fetch" })).resolves.toBe(
       "+refs/heads/*:refs/remotes/origin/*",
     );
-    for (const candidate of [database, coldDatabase]) {
-      const checkout = candidate.findCheckout(dir);
-      if (checkout === null) throw new Error("remote rollback checkout is missing");
-      const probe = candidate.openCheckout(checkout).reserveMemory();
-      try {
-        probe.set("other", MAX_OPERATION_MEMORY_BYTES);
-      } finally {
-        probe.dispose();
-      }
-    }
   });
 
   it("round-trips the former remote URL first excess through a cold reopen", async () => {
@@ -1600,7 +1589,7 @@ describe("createSqliteGitClient", () => {
     );
   });
 
-  it("keeps the maximal public scratch snapshot below SQL and memory budgets", async () => {
+  it("keeps the maximal public scratch snapshot below the SQL budget", async () => {
     const workspace = makeTestWorkspace();
     const setupGit = bindNativeGit(workspace);
     await setupGit.init({ dir: "/" });
@@ -1629,8 +1618,6 @@ describe("createSqliteGitClient", () => {
 
     expect(oid).toMatch(/^[0-9a-f]{40}$/);
     expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1_000);
-    expect(repo.store.memory.highWaterBytes).toBeLessThan(64 * 1024 * 1024);
-    expect(repo.store.memory.activeCount).toBe(0);
     expect(clientControlState(workspace, "/")).toEqual(beforeControl);
   });
 

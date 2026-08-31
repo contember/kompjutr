@@ -8,11 +8,6 @@ import {
   type TreeEntry,
   TreeParser,
 } from "../src/core/objects.js";
-import {
-  MAX_OPERATION_MEMORY_BYTES,
-  MemoryCoordinator,
-  type MemoryReservation,
-} from "../src/memory.js";
 import { Database, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
 import { PackTreeIndex } from "../src/sqlite/pack-ingest-index.js";
 import {
@@ -285,7 +280,6 @@ describe("incremental tree index sink", () => {
     const count = Math.floor((16 * ONE_MIB) / entrySize) + 1;
     const objectSize = count * entrySize;
     const sink = createTreeIndexSink(db, source(objectSize));
-    let maxRetainedBytes = sink.retainedBytes;
     let maxRetainedRows = sink.retainedRows;
     const byteChunk = new Uint8Array(1);
 
@@ -297,7 +291,6 @@ describe("incremental tree index sink", () => {
           byteChunk[0] = byte;
           sink.push(byteChunk);
         }
-        maxRetainedBytes = Math.max(maxRetainedBytes, sink.retainedBytes);
         maxRetainedRows = Math.max(maxRetainedRows, sink.retainedRows);
       }
       sink.finish();
@@ -339,9 +332,6 @@ describe("incremental tree index sink", () => {
     expect(edges[0]?.cumulative_base).toBe(perEntryBase);
     expect(readBlob(edges[1]?.raw_entry).length).toBe(entrySize);
     expect(edges[1]?.cumulative_base).toBe(count * perEntryBase);
-    expect(maxRetainedBytes).toBeLessThanOrEqual(ONE_MIB);
-    expect(sink.peakBytes).toBeLessThanOrEqual(ONE_MIB);
-    expect(sink.peakBytes).toBeGreaterThan(maxRetainedBytes);
     expect(maxRetainedRows).toBeLessThanOrEqual(2_048);
     expect(db.maxEntryRows).toBeLessThanOrEqual(2_048);
     expect(db.maxBoundBytes).toBeLessThanOrEqual(ONE_MIB);
@@ -372,141 +362,6 @@ describe("incremental tree index sink", () => {
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const oid = store.write("tree", data);
     expect([...store.walkTree(oid)]).toEqual([{ path: name, mode: "100644", oid: OID }]);
-    store.shared.memory.assertIdle();
-  });
-
-  it("composes oversized parser, arena, and direct binding ownership exactly", () => {
-    const data = rawEntry("100644", "x".repeat(704 * 1024 + 1));
-    const measured = new MemoryCoordinator();
-    const measuredOwner = measured.reserve();
-    const measuredDb = new TestDatabase();
-    initializeTreeSchema(measuredDb);
-    measuredDb.transactionSync(() =>
-      indexTreeSource(measuredDb, source(data.length), [data], measuredOwner),
-    );
-    const operationBytes = measuredOwner.highWaterBytes;
-    expect(measuredOwner.currentBytes).toBe(0);
-    measuredOwner.dispose();
-    measured.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const coordinator = new MemoryCoordinator();
-      const blocker = coordinator.reserve();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = coordinator.reserve();
-      const db = new TestDatabase();
-      initializeTreeSchema(db);
-      try {
-        const index = () =>
-          db.transactionSync(() => indexTreeSource(db, source(data.length), [data], owner));
-        if (excess === 0) expect(index).not.toThrow();
-        else expect(index).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        expect(owner.currentBytes).toBe(0);
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      coordinator.assertIdle();
-    }
-  });
-
-  it("owns direct pack tree streams by their actual current chunk", () => {
-    const data = rawEntry("100644", "x".repeat(32 * 1024));
-    const run = (coordinator: MemoryCoordinator) => {
-      const owner = coordinator.reserve();
-      const db = new TestDatabase();
-      initializeTreeSchema(db);
-      const index = new PackTreeIndex(db, owner);
-      index.addStream(1, TREE_OID, 1, data.length, () => [data]);
-      return { db, owner };
-    };
-
-    const measured = new MemoryCoordinator();
-    const baseline = run(measured);
-    const operationBytes = baseline.owner.highWaterBytes;
-    expect(operationBytes).toBeLessThan(2 * ONE_MIB);
-    expect(baseline.owner.currentBytes).toBe(0);
-    baseline.owner.dispose();
-    measured.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const coordinator = new MemoryCoordinator();
-      const blocker = coordinator.reserve();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = coordinator.reserve();
-      const db = new TestDatabase();
-      initializeTreeSchema(db);
-      const index = new PackTreeIndex(db, owner);
-      try {
-        const add = () => index.addStream(1, TREE_OID, 1, data.length, () => [data]);
-        if (excess === 0) expect(add).not.toThrow();
-        else expect(add).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        expect(owner.currentBytes).toBe(0);
-        expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(
-          excess === 0 ? 1 : 0,
-        );
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      coordinator.assertIdle();
-    }
-  });
-
-  it("pre-admits multi-source pack seed serialization before its SQL write", () => {
-    const count = 2_048;
-    const empty = new Uint8Array(0);
-    const stage = (db: TestDatabase, owner: MemoryReservation) => {
-      const index = new PackTreeIndex(db, owner);
-      for (let at = 0; at < count; at++) {
-        index.addBuffered(1, (at + 1).toString(16).padStart(40, "0"), 1, 0, empty);
-      }
-      return index;
-    };
-
-    const measured = new MemoryCoordinator();
-    const measuredOwner = measured.reserve();
-    const measuredDb = new TestDatabase();
-    initializeTreeSchema(measuredDb);
-    const measuredIndex = stage(measuredDb, measuredOwner);
-    const retainedBytes = measuredOwner.currentBytes;
-    measuredIndex.flush();
-    const operationBytes = measuredOwner.highWaterBytes;
-    expect(operationBytes).toBeGreaterThan(retainedBytes);
-    expect(measuredOwner.currentBytes).toBe(0);
-    measuredOwner.dispose();
-    measured.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const coordinator = new MemoryCoordinator();
-      const owner = coordinator.reserve();
-      const db = new TestDatabase();
-      initializeTreeSchema(db);
-      const index = stage(db, owner);
-      const blocker = coordinator.reserve();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      db.storage.histogram = new Map();
-      try {
-        const flush = () => index.flush();
-        if (excess === 0) expect(flush).not.toThrow();
-        else expect(flush).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        expect(owner.currentBytes).toBe(0);
-        expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(
-          excess === 0 ? count : 0,
-        );
-        if (excess === 1) {
-          expect(
-            [...db.storage.histogram.keys()].some((query) =>
-              query.startsWith("INSERT OR IGNORE INTO git_tree_sources"),
-            ),
-          ).toBe(false);
-        }
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      coordinator.assertIdle();
-    }
   });
 
   it("streams seeded marker RETURNING rows through the production adapter", () => {
@@ -532,36 +387,12 @@ describe("incremental tree index sink", () => {
       return db;
     };
 
-    const measured = new MemoryCoordinator();
-    const measuredOwner = measured.reserve();
-    const measuredDb = open();
-    measuredDb.transactionSync(() => indexSeededTreeSources(measuredDb, sources, measuredOwner));
-    const operationBytes = measuredOwner.highWaterBytes;
-    expect(measuredOwner.currentBytes).toBe(0);
-    measuredOwner.dispose();
-    measured.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const coordinator = new MemoryCoordinator();
-      const blocker = coordinator.reserve();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = coordinator.reserve();
-      const db = open();
-      try {
-        const index = () => db.transactionSync(() => indexSeededTreeSources(db, sources, owner));
-        if (excess === 0) expect(index).not.toThrow();
-        else expect(index).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        expect(owner.currentBytes).toBe(0);
-        expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(
-          excess === 0 ? count : 0,
-        );
-        expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      coordinator.assertIdle();
-    }
+    const db = open();
+    db.transactionSync(() => indexSeededTreeSources(db, sources));
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(
+      count,
+    );
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
   });
 
   it("keeps marker formulas and legacy adapters byte-exact", () => {

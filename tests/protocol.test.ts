@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import { concat, utf8 } from "../src/core/bytes.js";
-import { TransportOperationBudget } from "../src/core/ops/transport-budget.js";
 import {
   FLUSH,
   MAX_PKT_FRAME_BYTES,
@@ -13,7 +12,6 @@ import { receivePack } from "../src/core/protocol/receive-pack.js";
 import { discover, normalizeRemoteUrl, uploadPack } from "../src/core/protocol/remote.js";
 import { ByteReader, pktText } from "../src/core/protocol/stream.js";
 import type { GitHttpClient, GitHttpResponse } from "../src/core/protocol/transport.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 
@@ -113,74 +111,22 @@ describe("pkt-lines", () => {
     expect(await reader.readPkt()).toBeNull();
   });
 
-  it("admits the exact split header and payload peak before allocation", async () => {
-    const chunks = [utf8.encode("00"), utf8.encode("0aab"), utf8.encode("cdef")];
-    const measuredCoordinator = new MemoryCoordinator();
-    const measuredReservation = measuredCoordinator.reserve();
-    const measuredBudget = new TransportOperationBudget(measuredReservation);
-    const measuredReader = new ByteReader(once(...chunks), measuredBudget, "test-frame");
-    expect(pktText((await measuredReader.readPkt())!)).toBe("abcdef");
-    const peak = measuredReservation.highWaterBytes;
-    expect(peak).toBeGreaterThan(10);
-    await measuredReader.release();
-    measuredReservation.dispose();
-    measuredCoordinator.assertIdle();
-
-    const exactCoordinator = new MemoryCoordinator();
-    const exactReservation = exactCoordinator.reserve();
-    const exactBudget = new TransportOperationBudget(exactReservation);
-    exactBudget.setMemory("test-pressure", MAX_OPERATION_MEMORY_BYTES - peak);
-    const exactReader = new ByteReader(once(...chunks), exactBudget, "test-frame");
-    expect(pktText((await exactReader.readPkt())!)).toBe("abcdef");
-    await exactReader.release();
-    exactBudget.clearAllMemory();
-    exactReservation.dispose();
-    exactCoordinator.assertIdle();
-
-    const excessCoordinator = new MemoryCoordinator();
-    const excessReservation = excessCoordinator.reserve();
-    const excessBudget = new TransportOperationBudget(excessReservation);
-    excessBudget.setMemory("test-pressure", MAX_OPERATION_MEMORY_BYTES - peak + 1);
-    const source = trackedBody(chunks);
-    const excessReader = new ByteReader(source.body, excessBudget, "test-frame");
-    await expect(excessReader.readPkt()).rejects.toMatchObject({ code: "E2BIG" });
-    expect(source.returnCalls()).toBe(1);
-    expect(excessBudget.memory("test-frame")).toBe(0);
-    excessBudget.clearAllMemory();
-    excessReservation.dispose();
-    excessCoordinator.assertIdle();
-  });
-
   it("refuses a length that is not four hex digits", async () => {
     const reader = new ByteReader(once(utf8.encode("00zz")));
     await expect(reader.readPkt()).rejects.toMatchObject({ code: "ECORRUPT" });
   });
 
   it("refuses a frame the stream never finishes", async () => {
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
-    const reader = new ByteReader(once(utf8.encode("0020short")), operationBudget, "test-frame");
+    const reader = new ByteReader(once(utf8.encode("0020short")));
     await expect(reader.readPkt()).rejects.toMatchObject({ code: "ECORRUPT" });
-    expect(operationBudget.memory("test-frame")).toBe(0);
-    expect(reservation.currentBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
-  it("cleans frame ownership when source finalization throws", async () => {
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
+  it("finalizes the source when frame parsing fails", async () => {
     const source = trackedBody([utf8.encode("00zz")], new Error("close failed"));
-    const reader = new ByteReader(source.body, operationBudget, "test-frame");
+    const reader = new ByteReader(source.body);
 
     await expect(reader.readPkt()).rejects.toMatchObject({ code: "ECORRUPT" });
     expect(source.returnCalls()).toBe(1);
-    expect(operationBudget.memory("test-frame")).toBe(0);
-    expect(reservation.currentBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("hands the unconsumed tail to rest()", async () => {
@@ -196,15 +142,10 @@ describe("pkt-lines", () => {
     source.set(first);
     source.set(second, first.length);
     source.fill(0x70, first.length + second.length);
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
-    const reader = new ByteReader(once(source), operationBudget, "test-frame");
+    const reader = new ByteReader(once(source));
 
     expect(pktText((await reader.readPkt())!)).toBe("first");
     expect(pktText((await reader.readPkt())!)).toBe("second");
-    expect(operationBudget.memory("test-frame")).toBeGreaterThan(0);
-    expect(operationBudget.memory("test-frame")).toBeLessThan(source.length);
     const rest = reader.rest();
     const tail = await rest.next();
     expect(tail.done).toBe(false);
@@ -212,10 +153,6 @@ describe("pkt-lines", () => {
     expect(tail.value.buffer).toBe(source.buffer);
     expect(tail.value).toHaveLength(source.length - first.length - second.length);
     await rest.return(undefined);
-    expect(operationBudget.memory("test-frame")).toBe(0);
-    expect(reservation.currentBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("accepts the maximum frame and rejects the next byte", async () => {
@@ -370,30 +307,18 @@ describe("discovery", () => {
   it("retries one failed idempotent discovery request", async () => {
     const body = advertisementBody([`${OID} refs/heads/main`]);
     let calls = 0;
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
     const advertisement = await discover("http://host/repo", "git-upload-pack", {
       http: () => {
         calls++;
         if (calls === 1) return Promise.reject(new Error("stale keep-alive connection"));
         return Promise.resolve(respond(body, "application/x-git-upload-pack-advertisement"));
       },
-      operationBudget,
     });
     expect(calls).toBe(2);
     expect(advertisement.refs).toEqual([{ name: "refs/heads/main", oid: OID }]);
-    expect(operationBudget.memory("protocol-discovery-frame")).toBe(0);
-    expect(operationBudget.memory("protocol-discovery-parse")).toBe(0);
-    operationBudget.clearAllMemory();
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
-  it("releases discovery ownership when the auth callback throws", async () => {
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
+  it("propagates an auth callback failure", async () => {
     await expect(
       discover("http://host/repo", "git-upload-pack", {
         http: canned(() => ({
@@ -405,13 +330,8 @@ describe("discovery", () => {
         onAuth: () => {
           throw new Error("credential store unavailable");
         },
-        operationBudget,
       }),
     ).rejects.toThrow("credential store unavailable");
-    expect(operationBudget.retainedBytes).toBe(0);
-    expect(reservation.currentBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("treats an empty repository as zero refs", async () => {
@@ -468,9 +388,6 @@ describe("discovery", () => {
       FLUSH,
       pkt(`${OID} refs/heads/main\n`),
     ]);
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
     const source = trackedBody([body]);
     await expect(
       discover("http://host/repo", "git-upload-pack", {
@@ -480,14 +397,9 @@ describe("discovery", () => {
           headers: { "content-type": "application/x-git-upload-pack-advertisement" },
           body: source.body,
         })),
-        operationBudget,
       }),
     ).rejects.toMatchObject({ code: "ECORRUPT" });
     expect(source.returnCalls()).toBe(1);
-    expect(operationBudget.retainedBytes).toBe(0);
-    expect(reservation.currentBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("drains a large HTTP error while retaining only its prefix", async () => {
@@ -515,60 +427,6 @@ describe("discovery", () => {
     expect(yielded).toBe(17);
   });
 
-  it("admits discovery at the shared aggregate boundary and cleans the first excess", async () => {
-    const name = "refs/tags/release^{}";
-    const body = advertisementBody([`${OID} ${name}`]);
-    const response = () => respond(body, "application/x-git-upload-pack-advertisement");
-
-    const measuredCoordinator = new MemoryCoordinator();
-    const measuredReservation = measuredCoordinator.reserve();
-    const measuredBudget = new TransportOperationBudget(measuredReservation);
-    await discover("http://host/repo", "git-upload-pack", {
-      http: canned(response),
-      operationBudget: measuredBudget,
-    });
-    const retained = measuredBudget.memory("protocol-discovery");
-    const peak = measuredReservation.highWaterBytes;
-    expect(retained).toBeGreaterThan(0);
-    expect(peak).toBeGreaterThan(retained);
-    expect(measuredBudget.memory("protocol-discovery-frame")).toBe(0);
-    expect(measuredBudget.memory("protocol-discovery-parse")).toBe(0);
-    measuredBudget.clearAllMemory();
-    measuredReservation.dispose();
-    measuredCoordinator.assertIdle();
-
-    const exactCoordinator = new MemoryCoordinator();
-    const exactReservation = exactCoordinator.reserve();
-    const exactBudget = new TransportOperationBudget(exactReservation);
-    exactBudget.setMemory("test-pressure", MAX_OPERATION_MEMORY_BYTES - peak);
-    await expect(
-      discover("http://host/repo", "git-upload-pack", {
-        http: canned(response),
-        operationBudget: exactBudget,
-      }),
-    ).resolves.toMatchObject({ refs: [{ name, oid: OID }] });
-    exactBudget.clearAllMemory();
-    exactReservation.dispose();
-    exactCoordinator.assertIdle();
-
-    const excessCoordinator = new MemoryCoordinator();
-    const excessReservation = excessCoordinator.reserve();
-    const excessBudget = new TransportOperationBudget(excessReservation);
-    excessBudget.setMemory("test-pressure", MAX_OPERATION_MEMORY_BYTES - peak + 1);
-    await expect(
-      discover("http://host/repo", "git-upload-pack", {
-        http: canned(response),
-        operationBudget: excessBudget,
-      }),
-    ).rejects.toMatchObject({ code: "E2BIG" });
-    expect(excessBudget.memory("protocol-discovery")).toBe(0);
-    expect(excessBudget.memory("protocol-discovery-frame")).toBe(0);
-    expect(excessBudget.memory("protocol-discovery-parse")).toBe(0);
-    excessBudget.clearAllMemory();
-    excessReservation.dispose();
-    excessCoordinator.assertIdle();
-  });
-
   it("rejects duplicate advertisement rows before retaining another entry", async () => {
     const line = `${OID} refs/heads/repeated`;
     const response = canned(() =>
@@ -581,43 +439,22 @@ describe("discovery", () => {
     ).rejects.toMatchObject({ code: "ECORRUPT" });
   });
 
-  it("charges duplicate capabilities and the HEAD symref before retention", async () => {
+  it("deduplicates capabilities and the HEAD symref before applying the entry cap", async () => {
     const symref = "symref=HEAD:refs/heads/main";
     const headRef = "refs/heads/main";
     const line = `${OID} refs/heads/main\0thin-pack thin-pack ${symref}`;
     const response = () =>
       respond(advertisementBody([line]), "application/x-git-upload-pack-advertisement");
-    const stringBytes = (value: string): number => 48 + value.length * 2;
-    const retained =
-      256 +
-      64 +
-      stringBytes("thin-pack") +
-      64 +
-      stringBytes(symref) +
-      16 +
-      stringBytes(headRef) +
-      96 +
-      stringBytes(OID) +
-      stringBytes(headRef);
-
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
     await expect(
       discover("http://host/repo", "git-upload-pack", {
         http: canned(response),
         protocolLimits: { entries: 4 },
-        operationBudget,
       }),
     ).resolves.toMatchObject({
       capabilities: new Set(["thin-pack", symref]),
       headRef,
       refs: [{ name: headRef, oid: OID }],
     });
-    expect(operationBudget.memory("protocol-discovery")).toBe(retained);
-    operationBudget.clearAllMemory();
-    reservation.dispose();
-    coordinator.assertIdle();
     await expect(
       discover("http://host/repo", "git-upload-pack", {
         http: canned(response),
@@ -825,16 +662,13 @@ describe("upload-pack", () => {
     expect(source.returnCalls()).toBe(1);
   });
 
-  it("releases upload ownership when a progress callback throws", async () => {
+  it("finalizes the upload source when a progress callback throws", async () => {
     const body = concat([
       pkt("NAK\n"),
       pkt(concat([new Uint8Array([2]), utf8.encode("counting objects\n")])),
       pkt(concat([new Uint8Array([1]), PACK])),
       FLUSH,
     ]);
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
     const source = trackedBody([body]);
     const result = await uploadPack(
       {
@@ -852,19 +686,11 @@ describe("upload-pack", () => {
           headers: { "content-type": "application/x-git-upload-pack-result" },
           body: source.body,
         })),
-        operationBudget,
       },
     );
 
     await expect(collect(result.pack)).rejects.toThrow("progress sink failed");
     expect(source.returnCalls()).toBe(1);
-    expect(operationBudget.memory("protocol-upload-request")).toBe(0);
-    expect(operationBudget.memory("protocol-upload-result")).toBe(0);
-    expect(operationBudget.memory("protocol-upload-frame")).toBe(0);
-    expect(operationBudget.memory("protocol-upload-result-parse")).toBe(0);
-    expect(reservation.currentBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("reads a packfile the server did not wrap in side-band", async () => {
@@ -914,72 +740,6 @@ describe("upload-pack", () => {
     expect(result.shallow).toEqual([OID]);
     expect(result.unshallow).toEqual([other]);
     expect(await collect(result.pack)).toEqual(PACK);
-  });
-
-  it("reports retained shallow state as one named actual part", async () => {
-    const other = "3".repeat(40);
-    const body = concat([
-      pkt(`shallow ${OID}\n`),
-      pkt(`unshallow ${other}\n`),
-      pkt("NAK\n"),
-      pkt(concat([new Uint8Array([1]), PACK])),
-      FLUSH,
-    ]);
-    // Result 192 + two array entries 56 + two strings (48 + UTF-16 bytes).
-    const retained = 192 + 2 * (56 + 48 + OID.length * 2);
-    const request = {
-      url: "http://host/repo",
-      wants: [OID],
-      advertised: new Set(["side-band-64k"]),
-    };
-    const response = () => respond(body, "application/x-git-upload-pack-result");
-
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
-    let requestPeak = 0;
-    const result = await uploadPack(request, {
-      http: (input) => {
-        requestPeak = reservation.highWaterBytes;
-        return canned(response)(input);
-      },
-      operationBudget,
-    });
-    expect(result).toMatchObject({ shallow: [OID], unshallow: [other] });
-    await collect(result.pack);
-    expect(operationBudget.memory("protocol-upload-result")).toBe(retained);
-    expect(operationBudget.memory("protocol-upload-frame")).toBe(0);
-    const peak = reservation.highWaterBytes;
-    expect(peak).toBeGreaterThan(requestPeak);
-    operationBudget.clearAllMemory();
-    reservation.dispose();
-    coordinator.assertIdle();
-
-    const exactCoordinator = new MemoryCoordinator();
-    const exactReservation = exactCoordinator.reserve();
-    const exactBudget = new TransportOperationBudget(exactReservation);
-    exactBudget.setMemory("test-pressure", MAX_OPERATION_MEMORY_BYTES - peak);
-    const exact = await uploadPack(request, {
-      http: canned(response),
-      operationBudget: exactBudget,
-    });
-    await expect(collect(exact.pack)).resolves.toEqual(PACK);
-    exactBudget.clearAllMemory();
-    exactReservation.dispose();
-    exactCoordinator.assertIdle();
-
-    const excessCoordinator = new MemoryCoordinator();
-    const excessReservation = excessCoordinator.reserve();
-    const excessBudget = new TransportOperationBudget(excessReservation);
-    excessBudget.setMemory("test-pressure", MAX_OPERATION_MEMORY_BYTES - peak + 1);
-    await expect(
-      uploadPack(request, { http: canned(response), operationBudget: excessBudget }),
-    ).rejects.toMatchObject({ code: "E2BIG" });
-    expect(excessBudget.memory("protocol-upload-result")).toBe(0);
-    expect(excessBudget.memory("protocol-upload-result-parse")).toBe(0);
-    excessBudget.clearAllMemory();
-    excessReservation.dispose();
-    excessCoordinator.assertIdle();
   });
 
   it("rejects duplicate shallow entries before a partial result escapes", async () => {
@@ -1084,112 +844,6 @@ describe("upload-pack", () => {
       ),
     ).rejects.toMatchObject({ code: "E2BIG" });
     expect(calls).toBe(2);
-  });
-
-  it("accounts replayable requests and additive results in the caller operation", async () => {
-    const body = concat([
-      pkt(`shallow ${OID}\n`),
-      pkt("NAK\n"),
-      pkt(concat([new Uint8Array([1]), PACK])),
-      FLUSH,
-    ]);
-    const request = {
-      url: "http://host/repo",
-      wants: [OID],
-      haves: Array.from({ length: 128 }, (_, index) => index.toString(16).padStart(40, "0")),
-      advertised: new Set(["side-band-64k"]),
-    };
-    const response = () => respond(body, "application/x-git-upload-pack-result");
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
-    try {
-      const first = await uploadPack(request, { http: canned(response), operationBudget });
-      expect(first.shallow).toEqual([OID]);
-      expect(operationBudget.memory("protocol-upload-request")).toBe(0);
-      const firstResultBytes = operationBudget.memory("protocol-upload-result");
-      expect(firstResultBytes).toBeGreaterThan(0);
-
-      const second = await uploadPack(request, { http: canned(response), operationBudget });
-      expect(second.shallow).toEqual([OID]);
-      expect(operationBudget.memory("protocol-upload-request")).toBe(0);
-      expect(operationBudget.memory("protocol-upload-result")).toBe(2 * firstResultBytes);
-    } finally {
-      operationBudget.clearAllMemory();
-      expect(reservation.currentBytes).toBe(0);
-      reservation.dispose();
-    }
-    coordinator.assertIdle();
-
-    const measuredCoordinator = new MemoryCoordinator();
-    const measuredReservation = measuredCoordinator.reserve();
-    const measuredBudget = new TransportOperationBudget(measuredReservation);
-    await uploadPack(request, { http: canned(response), operationBudget: measuredBudget });
-    const requestPeak = measuredReservation.highWaterBytes;
-    measuredBudget.clearAllMemory();
-    measuredReservation.dispose();
-
-    const exactCoordinator = new MemoryCoordinator();
-    const exactReservation = exactCoordinator.reserve();
-    const exactBudget = new TransportOperationBudget(exactReservation);
-    exactBudget.setMemory("test-pressure", MAX_OPERATION_MEMORY_BYTES - requestPeak);
-    await expect(
-      uploadPack(request, { http: canned(response), operationBudget: exactBudget }),
-    ).resolves.toBeDefined();
-    exactBudget.clearAllMemory();
-    exactReservation.dispose();
-
-    let calls = 0;
-    const excessCoordinator = new MemoryCoordinator();
-    const excessReservation = excessCoordinator.reserve();
-    const excessBudget = new TransportOperationBudget(excessReservation);
-    excessBudget.setMemory("test-pressure", MAX_OPERATION_MEMORY_BYTES - requestPeak + 1);
-    await expect(
-      uploadPack(request, {
-        http: (input) => {
-          calls++;
-          return canned(response)(input);
-        },
-        operationBudget: excessBudget,
-      }),
-    ).rejects.toMatchObject({ code: "E2BIG" });
-    expect(calls).toBe(0);
-    expect(excessBudget.memory("protocol-upload-request")).toBe(0);
-    expect(excessBudget.memory("protocol-upload-result")).toBe(0);
-    expect(excessBudget.memory("protocol-upload-frame")).toBe(0);
-    expect(excessBudget.memory("protocol-upload-result-parse")).toBe(0);
-    excessBudget.clearAllMemory();
-    excessReservation.dispose();
-    excessCoordinator.assertIdle();
-  });
-
-  it("clears request, parse, and result memory after an HTTP error", async () => {
-    const coordinator = new MemoryCoordinator();
-    const reservation = coordinator.reserve();
-    const operationBudget = new TransportOperationBudget(reservation);
-    await expect(
-      uploadPack(
-        { url: "http://host/repo", wants: [OID], advertised: new Set() },
-        {
-          http: () =>
-            Promise.resolve({
-              status: 500,
-              statusText: "Internal Server Error",
-              headers: {},
-              body: once(utf8.encode("boom")),
-            }),
-          operationBudget,
-        },
-      ),
-    ).rejects.toMatchObject({ code: "EHTTP" });
-    expect(operationBudget.memory("protocol-upload-request")).toBe(0);
-    expect(operationBudget.memory("protocol-upload-result")).toBe(0);
-    expect(operationBudget.memory("protocol-upload-frame")).toBe(0);
-    expect(operationBudget.memory("protocol-upload-result-parse")).toBe(0);
-    operationBudget.clearAllMemory();
-    expect(reservation.currentBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("refuses to ask for nothing", async () => {

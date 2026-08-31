@@ -5,7 +5,6 @@
 import { GitError } from "../errors.js";
 import { hasCanonicalRefSyntax } from "../ref-name.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import type { RemoteView } from "./kinds.js";
 
 const REMOTE = "remote.";
@@ -53,25 +52,17 @@ export interface RemoteAddOptions {
 export function remoteAdd(repo: Repository, options: RemoteAddOptions): void {
   const name = requireRemoteName(options, "remote add");
   const url = requireText(options.url, "remote URL", true);
-  const owner = new ConfigStringOwner(repo);
-  try {
-    const section = owner.construct(REMOTE.length + name.length, () => `${REMOTE}${name}`);
-    const urlPath = owner.construct(section.length + ".url".length, () => `${section}.url`);
-    const fetchPath = owner.construct(section.length + ".fetch".length, () => `${section}.fetch`);
-    const fetch = owner.construct(
-      "+refs/heads/*:refs/remotes//*".length + name.length,
-      () => `+refs/heads/*:refs/remotes/${name}/*`,
-    );
-    if (options.force !== true && repo.store.configCardinality(urlPath) !== "missing") {
-      throw new GitError("EREMOTEFAIL", `remote ${name} already exists`);
-    }
-    repo.store.db.transactionSync(() => {
-      repo.store.configSet(urlPath, url);
-      repo.store.configSet(fetchPath, fetch);
-    });
-  } finally {
-    owner.dispose();
+  const section = `${REMOTE}${name}`;
+  const urlPath = `${section}.url`;
+  const fetchPath = `${section}.fetch`;
+  const fetch = `+refs/heads/*:refs/remotes/${name}/*`;
+  if (options.force !== true && repo.store.configCardinality(urlPath) !== "missing") {
+    throw new GitError("EREMOTEFAIL", `remote ${name} already exists`);
   }
+  repo.store.db.transactionSync(() => {
+    repo.store.configSet(urlPath, url);
+    repo.store.configSet(fetchPath, fetch);
+  });
 }
 
 export interface RemoteRemoveOptions {
@@ -89,33 +80,16 @@ export interface RemoteSetUrlOptions {
 
 export function remoteGetUrl(repo: Repository, options: RemoteGetUrlOptions): string {
   const name = requireRemoteName(options, "remote get-url");
-  const owner = new ConfigStringOwner(repo);
-  try {
-    const path = owner.construct(
-      REMOTE.length + name.length + ".url".length,
-      () => `${REMOTE}${name}.url`,
-    );
-    return requireSingleRemoteUrl(repo, name, path);
-  } finally {
-    owner.dispose();
-  }
+  return requireSingleRemoteUrl(repo, name, `${REMOTE}${name}.url`);
 }
 
 export function remoteSetUrl(repo: Repository, options: RemoteSetUrlOptions): void {
   const input = requireRemoteSetUrlOptions(options);
-  const owner = new ConfigStringOwner(repo);
-  try {
-    const path = owner.construct(
-      REMOTE.length + input.name.length + ".url".length,
-      () => `${REMOTE}${input.name}.url`,
-    );
-    repo.store.db.transactionSync(() => {
-      requireSingleRemoteUrl(repo, input.name, path);
-      repo.store.configSet(path, input.url);
-    });
-  } finally {
-    owner.dispose();
-  }
+  const path = `${REMOTE}${input.name}.url`;
+  repo.store.db.transactionSync(() => {
+    requireSingleRemoteUrl(repo, input.name, path);
+    repo.store.configSet(path, input.url);
+  });
 }
 
 function requireSingleRemoteUrl(repo: Repository, name: string, path: string): string {
@@ -184,70 +158,21 @@ function requireText(value: unknown, label: string, allowEmpty = false): string 
 /** Drops the config section. Remote-tracking refs are left alone. */
 export function remoteRemove(repo: Repository, options: RemoteRemoveOptions): void {
   const name = requireRemoteName(options, "remote remove");
-  const owner = new ConfigStringOwner(repo);
-  try {
-    const prefix = owner.construct(REMOTE.length + name.length + 1, () => `${REMOTE}${name}.`);
-    const paths = repo.store.configPaths(prefix);
-    for (const path of paths) owner.retain(path);
-    if (paths.length === 0) throw new GitError("EREMOTEFAIL", `no such remote: ${name}`);
-    repo.store.db.transactionSync(() => {
-      for (const path of paths) repo.store.configUnset(path);
-    });
-  } finally {
-    owner.dispose();
-  }
+  const paths = repo.store.configPaths(`${REMOTE}${name}.`);
+  if (paths.length === 0) throw new GitError("EREMOTEFAIL", `no such remote: ${name}`);
+  repo.store.db.transactionSync(() => {
+    for (const path of paths) repo.store.configUnset(path);
+  });
 }
 
 export function remoteList(repo: Repository): RemoteView[] {
-  const owner = new ConfigStringOwner(repo);
-  try {
-    const out: RemoteView[] = [];
-    for (const path of repo.store.configPaths(REMOTE)) {
-      owner.retain(path);
-      if (!path.endsWith(".url")) continue;
-      const url = repo.store.configGetBounded(path);
-      if (url === undefined) continue;
-      owner.retain(url);
-      const name = owner.construct(path.length - REMOTE.length - ".url".length, () =>
-        path.slice(REMOTE.length, path.length - ".url".length),
-      );
-      owner.addFixed(96);
-      out.push({ name, url });
-    }
-    return out;
-  } finally {
-    owner.dispose();
+  const out: RemoteView[] = [];
+  for (const path of repo.store.configPaths(REMOTE)) {
+    if (!path.endsWith(".url")) continue;
+    const url = repo.store.configGetBounded(path);
+    if (url === undefined) continue;
+    const name = path.slice(REMOTE.length, path.length - ".url".length);
+    out.push({ name, url });
   }
-}
-
-class ConfigStringOwner {
-  readonly #reservation;
-  #retained = 256;
-
-  constructor(repo: Repository) {
-    this.#reservation = repo.store.reserveMemory();
-    this.#reservation.set("other", this.#retained);
-  }
-
-  construct<T extends string>(units: number, construct: () => T): T {
-    this.#reservation.set("other", this.#retained + 48 + 2 * units);
-    const value = construct();
-    this.#retained += retainedStringBytes(value);
-    this.#reservation.set("other", this.#retained);
-    return value;
-  }
-
-  retain(value: string): void {
-    this.#retained += retainedStringBytes(value);
-    this.#reservation.set("other", this.#retained);
-  }
-
-  addFixed(bytes: number): void {
-    this.#retained += bytes;
-    this.#reservation.set("other", this.#retained);
-  }
-
-  dispose(): void {
-    this.#reservation.dispose();
-  }
+  return out;
 }

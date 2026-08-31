@@ -25,11 +25,6 @@ import type {
   ScanEntry,
   ScanOptions,
 } from "../src/fs/types.js";
-import {
-  MAX_OPERATION_MEMORY_BYTES,
-  MemoryCoordinator,
-  type MemoryReservation,
-} from "../src/memory.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -44,11 +39,7 @@ function withCompiledPathspec<T>(
   use: (pathspec: CompiledReadPathspec) => T,
 ): T {
   const pathspec = compileReadPathspec(options);
-  try {
-    return use(pathspec);
-  } finally {
-    pathspec.release();
-  }
+  return use(pathspec);
 }
 
 afterEach(() => {
@@ -342,7 +333,7 @@ describe("ls-files pathspec", () => {
     ).toEqual([cumulative[39]]);
   });
 
-  it("fails rather than truncating matcher or retained results", () => {
+  it("fails rather than truncating matcher work", () => {
     const workspace = makeRepo("/");
     const oid = workspace.repo.store.write("blob", new Uint8Array([1]));
     workspace.repo.checkout.indexPut(indexEntry("a", oid));
@@ -355,90 +346,7 @@ describe("ls-files pathspec", () => {
     expect(() =>
       lsFiles(workspace.repo, { paths: ["?"], limits: { maxMatcherWork: 1 } }),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-
-    const measured = new MemoryCoordinator();
-    const measuredOwner = measured.reserve();
-    const measuredPathspec = compileReadPathspec({ paths: ["a"] }, measuredOwner);
-    try {
-      expect(measuredPathspec.collect(["a"])).toEqual(["a"]);
-    } finally {
-      measuredPathspec.release();
-    }
-    const operationBytes = measured.highWaterBytes;
-    measuredOwner.dispose();
-    measured.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const coordinator = new MemoryCoordinator();
-      const blocker = coordinator.reserve();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = coordinator.reserve();
-      try {
-        const collect = (): string[] => {
-          const pathspec = compileReadPathspec({ paths: ["a"] }, owner);
-          try {
-            return pathspec.collect(["a"]);
-          } finally {
-            pathspec.release();
-          }
-        };
-        if (excess === 0) expect(collect()).toEqual(["a"]);
-        else expect(collect).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      coordinator.assertIdle();
-    }
   });
-
-  it.each([
-    ["segmented", { paths: ["dir/./leaf"] }, ["dir/leaf"], ["dir/leaf"]],
-    ["glob", { paths: ["src/*?.ts"] }, ["src/a.ts", "src/no.js"], ["src/a.ts"]],
-    [
-      "coalescing",
-      { paths: ["dir", "dir/file", "other/file"] },
-      ["dir/file", "other/file"],
-      ["dir/file", "other/file"],
-    ],
-    ["unmatched", { paths: ["*.ts"] }, ["a.js", "b.js"], []],
-  ])(
-    "pre-admits %s compilation and collection at the aggregate boundary",
-    (_, options, rows, expected) => {
-      const execute = (owner: MemoryReservation): string[] => {
-        const pathspec = compileReadPathspec(options, owner);
-        try {
-          return pathspec.collect(rows);
-        } finally {
-          pathspec.release();
-        }
-      };
-
-      const measured = new MemoryCoordinator();
-      const measuredOwner = measured.reserve();
-      expect(execute(measuredOwner)).toEqual(expected);
-      const operationBytes = measuredOwner.highWaterBytes;
-      measuredOwner.dispose();
-      measured.assertIdle();
-
-      for (const excess of [0, 1]) {
-        const coordinator = new MemoryCoordinator();
-        const blocker = coordinator.reserve();
-        blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-        const owner = coordinator.reserve();
-        try {
-          const collect = () => execute(owner);
-          if (excess === 0) expect(collect()).toEqual(expected);
-          else expect(collect).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-          expect(owner.currentBytes).toBe(0);
-        } finally {
-          owner.dispose();
-          blocker.dispose();
-        }
-        coordinator.assertIdle();
-      }
-    },
-  );
 });
 
 describe("ls-files selection", () => {
@@ -665,7 +573,6 @@ describe("ls-files selection", () => {
         excludeRoots: [root],
       }),
     ).toEqual([]);
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("accepts the global routing ceiling and applies the limit after coalescing", () => {
@@ -760,13 +667,9 @@ describe("ls-files selection", () => {
       yield "z-selected";
     }
     const pathspec = compileReadPathspec({ paths: ["*selected"] });
-    try {
-      expect(pathspec.scanPrefixes).toBeNull();
-      expect(pathspec.collect(rows())).toEqual(["z-selected"]);
-      expect(traversed).toBe(100_001);
-    } finally {
-      pathspec.release();
-    }
+    expect(pathspec.scanPrefixes).toBeNull();
+    expect(pathspec.collect(rows())).toEqual(["z-selected"]);
+    expect(traversed).toBe(100_001);
   });
 
   it("streams the 100,001st cached index row through leading-wildcard public paths", () => {

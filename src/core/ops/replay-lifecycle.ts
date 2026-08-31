@@ -1,6 +1,5 @@
 // Shared orchestration for one bounded cherry-pick or revert operation.
 
-import type { MemoryReservation } from "../../memory.js";
 import {
   readOperationStateOwned,
   replaceOperationStateOwned,
@@ -10,7 +9,6 @@ import type { GitContext, GitIdentity } from "../context.js";
 import { GitError } from "../errors.js";
 import { hashObject, type Person } from "../objects.js";
 import type { Repository, ResolvedHead } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import { joinSorted } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { type CommitIdentities, commitIndex } from "./commit.js";
@@ -23,15 +21,13 @@ import {
   requireBoundedIntegrationTree,
   requireCleanIntegrationIndex,
   requireSafeIntegrationWorktree,
-  reserveIntegrationPlan,
-  retainedTouchedPathSet,
+  touchedPathSet,
 } from "./integration-worktree.js";
 import type { ReplayEmptyReason, ReplayResult } from "./kinds.js";
 import { applyProjectedOperation, restoreProjectedOperation } from "./merge-apply.js";
 import {
   type CherryPickJournal,
   type OperationJournal,
-  operationJournalRetainedBytes,
   operationKindMismatch,
   operationNotActive,
   operationStepsForState,
@@ -43,9 +39,6 @@ import { planReplay, type ReplayIncomingLabelStyle, type ReplayPlan } from "./re
 import { treeStream } from "./tree-stream.js";
 
 const EMPTY_TREE_OID = hashObject("tree", new Uint8Array());
-const REPLAY_STATE_FIXED_BYTES = 2 * 1024;
-const REPLAY_STEP_FIXED_BYTES = 256;
-const REPLAY_METADATA_OBJECT_BYTES = 192;
 
 export interface ReplayStartOptions {
   source: string;
@@ -67,75 +60,13 @@ export interface ReplayPolicy {
   kind: ReplayKind;
   incomingLabelStyle: ReplayIncomingLabelStyle;
   suspendEmpty: boolean;
-  defaultMessage(plan: ReplayPlan, reservation: MemoryReservation): string;
+  defaultMessage(plan: ReplayPlan): string;
   resolveIdentities(
     context: GitContext,
     repo: Repository,
     plan: ReplayPlan,
     input: ReplayContinueOptions,
   ): CommitIdentities;
-}
-
-function checkedReplayBytes(current: number, added: number): number {
-  if (
-    !Number.isSafeInteger(current) ||
-    current < 0 ||
-    !Number.isSafeInteger(added) ||
-    added < 0 ||
-    added > Number.MAX_SAFE_INTEGER - current
-  ) {
-    throw new GitError("E2BIG", "replay journal memory accounting overflow");
-  }
-  return current + added;
-}
-
-function replayUtf8Bytes(value: string): number {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const low = value.charCodeAt(index + 1);
-      if (low < 0xdc00 || low > 0xdfff) {
-        throw new GitError("EINVAL", "replay journal text is not canonical UTF-16");
-      }
-      index++;
-      bytes += 4;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      throw new GitError("EINVAL", "replay journal text is not canonical UTF-16");
-    } else {
-      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
-    }
-  }
-  return bytes;
-}
-
-function replayIdentityBytes(identity: { name: string; email: string } | null): number {
-  return identity === null
-    ? 0
-    : checkedReplayBytes(replayUtf8Bytes(identity.name), replayUtf8Bytes(identity.email));
-}
-
-function replayJournalDraftRetainedBytes(
-  policy: ReplayPolicy,
-  plan: ReplayPlan,
-  head: { ref: string; oid: string },
-  message: string,
-  input: ReplayStartOptions,
-): number {
-  let bytes = REPLAY_STATE_FIXED_BYTES;
-  for (const value of [head.ref, plan.labels.current, plan.labels.incoming, message]) {
-    bytes = checkedReplayBytes(bytes, replayUtf8Bytes(value));
-  }
-  bytes = checkedReplayBytes(bytes, 40);
-  bytes = checkedReplayBytes(
-    bytes,
-    replayIdentityBytes(
-      policy.kind === "cherry-pick" ? plan.sourceCommit.author : (input.author ?? null),
-    ),
-  );
-  bytes = checkedReplayBytes(bytes, replayIdentityBytes(input.committer ?? null));
-  bytes = checkedReplayBytes(bytes, REPLAY_STEP_FIXED_BYTES + 40);
-  return plan.selectedParentOid === null ? bytes : checkedReplayBytes(bytes, 40);
 }
 
 function requireReplayHead(
@@ -171,9 +102,8 @@ function requireOriginalHead(
 function requireReplayJournal(
   repo: Repository,
   kind: ReplayKind,
-  reservation: MemoryReservation,
 ): CherryPickJournal | RevertJournal {
-  const journal = readOperationStateOwned(repo.checkout, reservation);
+  const journal = readOperationStateOwned(repo.checkout);
   if (journal === null) throw operationNotActive(kind);
   if (kind === "cherry-pick") {
     if (journal.kind !== "cherry-pick") throw operationKindMismatch(kind, journal.kind);
@@ -220,12 +150,6 @@ function replayState(
   };
 }
 
-function replayStateConstructionRetainedBytes(policy: ReplayPolicy): number {
-  return policy.kind === "cherry-pick"
-    ? REPLAY_METADATA_OBJECT_BYTES * 2
-    : REPLAY_METADATA_OBJECT_BYTES;
-}
-
 function emptyReason(plan: ReplayPlan): ReplayEmptyReason {
   const parentTree = plan.selectedParentTreeOid ?? EMPTY_TREE_OID;
   return plan.sourceTreeOid === parentTree ? "source" : "result";
@@ -254,7 +178,6 @@ function planForState(
     plan.labels.current !== state.currentLabel ||
     plan.labels.incoming !== state.incomingLabel
   ) {
-    plan.integration.release();
     throw new GitError("ECORRUPT", `${state.kind} journal differs from its replay plan`);
   }
   return plan;
@@ -300,60 +223,39 @@ function requireOwnership(
   worktree: Worktree,
   journal: CherryPickJournal | RevertJournal,
   incomingLabelStyle: ReplayIncomingLabelStyle,
-): {
-  plan: ReplayPlan;
-  reservation: ReturnType<Repository["store"]["reserveMemory"]>;
-} {
+): ReplayPlan {
   requireOriginalSnapshots(repo, journal);
   const plan = planForState(repo, journal.state, incomingLabelStyle);
-  let reservation: ReturnType<Repository["store"]["reserveMemory"]>;
-  try {
-    reservation = reserveIntegrationPlan(repo, plan.integration);
-  } catch (error) {
-    plan.integration.release();
-    throw error;
+  const omitted = touchedPathSet(journal.touched);
+  const projected = projectIntegrationWithCollisions(
+    repo,
+    worktree,
+    plan.baseTreeOid,
+    plan.incomingTreeOid,
+    plan.integration,
+    plan.labels.current,
+    plan.labels.incoming,
+    omitted,
+    plan.kind,
+  );
+  const expected = projectedTouchedShape(projected);
+  if (expected.length !== journal.touched.length) {
+    throw new GitError("ECORRUPT", "replay journal path ownership is incomplete");
   }
-  const omittedMemory = reservation.scope();
-  const shapeMemory = reservation.scope();
-  let succeeded = false;
-  try {
-    const omitted = retainedTouchedPathSet(journal.touched, omittedMemory);
-    const projected = projectIntegrationWithCollisions(
-      repo,
-      worktree,
-      plan.baseTreeOid,
-      plan.incomingTreeOid,
-      plan.integration,
-      plan.labels.current,
-      plan.labels.incoming,
-      omitted,
-      plan.kind,
-      reservation,
-    );
-    const expected = projectedTouchedShape(projected, shapeMemory);
-    if (expected.length !== journal.touched.length) {
-      throw new GitError("ECORRUPT", "replay journal path ownership is incomplete");
+  for (let index = 0; index < expected.length; index++) {
+    const wanted = expected[index];
+    const saved = journal.touched[index];
+    if (
+      wanted === undefined ||
+      saved === undefined ||
+      wanted.path !== saved.path ||
+      wanted.logicalPath !== saved.logicalPath ||
+      wanted.purpose !== saved.purpose
+    ) {
+      throw new GitError("ECORRUPT", "replay journal path ownership differs from its plan");
     }
-    for (let index = 0; index < expected.length; index++) {
-      const wanted = expected[index];
-      const saved = journal.touched[index];
-      if (
-        wanted === undefined ||
-        saved === undefined ||
-        wanted.path !== saved.path ||
-        wanted.logicalPath !== saved.logicalPath ||
-        wanted.purpose !== saved.purpose
-      ) {
-        throw new GitError("ECORRUPT", "replay journal path ownership differs from its plan");
-      }
-    }
-    succeeded = true;
-    return { plan, reservation };
-  } finally {
-    shapeMemory.dispose();
-    omittedMemory.dispose();
-    if (!succeeded) reservation.dispose();
   }
+  return plan;
 }
 
 export function startReplay(
@@ -376,103 +278,58 @@ export function startReplay(
       mainline: input.mainline,
       incomingLabelStyle: policy.incomingLabelStyle,
     });
-    const reservation = reserveIntegrationPlan(repo, plan.integration);
-    const messageMemory = reservation.scope();
-    try {
-      let message: string;
-      if (input.message === undefined) {
-        message = policy.defaultMessage(plan, messageMemory);
-      } else {
-        messageMemory.set("other", retainedStringBytes(input.message));
-        message = input.message;
+    const message = input.message ?? policy.defaultMessage(plan);
+    if (plan.integration.entries.length === 0) {
+      const reason = emptyReason(plan);
+      if (policy.suspendEmpty) {
+        const state = replayState(policy, plan, head, "empty", reason, message, input);
+        const steps = operationStepsForState(state);
+        writeOperationJournalOwned(repo.checkout, state, steps, []);
       }
-      if (plan.integration.entries.length === 0) {
-        const reason = emptyReason(plan);
-        if (policy.suspendEmpty) {
-          const writeMemory = reservation.scope();
-          writeMemory.set(
-            "other",
-            replayJournalDraftRetainedBytes(policy, plan, head, message, input),
-          );
-          try {
-            const state = replayState(policy, plan, head, "empty", reason, message, input);
-            const steps = operationStepsForState(state);
-            writeMemory.set("other", operationJournalRetainedBytes(state, [], steps));
-            writeOperationJournalOwned(repo.checkout, state, steps, [], writeMemory);
-          } finally {
-            writeMemory.dispose();
-          }
-        }
-        return { outcome: "empty", reason };
-      }
-      const projected = projectIntegrationWithCollisions(
-        repo,
-        worktree,
-        plan.baseTreeOid,
-        plan.incomingTreeOid,
-        plan.integration,
-        plan.labels.current,
-        plan.labels.incoming,
-        undefined,
-        policy.kind,
-        reservation,
-      );
-      requireSafeIntegrationWorktree(
-        repo,
-        worktree,
-        plan.incomingTreeOid,
-        plan.integration.entries,
-        policy.kind,
-        undefined,
-        reservation,
-      );
-      requireBoundedIntegrationTree(
-        repo,
-        (owner) => prospectiveIntegrationIndexEntries(repo, projected, owner),
-        reservation,
-      );
-      const conflicted = conflicts(plan.integration.entries);
-      const current = repo.head();
-      if (current.ref !== head.ref || current.oid !== head.oid) {
-        throw new GitError("ESTALEHEAD", `HEAD changed while ${policy.kind} was being prepared`);
-      }
-      const stateMemory = conflicted ? reservation.scope() : null;
-      let state: ReplayStateMetadata | null = null;
-      if (stateMemory !== null) {
-        stateMemory.set("other", replayStateConstructionRetainedBytes(policy));
-        state = replayState(policy, plan, head, "conflicted", null, message, input);
-      }
-      try {
-        applyProjectedOperation(
-          repo,
-          worktree,
-          projected,
-          {
-            suspendedState: state,
-          },
-          reservation,
-        );
-      } finally {
-        stateMemory?.dispose();
-      }
-      if (conflicted) return { outcome: "conflicted" };
-      const identities = policy.resolveIdentities(context, repo, plan, input);
-      const result = commitIndex(
-        repo,
-        {
-          message,
-          parent: [head.oid],
-          identities,
-          expectedHead: head,
-          refLogReason: policy.kind,
-        },
-        context,
-      );
-      return { outcome: "committed", oid: result.oid };
-    } finally {
-      messageMemory.dispose();
-      reservation.dispose();
+      return { outcome: "empty", reason };
     }
+    const projected = projectIntegrationWithCollisions(
+      repo,
+      worktree,
+      plan.baseTreeOid,
+      plan.incomingTreeOid,
+      plan.integration,
+      plan.labels.current,
+      plan.labels.incoming,
+      undefined,
+      policy.kind,
+    );
+    requireSafeIntegrationWorktree(
+      repo,
+      worktree,
+      plan.incomingTreeOid,
+      plan.integration.entries,
+      policy.kind,
+    );
+    requireBoundedIntegrationTree(repo, () => prospectiveIntegrationIndexEntries(repo, projected));
+    const conflicted = conflicts(plan.integration.entries);
+    const current = repo.head();
+    if (current.ref !== head.ref || current.oid !== head.oid) {
+      throw new GitError("ESTALEHEAD", `HEAD changed while ${policy.kind} was being prepared`);
+    }
+    const state = conflicted
+      ? replayState(policy, plan, head, "conflicted", null, message, input)
+      : null;
+    applyProjectedOperation(repo, worktree, projected, { suspendedState: state });
+    if (conflicted) return { outcome: "conflicted" };
+    const identities = policy.resolveIdentities(context, repo, plan, input);
+    const result = commitIndex(
+      repo,
+      {
+        message,
+        parent: [head.oid],
+        identities,
+        expectedHead: head,
+        refLogReason: policy.kind,
+      },
+      context,
+    );
+    return { outcome: "committed", oid: result.oid };
   });
 }
 
@@ -483,97 +340,67 @@ export function continueReplay(
   policy: ReplayPolicy,
 ): ReplayResult {
   return repo.store.db.transactionSync(() => {
-    const journalMemory = repo.store.reserveMemory();
-    try {
-      const journal = requireReplayJournal(repo, policy.kind, journalMemory);
-      const head = requireOriginalHead(repo, journal.state);
-      const verified = requireOwnership(repo, context.worktree, journal, policy.incomingLabelStyle);
-      const plan = verified.plan;
-      try {
-        if (journal.state.phase === "empty") {
-          const reason = journal.state.emptyReason;
-          if (reason === null) throw new GitError("ECORRUPT", "empty replay lost its reason");
-          return { outcome: "empty", reason };
-        }
-        if (repo.checkout.hasConflicts()) {
-          throw new GitError(
-            "EUNMERGED",
-            `cannot continue ${policy.kind}: the index has unmerged paths`,
-          );
-        }
-        requireBoundedIntegrationIndex(repo, verified.reservation);
-        if (integrationIndexMatchesTree(repo, plan.currentTreeOid)) {
-          const reason: ReplayEmptyReason = "result";
-          if (policy.suspendEmpty) {
-            const replaceMemory = verified.reservation.scope();
-            replaceMemory.set("other", journal.retainedBytes);
-            try {
-              const nextState: ReplayStateMetadata = {
-                ...journal.state,
-                phase: "empty",
-                emptyReason: reason,
-              };
-              replaceOperationStateOwned(
-                repo.checkout,
-                journal.integrityOid,
-                nextState,
-                replaceMemory,
-              );
-            } finally {
-              replaceMemory.dispose();
-            }
-          } else {
-            repo.checkout.clearOperationState();
-          }
-          return { outcome: "empty", reason };
-        }
-        const identities = policy.resolveIdentities(context, repo, plan, {
-          message: input.message,
-          author: input.author ?? journal.state.author ?? undefined,
-          committer: input.committer ?? journal.state.committer ?? undefined,
-          env: input.env,
-        });
-        const result = commitIndex(
-          repo,
-          {
-            message: input.message ?? journal.state.message,
-            parent: [journal.state.originalHeadOid],
-            identities,
-            expectedHead: head,
-            refLogReason: policy.kind,
-          },
-          context,
-        );
-        repo.checkout.clearOperationState();
-        return { outcome: "committed", oid: result.oid };
-      } finally {
-        verified.reservation.dispose();
-      }
-    } finally {
-      journalMemory.dispose();
+    const journal = requireReplayJournal(repo, policy.kind);
+    const head = requireOriginalHead(repo, journal.state);
+    const plan = requireOwnership(repo, context.worktree, journal, policy.incomingLabelStyle);
+    if (journal.state.phase === "empty") {
+      const reason = journal.state.emptyReason;
+      if (reason === null) throw new GitError("ECORRUPT", "empty replay lost its reason");
+      return { outcome: "empty", reason };
     }
+    if (repo.checkout.hasConflicts()) {
+      throw new GitError(
+        "EUNMERGED",
+        `cannot continue ${policy.kind}: the index has unmerged paths`,
+      );
+    }
+    requireBoundedIntegrationIndex(repo);
+    if (integrationIndexMatchesTree(repo, plan.currentTreeOid)) {
+      const reason: ReplayEmptyReason = "result";
+      if (policy.suspendEmpty) {
+        const nextState: ReplayStateMetadata = {
+          ...journal.state,
+          phase: "empty",
+          emptyReason: reason,
+        };
+        replaceOperationStateOwned(repo.checkout, journal.integrityOid, nextState);
+      } else {
+        repo.checkout.clearOperationState();
+      }
+      return { outcome: "empty", reason };
+    }
+    const identities = policy.resolveIdentities(context, repo, plan, {
+      message: input.message,
+      author: input.author ?? journal.state.author ?? undefined,
+      committer: input.committer ?? journal.state.committer ?? undefined,
+      env: input.env,
+    });
+    const result = commitIndex(
+      repo,
+      {
+        message: input.message ?? journal.state.message,
+        parent: [journal.state.originalHeadOid],
+        identities,
+        expectedHead: head,
+        refLogReason: policy.kind,
+      },
+      context,
+    );
+    repo.checkout.clearOperationState();
+    return { outcome: "committed", oid: result.oid };
   });
 }
 
 export function cancelReplay(repo: Repository, worktree: Worktree, kind: ReplayKind): void {
   repo.store.db.transactionSync(() => {
-    const journalMemory = repo.store.reserveMemory();
-    try {
-      const journal = requireReplayJournal(repo, kind, journalMemory);
-      requireOriginalHead(repo, journal.state);
-      const incomingLabelStyle: ReplayIncomingLabelStyle =
-        kind === "cherry-pick" ? "source-subject" : "parent-of-source-subject";
-      const verified = requireOwnership(repo, worktree, journal, incomingLabelStyle);
-      try {
-        if (journal.touched.length > 0) {
-          restoreProjectedOperation(repo, worktree, journal, verified.reservation);
-        }
-        repo.checkout.clearOperationState();
-      } finally {
-        verified.reservation.dispose();
-      }
-    } finally {
-      journalMemory.dispose();
+    const journal = requireReplayJournal(repo, kind);
+    requireOriginalHead(repo, journal.state);
+    const incomingLabelStyle: ReplayIncomingLabelStyle =
+      kind === "cherry-pick" ? "source-subject" : "parent-of-source-subject";
+    requireOwnership(repo, worktree, journal, incomingLabelStyle);
+    if (journal.touched.length > 0) {
+      restoreProjectedOperation(repo, worktree, journal);
     }
+    repo.checkout.clearOperationState();
   });
 }

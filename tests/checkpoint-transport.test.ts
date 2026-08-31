@@ -3,7 +3,6 @@ import { afterAll, describe, expect, it } from "vitest";
 import { openRepository } from "../src/core/context.js";
 import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transport.js";
 import { createGit, type Git } from "../src/index.js";
-import { MAX_OPERATION_MEMORY_BYTES, type MemoryReservation } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
@@ -415,47 +414,6 @@ describe("checkpoint transport workflow", () => {
       });
       expect(fixture.git("rev-parse", "refs/heads/session")).toBe(tip);
     } finally {
-      await server.close();
-    }
-  });
-
-  it("maps post-status tracking memory exhaustion to a failed outcome", async () => {
-    const fixture = originFixture();
-    const base = fixture.git("rev-parse", "refs/heads/main");
-    fixture.git("update-ref", "refs/heads/session", base);
-    const server = await startGitServer(fixture.dir);
-    const exhaustion: { blocker?: MemoryReservation } = {};
-    try {
-      const workspace = makeWorkspace();
-      const normalGit = bindGit(workspace);
-      await normalGit.clone({ url: server.url, dir: "/", singleBranch: true });
-      const tip = await commit(workspace, normalGit, "bounded\n", "bounded");
-      let posted = false;
-      const exhaustingHttp: GitHttpClient = async (request) => {
-        const response = await fetchHttpClient(request);
-        if (request.method === "POST") posted = true;
-        else if (posted && exhaustion.blocker === undefined) {
-          const store = openRepository(workspace.context, "/").store;
-          const blocker = store.reserveMemory();
-          exhaustion.blocker = blocker;
-          blocker.set("other", MAX_OPERATION_MEMORY_BYTES - store.memory.totalBytes);
-        }
-        return response;
-      };
-
-      const result = await bindGit(workspace, exhaustingHttp).push({
-        remote: "origin",
-        refspecs: [{ source: "refs/heads/main", destination: "refs/heads/session" }],
-      });
-
-      expect(result).toMatchObject({
-        ok: true,
-        refs: [{ ref: "refs/heads/session", ok: true }],
-        tracking: { outcome: "failed", code: "E2BIG" },
-      });
-      expect(fixture.git("rev-parse", "refs/heads/session")).toBe(tip);
-    } finally {
-      exhaustion.blocker?.dispose();
       await server.close();
     }
   });

@@ -4,10 +4,9 @@ import { openRepository } from "../src/core/context.js";
 import { CorruptError, GitError } from "../src/core/errors.js";
 import { commit } from "../src/core/ops/commit.js";
 import { eagerStatus, type StatusOptions, status, statusStream } from "../src/core/ops/status.js";
-import { FullStatusTrackerSeed, sparseStatus } from "../src/core/ops/status-sparse.js";
+import { sparseStatus } from "../src/core/ops/status-sparse.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
 import type { SparseWorkspaceSource } from "../src/core/sparse-workspace.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
   advanceIndexTrackerBaseline,
@@ -775,22 +774,6 @@ describe("sparse eager status", () => {
     expect(many).toBeLessThan(1_000);
   });
 
-  it("rejects ancestor facts above retained headroom before SQL", () => {
-    const workspace = makeRepo("/");
-    const lookup = requireSparseWorkspace(workspace).indexAncestorFacts;
-    if (lookup === undefined) throw new Error("SQLite sparse workspace has no ancestor lookup");
-    workspace.storage.resetCounters();
-
-    expect(() =>
-      lookup({
-        checkoutId: workspace.repo.checkout.checkoutId,
-        ancestors: ["fresh"],
-        maxRetainedBytes: 0,
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(workspace.storage.statementCount).toBe(0);
-  });
-
   it("rejects malformed ancestor requests before SQL", () => {
     const workspace = makeRepo("/");
     const lookup = requireSparseWorkspace(workspace).indexAncestorFacts;
@@ -1000,38 +983,6 @@ describe("sparse eager status", () => {
     ]);
   });
 
-  it("reseals at exact shared headroom and cleans up first excess", () => {
-    const path = "x".repeat(2_201);
-    const measuredCoordinator = new MemoryCoordinator();
-    const measuredOwner = measuredCoordinator.reserve();
-    const measured = new FullStatusTrackerSeed(measuredOwner);
-    measured.observeUntracked(path);
-    measured.finish();
-    expect(measured.resealable).toBe(true);
-    const operationBytes = measuredOwner.highWaterBytes;
-    measured.dispose();
-    measuredOwner.dispose();
-    measuredCoordinator.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const coordinator = new MemoryCoordinator();
-      const blocker = coordinator.reserve();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = coordinator.reserve();
-      const seed = new FullStatusTrackerSeed(owner);
-      try {
-        seed.observeUntracked(path);
-        seed.finish();
-        expect(seed.resealable).toBe(excess === 0);
-      } finally {
-        seed.dispose();
-        owner.dispose();
-        blocker.dispose();
-      }
-      coordinator.assertIdle();
-    }
-  });
-
   it("uses the tree diff when HEAD changes after the tracker baseline", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a.txt", "one\n");
@@ -1093,7 +1044,7 @@ describe("sparse eager status", () => {
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("holds sparse hydration and exact hashes at shared headroom and cleans up first excess", () => {
+  it("hydrates sparse paths, hashes them, and reseals the tracker", () => {
     const makeFixture = () => {
       const workspace = makeRepo("/");
       writeWorkFile(workspace, "/a.txt", "before\n");
@@ -1117,51 +1068,19 @@ describe("sparse eager status", () => {
       return { workspace, state, context, reseals: () => reseals };
     };
 
-    const measured = makeFixture();
-    const measuredOwner = measured.workspace.repo.store.reserveMemory();
-    const measuredWorktree = new NoScanWorktree(measured.workspace.worktree);
+    const fixture = makeFixture();
+    const worktree = new NoScanWorktree(fixture.workspace.worktree);
     expect(
       sparseStatus(
-        measured.workspace.repo,
-        measuredWorktree,
+        fixture.workspace.repo,
+        worktree,
         {},
-        measured.context,
-        measured.state.baselineTreeOid,
-        measuredOwner,
+        fixture.context,
+        fixture.state.baselineTreeOid,
       ),
     ).toEqual([expect.objectContaining({ path: "a.txt", worktree: "M" })]);
-    expect(measuredWorktree.bulkReadPaths).toEqual(["/a.txt"]);
-    expect(measured.reseals()).toBe(1);
-    const operationBytes = measuredOwner.highWaterBytes;
-    expect(measuredOwner.currentBytes).toBe(0);
-    measuredOwner.dispose();
-
-    for (const excess of [0, 1]) {
-      const fixture = makeFixture();
-      const blocker = fixture.workspace.repo.store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = fixture.workspace.repo.store.reserveMemory();
-      const worktree = new NoScanWorktree(fixture.workspace.worktree);
-      try {
-        const result = sparseStatus(
-          fixture.workspace.repo,
-          worktree,
-          {},
-          fixture.context,
-          fixture.state.baselineTreeOid,
-          owner,
-        );
-        expect(result).toEqual(
-          excess === 0 ? [expect.objectContaining({ path: "a.txt", worktree: "M" })] : null,
-        );
-        expect(worktree.bulkReadPaths).toEqual(["/a.txt"]);
-        expect(fixture.reseals()).toBe(excess === 0 ? 1 : 0);
-        expect(owner.currentBytes).toBe(0);
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-    }
+    expect(worktree.bulkReadPaths).toEqual(["/a.txt"]);
+    expect(fixture.reseals()).toBe(1);
   });
 
   it("propagates E2BIG from sparse tracker publication", () => {
@@ -1205,14 +1124,8 @@ describe("sparse eager status", () => {
     const context: Pick<GitContext, "sparseWorkspace" | "indexTracker"> = {
       sparseWorkspace: requireSparseWorkspace(workspace),
       indexTracker: {
-        reseal(checkoutId, baselineTreeOid, entries, owningReservation) {
-          return resealIndexTracker(
-            workspace.database.db,
-            checkoutId,
-            baselineTreeOid,
-            entries,
-            owningReservation,
-          );
+        reseal(checkoutId, baselineTreeOid, entries) {
+          return resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries);
         },
       },
     };

@@ -1,7 +1,6 @@
 // Pure structural planning for a three-way integration. Blob content is left
 // to the bounded content phase; this layer only compares tree identities.
 
-import { MemoryCoordinator, type MemoryReservation } from "../../memory.js";
 import { isOid } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
 import { MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../objects.js";
@@ -81,8 +80,6 @@ export interface IntegrationStructureInput {
   currentTreeOid: string | null;
   incomingTreeOid: string | null;
   limits?: IntegrationStructureLimits;
-  /** Dedicated owner for structural entries retained by the caller. */
-  reservation?: MemoryReservation;
 }
 
 interface ResolvedLimits {
@@ -108,10 +105,7 @@ class PlanBudget {
   #planBytes = 0;
   #prefixBytes = 0;
 
-  constructor(
-    private readonly limits: ResolvedLimits,
-    private readonly reservation: MemoryReservation,
-  ) {}
+  constructor(private readonly limits: ResolvedLimits) {}
 
   add(entry: StructuralIntegrationEntry): void {
     if (this.#entries >= this.limits.maxEntries) {
@@ -132,7 +126,6 @@ class PlanBudget {
     }
     this.#entries++;
     this.#planBytes += bytes;
-    this.#sync();
   }
 
   replace(before: StructuralIntegrationEntry, after: StructuralIntegrationEntry): void {
@@ -149,7 +142,6 @@ class PlanBudget {
       );
     }
     this.#planBytes += afterBytes - beforeBytes;
-    this.#sync();
   }
 
   addPrefix(bytes: number): void {
@@ -163,28 +155,20 @@ class PlanBudget {
       );
     }
     this.#prefixBytes += bytes;
-    this.#sync();
   }
 
   removePrefix(bytes: number): void {
     this.#prefixBytes -= bytes;
-    this.#sync();
   }
 
   finish(): void {
     this.#prefixBytes = 0;
-    this.#sync();
   }
 
   clear(): void {
     this.#entries = 0;
     this.#planBytes = 0;
     this.#prefixBytes = 0;
-    this.reservation.clear("other");
-  }
-
-  #sync(): void {
-    this.reservation.set("other", this.#planBytes + this.#prefixBytes);
   }
 }
 
@@ -414,13 +398,9 @@ export function classifyStructuralStreams(
   currentEntries: Iterable<TargetEntry>,
   incomingEntries: Iterable<TargetEntry>,
   limits?: IntegrationStructureLimits,
-  reservation?: MemoryReservation,
 ): StructuralIntegrationPlan {
   const resolved = resolveLimits(limits);
-  const local = reservation === undefined ? new MemoryCoordinator().reserve() : null;
-  const owner = reservation ?? local;
-  if (owner === null) throw new Error("integration structure memory owner is missing");
-  const budget = new PlanBudget(resolved, owner);
+  const budget = new PlanBudget(resolved);
   const entries: StructuralIntegrationEntry[] = [];
   const prefixes: PrefixCandidate[] = [];
   let sourceRows = 0;
@@ -489,8 +469,6 @@ export function classifyStructuralStreams(
   } catch (error) {
     budget.clear();
     throw error;
-  } finally {
-    local?.dispose();
   }
 }
 
@@ -500,9 +478,6 @@ export function classifyIntegrationStructure(
   input: IntegrationStructureInput,
 ): StructuralIntegrationPlan {
   resolveLimits(input.limits);
-  if (input.reservation !== undefined && !repo.store.ownsMemoryReservation(input.reservation)) {
-    throw new GitError("EINVAL", "integration structure reservation belongs to another repository");
-  }
   if (
     input.currentTreeOid === input.incomingTreeOid ||
     input.baseTreeOid === input.incomingTreeOid
@@ -523,7 +498,6 @@ export function classifyIntegrationStructure(
         stream.return(undefined);
       }
     }
-    input.reservation?.clear("other");
     return { entries: [], sourceRows: 0 };
   }
   return classifyStructuralStreams(
@@ -531,6 +505,5 @@ export function classifyIntegrationStructure(
     treeStream(repo, input.currentTreeOid),
     treeStream(repo, input.incomingTreeOid),
     input.limits,
-    input.reservation,
   );
 }

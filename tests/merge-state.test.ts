@@ -8,7 +8,6 @@ import {
   MAX_MERGE_TOUCHED_PATHS,
   type MergeStateMetadata,
   type MergeTouchedPath,
-  mergeJournalRetainedBytes,
 } from "../src/core/ops/merge-state.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -130,7 +129,6 @@ describe("durable merge journal", () => {
     expect(cold.requireMergeState()).toEqual({
       state,
       touched: paths,
-      retainedBytes: mergeJournalRetainedBytes(state, paths),
     });
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
@@ -173,7 +171,6 @@ describe("durable merge journal", () => {
     expect(store.requireMergeState()).toEqual({
       state,
       touched: [],
-      retainedBytes: mergeJournalRetainedBytes(state, []),
     });
   });
 

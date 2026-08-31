@@ -60,8 +60,8 @@ export class Workspace {
       initializeIndexTracker(this.db);
       const now = this.#options.now ?? Date.now;
       const indexTracker: IndexTrackerWriter = {
-        reseal: (checkoutId, baselineTreeOid, entries, owningReservation) =>
-          resealIndexTracker(this.db, checkoutId, baselineTreeOid, entries, owningReservation),
+        reseal: (checkoutId, baselineTreeOid, entries) =>
+          resealIndexTracker(this.db, checkoutId, baselineTreeOid, entries),
         advanceBaseline: (checkoutId, baselineTreeOid) =>
           advanceIndexTrackerBaseline(this.db, checkoutId, baselineTreeOid),
       };

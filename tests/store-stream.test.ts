@@ -8,12 +8,10 @@ import { describe, expect, it } from "vitest";
 import { concat, toHex, utf8 } from "../src/core/bytes.js";
 import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { Sha1 } from "../src/core/sha1.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { MAX_BLOB_ID_CACHE_ROWS } from "../src/sqlite/blob-id-cache.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { readMaintenanceRootEpoch } from "../src/sqlite/maintenance/control.js";
 import {
-  MAX_INDEX_PATH_BYTES,
   MAX_SCRATCH_INDEX_NAME_BYTES,
   MAX_SCRATCH_INDEXES_PER_REPOSITORY,
 } from "../src/sqlite/schema.js";
@@ -22,12 +20,11 @@ import {
   type IndexSink,
   type IndexStore,
   type InitialStateSession,
-  indexScanOwned,
   SqliteGitDatabase,
 } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
-/** Records the widest result any single query returned — the memory probe. */
+/** Records the widest result returned by any single query. */
 class WidestDatabase implements SqlDatabase {
   widestRows = 0;
   widestBlob = 0;
@@ -110,85 +107,6 @@ function entry(path: string, stage = 0, oid = "0".repeat(40)): IndexEntry {
 }
 
 describe("indexScan", () => {
-  it("admits the maximum owned row before materializing a result BLOB", () => {
-    const maximumRowBytes = 256 + 3 * (MAX_INDEX_PATH_BYTES + 40) + 2 * 48;
-
-    const exactDb = new WidestDatabase();
-    const exact = open(exactDb);
-    exact.indexPut(entry("tracked.txt"));
-    exactDb.widestResultBlob = 0;
-    const exactBlocker = exact.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - maximumRowBytes);
-    const exactOwner = exact.reserveMemory();
-    const exactScan = indexScanOwned(exact, exactOwner, { pageSize: 1 });
-    try {
-      expect(exactScan.next().value).toEqual(entry("tracked.txt"));
-      expect(exactDb.widestResultBlob).toBe(40);
-      if (exactScan.return === undefined) throw new Error("owned index scan cannot be closed");
-      exactScan.return();
-      expect(exactOwner.currentBytes).toBe(0);
-      expect(exact.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactOwner.dispose();
-      exactBlocker.dispose();
-    }
-    exact.shared.memory.assertIdle();
-
-    const excessDb = new WidestDatabase();
-    const excess = open(excessDb);
-    excess.indexPut(entry("tracked.txt"));
-    excessDb.widestResultBlob = 0;
-    const excessBlocker = excess.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - maximumRowBytes + 1);
-    const excessOwner = excess.reserveMemory();
-    try {
-      expect(() => indexScanOwned(excess, excessOwner, { pageSize: 1 }).next()).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(excessDb.widestResultBlob).toBe(0);
-    } finally {
-      excessOwner.dispose();
-      excessBlocker.dispose();
-    }
-    excess.shared.memory.assertIdle();
-
-    const full = open();
-    full.db.transactionSync(() => {
-      for (let index = 0; index < 2_048; index++) {
-        full.indexPut(entry(`full/${index.toString().padStart(4, "0")}`));
-      }
-    });
-    const fullOwner = full.reserveMemory();
-    try {
-      expect([...indexScanOwned(full, fullOwner, { pageSize: 2_048 })]).toHaveLength(2_048);
-      expect(fullOwner.currentBytes).toBe(0);
-    } finally {
-      fullOwner.dispose();
-    }
-    full.shared.memory.assertIdle();
-  });
-
-  it("charges only the current owned row and releases on iterator return", () => {
-    const store = open();
-    store.indexPut(entry(`a/${"x".repeat(1_000)}`));
-    store.indexPut(entry(`b/${"y".repeat(1_000)}`));
-    const owner = store.reserveMemory();
-    const scan = indexScanOwned(store, owner, { pageSize: 1 });
-    try {
-      expect(scan.next().done).toBe(false);
-      const firstBytes = owner.currentBytes;
-      expect(firstBytes).toBeGreaterThan(0);
-      expect(scan.next().done).toBe(false);
-      expect(owner.currentBytes).toBe(firstBytes);
-      if (scan.return === undefined) throw new Error("owned index scan cannot be closed");
-      scan.return();
-      expect(owner.currentBytes).toBe(0);
-    } finally {
-      owner.dispose();
-    }
-    store.shared.memory.assertIdle();
-  });
-
   it("yields exactly what indexEntries does", () => {
     const store = open();
     const paths = ["a.txt", "a/b.txt", "ab.txt", "z/y/x.txt", "\u{1F600}.txt", ".txt"];
@@ -806,72 +724,6 @@ describe("tryCreateInitialState", () => {
     expect(store.lookupBlobIds([mapping])).toEqual(new Map([[toHex(mapping), objectId]]));
   });
 
-  it("constructs initial buffers at the exact aggregate and cleans up the first excess", () => {
-    const constructorBytes = 64 * 1024 + 8 + 32;
-    const exact = open();
-    const exactBlocker = exact.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - constructorBytes);
-    expect(exact.tryCreateInitialState(() => "exact")).toEqual({
-      available: true,
-      value: "exact",
-    });
-    expect(exactBlocker.remainingBytes).toBe(constructorBytes);
-    exactBlocker.dispose();
-
-    const excess = open();
-    const excessBlocker = excess.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - constructorBytes + 1);
-    expect(() => excess.tryCreateInitialState(() => "unreachable")).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(excessBlocker.remainingBytes).toBe(constructorBytes - 1);
-    expect(excess.indexEntries()).toEqual([]);
-    excessBlocker.dispose();
-  });
-
-  it("admits the lazy blob payload at the exact aggregate and cleans up the first excess", () => {
-    const fixedSessionBytes = 64 * 1024;
-    const emptyIndexJsonBytes = 8;
-    const blobBufferFixedBytes = 32;
-    const blobPayloadBytes = 1024 * 1024;
-    const blobRowBytes = 384;
-    const blobRowJsonCopies = 96 * 2;
-    const coexistenceBytes =
-      fixedSessionBytes +
-      emptyIndexJsonBytes +
-      blobBufferFixedBytes +
-      blobPayloadBytes +
-      blobRowBytes +
-      blobRowJsonCopies;
-
-    const exact = open();
-    const exactBlocker = exact.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - coexistenceBytes);
-    let exactRetainedBytes = 0;
-    expect(
-      exact.tryCreateInitialState((session) => {
-        session.addBlobId({ contentId: new Uint8Array(0), oid: oid(1) });
-        exactRetainedBytes = session.retainedBytes;
-      }),
-    ).toEqual({ available: true, value: undefined });
-    expect(exactRetainedBytes).toBe(coexistenceBytes);
-    expect(exactBlocker.remainingBytes).toBe(coexistenceBytes);
-    exactBlocker.dispose();
-
-    const excess = open();
-    const excessBlocker = excess.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - coexistenceBytes + 1);
-    expect(() =>
-      excess.tryCreateInitialState((session) => {
-        session.addBlobId({ contentId: new Uint8Array(0), oid: oid(1) });
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(excessBlocker.remainingBytes).toBe(coexistenceBytes - 1);
-    expect(excess.indexEntries()).toEqual([]);
-    expect(excess.lookupBlobIds([new Uint8Array(0)])).toEqual(new Map());
-    excessBlocker.dispose();
-  });
-
   it("orders paths by Git UTF-8 bytes rather than JavaScript UTF-16 units", () => {
     const store = open();
     expect(
@@ -941,7 +793,6 @@ describe("tryCreateInitialState", () => {
     const store = open(db);
     inner.storage.resetCounters();
     db.widestBindings = 0;
-    let maxRetainedBytes = 0;
 
     const result = store.tryCreateInitialState((session) => {
       for (let index = 0; index < 24_252; index++) {
@@ -949,7 +800,6 @@ describe("tryCreateInitialState", () => {
         const objectId = oid(index + 1);
         session.put({ ...entry(path, 0, objectId), size: index });
         session.addBlobId({ contentId: contentId(index), oid: objectId });
-        maxRetainedBytes = Math.max(maxRetainedBytes, session.retainedBytes);
       }
       return 24_252;
     });
@@ -961,7 +811,6 @@ describe("tryCreateInitialState", () => {
     expect(db.widestBindings).toBeLessThanOrEqual(3);
     expect(db.widestBlob).toBeLessThanOrEqual(1024 * 1024);
     expect(db.widestStringBytes).toBeLessThanOrEqual(1_500_000);
-    expect(maxRetainedBytes).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
     expect(
       store.db.scalar<number>(
         "SELECT COUNT(*) FROM git_index WHERE checkout_id = ?",
@@ -1042,7 +891,6 @@ describe("tryCreateInitialState", () => {
     ).toThrow("body failed");
     const endedThrownSession = thrownSession;
     if (endedThrownSession === undefined) throw new Error("body did not capture its session");
-    expect(endedThrownSession.retainedBytes).toBe(0);
     expect(() => endedThrownSession.put(entry("late.txt"))).toThrow("no longer active");
 
     const asyncStore = open();
@@ -1060,7 +908,6 @@ describe("tryCreateInitialState", () => {
     ).toThrow("asynchronous result");
     const endedAsyncSession = asyncSession;
     if (endedAsyncSession === undefined) throw new Error("body did not capture its session");
-    expect(endedAsyncSession.retainedBytes).toBe(0);
     expect(() => endedAsyncSession.addBlobId({ contentId: contentId(1), oid: oid(1) })).toThrow(
       "no longer active",
     );

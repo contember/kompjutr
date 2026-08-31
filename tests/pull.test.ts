@@ -6,9 +6,8 @@ import { commit } from "../src/core/ops/commit.js";
 import type { MergeStateMetadata } from "../src/core/ops/merge-state.js";
 import { pull as pullCore, resolvePull, validatePullAfterFetch } from "../src/core/ops/pull.js";
 import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transport.js";
-import { Repository } from "../src/core/repository.js";
+import type { Repository } from "../src/core/repository.js";
 import { createGit, type Git, type GitPullOptions } from "../src/git/client.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -25,32 +24,6 @@ const REFLOG_TIME = 1_577_836_800_000;
 const compatibilityPullOptions: ComputerPullOptions = {};
 const nativePullOptions: GitPullOptions = compatibilityPullOptions;
 void nativePullOptions;
-
-class PullReadCommitRepository extends Repository {
-  constructor(
-    repo: Repository,
-    private readonly afterReadCommit: () => void,
-  ) {
-    super(repo.checkout);
-  }
-
-  override readCommit(oid: string) {
-    const result = super.readCommit(oid);
-    this.afterReadCommit();
-    return result;
-  }
-}
-
-function holdPullPressure(repo: Repository, bytes: number): () => void {
-  const pressure = repo.store.reserveMemory();
-  try {
-    pressure.set("other", bytes);
-    return () => pressure.dispose();
-  } catch (error) {
-    pressure.dispose();
-    throw error;
-  }
-}
 
 function committedRepo(): TestRepository {
   const workspace = makeRepo();
@@ -274,7 +247,7 @@ describe("pull", () => {
     );
   });
 
-  it("retains a long raw HEAD through preflight and unchanged post-fetch validation", () => {
+  it("accepts a long raw HEAD through preflight and unchanged post-fetch validation", () => {
     const ref = `refs/heads/${"h".repeat(1_000_001)}`;
     const rawHead = `ref: ${ref}`;
     const prepare = (): { repo: Repository; durableHead: string; durableRefs: unknown[] } => {
@@ -304,96 +277,22 @@ describe("pull", () => {
         ),
       };
     };
-    const ownedBytes = 490 + 4 * ref.length;
-
-    const measured = prepare();
-    let observedBytes = 0;
-    const measuredRepo = new PullReadCommitRepository(measured.repo, () => {
-      observedBytes = measured.repo.store.memory.totalBytes;
-    });
+    const prepared = prepare();
     const options = {
       remote: "origin",
       remoteRef: "main",
       url: "https://example.com/repo.git",
     };
-    expect(resolvePull(measuredRepo, options).headRef).toBe(ref);
-    expect(observedBytes).toBe(ownedBytes);
-    expect(measured.repo.store.memory.totalBytes).toBe(0);
-
-    const exact = prepare();
-    const exactRepo = new PullReadCommitRepository(exact.repo, () => {
-      const release = holdPullPressure(exact.repo, MAX_OPERATION_MEMORY_BYTES - ownedBytes);
-      release();
-    });
-    expect(resolvePull(exactRepo, options).headRef).toBe(ref);
-    expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    expect(exact.repo.store.memory.totalBytes).toBe(0);
-
-    const over = prepare();
-    const overRepo = new PullReadCommitRepository(over.repo, () => {
-      const release = holdPullPressure(over.repo, MAX_OPERATION_MEMORY_BYTES - ownedBytes + 1);
-      release();
-    });
-    expect(() => resolvePull(overRepo, options)).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(over.repo.checkout.head()).toBe(over.durableHead);
+    const plan = resolvePull(prepared.repo, options);
+    expect(plan.headRef).toBe(ref);
+    expect(() => validatePullAfterFetch(prepared.repo, options, plan)).not.toThrow();
+    expect(prepared.repo.checkout.head()).toBe(prepared.durableHead);
     expect(
-      over.repo.store.db.all<Record<string, unknown>>(
+      prepared.repo.store.db.all<Record<string, unknown>>(
         "SELECT name, target FROM git_refs WHERE repo_id = ? ORDER BY name",
-        over.repo.store.repoId,
+        prepared.repo.store.repoId,
       ),
-    ).toEqual(over.durableRefs);
-    expect(pullPublicationCount(over.repo)).toBe(0);
-    expect(over.repo.store.memory.totalBytes).toBe(0);
-
-    const validationMeasured = prepare();
-    const validationPlan = resolvePull(validationMeasured.repo, options);
-    let validationBytes = 0;
-    const validationMeasuredRepo = new PullReadCommitRepository(validationMeasured.repo, () => {
-      validationBytes = validationMeasured.repo.store.memory.totalBytes;
-    });
-    validatePullAfterFetch(validationMeasuredRepo, options, validationPlan);
-    expect(validationBytes).toBe(ownedBytes);
-    expect(validationMeasured.repo.store.memory.totalBytes).toBe(0);
-
-    const validationExact = prepare();
-    const validationExactPlan = resolvePull(validationExact.repo, options);
-    const validationExactRepo = new PullReadCommitRepository(validationExact.repo, () => {
-      const release = holdPullPressure(
-        validationExact.repo,
-        MAX_OPERATION_MEMORY_BYTES - ownedBytes,
-      );
-      release();
-    });
-    validatePullAfterFetch(validationExactRepo, options, validationExactPlan);
-    expect(validationExact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    expect(validationExact.repo.store.memory.totalBytes).toBe(0);
-
-    const validationOver = prepare();
-    const validationOverPlan = resolvePull(validationOver.repo, options);
-    const validationOverRepo = new PullReadCommitRepository(validationOver.repo, () => {
-      const release = holdPullPressure(
-        validationOver.repo,
-        MAX_OPERATION_MEMORY_BYTES - ownedBytes + 1,
-      );
-      release();
-    });
-    expect(() => validatePullAfterFetch(validationOverRepo, options, validationOverPlan)).toThrow(
-      expect.objectContaining({
-        code: "ESTALEUPSTREAM",
-        cause: expect.objectContaining({ code: "E2BIG" }),
-      }),
-    );
-    expect(validationOver.repo.checkout.head()).toBe(validationOver.durableHead);
-    expect(
-      validationOver.repo.store.db.all<Record<string, unknown>>(
-        "SELECT name, target FROM git_refs WHERE repo_id = ? ORDER BY name",
-        validationOver.repo.store.repoId,
-      ),
-    ).toEqual(validationOver.durableRefs);
-    expect(pullPublicationCount(validationOver.repo)).toBe(0);
-    expect(validationOver.repo.store.memory.totalBytes).toBe(0);
+    ).toEqual(prepared.durableRefs);
   });
 
   describe("pull orchestration", () => {
@@ -422,89 +321,14 @@ describe("pull", () => {
         );
         fixture.write("remote.txt", "remote\n");
         const incoming = fixture.commit("remote");
-        const observed: number[] = [];
-        const repo = new PullReadCommitRepository(baseRepo, () => {
-          observed.push(baseRepo.store.memory.totalBytes);
-        });
-
         await expect(
-          pullCore(context, repo, workspace.worktree, {
+          pullCore(context, baseRepo, workspace.worktree, {
             remote: "origin",
             remoteRef: "main",
             url: server.url,
           }),
         ).resolves.toEqual({ oid: incoming, fastForward: true });
-        expect(observed.length).toBeGreaterThanOrEqual(2);
-        expect(observed[0]).toBe(490 + 4 * ref.length);
-        expect(observed[1]).toBeGreaterThanOrEqual(observed[0] ?? 0);
-        expect(repo.head()).toEqual({ ref, oid: incoming });
-        expect(repo.store.memory.totalBytes).toBe(0);
-      } finally {
-        await server.close();
-        fixture.dispose();
-      }
-    });
-
-    it("releases retained pull strings after integration", async () => {
-      const { fixture } = remoteFixture();
-      const server = await startGitServer(fixture.dir);
-      const prepare = async (): Promise<{ git: Git; repo: Repository }> => {
-        const workspace = makeWorkspace();
-        await gitFor(workspace).clone({ url: server.url, dir: "/work", depth: 0 });
-        const database = new SqliteGitDatabase(new TestDatabase(workspace.storage));
-        const context = { ...workspace.context, database };
-        return {
-          git: createGit()({
-            database,
-            worktree: workspace.worktree,
-            now: workspace.context.now,
-            timezoneOffset: workspace.context.timezoneOffset,
-            defaultIdentity: IDENTITY,
-          }),
-          repo: openRepository(context, "/work"),
-        };
-      };
-
-      try {
-        const exact = await prepare();
-        fixture.write("remote.txt", "remote\n");
-        const incoming = fixture.commit("remote");
-
-        let observedIntegrationEntry = false;
-        const typeAndSize = exact.repo.store.typeAndSize;
-        exact.repo.store.typeAndSize = (oid) => {
-          const result = typeAndSize.call(exact.repo.store, oid);
-          // The incoming object's first type lookup is merge's post-fetch peel.
-          if (oid === incoming && !observedIntegrationEntry) {
-            const memory = exact.repo.store.memory;
-            expect(memory.activeCount).toBe(1);
-            expect(memory.totalBytes).toBeGreaterThan(0);
-            observedIntegrationEntry = true;
-            const release = holdPullPressure(
-              exact.repo,
-              MAX_OPERATION_MEMORY_BYTES - memory.totalBytes,
-            );
-            try {
-              expect(memory.totalBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-            } finally {
-              release();
-            }
-          }
-          return result;
-        };
-        try {
-          await expect(exact.git.pull({ dir: "/work" })).resolves.toEqual({
-            oid: incoming,
-            fastForward: true,
-          });
-        } finally {
-          exact.repo.store.typeAndSize = typeAndSize;
-        }
-        expect(observedIntegrationEntry).toBe(true);
-        expect(exact.repo.head().oid).toBe(incoming);
-        expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-        expect(exact.repo.store.memory.activeCount).toBe(0);
-        expect(exact.repo.store.memory.totalBytes).toBe(0);
+        expect(baseRepo.head()).toEqual({ ref, oid: incoming });
       } finally {
         await server.close();
         fixture.dispose();

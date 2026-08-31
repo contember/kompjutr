@@ -292,7 +292,7 @@ describe("bounded merge-base selection", () => {
           incomingOid: incoming,
           limits: { maxCommits: measured.commits },
         }),
-      ).toMatchObject({ commits: measured.commits, retainedBytes: measured.retainedBytes });
+      ).toMatchObject({ commits: measured.commits });
       expect(() =>
         selectMergeBases(new Repository(store), {
           currentOid: current,

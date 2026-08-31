@@ -1,20 +1,12 @@
 // Recording a commit: the index becomes trees, the trees become a commit,
 // and the ref HEAD points at moves to it.
 
-import type { MemoryReservation } from "../../memory.js";
 import { snapshotCommitTreeOwned } from "../../sqlite/sparse-workspace.js";
-import {
-  configGetOwned,
-  createRefMutationMemoryOwner,
-  indexScanOwned,
-  type RefMutationMemoryOwner,
-  writeObjectsOwned,
-} from "../../sqlite/store.js";
+import { indexScanOwned, writeObjectsOwned } from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError, hasErrorCode, MissingIdentityError } from "../errors.js";
 import { type Commit, hashObject, type Person, serializeCommit } from "../objects.js";
 import { type Repository, type ResolvedHead, resolveHeadOwned } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import type { CommitResult } from "./kinds.js";
 import { committerRefLogMetadata, type RefLogReason } from "./ref-log.js";
 import {
@@ -65,85 +57,46 @@ export interface UnpublishedCommitResult {
 type CommitMessage = { mode: "clean"; value: string } | { mode: "exact"; value: string };
 type PublishedCommitContext = Pick<GitContext, "commitTrees" | "indexTracker">;
 
-const COMMIT_OPERATION_FIXED_BYTES = 1_024;
-const COMMIT_VALUE_FIXED_BYTES = 256;
-const COMMIT_OPERATION_VALUE_COUNT = 12;
-const COMMIT_ARRAY_FIXED_BYTES = 64;
-const COMMIT_ARRAY_SLOT_BYTES = 8;
-
 export function commit(
   context: GitContext,
   repo: Repository,
   options: CommitOptions,
 ): CommitResult {
-  const owner = createRefMutationMemoryOwner(repo.store);
-  const lifetime = owner.memoryReservation().scope();
-  try {
-    validatePublishedMessage(options.message, lifetime);
-    lifetime.set("commit", commitLifetimeBytes(0));
-    return repo.store.db.transactionSync(() => {
-      if (repo.checkout.hasConflicts()) {
-        throw new GitError("EUNMERGED", "cannot commit: the index has unmerged paths");
-      }
+  validatePublishedMessage(options.message);
+  return repo.store.db.transactionSync(() => {
+    if (repo.checkout.hasConflicts()) {
+      throw new GitError("EUNMERGED", "cannot commit: the index has unmerged paths");
+    }
 
-      const head = resolveHeadOwned(repo, owner);
-      const amended =
-        options.amend === true ? readAmended(repo, head, owner.memoryReservation()) : undefined;
-      const parentCount = amended?.parent.length ?? (head.oid === null ? 0 : 1);
-      lifetime.set("commit", commitLifetimeBytes(parentCount));
-      const parent = amended !== undefined ? amended.parent : head.oid === null ? [] : [head.oid];
-      retainParents(owner, parent);
-      const headTree = ownNullable(
-        owner,
-        amended?.tree ??
-          (head.oid === null
-            ? null
-            : readCommitOwned(repo, head.oid, owner.memoryReservation()).tree),
-      );
-      const baselineTree =
-        amended !== undefined ? undefined : headTree === null ? EMPTY_TREE_OID : headTree;
-      const identities = ownIdentities(
-        owner,
-        resolveIdentityOwned(context, repo, options, amended, owner),
-      );
-      const message = cleanPublishedMessage(owner, options.message);
-      const result = ownCommitResult(
-        owner,
-        writeCommitObjects(
-          repo,
-          { parent, identities },
-          { mode: "exact", value: message },
-          context,
-          headTree,
-          owner.memoryReservation(),
-        ),
-      );
-      if (
-        baselineTree !== undefined &&
-        options.allowEmpty !== true &&
-        result.tree === baselineTree
-      ) {
-        throw new GitError("EEMPTYCOMMIT", "cannot commit: the index tree is unchanged");
-      }
-      const reason: RefLogReason =
-        options.amend === true
-          ? "commit (amend)"
-          : head.oid === null
-            ? "commit (initial)"
-            : "commit";
-      return publishCommitResult(
-        repo,
-        head,
-        result,
-        ownRefLogMetadata(owner, committerRefLogMetadata(identities.committer, reason)),
-        context,
-        owner,
-      );
-    });
-  } finally {
-    lifetime.dispose();
-    owner.dispose();
-  }
+    const head = resolveHeadOwned(repo);
+    const amended = options.amend === true ? readAmended(repo, head) : undefined;
+    const parent = amended !== undefined ? amended.parent : head.oid === null ? [] : [head.oid];
+    const headTree =
+      amended?.tree ?? (head.oid === null ? null : readCommitOwned(repo, head.oid).tree);
+    const baselineTree =
+      amended !== undefined ? undefined : headTree === null ? EMPTY_TREE_OID : headTree;
+    const identities = resolveIdentity(context, repo, options, amended);
+    const message = cleanPublishedMessage(options.message);
+    const result = writeCommitObjects(
+      repo,
+      { parent, identities },
+      { mode: "exact", value: message },
+      context,
+      headTree,
+    );
+    if (baselineTree !== undefined && options.allowEmpty !== true && result.tree === baselineTree) {
+      throw new GitError("EEMPTYCOMMIT", "cannot commit: the index tree is unchanged");
+    }
+    const reason: RefLogReason =
+      options.amend === true ? "commit (amend)" : head.oid === null ? "commit (initial)" : "commit";
+    return publishCommitResult(
+      repo,
+      head,
+      result,
+      committerRefLogMetadata(identities.committer, reason),
+      context,
+    );
+  });
 }
 
 /** Build the stage-zero index and move only the HEAD observed by the caller. */
@@ -152,29 +105,15 @@ export function commitIndex(
   options: IndexedCommitOptions,
   context?: PublishedCommitContext,
 ): CommitResult {
-  const owner = createRefMutationMemoryOwner(repo.store);
-  const lifetime = owner.memoryReservation().scope();
-  try {
-    validatePublishedMessage(options.message, lifetime);
-    retainParents(owner, options.parent);
-    ownIdentities(owner, options.identities);
-    retainResolvedHead(owner, options.expectedHead);
-    lifetime.set("commit", commitLifetimeBytes(options.parent.length));
-    return repo.store.db.transactionSync(() => {
-      const head = resolveHeadOwned(repo, owner);
-      if (head.ref !== options.expectedHead.ref || head.oid !== options.expectedHead.oid) {
-        throw new GitError("ESTALEHEAD", "HEAD changed while the commit was being prepared");
-      }
-      const headTree = ownNullable(
-        owner,
-        head.oid === null ? null : readCommitOwned(repo, head.oid, owner.memoryReservation()).tree,
-      );
-      return publishCommit(repo, options, context, headTree, owner);
-    });
-  } finally {
-    lifetime.dispose();
-    owner.dispose();
-  }
+  validatePublishedMessage(options.message);
+  return repo.store.db.transactionSync(() => {
+    const head = resolveHeadOwned(repo);
+    if (head.ref !== options.expectedHead.ref || head.oid !== options.expectedHead.oid) {
+      throw new GitError("ESTALEHEAD", "HEAD changed while the commit was being prepared");
+    }
+    const headTree = head.oid === null ? null : readCommitOwned(repo, head.oid).tree;
+    return publishCommit(repo, options, context, headTree);
+  });
 }
 
 /** Caller owns the transaction; this writes authoritative objects but never publishes a ref. */
@@ -190,22 +129,10 @@ export function writeUnpublishedCommitFromTree(
   repo: Repository,
   tree: string,
   options: UnpublishedCommitOptions,
-  owningReservation?: MemoryReservation,
 ): string {
-  const reservation = owningReservation ?? repo.store.reserveMemory();
-  try {
-    return writeObjectsOwned(repo.store, reservation, (batch) =>
-      writeSerializedCommit(
-        batch.write,
-        options,
-        { mode: "exact", value: options.message },
-        tree,
-        reservation,
-      ),
-    );
-  } finally {
-    if (owningReservation === undefined) reservation.dispose();
-  }
+  return writeObjectsOwned(repo.store, (batch) =>
+    writeSerializedCommit(batch.write, options, { mode: "exact", value: options.message }, tree),
+  );
 }
 
 /** Materialize the stage-zero index through one shared object encoder. */
@@ -215,37 +142,24 @@ function writeCommitObjects(
   message: CommitMessage,
   context?: PublishedCommitContext,
   baselineTreeOid?: string | null,
-  owningReservation?: MemoryReservation,
 ): UnpublishedCommitResult {
-  const reservation = owningReservation ?? repo.store.reserveMemory();
-  try {
-    const sparse =
-      context === undefined || baselineTreeOid === undefined
-        ? null
-        : sparseTreePlan(context, repo, baselineTreeOid, reservation);
-    if (sparse !== null) {
-      const tree = sparse.tree;
-      return writeObjectsOwned(repo.store, reservation, (batch) => {
-        writeSparseTreePlanInBatch(batch, sparse);
-        return {
-          oid: writeSerializedCommit(batch.write, options, message, tree, reservation),
-          tree,
-        };
-      });
-    }
-    // A paged scan, so the index never exists as one array alongside the build.
-    return writeObjectsOwned(repo.store, reservation, (batch) => {
-      const tree = buildTreeInBatch(
-        batch,
-        indexScanOwned(repo.checkout, reservation, { pageSize: 2048 }),
-        reservation,
-      );
-      const oid = writeSerializedCommit(batch.write, options, message, tree, reservation);
-      return { oid, tree };
+  const sparse =
+    context === undefined || baselineTreeOid === undefined
+      ? null
+      : sparseTreePlan(context, repo, baselineTreeOid);
+  if (sparse !== null) {
+    const tree = sparse.tree;
+    return writeObjectsOwned(repo.store, (batch) => {
+      writeSparseTreePlanInBatch(batch, sparse);
+      return { oid: writeSerializedCommit(batch.write, options, message, tree), tree };
     });
-  } finally {
-    if (owningReservation === undefined) reservation.dispose();
   }
+  // A paged scan, so the index never exists as one array alongside the build.
+  return writeObjectsOwned(repo.store, (batch) => {
+    const tree = buildTreeInBatch(batch, indexScanOwned(repo.checkout, { pageSize: 2048 }));
+    const oid = writeSerializedCommit(batch.write, options, message, tree);
+    return { oid, tree };
+  });
 }
 
 function writeSerializedCommit(
@@ -253,15 +167,8 @@ function writeSerializedCommit(
   options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
   message: CommitMessage,
   tree: string,
-  reservation: MemoryReservation,
 ): string {
-  const serialization = reservation.scope();
-  try {
-    serialization.set("commit", commitSerializationBytes(options, message.value, tree));
-    return write("commit", serializedCommit(options, message, tree));
-  } finally {
-    serialization.dispose();
-  }
+  return write("commit", serializedCommit(options, message, tree));
 }
 
 function serializedCommit(
@@ -282,23 +189,18 @@ function sparseTreePlan(
   context: PublishedCommitContext,
   repo: Repository,
   baselineTreeOid: string | null,
-  reservation: MemoryReservation,
 ): Extract<SparseTreeBuildPlan, { available: true }> | null {
   const source = context.commitTrees;
   if (source === undefined) return null;
   try {
-    const snapshot = snapshotCommitTreeOwned(
-      source,
-      {
-        repoId: repo.store.repoId,
-        checkoutId: repo.checkout.checkoutId,
-        root: repo.root,
-        baselineTreeOid,
-      },
-      reservation,
-    );
+    const snapshot = snapshotCommitTreeOwned(source, {
+      repoId: repo.store.repoId,
+      checkoutId: repo.checkout.checkoutId,
+      root: repo.root,
+      baselineTreeOid,
+    });
     if (!snapshot.available) return null;
-    const plan = planSparseTreeBuild(snapshot, baselineTreeOid, reservation);
+    const plan = planSparseTreeBuild(snapshot, baselineTreeOid);
     return plan.available ? plan : null;
   } catch (error) {
     if (hasErrorCode(error, "E2BIG")) return null;
@@ -312,30 +214,21 @@ function publishCommit(
   options: IndexedCommitOptions,
   context: PublishedCommitContext | undefined,
   baselineTreeOid: string | null,
-  owner: RefMutationMemoryOwner,
 ): CommitResult {
-  const message = cleanPublishedMessage(owner, options.message);
-  const result = ownCommitResult(
-    owner,
-    writeCommitObjects(
-      repo,
-      options,
-      { mode: "exact", value: message },
-      context,
-      baselineTreeOid,
-      owner.memoryReservation(),
-    ),
+  const message = cleanPublishedMessage(options.message);
+  const result = writeCommitObjects(
+    repo,
+    options,
+    { mode: "exact", value: message },
+    context,
+    baselineTreeOid,
   );
   return publishCommitResult(
     repo,
     options.expectedHead,
     result,
-    ownRefLogMetadata(
-      owner,
-      committerRefLogMetadata(options.identities.committer, options.refLogReason),
-    ),
+    committerRefLogMetadata(options.identities.committer, options.refLogReason),
     context,
-    owner,
   );
 }
 
@@ -345,149 +238,28 @@ function publishCommitResult(
   result: UnpublishedCommitResult,
   metadata: ReturnType<typeof committerRefLogMetadata>,
   context: PublishedCommitContext | undefined,
-  owner: RefMutationMemoryOwner,
 ): CommitResult {
   // A symbolic HEAD on an unborn branch creates the branch here.
   if (expectedHead.ref === null) {
-    repo.mutateRefs({ head: result.oid }, metadata, owner);
+    repo.mutateRefs({ head: result.oid }, metadata);
   } else {
-    repo.mutateRefs({ puts: [{ name: expectedHead.ref, target: result.oid }] }, metadata, owner);
+    repo.mutateRefs({ puts: [{ name: expectedHead.ref, target: result.oid }] }, metadata);
   }
   // A false result leaves the prior baseline mismatched, so sparse readers safely use full scans.
   context?.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, result.tree);
   return { oid: result.oid };
 }
 
-function validatePublishedMessage(message: string, reservation: MemoryReservation): void {
-  const validation = reservation.scope();
-  try {
-    validation.set("commit", checkedCommitBytes(256, 2 * retainedStringBytes(message)));
-    if (message.trim() === "") throw new GitError("EMSG", "commit message is required");
-  } finally {
-    validation.dispose();
-  }
+function validatePublishedMessage(message: string): void {
+  if (message.trim() === "") throw new GitError("EMSG", "commit message is required");
 }
 
-function cleanPublishedMessage(owner: RefMutationMemoryOwner, message: string): string {
-  const transient = owner.memoryReservation().scope();
-  try {
-    transient.set(
-      "commit",
-      checkedCommitBytes(512, 4 * retainedStringBytes(message), 3 * (message.length + 1)),
-    );
-    return owner.construct(message.length + 1, () => cleanMessage(message));
-  } finally {
-    transient.dispose();
-  }
+function cleanPublishedMessage(message: string): string {
+  return cleanMessage(message);
 }
 
-function ownCommitResult(
-  owner: RefMutationMemoryOwner,
-  result: UnpublishedCommitResult,
-): UnpublishedCommitResult {
-  return { oid: ownString(owner, result.oid), tree: ownString(owner, result.tree) };
-}
-
-function retainResolvedHead(owner: RefMutationMemoryOwner, head: ResolvedHead): void {
-  ownNullable(owner, head.ref);
-  ownNullable(owner, head.oid);
-}
-
-function ownIdentities(
-  owner: RefMutationMemoryOwner,
-  identities: CommitIdentities,
-): CommitIdentities {
-  ownPerson(owner, identities.author);
-  ownPerson(owner, identities.committer);
-  return identities;
-}
-
-function ownPerson(owner: RefMutationMemoryOwner, person: Person): void {
-  ownString(owner, person.name);
-  ownString(owner, person.email);
-}
-
-function retainParents(owner: RefMutationMemoryOwner, parents: readonly string[]): void {
-  for (const parent of parents) ownString(owner, parent);
-}
-
-function ownRefLogMetadata(
-  owner: RefMutationMemoryOwner,
-  metadata: ReturnType<typeof committerRefLogMetadata>,
-): ReturnType<typeof committerRefLogMetadata> {
-  ownString(owner, metadata.reason);
-  if (metadata.actor !== null) {
-    ownString(owner, metadata.actor.name);
-    ownString(owner, metadata.actor.email);
-  }
-  return metadata;
-}
-
-function ownNullable(owner: RefMutationMemoryOwner, value: string | null): string | null {
-  return value === null ? null : ownString(owner, value);
-}
-
-function ownString(owner: RefMutationMemoryOwner, value: string): string {
-  return owner.owns(value) ? value : owner.retain(value);
-}
-
-function commitLifetimeBytes(parentCount: number): number {
-  return checkedCommitBytes(
-    COMMIT_OPERATION_FIXED_BYTES,
-    COMMIT_OPERATION_VALUE_COUNT * COMMIT_VALUE_FIXED_BYTES,
-    2 * COMMIT_ARRAY_FIXED_BYTES,
-    2 * parentCount * COMMIT_ARRAY_SLOT_BYTES,
-  );
-}
-
-function commitSerializationBytes(
-  options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
-  message: string,
-  tree: string,
-): number {
-  const textUnits =
-    256 +
-    tree.length +
-    message.length +
-    options.identities.author.name.length +
-    options.identities.author.email.length +
-    options.identities.committer.name.length +
-    options.identities.committer.email.length +
-    options.parent.reduce((units, parent) => units + parent.length + 8, 0);
-  return checkedCommitBytes(
-    1_024,
-    checkedCommitProduct(4, checkedCommitBytes(48, checkedCommitProduct(2, textUnits))),
-    checkedCommitProduct(3, textUnits),
-    (options.parent.length + 8) * COMMIT_ARRAY_SLOT_BYTES,
-  );
-}
-
-function readCommitOwned(repo: Repository, oid: string, reservation: MemoryReservation): Commit {
-  return repo.readAuthenticatedCommitOwned(oid, reservation);
-}
-
-function checkedCommitProduct(left: number, right: number): number {
-  if (
-    !Number.isSafeInteger(left) ||
-    left < 0 ||
-    !Number.isSafeInteger(right) ||
-    right < 0 ||
-    (left !== 0 && right > Math.floor(Number.MAX_SAFE_INTEGER / left))
-  ) {
-    throw new GitError("E2BIG", "commit memory accounting overflows");
-  }
-  return left * right;
-}
-
-function checkedCommitBytes(...values: number[]): number {
-  let total = 0;
-  for (const value of values) {
-    if (!Number.isSafeInteger(value) || value < 0 || value > Number.MAX_SAFE_INTEGER - total) {
-      throw new GitError("E2BIG", "commit memory accounting overflows");
-    }
-    total += value;
-  }
-  return total;
+function readCommitOwned(repo: Repository, oid: string): Commit {
+  return repo.readAuthenticatedCommitOwned(oid);
 }
 
 /**
@@ -521,24 +293,6 @@ export function resolveIdentity(
             : repo.store.configGetBounded("user.email", maxIdentityBytes),
         );
   return completeIdentity(context, amended, sources, config);
-}
-
-export function resolveIdentityOwned(
-  context: GitContext,
-  repo: Repository,
-  options: Pick<CommitOptions, "author" | "committer" | "env">,
-  amended: Commit | undefined,
-  owner: RefMutationMemoryOwner,
-): CommitIdentities {
-  const sources = identitySources(context, options, amended);
-  const config =
-    sources.authorBeforeConfig !== null && sources.committerBeforeConfig !== null
-      ? null
-      : identityOf(
-          configGetOwned(repo.store, "user.name", owner),
-          configGetOwned(repo.store, "user.email", owner),
-        );
-  return ownIdentities(owner, completeIdentity(context, amended, sources, config));
 }
 
 interface IdentitySources {
@@ -589,11 +343,11 @@ function completeIdentity(
   };
 }
 
-function readAmended(repo: Repository, head: ResolvedHead, reservation: MemoryReservation): Commit {
+function readAmended(repo: Repository, head: ResolvedHead): Commit {
   if (head.oid === null) {
     throw new GitError("ENOCOMMIT", "cannot amend: HEAD does not point at a commit yet");
   }
-  return readCommitOwned(repo, head.oid, reservation);
+  return readCommitOwned(repo, head.oid);
 }
 
 /** A source only wins when it supplies both halves of an identity. */

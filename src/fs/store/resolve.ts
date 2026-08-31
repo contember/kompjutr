@@ -6,7 +6,6 @@
 // shadow its own target and diverge from every POSIX filesystem. Every path
 // entering the store passes through here first.
 
-import type { MemoryReservation } from "../../memory.js";
 import type { SqlDatabase } from "../../sqlite/db.js";
 import type { RealPath } from "../types.js";
 
@@ -17,16 +16,6 @@ const MAX_FOLLOWS = 40;
 const PATH_BATCH_BYTES = 1_500_000;
 
 const ENCODER = new TextEncoder();
-const ARRAY_FIXED_BYTES = 64;
-const ARRAY_SLOT_BYTES = 8;
-const STRING_FIXED_BYTES = 48;
-const BYTE_ARRAY_FIXED_BYTES = 64;
-const SET_FIXED_BYTES = 128;
-const SET_ENTRY_BYTES = 48;
-const MAP_FIXED_BYTES = 128;
-const MAP_ENTRY_BYTES = 48;
-const NODE_ROW_BYTES = 128;
-const RESOLVE_FIXED_BYTES = 512;
 
 interface NodeRow {
   path: string;
@@ -34,225 +23,18 @@ interface NodeRow {
   link_target: string | null;
 }
 
-function retainedStringUnits(units: number): number {
-  return STRING_FIXED_BYTES + units * 2;
-}
-
-function componentCount(path: string): number {
-  if (path === "" || /^\/+$/u.test(path)) return 0;
-  let count = 1;
-  for (let index = path.startsWith("/") ? 1 : 0; index < path.length; index++) {
-    if (path.charCodeAt(index) === 0x2f) count++;
-  }
-  return count;
-}
-
-function componentsAllocationBytes(path: string): number {
-  const count = componentCount(path);
-  return (
-    ARRAY_FIXED_BYTES +
-    count * (ARRAY_SLOT_BYTES + STRING_FIXED_BYTES) +
-    path.length * 2 +
-    retainedStringUnits(path.length)
-  );
-}
-
-function componentStateBytes(resolved: readonly string[], pending: readonly string[]): number {
-  let bytes = 2 * ARRAY_FIXED_BYTES;
-  for (const component of resolved) {
-    bytes += ARRAY_SLOT_BYTES + retainedStringUnits(component.length);
-  }
-  for (const component of pending) {
-    bytes += ARRAY_SLOT_BYTES + retainedStringUnits(component.length);
-  }
-  return bytes;
-}
-
-function componentStateMaximumBytes(
-  resolved: readonly string[],
-  pending: readonly string[],
-): number {
-  return componentStateBytes(resolved, pending) + pending.length * ARRAY_SLOT_BYTES;
-}
-
-function pathLength(parts: readonly string[]): number {
-  if (parts.length === 0) return 1;
-  let units = parts.length;
-  for (const part of parts) units += part.length;
-  return units;
-}
-
-function plannedPathsAllocationBytes(
-  resolved: readonly string[],
-  pending: readonly string[],
-): number {
-  let currentUnits = pathLength(resolved);
-  let maximumUnits = currentUnits;
-  let stringBytes = retainedStringUnits(currentUnits);
-  let retainedPaths = 1;
-  for (const component of pending) {
-    if (component === "" || component === ".") continue;
-    if (component !== "..") {
-      currentUnits += (currentUnits === 1 ? 0 : 1) + component.length;
-      maximumUnits = Math.max(maximumUnits, currentUnits);
-    }
-    stringBytes += retainedStringUnits(currentUnits);
-    retainedPaths++;
-  }
-  return (
-    2 * ARRAY_FIXED_BYTES +
-    (resolved.length + retainedPaths) * ARRAY_SLOT_BYTES +
-    SET_FIXED_BYTES +
-    retainedPaths * SET_ENTRY_BYTES +
-    stringBytes +
-    2 * retainedStringUnits(maximumUnits)
-  );
-}
-
-function jsonStringSize(value: string): { bytes: number; units: number } {
-  let bytes = 2;
-  let units = 2;
-  for (let index = 0; index < value.length; index++) {
-    const code = value.charCodeAt(index);
-    if (
-      code === 0x22 ||
-      code === 0x5c ||
-      code === 0x08 ||
-      code === 0x09 ||
-      code === 0x0a ||
-      code === 0x0c ||
-      code === 0x0d
-    ) {
-      bytes += 2;
-      units += 2;
-    } else if (code < 0x20) {
-      bytes += 6;
-      units += 6;
-    } else if (code < 0x80) {
-      bytes++;
-      units++;
-    } else if (code < 0x800) {
-      bytes += 2;
-      units++;
-    } else if (code >= 0xd800 && code <= 0xdbff) {
-      const low = value.charCodeAt(index + 1);
-      if (low >= 0xdc00 && low <= 0xdfff) {
-        bytes += 4;
-        units += 2;
-        index++;
-      } else {
-        bytes += 6;
-        units += 6;
-      }
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      bytes += 6;
-      units += 6;
-    } else {
-      bytes += 3;
-      units++;
-    }
-  }
-  return { bytes, units };
-}
-
-function nodesAllocationBytes(paths: readonly string[]): number {
-  let retainedRows = MAP_FIXED_BYTES;
-  let batchBytes = 2;
-  let batchItems = 0;
-  let batchItemUnits = 0;
-  let maximumBatchBytes = 0;
-  let maximumItemBytes = 0;
-  const flush = (): void => {
-    if (batchItems === 0) return;
-    const jsonUnits = batchItemUnits + batchItems - 1 + 2;
-    maximumBatchBytes = Math.max(
-      maximumBatchBytes,
-      ARRAY_FIXED_BYTES +
-        batchItems * ARRAY_SLOT_BYTES +
-        batchItems * STRING_FIXED_BYTES +
-        batchItemUnits * 2 +
-        2 * retainedStringUnits(jsonUnits) +
-        ARRAY_FIXED_BYTES +
-        batchItems * ARRAY_SLOT_BYTES,
-    );
-    batchBytes = 2;
-    batchItems = 0;
-    batchItemUnits = 0;
-  };
-
-  for (const path of paths) {
-    const item = jsonStringSize(path);
-    if (batchItems > 0 && batchBytes + item.bytes + 1 > PATH_BATCH_BYTES) flush();
-    batchItems++;
-    batchBytes += item.bytes + 1;
-    batchItemUnits += item.units;
-    maximumItemBytes = Math.max(maximumItemBytes, item.bytes);
-    retainedRows +=
-      MAP_ENTRY_BYTES +
-      NODE_ROW_BYTES +
-      retainedStringUnits(path.length) +
-      retainedStringUnits("symlink".length);
-  }
-  flush();
-  return retainedRows + maximumBatchBytes + BYTE_ARRAY_FIXED_BYTES + maximumItemBytes;
-}
-
-function symlinkTransitionBytes(target: string, suffixCount: number): number {
-  const targetComponents = componentCount(target);
-  return (
-    componentsAllocationBytes(target) +
-    3 * ARRAY_FIXED_BYTES +
-    (2 * targetComponents + 2 * suffixCount) * ARRAY_SLOT_BYTES +
-    (targetComponents + suffixCount) * ARRAY_SLOT_BYTES
-  );
-}
-
 /**
  * Fetch every node the ordered walk may inspect. `json_each` keeps this one
  * indexed statement regardless of depth; a symlink expansion starts a new
  * batch because only then is the next set of real prefixes known.
  */
-interface NodeMetadataRow {
-  row_count: unknown;
-  target_bytes: unknown;
-}
-
-function nodesOn(
-  db: SqlDatabase,
-  paths: readonly string[],
-  reservation?: MemoryReservation,
-  admittedBytes = 0,
-): Map<string, NodeRow> {
+function nodesOn(db: SqlDatabase, paths: readonly string[]): Map<string, NodeRow> {
   const out = new Map<string, NodeRow>();
-  let targetBytes = 0;
   let items: string[] = [];
   let bytes = 2;
   const flush = (): void => {
     if (items.length === 0) return;
     const binding = `[${items.join(",")}]`;
-    if (reservation !== undefined) {
-      const metadata = db.one<NodeMetadataRow>(
-        `SELECT count(*) AS row_count,
-                coalesce(sum(length(CAST(n.link_target AS BLOB))), 0) AS target_bytes
-           FROM fs_paths p
-           JOIN fs_nodes n ON n.inode = p.inode
-          WHERE p.path IN (SELECT value FROM json_each(?))`,
-        binding,
-      );
-      if (
-        metadata === undefined ||
-        typeof metadata.row_count !== "number" ||
-        !Number.isSafeInteger(metadata.row_count) ||
-        metadata.row_count < 0 ||
-        typeof metadata.target_bytes !== "number" ||
-        !Number.isSafeInteger(metadata.target_bytes) ||
-        metadata.target_bytes < 0
-      ) {
-        throw new Error("path resolution metadata is invalid");
-      }
-      targetBytes += metadata.row_count * STRING_FIXED_BYTES + metadata.target_bytes * 2;
-      reservation.set("other", admittedBytes + targetBytes);
-    }
     for (const row of db.all<NodeRow>(
       `SELECT p.path AS path,
               CASE
@@ -355,102 +137,52 @@ function resolve(
   path: string,
   followFinal: boolean,
   initialNodes?: ReadonlyMap<string, NodeRow>,
-  reservation?: MemoryReservation,
 ): RealPath {
-  const stateMemory = reservation?.scope() ?? null;
-  stateMemory?.set(
-    "other",
-    RESOLVE_FIXED_BYTES + ARRAY_FIXED_BYTES + componentsAllocationBytes(path),
-  );
   let resolved: string[] = [];
-  let pending: string[];
-  try {
-    pending = componentsOf(path);
-    stateMemory?.set("other", RESOLVE_FIXED_BYTES + componentStateMaximumBytes(resolved, pending));
-  } catch (error) {
-    stateMemory?.dispose();
-    throw error;
-  }
+  let pending = componentsOf(path);
   let follows = 0;
   let missingPrefix: string | undefined;
 
-  try {
-    for (;;) {
-      const iterationMemory = reservation?.scope() ?? null;
-      try {
-        stateMemory?.set(
-          "other",
-          RESOLVE_FIXED_BYTES + componentStateMaximumBytes(resolved, pending),
-        );
-        iterationMemory?.set("other", plannedPathsAllocationBytes(resolved, pending));
-        const pathsBytes = plannedPathsAllocationBytes(resolved, pending);
-        const paths = plannedPaths(resolved, pending);
-        const nodesBytes = nodesAllocationBytes(paths);
-        iterationMemory?.set("other", pathsBytes + nodesBytes);
-        const nodes =
-          initialNodes ?? nodesOn(db, paths, iterationMemory ?? undefined, pathsBytes + nodesBytes);
-        initialNodes = undefined;
-        let expanded = false;
+  for (;;) {
+    const paths = plannedPaths(resolved, pending);
+    const nodes = initialNodes ?? nodesOn(db, paths);
+    initialNodes = undefined;
+    let expanded = false;
 
-        for (let index = 0; index < pending.length; index++) {
-          const component = pending[index];
-          if (component === undefined) continue;
+    for (let index = 0; index < pending.length; index++) {
+      const component = pending[index];
+      if (component === undefined) continue;
 
-          const current = pathOf(resolved);
-          requireDirectory(nodes.get(current), path);
+      const current = pathOf(resolved);
+      requireDirectory(nodes.get(current), path);
 
-          if (component === "" || component === ".") continue;
-          if (component === "..") {
-            if (missingPrefix !== undefined) throw enoent(missingPrefix);
-            resolved.pop();
-            continue;
-          }
-
-          resolved.push(component);
-          const candidate = pathOf(resolved);
-          const node = nodes.get(candidate);
-          if (node === undefined && missingPrefix === undefined) missingPrefix = candidate;
-          const isFinal = index === pending.length - 1;
-          if (node?.type !== "symlink" || (!followFinal && isFinal)) continue;
-
-          if (follows >= MAX_FOLLOWS) throw eloop(path);
-          follows++;
-
-          resolved.pop();
-          const target = node.link_target ?? "";
-          const transitionMemory = reservation?.scope() ?? null;
-          try {
-            transitionMemory?.set(
-              "other",
-              symlinkTransitionBytes(target, pending.length - index - 1),
-            );
-            if (target.startsWith("/")) resolved = [];
-            pending = [...componentsOf(target), ...pending.slice(index + 1)];
-            stateMemory?.set(
-              "other",
-              RESOLVE_FIXED_BYTES + componentStateMaximumBytes(resolved, pending),
-            );
-          } finally {
-            transitionMemory?.dispose();
-          }
-          missingPrefix = undefined;
-          expanded = true;
-          break;
-        }
-
-        if (!expanded) {
-          const result = pathOf(resolved) as RealPath;
-          iterationMemory?.dispose();
-          stateMemory?.dispose();
-          reservation?.set("other", retainedStringUnits(result.length));
-          return result;
-        }
-      } finally {
-        iterationMemory?.dispose();
+      if (component === "" || component === ".") continue;
+      if (component === "..") {
+        if (missingPrefix !== undefined) throw enoent(missingPrefix);
+        resolved.pop();
+        continue;
       }
+
+      resolved.push(component);
+      const candidate = pathOf(resolved);
+      const node = nodes.get(candidate);
+      if (node === undefined && missingPrefix === undefined) missingPrefix = candidate;
+      const isFinal = index === pending.length - 1;
+      if (node?.type !== "symlink" || (!followFinal && isFinal)) continue;
+
+      if (follows >= MAX_FOLLOWS) throw eloop(path);
+      follows++;
+
+      resolved.pop();
+      const target = node.link_target ?? "";
+      if (target.startsWith("/")) resolved = [];
+      pending = [...componentsOf(target), ...pending.slice(index + 1)];
+      missingPrefix = undefined;
+      expanded = true;
+      break;
     }
-  } finally {
-    stateMemory?.dispose();
+
+    if (!expanded) return pathOf(resolved) as RealPath;
   }
 }
 
@@ -499,13 +231,9 @@ export function realpath(db: SqlDatabase, path: string): RealPath {
   return resolve(db, path, true);
 }
 
-/** Native resolver whose live prefix, JSON, row and component state is caller-owned. */
-export function realpathOwned(
-  db: SqlDatabase,
-  path: string,
-  reservation: MemoryReservation,
-): RealPath {
-  return resolve(db, path, true, undefined, reservation);
+/** Resolve through the native provider without widening its public contract. */
+export function realpathOwned(db: SqlDatabase, path: string): RealPath {
+  return resolve(db, path, true);
 }
 
 /** Resolve ancestors through symlinks but leave a final named link alone. */

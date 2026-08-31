@@ -1,4 +1,3 @@
-import type { MemoryReservation } from "../../memory.js";
 import type { SqlDatabase } from "../../sqlite/db.js";
 import type { RealPath, ScanEntry, ScanOptions } from "../types.js";
 import { realpathOwned } from "./resolve.js";
@@ -11,24 +10,19 @@ export function registerNativeOwnedReads(worktree: object, db: SqlDatabase): voi
   NATIVE_DATABASES.set(worktree, db);
 }
 
-/** Resolve through the native provider while its bounded result allocation is admitted. */
-export function nativeRealpathOwned(
-  worktree: object,
-  path: string,
-  reservation: MemoryReservation,
-): RealPath | null {
+/** Resolve through the native provider without widening its public contract. */
+export function nativeRealpathOwned(worktree: object, path: string): RealPath | null {
   const db = NATIVE_DATABASES.get(worktree);
   if (db === undefined) return null;
-  return realpathOwned(db, path, reservation);
+  return realpathOwned(db, path);
 }
 
-/** Read one native SQLite page only after its authoritative metadata is admitted. */
+/** Read one page through the native provider without widening its public contract. */
 export function nativeScanOwned(
   worktree: object,
   root: RealPath,
   options: ScanOptions,
-  reservation: MemoryReservation,
 ): ScanEntry[] | null {
   const db = NATIVE_DATABASES.get(worktree);
-  return db === undefined ? null : scanOwned(db, root, options, reservation);
+  return db === undefined ? null : scanOwned(db, root, options);
 }

@@ -1,5 +1,3 @@
-import type { MemoryReservation } from "../../memory.js";
-
 export const GIT_CLI_MAX_ARGV_ENTRIES = 256;
 export const GIT_CLI_MAX_ENV_ENTRIES = 256;
 export const GIT_CLI_MAX_LOG_COUNT = 50_000;
@@ -115,7 +113,6 @@ export interface GitCliInvocation<Command extends ParsedGitCliCommand = ParsedGi
 export type GitCliCommandHandler<Command extends ParsedGitCliCommand> = (
   invocation: GitCliInvocation<Command>,
   options: ResolvedGitCliRunOptions,
-  reservation: MemoryReservation,
 ) => GitCliResult;
 
 export interface GitCliHandlers {

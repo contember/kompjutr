@@ -5,11 +5,8 @@ import { describe, expect, it } from "vitest";
 import { concat, utf8 } from "../src/core/bytes.js";
 import { hashObject, MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
 import type { ReplayStateMetadata } from "../src/core/ops/operation-state.js";
-import { encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
-import { retainedStringBytes } from "../src/core/retained.js";
 import { deflate } from "../src/core/zlib.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { BLOB_ID_CACHE_ELIGIBILITY_BYTES } from "../src/sqlite/blob-id-cache.js";
 import { blob, readBlob } from "../src/sqlite/db.js";
 import {
@@ -22,17 +19,12 @@ import {
 } from "../src/sqlite/schema.js";
 import {
   ancestors,
-  blobIdMismatchRetainedBytes,
   CONFIG_SECTION_MOVE_UPDATE_SQL,
-  configGetOwned,
   contentIdKey,
-  createRefMutationMemoryOwner,
   MAX_CONFIG_SECTION_MOVE_ROWS,
-  MAX_REF_MUTATION_RETAINED_BYTES,
   PACK_BLOB_BATCH_TARGET_BYTES,
   SqliteGitDatabase,
   type StoreOptions,
-  writeBatchOwned,
 } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
@@ -42,11 +34,6 @@ function open(options: StoreOptions = {}) {
   const database = new SqliteGitDatabase(db, options);
   const repository = database.createRepository("/repo", "ref: refs/heads/main");
   return { db, database, store: database.openCheckout(repository) };
-}
-
-function assertMemoryCoordinatorIdle(store: ReturnType<typeof open>["store"]): void {
-  expect(store.shared.memory.activeCount).toBe(0);
-  expect(store.shared.memory.totalBytes).toBe(0);
 }
 
 function insertRawBlob(db: TestDatabase, repoId: number, data: Uint8Array): string {
@@ -248,7 +235,6 @@ describe("repository registry", () => {
       corrupt.database.createCheckout(1, "/corrupt", "ref: refs/heads/corrupt"),
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
     expect(corrupt.database.checkoutAt("/corrupt")).toBeNull();
-    assertMemoryCoordinatorIdle(corrupt.store);
   });
 
   it("caps checkout listing per store and keeps branch attachment unique", () => {
@@ -676,7 +662,6 @@ describe("blob id batches", () => {
         [0, storedOid],
       ]),
     );
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("snapshots yielded cacheable ids and does not retain oversized mismatch inputs", () => {
@@ -725,47 +710,6 @@ describe("blob id batches", () => {
     expect(store.blobIdMismatches([{ contentId: oversized, oid: firstOid }])).toEqual(
       new Map([[0, null]]),
     );
-    expect(store.shared.memory.highWaterBytes).toBeLessThan(oversized.length);
-    assertMemoryCoordinatorIdle(store);
-  });
-
-  it("charges expected and returned identity maps exactly and releases every path", () => {
-    const oid = "1".repeat(40);
-    const mappings = Array.from({ length: 2_048 }, (_, index) => ({
-      contentId: new Uint8Array([index & 0xff, index >>> 8]),
-      oid,
-    }));
-
-    const measured = open();
-    expect(measured.store.blobIdMismatches(mappings).size).toBe(mappings.length);
-    const operationBytes = measured.store.shared.memory.highWaterBytes;
-    expect(operationBytes).toBeGreaterThan(
-      mappings.reduce((bytes, mapping) => bytes + blobIdMismatchRetainedBytes(mapping), 0),
-    );
-    assertMemoryCoordinatorIdle(measured.store);
-
-    const exact = open();
-    const exactBlocker = exact.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    try {
-      expect(exact.store.blobIdMismatches(mappings).size).toBe(mappings.length);
-      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(exact.store);
-
-    const excess = open();
-    const excessBlocker = excess.store.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    try {
-      expect(() => excess.store.blobIdMismatches(mappings)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-    } finally {
-      excessBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(excess.store);
   });
 
   it("rejects invalid expected identities and fails closed on corrupt mappings", () => {
@@ -968,13 +912,11 @@ describe("loose objects", () => {
     expect(scalar.store.write("commit", data)).toBe(expectedOid);
     expect(scalar.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
     expect(scalar.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
-    assertMemoryCoordinatorIdle(scalar.store);
 
     const batch = open();
     expect(batch.store.writeObjects((writer) => writer.write("commit", data))).toBe(expectedOid);
     expect(batch.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
     expect(batch.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
-    assertMemoryCoordinatorIdle(batch.store);
 
     const streamed = open();
     expect(
@@ -986,7 +928,6 @@ describe("loose objects", () => {
     ).toBe(expectedOid);
     expect(streamed.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
     expect(streamed.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
-    assertMemoryCoordinatorIdle(streamed.store);
   });
 
   it("resolves unambiguous prefixes only", () => {
@@ -1044,7 +985,6 @@ describe("loose objects", () => {
       remaining: [],
       bytes: data.length,
     });
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("reads two packed 2.2 MiB objects under an 8 MiB caller target", async () => {
@@ -1067,7 +1007,6 @@ describe("loose objects", () => {
     expect(objects.objects.get(secondOid)).toEqual({ type: "blob", data: second });
     expect(objects.remaining).toEqual([]);
     expect(objects.bytes).toBe(first.length + second.length);
-    assertMemoryCoordinatorIdle(store);
 
     const blobs = store.readBlobs([secondOid, firstOid, secondOid], {
       budgetBytes: 8 * 1024 * 1024,
@@ -1077,86 +1016,6 @@ describe("loose objects", () => {
     expect(blobs.blobs.get(firstOid)).toEqual(first);
     expect(blobs.remaining).toEqual([]);
     expect(blobs.bytes).toBe(first.length + second.length);
-    assertMemoryCoordinatorIdle(store);
-  });
-
-  it("owns mixed loose and packed output once through final map assembly", async () => {
-    const db = new TestDatabase();
-    const setupDatabase = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
-    const setup = setupDatabase.openCheckout(
-      setupDatabase.createRepository("/repo", "ref: refs/heads/main"),
-    );
-    const loose = new Uint8Array(randomBytes(300_000));
-    const packed = new Uint8Array(randomBytes(300_001));
-    const looseOid = setup.write("blob", loose);
-    const packedOid = hashObject("blob", packed);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(1);
-    writer.object("blob", packed);
-    writer.finish();
-    await setup.packs.ingest(slices(concat(chunks), 64 * 1024));
-
-    const reopen = (): ReturnType<typeof open>["store"] => {
-      const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
-      const checkout = database.findCheckout("/repo");
-      if (checkout === null) throw new Error("mixed object checkout disappeared");
-      return database.openCheckout(checkout);
-    };
-    const read = (store: ReturnType<typeof open>["store"]): void => {
-      expect(store.readObjects([looseOid, packedOid], { budgetBytes: 1024 * 1024 })).toEqual({
-        objects: new Map([
-          [looseOid, { type: "blob", data: loose }],
-          [packedOid, { type: "blob", data: packed }],
-        ]),
-        remaining: [],
-        bytes: loose.length + packed.length,
-      });
-    };
-
-    const current = reopen();
-    read(current);
-    assertMemoryCoordinatorIdle(current);
-  });
-
-  it("owns a large loose delta base once during a packed read", async () => {
-    const db = new TestDatabase();
-    const options: StoreOptions = { chunkBytes: 0, objectCacheBytes: 0 };
-    const setupDatabase = new SqliteGitDatabase(db, options);
-    const setup = setupDatabase.openCheckout(
-      setupDatabase.createRepository("/repo", "ref: refs/heads/main"),
-    );
-    const base = new Uint8Array(4_500_000).fill(0x61);
-    const baseOid = setup.write("blob", base);
-    const target = new Uint8Array([0x62]);
-    const targetOid = hashObject("blob", target);
-    const packChunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => packChunks.push(chunk));
-    writer.header(1);
-    writer.refDelta(
-      baseOid,
-      concat([encodeDeltaHeader(base.length, target.length), new Uint8Array([1]), target]),
-    );
-    writer.finish();
-    await setup.packs.ingest(slices(concat(packChunks), 64 * 1024));
-
-    const reopen = (): ReturnType<typeof open>["store"] => {
-      const database = new SqliteGitDatabase(db, options);
-      const checkout = database.findCheckout("/repo");
-      if (checkout === null) throw new Error("packed read checkout disappeared");
-      return database.openCheckout(checkout);
-    };
-    const run = (store: ReturnType<typeof open>["store"]): void => {
-      expect(store.readBlobs([targetOid], { budgetBytes: 8 * 1024 * 1024 })).toEqual({
-        blobs: new Map([[targetOid, target]]),
-        remaining: [],
-        bytes: target.length,
-      });
-    };
-
-    const current = reopen();
-    run(current);
-    assertMemoryCoordinatorIdle(current);
   });
 
   it("validates complete metadata beyond the selected prefix", () => {
@@ -1166,93 +1025,6 @@ describe("loose objects", () => {
     expect(() => store.readObjects([present, missing], { budgetBytes: 10 })).toThrowError(
       expect.objectContaining({ code: "ENOTFOUND" }),
     );
-    assertMemoryCoordinatorIdle(store);
-  });
-
-  it("pre-admits complete object metadata before its query", () => {
-    const wanted = Array.from({ length: 256 }, (_, index) => index.toString(16).padStart(40, "0"));
-    const run = (opened: ReturnType<typeof open>): void => {
-      expect(() => opened.store.readObjects(wanted)).toThrowError(
-        expect.objectContaining({ code: "ENOTFOUND" }),
-      );
-    };
-
-    const measured = open();
-    measured.db.storage.resetCounters();
-    run(measured);
-    const operationBytes = measured.store.shared.memory.highWaterBytes;
-    expect(measured.db.storage.statementCount).toBe(1);
-    assertMemoryCoordinatorIdle(measured.store);
-
-    const exact = open();
-    const exactBlocker = exact.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    try {
-      exact.db.storage.resetCounters();
-      run(exact);
-      expect(exact.db.storage.statementCount).toBe(1);
-      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(exact.store);
-
-    const excess = open();
-    const excessBlocker = excess.store.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    try {
-      excess.db.storage.resetCounters();
-      expect(() => excess.store.readObjects(wanted)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(excess.db.storage.statementCount).toBe(0);
-    } finally {
-      excessBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(excess.store);
-  });
-
-  it("pre-admits loose rows and payloads before opening the payload cursor", () => {
-    const data = new Uint8Array(randomBytes(900_000));
-    const prepare = (): ReturnType<typeof open> => {
-      const opened = open();
-      insertRawBlob(opened.db, 1, data);
-      return opened;
-    };
-    const run = (opened: ReturnType<typeof open>) =>
-      opened.store.readBlobs([hashObject("blob", data)], { budgetBytes: 2 * 1024 * 1024 });
-
-    const measured = prepare();
-    measured.db.storage.resetCounters();
-    expect(run(measured).blobs.values().next().value).toEqual(data);
-    const operationBytes = measured.store.shared.memory.highWaterBytes;
-    expect(measured.db.storage.statementCount).toBe(3);
-    assertMemoryCoordinatorIdle(measured.store);
-
-    const exact = prepare();
-    const exactBlocker = exact.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    try {
-      exact.db.storage.resetCounters();
-      expect(run(exact).blobs.values().next().value).toEqual(data);
-      expect(exact.db.storage.statementCount).toBe(3);
-      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(exact.store);
-
-    const excess = prepare();
-    const excessBlocker = excess.store.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    try {
-      excess.db.storage.resetCounters();
-      expect(() => run(excess)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(excess.db.storage.statementCount).toBe(2);
-    } finally {
-      excessBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(excess.store);
   });
 });
 
@@ -1439,168 +1211,6 @@ describe("object batches", () => {
     expect(store.read(oid)?.data).toEqual(data);
   });
 
-  it("charges owned staged payloads across writes and clears on flush and error", () => {
-    const { store } = open();
-    const owner = store.reserveMemory();
-    const batch = writeBatchOwned(store.shared, owner, {
-      payloadBytes: MAX_OPERATION_MEMORY_BYTES,
-      flushEvery: 16,
-    });
-    try {
-      const first = utf8.encode("first staged object\n");
-      const second = new Uint8Array(randomBytes(8_192));
-      const firstOid = batch.write("blob", first);
-      const firstBytes = owner.currentBytes;
-      expect(firstBytes).toBeGreaterThan(first.byteLength);
-      const secondOid = batch.write("blob", second);
-      expect(owner.currentBytes).toBeGreaterThan(firstBytes + second.byteLength);
-      expect(store.has(firstOid)).toBe(false);
-      expect(store.has(secondOid)).toBe(false);
-
-      batch.flush();
-      expect(owner.currentBytes).toBe(0);
-      expect(store.has(firstOid)).toBe(true);
-      expect(store.has(secondOid)).toBe(true);
-
-      expect(() => batch.write("commit", utf8.encode("not a commit"))).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-      expect(owner.currentBytes).toBe(0);
-    } finally {
-      batch.dispose();
-      owner.dispose();
-    }
-    store.shared.memory.assertIdle();
-  });
-
-  it("admits commit parsing at the exact input-derived transient boundary", () => {
-    const person = {
-      name: "Commit Parser",
-      email: "parser@example.test",
-      timestamp: 1_700_000_000,
-      timezoneOffset: 0,
-    };
-    const data = serializeCommit({
-      tree: "1".repeat(40),
-      parent: [],
-      author: person,
-      committer: person,
-      message: `${"parsed commit body ".repeat(4_096)}\n`,
-    });
-
-    const measured = open();
-    const probe = measured.store.reserveMemory();
-    const measuredBatch = writeBatchOwned(measured.store.shared, probe, {
-      payloadBytes: MAX_OPERATION_MEMORY_BYTES,
-      flushEvery: 2,
-    });
-    try {
-      measuredBatch.write("commit", data);
-    } finally {
-      measuredBatch.dispose();
-    }
-    const operationBytes = probe.highWaterBytes;
-    probe.dispose();
-    measured.store.shared.memory.assertIdle();
-
-    const exact = open();
-    const exactBlocker = exact.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    const exactOwner = exact.store.reserveMemory();
-    const exactBatch = writeBatchOwned(exact.store.shared, exactOwner, {
-      payloadBytes: MAX_OPERATION_MEMORY_BYTES,
-      flushEvery: 2,
-    });
-    try {
-      exactBatch.write("commit", data);
-      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactBatch.dispose();
-      exactOwner.dispose();
-      exactBlocker.dispose();
-    }
-    exact.store.shared.memory.assertIdle();
-
-    const excess = open();
-    const excessBlocker = excess.store.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    const excessOwner = excess.store.reserveMemory();
-    const excessBatch = writeBatchOwned(excess.store.shared, excessOwner, {
-      payloadBytes: MAX_OPERATION_MEMORY_BYTES,
-      flushEvery: 2,
-    });
-    try {
-      expect(() => excessBatch.write("commit", data)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(excessOwner.currentBytes).toBe(0);
-      expect(excess.db.scalar<number>("SELECT count(*) FROM git_objects")).toBe(0);
-      expect(excess.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
-    } finally {
-      excessBatch.dispose();
-      excessOwner.dispose();
-      excessBlocker.dispose();
-    }
-    excess.store.shared.memory.assertIdle();
-  });
-
-  it("owns multi-object flush transients through exact commit or atomic failure", () => {
-    const objects = [
-      new Uint8Array(randomBytes(24_000)),
-      new Uint8Array(randomBytes(32_000)),
-      new Uint8Array(randomBytes(40_000)),
-    ];
-    const options = { payloadBytes: MAX_OPERATION_MEMORY_BYTES, flushEvery: 4 };
-
-    const measured = open();
-    const probe = measured.store.reserveMemory();
-    const measuredBatch = writeBatchOwned(measured.store.shared, probe, options);
-    for (const data of objects) measuredBatch.write("blob", data);
-    const stagedBytes = probe.highWaterBytes;
-    measuredBatch.flush();
-    const operationBytes = probe.highWaterBytes;
-    expect(operationBytes).toBeGreaterThan(stagedBytes + 1);
-    expect(probe.currentBytes).toBe(0);
-    measuredBatch.dispose();
-    probe.dispose();
-    measured.store.shared.memory.assertIdle();
-
-    const exact = open();
-    const exactBlocker = exact.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    const exactOwner = exact.store.reserveMemory();
-    const exactBatch = writeBatchOwned(exact.store.shared, exactOwner, options);
-    try {
-      for (const data of objects) exactBatch.write("blob", data);
-      exactBatch.flush();
-      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-      expect(exact.db.scalar<number>("SELECT count(*) FROM git_objects")).toBe(objects.length);
-    } finally {
-      exactBatch.dispose();
-      exactOwner.dispose();
-      exactBlocker.dispose();
-    }
-    exact.store.shared.memory.assertIdle();
-
-    const excess = open();
-    const excessBlocker = excess.store.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    const excessOwner = excess.store.reserveMemory();
-    const excessBatch = writeBatchOwned(excess.store.shared, excessOwner, options);
-    try {
-      for (const data of objects) excessBatch.write("blob", data);
-      expect(() => excessBatch.flush()).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(excessOwner.currentBytes).toBe(0);
-      expect(excess.db.scalar<number>("SELECT count(*) FROM git_objects")).toBe(0);
-      expect(excess.db.scalar<number>("SELECT count(*) FROM git_object_chunks")).toBe(0);
-    } finally {
-      excessBatch.dispose();
-      excessOwner.dispose();
-      excessBlocker.dispose();
-    }
-    excess.store.shared.memory.assertIdle();
-  });
-
   it("owns raw and zlib blob bytes before the caller can mutate them", () => {
     const { store } = open();
     const inputs = [new Uint8Array(randomBytes(4_096)), new Uint8Array(randomBytes(4_097))];
@@ -1768,44 +1378,6 @@ describe("refs, config and index", () => {
     expect(store.getRef("HEAD")).toBe("c".repeat(40));
   });
 
-  it("owns a single long listed ref row at the exact shared boundary", () => {
-    const name = `refs/tags/${"n".repeat(1_500_001)}`;
-    const target = "1".repeat(40);
-    const rowTextBytes = utf8.encode(name).byteLength + utf8.encode(target).byteLength;
-    const operationBytes = 1_224 + 5 * rowTextBytes;
-    expect(operationBytes).toBeLessThan(MAX_REF_MUTATION_RETAINED_BYTES);
-    const prepare = (): ReturnType<typeof open> => {
-      const opened = open();
-      opened.db.run("INSERT INTO git_refs (repo_id, name, target) VALUES (1, ?, ?)", name, target);
-      return opened;
-    };
-
-    const exact = prepare();
-    const externalBytes = MAX_REF_MUTATION_RETAINED_BYTES - operationBytes;
-    const exactBlocker = exact.store.reserveMemory();
-    exactBlocker.set("other", externalBytes);
-    try {
-      expect(exact.store.listRefs()).toEqual([{ name, target }]);
-      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
-      expect(exactBlocker.currentBytes).toBe(externalBytes);
-    } finally {
-      exactBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(exact.store);
-
-    const over = prepare();
-    const overBlocker = over.store.reserveMemory();
-    overBlocker.set("other", externalBytes + 1);
-    try {
-      expect(() => over.store.listRefs()).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(over.db.scalar<number>("SELECT count(*) FROM git_refs WHERE repo_id = 1")).toBe(1);
-      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
-    } finally {
-      overBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(over.store);
-  });
-
   it("streams repository refs with symbolic targets in strict Git byte order", () => {
     const { database, store } = open();
     const direct = "1".repeat(40);
@@ -1876,7 +1448,6 @@ describe("refs, config and index", () => {
         expect.objectContaining({ code: "ECORRUPT" }),
       );
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it.each([
@@ -1893,7 +1464,6 @@ describe("refs, config and index", () => {
       expect.objectContaining({ code: "ECORRUPT" }),
     );
     expect(() => store.reflog("HEAD")).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("rejects non-canonical UTF-8 in tracking control rows", () => {
@@ -1911,7 +1481,6 @@ describe("refs, config and index", () => {
     expect(() => revision.store.beginFetchPublication("refs/remotes/origin/")).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
-    assertMemoryCoordinatorIdle(revision.store);
 
     const namespace = open();
     namespace.store.beginFetchPublication("refs/remotes/origin/").dispose();
@@ -1925,7 +1494,6 @@ describe("refs, config and index", () => {
     expect(() => namespace.store.beginFetchPublication("refs/remotes/upstream/")).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
-    assertMemoryCoordinatorIdle(namespace.store);
   });
 
   it("lets only the newest same-namespace fetch publish, including after its raw no-op", () => {
@@ -1953,7 +1521,6 @@ describe("refs, config and index", () => {
       older.dispose();
       newer.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("fences overlapping tracking prefixes and lets disjoint prefixes commute", () => {
@@ -2005,7 +1572,6 @@ describe("refs, config and index", () => {
       origin.dispose();
       upstream.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("detects generic tracking ABA while unrelated local branches coexist", () => {
@@ -2058,7 +1624,6 @@ describe("refs, config and index", () => {
     } finally {
       fresh.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("detects tracking ABA from a store opened before the fetch namespace existed", () => {
@@ -2086,8 +1651,6 @@ describe("refs, config and index", () => {
     } finally {
       token.dispose();
     }
-    assertMemoryCoordinatorIdle(first.store);
-    assertMemoryCoordinatorIdle(second);
   });
 
   it("fences a tracking fallback after a newer same-target fetch generation", () => {
@@ -2134,7 +1697,6 @@ describe("refs, config and index", () => {
       independent.dispose();
       upstream.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("keeps a pending narrower fetch disjoint from first broad tracking publication", () => {
@@ -2167,7 +1729,6 @@ describe("refs, config and index", () => {
       fetch.dispose();
       tracking.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("lets a fresh tracking observation supersede an older tracking snapshot", () => {
@@ -2199,7 +1760,6 @@ describe("refs, config and index", () => {
       fetch.dispose();
       fresh?.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it.each([
@@ -2227,7 +1787,6 @@ describe("refs, config and index", () => {
       older.dispose();
       observation.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("creates a durable exact tracking revision before first fetch and detects ABA", () => {
@@ -2272,8 +1831,6 @@ describe("refs, config and index", () => {
         tracking,
       ),
     ).toBe(2);
-    assertMemoryCoordinatorIdle(store);
-    assertMemoryCoordinatorIdle(reopened);
   });
 
   it("enforces the exact tracking revision cardinality from stored rows", () => {
@@ -2301,7 +1858,6 @@ describe("refs, config and index", () => {
       expect.objectContaining({ code: "ECORRUPT" }),
     );
     expect(store.getRef("refs/heads/main")).toBeNull();
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("rejects a tracking token when its repository disappeared", () => {
@@ -2310,7 +1866,6 @@ describe("refs, config and index", () => {
     expect(() =>
       store.beginTrackingRefPublication("refs/remotes/origin/", "refs/remotes/origin/main"),
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("rejects disposed, consumed, and cross-repository tracking tokens", () => {
@@ -2343,8 +1898,6 @@ describe("refs, config and index", () => {
     } finally {
       consumed.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
-    assertMemoryCoordinatorIdle(second);
   });
 
   it("publishes an exact remote HEAD update and prune in one ref transaction", () => {
@@ -2386,7 +1939,6 @@ describe("refs, config and index", () => {
     } finally {
       token.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("accepts an idempotent global tag winner and rejects a different target", () => {
@@ -2435,7 +1987,6 @@ describe("refs, config and index", () => {
       different.dispose();
       replacement.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("checks only selected global tags and accepts an idempotent concurrent winner", () => {
@@ -2464,7 +2015,6 @@ describe("refs, config and index", () => {
     } finally {
       token.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("serializes global shallow mutations across disjoint fetch namespaces", () => {
@@ -2515,7 +2065,6 @@ describe("refs, config and index", () => {
     } finally {
       stale.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("snapshots shallow boundaries authoritatively across live store views", () => {
@@ -2537,8 +2086,6 @@ describe("refs, config and index", () => {
     } finally {
       token.dispose();
     }
-    assertMemoryCoordinatorIdle(first.store);
-    assertMemoryCoordinatorIdle(second);
   });
 
   it("rejects disposed, consumed, and cross-repository publication tokens", () => {
@@ -2570,8 +2117,6 @@ describe("refs, config and index", () => {
     } finally {
       consumed.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
-    assertMemoryCoordinatorIdle(second);
   });
 
   it("fails closed on corrupt or exhausted fetch generations and revisions", () => {
@@ -2584,7 +2129,6 @@ describe("refs, config and index", () => {
     expect(() =>
       corruptGeneration.store.beginFetchPublication("refs/remotes/origin/"),
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    assertMemoryCoordinatorIdle(corruptGeneration.store);
 
     const exhaustedGeneration = open();
     exhaustedGeneration.db.run(
@@ -2594,7 +2138,6 @@ describe("refs, config and index", () => {
     expect(() =>
       exhaustedGeneration.store.beginFetchPublication("refs/remotes/origin/"),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    assertMemoryCoordinatorIdle(exhaustedGeneration.store);
 
     const corruptNamespaceControl = open();
     const tracking = "refs/remotes/origin/main";
@@ -2612,7 +2155,6 @@ describe("refs, config and index", () => {
     } finally {
       corruptNamespaceToken.dispose();
     }
-    assertMemoryCoordinatorIdle(corruptNamespaceControl.store);
 
     const corruptRevision = open();
     const corruptToken = corruptRevision.store.beginFetchPublication("refs/remotes/origin/");
@@ -2628,7 +2170,6 @@ describe("refs, config and index", () => {
     } finally {
       corruptToken.dispose();
     }
-    assertMemoryCoordinatorIdle(corruptRevision.store);
 
     const exhaustedRevision = open();
     const exhaustedToken = exhaustedRevision.store.beginFetchPublication("refs/remotes/origin/");
@@ -2644,7 +2185,6 @@ describe("refs, config and index", () => {
     } finally {
       exhaustedToken.dispose();
     }
-    assertMemoryCoordinatorIdle(exhaustedRevision.store);
 
     const corruptTrackingRevision = open();
     const corruptTrackingToken = corruptTrackingRevision.store.beginTrackingRefPublication(
@@ -2667,7 +2207,6 @@ describe("refs, config and index", () => {
     } finally {
       corruptTrackingToken.dispose();
     }
-    assertMemoryCoordinatorIdle(corruptTrackingRevision.store);
 
     const exhaustedTrackingRevision = open();
     const exhaustedTrackingToken = exhaustedTrackingRevision.store.beginTrackingRefPublication(
@@ -2686,7 +2225,6 @@ describe("refs, config and index", () => {
     } finally {
       exhaustedTrackingToken.dispose();
     }
-    assertMemoryCoordinatorIdle(exhaustedTrackingRevision.store);
 
     const corruptShallowRevision = open();
     corruptShallowRevision.db.run("PRAGMA ignore_check_constraints = ON");
@@ -2697,7 +2235,6 @@ describe("refs, config and index", () => {
     expect(() =>
       corruptShallowRevision.store.beginFetchPublication("refs/remotes/origin/"),
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    assertMemoryCoordinatorIdle(corruptShallowRevision.store);
 
     const exhaustedShallowRevision = open();
     exhaustedShallowRevision.db.run(
@@ -2708,10 +2245,9 @@ describe("refs, config and index", () => {
       expect.objectContaining({ code: "E2BIG" }),
     );
     expect(exhaustedShallowRevision.store.shallow()).toEqual(new Set());
-    assertMemoryCoordinatorIdle(exhaustedShallowRevision.store);
   });
 
-  it("bounds fetch namespace count, retained inputs, and shared operation memory", () => {
+  it("bounds fetch namespace count and retained inputs", () => {
     const namespaceBound = open();
     namespaceBound.db.run("UPDATE git_repositories SET fetch_generation = 1 WHERE id = 1");
     namespaceBound.db.run(
@@ -2725,7 +2261,6 @@ describe("refs, config and index", () => {
     expect(() => namespaceBound.store.beginFetchPublication("refs/remotes/overflow/")).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
-    assertMemoryCoordinatorIdle(namespaceBound.store);
 
     const inputBound = open();
     const candidates = function* (): Generator<string> {
@@ -2739,114 +2274,7 @@ describe("refs, config and index", () => {
     expect(
       inputBound.db.scalar<number>("SELECT fetch_generation FROM git_repositories WHERE id = 1"),
     ).toBe(0);
-    assertMemoryCoordinatorIdle(inputBound.store);
-
-    const memoryBound = open();
-    const blocker = memoryBound.store.reserveMemory();
-    blocker.set("other", MAX_REF_MUTATION_RETAINED_BYTES);
-    try {
-      expect(() => memoryBound.store.beginFetchPublication("refs/remotes/origin/")).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(() =>
-        memoryBound.store.beginTrackingRefPublication(
-          "refs/remotes/origin/",
-          "refs/remotes/origin/main",
-        ),
-      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(blocker.currentBytes).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
-    } finally {
-      blocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(memoryBound.store);
   });
-
-  it.each(["tracking observation", "stored ref"])(
-    "owns the previous long %s row at the exact ordered-scan boundary",
-    (kind) => {
-      const prefix = "refs/remotes/origin/";
-      const long = "r".repeat(1_000_001);
-      const names =
-        kind === "tracking observation"
-          ? [`${prefix}a${long}`, `${prefix}b${long}`]
-          : [`refs/tags/a${long}`, `refs/tags/b${long}`];
-      const prepare = (): ReturnType<typeof open> => {
-        const opened = open();
-        if (kind === "tracking observation") {
-          opened.db.run(
-            `INSERT INTO git_tracking_ref_revisions (repo_id, ref_name, revision)
-             VALUES (1, ?, 0), (1, ?, 0)`,
-            names[0],
-            names[1],
-          );
-        } else {
-          opened.db.run(
-            `INSERT INTO git_refs (repo_id, name, target)
-             VALUES (1, ?, ?), (1, ?, ?)`,
-            names[0],
-            "1".repeat(40),
-            names[1],
-            "2".repeat(40),
-          );
-        }
-        return opened;
-      };
-      const run = (opened: ReturnType<typeof open>): void => {
-        const token = opened.store.beginFetchPublication(prefix);
-        token.dispose();
-      };
-      const durableState = (opened: ReturnType<typeof open>): Record<string, unknown> => ({
-        repository: opened.db.all<Record<string, unknown>>(
-          "SELECT fetch_generation FROM git_repositories WHERE id = 1",
-        ),
-        tracking: opened.db.all<Record<string, unknown>>(
-          `SELECT length(CAST(ref_name AS BLOB)) AS name_bytes, revision
-             FROM git_tracking_ref_revisions WHERE repo_id = 1 ORDER BY ref_name`,
-        ),
-        refs: opened.db.all<Record<string, unknown>>(
-          `SELECT length(CAST(name AS BLOB)) AS name_bytes, target
-             FROM git_refs WHERE repo_id = 1 ORDER BY name`,
-        ),
-        namespaces: opened.db.all<Record<string, unknown>>(
-          `SELECT tracking_prefix, latest_generation, revision
-             FROM git_fetch_namespaces WHERE repo_id = 1 ORDER BY tracking_prefix`,
-        ),
-      });
-
-      const measured = prepare();
-      run(measured);
-      const operationBytes = measured.store.shared.memory.highWaterBytes;
-      expect(operationBytes).toBeGreaterThan(3 * 1024 * 1024);
-      expect(operationBytes).toBeLessThan(MAX_REF_MUTATION_RETAINED_BYTES);
-      assertMemoryCoordinatorIdle(measured.store);
-
-      const externalBytes = MAX_REF_MUTATION_RETAINED_BYTES - operationBytes;
-      const exact = prepare();
-      const exactBlocker = exact.store.reserveMemory();
-      exactBlocker.set("other", externalBytes);
-      try {
-        run(exact);
-        expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
-        expect(exactBlocker.currentBytes).toBe(externalBytes);
-      } finally {
-        exactBlocker.dispose();
-      }
-      assertMemoryCoordinatorIdle(exact.store);
-
-      const over = prepare();
-      const before = durableState(over);
-      const overBlocker = over.store.reserveMemory();
-      overBlocker.set("other", externalBytes + 1);
-      try {
-        expect(() => run(over)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        expect(durableState(over)).toEqual(before);
-        expect(overBlocker.currentBytes).toBe(externalBytes + 1);
-      } finally {
-        overBlocker.dispose();
-      }
-      assertMemoryCoordinatorIdle(over.store);
-    },
-  );
 
   it("publishes 9,329 tracking refs within the statement target", () => {
     const { db, store } = open();
@@ -2868,7 +2296,6 @@ describe("refs, config and index", () => {
     } finally {
       token.dispose();
     }
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("publishes exact tracking state within the statement target", () => {
@@ -2900,7 +2327,6 @@ describe("refs, config and index", () => {
     expect(db.scalar<number>("SELECT count(*) FROM git_fetch_namespaces WHERE repo_id = 1")).toBe(
       1_024,
     );
-    assertMemoryCoordinatorIdle(store);
   });
 
   it("updates 9,329 refs and shallow boundaries in bounded statements", () => {
@@ -3309,71 +2735,6 @@ describe("refs, config and index", () => {
     }
   });
 
-  it("admits the measured ref aggregate exactly and rejects one external byte more", () => {
-    const target = "1".repeat(40);
-    const prefix = "refs/tags/";
-    const suffixBytes = 6;
-    const baseNameBytes = prefix.length + suffixBytes;
-    const nameBytes = 1_025;
-    const count = 8_192;
-    const name = (index: number): string =>
-      `${prefix}${index.toString(36).padStart(suffixBytes, "0")}${"x".repeat(nameBytes - baseNameBytes)}`;
-    const puts = function* (): Generator<{ name: string; target: string }> {
-      for (let index = 0; index < count; index++) yield { name: name(index), target };
-    };
-    expect(name(0)).toHaveLength(nameBytes);
-
-    const measured = open({ now: () => 1_800_000_000_000 });
-    assertMemoryCoordinatorIdle(measured.store);
-    measured.db.storage.resetCounters();
-    measured.store.updateRefs(puts());
-    const measuredHighWater = measured.store.shared.memory.highWaterBytes;
-    expect(measuredHighWater).toBeGreaterThan(32 * 1024 * 1024);
-    expect(measuredHighWater).toBeLessThan(MAX_REF_MUTATION_RETAINED_BYTES);
-    expect(measured.db.storage.statementCount).toBeLessThan(1_000);
-    expect(measured.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(count);
-    expect(measured.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(count);
-    expect(measured.store.getRef(name(0))).toBe(target);
-    expect(measured.store.getRef(name(count - 1))).toBe(target);
-    assertMemoryCoordinatorIdle(measured.store);
-
-    const exact = open({ now: () => 1_800_000_000_000 });
-    const exactBlocker = exact.store.reserveMemory();
-    const externalBytes = MAX_REF_MUTATION_RETAINED_BYTES - measuredHighWater;
-    exactBlocker.set("other", externalBytes);
-    exact.db.storage.resetCounters();
-    try {
-      exact.store.updateRefs(puts());
-      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
-      expect(exact.db.storage.statementCount).toBeLessThan(1_000);
-      expect(exact.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(count);
-      expect(exact.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(count);
-      expect(exact.store.getRef(name(0))).toBe(target);
-      expect(exact.store.getRef(name(count - 1))).toBe(target);
-      expect(exactBlocker.currentBytes).toBe(externalBytes);
-    } finally {
-      exactBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(exact.store);
-
-    const over = open({ now: () => 1_800_000_000_000 });
-    const overBlocker = over.store.reserveMemory();
-    overBlocker.set("other", externalBytes + 1);
-    over.db.storage.resetCounters();
-    try {
-      expect(() => over.store.updateRefs(puts())).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(over.db.storage.statementCount).toBeLessThan(1_000);
-      expect(over.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(0);
-      expect(over.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
-      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
-    } finally {
-      overBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(over.store);
-  });
-
   it("retains only the newest 1,024 entries per ref", () => {
     const now = 1_800_000_000;
     const { db, store } = open({ now: () => now * 1_000 });
@@ -3451,60 +2812,6 @@ describe("refs, config and index", () => {
       expect.objectContaining({ code: "E2BIG" }),
     );
     expect(over.db.storage.statementCount).toBeLessThan(1_000);
-  });
-
-  it("retains an owned config value and refuses one byte before reading its payload", () => {
-    const path = "user.name";
-    const value = "v".repeat(8_192);
-    const valueBytes = utf8.encode(value).byteLength;
-    const retainedValueBytes = 256 + 8 + retainedStringBytes(value);
-    const operationBytes = retainedValueBytes + 512 + 2 * valueBytes;
-    const setup = open();
-    setup.store.configSet(path, value);
-
-    const exactDb = new TestDatabase(setup.db.storage);
-    const exactDatabase = new SqliteGitDatabase(exactDb);
-    const exactCheckout = exactDatabase.checkoutAt("/repo");
-    if (exactCheckout === null) throw new Error("owned config checkout is missing");
-    const exactStore = exactDatabase.openCheckout(exactCheckout);
-    const exactBlocker = exactStore.shared.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    const exactOwner = createRefMutationMemoryOwner(exactStore.shared);
-    exactDb.storage.histogram = new Map();
-    exactDb.storage.resetCounters();
-    try {
-      expect(configGetOwned(exactStore.shared, path, exactOwner)).toBe(value);
-      expect(exactOwner.memoryReservation().currentBytes).toBe(retainedValueBytes);
-      expect(exactOwner.owns(value)).toBe(true);
-      expect(exactStore.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-      expect(exactDb.storage.statementCount).toBe(2);
-    } finally {
-      exactOwner.dispose();
-      exactBlocker.dispose();
-    }
-    exactStore.shared.memory.assertIdle();
-
-    const overDb = new TestDatabase(setup.db.storage);
-    const overDatabase = new SqliteGitDatabase(overDb);
-    const overCheckout = overDatabase.checkoutAt("/repo");
-    if (overCheckout === null) throw new Error("owned config checkout is missing");
-    const overStore = overDatabase.openCheckout(overCheckout);
-    const overBlocker = overStore.shared.reserveMemory();
-    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    const overOwner = createRefMutationMemoryOwner(overStore.shared);
-    overDb.storage.histogram = new Map();
-    overDb.storage.resetCounters();
-    try {
-      expect(() => configGetOwned(overStore.shared, path, overOwner)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(overOwner.memoryReservation().currentBytes).toBe(256);
-      expect(overDb.storage.statementCount).toBe(1);
-    } finally {
-      overOwner.dispose();
-      overBlocker.dispose();
-    }
-    overStore.shared.memory.assertIdle();
   });
 
   it("detects a multi-valued config key after inspecting only two metadata rows", () => {
@@ -3692,91 +2999,6 @@ describe("refs, config and index", () => {
     );
     expect(over.store.configPaths("branch.old.")).toHaveLength(MAX_CONFIG_SECTION_MOVE_ROWS + 1);
     expect(over.store.configPaths("branch.new.")).toEqual([]);
-  });
-
-  it("pre-admits the bounded config path row before opening its cursor", () => {
-    const prepare = (): ReturnType<typeof open> => {
-      const opened = open();
-      opened.store.configSet("branch.new.remote", "origin");
-      return opened;
-    };
-    const run = (opened: ReturnType<typeof open>): void => {
-      opened.store.configMoveSection("branch.old.", "branch.new.");
-    };
-
-    const measured = prepare();
-    measured.db.storage.resetCounters();
-    expect(() => run(measured)).toThrowError(expect.objectContaining({ code: "EEXIST" }));
-    const operationBytes = measured.store.shared.memory.highWaterBytes;
-    expect(measured.db.storage.statementCount).toBe(1);
-    assertMemoryCoordinatorIdle(measured.store);
-
-    const exact = prepare();
-    const exactBlocker = exact.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    try {
-      exact.db.storage.resetCounters();
-      expect(() => run(exact)).toThrowError(expect.objectContaining({ code: "EEXIST" }));
-      expect(exact.db.storage.statementCount).toBe(1);
-      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(exact.store);
-
-    const excess = prepare();
-    const excessBlocker = excess.store.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    try {
-      excess.db.storage.resetCounters();
-      expect(() => run(excess)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(excess.db.storage.statementCount).toBe(0);
-    } finally {
-      excessBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(excess.store);
-  });
-
-  it("streams config values above the former text cap with exact owner cleanup", () => {
-    const path = "branch.old.remote";
-    const value = "x".repeat(1_100_000);
-    const prepare = (): ReturnType<typeof open> => {
-      const opened = open();
-      opened.store.configSet(path, value);
-      return opened;
-    };
-
-    const measured = prepare();
-    measured.store.configMoveSection("branch.old.", "branch.new.");
-    expect(measured.store.configGet("branch.new.remote")).toBe(value);
-    const operationBytes = measured.store.shared.memory.highWaterBytes;
-    assertMemoryCoordinatorIdle(measured.store);
-
-    const exact = prepare();
-    const exactBlocker = exact.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    try {
-      exact.store.configMoveSection("branch.old.", "branch.new.");
-      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-      expect(exact.store.configGet("branch.new.remote")).toBe(value);
-    } finally {
-      exactBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(exact.store);
-
-    const excess = prepare();
-    const excessBlocker = excess.store.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    try {
-      expect(() => excess.store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-      expect(excess.store.configGet(path)).toBe(value);
-      expect(excess.store.configGet("branch.new.remote")).toBeUndefined();
-    } finally {
-      excessBlocker.dispose();
-    }
-    assertMemoryCoordinatorIdle(excess.store);
   });
 
   it("rejects corrupt config section rows before mutation", () => {

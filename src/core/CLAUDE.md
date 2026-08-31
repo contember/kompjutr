@@ -62,9 +62,8 @@ memory, format, platform, corruption, or structural limits.
   visibility.** Reject malformed, oversized, or unsafe-numeric commits instead of
   storing an object the cache cannot represent.
 - Give Git paths and traversals no component byte ceiling. Validate grammar,
-  charge simultaneously live values to the shared operation owner
-  (`MemoryCoordinator` in `src/memory.ts`, reached through `context.ts`), and
-  surface only real memory, format, platform, corruption, or structural failures.
+  and surface only real memory, format, platform, corruption, or structural
+  failures.
 
 ## diff/ is not MIT
 

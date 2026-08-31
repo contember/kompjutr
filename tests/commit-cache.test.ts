@@ -3,27 +3,20 @@ import { describe, expect, it } from "vitest";
 import { utf8 } from "../src/core/bytes.js";
 import { hasErrorCode } from "../src/core/errors.js";
 import { type Commit, hashObject, parseCommit, serializeCommit } from "../src/core/objects.js";
-import { Repository, walkIndexedOwned, walkOwned } from "../src/core/repository.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import { Repository } from "../src/core/repository.js";
 import {
   COMMIT_CACHE_FLUSH_BYTES,
   commitCacheBytes,
-  commitCacheMaterializationBytes,
-  commitCacheSqlPayloadBytes,
-  commitGraphBytes,
-  commitPreparationTransientBytes,
   indexCommitSource,
   MAX_LOG_COMMITS,
   prepareCommitCache,
   WALK_COMMIT_GRAPH_SQL,
 } from "../src/sqlite/commits.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
-import { readShallowOwned, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
-const FORMER_LOG_STATE_BYTES = 32 * 1024 * 1024;
 const FORMER_INDEXED_COMMIT_BYTES = 1024 * 1024;
-const MEMORY_EXCESS_COMMIT_MESSAGE_BYTES = 4 * 1024 * 1024;
 
 class MeasuredDatabase implements SqlDatabase {
   widestStringBytes = 0;
@@ -206,7 +199,7 @@ describe("parsed commit cache", () => {
     }
   });
 
-  it("charges a large accepted commit below the shared retained-memory cap", () => {
+  it("caches a large accepted commit below the fixed flush target", () => {
     const commit = fixture("m".repeat(600 * 1024));
     const data = serializeCommit(commit);
     const oid = hashObject("commit", data);
@@ -234,53 +227,6 @@ describe("parsed commit cache", () => {
     expect(store.cachedCommit(oid)).toBeNull();
     expect([...repo.walkIndexed(oid)].map((entry) => entry.oid)).toEqual([oid]);
     expect(store.cachedCommit(oid)).toBeNull();
-    store.shared.memory.assertIdle();
-  });
-
-  it("admits authoritative bytes before allocation and retains the parsed commit for its caller", () => {
-    const db = new TestDatabase();
-    const store = open(db);
-    const expected = fixture(`${"owned".repeat(10_000)}\n`);
-    expected.parent = [];
-    const data = serializeCommit(expected);
-    const oid = insertAuthoritativeCommit(db, data);
-    store.shared.markLoose();
-    const repo = new Repository(store);
-    const owner = store.reserveMemory();
-    const originalRead = repo.store.readAuthenticatedObject.bind(repo.store);
-    let admittedBeforeRead: number | undefined;
-    repo.store.readAuthenticatedObject = (candidate, type) => {
-      admittedBeforeRead = owner.currentBytes;
-      return originalRead(candidate, type);
-    };
-
-    let commit: Commit;
-    try {
-      commit = repo.readAuthenticatedCommitOwned(oid, owner);
-    } finally {
-      repo.store.readAuthenticatedObject = originalRead;
-    }
-    expect(admittedBeforeRead).toBe(commitPreparationTransientBytes(data.length));
-    expect(owner.currentBytes).toBe(commitCacheBytes(commit));
-    expect(commit.message).toBe(expected.message);
-    owner.dispose();
-    store.shared.memory.assertIdle();
-
-    expect(repo.readAuthenticatedCommit(oid).message).toBe(expected.message);
-    store.shared.memory.assertIdle();
-  });
-
-  it("charges the documented fixed graph slots before payload and parents", () => {
-    const commit: Commit = {
-      tree: "1".repeat(40),
-      parent: [],
-      author: { name: "", email: "", timestamp: 0, timezoneOffset: 0 },
-      committer: { name: "", email: "", timestamp: 0, timezoneOffset: 0 },
-      message: "",
-    };
-
-    expect(commitCacheBytes(commit)).toBe(592);
-    expect(commitGraphBytes(commit)).toBe(596);
   });
 
   it("round-trips NUL in every arbitrary text projection field", () => {
@@ -426,18 +372,14 @@ describe("parsed commit cache", () => {
     expect(store.cachedCommit(oid)?.commit.message).toBe("source\n");
   });
 
-  it("rejects malformed, unsafe-numeric, and real-memory-excess commits atomically", () => {
+  it("rejects malformed and unsafe-numeric commits atomically", () => {
     const malformed = utf8.encode("not a commit");
-    const oversized = serializeCommit(
-      fixture(`${"x".repeat(MEMORY_EXCESS_COMMIT_MESSAGE_BYTES)}\n`),
-    );
     const numeric = serializeCommit({
       ...fixture(),
       author: { ...fixture().author, timestamp: Number.MAX_SAFE_INTEGER + 1 },
     });
     const cases = [
       { data: malformed, code: "ECORRUPT" },
-      { data: oversized, code: "E2BIG" },
       { data: numeric, code: "E2BIG" },
     ];
 
@@ -584,129 +526,6 @@ describe("parsed commit cache", () => {
     expect([...store.commitGraph(oids[3]!, { maxCommits: 4 })]).toHaveLength(4);
   });
 
-  it("accepts the exact graph-byte boundary and rejects one byte less", () => {
-    const store = open();
-    const oid = commitChain(store, 1)[0]!;
-    const commit = store.cachedCommit(oid)!.commit;
-    const bytes = commitCacheMaterializationBytes(commit);
-
-    expect([...store.commitGraph(oid, { maxBytes: bytes })]).toHaveLength(1);
-    expect(() => [...store.commitGraph(oid, { maxBytes: bytes - 1 })]).toThrow(
-      /retained-memory capacity/,
-    );
-  });
-
-  it("pre-admits point-cache SQL payload coexistence at the exact shared boundary", () => {
-    const measured = open();
-    const oid = commitChain(measured, 1)[0]!;
-    const measuredOwner = measured.reserveMemory();
-    expect([...walkOwned(new Repository(measured), oid, measuredOwner)]).toHaveLength(1);
-    const operationBytes = measuredOwner.highWaterBytes;
-    expect(measuredOwner.currentBytes).toBe(0);
-    measuredOwner.dispose();
-    measured.shared.memory.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const store = open();
-      const candidate = commitChain(store, 1)[0]!;
-      const blocker = store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = store.reserveMemory();
-      try {
-        const read = () => [...walkOwned(new Repository(store), candidate, owner)];
-        if (excess === 0) expect(read()).toHaveLength(1);
-        else expect(read).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-        expect(owner.currentBytes).toBe(0);
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      store.shared.memory.assertIdle();
-    }
-  });
-
-  it("retains an owned graph at the exact shared-memory boundary and releases it", () => {
-    const measure = open();
-    const oid = commitChain(measure, 1)[0]!;
-    const measuredOwner = measure.reserveMemory();
-    expect([...walkIndexedOwned(new Repository(measure), oid, measuredOwner)]).toHaveLength(1);
-    const operationBytes = measuredOwner.highWaterBytes;
-    expect(measuredOwner.currentBytes).toBe(0);
-    measuredOwner.dispose();
-
-    const exactBlocker = measure.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    const exactOwner = measure.reserveMemory();
-    try {
-      expect([...walkIndexedOwned(new Repository(measure), oid, exactOwner)]).toHaveLength(1);
-      expect(exactOwner.currentBytes).toBe(0);
-      expect(measure.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactOwner.dispose();
-      exactBlocker.dispose();
-    }
-    measure.shared.memory.assertIdle();
-
-    const excess = open();
-    const excessOid = commitChain(excess, 1)[0]!;
-    const excessBlocker = excess.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    const excessOwner = excess.reserveMemory();
-    try {
-      expect(() => [
-        ...walkIndexedOwned(new Repository(excess), excessOid, excessOwner),
-      ]).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(excessOwner.currentBytes).toBe(0);
-    } finally {
-      excessOwner.dispose();
-      excessBlocker.dispose();
-    }
-    excess.shared.memory.assertIdle();
-  });
-
-  it("streams a full shallow boundary at the exact shared-memory limit", () => {
-    const boundaries = Array.from({ length: 2_048 }, (_, index) =>
-      index.toString(16).padStart(40, "0"),
-    );
-    const measured = open();
-    measured.setShallow(boundaries);
-    const probe = measured.reserveMemory();
-    expect(readShallowOwned(measured.shared, probe)).toEqual(new Set(boundaries));
-    const operationBytes = probe.highWaterBytes;
-    expect(probe.currentBytes).toBeLessThan(operationBytes);
-    probe.dispose();
-    measured.shared.memory.assertIdle();
-
-    const exact = open();
-    exact.setShallow(boundaries);
-    const exactBlocker = exact.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    const exactOwner = exact.reserveMemory();
-    try {
-      expect(readShallowOwned(exact.shared, exactOwner)).toEqual(new Set(boundaries));
-      expect(exact.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactOwner.dispose();
-      exactBlocker.dispose();
-    }
-    exact.shared.memory.assertIdle();
-
-    const excess = open();
-    excess.setShallow(boundaries);
-    const excessBlocker = excess.reserveMemory();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    const excessOwner = excess.reserveMemory();
-    try {
-      expect(() => readShallowOwned(excess.shared, excessOwner)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-    } finally {
-      excessOwner.dispose();
-      excessBlocker.dispose();
-    }
-    excess.shared.memory.assertIdle();
-  });
-
   it("rejects understated oversized payload metadata without returning its BLOB", () => {
     const inner = new TestDatabase();
     const db = new MeasuredDatabase(inner);
@@ -720,39 +539,9 @@ describe("parsed commit cache", () => {
     );
     db.widestResultBlob = 0;
 
-    expect(() => [...store.commitGraph(oid)]).toThrow(/retained-memory capacity/);
+    expect(() => [...store.commitGraph(oid)]).toThrow(/fixed state capacity/);
     expect(db.widestResultBlob).toBe(0);
   });
-
-  it("owns a graph above 32 MiB and rejects its exact aggregate first excess", () => {
-    const store = open();
-    let parent: string | undefined;
-    let root: string | undefined;
-    let bytes = 0;
-    let payloadBytes = 0;
-    for (let index = 0; bytes <= FORMER_LOG_STATE_BYTES; index++) {
-      const commit = fixture(`${"m".repeat(500_000)}${index}\n`);
-      commit.parent = parent === undefined ? [] : [parent];
-      commit.committer.timestamp = index;
-      const oid = store.write("commit", serializeCommit(commit));
-      const cached = store.cachedCommit(oid);
-      if (cached === null) throw new Error("large graph cache row is missing");
-      bytes += commitGraphBytes(cached.commit);
-      payloadBytes = Math.max(payloadBytes, commitCacheSqlPayloadBytes(cached.commit));
-      root = oid;
-      parent = oid;
-    }
-    if (root === undefined) throw new Error("large graph has no root");
-    const repo = new Repository(store);
-
-    expect(bytes).toBeGreaterThan(FORMER_LOG_STATE_BYTES);
-    const operationBytes = bytes + payloadBytes;
-    expect([...repo.walkIndexed(root, { maxBytes: operationBytes })]).not.toHaveLength(0);
-    expect(() => [...repo.walkIndexed(root, { maxBytes: operationBytes - 1 })]).toThrow(
-      /retained-memory capacity/,
-    );
-    store.shared.memory.assertIdle();
-  }, 30_000);
 
   it("stops at shallow commits before requiring their parents", () => {
     const store = open();
@@ -773,23 +562,6 @@ describe("parsed commit cache", () => {
     expect(() => walk.next()).toThrow(/cache is unavailable/);
   });
 
-  it("fails closed on a corrupt cached parent reached from an uncached root", () => {
-    const store = open();
-    const [parent, root] = commitChain(store, 2);
-    store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, root);
-    store.db.run("PRAGMA ignore_check_constraints = ON");
-    store.db.run(
-      "UPDATE git_commits SET parents = 'not-json' WHERE repo_id = ? AND oid = ?",
-      1,
-      parent,
-    );
-    store.db.run("PRAGMA ignore_check_constraints = OFF");
-    const repo = new Repository(store);
-
-    expect(() => [...repo.walkIndexed(root!)]).toThrow(/cache row is corrupt/);
-    store.shared.memory.assertIdle();
-  });
-
   it("fails a corrupt tail row before returning the valid root", () => {
     const store = open();
     const [parent, root] = commitChain(store, 2);
@@ -805,7 +577,7 @@ describe("parsed commit cache", () => {
     expect(() => walk.next()).toThrow(/cache is corrupt/);
   });
 
-  it("never falls back from a corrupt cache row and releases direct and caller owners", () => {
+  it("never falls back from a corrupt cache row", () => {
     const store = open();
     const oid = commitChain(store, 1)[0]!;
     store.db.run("PRAGMA ignore_check_constraints = ON");
@@ -818,32 +590,15 @@ describe("parsed commit cache", () => {
     const repo = new Repository(store);
 
     expect(() => [...repo.walkIndexed(oid)]).toThrow(/cache is corrupt/);
-    store.shared.memory.assertIdle();
-
-    const owner = store.reserveMemory();
-    const iterator = walkIndexedOwned(repo, oid, owner)[Symbol.iterator]();
-    expect(() => iterator.next()).toThrow(/cache is corrupt/);
-    expect(owner.currentBytes).toBe(0);
-    owner.dispose();
-    store.shared.memory.assertIdle();
   });
 
-  it("releases direct and caller-owned graph iterators on early return", () => {
+  it("releases graph iterators on early return", () => {
     const store = open();
     const oid = commitChain(store, 2)[1]!;
     const repo = new Repository(store);
     const direct = repo.walkIndexed(oid);
     expect(direct.next().done).toBe(false);
     direct.return(undefined);
-    store.shared.memory.assertIdle();
-
-    const owner = store.reserveMemory();
-    const owned = walkIndexedOwned(repo, oid, owner)[Symbol.iterator]();
-    expect(owned.next().done).toBe(false);
-    owned.return?.();
-    expect(owner.currentBytes).toBe(0);
-    owner.dispose();
-    store.shared.memory.assertIdle();
   });
 
   it("leaves graph cycles to fail-closed Repository validation", () => {

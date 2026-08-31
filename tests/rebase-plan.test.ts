@@ -119,7 +119,6 @@ describe("bounded rebase planner", () => {
           resultOid: null,
         })),
       );
-      expect(plan.retainedBytes).toBeGreaterThan(0);
       expect(snapshot(store)).toEqual(before);
     } finally {
       fixture.dispose();
@@ -144,7 +143,6 @@ describe("bounded rebase planner", () => {
         upstreamOid: second,
         baseOid: second,
         steps: [],
-        retainedBytes: 0,
       });
       fixture.git("branch", "upstream", second);
       expect(fixture.git("rebase", "upstream")).toContain("up to date");
@@ -156,7 +154,6 @@ describe("bounded rebase planner", () => {
         upstreamOid: third,
         baseOid: first,
         steps: [],
-        retainedBytes: 0,
       });
       fixture.git("checkout", "-q", "-b", "behind", first);
       fixture.git("rebase", "main");
@@ -174,7 +171,6 @@ describe("bounded rebase planner", () => {
       const measured = planRebase(repo, { upstream, currentOid: current });
       const exactLimits = {
         maxSteps: measured.steps.length,
-        maxRetainedBytes: measured.retainedBytes,
         maxGraphCommits: measured.graphCommits,
       };
 
@@ -182,9 +178,7 @@ describe("bounded rebase planner", () => {
         planRebase(repo, { upstream, currentOid: current, limits: exactLimits }),
       ).toMatchObject({
         steps: measured.steps,
-        retainedBytes: measured.retainedBytes,
         graphCommits: measured.graphCommits,
-        graphRetainedBytes: measured.graphRetainedBytes,
       });
       expectCode(
         () =>
@@ -192,15 +186,6 @@ describe("bounded rebase planner", () => {
             upstream,
             currentOid: current,
             limits: { ...exactLimits, maxSteps: measured.steps.length - 1 },
-          }),
-        "E2BIG",
-      );
-      expectCode(
-        () =>
-          planRebase(repo, {
-            upstream,
-            currentOid: current,
-            limits: { ...exactLimits, maxRetainedBytes: measured.retainedBytes - 1 },
           }),
         "E2BIG",
       );

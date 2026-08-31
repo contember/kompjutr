@@ -1,13 +1,10 @@
 // Plumbing: hashing bytes, reading raw objects, writing refs, and finding
 // the repository a directory belongs to.
 
-import type { MemoryReservation } from "../../memory.js";
 import {
-  createRefMutationMemoryOwner,
   type IndexEntry,
   type IndexStore,
   indexScanOwned,
-  mutateRefsOwned,
   writeObjectsOwned,
 } from "../../sqlite/store.js";
 import { isOid, utf8 } from "../bytes.js";
@@ -20,12 +17,11 @@ import {
   resolveHeadOwned,
   symbolicTargetOwned,
 } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import type { Worktree } from "../worktree.js";
 import { checkoutTree, indexFromTree } from "./checkout.js";
 import {
   type CommitIdentities,
-  resolveIdentityOwned,
+  resolveIdentity,
   writeUnpublishedCommitFromTree,
 } from "./commit.js";
 import { type CatFileResult, catFile as readObject, treeOf } from "./reads.js";
@@ -41,8 +37,6 @@ const READ_TREE_MAX_ROWS_PER_STREAM = 50_000;
 const WRITE_TREE_INDEX_PAGE = 2_048;
 export const MAX_COMMIT_TREE_PARENTS = 2;
 export const MAX_COMMIT_TREE_REVISION_TRAVERSALS = 8;
-const REQUIRED_OBJECTS_FIXED_BYTES = 192;
-const REQUIRED_OBJECT_ENTRY_BYTES = 64;
 
 export interface HashObjectOptions {
   content: Uint8Array | string;
@@ -138,51 +132,32 @@ function* boundedReadTreeIndex(repo: Repository, treeOid: string | null): Genera
 export function writeTree(repo: Repository, index: IndexStore = repo.checkout): string {
   return repo.store.runScratchAwareOperation(() =>
     repo.store.db.transactionSync(() => {
-      const reservation = repo.store.reserveMemory();
-      try {
-        let requiredObjectBytes = REQUIRED_OBJECTS_FIXED_BYTES;
-        reservation.set("other", requiredObjectBytes);
-        if (index.hasConflicts()) {
-          throw new GitError("EUNMERGED", "cannot write tree: the index has unmerged paths");
-        }
-        const requiredObjects = new Set<string>();
-        const entries = function* (): Generator<IndexEntry> {
-          for (const entry of indexScanOwned(index, reservation, {
-            pageSize: WRITE_TREE_INDEX_PAGE,
-          })) {
-            if (entry.stage !== 0) {
-              throw new GitError("EUNMERGED", "cannot write tree: the index has unmerged paths");
-            }
-            if (entry.mode !== 0o160000 && !requiredObjects.has(entry.oid)) {
-              const next =
-                requiredObjectBytes + REQUIRED_OBJECT_ENTRY_BYTES + retainedStringBytes(entry.oid);
-              reservation.set("other", next);
-              requiredObjects.add(entry.oid);
-              requiredObjectBytes = next;
-            }
-            yield entry;
-          }
-        };
-        preflightTreeBuild(
-          entries(),
-          {
-            maxEntriesPerTree: MAX_TREE_BUILD_LEAF_ENTRIES,
-            maxTreeObjects: MAX_TREE_BUILD_OBJECTS,
-          },
-          reservation,
-        );
-        const missing = repo.store.missing(requiredObjects);
-        if (missing[0] !== undefined) throw new ObjectNotFoundError(missing[0]);
-        return writeObjectsOwned(repo.store, reservation, (batch) =>
-          buildTreeInBatch(
-            batch,
-            indexScanOwned(index, reservation, { pageSize: WRITE_TREE_INDEX_PAGE }),
-            reservation,
-          ),
-        );
-      } finally {
-        reservation.dispose();
+      if (index.hasConflicts()) {
+        throw new GitError("EUNMERGED", "cannot write tree: the index has unmerged paths");
       }
+      const requiredObjects = new Set<string>();
+      const entries = function* (): Generator<IndexEntry> {
+        for (const entry of indexScanOwned(index, {
+          pageSize: WRITE_TREE_INDEX_PAGE,
+        })) {
+          if (entry.stage !== 0) {
+            throw new GitError("EUNMERGED", "cannot write tree: the index has unmerged paths");
+          }
+          if (entry.mode !== 0o160000 && !requiredObjects.has(entry.oid)) {
+            requiredObjects.add(entry.oid);
+          }
+          yield entry;
+        }
+      };
+      preflightTreeBuild(entries(), {
+        maxEntriesPerTree: MAX_TREE_BUILD_LEAF_ENTRIES,
+        maxTreeObjects: MAX_TREE_BUILD_OBJECTS,
+      });
+      const missing = repo.store.missing(requiredObjects);
+      if (missing[0] !== undefined) throw new ObjectNotFoundError(missing[0]);
+      return writeObjectsOwned(repo.store, (batch) =>
+        buildTreeInBatch(batch, indexScanOwned(index, { pageSize: WRITE_TREE_INDEX_PAGE })),
+      );
     }),
   );
 }
@@ -213,50 +188,38 @@ export function commitTree(
   repo: Repository,
   options: CommitTreeOptions,
 ): string {
-  const owner = createRefMutationMemoryOwner(repo.store);
-  const reservation = owner.memoryReservation();
-  try {
-    return repo.store.runScratchAwareOperation(() => {
-      const input = checkCommitTreeInput(options, reservation);
-      return repo.store.db.transactionSync(() => {
-        const tree = repo.revParse(input.tree);
-        authenticateCommitTreeObject(repo, tree, "tree", reservation);
+  return repo.store.runScratchAwareOperation(() => {
+    const input = checkCommitTreeInput(options);
+    return repo.store.db.transactionSync(() => {
+      const tree = repo.revParse(input.tree);
+      authenticateCommitTreeObject(repo, tree, "tree");
 
-        const parent: string[] = [];
-        const seen = new Set<string>();
-        for (const expression of input.parent) {
-          const oid = repo.revParse(expression);
-          if (seen.has(oid)) continue;
-          seen.add(oid);
-          authenticateCommitTreeObject(repo, oid, "commit", reservation);
-          parent.push(oid);
-        }
+      const parent: string[] = [];
+      const seen = new Set<string>();
+      for (const expression of input.parent) {
+        const oid = repo.revParse(expression);
+        if (seen.has(oid)) continue;
+        seen.add(oid);
+        authenticateCommitTreeObject(repo, oid, "commit");
+        parent.push(oid);
+      }
 
-        const identities = resolveIdentityOwned(context, repo, options, undefined, owner);
-        const identityBytes = validateCommitIdentities(identities);
-        requireCommitTreeInputBytes(input.bytes, identityBytes);
-        return writeUnpublishedCommitFromTree(
-          repo,
-          tree,
-          {
-            message: input.message,
-            parent,
-            identities,
-          },
-          reservation,
-        );
+      const identities = resolveIdentity(context, repo, options);
+      const identityBytes = validateCommitIdentities(identities);
+      requireCommitTreeInputBytes(input.bytes, identityBytes);
+      return writeUnpublishedCommitFromTree(repo, tree, {
+        message: input.message,
+        parent,
+        identities,
       });
     });
-  } finally {
-    owner.dispose();
-  }
+  });
 }
 
 function authenticateCommitTreeObject(
   repo: Repository,
   oid: string,
   expectedType: "tree" | "commit",
-  reservation: ReturnType<Repository["store"]["reserveMemory"]>,
 ): void {
   const info = repo.store.typeAndSize(oid);
   if (info === null) throw new ObjectNotFoundError(oid);
@@ -264,23 +227,15 @@ function authenticateCommitTreeObject(
     throw new CorruptError(`${oid} is a ${info.type}, not a ${expectedType}`);
   }
   if (expectedType === "commit") {
-    repo.readAuthenticatedCommitOwned(oid, reservation);
+    repo.readAuthenticatedCommitOwned(oid);
     return;
   }
-  reservation.set("tree", info.size);
-  try {
-    if (repo.store.readAuthenticatedObject(oid, expectedType) === null) {
-      throw new ObjectNotFoundError(oid);
-    }
-  } finally {
-    reservation.clear("tree");
+  if (repo.store.readAuthenticatedObject(oid, expectedType) === null) {
+    throw new ObjectNotFoundError(oid);
   }
 }
 
-function checkCommitTreeInput(
-  options: CommitTreeOptions,
-  reservation: MemoryReservation,
-): CheckedCommitTreeInput {
+function checkCommitTreeInput(options: CommitTreeOptions): CheckedCommitTreeInput {
   const tree: unknown = Reflect.get(options, "tree");
   const message: unknown = Reflect.get(options, "message");
   const rawParent: unknown = Reflect.get(options, "parent");
@@ -297,12 +252,6 @@ function checkCommitTreeInput(
   if (candidates.length > MAX_COMMIT_TREE_PARENTS) {
     throw new GitError("E2BIG", `commit-tree exceeds ${MAX_COMMIT_TREE_PARENTS} parent revisions`);
   }
-
-  let retainedBytes = 512 + retainedStringBytes(tree) + retainedStringBytes(message);
-  for (const candidate of candidates) {
-    if (typeof candidate === "string") retainedBytes += retainedStringBytes(candidate);
-  }
-  reservation.set("commit", retainedBytes);
 
   let bytes = commitTreeTextBytes(tree, "tree revision");
   let traversals = commitTreeRevisionTraversals(tree);
@@ -494,15 +443,10 @@ export function readRef(repo: Repository, options: ReadRefOptions): RawRefTarget
   ) {
     throw new GitError("EINVAL", "raw ref name must be HEAD or a full refs/... name");
   }
-  const owner = createRefMutationMemoryOwner(repo.store);
-  try {
-    const raw = readRawRefOwned(repo, ref, owner);
-    if (raw === null) return { kind: "absent" };
-    const target = symbolicTargetOwned(raw, owner);
-    return target === null ? { kind: "direct", oid: raw } : { kind: "symbolic", target };
-  } finally {
-    owner.dispose();
-  }
+  const raw = readRawRefOwned(repo, ref);
+  if (raw === null) return { kind: "absent" };
+  const target = symbolicTargetOwned(raw);
+  return target === null ? { kind: "direct", oid: raw } : { kind: "symbolic", target };
 }
 
 /**
@@ -540,19 +484,12 @@ export function updateRef(context: GitContext, repo: Repository, options: Update
       return;
     }
     const target = requireDirectOid(value);
-    const owner = createRefMutationMemoryOwner(repo.store);
-    try {
-      const metadata = operationRefLogMetadata(context, repo, "update-ref", {}, owner);
-      repo.typeOf(target);
-      mutateRefsOwned(
-        repo.checkout,
-        { puts: [{ name: ref, target }], expected: { name: ref, target: checkedExpected ?? null } },
-        metadata,
-        owner,
-      );
-    } finally {
-      owner.dispose();
-    }
+    const metadata = operationRefLogMetadata(context, repo, "update-ref");
+    repo.typeOf(target);
+    repo.mutateRefs(
+      { puts: [{ name: ref, target }], expected: { name: ref, target: checkedExpected ?? null } },
+      metadata,
+    );
     return;
   }
   if (typeof value !== "string") throw new GitError("EINVAL", "update-ref value is required");
@@ -597,10 +534,5 @@ export function repoRoot(context: GitContext, options: RepoRootOptions = {}): st
 
 /** HEAD's symbolic target, or undefined when HEAD is detached. */
 export function symbolicRef(repo: Repository): string | undefined {
-  const owner = createRefMutationMemoryOwner(repo.store);
-  try {
-    return resolveHeadOwned(repo, owner).ref ?? undefined;
-  } finally {
-    owner.dispose();
-  }
+  return resolveHeadOwned(repo).ref ?? undefined;
 }

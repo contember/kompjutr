@@ -7,12 +7,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ComputerWorktree } from "../src/compat/computer/worktree.js";
 import { type GitContext, openRepository } from "../src/core/context.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
-import { diffSummaryBounded } from "../src/core/ops/diff.js";
+import { diffSummaryBounded, diffSummaryEntryRetainedBytes } from "../src/core/ops/diff.js";
 import { initRepository } from "../src/core/ops/init.js";
 import { rebase } from "../src/core/ops/rebase.js";
 import { dirtyPathStream } from "../src/core/ops/worktree-io.js";
 import type { Repository } from "../src/core/repository.js";
-import { retainedStringBytes } from "../src/core/retained.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
 import { createGitCliRunner } from "../src/git/cli/index.js";
 import { createGitCliWriteHandlers } from "../src/git/cli/write.js";
@@ -409,7 +408,6 @@ describe("mutating git CLI handlers", () => {
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("1 file changed, 0 insertions(+), 0 deletions(-)");
     expect(result.stdout).toContain("create mode 100644 large.bin");
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("maps missing and outside path operands without changing the index", () => {
@@ -627,7 +625,18 @@ describe("mutating git CLI handlers", () => {
     const current = workspace.repo.head().oid;
     if (current === null) throw new Error("changed commit is missing");
     const options = { ref: parent, to: current, renames: false };
-    const exactBytes = 128 + retainedStringBytes("file.txt");
+    const [summaryRow] = diffSummaryBounded(
+      workspace.repo,
+      workspace.worktree,
+      options,
+      undefined,
+      {
+        maxRows: 1,
+        maxRetainedBytes: Number.MAX_SAFE_INTEGER,
+      },
+    );
+    if (summaryRow === undefined) throw new Error("diff summary row is missing");
+    const exactBytes = diffSummaryEntryRetainedBytes(summaryRow);
 
     expect(
       diffSummaryBounded(workspace.repo, workspace.worktree, options, undefined, {

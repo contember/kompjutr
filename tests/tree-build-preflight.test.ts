@@ -6,7 +6,6 @@ import {
   type TreeBuildPreflightLimits,
 } from "../src/core/ops/tree-build.js";
 import type { CommitTreeSnapshotResult } from "../src/core/sparse-workspace.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 
 const OID = "1".repeat(40);
@@ -16,12 +15,7 @@ const LIMITS: TreeBuildPreflightLimits = {
 };
 
 function preflight(entries: Iterable<IndexEntry>, limits: TreeBuildPreflightLimits = LIMITS) {
-  const reservation = new MemoryCoordinator().reserve();
-  try {
-    return preflightTreeBuild(entries, limits, reservation);
-  } finally {
-    reservation.dispose();
-  }
+  return preflightTreeBuild(entries, limits);
 }
 
 function entry(path: string, mode = 0o100644, stage = 0): IndexEntry {
@@ -138,43 +132,6 @@ describe("tree-build preflight", () => {
     expect(stats.maxSingleTreeBytes).toBeLessThan(1024 * 1024);
   });
 
-  it("composes preflight state at the exact shared memory ceiling and releases it", () => {
-    const rows = [entry("deep/path/to/file.txt")];
-    const measured = new MemoryCoordinator();
-    const measuredReservation = measured.reserve();
-    preflightTreeBuild(rows, LIMITS, measuredReservation);
-    const operationBytes = measuredReservation.highWaterBytes;
-    measuredReservation.dispose();
-    measured.assertIdle();
-
-    const exact = new MemoryCoordinator();
-    const exactBlocker = exact.reserve();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    const exactReservation = exact.reserve();
-    try {
-      expect(preflightTreeBuild(rows, LIMITS, exactReservation)).toMatchObject({ leafEntries: 1 });
-      expect(exact.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      exactReservation.dispose();
-      exactBlocker.dispose();
-    }
-    exact.assertIdle();
-
-    const excess = new MemoryCoordinator();
-    const excessBlocker = excess.reserve();
-    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    const excessReservation = excess.reserve();
-    try {
-      expect(() => preflightTreeBuild(rows, LIMITS, excessReservation)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-    } finally {
-      excessReservation.dispose();
-      excessBlocker.dispose();
-    }
-    excess.assertIdle();
-  });
-
   it("rejects unsorted, nested-file, and malformed paths", () => {
     for (const entries of [[entry("b"), entry("a")], [entry("a"), entry("a/b")], [entry("a//b")]]) {
       expect(() => preflight(entries)).toThrow();
@@ -183,7 +140,7 @@ describe("tree-build preflight", () => {
     expect(preflight([entry("x".repeat(2_201))])).toMatchObject({ leafEntries: 1 });
   });
 
-  it("plans beyond the former 8 MiB state and 16 MiB object ceilings at exact aggregate memory", () => {
+  it("plans beyond the former 8 MiB state and 16 MiB object ceilings", () => {
     const treeEntries = Array.from({ length: 8_192 }, (_, index) => ({
       mode: MODE_FILE,
       name: `p${index.toString().padStart(4, "0")}${"ࠀ".repeat(682)}`,
@@ -194,45 +151,17 @@ describe("tree-build preflight", () => {
     const baseline = hashObject("tree", baselineData);
     const changedPath = treeEntries[0]?.name;
     if (changedPath === undefined) throw new Error("large sparse plan fixture is empty");
-    const retainedBytes = 8 * 1024 * 1024 + 1;
     const snapshot = {
       available: true,
       baselineTreeOid: baseline,
       dirty: [{ path: changedPath, flags: 1 }],
       index: [{ ...entry(changedPath), oid: "2".repeat(40) }],
       directories: [{ path: "", oid: baseline, entries: treeEntries }],
-      retainedBytes,
     } satisfies Extract<CommitTreeSnapshotResult, { available: true }>;
 
     const standalone = planSparseTreeBuild(snapshot, baseline);
     expect(standalone.available).toBe(true);
     if (!standalone.available) throw new Error("large standalone sparse plan was unavailable");
     expect(standalone.objects[0]?.data.byteLength).toBeGreaterThan(16 * 1024 * 1024);
-
-    const measured = new MemoryCoordinator();
-    const measuredOwner = measured.reserve();
-    measuredOwner.set("other", retainedBytes);
-    const measuredPlan = planSparseTreeBuild(snapshot, baseline, measuredOwner);
-    expect(measuredPlan.available).toBe(true);
-    const operationBytes = measuredOwner.highWaterBytes;
-    measuredOwner.dispose();
-    measured.assertIdle();
-
-    for (const excess of [0, 1]) {
-      const coordinator = new MemoryCoordinator();
-      const blocker = coordinator.reserve();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      const owner = coordinator.reserve();
-      try {
-        owner.set("other", retainedBytes);
-        const plan = planSparseTreeBuild(snapshot, baseline, owner);
-        if (excess === 0) expect(plan.available).toBe(true);
-        else expect(plan).toEqual({ available: false });
-      } finally {
-        owner.dispose();
-        blocker.dispose();
-      }
-      coordinator.assertIdle();
-    }
   });
 });

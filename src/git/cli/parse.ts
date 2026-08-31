@@ -1,6 +1,4 @@
 import { GitError } from "../../core/errors.js";
-import { retainedStringBytes } from "../../core/retained.js";
-import { MemoryCoordinator, type MemoryReservation } from "../../memory.js";
 import {
   type GitCliOutputContext,
   gitCliCommitMessageRequired,
@@ -30,9 +28,6 @@ const INPUT_KEYS = new Set(["argv", "cwd", "env", "stdin"]);
 const NETWORK_COMMANDS = new Set(["fetch", "push", "pull", "clone", "ls-remote"]);
 const DECIMAL_COUNT = /^[0-9]+$/;
 const GLOB_PATHSPEC = /[*?[]/;
-const ARRAY_FIXED_BYTES = 64;
-const ARRAY_SLOT_BYTES = 8;
-const OBJECT_FIXED_BYTES = 64;
 
 export interface ValidatedGitCliInput {
   readonly argv: readonly string[];
@@ -44,63 +39,29 @@ export interface ValidatedGitCliInput {
 export function parseGitCliInput(
   input: unknown,
   logLimitHint?: number,
-  owningReservation?: MemoryReservation,
   outputContext?: GitCliOutputContext,
 ): GitCliParseResult {
-  const reservation = owningReservation ?? new MemoryCoordinator().reserve();
-  const memory = new ParserMemory(reservation);
   const diagnostics = outputContext ?? {
     options: resolveGitCliRunOptions(undefined),
-    reservation,
   };
-  try {
-    let validated: ValidatedGitCliInput | null = validateGitCliInputOwned(input, memory);
-    let parsed: GitCliParseResult | null = parseGitCliCommandInternal(
-      validated.argv,
-      logLimitHint,
-      memory,
-      diagnostics,
-    );
-    if (!parsed.ok) {
-      const result = parsed;
-      parsed = null;
-      validated = null;
-      memory.set(OBJECT_FIXED_BYTES);
-      return result;
-    }
-    const commandBytes = parsedCommandRetainedBytes(parsed.invocation.command, validated.argv);
-    memory.admit(2 * OBJECT_FIXED_BYTES);
-    const result: GitCliParseResult = {
-      ok: true,
-      invocation: {
-        command: parsed.invocation.command,
-        cwd: validated.cwd,
-        env: validated.env,
-      },
-    };
-    parsed = null;
-    validated = null;
-    memory.set(3 * OBJECT_FIXED_BYTES + commandBytes);
-    return result;
-  } finally {
-    if (owningReservation === undefined) reservation.dispose();
-  }
+  const validated = validateGitCliInputInternal(input);
+  const parsed = parseGitCliCommandInternal(validated.argv, logLimitHint, diagnostics);
+  if (!parsed.ok) return parsed;
+  return {
+    ok: true,
+    invocation: {
+      command: parsed.invocation.command,
+      cwd: validated.cwd,
+      env: validated.env,
+    },
+  };
 }
 
-export function validateGitCliInput(
-  input: unknown,
-  owningReservation?: MemoryReservation,
-): ValidatedGitCliInput {
-  const reservation = owningReservation ?? new MemoryCoordinator().reserve();
-  const memory = new ParserMemory(reservation);
-  try {
-    return validateGitCliInputOwned(input, memory);
-  } finally {
-    if (owningReservation === undefined) reservation.dispose();
-  }
+export function validateGitCliInput(input: unknown): ValidatedGitCliInput {
+  return validateGitCliInputInternal(input);
 }
 
-function validateGitCliInputOwned(input: unknown, memory: ParserMemory): ValidatedGitCliInput {
+function validateGitCliInputInternal(input: unknown): ValidatedGitCliInput {
   if (!isPlainRecord(input)) {
     throw new GitError("EINVAL", "git CLI input must be a plain object");
   }
@@ -116,7 +77,6 @@ function validateGitCliInputOwned(input: unknown, memory: ParserMemory): Validat
   if (argvLength > GIT_CLI_MAX_ARGV_ENTRIES) {
     throw new GitError("E2BIG", `git CLI argv exceeds ${GIT_CLI_MAX_ARGV_ENTRIES} entries`);
   }
-  memory.set(validatedInputRetainedBytes(argvLength));
   const argv = new Array<string>(argvLength);
   for (let index = 0; index < argvLength; index++) {
     if (inputArgv.length !== argvLength) throw mutatedArgv();
@@ -148,34 +108,18 @@ function validateGitCliInputOwned(input: unknown, memory: ParserMemory): Validat
 export function parseGitCliCommand(
   argv: readonly string[],
   logLimitHint?: number,
-  owningReservation?: MemoryReservation,
 ): GitCliParseResult {
-  const reservation = owningReservation ?? new MemoryCoordinator().reserve();
-  const memory = new ParserMemory(reservation);
   const diagnostics: GitCliOutputContext = {
     options: resolveGitCliRunOptions(undefined),
-    reservation,
   };
-  try {
-    const result = parseGitCliCommandInternal(argv, logLimitHint, memory, diagnostics);
-    memory.set(
-      result.ok
-        ? 3 * OBJECT_FIXED_BYTES + parsedCommandRetainedBytes(result.invocation.command, argv)
-        : OBJECT_FIXED_BYTES,
-    );
-    return result;
-  } finally {
-    if (owningReservation === undefined) reservation.dispose();
-  }
+  return parseGitCliCommandInternal(argv, logLimitHint, diagnostics);
 }
 
 function parseGitCliCommandInternal(
   argv: readonly string[],
   logLimitHint: number | undefined,
-  memory: ParserMemory,
   outputContext?: GitCliOutputContext,
 ): GitCliParseResult {
-  memory.admit(OBJECT_FIXED_BYTES);
   const name = argv[0];
   if (name === undefined) {
     return { ok: false, result: gitCliUnknownCommand(undefined, outputContext) };
@@ -184,50 +128,42 @@ function parseGitCliCommandInternal(
     return { ok: false, result: gitCliNetworkRefusal(name, outputContext) };
   }
   let command: ParsedGitCliCommand | undefined;
-  if (name === "status") command = parseStatus(argv, memory);
-  else if (name === "diff") command = parseDiff(argv, memory);
-  else if (name === "log") return parseLog(argv, logLimitHint, memory, outputContext);
-  else if (name === "rev-list") command = parseRevList(argv, memory);
-  else if (name === "symbolic-ref") command = parseSymbolicRef(argv, memory);
-  else if (name === "add") command = parseAdd(argv, memory);
-  else if (name === "commit") command = parseCommit(argv, memory);
-  else if (name === "rebase") command = parseRebase(argv, memory);
+  if (name === "status") command = parseStatus(argv);
+  else if (name === "diff") command = parseDiff(argv);
+  else if (name === "log") return parseLog(argv, logLimitHint, outputContext);
+  else if (name === "rev-list") command = parseRevList(argv);
+  else if (name === "symbolic-ref") command = parseSymbolicRef(argv);
+  else if (name === "add") command = parseAdd(argv);
+  else if (name === "commit") command = parseCommit(argv);
+  else if (name === "rebase") command = parseRebase(argv);
   else return { ok: false, result: gitCliUnknownCommand(name, outputContext) };
   if (command === undefined) return invalidInvocation(name, argv, outputContext);
-  return invocation(command, memory);
+  return invocation(command);
 }
 
-function parseStatus(
-  argv: readonly string[],
-  memory: ParserMemory,
-): ParsedGitCliCommand | undefined {
+function parseStatus(argv: readonly string[]): ParsedGitCliCommand | undefined {
   if (argv.length !== 2) return undefined;
   const option = argv[1];
   if (option === "--porcelain" || option === "--porcelain=v1") {
-    memory.admit(OBJECT_FIXED_BYTES);
     return { kind: "status", format: "porcelain-v1" };
   }
   if (option === "--short" || option === "-s") {
-    memory.admit(OBJECT_FIXED_BYTES);
     return { kind: "status", format: "short" };
   }
   return undefined;
 }
 
-function parseDiff(argv: readonly string[], memory: ParserMemory): ParsedGitCliCommand | undefined {
+function parseDiff(argv: readonly string[]): ParsedGitCliCommand | undefined {
   if (argv.length !== 1) return undefined;
-  memory.admit(OBJECT_FIXED_BYTES);
   return { kind: "diff" };
 }
 
 function parseLog(
   argv: readonly string[],
   logLimitHint: number | undefined,
-  memory: ParserMemory,
   outputContext?: GitCliOutputContext,
 ): GitCliParseResult {
   let count: number | undefined;
-  memory.admit(OBJECT_FIXED_BYTES);
   let format: GitCliLogFormat = { kind: "default" };
   let hasFormat = false;
   let revision: GitCliRevision | undefined;
@@ -276,7 +212,7 @@ function parseLog(
     }
     if (argument.startsWith("--max-count=")) {
       if (count !== undefined) return duplicateLogSelector("count", outputContext);
-      let value = sliceOwned(argument, "--max-count=".length, memory);
+      const value = argument.slice("--max-count=".length);
       const parsed = parseCount(value);
       if (parsed === undefined) {
         return {
@@ -291,26 +227,20 @@ function parseLog(
         };
       }
       count = parsed;
-      memory.release(retainedStringBytes(value));
-      value = "";
       continue;
     }
     if (argument === "--oneline") {
       if (hasFormat) return duplicateLogSelector("format", outputContext);
       hasFormat = true;
-      memory.admit(OBJECT_FIXED_BYTES);
       format = { kind: "oneline" };
-      memory.release(OBJECT_FIXED_BYTES);
       continue;
     }
     if (argument.startsWith("--format=")) {
       if (hasFormat) return duplicateLogSelector("format", outputContext);
-      const template = sliceOwned(argument, "--format=".length, memory);
+      const template = argument.slice("--format=".length);
       validateLogFormat(template);
       hasFormat = true;
-      memory.admit(OBJECT_FIXED_BYTES);
       format = { kind: "template", template };
-      memory.release(OBJECT_FIXED_BYTES);
       continue;
     }
     if (argument.startsWith("-")) {
@@ -325,7 +255,7 @@ function parseLog(
         ),
       };
     }
-    const parsedRevision = parseRevision(argument, memory);
+    const parsedRevision = parseRevision(argument);
     if (parsedRevision === undefined) {
       return {
         ok: false,
@@ -343,37 +273,27 @@ function parseLog(
   if (logLimitHint !== undefined && (count === undefined || logLimitHint < count)) {
     count = logLimitHint;
   }
-  memory.admit(OBJECT_FIXED_BYTES);
   const command: GitCliLogCommand = { kind: "log", count, format, revision };
-  return invocation(command, memory);
+  return invocation(command);
 }
 
-function parseRevList(
-  argv: readonly string[],
-  memory: ParserMemory,
-): ParsedGitCliCommand | undefined {
+function parseRevList(argv: readonly string[]): ParsedGitCliCommand | undefined {
   if (argv.length !== 3 || argv[1] !== "--count") return undefined;
   const value = argv[2];
   if (value === undefined) return undefined;
-  const range = parseRange(value, memory);
+  const range = parseRange(value);
   if (range === undefined) return undefined;
-  memory.admit(OBJECT_FIXED_BYTES);
   return { kind: "rev-list", left: range.left, right: range.right };
 }
 
-function parseSymbolicRef(
-  argv: readonly string[],
-  memory: ParserMemory,
-): ParsedGitCliCommand | undefined {
+function parseSymbolicRef(argv: readonly string[]): ParsedGitCliCommand | undefined {
   if (argv.length !== 3 || argv[1] !== "--short" || argv[2] === "") return undefined;
   const ref = argv[2];
   if (ref === undefined) return undefined;
-  memory.admit(OBJECT_FIXED_BYTES);
   return { kind: "symbolic-ref", ref };
 }
 
-function parseAdd(argv: readonly string[], memory: ParserMemory): ParsedGitCliCommand | undefined {
-  memory.admit(ARRAY_FIXED_BYTES + Math.max(0, argv.length - 1) * ARRAY_SLOT_BYTES);
+function parseAdd(argv: readonly string[]): ParsedGitCliCommand | undefined {
   const paths: string[] = [];
   let endOptions = false;
   for (let index = 1; index < argv.length; index++) {
@@ -390,41 +310,30 @@ function parseAdd(argv: readonly string[], memory: ParserMemory): ParsedGitCliCo
     paths.push(argument);
   }
   if (paths.length === 0) return undefined;
-  memory.admit(OBJECT_FIXED_BYTES);
   return { kind: "add", paths };
 }
 
-function parseCommit(
-  argv: readonly string[],
-  memory: ParserMemory,
-): ParsedGitCliCommand | undefined {
+function parseCommit(argv: readonly string[]): ParsedGitCliCommand | undefined {
   if (argv.length === 3 && argv[1] === "-m") {
     const message = argv[2];
     if (message === undefined) return undefined;
     validateCommitMessage(message);
-    memory.admit(OBJECT_FIXED_BYTES);
     return { kind: "commit", message };
   }
   if (argv.length === 2 && argv[1]?.startsWith("--message=")) {
-    const message = sliceOwned(argv[1], "--message=".length, memory);
+    const message = argv[1].slice("--message=".length);
     validateCommitMessage(message);
-    memory.admit(OBJECT_FIXED_BYTES);
     return { kind: "commit", message };
   }
   return undefined;
 }
 
-function parseRebase(
-  argv: readonly string[],
-  memory: ParserMemory,
-): ParsedGitCliCommand | undefined {
+function parseRebase(argv: readonly string[]): ParsedGitCliCommand | undefined {
   if (argv.length !== 2) return undefined;
   if (argv[1] === "--continue") {
-    memory.admit(OBJECT_FIXED_BYTES);
     return { kind: "rebase", action: "continue" };
   }
   if (argv[1] === "--abort") {
-    memory.admit(OBJECT_FIXED_BYTES);
     return { kind: "rebase", action: "abort" };
   }
   return undefined;
@@ -517,33 +426,26 @@ function validateCommitMessage(message: string): void {
   gitCliUtf8ByteLength(message, "git CLI commit message", true);
 }
 
-function parseRevision(value: string, memory: ParserMemory): GitCliRevision | undefined {
-  const range = parseRange(value, memory);
+function parseRevision(value: string): GitCliRevision | undefined {
+  const range = parseRange(value);
   if (range !== undefined) {
-    memory.admit(OBJECT_FIXED_BYTES);
     return { kind: "range", left: range.left, right: range.right };
   }
   if (value.includes("..")) return undefined;
   if (value.length === 0) return undefined;
-  memory.admit(OBJECT_FIXED_BYTES);
   return { kind: "ref", ref: value };
 }
 
-function parseRange(
-  value: string,
-  memory: ParserMemory,
-): { left: string; right: string } | undefined {
+function parseRange(value: string): { left: string; right: string } | undefined {
   const separator = value.indexOf("..");
   if (separator <= 0 || separator + 2 >= value.length) return undefined;
   if (value.indexOf("..", separator + 2) !== -1 || value[separator + 2] === ".") return undefined;
-  const left = sliceOwned(value, 0, memory, separator);
-  const right = sliceOwned(value, separator + 2, memory);
-  memory.admit(OBJECT_FIXED_BYTES);
+  const left = value.slice(0, separator);
+  const right = value.slice(separator + 2);
   return { left, right };
 }
 
-function invocation(command: ParsedGitCliCommand, memory: ParserMemory): GitCliParseResult {
-  memory.admit(2 * OBJECT_FIXED_BYTES);
+function invocation(command: ParsedGitCliCommand): GitCliParseResult {
   const value: GitCliInvocation = { command, cwd: "/", env: {} };
   return { ok: true, invocation: value };
 }
@@ -604,77 +506,8 @@ function validateEnvironment(input: object): GitCliEnvironment {
   };
 }
 
-function parsedCommandRetainedBytes(command: ParsedGitCliCommand, argv: readonly string[]): number {
-  let bytes = OBJECT_FIXED_BYTES;
-  if (command.kind === "add") {
-    bytes += ARRAY_FIXED_BYTES + command.paths.length * ARRAY_SLOT_BYTES;
-  } else if (command.kind === "log") {
-    bytes += OBJECT_FIXED_BYTES;
-    if (command.format.kind === "template") {
-      bytes += retainedStringBytes(command.format.template);
-    }
-    if (command.revision !== undefined) bytes += OBJECT_FIXED_BYTES;
-    if (command.revision?.kind === "range") {
-      bytes +=
-        retainedStringBytes(command.revision.left) + retainedStringBytes(command.revision.right);
-    }
-  } else if (command.kind === "rev-list") {
-    bytes += retainedStringBytes(command.left) + retainedStringBytes(command.right);
-  } else if (command.kind === "commit" && argv[1]?.startsWith("--message=")) {
-    bytes += retainedStringBytes(command.message);
-  }
-  if (!Number.isSafeInteger(bytes)) {
-    throw new GitError("E2BIG", "git CLI parsed state is too large");
-  }
-  return bytes;
-}
-
-function validatedInputRetainedBytes(argvEntries: number): number {
-  return 2 * OBJECT_FIXED_BYTES + ARRAY_FIXED_BYTES + argvEntries * ARRAY_SLOT_BYTES;
-}
-
-function sliceOwned(
-  value: string,
-  start: number,
-  memory: ParserMemory,
-  end = value.length,
-): string {
-  const bytes = retainedStringBytes("") + (end - start) * 2;
-  memory.admit(bytes);
-  return value.slice(start, end);
-}
-
 function mutatedArgv(): GitError {
   return new GitError("EINVAL", "git CLI argv changed during validation");
-}
-
-class ParserMemory {
-  #bytes = 0;
-
-  constructor(private readonly reservation: MemoryReservation) {}
-
-  admit(bytes: number): void {
-    if (
-      !Number.isSafeInteger(bytes) ||
-      bytes < 0 ||
-      bytes > Number.MAX_SAFE_INTEGER - this.#bytes
-    ) {
-      throw new GitError("E2BIG", "git CLI parsed state is too large");
-    }
-    this.set(this.#bytes + bytes);
-  }
-
-  release(bytes: number): void {
-    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.#bytes) {
-      throw new Error("git CLI parser memory accounting is corrupt");
-    }
-    this.set(this.#bytes - bytes);
-  }
-
-  set(bytes: number): void {
-    this.reservation.set("other", bytes);
-    this.#bytes = bytes;
-  }
 }
 
 function isPlainRecord(value: unknown): value is object {

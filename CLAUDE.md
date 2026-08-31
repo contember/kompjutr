@@ -31,7 +31,6 @@ src/core/      Git engine: ops, object store, packs, protocol, diff, ignore
 src/fs/        The filesystem over Durable Object SQLite
 src/shell/     kompjutr/shell — bash-shaped commands compiled to queries
 src/sqlite/    The Git store: adapter, schema, objects, packs, caches, maintenance
-src/memory.ts  MemoryCoordinator: the shared per-operation byte owner
 src/runtime/   Workspace: composes db + filesystem + git
 src/git/       Git client facade over core/ops
 src/compat/    Migration adapter; the only entry allowed to import @cloudflare/computer

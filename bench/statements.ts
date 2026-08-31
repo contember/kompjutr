@@ -1449,15 +1449,6 @@ async function replayRows(rows: ResultRow[]): Promise<void> {
   try {
     const workspace = await imported(planned.fixture);
     const preflightOids = [planned.base, planned.current, planned.incoming, planned.current];
-    let expectedBytes = 0;
-    for (const oid of [planned.base, planned.current, planned.incoming]) {
-      const size = Number(planned.fixture.git("cat-file", "-s", oid));
-      assert(
-        Number.isSafeInteger(size) && size >= 0,
-        `replay preflight fixture has an invalid commit size for ${oid}`,
-      );
-      expectedBytes += size;
-    }
     const preflightDb = new TestDatabase(workspace.storage);
     const preflightDatabase = new SqliteGitDatabase(preflightDb, {
       chunkBytes: 0,
@@ -1471,8 +1462,7 @@ async function replayRows(rows: ResultRow[]): Promise<void> {
       preflightDb.storage,
       "replay.preflight",
       () => preflightReplayCommitObjects(preflightRepo, preflightOids),
-      (value) => {
-        assert(value.bytes === expectedBytes, "replay preflight changed authoritative bytes");
+      () => {
         assert(preflightRepo.head().oid === planned.current, "replay preflight moved HEAD");
         const baseCommit = preflightRepo.readCommit(planned.base);
         const currentCommit = preflightRepo.readCommit(planned.current);

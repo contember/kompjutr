@@ -1,6 +1,5 @@
 import { CHUNK_SIZE } from "../src/fs/schema.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
-import { commitGraphBytes } from "../src/sqlite/commits.js";
+import { commitGraphBytes } from "./commit-graph-bytes.js";
 
 export const SQL_STATEMENT_TARGET = 1_000;
 export const PROCESS_TRANSIENT_TARGET_BYTES = 100 * 1024 * 1024;
@@ -100,7 +99,6 @@ export interface MemoryScenarioSpec {
   formerLimitBytes: number;
   verifiedContentBytes: number;
   verifiedChunkCount: number;
-  coordinator: "required" | "absent";
 }
 
 const INITIAL_WRITE_SPEC: MemoryScenarioSpec = {
@@ -111,7 +109,6 @@ const INITIAL_WRITE_SPEC: MemoryScenarioSpec = {
   formerLimitBytes: 64 * 1024,
   verifiedContentBytes: INITIAL_STREAM_BYTES,
   verifiedChunkCount: Math.ceil(INITIAL_STREAM_BYTES / CHUNK_SIZE),
-  coordinator: "required",
 };
 
 const REDIRECT_STREAM_SPEC: MemoryScenarioSpec = {
@@ -122,7 +119,6 @@ const REDIRECT_STREAM_SPEC: MemoryScenarioSpec = {
   formerLimitBytes: 96 * 1024 * 1024,
   verifiedContentBytes: REDIRECT_STREAM_BYTES,
   verifiedChunkCount: Math.ceil(REDIRECT_STREAM_BYTES / CHUNK_SIZE),
-  coordinator: "absent",
 };
 
 const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
@@ -136,7 +132,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 32 * 1024 * 1024,
     verifiedContentBytes: HASH_WORKLOAD_BYTES,
     verifiedChunkCount: RANGE_HASH_CHUNKS,
-    coordinator: "required",
   },
   {
     scenario: "core.rebase.baseline-hash",
@@ -146,7 +141,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 32 * 1024 * 1024,
     verifiedContentBytes: HASH_WORKLOAD_BYTES,
     verifiedChunkCount: RANGE_HASH_CHUNKS,
-    coordinator: "required",
   },
   {
     scenario: "core.staging.add-hash",
@@ -156,7 +150,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 32 * 1024 * 1024,
     verifiedContentBytes: HASH_WORKLOAD_BYTES,
     verifiedChunkCount: RANGE_HASH_CHUNKS * 2,
-    coordinator: "required",
   },
   {
     scenario: "sqlite.maintenance.reachability",
@@ -166,7 +159,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 48 * 1024 * 1024,
     verifiedContentBytes: LARGE_HEADER_BYTES,
     verifiedChunkCount: Math.ceil(LARGE_HEADER_BYTES / SQLITE_OBJECT_CHUNK_BYTES),
-    coordinator: "required",
   },
   {
     scenario: "sqlite.pack.fallback-audit",
@@ -176,7 +168,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 48 * 1024 * 1024,
     verifiedContentBytes: PACK_FIXTURE_OBJECT_BYTES,
     verifiedChunkCount: Math.ceil(FALLBACK_COMPRESSED_BYTES / PACK_STREAM_CHUNK_BYTES),
-    coordinator: "required",
   },
   {
     scenario: "sqlite.pack.authenticate",
@@ -186,7 +177,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 64 * 1024 * 1024,
     verifiedContentBytes: PACK_FIXTURE_OBJECT_BYTES,
     verifiedChunkCount: Math.ceil(AUTH_COMPRESSED_BYTES / PACK_STREAM_CHUNK_BYTES),
-    coordinator: "required",
   },
   {
     scenario: "sqlite.graph.retained",
@@ -196,7 +186,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 32 * 1024 * 1024,
     verifiedContentBytes: GRAPH_COMMIT_COUNT * GRAPH_MESSAGE_BYTES,
     verifiedChunkCount: GRAPH_COMMIT_COUNT,
-    coordinator: "required",
   },
   {
     scenario: "sqlite.object.singleton",
@@ -206,7 +195,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 4 * 1024 * 1024,
     verifiedContentBytes: LARGE_OBJECT_BYTES,
     verifiedChunkCount: Math.ceil(LARGE_OBJECT_BYTES / SQLITE_OBJECT_CHUNK_BYTES),
-    coordinator: "required",
   },
   {
     scenario: "sqlite.config.move",
@@ -216,7 +204,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 1024 * 1024,
     verifiedContentBytes: LARGE_CONFIG_BYTES,
     verifiedChunkCount: Math.ceil(LARGE_CONFIG_BYTES / (1024 * 1024)),
-    coordinator: "required",
   },
   {
     scenario: "sqlite.checkout.list",
@@ -226,7 +213,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 6 * 1024 * 1024,
     verifiedContentBytes: CHECKOUT_TEXT_BYTES,
     verifiedChunkCount: CHECKOUT_COUNT,
-    coordinator: "required",
   },
 ];
 
@@ -271,9 +257,6 @@ export interface MemoryPhaseEvidence {
   verifiedContentBytes: number;
   verifiedChunkCount: number;
   verificationDigest: string;
-  coordinatorHighWaterBytes: number | null;
-  coordinatorFinalBytes: number | null;
-  coordinatorActiveReservations: number | null;
 }
 
 export interface MemoryRun {
@@ -301,9 +284,6 @@ export interface MemoryRun {
   verifiedChunkCount: number;
   verificationDigest: string;
   semanticStatus: "ok";
-  coordinatorHighWaterBytes: number | null;
-  coordinatorFinalBytes: number | null;
-  coordinatorActiveReservations: number | null;
   cgroupMemory: CgroupMemoryEvidence;
   runtime: RuntimeEvidence;
 }
@@ -511,9 +491,6 @@ const MEMORY_RUN_KEYS = [
   "verifiedChunkCount",
   "verificationDigest",
   "semanticStatus",
-  "coordinatorHighWaterBytes",
-  "coordinatorFinalBytes",
-  "coordinatorActiveReservations",
   "cgroupMemory",
   "runtime",
 ];
@@ -589,29 +566,6 @@ export function parseMemoryRun(line: string, expected?: MemoryRunIdentity): Memo
     throw new Error("verificationDigest must be a SHA-256 hex digest");
   }
   if (value.semanticStatus !== "ok") throw new Error("semantic verification did not pass");
-  const coordinatorHighWaterBytes = nullableSafeIntegerField(value, "coordinatorHighWaterBytes");
-  const coordinatorFinalBytes = nullableSafeIntegerField(value, "coordinatorFinalBytes");
-  const coordinatorActiveReservations = nullableSafeIntegerField(
-    value,
-    "coordinatorActiveReservations",
-  );
-  if (spec.coordinator === "required") {
-    if (
-      coordinatorHighWaterBytes === null ||
-      coordinatorHighWaterBytes <= 0 ||
-      coordinatorHighWaterBytes > MAX_OPERATION_MEMORY_BYTES ||
-      coordinatorFinalBytes !== 0 ||
-      coordinatorActiveReservations !== 0
-    ) {
-      throw new Error("coordinator evidence is not positive, bounded, and idle");
-    }
-  } else if (
-    coordinatorHighWaterBytes !== null ||
-    coordinatorFinalBytes !== null ||
-    coordinatorActiveReservations !== null
-  ) {
-    throw new Error("scenario without a coordinator must not claim coordinator evidence");
-  }
   const cgroupMemory = parseCgroupMemory(value.cgroupMemory);
   const runtime = parseRuntimeEvidence(value.runtime);
 
@@ -640,9 +594,6 @@ export function parseMemoryRun(line: string, expected?: MemoryRunIdentity): Memo
     verifiedChunkCount,
     verificationDigest,
     semanticStatus: "ok",
-    coordinatorHighWaterBytes,
-    coordinatorFinalBytes,
-    coordinatorActiveReservations,
     cgroupMemory,
     runtime,
   };
@@ -693,9 +644,6 @@ const RECONCILED_KEYS: (keyof MemoryRun)[] = [
   "verifiedChunkCount",
   "verificationDigest",
   "semanticStatus",
-  "coordinatorHighWaterBytes",
-  "coordinatorFinalBytes",
-  "coordinatorActiveReservations",
 ];
 
 /** Calibration and capped runs may differ only in timing and memory observations. */

@@ -11,8 +11,6 @@ import {
   formatShort,
   statusFormatOptions,
 } from "../../core/ops/status-format.js";
-import { retainedStringBytes } from "../../core/retained.js";
-import type { MemoryReservation } from "../../memory.js";
 import {
   type GitCliOutputContext,
   gitCliDiagnosticResult,
@@ -39,57 +37,44 @@ type ReadHandlers = Pick<GitCliHandlers, "status" | "diff" | "log" | "revList" |
 
 export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
   return {
-    status(invocation, runOptions, reservation) {
-      return withRepository(
-        context,
-        invocation.cwd,
-        outputContext(runOptions, reservation),
-        (repo) => {
-          const rows = eagerStatus(
-            repo,
-            context.worktree,
-            { excludeRoots: nestedRoots(context, repo.root) },
-            context,
-          );
-          const options = statusFormatOptions(repo);
-          preflightStatusOutput(
-            rows,
-            options.quotePath ?? true,
-            Math.min(runOptions.maxStdoutBytes, runOptions.maxCombinedOutputBytes),
-          );
-          const stdout =
-            invocation.command.format === "short"
-              ? formatShort(rows, options)
-              : formatPorcelainV1(rows, options);
-          return gitCliResult(stdout, "", 0);
-        },
-      );
+    status(invocation, runOptions) {
+      return withRepository(context, invocation.cwd, outputContext(runOptions), (repo) => {
+        const rows = eagerStatus(
+          repo,
+          context.worktree,
+          { excludeRoots: nestedRoots(context, repo.root) },
+          context,
+        );
+        const options = statusFormatOptions(repo);
+        preflightStatusOutput(
+          rows,
+          options.quotePath ?? true,
+          Math.min(runOptions.maxStdoutBytes, runOptions.maxCombinedOutputBytes),
+        );
+        const stdout =
+          invocation.command.format === "short"
+            ? formatShort(rows, options)
+            : formatPorcelainV1(rows, options);
+        return gitCliResult(stdout, "", 0);
+      });
     },
-    diff(invocation, runOptions, reservation) {
-      return withRepository(
-        context,
-        invocation.cwd,
-        outputContext(runOptions, reservation),
-        (repo) => {
-          const quotePath = statusFormatOptions(repo).quotePath ?? true;
-          return gitCliResult(
-            diff(repo, context.worktree, {}, context.sparseWorkspace, {
-              quotePaths: true,
-              quoteNonAscii: quotePath,
-              indexBase: true,
-              maxOutputBytes: Math.min(
-                runOptions.maxStdoutBytes,
-                runOptions.maxCombinedOutputBytes,
-              ),
-            }),
-            "",
-            0,
-          );
-        },
-      );
+    diff(invocation, runOptions) {
+      return withRepository(context, invocation.cwd, outputContext(runOptions), (repo) => {
+        const quotePath = statusFormatOptions(repo).quotePath ?? true;
+        return gitCliResult(
+          diff(repo, context.worktree, {}, context.sparseWorkspace, {
+            quotePaths: true,
+            quoteNonAscii: quotePath,
+            indexBase: true,
+            maxOutputBytes: Math.min(runOptions.maxStdoutBytes, runOptions.maxCombinedOutputBytes),
+          }),
+          "",
+          0,
+        );
+      });
     },
-    log(invocation, runOptions, reservation) {
-      const output = outputContext(runOptions, reservation);
+    log(invocation, runOptions) {
+      const output = outputContext(runOptions);
       return withRepository(context, invocation.cwd, output, (repo) => {
         const command = invocation.command;
         const revision = command.revision;
@@ -133,15 +118,14 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
             commits,
             command.format,
             Math.min(runOptions.maxStdoutBytes, runOptions.maxCombinedOutputBytes),
-            reservation,
           ),
           "",
           0,
         );
       });
     },
-    revList(invocation, runOptions, reservation) {
-      const output = outputContext(runOptions, reservation);
+    revList(invocation, runOptions) {
+      const output = outputContext(runOptions);
       return withRepository(context, invocation.cwd, output, (repo) => {
         if (
           repo.tryRevParse(invocation.command.left) === undefined ||
@@ -159,8 +143,8 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
         return gitCliResult(`${result.behind}\n`, "", 0);
       });
     },
-    symbolicRef(invocation, runOptions, reservation) {
-      const output = outputContext(runOptions, reservation);
+    symbolicRef(invocation, runOptions) {
+      const output = outputContext(runOptions);
       return withRepository(context, invocation.cwd, output, (repo) => {
         const ref = invocation.command.ref;
         if (ref !== "HEAD" && !ref.startsWith(REFS)) return notSymbolicRef(ref, output);
@@ -259,11 +243,8 @@ function unbornLogFailure(ref: string | null, output: GitCliOutputContext): GitC
   );
 }
 
-function outputContext(
-  options: ResolvedGitCliRunOptions,
-  reservation: MemoryReservation,
-): GitCliOutputContext {
-  return { options, reservation };
+function outputContext(options: ResolvedGitCliRunOptions): GitCliOutputContext {
+  return { options };
 }
 
 function notSymbolicRef(ref: string, output: GitCliOutputContext): GitCliResult {
@@ -392,9 +373,8 @@ function formatLog(
         readonly template: string;
       },
   maximum: number,
-  reservation: MemoryReservation,
 ): string {
-  const out = new BoundedLogOutput(maximum, reservation);
+  const out = new BoundedLogOutput(maximum);
   if (format.kind === "template" && format.template === "") return "";
   let operations = 0;
   for (let index = 0; index < commits.length; index++) {
@@ -417,19 +397,9 @@ function formatLog(
 
 class BoundedLogOutput {
   #bytes = 0;
-  #codeUnits = 0;
-  #retainedBytes = 64;
-  readonly #chunks: string[];
-  readonly #memory: MemoryReservation;
+  readonly #chunks: string[] = [];
 
-  constructor(
-    private readonly maximum: number,
-    private readonly outputMemory: MemoryReservation,
-  ) {
-    this.#memory = outputMemory.scope();
-    this.#memory.set("other", this.#retainedBytes);
-    this.#chunks = [];
-  }
+  constructor(private readonly maximum: number) {}
 
   append(value: string): void {
     if (value === "") return;
@@ -440,31 +410,25 @@ class BoundedLogOutput {
   appendSlice(value: string, start: number, end = value.length): void {
     if (start === end) return;
     const bytes = utf8RangeBytes(value, start, end);
-    this.#admit(end - start, bytes);
+    this.#admit(bytes);
     const chunk = value.slice(start, end);
     this.#chunks.push(chunk);
   }
 
   #append(value: string, bytes: number): void {
-    this.#admit(value.length, bytes);
+    this.#admit(bytes);
     this.#chunks.push(value);
   }
 
-  #admit(codeUnits: number, bytes: number): void {
+  #admit(bytes: number): void {
     if (bytes > this.maximum - this.#bytes) {
       throw new GitError("E2BIG", `git CLI log output exceeds ${this.maximum} bytes`);
     }
-    this.#retainedBytes += 8 + retainedStringBytes("") + codeUnits * 2;
-    this.#memory.set("other", this.#retainedBytes);
     this.#bytes += bytes;
-    this.#codeUnits += codeUnits;
   }
 
   finish(): string {
-    this.outputMemory.set("flat", retainedStringBytes("") + this.#codeUnits * 2);
-    const output = this.#chunks.join("");
-    this.#memory.dispose();
-    return output;
+    return this.#chunks.join("");
   }
 }
 

@@ -3,9 +3,7 @@
 
 import { isOid, utf8, ZERO_OID } from "../bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../errors.js";
-import type { TransportOperationBudget } from "../ops/transport-budget.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../ref-name.js";
-import { retainedStringBytes } from "../retained.js";
 import { FLUSH, MAX_PKT_PAYLOAD_BYTES, pkt } from "./pktline.js";
 import {
   baseHeaders,
@@ -20,30 +18,16 @@ export const MAX_RECEIVE_PACK_COMMANDS = 1_024;
 export const MAX_PUSH_OPTIONS = 64;
 export const MAX_RECEIVE_PACK_STATUS_PACKETS = 16_384;
 
-const REQUEST_MEMORY_PART = "receive-pack-request";
-const RESULT_MEMORY_PART = "receive-pack-result";
-const STATUS_PARSE_MEMORY_PART = "receive-pack-status-parse";
-const STATUS_FRAME_MEMORY_PART = "receive-pack-status-frame";
-const STATUS_READER_MEMORY_PART = "receive-pack-status-reader";
-const SIDEBAND_FRAME_MEMORY_PART = "receive-pack-sideband-frame";
-const SIDEBAND_READER_MEMORY_PART = "receive-pack-sideband-reader";
-const ERROR_RESPONSE_MEMORY_PART = "receive-pack-error-response";
-const REQUEST_FIXED_BYTES = 256;
-const COMMAND_FIXED_BYTES = 96;
-const OPTION_FIXED_BYTES = 64;
-const FRAME_FIXED_BYTES = 32;
 const RESULT_FIXED_BYTES = 192;
 const STATUS_FIXED_BYTES = 96;
-const STATUS_PARSE_FIXED_BYTES = 192;
-const EXPECTED_STATUS_FIXED_BYTES = 48;
-const OUTPUT_MAP_ENTRY_BYTES = 48;
-const CURRENT_FRAME_FIXED_BYTES = 96;
 const ERROR_PREFIX_BYTES = 800;
 const ERROR_PREFIX_CHARACTERS = 200;
-const ERROR_RESPONSE_RETAINED_BYTES =
-  ERROR_PREFIX_BYTES + 48 + ERROR_PREFIX_BYTES * 2 + 48 + ERROR_PREFIX_CHARACTERS * 2;
 const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const lossyUtf8Decoder = new TextDecoder();
+
+function resultStringBytes(value: string): number {
+  return 48 + value.length * 2;
+}
 
 export interface ReceivePackCommand {
   readonly oldOid: string;
@@ -72,9 +56,7 @@ export interface ReceivePackStatus {
   readonly refs: Map<string, ReceivePackRefStatus>;
 }
 
-export interface ReceivePackOptions extends ProtocolRequestOptions {
-  readonly operationBudget?: TransportOperationBudget;
-}
+export interface ReceivePackOptions extends ProtocolRequestOptions {}
 
 interface PreparedRequest {
   readonly commands: readonly ReceivePackCommand[];
@@ -138,17 +120,10 @@ class StatusWireBudget {
 }
 
 class ResultBudget {
-  constructor(
-    private readonly limit: number | undefined,
-    private readonly operationBudget: TransportOperationBudget | undefined,
-  ) {}
+  constructor(private readonly limit: number | undefined) {}
 
   validateLogical(bytes: number): void {
     if (this.limit !== undefined && bytes > this.limit) this.#tooLarge();
-  }
-
-  setOwned(bytes: number): void {
-    this.operationBudget?.setMemory(RESULT_MEMORY_PART, bytes);
   }
 
   #tooLarge(): never {
@@ -196,16 +171,6 @@ function boundedLimit(value: number | undefined, ceiling: number): number {
     throw new RangeError("receive-pack protocol limits must be positive safe integers");
   }
   return Math.min(value, ceiling);
-}
-
-function addRequestMemory(
-  budget: TransportOperationBudget | undefined,
-  current: number,
-  bytes: number,
-): number {
-  const next = current + bytes;
-  budget?.setMemory(REQUEST_MEMORY_PART, next);
-  return next;
 }
 
 function validateCommand(command: ReceivePackCommand, index: number): ReceivePackCommand {
@@ -303,10 +268,7 @@ function requireCapability(advertised: Set<string>, capability: string): void {
   }
 }
 
-function prepareRequest(
-  request: ReceivePackRequest,
-  operationBudget: TransportOperationBudget | undefined,
-): PreparedRequest {
+function prepareRequest(request: ReceivePackRequest): PreparedRequest {
   if (!Array.isArray(request.commands) || request.commands.length === 0) {
     throw new GitError("EINVAL", "receive-pack requires at least one command");
   }
@@ -330,28 +292,20 @@ function prepareRequest(
 
   const commands: ReceivePackCommand[] = [];
   const destinations = new Set<string>();
-  let requestBytes = addRequestMemory(operationBudget, 0, REQUEST_FIXED_BYTES);
   let deleting = false;
   let hasNonDeletion = false;
   for (const [index, input] of request.commands.entries()) {
-    const nextRequestBytes = addRequestMemory(operationBudget, requestBytes, COMMAND_FIXED_BYTES);
     const command = validateCommand(input, index);
     if (destinations.has(command.ref)) {
       throw new GitError("EINVAL", `duplicate receive-pack destination ${command.ref}`);
     }
-    requestBytes = nextRequestBytes;
     destinations.add(command.ref);
     commands.push(command);
     if (command.newOid === ZERO_OID) deleting = true;
     else hasNonDeletion = true;
   }
 
-  const optionBytes = validatePushOptions(pushOptions);
-  for (let index = 0; index < pushOptions.length; index++) {
-    const bytes = optionBytes[index];
-    if (bytes === undefined) throw new Error("receive-pack option accounting is incomplete");
-    requestBytes = addRequestMemory(operationBudget, requestBytes, OPTION_FIXED_BYTES);
-  }
+  validatePushOptions(pushOptions);
 
   requireCapability(request.advertised, "report-status");
   if (deleting) requireCapability(request.advertised, "delete-refs");
@@ -375,36 +329,12 @@ function prepareRequest(
         `receive-pack command ${index} exceeds the pkt-line payload limit`,
       );
     }
-    const textUnits = 40 + 1 + 40 + 1 + command.ref.length + suffix.length + 1;
-    operationBudget?.setMemory(
-      REQUEST_MEMORY_PART,
-      requestBytes + 48 + textUnits * 2 + (payloadBytes + 4) * 2 + FRAME_FIXED_BYTES,
-    );
     const text = `${command.oldOid} ${command.newOid} ${command.ref}${suffix}\n`;
     const frame = pkt(text);
-    requestBytes = addRequestMemory(
-      operationBudget,
-      requestBytes,
-      FRAME_FIXED_BYTES + frame.length,
-    );
     commandFrames.push(frame);
   }
   const optionFrames: Uint8Array[] = [];
-  for (const [index, option] of pushOptions.entries()) {
-    const bytes = optionBytes[index];
-    if (bytes === undefined) throw new Error("receive-pack option accounting is incomplete");
-    operationBudget?.setMemory(
-      REQUEST_MEMORY_PART,
-      requestBytes + (bytes + 4) * 2 + FRAME_FIXED_BYTES,
-    );
-    const frame = pkt(option);
-    requestBytes = addRequestMemory(
-      operationBudget,
-      requestBytes,
-      FRAME_FIXED_BYTES + frame.length,
-    );
-    optionFrames.push(frame);
-  }
+  for (const option of pushOptions) optionFrames.push(pkt(option));
   return {
     commands,
     commandFrames,
@@ -488,9 +418,8 @@ async function* sidebandBody(
   limits: ResolvedStatusLimits,
   onProgress: ((message: string) => void) | undefined,
   onMessage: ((message: string) => void) | undefined,
-  operationBudget: TransportOperationBudget | undefined,
 ): AsyncGenerator<Uint8Array> {
-  const reader = new ByteReader(source, operationBudget, SIDEBAND_READER_MEMORY_PART);
+  const reader = new ByteReader(source);
   const budget = new StatusWireBudget(limits);
   let flushed = false;
   try {
@@ -502,64 +431,39 @@ async function* sidebandBody(
         break;
       }
       budget.packet(frame);
-      operationBudget?.setMemory(SIDEBAND_FRAME_MEMORY_PART, CURRENT_FRAME_FIXED_BYTES);
-      try {
-        if (frame.kind !== "line" || frame.payload.length === 0) {
-          throw new CorruptError("receive-pack returned an invalid sideband frame");
+      if (frame.kind !== "line" || frame.payload.length === 0) {
+        throw new CorruptError("receive-pack returned an invalid sideband frame");
+      }
+      const band = frame.payload[0];
+      const payload = frame.payload.subarray(1);
+      if (band === 1) {
+        if (payload.length > 0) yield payload;
+      } else if (band === 2) {
+        let message: string;
+        try {
+          message = strictUtf8Decoder.decode(payload);
+        } catch (cause) {
+          throw new CorruptError("receive-pack progress contains malformed UTF-8", { cause });
         }
-        const band = frame.payload[0];
-        const payload = frame.payload.subarray(1);
-        if (band === 1) {
-          if (payload.length > 0) yield payload;
-        } else if (band === 2) {
-          operationBudget?.setMemory(
-            SIDEBAND_FRAME_MEMORY_PART,
-            CURRENT_FRAME_FIXED_BYTES + 48 + payload.length * 2,
-          );
-          let message: string;
-          try {
-            message = strictUtf8Decoder.decode(payload);
-          } catch (cause) {
-            throw new CorruptError("receive-pack progress contains malformed UTF-8", { cause });
-          }
-          operationBudget?.setMemory(
-            SIDEBAND_FRAME_MEMORY_PART,
-            CURRENT_FRAME_FIXED_BYTES + retainedStringBytes(message),
-          );
-          onProgress?.(message);
-          onMessage?.(message);
-        } else if (band === 3) {
-          operationBudget?.setMemory(
-            SIDEBAND_FRAME_MEMORY_PART,
-            CURRENT_FRAME_FIXED_BYTES + 96 + payload.length * 4,
-          );
-          let message: string;
-          try {
-            message = strictUtf8Decoder.decode(payload).trim();
-          } catch (cause) {
-            throw new CorruptError("receive-pack fatal message contains malformed UTF-8", {
-              cause,
-            });
-          }
-          operationBudget?.setMemory(
-            SIDEBAND_FRAME_MEMORY_PART,
-            CURRENT_FRAME_FIXED_BYTES + retainedStringBytes(message),
-          );
-          throw new GitError(
-            "EPUSHREJECTED",
-            message === "" ? "receive-pack fatal error" : message,
-          );
-        } else {
-          throw new CorruptError("receive-pack returned an invalid sideband");
+        onProgress?.(message);
+        onMessage?.(message);
+      } else if (band === 3) {
+        let message: string;
+        try {
+          message = strictUtf8Decoder.decode(payload).trim();
+        } catch (cause) {
+          throw new CorruptError("receive-pack fatal message contains malformed UTF-8", {
+            cause,
+          });
         }
-      } finally {
-        operationBudget?.clearMemory(SIDEBAND_FRAME_MEMORY_PART);
+        throw new GitError("EPUSHREJECTED", message === "" ? "receive-pack fatal error" : message);
+      } else {
+        throw new CorruptError("receive-pack returned an invalid sideband");
       }
     }
     if (!flushed) throw new CorruptError("truncated receive-pack sideband");
     await requireStreamEnd(reader, "sideband");
   } finally {
-    operationBudget?.clearMemory(SIDEBAND_FRAME_MEMORY_PART);
     await reader.release();
   }
 }
@@ -569,13 +473,10 @@ async function parseStatus(
   commands: readonly ReceivePackCommand[],
   atomic: boolean,
   limits: ResolvedStatusLimits,
-  operationBudget: TransportOperationBudget | undefined,
 ): Promise<ReceivePackStatus> {
-  const reader = new ByteReader(body, operationBudget, STATUS_READER_MEMORY_PART);
+  const reader = new ByteReader(body);
   const wireBudget = new StatusWireBudget(limits);
-  const resultBudget = new ResultBudget(limits.retainedBytes, operationBudget);
-  let parseBytes = STATUS_PARSE_FIXED_BYTES + commands.length * EXPECTED_STATUS_FIXED_BYTES;
-  operationBudget?.setMemory(STATUS_PARSE_MEMORY_PART, parseBytes);
+  const resultBudget = new ResultBudget(limits.retainedBytes);
   const expected = new Set<string>();
   for (const command of commands) expected.add(command.ref);
   const received = new Map<string, ReceivePackRefStatus>();
@@ -590,46 +491,24 @@ async function parseStatus(
         break;
       }
       wireBudget.packet(packet);
-      operationBudget?.setMemory(
-        STATUS_FRAME_MEMORY_PART,
-        CURRENT_FRAME_FIXED_BYTES + 96 + packet.payload.length * 4,
-      );
-      try {
-        const line = decodeLine(packet, "status");
-        const status = parseStatusLine(line);
-        operationBudget?.setMemory(
-          STATUS_FRAME_MEMORY_PART,
-          CURRENT_FRAME_FIXED_BYTES + retainedStringBytes(line),
-        );
-        if (status.kind === "unpack") {
-          if (unpack !== null) throw new CorruptError("duplicate receive-pack unpack status");
-          if (received.size > 0) {
-            throw new CorruptError("receive-pack unpack status is out of order");
-          }
-          parseBytes += retainedStringBytes(status.text);
-          operationBudget?.setMemory(STATUS_PARSE_MEMORY_PART, parseBytes);
-          unpack = status.text;
-          continue;
+      const line = decodeLine(packet, "status");
+      const status = parseStatusLine(line);
+      if (status.kind === "unpack") {
+        if (unpack !== null) throw new CorruptError("duplicate receive-pack unpack status");
+        if (received.size > 0) {
+          throw new CorruptError("receive-pack unpack status is out of order");
         }
-        if (unpack === null) {
-          throw new CorruptError("receive-pack ref status precedes unpack status");
-        }
-        const ref = status.ref;
-        if (!expected.has(ref)) throw new CorruptError(`unexpected receive-pack status for ${ref}`);
-        if (received.has(ref)) throw new CorruptError(`duplicate receive-pack status for ${ref}`);
-        if (status.kind === "ok") {
-          parseBytes += STATUS_FIXED_BYTES + retainedStringBytes(ref);
-          operationBudget?.setMemory(STATUS_PARSE_MEMORY_PART, parseBytes);
-          received.set(ref, { ok: true });
-        } else {
-          const error = status.text;
-          parseBytes += STATUS_FIXED_BYTES + retainedStringBytes(ref) + retainedStringBytes(error);
-          operationBudget?.setMemory(STATUS_PARSE_MEMORY_PART, parseBytes);
-          received.set(ref, { ok: false, error });
-        }
-      } finally {
-        operationBudget?.clearMemory(STATUS_FRAME_MEMORY_PART);
+        unpack = status.text;
+        continue;
       }
+      if (unpack === null) {
+        throw new CorruptError("receive-pack ref status precedes unpack status");
+      }
+      const ref = status.ref;
+      if (!expected.has(ref)) throw new CorruptError(`unexpected receive-pack status for ${ref}`);
+      if (received.has(ref)) throw new CorruptError(`duplicate receive-pack status for ${ref}`);
+      if (status.kind === "ok") received.set(ref, { ok: true });
+      else received.set(ref, { ok: false, error: status.text });
     }
     if (!flushed) throw new CorruptError("truncated receive-pack status");
     await requireStreamEnd(reader, "status");
@@ -645,18 +524,16 @@ async function parseStatus(
 
     let successes = 0;
     let failures = 0;
-    let ownedResultBytes = RESULT_FIXED_BYTES + retainedStringBytes(unpack);
-    let logicalResultBytes = ownedResultBytes;
+    let logicalResultBytes = RESULT_FIXED_BYTES + resultStringBytes(unpack);
     for (const command of commands) {
       const status = received.get(command.ref);
       if (status === undefined) {
         throw new CorruptError(`receive-pack omitted status for ${command.ref}`);
       }
-      const ownedStatusBytes =
+      const statusBytes =
         STATUS_FIXED_BYTES +
-        (status.ok || status.error === undefined ? 0 : retainedStringBytes(status.error));
-      ownedResultBytes += ownedStatusBytes;
-      logicalResultBytes += ownedStatusBytes + retainedStringBytes(command.ref);
+        (status.ok || status.error === undefined ? 0 : resultStringBytes(status.error));
+      logicalResultBytes += statusBytes + resultStringBytes(command.ref);
       if (status.ok) successes++;
       else failures++;
     }
@@ -668,26 +545,18 @@ async function parseStatus(
     }
     resultBudget.validateLogical(logicalResultBytes);
 
-    let outputBytes = RESULT_FIXED_BYTES;
-    resultBudget.setOwned(outputBytes);
     const refs = new Map<string, ReceivePackRefStatus>();
     for (const command of commands) {
       const status = received.get(command.ref);
       if (status === undefined) {
         throw new CorruptError(`receive-pack omitted status for ${command.ref}`);
       }
-      outputBytes += OUTPUT_MAP_ENTRY_BYTES;
-      resultBudget.setOwned(outputBytes);
       refs.set(command.ref, status);
     }
     expected.clear();
     received.clear();
-    operationBudget?.clearMemory(STATUS_PARSE_MEMORY_PART);
-    resultBudget.setOwned(ownedResultBytes);
     return { unpack, refs };
   } finally {
-    operationBudget?.clearMemory(STATUS_FRAME_MEMORY_PART);
-    operationBudget?.clearMemory(STATUS_PARSE_MEMORY_PART);
     await reader.release();
   }
 }
@@ -761,10 +630,8 @@ function uncertain(message: string, cause: unknown): GitError {
 
 async function readResponsePrefix(
   body: AsyncIterable<Uint8Array>,
-  operationBudget: TransportOperationBudget | undefined,
   inputLimit: number | undefined,
 ): Promise<string> {
-  operationBudget?.setMemory(ERROR_RESPONSE_MEMORY_PART, ERROR_RESPONSE_RETAINED_BYTES);
   const prefix = new Uint8Array(ERROR_PREFIX_BYTES);
   let retained = 0;
   let input = 0;
@@ -785,113 +652,86 @@ export async function receivePack(
   request: ReceivePackRequest,
   options: ReceivePackOptions = {},
 ): Promise<ReceivePackStatus> {
-  const operationBudget = options.operationBudget;
-  let succeeded = false;
+  const limits = resolvedStatusLimits(options.protocolLimits);
+  const prepared = prepareRequest(request);
+  const base = normalizeRemoteUrl(request.url);
+  let response: GitHttpResponse;
   try {
-    const limits = resolvedStatusLimits(options.protocolLimits);
-    const prepared = prepareRequest(request, operationBudget);
-    const base = normalizeRemoteUrl(request.url);
-    let response: GitHttpResponse;
-    try {
-      response = await requestWithAuth(
-        () => ({
-          url: `${base}/git-receive-pack`,
-          method: "POST",
-          headers: {
-            ...baseHeaders(),
-            "Content-Type": "application/x-git-receive-pack-request",
-            Accept: "application/x-git-receive-pack-result",
-          },
-          body: requestBody(prepared, prepared.pack),
-        }),
-        authOptions(options),
-        options.authSession,
-      );
-    } catch (error) {
-      const localPackFailure = findLocalPackFailure(error);
-      if (localPackFailure !== null) {
-        const cause = localPackFailure.cause;
-        if (hasErrorCode(cause, "E2BIG") || hasErrorCode(cause, "EPUSHLOCAL")) throw cause;
-        throw new GitError("EPUSHLOCAL", "local receive-pack body generation failed", { cause });
-      }
-      if (hasErrorCode(error, "EAUTH")) throw error;
-      throw uncertain("receive-pack POST failed after the request may have been consumed", error);
+    response = await requestWithAuth(
+      () => ({
+        url: `${base}/git-receive-pack`,
+        method: "POST",
+        headers: {
+          ...baseHeaders(),
+          "Content-Type": "application/x-git-receive-pack-request",
+          Accept: "application/x-git-receive-pack-result",
+        },
+        body: requestBody(prepared, prepared.pack),
+      }),
+      authOptions(options),
+      options.authSession,
+    );
+  } catch (error) {
+    const localPackFailure = findLocalPackFailure(error);
+    if (localPackFailure !== null) {
+      const cause = localPackFailure.cause;
+      if (hasErrorCode(cause, "E2BIG") || hasErrorCode(cause, "EPUSHLOCAL")) throw cause;
+      throw new GitError("EPUSHLOCAL", "local receive-pack body generation failed", { cause });
     }
+    if (hasErrorCode(error, "EAUTH")) throw error;
+    throw uncertain("receive-pack POST failed after the request may have been consumed", error);
+  }
 
-    if (response.status === 401) {
-      let text = "";
-      try {
-        text = await readResponsePrefix(response.body, operationBudget, limits.inputBytes);
-      } catch (cause) {
-        throw new GitError("EHTTP", "git-receive-pack authentication failed", { cause });
-      }
-      throw new HttpError(
-        response.status,
-        `git-receive-pack failed: 401 ${response.statusText}${text === "" ? "" : ` — ${text}`}`,
-      );
+  if (response.status === 401) {
+    let text = "";
+    try {
+      text = await readResponsePrefix(response.body, limits.inputBytes);
+    } catch (cause) {
+      throw new GitError("EHTTP", "git-receive-pack authentication failed", { cause });
     }
-    if (response.status !== 200) {
-      let text: string;
-      try {
-        text = await readResponsePrefix(response.body, operationBudget, limits.inputBytes);
-      } catch (cause) {
-        throw uncertain("receive-pack returned an uncertain HTTP response", cause);
-      }
-      const cause = new HttpError(
-        response.status,
-        `git-receive-pack failed: ${response.status} ${response.statusText}${text === "" ? "" : ` — ${text}`}`,
-      );
+    throw new HttpError(
+      response.status,
+      `git-receive-pack failed: 401 ${response.statusText}${text === "" ? "" : ` — ${text}`}`,
+    );
+  }
+  if (response.status !== 200) {
+    let text: string;
+    try {
+      text = await readResponsePrefix(response.body, limits.inputBytes);
+    } catch (cause) {
       throw uncertain("receive-pack returned an uncertain HTTP response", cause);
     }
-    const contentType = response.headers["content-type"] ?? "";
-    const mediaType = contentType.split(";")[0]?.trim() ?? "";
-    if (mediaType !== "application/x-git-receive-pack-result") {
-      try {
-        await readResponsePrefix(response.body, operationBudget, limits.inputBytes);
-      } catch (cause) {
-        throw uncertain("receive-pack returned an uncertain malformed response", cause);
-      }
-      throw uncertain(
-        "receive-pack returned an uncertain malformed response",
-        new CorruptError(
-          `invalid receive-pack content-type: ${contentType === "" ? "none" : contentType}`,
-        ),
-      );
-    }
-    const sideband = prepared.sideband
-      ? sidebandBody(
-          response.body,
-          limits,
-          prepared.onProgress,
-          prepared.onMessage,
-          operationBudget,
-        )
-      : null;
-    const statusBody = sideband ?? response.body;
+    const cause = new HttpError(
+      response.status,
+      `git-receive-pack failed: ${response.status} ${response.statusText}${text === "" ? "" : ` — ${text}`}`,
+    );
+    throw uncertain("receive-pack returned an uncertain HTTP response", cause);
+  }
+  const contentType = response.headers["content-type"] ?? "";
+  const mediaType = contentType.split(";")[0]?.trim() ?? "";
+  if (mediaType !== "application/x-git-receive-pack-result") {
     try {
-      const status = await parseStatus(
-        statusBody,
-        prepared.commands,
-        prepared.atomic,
-        limits,
-        operationBudget,
-      );
-      succeeded = true;
-      return status;
+      await readResponsePrefix(response.body, limits.inputBytes);
     } catch (cause) {
-      throw uncertain("receive-pack returned an incomplete or invalid status", cause);
-    } finally {
-      await sideband?.return(undefined);
+      throw uncertain("receive-pack returned an uncertain malformed response", cause);
     }
+    throw uncertain(
+      "receive-pack returned an uncertain malformed response",
+      new CorruptError(
+        `invalid receive-pack content-type: ${contentType === "" ? "none" : contentType}`,
+      ),
+    );
+  }
+  const sideband = prepared.sideband
+    ? sidebandBody(response.body, limits, prepared.onProgress, prepared.onMessage)
+    : null;
+  const statusBody = sideband ?? response.body;
+  try {
+    return await parseStatus(statusBody, prepared.commands, prepared.atomic, limits);
+  } catch (cause) {
+    throw uncertain("receive-pack returned an incomplete or invalid status", cause);
   } finally {
-    operationBudget?.clearMemory(REQUEST_MEMORY_PART);
-    operationBudget?.clearMemory(ERROR_RESPONSE_MEMORY_PART);
-    operationBudget?.clearMemory(STATUS_FRAME_MEMORY_PART);
-    operationBudget?.clearMemory(STATUS_READER_MEMORY_PART);
-    operationBudget?.clearMemory(SIDEBAND_FRAME_MEMORY_PART);
-    operationBudget?.clearMemory(SIDEBAND_READER_MEMORY_PART);
-    operationBudget?.clearMemory(STATUS_PARSE_MEMORY_PART);
-    if (!succeeded) operationBudget?.clearMemory(RESULT_MEMORY_PART);
+    await sideband?.return(undefined);
   }
 }
 

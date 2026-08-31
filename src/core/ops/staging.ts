@@ -5,7 +5,6 @@
 // tracked-file count is the single `SELECT` over `git_index` — everything
 // after that is bounded by what actually changed.
 
-import type { MemoryReservation } from "../../memory.js";
 import { MAX_ROUTING_CHECKOUTS } from "../../sqlite/schema.js";
 import {
   selectSparsePathsOwned,
@@ -32,7 +31,6 @@ import {
   relativeTo,
 } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import {
   array,
   blob,
@@ -94,17 +92,20 @@ const SELECTED_ANCESTOR_FACT_FIXED_BYTES = 64;
 const SELECTED_ANCESTOR_SLOT_BYTES = 8;
 const SELECTED_MERGE_FIXED_BYTES = 128;
 const SELECTED_MERGE_SLOT_BYTES = 8;
-const STAGE_CANDIDATE_FIXED_BYTES = 320;
 const TYPED_ARRAY_BYTE_LENGTH_GETTER: unknown = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   "byteLength",
 )?.get;
 
-export const MAX_LS_FILES_EXCLUDE_ROOTS = MAX_ROUTING_CHECKOUTS;
-const LS_FILES_ARRAY_BYTES = 64;
-const LS_FILES_ARRAY_SLOT_BYTES = 8;
+function structuralStringBytes(value: string): number {
+  return 48 + value.length * 2;
+}
 
-type AvailableSelectedPaths = Extract<SelectedPathResult, { available: true }>;
+export const MAX_LS_FILES_EXCLUDE_ROOTS = MAX_ROUTING_CHECKOUTS;
+
+interface AvailableSelectedPaths extends Extract<SelectedPathResult, { available: true }> {
+  structuralBytes: number;
+}
 
 interface AddIndexPath {
   path: string;
@@ -131,8 +132,6 @@ interface StageCandidate {
 
 interface StageCandidateBatch {
   rows: StageCandidate[];
-  memory: MemoryReservation;
-  retainedBytes: number;
 }
 
 const MALFORMED_SELECTED_INDEX_ROW = "selected add index source returned a malformed row";
@@ -233,22 +232,9 @@ export function add(
   context?: Pick<GitContext, "selectedPaths" | "sparseWorkspace">,
   index: IndexStore = repo.checkout,
 ): void {
-  const operation = repo.store.reserveMemory();
-  try {
-    repo.store.runScratchAwareOperation(() => {
-      runAdd(
-        repo,
-        worktree,
-        options,
-        normalizeAddSpecs(options.paths, operation),
-        context,
-        index,
-        operation,
-      );
-    });
-  } finally {
-    operation.dispose();
-  }
+  repo.store.runScratchAwareOperation(() => {
+    runAdd(repo, worktree, options, normalizeAddSpecs(options.paths), context, index);
+  });
 }
 
 /** Stage already-normalized literal paths without rewriting their bytes. */
@@ -258,28 +244,18 @@ export function addLiteralPaths(
   options: AddOptions,
   context?: Pick<GitContext, "selectedPaths" | "sparseWorkspace">,
 ): AddLiteralPathsResult {
-  const operation = repo.store.reserveMemory();
-  try {
-    return repo.store.runScratchAwareOperation(() => {
-      if (options.all === true) {
-        throw new GitError("EINVAL", "literal add requires explicit paths");
-      }
-      const validationMemory = operation.scope();
-      try {
-        compilePathspecsOwned(options.paths, validationMemory);
-      } finally {
-        validationMemory.dispose();
-      }
-      const specs = uniqueSpecs(options.paths, operation);
-      const preflight = preflightLiteralAdd(repo, worktree, specs, options.excludeRoots, operation);
-      runAdd(repo, worktree, options, specs, context, repo.checkout, operation, preflight.ignores);
-      return preflight.ignored.length === 0
-        ? { outcome: "staged" }
-        : { outcome: "ignored", paths: preflight.ignored };
-    });
-  } finally {
-    operation.dispose();
-  }
+  return repo.store.runScratchAwareOperation(() => {
+    if (options.all === true) {
+      throw new GitError("EINVAL", "literal add requires explicit paths");
+    }
+    compilePathspecsOwned(options.paths);
+    const specs = uniqueSpecs(options.paths);
+    const preflight = preflightLiteralAdd(repo, worktree, specs, options.excludeRoots);
+    runAdd(repo, worktree, options, specs, context, repo.checkout, preflight.ignores);
+    return preflight.ignored.length === 0
+      ? { outcome: "staged" }
+      : { outcome: "ignored", paths: preflight.ignored };
+  });
 }
 
 function runAdd(
@@ -289,13 +265,11 @@ function runAdd(
   specs: string[],
   context: Pick<GitContext, "selectedPaths" | "sparseWorkspace"> | undefined,
   index: IndexStore,
-  operation: MemoryReservation,
   preloadedIgnores?: IgnoreMatcher,
 ): void {
   const all = options.all === true;
   if (!all && specs.length === 0) return;
 
-  const pathspecMemory = operation.scope();
   const limits: AddOperationLimits = {
     indexRows: 0,
     worktreeRows: 0,
@@ -304,64 +278,50 @@ function runAdd(
   const force = options.force === true;
   const trackedOnly = all && options.trackedOnly === true;
   let pathspec: CompiledPathspecMatcher | undefined;
-  try {
-    pathspec = all ? undefined : compilePathspecsOwned(specs, pathspecMemory);
-    if (!all && pathspec !== undefined) {
-      const selected =
-        index === repo.checkout ? selectAddPaths(repo, specs, pathspec, context, operation) : null;
-      if (selected !== null) {
-        assertSelectedPathspecsMatch(specs, selected);
-        applyAdd(
-          repo,
-          worktree,
-          options,
-          snapshotAddIndexRows(
-            selected.index,
-            pathspec,
-            selected.retainedBytes,
-            limits,
-            operation,
-            true,
-          ),
-          selectedWorktreeFiles(selected.worktree, pathspec),
-          pathspec,
-          force,
-          false,
-          index,
-          limits,
-          operation,
-          preloadedIgnores,
-        );
-        return;
-      }
-      assertPathspecsMatch(repo, worktree, specs, index, operation);
+  pathspec = all ? undefined : compilePathspecsOwned(specs);
+  if (!all && pathspec !== undefined) {
+    const selected =
+      index === repo.checkout ? selectAddPaths(repo, specs, pathspec, context) : null;
+    if (selected !== null) {
+      assertSelectedPathspecsMatch(specs, selected);
+      applyAdd(
+        repo,
+        worktree,
+        options,
+        snapshotAddIndexRows(selected.index, pathspec, selected.structuralBytes, limits),
+        selectedWorktreeFiles(selected.worktree, pathspec),
+        pathspec,
+        force,
+        false,
+        index,
+        limits,
+        preloadedIgnores,
+      );
+      return;
     }
-
-    const snapshot = snapshotAddIndex(index, pathspec, limits, operation);
-    const walkMemory = operation.scope();
-    const walked = walkWorktreeEntriesStreamOwned(worktree, repo.root, walkMemory, {
-      pathspec,
-      excludeRoots: options.excludeRoots,
-      includeIgnored: true,
-      maxScanRows: ADD_MAX_ROWS_PER_STREAM,
-    });
-    applyAdd(
-      repo,
-      worktree,
-      options,
-      snapshot,
-      walked,
-      pathspec,
-      force,
-      trackedOnly,
-      index,
-      limits,
-      operation,
-      preloadedIgnores,
-    );
-  } finally {
-    pathspecMemory.dispose();
+    assertPathspecsMatch(repo, worktree, specs, index);
   }
+
+  const snapshot = snapshotAddIndex(index, pathspec, limits);
+  const walked = walkWorktreeEntriesStreamOwned(worktree, repo.root, {
+    pathspec,
+    excludeRoots: options.excludeRoots,
+    includeIgnored: true,
+    maxScanRows: ADD_MAX_ROWS_PER_STREAM,
+  });
+  applyAdd(
+    repo,
+    worktree,
+    options,
+    snapshot,
+    walked,
+    pathspec,
+    force,
+    trackedOnly,
+    index,
+    limits,
+    preloadedIgnores,
+  );
 }
 
 function applyAdd(
@@ -375,7 +335,6 @@ function applyAdd(
   trackedOnly: boolean,
   index: IndexStore,
   limits: AddOperationLimits,
-  operation: MemoryReservation,
   preloadedIgnores?: IgnoreMatcher,
 ): void {
   let ignores = preloadedIgnores;
@@ -384,59 +343,51 @@ function applyAdd(
     ignores ??= loadIgnoreMatcher(worktree, repo.root, { excludeRoots: options.excludeRoots });
     return ignores.ignores(path, false);
   };
-  const excluded = relativeExcludeRoots(repo.root, options.excludeRoots, operation);
+  const excluded = relativeExcludeRoots(repo.root, options.excludeRoots);
   // `commit -a` never adds a path HEAD does not already have.
   const head = trackedOnly ? treeStream(repo, repo.headTree()) : [];
-  const pendingMemory = operation.scope();
   const pending: StageCandidateBatch = {
     rows: [],
-    memory: pendingMemory,
-    retainedBytes: SELECTED_ARRAY_FIXED_BYTES,
   };
-  pendingMemory.set("other", pending.retainedBytes);
-  try {
-    index.indexApply((sink) => {
-      const flush = (): void => stageCandidates(repo, worktree, pending, sink, operation);
-      for (const row of joinSorted3(
-        boundedAddWorktreeRows(walked, limits),
-        snapshot.paths,
-        boundedAddHeadRows(head, limits),
-        {
-          a: (entry) => entry.path,
-          b: (entry) => entry.path,
-          c: (entry) => entry.path,
-        },
-      )) {
-        if (trackedOnly && row.c === undefined) continue;
-        const existing = row.b?.entry;
+  index.indexApply((sink) => {
+    const flush = (): void => stageCandidates(repo, worktree, pending, sink);
+    for (const row of joinSorted3(
+      boundedAddWorktreeRows(walked, limits),
+      snapshot.paths,
+      boundedAddHeadRows(head, limits),
+      {
+        a: (entry) => entry.path,
+        b: (entry) => entry.path,
+        c: (entry) => entry.path,
+      },
+    )) {
+      if (trackedOnly && row.c === undefined) continue;
+      const existing = row.b?.entry;
 
-        if (row.a !== undefined) {
-          if (row.b === undefined && isExcluded(row.path, excluded)) continue;
-          if (row.b === undefined && isIgnored(row.path)) continue;
-          const conflicted = snapshot.conflicted.has(row.path);
-          if (!conflicted && existing !== undefined && indexMatchesStat(existing, row.a.stat)) {
-            continue;
-          }
-          retainStageCandidate(pending, {
-            path: row.path,
-            existing,
-            worktree: row.a,
-            conflicted,
-          });
-          if (pending.rows.length >= ADD_WINDOW_ROWS) flush();
+      if (row.a !== undefined) {
+        if (row.b === undefined && isExcluded(row.path, excluded)) continue;
+        if (row.b === undefined && isIgnored(row.path)) continue;
+        const conflicted = snapshot.conflicted.has(row.path);
+        if (!conflicted && existing !== undefined && indexMatchesStat(existing, row.a.stat)) {
           continue;
         }
-
-        // A conflict-only path has no stage-zero row but still needs removal.
-        if (row.b === undefined) continue;
-        if (pathspec !== undefined && !pathspec.matches(row.path)) continue;
-        sink.remove(row.path);
+        retainStageCandidate(pending, {
+          path: row.path,
+          existing,
+          worktree: row.a,
+          conflicted,
+        });
+        if (pending.rows.length >= ADD_WINDOW_ROWS) flush();
+        continue;
       }
-      flush();
-    });
-  } finally {
-    pendingMemory.dispose();
-  }
+
+      // A conflict-only path has no stage-zero row but still needs removal.
+      if (row.b === undefined) continue;
+      if (pathspec !== undefined && !pathspec.matches(row.path)) continue;
+      sink.remove(row.path);
+    }
+    flush();
+  });
 }
 
 function selectAddPaths(
@@ -444,17 +395,8 @@ function selectAddPaths(
   specs: readonly string[],
   pathspec: CompiledPathspecMatcher,
   context: Pick<GitContext, "selectedPaths" | "sparseWorkspace"> | undefined,
-  operation: MemoryReservation,
 ): AvailableSelectedPaths | null {
-  const selectionMemory = operation.scope();
-  try {
-    const selected = selectAddPathsOwned(repo, specs, pathspec, context, selectionMemory);
-    if (selected === null) selectionMemory.dispose();
-    return selected;
-  } catch (error) {
-    selectionMemory.dispose();
-    throw error;
-  }
+  return selectAddPathsOwned(repo, specs, pathspec, context);
 }
 
 function selectAddPathsOwned(
@@ -462,23 +404,15 @@ function selectAddPathsOwned(
   specs: readonly string[],
   pathspec: CompiledPathspecMatcher,
   context: Pick<GitContext, "selectedPaths" | "sparseWorkspace"> | undefined,
-  operation: MemoryReservation,
 ): AvailableSelectedPaths | null {
   const source = context?.selectedPaths;
   if (source === undefined || specs.length > ADD_SELECTED_PATHS || specs.includes("")) return null;
-  const planMemory = operation.scope();
-  planMemory.set(
-    "other",
-    SELECTED_ARRAY_FIXED_BYTES + specs.length * (SELECTED_ARRAY_SLOT_BYTES + 64),
-  );
   const requested: SelectedPathSpec[] = specs
     .map((path) => ({ path, recursive: false }))
     .sort((left, right) => comparePaths(left.path, right.path));
   const ancestorSource = context?.sparseWorkspace?.indexAncestorFacts;
   if (ancestorSource === undefined) {
-    const selected = selectRecursiveAddPaths(repo, requested, pathspec, source, operation);
-    if (selected !== null) planMemory.dispose();
-    return selected;
+    return selectRecursiveAddPaths(repo, requested, pathspec, source);
   }
 
   const exactRequest: SelectedPathRequest = {
@@ -486,7 +420,6 @@ function selectAddPathsOwned(
     checkoutId: repo.checkout.checkoutId,
     root: repo.root,
     specs: requested,
-    maxRetainedBytes: ADD_SELECTED_RETAINED_BYTES,
   };
   const exact = selectAddSource(
     source,
@@ -494,16 +427,15 @@ function selectAddPathsOwned(
     (path) => hasExactRequestedPath(requested, path),
     requested.length * 4,
     requested.length,
-    operation,
+    ADD_SELECTED_RETAINED_BYTES,
   );
   if (exact === null) return null;
 
   const sparseWorkspace = context?.sparseWorkspace;
   if (sparseWorkspace === undefined) return null;
-  const recursive = recursiveAddSpecs(repo, requested, exact, sparseWorkspace, operation);
+  const recursive = recursiveAddSpecs(repo, requested, exact, sparseWorkspace);
   if (recursive === null) return null;
   if (recursive.length === 0) {
-    planMemory.dispose();
     return exact;
   }
 
@@ -512,30 +444,18 @@ function selectAddPathsOwned(
     checkoutId: repo.checkout.checkoutId,
     root: repo.root,
     specs: recursive.map((path) => ({ path, recursive: true })),
-    maxRetainedBytes: Math.min(
-      ADD_SELECTED_RETAINED_BYTES,
-      ADD_RETAINED_BYTES - exact.retainedBytes,
-    ),
   };
-  const recursiveMatcherMemory = operation.scope();
-  const recursiveMatcher = compilePathspecsOwned(recursive, recursiveMatcherMemory);
-  let selected: AvailableSelectedPaths | null;
-  try {
-    selected = selectAddSource(
-      source,
-      recursiveRequest,
-      (path) => recursiveMatcher.matches(path),
-      ADD_SELECTED_ROWS,
-      ADD_SELECTED_ROWS,
-      operation,
-    );
-  } finally {
-    recursiveMatcherMemory.dispose();
-  }
+  const recursiveMatcher = compilePathspecsOwned(recursive);
+  const selected = selectAddSource(
+    source,
+    recursiveRequest,
+    (path) => recursiveMatcher.matches(path),
+    ADD_SELECTED_ROWS,
+    ADD_SELECTED_ROWS,
+    Math.min(ADD_SELECTED_RETAINED_BYTES, ADD_RETAINED_BYTES - exact.structuralBytes),
+  );
   if (selected === null) return null;
-  const merged = mergeSelectedAddResults(exact, selected, operation);
-  if (merged !== null) planMemory.dispose();
-  return merged;
+  return mergeSelectedAddResults(exact, selected);
 }
 
 function selectRecursiveAddPaths(
@@ -543,14 +463,12 @@ function selectRecursiveAddPaths(
   requested: readonly SelectedPathSpec[],
   pathspec: CompiledPathspecMatcher,
   source: NonNullable<GitContext["selectedPaths"]>,
-  operation: MemoryReservation,
 ): AvailableSelectedPaths | null {
   const request: SelectedPathRequest = {
     repoId: repo.store.repoId,
     checkoutId: repo.checkout.checkoutId,
     root: repo.root,
     specs: requested.map((spec) => ({ path: spec.path, recursive: true })),
-    maxRetainedBytes: ADD_SELECTED_RETAINED_BYTES,
   };
   return selectAddSource(
     source,
@@ -558,7 +476,7 @@ function selectRecursiveAddPaths(
     (path) => pathspec.matches(path),
     ADD_SELECTED_ROWS,
     ADD_SELECTED_ROWS,
-    operation,
+    ADD_SELECTED_RETAINED_BYTES,
   );
 }
 
@@ -568,26 +486,19 @@ function selectAddSource(
   matches: (path: string) => boolean,
   maxIndexRows: number,
   maxWorktreeRows: number,
-  operation: MemoryReservation,
+  maxStructuralBytes: number,
 ): AvailableSelectedPaths | null {
-  const sourceMemory = operation.scope();
-  const selected: unknown = selectSparsePathsOwned(source, request, sourceMemory);
-  const validationMemory = operation.scope();
+  const selected: unknown = selectSparsePathsOwned(source, request);
   try {
     const validated = validateSelectedAddResult(
       selected,
       matches,
       maxIndexRows,
       maxWorktreeRows,
-      request.maxRetainedBytes ?? ADD_SELECTED_RETAINED_BYTES,
-      validationMemory,
+      maxStructuralBytes,
     );
-    sourceMemory.dispose();
-    if (validated === null) validationMemory.dispose();
     return validated;
   } catch (error) {
-    sourceMemory.dispose();
-    validationMemory.dispose();
     if (hasErrorCode(error, "E2BIG")) return null;
     throw error;
   }
@@ -598,7 +509,6 @@ function recursiveAddSpecs(
   requested: readonly SelectedPathSpec[],
   exact: AvailableSelectedPaths,
   sparseWorkspace: NonNullable<GitContext["sparseWorkspace"]>,
-  operation: MemoryReservation,
 ): string[] | null {
   const recursive = new Set<string>();
   for (const row of exact.worktree) {
@@ -609,47 +519,28 @@ function recursiveAddSpecs(
 
   const retainedHeadroom = Math.min(
     ADD_SELECTED_RETAINED_BYTES,
-    ADD_RETAINED_BYTES - exact.retainedBytes,
+    ADD_RETAINED_BYTES - exact.structuralBytes,
   );
   let result: unknown;
-  const sourceMemory = operation.scope();
   try {
-    result = sparseIndexAncestorFactsOwned(
-      sparseWorkspace,
-      {
-        checkoutId: repo.checkout.checkoutId,
-        ancestors: candidates,
-        maxRetainedBytes: retainedHeadroom,
-      },
-      sourceMemory,
-    );
+    result = sparseIndexAncestorFactsOwned(sparseWorkspace, {
+      checkoutId: repo.checkout.checkoutId,
+      ancestors: candidates,
+    });
   } catch (error) {
-    sourceMemory.dispose();
     if (hasErrorCode(error, "E2BIG")) return null;
     throw error;
   }
-  const validationMemory = operation.scope();
   let validated: ValidatedSelectedAncestorResult | null;
   try {
-    validated = validateSelectedAncestorResult(
-      result,
-      candidates,
-      exact.index,
-      retainedHeadroom,
-      validationMemory,
-    );
+    validated = validateSelectedAncestorResult(result, candidates, exact.index, retainedHeadroom);
   } catch (error) {
-    sourceMemory.dispose();
-    validationMemory.dispose();
     if (hasErrorCode(error, "E2BIG")) return null;
     throw error;
   }
   if (validated === null) {
-    sourceMemory.dispose();
-    validationMemory.dispose();
     return null;
   }
-  sourceMemory.dispose();
   const facts = validated.facts;
   for (let ordinal = 0; ordinal < candidates.length; ordinal++) {
     const path = candidates[ordinal];
@@ -660,7 +551,6 @@ function recursiveAddSpecs(
     if (fact.descendant) recursive.add(path);
   }
   const recursivePaths = [...recursive].sort(comparePaths);
-  validationMemory.dispose();
   return recursivePaths;
 }
 
@@ -672,7 +562,7 @@ interface ValidatedSelectedAncestorFact {
 
 interface ValidatedSelectedAncestorResult {
   facts: ValidatedSelectedAncestorFact[];
-  retainedBytes: number;
+  structuralBytes: number;
 }
 
 function validateSelectedAncestorResult(
@@ -680,31 +570,23 @@ function validateSelectedAncestorResult(
   expected: readonly string[],
   exactIndex: readonly IndexEntry[],
   retainedLimit: number,
-  validationMemory: MemoryReservation,
 ): ValidatedSelectedAncestorResult | null {
   const decoded = new RowShape(
     {
-      facts: unknownArray("selected add ancestor source returned invalid retained state"),
-      retainedBytes: int(
-        0,
-        retainedLimit,
-        "selected add ancestor source returned invalid retained state",
-      ),
+      facts: unknownArray("selected add ancestor source returned invalid state"),
     },
     "selected add ancestor source returned a malformed result",
   ).decode(result);
   const factsLength = decoded.facts.length;
   if (factsLength !== expected.length) {
-    throw new GitError("ECORRUPT", "selected add ancestor source returned invalid retained state");
+    throw new GitError("ECORRUPT", "selected add ancestor source returned invalid state");
   }
   let minimumRetained = SELECTED_ANCESTOR_RESULT_FIXED_BYTES + SELECTED_ANCESTOR_ARRAY_FIXED_BYTES;
-  minimumRetained = addSelectedRetained(
+  minimumRetained = addSelectedStructuralBytes(
     minimumRetained,
     factsLength * SELECTED_ANCESTOR_SLOT_BYTES,
-    decoded.retainedBytes,
   );
-  validationMemory.set("other", minimumRetained);
-  if (decoded.retainedBytes > retainedLimit - minimumRetained) return null;
+  if (minimumRetained > retainedLimit) return null;
   const snapshot: ValidatedSelectedAncestorFact[] = [];
   let previous: string | undefined;
   for (let ordinal = 0; ordinal < factsLength; ordinal++) {
@@ -721,17 +603,15 @@ function validateSelectedAncestorResult(
     ) {
       throw new GitError("ECORRUPT", "selected add ancestor source returned malformed facts");
     }
-    minimumRetained = addSelectedRetained(
+    minimumRetained = addSelectedStructuralBytes(
       minimumRetained,
       SELECTED_ANCESTOR_FACT_FIXED_BYTES + fact.path.length * 2,
-      decoded.retainedBytes,
     );
-    validationMemory.set("other", minimumRetained);
-    if (decoded.retainedBytes > retainedLimit - minimumRetained) return null;
+    if (minimumRetained > retainedLimit) return null;
     snapshot.push(fact);
     previous = fact.path;
   }
-  return { facts: snapshot, retainedBytes: decoded.retainedBytes + minimumRetained };
+  return { facts: snapshot, structuralBytes: minimumRetained };
 }
 
 function validateSelectedAddResult(
@@ -739,8 +619,7 @@ function validateSelectedAddResult(
   matches: (path: string) => boolean,
   maxIndexRows: number,
   maxWorktreeRows: number,
-  maxRetainedBytes: number,
-  validationMemory: MemoryReservation,
+  maxStructuralBytes: number,
 ): AvailableSelectedPaths | null {
   const availability = new RowShape(
     { available: bool("selected add source returned invalid availability") },
@@ -749,13 +628,8 @@ function validateSelectedAddResult(
   if (!availability.available) return null;
   const decoded = new RowShape(
     {
-      index: unknownArray("selected add source returned invalid retained state"),
-      worktree: unknownArray("selected add source returned invalid retained state"),
-      retainedBytes: int(
-        0,
-        maxRetainedBytes,
-        "selected add source returned invalid retained state",
-      ),
+      index: unknownArray("selected add source returned invalid state"),
+      worktree: unknownArray("selected add source returned invalid state"),
     },
     "selected add source returned a malformed result",
   ).decode(selected);
@@ -765,13 +639,11 @@ function validateSelectedAddResult(
     throw new GitError("ECORRUPT", "selected add source returned excessive facts");
   }
   let minimumRetained = SELECTED_RESULT_FIXED_BYTES + SELECTED_ARRAY_FIXED_BYTES * 2;
-  minimumRetained = addSelectedRetained(
+  minimumRetained = addSelectedStructuralBytes(
     minimumRetained,
     (indexLength + worktreeLength) * SELECTED_ARRAY_SLOT_BYTES,
-    decoded.retainedBytes,
   );
-  validationMemory.set("other", minimumRetained);
-  if (decoded.retainedBytes > maxRetainedBytes - minimumRetained) return null;
+  if (minimumRetained > maxStructuralBytes) return null;
   const snapshotIndex: IndexEntry[] = [];
   let previousIndex: IndexEntry | undefined;
   for (let ordinal = 0; ordinal < indexLength; ordinal++) {
@@ -787,13 +659,13 @@ function validateSelectedAddResult(
     ) {
       throw new GitError("ECORRUPT", "selected add index source returned an unrelated path");
     }
-    minimumRetained = addSelectedRetained(
+    minimumRetained = addSelectedStructuralBytes(
       minimumRetained,
-      SELECTED_INDEX_FIXED_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid),
-      decoded.retainedBytes,
+      SELECTED_INDEX_FIXED_BYTES +
+        structuralStringBytes(entry.path) +
+        structuralStringBytes(entry.oid),
     );
-    validationMemory.set("other", minimumRetained);
-    if (decoded.retainedBytes > maxRetainedBytes - minimumRetained) return null;
+    if (minimumRetained > maxStructuralBytes) return null;
     snapshotIndex.push(entry);
     previousIndex = entry;
   }
@@ -810,16 +682,14 @@ function validateSelectedAddResult(
     ) {
       throw new GitError("ECORRUPT", "selected add worktree source returned an unrelated path");
     }
-    minimumRetained = addSelectedRetained(
+    minimumRetained = addSelectedStructuralBytes(
       minimumRetained,
       SELECTED_WORKTREE_FIXED_BYTES +
-        retainedStringBytes(fields.path) +
-        retainedStringBytes(fields.target ?? "") +
+        structuralStringBytes(fields.path) +
+        structuralStringBytes(fields.target ?? "") +
         fields.contentBytes,
-      decoded.retainedBytes,
     );
-    validationMemory.set("other", minimumRetained);
-    if (decoded.retainedBytes > maxRetainedBytes - minimumRetained) return null;
+    if (minimumRetained > maxStructuralBytes) return null;
     const entry = snapshotSelectedWorktreeFact(fields);
     snapshotWorktree.push(entry);
     previousWorktree = entry;
@@ -828,13 +698,13 @@ function validateSelectedAddResult(
     available: true,
     index: snapshotIndex,
     worktree: snapshotWorktree,
-    retainedBytes: decoded.retainedBytes + minimumRetained,
+    structuralBytes: minimumRetained,
   };
 }
 
-function addSelectedRetained(current: number, added: number, reported: number): number {
-  if (!Number.isSafeInteger(added) || added < 0 || current > reported - added) {
-    throw new GitError("ECORRUPT", "selected add source underreported retained state");
+function addSelectedStructuralBytes(current: number, added: number): number {
+  if (!Number.isSafeInteger(added) || added < 0 || current > Number.MAX_SAFE_INTEGER - added) {
+    throw new GitError("E2BIG", "selected add state is too large");
   }
   return current + added;
 }
@@ -948,25 +818,22 @@ function hasExactSelectedIndexPath(rows: readonly IndexEntry[], path: string): b
 function mergeSelectedAddResults(
   exact: AvailableSelectedPaths,
   recursive: AvailableSelectedPaths,
-  operation: MemoryReservation,
 ): AvailableSelectedPaths | null {
   const slots =
     exact.index.length + recursive.index.length + exact.worktree.length + recursive.worktree.length;
   const mergeCharge = SELECTED_MERGE_FIXED_BYTES + slots * SELECTED_MERGE_SLOT_BYTES;
   if (
     !Number.isSafeInteger(mergeCharge) ||
-    exact.retainedBytes > ADD_RETAINED_BYTES - recursive.retainedBytes ||
-    exact.retainedBytes + recursive.retainedBytes > ADD_RETAINED_BYTES - mergeCharge
+    exact.structuralBytes > ADD_RETAINED_BYTES - recursive.structuralBytes ||
+    exact.structuralBytes + recursive.structuralBytes > ADD_RETAINED_BYTES - mergeCharge
   ) {
     return null;
   }
-  const mergeMemory = operation.scope();
-  mergeMemory.set("other", mergeCharge);
   return {
     available: true,
     index: mergeSelectedIndexRows(exact.index, recursive.index),
     worktree: mergeSelectedWorktreeRows(exact.worktree, recursive.worktree),
-    retainedBytes: exact.retainedBytes + recursive.retainedBytes + mergeCharge,
+    structuralBytes: exact.structuralBytes + recursive.structuralBytes + mergeCharge,
   };
 }
 
@@ -1132,21 +999,8 @@ function snapshotAddIndex(
   index: IndexStore,
   pathspec: CompiledPathspecMatcher | undefined,
   limits: AddOperationLimits,
-  operation: MemoryReservation,
 ): AddIndexSnapshot {
-  const scanMemory = operation.scope();
-  try {
-    return snapshotAddIndexRows(
-      indexScanOwned(index, scanMemory),
-      pathspec,
-      0,
-      limits,
-      operation,
-      false,
-    );
-  } finally {
-    scanMemory.dispose();
-  }
+  return snapshotAddIndexRows(indexScanOwned(index), pathspec, 0, limits);
 }
 
 function snapshotAddIndexRows(
@@ -1154,15 +1008,10 @@ function snapshotAddIndexRows(
   pathspec: CompiledPathspecMatcher | undefined,
   initialRetained: number,
   limits: AddOperationLimits,
-  operation: MemoryReservation,
-  sourceRowsAlreadyOwned: boolean,
 ): AddIndexSnapshot {
-  const retainedMemory = operation.scope();
   const paths: AddIndexPath[] = [];
   const conflicted = new Set<string>();
   let retained = initialRetained;
-  let ownedRetained = 0;
-  retainedMemory.set("other", ownedRetained);
   let current: AddIndexPath | null = null;
   for (const entry of entries) {
     if (limits.indexRows >= ADD_MAX_ROWS_PER_STREAM) {
@@ -1171,10 +1020,8 @@ function snapshotAddIndexRows(
     limits.indexRows++;
     if (pathspec !== undefined && !pathspec.matches(entry.path)) continue;
     const rowRetained =
-      INDEX_ROW_FIXED_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid);
+      INDEX_ROW_FIXED_BYTES + structuralStringBytes(entry.path) + structuralStringBytes(entry.oid);
     retained += rowRetained;
-    if (!sourceRowsAlreadyOwned) ownedRetained += rowRetained;
-    retainedMemory.set("other", ownedRetained);
     if (retained > ADD_RETAINED_BYTES) {
       throw new GitError("E2BIG", `add retained state exceeds ${ADD_RETAINED_BYTES} bytes`);
     }
@@ -1183,15 +1030,11 @@ function snapshotAddIndexRows(
       paths.push(current);
       const pathRetained = PATH_ENTRY_FIXED_BYTES;
       retained += pathRetained;
-      ownedRetained += pathRetained;
-      retainedMemory.set("other", ownedRetained);
     } else if (entry.stage === 0) {
       current.entry = entry;
     }
     if (entry.stage !== 0 && !conflicted.has(entry.path)) {
       retained += PATH_ENTRY_FIXED_BYTES;
-      ownedRetained += PATH_ENTRY_FIXED_BYTES;
-      retainedMemory.set("other", ownedRetained);
       conflicted.add(entry.path);
     }
     if (retained > ADD_RETAINED_BYTES) {
@@ -1232,14 +1075,10 @@ function stageCandidates(
   worktree: Worktree,
   candidates: StageCandidateBatch,
   sink: IndexSink,
-  operation: MemoryReservation,
 ): void {
   if (candidates.rows.length === 0) return;
-  const stageMemory = operation.scope();
   try {
     const rows = candidates.rows;
-    let stageRetained = 0;
-    stageMemory.set("other", stageRetained);
     const identities = repo.store.lookupBlobIds(
       rows.flatMap((row) => {
         if (row.existing !== undefined && indexMatchesStat(row.existing, row.worktree.stat))
@@ -1248,104 +1087,68 @@ function stageCandidates(
         return contentId === null ? [] : [contentId];
       }),
     );
-    stageRetained += identities.size * 160;
-    stageMemory.set("other", stageRetained);
     const unresolved: WorktreePath[] = [];
     const mapped = new Map<string, string>();
     for (const row of rows) {
       if (row.existing !== undefined && indexMatchesStat(row.existing, row.worktree.stat)) continue;
       const contentId = row.worktree.stat.contentId;
       const oid = contentId === null ? undefined : identities.get(contentIdKey(contentId));
-      stageRetained += SELECTED_ARRAY_SLOT_BYTES;
       if (oid === undefined) {
         unresolved.push(row.worktree);
       } else {
-        stageRetained += 160;
         mapped.set(row.path, oid);
       }
-      stageMemory.set("other", stageRetained);
     }
-    const hashMemory = operation.scope();
-    try {
-      const hashes = hashWorktreePathsOwned(repo, worktree, unresolved, hashMemory);
-      repo.store.upsertBlobIds(
-        [...hashes.values()].flatMap((hashed) => {
-          const contentId = hashed.stat.contentId;
-          return contentId === null ? [] : [{ contentId, oid: hashed.oid }];
-        }),
-      );
+    const hashes = hashWorktreePathsOwned(repo, worktree, unresolved);
+    repo.store.upsertBlobIds(
+      [...hashes.values()].flatMap((hashed) => {
+        const contentId = hashed.stat.contentId;
+        return contentId === null ? [] : [{ contentId, oid: hashed.oid }];
+      }),
+    );
 
-      for (const row of rows) {
-        let update: IndexEntry | null = null;
-        if (row.existing !== undefined && indexMatchesStat(row.existing, row.worktree.stat)) {
+    for (const row of rows) {
+      let update: IndexEntry | null = null;
+      if (row.existing !== undefined && indexMatchesStat(row.existing, row.worktree.stat)) {
+        update = indexEntryFor(row.path, {
+          oid: row.existing.oid,
+          mode: row.existing.mode.toString(8).padStart(6, "0"),
+          stat: row.worktree.stat,
+        });
+      } else {
+        const hashed = hashes.get(row.path);
+        const oid = mapped.get(row.path);
+        if (hashed !== undefined) update = indexEntryFor(row.path, hashed);
+        else if (oid !== undefined) {
           update = indexEntryFor(row.path, {
-            oid: row.existing.oid,
-            mode: row.existing.mode.toString(8).padStart(6, "0"),
+            oid,
+            mode: gitModeFor(row.worktree.stat),
             stat: row.worktree.stat,
           });
-        } else {
-          const hashed = hashes.get(row.path);
-          const oid = mapped.get(row.path);
-          if (hashed !== undefined) update = indexEntryFor(row.path, hashed);
-          else if (oid !== undefined) {
-            update = indexEntryFor(row.path, {
-              oid,
-              mode: gitModeFor(row.worktree.stat),
-              stat: row.worktree.stat,
-            });
-          }
         }
-        if (update === null) {
-          if (row.existing !== undefined || row.conflicted) sink.remove(row.path);
-          continue;
-        }
-        if (row.conflicted) sink.remove(row.path);
-        sink.put(update);
       }
-    } finally {
-      hashMemory.dispose();
+      if (update === null) {
+        if (row.existing !== undefined || row.conflicted) sink.remove(row.path);
+        continue;
+      }
+      if (row.conflicted) sink.remove(row.path);
+      sink.put(update);
     }
   } finally {
-    stageMemory.dispose();
     candidates.rows.length = 0;
-    candidates.retainedBytes = SELECTED_ARRAY_FIXED_BYTES;
-    candidates.memory.set("other", candidates.retainedBytes);
   }
 }
 
 function retainStageCandidate(batch: StageCandidateBatch, candidate: StageCandidate): void {
-  const retained =
-    STAGE_CANDIDATE_FIXED_BYTES +
-    SELECTED_ARRAY_SLOT_BYTES +
-    retainedStringBytes(candidate.path) +
-    retainedStringBytes(candidate.worktree.stat.target ?? "") +
-    (candidate.worktree.stat.contentId?.byteLength ?? 0);
-  batch.memory.set("other", batch.retainedBytes + retained);
-  batch.retainedBytes += retained;
   batch.rows.push(candidate);
 }
 
-function relativeExcludeRoots(
-  root: string,
-  paths: readonly string[] | undefined,
-  operation?: MemoryReservation,
-): string[] {
-  const memory = operation?.scope();
+function relativeExcludeRoots(root: string, paths: readonly string[] | undefined): string[] {
   const relatives: string[] = [];
-  let retained = LS_FILES_ARRAY_BYTES;
-  memory?.set("other", retained);
   for (const path of paths ?? []) {
-    const transient = operation?.scope();
-    try {
-      transient?.set("other", retainedStringBytes(root) + retainedStringBytes(path) + 64);
-      const relative = relativeTo(root, path);
-      if (relative === null || relative === "") continue;
-      retained += LS_FILES_ARRAY_SLOT_BYTES + retainedStringBytes(relative);
-      memory?.set("other", retained);
-      relatives.push(relative);
-    } finally {
-      transient?.dispose();
-    }
+    const relative = relativeTo(root, path);
+    if (relative === null || relative === "") continue;
+    relatives.push(relative);
   }
   return relatives;
 }
@@ -1384,7 +1187,6 @@ interface RmSpec {
 interface RmSpecIndex {
   files: Map<string, RmSpec>;
   directories: Map<string, RmSpec>;
-  memory: MemoryReservation;
 }
 
 interface RmCandidate {
@@ -1408,39 +1210,27 @@ const RM_EXECUTION_HEADROOM_BYTES = 4 * 1024 * 1024;
 
 /** Remove tracked paths with Git's HEAD/index/worktree safety checks. */
 export function rm(repo: Repository, worktree: Worktree, options: RmOptions): void {
-  const operation = repo.store.reserveMemory();
-  try {
-    runRm(repo, worktree, options, operation);
-  } finally {
-    operation.dispose();
-  }
+  runRm(repo, worktree, options);
 }
 
-function runRm(
-  repo: Repository,
-  worktree: Worktree,
-  options: RmOptions,
-  operation: MemoryReservation,
-): void {
-  const normalized = normalizeRmSpecs(options.paths, operation);
+function runRm(repo: Repository, worktree: Worktree, options: RmOptions): void {
+  const normalized = normalizeRmSpecs(options.paths);
   const specs = normalized.specs;
   if (specs.length === 0) return;
 
   const cached = options.cached === true;
   const force = options.force === true;
   const recursive = options.recursive === true;
-  const excluded = relativeExcludeRoots(repo.root, options.excludeRoots, operation);
+  const excluded = relativeExcludeRoots(repo.root, options.excludeRoots);
   const candidates: RmCandidate[] = [];
   const removed = new Set<string>();
   let retained = normalized.retained;
-  const retainedMemory = normalized.retainedMemory;
-  const walkMemory = operation.scope();
 
   for (const row of joinSorted3(
     boundedRmRows(treeStream(repo, repo.headTree()), "HEAD"),
-    rmIndexPaths(repo, normalized.index, excluded, operation),
+    rmIndexPaths(repo, normalized.index, excluded),
     boundedRmRows(
-      walkWorktreeEntriesStreamOwned(worktree, repo.root, walkMemory, {
+      walkWorktreeEntriesStreamOwned(worktree, repo.root, {
         excludeRoots: options.excludeRoots,
         includeIgnored: true,
         includeDirectories: true,
@@ -1454,12 +1244,11 @@ function runRm(
     noteRmMatches(normalized.index, selected.path, row.c?.stat.type === "dir");
     retained +=
       RM_CANDIDATE_FIXED_BYTES +
-      retainedStringBytes(selected.path) +
-      retainedStringBytes(selected.entry?.oid ?? "") +
-      retainedStringBytes(row.a?.oid ?? "") +
-      retainedStringBytes(row.c?.stat.target ?? "") +
+      structuralStringBytes(selected.path) +
+      structuralStringBytes(selected.entry?.oid ?? "") +
+      structuralStringBytes(row.a?.oid ?? "") +
+      structuralStringBytes(row.c?.stat.target ?? "") +
       (row.c?.stat.contentId?.byteLength ?? 0);
-    retainedMemory.set("other", retained);
     requireRmRetained(retained);
     removed.add(selected.path);
     candidates.push({
@@ -1486,7 +1275,7 @@ function runRm(
   if (candidates.length === 0) return;
 
   if (!force) {
-    identifyRmWorktree(repo, worktree, candidates, operation);
+    identifyRmWorktree(repo, worktree, candidates);
     for (const candidate of candidates) {
       if (candidate.conflicted) continue;
       const entry = candidate.index;
@@ -1519,24 +1308,16 @@ function runRm(
       removed,
       options.excludeRoots,
       retained,
-      operation,
-      retainedMemory,
     );
     pruned = planned.directories;
     retained = planned.retained;
-    retainedMemory.set("other", retained);
   }
   requireRmRetained(retained);
 
   repo.store.db.transactionSync(() => {
     if (!cached) {
-      removeRmWorktreePaths(
-        worktree,
-        physicalRmPaths(repo, candidates, operation),
-        false,
-        operation,
-      );
-      removeRmWorktreePaths(worktree, absoluteRmPaths(repo, pruned, operation), true, operation);
+      removeRmWorktreePaths(worktree, physicalRmPaths(repo, candidates), false);
+      removeRmWorktreePaths(worktree, absoluteRmPaths(repo, pruned), true);
     }
     repo.checkout.indexApply((sink) => {
       for (const candidate of candidates) sink.remove(candidate.path);
@@ -1548,43 +1329,26 @@ function* rmIndexPaths(
   repo: Repository,
   specs: RmSpecIndex,
   excluded: readonly string[],
-  operation: MemoryReservation,
 ): Generator<RmIndexPath> {
-  const scanMemory = operation.scope();
-  const currentMemory = operation.scope();
   let current: RmIndexPath | null = null;
-  try {
-    for (const entry of boundedRmRows(indexScanOwned(repo.checkout, scanMemory), "index")) {
-      if (!matchesRmSpecs(specs, entry.path) || isExcluded(entry.path, excluded)) continue;
-      if (current === null || current.path !== entry.path) {
-        if (current !== null) yield current;
-        currentMemory.set(
-          "other",
-          INDEX_ROW_FIXED_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid),
-        );
-        current = {
-          path: entry.path,
-          entry: entry.stage === 0 ? entry : undefined,
-          conflicted: entry.stage !== 0,
-        };
-        continue;
-      }
-      if (entry.stage === 0) current.entry = entry;
-      else current.conflicted = true;
+  for (const entry of boundedRmRows(indexScanOwned(repo.checkout), "index")) {
+    if (!matchesRmSpecs(specs, entry.path) || isExcluded(entry.path, excluded)) continue;
+    if (current === null || current.path !== entry.path) {
+      if (current !== null) yield current;
+      current = {
+        path: entry.path,
+        entry: entry.stage === 0 ? entry : undefined,
+        conflicted: entry.stage !== 0,
+      };
+      continue;
     }
-    if (current !== null) yield current;
-  } finally {
-    currentMemory.dispose();
-    scanMemory.dispose();
+    if (entry.stage === 0) current.entry = entry;
+    else current.conflicted = true;
   }
+  if (current !== null) yield current;
 }
 
-function identifyRmWorktree(
-  repo: Repository,
-  worktree: Worktree,
-  candidates: RmCandidate[],
-  operation: MemoryReservation,
-): void {
+function identifyRmWorktree(repo: Repository, worktree: Worktree, candidates: RmCandidate[]): void {
   for (let offset = 0; offset < candidates.length; offset += RM_WINDOW_ROWS) {
     const batch = candidates.slice(offset, offset + RM_WINDOW_ROWS);
     const pending = batch.filter(
@@ -1611,25 +1375,20 @@ function identifyRmWorktree(
     const authoritative = pending.flatMap((candidate) =>
       candidate.worktree === undefined ? [] : [candidate.worktree],
     );
-    const hashMemory = operation.scope();
-    try {
-      const hashes = hashExactWorktreePathsOwned(repo, worktree, authoritative, hashMemory, {
-        write: false,
-      });
-      for (const candidate of pending) {
-        const entry = candidate.index;
-        const hashed = hashes.get(candidate.path);
-        if (
-          entry !== undefined &&
-          hashed !== undefined &&
-          hashed.oid === entry.oid &&
-          Number.parseInt(hashed.mode, 8) === entry.mode
-        ) {
-          candidate.worktreeMatchesIndex = true;
-        }
+    const hashes = hashExactWorktreePathsOwned(repo, worktree, authoritative, {
+      write: false,
+    });
+    for (const candidate of pending) {
+      const entry = candidate.index;
+      const hashed = hashes.get(candidate.path);
+      if (
+        entry !== undefined &&
+        hashed !== undefined &&
+        hashed.oid === entry.oid &&
+        Number.parseInt(hashed.mode, 8) === entry.mode
+      ) {
+        candidate.worktreeMatchesIndex = true;
       }
-    } finally {
-      hashMemory.dispose();
     }
   }
 }
@@ -1641,54 +1400,37 @@ function planRmDirectoryPrune(
   removed: ReadonlySet<string>,
   excludeRoots: readonly string[] | undefined,
   initialRetained: number,
-  operation: MemoryReservation,
-  retainedMemory: MemoryReservation,
 ): { directories: string[]; retained: number } {
   const directories = new Set<string>();
   let retained = initialRetained;
   for (const { path } of candidates) {
-    const transient = operation.scope();
-    transient.set("other", 4 * retainedStringBytes(path) + 64);
-    try {
-      const parts = path.split("/");
-      for (let depth = parts.length - 1; depth > 0; depth--) {
-        const directory = parts.slice(0, depth).join("/");
-        if (directories.has(directory)) continue;
-        retained += RM_DIRECTORY_FIXED_BYTES + retainedStringBytes(directory);
-        retainedMemory.set("other", retained);
-        requireRmRetained(retained);
-        directories.add(directory);
-      }
-    } finally {
-      transient.dispose();
+    const parts = path.split("/");
+    for (let depth = parts.length - 1; depth > 0; depth--) {
+      const directory = parts.slice(0, depth).join("/");
+      if (directories.has(directory)) continue;
+      retained += RM_DIRECTORY_FIXED_BYTES + structuralStringBytes(directory);
+      requireRmRetained(retained);
+      directories.add(directory);
     }
   }
   if (directories.size === 0) return { directories: [], retained };
 
   const blocked = new Set<string>();
   const block = (path: string, includeSelf: boolean): void => {
-    const transient = operation.scope();
-    transient.set("other", 4 * retainedStringBytes(path) + 64);
-    try {
-      const parts = path.split("/");
-      let depth = includeSelf ? parts.length : parts.length - 1;
-      for (; depth > 0; depth--) {
-        const directory = parts.slice(0, depth).join("/");
-        if (!directories.has(directory) || blocked.has(directory)) continue;
-        retained += RM_DIRECTORY_FIXED_BYTES;
-        retainedMemory.set("other", retained);
-        requireRmRetained(retained);
-        blocked.add(directory);
-      }
-    } finally {
-      transient.dispose();
+    const parts = path.split("/");
+    let depth = includeSelf ? parts.length : parts.length - 1;
+    for (; depth > 0; depth--) {
+      const directory = parts.slice(0, depth).join("/");
+      if (!directories.has(directory) || blocked.has(directory)) continue;
+      retained += RM_DIRECTORY_FIXED_BYTES;
+      requireRmRetained(retained);
+      blocked.add(directory);
     }
   };
 
-  for (const root of relativeExcludeRoots(repo.root, excludeRoots, operation)) block(root, true);
-  const walkMemory = operation.scope();
+  for (const root of relativeExcludeRoots(repo.root, excludeRoots)) block(root, true);
   for (const entry of boundedRmRows(
-    walkWorktreeEntriesStreamOwned(worktree, repo.root, walkMemory, {
+    walkWorktreeEntriesStreamOwned(worktree, repo.root, {
       excludeRoots: excludeRoots === undefined ? undefined : [...excludeRoots],
       includeIgnored: true,
       includeDirectories: true,
@@ -1704,7 +1446,6 @@ function planRmDirectoryPrune(
   for (const directory of directories) {
     if (blocked.has(directory)) continue;
     retained += RM_ARRAY_ENTRY_BYTES;
-    retainedMemory.set("other", retained);
     requireRmRetained(retained);
     pruned.push(directory);
   }
@@ -1723,14 +1464,10 @@ function pathDepth(path: string): number {
   return depth;
 }
 
-function normalizeRmSpecs(
-  paths: readonly string[],
-  operation: MemoryReservation,
-): {
+function normalizeRmSpecs(paths: readonly string[]): {
   specs: RmSpec[];
   index: RmSpecIndex;
   retained: number;
-  retainedMemory: MemoryReservation;
 } {
   if (paths.length > RM_MAX_PATHSPECS) {
     throw new GitError("E2BIG", `rm pathspec count exceeds ${RM_MAX_PATHSPECS}`);
@@ -1738,33 +1475,23 @@ function normalizeRmSpecs(
   const specs: RmSpec[] = [];
   const files = new Map<string, RmSpec>();
   const directories = new Map<string, RmSpec>();
-  const matcherMemory = operation.scope();
   let retained = RM_EXECUTION_HEADROOM_BYTES;
-  const retainedMemory = operation.scope();
-  retainedMemory.set("other", retained);
   for (const raw of paths) {
-    const transient = operation.scope();
     let path: string;
     let directoryOnly: boolean;
-    try {
-      transient.set("other", 2 * retainedStringBytes(raw) + 64);
-      path = raw;
-      while (path.startsWith("./")) path = path.slice(2);
-      directoryOnly = path === "." || path.endsWith("/");
-      while (path.endsWith("/")) path = path.slice(0, -1);
-      if (path === ".") {
-        path = "";
-        directoryOnly = true;
-      }
-    } finally {
-      transient.dispose();
+    path = raw;
+    while (path.startsWith("./")) path = path.slice(2);
+    directoryOnly = path === "." || path.endsWith("/");
+    while (path.endsWith("/")) path = path.slice(0, -1);
+    if (path === ".") {
+      path = "";
+      directoryOnly = true;
     }
     const seen = directoryOnly ? directories : files;
     if (seen.has(path)) continue;
-    const additional = RM_SPEC_FIXED_BYTES + RM_ARRAY_ENTRY_BYTES + retainedStringBytes(path);
+    const additional = RM_SPEC_FIXED_BYTES + RM_ARRAY_ENTRY_BYTES + structuralStringBytes(path);
     requireRmRetained(retained + additional);
     retained += additional;
-    retainedMemory.set("other", retained);
     const spec: RmSpec = {
       path,
       directoryOnly,
@@ -1777,9 +1504,8 @@ function normalizeRmSpecs(
   }
   return {
     specs,
-    index: { files, directories, memory: matcherMemory },
+    index: { files, directories },
     retained,
-    retainedMemory,
   };
 }
 
@@ -1802,27 +1528,21 @@ function visitMatchingRmSpecs(
   path: string,
   visit: (spec: RmSpec) => void,
 ): boolean {
-  const transient = specs.memory.scope();
-  transient.set("other", retainedStringBytes(path) + 64);
   let matched = false;
   const found = (spec: RmSpec | undefined): void => {
     if (spec === undefined) return;
     matched = true;
     visit(spec);
   };
-  try {
-    found(specs.files.get(""));
-    found(specs.directories.get(""));
-    found(specs.files.get(path));
-    for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
-      const prefix = path.slice(0, slash);
-      found(specs.files.get(prefix));
-      found(specs.directories.get(prefix));
-    }
-    return matched;
-  } finally {
-    transient.dispose();
+  found(specs.files.get(""));
+  found(specs.directories.get(""));
+  found(specs.files.get(path));
+  for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+    const prefix = path.slice(0, slash);
+    found(specs.files.get(prefix));
+    found(specs.directories.get(prefix));
   }
+  return matched;
 }
 
 function displayRmSpec(spec: RmSpec): string {
@@ -1837,81 +1557,37 @@ function rmDirectoryError(spec: RmSpec): GitError {
   );
 }
 
-function* physicalRmPaths(
-  repo: Repository,
-  candidates: readonly RmCandidate[],
-  operation: MemoryReservation,
-): Generator<string> {
+function* physicalRmPaths(repo: Repository, candidates: readonly RmCandidate[]): Generator<string> {
   for (const candidate of candidates) {
     if (candidate.worktree === undefined) continue;
-    yield* joinedRmPath(repo.root, candidate.path, operation);
+    yield joinPath(repo.root, candidate.path);
   }
 }
 
-function* absoluteRmPaths(
-  repo: Repository,
-  paths: readonly string[],
-  operation: MemoryReservation,
-): Generator<string> {
-  for (const path of paths) yield* joinedRmPath(repo.root, path, operation);
-}
-
-function* joinedRmPath(
-  root: string,
-  path: string,
-  operation: MemoryReservation,
-): Generator<string> {
-  const memory = operation.scope();
-  memory.set("other", 2 * (retainedStringBytes(root) + retainedStringBytes(path)) + 64);
-  try {
-    const absolute = joinPath(root, path);
-    memory.set("other", retainedStringBytes(absolute));
-    yield absolute;
-  } finally {
-    memory.dispose();
-  }
+function* absoluteRmPaths(repo: Repository, paths: readonly string[]): Generator<string> {
+  for (const path of paths) yield joinPath(repo.root, path);
 }
 
 function removeRmWorktreePaths(
   worktree: Worktree,
   paths: Iterable<string>,
   recursive: boolean,
-  operation: MemoryReservation,
 ): void {
   let batch: string[] = [];
   let bytes = 2;
-  let stringBytes = 0;
-  const retainedMemory = operation.scope();
   const flush = (): void => {
     if (batch.length === 0) return;
     worktree.removeFiles(batch, { force: true, recursive });
     batch = [];
     bytes = 2;
-    stringBytes = 0;
-    retainedMemory.clear("other");
   };
-  try {
-    for (const path of paths) {
-      const itemBytes = jsonStringUtf8Length(path);
-      if (batch.length > 0 && bytes + itemBytes + 1 > RM_REMOVE_BINDING_BYTES) flush();
-      const itemStringBytes = retainedStringBytes(path);
-      retainedMemory.set(
-        "other",
-        (batch.length + 1) * RM_ARRAY_ENTRY_BYTES +
-          stringBytes +
-          itemStringBytes +
-          bytes +
-          itemBytes +
-          1,
-      );
-      batch.push(path);
-      stringBytes += itemStringBytes;
-      bytes += itemBytes + 1;
-    }
-    flush();
-  } finally {
-    retainedMemory.dispose();
+  for (const path of paths) {
+    const itemBytes = jsonStringUtf8Length(path);
+    if (batch.length > 0 && bytes + itemBytes + 1 > RM_REMOVE_BINDING_BYTES) flush();
+    batch.push(path);
+    bytes += itemBytes + 1;
   }
+  flush();
 }
 
 function jsonStringUtf8Length(value: string): number {
@@ -2061,17 +1737,8 @@ const LS_FILES_WORKTREE_OPTIONS = new OptionsSchema(
 
 /** Unique cached paths. Literal selectors stay on indexed prefix scans. */
 export function lsFiles(repo: Repository, options: LsFilesOptions = {}): string[] {
-  const operation = repo.store.reserveMemory();
-  try {
-    const pathspec = compileReadPathspec(options, operation);
-    try {
-      return pathspec.collect(indexPaths(repo, pathspec.scanPrefixes, operation));
-    } finally {
-      pathspec.release();
-    }
-  } finally {
-    operation.dispose();
-  }
+  const pathspec = compileReadPathspec(options);
+  return pathspec.collect(indexPaths(repo, pathspec.scanPrefixes));
 }
 
 /** A bounded cached/untracked worktree selection. */
@@ -2080,62 +1747,41 @@ export function lsFilesWithWorktree(
   worktree: Worktree,
   options: LsFilesWorktreeOptions = {},
 ): string[] {
-  const operation = repo.store.reserveMemory();
-  try {
-    const decodedOptions = LS_FILES_WORKTREE_OPTIONS.decode(options);
-    const others = decodedOptions.others === true;
-    const selection: LsFilesSelection = {
-      cached: decodedOptions.cached ?? !others,
-      others,
-      excludeStandard: decodedOptions.excludeStandard === true,
-    };
-    if (selection.excludeStandard && !selection.others) {
-      throw new GitError("EINVAL", "ls-files excludeStandard requires others");
-    }
-    const pathspecOptions: LsFilesOptions = {
-      paths: decodedOptions.paths,
-      limits: decodedOptions.limits,
-    };
-    if (!selection.others) {
-      const pathspec = compileReadPathspec(pathspecOptions, operation);
-      try {
-        return selection.cached
-          ? pathspec.collect(indexPaths(repo, pathspec.scanPrefixes, operation))
-          : pathspec.collect([]);
-      } finally {
-        pathspec.release();
-      }
-    }
-    const excludeRoots = lsFilesExcludeRoots(repo.root, decodedOptions.excludeRoots, operation);
-    const pathspec = compileReadPathspec(pathspecOptions, operation);
-    try {
-      const ignores = selection.excludeStandard
-        ? loadIgnoreMatcher(worktree, repo.root, { excludeRoots })
-        : undefined;
-      const index = uniqueIndexPaths(repo, pathspec.scanPrefixes, operation);
-      const walkMemory = operation.scope();
-      const walked = walkWorktreeEntriesStreamOwned(worktree, repo.root, walkMemory, {
-        excludeRoots,
-        ignores,
-      });
-      return pathspec.collect(selectedLsFilesPaths(index, walked, selection.cached));
-    } finally {
-      pathspec.release();
-    }
-  } finally {
-    operation.dispose();
+  const decodedOptions = LS_FILES_WORKTREE_OPTIONS.decode(options);
+  const others = decodedOptions.others === true;
+  const selection: LsFilesSelection = {
+    cached: decodedOptions.cached ?? !others,
+    others,
+    excludeStandard: decodedOptions.excludeStandard === true,
+  };
+  if (selection.excludeStandard && !selection.others) {
+    throw new GitError("EINVAL", "ls-files excludeStandard requires others");
   }
+  const pathspecOptions: LsFilesOptions = {
+    paths: decodedOptions.paths,
+    limits: decodedOptions.limits,
+  };
+  if (!selection.others) {
+    const pathspec = compileReadPathspec(pathspecOptions);
+    return selection.cached
+      ? pathspec.collect(indexPaths(repo, pathspec.scanPrefixes))
+      : pathspec.collect([]);
+  }
+  const excludeRoots = lsFilesExcludeRoots(repo.root, decodedOptions.excludeRoots);
+  const pathspec = compileReadPathspec(pathspecOptions);
+  const ignores = selection.excludeStandard
+    ? loadIgnoreMatcher(worktree, repo.root, { excludeRoots })
+    : undefined;
+  const index = uniqueIndexPaths(repo, pathspec.scanPrefixes);
+  const walked = walkWorktreeEntriesStreamOwned(worktree, repo.root, {
+    excludeRoots,
+    ignores,
+  });
+  return pathspec.collect(selectedLsFilesPaths(index, walked, selection.cached));
 }
 
-function lsFilesExcludeRoots(
-  root: string,
-  paths: readonly string[] | undefined,
-  operation: MemoryReservation,
-): string[] {
+function lsFilesExcludeRoots(root: string, paths: readonly string[] | undefined): string[] {
   if (paths === undefined) return [];
-  const retainedMemory = operation.scope();
-  let retainedBytes = 2 * LS_FILES_ARRAY_BYTES;
-  retainedMemory.set("other", retainedBytes);
   const roots: string[] = [];
   for (let index = 0; index < paths.length; index++) {
     const path = paths[index];
@@ -2145,14 +1791,8 @@ function lsFilesExcludeRoots(
     if (!isCanonicalAbsolutePath(path) || !isNestedPath(root, path)) {
       throw new GitError("EINVAL", "ls-files exclude roots must be canonical nested paths");
     }
-    retainedBytes += LS_FILES_ARRAY_SLOT_BYTES;
-    retainedMemory.set("other", retainedBytes);
     roots.push(path);
   }
-  retainedMemory.set(
-    "other",
-    retainedBytes + roots.length * LS_FILES_ARRAY_SLOT_BYTES + LS_FILES_ARRAY_BYTES,
-  );
   roots.sort(comparePaths);
   const coalesced: string[] = [];
   for (const path of roots) {
@@ -2161,8 +1801,6 @@ function lsFilesExcludeRoots(
     if (coalesced.length >= MAX_LS_FILES_EXCLUDE_ROOTS) {
       throw new GitError("E2BIG", `ls-files exclude roots exceeds ${MAX_LS_FILES_EXCLUDE_ROOTS}`);
     }
-    retainedBytes += LS_FILES_ARRAY_SLOT_BYTES;
-    retainedMemory.set("other", retainedBytes);
     coalesced.push(path);
   }
   return coalesced;
@@ -2171,10 +1809,9 @@ function lsFilesExcludeRoots(
 function* uniqueIndexPaths(
   repo: Repository,
   prefixes: readonly string[] | null,
-  operation: MemoryReservation,
 ): Generator<string> {
   let previous: string | undefined;
-  for (const path of indexPaths(repo, prefixes, operation)) {
+  for (const path of indexPaths(repo, prefixes)) {
     if (path === previous) continue;
     previous = path;
     yield path;
@@ -2198,31 +1835,22 @@ function* selectedLsFilesPaths(
   }
 }
 
-function* indexPaths(
-  repo: Repository,
-  prefixes: readonly string[] | null,
-  operation: MemoryReservation,
-): Generator<string> {
-  const scanMemory = operation.scope();
-  try {
-    if (prefixes === null) {
-      for (const entry of indexScanOwned(repo.checkout, scanMemory, {
-        pageSize: LS_FILES_INDEX_PAGE,
-      })) {
-        yield entry.path;
-      }
-      return;
+function* indexPaths(repo: Repository, prefixes: readonly string[] | null): Generator<string> {
+  if (prefixes === null) {
+    for (const entry of indexScanOwned(repo.checkout, {
+      pageSize: LS_FILES_INDEX_PAGE,
+    })) {
+      yield entry.path;
     }
-    for (const prefix of prefixes) {
-      for (const entry of indexScanOwned(repo.checkout, scanMemory, {
-        prefix,
-        pageSize: LS_FILES_INDEX_PAGE,
-      })) {
-        yield entry.path;
-      }
+    return;
+  }
+  for (const prefix of prefixes) {
+    for (const entry of indexScanOwned(repo.checkout, {
+      prefix,
+      pageSize: LS_FILES_INDEX_PAGE,
+    })) {
+      yield entry.path;
     }
-  } finally {
-    scanMemory.dispose();
   }
 }
 
@@ -2259,27 +1887,16 @@ function targetTree(repo: Repository, ref?: string): string | null {
 }
 
 /** Repo-relative pathspecs, without the "./" and trailing-slash noise. */
-function normalizeAddSpecs(paths: string[], operation: MemoryReservation): string[] {
-  const retainedMemory = operation.scope();
+function normalizeAddSpecs(paths: string[]): string[] {
   const out: string[] = [];
-  let retained = LS_FILES_ARRAY_BYTES;
-  retainedMemory.set("other", retained);
   for (const raw of paths) {
-    const transient = operation.scope();
     let spec: string;
-    try {
-      transient.set("other", 3 * retainedStringBytes(raw) + 64);
-      spec = raw.trim();
-      while (spec.startsWith("./")) spec = spec.slice(2);
-      spec = spec.replace(/\/+$/, "");
-      if (spec === ".") spec = "";
-    } finally {
-      transient.dispose();
-    }
+    spec = raw.trim();
+    while (spec.startsWith("./")) spec = spec.slice(2);
+    spec = spec.replace(/\/+$/, "");
+    if (spec === ".") spec = "";
     if (!out.includes(spec)) out.push(spec);
     else continue;
-    retained += LS_FILES_ARRAY_SLOT_BYTES + retainedStringBytes(spec);
-    retainedMemory.set("other", retained);
   }
   return out;
 }
@@ -2296,15 +1913,10 @@ function normalizeSpecs(paths: string[]): string[] {
   return out;
 }
 
-function uniqueSpecs(paths: readonly string[], operation: MemoryReservation): string[] {
-  const retainedMemory = operation.scope();
+function uniqueSpecs(paths: readonly string[]): string[] {
   const out: string[] = [];
-  let retained = LS_FILES_ARRAY_BYTES;
-  retainedMemory.set("other", retained);
   for (const path of paths) {
     if (out.includes(path)) continue;
-    retained += LS_FILES_ARRAY_SLOT_BYTES;
-    retainedMemory.set("other", retained);
     out.push(path);
   }
   return out;
@@ -2320,32 +1932,19 @@ function preflightLiteralAdd(
   worktree: Worktree,
   specs: readonly string[],
   excludeRoots: readonly string[] | undefined,
-  operation: MemoryReservation,
 ): LiteralAddPreflight {
-  const excluded = relativeExcludeRoots(repo.root, excludeRoots, operation);
-  const ignoredMemory = operation.scope();
+  const excluded = relativeExcludeRoots(repo.root, excludeRoots);
   const ignored: string[] = [];
-  let ignoredRetained = LS_FILES_ARRAY_BYTES;
-  ignoredMemory.set("other", ignoredRetained);
   let ignores: IgnoreMatcher | undefined;
   for (const spec of specs) {
     if (spec === "" || isExcluded(spec, excluded)) continue;
-    const current = operation.scope();
-    current.set("other", 2 * (retainedStringBytes(repo.root) + retainedStringBytes(spec)) + 64);
     const absolute = joinPath(repo.root, spec);
-    current.set("other", retainedStringBytes(absolute));
     const stat = worktree.stat(absolute);
-    current.dispose();
-    if (
-      stat === null ||
-      (stat.type !== "dir" && literalSelectionIsExactTracked(repo, spec, operation))
-    ) {
+    if (stat === null || (stat.type !== "dir" && literalSelectionIsExactTracked(repo, spec))) {
       continue;
     }
     ignores ??= loadIgnoreMatcher(worktree, repo.root, { excludeRoots: [...(excludeRoots ?? [])] });
     if (ignores.ignores(spec, stat.type === "dir")) {
-      ignoredRetained += LS_FILES_ARRAY_SLOT_BYTES;
-      ignoredMemory.set("other", ignoredRetained);
       ignored.push(spec);
     }
   }
@@ -2353,19 +1952,13 @@ function preflightLiteralAdd(
   return { ignored, ignores };
 }
 
-function literalSelectionIsExactTracked(
-  repo: Repository,
-  spec: string,
-  operation: MemoryReservation,
-): boolean {
-  const scanMemory = operation.scope();
-  const entries = indexScanOwned(repo.checkout, scanMemory, { prefix: spec, pageSize: 1 });
+function literalSelectionIsExactTracked(repo: Repository, spec: string): boolean {
+  const entries = indexScanOwned(repo.checkout, { prefix: spec, pageSize: 1 });
   try {
     const exact = entries.next();
     return exact.done !== true && exact.value.path === spec;
   } finally {
     entries.return?.();
-    scanMemory.dispose();
   }
 }
 
@@ -2383,25 +1976,18 @@ function assertPathspecsMatch(
   worktree: Worktree,
   specs: string[],
   index: IndexStore,
-  operation: MemoryReservation,
 ): void {
   for (const spec of specs) {
     if (spec === "") continue;
-    const current = operation.scope();
-    current.set("other", 2 * (retainedStringBytes(repo.root) + retainedStringBytes(spec)) + 64);
     const absolute = joinPath(repo.root, spec);
-    current.set("other", retainedStringBytes(absolute));
     const stat = worktree.stat(absolute);
-    current.dispose();
     if (stat !== null) continue;
-    const scanMemory = operation.scope();
-    const entries = indexScanOwned(index, scanMemory, { prefix: spec, pageSize: 1 });
+    const entries = indexScanOwned(index, { prefix: spec, pageSize: 1 });
     let tracked: IteratorResult<IndexEntry>;
     try {
       tracked = entries.next();
     } finally {
       entries.return?.();
-      scanMemory.dispose();
     }
     if (tracked.done !== true) continue;
     throw new PathspecNotFoundError(spec);

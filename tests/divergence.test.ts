@@ -4,7 +4,6 @@ import { utf8 } from "../src/core/bytes.js";
 import { serializeCommit, serializeTree } from "../src/core/objects.js";
 import { divergence, MAX_MERGE_BASE_COMMITS } from "../src/core/ops/merge-base.js";
 import { Repository } from "../src/core/repository.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { MAX_LOG_COMMITS } from "../src/sqlite/commits.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { type CheckoutRow, type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
@@ -349,7 +348,6 @@ describe("bounded divergence", () => {
       ahead: 19,
       behind: 0,
     });
-    active.repo.store.memory.assertIdle();
 
     const split = divergentFixture();
     try {
@@ -364,54 +362,6 @@ describe("bounded divergence", () => {
         relationship: "diverged",
         ...gitCounts(split.fixture, split.current, split.upstream),
       });
-    } finally {
-      split.fixture.dispose();
-    }
-  });
-
-  it("shares exact aggregate graph capacity and releases success and failure ownership", () => {
-    const split = divergentFixture();
-    try {
-      const attempt = (capacity: number, expectExactHighWater = false): boolean => {
-        const active = harness();
-        importReachable(active.store, split.fixture, [split.current, split.upstream]);
-        const blocker = active.repo.store.reserveMemory();
-        blocker.set("other", MAX_OPERATION_MEMORY_BYTES - capacity);
-        try {
-          let result: ReturnType<typeof divergence>;
-          try {
-            result = divergence(active.repo, {
-              current: split.current,
-              upstream: split.upstream,
-            });
-          } catch (error) {
-            expect(error).toEqual(expect.objectContaining({ code: "E2BIG" }));
-            return false;
-          }
-          expect(result).toEqual({
-            relationship: "diverged",
-            ...gitCounts(split.fixture, split.current, split.upstream),
-          });
-          if (expectExactHighWater) {
-            expect(active.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-          }
-          return true;
-        } finally {
-          blocker.dispose();
-          active.repo.store.memory.assertIdle();
-        }
-      };
-
-      let insufficient = 0;
-      let sufficient = MAX_OPERATION_MEMORY_BYTES;
-      while (sufficient - insufficient > 1) {
-        const candidate = insufficient + Math.floor((sufficient - insufficient) / 2);
-        if (attempt(candidate)) sufficient = candidate;
-        else insufficient = candidate;
-      }
-      expect(sufficient).toBeGreaterThan(1);
-      expect(attempt(sufficient, true)).toBe(true);
-      expect(attempt(sufficient - 1)).toBe(false);
     } finally {
       split.fixture.dispose();
     }

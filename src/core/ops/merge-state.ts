@@ -11,9 +11,6 @@ export const MAX_MERGE_LABEL_BYTES = 256;
 export const MAX_MERGE_IDENTITY_BYTES = 1_024;
 export const MAX_MERGE_MESSAGE_BYTES = 1024 * 1024;
 
-const MERGE_STATE_FIXED_BYTES = 2 * 1024;
-const MERGE_TOUCHED_FIXED_BYTES = 768;
-
 export type MergeStatePhase = "conflicted" | "ready";
 export type MergeStateMode = "commit" | "no-commit";
 export type MergeOrigin = "merge" | "pull";
@@ -65,18 +62,6 @@ export interface MergeTouchedPath {
 export interface MergeJournal {
   state: MergeStateMetadata;
   touched: readonly MergeTouchedPath[];
-  retainedBytes: number;
-}
-
-function checkedAdd(left: number, right: number): number {
-  if (
-    !Number.isSafeInteger(left) ||
-    !Number.isSafeInteger(right) ||
-    right > Number.MAX_SAFE_INTEGER - left
-  ) {
-    throw new GitError("E2BIG", "merge journal byte accounting overflow");
-  }
-  return left + right;
 }
 
 function boundedTextBytes(
@@ -216,8 +201,8 @@ export function requireMergePurpose(value: unknown): MergeTouchedPurpose {
   return value;
 }
 
-function validateIdentity(identity: MergeSavedIdentity | null, label: string): number {
-  if (identity === null) return 0;
+function validateIdentity(identity: MergeSavedIdentity | null, label: string): void {
+  if (identity === null) return;
   const forbiddenName = (unit: number): boolean => control(unit) || unit === 0x3c || unit === 0x3e;
   const forbiddenEmail = (unit: number): boolean => control(unit) || unit === 0x3c || unit === 0x3e;
   const name = boundedTextBytes(
@@ -233,10 +218,9 @@ function validateIdentity(identity: MergeSavedIdentity | null, label: string): n
     forbiddenEmail,
   );
   if (name === 0 || email === 0) throw new CorruptError(`merge ${label} identity is incomplete`);
-  return checkedAdd(name, email);
 }
 
-export function validateMergeStateMetadata(state: MergeStateMetadata): number {
+export function validateMergeStateMetadata(state: MergeStateMetadata): void {
   if (
     !state.originalHeadRef.startsWith("refs/heads/") ||
     state.originalHeadRef.length === "refs/heads/".length ||
@@ -266,11 +250,7 @@ export function validateMergeStateMetadata(state: MergeStateMetadata): number {
       throw new CorruptError("merge original HEAD is not a valid branch ref");
     }
   }
-  let bytes = MERGE_STATE_FIXED_BYTES;
-  bytes = checkedAdd(
-    bytes,
-    boundedTextBytes(state.originalHeadRef, "original HEAD ref", MAX_MERGE_REF_BYTES, control),
-  );
+  boundedTextBytes(state.originalHeadRef, "original HEAD ref", MAX_MERGE_REF_BYTES, control);
   const oids: readonly (readonly [string, string])[] = [
     ["original HEAD", state.originalHeadOid],
     ["current parent", state.currentParentOid],
@@ -278,7 +258,6 @@ export function validateMergeStateMetadata(state: MergeStateMetadata): number {
   ];
   for (const [label, oid] of oids) {
     if (!isOid(oid)) throw new CorruptError(`merge ${label} has an invalid object id`);
-    bytes = checkedAdd(bytes, 40);
   }
   if (state.currentParentOid !== state.originalHeadOid) {
     throw new CorruptError("merge current parent differs from the original HEAD");
@@ -292,7 +271,7 @@ export function validateMergeStateMetadata(state: MergeStateMetadata): number {
   if (state.phase === "ready" && state.mode !== "no-commit") {
     throw new CorruptError("a ready merge journal must be a no-commit merge");
   }
-  bytes = checkedAdd(bytes, requireMergeOrigin(state.mergeOrigin).length);
+  requireMergeOrigin(state.mergeOrigin);
   const currentLabelBytes = boundedTextBytes(
     state.currentLabel,
     "current label",
@@ -308,23 +287,17 @@ export function validateMergeStateMetadata(state: MergeStateMetadata): number {
   if (currentLabelBytes === 0 || incomingLabelBytes === 0) {
     throw new CorruptError("merge labels must not be empty");
   }
-  bytes = checkedAdd(bytes, currentLabelBytes);
-  bytes = checkedAdd(bytes, incomingLabelBytes);
-  bytes = checkedAdd(
-    bytes,
-    boundedTextBytes(state.message, "message", MAX_MERGE_MESSAGE_BYTES, nul),
-  );
-  bytes = checkedAdd(bytes, validateIdentity(state.author, "author"));
-  bytes = checkedAdd(bytes, validateIdentity(state.committer, "committer"));
-  return bytes;
+  boundedTextBytes(state.message, "message", MAX_MERGE_MESSAGE_BYTES, nul);
+  validateIdentity(state.author, "author");
+  validateIdentity(state.committer, "committer");
 }
 
 function validIndexMode(mode: number): boolean {
   return mode === 0o100644 || mode === 0o100755 || mode === 0o120000 || mode === 0o160000;
 }
 
-function validateIndex(snapshot: MergeIndexSnapshot | null): number {
-  if (snapshot === null) return 0;
+function validateIndex(snapshot: MergeIndexSnapshot | null): void {
+  if (snapshot === null) return;
   if (snapshot.stage !== 0) throw new CorruptError("merge index snapshot is not stage zero");
   if (!Number.isSafeInteger(snapshot.mode) || !validIndexMode(snapshot.mode)) {
     throw new CorruptError("merge index snapshot has an invalid mode");
@@ -341,11 +314,10 @@ function validateIndex(snapshot: MergeIndexSnapshot | null): number {
       throw new CorruptError(`merge index snapshot has an invalid ${label}`);
     }
   }
-  return 256;
 }
 
-function validateWorktree(snapshot: MergeWorktreeSnapshot): number {
-  if (snapshot.kind === "absent") return 0;
+function validateWorktree(snapshot: MergeWorktreeSnapshot): void {
+  if (snapshot.kind === "absent") return;
   if (
     !Number.isSafeInteger(snapshot.mode) ||
     snapshot.mode < 0 ||
@@ -358,19 +330,17 @@ function validateWorktree(snapshot: MergeWorktreeSnapshot): number {
   const type = snapshot.mode & 0o170000;
   if (snapshot.kind === "directory") {
     if (type !== 0o040000) throw new CorruptError("merge directory snapshot has an invalid mode");
-    return 128;
+    return;
   }
   const expected = snapshot.kind === "file" ? 0o100000 : 0o120000;
   if (type !== expected || !isOid(snapshot.oid)) {
     throw new CorruptError(`merge ${snapshot.kind} snapshot has an invalid identity`);
   }
-  return 256;
 }
 
-export function validateMergeTouchedPath(entry: MergeTouchedPath): number {
-  let bytes = MERGE_TOUCHED_FIXED_BYTES;
-  bytes = checkedAdd(bytes, validateMergePath(entry.path, "touched path") * 2);
-  bytes = checkedAdd(bytes, validateMergePath(entry.logicalPath, "logical path") * 2);
+export function validateMergeTouchedPath(entry: MergeTouchedPath): void {
+  validateMergePath(entry.path, "touched path");
+  validateMergePath(entry.logicalPath, "logical path");
   if (
     entry.purpose !== "primary" &&
     entry.purpose !== "current-relocation" &&
@@ -384,26 +354,24 @@ export function validateMergeTouchedPath(entry: MergeTouchedPath): number {
   if (entry.purpose !== "primary" && entry.path === entry.logicalPath) {
     throw new CorruptError("merge relocation path equals its logical path");
   }
-  bytes = checkedAdd(bytes, validateIndex(entry.index));
-  bytes = checkedAdd(bytes, validateWorktree(entry.worktree));
-  return bytes;
+  validateIndex(entry.index);
+  validateWorktree(entry.worktree);
 }
 
-export function mergeJournalRetainedBytes(
+function validateMergeJournal(
   state: MergeStateMetadata,
   touched: readonly MergeTouchedPath[],
-): number {
+): void {
   if (touched.length > MAX_MERGE_TOUCHED_PATHS) {
     throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`);
   }
   if (state.phase === "conflicted" && touched.length === 0) {
     throw new CorruptError("a conflicted merge journal must retain a touched path");
   }
-  let bytes = validateMergeStateMetadata(state);
+  validateMergeStateMetadata(state);
   for (const entry of touched) {
-    bytes = checkedAdd(bytes, validateMergeTouchedPath(entry));
+    validateMergeTouchedPath(entry);
   }
-  return bytes;
 }
 
 function savedIdentityVector(identity: MergeSavedIdentity | null): readonly unknown[] | null {
@@ -435,7 +403,7 @@ export function mergeJournalIntegrityOid(
   state: MergeStateMetadata,
   touched: readonly MergeTouchedPath[],
 ): string {
-  mergeJournalRetainedBytes(state, touched);
+  validateMergeJournal(state, touched);
   const payload: readonly unknown[] = [
     2,
     [

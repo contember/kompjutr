@@ -1,34 +1,21 @@
 // Compatibility facade for the SQLite repository store.
-export { PACK_BLOB_BATCH_TARGET_BYTES, PACK_BLOB_CALLER_HEADROOM_BYTES } from "./packs.js";
+export { PACK_BLOB_BATCH_TARGET_BYTES } from "./packs.js";
 export {
   ancestors,
-  blobIdMismatchRetainedBytes,
   CheckoutStore,
   CONFIG_SECTION_MOVE_UPDATE_SQL,
   configGetOwned,
   contentIdKey,
-  createRefMutationMemoryOwner,
   indexScanOwned,
   MAX_CONFIG_SECTION_MOVE_ROWS,
-  MAX_REF_MUTATION_RETAINED_BYTES,
-  MAX_REFLOG_ROOT_RETAINED_BYTES,
   MAX_REFLOG_ROOT_SCAN_BYTES,
   MAX_REFLOG_ROOT_SCAN_ENTRIES,
   mutateRefsOwned,
   normalizeRoot,
   PROVISIONAL_CLONE_LEASE_MS,
-  REF_MUTATION_FIXED_RETAINED_BYTES,
-  REFLOG_ROOT_ENDPOINT_BYTES,
-  REFLOG_ROOT_JS_HEADROOM_BYTES,
-  REFLOG_ROOT_OBJECT_CACHE_BYTES,
-  REFLOG_ROOT_PACK_ROW_CACHE_BYTES,
-  REFLOG_ROOT_ROW_FIXED_BYTES,
-  REFLOG_ROOT_SCAN_FIXED_BYTES,
   readAuthenticatedObjectOwned,
   readOperationStateOwned,
   readShallowOwned,
-  refMutationCheckoutRetainedBytes,
-  refMutationCreateRetainedBytes,
   replaceOperationJournalOwned,
   replaceOperationStateOwned,
   writeBatchOwned,
@@ -64,11 +51,7 @@ export type {
   RepositoryLifecycle,
   StoreOptions,
 } from "./store/contracts.js";
-export {
-  FetchPublicationToken,
-  RefMutationMemoryOwner,
-  TrackingRefPublicationToken,
-} from "./store/contracts.js";
+export { FetchPublicationToken, TrackingRefPublicationToken } from "./store/contracts.js";
 export {
   advanceMaintenanceRootSnapshotOwned,
   listCheckoutsOwned,

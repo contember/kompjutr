@@ -1,6 +1,4 @@
 import { GitError } from "../../core/errors.js";
-import { retainedStringBytes } from "../../core/retained.js";
-import { MemoryCoordinator, type MemoryReservation } from "../../memory.js";
 import {
   GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
   GIT_CLI_MAX_LOG_COUNT,
@@ -15,8 +13,6 @@ const OPTION_KEYS = new Set([
   "discardStderr",
   "logLimitHint",
 ]);
-const RESULT_FIXED_BYTES = 64;
-
 const USAGE = {
   status:
     "usage: git status [<options>] [--] [<pathspec>...]\n\n    -v, --[no-]verbose    be verbose\n    -s, --[no-]short      show status concisely\n    -b, --[no-]branch     show branch information\n    --[no-]show-stash     show stash information\n    --[no-]ahead-behind   compute full ahead/behind values\n    --[no-]porcelain[=<version>]\n                          machine-readable output\n    --[no-]long           show status in long format (default)\n    -z, --[no-]null       terminate entries with NUL\n    -u, --[no-]untracked-files[=<mode>]\n                          show untracked files, optional modes: all, normal, no. (Default: all)\n    --[no-]ignored[=<mode>]\n                          show ignored files, optional modes: traditional, matching, no. (Default: traditional)\n    --[no-]ignore-submodules[=<when>]\n                          ignore changes to submodules, optional when: all, dirty, untracked. (Default: all)\n    --[no-]column[=<style>]\n                          list untracked files in columns\n    --no-renames          do not detect renames\n    --renames             opposite of --no-renames\n    -M, --find-renames[=<n>]\n                          detect renames, optionally set similarity index\n\n",
@@ -46,7 +42,6 @@ export type GitCliUsageCommand = keyof typeof USAGE;
 
 export interface GitCliOutputContext {
   readonly options: ResolvedGitCliRunOptions;
-  readonly reservation: MemoryReservation;
 }
 
 export function gitCliResult(stdout: string, stderr: string, exitCode: number): GitCliResult {
@@ -83,7 +78,7 @@ export function gitCliUnknownOptionFailure(
       context,
     );
   }
-  if (context?.options.discardStderr === true) return emptyDiagnostic(129, context);
+  if (context?.options.discardStderr === true) return emptyDiagnostic(129);
   const offset = option.startsWith("--") ? 2 : 1;
   return gitCliDiagnosticSliceResult(
     "error: unknown option `",
@@ -188,61 +183,40 @@ export function resolveGitCliRunOptions(value: unknown): ResolvedGitCliRunOption
 export function boundedGitCliResult(
   result: GitCliResult,
   options: ResolvedGitCliRunOptions,
-  owningReservation?: MemoryReservation,
 ): GitCliResult {
-  const reservation = owningReservation ?? new MemoryCoordinator().reserve();
-  try {
-    if (typeof result !== "object" || result === null || Array.isArray(result)) {
-      throw new GitError("EINVAL", "git CLI handler result must be an object");
-    }
-    const stdout: unknown = Reflect.get(result, "stdout");
-    const stderr: unknown = Reflect.get(result, "stderr");
-    const exitCode: unknown = Reflect.get(result, "exitCode");
-    validateResultString(stdout, "stdout");
-    validateResultString(stderr, "stderr");
-    validateExitCode(exitCode);
-    const initialRetained = gitCliResultRetainedBytes(stdout, stderr);
-    reservation.set("flat", initialRetained);
-    const stdoutBytes = gitCliUtf8ByteLength(stdout, "git CLI stdout", false);
-    if (stdoutBytes > options.maxStdoutBytes) {
-      throw new GitError("E2BIG", `git CLI stdout exceeds ${options.maxStdoutBytes} bytes`);
-    }
-    if (options.discardStderr) {
-      if (stdoutBytes > options.maxCombinedOutputBytes) {
-        throw new GitError(
-          "E2BIG",
-          `git CLI combined output exceeds ${options.maxCombinedOutputBytes} bytes`,
-        );
-      }
-      const retained = gitCliResultRetainedBytes(stdout, "");
-      reservation.set("flat", initialRetained + RESULT_FIXED_BYTES);
-      const discarded = { stdout, stderr: "", exitCode };
-      result = discarded;
-      reservation.set("flat", retained);
-      return result;
-    }
-    const stderrBytes = gitCliUtf8ByteLength(stderr, "git CLI stderr", false);
-    if (stderrBytes > options.maxStderrBytes) {
-      throw new GitError("E2BIG", `git CLI stderr exceeds ${options.maxStderrBytes} bytes`);
-    }
-    if (stderrBytes > options.maxCombinedOutputBytes - stdoutBytes) {
+  if (typeof result !== "object" || result === null || Array.isArray(result)) {
+    throw new GitError("EINVAL", "git CLI handler result must be an object");
+  }
+  const stdout: unknown = Reflect.get(result, "stdout");
+  const stderr: unknown = Reflect.get(result, "stderr");
+  const exitCode: unknown = Reflect.get(result, "exitCode");
+  validateResultString(stdout, "stdout");
+  validateResultString(stderr, "stderr");
+  validateExitCode(exitCode);
+  const stdoutBytes = gitCliUtf8ByteLength(stdout, "git CLI stdout", false);
+  if (stdoutBytes > options.maxStdoutBytes) {
+    throw new GitError("E2BIG", `git CLI stdout exceeds ${options.maxStdoutBytes} bytes`);
+  }
+  if (options.discardStderr) {
+    if (stdoutBytes > options.maxCombinedOutputBytes) {
       throw new GitError(
         "E2BIG",
         `git CLI combined output exceeds ${options.maxCombinedOutputBytes} bytes`,
       );
     }
-    reservation.set("flat", initialRetained + RESULT_FIXED_BYTES);
-    const checked = { stdout, stderr, exitCode };
-    result = checked;
-    reservation.set("flat", initialRetained);
-    return result;
-  } finally {
-    if (owningReservation === undefined) reservation.dispose();
+    return { stdout, stderr: "", exitCode };
   }
-}
-
-export function gitCliResultRetainedBytes(stdout: string, stderr: string): number {
-  return RESULT_FIXED_BYTES + retainedStringBytes(stdout) + retainedStringBytes(stderr);
+  const stderrBytes = gitCliUtf8ByteLength(stderr, "git CLI stderr", false);
+  if (stderrBytes > options.maxStderrBytes) {
+    throw new GitError("E2BIG", `git CLI stderr exceeds ${options.maxStderrBytes} bytes`);
+  }
+  if (stderrBytes > options.maxCombinedOutputBytes - stdoutBytes) {
+    throw new GitError(
+      "E2BIG",
+      `git CLI combined output exceeds ${options.maxCombinedOutputBytes} bytes`,
+    );
+  }
+  return { stdout, stderr, exitCode };
 }
 
 export function gitCliUtf8ByteLength(value: string, label: string, rejectNul: boolean): number {
@@ -303,7 +277,7 @@ export function gitCliDiagnosticResultParts(
   exitCode: number,
   context?: GitCliOutputContext,
 ): GitCliResult {
-  if (context?.options.discardStderr === true) return emptyDiagnostic(exitCode, context);
+  if (context?.options.discardStderr === true) return emptyDiagnostic(exitCode);
   if (context !== undefined) {
     const stderrBytes =
       gitCliUtf8ByteLength(first, "git CLI stderr", false) +
@@ -320,12 +294,6 @@ export function gitCliDiagnosticResultParts(
         `git CLI combined output exceeds ${context.options.maxCombinedOutputBytes} bytes`,
       );
     }
-    context.reservation.set(
-      "flat",
-      diagnosticRetainedBytes(
-        first.length + second.length + third.length + fourth.length + fifth.length,
-      ),
-    );
   }
   return gitCliResult("", `${first}${second}${third}${fourth}${fifth}`, exitCode);
 }
@@ -338,8 +306,7 @@ export function gitCliDiagnosticSliceResult(
   exitCode: number,
   context?: GitCliOutputContext,
 ): GitCliResult {
-  if (context?.options.discardStderr === true) return emptyDiagnostic(exitCode, context);
-  const sliceBytes = retainedStringUnits(source.length - start);
+  if (context?.options.discardStderr === true) return emptyDiagnostic(exitCode);
   if (context !== undefined) {
     const stderrBytes =
       gitCliUtf8ByteLength(prefix, "git CLI stderr", false) +
@@ -354,29 +321,13 @@ export function gitCliDiagnosticSliceResult(
         `git CLI combined output exceeds ${context.options.maxCombinedOutputBytes} bytes`,
       );
     }
-    context.reservation.set(
-      "flat",
-      diagnosticRetainedBytes(prefix.length + source.length - start + suffix.length) + sliceBytes,
-    );
   }
-  let value = source.slice(start);
-  const result = gitCliResult("", `${prefix}${value}${suffix}`, exitCode);
-  value = "";
-  context?.reservation.set("flat", gitCliResultRetainedBytes(result.stdout, result.stderr));
-  return result;
+  const value = source.slice(start);
+  return gitCliResult("", `${prefix}${value}${suffix}`, exitCode);
 }
 
-function emptyDiagnostic(exitCode: number, context: GitCliOutputContext): GitCliResult {
-  context.reservation.set("flat", gitCliResultRetainedBytes("", ""));
+function emptyDiagnostic(exitCode: number): GitCliResult {
   return gitCliResult("", "", exitCode);
-}
-
-function diagnosticRetainedBytes(stderrUnits: number): number {
-  return RESULT_FIXED_BYTES + retainedStringBytes("") + retainedStringUnits(stderrUnits);
-}
-
-function retainedStringUnits(codeUnits: number): number {
-  return retainedStringBytes("") + codeUnits * 2;
 }
 
 function gitCliUtf8ByteLengthRange(value: string, start: number, label: string): number {

@@ -1,14 +1,11 @@
 import { isOid } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
 import { hashObject, type ObjectType, parseCommit } from "../core/objects.js";
-import { type ChunkedBytes, type ChunkPool, PACK_CHUNK_BYTES } from "../core/pack/chunks.js";
-import type { MemoryReservation } from "../memory.js";
+import { type ChunkedBytes, PACK_CHUNK_BYTES } from "../core/pack/chunks.js";
 import {
   COMMIT_CACHE_FLUSH_BYTES,
   type CommitCacheEntry,
   type CommitCacheSource,
-  commitCacheFlushTransientBytes,
-  commitPreparationTransientBytes,
   insertCommitCaches,
   prepareCommitCacheOwned,
 } from "./commits.js";
@@ -26,34 +23,16 @@ const PACK_TREE_BATCH_SOURCES = 2048;
 const PACK_TREE_SOURCE_BYTES = 256;
 export const PACK_TREE_CHUNK_BYTES = 64;
 const PACK_TREE_CHUNK_ARRAY_BYTES = 64;
-const PACK_TREE_DIRECT_FIXED_BYTES =
-  PACK_TREE_SOURCE_BYTES + PACK_TREE_CHUNK_ARRAY_BYTES + PACK_TREE_CHUNK_BYTES;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
 export const PACK_COMMIT_PAYLOAD_BYTES = 256;
 const PACK_INDEX_BATCH_BYTES = 1024 * 1024;
 const PACK_INDEX_BATCH_ROWS = 2048;
 export const PACK_PENDING_PAGE_ROWS = 4096;
-export const PACK_PENDING_PAGE_MEMORY_BYTES = PACK_PENDING_PAGE_ROWS * 512;
-export const PACK_INDEX_MEMORY_BYTES = 3 * 1024 * 1024;
-export const PACK_OFFSET_WINDOW_BYTES = 2 * 1024 * 1024;
-export const PACK_INGEST_METADATA_BYTES =
-  PACK_INDEX_MEMORY_BYTES + PACK_OFFSET_WINDOW_BYTES + PACK_PENDING_PAGE_MEMORY_BYTES;
 
-function largeCommitParserBytes(data: Uint8Array): number {
-  let physicalLines = 1;
-  for (const byte of data) if (byte === 0x0a) physicalLines++;
-  const retained = 1_024 + 6 * data.length + 128 * physicalLines;
-  if (!Number.isSafeInteger(retained)) {
-    throw new GitError("E2BIG", "packed commit parser memory accounting overflow");
-  }
-  return retained;
-}
-
-function validateLargeCommit(source: CommitCacheSource, reservation: MemoryReservation): void {
+function validateLargeCommit(source: CommitCacheSource): void {
   if (!Number.isSafeInteger(source.repoId) || source.repoId < 1 || !isOid(source.oid)) {
     throw new CorruptError("commit cache source identity is invalid");
   }
-  reservation.set("commit", largeCommitParserBytes(source.data));
   if (hashObject("commit", source.data) !== source.oid) {
     throw new CorruptError(`commit cache source ${source.oid} does not match its bytes`);
   }
@@ -236,14 +215,7 @@ export class PackTreeIndex {
   #payloadBytes = 0;
   #retainedBytes = 0;
 
-  constructor(
-    private readonly db: SqlDatabase,
-    private readonly reservation: MemoryReservation,
-  ) {}
-
-  get retainedBytes(): number {
-    return this.#retainedBytes;
-  }
+  constructor(private readonly db: SqlDatabase) {}
 
   addBuffered(
     repoId: number,
@@ -262,17 +234,11 @@ export class PackTreeIndex {
       this.flush();
     }
     if (retained > PACK_TREE_BATCH_BYTES) {
-      this.#direct(PACK_TREE_DIRECT_FIXED_BYTES, () =>
-        indexTreeSource(
-          this.db,
-          this.#directSource(repoId, treeOid, sourceId, objectSize),
-          [data],
-          this.reservation,
-        ),
+      this.#direct(() =>
+        indexTreeSource(this.db, this.#directSource(repoId, treeOid, sourceId, objectSize), [data]),
       );
       return;
     }
-    this.reservation.set("tree", this.#retainedBytes + retained);
     this.#sources.push(this.#source(repoId, treeOid, sourceId, objectSize, [data]));
     this.#payloadBytes += data.length;
     this.#retainedBytes += retained;
@@ -286,14 +252,9 @@ export class PackTreeIndex {
     chunks: () => Iterable<Uint8Array>,
   ): void {
     this.flush();
-    this.#direct(PACK_TREE_DIRECT_FIXED_BYTES, () => {
+    this.#direct(() => {
       const source = this.#directSource(repoId, treeOid, sourceId, objectSize);
-      indexTreeSource(
-        this.db,
-        source,
-        this.#ownDirectChunks(chunks(), PACK_TREE_DIRECT_FIXED_BYTES),
-        this.reservation,
-      );
+      indexTreeSource(this.db, source, chunks());
     });
   }
 
@@ -308,9 +269,9 @@ export class PackTreeIndex {
     const retained = this.#sourceBytes(target.length, chunkCount);
     if (retained > PACK_TREE_BATCH_BYTES) {
       this.flush();
-      this.#direct(PACK_TREE_DIRECT_FIXED_BYTES, () => {
+      this.#direct(() => {
         const source = this.#directSource(repoId, treeOid, sourceId, objectSize);
-        const sink = createTreeIndexSink(this.db, source, this.reservation);
+        const sink = createTreeIndexSink(this.db, source);
         try {
           for (const chunk of target.chunks()) sink.push(chunk);
           sink.finish();
@@ -328,28 +289,21 @@ export class PackTreeIndex {
     ) {
       this.flush();
     }
-    this.reservation.set("tree", this.#retainedBytes + retained);
     const chunks: Uint8Array[] = [];
-    try {
-      for (const chunk of target.chunks()) chunks.push(chunk.slice());
-      this.#sources.push(this.#source(repoId, treeOid, sourceId, objectSize, chunks));
-      this.#payloadBytes += target.length;
-      this.#retainedBytes += retained;
-    } catch (error) {
-      this.reservation.set("tree", this.#retainedBytes);
-      throw error;
-    }
+    for (const chunk of target.chunks()) chunks.push(chunk.slice());
+    this.#sources.push(this.#source(repoId, treeOid, sourceId, objectSize, chunks));
+    this.#payloadBytes += target.length;
+    this.#retainedBytes += retained;
   }
 
   flush(): void {
     if (this.#sources.length === 0) return;
     try {
-      this.db.transactionSync(() => indexTreeSources(this.db, this.#sources, this.reservation));
+      this.db.transactionSync(() => indexTreeSources(this.db, this.#sources));
     } finally {
       this.#sources.length = 0;
       this.#payloadBytes = 0;
       this.#retainedBytes = 0;
-      this.reservation.clear("tree");
     }
   }
 
@@ -379,28 +333,8 @@ export class PackTreeIndex {
     return { repoId, treeOid, storage: "pack", sourceId, objectSize };
   }
 
-  *#ownDirectChunks(chunks: Iterable<Uint8Array>, retainedBytes: number): Generator<Uint8Array> {
-    for (const chunk of chunks) {
-      const currentBytes = retainedBytes + chunk.length;
-      if (!Number.isSafeInteger(currentBytes)) {
-        throw new GitError("E2BIG", "packed tree stream ownership is too large");
-      }
-      this.reservation.set("tree", currentBytes);
-      try {
-        yield chunk;
-      } finally {
-        this.reservation.set("tree", retainedBytes);
-      }
-    }
-  }
-
-  #direct(retainedBytes: number, write: () => void): void {
-    try {
-      this.reservation.set("tree", retainedBytes);
-      this.db.transactionSync(write);
-    } finally {
-      this.reservation.clear("tree");
-    }
+  #direct(write: () => void): void {
+    this.db.transactionSync(write);
   }
 }
 
@@ -418,52 +352,20 @@ export class PackCommitIndex {
     private readonly repoId: number,
     private readonly packId: number,
     private readonly objects: PackObjectBatch,
-    private readonly reservation: MemoryReservation,
-    private readonly pool: ChunkPool,
   ) {}
 
-  get retainedBytes(): number {
-    return this.#bytes;
-  }
-
   add(source: CommitCacheSource): void {
-    this.reservation.set("pool", this.pool.allocatedBytes);
-    let completed = false;
-    try {
-      this.#add(source);
-      completed = true;
-    } finally {
-      if (completed) this.reservation.set("pool", this.pool.allocatedBytes);
-    }
+    this.#add(source);
   }
 
   #add(source: CommitCacheSource): void {
     if (source.data.length > COMMIT_CACHE_FLUSH_BYTES) {
-      const parserBytes = largeCommitParserBytes(source.data);
-      if (this.#entries.length > 0 && parserBytes > this.reservation.remainingBytes) {
-        this.#stage();
-      }
-      const parser = this.reservation.scope();
-      try {
-        validateLargeCommit(source, parser);
-      } finally {
-        parser.dispose();
-      }
+      validateLargeCommit(source);
       this.#expected++;
       this.#skipped++;
       return;
     }
-    const prepareBytes = commitPreparationTransientBytes(source.data.length);
-    if (this.#entries.length > 0 && prepareBytes > this.reservation.remainingBytes) {
-      this.#stage();
-    }
-    const preparation = this.reservation.scope();
-    let entry: CommitCacheEntry;
-    try {
-      entry = prepareCommitCacheOwned(source, preparation);
-    } finally {
-      preparation.dispose();
-    }
+    const entry = prepareCommitCacheOwned(source);
     this.#expected++;
     if (entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES) {
       this.#skipped++;
@@ -476,7 +378,6 @@ export class PackCommitIndex {
     ) {
       this.#stage();
     }
-    this.reservation.set("commit", this.#bytes + entry.cacheBytes);
     this.#entries.push(entry);
     this.#bytes += entry.cacheBytes;
   }
@@ -520,28 +421,22 @@ export class PackCommitIndex {
 
   #insert(): void {
     if (this.#entries.length === 0) return;
-    this.reservation.set("commit", this.#bytes + commitCacheFlushTransientBytes(this.#entries));
-    try {
-      const result = insertCommitCaches(this.db, this.#entries);
-      if (
-        result.written !== result.eligible ||
-        result.eligible + result.skipped !== this.#entries.length
-      ) {
-        throw new CorruptError(
-          `packed commit cache wrote ${result.written} of ${result.eligible} eligible rows and skipped ${result.skipped} of ${this.#entries.length}`,
-        );
-      }
-      this.#eligible += result.eligible;
-      this.#skipped += result.skipped;
-      this.#written += result.written;
-    } finally {
-      this.reservation.set("commit", this.#bytes);
+    const result = insertCommitCaches(this.db, this.#entries);
+    if (
+      result.written !== result.eligible ||
+      result.eligible + result.skipped !== this.#entries.length
+    ) {
+      throw new CorruptError(
+        `packed commit cache wrote ${result.written} of ${result.eligible} eligible rows and skipped ${result.skipped} of ${this.#entries.length}`,
+      );
     }
+    this.#eligible += result.eligible;
+    this.#skipped += result.skipped;
+    this.#written += result.written;
   }
 
   #clear(): void {
     this.#entries.length = 0;
     this.#bytes = 0;
-    this.reservation.clear("commit");
   }
 }

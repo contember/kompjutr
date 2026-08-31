@@ -40,7 +40,6 @@ import {
   type OperationStepMetadata,
   operationAlreadyActive,
   operationJournalIntegrityOid,
-  operationJournalRetainedBytes,
   operationKindMismatch,
   operationNotActive,
   operationStepsForState,
@@ -49,34 +48,23 @@ import {
   type RevertJournal,
 } from "../../core/ops/operation-state.js";
 import { hasCanonicalRefSyntax } from "../../core/ref-name.js";
-import { retainedStringBytes } from "../../core/retained.js";
 import { Sha1 } from "../../core/sha1.js";
 import { comparePaths } from "../../core/streams.js";
 import { deflate, InflateInto, InflateSizeError, InflateStream } from "../../core/zlib.js";
-import type { MemoryCoordinator, MemoryReservation } from "../../memory.js";
 import { BLOB_ID_CACHE_ELIGIBILITY_BYTES, BLOB_ID_GENERATION_EXHAUSTED } from "../blob-id-cache.js";
 import {
   type CommitCacheEntry,
   type CommitCacheWriteResult,
   type CommitGraphLimits,
-  commitCacheFlushTransientBytes,
-  commitPreparationTransientBytes,
   indexCommitSource,
   insertCommitCaches,
   prepareCommitCache,
-  prepareCommitCacheOwned,
   readCommitCache,
   readCommitGraph,
 } from "../commits.js";
 import { blob, readBlob, type SqlDatabase } from "../db.js";
 import { bumpMaintenanceRootEpoch } from "../maintenance/control.js";
-import {
-  MAX_PACK_DELTA_WORKING_BYTES,
-  MAX_PACK_ROW_CACHE_BYTES,
-  PACK_BLOB_BATCH_TARGET_BYTES,
-  type PackReadOwnership,
-  PackStore,
-} from "../packs.js";
+import { MAX_PACK_DELTA_WORKING_BYTES, PACK_BLOB_BATCH_TARGET_BYTES, PackStore } from "../packs.js";
 import {
   rawSymbolicTarget,
   refTextBytes,
@@ -132,13 +120,7 @@ import type {
   RepositoryLifecycle,
   StoreOptions,
 } from "./contracts.js";
-import {
-  FetchPublicationToken,
-  REF_MUTATION_MEMORY_OWNER_TOKEN,
-  RefMutationMemoryOwner,
-  retainedStringUnits,
-  TrackingRefPublicationToken,
-} from "./contracts.js";
+import { FetchPublicationToken, TrackingRefPublicationToken } from "./contracts.js";
 import type { SharedRepoOwnedOperations, SharedRepoStore } from "./shared.js";
 
 /** Bytes per `git_object_chunks` row. */
@@ -180,36 +162,18 @@ export const DEFAULT_INDEX_FLUSH = 512;
 
 /** Non-refusing JSON page target with framing headroom below 2 MiB. */
 export const INDEX_MUTATION_JSON_FLUSH_BYTES = 1_500_000;
-export const INDEX_MUTATION_ROW_BYTES = 192;
-export const INITIAL_STATE_FIXED_BYTES = 64 * 1024;
-export const INITIAL_BLOB_ROW_JSON_BYTES = 96;
-export const INITIAL_INDEX_EMPTY_RESERVED_BYTES = 8;
-export const INITIAL_BLOB_EMPTY_RESERVED_BYTES = 32;
-export const INITIAL_STATE_CONSTRUCTOR_BYTES =
-  INITIAL_STATE_FIXED_BYTES +
-  INITIAL_INDEX_EMPTY_RESERVED_BYTES +
-  INITIAL_BLOB_EMPTY_RESERVED_BYTES;
-
 /** Parsed commits staged beside encoded object bytes before a batch flush. */
 export const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
 
 export const DEFAULT_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 export const REFLOG_RETENTION_SECONDS = 90 * 24 * 60 * 60;
 export const REFLOG_RETENTION_ROWS = 1_024;
-export const MAX_REFLOG_ROOT_RETAINED_BYTES = 100 * 1024 * 1024 - 1;
-export const REFLOG_ROOT_OBJECT_CACHE_BYTES = DEFAULT_OBJECT_CACHE_BYTES;
-export const REFLOG_ROOT_PACK_ROW_CACHE_BYTES = MAX_PACK_ROW_CACHE_BYTES;
-export const REFLOG_ROOT_JS_HEADROOM_BYTES = 4 * 1024 * 1024;
-export const MAX_REFLOG_ROOT_SCAN_BYTES =
-  MAX_REFLOG_ROOT_RETAINED_BYTES -
-  REFLOG_ROOT_OBJECT_CACHE_BYTES -
-  REFLOG_ROOT_PACK_ROW_CACHE_BYTES -
-  REFLOG_ROOT_JS_HEADROOM_BYTES;
-export const REFLOG_ROOT_SCAN_FIXED_BYTES = 8 * 1024 * 1024;
+export const MAX_REFLOG_ROOT_SCAN_BYTES = 88_080_383;
+const REFLOG_ROOT_SCAN_FIXED_BYTES = 8 * 1024 * 1024;
 /** Legacy per-row envelope retained only to preserve the reviewed structural row cap. */
-export const REFLOG_ROOT_ENDPOINT_BYTES = 4_096;
+const REFLOG_ROOT_ENDPOINT_BYTES = 4_096;
 /** Numeric slots, row handles, and sort/group metadata retained per physical row. */
-export const REFLOG_ROOT_ROW_FIXED_BYTES = 512;
+const REFLOG_ROOT_ROW_FIXED_BYTES = 512;
 export const MAX_REFLOG_ROOT_SCAN_ENTRIES = Math.floor(
   (MAX_REFLOG_ROOT_SCAN_BYTES - REFLOG_ROOT_SCAN_FIXED_BYTES) / (2 * REFLOG_ROOT_ENDPOINT_BYTES),
 );
@@ -217,11 +181,6 @@ export const MAX_REF_MUTATION_INPUTS = 100_000;
 export const MAX_FETCH_NAMESPACES = 1_024;
 export const MAX_FETCH_PUBLICATION_INPUTS = 100_000;
 export const CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES = 1_024;
-export const CHECKOUT_RESULT_ARRAY_BYTES = 128;
-export const CHECKOUT_RESULT_ARRAY_SLOT_BYTES = 8;
-export const CHECKOUT_RESULT_ROW_BYTES = 128;
-export const CHECKOUT_ROUTING_MAP_BYTES = 128;
-export const CHECKOUT_ROUTING_MAP_ENTRY_BYTES = 72;
 export const MAX_CONFIG_SECTION_MOVE_ROWS = 1_024;
 export const CONFIG_SECTION_MOVE_UPDATE_SQL = `UPDATE git_config
        SET path = ? || substr(path, length(?) + 1)
@@ -233,15 +192,6 @@ export const CONFIG_SECTION_MOVE_UPDATE_SQL = `UPDATE git_config
        )`;
 export const PROVISIONAL_CLONE_LEASE_MS = 5 * 60 * 1_000;
 export const PROVISIONAL_CLONE_RENEW_WINDOW_MS = PROVISIONAL_CLONE_LEASE_MS / 2;
-export const REF_ROW_RETAINED_BYTES = 256;
-export const REF_MUTATION_ITEM_RETAINED_BYTES = 512;
-export const REF_MUTATION_EVENT_RETAINED_BYTES = 2_048;
-export const REF_MUTATION_METADATA_RETAINED_BYTES = 256;
-export const REF_MUTATION_SQL_HEADROOM_BYTES = 8 * 1024 * 1024;
-export const MAX_REF_MUTATION_RETAINED_BYTES = 64 * 1024 * 1024;
-export const REF_MUTATION_STATE_FIXED_RETAINED_BYTES = REF_ROW_RETAINED_BYTES;
-export const REF_MUTATION_FIXED_RETAINED_BYTES =
-  REF_MUTATION_SQL_HEADROOM_BYTES + REF_MUTATION_STATE_FIXED_RETAINED_BYTES;
 /** Conservative SQL ceiling for one direct-ref or raw-HEAD publication. */
 
 export interface ConfigSectionCandidateMetadata {
@@ -256,39 +206,7 @@ export interface ConfigSectionMoveMetadata extends ConfigSectionCandidateMetadat
   readonly valueBytes: number;
 }
 
-export function createRefMutationMemoryOwner(store: SharedRepoStore): RefMutationMemoryOwner {
-  const reservation = store.reserveMemory();
-  try {
-    return new RefMutationMemoryOwner(REF_MUTATION_MEMORY_OWNER_TOKEN, reservation);
-  } catch (error) {
-    reservation.dispose();
-    throw error;
-  }
-}
-
-export function validateRefMutationMemoryOwner(
-  store: SharedRepoStore,
-  owner: RefMutationMemoryOwner,
-  operation: string,
-): MemoryReservation {
-  if (!(owner instanceof RefMutationMemoryOwner)) {
-    throw new GitError("EINVAL", `${operation} memory owner was not issued by the store`);
-  }
-  const reservation = owner.memoryReservation();
-  if (reservation.disposed) {
-    throw new GitError("EINVAL", `${operation} memory owner is disposed`);
-  }
-  if (!store.ownsMemoryReservation(reservation)) {
-    throw new GitError("EINVAL", `${operation} memory owner belongs to another repository`);
-  }
-  return reservation;
-}
-
-export type OwnedRefMutation = (
-  mutation: RefMutation,
-  metadata: RefLogMetadata,
-  owner: RefMutationMemoryOwner,
-) => boolean;
+export type OwnedRefMutation = (mutation: RefMutation, metadata: RefLogMetadata) => boolean;
 
 export const OWNED_REF_MUTATIONS = new WeakMap<CheckoutStore, OwnedRefMutation>();
 
@@ -296,48 +214,37 @@ export function mutateRefsOwned(
   store: CheckoutStore,
   mutation: RefMutation,
   metadata: RefLogMetadata,
-  owner: RefMutationMemoryOwner,
 ): boolean {
   const mutate = OWNED_REF_MUTATIONS.get(store);
   if (mutate === undefined) throw new GitError("EINVAL", "checkout store is not active");
-  return mutate(mutation, metadata, owner);
+  return mutate(mutation, metadata);
 }
 
-export type OwnedConfigGet = (path: string, owner: RefMutationMemoryOwner) => string | undefined;
+export type OwnedConfigGet = (path: string) => string | undefined;
 
 export const OWNED_CONFIG_GETTERS = new WeakMap<SharedRepoStore, OwnedConfigGet>();
 
-/** Internal last-value config read retained by an existing ref-mutation owner. */
-export function configGetOwned(
-  store: SharedRepoStore,
-  path: string,
-  owner: RefMutationMemoryOwner,
-): string | undefined {
+/** Internal last-value config read through the shared repository seam. */
+export function configGetOwned(store: SharedRepoStore, path: string): string | undefined {
   const get = OWNED_CONFIG_GETTERS.get(store);
   if (get === undefined)
     throw new GitError("EINVAL", "shared repository operations are unavailable");
-  return get(path, owner);
+  return get(path);
 }
 
 export interface OwnedOperationJournalAccess {
-  read(reservation: MemoryReservation): OperationJournal | null;
+  read(): OperationJournal | null;
   write(
     state: OperationStateMetadata,
     steps: readonly OperationStepMetadata[],
     touched: readonly MergeTouchedPath[],
-    reservation: MemoryReservation,
   ): void;
-  replaceState(
-    expectedIntegrityOid: string,
-    state: OperationStateMetadata,
-    reservation: MemoryReservation,
-  ): void;
+  replaceState(expectedIntegrityOid: string, state: OperationStateMetadata): void;
   replaceJournal(
     expectedIntegrityOid: string,
     state: OperationStateMetadata,
     steps: readonly OperationStepMetadata[],
     touched: readonly MergeTouchedPath[],
-    reservation: MemoryReservation,
   ): void;
 }
 
@@ -349,51 +256,39 @@ export function operationJournalAccess(store: CheckoutStore): OwnedOperationJour
   return access;
 }
 
-/** Internal journal read retained under an existing repository operation. */
-export function readOperationStateOwned(
-  store: CheckoutStore,
-  reservation: MemoryReservation,
-): OperationJournal | null {
-  return operationJournalAccess(store).read(reservation);
+/** Internal journal read through the installed checkout seam. */
+export function readOperationStateOwned(store: CheckoutStore): OperationJournal | null {
+  return operationJournalAccess(store).read();
 }
 
-/** Internal journal creation retained under an existing repository operation. */
+/** Internal journal creation through the installed checkout seam. */
 export function writeOperationJournalOwned(
   store: CheckoutStore,
   state: OperationStateMetadata,
   steps: readonly OperationStepMetadata[],
   touched: readonly MergeTouchedPath[],
-  reservation: MemoryReservation,
 ): void {
-  operationJournalAccess(store).write(state, steps, touched, reservation);
+  operationJournalAccess(store).write(state, steps, touched);
 }
 
-/** Internal metadata replacement retained under an existing repository operation. */
+/** Internal metadata replacement through the installed checkout seam. */
 export function replaceOperationStateOwned(
   store: CheckoutStore,
   expectedIntegrityOid: string,
   state: OperationStateMetadata,
-  reservation: MemoryReservation,
 ): void {
-  operationJournalAccess(store).replaceState(expectedIntegrityOid, state, reservation);
+  operationJournalAccess(store).replaceState(expectedIntegrityOid, state);
 }
 
-/** Internal whole-journal replacement retained under an existing repository operation. */
+/** Internal whole-journal replacement through the installed checkout seam. */
 export function replaceOperationJournalOwned(
   store: CheckoutStore,
   expectedIntegrityOid: string,
   state: OperationStateMetadata,
   steps: readonly OperationStepMetadata[],
   touched: readonly MergeTouchedPath[],
-  reservation: MemoryReservation,
 ): void {
-  operationJournalAccess(store).replaceJournal(
-    expectedIntegrityOid,
-    state,
-    steps,
-    touched,
-    reservation,
-  );
+  operationJournalAccess(store).replaceJournal(expectedIntegrityOid, state, steps, touched);
 }
 
 export interface RefLogEvent {
@@ -419,7 +314,6 @@ export interface NormalizedRefMutation {
   deletes: Set<string>;
   head: string | undefined;
   expected: RefMutationExpected | undefined;
-  budget: RefMutationBudget;
 }
 
 export interface FetchPublicationState {
@@ -430,9 +324,6 @@ export interface FetchPublicationState {
   readonly trackingRefs: ReadonlyMap<string, string>;
   readonly exactRefs: ReadonlyMap<string, string | null>;
   readonly checkoutRevision: number;
-  readonly budget: RefMutationBudget;
-  readonly reservation: MemoryReservation;
-  readonly owner: RefMutationMemoryOwner | undefined;
   disposed: boolean;
 }
 
@@ -440,8 +331,6 @@ export interface TrackingRefPublicationState {
   readonly refName: string;
   readonly target: string | null;
   readonly refRevision: number;
-  readonly budget: RefMutationBudget;
-  readonly reservation: MemoryReservation;
   disposed: boolean;
 }
 
@@ -473,7 +362,6 @@ export interface OperationStateRow {
   committer_name: unknown;
   committer_email: unknown;
   touched_count: unknown;
-  retained_bytes: unknown;
   integrity_oid: unknown;
 }
 
@@ -551,15 +439,11 @@ export function contentIdKey(contentId: Uint8Array): string {
   return toHex(contentId);
 }
 
-export type OwnedObjectBatchFactory = (
-  reservation: MemoryReservation,
-  options: ObjectBatchOptions,
-) => OwnedObjectBatch;
+export type OwnedObjectBatchFactory = (options: ObjectBatchOptions) => OwnedObjectBatch;
 
 export type OwnedAuthenticatedObjectReader = (
   oid: string,
   expectedType: ObjectType,
-  reservation: MemoryReservation,
 ) => RawObject | null;
 
 export const OWNED_OBJECT_BATCHES = new WeakMap<SharedRepoStore, OwnedObjectBatchFactory>();
@@ -575,23 +459,21 @@ export function ownedObjectBatchFactory(store: SharedRepoStore): OwnedObjectBatc
   return factory;
 }
 
-/** Internal object batch whose staged allocations remain charged until flush. */
+/** Internal object batch whose staged allocations remain bounded until flush. */
 export function writeBatchOwned(
   store: SharedRepoStore,
-  reservation: MemoryReservation,
   options: ObjectBatchOptions = {},
 ): OwnedObjectBatch {
-  return ownedObjectBatchFactory(store)(reservation, options);
+  return ownedObjectBatchFactory(store)(options);
 }
 
-/** Internal scoped object writer retained under an existing operation owner. */
+/** Internal scoped object writer used by shared repository operations. */
 export function writeObjectsOwned<T>(
   store: SharedRepoStore,
-  reservation: MemoryReservation,
   body: (batch: ObjectBatch) => T,
   options: ObjectBatchOptions = {},
 ): T {
-  const batch = writeBatchOwned(store, reservation, options);
+  const batch = writeBatchOwned(store, options);
   try {
     const result = body(batch);
     if (isThenableResult(result)) {
@@ -605,28 +487,21 @@ export function writeObjectsOwned<T>(
   }
 }
 
-/** Internal authenticated read covered by a caller's pre-admitted live-set owner. */
+/** Internal authenticated read through the installed shared-store seam. */
 export function readAuthenticatedObjectOwned(
   store: SharedRepoStore,
   oid: string,
   expectedType: ObjectType,
-  reservation: MemoryReservation,
 ): RawObject | null {
   const read = OWNED_AUTHENTICATED_OBJECT_READERS.get(store);
   if (read === undefined) {
     throw new GitError("EINVAL", "repository authenticated object reader is unavailable");
   }
-  return read(oid, expectedType, reservation);
+  return read(oid, expectedType);
 }
 
-/** Internal shallow-boundary snapshot retained under an existing graph owner. */
-export function readShallowOwned(
-  store: SharedRepoStore,
-  reservation: MemoryReservation,
-): Set<string> {
-  if (!store.ownsMemoryReservation(reservation)) {
-    throw new GitError("EINVAL", "shallow reservation belongs to another repository");
-  }
+/** Internal shallow-boundary snapshot through the installed shared-store seam. */
+export function readShallowOwned(store: SharedRepoStore): Set<string> {
   const metadata = store.db.one<{
     rows: unknown;
     text_bytes: unknown;
@@ -653,14 +528,6 @@ export function readShallowOwned(
   ) {
     throw new CorruptError("shallow boundary metadata is invalid");
   }
-  const retainedBytes = 256 + metadata.rows * (64 + 48) + 2 * metadata.text_bytes;
-  const peakBytes =
-    retainedBytes +
-    (metadata.max_oid_bytes === 0 ? 0 : currentTextRowRetainedBytes(metadata.max_oid_bytes));
-  if (!Number.isSafeInteger(retainedBytes) || !Number.isSafeInteger(peakBytes)) {
-    throw new GitError("E2BIG", "shallow boundary retained-memory accounting overflow");
-  }
-  reservation.set("other", peakBytes);
   const boundary = new Set<string>();
   let previous: string | null = null;
   let observedBytes = 0;
@@ -694,7 +561,6 @@ export function readShallowOwned(
   if (boundary.size !== metadata.rows || observedBytes !== metadata.text_bytes) {
     throw new CorruptError("shallow boundary changed after metadata preflight");
   }
-  reservation.set("other", retainedBytes);
   return boundary;
 }
 
@@ -738,79 +604,32 @@ export interface BlobIdWriteRow {
   o: string;
 }
 
-export const BLOB_ID_MISMATCH_ROW_BYTES = 384;
-
-export function blobIdMismatchRetainedBytes(mapping: BlobIdMapping): number {
-  return BLOB_ID_MISMATCH_ROW_BYTES + mapping.contentId.length + mapping.oid.length * 2;
-}
-
-export function blobIdRetainedTotal(current: number, addition: number, label: string): number {
-  const next = current + addition;
-  if (!Number.isSafeInteger(next)) {
-    throw new GitError("E2BIG", `${label} retained-memory accounting overflow`);
-  }
-  return next;
-}
-
-export function* contentIdPages(
-  contentIds: Iterable<Uint8Array>,
-  reservation: MemoryReservation,
-): Generator<ContentIdPage> {
+export function* contentIdPages(contentIds: Iterable<Uint8Array>): Generator<ContentIdPage> {
   const unique = new Map<string, Uint8Array>();
-  let retainedBytes = 0;
-  const inputMemory = reservation.scope();
-  const pageMemory = reservation.scope();
-  try {
-    for (const contentId of contentIds) {
-      if (contentId.length > BLOB_ID_CACHE_ELIGIBILITY_BYTES) continue;
-      const keyBytes = contentId.length * 4;
-      const nextBytes = blobIdRetainedTotal(
-        retainedBytes,
-        BLOB_ID_MISMATCH_ROW_BYTES + contentId.length + keyBytes,
-        "blob id lookup",
-      );
-      inputMemory.set("other", nextBytes);
-      const snapshot = contentId.slice();
-      const key = contentIdKey(snapshot);
-      if (!unique.has(key)) {
-        retainedBytes = nextBytes;
-        unique.set(key, snapshot);
-      } else {
-        unique.set(key, snapshot);
-        inputMemory.set("other", retainedBytes);
-      }
-    }
-    let parts: Uint8Array[] = [];
-    let rows: { a: number; n: number }[] = [];
-    let length = 0;
-    let pageBytes = 256;
-    for (const contentId of unique.values()) {
-      if (
-        rows.length > 0 &&
-        (rows.length >= CONTENT_ID_PAGE || length + contentId.length > CONTENT_ID_PAYLOAD)
-      ) {
-        pageMemory.set("other", blobIdRetainedTotal(pageBytes, length, "blob id lookup page"));
-        yield { payload: concat(parts), rows };
-        parts = [];
-        rows = [];
-        length = 0;
-        pageBytes = 256;
-        pageMemory.set("other", pageBytes);
-      }
-      pageBytes = blobIdRetainedTotal(pageBytes, 96, "blob id lookup page");
-      pageMemory.set("other", pageBytes);
-      rows.push({ a: length + 1, n: contentId.length });
-      parts.push(contentId);
-      length += contentId.length;
-    }
-    if (rows.length > 0) {
-      pageMemory.set("other", blobIdRetainedTotal(pageBytes, length, "blob id lookup page"));
-      yield { payload: concat(parts), rows };
-    }
-  } finally {
-    pageMemory.dispose();
-    inputMemory.dispose();
+  for (const contentId of contentIds) {
+    if (contentId.length > BLOB_ID_CACHE_ELIGIBILITY_BYTES) continue;
+    const snapshot = contentId.slice();
+    const key = contentIdKey(snapshot);
+    unique.set(key, snapshot);
   }
+  let parts: Uint8Array[] = [];
+  let rows: { a: number; n: number }[] = [];
+  let length = 0;
+  for (const contentId of unique.values()) {
+    if (
+      rows.length > 0 &&
+      (rows.length >= CONTENT_ID_PAGE || length + contentId.length > CONTENT_ID_PAYLOAD)
+    ) {
+      yield { payload: concat(parts), rows };
+      parts = [];
+      rows = [];
+      length = 0;
+    }
+    rows.push({ a: length + 1, n: contentId.length });
+    parts.push(contentId);
+    length += contentId.length;
+  }
+  if (rows.length > 0) yield { payload: concat(parts), rows };
 }
 
 export function writeBlobIdPage(
@@ -859,58 +678,31 @@ export function writeBlobIdPage(
 /** Expected mappings in pages whose BLOB and JSON inputs stay bounded. */
 export function* expectedContentIdPages(
   mappings: readonly ExpectedBlobIdMapping[],
-  reservation: MemoryReservation,
 ): Generator<ExpectedContentIdPage> {
   let parts: Uint8Array[] = [];
   let rows: { i: number; a: number; n: number; o: string }[] = [];
   let length = 0;
-  let retainedBytes = 256;
-  const pageMemory = reservation.scope();
-
-  try {
-    pageMemory.set("other", retainedBytes);
-    for (const mapping of mappings) {
-      if (mapping === undefined) continue;
-      if (
-        rows.length > 0 &&
-        (rows.length >= CONTENT_ID_PAGE || length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
-      ) {
-        pageMemory.set(
-          "other",
-          blobIdRetainedTotal(retainedBytes, length, "blob id comparison page"),
-        );
-        yield { payload: concat(parts), rows };
-        parts = [];
-        rows = [];
-        length = 0;
-        retainedBytes = 256;
-        pageMemory.set("other", retainedBytes);
-      }
-      retainedBytes = blobIdRetainedTotal(
-        retainedBytes,
-        160 + mapping.oid.length * 2,
-        "blob id comparison page",
-      );
-      pageMemory.set("other", retainedBytes);
-      rows.push({
-        i: mapping.ordinal,
-        a: length + 1,
-        n: mapping.contentId.length,
-        o: mapping.oid,
-      });
-      parts.push(mapping.contentId);
-      length += mapping.contentId.length;
-    }
-    if (rows.length > 0) {
-      pageMemory.set(
-        "other",
-        blobIdRetainedTotal(retainedBytes, length, "blob id comparison page"),
-      );
+  for (const mapping of mappings) {
+    if (mapping === undefined) continue;
+    if (
+      rows.length > 0 &&
+      (rows.length >= CONTENT_ID_PAGE || length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
+    ) {
       yield { payload: concat(parts), rows };
+      parts = [];
+      rows = [];
+      length = 0;
     }
-  } finally {
-    pageMemory.dispose();
+    rows.push({
+      i: mapping.ordinal,
+      a: length + 1,
+      n: mapping.contentId.length,
+      o: mapping.oid,
+    });
+    parts.push(mapping.contentId);
+    length += mapping.contentId.length;
   }
+  if (rows.length > 0) yield { payload: concat(parts), rows };
 }
 
 export function requireCommitCacheWrites(result: CommitCacheWriteResult, expected: number): void {
@@ -946,122 +738,6 @@ export function maximumDeflatedBytes(bytes: number): number {
   return maximum;
 }
 
-export function* stagedCommitEntries(objects: Iterable<StagedObject>): Generator<CommitCacheEntry> {
-  for (const object of objects) {
-    if (object.commitEntry !== undefined) yield object.commitEntry;
-  }
-}
-
-export function objectFlushInitialRetainedBytes(objectCount: number): number {
-  const retained = 64 + objectCount * 8;
-  if (!Number.isSafeInteger(retained)) {
-    throw new GitError("E2BIG", "object flush memory accounting overflow");
-  }
-  return retained;
-}
-
-export function objectFlushTransientBytes(
-  objects: readonly StagedObject[],
-  payloadBytes: number,
-): number {
-  let metadataUnits = 2;
-  let metadataBytes = 2;
-  let oidUnits = 2;
-  let oidBytes = 2;
-  let treeCount = 0;
-  let commitCount = 0;
-  let chunkRows = 0;
-  let payloadCount = 1;
-  let currentPayloadBytes = 0;
-  let currentPayloadRows = 0;
-  let largestPayloadBytes = 0;
-  let largestPayloadRows = 0;
-  let maximumPayloadRowUnits = 0;
-  let maximumPayloadRowBytes = 0;
-  for (let objectIndex = 0; objectIndex < objects.length; objectIndex++) {
-    const object = objects[objectIndex];
-    if (object === undefined) throw new CorruptError("object flush input is sparse");
-    const separator = objectIndex === 0 ? 0 : 1;
-    metadataUnits +=
-      separator +
-      64 +
-      jsonStringMaxUnits(object.oid) +
-      jsonStringMaxUnits(object.type) +
-      jsonStringMaxUnits(object.stored) +
-      24;
-    metadataBytes +=
-      separator +
-      64 +
-      jsonStringEncodedBytes(object.oid) +
-      jsonStringEncodedBytes(object.type) +
-      jsonStringEncodedBytes(object.stored) +
-      24;
-    oidUnits += separator + jsonStringMaxUnits(object.oid);
-    oidBytes += separator + jsonStringEncodedBytes(object.oid);
-    if (object.treeData !== undefined) treeCount++;
-    if (object.commitEntry !== undefined) commitCount++;
-    maximumPayloadRowUnits = Math.max(
-      maximumPayloadRowUnits,
-      64 + jsonStringMaxUnits(object.oid) + 3 * 24,
-    );
-    maximumPayloadRowBytes = Math.max(
-      maximumPayloadRowBytes,
-      64 + jsonStringEncodedBytes(object.oid) + 3 * 24,
-    );
-    for (
-      let offset = 0, sequence = 0;
-      offset < object.storedData.length || sequence === 0;
-      offset += OBJECT_CHUNK, sequence++
-    ) {
-      const partBytes = Math.min(OBJECT_CHUNK, Math.max(0, object.storedData.length - offset));
-      if (currentPayloadBytes > 0 && currentPayloadBytes + partBytes > payloadBytes) {
-        largestPayloadBytes = Math.max(largestPayloadBytes, currentPayloadBytes);
-        largestPayloadRows = Math.max(largestPayloadRows, currentPayloadRows);
-        payloadCount++;
-        currentPayloadBytes = 0;
-        currentPayloadRows = 0;
-      }
-      currentPayloadBytes += partBytes;
-      currentPayloadRows++;
-      chunkRows++;
-    }
-  }
-  largestPayloadBytes = Math.max(largestPayloadBytes, currentPayloadBytes);
-  largestPayloadRows = Math.max(largestPayloadRows, currentPayloadRows);
-  const payloadRowUnits =
-    2 + largestPayloadRows * maximumPayloadRowUnits + Math.max(0, largestPayloadRows - 1);
-  const payloadRowBytes =
-    2 + largestPayloadRows * maximumPayloadRowBytes + Math.max(0, largestPayloadRows - 1);
-  const collections =
-    1_024 +
-    objects.length * (256 + 128 + 8 + 8) +
-    commitCount * 8 +
-    payloadCount * 384 +
-    chunkRows * (96 + 192) +
-    treeCount * 384;
-  const retained =
-    collections +
-    retainedStringUnits(metadataUnits) +
-    metadataBytes +
-    retainedStringUnits(oidUnits) +
-    oidBytes +
-    retainedStringUnits(payloadRowUnits) +
-    payloadRowBytes +
-    largestPayloadBytes +
-    commitCacheFlushTransientBytes(stagedCommitEntries(objects));
-  if (
-    !Number.isSafeInteger(metadataUnits) ||
-    !Number.isSafeInteger(metadataBytes) ||
-    !Number.isSafeInteger(oidUnits) ||
-    !Number.isSafeInteger(oidBytes) ||
-    !Number.isSafeInteger(collections) ||
-    !Number.isSafeInteger(retained)
-  ) {
-    throw new GitError("E2BIG", "object flush memory accounting overflow");
-  }
-  return retained;
-}
-
 export function parseLooseEncoding(stored: string): LooseEncoding {
   if (stored === "raw" || stored === "zlib") return stored;
   throw new CorruptError(`loose object has unknown storage encoding '${stored}'`);
@@ -1078,25 +754,6 @@ export const CANONICAL_TEXT_DECODER = new TextDecoder("utf-8", {
 });
 export const JSON_BATCH_ROWS = 2_048;
 export const JSON_BATCH_BYTES = 1_500_000;
-export const CONFIG_READ_FIXED_RETAINED_BYTES = 512;
-
-export interface JsonPageMemory<T> {
-  readonly reservation: MemoryReservation;
-  readonly maxUnits: (item: T) => number;
-}
-
-export function currentTextRowRetainedBytes(textBytes: number, stringSlots = 1): number {
-  if (
-    !Number.isSafeInteger(textBytes) ||
-    textBytes < 0 ||
-    !Number.isSafeInteger(stringSlots) ||
-    stringSlots < 0
-  ) {
-    throw new CorruptError("stored text row metadata is invalid");
-  }
-  return REF_ROW_RETAINED_BYTES + textBytes + stringSlots * 48 + 2 * textBytes;
-}
-
 export function utf8ByteLength(value: string): number {
   let bytes = 0;
   for (let index = 0; index < value.length; index++) {
@@ -1112,55 +769,6 @@ export function utf8ByteLength(value: string): number {
     }
   }
   return bytes;
-}
-
-export function checkoutRootInputRetainedBytes(value: string): number {
-  const relativePrefix = value.startsWith("/") ? 0 : 1;
-  const sourceUnits = value.length + relativePrefix;
-  let parts = 1 + relativePrefix;
-  for (let index = 0; index < value.length; index++) {
-    if (value.charCodeAt(index) === 0x2f) parts++;
-  }
-  const sourceBytes = utf8ByteLength(value) + relativePrefix;
-  const retained =
-    1_024 +
-    retainedStringUnits(value.length) +
-    (relativePrefix === 0 ? 0 : retainedStringUnits(sourceUnits)) +
-    128 +
-    parts * 64 +
-    2 * sourceUnits +
-    2 * retainedStringUnits(sourceUnits + 1) +
-    2 * (256 + sourceBytes);
-  if (!Number.isSafeInteger(retained)) {
-    throw new GitError("E2BIG", "checkout root memory accounting overflow");
-  }
-  return retained;
-}
-
-export function checkoutRootSqlRetainedBytes(input: string, normalized: string): number {
-  const normalizedBytes = utf8ByteLength(normalized);
-  const retained =
-    512 +
-    retainedStringUnits(input.length) +
-    retainedStringUnits(normalized.length) +
-    2 * (256 + normalizedBytes);
-  if (!Number.isSafeInteger(retained)) {
-    throw new GitError("E2BIG", "checkout root memory accounting overflow");
-  }
-  return retained;
-}
-
-export function checkoutResultRowRetainedBytes(row: CheckoutRow): number {
-  return (
-    CHECKOUT_RESULT_ARRAY_SLOT_BYTES +
-    CHECKOUT_RESULT_ROW_BYTES +
-    retainedStringBytes(row.root) +
-    retainedStringBytes(row.head)
-  );
-}
-
-export function checkoutRootResultRetainedBytes(root: string): number {
-  return CHECKOUT_RESULT_ARRAY_SLOT_BYTES + retainedStringBytes(root);
 }
 
 export function requireCheckoutRootInput(value: unknown): string {
@@ -1269,63 +877,34 @@ export function refRowJsonMaxUnits(row: RefRow): number {
   return 19 + jsonStringMaxUnits(row.name) + jsonStringMaxUnits(row.target);
 }
 
-export function* jsonPages<T>(
-  items: Iterable<T>,
-  _label: string,
-  memory?: JsonPageMemory<T>,
-): Generator<string> {
+export function* jsonPages<T>(items: Iterable<T>, _label: string): Generator<string> {
   let rows: string[] = [];
   let bytes = 2;
-  let retained = 256;
-  const pageMemory = memory?.reservation.scope();
-  const emit = function* (pendingBytes = 0): Generator<string> {
-    const joinedUnits = Math.max(0, bytes - 2);
-    pageMemory?.set(
-      "other",
-      retained +
-        pendingBytes +
-        retainedStringUnits(joinedUnits) +
-        retainedStringUnits(joinedUnits + 2),
-    );
+  const emit = function* (): Generator<string> {
     const joined = rows.join(",");
     yield `[${joined}]`;
   };
-  try {
-    pageMemory?.set("other", retained);
-    for (const item of items) {
-      if (memory !== undefined) {
-        pageMemory?.set("other", retained + retainedStringUnits(memory.maxUnits(item)));
-      }
-      const row = JSON.stringify(item);
-      const rowBytes = refTextBytes(row, "JSON batch row", "input");
-      const separator = rows.length === 0 ? 0 : 1;
-      if (
-        rows.length > 0 &&
-        (rows.length >= JSON_BATCH_ROWS || bytes + separator + rowBytes > JSON_BATCH_BYTES)
-      ) {
-        const pendingBytes = retainedStringBytes(row);
-        yield* emit(pendingBytes);
-        rows = [];
-        bytes = 2;
-        retained = 256;
-        pageMemory?.set("other", retained + pendingBytes);
-      }
-      bytes += (rows.length === 0 ? 0 : 1) + rowBytes;
-      rows.push(row);
-      retained += 8 + retainedStringBytes(row);
-      pageMemory?.set("other", retained);
-      if (bytes >= JSON_BATCH_BYTES) {
-        yield* emit();
-        rows = [];
-        bytes = 2;
-        retained = 256;
-        pageMemory?.set("other", retained);
-      }
+  for (const item of items) {
+    const row = JSON.stringify(item);
+    const rowBytes = refTextBytes(row, "JSON batch row", "input");
+    const separator = rows.length === 0 ? 0 : 1;
+    if (
+      rows.length > 0 &&
+      (rows.length >= JSON_BATCH_ROWS || bytes + separator + rowBytes > JSON_BATCH_BYTES)
+    ) {
+      yield* emit();
+      rows = [];
+      bytes = 2;
     }
-    if (rows.length > 0) yield* emit();
-  } finally {
-    pageMemory?.dispose();
+    bytes += (rows.length === 0 ? 0 : 1) + rowBytes;
+    rows.push(row);
+    if (bytes >= JSON_BATCH_BYTES) {
+      yield* emit();
+      rows = [];
+      bytes = 2;
+    }
   }
+  if (rows.length > 0) yield* emit();
 }
 
 export function requireNullableRawRefTarget(value: unknown, label: string): string | null {
@@ -1757,91 +1336,19 @@ export function staleFetch(message: string): GitError {
   return new GitError("ESTALEFETCH", message);
 }
 
-export class RefMutationBudget {
-  readonly #reservation: MemoryReservation;
-  #retained = 0;
-  #hasSqlHeadroom: boolean;
-
-  constructor(reservation: MemoryReservation, deferSqlHeadroom = false) {
-    this.#reservation = reservation;
-    this.#hasSqlHeadroom = !deferSqlHeadroom;
-    this.charge(
-      deferSqlHeadroom
-        ? REF_MUTATION_STATE_FIXED_RETAINED_BYTES
-        : REF_MUTATION_FIXED_RETAINED_BYTES,
-    );
-  }
-
-  requireSqlHeadroom(): void {
-    if (this.#hasSqlHeadroom) return;
-    this.charge(REF_MUTATION_SQL_HEADROOM_BYTES);
-    this.#hasSqlHeadroom = true;
-  }
-
-  memoryReservation(): MemoryReservation {
-    return this.#reservation;
-  }
-
-  charge(bytes: number): void {
-    if (
-      !Number.isSafeInteger(bytes) ||
-      bytes < 0 ||
-      bytes > MAX_REF_MUTATION_RETAINED_BYTES - this.#retained
-    ) {
-      throw new GitError("E2BIG", "ref mutation exceeds its 64 MiB retained-memory bound");
-    }
-    const retained = this.#retained + bytes;
-    this.#reservation.set("other", retained);
-    this.#retained = retained;
-  }
-}
-
-export function refMutationCreateRetainedBytes(row: RefRow): number {
-  const name = requireRefName(row.name, "updated ref name", "input");
-  const target = requireRawRefTarget(row.target, "updated ref target", "input");
-  return (
-    REF_MUTATION_ITEM_RETAINED_BYTES +
-    REF_MUTATION_EVENT_RETAINED_BYTES +
-    retainedStringBytes(name) +
-    retainedStringBytes(target)
-  );
-}
-
-export function refMutationCheckoutRetainedBytes(checkout: { root: string; head: string }): number {
-  const root = requireCheckoutRoot(checkout.root, "stored");
-  const head = requireRawRefTarget(checkout.head, "stored HEAD target", "stored");
-  const retained = 1_024 + retainedStringBytes(root) + retainedStringBytes(head);
-  return Math.ceil(retained / 4) * 4;
-}
-
-export function normalizeRefMutation(
-  mutation: RefMutation,
-  budget: RefMutationBudget,
-  owner?: RefMutationMemoryOwner,
-): NormalizedRefMutation {
+export function normalizeRefMutation(mutation: RefMutation): NormalizedRefMutation {
   const puts = new Map<string, string>();
   const deletes = new Set<string>();
-  const chargedStrings: string[] = [];
-  const stringBytes = (value: string): number => {
-    if (owner?.owns(value) === true || chargedStrings.includes(value)) return 0;
-    chargedStrings.push(value);
-    return retainedStringBytes(value);
-  };
   let inputs = 0;
-  const charge = (name: string, target?: string): void => {
+  const countInput = (): void => {
     inputs++;
     if (inputs > MAX_REF_MUTATION_INPUTS) {
       throw new GitError("E2BIG", "ref mutation exceeds its retained input count bound");
     }
-    budget.charge(
-      REF_MUTATION_ITEM_RETAINED_BYTES +
-        stringBytes(name) +
-        (target === undefined ? 0 : stringBytes(target)),
-    );
   };
   for (const value of mutation.deletes ?? []) {
     const name = requireRefName(value, "deleted ref name", "input");
-    charge(name);
+    countInput();
     deletes.add(name);
   }
   for (const row of mutation.puts ?? []) {
@@ -1850,7 +1357,7 @@ export function normalizeRefMutation(
     }
     const name = requireRefName(row.name, "updated ref name", "input");
     const target = requireRawRefTarget(row.target, "updated ref target", "input");
-    charge(name, target);
+    countInput();
     puts.set(name, target);
   }
   const head =
@@ -1858,7 +1365,7 @@ export function normalizeRefMutation(
       ? undefined
       : requireRawRefTarget(mutation.head, "HEAD target", "input");
   if (head !== undefined) {
-    charge("HEAD", head);
+    countInput();
   }
   let expected: RefMutationExpected | undefined;
   if (mutation.expected !== undefined) {
@@ -1867,11 +1374,7 @@ export function normalizeRefMutation(
       mutation.expected.target === null
         ? null
         : requireRawRefTarget(mutation.expected.target, "expected ref target", "input");
-    budget.charge(
-      REF_MUTATION_ITEM_RETAINED_BYTES +
-        stringBytes(name) +
-        (target === null ? 0 : stringBytes(target)),
-    );
+    countInput();
     expected = { name, target };
     if (puts.has(name) === deletes.has(name)) {
       throw new GitError(
@@ -1880,39 +1383,25 @@ export function normalizeRefMutation(
       );
     }
   }
-  return { puts, deletes, head, expected, budget };
+  return { puts, deletes, head, expected };
 }
 
 export function normalizeFetchPublication(
   state: FetchPublicationState,
   plan: FetchPublicationPlan,
-  budget: RefMutationBudget,
-  owner?: RefMutationMemoryOwner,
 ): NormalizedFetchPublication {
   const puts = new Map<string, string>();
   const deletes = new Set<string>();
   const keep = new Set<string>();
-  const chargedStrings: string[] = [];
-  const stringBytes = (value: string): number => {
-    if (owner?.owns(value) === true || chargedStrings.includes(value)) return 0;
-    chargedStrings.push(value);
-    return retainedStringBytes(value);
-  };
-  budget.charge(48 + 2 * (state.trackingPrefix.length + "HEAD".length));
   const remoteHeadName = `${state.trackingPrefix}HEAD`;
   let inputs = 0;
-  const charge = (name: string, label: string, target?: string, nameAlreadyOwned = false): void => {
+  const countInput = (name: string, label: string, target?: string): void => {
     inputs++;
     if (inputs > MAX_FETCH_PUBLICATION_INPUTS) {
       throw new GitError("E2BIG", "fetch publication exceeds its retained input count bound");
     }
     refTextBytes(name, label, "input");
     if (target !== undefined) refTextBytes(target, "fetch ref target", "input");
-    budget.charge(
-      REF_MUTATION_ITEM_RETAINED_BYTES +
-        (nameAlreadyOwned ? 0 : stringBytes(name)) +
-        (target === undefined ? 0 : stringBytes(target)),
-    );
   };
   const trackingName = (value: unknown, label: string): string => {
     const name = requireRefName(value, label, "input");
@@ -1928,14 +1417,14 @@ export function normalizeFetchPublication(
     }
     const name = trackingName(row.name, "fetch tracking ref name");
     const target = requireRawRefTarget(row.target, `target of ${name}`, "input");
-    charge(name, "fetch tracking ref name", target);
+    countInput(name, "fetch tracking ref name", target);
     puts.set(name, target);
     keep.add(name);
   }
   const prune = plan.trackingKeep !== undefined;
   for (const value of plan.trackingKeep ?? []) {
     const name = trackingName(value, "advertised tracking ref name");
-    charge(name, "advertised tracking ref name");
+    countInput(name, "advertised tracking ref name");
     keep.add(name);
   }
   if (prune) {
@@ -1946,11 +1435,11 @@ export function normalizeFetchPublication(
 
   if (plan.remoteHead !== undefined) {
     if (plan.remoteHead === null) {
-      charge(remoteHeadName, "remote HEAD ref name", undefined, true);
+      countInput(remoteHeadName, "remote HEAD ref name");
       deletes.add(remoteHeadName);
     } else {
       const target = requireRawRefTarget(plan.remoteHead, "remote HEAD target", "input");
-      charge(remoteHeadName, "remote HEAD ref name", target, true);
+      countInput(remoteHeadName, "remote HEAD ref name", target);
       puts.set(remoteHeadName, target);
     }
   }
@@ -1973,7 +1462,7 @@ export function normalizeFetchPublication(
     if (puts.has(name) || deletes.has(name)) {
       throw new GitError("EINVAL", `fetch publication contains duplicate destination ${name}`);
     }
-    charge(name, `${label} name`, target);
+    countInput(name, `${label} name`, target);
     puts.set(name, target);
   };
   for (const row of plan.globalTagPuts ?? []) {
@@ -1989,7 +1478,7 @@ export function normalizeFetchPublication(
     if (typeof value !== "string" || !isOid(value)) {
       throw new GitError("EINVAL", `${label} must be a full object id`);
     }
-    charge(value, label);
+    countInput(value, label);
     return value;
   };
   for (const value of plan.shallowAdd ?? []) {
@@ -2004,7 +1493,6 @@ export function normalizeFetchPublication(
     deletes,
     head: undefined,
     expected: undefined,
-    budget,
   };
   return {
     refs,
@@ -2029,33 +1517,6 @@ export function resolveRawRef(
     value = lookup(target);
   }
   return null;
-}
-
-export function refLogEventRetainedBytes(
-  refName: string,
-  oldRaw: string | null,
-  newRaw: string | null,
-): number {
-  refTextBytes(refName, "reflog ref name", "input");
-  if (oldRaw !== null) refTextBytes(oldRaw, "reflog old raw target", "input");
-  if (newRaw !== null) refTextBytes(newRaw, "reflog new raw target", "input");
-  return REF_MUTATION_EVENT_RETAINED_BYTES;
-}
-
-export function refLogMetadataRetainedBytes(
-  metadata: RefLogMetadata,
-  owner?: RefMutationMemoryOwner,
-): number {
-  return (
-    REF_MUTATION_METADATA_RETAINED_BYTES +
-    (owner?.owns(metadata.reason) === true ? 0 : retainedStringBytes(metadata.reason)) +
-    (metadata.actor === null
-      ? 0
-      : (owner?.owns(metadata.actor.name) === true ? 0 : retainedStringBytes(metadata.actor.name)) +
-        (owner?.owns(metadata.actor.email) === true
-          ? 0
-          : retainedStringBytes(metadata.actor.email)))
-  );
 }
 
 export function refLogEventJsonMaxUnits(event: RefLogEvent | CheckoutRefLogEvent): number {
@@ -2105,14 +1566,6 @@ export class IndexMutationBuffer {
     private readonly flushEvery: number,
     private readonly apply: (pending: readonly BufferedIndexMutation[]) => void,
   ) {}
-
-  get retainedBytes(): number {
-    return this.#bytes * 2 + this.#pending.length * INDEX_MUTATION_ROW_BYTES;
-  }
-
-  get reservedBytes(): number {
-    return this.retainedBytes + this.#bytes * 2 + this.#pending.length * 8;
-  }
 
   add(item: IndexEntry | string): void {
     let mutation = serializeIndexMutation(item, this.#pending.length);
@@ -2217,8 +1670,8 @@ export function initialPathJsonBytes(path: string, maxUtf8Bytes?: number): numbe
   return jsonBytes;
 }
 
-export function validateInitialIndexEntry(entry: IndexEntry): number {
-  const pathJsonBytes = initialPathJsonBytes(entry.path);
+export function validateInitialIndexEntry(entry: IndexEntry): void {
+  initialPathJsonBytes(entry.path);
   if (entry.stage !== 0) throw new CorruptError("initial index entry must be stage 0");
   if (
     entry.mode !== 0o100644 &&
@@ -2237,7 +1690,6 @@ export function validateInitialIndexEntry(entry: IndexEntry): number {
   ) {
     throw new CorruptError("initial index entry has invalid filesystem metadata");
   }
-  return pathJsonBytes;
 }
 
 export function operationIdentityFromRow(
@@ -2285,93 +1737,6 @@ export function operationStepFromRow(row: OperationStepRow): OperationStepMetada
     outcome,
     resultOid: requireNullableOperationOid(row.result_oid, "step result"),
   };
-}
-
-export function operationJournalReadBytes(
-  retainedBytes: number,
-  stateTextBytes: number,
-  stepTextBytes: number,
-  touchedTextBytes: number,
-): number {
-  const currentRowBytes = Math.max(
-    currentTextRowRetainedBytes(stateTextBytes, 19),
-    stepTextBytes === 0 ? 0 : currentTextRowRetainedBytes(stepTextBytes, 4),
-    touchedTextBytes === 0 ? 0 : currentTextRowRetainedBytes(touchedTextBytes, 6),
-  );
-  const retained = retainedBytes + currentRowBytes;
-  if (!Number.isSafeInteger(retained)) {
-    throw new GitError("E2BIG", "operation journal retained-memory accounting overflow");
-  }
-  return retained;
-}
-
-export function operationJournalIntegrityBytes(
-  state: OperationStateMetadata,
-  steps: readonly OperationStepMetadata[],
-  touched: readonly MergeTouchedPath[],
-  retainedBytes: number,
-): number {
-  let jsonUnits = 2_048 + steps.length * 256 + touched.length * 512;
-  let jsonBytes = jsonUnits;
-  const add = (value: string | null): void => {
-    if (value === null) {
-      jsonUnits += 4;
-      jsonBytes += 4;
-      return;
-    }
-    jsonUnits += jsonStringMaxUnits(value);
-    jsonBytes += jsonStringEncodedBytes(value);
-  };
-  add(state.kind);
-  add(state.originalHeadRef);
-  add(state.originalHeadOid);
-  add(state.currentLabel);
-  add(state.incomingLabel);
-  add(state.message);
-  add(state.author?.name ?? null);
-  add(state.author?.email ?? null);
-  add(state.committer?.name ?? null);
-  add(state.committer?.email ?? null);
-  if (state.kind === "merge") {
-    add(state.currentParentOid);
-    add(state.incomingParentOid);
-    add(state.phase);
-    add(state.mode);
-    add(state.mergeOrigin);
-  } else if (state.kind === "rebase") {
-    add(state.phase);
-    add(state.upstreamOid);
-    add(state.baseOid);
-    add(state.currentParentOid);
-  } else {
-    add(state.phase);
-    add(state.emptyReason);
-    add(state.sourceOid);
-    add(state.selectedParentOid);
-  }
-  for (const step of steps) {
-    add(step.sourceOid);
-    add(step.selectedParentOid);
-    add(step.outcome);
-    add(step.resultOid);
-  }
-  for (const entry of touched) {
-    add(entry.path);
-    add(entry.logicalPath);
-    add(entry.purpose);
-    add(entry.index?.oid ?? null);
-    add(entry.worktree.kind);
-    add(
-      entry.worktree.kind === "file" || entry.worktree.kind === "symlink"
-        ? entry.worktree.oid
-        : null,
-    );
-  }
-  const bytes = retainedBytes + retainedStringUnits(jsonUnits) + jsonBytes + 512;
-  if (!Number.isSafeInteger(bytes)) {
-    throw new GitError("E2BIG", "operation journal integrity accounting overflow");
-  }
-  return bytes;
 }
 
 export function operationMetadataFromRow(
@@ -2473,10 +1838,9 @@ export function operationJournal(
   state: OperationStateMetadata,
   steps: readonly OperationStepMetadata[],
   touched: readonly MergeTouchedPath[],
-  retainedBytes: number,
   integrityOid: string,
 ): OperationJournal {
-  const fields = { steps, touched, retainedBytes, integrityOid };
+  const fields = { steps, touched, integrityOid };
   if (state.kind === "merge") return { kind: state.kind, state, ...fields };
   if (state.kind === "cherry-pick") return { kind: state.kind, state, ...fields };
   if (state.kind === "revert") return { kind: state.kind, state, ...fields };
@@ -2687,22 +2051,6 @@ export class InitialBlobIdBuffer {
     private readonly repoId: number,
   ) {}
 
-  get retainedBytes(): number {
-    return (this.#payload?.length ?? 0) + this.#rows.length * BLOB_ID_MISMATCH_ROW_BYTES;
-  }
-
-  get reservedBytes(): number {
-    return this.retainedBytes + this.#rows.length * INITIAL_BLOB_ROW_JSON_BYTES * 2 + 32;
-  }
-
-  additionalReservedBytes(): number {
-    return (
-      (this.#payload === null ? CONTENT_ID_PAYLOAD : 0) +
-      BLOB_ID_MISMATCH_ROW_BYTES +
-      INITIAL_BLOB_ROW_JSON_BYTES * 2
-    );
-  }
-
   willCache(mapping: BlobIdMapping): boolean {
     return mapping.contentId.length <= BLOB_ID_CACHE_ELIGIBILITY_BYTES;
   }
@@ -2761,62 +2109,45 @@ export function isThenableResult(value: unknown): boolean {
   return typeof Reflect.get(value, "then") === "function";
 }
 
-export type OwnedIndexScan = (
-  reservation: MemoryReservation,
-  options: IndexScanOptions,
-) => IterableIterator<IndexEntry>;
+export type OwnedIndexScan = (options: IndexScanOptions) => IterableIterator<IndexEntry>;
 
 export const OWNED_INDEX_SCANS = new WeakMap<IndexStore, OwnedIndexScan>();
 
-/** Internal ordered scan whose current persisted row is charged to the caller. */
+/** Internal ordered scan over validated persisted rows. */
 export function indexScanOwned(
   index: IndexStore,
-  reservation: MemoryReservation,
   options: IndexScanOptions = {},
 ): IterableIterator<IndexEntry> {
   const scan = OWNED_INDEX_SCANS.get(index);
-  return scan === undefined
-    ? scanGenericIndexOwned(index.indexScan(options), reservation)
-    : scan(reservation, options);
+  return scan === undefined ? scanGenericIndexOwned(index.indexScan(options)) : scan(options);
 }
 
 export function* scanGenericIndexOwned(
   entries: IterableIterator<IndexEntry>,
-  reservation: MemoryReservation,
 ): Generator<IndexEntry> {
-  const rowMemory = reservation.scope();
   let previousPath: string | null = null;
   let previousStage = -1;
-  try {
-    for (const raw of entries) {
-      const entry = requireStoredIndexEntry({
-        path: raw.path,
-        stage: raw.stage,
-        mode: raw.mode,
-        oid: raw.oid,
-        size: raw.size,
-        mtime: raw.mtime,
-        ino: raw.ino,
-        rev: raw.rev ?? null,
-      });
-      if (
-        previousPath !== null &&
-        (comparePaths(previousPath, entry.path) > 0 ||
-          (previousPath === entry.path && previousStage >= entry.stage))
-      ) {
-        throw new CorruptError("index scan rows are not in strict path and stage order");
-      }
-      rowMemory.set(
-        "other",
-        256 + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid),
-      );
-      previousPath = entry.path;
-      previousStage = entry.stage;
-      yield entry;
-      rowMemory.clear("other");
+  for (const raw of entries) {
+    const entry = requireStoredIndexEntry({
+      path: raw.path,
+      stage: raw.stage,
+      mode: raw.mode,
+      oid: raw.oid,
+      size: raw.size,
+      mtime: raw.mtime,
+      ino: raw.ino,
+      rev: raw.rev ?? null,
+    });
+    if (
+      previousPath !== null &&
+      (comparePaths(previousPath, entry.path) > 0 ||
+        (previousPath === entry.path && previousStage >= entry.stage))
+    ) {
+      throw new CorruptError("index scan rows are not in strict path and stage order");
     }
-  } finally {
-    rowMemory.dispose();
+    previousPath = entry.path;
+    previousStage = entry.stage;
+    yield entry;
   }
 }
 
@@ -2874,30 +2205,22 @@ export type OwnedIndexSource =
 export function* scanIndexOwned(
   db: SqlDatabase,
   source: OwnedIndexSource,
-  reservation: MemoryReservation,
-  ownsReservation: (reservation: MemoryReservation) => boolean,
   requireActive: () => void,
   options: IndexScanOptions,
 ): Generator<IndexEntry> {
   requireActive();
-  if (!ownsReservation(reservation)) {
-    throw new GitError("EINVAL", "index scan reservation belongs to another repository");
-  }
-  const rowMemory = reservation.scope();
-  const progressMemory = reservation.scope();
-  try {
-    const pageSize = requireIndexPageSize(options.pageSize ?? DEFAULT_INDEX_PAGE);
-    const prefix = options.prefix;
-    let path = options.after?.path ?? "";
-    let stage = options.after?.stage ?? -1;
-    let previousPath: string | null = null;
-    let previousStage = -1;
-    for (;;) {
-      requireActive();
-      const query =
-        source.kind === "checkout"
-          ? prefix === undefined || prefix === ""
-            ? `SELECT checkout.repo_id,
+  const pageSize = requireIndexPageSize(options.pageSize ?? DEFAULT_INDEX_PAGE);
+  const prefix = options.prefix;
+  let path = options.after?.path ?? "";
+  let stage = options.after?.stage ?? -1;
+  let previousPath: string | null = null;
+  let previousStage = -1;
+  for (;;) {
+    requireActive();
+    const query =
+      source.kind === "checkout"
+        ? prefix === undefined || prefix === ""
+          ? `SELECT checkout.repo_id,
                       typeof(entry.path) AS path_type,
                       length(CAST(entry.path AS BLOB)) AS path_bytes,
                       CAST(entry.path AS BLOB) AS path_blob,
@@ -2911,7 +2234,7 @@ export function* scanIndexOwned(
                 WHERE entry.checkout_id = ?
                   AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
                 ORDER BY entry.path, entry.stage LIMIT ?`
-            : `SELECT checkout.repo_id,
+          : `SELECT checkout.repo_id,
                       typeof(entry.path) AS path_type,
                       length(CAST(entry.path AS BLOB)) AS path_bytes,
                       CAST(entry.path AS BLOB) AS path_blob,
@@ -2926,8 +2249,8 @@ export function* scanIndexOwned(
                   AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
                   AND (entry.path = ? OR (entry.path >= ? AND entry.path < ?))
                 ORDER BY entry.path, entry.stage LIMIT ?`
-          : prefix === undefined || prefix === ""
-            ? `SELECT entry.repo_id,
+        : prefix === undefined || prefix === ""
+          ? `SELECT entry.repo_id,
                       typeof(entry.path) AS path_type,
                       length(CAST(entry.path AS BLOB)) AS path_bytes,
                       CAST(entry.path AS BLOB) AS path_blob,
@@ -2940,7 +2263,7 @@ export function* scanIndexOwned(
                 WHERE entry.repo_id = ? AND entry.name = ?
                   AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
                 ORDER BY entry.path, entry.stage LIMIT ?`
-            : `SELECT entry.repo_id,
+          : `SELECT entry.repo_id,
                       typeof(entry.path) AS path_type,
                       length(CAST(entry.path AS BLOB)) AS path_bytes,
                       CAST(entry.path AS BLOB) AS path_blob,
@@ -2954,102 +2277,91 @@ export function* scanIndexOwned(
                   AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
                   AND (entry.path = ? OR (entry.path >= ? AND entry.path < ?))
                 ORDER BY entry.path, entry.stage LIMIT ?`;
-      const bindings: (string | number)[] =
-        source.kind === "checkout"
-          ? prefix === undefined || prefix === ""
-            ? [source.checkoutId, path, path, stage, pageSize]
-            : [
-                source.checkoutId,
-                path,
-                path,
-                stage,
-                prefix,
-                `${prefix}/`,
-                nextPrefix(`${prefix}/`),
-                pageSize,
-              ]
-          : prefix === undefined || prefix === ""
-            ? [source.repoId, source.name, path, path, stage, pageSize]
-            : [
-                source.repoId,
-                source.name,
-                path,
-                path,
-                stage,
-                prefix,
-                `${prefix}/`,
-                nextPrefix(`${prefix}/`),
-                pageSize,
-              ];
-      let pageRows = 0;
-      let last: IndexEntry | undefined;
-      const maximumRowBytes = currentTextRowRetainedBytes(MAX_INDEX_PATH_BYTES + 40, 2);
-      rowMemory.set("other", maximumRowBytes);
-      const rows = db.iterate(query, ...bindings)[Symbol.iterator]();
-      try {
-        for (;;) {
-          requireActive();
-          rowMemory.set("other", maximumRowBytes);
-          const next = rows.next();
-          if (next.done) {
-            rowMemory.clear("other");
-            break;
-          }
-          const row = next.value;
-          if (row.repo_id !== source.repoId || pageRows >= pageSize) {
-            throw new CorruptError("index scan returned invalid repository or page cardinality");
-          }
-          const pathBytes = requireStoredTextByteLength(
-            row.path_type,
-            row.path_bytes,
-            "stored index path",
-          );
-          const oidBytes = requireStoredTextByteLength(
-            row.oid_type,
-            row.oid_bytes,
-            "stored index oid",
-          );
-          if (pathBytes > MAX_INDEX_PATH_BYTES || oidBytes !== 40) {
-            throw new CorruptError("stored index path or oid exceeds its structural bound");
-          }
-          rowMemory.set("other", currentTextRowRetainedBytes(pathBytes + oidBytes, 2));
-          const entry = requireStoredIndexEntry({
-            path: requireCanonicalStoredText(row.path_type, row.path_blob, "stored index path"),
-            stage: row.stage,
-            mode: row.mode,
-            oid: requireCanonicalStoredText(row.oid_type, row.oid_blob, "stored index oid"),
-            size: row.size,
-            mtime: row.mtime,
-            ino: row.ino,
-            rev: row.rev,
-          });
-          if (
-            previousPath !== null &&
-            (comparePaths(previousPath, entry.path) > 0 ||
-              (previousPath === entry.path && previousStage >= entry.stage))
-          ) {
-            throw new CorruptError("index scan rows are not in strict path and stage order");
-          }
-          previousPath = entry.path;
-          previousStage = entry.stage;
-          progressMemory.set("other", 128 + retainedStringBytes(entry.path));
-          last = entry;
-          pageRows++;
-          yield entry;
+    const bindings: (string | number)[] =
+      source.kind === "checkout"
+        ? prefix === undefined || prefix === ""
+          ? [source.checkoutId, path, path, stage, pageSize]
+          : [
+              source.checkoutId,
+              path,
+              path,
+              stage,
+              prefix,
+              `${prefix}/`,
+              nextPrefix(`${prefix}/`),
+              pageSize,
+            ]
+        : prefix === undefined || prefix === ""
+          ? [source.repoId, source.name, path, path, stage, pageSize]
+          : [
+              source.repoId,
+              source.name,
+              path,
+              path,
+              stage,
+              prefix,
+              `${prefix}/`,
+              nextPrefix(`${prefix}/`),
+              pageSize,
+            ];
+    let pageRows = 0;
+    let last: IndexEntry | undefined;
+    const rows = db.iterate(query, ...bindings)[Symbol.iterator]();
+    try {
+      for (;;) {
+        requireActive();
+        const next = rows.next();
+        if (next.done) {
+          break;
         }
-      } finally {
-        if (rows.return !== undefined) rows.return();
-        rowMemory.clear("other");
+        const row = next.value;
+        if (row.repo_id !== source.repoId || pageRows >= pageSize) {
+          throw new CorruptError("index scan returned invalid repository or page cardinality");
+        }
+        const pathBytes = requireStoredTextByteLength(
+          row.path_type,
+          row.path_bytes,
+          "stored index path",
+        );
+        const oidBytes = requireStoredTextByteLength(
+          row.oid_type,
+          row.oid_bytes,
+          "stored index oid",
+        );
+        if (pathBytes > MAX_INDEX_PATH_BYTES || oidBytes !== 40) {
+          throw new CorruptError("stored index path or oid exceeds its structural bound");
+        }
+        const entry = requireStoredIndexEntry({
+          path: requireCanonicalStoredText(row.path_type, row.path_blob, "stored index path"),
+          stage: row.stage,
+          mode: row.mode,
+          oid: requireCanonicalStoredText(row.oid_type, row.oid_blob, "stored index oid"),
+          size: row.size,
+          mtime: row.mtime,
+          ino: row.ino,
+          rev: row.rev,
+        });
+        if (
+          previousPath !== null &&
+          (comparePaths(previousPath, entry.path) > 0 ||
+            (previousPath === entry.path && previousStage >= entry.stage))
+        ) {
+          throw new CorruptError("index scan rows are not in strict path and stage order");
+        }
+        previousPath = entry.path;
+        previousStage = entry.stage;
+        last = entry;
+        pageRows++;
+        yield entry;
       }
-      if (pageRows === 0) return;
-      if (last === undefined) throw new CorruptError("index scan page lost its last row");
-      path = last.path;
-      stage = last.stage;
-      if (pageRows < pageSize) return;
+    } finally {
+      if (rows.return !== undefined) rows.return();
     }
-  } finally {
-    progressMemory.dispose();
-    rowMemory.dispose();
+    if (pageRows === 0) return;
+    if (last === undefined) throw new CorruptError("index scan page lost its last row");
+    path = last.path;
+    stage = last.stage;
+    if (pageRows < pageSize) return;
   }
 }
 
@@ -3322,20 +2634,16 @@ export class ScratchIndexStore implements IndexStore {
   readonly #db: SqlDatabase;
   readonly #repoId: number;
   readonly #name: string;
-  readonly #shared: SharedRepoStore;
   #active = true;
 
   constructor(shared: SharedRepoStore, name: string) {
-    this.#shared = shared;
     this.#db = shared.db;
     this.#repoId = shared.repoId;
     this.#name = name;
-    OWNED_INDEX_SCANS.set(this, (reservation, options) =>
+    OWNED_INDEX_SCANS.set(this, (options) =>
       scanIndexOwned(
         this.#db,
         { kind: "scratch", repoId: this.#repoId, name: this.#name },
-        reservation,
-        (candidate) => this.#shared.ownsMemoryReservation(candidate),
         () => this.#requireActive(),
         options,
       ),
@@ -3559,7 +2867,6 @@ export class CheckoutStore implements IndexStore {
   readonly #isPrimary: boolean;
   readonly #objectCache: ByteLru<string, RawObject>;
   readonly #packStore: PackStore;
-  readonly #memoryCoordinator: MemoryCoordinator;
   readonly #onDestroy: (() => void) | undefined;
   readonly #now: () => number;
   readonly #lifetime: CheckoutStoreLifetime;
@@ -3596,56 +2903,42 @@ export class CheckoutStore implements IndexStore {
     this.#root = checkout.root;
     this.#isPrimary = checkout.isPrimary;
     this.#objectCache = shared.objects;
-    this.#memoryCoordinator = shared.memory;
     this.#packStore = shared.installPacks(
       new PackStore(
         this.#database,
         this.#repoId,
         this.#objectCache,
         shared.packRows,
-        this.#memoryCoordinator,
-        (reservation) => shared.scopeMemoryReservation(reservation),
         shared.cacheNamespace,
-        (oids: readonly string[], ownership: PackReadOwnership) =>
-          this.#readLooseObjects(oids, ownership),
+        (oids: readonly string[]) => this.#readLooseObjects(oids),
         (oids) => this.#looseObjectMetadata(oids),
         options,
       ),
     );
-    OWNED_REF_MUTATIONS.set(this, (mutation, metadata, owner) =>
-      this.#mutateRefsOwned(mutation, metadata, owner),
+    OWNED_REF_MUTATIONS.set(this, (mutation, metadata) =>
+      this.#mutateRefsOwned(mutation, metadata),
     );
-    OWNED_INDEX_SCANS.set(this, (reservation, scanOptions) =>
+    OWNED_INDEX_SCANS.set(this, (scanOptions) =>
       scanIndexOwned(
         this.#db,
         { kind: "checkout", repoId: this.#repoId, checkoutId: this.#checkoutId },
-        reservation,
-        (candidate) => this.#sharedStore.ownsMemoryReservation(candidate),
         () => this.#requireActive(),
         scanOptions,
       ),
     );
     OWNED_OPERATION_JOURNALS.set(this, {
-      read: (reservation) => this.#readOperationStateOwned(reservation),
-      write: (state, steps, touched, reservation) =>
-        this.#writeOperationJournalOwned(state, steps, touched, reservation),
-      replaceState: (expectedIntegrityOid, state, reservation) =>
-        this.#replaceOperationStateOwned(expectedIntegrityOid, state, reservation),
-      replaceJournal: (expectedIntegrityOid, state, steps, touched, reservation) =>
-        this.#replaceOperationJournalOwned(
-          expectedIntegrityOid,
-          state,
-          steps,
-          touched,
-          reservation,
-        ),
+      read: () => this.#readOperationStateOwned(),
+      write: (state, steps, touched) => this.#writeOperationJournalOwned(state, steps, touched),
+      replaceState: (expectedIntegrityOid, state) =>
+        this.#replaceOperationStateOwned(expectedIntegrityOid, state),
+      replaceJournal: (expectedIntegrityOid, state, steps, touched) =>
+        this.#replaceOperationJournalOwned(expectedIntegrityOid, state, steps, touched),
     });
     const ownedOperations: SharedRepoOwnedOperations = {
-      objectBatch: (reservation, batchOptions) =>
-        this.#writeBatchOwned(reservation, batchOptions),
-      authenticatedObject: (oid, expectedType, reservation) =>
-        this.#readAuthenticatedObjectOwned(oid, expectedType, reservation),
-      configValue: (path, owner) => this.#configGetOwned(path, owner),
+      objectBatch: (batchOptions) => this.#writeBatchOwned(batchOptions),
+      authenticatedObject: (oid, expectedType) =>
+        this.#readAuthenticatedObjectOwned(oid, expectedType),
+      configValue: (path) => this.#configGetOwned(path),
     };
     shared.installOperations(this, ownedOperations);
   }
@@ -3672,11 +2965,6 @@ export class CheckoutStore implements IndexStore {
   get #packs(): PackStore {
     this.#requireActive();
     return this.#packStore;
-  }
-
-  get #memory(): MemoryCoordinator {
-    this.#requireActive();
-    return this.#memoryCoordinator;
   }
 
   get db(): SqlDatabase {
@@ -3712,24 +3000,14 @@ export class CheckoutStore implements IndexStore {
     return { objects: this.#objects.bytes, chunks: this.#packs.cachedChunkBytes };
   }
 
-  /** Reserve operation state against this database's shared memory budget. */
-  reserveMemory(): MemoryReservation {
-    return this.#sharedStore.reserveMemory();
-  }
-
   // -- objects --------------------------------------------------------
 
   /** Look up opaque filesystem content ids without interpreting their bytes. */
   lookupBlobIds(contentIds: Iterable<Uint8Array>): Map<string, string> {
-    const reservation = this.reserveMemory();
-    const resultMemory = reservation.scope();
     const found = new Map<string, string>();
-    let resultBytes = 128;
-    try {
-      resultMemory.set("other", resultBytes);
-      for (const page of contentIdPages(contentIds, reservation)) {
-        for (const row of this.#db.iterate(
-          `WITH ids(content_id) AS MATERIALIZED (
+    for (const page of contentIdPages(contentIds)) {
+      for (const row of this.#db.iterate(
+        `WITH ids(content_id) AS MATERIALIZED (
              SELECT CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
                          ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
                      END
@@ -3738,29 +3016,19 @@ export class CheckoutStore implements IndexStore {
            SELECT lower(hex(ids.content_id)) AS content_key, b.oid
              FROM ids
              JOIN git_blob_ids b ON b.repo_id = ? AND b.content_id = ids.content_id`,
-          blob(page.payload),
-          JSON.stringify(page.rows),
-          this.#repoId,
-        )) {
-          const contentKey = row.content_key;
-          const oid = row.oid;
-          if (typeof contentKey !== "string" || typeof oid !== "string" || !isOid(oid)) {
-            throw new CorruptError("blob id lookup returned an invalid mapping");
-          }
-          resultBytes = blobIdRetainedTotal(
-            resultBytes,
-            BLOB_ID_MISMATCH_ROW_BYTES + contentKey.length * 2 + oid.length * 2,
-            "blob id lookup result",
-          );
-          resultMemory.set("other", resultBytes);
-          found.set(contentKey, oid);
+        blob(page.payload),
+        JSON.stringify(page.rows),
+        this.#repoId,
+      )) {
+        const contentKey = row.content_key;
+        const oid = row.oid;
+        if (typeof contentKey !== "string" || typeof oid !== "string" || !isOid(oid)) {
+          throw new CorruptError("blob id lookup returned an invalid mapping");
         }
+        found.set(contentKey, oid);
       }
-      return found;
-    } finally {
-      resultMemory.dispose();
-      reservation.dispose();
     }
+    return found;
   }
 
   /**
@@ -3771,38 +3039,27 @@ export class CheckoutStore implements IndexStore {
    * the content instead of trusting it.
    */
   blobIdMismatches(expected: Iterable<BlobIdMapping>): Map<number, string | null> {
-    const reservation = this.reserveMemory();
-    const stateMemory = reservation.scope();
     const retained: ExpectedBlobIdMapping[] = [];
     const mismatches = new Map<number, string | null>();
-    let retainedBytes = 256;
     let capturedCount = 0;
-    try {
-      stateMemory.set("other", retainedBytes);
-      for (const mapping of expected) {
-        if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
-        const cacheable = mapping.contentId.length <= BLOB_ID_CACHE_ELIGIBILITY_BYTES;
-        retainedBytes = blobIdRetainedTotal(
-          retainedBytes,
-          cacheable ? blobIdMismatchRetainedBytes(mapping) : BLOB_ID_MISMATCH_ROW_BYTES,
-          "blob id comparison",
-        );
-        stateMemory.set("other", retainedBytes);
-        if (cacheable) {
-          retained.push({
-            ordinal: capturedCount,
-            contentId: mapping.contentId.slice(),
-            oid: mapping.oid,
-          });
-        } else {
-          mismatches.set(capturedCount, null);
-        }
-        capturedCount++;
+    for (const mapping of expected) {
+      if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
+      const cacheable = mapping.contentId.length <= BLOB_ID_CACHE_ELIGIBILITY_BYTES;
+      if (cacheable) {
+        retained.push({
+          ordinal: capturedCount,
+          contentId: mapping.contentId.slice(),
+          oid: mapping.oid,
+        });
+      } else {
+        mismatches.set(capturedCount, null);
       }
+      capturedCount++;
+    }
 
-      for (const page of expectedContentIdPages(retained, reservation)) {
-        for (const row of this.#db.iterate(
-          `WITH expected(ordinal, content_id, expected_oid) AS MATERIALIZED (
+    for (const page of expectedContentIdPages(retained)) {
+      for (const row of this.#db.iterate(
+        `WITH expected(ordinal, content_id, expected_oid) AS MATERIALIZED (
              SELECT json_extract(value, '$.i'),
                     CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
                          ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
@@ -3815,105 +3072,69 @@ export class CheckoutStore implements IndexStore {
              LEFT JOIN git_blob_ids b
                ON b.repo_id = ? AND b.content_id = expected.content_id
             WHERE b.oid IS NULL OR b.oid <> expected.expected_oid`,
-          blob(page.payload),
-          JSON.stringify(page.rows),
-          this.#repoId,
-        )) {
-          const returnedOrdinal = row.ordinal;
-          const oid = row.oid;
-          if (
-            typeof returnedOrdinal !== "number" ||
-            !Number.isSafeInteger(returnedOrdinal) ||
-            returnedOrdinal < 0 ||
-            returnedOrdinal >= capturedCount ||
-            !page.rows.some((candidate) => candidate.i === returnedOrdinal) ||
-            (oid !== null && (typeof oid !== "string" || !isOid(oid)))
-          ) {
-            throw new CorruptError("blob id comparison returned an invalid mapping");
-          }
-          if (mismatches.has(returnedOrdinal)) {
-            throw new CorruptError("blob id comparison returned a duplicate ordinal");
-          }
-          mismatches.set(returnedOrdinal, oid);
+        blob(page.payload),
+        JSON.stringify(page.rows),
+        this.#repoId,
+      )) {
+        const returnedOrdinal = row.ordinal;
+        const oid = row.oid;
+        if (
+          typeof returnedOrdinal !== "number" ||
+          !Number.isSafeInteger(returnedOrdinal) ||
+          returnedOrdinal < 0 ||
+          returnedOrdinal >= capturedCount ||
+          !page.rows.some((candidate) => candidate.i === returnedOrdinal) ||
+          (oid !== null && (typeof oid !== "string" || !isOid(oid)))
+        ) {
+          throw new CorruptError("blob id comparison returned an invalid mapping");
         }
+        if (mismatches.has(returnedOrdinal)) {
+          throw new CorruptError("blob id comparison returned a duplicate ordinal");
+        }
+        mismatches.set(returnedOrdinal, oid);
       }
-      return mismatches;
-    } finally {
-      stateMemory.dispose();
-      reservation.dispose();
     }
+    return mismatches;
   }
 
   /** Upsert opaque content-id mappings in bounded BLOB payloads. */
   upsertBlobIds(mappings: Iterable<BlobIdMapping>): void {
-    const reservation = this.reserveMemory();
-    const inputMemory = reservation.scope();
-    const pageMemory = reservation.scope();
     const unique = new Map<string, BlobIdMapping>();
-    let retainedBytes = 256;
-    try {
-      inputMemory.set("other", retainedBytes);
-      for (const mapping of mappings) {
-        if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
-        if (mapping.contentId.length > BLOB_ID_CACHE_ELIGIBILITY_BYTES) continue;
-        const addition = blobIdMismatchRetainedBytes(mapping) + mapping.contentId.length * 4;
-        const nextBytes = blobIdRetainedTotal(retainedBytes, addition, "blob id update");
-        inputMemory.set("other", nextBytes);
-        const snapshot: BlobIdMapping = {
-          contentId: mapping.contentId.slice(),
-          oid: mapping.oid,
-        };
-        const key = contentIdKey(snapshot.contentId);
-        if (!unique.has(key)) {
-          retainedBytes = nextBytes;
-          unique.set(key, snapshot);
-        } else {
-          unique.set(key, snapshot);
-          inputMemory.set("other", retainedBytes);
-        }
-      }
-      if (unique.size === 0) return;
-      this.#db.transactionSync(() => {
-        let parts: Uint8Array[] = [];
-        let rows: { a: number; n: number; o: string }[] = [];
-        let length = 0;
-        let pageBytes = 256;
-        const flush = (): void => {
-          if (rows.length === 0) return;
-          pageMemory.set("other", blobIdRetainedTotal(pageBytes, length, "blob id update page"));
-          writeBlobIdPage(this.#db, this.#repoId, concat(parts), rows, true, true);
-          parts = [];
-          rows = [];
-          length = 0;
-          pageBytes = 256;
-          pageMemory.set("other", pageBytes);
-        };
-        pageMemory.set("other", pageBytes);
-        for (const mapping of unique.values()) {
-          if (
-            rows.length > 0 &&
-            (rows.length >= CONTENT_ID_PAGE ||
-              length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
-          ) {
-            flush();
-          }
-          pageBytes = blobIdRetainedTotal(
-            pageBytes,
-            160 + mapping.oid.length * 2,
-            "blob id update page",
-          );
-          pageMemory.set("other", pageBytes);
-          rows.push({ a: length + 1, n: mapping.contentId.length, o: mapping.oid });
-          parts.push(mapping.contentId);
-          length += mapping.contentId.length;
-        }
-        flush();
-      });
-    } finally {
-      pageMemory.dispose();
-      inputMemory.dispose();
-      reservation.dispose();
+    for (const mapping of mappings) {
+      if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
+      if (mapping.contentId.length > BLOB_ID_CACHE_ELIGIBILITY_BYTES) continue;
+      const snapshot: BlobIdMapping = {
+        contentId: mapping.contentId.slice(),
+        oid: mapping.oid,
+      };
+      const key = contentIdKey(snapshot.contentId);
+      unique.set(key, snapshot);
     }
+    if (unique.size === 0) return;
+    this.#db.transactionSync(() => {
+      let parts: Uint8Array[] = [];
+      let rows: { a: number; n: number; o: string }[] = [];
+      let length = 0;
+      const flush = (): void => {
+        if (rows.length === 0) return;
+        writeBlobIdPage(this.#db, this.#repoId, concat(parts), rows, true, true);
+        parts = [];
+        rows = [];
+        length = 0;
+      };
+      for (const mapping of unique.values()) {
+        if (
+          rows.length > 0 &&
+          (rows.length >= CONTENT_ID_PAGE || length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
+        ) {
+          flush();
+        }
+        rows.push({ a: length + 1, n: mapping.contentId.length, o: mapping.oid });
+        parts.push(mapping.contentId);
+        length += mapping.contentId.length;
+      }
+      flush();
+    });
   }
 
   has(oid: string): boolean {
@@ -3983,89 +3204,29 @@ export class CheckoutStore implements IndexStore {
     return this.#readAuthenticatedObject(oid, expectedType);
   }
 
-  #readAuthenticatedObjectOwned(
-    oid: string,
-    expectedType: ObjectType,
-    reservation: MemoryReservation,
-  ): RawObject | null {
-    if (reservation.disposed) {
-      throw new GitError("EINVAL", "authenticated object read reservation is disposed");
-    }
-    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
-      throw new GitError(
-        "EINVAL",
-        "authenticated object read reservation belongs to another repository",
-      );
-    }
-    if (reservation.currentBytes === 0) {
-      throw new GitError("EINVAL", "authenticated object read reservation is not pre-admitted");
-    }
-    return this.#readAuthenticatedObject(oid, expectedType, reservation);
+  #readAuthenticatedObjectOwned(oid: string, expectedType: ObjectType): RawObject | null {
+    return this.#readAuthenticatedObject(oid, expectedType);
   }
 
-  #readAuthenticatedObject(
-    oid: string,
-    expectedType: ObjectType,
-    owningReservation?: MemoryReservation,
-  ): RawObject | null {
+  #readAuthenticatedObject(oid: string, expectedType: ObjectType): RawObject | null {
     if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
     const loose = this.#looseRow(oid);
-    const operation = owningReservation?.scope();
-    const output = owningReservation?.scope();
+    if (loose === null) {
+      return this.#packs.readAuthenticatedObject(oid, expectedType);
+    }
+    const cacheKey = this.#objectCacheKey(oid);
     try {
-      if (loose === null) {
-        if (operation === undefined || output === undefined || owningReservation === undefined) {
-          return this.#packs.readAuthenticatedObject(oid, expectedType);
-        }
-        const admittedBytes = owningReservation.currentBytes;
-        owningReservation.clear("other");
-        if (owningReservation.currentBytes !== 0) {
-          owningReservation.set("other", admittedBytes - owningReservation.currentBytes);
-          throw new GitError(
-            "EINVAL",
-            "authenticated object read reservation must use a dedicated scope",
-          );
-        }
-        let aggregateRestored = false;
-        try {
-          const object = this.#packs.readAuthenticatedObject(oid, expectedType, {
-            operation,
-            output,
-          });
-          output.transfer("flat", owningReservation, "other");
-          owningReservation.set("other", admittedBytes);
-          aggregateRestored = true;
-          return object;
-        } finally {
-          if (!aggregateRestored) {
-            output.dispose();
-            operation.dispose();
-            owningReservation.set("other", admittedBytes);
-          }
-        }
+      const object = this.#readLooseObjectRows([{ oid, ...loose }]).get(oid);
+      if (object === undefined) throw new CorruptError(`loose ${expectedType} ${oid} disappeared`);
+      if (object.type !== expectedType) {
+        throw new CorruptError(`${oid} is a ${object.type}, not a ${expectedType}`);
       }
-      const cacheKey = this.#objectCacheKey(oid);
-      try {
-        const object = this.#readLooseObjectRows(
-          [{ oid, ...loose }],
-          operation === undefined || output === undefined ? undefined : { operation, output },
-          owningReservation !== undefined,
-        ).get(oid);
-        if (object === undefined)
-          throw new CorruptError(`loose ${expectedType} ${oid} disappeared`);
-        if (object.type !== expectedType) {
-          throw new CorruptError(`${oid} is a ${object.type}, not a ${expectedType}`);
-        }
-        if (hashObject(object.type, object.data) !== oid) {
-          throw new CorruptError(`loose ${expectedType} ${oid} does not match its bytes`);
-        }
-        return object;
-      } finally {
-        this.#objects.delete(cacheKey);
+      if (hashObject(object.type, object.data) !== oid) {
+        throw new CorruptError(`loose ${expectedType} ${oid} does not match its bytes`);
       }
+      return object;
     } finally {
-      output?.dispose();
-      operation?.dispose();
+      this.#objects.delete(cacheKey);
     }
   }
 
@@ -4186,19 +3347,10 @@ export class CheckoutStore implements IndexStore {
 
   /** Read a deduplicated prefix of mixed objects under an explicit byte budget. */
   readObjects(oids: readonly string[], options: { budgetBytes?: number } = {}): ObjectReadBatch {
-    const reservation = this.reserveMemory();
-    try {
-      return this.#readObjectsOwned(oids, options, reservation);
-    } finally {
-      reservation.dispose();
-    }
+    return this.#readObjectsOwned(oids, options);
   }
 
-  #readObjectsOwned(
-    oids: readonly string[],
-    options: { budgetBytes?: number },
-    reservation: MemoryReservation,
-  ): ObjectReadBatch {
+  #readObjectsOwned(oids: readonly string[], options: { budgetBytes?: number }): ObjectReadBatch {
     const budget = options.budgetBytes ?? PACK_BLOB_BATCH_TARGET_BYTES;
     if (!Number.isSafeInteger(budget) || budget <= 0) {
       throw new RangeError("object read budget must be a positive safe integer");
@@ -4207,19 +3359,10 @@ export class CheckoutStore implements IndexStore {
     if (!Number.isSafeInteger(inputLength) || inputLength > MAX_BLOB_BATCH_OIDS) {
       throw new GitError("E2BIG", `object batch exceeds ${MAX_BLOB_BATCH_OIDS} inputs`);
     }
-    const inputMemory = reservation.scope();
-    let inputBytes = 512 + inputLength * 8;
-    inputMemory.set("other", inputBytes);
     const captured: string[] = [];
     for (let index = 0; index < inputLength; index++) {
       const oid = oids[index];
       if (typeof oid !== "string") throw new CorruptError("invalid object id input");
-      inputBytes = blobIdRetainedTotal(
-        inputBytes,
-        retainedStringBytes(oid) + 8,
-        "object read input",
-      );
-      inputMemory.set("other", inputBytes);
       captured.push(oid);
       if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
     }
@@ -4227,20 +3370,13 @@ export class CheckoutStore implements IndexStore {
     const wanted: string[] = [];
     for (const oid of captured) {
       if (seen.has(oid)) continue;
-      inputBytes = blobIdRetainedTotal(inputBytes, 160, "object read input");
-      inputMemory.set("other", inputBytes);
       seen.add(oid);
       wanted.push(oid);
     }
     if (wanted.length === 0) return { objects: new Map(), remaining: [], bytes: 0 };
 
-    const jsonMemory = reservation.scope();
-    const jsonUnits = 2 + Math.max(0, wanted.length - 1) + wanted.length * 42;
-    jsonMemory.set("other", 128 + retainedStringUnits(jsonUnits));
     const encodedWanted = JSON.stringify(wanted);
 
-    const metadataMemory = reservation.scope();
-    metadataMemory.set("other", 512 + wanted.length * 768);
     const rawMetadata = this.#db.all<Record<string, unknown>>(
       `WITH wanted(ordinal, oid) AS (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
@@ -4322,271 +3458,152 @@ export class CheckoutStore implements IndexStore {
       });
     }
 
-    const selectionMemory = reservation.scope();
-    let selectionBytes = 256;
-    selectionMemory.set("other", selectionBytes);
     const selected: ObjectReadMetadata[] = [];
     let bytes = 0;
     for (const row of metadata) {
       if (row.size > Number.MAX_SAFE_INTEGER - bytes) {
-        throw new GitError("E2BIG", "object read retained-memory accounting overflow");
+        throw new GitError("E2BIG", "object read size accounting overflow");
       }
       if (selected.length > 0 && bytes + row.size > budget) break;
-      selectionBytes = blobIdRetainedTotal(selectionBytes, 200, "object read selection");
-      selectionMemory.set("other", selectionBytes);
       selected.push(row);
       bytes += row.size;
       if (bytes >= budget) break;
     }
 
-    let sourceArrayBytes = selectionBytes;
-    let looseOutputBytes = 0;
-    let packedOutputBytes = 0;
     const looseRows: ObjectReadMetadata[] = [];
     const packedOids: string[] = [];
     for (const row of selected) {
-      sourceArrayBytes = blobIdRetainedTotal(
-        sourceArrayBytes,
-        row.source === "loose" ? 8 : 8 + retainedStringBytes(row.oid),
-        "object read source arrays",
-      );
-      selectionMemory.set("other", sourceArrayBytes);
       if (row.source === "loose") {
-        looseOutputBytes = blobIdRetainedTotal(looseOutputBytes, row.size, "loose object output");
         looseRows.push(row);
       } else {
-        packedOutputBytes = blobIdRetainedTotal(
-          packedOutputBytes,
-          row.size,
-          "packed object output",
-        );
         packedOids.push(row.oid);
       }
     }
 
-    const remainingCount = wanted.length - selected.length;
-    const outputBytes =
-      512 + selected.length * 256 + remainingCount * 8 + looseOutputBytes + packedOutputBytes;
-    if (!Number.isSafeInteger(outputBytes)) {
-      throw new GitError("E2BIG", "object read output memory accounting overflow");
-    }
-    const outputMemory = reservation.scope();
-    const initialOutputBytes = 512 + selected.length * 256 + remainingCount * 8 + looseOutputBytes;
-    outputMemory.set("other", initialOutputBytes);
     const remaining = wanted.slice(selected.length);
-    const looseOperation = reservation.scope();
-    const packedOperation = reservation.scope();
-    const packedOutput = reservation.scope();
-    try {
-      const looseObjects = this.#readLooseObjectRows(looseRows, {
-        operation: looseOperation,
-        output: outputMemory,
-      });
-      const packed =
-        packedOids.length === 0
-          ? new Map<string, RawObject>()
-          : this.#packs.readObjects(packedOids, null, {
-              operation: packedOperation,
-              output: packedOutput,
-            });
-      const objects = new Map<string, RawObject>();
-      for (const row of selected) {
-        const object = (row.source === "loose" ? looseObjects : packed).get(row.oid);
-        if (object === undefined || object.type !== row.type || object.data.length !== row.size) {
-          throw new CorruptError(`object ${row.oid} did not produce its indexed bytes`);
-        }
-        objects.set(row.oid, object);
+    const looseObjects = this.#readLooseObjectRows(looseRows);
+    const packed =
+      packedOids.length === 0 ? new Map<string, RawObject>() : this.#packs.readObjects(packedOids);
+    const objects = new Map<string, RawObject>();
+    for (const row of selected) {
+      const object = (row.source === "loose" ? looseObjects : packed).get(row.oid);
+      if (object === undefined || object.type !== row.type || object.data.length !== row.size) {
+        throw new CorruptError(`object ${row.oid} did not produce its indexed bytes`);
       }
-      packed.clear();
-      packedOutput.transfer("flat", outputMemory, "other");
-      outputMemory.set("other", outputBytes);
-      return { objects, remaining, bytes };
-    } finally {
-      packedOutput.dispose();
-      packedOperation.dispose();
-      looseOperation.dispose();
+      objects.set(row.oid, object);
     }
+    return { objects, remaining, bytes };
   }
 
   /** Read a deduplicated prefix of blobs under an explicit byte budget. */
   readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {
-    const reservation = this.reserveMemory();
-    try {
-      const batch = this.#readObjectsOwned(oids, options, reservation);
-      reservation.set("metadata", 128 + batch.objects.size * 128);
-      const blobs = new Map<string, Uint8Array>();
-      for (const [oid, object] of batch.objects) {
-        if (object.type !== "blob")
-          throw new CorruptError(`${oid} is a ${object.type}, not a blob`);
-        blobs.set(oid, object.data);
-      }
-      return { blobs, remaining: batch.remaining, bytes: batch.bytes };
-    } finally {
-      reservation.dispose();
+    const batch = this.#readObjectsOwned(oids, options);
+    const blobs = new Map<string, Uint8Array>();
+    for (const [oid, object] of batch.objects) {
+      if (object.type !== "blob") throw new CorruptError(`${oid} is a ${object.type}, not a blob`);
+      blobs.set(oid, object.data);
     }
+    return { blobs, remaining: batch.remaining, bytes: batch.bytes };
   }
 
   /** Stream every non-tree entry in raw Git DFS order with one SQL statement. */
-  *walkTree(treeOid: string, owningReservation?: MemoryReservation): Generator<WalkTreeEntry> {
-    if (
-      owningReservation !== undefined &&
-      !this.#sharedStore.ownsMemoryReservation(owningReservation)
-    ) {
-      throw new GitError("EINVAL", "tree walk reservation belongs to another repository");
-    }
-    const reservation = owningReservation?.scope() ?? this.reserveMemory();
-    try {
-      yield* iterateTree(this.#db, this.#repoId, treeOid, reservation);
-    } finally {
-      reservation.dispose();
-    }
+  *walkTree(treeOid: string): Generator<WalkTreeEntry> {
+    yield* iterateTree(this.#db, this.#repoId, treeOid);
   }
 
   /** Stream changed leaves between two trees while pruning equal subtrees. */
   *walkTreeDiff(
     beforeTreeOid: string | null,
     afterTreeOid: string | null,
-    owningReservation?: MemoryReservation,
   ): Generator<WalkTreeDiffEntry> {
-    if (
-      owningReservation !== undefined &&
-      !this.#sharedStore.ownsMemoryReservation(owningReservation)
-    ) {
-      throw new GitError("EINVAL", "tree diff reservation belongs to another repository");
-    }
-    const reservation = owningReservation?.scope() ?? this.reserveMemory();
-    try {
-      yield* iterateTreeDiff(this.#db, this.#repoId, beforeTreeOid, afterTreeOid, reservation);
-    } finally {
-      reservation.dispose();
-    }
+    yield* iterateTreeDiff(this.#db, this.#repoId, beforeTreeOid, afterTreeOid);
   }
 
   /** Stream objects introduced by one tree transition. */
   *walkTreeDiffObjects(
     beforeTreeOid: string | null,
     afterTreeOid: string,
-    owningReservation?: MemoryReservation,
   ): Generator<WalkTreeDiffObject> {
-    if (
-      owningReservation !== undefined &&
-      !this.#sharedStore.ownsMemoryReservation(owningReservation)
-    ) {
-      throw new GitError("EINVAL", "tree diff reservation belongs to another repository");
-    }
-    const reservation = owningReservation?.scope() ?? this.reserveMemory();
-    try {
-      yield* iterateTreeDiffObjects(
-        this.#db,
-        this.#repoId,
-        beforeTreeOid,
-        afterTreeOid,
-        reservation,
-      );
-    } finally {
-      reservation.dispose();
-    }
+    yield* iterateTreeDiffObjects(this.#db, this.#repoId, beforeTreeOid, afterTreeOid);
   }
 
   write(type: ObjectType, data: Uint8Array): string {
-    const reservation = this.reserveMemory();
-    const commitMemory = reservation.scope();
-    const storageMemory = reservation.scope();
-    try {
-      const oid = hashObject(type, data);
-      const commitEntry =
-        type === "commit"
-          ? prepareCommitCacheOwned({ repoId: this.#repoId, oid, data }, commitMemory)
-          : undefined;
-      if (this.has(oid)) {
-        if (commitEntry !== undefined) {
-          requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
-        }
-        return oid;
+    const oid = hashObject(type, data);
+    const commitEntry =
+      type === "commit" ? prepareCommitCache({ repoId: this.#repoId, oid, data }) : undefined;
+    if (this.has(oid)) {
+      if (commitEntry !== undefined) {
+        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
       }
-      const stored = looseEncoding(data.length);
-      storageMemory.set(
-        "other",
-        stored === "raw" ? data.length : maximumDeflatedBytes(data.length),
-      );
-      const storedData = encodeLoose(data, stored);
-      storageMemory.set("other", storedData.length);
-      const createdMs = this.#nowMilliseconds();
-      this.#db.transactionSync(() => {
-        this.#db.run(
-          "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, ?)",
-          this.#repoId,
-          oid,
-          type,
-          data.length,
-          stored,
-        );
-        this.#db.run(
-          `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
-         VALUES (?, ?, ?)`,
-          this.#repoId,
-          oid,
-          createdMs,
-        );
-        this.#db.run(
-          "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
-          this.#repoId,
-          oid,
-        );
-        for (
-          let seq = 0, offset = 0;
-          offset < storedData.length || seq === 0;
-          seq++, offset += OBJECT_CHUNK
-        ) {
-          const part = storedData.subarray(offset, offset + OBJECT_CHUNK);
-          if (part.length === 0) {
-            this.#db.run(
-              "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, zeroblob(0))",
-              this.#repoId,
-              oid,
-              seq,
-            );
-          } else {
-            this.#db.run(
-              "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-              this.#repoId,
-              oid,
-              seq,
-              blob(part),
-            );
-          }
-        }
-        if (type === "tree") {
-          const treeMemory = reservation.scope();
-          try {
-            indexSeededTreeSource(
-              this.#db,
-              {
-                repoId: this.#repoId,
-                treeOid: oid,
-                storage: "loose",
-                sourceId: 0,
-                objectSize: data.length,
-              },
-              [data],
-              treeMemory,
-            );
-          } finally {
-            treeMemory.dispose();
-          }
-        }
-        if (commitEntry !== undefined) {
-          requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
-        }
-      });
-      this.shared.markLoose();
-      this.#objects.set(this.#objectCacheKey(oid), { type, data });
       return oid;
-    } finally {
-      storageMemory.dispose();
-      commitMemory.dispose();
-      reservation.dispose();
     }
+    const stored = looseEncoding(data.length);
+    const storedData = encodeLoose(data, stored);
+    const createdMs = this.#nowMilliseconds();
+    this.#db.transactionSync(() => {
+      this.#db.run(
+        "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, ?)",
+        this.#repoId,
+        oid,
+        type,
+        data.length,
+        stored,
+      );
+      this.#db.run(
+        `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
+         VALUES (?, ?, ?)`,
+        this.#repoId,
+        oid,
+        createdMs,
+      );
+      this.#db.run(
+        "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
+        this.#repoId,
+        oid,
+      );
+      for (
+        let seq = 0, offset = 0;
+        offset < storedData.length || seq === 0;
+        seq++, offset += OBJECT_CHUNK
+      ) {
+        const part = storedData.subarray(offset, offset + OBJECT_CHUNK);
+        if (part.length === 0) {
+          this.#db.run(
+            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, zeroblob(0))",
+            this.#repoId,
+            oid,
+            seq,
+          );
+        } else {
+          this.#db.run(
+            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+            this.#repoId,
+            oid,
+            seq,
+            blob(part),
+          );
+        }
+      }
+      if (type === "tree") {
+        indexSeededTreeSource(
+          this.#db,
+          {
+            repoId: this.#repoId,
+            treeOid: oid,
+            storage: "loose",
+            sourceId: 0,
+            objectSize: data.length,
+          },
+          [data],
+        );
+      }
+      if (commitEntry !== undefined) {
+        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
+      }
+    });
+    this.shared.markLoose();
+    this.#objects.set(this.#objectCacheKey(oid), { type, data });
+    return oid;
   }
 
   /**
@@ -4600,128 +3617,50 @@ export class CheckoutStore implements IndexStore {
     if (!Number.isSafeInteger(size) || size < 0) {
       throw new GitError("EINVAL", "streamed object size must be a safe nonnegative integer");
     }
-    const reservation = this.reserveMemory();
-    const sourceMemory = reservation.scope();
-    const parserMemory = reservation.scope();
-    const storageMemory = reservation.scope();
-    try {
-      const hash = new Sha1().update(objectHeader(type, size));
-      if (type === "commit") sourceMemory.set("other", size);
-      const commitData = type === "commit" ? new Uint8Array(size) : undefined;
-      let hashed = 0;
-      for (const chunk of chunks()) {
-        if (hashed + chunk.length <= size) commitData?.set(chunk, hashed);
-        hashed += chunk.length;
-        hash.update(chunk);
+    const hash = new Sha1().update(objectHeader(type, size));
+    const commitData = type === "commit" ? new Uint8Array(size) : undefined;
+    let hashed = 0;
+    for (const chunk of chunks()) {
+      if (hashed + chunk.length <= size) commitData?.set(chunk, hashed);
+      hashed += chunk.length;
+      hash.update(chunk);
+    }
+    if (hashed !== size) {
+      throw new CorruptError(`streamed ${hashed} bytes for a ${type} declared as ${size}`);
+    }
+    const oid = toHex(hash.digest());
+    const commitEntry =
+      commitData === undefined
+        ? undefined
+        : prepareCommitCache({ repoId: this.#repoId, oid, data: commitData });
+    if (this.has(oid)) {
+      if (commitEntry !== undefined) {
+        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
       }
-      if (hashed !== size) {
-        throw new CorruptError(`streamed ${hashed} bytes for a ${type} declared as ${size}`);
-      }
-      const oid = toHex(hash.digest());
-      const commitEntry =
-        commitData === undefined
-          ? undefined
-          : prepareCommitCacheOwned({ repoId: this.#repoId, oid, data: commitData }, parserMemory);
-      if (this.has(oid)) {
-        if (commitEntry !== undefined) {
-          requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
-        }
-        return oid;
-      }
+      return oid;
+    }
 
-      const stored = looseEncoding(size);
-      if (stored === "raw") {
-        if (commitData === undefined) storageMemory.set("other", size);
-        const data = commitData ?? new Uint8Array(size);
-        const storageHash = new Sha1().update(objectHeader(type, size));
-        let offset = 0;
-        for (const chunk of chunks()) {
-          if (offset + chunk.length > size) {
-            throw new CorruptError(`stream changed after hashing ${oid}`);
-          }
-          data.set(chunk, offset);
-          storageHash.update(chunk);
-          offset += chunk.length;
-        }
-        if (offset !== size) throw new CorruptError(`stream changed after hashing ${oid}`);
-        if (toHex(storageHash.digest()) !== oid) {
+    const stored = looseEncoding(size);
+    if (stored === "raw") {
+      const data = commitData ?? new Uint8Array(size);
+      const storageHash = new Sha1().update(objectHeader(type, size));
+      let offset = 0;
+      for (const chunk of chunks()) {
+        if (offset + chunk.length > size) {
           throw new CorruptError(`stream changed after hashing ${oid}`);
         }
-        const createdMs = this.#nowMilliseconds();
-        this.#db.transactionSync(() => {
-          this.#db.run(
-            "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'raw')",
-            this.#repoId,
-            oid,
-            type,
-            size,
-          );
-          this.#db.run(
-            `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
-           VALUES (?, ?, ?)`,
-            this.#repoId,
-            oid,
-            createdMs,
-          );
-          this.#db.run(
-            "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
-            this.#repoId,
-            oid,
-          );
-          if (data.length === 0) {
-            this.#db.run(
-              "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, zeroblob(0))",
-              this.#repoId,
-              oid,
-            );
-          } else {
-            this.#db.run(
-              "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
-              this.#repoId,
-              oid,
-              blob(data),
-            );
-          }
-          if (type === "tree") {
-            const treeMemory = reservation.scope();
-            try {
-              indexSeededTreeSource(
-                this.#db,
-                {
-                  repoId: this.#repoId,
-                  treeOid: oid,
-                  storage: "loose",
-                  sourceId: 0,
-                  objectSize: size,
-                },
-                [data],
-                treeMemory,
-              );
-            } finally {
-              treeMemory.dispose();
-            }
-          }
-          if (commitEntry !== undefined) {
-            requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
-          }
-        });
-        this.shared.markLoose();
-        return oid;
+        data.set(chunk, offset);
+        storageHash.update(chunk);
+        offset += chunk.length;
       }
-
-      const rows: Uint8Array[] = [];
-      storageMemory.set("other", 2 * STREAM_CHUNK);
-      const deflate = new pako.Deflate({ chunkSize: STREAM_CHUNK });
-      deflate.onData = (chunk) => {
-        if (!(chunk instanceof Uint8Array))
-          throw new CorruptError("deflate produced a non-binary chunk");
-        rows.push(chunk);
-      };
-
+      if (offset !== size) throw new CorruptError(`stream changed after hashing ${oid}`);
+      if (toHex(storageHash.digest()) !== oid) {
+        throw new CorruptError(`stream changed after hashing ${oid}`);
+      }
       const createdMs = this.#nowMilliseconds();
       this.#db.transactionSync(() => {
         this.#db.run(
-          "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'zlib')",
+          "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'raw')",
           this.#repoId,
           oid,
           type,
@@ -4729,7 +3668,7 @@ export class CheckoutStore implements IndexStore {
         );
         this.#db.run(
           `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
-         VALUES (?, ?, ?)`,
+           VALUES (?, ?, ?)`,
           this.#repoId,
           oid,
           createdMs,
@@ -4739,72 +3678,31 @@ export class CheckoutStore implements IndexStore {
           this.#repoId,
           oid,
         );
-        let seq = 0;
-        const drain = (): void => {
-          for (const row of rows) {
-            this.#db.run(
-              "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-              this.#repoId,
-              oid,
-              seq++,
-              blob(row),
-            );
-          }
-          rows.length = 0;
-        };
-        const storageChunks = function* (): Generator<Uint8Array> {
-          const storageHash = new Sha1().update(objectHeader(type, size));
-          let streamed = 0;
-          for (const chunk of chunks()) {
-            const offset = streamed;
-            streamed += chunk.length;
-            if (streamed > size) throw new CorruptError(`stream changed after hashing ${oid}`);
-            commitData?.set(chunk, offset);
-            storageHash.update(chunk);
-            deflate.push(chunk, false);
-            if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
-            drain();
-            yield chunk;
-          }
-          deflate.push(new Uint8Array(0), true);
-          if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
-          drain();
-          if (streamed !== size || toHex(storageHash.digest()) !== oid) {
-            throw new CorruptError(`stream changed after hashing ${oid}`);
-          }
-        };
-        const storage = storageChunks();
-        if (type === "tree") {
-          const treeMemory = reservation.scope();
-          try {
-            indexSeededTreeSource(
-              this.#db,
-              {
-                repoId: this.#repoId,
-                treeOid: oid,
-                storage: "loose",
-                sourceId: 0,
-                objectSize: size,
-              },
-              storage,
-              treeMemory,
-            );
-          } finally {
-            treeMemory.dispose();
-          }
-        } else {
-          for (const _chunk of storage) {
-            // Storage and hashing advance together without retaining the object.
-          }
-        }
-        // An empty object still deserves one row, matching `write`.
-        if (seq === 0) {
+        if (data.length === 0) {
           this.#db.run(
-            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, zeroblob(0))",
             this.#repoId,
             oid,
-            0,
-            blob(new Uint8Array(0)),
+          );
+        } else {
+          this.#db.run(
+            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
+            this.#repoId,
+            oid,
+            blob(data),
+          );
+        }
+        if (type === "tree") {
+          indexSeededTreeSource(
+            this.#db,
+            {
+              repoId: this.#repoId,
+              treeOid: oid,
+              storage: "loose",
+              sourceId: 0,
+              objectSize: size,
+            },
+            [data],
           );
         }
         if (commitEntry !== undefined) {
@@ -4813,12 +3711,105 @@ export class CheckoutStore implements IndexStore {
       });
       this.shared.markLoose();
       return oid;
-    } finally {
-      storageMemory.dispose();
-      parserMemory.dispose();
-      sourceMemory.dispose();
-      reservation.dispose();
     }
+
+    const rows: Uint8Array[] = [];
+    const deflate = new pako.Deflate({ chunkSize: STREAM_CHUNK });
+    deflate.onData = (chunk) => {
+      if (!(chunk instanceof Uint8Array))
+        throw new CorruptError("deflate produced a non-binary chunk");
+      rows.push(chunk);
+    };
+
+    const createdMs = this.#nowMilliseconds();
+    this.#db.transactionSync(() => {
+      this.#db.run(
+        "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'zlib')",
+        this.#repoId,
+        oid,
+        type,
+        size,
+      );
+      this.#db.run(
+        `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
+         VALUES (?, ?, ?)`,
+        this.#repoId,
+        oid,
+        createdMs,
+      );
+      this.#db.run(
+        "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
+        this.#repoId,
+        oid,
+      );
+      let seq = 0;
+      const drain = (): void => {
+        for (const row of rows) {
+          this.#db.run(
+            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+            this.#repoId,
+            oid,
+            seq++,
+            blob(row),
+          );
+        }
+        rows.length = 0;
+      };
+      const storageChunks = function* (): Generator<Uint8Array> {
+        const storageHash = new Sha1().update(objectHeader(type, size));
+        let streamed = 0;
+        for (const chunk of chunks()) {
+          const offset = streamed;
+          streamed += chunk.length;
+          if (streamed > size) throw new CorruptError(`stream changed after hashing ${oid}`);
+          commitData?.set(chunk, offset);
+          storageHash.update(chunk);
+          deflate.push(chunk, false);
+          if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
+          drain();
+          yield chunk;
+        }
+        deflate.push(new Uint8Array(0), true);
+        if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
+        drain();
+        if (streamed !== size || toHex(storageHash.digest()) !== oid) {
+          throw new CorruptError(`stream changed after hashing ${oid}`);
+        }
+      };
+      const storage = storageChunks();
+      if (type === "tree") {
+        indexSeededTreeSource(
+          this.#db,
+          {
+            repoId: this.#repoId,
+            treeOid: oid,
+            storage: "loose",
+            sourceId: 0,
+            objectSize: size,
+          },
+          storage,
+        );
+      } else {
+        for (const _chunk of storage) {
+          // Storage and hashing advance together without retaining the object.
+        }
+      }
+      // An empty object still deserves one row, matching `write`.
+      if (seq === 0) {
+        this.#db.run(
+          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+          this.#repoId,
+          oid,
+          0,
+          blob(new Uint8Array(0)),
+        );
+      }
+      if (commitEntry !== undefined) {
+        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
+      }
+    });
+    this.shared.markLoose();
+    return oid;
   }
 
   /**
@@ -4833,17 +3824,11 @@ export class CheckoutStore implements IndexStore {
     return this.#createWriteBatch(options);
   }
 
-  #writeBatchOwned(reservation: MemoryReservation, options: ObjectBatchOptions): OwnedObjectBatch {
-    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
-      throw new GitError("EINVAL", "object batch reservation belongs to another repository");
-    }
-    return this.#createWriteBatch(options, reservation);
+  #writeBatchOwned(options: ObjectBatchOptions): OwnedObjectBatch {
+    return this.#createWriteBatch(options);
   }
 
-  #createWriteBatch(
-    options: ObjectBatchOptions,
-    reservation?: MemoryReservation,
-  ): OwnedObjectBatch {
+  #createWriteBatch(options: ObjectBatchOptions): OwnedObjectBatch {
     const payloadBytes = options.payloadBytes ?? OBJECT_PAYLOAD;
     const flushEvery = options.flushEvery ?? DEFAULT_OBJECT_FLUSH;
     // Keyed by oid: a tree build re-emits identical subtrees, and one
@@ -4852,36 +3837,20 @@ export class CheckoutStore implements IndexStore {
     let bytes = 0;
     let commitBytes = 0;
     let active = true;
-    const stageMemory = reservation?.scope();
     const requireActive = (): void => {
       if (!active) throw new GitError("EINVAL", "object batch is disposed");
-    };
-    const charge = (
-      nextBytes = bytes,
-      nextCommitBytes = commitBytes,
-      count = staged.size,
-    ): void => {
-      const retained = 512 + count * 256 + nextBytes + nextCommitBytes;
-      if (!Number.isSafeInteger(retained)) {
-        throw new GitError("E2BIG", "object batch retained-memory accounting overflow");
-      }
-      stageMemory?.set("other", retained);
     };
     const clear = (): void => {
       staged.clear();
       bytes = 0;
       commitBytes = 0;
-      stageMemory?.clear("other");
     };
     const flush = (): void => {
       requireActive();
       if (staged.size === 0) return;
-      const flushMemory = reservation?.scope();
       try {
-        flushMemory?.set("other", objectFlushInitialRetainedBytes(staged.size));
-        this.#flushObjects([...staged.values()], payloadBytes, flushMemory);
+        this.#flushObjects([...staged.values()], payloadBytes);
       } finally {
-        flushMemory?.dispose();
         clear();
       }
     };
@@ -4892,16 +3861,6 @@ export class CheckoutStore implements IndexStore {
           const oid = hashObject(type, data);
           if (staged.has(oid)) return oid;
           const stored = looseEncoding(data.length);
-          const maximumStoredBytes =
-            stored === "raw" ? data.length : maximumDeflatedBytes(data.length);
-          const maximumTreeBytes = type === "tree" && stored !== "raw" ? data.length : 0;
-          const commitPreparationBytes =
-            type === "commit" ? commitPreparationTransientBytes(data.length) : 0;
-          charge(
-            bytes + maximumStoredBytes + maximumTreeBytes,
-            commitBytes + commitPreparationBytes,
-            staged.size + 1,
-          );
           const storedData = stored === "raw" ? data.slice() : encodeLoose(data, stored);
           const object: StagedObject = { oid, type, size: data.length, stored, storedData };
           if (type === "tree") object.treeData = stored === "raw" ? storedData : data.slice();
@@ -4916,7 +3875,6 @@ export class CheckoutStore implements IndexStore {
               ? object.treeData.length
               : 0);
           const nextCommitBytes = commitBytes + (object.commitEntry?.cacheBytes ?? 0);
-          charge(nextBytes, nextCommitBytes, staged.size + 1);
           staged.set(oid, object);
           bytes = nextBytes;
           commitBytes = nextCommitBytes;
@@ -4940,15 +3898,13 @@ export class CheckoutStore implements IndexStore {
         if (!active) return;
         clear();
         active = false;
-        stageMemory?.dispose();
       },
     };
   }
 
   /** Run `body` with a batch, flushing what it staged when it returns. */
   writeObjects<T>(body: (batch: ObjectBatch) => T, options: ObjectBatchOptions = {}): T {
-    const reservation = this.reserveMemory();
-    const batch = this.#createWriteBatch(options, reservation);
+    const batch = this.#createWriteBatch(options);
     try {
       const result = body(batch);
       if (isThenableResult(result)) {
@@ -4959,16 +3915,10 @@ export class CheckoutStore implements IndexStore {
       return result;
     } finally {
       batch.dispose();
-      reservation.dispose();
     }
   }
 
-  #flushObjects(
-    staged: StagedObject[],
-    payloadBytes: number,
-    transientMemory?: MemoryReservation,
-  ): void {
-    transientMemory?.set("other", objectFlushTransientBytes(staged, payloadBytes));
+  #flushObjects(staged: StagedObject[], payloadBytes: number): void {
     const byOid = new Map(staged.map((object) => [object.oid, object]));
     const commitEntries = staged.flatMap((object) =>
       object.commitEntry === undefined ? [] : [object.commitEntry],
@@ -5065,33 +4015,22 @@ export class CheckoutStore implements IndexStore {
           JSON.stringify(payload.rows),
         );
       }
-      let treeMemory = transientMemory;
-      let localTreeMemory: MemoryReservation | null = null;
-      if (treeMemory === undefined) {
-        localTreeMemory = this.reserveMemory();
-        treeMemory = localTreeMemory;
-      }
-      try {
-        indexSeededTreeSources(
-          this.#db,
-          fresh.flatMap((object) => {
-            if (object.type !== "tree" || object.treeData === undefined) return [];
-            return [
-              {
-                repoId: this.#repoId,
-                treeOid: object.oid,
-                storage: "loose",
-                sourceId: 0,
-                objectSize: object.size,
-                chunks: [object.treeData],
-              },
-            ];
-          }),
-          treeMemory,
-        );
-      } finally {
-        localTreeMemory?.dispose();
-      }
+      indexSeededTreeSources(
+        this.#db,
+        fresh.flatMap((object) => {
+          if (object.type !== "tree" || object.treeData === undefined) return [];
+          return [
+            {
+              repoId: this.#repoId,
+              treeOid: object.oid,
+              storage: "loose",
+              sourceId: 0,
+              objectSize: object.size,
+              chunks: [object.treeData],
+            },
+          ];
+        }),
+      );
       requireCommitCacheWrites(insertCommitCaches(this.#db, commitEntries), commitEntries.length);
     });
     if (wroteLoose) this.shared.markLoose();
@@ -5194,8 +4133,7 @@ export class CheckoutStore implements IndexStore {
     return this.#readLooseObjectRows([{ oid, ...row }]).get(oid) ?? null;
   }
 
-  #readLooseObjects(oids: readonly string[], ownership: PackReadOwnership): Map<string, RawObject> {
-    this.#validateLooseReadOwnership(ownership);
+  #readLooseObjects(oids: readonly string[]): Map<string, RawObject> {
     if (oids.length === 0) return new Map();
     const rows = this.#db.all<{
       oid: string;
@@ -5209,7 +4147,7 @@ export class CheckoutStore implements IndexStore {
       JSON.stringify(oids),
       this.#repoId,
     );
-    return this.#readLooseObjectRows(rows, ownership);
+    return this.#readLooseObjectRows(rows);
   }
 
   #looseObjectMetadata(oids: readonly string[]): Map<string, { type: ObjectType; size: number }> {
@@ -5244,65 +4182,19 @@ export class CheckoutStore implements IndexStore {
       size: number | null;
       stored: string | null;
     }[],
-    ownership?: PackReadOwnership,
-    callerOwnsLiveSet = false,
   ): Map<string, RawObject> {
     if (rows.length === 0) return new Map();
-    if (callerOwnsLiveSet && ownership === undefined) {
-      throw new GitError("EINVAL", "pre-admitted loose object read ownership is missing");
-    }
-    let localOperation: MemoryReservation | undefined;
-    let localOutput: MemoryReservation | undefined;
-    if (ownership === undefined) {
-      let outputBytes = 512 + rows.length * 256;
-      for (const row of rows) {
-        if (typeof row.size !== "number" || !Number.isSafeInteger(row.size) || row.size < 0) {
-          throw new CorruptError(`loose blob ${row.oid} has an invalid size`);
-        }
-        outputBytes = blobIdRetainedTotal(outputBytes, row.size, "loose object output");
-      }
-      localOperation = this.reserveMemory();
-      localOutput = localOperation.scope();
-      try {
-        localOutput.set("other", outputBytes);
-      } catch (error) {
-        localOutput.dispose();
-        localOperation.dispose();
-        throw error;
-      }
-      ownership = { operation: localOperation, output: localOutput };
-    } else {
-      this.#validateLooseReadOwnership(ownership);
-    }
-    const reservation = ownership.operation.scope();
-    try {
-      const inputMemory = reservation.scope();
-      if (!callerOwnsLiveSet) inputMemory.set("other", 256 + rows.length * 512);
-      const wanted = rows.map((row) => row.oid);
-      let wantedJsonUnits = 2 + Math.max(0, wanted.length - 1);
-      for (const oid of wanted) {
-        wantedJsonUnits = blobIdRetainedTotal(
-          wantedJsonUnits,
-          jsonStringMaxUnits(oid),
-          "loose object input JSON",
-        );
-      }
-      const jsonMemory = reservation.scope();
-      if (!callerOwnsLiveSet) {
-        jsonMemory.set("other", 128 + retainedStringUnits(wantedJsonUnits));
-      }
-      const encodedWanted = JSON.stringify(wanted);
-      const gateMemory = reservation.scope();
-      if (!callerOwnsLiveSet) gateMemory.set("other", 256 + rows.length * 384);
-      const gate = this.#db.all<{
-        oid: string;
-        chunks: number;
-        first_seq: number | null;
-        last_seq: number | null;
-        largest_chunk: number;
-        stored_bytes: number;
-      }>(
-        `WITH wanted(ordinal, oid) AS (
+    const wanted = rows.map((row) => row.oid);
+    const encodedWanted = JSON.stringify(wanted);
+    const gate = this.#db.all<{
+      oid: string;
+      chunks: number;
+      first_seq: number | null;
+      last_seq: number | null;
+      largest_chunk: number;
+      stored_bytes: number;
+    }>(
+      `WITH wanted(ordinal, oid) AS (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
        )
        SELECT w.oid, COUNT(c.seq) AS chunks, MIN(c.seq) AS first_seq,
@@ -5312,149 +4204,114 @@ export class CheckoutStore implements IndexStore {
          LEFT JOIN git_object_chunks c ON c.repo_id = ? AND c.oid = w.oid
         GROUP BY w.ordinal, w.oid
         ORDER BY w.ordinal`,
-        encodedWanted,
-        this.#repoId,
-      );
-      let storedBytes = 0;
-      let rawOutputBytes = 0;
-      let inflatedOutputBytes = 0;
-      if (gate.length !== rows.length) throw new CorruptError("loose blob gate lost an object");
-      for (let index = 0; index < gate.length; index++) {
-        const checked = gate[index]!;
-        const source = rows[index]!;
-        const chunks = Number(checked.chunks);
-        const size = source.size;
-        const stored = parseLooseEncoding(source.stored ?? "");
-        if (
-          checked.oid !== source.oid ||
-          !isObjectType(source.type) ||
-          typeof size !== "number" ||
-          !Number.isSafeInteger(size) ||
-          size < 0 ||
-          size > MAX_PACK_DELTA_WORKING_BYTES ||
-          !Number.isSafeInteger(chunks) ||
-          chunks <= 0 ||
-          checked.first_seq !== 0 ||
-          checked.last_seq !== chunks - 1 ||
-          !Number.isSafeInteger(checked.largest_chunk) ||
-          checked.largest_chunk < 0 ||
-          checked.largest_chunk > OBJECT_CHUNK ||
-          !Number.isSafeInteger(checked.stored_bytes) ||
-          checked.stored_bytes < 0 ||
-          (stored === "raw" && checked.stored_bytes !== size) ||
-          (stored === "zlib" && checked.stored_bytes === 0)
-        ) {
-          throw new CorruptError(`loose blob ${source.oid} has invalid chunk metadata`);
-        }
-        storedBytes += checked.stored_bytes;
-        if (!Number.isSafeInteger(storedBytes)) {
-          throw new GitError("E2BIG", "loose object storage memory accounting overflow");
-        }
-        if (stored === "raw") rawOutputBytes += size;
-        else inflatedOutputBytes += size;
-        if (!Number.isSafeInteger(rawOutputBytes) || !Number.isSafeInteger(inflatedOutputBytes)) {
-          throw new GitError("E2BIG", "loose object output memory accounting overflow");
-        }
+      encodedWanted,
+      this.#repoId,
+    );
+    if (gate.length !== rows.length) throw new CorruptError("loose blob gate lost an object");
+    for (let index = 0; index < gate.length; index++) {
+      const checked = gate[index]!;
+      const source = rows[index]!;
+      const chunks = Number(checked.chunks);
+      const size = source.size;
+      const stored = parseLooseEncoding(source.stored ?? "");
+      if (
+        checked.oid !== source.oid ||
+        !isObjectType(source.type) ||
+        typeof size !== "number" ||
+        !Number.isSafeInteger(size) ||
+        size < 0 ||
+        size > MAX_PACK_DELTA_WORKING_BYTES ||
+        !Number.isSafeInteger(chunks) ||
+        chunks <= 0 ||
+        checked.first_seq !== 0 ||
+        checked.last_seq !== chunks - 1 ||
+        !Number.isSafeInteger(checked.largest_chunk) ||
+        checked.largest_chunk < 0 ||
+        checked.largest_chunk > OBJECT_CHUNK ||
+        !Number.isSafeInteger(checked.stored_bytes) ||
+        checked.stored_bytes < 0 ||
+        (stored === "raw" && checked.stored_bytes !== size) ||
+        (stored === "zlib" && checked.stored_bytes === 0)
+      ) {
+        throw new CorruptError(`loose blob ${source.oid} has invalid chunk metadata`);
       }
-      const materializationBytes = 1_024 + rows.length * 512 + 2 * storedBytes - rawOutputBytes;
-      if (!Number.isSafeInteger(materializationBytes)) {
-        throw new GitError("E2BIG", "loose object materialization memory accounting overflow");
-      }
-      if (!callerOwnsLiveSet) reservation.set("other", materializationBytes);
+    }
 
-      const parts = new Map<string, Uint8Array[]>();
-      for (const row of this.#db.iterate(
-        `WITH wanted(ordinal, oid) AS (
+    const parts = new Map<string, Uint8Array[]>();
+    for (const row of this.#db.iterate(
+      `WITH wanted(ordinal, oid) AS (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
        )
        SELECT w.oid, c.seq, c.data
          FROM wanted w
          JOIN git_object_chunks c ON c.repo_id = ? AND c.oid = w.oid
         ORDER BY w.ordinal, c.seq`,
-        encodedWanted,
-        this.#repoId,
-      )) {
-        if (typeof row.oid !== "string" || !Number.isSafeInteger(row.seq)) {
-          throw new CorruptError("loose blob query returned invalid chunk metadata");
-        }
-        const list = parts.get(row.oid);
-        if (list === undefined) parts.set(row.oid, [readBlob(row.data)]);
-        else list.push(readBlob(row.data));
+      encodedWanted,
+      this.#repoId,
+    )) {
+      if (typeof row.oid !== "string" || !Number.isSafeInteger(row.seq)) {
+        throw new CorruptError("loose blob query returned invalid chunk metadata");
       }
+      const list = parts.get(row.oid);
+      if (list === undefined) parts.set(row.oid, [readBlob(row.data)]);
+      else list.push(readBlob(row.data));
+    }
 
-      const result = new Map<string, RawObject>();
-      for (const row of rows) {
-        if (!isObjectType(row.type))
-          throw new CorruptError(`${row.oid} has an invalid object type`);
-        const size = row.size;
-        if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
-          throw new CorruptError(`loose blob ${row.oid} has an invalid size`);
-        }
-        if (size > MAX_PACK_DELTA_WORKING_BYTES) {
-          throw new GitError("E2BIG", `loose blob ${row.oid} exceeds the bounded inflate limit`);
-        }
-        const stored = parseLooseEncoding(row.stored ?? "");
-        const encoded = concat(parts.get(row.oid) ?? []);
-        let data: Uint8Array;
-        if (stored === "raw") {
-          data = encoded;
-        } else {
-          const stream = new InflateInto(size);
-          let consumed = 0;
-          while (!stream.ended && consumed < encoded.length) {
-            const input = encoded.subarray(consumed, consumed + INFLATE_FEED);
-            let used: number;
-            try {
-              used = stream.push(input);
-            } catch (error) {
-              if (error instanceof InflateSizeError) {
-                throw new CorruptError(`loose object ${row.oid} exceeds its indexed size`, {
-                  cause: error,
-                });
-              }
-              throw error;
-            }
-            consumed += used;
-            if (!stream.ended && used !== input.length) {
-              throw new CorruptError(`loose object ${row.oid} inflater made no progress`);
-            }
-          }
-          if (!stream.ended || consumed !== encoded.length) {
-            throw new CorruptError(`loose object ${row.oid} size does not match its metadata`);
-          }
+    const result = new Map<string, RawObject>();
+    for (const row of rows) {
+      if (!isObjectType(row.type)) throw new CorruptError(`${row.oid} has an invalid object type`);
+      const size = row.size;
+      if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
+        throw new CorruptError(`loose blob ${row.oid} has an invalid size`);
+      }
+      if (size > MAX_PACK_DELTA_WORKING_BYTES) {
+        throw new GitError("E2BIG", `loose blob ${row.oid} exceeds the bounded inflate limit`);
+      }
+      const stored = parseLooseEncoding(row.stored ?? "");
+      const encoded = concat(parts.get(row.oid) ?? []);
+      let data: Uint8Array;
+      if (stored === "raw") {
+        data = encoded;
+      } else {
+        const stream = new InflateInto(size);
+        let consumed = 0;
+        while (!stream.ended && consumed < encoded.length) {
+          const input = encoded.subarray(consumed, consumed + INFLATE_FEED);
+          let used: number;
           try {
-            data = stream.finish();
+            used = stream.push(input);
           } catch (error) {
-            throw new CorruptError(`loose object ${row.oid} size does not match its metadata`, {
-              cause: error,
-            });
+            if (error instanceof InflateSizeError) {
+              throw new CorruptError(`loose object ${row.oid} exceeds its indexed size`, {
+                cause: error,
+              });
+            }
+            throw error;
+          }
+          consumed += used;
+          if (!stream.ended && used !== input.length) {
+            throw new CorruptError(`loose object ${row.oid} inflater made no progress`);
           }
         }
-        if (data.length !== size) {
-          throw new CorruptError(`loose blob ${row.oid} size does not match its metadata`);
+        if (!stream.ended || consumed !== encoded.length) {
+          throw new CorruptError(`loose object ${row.oid} size does not match its metadata`);
         }
-        const object: RawObject = { type: row.type, data };
-        this.#objects.set(this.#objectCacheKey(row.oid), object);
-        result.set(row.oid, object);
+        try {
+          data = stream.finish();
+        } catch (error) {
+          throw new CorruptError(`loose object ${row.oid} size does not match its metadata`, {
+            cause: error,
+          });
+        }
       }
-      return result;
-    } finally {
-      reservation.dispose();
-      localOutput?.dispose();
-      localOperation?.dispose();
+      if (data.length !== size) {
+        throw new CorruptError(`loose blob ${row.oid} size does not match its metadata`);
+      }
+      const object: RawObject = { type: row.type, data };
+      this.#objects.set(this.#objectCacheKey(row.oid), object);
+      result.set(row.oid, object);
     }
-  }
-
-  #validateLooseReadOwnership(ownership: PackReadOwnership): void {
-    if (
-      ownership.operation === ownership.output ||
-      ownership.operation.disposed ||
-      ownership.output.disposed ||
-      !this.#memoryCoordinator.owns(ownership.operation) ||
-      !this.#memoryCoordinator.owns(ownership.output)
-    ) {
-      throw new GitError("EINVAL", "loose object read ownership is invalid");
-    }
+    return result;
   }
 
   // -- refs -----------------------------------------------------------
@@ -5492,62 +4349,41 @@ export class CheckoutStore implements IndexStore {
     ) {
       throw new CorruptError(`stored target of ${checkedName} has invalid text metadata`);
     }
-    const reservation = this.#sharedStore.reserveMemory();
-    try {
-      reservation.set(
-        "other",
-        256 +
-          metadata.name_bytes +
-          metadata.target_bytes +
-          retainedStringUnits(metadata.name_bytes) +
-          retainedStringUnits(metadata.target_bytes),
-      );
-      const row = this.#db.one<Record<string, unknown>>(
-        `SELECT repo_id, typeof(name) AS name_type,
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT repo_id, typeof(name) AS name_type,
                 length(CAST(name AS BLOB)) AS name_bytes,
                 CAST(name AS BLOB) AS name_blob,
                 typeof(target) AS target_type,
                 length(CAST(target AS BLOB)) AS target_bytes,
                 CAST(target AS BLOB) AS target_blob
            FROM git_refs WHERE repo_id = ? AND name = ?`,
-        this.#repoId,
-        checkedName,
-      );
-      if (
-        row === undefined ||
-        row.repo_id !== this.#repoId ||
-        row.name_type !== "text" ||
-        row.name_bytes !== metadata.name_bytes ||
-        row.target_type !== "text" ||
-        row.target_bytes !== metadata.target_bytes
-      ) {
-        throw new CorruptError(`stored ref ${checkedName} changed after validation`);
-      }
-      const storedName = requireRefName(
-        decodeCanonicalStoredText(row.name_blob, "stored ref name"),
-        "stored ref name",
-        "stored",
-      );
-      if (storedName !== checkedName) {
-        throw new CorruptError(`stored ref ${checkedName} crossed a ref boundary`);
-      }
-      const checked = requireRawRefTarget(
-        decodeCanonicalStoredText(row.target_blob, `stored target of ${checkedName}`),
-        `stored target of ${checkedName}`,
-        "stored",
-      );
-      reservation.set(
-        "other",
-        256 +
-          metadata.name_bytes +
-          metadata.target_bytes +
-          retainedStringBytes(storedName) +
-          retainedStringBytes(checked),
-      );
-      return checked;
-    } finally {
-      reservation.dispose();
+      this.#repoId,
+      checkedName,
+    );
+    if (
+      row === undefined ||
+      row.repo_id !== this.#repoId ||
+      row.name_type !== "text" ||
+      row.name_bytes !== metadata.name_bytes ||
+      row.target_type !== "text" ||
+      row.target_bytes !== metadata.target_bytes
+    ) {
+      throw new CorruptError(`stored ref ${checkedName} changed after validation`);
     }
+    const storedName = requireRefName(
+      decodeCanonicalStoredText(row.name_blob, "stored ref name"),
+      "stored ref name",
+      "stored",
+    );
+    if (storedName !== checkedName) {
+      throw new CorruptError(`stored ref ${checkedName} crossed a ref boundary`);
+    }
+    const checked = requireRawRefTarget(
+      decodeCanonicalStoredText(row.target_blob, `stored target of ${checkedName}`),
+      `stored target of ${checkedName}`,
+      "stored",
+    );
+    return checked;
   }
 
   setRef(name: string, target: string): void {
@@ -5602,41 +4438,32 @@ export class CheckoutStore implements IndexStore {
     ) {
       throw new CorruptError("stored tracking revision ref metadata is invalid");
     }
-    const reservation = this.#sharedStore.reserveMemory();
-    try {
-      reservation.set(
-        "other",
-        256 + metadata.ref_name_bytes + retainedStringUnits(metadata.ref_name_bytes),
-      );
-      const row = this.#db.one<Record<string, unknown>>(
-        `SELECT repo_id, typeof(ref_name) AS ref_name_type,
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT repo_id, typeof(ref_name) AS ref_name_type,
                 length(CAST(ref_name AS BLOB)) AS ref_name_bytes,
                 CAST(ref_name AS BLOB) AS ref_name_blob, revision
            FROM git_tracking_ref_revisions
           WHERE repo_id = ? AND ref_name = ?`,
-        this.#repoId,
-        refName,
-      );
-      if (
-        row === undefined ||
-        row.repo_id !== this.#repoId ||
-        row.ref_name_type !== "text" ||
-        row.ref_name_bytes !== metadata.ref_name_bytes
-      ) {
-        throw new CorruptError("tracking revision changed after metadata preflight");
-      }
-      const storedName = requireRefName(
-        decodeCanonicalStoredText(row.ref_name_blob, "stored tracking revision ref"),
-        "stored tracking revision ref",
-        "stored",
-      );
-      if (storedName !== refName) {
-        throw new CorruptError("tracking revision crossed repository or ref boundaries");
-      }
-      return requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
-    } finally {
-      reservation.dispose();
+      this.#repoId,
+      refName,
+    );
+    if (
+      row === undefined ||
+      row.repo_id !== this.#repoId ||
+      row.ref_name_type !== "text" ||
+      row.ref_name_bytes !== metadata.ref_name_bytes
+    ) {
+      throw new CorruptError("tracking revision changed after metadata preflight");
     }
+    const storedName = requireRefName(
+      decodeCanonicalStoredText(row.ref_name_blob, "stored tracking revision ref"),
+      "stored tracking revision ref",
+      "stored",
+    );
+    if (storedName !== refName) {
+      throw new CorruptError("tracking revision crossed repository or ref boundaries");
+    }
+    return requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
   }
 
   #trackingRefRevisionCount(): number {
@@ -5706,56 +4533,47 @@ export class CheckoutStore implements IndexStore {
     ) {
       throw new CorruptError("tracking observation metadata is invalid");
     }
-    const reservation = this.#sharedStore.reserveMemory();
     let matched = 0;
     let previousNameBytes: Uint8Array | null = null;
-    try {
-      reservation.set(
-        "other",
-        256 + 2 * metadata.ref_name_bytes + retainedStringUnits(metadata.ref_name_bytes),
-      );
-      for (const row of this.#db.iterate(
-        `SELECT repo_id, typeof(ref_name) AS ref_name_type,
+    for (const row of this.#db.iterate(
+      `SELECT repo_id, typeof(ref_name) AS ref_name_type,
                 CAST(ref_name AS BLOB) AS ref_name_blob, revision
            FROM git_tracking_ref_revisions
           WHERE repo_id = ? AND substr(ref_name, 1, length(?)) = ?
           ORDER BY ref_name`,
-        this.#repoId,
-        trackingPrefix,
-        trackingPrefix,
-      )) {
-        const nameBytes = requireStoredTextBytes(
-          row.ref_name_type,
-          row.ref_name_blob,
-          "stored tracking revision ref",
-        );
-        const name = requireRefName(
-          decodeCanonicalText(nameBytes, "stored tracking revision ref"),
-          "stored tracking revision ref",
-          "stored",
-        );
-        if (
-          row.repo_id !== this.#repoId ||
-          !name.startsWith(trackingPrefix) ||
-          (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0)
-        ) {
-          throw new CorruptError("tracking observation scan crossed or reordered repositories");
-        }
-        previousNameBytes = nameBytes;
-        matched++;
-        if (matched > metadata.rows) {
-          throw new CorruptError("tracking observation count is invalid");
-        }
-        const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
-        if (revision === Number.MAX_SAFE_INTEGER) {
-          throw new GitError("E2BIG", "tracking ref revision is exhausted");
-        }
+      this.#repoId,
+      trackingPrefix,
+      trackingPrefix,
+    )) {
+      const nameBytes = requireStoredTextBytes(
+        row.ref_name_type,
+        row.ref_name_blob,
+        "stored tracking revision ref",
+      );
+      const name = requireRefName(
+        decodeCanonicalText(nameBytes, "stored tracking revision ref"),
+        "stored tracking revision ref",
+        "stored",
+      );
+      if (
+        row.repo_id !== this.#repoId ||
+        !name.startsWith(trackingPrefix) ||
+        (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0)
+      ) {
+        throw new CorruptError("tracking observation scan crossed or reordered repositories");
       }
-      if (matched !== metadata.rows) {
-        throw new CorruptError("tracking observation changed after metadata preflight");
+      previousNameBytes = nameBytes;
+      matched++;
+      if (matched > metadata.rows) {
+        throw new CorruptError("tracking observation count is invalid");
       }
-    } finally {
-      reservation.dispose();
+      const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
+      if (revision === Number.MAX_SAFE_INTEGER) {
+        throw new GitError("E2BIG", "tracking ref revision is exhausted");
+      }
+    }
+    if (matched !== metadata.rows) {
+      throw new CorruptError("tracking observation changed after metadata preflight");
     }
     if (matched === 0) return;
     this.#db.run(
@@ -5767,13 +4585,10 @@ export class CheckoutStore implements IndexStore {
     );
   }
 
-  #bumpTrackingRefRevisions(changedNames: ReadonlySet<string>, budget: RefMutationBudget): void {
+  #bumpTrackingRefRevisions(changedNames: ReadonlySet<string>): void {
     if (changedNames.size === 0) return;
     const affected: string[] = [];
-    for (const page of jsonPages(changedNames, "tracking ref revision lookup", {
-      reservation: budget.memoryReservation(),
-      maxUnits: jsonStringMaxUnits,
-    })) {
+    for (const page of jsonPages(changedNames, "tracking ref revision lookup")) {
       const metadata = this.#db.one<{ max_ref_name_bytes: unknown }>(
         `SELECT coalesce(max(length(CAST(ref_name AS BLOB))), 0) AS max_ref_name_bytes
            FROM git_tracking_ref_revisions
@@ -5785,69 +4600,56 @@ export class CheckoutStore implements IndexStore {
         metadata?.max_ref_name_bytes,
         "tracking revision scan",
       );
-      const rowMemory = budget.memoryReservation().scope();
-      rowMemory.set(
-        "other",
-        maxRefNameBytes === 0 ? 0 : currentTextRowRetainedBytes(maxRefNameBytes),
-      );
       let observedMaxRefNameBytes = 0;
-      try {
-        for (const row of this.#db.iterate(
-          `SELECT repo_id, typeof(ref_name) AS ref_name_type,
+      for (const row of this.#db.iterate(
+        `SELECT repo_id, typeof(ref_name) AS ref_name_type,
                   length(CAST(ref_name AS BLOB)) AS ref_name_bytes,
                   CAST(ref_name AS BLOB) AS ref_name_blob, revision
              FROM git_tracking_ref_revisions
             WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))
             ORDER BY ref_name`,
-          this.#repoId,
-          page,
-        )) {
-          if (row.repo_id !== this.#repoId) {
-            throw new CorruptError("tracking revision scan crossed repository boundaries");
-          }
-          const nameByteLength = requireStoredTextByteLength(
-            row.ref_name_type,
-            row.ref_name_bytes,
-            "stored tracking revision ref",
-          );
-          if (nameByteLength > maxRefNameBytes) {
-            throw new CorruptError("tracking revision scan changed after metadata preflight");
-          }
-          const nameBytes = requireStoredTextBytes(
-            row.ref_name_type,
-            row.ref_name_blob,
-            "stored tracking revision ref",
-          );
-          if (nameBytes.byteLength !== nameByteLength) {
-            throw new CorruptError("stored tracking revision ref changed after validation");
-          }
-          const name = requireRefName(
-            decodeCanonicalText(nameBytes, "stored tracking revision ref"),
-            "stored tracking revision ref",
-            "stored",
-          );
-          if (!changedNames.has(name)) {
-            throw new CorruptError("tracking revision scan crossed ref boundaries");
-          }
-          const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
-          if (revision === Number.MAX_SAFE_INTEGER) {
-            throw new GitError("E2BIG", "tracking ref revision is exhausted");
-          }
-          observedMaxRefNameBytes = Math.max(observedMaxRefNameBytes, nameByteLength);
-          budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(name));
-          affected.push(name);
+        this.#repoId,
+        page,
+      )) {
+        if (row.repo_id !== this.#repoId) {
+          throw new CorruptError("tracking revision scan crossed repository boundaries");
         }
-        if (observedMaxRefNameBytes !== maxRefNameBytes) {
+        const nameByteLength = requireStoredTextByteLength(
+          row.ref_name_type,
+          row.ref_name_bytes,
+          "stored tracking revision ref",
+        );
+        if (nameByteLength > maxRefNameBytes) {
           throw new CorruptError("tracking revision scan changed after metadata preflight");
         }
-      } finally {
-        rowMemory.dispose();
+        const nameBytes = requireStoredTextBytes(
+          row.ref_name_type,
+          row.ref_name_blob,
+          "stored tracking revision ref",
+        );
+        if (nameBytes.byteLength !== nameByteLength) {
+          throw new CorruptError("stored tracking revision ref changed after validation");
+        }
+        const name = requireRefName(
+          decodeCanonicalText(nameBytes, "stored tracking revision ref"),
+          "stored tracking revision ref",
+          "stored",
+        );
+        if (!changedNames.has(name)) {
+          throw new CorruptError("tracking revision scan crossed ref boundaries");
+        }
+        const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
+        if (revision === Number.MAX_SAFE_INTEGER) {
+          throw new GitError("E2BIG", "tracking ref revision is exhausted");
+        }
+        observedMaxRefNameBytes = Math.max(observedMaxRefNameBytes, nameByteLength);
+        affected.push(name);
+      }
+      if (observedMaxRefNameBytes !== maxRefNameBytes) {
+        throw new CorruptError("tracking revision scan changed after metadata preflight");
       }
     }
-    for (const page of jsonPages(affected, "tracking ref revision update", {
-      reservation: budget.memoryReservation(),
-      maxUnits: jsonStringMaxUnits,
-    })) {
+    for (const page of jsonPages(affected, "tracking ref revision update")) {
       this.#db.run(
         `UPDATE git_tracking_ref_revisions SET revision = revision + 1
           WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))`,
@@ -5862,108 +4664,53 @@ export class CheckoutStore implements IndexStore {
     trackingPrefix: string,
     refName: string,
   ): TrackingRefPublicationToken {
-    const reservation = this.#sharedStore.reserveMemory();
-    try {
-      const budget = new RefMutationBudget(reservation, true);
-      const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
-      const name = requireRefName(refName, "tracking publication ref", "input");
-      budget.charge(
-        REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(prefix) + retainedStringBytes(name),
-      );
-      if (
-        !name.startsWith(prefix) ||
-        (name.length === prefix.length + 4 && name.endsWith("HEAD"))
-      ) {
-        throw new GitError("EINVAL", "tracking publication ref is outside its branch namespace");
-      }
-      const snapshot = this.#db.transactionSync(() => {
-        const refRevision = this.#ensureTrackingRefRevision(name);
-        const targetMetadata = this.#db.one<{ target_type: unknown; target_bytes: unknown }>(
-          `SELECT typeof(target) AS target_type,
-                  length(CAST(target AS BLOB)) AS target_bytes
-             FROM git_refs WHERE repo_id = ? AND name = ?`,
-          this.#repoId,
-          name,
-        );
-        const targetMemory = reservation.scope();
-        if (targetMetadata !== undefined) {
-          if (
-            targetMetadata.target_type !== "text" ||
-            typeof targetMetadata.target_bytes !== "number" ||
-            !Number.isSafeInteger(targetMetadata.target_bytes) ||
-            targetMetadata.target_bytes < 1
-          ) {
-            throw new CorruptError("tracking publication target metadata is invalid");
-          }
-          targetMemory.set("other", currentTextRowRetainedBytes(targetMetadata.target_bytes));
-        }
-        let target: string | null;
-        try {
-          const row = this.#db.one<Record<string, unknown>>(
-            `SELECT typeof(target) AS target_type,
-                    length(CAST(target AS BLOB)) AS target_bytes,
-                    CAST(target AS BLOB) AS target_blob
-               FROM git_refs WHERE repo_id = ? AND name = ?`,
-            this.#repoId,
-            name,
-          );
-          target =
-            row === undefined
-              ? null
-              : requireRawRefTarget(
-                  requireCanonicalStoredText(
-                    row.target_type,
-                    row.target_blob,
-                    "stored tracking target",
-                  ),
-                  "stored tracking target",
-                  "stored",
-                );
-          if (
-            row !== undefined &&
-            (row.target_type !== "text" || row.target_bytes !== targetMetadata?.target_bytes)
-          ) {
-            throw new CorruptError("tracking publication target changed after metadata preflight");
-          }
-          targetMemory.clear("other");
-          if (target !== null) budget.charge(retainedStringBytes(target));
-        } finally {
-          targetMemory.dispose();
-        }
-        const state: TrackingRefPublicationState = {
-          refName: name,
-          target,
-          refRevision,
-          budget,
-          reservation,
-          disposed: false,
-        };
-        return state;
-      });
-      let issuedToken: TrackingRefPublicationToken | null = null;
-      const token = new TrackingRefPublicationToken(
-        prefix,
-        snapshot.refName,
-        snapshot.target,
-        () => snapshot.disposed,
-        () => {
-          if (snapshot.disposed) return;
-          snapshot.disposed = true;
-          snapshot.reservation.dispose();
-          if (issuedToken !== null) {
-            this.#issuedTrackingRefPublications.delete(issuedToken);
-            this.#trackingRefPublicationStates.delete(issuedToken);
-          }
-        },
-      );
-      issuedToken = token;
-      this.#issuedTrackingRefPublications.add(token);
-      this.#trackingRefPublicationStates.set(token, snapshot);
-      return token;
-    } catch (error) {
-      reservation.dispose();
-      throw error;
+    const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
+    const name = requireRefName(refName, "tracking publication ref", "input");
+    if (!name.startsWith(prefix) || (name.length === prefix.length + 4 && name.endsWith("HEAD"))) {
+      throw new GitError("EINVAL", "tracking publication ref is outside its branch namespace");
     }
+    const snapshot = this.#db.transactionSync(() => {
+      const refRevision = this.#ensureTrackingRefRevision(name);
+      const row = this.#db.one<Record<string, unknown>>(
+        `SELECT typeof(target) AS target_type,
+                CAST(target AS BLOB) AS target_blob
+           FROM git_refs WHERE repo_id = ? AND name = ?`,
+        this.#repoId,
+        name,
+      );
+      const target =
+        row === undefined
+          ? null
+          : requireRawRefTarget(
+              requireCanonicalStoredText(
+                row.target_type,
+                row.target_blob,
+                "stored tracking target",
+              ),
+              "stored tracking target",
+              "stored",
+            );
+      return { refName: name, target, refRevision, disposed: false };
+    });
+    let issuedToken: TrackingRefPublicationToken | null = null;
+    const token = new TrackingRefPublicationToken(
+      prefix,
+      snapshot.refName,
+      snapshot.target,
+      () => snapshot.disposed,
+      () => {
+        if (snapshot.disposed) return;
+        snapshot.disposed = true;
+        if (issuedToken !== null) {
+          this.#issuedTrackingRefPublications.delete(issuedToken);
+          this.#trackingRefPublicationStates.delete(issuedToken);
+        }
+      },
+    );
+    issuedToken = token;
+    this.#issuedTrackingRefPublications.add(token);
+    this.#trackingRefPublicationStates.set(token, snapshot);
+    return token;
   }
 
   /** Publish one tracking result unless its exact observation is stale. */
@@ -5979,19 +4726,13 @@ export class CheckoutStore implements IndexStore {
     if (state === undefined || state.disposed) {
       throw staleFetch("tracking publication token is no longer active");
     }
-    const publicationReservation = state.reservation.scope();
     try {
-      const budget = new RefMutationBudget(publicationReservation);
-      const normalized = normalizeRefMutation(
-        {
-          puts: target === null ? [] : [{ name: state.refName, target }],
-          deletes: target === null ? [state.refName] : [],
-          expected: { name: state.refName, target: state.target },
-        },
-        budget,
-      );
+      const normalized = normalizeRefMutation({
+        puts: target === null ? [] : [{ name: state.refName, target }],
+        deletes: target === null ? [state.refName] : [],
+        expected: { name: state.refName, target: state.target },
+      });
       const checkedMetadata = validateRefLogMetadata(metadata);
-      budget.charge(refLogMetadataRetainedBytes(checkedMetadata));
       const changed = this.#db.transactionSync(() => {
         const refRevision = this.#readTrackingRefRevision(state.refName);
         if (refRevision !== state.refRevision) {
@@ -5999,8 +4740,8 @@ export class CheckoutStore implements IndexStore {
         }
         const refChanged = this.#mutateRefs(normalized, checkedMetadata);
         if (!refChanged) {
-          this.#bumpTrackingRefRevisions(new Set([state.refName]), budget);
-          this.#bumpFetchNamespaceRevisions(new Set([state.refName]), budget);
+          this.#bumpTrackingRefRevisions(new Set([state.refName]));
+          this.#bumpFetchNamespaceRevisions(new Set([state.refName]));
         }
         return refChanged;
       });
@@ -6012,8 +4753,6 @@ export class CheckoutStore implements IndexStore {
         throw staleFetch(`tracking ref ${state.refName} changed after observation`);
       }
       throw error;
-    } finally {
-      publicationReservation.dispose();
     }
   }
 
@@ -6021,292 +4760,237 @@ export class CheckoutStore implements IndexStore {
   beginFetchPublication(
     trackingPrefix: string,
     candidateExactRefs: Iterable<string> = [],
-    owningReservation?: MemoryReservation,
-    owner?: RefMutationMemoryOwner,
   ): FetchPublicationToken {
-    if (owner !== undefined) {
-      validateRefMutationMemoryOwner(this.#sharedStore, owner, "fetch publication");
+    const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
+    const candidates = new Map<string, string | null>();
+    let candidateInputs = 0;
+    for (const value of candidateExactRefs) {
+      candidateInputs++;
+      if (candidateInputs > MAX_FETCH_PUBLICATION_INPUTS) {
+        throw new GitError("E2BIG", "fetch exact candidate count exceeds 100,000");
+      }
+      const name = requireRefName(value, "fetch exact ref candidate", "input");
+      if (!name.startsWith("refs/")) {
+        throw new GitError("EINVAL", "fetch exact ref candidates must be full refs");
+      }
+      if (candidates.has(name)) {
+        throw new GitError("EINVAL", `duplicate fetch exact ref candidate ${name}`);
+      }
+      candidates.set(name, null);
     }
-    if (owningReservation !== undefined) {
-      if (owningReservation.disposed) {
-        throw new GitError("EINVAL", "fetch publication reservation is disposed");
-      }
-      if (!this.#sharedStore.ownsMemoryReservation(owningReservation)) {
-        throw new GitError("EINVAL", "fetch publication reservation belongs to another repository");
-      }
-    }
-    const reservation = owningReservation?.scope() ?? this.#sharedStore.reserveMemory();
-    const budget = (() => {
-      try {
-        return new RefMutationBudget(reservation, true);
-      } catch (error) {
-        reservation.dispose();
-        throw error;
-      }
-    })();
-    try {
-      const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
-      budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(prefix));
-      const candidates = new Map<string, string | null>();
-      let candidateInputs = 0;
-      for (const value of candidateExactRefs) {
-        candidateInputs++;
-        if (candidateInputs > MAX_FETCH_PUBLICATION_INPUTS) {
-          throw new GitError("E2BIG", "fetch exact candidate count exceeds 100,000");
-        }
-        const name = requireRefName(value, "fetch exact ref candidate", "input");
-        if (!name.startsWith("refs/")) {
-          throw new GitError("EINVAL", "fetch exact ref candidates must be full refs");
-        }
-        if (candidates.has(name)) {
-          throw new GitError("EINVAL", `duplicate fetch exact ref candidate ${name}`);
-        }
-        budget.charge(
-          REF_MUTATION_ITEM_RETAINED_BYTES +
-            (owner?.owns(name) === true ? 0 : retainedStringBytes(name)),
-        );
-        candidates.set(name, null);
-      }
 
-      const snapshot = this.#db.transactionSync(() => {
-        const repository = this.#db.one<{
-          repo_id: unknown;
-          fetch_generation: unknown;
-          shallow_revision: unknown;
-          checkout_revision: unknown;
-          tracking_ref_revision_rows: unknown;
-        }>(
-          `SELECT id AS repo_id, fetch_generation, shallow_revision, checkout_revision,
+    const snapshot = this.#db.transactionSync(() => {
+      const repository = this.#db.one<{
+        repo_id: unknown;
+        fetch_generation: unknown;
+        shallow_revision: unknown;
+        checkout_revision: unknown;
+        tracking_ref_revision_rows: unknown;
+      }>(
+        `SELECT id AS repo_id, fetch_generation, shallow_revision, checkout_revision,
                   (SELECT count(*) FROM (
                      SELECT 1 FROM git_tracking_ref_revisions
                       WHERE repo_id = ? LIMIT ${MAX_TRACKING_REF_REVISIONS + 1}
                    )) AS tracking_ref_revision_rows
              FROM git_repositories WHERE id = ?`,
-          this.#repoId,
-          this.#repoId,
-        );
-        if (repository === undefined) throw new CorruptError("fetch repository is missing");
-        if (requireSafeId(repository.repo_id, "fetch repository id") !== this.#repoId) {
-          throw new CorruptError("fetch generation crossed repository boundaries");
-        }
-        const currentGeneration = requireFetchGeneration(
-          repository.fetch_generation,
-          "stored fetch generation",
-          0,
-        );
-        const shallowRevision = requireFetchGeneration(
-          repository.shallow_revision,
-          "stored shallow revision",
-          0,
-        );
-        const checkoutRevision = requireFetchGeneration(
-          repository.checkout_revision,
-          "stored checkout revision",
-          0,
-        );
-        if (currentGeneration === Number.MAX_SAFE_INTEGER) {
-          throw new GitError("E2BIG", "fetch publication generation is exhausted");
-        }
-        const trackingRefRevisionCount = requireFetchGeneration(
-          repository.tracking_ref_revision_rows,
-          "stored tracking ref revision count",
-          0,
-        );
-        if (trackingRefRevisionCount > MAX_TRACKING_REF_REVISIONS) {
-          throw new CorruptError("tracking ref revision count exceeds its bound");
-        }
+        this.#repoId,
+        this.#repoId,
+      );
+      if (repository === undefined) throw new CorruptError("fetch repository is missing");
+      if (requireSafeId(repository.repo_id, "fetch repository id") !== this.#repoId) {
+        throw new CorruptError("fetch generation crossed repository boundaries");
+      }
+      const currentGeneration = requireFetchGeneration(
+        repository.fetch_generation,
+        "stored fetch generation",
+        0,
+      );
+      const shallowRevision = requireFetchGeneration(
+        repository.shallow_revision,
+        "stored shallow revision",
+        0,
+      );
+      const checkoutRevision = requireFetchGeneration(
+        repository.checkout_revision,
+        "stored checkout revision",
+        0,
+      );
+      if (currentGeneration === Number.MAX_SAFE_INTEGER) {
+        throw new GitError("E2BIG", "fetch publication generation is exhausted");
+      }
+      const trackingRefRevisionCount = requireFetchGeneration(
+        repository.tracking_ref_revision_rows,
+        "stored tracking ref revision count",
+        0,
+      );
+      if (trackingRefRevisionCount > MAX_TRACKING_REF_REVISIONS) {
+        throw new CorruptError("tracking ref revision count exceeds its bound");
+      }
 
-        this.#advanceTrackingRefObservations(prefix, trackingRefRevisionCount);
+      this.#advanceTrackingRefObservations(prefix, trackingRefRevisionCount);
 
-        const namespaces = this.#readFetchNamespaces(budget);
-        for (const namespace of namespaces) {
-          if (namespace.latestGeneration > currentGeneration) {
-            throw new CorruptError("fetch namespace generation exceeds its repository control");
-          }
+      const namespaces = this.#readFetchNamespaces();
+      for (const namespace of namespaces) {
+        if (namespace.latestGeneration > currentGeneration) {
+          throw new CorruptError("fetch namespace generation exceeds its repository control");
         }
-        const exact = namespaces.find((namespace) => namespace.trackingPrefix === prefix);
-        if (exact === undefined && namespaces.length >= MAX_FETCH_NAMESPACES) {
-          throw new GitError("E2BIG", "repository fetch namespace count exceeds 1,024");
-        }
+      }
+      const exact = namespaces.find((namespace) => namespace.trackingPrefix === prefix);
+      if (exact === undefined && namespaces.length >= MAX_FETCH_NAMESPACES) {
+        throw new GitError("E2BIG", "repository fetch namespace count exceeds 1,024");
+      }
 
-        const tracking = new Map<string, string>();
-        const trackingRows: Readonly<RefRow>[] = [];
-        let rows = 0;
-        for (const { name, target } of this.#iterateStoredRefs(
-          budget.memoryReservation(),
-          "fetch ref snapshot",
-        )) {
-          rows++;
-          if (rows > MAX_REFLOG_STATE_ROWS) {
-            throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
-          }
-          if (name.startsWith(prefix)) {
-            if (candidateInputs + tracking.size >= MAX_FETCH_PUBLICATION_INPUTS) {
-              throw new GitError("E2BIG", "fetch snapshot exceeds its retained input count bound");
-            }
-            budget.charge(
-              REF_MUTATION_ITEM_RETAINED_BYTES +
-                retainedStringBytes(name) +
-                retainedStringBytes(target),
-            );
-            tracking.set(name, target);
-            trackingRows.push(Object.freeze({ name, target }));
-          }
-          if (candidates.has(name)) {
-            if (!isOid(target)) {
-              throw new GitError("EINVAL", `fetch exact ref candidate ${name} is symbolic`);
-            }
-            candidates.set(name, target);
-            budget.charge(retainedStringBytes(target));
-          }
+      const tracking = new Map<string, string>();
+      const trackingRows: Readonly<RefRow>[] = [];
+      let rows = 0;
+      for (const { name, target } of this.#iterateStoredRefs("fetch ref snapshot")) {
+        rows++;
+        if (rows > MAX_REFLOG_STATE_ROWS) {
+          throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
         }
-
-        const shallowRows: string[] = [];
-        let previousShallow: string | null = null;
-        for (const row of this.#db.iterate(
-          "SELECT repo_id, oid FROM git_shallow WHERE repo_id = ? ORDER BY oid",
-          this.#repoId,
-        )) {
-          if (row.repo_id !== this.#repoId || typeof row.oid !== "string" || !isOid(row.oid)) {
-            throw new CorruptError("fetch shallow snapshot contains an invalid row");
-          }
-          if (previousShallow !== null && comparePaths(previousShallow, row.oid) >= 0) {
-            throw new CorruptError("stored shallow boundaries are not in strict object-id order");
-          }
-          previousShallow = row.oid;
-          if (
-            candidateInputs + tracking.size + shallowRows.length >=
-            MAX_FETCH_PUBLICATION_INPUTS
-          ) {
+        if (name.startsWith(prefix)) {
+          if (candidateInputs + tracking.size >= MAX_FETCH_PUBLICATION_INPUTS) {
             throw new GitError("E2BIG", "fetch snapshot exceeds its retained input count bound");
           }
-          budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(row.oid));
-          shallowRows.push(row.oid);
+          tracking.set(name, target);
+          trackingRows.push(Object.freeze({ name, target }));
         }
+        if (candidates.has(name)) {
+          if (!isOid(target)) {
+            throw new GitError("EINVAL", `fetch exact ref candidate ${name} is symbolic`);
+          }
+          candidates.set(name, target);
+        }
+      }
 
-        const generation = currentGeneration + 1;
-        const updated = this.#db.one<{ fetch_generation: unknown }>(
-          `UPDATE git_repositories SET fetch_generation = ?
+      const shallowRows: string[] = [];
+      let previousShallow: string | null = null;
+      for (const row of this.#db.iterate(
+        "SELECT repo_id, oid FROM git_shallow WHERE repo_id = ? ORDER BY oid",
+        this.#repoId,
+      )) {
+        if (row.repo_id !== this.#repoId || typeof row.oid !== "string" || !isOid(row.oid)) {
+          throw new CorruptError("fetch shallow snapshot contains an invalid row");
+        }
+        if (previousShallow !== null && comparePaths(previousShallow, row.oid) >= 0) {
+          throw new CorruptError("stored shallow boundaries are not in strict object-id order");
+        }
+        previousShallow = row.oid;
+        if (candidateInputs + tracking.size + shallowRows.length >= MAX_FETCH_PUBLICATION_INPUTS) {
+          throw new GitError("E2BIG", "fetch snapshot exceeds its retained input count bound");
+        }
+        shallowRows.push(row.oid);
+      }
+
+      const generation = currentGeneration + 1;
+      const updated = this.#db.one<{ fetch_generation: unknown }>(
+        `UPDATE git_repositories SET fetch_generation = ?
             WHERE id = ? AND fetch_generation = ?
             RETURNING fetch_generation`,
+        generation,
+        this.#repoId,
+        currentGeneration,
+      );
+      if (
+        updated === undefined ||
+        requireFetchGeneration(updated.fetch_generation, "updated fetch generation", 1) !==
+          generation
+      ) {
+        throw new CorruptError("fetch generation changed during atomic allocation");
+      }
+
+      const overlapping = namespaces
+        .filter(
+          (namespace) =>
+            namespace.trackingPrefix.startsWith(prefix) ||
+            prefix.startsWith(namespace.trackingPrefix),
+        )
+        .map((namespace) => namespace.trackingPrefix);
+      for (const page of jsonPages(overlapping, "overlapping fetch namespace")) {
+        this.#db.run(
+          `UPDATE git_fetch_namespaces SET latest_generation = ?
+              WHERE repo_id = ? AND tracking_prefix IN (SELECT value FROM json_each(?))`,
           generation,
           this.#repoId,
-          currentGeneration,
+          page,
         );
-        if (
-          updated === undefined ||
-          requireFetchGeneration(updated.fetch_generation, "updated fetch generation", 1) !==
-            generation
-        ) {
-          throw new CorruptError("fetch generation changed during atomic allocation");
-        }
-
-        const overlapping = namespaces
-          .filter(
-            (namespace) =>
-              namespace.trackingPrefix.startsWith(prefix) ||
-              prefix.startsWith(namespace.trackingPrefix),
-          )
-          .map((namespace) => namespace.trackingPrefix);
-        for (const page of jsonPages(overlapping, "overlapping fetch namespace", {
-          reservation: budget.memoryReservation(),
-          maxUnits: jsonStringMaxUnits,
-        })) {
-          this.#db.run(
-            `UPDATE git_fetch_namespaces SET latest_generation = ?
-              WHERE repo_id = ? AND tracking_prefix IN (SELECT value FROM json_each(?))`,
-            generation,
-            this.#repoId,
-            page,
-          );
-        }
-        this.#db.run(
-          `INSERT INTO git_fetch_namespaces
+      }
+      this.#db.run(
+        `INSERT INTO git_fetch_namespaces
              (repo_id, tracking_prefix, latest_generation, revision)
            VALUES (?, ?, ?, 0)
            ON CONFLICT(repo_id, tracking_prefix)
            DO UPDATE SET latest_generation = excluded.latest_generation`,
-          this.#repoId,
-          prefix,
-          generation,
-        );
-        const issued = this.#db.one<{
-          latest_generation: unknown;
-          revision: unknown;
-        }>(
-          `SELECT latest_generation, revision FROM git_fetch_namespaces
-            WHERE repo_id = ? AND tracking_prefix = ?`,
-          this.#repoId,
-          prefix,
-        );
-        if (issued === undefined) {
-          throw new CorruptError("issued fetch namespace is missing");
-        }
-        const latestGeneration = requireFetchGeneration(
-          issued.latest_generation,
-          "issued fetch namespace generation",
-          1,
-        );
-        if (latestGeneration !== generation) {
-          throw new CorruptError("issued fetch namespace has the wrong generation");
-        }
-        const namespaceRevision = requireFetchGeneration(
-          issued.revision,
-          "issued fetch namespace revision",
-          0,
-        );
-        const exactRows = [...candidates].map(([name, target]) => Object.freeze({ name, target }));
-        const state: FetchPublicationState = {
-          generation,
-          trackingPrefix: prefix,
-          namespaceRevision,
-          shallowRevision,
-          trackingRefs: tracking,
-          exactRefs: candidates,
-          checkoutRevision,
-          budget,
-          reservation,
-          owner,
-          disposed: false,
-        };
-        return {
-          state,
-          shallowRows: Object.freeze(shallowRows),
-          trackingRows: Object.freeze(trackingRows),
-          exactRows: Object.freeze(exactRows),
-        };
-      });
-      let issuedToken: FetchPublicationToken | null = null;
-      const token = new FetchPublicationToken(
-        snapshot.state.generation,
-        snapshot.state.trackingPrefix,
-        snapshot.state.namespaceRevision,
-        snapshot.state.shallowRevision,
-        snapshot.shallowRows,
-        snapshot.trackingRows,
-        snapshot.exactRows,
-        () =>
-          snapshot.state.disposed ||
-          snapshot.state.reservation.disposed ||
-          snapshot.state.owner?.memoryReservation().disposed === true,
-        () => {
-          if (snapshot.state.disposed) return;
-          snapshot.state.disposed = true;
-          snapshot.state.reservation.dispose();
-          if (issuedToken !== null) {
-            this.#issuedFetchPublications.delete(issuedToken);
-            this.#fetchPublicationStates.delete(issuedToken);
-          }
-        },
+        this.#repoId,
+        prefix,
+        generation,
       );
-      issuedToken = token;
-      this.#issuedFetchPublications.add(token);
-      this.#fetchPublicationStates.set(token, snapshot.state);
-      return token;
-    } catch (error) {
-      reservation.dispose();
-      throw error;
-    }
+      const issued = this.#db.one<{
+        latest_generation: unknown;
+        revision: unknown;
+      }>(
+        `SELECT latest_generation, revision FROM git_fetch_namespaces
+            WHERE repo_id = ? AND tracking_prefix = ?`,
+        this.#repoId,
+        prefix,
+      );
+      if (issued === undefined) {
+        throw new CorruptError("issued fetch namespace is missing");
+      }
+      const latestGeneration = requireFetchGeneration(
+        issued.latest_generation,
+        "issued fetch namespace generation",
+        1,
+      );
+      if (latestGeneration !== generation) {
+        throw new CorruptError("issued fetch namespace has the wrong generation");
+      }
+      const namespaceRevision = requireFetchGeneration(
+        issued.revision,
+        "issued fetch namespace revision",
+        0,
+      );
+      const exactRows = [...candidates].map(([name, target]) => Object.freeze({ name, target }));
+      const state: FetchPublicationState = {
+        generation,
+        trackingPrefix: prefix,
+        namespaceRevision,
+        shallowRevision,
+        trackingRefs: tracking,
+        exactRefs: candidates,
+        checkoutRevision,
+        disposed: false,
+      };
+      return {
+        state,
+        shallowRows: Object.freeze(shallowRows),
+        trackingRows: Object.freeze(trackingRows),
+        exactRows: Object.freeze(exactRows),
+      };
+    });
+    let issuedToken: FetchPublicationToken | null = null;
+    const token = new FetchPublicationToken(
+      snapshot.state.generation,
+      snapshot.state.trackingPrefix,
+      snapshot.state.namespaceRevision,
+      snapshot.state.shallowRevision,
+      snapshot.shallowRows,
+      snapshot.trackingRows,
+      snapshot.exactRows,
+      () => snapshot.state.disposed,
+      () => {
+        if (snapshot.state.disposed) return;
+        snapshot.state.disposed = true;
+        if (issuedToken !== null) {
+          this.#issuedFetchPublications.delete(issuedToken);
+          this.#fetchPublicationStates.delete(issuedToken);
+        }
+      },
+    );
+    issuedToken = token;
+    this.#issuedFetchPublications.add(token);
+    this.#fetchPublicationStates.set(token, snapshot.state);
+    return token;
   }
 
   /** Publish a fetch snapshot atomically, or reject it after any conflicting observation. */
@@ -6314,32 +4998,17 @@ export class CheckoutStore implements IndexStore {
     token: FetchPublicationToken,
     plan: FetchPublicationPlan,
     metadata: RefLogMetadata,
-    owner?: RefMutationMemoryOwner,
   ): boolean {
     if (!this.#issuedFetchPublications.has(token)) {
       throw staleFetch("fetch publication token was not issued by this repository");
     }
     const state = this.#fetchPublicationStates.get(token);
-    if (state === undefined || state.disposed || state.reservation.disposed) {
+    if (state === undefined || state.disposed) {
       throw staleFetch("fetch publication token is no longer active");
     }
-    if (state.owner?.memoryReservation().disposed === true) {
-      throw staleFetch("fetch publication memory owner is no longer active");
-    }
-    if (owner !== state.owner) {
-      throw new GitError("EINVAL", "fetch publication requires its issued memory owner");
-    }
-    const ownerReservation =
-      owner === undefined
-        ? undefined
-        : validateRefMutationMemoryOwner(this.#sharedStore, owner, "fetch publication");
-    const publicationReservation =
-      ownerReservation === undefined ? state.reservation.scope() : ownerReservation.scope();
-    try {
-      const budget = new RefMutationBudget(publicationReservation);
-      const normalized = normalizeFetchPublication(state, plan, budget, owner);
+    {
+      const normalized = normalizeFetchPublication(state, plan);
       const checkedMetadata = validateRefLogMetadata(metadata);
-      budget.charge(refLogMetadataRetainedBytes(checkedMetadata));
       const shallowTouched =
         normalized.shallowAdd.length > 0 || normalized.shallowRemove.length > 0;
       const refChanged = this.#db.transactionSync(() => {
@@ -6368,12 +5037,10 @@ export class CheckoutStore implements IndexStore {
       this.#issuedFetchPublications.delete(token);
       this.#fetchPublicationStates.delete(token);
       return refChanged || shallowTouched;
-    } finally {
-      publicationReservation.dispose();
     }
   }
 
-  #readFetchNamespaces(budget: RefMutationBudget): {
+  #readFetchNamespaces(): {
     trackingPrefix: string;
     latestGeneration: number;
     revision: number;
@@ -6403,55 +5070,45 @@ export class CheckoutStore implements IndexStore {
     if (metadata.rows > MAX_FETCH_NAMESPACES) {
       throw new GitError("E2BIG", "repository fetch namespace count exceeds 1,024");
     }
-    const rowMemory = budget.memoryReservation().scope();
-    rowMemory.set(
-      "other",
-      256 + metadata.tracking_prefix_bytes + retainedStringUnits(metadata.tracking_prefix_bytes),
-    );
     let previousPrefix: string | null = null;
-    try {
-      for (const row of this.#db.iterate(
-        `SELECT repo_id, typeof(tracking_prefix) AS tracking_prefix_type,
+    for (const row of this.#db.iterate(
+      `SELECT repo_id, typeof(tracking_prefix) AS tracking_prefix_type,
                 CAST(tracking_prefix AS BLOB) AS tracking_prefix_blob,
                 latest_generation, revision
            FROM git_fetch_namespaces WHERE repo_id = ? ORDER BY tracking_prefix
            LIMIT ${MAX_FETCH_NAMESPACES + 1}`,
-        this.#repoId,
-      )) {
-        if (row.repo_id !== this.#repoId) {
-          throw new CorruptError("fetch namespace scan crossed repository boundaries");
-        }
-        const storedPrefix = requireFetchTrackingPrefix(
-          requireCanonicalStoredText(
-            row.tracking_prefix_type,
-            row.tracking_prefix_blob,
-            "stored fetch tracking prefix",
-          ),
-          "stored",
-        );
-        if (previousPrefix !== null && comparePaths(previousPrefix, storedPrefix) >= 0) {
-          throw new CorruptError("fetch namespaces are not in strict Git byte order");
-        }
-        previousPrefix = storedPrefix;
-        budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(storedPrefix));
-        namespaces.push({
-          trackingPrefix: storedPrefix,
-          latestGeneration: requireFetchGeneration(
-            row.latest_generation,
-            "stored fetch namespace generation",
-            1,
-          ),
-          revision: requireFetchGeneration(row.revision, "stored fetch namespace revision", 0),
-        });
-        if (namespaces.length > metadata.rows) {
-          throw new CorruptError("fetch namespace count changed after metadata preflight");
-        }
+      this.#repoId,
+    )) {
+      if (row.repo_id !== this.#repoId) {
+        throw new CorruptError("fetch namespace scan crossed repository boundaries");
       }
-      if (namespaces.length !== metadata.rows) {
-        throw new CorruptError("fetch namespaces changed after metadata preflight");
+      const storedPrefix = requireFetchTrackingPrefix(
+        requireCanonicalStoredText(
+          row.tracking_prefix_type,
+          row.tracking_prefix_blob,
+          "stored fetch tracking prefix",
+        ),
+        "stored",
+      );
+      if (previousPrefix !== null && comparePaths(previousPrefix, storedPrefix) >= 0) {
+        throw new CorruptError("fetch namespaces are not in strict Git byte order");
       }
-    } finally {
-      rowMemory.dispose();
+      previousPrefix = storedPrefix;
+      namespaces.push({
+        trackingPrefix: storedPrefix,
+        latestGeneration: requireFetchGeneration(
+          row.latest_generation,
+          "stored fetch namespace generation",
+          1,
+        ),
+        revision: requireFetchGeneration(row.revision, "stored fetch namespace revision", 0),
+      });
+      if (namespaces.length > metadata.rows) {
+        throw new CorruptError("fetch namespace count changed after metadata preflight");
+      }
+    }
+    if (namespaces.length !== metadata.rows) {
+      throw new CorruptError("fetch namespaces changed after metadata preflight");
     }
     return namespaces;
   }
@@ -6548,45 +5205,36 @@ export class CheckoutStore implements IndexStore {
         checkoutMetadata.max_head_bytes,
         "fetch checkout HEAD maximum",
       );
-      const checkoutRowMemory = state.budget.memoryReservation().scope();
-      checkoutRowMemory.set("other", currentTextRowRetainedBytes(maxRootBytes + maxHeadBytes, 2));
       let checkoutRows = 0;
       let previousCheckoutId = 0;
-      try {
-        for (const row of this.#db.iterate(
-          `SELECT id AS checkout_id, repo_id, root, typeof(root) AS root_type,
+      for (const row of this.#db.iterate(
+        `SELECT id AS checkout_id, repo_id, root, typeof(root) AS root_type,
                   length(CAST(root AS BLOB)) AS root_bytes, typeof(head) AS head_type,
                   length(CAST(head AS BLOB)) AS head_bytes,
                   CAST(head AS BLOB) AS head_blob, is_primary
              FROM git_checkouts WHERE repo_id = ? ORDER BY id
              LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
-          this.#repoId,
-        )) {
-          const checkout = requireStoredCheckoutRow(row, maxRootBytes, maxHeadBytes);
-          if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
-            throw new CorruptError("fetch checkout scan crossed or reordered repositories");
-          }
-          previousCheckoutId = checkout.id;
-          checkoutRows++;
-          if (checkoutRows > MAX_CHECKOUTS_PER_REPOSITORY) {
-            throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
-          }
-          const attached = rawSymbolicTarget(checkout.head);
-          if (attached !== null && selectedBranches.has(attached)) {
-            throw staleFetch(`branch ${attached} became attached after fetch preflight`);
-          }
+        this.#repoId,
+      )) {
+        const checkout = requireStoredCheckoutRow(row, maxRootBytes, maxHeadBytes);
+        if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
+          throw new CorruptError("fetch checkout scan crossed or reordered repositories");
         }
-      } finally {
-        checkoutRowMemory.dispose();
+        previousCheckoutId = checkout.id;
+        checkoutRows++;
+        if (checkoutRows > MAX_CHECKOUTS_PER_REPOSITORY) {
+          throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
+        }
+        const attached = rawSymbolicTarget(checkout.head);
+        if (attached !== null && selectedBranches.has(attached)) {
+          throw staleFetch(`branch ${attached} became attached after fetch preflight`);
+        }
       }
     }
     const presentExactRefs = new Set<string>();
     let rows = 0;
     let trackingRows = 0;
-    for (const { name, target } of this.#iterateStoredRefs(
-      state.budget.memoryReservation(),
-      "fetch publication preflight",
-    )) {
+    for (const { name, target } of this.#iterateStoredRefs("fetch publication preflight")) {
       rows++;
       if (rows > MAX_REFLOG_STATE_ROWS) {
         throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
@@ -6640,10 +5288,10 @@ export class CheckoutStore implements IndexStore {
     }
   }
 
-  #bumpFetchNamespaceRevisions(changedNames: ReadonlySet<string>, budget: RefMutationBudget): void {
+  #bumpFetchNamespaceRevisions(changedNames: ReadonlySet<string>): void {
     if (changedNames.size === 0) return;
     const affected: string[] = [];
-    for (const namespace of this.#readFetchNamespaces(budget)) {
+    for (const namespace of this.#readFetchNamespaces()) {
       let changed = false;
       for (const name of changedNames) {
         if (name.startsWith(namespace.trackingPrefix)) {
@@ -6657,10 +5305,7 @@ export class CheckoutStore implements IndexStore {
       }
       affected.push(namespace.trackingPrefix);
     }
-    for (const page of jsonPages(affected, "fetch namespace revision", {
-      reservation: budget.memoryReservation(),
-      maxUnits: jsonStringMaxUnits,
-    })) {
+    for (const page of jsonPages(affected, "fetch namespace revision")) {
       this.#db.run(
         `UPDATE git_fetch_namespaces SET revision = revision + 1
           WHERE repo_id = ? AND tracking_prefix IN (SELECT value FROM json_each(?))`,
@@ -6675,27 +5320,10 @@ export class CheckoutStore implements IndexStore {
     return this.#mutateRefsOwned(mutation, metadata);
   }
 
-  #mutateRefsOwned(
-    mutation: RefMutation,
-    metadata: RefLogMetadata,
-    owner?: RefMutationMemoryOwner,
-  ): boolean {
-    if (owner !== undefined && !(owner instanceof RefMutationMemoryOwner)) {
-      throw new GitError("EINVAL", "ref mutation memory owner was not issued by the store");
-    }
-    const reservation =
-      owner === undefined
-        ? this.#sharedStore.reserveMemory()
-        : this.#sharedStore.scopeMemoryReservation(owner.memoryReservation());
-    try {
-      const budget = new RefMutationBudget(reservation);
-      const normalized = normalizeRefMutation(mutation, budget, owner);
-      const checkedMetadata = validateRefLogMetadata(metadata);
-      budget.charge(refLogMetadataRetainedBytes(checkedMetadata, owner));
-      return this.#mutateRefs(normalized, checkedMetadata);
-    } finally {
-      reservation.dispose();
-    }
+  #mutateRefsOwned(mutation: RefMutation, metadata: RefLogMetadata): boolean {
+    const normalized = normalizeRefMutation(mutation);
+    const checkedMetadata = validateRefLogMetadata(metadata);
+    return this.#mutateRefs(normalized, checkedMetadata);
   }
 
   #mutateRefs(normalized: NormalizedRefMutation, checkedMetadata: RefLogMetadata): boolean {
@@ -6817,39 +5445,25 @@ export class CheckoutStore implements IndexStore {
         checkoutMetadata.max_head_bytes,
         "ref mutation checkout HEAD maximum",
       );
-      const checkoutRowMemory = normalized.budget.memoryReservation().scope();
-      checkoutRowMemory.set(
-        "other",
-        currentTextRowRetainedBytes(maxCheckoutRootBytes + maxCheckoutHeadBytes, 2),
-      );
-      try {
-        for (const raw of this.#db.iterate(
-          `SELECT id AS checkout_id, repo_id, root, typeof(root) AS root_type,
+      for (const raw of this.#db.iterate(
+        `SELECT id AS checkout_id, repo_id, root, typeof(root) AS root_type,
                   length(CAST(root AS BLOB)) AS root_bytes, typeof(head) AS head_type,
                   length(CAST(head AS BLOB)) AS head_bytes,
                   CAST(head AS BLOB) AS head_blob, is_primary
              FROM git_checkouts WHERE repo_id = ? ORDER BY id
              LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
-          this.#repoId,
-        )) {
-          const checkout = requireStoredCheckoutRow(
-            raw,
-            maxCheckoutRootBytes,
-            maxCheckoutHeadBytes,
-          );
-          if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
-            throw new CorruptError("reflog checkout scan crossed or reordered repositories");
-          }
-          previousCheckoutId = checkout.id;
-          normalized.budget.charge(refMutationCheckoutRetainedBytes(checkout));
-          checkouts.push(checkout);
-          if (checkout.id === this.#checkoutId) selected = checkout;
-          if (checkouts.length > MAX_CHECKOUTS_PER_REPOSITORY) {
-            throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
-          }
+        this.#repoId,
+      )) {
+        const checkout = requireStoredCheckoutRow(raw, maxCheckoutRootBytes, maxCheckoutHeadBytes);
+        if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
+          throw new CorruptError("reflog checkout scan crossed or reordered repositories");
         }
-      } finally {
-        checkoutRowMemory.dispose();
+        previousCheckoutId = checkout.id;
+        checkouts.push(checkout);
+        if (checkout.id === this.#checkoutId) selected = checkout;
+        if (checkouts.length > MAX_CHECKOUTS_PER_REPOSITORY) {
+          throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
+        }
       }
       if (selected === null)
         throw new CorruptError("selected checkout disappeared during ref mutation");
@@ -6857,17 +5471,11 @@ export class CheckoutStore implements IndexStore {
 
       const before = new Map<string, string>();
       let rows = 0;
-      for (const { name, target } of this.#iterateStoredRefs(
-        normalized.budget.memoryReservation(),
-        "ref state query",
-      )) {
+      for (const { name, target } of this.#iterateStoredRefs("ref state query")) {
         rows++;
         if (rows > MAX_REFLOG_STATE_ROWS) {
           throw new GitError("E2BIG", "repository ref state exceeds its structural row bound");
         }
-        normalized.budget.charge(
-          REF_ROW_RETAINED_BYTES + retainedStringBytes(name) + retainedStringBytes(target),
-        );
         before.set(name, target);
       }
 
@@ -6920,32 +5528,26 @@ export class CheckoutStore implements IndexStore {
           metadata.head_bytes,
           "attached checkout HEAD",
         );
-        const ownerMemory = normalized.budget.memoryReservation().scope();
-        ownerMemory.set("other", currentTextRowRetainedBytes(rootBytes + headBytes, 2));
-        try {
-          const owner = this.#db.one<Record<string, unknown>>(
-            `SELECT id AS checkout_id, repo_id, root, typeof(root) AS root_type,
+        const owner = this.#db.one<Record<string, unknown>>(
+          `SELECT id AS checkout_id, repo_id, root, typeof(root) AS root_type,
                     length(CAST(root AS BLOB)) AS root_bytes, typeof(head) AS head_type,
                     length(CAST(head AS BLOB)) AS head_bytes,
                     CAST(head AS BLOB) AS head_blob, is_primary
                FROM git_checkouts
               WHERE repo_id = ? AND head = ? AND id != ?
               LIMIT 1`,
-            this.#repoId,
-            newHead,
-            this.#checkoutId,
-          );
-          if (owner === undefined) {
-            throw new CorruptError("attached checkout changed after metadata preflight");
-          }
-          const checkedOwner = requireStoredCheckoutRow(owner, rootBytes, headBytes);
-          if (checkedOwner.repoId !== this.#repoId || checkedOwner.head !== newHead) {
-            throw new CorruptError("attached branch ownership crossed a repository boundary");
-          }
-          return checkedOwner;
-        } finally {
-          ownerMemory.dispose();
+          this.#repoId,
+          newHead,
+          this.#checkoutId,
+        );
+        if (owner === undefined) {
+          throw new CorruptError("attached checkout changed after metadata preflight");
         }
+        const checkedOwner = requireStoredCheckoutRow(owner, rootBytes, headBytes);
+        if (checkedOwner.repoId !== this.#repoId || checkedOwner.head !== newHead) {
+          throw new CorruptError("attached branch ownership crossed a repository boundary");
+        }
+        return checkedOwner;
       };
       if (newHead !== oldHead) {
         const owner = attachedBranchOwner();
@@ -6962,7 +5564,6 @@ export class CheckoutStore implements IndexStore {
         const oldRaw = beforeTarget(name);
         const newRaw = afterTarget(name);
         if (oldRaw !== newRaw && !changedNames.has(name)) {
-          normalized.budget.charge(refLogEventRetainedBytes(name, oldRaw, newRaw));
           changedNames.add(name);
         }
       }
@@ -6970,7 +5571,6 @@ export class CheckoutStore implements IndexStore {
         const oldRaw = beforeTarget(name);
         const newRaw = afterTarget(name);
         if (oldRaw !== newRaw && !changedNames.has(name)) {
-          normalized.budget.charge(refLogEventRetainedBytes(name, oldRaw, newRaw));
           changedNames.add(name);
         }
       }
@@ -7002,9 +5602,6 @@ export class CheckoutStore implements IndexStore {
         const oldHeadOid = resolveRawRef(checkout.head, beforeTarget);
         const newHeadOid = resolveRawRef(checkoutNewHead, afterTarget);
         if (checkout.head !== checkoutNewHead || oldHeadOid !== newHeadOid || causalHeadChange) {
-          normalized.budget.charge(
-            refLogEventRetainedBytes("HEAD", checkout.head, checkoutNewHead),
-          );
           pendingHeads.push({
             checkoutId: checkout.id,
             event: {
@@ -7044,10 +5641,7 @@ export class CheckoutStore implements IndexStore {
           put.push({ name: event.refName, target: event.newRaw });
         }
       }
-      for (const page of jsonPages(deleted, "ref deletion", {
-        reservation: normalized.budget.memoryReservation(),
-        maxUnits: jsonStringMaxUnits,
-      })) {
+      for (const page of jsonPages(deleted, "ref deletion")) {
         this.#db.run(
           `DELETE FROM git_refs
             WHERE repo_id = ? AND name IN (SELECT value FROM json_each(?))`,
@@ -7055,10 +5649,7 @@ export class CheckoutStore implements IndexStore {
           page,
         );
       }
-      for (const page of jsonPages(put, "ref update", {
-        reservation: normalized.budget.memoryReservation(),
-        maxUnits: refRowJsonMaxUnits,
-      })) {
+      for (const page of jsonPages(put, "ref update")) {
         this.#db.run(
           `INSERT INTO git_refs (repo_id, name, target)
            SELECT ?, json_extract(value, '$.name'), json_extract(value, '$.target')
@@ -7072,13 +5663,8 @@ export class CheckoutStore implements IndexStore {
       if (newHead !== oldHead) {
         const updatedRootBytes = utf8ByteLength(this.#root);
         const updatedHeadBytes = refTextBytes(newHead, "updated HEAD target", "input");
-        const updatedHeadMemory = normalized.budget.memoryReservation().scope();
-        updatedHeadMemory.set(
-          "other",
-          currentTextRowRetainedBytes(updatedRootBytes + updatedHeadBytes, 2),
-        );
         let updated: Record<string, unknown> | undefined;
-        try {
+        {
           try {
             updated = this.#db.one<Record<string, unknown>>(
               `UPDATE git_checkouts SET head = ?
@@ -7112,15 +5698,10 @@ export class CheckoutStore implements IndexStore {
           if (checked.id !== this.#checkoutId || checked.repoId !== this.#repoId) {
             throw new CorruptError("HEAD update crossed a checkout boundary");
           }
-        } finally {
-          updatedHeadMemory.dispose();
         }
         advanceCheckoutRevision(this.#db, this.#repoId, 1, checkoutRevision);
       }
-      for (const page of jsonPages(events, "reflog entry", {
-        reservation: normalized.budget.memoryReservation(),
-        maxUnits: refLogEventJsonMaxUnits,
-      })) {
+      for (const page of jsonPages(events, "reflog entry")) {
         this.#db.run(
           `INSERT INTO git_reflog_entries
              (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
@@ -7142,10 +5723,7 @@ export class CheckoutStore implements IndexStore {
           page,
         );
       }
-      for (const page of jsonPages(checkoutEvents, "checkout reflog entry", {
-        reservation: normalized.budget.memoryReservation(),
-        maxUnits: refLogEventJsonMaxUnits,
-      })) {
+      for (const page of jsonPages(checkoutEvents, "checkout reflog entry")) {
         this.#db.run(
           `INSERT INTO git_checkout_reflog_entries
              (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
@@ -7191,10 +5769,7 @@ export class CheckoutStore implements IndexStore {
         cutoff,
       );
       const touchedRefs = events.map((event) => event.refName);
-      for (const page of jsonPages(touchedRefs, "reflog retention ref", {
-        reservation: normalized.budget.memoryReservation(),
-        maxUnits: jsonStringMaxUnits,
-      })) {
+      for (const page of jsonPages(touchedRefs, "reflog retention ref")) {
         this.#db.run(
           `DELETE FROM git_reflog_entries AS entry
             WHERE entry.repo_id = ?
@@ -7229,17 +5804,17 @@ export class CheckoutStore implements IndexStore {
         );
       }
       if (trackingRefRevisionCount > 0) {
-        this.#bumpTrackingRefRevisions(changedNames, normalized.budget);
+        this.#bumpTrackingRefRevisions(changedNames);
       }
       if (fetchNamespacePresent) {
-        this.#bumpFetchNamespaceRevisions(changedNames, normalized.budget);
+        this.#bumpFetchNamespaceRevisions(changedNames);
       }
       bumpMaintenanceRootEpoch(this.#db, this.#repoId);
       return true;
     });
   }
 
-  *#iterateStoredRefs(reservation: MemoryReservation, label: string): Generator<RefRow> {
+  *#iterateStoredRefs(label: string): Generator<RefRow> {
     const metadata = this.#db.one<{
       rows: unknown;
       name_bytes: unknown;
@@ -7255,197 +5830,162 @@ export class CheckoutStore implements IndexStore {
     if (measured.rows > MAX_REFLOG_STATE_ROWS) {
       throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
     }
-    const rowMemory = reservation.scope();
     let rows = 0;
     let previousNameBytes: Uint8Array | null = null;
-    try {
-      rowMemory.set(
-        "other",
-        256 +
-          2 * measured.nameBytes +
-          measured.targetBytes +
-          retainedStringUnits(measured.nameBytes) +
-          retainedStringUnits(measured.targetBytes),
-      );
-      for (const row of this.#db.iterate(
-        `SELECT repo_id, typeof(name) AS name_type, CAST(name AS BLOB) AS name_blob,
+    for (const row of this.#db.iterate(
+      `SELECT repo_id, typeof(name) AS name_type, CAST(name AS BLOB) AS name_blob,
                 typeof(target) AS target_type, CAST(target AS BLOB) AS target_blob
            FROM git_refs
           WHERE repo_id = ?
           ORDER BY name
           LIMIT ${MAX_REFLOG_STATE_ROWS + 1}`,
-        this.#repoId,
-      )) {
-        if (row.repo_id !== this.#repoId) {
-          throw new CorruptError(`${label} crossed repository boundaries`);
-        }
-        const nameBytes = requireStoredTextBytes(row.name_type, row.name_blob, "stored ref name");
-        const name = requireRefName(
-          decodeCanonicalText(nameBytes, "stored ref name"),
-          "stored ref name",
-          "stored",
-        );
-        const target = requireRawRefTarget(
-          requireCanonicalStoredText(row.target_type, row.target_blob, `stored target of ${name}`),
-          `stored target of ${name}`,
-          "stored",
-        );
-        if (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0) {
-          throw new CorruptError("stored refs are not in strict Git byte order");
-        }
-        rows++;
-        if (rows > MAX_REFLOG_STATE_ROWS) {
-          throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
-        }
-        previousNameBytes = nameBytes;
-        yield { name, target };
+      this.#repoId,
+    )) {
+      if (row.repo_id !== this.#repoId) {
+        throw new CorruptError(`${label} crossed repository boundaries`);
       }
-      if (rows !== measured.rows) {
-        throw new CorruptError(`${label} changed after metadata preflight`);
+      const nameBytes = requireStoredTextBytes(row.name_type, row.name_blob, "stored ref name");
+      const name = requireRefName(
+        decodeCanonicalText(nameBytes, "stored ref name"),
+        "stored ref name",
+        "stored",
+      );
+      const target = requireRawRefTarget(
+        requireCanonicalStoredText(row.target_type, row.target_blob, `stored target of ${name}`),
+        `stored target of ${name}`,
+        "stored",
+      );
+      if (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0) {
+        throw new CorruptError("stored refs are not in strict Git byte order");
       }
-    } finally {
-      rowMemory.dispose();
+      rows++;
+      if (rows > MAX_REFLOG_STATE_ROWS) {
+        throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
+      }
+      previousNameBytes = nameBytes;
+      yield { name, target };
+    }
+    if (rows !== measured.rows) {
+      throw new CorruptError(`${label} changed after metadata preflight`);
     }
   }
 
   listRefs(prefix = ""): RefRow[] {
-    const reservation = this.#sharedStore.reserveMemory();
-    reservation.set("other", 512);
-    try {
-      let upper: string | undefined;
-      if (prefix !== "") {
-        reservation.set("other", 512 + retainedStringUnits(prefix.length));
-        upper = nextPrefix(prefix);
-        reservation.set("other", 512 + retainedStringBytes(upper));
-      }
-      const metadata = this.#db.one<{
-        rows: unknown;
-        name_bytes: unknown;
-        target_bytes: unknown;
-        max_row_bytes: unknown;
-      }>(
-        prefix === ""
-          ? `SELECT count(*) AS rows,
+    let upper: string | undefined;
+    if (prefix !== "") upper = nextPrefix(prefix);
+    const metadata = this.#db.one<{
+      rows: unknown;
+      name_bytes: unknown;
+      target_bytes: unknown;
+      max_row_bytes: unknown;
+    }>(
+      prefix === ""
+        ? `SELECT count(*) AS rows,
                     coalesce(sum(length(CAST(name AS BLOB))), 0) AS name_bytes,
                     coalesce(sum(length(CAST(target AS BLOB))), 0) AS target_bytes,
                     coalesce(max(
                       length(CAST(name AS BLOB)) + length(CAST(target AS BLOB))
                     ), 0) AS max_row_bytes
                FROM git_refs WHERE repo_id = ?`
-          : `SELECT count(*) AS rows,
+        : `SELECT count(*) AS rows,
                     coalesce(sum(length(CAST(name AS BLOB))), 0) AS name_bytes,
                     coalesce(sum(length(CAST(target AS BLOB))), 0) AS target_bytes,
                     coalesce(max(
                       length(CAST(name AS BLOB)) + length(CAST(target AS BLOB))
                     ), 0) AS max_row_bytes
                FROM git_refs WHERE repo_id = ? AND name >= ? AND name < ?`,
-        this.#repoId,
-        ...(upper === undefined ? [] : [prefix, upper]),
-      );
-      const measured = requireRefReadMetadata(metadata, "ref list");
-      if (measured.rows > MAX_REFLOG_STATE_ROWS) {
-        throw new GitError("E2BIG", "repository ref state exceeds 100,000 rows");
-      }
-      const maxRowBytes = requireMaximumStoredTextBytes(metadata?.max_row_bytes, "ref list row");
-      if ((measured.rows === 0) !== (maxRowBytes === 0)) {
-        throw new CorruptError("ref list row metadata is inconsistent");
-      }
-      reservation.set(
-        "other",
-        512 +
-          measured.rows * (REF_ROW_RETAINED_BYTES + 2 * 48 + 8) +
-          2 * (measured.nameBytes + measured.targetBytes),
-      );
-      const rowMemory = reservation.scope();
-      rowMemory.set("other", maxRowBytes === 0 ? 0 : currentTextRowRetainedBytes(maxRowBytes, 2));
-      const result: RefRow[] = [];
-      const sql =
-        prefix === ""
-          ? `SELECT repo_id, typeof(name) AS name_type,
+      this.#repoId,
+      ...(upper === undefined ? [] : [prefix, upper]),
+    );
+    const measured = requireRefReadMetadata(metadata, "ref list");
+    if (measured.rows > MAX_REFLOG_STATE_ROWS) {
+      throw new GitError("E2BIG", "repository ref state exceeds 100,000 rows");
+    }
+    const maxRowBytes = requireMaximumStoredTextBytes(metadata?.max_row_bytes, "ref list row");
+    if ((measured.rows === 0) !== (maxRowBytes === 0)) {
+      throw new CorruptError("ref list row metadata is inconsistent");
+    }
+    const result: RefRow[] = [];
+    const sql =
+      prefix === ""
+        ? `SELECT repo_id, typeof(name) AS name_type,
                     length(CAST(name AS BLOB)) AS name_bytes, CAST(name AS BLOB) AS name_blob,
                     typeof(target) AS target_type,
                     length(CAST(target AS BLOB)) AS target_bytes,
                     CAST(target AS BLOB) AS target_blob
                FROM git_refs WHERE repo_id = ? ORDER BY name`
-          : `SELECT repo_id, typeof(name) AS name_type,
+        : `SELECT repo_id, typeof(name) AS name_type,
                     length(CAST(name AS BLOB)) AS name_bytes, CAST(name AS BLOB) AS name_blob,
                     typeof(target) AS target_type,
                     length(CAST(target AS BLOB)) AS target_bytes,
                     CAST(target AS BLOB) AS target_blob
                FROM git_refs WHERE repo_id = ? AND name >= ? AND name < ? ORDER BY name`;
-      let actualNameBytes = 0;
-      let actualTargetBytes = 0;
-      let previousNameBytes: Uint8Array | null = null;
-      try {
-        for (const row of this.#db.iterate(
-          sql,
-          this.#repoId,
-          ...(upper === undefined ? [] : [prefix, upper]),
-        )) {
-          if (row.repo_id !== this.#repoId) {
-            throw new CorruptError("ref list crossed repository boundaries");
-          }
-          const nameByteLength = requireStoredTextByteLength(
-            row.name_type,
-            row.name_bytes,
-            "stored ref name",
-          );
-          const targetByteLength = requireStoredTextByteLength(
-            row.target_type,
-            row.target_bytes,
-            "stored ref target",
-          );
-          const currentRowBytes = nameByteLength + targetByteLength;
-          if (!Number.isSafeInteger(currentRowBytes) || currentRowBytes > maxRowBytes) {
-            throw new CorruptError("ref list row changed after metadata preflight");
-          }
-          const nameBytes = requireStoredTextBytes(row.name_type, row.name_blob, "stored ref name");
-          if (nameBytes.byteLength !== nameByteLength) {
-            throw new CorruptError("stored ref name changed after validation");
-          }
-          if (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0) {
-            throw new CorruptError("stored refs are not in strict Git byte order");
-          }
-          const name = requireRefName(
-            decodeCanonicalText(nameBytes, "stored ref name"),
-            "stored ref name",
-            "stored",
-          );
-          const targetBytes = requireStoredTextBytes(
-            row.target_type,
-            row.target_blob,
-            `stored target of ${name}`,
-          );
-          if (targetBytes.byteLength !== targetByteLength) {
-            throw new CorruptError(`stored target of ${name} changed after validation`);
-          }
-          const target = requireRawRefTarget(
-            decodeCanonicalText(targetBytes, `stored target of ${name}`),
-            `stored target of ${name}`,
-            "stored",
-          );
-          actualNameBytes += nameByteLength;
-          actualTargetBytes += targetByteLength;
-          if (!Number.isSafeInteger(actualNameBytes) || !Number.isSafeInteger(actualTargetBytes)) {
-            throw new CorruptError("ref list byte totals are invalid");
-          }
-          previousNameBytes = nameBytes;
-          result.push({ name, target });
-        }
-        if (
-          result.length !== measured.rows ||
-          actualNameBytes !== measured.nameBytes ||
-          actualTargetBytes !== measured.targetBytes
-        ) {
-          throw new CorruptError("ref list changed after metadata preflight");
-        }
-      } finally {
-        rowMemory.dispose();
+    let actualNameBytes = 0;
+    let actualTargetBytes = 0;
+    let previousNameBytes: Uint8Array | null = null;
+    for (const row of this.#db.iterate(
+      sql,
+      this.#repoId,
+      ...(upper === undefined ? [] : [prefix, upper]),
+    )) {
+      if (row.repo_id !== this.#repoId) {
+        throw new CorruptError("ref list crossed repository boundaries");
       }
-      return result;
-    } finally {
-      reservation.dispose();
+      const nameByteLength = requireStoredTextByteLength(
+        row.name_type,
+        row.name_bytes,
+        "stored ref name",
+      );
+      const targetByteLength = requireStoredTextByteLength(
+        row.target_type,
+        row.target_bytes,
+        "stored ref target",
+      );
+      const currentRowBytes = nameByteLength + targetByteLength;
+      if (!Number.isSafeInteger(currentRowBytes) || currentRowBytes > maxRowBytes) {
+        throw new CorruptError("ref list row changed after metadata preflight");
+      }
+      const nameBytes = requireStoredTextBytes(row.name_type, row.name_blob, "stored ref name");
+      if (nameBytes.byteLength !== nameByteLength) {
+        throw new CorruptError("stored ref name changed after validation");
+      }
+      if (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0) {
+        throw new CorruptError("stored refs are not in strict Git byte order");
+      }
+      const name = requireRefName(
+        decodeCanonicalText(nameBytes, "stored ref name"),
+        "stored ref name",
+        "stored",
+      );
+      const targetBytes = requireStoredTextBytes(
+        row.target_type,
+        row.target_blob,
+        `stored target of ${name}`,
+      );
+      if (targetBytes.byteLength !== targetByteLength) {
+        throw new CorruptError(`stored target of ${name} changed after validation`);
+      }
+      const target = requireRawRefTarget(
+        decodeCanonicalText(targetBytes, `stored target of ${name}`),
+        `stored target of ${name}`,
+        "stored",
+      );
+      actualNameBytes += nameByteLength;
+      actualTargetBytes += targetByteLength;
+      if (!Number.isSafeInteger(actualNameBytes) || !Number.isSafeInteger(actualTargetBytes)) {
+        throw new CorruptError("ref list byte totals are invalid");
+      }
+      previousNameBytes = nameBytes;
+      result.push({ name, target });
     }
+    if (
+      result.length !== measured.rows ||
+      actualNameBytes !== measured.nameBytes ||
+      actualTargetBytes !== measured.targetBytes
+    ) {
+      throw new CorruptError("ref list changed after metadata preflight");
+    }
+    return result;
   }
 
   /** Stream all raw refs without materializing repository ref state. */
@@ -7465,16 +6005,7 @@ export class CheckoutStore implements IndexStore {
     if (measured.rows > MAX_REFLOG_STATE_ROWS) {
       throw new GitError("E2BIG", "repository ref state exceeds 100,000 rows");
     }
-    const reservation = this.#sharedStore.reserveMemory();
-    reservation.set(
-      "other",
-      2 * REF_ROW_RETAINED_BYTES + 4 * 48 + 4 * (measured.nameBytes + measured.targetBytes),
-    );
-    try {
-      yield* this.#iterateStoredRefs(reservation, "ref iteration");
-    } finally {
-      reservation.dispose();
-    }
+    yield* this.#iterateStoredRefs("ref iteration");
   }
 
   head(): string {
@@ -7496,36 +6027,29 @@ export class CheckoutStore implements IndexStore {
     ) {
       throw new CorruptError("HEAD read crossed a checkout boundary");
     }
-    const reservation = this.#sharedStore.reserveMemory();
-    try {
-      reservation.set("other", currentTextRowRetainedBytes(metadata.head_bytes));
-      const row = this.#db.one<Record<string, unknown>>(
-        `SELECT id AS checkout_id, repo_id, typeof(head) AS head_type,
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT id AS checkout_id, repo_id, typeof(head) AS head_type,
                 length(CAST(head AS BLOB)) AS head_bytes,
                 CAST(head AS BLOB) AS head_blob
            FROM git_checkouts WHERE id = ? AND repo_id = ?`,
-        this.#checkoutId,
-        this.#repoId,
-      );
-      if (
-        row === undefined ||
-        row.checkout_id !== this.#checkoutId ||
-        row.repo_id !== this.#repoId ||
-        row.head_type !== "text" ||
-        row.head_bytes !== metadata.head_bytes
-      ) {
-        throw new CorruptError("checkout HEAD changed after validation");
-      }
-      const checked = requireRawRefTarget(
-        decodeCanonicalStoredText(row.head_blob, "stored HEAD target"),
-        "stored HEAD target",
-        "stored",
-      );
-      reservation.set("other", 256 + metadata.head_bytes + retainedStringBytes(checked));
-      return checked;
-    } finally {
-      reservation.dispose();
+      this.#checkoutId,
+      this.#repoId,
+    );
+    if (
+      row === undefined ||
+      row.checkout_id !== this.#checkoutId ||
+      row.repo_id !== this.#repoId ||
+      row.head_type !== "text" ||
+      row.head_bytes !== metadata.head_bytes
+    ) {
+      throw new CorruptError("checkout HEAD changed after validation");
     }
+    const checked = requireRawRefTarget(
+      decodeCanonicalStoredText(row.head_blob, "stored HEAD target"),
+      "stored HEAD target",
+      "stored",
+    );
+    return checked;
   }
 
   setHead(value: string): void {
@@ -7619,22 +6143,11 @@ export class CheckoutStore implements IndexStore {
     if ((measured.rows === 0) !== (maxTextBytes === 0)) {
       throw new CorruptError("reflog retained entry metadata is inconsistent");
     }
-    const reservation = this.#sharedStore.reserveMemory();
-    reservation.set(
-      "other",
-      512 +
-        retainedStringUnits(measured.headBytes) +
-        measured.rows * (512 + 9 * 48 + 16) +
-        2 * measured.textBytes +
-        currentTextRowRetainedBytes(measured.headBytes) +
-        (maxTextBytes === 0 ? 0 : currentTextRowRetainedBytes(maxTextBytes, 8)),
-    );
-    try {
-      const active: RefLogEntry[] = [];
-      let headerSeen = false;
-      let nextOrdinal = 0;
-      let previousOrdinal: number | null = null;
-      const headerSql = `SELECT 0 AS kind, repository.id AS repo_id,
+    const active: RefLogEntry[] = [];
+    let headerSeen = false;
+    let nextOrdinal = 0;
+    let previousOrdinal: number | null = null;
+    const headerSql = `SELECT 0 AS kind, repository.id AS repo_id,
               typeof(checkout.head) AS head_type,
               CAST(checkout.head AS BLOB) AS head_blob,
               state.next_ordinal,
@@ -7658,10 +6171,10 @@ export class CheckoutStore implements IndexStore {
          JOIN git_reflog_state state ON state.repo_id = repository.id
          JOIN git_checkouts checkout ON checkout.repo_id = repository.id
         WHERE repository.id = ? AND checkout.id = ?`;
-      const rows =
-        name === "HEAD"
-          ? this.#db.iterate(
-              `${headerSql}
+    const rows =
+      name === "HEAD"
+        ? this.#db.iterate(
+            `${headerSql}
              UNION ALL
              SELECT 1 AS kind, entry.repo_id, NULL AS head_type, NULL AS head_blob,
                     NULL AS next_ordinal,
@@ -7685,13 +6198,13 @@ export class CheckoutStore implements IndexStore {
               WHERE entry.repo_id = ? AND entry.checkout_id = ?
               ORDER BY kind, ordinal DESC
               LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
-              this.#repoId,
-              this.#checkoutId,
-              this.#repoId,
-              this.#checkoutId,
-            )
-          : this.#db.iterate(
-              `${headerSql}
+            this.#repoId,
+            this.#checkoutId,
+            this.#repoId,
+            this.#checkoutId,
+          )
+        : this.#db.iterate(
+            `${headerSql}
              UNION ALL
              SELECT 1 AS kind, entry.repo_id, NULL AS head_type, NULL AS head_blob,
               NULL AS next_ordinal,
@@ -7715,42 +6228,39 @@ export class CheckoutStore implements IndexStore {
               WHERE entry.repo_id = ? AND entry.ref_name = ?
               ORDER BY kind, ordinal DESC
               LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
-              this.#repoId,
-              this.#checkoutId,
-              this.#repoId,
-              name,
-            );
-      for (const row of rows) {
-        if (row.kind === 0) {
-          if (headerSeen) throw new CorruptError("reflog query returned duplicate headers");
-          headerSeen = true;
-          nextOrdinal = requireRefLogHeader(row, this.#repoId);
-          continue;
-        }
-        if (row.kind !== 1 || !headerSeen) {
-          throw new CorruptError("reflog query returned an invalid row sequence");
-        }
-        const entry = requireStoredRefLogEntry(row, this.#repoId);
-        if (entry.refName !== name) throw new CorruptError("reflog query returned another ref");
-        if (entry.ordinal > nextOrdinal) {
-          throw new CorruptError("reflog entry exceeds the repository allocation state");
-        }
-        if (previousOrdinal !== null && previousOrdinal <= entry.ordinal) {
-          throw new CorruptError("reflog entries are not in strict descending ordinal order");
-        }
-        previousOrdinal = entry.ordinal;
-        if (entry.timestamp >= cutoff) active.push(entry);
+            this.#repoId,
+            this.#checkoutId,
+            this.#repoId,
+            name,
+          );
+    for (const row of rows) {
+      if (row.kind === 0) {
+        if (headerSeen) throw new CorruptError("reflog query returned duplicate headers");
+        headerSeen = true;
+        nextOrdinal = requireRefLogHeader(row, this.#repoId);
+        continue;
       }
-      if (!headerSeen) throw new CorruptError("repository is missing its reflog state");
-      const page: RefLogEntry[] = [];
-      for (const entry of active) {
-        if (before !== undefined && entry.ordinal >= before) continue;
-        if (page.length < limit) page.push(entry);
+      if (row.kind !== 1 || !headerSeen) {
+        throw new CorruptError("reflog query returned an invalid row sequence");
       }
-      return page;
-    } finally {
-      reservation.dispose();
+      const entry = requireStoredRefLogEntry(row, this.#repoId);
+      if (entry.refName !== name) throw new CorruptError("reflog query returned another ref");
+      if (entry.ordinal > nextOrdinal) {
+        throw new CorruptError("reflog entry exceeds the repository allocation state");
+      }
+      if (previousOrdinal !== null && previousOrdinal <= entry.ordinal) {
+        throw new CorruptError("reflog entries are not in strict descending ordinal order");
+      }
+      previousOrdinal = entry.ordinal;
+      if (entry.timestamp >= cutoff) active.push(entry);
     }
+    if (!headerSeen) throw new CorruptError("repository is missing its reflog state");
+    const page: RefLogEntry[] = [];
+    for (const entry of active) {
+      if (before !== undefined && entry.ordinal >= before) continue;
+      if (page.length < limit) page.push(entry);
+    }
+    return page;
   }
 
   /** Distinct active reflog roots in strict byte order. */
@@ -7994,83 +6504,11 @@ export class CheckoutStore implements IndexStore {
     return values.length === 0 ? undefined : values[values.length - 1];
   }
 
-  #configGetOwned(path: string, owner: RefMutationMemoryOwner): string | undefined {
+  #configGetOwned(path: string): string | undefined {
     if (typeof path !== "string" || path === "") {
       throw new GitError("EINVAL", "config path must be a non-empty string");
     }
-    const owningReservation = owner.memoryReservation();
-    const transientMemory = this.#sharedStore.scopeMemoryReservation(owningReservation);
-    try {
-      transientMemory.set("other", CONFIG_READ_FIXED_RETAINED_BYTES);
-      const info = this.#db.one<{
-        repo_id: unknown;
-        seq_type: unknown;
-        seq: unknown;
-        value_type: unknown;
-        value_bytes: unknown;
-      }>(
-        `SELECT repo_id, typeof(seq) AS seq_type,
-                CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
-                typeof(value) AS value_type,
-                length(CAST(value AS BLOB)) AS value_bytes
-           FROM git_config
-          WHERE repo_id = ? AND path = ?
-          ORDER BY seq DESC
-          LIMIT 1`,
-        this.#repoId,
-        path,
-      );
-      if (info === undefined) return undefined;
-      if (
-        info.repo_id !== this.#repoId ||
-        info.seq_type !== "integer" ||
-        typeof info.seq !== "number" ||
-        !Number.isSafeInteger(info.seq) ||
-        info.seq < 0 ||
-        info.value_type !== "text" ||
-        typeof info.value_bytes !== "number" ||
-        !Number.isSafeInteger(info.value_bytes) ||
-        info.value_bytes < 0
-      ) {
-        throw new CorruptError(`config ${path} has invalid text metadata`);
-      }
-      if (info.value_bytes > (Number.MAX_SAFE_INTEGER - CONFIG_READ_FIXED_RETAINED_BYTES) / 2) {
-        throw new GitError("E2BIG", "config read memory accounting overflow");
-      }
-      transientMemory.set("other", CONFIG_READ_FIXED_RETAINED_BYTES + 2 * info.value_bytes);
-      return owner.construct(info.value_bytes, () => {
-        const row = this.#db.one<Record<string, unknown>>(
-          `SELECT repo_id, typeof(seq) AS seq_type,
-                  CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
-                  typeof(value) AS value_type,
-                  length(CAST(value AS BLOB)) AS value_bytes,
-                  CAST(value AS BLOB) AS value_blob
-             FROM git_config
-            WHERE repo_id = ? AND path = ? AND seq = ?
-            LIMIT 1`,
-          this.#repoId,
-          path,
-          info.seq,
-        );
-        if (
-          row === undefined ||
-          row.repo_id !== this.#repoId ||
-          row.seq_type !== "integer" ||
-          row.seq !== info.seq ||
-          row.value_type !== "text" ||
-          row.value_bytes !== info.value_bytes
-        ) {
-          throw new CorruptError(`config ${path} changed after validation`);
-        }
-        const bytes = readBlob(row.value_blob);
-        if (bytes.byteLength !== info.value_bytes) {
-          throw new CorruptError(`config ${path} changed after validation`);
-        }
-        return decodeCanonicalText(bytes, `config ${path}`);
-      });
-    } finally {
-      transientMemory.dispose();
-    }
+    return this.configGetBounded(path);
   }
 
   /** Read one config value only after SQLite proves its text metadata. */
@@ -8078,17 +6516,14 @@ export class CheckoutStore implements IndexStore {
     if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
       throw new GitError("EINVAL", "config byte limit must be a non-negative safe integer");
     }
-    const reservation = this.#sharedStore.reserveMemory();
-    reservation.set("other", CONFIG_READ_FIXED_RETAINED_BYTES);
-    try {
-      const info = this.#db.one<{
-        repo_id: unknown;
-        seq_type: unknown;
-        seq: unknown;
-        value_type: unknown;
-        value_bytes: unknown;
-      }>(
-        `SELECT repo_id, typeof(seq) AS seq_type,
+    const info = this.#db.one<{
+      repo_id: unknown;
+      seq_type: unknown;
+      seq: unknown;
+      value_type: unknown;
+      value_bytes: unknown;
+    }>(
+      `SELECT repo_id, typeof(seq) AS seq_type,
               CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
               typeof(value) AS value_type,
               length(CAST(value AS BLOB)) AS value_bytes
@@ -8096,32 +6531,28 @@ export class CheckoutStore implements IndexStore {
         WHERE repo_id = ? AND path = ?
         ORDER BY seq DESC
         LIMIT 1`,
-        this.#repoId,
-        path,
-      );
-      if (info === undefined) return undefined;
-      if (
-        info.repo_id !== this.#repoId ||
-        info.seq_type !== "integer" ||
-        typeof info.seq !== "number" ||
-        !Number.isSafeInteger(info.seq) ||
-        info.seq < 0 ||
-        info.value_type !== "text" ||
-        typeof info.value_bytes !== "number" ||
-        !Number.isSafeInteger(info.value_bytes) ||
-        info.value_bytes < 0
-      ) {
-        throw new CorruptError(`config ${path} has invalid text metadata`);
-      }
-      if (maxBytes !== undefined && info.value_bytes > maxBytes) {
-        throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
-      }
-      reservation.set(
-        "other",
-        CONFIG_READ_FIXED_RETAINED_BYTES + info.value_bytes + 48 + 2 * info.value_bytes,
-      );
-      const row = this.#db.one<Record<string, unknown>>(
-        `SELECT repo_id, typeof(seq) AS seq_type,
+      this.#repoId,
+      path,
+    );
+    if (info === undefined) return undefined;
+    if (
+      info.repo_id !== this.#repoId ||
+      info.seq_type !== "integer" ||
+      typeof info.seq !== "number" ||
+      !Number.isSafeInteger(info.seq) ||
+      info.seq < 0 ||
+      info.value_type !== "text" ||
+      typeof info.value_bytes !== "number" ||
+      !Number.isSafeInteger(info.value_bytes) ||
+      info.value_bytes < 0
+    ) {
+      throw new CorruptError(`config ${path} has invalid text metadata`);
+    }
+    if (maxBytes !== undefined && info.value_bytes > maxBytes) {
+      throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
+    }
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT repo_id, typeof(seq) AS seq_type,
                 CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
                 typeof(value) AS value_type,
                 length(CAST(value AS BLOB)) AS value_bytes,
@@ -8129,33 +6560,25 @@ export class CheckoutStore implements IndexStore {
            FROM git_config
           WHERE repo_id = ? AND path = ? AND seq = ?
           LIMIT 1`,
-        this.#repoId,
-        path,
-        info.seq,
-      );
-      if (
-        row === undefined ||
-        row.repo_id !== this.#repoId ||
-        row.seq_type !== "integer" ||
-        row.seq !== info.seq ||
-        row.value_type !== "text" ||
-        row.value_bytes !== info.value_bytes
-      ) {
-        throw new CorruptError(`config ${path} changed after validation`);
-      }
-      const bytes = readBlob(row.value_blob);
-      if (bytes.byteLength !== info.value_bytes) {
-        throw new CorruptError(`config ${path} changed after validation`);
-      }
-      const value = decodeCanonicalText(bytes, `config ${path}`);
-      reservation.set(
-        "other",
-        CONFIG_READ_FIXED_RETAINED_BYTES + bytes.byteLength + retainedStringBytes(value),
-      );
-      return value;
-    } finally {
-      reservation.dispose();
+      this.#repoId,
+      path,
+      info.seq,
+    );
+    if (
+      row === undefined ||
+      row.repo_id !== this.#repoId ||
+      row.seq_type !== "integer" ||
+      row.seq !== info.seq ||
+      row.value_type !== "text" ||
+      row.value_bytes !== info.value_bytes
+    ) {
+      throw new CorruptError(`config ${path} changed after validation`);
     }
+    const bytes = readBlob(row.value_blob);
+    if (bytes.byteLength !== info.value_bytes) {
+      throw new CorruptError(`config ${path} changed after validation`);
+    }
+    return decodeCanonicalText(bytes, `config ${path}`);
   }
 
   /** Read zero or one canonical value without materialising a multi-valued key. */
@@ -8168,12 +6591,9 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("EINVAL", "config byte limit must be a non-negative safe integer");
     }
 
-    const reservation = this.#sharedStore.reserveMemory();
-    reservation.set("other", CONFIG_READ_FIXED_RETAINED_BYTES + 2 * 128);
-    try {
-      const metadata: { seq: number; bytes: number }[] = [];
-      for (const row of this.#db.iterate(
-        `SELECT repo_id, typeof(seq) AS seq_type,
+    const metadata: { seq: number; bytes: number }[] = [];
+    for (const row of this.#db.iterate(
+      `SELECT repo_id, typeof(seq) AS seq_type,
               CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
               typeof(value) AS value_type,
               length(CAST(value AS BLOB)) AS value_bytes
@@ -8181,40 +6601,35 @@ export class CheckoutStore implements IndexStore {
         WHERE repo_id = ? AND path = ?
         ORDER BY seq
         LIMIT 2`,
-        this.#repoId,
-        path,
-      )) {
-        if (row.repo_id !== this.#repoId) {
-          throw new CorruptError(`config ${path} crossed repository boundaries`);
-        }
-        if (
-          row.seq_type !== "integer" ||
-          typeof row.seq !== "number" ||
-          !Number.isSafeInteger(row.seq) ||
-          row.seq < 0 ||
-          row.value_type !== "text" ||
-          typeof row.value_bytes !== "number" ||
-          !Number.isSafeInteger(row.value_bytes) ||
-          row.value_bytes < 0
-        ) {
-          throw new CorruptError(`config ${path} has invalid value metadata`);
-        }
-        if (maxBytes !== undefined && row.value_bytes > maxBytes) {
-          throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
-        }
-        metadata.push({ seq: row.seq, bytes: row.value_bytes });
+      this.#repoId,
+      path,
+    )) {
+      if (row.repo_id !== this.#repoId) {
+        throw new CorruptError(`config ${path} crossed repository boundaries`);
       }
-      const expected = metadata[0];
-      if (expected === undefined) return { kind: "missing" };
-      if (metadata.length !== 1) return { kind: "multiple" };
+      if (
+        row.seq_type !== "integer" ||
+        typeof row.seq !== "number" ||
+        !Number.isSafeInteger(row.seq) ||
+        row.seq < 0 ||
+        row.value_type !== "text" ||
+        typeof row.value_bytes !== "number" ||
+        !Number.isSafeInteger(row.value_bytes) ||
+        row.value_bytes < 0
+      ) {
+        throw new CorruptError(`config ${path} has invalid value metadata`);
+      }
+      if (maxBytes !== undefined && row.value_bytes > maxBytes) {
+        throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
+      }
+      metadata.push({ seq: row.seq, bytes: row.value_bytes });
+    }
+    const expected = metadata[0];
+    if (expected === undefined) return { kind: "missing" };
+    if (metadata.length !== 1) return { kind: "multiple" };
 
-      reservation.set(
-        "other",
-        CONFIG_READ_FIXED_RETAINED_BYTES + 2 * 128 + expected.bytes + 48 + 2 * expected.bytes,
-      );
-
-      const row = this.#db.one<Record<string, unknown>>(
-        `SELECT repo_id, typeof(seq) AS seq_type,
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT repo_id, typeof(seq) AS seq_type,
               CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
               typeof(value) AS value_type,
               length(CAST(value AS BLOB)) AS value_bytes,
@@ -8222,38 +6637,31 @@ export class CheckoutStore implements IndexStore {
          FROM git_config
         WHERE repo_id = ? AND path = ? AND seq = ?
         LIMIT 1`,
-        this.#repoId,
-        path,
-        expected.seq,
-      );
-      if (
-        row === undefined ||
-        row.repo_id !== this.#repoId ||
-        row.seq_type !== "integer" ||
-        row.seq !== expected.seq ||
-        row.value_type !== "text" ||
-        row.value_bytes !== expected.bytes
-      ) {
-        throw new CorruptError(`config ${path} changed after validation`);
-      }
-      let bytes: Uint8Array;
-      try {
-        bytes = readBlob(row.value_blob);
-      } catch (error) {
-        throw new CorruptError(`config ${path} has an invalid value BLOB`, { cause: error });
-      }
-      if (bytes.byteLength !== expected.bytes) {
-        throw new CorruptError(`config ${path} changed after validation`);
-      }
-      const value = decodeCanonicalText(bytes, `config ${path}`);
-      reservation.set(
-        "other",
-        CONFIG_READ_FIXED_RETAINED_BYTES + 2 * 128 + bytes.byteLength + retainedStringBytes(value),
-      );
-      return { kind: "single", value };
-    } finally {
-      reservation.dispose();
+      this.#repoId,
+      path,
+      expected.seq,
+    );
+    if (
+      row === undefined ||
+      row.repo_id !== this.#repoId ||
+      row.seq_type !== "integer" ||
+      row.seq !== expected.seq ||
+      row.value_type !== "text" ||
+      row.value_bytes !== expected.bytes
+    ) {
+      throw new CorruptError(`config ${path} changed after validation`);
     }
+    let bytes: Uint8Array;
+    try {
+      bytes = readBlob(row.value_blob);
+    } catch (error) {
+      throw new CorruptError(`config ${path} has an invalid value BLOB`, { cause: error });
+    }
+    if (bytes.byteLength !== expected.bytes) {
+      throw new CorruptError(`config ${path} changed after validation`);
+    }
+    const value = decodeCanonicalText(bytes, `config ${path}`);
+    return { kind: "single", value };
   }
 
   /** Inspect zero, one, or multiple values without materialising their payloads. */
@@ -8347,115 +6755,89 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("EINVAL", "config section source and destination must differ");
     }
 
-    const reservation = this.reserveMemory();
-    const metadataMemory = reservation.scope();
-    const valueMemory = reservation.scope();
-    try {
-      reservation.set(
-        "other",
-        512 + retainedStringBytes(source) + retainedStringBytes(destination),
-      );
-      this.#db.transactionSync(() => {
-        let destinationCandidates = 0;
-        valueMemory.set("other", currentTextRowRetainedBytes(MAX_INDEX_PATH_BYTES, 2));
-        for (const row of this.#db.iterate(
-          configSectionMetadataSql(),
-          this.#repoId,
-          destination,
-          nextPrefix(destination),
-        )) {
-          destinationCandidates++;
-          if (destinationCandidates > MAX_CONFIG_SECTION_MOVE_ROWS) {
-            throw new GitError(
-              "E2BIG",
-              `config section ${destination} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
-            );
-          }
-          const candidate = requireConfigSectionMetadata(row, this.#repoId, destination);
-          if (configSectionVariable(candidate.path, destination) !== null) {
-            throw new GitError("EEXIST", `config section ${destination} already exists`);
-          }
-        }
-        valueMemory.clear("other");
-
-        const metadata: ConfigSectionMoveMetadata[] = [];
-        let sourceCandidates = 0;
-        let metadataBytes = 256;
-        metadataMemory.set("other", metadataBytes);
-        valueMemory.set("other", currentTextRowRetainedBytes(MAX_INDEX_PATH_BYTES, 2));
-        for (const row of this.#db.iterate(
-          configSectionMetadataSql(),
-          this.#repoId,
-          source,
-          nextPrefix(source),
-        )) {
-          sourceCandidates++;
-          if (sourceCandidates > MAX_CONFIG_SECTION_MOVE_ROWS) {
-            throw new GitError(
-              "E2BIG",
-              `config section ${source} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
-            );
-          }
-          const candidate = requireConfigSectionMetadata(row, this.#repoId, source);
-          const variable = configSectionVariable(candidate.path, source);
-          if (variable === null) continue;
-          if (
-            candidate.valueType !== "text" ||
-            candidate.valueBytes === null ||
-            candidate.valueBytes < 0
-          ) {
-            throw new CorruptError(`config section ${source} has an invalid stored value`);
-          }
-          configSectionDestinationBytes(destination, variable);
-          metadataBytes = blobIdRetainedTotal(
-            metadataBytes,
-            192 + retainedStringBytes(candidate.path),
-            "config section metadata",
+    this.#db.transactionSync(() => {
+      let destinationCandidates = 0;
+      for (const row of this.#db.iterate(
+        configSectionMetadataSql(),
+        this.#repoId,
+        destination,
+        nextPrefix(destination),
+      )) {
+        destinationCandidates++;
+        if (destinationCandidates > MAX_CONFIG_SECTION_MOVE_ROWS) {
+          throw new GitError(
+            "E2BIG",
+            `config section ${destination} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
           );
-          metadataMemory.set("other", metadataBytes);
-          metadata.push({ ...candidate, valueBytes: candidate.valueBytes });
         }
-        valueMemory.clear("other");
+        const candidate = requireConfigSectionMetadata(row, this.#repoId, destination);
+        if (configSectionVariable(candidate.path, destination) !== null) {
+          throw new GitError("EEXIST", `config section ${destination} already exists`);
+        }
+      }
 
-        function* validationRows(): Generator<{
-          ordinal: number;
-          path: string;
-          seq: number;
-          valueBytes: number;
-        }> {
-          for (let ordinal = 0; ordinal < metadata.length; ordinal++) {
-            const candidate = metadata[ordinal];
-            if (candidate === undefined)
-              throw new CorruptError("config section metadata is sparse");
-            yield {
-              ordinal,
-              path: candidate.path,
-              seq: candidate.seq,
-              valueBytes: candidate.valueBytes,
-            };
-          }
+      const metadata: ConfigSectionMoveMetadata[] = [];
+      let sourceCandidates = 0;
+      for (const row of this.#db.iterate(
+        configSectionMetadataSql(),
+        this.#repoId,
+        source,
+        nextPrefix(source),
+      )) {
+        sourceCandidates++;
+        if (sourceCandidates > MAX_CONFIG_SECTION_MOVE_ROWS) {
+          throw new GitError(
+            "E2BIG",
+            `config section ${source} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
+          );
         }
-        let validatedValues = 0;
-        for (const page of jsonPages(validationRows(), "config section value validation", {
-          reservation,
-          maxUnits: (row) => 128 + jsonStringMaxUnits(row.path),
-        })) {
-          valueMemory.set("other", 512 + 4 * OBJECT_PAYLOAD);
-          let currentOrdinal = -1;
-          let expectedOffset = 0;
-          let decoder = new TextDecoder("utf-8", { fatal: true });
-          const finishDecoder = (candidate: ConfigSectionMoveMetadata): void => {
-            try {
-              decoder.decode();
-            } catch (error) {
-              throw new CorruptError(`config value at ${candidate.path} is not canonical UTF-8`, {
-                cause: error,
-              });
-            }
+        const candidate = requireConfigSectionMetadata(row, this.#repoId, source);
+        const variable = configSectionVariable(candidate.path, source);
+        if (variable === null) continue;
+        if (
+          candidate.valueType !== "text" ||
+          candidate.valueBytes === null ||
+          candidate.valueBytes < 0
+        ) {
+          throw new CorruptError(`config section ${source} has an invalid stored value`);
+        }
+        configSectionDestinationBytes(destination, variable);
+        metadata.push({ ...candidate, valueBytes: candidate.valueBytes });
+      }
+
+      function* validationRows(): Generator<{
+        ordinal: number;
+        path: string;
+        seq: number;
+        valueBytes: number;
+      }> {
+        for (let ordinal = 0; ordinal < metadata.length; ordinal++) {
+          const candidate = metadata[ordinal];
+          if (candidate === undefined) throw new CorruptError("config section metadata is sparse");
+          yield {
+            ordinal,
+            path: candidate.path,
+            seq: candidate.seq,
+            valueBytes: candidate.valueBytes,
           };
+        }
+      }
+      let validatedValues = 0;
+      for (const page of jsonPages(validationRows(), "config section value validation")) {
+        let currentOrdinal = -1;
+        let expectedOffset = 0;
+        let decoder = new TextDecoder("utf-8", { fatal: true });
+        const finishDecoder = (candidate: ConfigSectionMoveMetadata): void => {
           try {
-            for (const row of this.#db.iterate(
-              `WITH RECURSIVE wanted(ordinal, path, seq, value_bytes) AS MATERIALIZED (
+            decoder.decode();
+          } catch (error) {
+            throw new CorruptError(`config value at ${candidate.path} is not canonical UTF-8`, {
+              cause: error,
+            });
+          }
+        };
+        for (const row of this.#db.iterate(
+          `WITH RECURSIVE wanted(ordinal, path, seq, value_bytes) AS MATERIALIZED (
                  SELECT json_extract(value, '$.ordinal'), json_extract(value, '$.path'),
                         json_extract(value, '$.seq'), json_extract(value, '$.valueBytes')
                    FROM json_each(?)
@@ -8474,200 +6856,106 @@ export class CheckoutStore implements IndexStore {
                  JOIN git_config config
                    ON config.repo_id = ? AND config.path = chunks.path AND config.seq = chunks.seq
                 ORDER BY chunks.ordinal, chunks.offset`,
-              page,
-              this.#repoId,
-            )) {
-              const ordinal = row.ordinal;
-              if (
-                typeof ordinal !== "number" ||
-                !Number.isSafeInteger(ordinal) ||
-                ordinal < 0 ||
-                ordinal >= metadata.length
-              ) {
-                throw new CorruptError(`config section ${source} changed after validation`);
-              }
-              const candidate = metadata[ordinal];
-              if (candidate === undefined) {
-                throw new CorruptError(`config section ${source} changed after validation`);
-              }
-              if (ordinal !== currentOrdinal) {
-                if (currentOrdinal >= 0) {
-                  const previous = metadata[currentOrdinal];
-                  if (previous === undefined || expectedOffset !== previous.valueBytes) {
-                    throw new CorruptError(`config section ${source} changed after validation`);
-                  }
-                  finishDecoder(previous);
-                }
-                currentOrdinal = ordinal;
-                expectedOffset = 0;
-                decoder = new TextDecoder("utf-8", { fatal: true });
-                validatedValues++;
-              }
-              const chunk = readBlob(row.chunk);
-              const expectedChunkBytes = Math.min(
-                OBJECT_PAYLOAD,
-                candidate.valueBytes - expectedOffset,
-              );
-              if (
-                row.path !== candidate.path ||
-                row.seq !== candidate.seq ||
-                row.offset !== expectedOffset ||
-                row.value_type !== "text" ||
-                row.value_bytes !== candidate.valueBytes ||
-                chunk.byteLength !== expectedChunkBytes
-              ) {
-                throw new CorruptError(`config section ${source} changed after validation`);
-              }
-              try {
-                decoder.decode(chunk, { stream: true });
-              } catch (error) {
-                throw new CorruptError(`config value at ${candidate.path} is not canonical UTF-8`, {
-                  cause: error,
-                });
-              }
-              expectedOffset += chunk.byteLength;
-            }
+          page,
+          this.#repoId,
+        )) {
+          const ordinal = row.ordinal;
+          if (
+            typeof ordinal !== "number" ||
+            !Number.isSafeInteger(ordinal) ||
+            ordinal < 0 ||
+            ordinal >= metadata.length
+          ) {
+            throw new CorruptError(`config section ${source} changed after validation`);
+          }
+          const candidate = metadata[ordinal];
+          if (candidate === undefined) {
+            throw new CorruptError(`config section ${source} changed after validation`);
+          }
+          if (ordinal !== currentOrdinal) {
             if (currentOrdinal >= 0) {
-              const current = metadata[currentOrdinal];
-              if (current === undefined || expectedOffset !== current.valueBytes) {
+              const previous = metadata[currentOrdinal];
+              if (previous === undefined || expectedOffset !== previous.valueBytes) {
                 throw new CorruptError(`config section ${source} changed after validation`);
               }
-              finishDecoder(current);
+              finishDecoder(previous);
             }
-          } finally {
-            valueMemory.clear("other");
+            currentOrdinal = ordinal;
+            expectedOffset = 0;
+            decoder = new TextDecoder("utf-8", { fatal: true });
+            validatedValues++;
           }
-        }
-        if (validatedValues !== metadata.length) {
-          throw new CorruptError(`config section ${source} changed after validation`);
-        }
-        if (metadata.length === 0) return;
-
-        function* updateRows(): Generator<{ path: string; seq: number }> {
-          for (const row of metadata) yield { path: row.path, seq: row.seq };
-        }
-        let changedRows = 0;
-        for (const page of jsonPages(updateRows(), "config section move", {
-          reservation,
-          maxUnits: (row) => 64 + jsonStringMaxUnits(row.path),
-        })) {
-          this.#db.run(
-            CONFIG_SECTION_MOVE_UPDATE_SQL,
-            destination,
-            source,
-            this.#repoId,
-            source,
-            nextPrefix(source),
-            page,
+          const chunk = readBlob(row.chunk);
+          const expectedChunkBytes = Math.min(
+            OBJECT_PAYLOAD,
+            candidate.valueBytes - expectedOffset,
           );
-          const changed = this.#db.scalar<unknown>("SELECT changes()");
-          if (typeof changed !== "number" || !Number.isSafeInteger(changed) || changed < 0) {
-            throw new CorruptError(`config section ${source} returned an invalid change count`);
+          if (
+            row.path !== candidate.path ||
+            row.seq !== candidate.seq ||
+            row.offset !== expectedOffset ||
+            row.value_type !== "text" ||
+            row.value_bytes !== candidate.valueBytes ||
+            chunk.byteLength !== expectedChunkBytes
+          ) {
+            throw new CorruptError(`config section ${source} changed after validation`);
           }
-          changedRows += changed;
+          try {
+            decoder.decode(chunk, { stream: true });
+          } catch (error) {
+            throw new CorruptError(`config value at ${candidate.path} is not canonical UTF-8`, {
+              cause: error,
+            });
+          }
+          expectedOffset += chunk.byteLength;
         }
-        if (changedRows !== metadata.length) {
-          throw new CorruptError(`config section ${source} changed during its move`);
+        if (currentOrdinal >= 0) {
+          const current = metadata[currentOrdinal];
+          if (current === undefined || expectedOffset !== current.valueBytes) {
+            throw new CorruptError(`config section ${source} changed after validation`);
+          }
+          finishDecoder(current);
         }
-      });
-    } finally {
-      valueMemory.dispose();
-      metadataMemory.dispose();
-      reservation.dispose();
-    }
+      }
+      if (validatedValues !== metadata.length) {
+        throw new CorruptError(`config section ${source} changed after validation`);
+      }
+      if (metadata.length === 0) return;
+
+      function* updateRows(): Generator<{ path: string; seq: number }> {
+        for (const row of metadata) yield { path: row.path, seq: row.seq };
+      }
+      let changedRows = 0;
+      for (const page of jsonPages(updateRows(), "config section move")) {
+        this.#db.run(
+          CONFIG_SECTION_MOVE_UPDATE_SQL,
+          destination,
+          source,
+          this.#repoId,
+          source,
+          nextPrefix(source),
+          page,
+        );
+        const changed = this.#db.scalar<unknown>("SELECT changes()");
+        if (typeof changed !== "number" || !Number.isSafeInteger(changed) || changed < 0) {
+          throw new CorruptError(`config section ${source} returned an invalid change count`);
+        }
+        changedRows += changed;
+      }
+      if (changedRows !== metadata.length) {
+        throw new CorruptError(`config section ${source} changed during its move`);
+      }
+    });
   }
 
   // -- integration operation journal --------------------------------
 
   /** Read and validate the one durable incomplete integration operation. */
   readOperationState(): OperationJournal | null {
-    const reservation = this.reserveMemory();
-    try {
-      return this.#readOperationStateOwned(reservation);
-    } finally {
-      reservation.dispose();
-    }
+    return this.#readOperationStateOwned();
   }
 
-  #readOperationStateOwned(reservation: MemoryReservation): OperationJournal | null {
-    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
-      throw new GitError("EINVAL", "operation journal reservation belongs to another repository");
-    }
-    const metadata = this.#db.one<{
-      step_count: unknown;
-      touched_count: unknown;
-      retained_bytes: unknown;
-      state_text_bytes: unknown;
-      step_text_bytes: unknown;
-      touched_text_bytes: unknown;
-    }>(
-      `SELECT state.step_count, state.touched_count, state.retained_bytes,
-              coalesce(length(CAST(state.kind AS BLOB)), 0) +
-              coalesce(length(CAST(state.original_head_ref AS BLOB)), 0) +
-              coalesce(length(CAST(state.original_head_oid AS BLOB)), 0) +
-              coalesce(length(CAST(state.current_parent_oid AS BLOB)), 0) +
-              coalesce(length(CAST(state.incoming_parent_oid AS BLOB)), 0) +
-              coalesce(length(CAST(state.upstream_oid AS BLOB)), 0) +
-              coalesce(length(CAST(state.base_oid AS BLOB)), 0) +
-              coalesce(length(CAST(state.phase AS BLOB)), 0) +
-              coalesce(length(CAST(state.empty_reason AS BLOB)), 0) +
-              coalesce(length(CAST(state.mode AS BLOB)), 0) +
-              coalesce(length(CAST(state.merge_origin AS BLOB)), 0) +
-              coalesce(length(CAST(state.current_label AS BLOB)), 0) +
-              coalesce(length(CAST(state.incoming_label AS BLOB)), 0) +
-              coalesce(length(CAST(state.message AS BLOB)), 0) +
-              coalesce(length(CAST(state.author_name AS BLOB)), 0) +
-              coalesce(length(CAST(state.author_email AS BLOB)), 0) +
-              coalesce(length(CAST(state.committer_name AS BLOB)), 0) +
-              coalesce(length(CAST(state.committer_email AS BLOB)), 0) +
-              coalesce(length(CAST(state.integrity_oid AS BLOB)), 0)
-                AS state_text_bytes,
-              coalesce((SELECT max(
-                coalesce(length(CAST(source_oid AS BLOB)), 0) +
-                coalesce(length(CAST(selected_parent_oid AS BLOB)), 0) +
-                coalesce(length(CAST(outcome AS BLOB)), 0) +
-                coalesce(length(CAST(result_oid AS BLOB)), 0)
-              ) FROM git_operation_steps WHERE checkout_id = state.checkout_id), 0)
-                AS step_text_bytes,
-              coalesce((SELECT max(
-                coalesce(length(CAST(path AS BLOB)), 0) +
-                coalesce(length(CAST(logical_path AS BLOB)), 0) +
-                coalesce(length(CAST(purpose AS BLOB)), 0) +
-                coalesce(length(CAST(index_oid AS BLOB)), 0) +
-                coalesce(length(CAST(worktree_kind AS BLOB)), 0) +
-                coalesce(length(CAST(worktree_oid AS BLOB)), 0)
-              ) FROM git_operation_touched WHERE checkout_id = state.checkout_id), 0)
-                AS touched_text_bytes
-         FROM git_operation_state state WHERE state.checkout_id = ?`,
-      this.#checkoutId,
-    );
-    if (metadata !== undefined) {
-      const stepCount = requireMergeInteger(metadata.step_count, "step count");
-      const touchedCount = requireMergeInteger(metadata.touched_count, "touched-path count");
-      const retainedBytes = requireMergeInteger(metadata.retained_bytes, "retained-byte count");
-      const stateTextBytes = requireMergeInteger(
-        metadata.state_text_bytes,
-        "state text byte count",
-      );
-      const stepTextBytes = requireMergeInteger(metadata.step_text_bytes, "step text byte count");
-      const touchedTextBytes = requireMergeInteger(
-        metadata.touched_text_bytes,
-        "touched-path text byte count",
-      );
-      if (stepCount > MAX_OPERATION_STEPS) {
-        throw new GitError("E2BIG", `operation journal exceeds ${MAX_OPERATION_STEPS} steps`);
-      }
-      if (touchedCount > MAX_MERGE_TOUCHED_PATHS) {
-        throw new GitError(
-          "E2BIG",
-          `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`,
-        );
-      }
-      reservation.set(
-        "other",
-        operationJournalReadBytes(retainedBytes, stateTextBytes, stepTextBytes, touchedTextBytes),
-      );
-    }
+  #readOperationStateOwned(): OperationJournal | null {
     const row = this.#db.one<OperationStateRow>(
       `SELECT
               CASE WHEN typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= 11
@@ -8736,7 +7024,7 @@ export class CheckoutStore implements IndexStore {
                    WHEN typeof(committer_email) = 'text'
                          AND length(CAST(committer_email AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
                    THEN committer_email ELSE 0 END AS committer_email,
-              touched_count, retained_bytes,
+              touched_count,
               CASE WHEN typeof(integrity_oid) = 'text'
                          AND length(CAST(integrity_oid AS BLOB)) = 40
                    THEN integrity_oid END AS integrity_oid
@@ -8765,7 +7053,6 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("E2BIG", `operation journal exceeds ${MAX_OPERATION_STEPS} steps`);
     }
     const touchedCount = requireMergeInteger(row.touched_count, "touched-path count");
-    const storedBytes = requireMergeInteger(row.retained_bytes, "retained-byte count");
     if (touchedCount > MAX_MERGE_TOUCHED_PATHS) {
       throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`);
     }
@@ -8878,18 +7165,12 @@ export class CheckoutStore implements IndexStore {
     if (touched.length !== touchedCount) {
       throw new CorruptError("merge journal touched-path count does not match its rows");
     }
-    const retainedBytes = operationJournalRetainedBytes(state, touched, steps);
-    if (retainedBytes !== storedBytes) {
-      throw new CorruptError("merge journal retained-byte count does not match its rows");
-    }
     const integrityOid = requireMergeOid(row.integrity_oid, "journal integrity oid");
-    reservation.set("other", operationJournalIntegrityBytes(state, steps, touched, retainedBytes));
     if (operationJournalIntegrityOid(state, touched, steps) !== integrityOid) {
       throw new CorruptError("operation journal integrity identity does not match its rows");
     }
-    const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
-    this.#validateOperationObjects(journal, reservation);
-    reservation.set("other", retainedBytes);
+    const journal = operationJournal(state, steps, touched, integrityOid);
+    this.#validateOperationObjects(journal);
     return journal;
   }
 
@@ -8907,28 +7188,16 @@ export class CheckoutStore implements IndexStore {
     steps: readonly OperationStepMetadata[],
     touched: readonly MergeTouchedPath[],
   ): void {
-    const reservation = this.reserveMemory();
-    try {
-      this.#writeOperationJournalOwned(state, steps, touched, reservation);
-    } finally {
-      reservation.dispose();
-    }
+    this.#writeOperationJournalOwned(state, steps, touched);
   }
 
   #writeOperationJournalOwned(
     state: OperationStateMetadata,
     steps: readonly OperationStepMetadata[],
     touched: readonly MergeTouchedPath[],
-    reservation: MemoryReservation,
   ): void {
-    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
-      throw new GitError("EINVAL", "operation journal reservation belongs to another repository");
-    }
     if (state.kind === "rebase") requireInitialRebaseJournal(state, steps, touched);
-    const retainedBytes = operationJournalRetainedBytes(state, touched, steps);
-    reservation.set("other", operationJournalIntegrityBytes(state, steps, touched, retainedBytes));
     const integrityOid = operationJournalIntegrityOid(state, touched, steps);
-    reservation.set("other", retainedBytes);
     let previousPath: string | null = null;
     for (const entry of touched) {
       if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
@@ -8938,25 +7207,14 @@ export class CheckoutStore implements IndexStore {
     }
 
     this.#db.transactionSync(() => {
-      const activeMemory = reservation.scope();
-      try {
-        const active = this.#readOperationStateOwned(activeMemory);
-        if (active !== null) throw operationAlreadyActive(active.state.kind);
-        const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
-        this.#validateOperationObjects(journal, reservation);
-        this.#insertOperationHeader(
-          state,
-          steps.length,
-          touched.length,
-          retainedBytes,
-          integrityOid,
-        );
-        this.#insertOperationSteps(steps, reservation);
-        this.#insertOperationTouched(touched, reservation);
-        bumpMaintenanceRootEpoch(this.#db, this.#repoId);
-      } finally {
-        activeMemory.dispose();
-      }
+      const active = this.#readOperationStateOwned();
+      if (active !== null) throw operationAlreadyActive(active.state.kind);
+      const journal = operationJournal(state, steps, touched, integrityOid);
+      this.#validateOperationObjects(journal);
+      this.#insertOperationHeader(state, steps.length, touched.length, integrityOid);
+      this.#insertOperationSteps(steps);
+      this.#insertOperationTouched(touched);
+      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
     });
   }
 
@@ -8964,7 +7222,6 @@ export class CheckoutStore implements IndexStore {
     state: OperationStateMetadata,
     stepCount: number,
     touchedCount: number,
-    retainedBytes: number,
     integrityOid: string,
   ): void {
     this.#db.run(
@@ -8973,8 +7230,8 @@ export class CheckoutStore implements IndexStore {
           current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode, merge_origin,
           current_step, step_count, current_label, incoming_label, message,
           author_name, author_email, committer_name, committer_email,
-          touched_count, retained_bytes, integrity_oid)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          touched_count, integrity_oid)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       this.#checkoutId,
       state.kind,
       state.originalHeadRef,
@@ -8997,15 +7254,11 @@ export class CheckoutStore implements IndexStore {
       state.committer?.name ?? null,
       state.committer?.email ?? null,
       touchedCount,
-      retainedBytes,
       integrityOid,
     );
   }
 
-  #insertOperationSteps(
-    steps: readonly OperationStepMetadata[],
-    reservation: MemoryReservation,
-  ): void {
+  #insertOperationSteps(steps: readonly OperationStepMetadata[]): void {
     function* rows(): Generator<PersistedOperationStep> {
       for (let ordinal = 0; ordinal < steps.length; ordinal++) {
         const step = steps[ordinal];
@@ -9013,15 +7266,7 @@ export class CheckoutStore implements IndexStore {
         yield persistedOperationStep(step, ordinal);
       }
     }
-    for (const page of jsonPages(rows(), "operation step", {
-      reservation,
-      maxUnits: (row) =>
-        256 +
-        jsonStringMaxUnits(row.sourceOid) +
-        (row.selectedParentOid === null ? 4 : jsonStringMaxUnits(row.selectedParentOid)) +
-        jsonStringMaxUnits(row.outcome) +
-        (row.resultOid === null ? 4 : jsonStringMaxUnits(row.resultOid)),
-    })) {
+    for (const page of jsonPages(rows(), "operation step")) {
       this.#db.run(
         `INSERT INTO git_operation_steps
            (checkout_id, ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid)
@@ -9039,10 +7284,7 @@ export class CheckoutStore implements IndexStore {
     }
   }
 
-  #insertOperationTouched(
-    touched: readonly MergeTouchedPath[],
-    reservation: MemoryReservation,
-  ): void {
+  #insertOperationTouched(touched: readonly MergeTouchedPath[]): void {
     function* rows(): Generator<PersistedOperationTouched> {
       for (let ordinal = 0; ordinal < touched.length; ordinal++) {
         const entry = touched[ordinal];
@@ -9050,17 +7292,7 @@ export class CheckoutStore implements IndexStore {
         yield persistedOperationTouched(entry, ordinal);
       }
     }
-    for (const page of jsonPages(rows(), "operation touched path", {
-      reservation,
-      maxUnits: (row) =>
-        512 +
-        jsonStringMaxUnits(row.path) +
-        jsonStringMaxUnits(row.logicalPath) +
-        jsonStringMaxUnits(row.purpose) +
-        (row.indexOid === null ? 4 : jsonStringMaxUnits(row.indexOid)) +
-        jsonStringMaxUnits(row.worktreeKind) +
-        (row.worktreeOid === null ? 4 : jsonStringMaxUnits(row.worktreeOid)),
-    })) {
+    for (const page of jsonPages(rows(), "operation touched path")) {
       this.#db.run(
         `INSERT INTO git_operation_touched
            (checkout_id, ordinal, path, logical_path, purpose,
@@ -9090,15 +7322,7 @@ export class CheckoutStore implements IndexStore {
     }
   }
 
-  #validateOperationObjects(journal: OperationJournal, reservation: MemoryReservation): void {
-    const validationMemory = reservation.scope();
-    const rowMemory = reservation.scope();
-    const candidateCount =
-      1 +
-      (journal.state.kind === "merge" ? 2 : journal.state.kind === "rebase" ? 3 : 0) +
-      journal.steps.length * 3 +
-      journal.touched.length * 2;
-    validationMemory.set("other", 512 + candidateCount * 256);
+  #validateOperationObjects(journal: OperationJournal): void {
     const expected = new Map<string, ExpectedOperationObject>();
     const objectSizes = new Map<string, number>();
     const add = (object: ExpectedOperationObject): void => {
@@ -9149,52 +7373,43 @@ export class CheckoutStore implements IndexStore {
       }
     }
 
-    try {
-      let page: string[] = [];
-      const validatePage = (): void => {
-        if (page.length === 0) return;
-        const jsonUnits = 2 + page.length * 43 - 1;
-        rowMemory.set("other", 512 + page.length * 256 + retainedStringUnits(jsonUnits));
-        let info: ObjectReadInfo[];
-        try {
-          info = this.objectInfo(page);
-        } catch (error) {
-          if (hasErrorCode(error, "ENOTFOUND")) {
-            throw new CorruptError("operation journal references a missing object", {
-              cause: error,
-            });
-          }
-          throw error;
+    let page: string[] = [];
+    const validatePage = (): void => {
+      if (page.length === 0) return;
+      let info: ObjectReadInfo[];
+      try {
+        info = this.objectInfo(page);
+      } catch (error) {
+        if (hasErrorCode(error, "ENOTFOUND")) {
+          throw new CorruptError("operation journal references a missing object", {
+            cause: error,
+          });
         }
-        for (const object of info) {
-          const wanted = expected.get(object.oid);
-          if (wanted === undefined || object.type !== wanted.type) {
-            throw new CorruptError(
-              `operation ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
-            );
-          }
-          objectSizes.set(object.oid, object.size);
+        throw error;
+      }
+      for (const object of info) {
+        const wanted = expected.get(object.oid);
+        if (wanted === undefined || object.type !== wanted.type) {
+          throw new CorruptError(
+            `operation ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
+          );
         }
-        page = [];
-        rowMemory.clear("other");
-      };
-      for (const oid of expected.keys()) {
-        page.push(oid);
-        if (page.length === MAX_BLOB_BATCH_OIDS) validatePage();
+        objectSizes.set(object.oid, object.size);
       }
-      validatePage();
-      if (journal.kind !== "merge") {
-        this.#validateReplayTopology(journal, reservation, objectSizes);
-      }
-    } finally {
-      rowMemory.dispose();
-      validationMemory.dispose();
+      page = [];
+    };
+    for (const oid of expected.keys()) {
+      page.push(oid);
+      if (page.length === MAX_BLOB_BATCH_OIDS) validatePage();
+    }
+    validatePage();
+    if (journal.kind !== "merge") {
+      this.#validateReplayTopology(journal, objectSizes);
     }
   }
 
   #validateReplayTopology(
     journal: CherryPickJournal | RevertJournal | RebaseJournal,
-    reservation: MemoryReservation,
     objectSizes: ReadonlyMap<string, number>,
   ): void {
     if (journal.kind !== "rebase") {
@@ -9205,7 +7420,6 @@ export class CheckoutStore implements IndexStore {
         (_oid, source) => {
           this.#validateReplayParentSelection(step, source.commit.parent);
         },
-        reservation,
         objectSizes,
       );
       return;
@@ -9228,7 +7442,6 @@ export class CheckoutStore implements IndexStore {
         }
         expectedSourceParent = step.sourceOid;
       },
-      reservation,
       objectSizes,
     );
     if (expectedSourceParent !== journal.state.originalHeadOid) {
@@ -9253,7 +7466,6 @@ export class CheckoutStore implements IndexStore {
         }
         expectedResultParent = step.resultOid;
       },
-      reservation,
       objectSizes,
     );
   }
@@ -9261,74 +7473,37 @@ export class CheckoutStore implements IndexStore {
   #validateOperationCommitBodies(
     oids: readonly string[],
     visit: (oid: string, commit: CommitCacheEntry) => void,
-    reservation: MemoryReservation,
     objectSizes: ReadonlyMap<string, number>,
   ): void {
     const seen = new Set<string>();
-    const objectMemory = reservation.scope();
-    const parserMemory = reservation.scope();
-    try {
-      for (let offset = 0; offset < oids.length; offset += MAX_BLOB_BATCH_OIDS) {
-        const page = oids.slice(offset, offset + MAX_BLOB_BATCH_OIDS);
-        objectMemory.set(
-          "other",
-          256 +
-            page.length * (8 + 160) +
-            page.reduce((bytes, oid) => bytes + retainedStringBytes(oid), 0),
-        );
-        for (const oid of page) {
-          if (seen.has(oid)) throw new CorruptError("operation commit sequence contains a cycle");
-          seen.add(oid);
-        }
-        let remaining = page;
-        while (remaining.length > 0) {
-          for (const oid of remaining) {
-            if (objectSizes.get(oid) === undefined) {
-              throw new CorruptError(`operation commit ${oid} lost its validated size`);
-            }
-          }
-          const batchMemory = objectMemory.scope();
-          try {
-            const batch = this.#readObjectsOwned(
-              remaining,
-              { budgetBytes: PACK_BLOB_BATCH_TARGET_BYTES },
-              batchMemory,
-            );
-            remaining = [];
-            objectMemory.clear("other");
-            if (batch.objects.size === 0 || batch.bytes <= 0) {
-              throw new CorruptError("operation commit validation made no progress");
-            }
-            for (const [oid, object] of batch.objects) {
-              if (object.type !== "commit") {
-                throw new CorruptError("operation step did not produce a complete commit object");
-              }
-              visit(
-                oid,
-                prepareCommitCacheOwned(
-                  { repoId: this.#repoId, oid, data: object.data },
-                  parserMemory,
-                ),
-              );
-              parserMemory.clear("commit");
-            }
-            const nextRemaining = batch.remaining;
-            objectMemory.set(
-              "other",
-              256 +
-                nextRemaining.length * (8 + 160) +
-                nextRemaining.reduce((bytes, oid) => bytes + retainedStringBytes(oid), 0),
-            );
-            remaining = nextRemaining;
-          } finally {
-            batchMemory.dispose();
-          }
-        }
-        objectMemory.clear("other");
+    for (let offset = 0; offset < oids.length; offset += MAX_BLOB_BATCH_OIDS) {
+      const page = oids.slice(offset, offset + MAX_BLOB_BATCH_OIDS);
+      for (const oid of page) {
+        if (seen.has(oid)) throw new CorruptError("operation commit sequence contains a cycle");
+        seen.add(oid);
       }
-    } finally {
-      parserMemory.dispose();
-      objectMemory.dispose();
+      let remaining = page;
+      while (remaining.length > 0) {
+        for (const oid of remaining) {
+          if (objectSizes.get(oid) === undefined) {
+            throw new CorruptError(`operation commit ${oid} lost its validated size`);
+          }
+        }
+        const batch = this.#readObjectsOwned(remaining, {
+          budgetBytes: PACK_BLOB_BATCH_TARGET_BYTES,
+        });
+        remaining = [];
+        if (batch.objects.size === 0 || batch.bytes <= 0) {
+          throw new CorruptError("operation commit validation made no progress");
+        }
+        for (const [oid, object] of batch.objects) {
+          if (object.type !== "commit") {
+            throw new CorruptError("operation step did not produce a complete commit object");
+          }
+          visit(oid, prepareCommitCache({ repoId: this.#repoId, oid, data: object.data }));
+        }
+        remaining = batch.remaining;
+      }
     }
   }
 
@@ -9359,22 +7534,10 @@ export class CheckoutStore implements IndexStore {
 
   /** Replace authenticated metadata while retaining the exact touched snapshot. */
   replaceOperationState(expectedIntegrityOid: string, state: OperationStateMetadata): void {
-    const reservation = this.reserveMemory();
-    try {
-      this.#replaceOperationStateOwned(expectedIntegrityOid, state, reservation);
-    } finally {
-      reservation.dispose();
-    }
+    this.#replaceOperationStateOwned(expectedIntegrityOid, state);
   }
 
-  #replaceOperationStateOwned(
-    expectedIntegrityOid: string,
-    state: OperationStateMetadata,
-    reservation: MemoryReservation,
-  ): void {
-    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
-      throw new GitError("EINVAL", "operation journal reservation belongs to another repository");
-    }
+  #replaceOperationStateOwned(expectedIntegrityOid: string, state: OperationStateMetadata): void {
     if (state.kind === "rebase") {
       throw new GitError("EOPMISMATCH", "rebase replacement requires a whole-journal transition");
     }
@@ -9382,62 +7545,49 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("EINVAL", "expected operation integrity identity is invalid");
     }
     this.#db.transactionSync(() => {
-      const currentMemory = reservation.scope();
-      try {
-        const current = this.#readOperationStateOwned(currentMemory);
-        if (current === null) throw operationNotActive(state.kind);
-        if (current.state.kind !== state.kind) {
-          throw operationKindMismatch(state.kind, current.state.kind);
-        }
-        if (current.integrityOid !== expectedIntegrityOid) {
-          throw new GitError("EOPMISMATCH", "operation state changed before replacement");
-        }
-        const retainedBytes = operationJournalRetainedBytes(state, current.touched, current.steps);
-        reservation.set(
-          "other",
-          operationJournalIntegrityBytes(state, current.steps, current.touched, retainedBytes),
-        );
-        const integrityOid = operationJournalIntegrityOid(state, current.touched, current.steps);
-        reservation.set("other", retainedBytes);
-        this.#validateOperationObjects(
-          operationJournal(state, current.steps, current.touched, retainedBytes, integrityOid),
-          reservation,
-        );
-        this.#db.run(
-          `UPDATE git_operation_state
+      const current = this.#readOperationStateOwned();
+      if (current === null) throw operationNotActive(state.kind);
+      if (current.state.kind !== state.kind) {
+        throw operationKindMismatch(state.kind, current.state.kind);
+      }
+      if (current.integrityOid !== expectedIntegrityOid) {
+        throw new GitError("EOPMISMATCH", "operation state changed before replacement");
+      }
+      const integrityOid = operationJournalIntegrityOid(state, current.touched, current.steps);
+      this.#validateOperationObjects(
+        operationJournal(state, current.steps, current.touched, integrityOid),
+      );
+      this.#db.run(
+        `UPDATE git_operation_state
             SET original_head_ref = ?, original_head_oid = ?, phase = ?, empty_reason = ?,
                 current_parent_oid = ?, incoming_parent_oid = ?, upstream_oid = ?, base_oid = ?,
                 mode = ?, merge_origin = ?, current_step = ?, current_label = ?, incoming_label = ?,
                 message = ?, author_name = ?, author_email = ?, committer_name = ?,
-                committer_email = ?, retained_bytes = ?, integrity_oid = ?
+                committer_email = ?, integrity_oid = ?
           WHERE checkout_id = ? AND integrity_oid = ?`,
-          state.originalHeadRef,
-          state.originalHeadOid,
-          state.phase,
-          state.kind === "cherry-pick" || state.kind === "revert" ? state.emptyReason : null,
-          state.kind === "merge" ? state.currentParentOid : null,
-          state.kind === "merge" ? state.incomingParentOid : null,
-          null,
-          null,
-          state.kind === "merge" ? state.mode : null,
-          state.kind === "merge" ? state.mergeOrigin : null,
-          0,
-          state.currentLabel,
-          state.incomingLabel,
-          state.message,
-          state.author?.name ?? null,
-          state.author?.email ?? null,
-          state.committer?.name ?? null,
-          state.committer?.email ?? null,
-          retainedBytes,
-          integrityOid,
-          this.#checkoutId,
-          expectedIntegrityOid,
-        );
-        bumpMaintenanceRootEpoch(this.#db, this.#repoId);
-      } finally {
-        currentMemory.dispose();
-      }
+        state.originalHeadRef,
+        state.originalHeadOid,
+        state.phase,
+        state.kind === "cherry-pick" || state.kind === "revert" ? state.emptyReason : null,
+        state.kind === "merge" ? state.currentParentOid : null,
+        state.kind === "merge" ? state.incomingParentOid : null,
+        null,
+        null,
+        state.kind === "merge" ? state.mode : null,
+        state.kind === "merge" ? state.mergeOrigin : null,
+        0,
+        state.currentLabel,
+        state.incomingLabel,
+        state.message,
+        state.author?.name ?? null,
+        state.author?.email ?? null,
+        state.committer?.name ?? null,
+        state.committer?.email ?? null,
+        integrityOid,
+        this.#checkoutId,
+        expectedIntegrityOid,
+      );
+      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
     });
   }
 
@@ -9448,12 +7598,7 @@ export class CheckoutStore implements IndexStore {
     steps: readonly OperationStepMetadata[],
     touched: readonly MergeTouchedPath[],
   ): void {
-    const reservation = this.reserveMemory();
-    try {
-      this.#replaceOperationJournalOwned(expectedIntegrityOid, state, steps, touched, reservation);
-    } finally {
-      reservation.dispose();
-    }
+    this.#replaceOperationJournalOwned(expectedIntegrityOid, state, steps, touched);
   }
 
   #replaceOperationJournalOwned(
@@ -9461,18 +7606,11 @@ export class CheckoutStore implements IndexStore {
     state: OperationStateMetadata,
     steps: readonly OperationStepMetadata[],
     touched: readonly MergeTouchedPath[],
-    reservation: MemoryReservation,
   ): void {
-    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
-      throw new GitError("EINVAL", "operation journal reservation belongs to another repository");
-    }
     if (!isOid(expectedIntegrityOid)) {
       throw new GitError("EINVAL", "expected operation integrity identity is invalid");
     }
-    const retainedBytes = operationJournalRetainedBytes(state, touched, steps);
-    reservation.set("other", operationJournalIntegrityBytes(state, steps, touched, retainedBytes));
     const integrityOid = operationJournalIntegrityOid(state, touched, steps);
-    reservation.set("other", retainedBytes);
     let previousPath: string | null = null;
     for (const entry of touched) {
       if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
@@ -9481,40 +7619,29 @@ export class CheckoutStore implements IndexStore {
       previousPath = entry.path;
     }
     this.#db.transactionSync(() => {
-      const currentMemory = reservation.scope();
-      try {
-        const current = this.#readOperationStateOwned(currentMemory);
-        if (current === null) throw operationNotActive(state.kind);
-        if (current.kind !== state.kind) throw operationKindMismatch(state.kind, current.kind);
-        if (current.integrityOid !== expectedIntegrityOid) {
-          throw new GitError("EOPMISMATCH", "operation state changed before replacement");
-        }
-        if (current.kind === "rebase") {
-          if (state.kind !== "rebase") throw operationKindMismatch(state.kind, current.kind);
-          requireRebaseJournalTransition(current, state, steps, touched);
-        }
-        const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
-        this.#validateOperationObjects(journal, reservation);
-        this.#db.run("DELETE FROM git_operation_touched WHERE checkout_id = ?", this.#checkoutId);
-        this.#db.run("DELETE FROM git_operation_steps WHERE checkout_id = ?", this.#checkoutId);
-        this.#db.run(
-          "DELETE FROM git_operation_state WHERE checkout_id = ? AND integrity_oid = ?",
-          this.#checkoutId,
-          expectedIntegrityOid,
-        );
-        this.#insertOperationHeader(
-          state,
-          steps.length,
-          touched.length,
-          retainedBytes,
-          integrityOid,
-        );
-        this.#insertOperationSteps(steps, reservation);
-        this.#insertOperationTouched(touched, reservation);
-        bumpMaintenanceRootEpoch(this.#db, this.#repoId);
-      } finally {
-        currentMemory.dispose();
+      const current = this.#readOperationStateOwned();
+      if (current === null) throw operationNotActive(state.kind);
+      if (current.kind !== state.kind) throw operationKindMismatch(state.kind, current.kind);
+      if (current.integrityOid !== expectedIntegrityOid) {
+        throw new GitError("EOPMISMATCH", "operation state changed before replacement");
       }
+      if (current.kind === "rebase") {
+        if (state.kind !== "rebase") throw operationKindMismatch(state.kind, current.kind);
+        requireRebaseJournalTransition(current, state, steps, touched);
+      }
+      const journal = operationJournal(state, steps, touched, integrityOid);
+      this.#validateOperationObjects(journal);
+      this.#db.run("DELETE FROM git_operation_touched WHERE checkout_id = ?", this.#checkoutId);
+      this.#db.run("DELETE FROM git_operation_steps WHERE checkout_id = ?", this.#checkoutId);
+      this.#db.run(
+        "DELETE FROM git_operation_state WHERE checkout_id = ? AND integrity_oid = ?",
+        this.#checkoutId,
+        expectedIntegrityOid,
+      );
+      this.#insertOperationHeader(state, steps.length, touched.length, integrityOid);
+      this.#insertOperationSteps(steps);
+      this.#insertOperationTouched(touched);
+      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
     });
   }
 
@@ -9605,7 +7732,6 @@ export class CheckoutStore implements IndexStore {
       }
       if (exists === 1) return { available: false };
 
-      const reservation = this.reserveMemory();
       let active = true;
       let failed = false;
       let failure: unknown;
@@ -9613,7 +7739,6 @@ export class CheckoutStore implements IndexStore {
       let pending: IndexMutationBuffer | null = null;
       let blobIds: InitialBlobIdBuffer | null = null;
       try {
-        reservation.set("other", INITIAL_STATE_CONSTRUCTOR_BYTES);
         pending = new IndexMutationBuffer(DEFAULT_INDEX_FLUSH, (mutations) => {
           this.#applyIndexMutations(mutations);
         });
@@ -9634,53 +7759,15 @@ export class CheckoutStore implements IndexStore {
             throw error;
           }
         };
-        const reservedBytes = (): number =>
-          INITIAL_STATE_FIXED_BYTES +
-          mutationBuffer.reservedBytes +
-          blobBuffer.reservedBytes +
-          (previousPath?.length ?? 0) * 2;
-        const reserve = (bytes: number): boolean => {
-          try {
-            reservation.set("other", bytes);
-            return true;
-          } catch (error) {
-            if (
-              typeof error === "object" &&
-              error !== null &&
-              Reflect.get(error, "code") === "E2BIG"
-            ) {
-              return false;
-            }
-            throw error;
-          }
-        };
-        const requireRoom = (additional: number, first: "index" | "blob"): void => {
-          if (reserve(reservedBytes() + additional)) return;
-          if (first === "index") mutationBuffer.flush();
-          else blobBuffer.flush();
-          if (reserve(reservedBytes() + additional)) return;
-          if (first === "index") blobBuffer.flush();
-          else mutationBuffer.flush();
-          reservation.set("other", reservedBytes() + additional);
-        };
         const session: InitialStateSession = {
-          get retainedBytes() {
-            return active ? reservedBytes() : 0;
-          },
           put: (entry) => {
             attempt(() => {
-              const pathJsonBytes = validateInitialIndexEntry(entry);
+              validateInitialIndexEntry(entry);
               if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
                 throw new CorruptError("initial index entries are not in strict Git path order");
               }
-              const mutationJsonBytes = pathJsonBytes + 512;
-              requireRoom(
-                mutationJsonBytes * 4 + INDEX_MUTATION_ROW_BYTES + entry.path.length * 2,
-                "index",
-              );
               mutationBuffer.add(entry);
               previousPath = entry.path;
-              reservation.set("other", reservedBytes());
             });
           },
           addBlobId: (mapping) => {
@@ -9688,17 +7775,13 @@ export class CheckoutStore implements IndexStore {
               blobBuffer.validate(mapping);
               if (!blobBuffer.willCache(mapping)) return;
               if (blobBuffer.needsFlush(mapping)) blobBuffer.flush();
-              requireRoom(blobBuffer.additionalReservedBytes(), "blob");
               blobBuffer.add(mapping);
-              reservation.set("other", reservedBytes());
             });
           },
         };
         const finish = (): void => {
           attempt(() => mutationBuffer.flush());
-          reservation.set("other", reservedBytes());
           attempt(() => blobBuffer.finish());
-          reservation.set("other", reservedBytes());
         };
 
         const value = body(session);
@@ -9717,7 +7800,6 @@ export class CheckoutStore implements IndexStore {
         blobIds?.dispose();
         previousPath = null;
         failure = undefined;
-        reservation.dispose();
       }
     });
   }

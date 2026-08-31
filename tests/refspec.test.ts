@@ -8,21 +8,9 @@ import {
   type PushRefspec,
   type RefspecSourceRef,
 } from "../src/core/ops/refspec.js";
-import { TransportOperationBudget } from "../src/core/ops/transport-budget.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import { requireRefName } from "../src/sqlite/ref-validation.js";
 
 const OID = "1".repeat(40);
-
-function fixture(): {
-  readonly coordinator: MemoryCoordinator;
-  readonly reservation: ReturnType<MemoryCoordinator["reserve"]>;
-  readonly budget: TransportOperationBudget;
-} {
-  const coordinator = new MemoryCoordinator();
-  const reservation = coordinator.reserve();
-  return { coordinator, reservation, budget: new TransportOperationBudget(reservation) };
-}
 
 function expectCode(run: () => unknown, code: string): void {
   let caught: unknown;
@@ -35,23 +23,15 @@ function expectCode(run: () => unknown, code: string): void {
 }
 
 describe("structured refspecs", () => {
-  it("rejects an empty input list before retaining compiled state", () => {
-    const { coordinator, reservation, budget } = fixture();
-    expectCode(() => compileFetchRefspecs([], budget), "EINVAL");
-    expect(budget.retainedBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
+  it("rejects an empty input list", () => {
+    expectCode(() => compileFetchRefspecs([]), "EINVAL");
   });
 
   it("expands exact and wildcard fetch mappings in Git UTF-8 destination order", () => {
-    const { coordinator, reservation, budget } = fixture();
-    const compiled = compileFetchRefspecs(
-      [
-        { source: "refs/heads/main", destination: "refs/local/main" },
-        { source: "refs/source/*", destination: "refs/destination/*", force: true },
-      ],
-      budget,
-    );
+    const compiled = compileFetchRefspecs([
+      { source: "refs/heads/main", destination: "refs/local/main" },
+      { source: "refs/source/*", destination: "refs/destination/*", force: true },
+    ]);
     const expanded = compiled.expand([
       { name: "HEAD", oid: OID },
       { name: "refs/tags/v1^{}", oid: "2".repeat(40) },
@@ -80,22 +60,13 @@ describe("structured refspecs", () => {
         force: false,
       },
     ]);
-    expect(budget.retainedBytes).toBeGreaterThan(0);
-    compiled.dispose();
-    expect(budget.retainedBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("keeps an empty wildcard empty and combines it with nonempty mappings", () => {
-    const { coordinator, reservation, budget } = fixture();
-    const compiled = compilePushRefspecs(
-      [
-        { source: "refs/missing/*", destination: "refs/remote/missing/*" },
-        { source: "refs/heads/main", destination: "refs/heads/main" },
-      ],
-      budget,
-    );
+    const compiled = compilePushRefspecs([
+      { source: "refs/missing/*", destination: "refs/remote/missing/*" },
+      { source: "refs/heads/main", destination: "refs/heads/main" },
+    ]);
     expect(compiled.expand([{ name: "refs/heads/main", oid: OID }])).toEqual([
       {
         source: "refs/heads/main",
@@ -104,21 +75,14 @@ describe("structured refspecs", () => {
         force: false,
       },
     ]);
-    compiled.dispose();
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("supports push oid sources and deletions without wildcarding them", () => {
-    const { coordinator, reservation, budget } = fixture();
     const oid = "a".repeat(40);
-    const compiled = compilePushRefspecs(
-      [
-        { source: oid, destination: "refs/checkpoints/exact", force: true },
-        { source: null, destination: "refs/heads/old" },
-      ],
-      budget,
-    );
+    const compiled = compilePushRefspecs([
+      { source: oid, destination: "refs/checkpoints/exact", force: true },
+      { source: null, destination: "refs/heads/old" },
+    ]);
     expect(compiled.expand([])).toEqual([
       {
         source: oid,
@@ -133,34 +97,23 @@ describe("structured refspecs", () => {
         force: false,
       },
     ]);
-    compiled.dispose();
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("rejects runtime deletion force and wildcarded deletion or oid destinations", () => {
-    const { coordinator, reservation, budget } = fixture();
     const forcedDeletion: PushRefspec = {
       source: null,
       destination: "refs/heads/old",
     };
     Object.defineProperty(forcedDeletion, "force", { value: true });
-    expectCode(() => compilePushRefspecs([forcedDeletion], budget), "EINVAL");
+    expectCode(() => compilePushRefspecs([forcedDeletion]), "EINVAL");
     expectCode(
-      () => compilePushRefspecs([{ source: null, destination: "refs/heads/*" }], budget),
+      () => compilePushRefspecs([{ source: null, destination: "refs/heads/*" }]),
       "EINVAL",
     );
     expectCode(
-      () =>
-        compilePushRefspecs(
-          [{ source: "a".repeat(40), destination: "refs/checkpoints/*" }],
-          budget,
-        ),
+      () => compilePushRefspecs([{ source: "a".repeat(40), destination: "refs/checkpoints/*" }]),
       "EINVAL",
     );
-    expect(budget.retainedBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("rejects malformed wildcard placement and invalid refs", () => {
@@ -171,11 +124,7 @@ describe("structured refspecs", () => {
       [{ source: "refs/source/main", destination: "refs/destination/.hidden" }, "EINVALIDREF"],
     ];
     for (const [refspec, code] of cases) {
-      const { coordinator, reservation, budget } = fixture();
-      expectCode(() => compileFetchRefspecs([refspec], budget), code);
-      expect(budget.retainedBytes).toBe(0);
-      reservation.dispose();
-      coordinator.assertIdle();
+      expectCode(() => compileFetchRefspecs([refspec]), code);
     }
   });
 
@@ -184,48 +133,29 @@ describe("structured refspecs", () => {
     const exact = `${exactPrefix}${"a".repeat(1_025 - exactPrefix.length)}`;
     const patternPrefix = "refs/source/";
     const pattern = `${patternPrefix}${"a".repeat(1_024 - patternPrefix.length)}*`;
-    const { coordinator, reservation, budget } = fixture();
-    const compiled = compileFetchRefspecs(
-      [
-        { source: exact, destination: exact },
-        { source: pattern, destination: "refs/destination/*" },
-      ],
-      budget,
-    );
+    const compiled = compileFetchRefspecs([
+      { source: exact, destination: exact },
+      { source: pattern, destination: "refs/destination/*" },
+    ]);
     expect(compiled.expand([{ name: exact, oid: OID }])).toEqual([
       { source: exact, destination: exact, oid: OID, force: false },
     ]);
-    compiled.dispose();
-    expect(budget.retainedBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("rejects exact duplicates before expansion and wildcard collisions during expansion", () => {
-    const first = fixture();
     expectCode(
       () =>
-        compileFetchRefspecs(
-          [
-            { source: "refs/heads/a", destination: "refs/local/same" },
-            { source: "refs/heads/b", destination: "refs/local/same" },
-          ],
-          first.budget,
-        ),
+        compileFetchRefspecs([
+          { source: "refs/heads/a", destination: "refs/local/same" },
+          { source: "refs/heads/b", destination: "refs/local/same" },
+        ]),
       "EINVAL",
     );
-    expect(first.budget.retainedBytes).toBe(0);
-    first.reservation.dispose();
-    first.coordinator.assertIdle();
 
-    const second = fixture();
-    const fetch = compileFetchRefspecs(
-      [
-        { source: "refs/heads/a", destination: "refs/local/a" },
-        { source: "refs/source/*", destination: "refs/local/*" },
-      ],
-      second.budget,
-    );
+    const fetch = compileFetchRefspecs([
+      { source: "refs/heads/a", destination: "refs/local/a" },
+      { source: "refs/source/*", destination: "refs/local/*" },
+    ]);
     expectCode(
       () =>
         fetch.expand([
@@ -234,19 +164,11 @@ describe("structured refspecs", () => {
         ]),
       "EINVAL",
     );
-    expect(second.budget.memory("refspec-expanded")).toBe(0);
-    fetch.dispose();
-    second.reservation.dispose();
-    second.coordinator.assertIdle();
 
-    const third = fixture();
-    const push = compilePushRefspecs(
-      [
-        { source: "refs/heads/a", destination: "refs/remote/a" },
-        { source: "refs/source/*", destination: "refs/remote/*" },
-      ],
-      third.budget,
-    );
+    const push = compilePushRefspecs([
+      { source: "refs/heads/a", destination: "refs/remote/a" },
+      { source: "refs/source/*", destination: "refs/remote/*" },
+    ]);
     expectCode(
       () =>
         push.expand([
@@ -255,25 +177,14 @@ describe("structured refspecs", () => {
         ]),
       "EINVAL",
     );
-    push.dispose();
-    third.reservation.dispose();
-    third.coordinator.assertIdle();
   });
 
   it("fails a mixed set when an exact source is missing", () => {
-    const { coordinator, reservation, budget } = fixture();
-    const compiled = compilePushRefspecs(
-      [
-        { source: "refs/source/*", destination: "refs/remote/*" },
-        { source: "refs/heads/missing", destination: "refs/heads/missing" },
-      ],
-      budget,
-    );
+    const compiled = compilePushRefspecs([
+      { source: "refs/source/*", destination: "refs/remote/*" },
+      { source: "refs/heads/missing", destination: "refs/heads/missing" },
+    ]);
     expectCode(() => compiled.expand([{ name: "refs/source/a", oid: OID }]), "EREFNOTFOUND");
-    expect(budget.memory("refspec-expanded")).toBe(0);
-    compiled.dispose();
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("accepts exact mapping and expansion caps and rejects their first excess", () => {
@@ -282,48 +193,32 @@ describe("structured refspecs", () => {
       source: source.name,
       destination: `refs/destination/${index.toString().padStart(4, "0")}`,
     }));
-    const exact = fixture();
-    const compiled = compileFetchRefspecs(exactMappings, exact.budget);
+    const compiled = compileFetchRefspecs(exactMappings);
     expect(compiled.expand([source])).toHaveLength(MAX_REFSPEC_EXPANDED_DESTINATIONS);
-    compiled.dispose();
-    exact.reservation.dispose();
-    exact.coordinator.assertIdle();
 
-    const inputExcess = fixture();
     expectCode(
       () =>
-        compileFetchRefspecs(
-          [...exactMappings, { source: source.name, destination: "refs/destination/excess" }],
-          inputExcess.budget,
-        ),
+        compileFetchRefspecs([
+          ...exactMappings,
+          { source: source.name, destination: "refs/destination/excess" },
+        ]),
       "E2BIG",
     );
-    expect(inputExcess.budget.retainedBytes).toBe(0);
-    inputExcess.reservation.dispose();
-    inputExcess.coordinator.assertIdle();
 
-    const expansionExcess = fixture();
-    const wildcard = compileFetchRefspecs(
-      [{ source: "refs/source/*", destination: "refs/destination/*" }],
-      expansionExcess.budget,
-    );
+    const wildcard = compileFetchRefspecs([
+      { source: "refs/source/*", destination: "refs/destination/*" },
+    ]);
     const sources = Array.from({ length: MAX_REFSPEC_EXPANDED_DESTINATIONS + 1 }, (_, index) => ({
       name: `refs/source/${index}`,
       oid: OID,
     }));
     expectCode(() => wildcard.expand(sources), "E2BIG");
-    expect(expansionExcess.budget.memory("refspec-expanded")).toBe(0);
-    wildcard.dispose();
-    expansionExcess.reservation.dispose();
-    expansionExcess.coordinator.assertIdle();
   });
 
   it("accepts an expanded destination at the former first byte excess", () => {
-    const { coordinator, reservation, budget } = fixture();
-    const compiled = compileFetchRefspecs(
-      [{ source: "refs/*", destination: "refs/destination/*" }],
-      budget,
-    );
+    const compiled = compileFetchRefspecs([
+      { source: "refs/*", destination: "refs/destination/*" },
+    ]);
     const sourcePrefix = "refs/";
     const destinationPrefix = "refs/destination/";
     const capture = "a".repeat(1_025 - destinationPrefix.length);
@@ -336,10 +231,6 @@ describe("structured refspecs", () => {
         force: false,
       },
     ]);
-    compiled.dispose();
-    expect(budget.retainedBytes).toBe(0);
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
   it("keeps stored-ref acceptance and caller-specific errors unchanged", () => {
@@ -349,26 +240,5 @@ describe("structured refspecs", () => {
     expectCode(() => requireRefName("refs/heads/.hidden", "input ref", "input"), "EINVAL");
     const formerFirstExcess = `refs/heads/${"a".repeat(1_025 - "refs/heads/".length)}`;
     expect(requireRefName(formerFirstExcess, "stored ref", "stored")).toBe(formerFirstExcess);
-  });
-});
-
-describe("transport operation budget", () => {
-  it("composes named memory against one 64 MiB operation reservation", () => {
-    const { coordinator, reservation, budget } = fixture();
-    budget.setMemory("compiled", MAX_OPERATION_MEMORY_BYTES - 1);
-    budget.setMemory("expanded", 1);
-    expect(budget.retainedBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    expect(budget.remainingMemoryBytes).toBe(0);
-    expectCode(() => budget.setMemory("expanded", 2), "E2BIG");
-    expect(budget.retainedBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    budget.clearAllMemory();
-
-    reservation.set("other", 1);
-    expect(budget.remainingMemoryBytes).toBe(MAX_OPERATION_MEMORY_BYTES - 1);
-    expectCode(() => budget.setMemory("protocol", MAX_OPERATION_MEMORY_BYTES), "E2BIG");
-    expect(budget.retainedBytes).toBe(0);
-    reservation.clear("other");
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 });

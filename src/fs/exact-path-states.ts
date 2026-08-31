@@ -1,4 +1,3 @@
-import { MemoryCoordinator, type MemoryReservation } from "../memory.js";
 import type { SqlDatabase } from "../sqlite/db.js";
 import { filesystemError } from "./errors.js";
 
@@ -9,19 +8,12 @@ export interface ExactPathStateSource {
   states(paths: readonly string[]): readonly ExactPathState[];
 }
 
-type OwnedExactPathStates = (
-  paths: readonly string[],
-  reservation: MemoryReservation,
-) => readonly ExactPathState[];
+type OwnedExactPathStates = (paths: readonly string[]) => readonly ExactPathState[];
 
 const OWNED_EXACT_PATH_STATES = new WeakMap<ExactPathStateSource, OwnedExactPathStates>();
 
 const MAX_PATHS = 1_024;
 const MAX_JSON_BYTES = 1_500_000;
-const ARRAY_FIXED_BYTES = 64;
-const ARRAY_SLOT_BYTES = 8;
-const STRING_FIXED_BYTES = 48;
-const SQL_ROW_FIXED_BYTES = 512;
 
 const STATES_SQL = `
 WITH requested AS (
@@ -47,13 +39,8 @@ SELECT requested.ordinal AS ordinal,
   LEFT JOIN fs_nodes node ON node.inode = stored.inode
  ORDER BY requested.ordinal`;
 
-function retainedStringUnits(units: number): number {
-  return STRING_FIXED_BYTES + units * 2;
-}
-
-function jsonStringSize(value: string): { bytes: number; units: number } {
+function jsonStringBytes(value: string): number {
   let bytes = 2;
-  let units = 2;
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);
     if (
@@ -66,35 +53,27 @@ function jsonStringSize(value: string): { bytes: number; units: number } {
       code === 0x0d
     ) {
       bytes += 2;
-      units += 2;
     } else if (code < 0x20) {
       bytes += 6;
-      units += 6;
     } else if (code < 0x80) {
       bytes++;
-      units++;
     } else if (code < 0x800) {
       bytes += 2;
-      units++;
     } else if (code >= 0xd800 && code <= 0xdbff) {
       const low = value.charCodeAt(index + 1);
       if (low >= 0xdc00 && low <= 0xdfff) {
         bytes += 4;
-        units += 2;
         index++;
       } else {
         bytes += 6;
-        units += 6;
       }
     } else if (code >= 0xdc00 && code <= 0xdfff) {
       bytes += 6;
-      units += 6;
     } else {
       bytes += 3;
-      units++;
     }
   }
-  return { bytes, units };
+  return bytes;
 }
 
 function isCanonical(path: string): boolean {
@@ -176,129 +155,64 @@ function validateRow(
   return "present";
 }
 
-function states(
-  db: SqlDatabase,
-  paths: readonly string[],
-  reservation: MemoryReservation,
-): readonly ExactPathState[] {
+function states(db: SqlDatabase, paths: readonly string[]): readonly ExactPathState[] {
   if (paths.length > MAX_PATHS) {
     throw filesystemError("E2BIG", `exact path lookup accepts at most ${MAX_PATHS} paths`);
   }
 
-  const validatedMemory = reservation.scope();
-  const pageMemory = reservation.scope();
-  const resultMemory = reservation.scope();
-  validatedMemory.set("other", ARRAY_FIXED_BYTES + paths.length * ARRAY_SLOT_BYTES);
   const validated: string[] = [];
-  pageMemory.set("other", 2 * ARRAY_FIXED_BYTES);
   const pagePaths: string[] = [];
   const pageItems: string[] = [];
-  resultMemory.set("other", ARRAY_FIXED_BYTES + paths.length * ARRAY_SLOT_BYTES);
   const result: ExactPathState[] = [];
-  let pageCapacity = 0;
-  let pageItemStringBytes = 0;
   let pageBytes = 2;
-  let pageMaximumPathUnits = 0;
 
   const flush = (): void => {
     if (pagePaths.length === 0) return;
-    const joinedUnits =
-      pageItems.reduce((units, item) => units + item.length, 0) + pageItems.length - 1;
-    const bindingMemory = reservation.scope();
-    const rowMemory = reservation.scope();
-    bindingMemory.set(
-      "other",
-      retainedStringUnits(joinedUnits) + retainedStringUnits(joinedUnits + 2),
-    );
-    rowMemory.set("other", SQL_ROW_FIXED_BYTES + 2 * retainedStringUnits(pageMaximumPathUnits));
     let ordinal = 0;
-    try {
-      const joined = pageItems.join(",");
-      const framed = `[${joined}]`;
-      for (const row of db.iterate(STATES_SQL, framed)) {
-        result.push(validateRow(row, pagePaths, ordinal));
-        ordinal++;
-      }
-      if (ordinal !== pagePaths.length) {
-        throw filesystemError("EIO", "exact path state query returned an incomplete page");
-      }
-    } finally {
-      rowMemory.dispose();
-      bindingMemory.dispose();
+    const joined = pageItems.join(",");
+    const framed = `[${joined}]`;
+    for (const row of db.iterate(STATES_SQL, framed)) {
+      result.push(validateRow(row, pagePaths, ordinal));
+      ordinal++;
+    }
+    if (ordinal !== pagePaths.length) {
+      throw filesystemError("EIO", "exact path state query returned an incomplete page");
     }
     pagePaths.length = 0;
     pageItems.length = 0;
-    pageItemStringBytes = 0;
     pageBytes = 2;
-    pageMaximumPathUnits = 0;
-    pageMemory.set("other", 2 * ARRAY_FIXED_BYTES + pageCapacity * 2 * ARRAY_SLOT_BYTES);
   };
 
-  try {
-    for (const path of paths) validated.push(validatePath(path));
-    for (const path of validated) {
-      const itemSize = jsonStringSize(path);
-      const separatorBytes = pageItems.length === 0 ? 0 : 1;
-      const nextBytes = pageBytes + separatorBytes + itemSize.bytes;
-      if (pageItems.length > 0 && nextBytes > MAX_JSON_BYTES) flush();
-      pageCapacity = Math.max(pageCapacity, pageItems.length + 1);
-      pageMemory.set(
-        "other",
-        2 * ARRAY_FIXED_BYTES +
-          pageCapacity * 2 * ARRAY_SLOT_BYTES +
-          pageItemStringBytes +
-          retainedStringUnits(itemSize.units),
-      );
-      const item = JSON.stringify(path);
-      pagePaths.push(path);
-      pageItems.push(item);
-      pageItemStringBytes += retainedStringUnits(item.length);
-      pageBytes += (pageItems.length === 1 ? 0 : 1) + itemSize.bytes;
-      pageMaximumPathUnits = Math.max(pageMaximumPathUnits, path.length);
-    }
-    flush();
-
-    if (result.length !== validated.length) {
-      throw filesystemError("EIO", "exact path state query returned an invalid result length");
-    }
-    return Object.freeze(result);
-  } finally {
-    resultMemory.dispose();
-    pageMemory.dispose();
-    validatedMemory.dispose();
+  for (const path of paths) validated.push(validatePath(path));
+  for (const path of validated) {
+    const itemBytes = jsonStringBytes(path);
+    const separatorBytes = pageItems.length === 0 ? 0 : 1;
+    const nextBytes = pageBytes + separatorBytes + itemBytes;
+    if (pageItems.length > 0 && nextBytes > MAX_JSON_BYTES) flush();
+    pagePaths.push(path);
+    pageItems.push(JSON.stringify(path));
+    pageBytes += (pageItems.length === 1 ? 0 : 1) + itemBytes;
   }
+  flush();
+
+  if (result.length !== validated.length) {
+    throw filesystemError("EIO", "exact path state query returned an invalid result length");
+  }
+  return Object.freeze(result);
 }
 
-export function createExactPathStateSource(
-  db: SqlDatabase,
-  memory = new MemoryCoordinator(),
-): ExactPathStateSource {
+export function createExactPathStateSource(db: SqlDatabase): ExactPathStateSource {
   const source: ExactPathStateSource = {
-    states: (paths) => {
-      const reservation = memory.reserve();
-      try {
-        return states(db, paths, reservation);
-      } finally {
-        reservation.dispose();
-      }
-    },
+    states: (paths) => states(db, paths),
   };
-  OWNED_EXACT_PATH_STATES.set(source, (paths, owningReservation) => {
-    const reservation = owningReservation.scope();
-    try {
-      return states(db, paths, reservation);
-    } finally {
-      reservation.dispose();
-    }
-  });
+  OWNED_EXACT_PATH_STATES.set(source, (paths) => states(db, paths));
   return source;
 }
 
-/** Use a native source under the caller's operation owner without widening its public contract. */
+/** Use a native source without widening its public contract. */
 export function exactPathStatesOwned(
   source: ExactPathStateSource,
   paths: readonly string[],
-  reservation: MemoryReservation,
 ): readonly ExactPathState[] | null {
-  return OWNED_EXACT_PATH_STATES.get(source)?.(paths, reservation) ?? null;
+  return OWNED_EXACT_PATH_STATES.get(source)?.(paths) ?? null;
 }

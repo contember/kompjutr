@@ -10,8 +10,7 @@ import {
   type TreeEntry,
 } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
-import { createGit, type GitFactory, type GitMaintenanceResult } from "../src/git/client.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import { createGit, type GitMaintenanceResult } from "../src/git/client.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import { GC_GRACE_MS } from "../src/sqlite/maintenance/sweep.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
@@ -64,8 +63,6 @@ interface Fixture {
 
 interface MaintenanceCallObservation {
   result: GitMaintenanceResult;
-  coordinatorHighWater: number;
-  packIngestHighWater: number;
 }
 
 function requiredItem<T>(items: readonly T[], index: number, label: string): T {
@@ -283,15 +280,9 @@ async function publicMaintenanceCall(
   storage: SqliteTestStorage,
   clock: Clock,
 ): Promise<MaintenanceCallObservation> {
-  let captured: SqliteGitDatabase | undefined;
-  const base = createGit();
-  const git: GitFactory = (binding) => {
-    captured = binding.database;
-    return base(binding);
-  };
   const workspace = new Workspace({
     storage,
-    git,
+    git: createGit(),
     now: () => clock.value,
     defaultGitIdentity: IDENTITY,
   });
@@ -299,19 +290,7 @@ async function publicMaintenanceCall(
   const result = await workspace.git.maintenance({ dir: "/repo" });
   expect(storage.statementCount).toBeLessThan(1_000);
 
-  const database = captured;
-  if (database === undefined) throw new Error("maintenance Git binding was not captured");
-  const checkout = database.findCheckout("/repo");
-  if (checkout === null) throw new Error("maintenance cost checkout disappeared");
-  const store = database.openCheckout(checkout);
-  const coordinatorHighWater = store.shared.memory.highWaterBytes;
-  const packIngestHighWater = store.packs.lastIngestMemoryHighWater;
-  expect(coordinatorHighWater).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
-  expect(store.shared.memory.totalBytes).toBe(0);
-  expect(store.shared.memory.activeCount).toBe(0);
-  store.shared.memory.assertIdle();
-  expect(packIngestHighWater).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
-  return { result, coordinatorHighWater, packIngestHighWater };
+  return { result };
 }
 
 function publishCompletedMark(
@@ -516,14 +495,6 @@ describe("public maintenance storage pressure", () => {
         (count) => count > 0,
       ),
     ).toEqual([2_048, LIVE_LOOSE_OBJECTS]);
-    const publicationCalls = first.calls.filter((call) => call.packIngestHighWater > 0);
-    expect(publicationCalls).toHaveLength(2);
-    for (const call of publicationCalls) {
-      expect(call.result).toMatchObject({ status: "progress", phase: "repack" });
-      expect(call.coordinatorHighWater).toBeGreaterThan(0);
-      expect(call.packIngestHighWater).toBeGreaterThan(0);
-    }
-
     const maintenancePacks = db.all<{ pack_id: number; count: number }>(
       `SELECT pack_id, count FROM git_pack_meta
         WHERE repo_id = ? AND pack_id NOT IN (?, ?) ORDER BY pack_id`,

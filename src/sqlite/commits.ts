@@ -1,23 +1,21 @@
 import { isOid, utf8Decoder } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
 import { type Commit, hashObject, parseCommit } from "../core/objects.js";
-import { MemoryCoordinator, type MemoryReservation } from "../memory.js";
 import { readBlob, type SqlDatabase } from "./db.js";
+
+const JSON_ENCODER = new TextEncoder();
 
 /** Non-refusing target for flushing retained cache projections. */
 export const COMMIT_CACHE_FLUSH_BYTES = 4 * 1024 * 1024;
 export const MAX_LOG_COMMITS = 50_000;
+// The recursive CTE otherwise accumulates graph state proportional to history size.
+const COMMIT_GRAPH_WALK_BYTES = 64 * 1024 * 1024;
 const COMMIT_BATCH_ROWS = 2048;
 const COMMIT_BATCH_JSON_BYTES = 1024 * 1024;
 /** Commit wrappers plus graph map, set, heap, DFS and result slots. */
 const COMMIT_FIXED_CACHE_BYTES = 512;
 const COMMIT_PARENT_CACHE_BYTES = 64;
 const COMMIT_SQL_ROW_FIXED_BYTES = 1_024;
-const JSON_ENCODER = new TextEncoder();
-
-function retainedStringUnits(units: number): number {
-  return 48 + 2 * units;
-}
 
 function jsonStringShape(value: string): { units: number; bytes: number } {
   let units = 2;
@@ -59,22 +57,6 @@ function jsonStringShape(value: string): { units: number; bytes: number } {
   return { units, bytes };
 }
 
-/** Pre-parse allocations structurally derived from one authoritative commit body. */
-export function commitPreparationTransientBytes(objectBytes: number): number {
-  if (!Number.isSafeInteger(objectBytes) || objectBytes < 0) {
-    throw new GitError("E2BIG", "commit preparation memory accounting overflow");
-  }
-  const parentSlots = Math.floor(objectBytes / 48);
-  const decodedSource = retainedStringUnits(objectBytes);
-  const parsedCommit = 1_024 + 2 * objectBytes + parentSlots * COMMIT_PARENT_CACHE_BYTES;
-  const jsonUnits = 512 + 6 * objectBytes;
-  const jsonBytes = 512 + 6 * objectBytes;
-  const retained = 512 + decodedSource + parsedCommit + retainedStringUnits(jsonUnits) + jsonBytes;
-  if (!Number.isSafeInteger(retained)) {
-    throw new GitError("E2BIG", "commit preparation memory accounting overflow");
-  }
-  return retained;
-}
 const COMMIT_CACHE_ENTRY: unique symbol = Symbol("CommitCacheEntry");
 
 export interface CommitCacheSource {
@@ -118,43 +100,9 @@ function commitCacheJsonShape(entry: CommitCacheEntry): { units: number; bytes: 
   units += quotedParentJsonUnits;
   bytes += quotedParentJsonUnits;
   if (!Number.isSafeInteger(units) || !Number.isSafeInteger(bytes)) {
-    throw new GitError("E2BIG", "commit cache JSON memory accounting overflow");
+    throw new GitError("E2BIG", "commit cache JSON size accounting overflow");
   }
   return { units, bytes };
-}
-
-/** Peak JSON page allocations while prepared entries remain owned by their caller. */
-export function commitCacheFlushTransientBytes(entries: Iterable<CommitCacheEntry>): number {
-  let totalUnits = 2;
-  let totalBytes = 2;
-  let maximumEntryUnits = 0;
-  let maximumEntryBytes = 0;
-  let entryCount = 0;
-  for (const entry of entries) {
-    const shape = commitCacheJsonShape(entry);
-    const separator = totalUnits === 2 ? 0 : 1;
-    totalUnits += separator + shape.units;
-    totalBytes += separator + shape.bytes;
-    maximumEntryUnits = Math.max(maximumEntryUnits, shape.units);
-    maximumEntryBytes = Math.max(maximumEntryBytes, shape.bytes);
-    entryCount++;
-  }
-  if (entryCount === 0) return 0;
-  const pageBytes = entryCount === 1 ? totalBytes : Math.min(COMMIT_BATCH_JSON_BYTES, totalBytes);
-  const pageEntries = Math.min(COMMIT_BATCH_ROWS, entryCount);
-  const pendingStrings = pageEntries * 48 + 2 * pageBytes;
-  const joinedPage = retainedStringUnits(pageBytes);
-  const currentString = retainedStringUnits(maximumEntryUnits);
-  const retained =
-    512 + pageEntries * 64 + pendingStrings + joinedPage + currentString + maximumEntryBytes;
-  if (
-    !Number.isSafeInteger(totalUnits) ||
-    !Number.isSafeInteger(totalBytes) ||
-    !Number.isSafeInteger(retained)
-  ) {
-    throw new GitError("E2BIG", "commit cache JSON memory accounting overflow");
-  }
-  return retained;
 }
 
 export interface CommitCacheWriteResult {
@@ -199,20 +147,6 @@ interface CommitCacheRow {
   cache_bytes: unknown;
 }
 
-interface CommitCacheReadShapeRow {
-  source_valid: unknown;
-  row_valid: unknown;
-  eligible: unknown;
-  retained_bytes: unknown;
-  payload_bytes: unknown;
-}
-
-export interface CommitCacheReadMemory {
-  eligible: boolean;
-  retainedBytes: number;
-  materializationBytes: number;
-}
-
 interface CommitGraphRow extends CommitCacheRow {
   kind: unknown;
   error_code: unknown;
@@ -223,7 +157,7 @@ interface CommitGraphRow extends CommitCacheRow {
 export interface CommitGraphLimits {
   /** Test seam. Production callers cannot raise the absolute ceiling. */
   maxCommits?: number;
-  /** Optional caller-selected sub-limit within actual operation headroom. */
+  /** Optional caller-selected sub-limit within the fixed graph cap. */
   maxBytes?: number;
 }
 
@@ -388,7 +322,7 @@ export const WALK_COMMIT_GRAPH_SQL = `WITH RECURSIVE
       WHEN missing > 0 THEN 'commit graph references a missing commit source'
       WHEN invalid > 0 THEN 'commit graph cache is corrupt'
       WHEN incomplete > 0 THEN 'commit graph cache is unavailable'
-      WHEN admission_bytes > p.byte_cap THEN 'commit graph exceeds its retained-memory capacity'
+      WHEN admission_bytes > p.byte_cap THEN 'commit graph exceeds its fixed state capacity'
       ELSE NULL
     END AS error,
     summary.bytes AS graph_bytes,
@@ -432,151 +366,13 @@ function stringsBytes(commit: Commit): number {
   return codeUnits * 2;
 }
 
-/** Conservative retained-memory charge for one parsed commit. */
+/** Conservative state-size charge for one parsed commit. */
 export function commitCacheBytes(commit: Commit): number {
   return (
     COMMIT_FIXED_CACHE_BYTES +
     stringsBytes(commit) +
     commit.parent.length * COMMIT_PARENT_CACHE_BYTES
   );
-}
-
-/** SQL-computable upper bound for the same graph row, including UTF-8 expansion. */
-export function commitGraphBytes(commit: Commit): number {
-  const textBytes =
-    JSON_ENCODER.encode(commit.tree).byteLength +
-    JSON_ENCODER.encode(JSON.stringify(commit.parent)).byteLength +
-    JSON_ENCODER.encode(commit.author.name).byteLength +
-    JSON_ENCODER.encode(commit.author.email).byteLength +
-    JSON_ENCODER.encode(commit.committer.name).byteLength +
-    JSON_ENCODER.encode(commit.committer.email).byteLength +
-    JSON_ENCODER.encode(commit.message).byteLength +
-    (commit.gpgsig === undefined ? 0 : JSON_ENCODER.encode(commit.gpgsig).byteLength);
-  return (
-    COMMIT_FIXED_CACHE_BYTES + 2 * textBytes + commit.parent.length * COMMIT_PARENT_CACHE_BYTES
-  );
-}
-
-/** Live SQL row wrappers and projected BLOB/JSON payload for one cached commit. */
-export function commitCacheSqlPayloadBytes(commit: Commit): number {
-  const parents = JSON_ENCODER.encode(JSON.stringify(commit.parent)).byteLength;
-  const tree = JSON_ENCODER.encode(commit.tree).byteLength;
-  const blobs =
-    JSON_ENCODER.encode(commit.author.name).byteLength +
-    JSON_ENCODER.encode(commit.author.email).byteLength +
-    JSON_ENCODER.encode(commit.committer.name).byteLength +
-    JSON_ENCODER.encode(commit.committer.email).byteLength +
-    JSON_ENCODER.encode(commit.message).byteLength +
-    (commit.gpgsig === undefined ? 0 : JSON_ENCODER.encode(commit.gpgsig).byteLength);
-  const bytes = COMMIT_SQL_ROW_FIXED_BYTES + 2 * (tree + parents) + blobs;
-  if (!Number.isSafeInteger(bytes)) {
-    throw new GitError("E2BIG", "commit cache SQL payload memory accounting overflow");
-  }
-  return bytes;
-}
-
-/** Point-read peak while the projected SQL row and decoded commit coexist. */
-export function commitCacheMaterializationBytes(commit: Commit): number {
-  const retained = commitGraphBytes(commit);
-  const payload = commitCacheSqlPayloadBytes(commit);
-  if (payload > Number.MAX_SAFE_INTEGER - retained) {
-    throw new GitError("E2BIG", "commit cache read memory accounting overflow");
-  }
-  return retained + payload;
-}
-
-/** Preflight one cache row without projecting any caller-controlled BLOB. */
-export function commitCacheReadMemory(
-  db: SqlDatabase,
-  repoId: number,
-  oid: string,
-): CommitCacheReadMemory | null {
-  const row = db.one<CommitCacheReadShapeRow>(
-    `SELECT
-       EXISTS (
-         SELECT 1 FROM git_objects o
-          WHERE o.repo_id = c.repo_id AND o.oid = c.oid
-            AND o.type = 'commit' AND o.size = c.object_size
-         UNION ALL
-         SELECT 1 FROM git_pack_objects o
-           JOIN git_pack_meta m ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id
-          WHERE o.repo_id = c.repo_id AND o.oid = c.oid
-            AND o.type = 'commit' AND o.size = c.object_size
-            AND m.state = 'complete'
-       ) AS source_valid,
-       CASE WHEN typeof(c.cache_bytes) = 'integer'
-                  AND c.cache_bytes BETWEEN 0 AND ${COMMIT_CACHE_FLUSH_BYTES}
-             THEN 1 ELSE 0 END AS eligible,
-       CASE WHEN typeof(c.parents) != 'text' OR NOT json_valid(c.parents)
-                  OR json_type(c.parents) != 'array'
-                  OR typeof(c.tree) != 'text' OR length(c.tree) != 40
-                  OR c.tree GLOB '*[^0-9a-f]*'
-                  OR typeof(c.author_name) != 'blob' OR typeof(c.author_email) != 'blob'
-                  OR typeof(c.committer_name) != 'blob' OR typeof(c.committer_email) != 'blob'
-                  OR typeof(c.message) != 'blob'
-                  OR (c.gpgsig IS NOT NULL AND typeof(c.gpgsig) != 'blob')
-                  OR typeof(c.author_time) != 'integer'
-                  OR typeof(c.author_timezone) != 'integer'
-                  OR typeof(c.committer_time) != 'integer'
-                  OR typeof(c.committer_timezone) != 'integer'
-                  OR typeof(c.object_size) != 'integer' OR c.object_size < 0
-                  OR typeof(c.cache_bytes) != 'integer' OR c.cache_bytes < 0
-             THEN 0 ELSE 1 END AS row_valid,
-       CASE WHEN typeof(c.parents) != 'text' OR NOT json_valid(c.parents)
-                  OR json_type(c.parents) != 'array'
-             THEN 0 ELSE
-         ? + 2 * (length(CAST(c.tree AS BLOB)) + length(CAST(c.parents AS BLOB))
-           + length(c.author_name) + length(c.author_email)
-           + length(c.committer_name) + length(c.committer_email)
-           + length(c.message) + COALESCE(length(c.gpgsig), 0))
-           + ? * json_array_length(c.parents)
-       END AS retained_bytes,
-       CASE WHEN typeof(c.parents) != 'text' OR NOT json_valid(c.parents)
-                  OR json_type(c.parents) != 'array'
-             THEN 0 ELSE
-         ${COMMIT_SQL_ROW_FIXED_BYTES}
-           + 2 * (length(CAST(c.tree AS BLOB)) + length(CAST(c.parents AS BLOB)))
-           + length(c.author_name) + length(c.author_email)
-           + length(c.committer_name) + length(c.committer_email)
-           + length(c.message) + COALESCE(length(c.gpgsig), 0)
-       END AS payload_bytes
-     FROM git_commits c WHERE c.repo_id = ? AND c.oid = ?`,
-    COMMIT_FIXED_CACHE_BYTES,
-    COMMIT_PARENT_CACHE_BYTES,
-    repoId,
-    oid,
-  );
-  if (row === undefined) return null;
-  if (row.source_valid !== 0 && row.source_valid !== 1) {
-    throw new CorruptError("commit cache preflight returned invalid source state");
-  }
-  if (row.source_valid === 0) {
-    throw new CorruptError("commit cache row has no authoritative source");
-  }
-  if (row.eligible !== 0 && row.eligible !== 1) {
-    throw new CorruptError("commit cache preflight returned invalid eligibility");
-  }
-  if (row.row_valid !== 1) throw new CorruptError("commit cache row is corrupt");
-  if (
-    typeof row.retained_bytes !== "number" ||
-    !Number.isSafeInteger(row.retained_bytes) ||
-    row.retained_bytes < 0
-  ) {
-    throw new CorruptError("commit cache preflight returned invalid retained bytes");
-  }
-  if (
-    typeof row.payload_bytes !== "number" ||
-    !Number.isSafeInteger(row.payload_bytes) ||
-    row.payload_bytes < 0 ||
-    row.payload_bytes > Number.MAX_SAFE_INTEGER - row.retained_bytes
-  ) {
-    throw new CorruptError("commit cache preflight returned invalid payload bytes");
-  }
-  return {
-    eligible: row.eligible === 1,
-    retainedBytes: row.retained_bytes,
-    materializationBytes: row.retained_bytes + row.payload_bytes,
-  };
 }
 
 function stringField(value: unknown, name: string): string {
@@ -673,20 +469,14 @@ export function* readCommitGraph(
   rootOid: string,
   limits: CommitGraphLimits = {},
 ): Generator<CommitCacheEntry> {
-  const reservation = new MemoryCoordinator().reserve();
-  try {
-    yield* readCommitGraphOwned(db, repoId, rootOid, reservation, limits);
-  } finally {
-    reservation.dispose();
-  }
+  yield* readCommitGraphOwned(db, repoId, rootOid, limits);
 }
 
-/** Internal graph path whose parsed rows remain charged to the supplied operation owner. */
+/** Internal graph path with a fixed bound on recursive state. */
 export function* readCommitGraphOwned(
   db: SqlDatabase,
   repoId: number,
   rootOid: string,
-  reservation: MemoryReservation,
   limits: CommitGraphLimits = {},
 ): Generator<CommitCacheEntry> {
   if (!Number.isSafeInteger(repoId) || repoId < 1) {
@@ -705,12 +495,8 @@ export function* readCommitGraphOwned(
   ) {
     throw new RangeError("commit graph byte limit must be a positive safe integer");
   }
-  const available = reservation.remainingBytes;
-  const maxBytes = Math.min(requestedBytes ?? available, available);
-  if (maxBytes < 1) {
-    throw new GitError("E2BIG", "commit graph has no retained-memory capacity");
-  }
-  let retainedBytes = 0;
+  const maxBytes = Math.min(requestedBytes ?? COMMIT_GRAPH_WALK_BYTES, COMMIT_GRAPH_WALK_BYTES);
+  let graphStateBytes = 0;
   let admittedBytes: number | undefined;
   let graphBytes: number | undefined;
   for (const value of db.iterate(
@@ -752,33 +538,31 @@ export function* readCommitGraphOwned(
     }
     if (row.kind === "admission") {
       if (admittedBytes !== undefined) {
-        throw new CorruptError("commit graph yielded duplicate memory admission");
+        throw new CorruptError("commit graph yielded duplicate state admission");
       }
-      graphBytes = integerField(row.object_size, "graph retained bytes");
-      admittedBytes = integerField(row.cache_bytes, "graph retained bytes");
+      graphBytes = integerField(row.object_size, "graph state bytes");
+      admittedBytes = integerField(row.cache_bytes, "graph state bytes");
       if (graphBytes < 0 || graphBytes > admittedBytes || admittedBytes > maxBytes) {
-        throw new CorruptError("commit graph yielded invalid memory admission");
+        throw new CorruptError("commit graph yielded invalid state admission");
       }
-      reservation.set("commit", admittedBytes);
       continue;
     }
     if (row.kind !== "commit" || typeof row.oid !== "string" || !isOid(row.oid)) {
       throw new CorruptError("commit graph yielded an invalid commit row");
     }
     if (admittedBytes === undefined || graphBytes === undefined) {
-      throw new CorruptError("commit graph payload preceded memory admission");
+      throw new CorruptError("commit graph payload preceded state admission");
     }
     const entry = decodeCommitCacheRow(repoId, row.oid, row);
-    if (entry.cacheBytes > graphBytes - retainedBytes) {
-      throw new CorruptError("commit graph payload exceeds its admitted memory");
+    if (entry.cacheBytes > graphBytes - graphStateBytes) {
+      throw new CorruptError("commit graph payload exceeds its admitted state");
     }
-    retainedBytes += entry.cacheBytes;
+    graphStateBytes += entry.cacheBytes;
     yield entry;
   }
   if (admittedBytes === undefined || graphBytes === undefined) {
-    throw new CorruptError("commit graph omitted memory admission");
+    throw new CorruptError("commit graph omitted state admission");
   }
-  reservation.set("commit", retainedBytes);
 }
 
 function validateCommitNumbers(commit: Commit): void {
@@ -796,24 +580,15 @@ function validateCommitNumbers(commit: Commit): void {
 
 /** Build one opaque, immutable derived row or reject the source. */
 export function prepareCommitCache(source: CommitCacheSource): CommitCacheEntry {
-  const reservation = new MemoryCoordinator().reserve();
-  try {
-    return prepareCommitCacheOwned(source, reservation);
-  } finally {
-    reservation.dispose();
-  }
+  return prepareCommitCacheOwned(source);
 }
 
 /** Authenticate and parse one commit while all parser allocations are admitted. */
-export function prepareCommitCacheOwned(
-  source: CommitCacheSource,
-  reservation: MemoryReservation,
-): CommitCacheEntry {
+export function prepareCommitCacheOwned(source: CommitCacheSource): CommitCacheEntry {
   if (!Number.isSafeInteger(source.repoId) || source.repoId < 1) {
     throw new CorruptError("commit cache source has an invalid repository id");
   }
   if (!isOid(source.oid)) throw new CorruptError("commit cache source has an invalid oid");
-  reservation.set("commit", commitPreparationTransientBytes(source.data.length));
   if (hashObject("commit", source.data) !== source.oid) {
     throw new CorruptError(`commit cache source ${source.oid} does not match its bytes`);
   }
@@ -829,7 +604,6 @@ export function prepareCommitCacheOwned(
   if (!Number.isSafeInteger(entry.cacheBytes)) {
     throw new GitError("E2BIG", `commit ${source.oid} has an unrepresentable cache byte charge`);
   }
-  reservation.set("commit", entry.cacheBytes);
   return entry;
 }
 

@@ -12,7 +12,6 @@ import {
 import { restoreProjectedOperation } from "../src/core/ops/merge-apply.js";
 import { add, rm } from "../src/core/ops/staging.js";
 import { Repository } from "../src/core/repository.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -176,7 +175,7 @@ describe("cherry-pick lifecycle", () => {
     }
   });
 
-  it("rolls back an empty replay journal failure and releases its owner", async () => {
+  it("rolls back an empty replay journal failure", async () => {
     const source = fixture();
     source.write("base.txt", "base\n");
     source.commit("base");
@@ -198,7 +197,6 @@ describe("cherry-pick lifecycle", () => {
       cherryPick(workspace.context, workspace.repo, workspace.worktree, { source: picked }),
     ).toThrow("fault empty journal");
     expect(durableSnapshot(workspace)).toEqual(before);
-    workspace.repo.store.memory.assertIdle();
   });
 
   it("rolls back commit-object and ref write failures", async () => {
@@ -353,89 +351,6 @@ describe("cherry-pick lifecycle", () => {
       expect(cold.repo.store.reflog("refs/heads/main")).toEqual([]);
       expect(cold.repo.checkout.reflog("HEAD")).toEqual([]);
     }
-  });
-
-  it("admits a cold replay journal before continue and abort decode", async () => {
-    const source = fixture();
-    source.write("base.txt", "base\n");
-    source.commit("base");
-    source.git("checkout", "-q", "-b", "topic");
-    source.git("commit", "--allow-empty", "-m", "empty");
-    const picked = source.git("rev-parse", "HEAD");
-    source.git("checkout", "-q", "main");
-    const workspace = await imported(source);
-    expect(
-      cherryPick(workspace.context, workspace.repo, workspace.worktree, { source: picked }),
-    ).toEqual({ outcome: "empty", reason: "source" });
-
-    const cold = reopen(workspace);
-    const blocker = cold.repo.store.reserveMemory();
-    blocker.set("other", MAX_OPERATION_MEMORY_BYTES - 1);
-    try {
-      for (const action of [
-        () => cherryPickContinue(cold.context, cold.repo),
-        () => cherryPickAbort(cold.repo, workspace.worktree),
-      ]) {
-        workspace.storage.resetCounters();
-        expect(action).toThrow(expect.objectContaining({ code: "E2BIG" }));
-        expect(workspace.storage.statementCount).toBe(1);
-      }
-    } finally {
-      blocker.dispose();
-    }
-    expect(cold.repo.checkout.readOperationState()).not.toBeNull();
-    cold.repo.store.memory.assertIdle();
-  });
-
-  it("admits conflicted replay state before constructing it at the exact boundary", async () => {
-    const source = fixture();
-    source.write("conflict.txt", "base\n");
-    source.commit("base");
-    source.git("checkout", "-q", "-b", "topic");
-    source.write("conflict.txt", "incoming\n");
-    const picked = source.commit("topic");
-    source.git("checkout", "-q", "main");
-    source.write("conflict.txt", "current\n");
-    source.commit("main");
-
-    const run = async (remainingStateBytes: number): Promise<number> => {
-      const workspace = await imported(source);
-      const before = durableSnapshot(workspace);
-      const blocker = workspace.repo.store.reserveMemory();
-      const originalHead = workspace.repo.head.bind(workspace.repo);
-      const originalInterlock = workspace.repo.checkout.requireNoOperationState.bind(
-        workspace.repo.checkout,
-      );
-      let headReads = 0;
-      let interlocks = 0;
-      workspace.repo.head = () => {
-        const head = originalHead();
-        headReads++;
-        if (headReads === 2) {
-          blocker.set("other", workspace.repo.store.memory.remainingBytes - remainingStateBytes);
-        }
-        return head;
-      };
-      workspace.repo.checkout.requireNoOperationState = () => {
-        interlocks++;
-        return originalInterlock();
-      };
-      try {
-        expect(() =>
-          cherryPick(workspace.context, workspace.repo, workspace.worktree, { source: picked }),
-        ).toThrow(expect.objectContaining({ code: "E2BIG" }));
-      } finally {
-        blocker.dispose();
-      }
-      expect(headReads).toBe(2);
-      expect(durableSnapshot(workspace)).toEqual(before);
-      workspace.repo.store.memory.assertIdle();
-      return interlocks;
-    };
-
-    const stateAndAuthorBytes = 192 * 2;
-    expect(await run(stateAndAuthorBytes)).toBe(2);
-    expect(await run(stateAndAuthorBytes - 1)).toBe(1);
   });
 
   it("persists exact conflict stages and continues after a cold reopen", async () => {
@@ -597,7 +512,6 @@ describe("cherry-pick lifecycle", () => {
       "fault empty replacement",
     );
     expect(durableSnapshot(workspace)).toEqual(beforeReplacement);
-    workspace.repo.store.memory.assertIdle();
     workspace.repo.store.db.run("DROP TRIGGER fault_empty_replay_replacement");
     expect(cherryPickContinue(workspace.context, workspace.repo)).toEqual({
       outcome: "empty",

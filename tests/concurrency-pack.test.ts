@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 import { concat, utf8 } from "../src/core/bytes.js";
 import { hashObject } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { blob, readBlob } from "../src/sqlite/db.js";
 import {
   type CompletePackObject,
@@ -240,15 +239,9 @@ describe("concurrent pack ownership", () => {
       activePrefixStatements + opened.storage.statementCount - activeTailStart;
     expect(activeStatements).toBeLessThan(1_000);
     expect(rejectedStatements).toBeLessThan(1_000);
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     const retryStart = opened.storage.statementCount;
     const retry = await opened.store.packs.ingest(slices(fullObjectPack([targetData]), 4 * 1024));
     expect(opened.storage.statementCount - retryStart).toBeLessThan(1_000);
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
 
     const cold = reopenStore(opened.storage);
     expect(cold.store.packs.reclaimPending()).toBe(0);
@@ -299,7 +292,6 @@ describe("concurrent pack ownership", () => {
         ),
       ).rejects.toMatchObject({ code: "EBUSY" });
       rejectedStatements = first.storage.statementCount - rejectedStart;
-      expect(competing.store.packs.lastIngestMemoryHighWater).toBe(0);
       activeStateAfterWinner =
         first.db.scalar<string>(
           "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
@@ -312,9 +304,6 @@ describe("concurrent pack ownership", () => {
       active.barrier.release();
     }
     const completed = await active.owner;
-    expect(first.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     const activeStatements =
       activePrefixStatements + first.storage.statementCount - activeResumeStart;
     expect(rejectedStatements).toBeLessThan(1_000);
@@ -387,9 +376,6 @@ describe("concurrent pack ownership", () => {
       slices(fullObjectPack([targetData, winnerOnlyData]), 4 * 1024),
     );
     const winnerStatements = opened.storage.statementCount;
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     const pending = checkpointPack(targetData, "later-pending-b");
     const loserStart = opened.storage.statementCount;
     const loser = startPausedIngest(opened.store, pending, "later B index checkpoint", true);
@@ -412,9 +398,6 @@ describe("concurrent pack ownership", () => {
       loser.barrier.release();
       await expect(loser.owner).rejects.toBe(loser.publicationFailure);
     }
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     const loserStatements = loserBeforeRelease + (opened.storage.statementCount - loserResumeStart);
     expect(winnerStatements).toBeLessThan(1_000);
     expect(loserStatements).toBeLessThan(1_000);
@@ -434,9 +417,6 @@ describe("concurrent pack ownership", () => {
       },
     });
     expect(opened.storage.statementCount - retryStart).toBeLessThan(1_000);
-    expect(retryStore.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     expect(retry.packId).toBe(loserPackId + 1);
     expect(packsAtRetryReservation).toEqual([
       { pack_id: winner.packId, state: "complete" },
@@ -484,9 +464,6 @@ describe("concurrent pack ownership", () => {
       }),
     ).rejects.toMatchObject({ code: "ESTALE" });
     expect(first.storage.statementCount - rejectedStart).toBeLessThan(1_000);
-    expect(competing.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     expect(
       first.db.scalar<string>(
         "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = 2",
@@ -499,9 +476,6 @@ describe("concurrent pack ownership", () => {
     const winner = await active.owner;
     expect(activePrefixStatements + first.storage.statementCount - activeTailStart).toBeLessThan(
       1_000,
-    );
-    expect(first.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
     );
     const cold = reopenStore(first.storage);
     expect(cold.store.packs.reclaimPending()).toBe(1);
@@ -517,7 +491,7 @@ describe("concurrent pack ownership", () => {
     ).toEqual([{ pack_id: winner.packId, state: "complete" }]);
   });
 
-  it("allows reentrant deletion when the actual memory owners fit", async () => {
+  it("allows reentrant deletion during ingest", async () => {
     const opened = createStore();
     const retained = utf8.encode("retained during reentrant deletion\n");
     const published = utf8.encode("reentrant publication\n");
@@ -535,12 +509,8 @@ describe("concurrent pack ownership", () => {
     expect(deleted).toBe(1);
     expect(second.packId).toBe(first.packId + 1);
     expect(opened.storage.statementCount).toBeLessThan(1_000);
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     expect(opened.store.read(hashObject("blob", retained))).toBeNull();
     expect(opened.store.read(hashObject("blob", published))?.data).toEqual(published);
-    opened.store.shared.memory.assertIdle();
 
     const cold = reopenStore(opened.storage);
     expect(cold.store.packs.reclaimPending()).toBe(0);
@@ -556,7 +526,6 @@ describe("concurrent pack ownership", () => {
         cold.store.sharedRepoId,
       ),
     ).toEqual([{ pack_id: second.packId, state: "complete" }]);
-    cold.store.shared.memory.assertIdle();
   });
 
   it("reports ESTALE when a reentrant progress callback expires and reclaims its lease", async () => {
@@ -591,9 +560,6 @@ describe("concurrent pack ownership", () => {
     expect(progressCalls).toBe(1);
     expect(reclaimed).toBe(1);
     expect(first.storage.statementCount).toBeLessThan(1_000);
-    expect(first.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     const cold = reopenStore(first.storage, now);
     expect(cold.store.packs.reclaimPending()).toBe(0);
     expect(cold.store.packs.reclaimPending()).toBe(0);
@@ -627,9 +593,6 @@ describe("concurrent pack ownership", () => {
     active.barrier.release();
     await expect(active.owner).rejects.toThrow(/publication membership metadata disagrees/);
     expect(prefixStatements + opened.storage.statementCount - tailStart).toBeLessThan(1_000);
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     const cold = reopenStore(opened.storage);
     expect(cold.store.packs.reclaimPending()).toBe(1);
     expect(cold.store.packs.reclaimPending()).toBe(0);
@@ -658,9 +621,6 @@ describe("concurrent pack ownership", () => {
     active.barrier.release();
     await expect(active.owner).rejects.toThrow(/publication membership/);
     expect(prefixStatements + opened.storage.statementCount - tailStart).toBeLessThan(1_000);
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     expect(opened.store.read(pending.targetOid)?.data).toEqual(pending.targetData);
     expect(opened.store.read(pending.uniqueOid)?.data).toEqual(pending.uniqueData);
     const cold = reopenStore(opened.storage);
@@ -704,9 +664,6 @@ describe("concurrent pack ownership", () => {
     active.barrier.release();
     await expect(active.owner).rejects.toMatchObject({ code: "ECORRUPT" });
     expect(prefixStatements + opened.storage.statementCount - tailStart).toBeLessThan(1_000);
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     expect(
       opened.db.scalar<string>(
         "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
@@ -828,9 +785,6 @@ describe("concurrent pack ownership", () => {
     active.barrier.release();
     await expect(active.owner).rejects.toThrow(/publication bytes disagree/);
     expect(prefixStatements + opened.storage.statementCount - tailStart).toBeLessThan(1_000);
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     expect(
       opened.db.scalar<string>(
         "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
@@ -889,9 +843,6 @@ describe("concurrent pack ownership", () => {
     active.barrier.release();
     await expect(active.owner).rejects.toThrow(/publication membership metadata disagrees/);
     expect(prefixStatements + opened.storage.statementCount - tailStart).toBeLessThan(1_000);
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     expect(
       opened.db.scalar<string>(
         "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
@@ -950,7 +901,6 @@ describe("concurrent pack ownership", () => {
       competing.store.packs.ingest(slices(fullObjectPack([data]), 64)),
     ).rejects.toMatchObject({ code: "EBUSY" });
     expect(opened.storage.statementCount - rejectedStart).toBeLessThan(1_000);
-    expect(competing.store.packs.lastIngestMemoryHighWater).toBe(0);
     expect(
       opened.db.scalar<number>(
         "SELECT expires_ms FROM git_pack_ingest_control WHERE repo_id = ?",
@@ -964,9 +914,6 @@ describe("concurrent pack ownership", () => {
     const activeStatements =
       prefixStatements + middleStatements + opened.storage.statementCount - tailStart;
     expect(activeStatements).toBeLessThan(1_000);
-    expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     const cold = reopenStore(opened.storage, now);
     expect(cold.store.packs.completePackMatches(completed.packId, [blobMembership(data)])).toBe(
       true,
@@ -1002,18 +949,12 @@ describe("concurrent pack ownership", () => {
       slices(fullObjectPack([stale.targetData, winnerData]), 4 * 1024),
     );
     expect(first.storage.statementCount - winnerStart).toBeLessThan(1_000);
-    expect(competing.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
-    );
     expect(winner.packId).toBe(2);
     const staleTailStart = first.storage.statementCount;
     active.barrier.release();
     await expect(active.owner).rejects.toMatchObject({ code: "ESTALE" });
     expect(activePrefixStatements + first.storage.statementCount - staleTailStart).toBeLessThan(
       1_000,
-    );
-    expect(first.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
-      MAX_OPERATION_MEMORY_BYTES,
     );
 
     const cold = reopenStore(first.storage, now);

@@ -646,8 +646,7 @@ const STATEMENTS = [
    ) WITHOUT ROWID`,
 
   `CREATE INDEX IF NOT EXISTS git_tree_entries_by_name_bytes
-     ON git_tree_entries (source_key, name_bytes)
-     WHERE typeof(name_bytes) = 'blob'`,
+     ON git_tree_entries (source_key, name_bytes)`,
 
   `CREATE VIEW IF NOT EXISTS git_tree_entries_wide AS
      SELECT s.repo_id, s.tree_oid, s.storage, s.source_id,

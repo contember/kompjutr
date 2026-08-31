@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import { fromHex, toHex, utf8, utf8Decoder } from "../src/core/bytes.js";
 import type { GitContext, IndexTrackerSeedEntry } from "../src/core/context.js";
 import { CorruptError } from "../src/core/errors.js";
-import { checkoutSparseChanges, type SparseCheckoutChange } from "../src/core/ops/checkout.js";
 import { commit } from "../src/core/ops/commit.js";
 import { checkout } from "../src/core/ops/refs.js";
 import { hashWorktreePath } from "../src/core/ops/worktree-io.js";
@@ -21,7 +20,6 @@ import type {
   WriteEntry,
   WriteOptions,
 } from "../src/fs/types.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
   createSqliteSelectedPathSource,
@@ -349,38 +347,7 @@ function checkoutState(workspace: TestRepository) {
 }
 
 describe("sparse checkout", () => {
-  it("falls back on shared headroom before plan mutation", () => {
-    const workspace = makeRepo("/");
-    writeWorkFile(workspace, "/a", "a\n");
-    stageWorktreePaths(workspace, ["a"]);
-    const entry = workspace.repo.checkout.indexGet("a");
-    if (entry === null) throw new Error("missing plan boundary index entry");
-    const change: SparseCheckoutChange = {
-      path: "a",
-      before: { path: "a", mode: "100644", oid: entry.oid },
-      after: undefined,
-      worktreeType: "file",
-    };
-    const constrained = workspace.repo.store.reserveMemory();
-    const blocker = workspace.repo.store.reserveMemory();
-    blocker.set("other", MAX_OPERATION_MEMORY_BYTES - 1);
-
-    workspace.storage.resetCounters();
-    expect(checkoutSparseChanges(workspace.repo, workspace.worktree, [change], constrained)).toBe(
-      false,
-    );
-    expect(workspace.storage.statementCount).toBe(0);
-    expect(workspace.worktree.stat("/a")?.type).toBe("file");
-    expect(workspace.repo.checkout.indexGet("a")).not.toBeNull();
-    blocker.dispose();
-    constrained.dispose();
-
-    expect(checkoutSparseChanges(workspace.repo, workspace.worktree, [change])).toBe(true);
-    expect(workspace.worktree.stat("/a")).toBeNull();
-    expect(workspace.repo.checkout.indexGet("a")).toBeNull();
-  });
-
-  it("charges a large symlink target before raw egress and checkout mutation", () => {
+  it("hydrates a large symlink target", () => {
     const workspace = makeRepo("/");
     configureFixtureIdentity(workspace);
     const largeTarget = "t".repeat(512 * 1024);
@@ -393,7 +360,7 @@ describe("sparse checkout", () => {
     workspace.worktree.unlink("/link");
     workspace.worktree.symlink("after", "/link");
     stageWorktreePaths(workspace, ["link"]);
-    const target = commit(workspace.context, workspace.repo, { message: "target" }).oid;
+    commit(workspace.context, workspace.repo, { message: "target" });
     workspace.worktree.writeFiles([
       { path: "/link", target: largeTarget, contentId: fromHex(baseEntry.oid) },
     ]);
@@ -403,8 +370,6 @@ describe("sparse checkout", () => {
 
     const probe = new WorktreePayloadProbe(workspace.database.db);
     const source = createSqliteSparseWorkspaceSource(probe);
-    // Request and index state use 1,420 bytes; JS retains two bytes per ASCII unit plus the ID.
-    const exactRetainedBytes = 1_420 + largeTarget.length * 2 + 20;
     const exact = source.hydrate({
       repoId: workspace.repo.store.repoId,
       checkoutId: workspace.repo.checkout.checkoutId,
@@ -412,36 +377,11 @@ describe("sparse checkout", () => {
       baselineTreeOid: null,
       currentTreeOid: null,
       paths: ["link"],
-      maxRetainedBytes: exactRetainedBytes,
     });
     expect(exact.available).toBe(true);
     if (!exact.available) return;
-    expect(exact.retainedBytes).toBe(exactRetainedBytes);
     expect(exact.rows[0]?.worktree?.target).toBe(largeTarget);
     expect(probe.rawSymlinkTargets).toBe(1);
-
-    probe.rawSymlinkTargets = 0;
-    const constrainedSource: SparseWorkspaceSource = {
-      readState: (checkoutId) => source.readState(checkoutId),
-      dirtyPaths: (checkoutId) => source.dirtyPaths(checkoutId),
-      hydrate: (request) =>
-        source.hydrate({ ...request, maxRetainedBytes: exactRetainedBytes - 1 }),
-    };
-    const worktree = new NoScanWorktree(workspace.worktree);
-    expect(() =>
-      checkout(sparseTrackerContext(workspace, constrainedSource), workspace.repo, worktree, {
-        ref: target,
-      }),
-    ).toThrow(/must not scan/);
-    expect(probe.rawSymlinkTargets).toBe(0);
-    expect(worktree.writes).toEqual([]);
-    expect(worktree.removals).toEqual([]);
-    expect(workspace.repo.head().oid).toBe(base);
-    expect(
-      workspace.database.db.scalar<number>(
-        "SELECT length(CAST(link_target AS BLOB)) FROM fs_nodes WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/link')",
-      ),
-    ).toBe(largeTarget.length);
   });
 
   it("matches legacy checkout for a clean forced target change", () => {
@@ -513,7 +453,7 @@ describe("sparse checkout", () => {
     expect(calls).toEqual({ requests: [], statements: [], hydrates: 0 });
   });
 
-  it("uses current hydration when exact selected facts are unavailable or over capacity", () => {
+  it("uses current hydration when exact selected facts are unavailable", () => {
     const { workspace, target } = makeChangedFiles(2, 1);
     const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
     const context = selectedCheckoutContext(workspace, calls);
@@ -525,48 +465,6 @@ describe("sparse checkout", () => {
     expect(calls.hydrates).toBe(1);
     expect(worktree.writes).toHaveLength(1);
     expect(workspace.repo.head().oid).toBe(target);
-
-    const capacity = makeChangedFiles(2, 1);
-    const capacityCalls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
-    const capacityContext = selectedCheckoutContext(capacity.workspace, capacityCalls);
-    const native = createSqliteSelectedPathSource(capacity.workspace.database.db);
-    capacityContext.selectedPaths = {
-      select: (request) => native.select({ ...request, maxRetainedBytes: 1 }),
-    };
-    checkout(capacityContext, capacity.workspace.repo, capacity.workspace.worktree, {
-      ref: capacity.target,
-    });
-    expect(capacityCalls.hydrates).toBe(1);
-    expect(capacity.workspace.repo.head().oid).toBe(capacity.target);
-  });
-
-  it("does not impose a selected-mapping retained sublimit", () => {
-    const run = (excess: number): SelectedCheckoutCalls => {
-      const fixture = makeChangedFiles(2, 1);
-      const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
-      const context = selectedCheckoutContext(fixture.workspace, calls);
-      const native = createSqliteSelectedPathSource(fixture.workspace.database.db);
-      context.selectedPaths = {
-        select(request) {
-          const result = native.select(request);
-          if (!result.available) return result;
-          const limit = request.maxRetainedBytes;
-          if (limit === undefined) throw new Error("missing selected mapping retained limit");
-          // Result + rows vector + one row/index array + their reference slots.
-          const mappingBytes = 64 + 64 + 256 + 64 + 8 + 8;
-          return { ...result, retainedBytes: limit - mappingBytes + excess };
-        },
-      };
-
-      checkout(context, fixture.workspace.repo, fixture.workspace.worktree, {
-        ref: fixture.target,
-      });
-      expect(fixture.workspace.repo.head().oid).toBe(fixture.target);
-      return calls;
-    };
-
-    expect(run(0).hydrates).toBe(0);
-    expect(run(1).hydrates).toBe(0);
   });
 
   it("uses a selected path past the former component ceiling", () => {
@@ -618,7 +516,6 @@ describe("sparse checkout", () => {
       ).toEqual(before);
     };
 
-    assertRejected((result) => ({ ...result, retainedBytes: Number.MAX_SAFE_INTEGER }));
     assertRejected((result) => ({
       ...result,
       index: result.index.map((entry, index) => (index === 0 ? { ...entry, stage: 5 } : entry)),
@@ -633,15 +530,6 @@ describe("sparse checkout", () => {
     assertRejected((result) => ({ ...result, worktree: [...result.worktree].reverse() }));
     assertRejected((result) => ({
       ...result,
-      worktree: result.worktree.map((entry, index) =>
-        index === 0
-          ? { ...entry, stat: { ...entry.stat, contentId: new Uint8Array(16_384) } }
-          : entry,
-      ),
-    }));
-    assertRejected((result) => ({
-      ...result,
-      retainedBytes: result.retainedBytes + 512,
       worktree: [
         ...result.worktree,
         {
@@ -974,7 +862,6 @@ describe("sparse checkout", () => {
         if (!result.available) return result;
         return {
           available: true,
-          retainedBytes: result.retainedBytes,
           rows: result.rows.map((row, index) =>
             index === 0 ? { ...row, path: `${row.path}.wrong` } : row,
           ),

@@ -2,7 +2,6 @@ import { isOid, toHex } from "../../core/bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../../core/errors.js";
 import type { ObjectType } from "../../core/objects.js";
 import { InflateStream } from "../../core/zlib.js";
-import type { MemoryReservation } from "../../memory.js";
 import type { SqlDatabase } from "../db.js";
 import { MAX_DELTA_DEPTH } from "../packs.js";
 import type { ObjectReadInfo, SharedRepoStore } from "../store.js";
@@ -10,19 +9,6 @@ import { TREE_QUEUE_ROW_FIXED_BYTES } from "../tree-index.js";
 
 const EDGE_PAGE = 256;
 const HEADER_LINE_PREFIX_BYTES = 128;
-// These own the current parser/cursor live set; total object bytes are streamed work.
-const HEADER_PARSER_FIXED_BYTES = 1_024;
-const HEADER_STRING_FIXED_BYTES = 48;
-const HEADER_ARRAY_FIXED_BYTES = 64;
-const HEADER_ARRAY_SLOT_BYTES = 8;
-const HEADER_SQL_ROW_FIXED_BYTES = 512;
-const HEADER_INFLATE_STATE_BYTES = 64 * 1024;
-const HEADER_EXPANSION_EDGE_BYTES = 256;
-const TREE_EDGE_METADATA_ROW_BYTES = 256;
-const TREE_EDGE_RESULT_BYTES = 256;
-const TREE_EDGE_EXPECTED_JSON_BYTES = 256;
-const REACHABILITY_PUBLICATION_ROW_BYTES = 1024;
-const REACHABILITY_OPERATION_BYTES = 1024;
 
 export type MaintenanceReachabilityStatus = "progress" | "complete" | "root-changed";
 
@@ -419,18 +405,11 @@ class StreamingHeaders {
   }
 }
 
-function requireObjectInfo(
-  store: SharedRepoStore,
-  oid: string,
-  reservation: MemoryReservation,
-): ReachabilityObjectInfo {
-  const metadataMemory = reservation.scope();
-  metadataMemory.set("metadata", HEADER_SQL_ROW_FIXED_BYTES);
+function requireObjectInfo(store: SharedRepoStore, oid: string): ReachabilityObjectInfo {
   let result: ReachabilityObjectInfo | null = null;
   let rows = 0;
-  try {
-    for (const row of store.db.iterate(
-      `SELECT /* maintenance-object-info */ input.oid,
+  for (const row of store.db.iterate(
+    `SELECT /* maintenance-object-info */ input.oid,
              CASE WHEN loose.oid IS NOT NULL THEN 'loose'
                   WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
              CASE WHEN loose.oid IS NOT NULL AND typeof(loose.type) = 'text'
@@ -491,68 +470,65 @@ function requireObjectInfo(
          ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
         AND pack.state = 'complete'
       LIMIT 2`,
-      store.repoId,
-      store.repoId,
-      store.repoId,
-      store.repoId,
-      store.repoId,
-      store.repoId,
-      oid,
-      store.repoId,
-      store.repoId,
-    )) {
-      rows++;
-      if (rows > 1 || row.oid !== oid) {
-        throw new CorruptError("reachable object metadata returned inconsistent rows");
-      }
-      if (row.source !== "loose" && row.source !== "pack") {
-        if (row.source === null) throw new CorruptError(`reachable object ${oid} is missing`);
-        throw new CorruptError("reachable object metadata returned an invalid source");
-      }
-      const type = objectType(row.type, "reachable object type");
-      const size = safeInteger(row.size, "reachable object size", 0);
-      const chunkRows = safeInteger(row.chunk_rows, "reachable object chunk count", 0);
-      const invalidChunkRows = safeInteger(
-        row.invalid_chunk_rows,
-        "reachable object invalid chunk count",
-        0,
-      );
-      const largestChunk = safeInteger(row.largest_chunk, "reachable object chunk size", 0);
-      const storedBytes = safeInteger(row.stored_bytes, "reachable object stored size", 0);
-      if (
-        (row.source === "loose" && row.stored !== "raw" && row.stored !== "zlib") ||
-        (row.source === "loose" && chunkRows <= 0) ||
-        (row.source === "loose" && invalidChunkRows !== 0) ||
-        (row.source === "loose" && row.first_chunk !== 0) ||
-        (row.source === "loose" && row.last_chunk !== chunkRows - 1) ||
-        (row.source === "loose" && largestChunk > 1024 * 1024) ||
-        (row.source === "loose" && row.stored === "raw" && storedBytes !== size) ||
-        (row.source === "loose" && row.stored === "zlib" && storedBytes === 0) ||
-        (row.source === "pack" &&
-          (row.stored !== null ||
-            chunkRows !== 0 ||
-            row.first_chunk !== null ||
-            row.last_chunk !== null ||
-            largestChunk !== 0 ||
-            storedBytes !== 0))
-      ) {
-        throw new CorruptError("reachable object metadata returned invalid fields");
-      }
-      result = {
-        oid,
-        type,
-        size,
-        source: row.source,
-        chunkRows,
-        stored:
-          row.source === "loose" && (row.stored === "raw" || row.stored === "zlib")
-            ? row.stored
-            : null,
-        largestChunk,
-      };
+    store.repoId,
+    store.repoId,
+    store.repoId,
+    store.repoId,
+    store.repoId,
+    store.repoId,
+    oid,
+    store.repoId,
+    store.repoId,
+  )) {
+    rows++;
+    if (rows > 1 || row.oid !== oid) {
+      throw new CorruptError("reachable object metadata returned inconsistent rows");
     }
-  } finally {
-    metadataMemory.dispose();
+    if (row.source !== "loose" && row.source !== "pack") {
+      if (row.source === null) throw new CorruptError(`reachable object ${oid} is missing`);
+      throw new CorruptError("reachable object metadata returned an invalid source");
+    }
+    const type = objectType(row.type, "reachable object type");
+    const size = safeInteger(row.size, "reachable object size", 0);
+    const chunkRows = safeInteger(row.chunk_rows, "reachable object chunk count", 0);
+    const invalidChunkRows = safeInteger(
+      row.invalid_chunk_rows,
+      "reachable object invalid chunk count",
+      0,
+    );
+    const largestChunk = safeInteger(row.largest_chunk, "reachable object chunk size", 0);
+    const storedBytes = safeInteger(row.stored_bytes, "reachable object stored size", 0);
+    if (
+      (row.source === "loose" && row.stored !== "raw" && row.stored !== "zlib") ||
+      (row.source === "loose" && chunkRows <= 0) ||
+      (row.source === "loose" && invalidChunkRows !== 0) ||
+      (row.source === "loose" && row.first_chunk !== 0) ||
+      (row.source === "loose" && row.last_chunk !== chunkRows - 1) ||
+      (row.source === "loose" && largestChunk > 1024 * 1024) ||
+      (row.source === "loose" && row.stored === "raw" && storedBytes !== size) ||
+      (row.source === "loose" && row.stored === "zlib" && storedBytes === 0) ||
+      (row.source === "pack" &&
+        (row.stored !== null ||
+          chunkRows !== 0 ||
+          row.first_chunk !== null ||
+          row.last_chunk !== null ||
+          largestChunk !== 0 ||
+          storedBytes !== 0))
+    ) {
+      throw new CorruptError("reachable object metadata returned invalid fields");
+    }
+    result = {
+      oid,
+      type,
+      size,
+      source: row.source,
+      chunkRows,
+      stored:
+        row.source === "loose" && (row.stored === "raw" || row.stored === "zlib")
+          ? row.stored
+          : null,
+      largestChunk,
+    };
   }
   if (rows !== 1 || result === null) {
     throw new CorruptError("reachable object metadata returned an incomplete result");
@@ -566,78 +542,33 @@ function scanHeaders(
   kind: "commit" | "tag",
   parentStart: number,
   parentLimit: number,
-  reservation: MemoryReservation,
 ): HeaderScanResult {
-  const parserMemory = reservation.scope();
-  parserMemory.set("other", headerParserMemoryBytes(parentLimit));
-  try {
-    const parser = new StreamingHeaders(kind, parentStart, parentLimit);
-    if (info.source === "loose") streamLooseHeaders(store, info, parser, reservation);
-    else {
-      const packedOperation = reservation.scope();
-      const packedOutput = reservation.scope();
-      try {
-        const objects = store.packs.readObjects([info.oid], kind, {
-          operation: packedOperation,
-          output: packedOutput,
-        });
-        const object = objects.get(info.oid);
-        if (object === undefined)
-          throw new CorruptError(`reachable ${kind} ${info.oid} disappeared`);
-        if (objects.size !== 1 || object.type !== kind || object.data.length !== info.size) {
-          throw new CorruptError(`reachable packed ${kind} disagrees with its indexed metadata`);
-        }
-        parser.push(object.data);
-        const result = parser.finish(info.size);
-        reservation.set("other", headerResultMemoryBytes(result));
-        return result;
-      } finally {
-        packedOperation.dispose();
-      }
+  const parser = new StreamingHeaders(kind, parentStart, parentLimit);
+  if (info.source === "loose") streamLooseHeaders(store, info, parser);
+  else {
+    const objects = store.packs.readObjects([info.oid], kind);
+    const object = objects.get(info.oid);
+    if (object === undefined) throw new CorruptError(`reachable ${kind} ${info.oid} disappeared`);
+    if (objects.size !== 1 || object.type !== kind || object.data.length !== info.size) {
+      throw new CorruptError(`reachable packed ${kind} disagrees with its indexed metadata`);
     }
-    const result = parser.finish(info.size);
-    reservation.set("other", headerResultMemoryBytes(result));
-    return result;
-  } finally {
-    parserMemory.dispose();
+    parser.push(object.data);
   }
-}
-
-function headerParserMemoryBytes(parentLimit: number): number {
-  return (
-    HEADER_PARSER_FIXED_BYTES +
-    HEADER_LINE_PREFIX_BYTES +
-    HEADER_ARRAY_FIXED_BYTES +
-    parentLimit * (HEADER_ARRAY_SLOT_BYTES + HEADER_STRING_FIXED_BYTES + 80) +
-    2 * (HEADER_STRING_FIXED_BYTES + HEADER_LINE_PREFIX_BYTES * 2)
-  );
-}
-
-function headerResultMemoryBytes(result: HeaderScanResult): number {
-  let bytes = HEADER_ARRAY_FIXED_BYTES + result.parentOids.length * HEADER_ARRAY_SLOT_BYTES;
-  for (const oid of result.parentOids) bytes += HEADER_STRING_FIXED_BYTES + oid.length * 2;
-  for (const value of [result.treeOid, result.tagOid, result.tagType]) {
-    if (value !== null) bytes += HEADER_STRING_FIXED_BYTES + value.length * 2;
-  }
-  return bytes;
+  return parser.finish(info.size);
 }
 
 function streamLooseHeaders(
   store: SharedRepoStore,
   info: ReachabilityObjectInfo,
   parser: StreamingHeaders,
-  reservation: MemoryReservation,
 ): void {
   if (info.stored === null) throw new CorruptError("loose header stream lost its encoding");
   let rows = 0;
   let stored: "raw" | "zlib" | null = null;
   let inflater: InflateStream | null = null;
-  const rowMemory = reservation.scope();
-  const inflateMemory = reservation.scope();
   let iterator: Iterator<Record<string, unknown>> | null = null;
   let finished = false;
   try {
-    rowMemory.set("other", HEADER_SQL_ROW_FIXED_BYTES + info.largestChunk);
     const source = store.db.iterate(
       `SELECT /* maintenance-loose-headers */ object.repo_id, object.oid,
              CASE WHEN typeof(object.stored) = 'text'
@@ -662,7 +593,6 @@ function streamLooseHeaders(
       const next = iterator.next();
       if (next.done) {
         finished = true;
-        rowMemory.clear("other");
         break;
       }
       const row = next.value;
@@ -683,7 +613,6 @@ function streamLooseHeaders(
       if (stored === "raw") parser.push(data);
       else {
         if (inflater === null) {
-          inflateMemory.set("other", HEADER_INFLATE_STATE_BYTES);
           inflater = new InflateStream((chunk) => parser.push(chunk));
         }
         try {
@@ -698,13 +627,9 @@ function streamLooseHeaders(
         }
       }
       rows++;
-      rowMemory.clear("other");
-      rowMemory.set("other", HEADER_SQL_ROW_FIXED_BYTES + info.largestChunk);
     }
   } finally {
     if (!finished) iterator?.return?.();
-    inflateMemory.dispose();
-    rowMemory.dispose();
   }
   if (rows !== info.chunkRows || stored === null) {
     throw new CorruptError("loose header stream returned an incomplete chunk sequence");
@@ -983,7 +908,6 @@ function headerExpansion(
   store: SharedRepoStore,
   object: QueueObject,
   info: ReachabilityObjectInfo,
-  reservation: MemoryReservation,
 ): ObjectExpansion {
   if (info.type === "blob") {
     if (object.edgeCursor !== 0) throw new CorruptError("blob retained a semantic edge cursor");
@@ -992,11 +916,9 @@ function headerExpansion(
   }
   if (info.type === "tag") {
     if (object.edgeCursor !== 0) throw new CorruptError("tag retained a semantic edge cursor");
-    const parsed = scanHeaders(store, info, "tag", 0, 0, reservation);
+    const parsed = scanHeaders(store, info, "tag", 0, 0);
     if (parsed.tagOid === null) throw new CorruptError("tag is missing its object header");
     if (parsed.tagType === null) throw new CorruptError("tag is missing its type header");
-    const parsedBytes = headerResultMemoryBytes(parsed);
-    reservation.set("other", parsedBytes + HEADER_EXPANSION_EDGE_BYTES * 2);
     const edges: ReachabilityEdge[] = [
       {
         oid: parsed.tagOid,
@@ -1007,7 +929,6 @@ function headerExpansion(
     ];
     const base = packedBaseEdge(store, object.oid, info.type);
     if (base !== null) edges.push(base);
-    reservation.set("other", edges.length * HEADER_EXPANSION_EDGE_BYTES);
     return { edges, nextCursor: 0, complete: true };
   }
   if (info.type !== "commit") {
@@ -1018,14 +939,12 @@ function headerExpansion(
   }
   const parentStart = Math.max(0, object.edgeCursor - 1);
   const semanticCapacity = EDGE_PAGE - (object.edgeCursor === 0 ? 1 : 0);
-  const parsed = scanHeaders(store, info, "commit", parentStart, semanticCapacity + 1, reservation);
+  const parsed = scanHeaders(store, info, "commit", parentStart, semanticCapacity + 1);
   if (parsed.treeOid === null) throw new CorruptError("commit is missing its tree header");
   const semanticCount = 1 + (object.shallowBoundary ? 0 : parsed.parentCount);
   if (object.edgeCursor > semanticCount) {
     throw new CorruptError("commit edge cursor exceeds its header edges");
   }
-  const parsedBytes = headerResultMemoryBytes(parsed);
-  reservation.set("other", parsedBytes + EDGE_PAGE * HEADER_EXPANSION_EDGE_BYTES);
   const edges: ReachabilityEdge[] = [];
   if (object.edgeCursor === 0) {
     edges.push({
@@ -1056,7 +975,6 @@ function headerExpansion(
       else complete = false;
     }
   }
-  reservation.set("other", edges.length * HEADER_EXPANSION_EDGE_BYTES);
   return { edges, nextCursor, complete };
 }
 
@@ -1163,7 +1081,6 @@ function treeExpansion(
   store: SharedRepoStore,
   object: QueueObject,
   info: ObjectReadInfo,
-  reservation: MemoryReservation,
 ): ObjectExpansion {
   let source: Record<string, unknown> | null = null;
   let sourceRows = 0;
@@ -1231,11 +1148,7 @@ function treeExpansion(
     previousBase = safeInteger(previous.cumulative_base, "preceding tree cumulative cost", 0);
   }
 
-  const page = reservation.scope();
-  page.set("metadata", (EDGE_PAGE + 1) * TREE_EDGE_METADATA_ROW_BYTES);
   const metadata: TreeEdgeMetadata[] = [];
-  let largestPayload = 0;
-  let largestDecode = 0;
   for (const row of db.iterate(
     `SELECT /* maintenance-tree-edge-metadata */ source_key, ordinal,
             CASE WHEN typeof(mode) = 'text' AND length(CAST(mode AS BLOB)) <= 6
@@ -1261,12 +1174,6 @@ function treeExpansion(
     if (object.edgeCursor + metadata.length > entryCount) {
       throw new CorruptError("tree source has rows beyond its completion marker");
     }
-    const payload = checked.nameLength + checked.rawLength;
-    if (!Number.isSafeInteger(payload)) {
-      throw new GitError("E2BIG", "tree edge payload memory accounting overflows");
-    }
-    largestPayload = Math.max(largestPayload, payload);
-    largestDecode = Math.max(largestDecode, checked.nameLength * 2);
   }
   const remaining = entryCount - object.edgeCursor;
   if (metadata.length !== Math.min(remaining, EDGE_PAGE + 1)) {
@@ -1277,16 +1184,6 @@ function treeExpansion(
   if (semanticComplete && previousBase !== baseCost) {
     throw new CorruptError("tree source completion cost is inconsistent");
   }
-  const edgeCount = Math.min(metadata.length, EDGE_PAGE);
-  const retainedMetadata = metadata.length * TREE_EDGE_METADATA_ROW_BYTES;
-  const resultBytes = edgeCount * TREE_EDGE_RESULT_BYTES;
-  const liveBytes =
-    resultBytes + metadata.length * TREE_EDGE_EXPECTED_JSON_BYTES + largestPayload + largestDecode;
-  if (!Number.isSafeInteger(liveBytes)) {
-    throw new GitError("E2BIG", "tree edge page memory accounting overflows");
-  }
-  page.set("metadata", retainedMetadata);
-  page.set("other", liveBytes);
   const expectedPayloads = JSON.stringify(
     metadata.map((entry) => ({ q: entry.ordinal, n: entry.nameLength, r: entry.rawLength })),
   );
@@ -1335,14 +1232,10 @@ function treeExpansion(
   return { edges, nextCursor, complete };
 }
 
-function physicalExpansion(
-  store: SharedRepoStore,
-  object: QueueObject,
-  reservation: MemoryReservation,
-): ObjectExpansion {
+function physicalExpansion(store: SharedRepoStore, object: QueueObject): ObjectExpansion {
   const packed = validatedPackedBaseChain(store, object.oid);
   if (packed === null) {
-    requireObjectInfo(store, object.oid, reservation);
+    requireObjectInfo(store, object.oid);
     return { edges: [], nextCursor: 0, complete: true };
   }
   if (packed.baseOid === null) return { edges: [], nextCursor: 0, complete: true };
@@ -1587,18 +1480,8 @@ function publishExpansion(
   run: RunState,
   object: QueueObject,
   expansion: ObjectExpansion,
-  reservation: MemoryReservation,
 ): PublicationResult {
-  const publication = reservation.scope();
-  publication.set(
-    "other",
-    REACHABILITY_OPERATION_BYTES + expansion.edges.length * REACHABILITY_PUBLICATION_ROW_BYTES,
-  );
-  try {
-    return publishExpansionOwned(db, store, run, object, expansion);
-  } finally {
-    publication.dispose();
-  }
+  return publishExpansionOwned(db, store, run, object, expansion);
 }
 
 function publishExpansionOwned(
@@ -1767,76 +1650,65 @@ export function advanceMaintenanceReachability(
   if (!Number.isSafeInteger(store.repoId) || store.repoId < 1) {
     throw new GitError("EINVAL", "repository id must be a safe positive integer");
   }
-  const reservation = store.reserveMemory();
-  try {
-    reservation.set("other", REACHABILITY_OPERATION_BYTES);
-    return store.db.transactionSync(() => {
-      let run = readRun(store.db, store.repoId);
-      if (run.observedRootEpoch !== run.rootEpoch) {
-        return {
-          runId: run.runId,
-          status: "root-changed",
-          processedOid: null,
-          discoveredObjects: 0,
-          discoveredLogicalObjects: 0,
-        };
+  return store.db.transactionSync(() => {
+    let run = readRun(store.db, store.repoId);
+    if (run.observedRootEpoch !== run.rootEpoch) {
+      return {
+        runId: run.runId,
+        status: "root-changed",
+        processedOid: null,
+        discoveredObjects: 0,
+        discoveredLogicalObjects: 0,
+      };
+    }
+    if (run.phase === "classify-loose") {
+      auditCompletedMark(store.db, store.repoId, run);
+      return {
+        runId: run.runId,
+        status: "complete",
+        processedOid: null,
+        discoveredObjects: 0,
+        discoveredLogicalObjects: 0,
+      };
+    }
+    if (run.phase !== "mark") {
+      throw new GitError("EINVAL", `maintenance reachability cannot advance phase ${run.phase}`);
+    }
+    run = initializeAndValidateCounters(store.db, store.repoId, run);
+    const object = readNextObject(store.db, store.repoId, run.runId);
+    if (object === null) {
+      finishMark(store.db, store.repoId, run);
+      return {
+        runId: run.runId,
+        status: "complete",
+        processedOid: null,
+        discoveredObjects: 0,
+        discoveredLogicalObjects: 0,
+      };
+    }
+    if (run.queuedObjects === 0) {
+      throw new CorruptError("maintenance queued count omitted an unexpanded mark");
+    }
+    let expansion: ObjectExpansion;
+    if (object.physicalOnly) {
+      expansion = physicalExpansion(store, object);
+    } else {
+      const info = requireObjectInfo(store, object.oid);
+      if (object.shallowBoundary && info.type !== "commit") {
+        throw new CorruptError("maintenance shallow boundary is not a commit");
       }
-      if (run.phase === "classify-loose") {
-        auditCompletedMark(store.db, store.repoId, run);
-        return {
-          runId: run.runId,
-          status: "complete",
-          processedOid: null,
-          discoveredObjects: 0,
-          discoveredLogicalObjects: 0,
-        };
-      }
-      if (run.phase !== "mark") {
-        throw new GitError("EINVAL", `maintenance reachability cannot advance phase ${run.phase}`);
-      }
-      run = initializeAndValidateCounters(store.db, store.repoId, run);
-      const object = readNextObject(store.db, store.repoId, run.runId);
-      if (object === null) {
-        finishMark(store.db, store.repoId, run);
-        return {
-          runId: run.runId,
-          status: "complete",
-          processedOid: null,
-          discoveredObjects: 0,
-          discoveredLogicalObjects: 0,
-        };
-      }
-      if (run.queuedObjects === 0) {
-        throw new CorruptError("maintenance queued count omitted an unexpanded mark");
-      }
-      let expansion: ObjectExpansion;
-      const expansionMemory = reservation.scope();
-      try {
-        if (object.physicalOnly) {
-          expansion = physicalExpansion(store, object, expansionMemory);
-        } else {
-          const info = requireObjectInfo(store, object.oid, reservation);
-          if (object.shallowBoundary && info.type !== "commit") {
-            throw new CorruptError("maintenance shallow boundary is not a commit");
-          }
-          expansion =
-            info.type === "tree"
-              ? treeExpansion(store.db, store, object, info, expansionMemory)
-              : headerExpansion(store, object, info, expansionMemory);
-        }
-        const published = publishExpansion(store.db, store, run, object, expansion, reservation);
-        return {
-          runId: run.runId,
-          status: "progress",
-          processedOid: object.oid,
-          discoveredObjects: published.discoveredObjects,
-          discoveredLogicalObjects: published.discoveredLogicalObjects,
-        };
-      } finally {
-        expansionMemory.dispose();
-      }
-    });
-  } finally {
-    reservation.dispose();
-  }
+      expansion =
+        info.type === "tree"
+          ? treeExpansion(store.db, store, object, info)
+          : headerExpansion(store, object, info);
+    }
+    const published = publishExpansion(store.db, store, run, object, expansion);
+    return {
+      runId: run.runId,
+      status: "progress",
+      processedOid: object.oid,
+      discoveredObjects: published.discoveredObjects,
+      discoveredLogicalObjects: published.discoveredLogicalObjects,
+    };
+  });
 }

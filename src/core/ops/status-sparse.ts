@@ -1,4 +1,3 @@
-import type { MemoryReservation } from "../../memory.js";
 import {
   hydrateSparseWorkspaceOwned,
   sparseDirtyPathsOwned,
@@ -9,7 +8,6 @@ import type { GitContext, IndexTrackerSeedEntry } from "../context.js";
 import { CorruptError, GitError, hasErrorCode } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import type { Repository } from "../repository.js";
-import { retainedStringBytes } from "../retained.js";
 import type {
   SparseIndexAncestorFact,
   SparseWorkspaceResult,
@@ -40,25 +38,14 @@ import {
 
 const SPARSE_STATUS_PATHS = 1_000;
 const SPARSE_STATUS_ANCESTORS = 32_768;
-const SPARSE_STATUS_PATH_FIXED_BYTES = 96;
-const SPARSE_STATUS_ARRAY_SLOT_BYTES = 8;
 const SPARSE_INDEX_DIRTY = 1;
 const SPARSE_WORKTREE_DIRTY = 2;
-const FULL_STATUS_TRACKER_FIXED_BYTES = 256;
-const FULL_STATUS_TRACKER_ROW_BYTES = 256;
 
 /** Bounded dirty-leaf snapshot collected only by the eager repair pass. */
 export class FullStatusTrackerSeed {
   #entries = new Map<string, number>();
-  #retainedBytes = FULL_STATUS_TRACKER_FIXED_BYTES;
   #available = true;
   #finished = false;
-  #reservation: MemoryReservation | null;
-
-  constructor(owningReservation: MemoryReservation) {
-    this.#reservation = owningReservation.scope();
-    this.#reservation.set("other", this.#retainedBytes);
-  }
 
   get resealable(): boolean {
     return this.#available && this.#finished;
@@ -112,11 +99,6 @@ export class FullStatusTrackerSeed {
     for (const [path, flags] of this.#entries) yield { path, flags };
   }
 
-  dispose(): void {
-    this.#reservation?.dispose();
-    this.#reservation = null;
-  }
-
   #mark(path: string, flags: number): void {
     if (!this.#available || flags === 0) return;
     const previous = this.#entries.get(path);
@@ -128,26 +110,12 @@ export class FullStatusTrackerSeed {
       this.#disable();
       return;
     }
-    const retained = FULL_STATUS_TRACKER_ROW_BYTES + retainedStringBytes(path);
-    const reservation = this.#reservation;
-    if (reservation === null || this.#retainedBytes > Number.MAX_SAFE_INTEGER - retained) {
-      this.#disable();
-      return;
-    }
-    try {
-      reservation.set("other", this.#retainedBytes + retained);
-      this.#entries.set(path, flags);
-      this.#retainedBytes += retained;
-    } catch (error) {
-      if (!hasErrorCode(error, "E2BIG")) throw error;
-      this.#disable();
-    }
+    this.#entries.set(path, flags);
   }
 
   #disable(): void {
     this.#available = false;
     this.#entries = new Map();
-    this.dispose();
   }
 }
 
@@ -157,43 +125,22 @@ export function sparseStatus(
   options: StatusOptions,
   context: Pick<GitContext, "sparseWorkspace" | "indexTracker">,
   baselineTreeOid: string | null,
-  owningReservation: MemoryReservation,
 ): StatusDetail[] | null {
   const source = context.sparseWorkspace;
   const tracker = context.indexTracker;
   if (source === undefined || tracker === undefined) return null;
-  if (!repo.store.ownsMemoryReservation(owningReservation)) {
-    throw new GitError("EINVAL", "sparse status reservation belongs to another repository");
-  }
-  const reservation = owningReservation.scope();
+  let prepared: PreparedSparseStatus | null;
   try {
-    let prepared: PreparedSparseStatus | null;
-    try {
-      prepared = prepareSparseStatus(
-        repo,
-        worktree,
-        options,
-        context,
-        baselineTreeOid,
-        reservation,
-      );
-    } catch (error) {
-      if (hasErrorCode(error, "E2BIG")) return null;
-      throw error;
-    }
-    if (prepared === null) return null;
-    if (prepared.reseal !== null) {
-      tracker.reseal(
-        repo.checkout.checkoutId,
-        prepared.reseal.currentTreeOid,
-        prepared.reseal.seed,
-        reservation,
-      );
-    }
-    return prepared.details;
-  } finally {
-    reservation.dispose();
+    prepared = prepareSparseStatus(repo, worktree, options, context, baselineTreeOid);
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return null;
+    throw error;
   }
+  if (prepared === null) return null;
+  if (prepared.reseal !== null) {
+    tracker.reseal(repo.checkout.checkoutId, prepared.reseal.currentTreeOid, prepared.reseal.seed);
+  }
+  return prepared.details;
 }
 
 interface PreparedSparseStatus {
@@ -207,7 +154,6 @@ function prepareSparseStatus(
   options: StatusOptions,
   context: Pick<GitContext, "sparseWorkspace" | "indexTracker">,
   baselineTreeOid: string | null,
-  reservation: MemoryReservation,
 ): PreparedSparseStatus | null {
   const source = context.sparseWorkspace;
   if (source === undefined || context.indexTracker === undefined) return null;
@@ -216,10 +162,9 @@ function prepareSparseStatus(
   try {
     candidates = sparseStatusCandidates(
       repo,
-      sparseDirtyPathsOwned(source, repo.checkout.checkoutId, reservation),
+      sparseDirtyPathsOwned(source, repo.checkout.checkoutId),
       baselineTreeOid,
       currentTreeOid,
-      reservation,
     );
   } catch (error) {
     if (hasErrorCode(error, "E2BIG")) return null;
@@ -228,26 +173,18 @@ function prepareSparseStatus(
   if (candidates === null) return null;
   if (candidates.length === 0) return { details: [], reseal: null };
 
-  const hydrated: SparseWorkspaceResult = hydrateSparseWorkspaceOwned(
-    source,
-    {
-      repoId: repo.store.repoId,
-      checkoutId: repo.checkout.checkoutId,
-      root: repo.root,
-      baselineTreeOid,
-      currentTreeOid,
-      paths: candidates,
-    },
-    reservation,
-  );
+  const hydrated: SparseWorkspaceResult = hydrateSparseWorkspaceOwned(source, {
+    repoId: repo.store.repoId,
+    checkoutId: repo.checkout.checkoutId,
+    root: repo.root,
+    baselineTreeOid,
+    currentTreeOid,
+    paths: candidates,
+  });
   if (!hydrated.available) return null;
   if (hydrated.rows.length !== candidates.length) {
     throw new CorruptError("sparse status hydration returned the wrong row count");
   }
-  if (!Number.isSafeInteger(hydrated.retainedBytes) || hydrated.retainedBytes < 0) {
-    throw new CorruptError("sparse status hydration returned invalid retained bytes");
-  }
-
   const untrackedMode = options.untrackedFiles ?? "normal";
   let ignores = options.ignores;
   const ignoredUntracked = new Set<string>();
@@ -271,23 +208,15 @@ function prepareSparseStatus(
   let ancestorFacts = new Map<string, SparseIndexAncestorFact>();
   if (untrackedMode === "normal" && reportableUntracked.length !== 0) {
     try {
-      const ancestors = sparseUntrackedAncestors(reportableUntracked, reservation);
+      const ancestors = sparseUntrackedAncestors(reportableUntracked);
       if (ancestors.paths.length !== 0) {
         if (source.indexAncestorFacts === undefined) return null;
-        const result = sparseIndexAncestorFactsOwned(
-          source,
-          {
-            checkoutId: repo.checkout.checkoutId,
-            ancestors: ancestors.paths,
-          },
-          reservation,
-        );
-        if (
-          !Number.isSafeInteger(result.retainedBytes) ||
-          result.retainedBytes < 0 ||
-          result.facts.length !== ancestors.paths.length
-        ) {
-          throw new CorruptError("sparse index ancestor lookup returned invalid retained state");
+        const result = sparseIndexAncestorFactsOwned(source, {
+          checkoutId: repo.checkout.checkoutId,
+          ancestors: ancestors.paths,
+        });
+        if (result.facts.length !== ancestors.paths.length) {
+          throw new CorruptError("sparse index ancestor lookup returned the wrong fact count");
         }
         ancestorFacts = validatedAncestorFacts(ancestors.paths, result.facts);
       }
@@ -297,7 +226,7 @@ function prepareSparseStatus(
     }
   }
 
-  const worktreeComparison = compareSparseWorktree(repo, worktree, hydrated.rows, reservation);
+  const worktreeComparison = compareSparseWorktree(repo, worktree, hydrated.rows);
   const buffered: BufferedStatusRow[] = [];
   const retained = new Map<string, number>();
   const collapsedIgnored = new Set<string>();
@@ -368,7 +297,6 @@ function compareSparseWorktree(
   repo: Repository,
   worktree: Worktree,
   rows: readonly SparseWorkspaceRow[],
-  owningReservation: MemoryReservation,
 ): { dirty: Set<string>; hashes: Map<string, HashedPath> } {
   const dirty = new Set<string>();
   const pending: Array<{ entry: IndexEntry; worktree: WorktreePath }> = [];
@@ -409,8 +337,7 @@ function compareSparseWorktree(
     if (oid === undefined) unresolved.push(candidate.worktree);
     else if (oid !== candidate.entry.oid) dirty.add(candidate.entry.path);
   }
-  const hashReservation = owningReservation.scope();
-  const hashed = hashExactWorktreePathsOwned(repo, worktree, unresolved, hashReservation, {
+  const hashed = hashExactWorktreePathsOwned(repo, worktree, unresolved, {
     write: false,
   });
   repo.store.upsertBlobIds(
@@ -431,81 +358,40 @@ function sparseStatusCandidates(
   dirty: Iterable<{ path: string }>,
   baselineTreeOid: string | null,
   currentTreeOid: string | null,
-  owningReservation: MemoryReservation,
 ): string[] | null {
-  const reservation = owningReservation.scope();
   const paths = new Set<string>();
-  let retainedBytes = 0;
   const add = (path: string): boolean => {
     if (paths.has(path)) return true;
-    const next = retainedBytes + SPARSE_STATUS_PATH_FIXED_BYTES + retainedStringBytes(path);
-    if (!Number.isSafeInteger(next) || paths.size === SPARSE_STATUS_PATHS) return false;
-    reservation.set("other", next);
+    if (paths.size === SPARSE_STATUS_PATHS) return false;
     paths.add(path);
-    retainedBytes = next;
     return true;
   };
-  try {
-    for (const entry of dirty) {
-      if (!add(entry.path)) {
-        reservation.dispose();
-        return null;
-      }
+  for (const entry of dirty) {
+    if (!add(entry.path)) {
+      return null;
     }
-    for (const entry of repo.store.walkTreeDiff(
-      baselineTreeOid,
-      currentTreeOid,
-      owningReservation,
-    )) {
-      if (!add(entry.path)) {
-        reservation.dispose();
-        return null;
-      }
-    }
-    const arrayBytes = SPARSE_STATUS_PATH_FIXED_BYTES + paths.size * SPARSE_STATUS_ARRAY_SLOT_BYTES;
-    reservation.set("other", retainedBytes + arrayBytes);
-    return [...paths].sort(comparePaths);
-  } catch (error) {
-    reservation.dispose();
-    throw error;
   }
+  for (const entry of repo.store.walkTreeDiff(baselineTreeOid, currentTreeOid)) {
+    if (!add(entry.path)) {
+      return null;
+    }
+  }
+  return [...paths].sort(comparePaths);
 }
 
-function sparseUntrackedAncestors(
-  paths: readonly string[],
-  owningReservation: MemoryReservation,
-): { paths: string[] } {
-  const reservation = owningReservation.scope();
+function sparseUntrackedAncestors(paths: readonly string[]): { paths: string[] } {
   const ancestors = new Set<string>();
-  let retainedBytes = 0;
-  try {
-    for (const path of paths) {
-      for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
-        const retained = SPARSE_STATUS_PATH_FIXED_BYTES + 48 + slash * 2;
-        if (!Number.isSafeInteger(retained) || retainedBytes > Number.MAX_SAFE_INTEGER - retained) {
-          throw new GitError("E2BIG", "sparse status ancestor state is too large");
-        }
-        reservation.set("other", retainedBytes + retained);
-        const ancestor = path.slice(0, slash);
-        if (ancestors.has(ancestor)) {
-          reservation.set("other", retainedBytes);
-          continue;
-        }
-        if (ancestors.size === SPARSE_STATUS_ANCESTORS) {
-          throw new GitError("E2BIG", "sparse status has too many untracked ancestors");
-        }
-        ancestors.add(ancestor);
-        retainedBytes += retained;
+  for (const path of paths) {
+    for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+      const ancestor = path.slice(0, slash);
+      if (ancestors.has(ancestor)) continue;
+      if (ancestors.size === SPARSE_STATUS_ANCESTORS) {
+        throw new GitError("E2BIG", "sparse status has too many untracked ancestors");
       }
+      ancestors.add(ancestor);
     }
-    const arrayBytes =
-      SPARSE_STATUS_PATH_FIXED_BYTES + ancestors.size * SPARSE_STATUS_ARRAY_SLOT_BYTES;
-    reservation.set("other", retainedBytes + arrayBytes);
-    return { paths: [...ancestors].sort(comparePaths) };
-  } catch (error) {
-    reservation.dispose();
-    throw error;
   }
+  return { paths: [...ancestors].sort(comparePaths) };
 }
 
 function validatedAncestorFacts(
