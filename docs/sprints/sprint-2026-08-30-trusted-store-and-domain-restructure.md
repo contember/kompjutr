@@ -329,3 +329,26 @@ spec and this plan are authoritative; tests are the only gate.
   (Decoder/RowShape/OptionsSchema kit) + consolidated `src/core/paths.ts`;
   `staging.ts` and `maintenance/state.ts` converted as the representative
   slice (zero `Reflect.get` option loops remain in staging).
+- 2026-08-31 — WU4 landed (fanned out over four agents; one was killed
+  mid-run and finished by a successor): `src/memory.ts`,
+  `core/ops/transport-budget.ts`, `core/retained.ts`, and
+  `tests/memory.test.ts` deleted; reservation plumbing stripped from every
+  Git-side signature; new fixed structural caps replace the reservation-derived
+  ones (`MAX_PUSH_PLAN_BYTES` 64 MiB, `COMMIT_GRAPH_WALK_BYTES` 64 MiB,
+  `TREE_WALK_PATH_BYTES` 7,456,512, `TREE_WALK_STATE_BYTES` 64 MiB,
+  `SPARSE_WORKSPACE_STATE_BYTES` 64 MiB); the commit cache now always flushes
+  (the ledger gate silently dropped it); `git_operation_state.retained_bytes`
+  dropped. No package-entrypoint export changed
+  (`tests/public-exports.test.ts` untouched); removed members on exported
+  classes for the OUTCOME: `SharedRepoStore.{memory,reserveMemory,
+  ownsMemoryReservation,scopeMemoryReservation}`, `CheckoutStore.reserveMemory`,
+  reservation parameters on `walkTree*`/`beginFetchPublication`/the `*Owned`
+  family/`runGitCli`/`createGitCliRunner`, and ledger-only result fields
+  (`retainedBytes` on merge-base/rebase/replay/sparse/ls-files results,
+  `TreeParser.retainedBytes`, `InitialWorktreeSession.highWaterBytes`).
+  Gates: typecheck 0, biome clean, `npm test` 161/161 (six deleted ledger
+  smoke tests account for the drop from 167). Leased 512 MiB cgroup scenarios:
+  12/12 pass, max process transient 54.4 MiB (`sqlite.pack.fallback-audit`),
+  min 1.1 MiB; three `core.*` SQL-target misses are report-only. The
+  `git_tree_entries_by_name_bytes` index is now unconditional (wave-3 seam for
+  deleting its `typeof` join predicates).
