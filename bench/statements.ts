@@ -303,20 +303,20 @@ const BASELINE_ROWS_READ: Record<RequiredRow, number> = {
 const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
   {
     operation: "git.clone",
-    statements: 1_586,
-    rowsRead: 109_918,
+    statements: 906,
+    rowsRead: 78_558,
     source: "frozen three-run baseline",
   },
   {
     operation: "git.commit (100)",
-    statements: 44,
-    rowsRead: 722,
+    statements: 49,
+    rowsRead: 725,
     source: "frozen three-run baseline",
   },
   {
     operation: "git.checkout main (force)",
-    statements: 67,
-    rowsRead: 925,
+    statements: 68,
+    rowsRead: 926,
     source: "frozen three-run baseline",
   },
 ];

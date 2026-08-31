@@ -1,7 +1,8 @@
 # Current benchmark snapshot
 
-Measured in three clean runs on 2026-08-27 at commit
-`d03aa708af926d3590fc4903bc6946b38698be7e` with Node v24.4.0, SQLite 3.50.2,
+Measured in three clean runs on 2026-08-31 from the working tree based on commit
+`dd7f0f3f1504d837bc23d851bb7bdd21d3500f88`, including the clone lease-window
+change recorded with this snapshot. The host used Node v24.4.0, SQLite 3.50.2,
 git 2.54.0, Linux 6.17.0-41-generic x64, and an AMD Ryzen 7 PRO 8840HS:
 
 ```bash
@@ -23,34 +24,61 @@ proof of a production isolate limit.
 
 | Operation | Median wall | SQL | Rows |
 | --- | ---: | ---: | ---: |
-| `git.clone` | 11,628.592 ms | 824 | 78,537 |
-| `git.status` — clean clone | 2.461 ms | 9 | 7 |
-| `git.branch` | 4.050 ms | 23 | 13 |
-| `fs.writeFiles` — 100 | 23.206 ms | 6 | 288 |
-| `git.status` — 100 modified | 1,234.155 ms | 59 | 49,538 |
-| `git.diffSummary` — 100 | 74.973 ms | 28 | 1,574 |
-| `git.diff` — 100 | 65.242 ms | 27 | 1,572 |
-| `git.add` — 100 | 75.338 ms | 15 | 1,752 |
-| `git.status` — 100 staged | 1,176.031 ms | 58 | 49,192 |
-| `git.commit` — 100 | 55.527 ms | 38 | 717 |
-| `git.push` — 100 | 414.325 ms | 29 | 738 |
-| `git.status` — clean commit | 29.487 ms | 23 | 683 |
-| `git.checkout main` | 87.534 ms | 59 | 819 |
-| `git.checkout main --force` | 70.305 ms | 60 | 919 |
-| `git.status` — clean main | 0.723 ms | 10 | 7 |
-| `git.checkout bench-work` | 71.178 ms | 59 | 1,018 |
-| `git.checkout bench-work --force` | 78.531 ms | 59 | 1,018 |
-| `git.status` — clean work | 0.791 ms | 9 | 7 |
+| `git.clone` | 11,334.516 ms | 906 | 78,558 |
+| `git.status` — clean clone | 3.975 ms | 14 | 12 |
+| `git.branch` | 5.067 ms | 29 | 19 |
+| `fs.writeFiles` — 100 | 29.420 ms | 6 | 288 |
+| `git.status` — 100 modified | 619.453 ms | 61 | 49,540 |
+| `git.diffSummary` — 100 | 70.051 ms | 29 | 1,575 |
+| `git.diff` — 100 | 69.355 ms | 28 | 1,573 |
+| `git.add` — 100 | 77.207 ms | 17 | 1,752 |
+| `git.status` — 100 staged | 574.037 ms | 60 | 49,194 |
+| `git.commit` — 100 | 53.048 ms | 49 | 725 |
+| `git.push` — 100 | 423.362 ms | 47 | 763 |
+| `git.status` — clean commit | 27.151 ms | 25 | 685 |
+| `git.checkout main` | 80.399 ms | 67 | 826 |
+| `git.checkout main --force` | 67.368 ms | 68 | 926 |
+| `git.status` — clean main | 0.815 ms | 11 | 8 |
+| `git.checkout bench-work` | 69.828 ms | 66 | 1,025 |
+| `git.checkout bench-work --force` | 67.672 ms | 66 | 1,025 |
+| `git.status` — clean work | 0.738 ms | 10 | 8 |
 
 Every phase met the at-most-1,000-statement benchmark target in all three runs,
 and every operation and status assertion passed. Target status is performance
-evidence, not a runtime admission rule. Every one of the three
-runs for each required row was below 100 ms: maxima were 76.957 ms for add,
-58.832 ms for commit, 29.558 ms for clean post-commit status, 89.446 ms for
-checkout to main, and 79.682 ms for checkout to bench-work. Both real force
-transitions were also below 100 ms in all three runs, with maxima of 72.793 and
-98.198 ms. The modified and staged status rows remain full-repository paths and
-do not meet that wall target.
+evidence, not a runtime admission rule. Every one of the three runs for each
+required row was below 100 ms: maxima were 90.140 ms for add, 57.715 ms for
+commit, 28.108 ms for clean post-commit status, 82.985 ms for checkout to main,
+and 76.114 ms for checkout to bench-work. Both real force transitions were also
+below 100 ms in all three runs, with maxima of 71.589 and 68.191 ms. The modified
+and staged status rows remain full-repository paths and do not meet that wall
+target.
+
+## Clone statement profile
+
+The trusted-store restructure's first informative clone measured 1,613
+statements over 79,265 rows. A leased statement histogram attributed 709 calls
+to the provisional-owner lifecycle lookup: every pack-ingest checkpoint called
+the durable renewal path even though clone had just written a five-minute lease.
+Retaining that known expiry in the clone operation and entering the durable
+renewal path only inside its fixed renewal window removed 707 redundant lookups.
+The durable lookup and CAS still run before expiry, after a long yield, and at
+publication; takeover and restart behavior are unchanged.
+
+The post-fix profile is 906 statements over 78,558 rows. Its remaining largest
+shapes are structurally bounded work rather than scalar reads in a path loop:
+
+| Query family | Calls | Decision |
+| --- | ---: | --- |
+| Initial filesystem chunk writes | 155 | Accept: payload-sized chunk batches. |
+| Initial filesystem node writes | 114 | Accept: bounded JSON batches. |
+| Initial filesystem path writes | 114 | Accept: bounded JSON batches. |
+| Packed-blob graph and source reads | 182 | Accept: capped input and graph pages. |
+| Pack chunk, object-index, and pending writes | 130 | Accept: fixed chunk and row/byte batches. |
+| Initial filesystem mutation pages | 48 | Accept: bounded mutation batches. |
+
+Commit-cache inserts were not among the twelve hottest shapes, rejecting the
+initial suspicion that unconditional cache flushing caused the growth. No cache
+skip or new runtime admission rule was added.
 
 The harness writes detailed generated output to `bench/results/`, which is
 gitignored. Update this curated snapshot only from a CPU-leased run. Historical

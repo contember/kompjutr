@@ -30,14 +30,14 @@ None right now.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Shipped: the trusted-store restructure — trusted rows, no memory ledger,
-  `fs`/`shell`/`git` domains over the `src/db/` kernel, store families split
-  ([`archived sprint`](archive/sprint-2026-08-30-trusted-store-and-domain-restructure.md)).
-  Next: [backlog 65](backlog/65-clone-statement-profile-after-trusted-store.md)
-  profiles the clone statement growth and refreshes the benchmark snapshot.
-- The external consumer adapter remains an integration gate outside this public
-  repository; its provider lacks the bulk worktree scan needed for an efficient
-  implementation without crossing private storage boundaries.
+- The trusted-store restructure and its clone follow-up are complete. Clone is
+  back under the statement target at 906 SQL / 78,558 rows; the attribution and
+  current median-of-three snapshot are in
+  [`benchmark-current`](reference/benchmark-current.md#clone-statement-profile).
+- Next is the external consumer integration gate outside this public repository;
+  its provider still lacks the bulk worktree scan needed for an efficient
+  implementation without crossing private storage boundaries. Phase 2 is
+  re-planned from that real workflow rather than package-local assumptions.
 
 ## Key reference
 

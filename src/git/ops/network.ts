@@ -33,6 +33,8 @@ import {
   type FetchPublicationToken,
   listCheckoutsOwned,
   PACK_BLOB_BATCH_TARGET_BYTES,
+  PROVISIONAL_CLONE_LEASE_MS,
+  PROVISIONAL_CLONE_RENEW_WINDOW_MS,
 } from "../store/index.js";
 import { checkoutTree, matchesPaths, type TargetEntry } from "./checkout.js";
 import type { GitContext } from "./context.js";
@@ -1280,15 +1282,19 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     checkoutTree(new Repository(store), context.worktree, null);
     return undefined;
   };
+  const cloneStartedAt = context.now();
   const owner = context.database.beginProvisionalClone(
     root,
     "ref: refs/heads/main",
-    context.now(),
+    cloneStartedAt,
     cleanup,
   );
   const repo = new Repository(owner.store);
+  let leaseExpiresAt = cloneStartedAt + PROVISIONAL_CLONE_LEASE_MS;
   const heartbeat = (): void => {
-    context.database.renewProvisionalClone(owner, context.now());
+    const now = context.now();
+    if (leaseExpiresAt - now > PROVISIONAL_CLONE_RENEW_WINDOW_MS) return;
+    leaseExpiresAt = context.database.renewProvisionalClone(owner, now);
   };
   const checkpoint = (): Promise<void> | undefined => {
     heartbeat();

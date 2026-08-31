@@ -24,6 +24,7 @@ class RecordingStorage implements DurableObjectStorageLike {
   // These counters distinguish fast-path and fallback query shapes, not total SQL cost.
   walkStatements = 0;
   blobReadStatements = 0;
+  provisionalOwnerReads = 0;
   maxBlobReadOids = 0;
 
   constructor() {
@@ -43,6 +44,12 @@ class RecordingStorage implements DurableObjectStorageLike {
             );
           }
         }
+        if (
+          query.includes("FROM git_repositories repository") &&
+          query.includes("checkout.id = ? AND checkout.is_primary = 1")
+        ) {
+          this.provisionalOwnerReads++;
+        }
         return this.inner.sql.exec<Row>(query, ...bindings);
       },
     };
@@ -56,6 +63,7 @@ class RecordingStorage implements DurableObjectStorageLike {
     this.inner.resetCounters();
     this.walkStatements = 0;
     this.blobReadStatements = 0;
+    this.provisionalOwnerReads = 0;
     this.maxBlobReadOids = 0;
   }
 }
@@ -437,6 +445,7 @@ describe("clone initial-state fast path", () => {
       expect(count(workspace, "git_index")).toBe(24_252);
       expect(storage.walkStatements).toBe(3);
       expect(storage.maxBlobReadOids).toBe(1_000);
+      expect(storage.provisionalOwnerReads).toBe(1);
       expect(storage.inner.statementCount).toBeLessThan(1_000);
     } finally {
       await server.close();

@@ -43,7 +43,12 @@ export {
   SqliteGitDatabase,
 } from "./database.js";
 export { indexScanOwned } from "./index-table.js";
-export { ancestors, normalizeRoot, PROVISIONAL_CLONE_LEASE_MS } from "./lifecycle.js";
+export {
+  ancestors,
+  normalizeRoot,
+  PROVISIONAL_CLONE_LEASE_MS,
+  PROVISIONAL_CLONE_RENEW_WINDOW_MS,
+} from "./lifecycle.js";
 export {
   readAuthenticatedObjectOwned,
   writeBatchOwned,
