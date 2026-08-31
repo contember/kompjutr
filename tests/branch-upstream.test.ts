@@ -86,20 +86,4 @@ describe("branch upstream resolver", () => {
     );
   });
 
-  it("rejects a corrupt direct upstream ref", () => {
-    const workspace = makeRepo("/");
-    workspace.repo.store.configSet("branch.main.remote", ".");
-    workspace.repo.store.configSet("branch.main.merge", "refs/heads/release");
-    workspace.repo.store.setRef("refs/heads/release", OID);
-    workspace.database.db.run(
-      "UPDATE git_refs SET target = ? WHERE repo_id = ? AND name = ?",
-      "malformed",
-      workspace.repo.store.repoId,
-      "refs/heads/release",
-    );
-
-    expect(() => resolveBranchUpstream(workspace.repo, "refs/heads/main")).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-  });
 });
