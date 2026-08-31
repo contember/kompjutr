@@ -7,7 +7,7 @@
 // over last.
 
 import { utf8Decoder } from "../common/bytes.js";
-import { CorruptError } from "../common/errors.js";
+import { CorruptError, GitError } from "../common/errors.js";
 import { MAX_PKT_FRAME_BYTES } from "./pktline.js";
 
 export { MAX_PKT_FRAME_BYTES } from "./pktline.js";
@@ -21,6 +21,29 @@ export interface Pkt {
   payload: Uint8Array;
 }
 
+export function abortedError(signal: AbortSignal): GitError {
+  return new GitError("EABORTED", "network operation aborted", { cause: signal.reason });
+}
+
+export function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw abortedError(signal);
+}
+
+export async function abortable<T>(
+  operation: PromiseLike<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  throwIfAborted(signal);
+  if (signal === undefined) return await operation;
+  return await new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(abortedError(signal));
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(operation).then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
+}
+
 export function pktText(pkt: Pkt): string {
   const text = utf8Decoder.decode(pkt.payload);
   return text.endsWith("\n") ? text.slice(0, -1) : text;
@@ -28,13 +51,15 @@ export function pktText(pkt: Pkt): string {
 
 export class ByteReader {
   readonly #source: AsyncIterator<Uint8Array>;
+  readonly #signal: AbortSignal | undefined;
   #chunk: Uint8Array = EMPTY;
   #offset = 0;
   #done = false;
   #releasePromise: Promise<void> | null = null;
 
-  constructor(source: AsyncIterable<Uint8Array>) {
+  constructor(source: AsyncIterable<Uint8Array>, signal?: AbortSignal) {
     this.#source = source[Symbol.asyncIterator]();
+    this.#signal = signal;
   }
 
   /** Finalize the source once and release the current parse frame. */
@@ -54,7 +79,7 @@ export class ByteReader {
 
   async #advance(): Promise<boolean> {
     while (!this.#done) {
-      const next = await this.#source.next();
+      const next = await abortable(this.#source.next(), this.#signal);
       if (next.done === true) {
         this.#done = true;
         return false;
@@ -99,6 +124,7 @@ export class ByteReader {
   /** The next pkt-line, or null at end of stream. */
   async readPkt(): Promise<Pkt | null> {
     try {
+      throwIfAborted(this.#signal);
       let header: Uint8Array | null;
       try {
         header = await this.#takeExact(4);
@@ -137,14 +163,15 @@ export class ByteReader {
   /** Everything not yet consumed, streamed on. */
   async *rest(): AsyncGenerator<Uint8Array> {
     try {
+      throwIfAborted(this.#signal);
       if (this.#offset < this.#chunk.length) {
         yield this.#chunk.subarray(this.#offset);
         this.#offset = this.#chunk.length;
       }
-      for (;;) {
-        const next = await this.#source.next();
-        if (next.done === true) return;
-        if (next.value.length > 0) yield next.value;
+      while (await this.#advance()) {
+        const chunk = this.#chunk;
+        this.#offset = chunk.length;
+        yield chunk;
       }
     } finally {
       await this.release();

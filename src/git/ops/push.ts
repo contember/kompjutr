@@ -16,9 +16,11 @@ import { type Advertisement, discover } from "../protocol/remote.js";
 import type { FetchPublicationToken, RefRow } from "../store/index.js";
 import type { GitContext } from "./context.js";
 import {
+  type AbortableNetworkOptions,
   createRemoteAuth,
   type RemoteAuthOptions,
   remoteUrlFor,
+  validateAbortableNetworkOptions,
   validateRemoteAuthOptions,
   withPromisorHydration,
 } from "./network.js";
@@ -60,6 +62,7 @@ interface LegacyPushSelection {
 }
 
 export type PushOptions = RemoteAuthOptions &
+  AbortableNetworkOptions &
   RemoteTarget & {
     readonly atomic?: boolean;
     readonly pushOptions?: readonly string[];
@@ -90,6 +93,7 @@ function validatePushOperationOptions(options: unknown): void {
     throw new GitError("EINVAL", "push options must be an object");
   }
   validateRemoteAuthOptions(options);
+  validateAbortableNetworkOptions(options);
   const remote = Reflect.get(options, "remote");
   const url = Reflect.get(options, "url");
   if (remote !== undefined && url !== undefined) {

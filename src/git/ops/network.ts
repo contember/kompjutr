@@ -28,6 +28,7 @@ import {
   type UploadPackFilter,
   uploadPack,
 } from "../protocol/remote.js";
+import { throwIfAborted } from "../protocol/stream.js";
 import { type AuthCallback, type GitAuth, RemoteAuthSession } from "../protocol/transport.js";
 import {
   type CheckoutStore,
@@ -71,6 +72,20 @@ export interface RemoteAuthOptions {
   onMessage?: MessageCallback;
 }
 
+export interface AbortableNetworkOptions {
+  readonly signal?: AbortSignal;
+}
+
+export function validateAbortableNetworkOptions(options: unknown): void {
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new GitError("EINVAL", "network options must be an object");
+  }
+  const signal = Reflect.get(options, "signal");
+  if (signal !== undefined && !(signal instanceof AbortSignal)) {
+    throw new GitError("EINVAL", "network signal must be an AbortSignal");
+  }
+}
+
 /** Validate the static remote/auth callback surface before any network request. */
 export function validateRemoteAuthOptions(options: unknown): void {
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
@@ -85,7 +100,7 @@ export function validateRemoteAuthOptions(options: unknown): void {
   }
 }
 
-export interface CloneOptions extends RemoteAuthOptions {
+export interface CloneOptions extends RemoteAuthOptions, AbortableNetworkOptions {
   url: string;
   dir?: string;
   ref?: string;
@@ -117,7 +132,7 @@ interface LegacyFetchSelection {
   readonly tags?: boolean;
 }
 
-export type FetchOptions = RemoteAuthOptions & {
+export type FetchOptions = RemoteAuthOptions & AbortableNetworkOptions & {
   readonly dir?: string;
   readonly filter?: UploadPackFilter;
 } & RemoteTarget &
@@ -126,7 +141,7 @@ export type FetchOptions = RemoteAuthOptions & {
 export type FetchResult = StructuredFetchResult;
 
 /** Internal clone/concurrency callers may pin both the configured name and its observed URL. */
-type FetchOperationOptions = RemoteAuthOptions & {
+type FetchOperationOptions = RemoteAuthOptions & AbortableNetworkOptions & {
   readonly dir?: string;
   readonly remote?: string;
   readonly url?: string;
@@ -144,6 +159,7 @@ export function validateFetchOptions(options: unknown): void {
     throw new GitError("EINVAL", "fetch options must be an object");
   }
   validateRemoteAuthOptions(options);
+  validateAbortableNetworkOptions(options);
   if (!("remote" in options) && !("url" in options) && !("refspecs" in options)) {
     return;
   }
@@ -194,6 +210,17 @@ type FetchCheckpointStage =
   | "after-shallow-response"
   | "before-ref-publication"
   | "after-ref-publication";
+
+async function runFetchCheckpoint(
+  checkpoint: FetchBehavior["checkpoint"],
+  stage: FetchCheckpointStage,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  throwIfAborted(signal);
+  const pending = checkpoint?.(stage);
+  if (pending !== undefined) await pending;
+  throwIfAborted(signal);
+}
 
 interface FetchSelection {
   coverage: RemoteRef[];
@@ -508,29 +535,31 @@ async function ingestPack(
   say: ((text: string) => void) | undefined,
   checkpoint: ((stage: FetchCheckpointStage) => Promise<void> | undefined) | undefined,
   promisor: { remote: string; url: string } | undefined,
+  signal: AbortSignal | undefined,
 ): Promise<void> {
   const yieldNow =
     checkpoint === undefined
       ? context.yieldNow
       : async (): Promise<void> => {
-          const pending = checkpoint("pack-ingest");
-          if (pending !== undefined) await pending;
+          await runFetchCheckpoint(checkpoint, "pack-ingest", signal);
         };
-  await repo.store.packs.ingest(pack, {
+  const ingestOptions = {
     ...(say === undefined ? {} : { onProgress: say }),
     now: context.now,
     ...(yieldNow === undefined ? {} : { yieldNow }),
+    ...(signal === undefined ? {} : { signal }),
     ...(promisor === undefined
       ? {}
       : {
           lifecycle: {
             reserved() {},
-            published(result) {
+            published(result: { readonly packId: number }) {
               recordPartialFetch(repo, promisor.remote, promisor.url, result.packId);
             },
           },
         }),
-  });
+  };
+  await repo.store.packs.ingest(pack, ingestOptions);
 }
 
 async function transferPack(
@@ -549,13 +578,14 @@ async function transferPack(
     haves?: string[];
     useLocalHaves?: boolean;
   },
-  auth: Parameters<typeof uploadPack>[1],
+  auth: NonNullable<Parameters<typeof uploadPack>[1]>,
   say: ((text: string) => void) | undefined,
   checkpoint: ((stage: FetchCheckpointStage) => Promise<void> | undefined) | undefined,
 ): Promise<{ shallow: string[]; unshallow: string[] }> {
+  const signal = auth.signal;
+  throwIfAborted(signal);
   if (request.wants.length === 0) return { shallow: [], unshallow: [] };
-  const beforeUpload = checkpoint?.("before-upload");
-  if (beforeUpload !== undefined) await beforeUpload;
+  await runFetchCheckpoint(checkpoint, "before-upload", signal);
   let result: Awaited<ReturnType<typeof uploadPack>>;
   try {
     const haves = [
@@ -580,34 +610,41 @@ async function transferPack(
       auth,
     );
   } catch (error) {
+    throwIfAborted(signal);
     if (isPublicFetchNetworkError(error)) throw error;
     throw new GitError("EHTTP", "upload-pack request failed", { cause: error });
   }
-  const beforeIngest = checkpoint?.("before-ingest");
-  if (beforeIngest !== undefined) await beforeIngest;
+  await runFetchCheckpoint(checkpoint, "before-ingest", signal);
   await ingestPack(
     context,
     repo,
-    fetchPackStream(result.pack),
+    fetchPackStream(result.pack, signal),
     say,
     checkpoint,
     request.promisorRemote === undefined
       ? undefined
       : { remote: request.promisorRemote, url: request.url },
+    signal,
   );
-  const afterIngest = checkpoint?.("after-ingest");
-  if (afterIngest !== undefined) await afterIngest;
+  await runFetchCheckpoint(checkpoint, "after-ingest", signal);
   if (result.shallow.length > 0 || result.unshallow.length > 0) {
-    const afterShallow = checkpoint?.("after-shallow-response");
-    if (afterShallow !== undefined) await afterShallow;
+    await runFetchCheckpoint(checkpoint, "after-shallow-response", signal);
   }
   return { shallow: result.shallow, unshallow: result.unshallow };
 }
 
-async function* fetchPackStream(source: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+async function* fetchPackStream(
+  source: AsyncIterable<Uint8Array>,
+  signal?: AbortSignal,
+): AsyncGenerator<Uint8Array> {
   try {
-    yield* source;
+    for await (const chunk of source) {
+      throwIfAborted(signal);
+      yield chunk;
+    }
+    throwIfAborted(signal);
   } catch (error) {
+    throwIfAborted(signal);
     if (isPublicFetchNetworkError(error)) throw error;
     throw new GitError("EHTTP", "upload-pack response stream failed", { cause: error });
   }
@@ -717,8 +754,11 @@ export async function hydratePromisedBlobs(
   context: GitContext,
   repo: Repository,
   oids: readonly string[],
-  options: RemoteAuthOptions = {},
+  options: RemoteAuthOptions & AbortableNetworkOptions = {},
 ): Promise<void> {
+  validateRemoteAuthOptions(options);
+  validateAbortableNetworkOptions(options);
+  throwIfAborted(options.signal);
   const unique = [...new Set(oids)];
   if (unique.length > MAX_PROTOCOL_NEGOTIATION_ENTRIES) {
     throw new GitError(
@@ -735,6 +775,7 @@ export async function hydratePromisedBlobs(
     else group.push(blob.oid);
   }
   for (const [remote, wants] of byRemote) {
+    throwIfAborted(options.signal);
     const promisor = repo.store.readPromisorRemote(remote);
     if (promisor === null) throw new CorruptError(`promisor remote ${remote} is missing`);
     const configured = remoteUrlFor(repo, remote);
@@ -743,12 +784,16 @@ export async function hydratePromisedBlobs(
     }
     const headers = options.headers ?? context.promisorHeaders;
     const onAuth = options.onAuth ?? context.promisorAuth;
-    const auth = createRemoteAuth(context, {
-      ...(headers === undefined ? {} : { headers }),
-      ...(onAuth === undefined ? {} : { onAuth }),
-      ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
-      ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
-    });
+    const auth = createRemoteAuth(
+      context,
+      {
+        ...(headers === undefined ? {} : { headers }),
+        ...(onAuth === undefined ? {} : { onAuth }),
+        ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+        ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
+      },
+      options.signal,
+    );
     const advertisement = await fetchAdvertisement(promisor.url, auth);
     const transfer = await transferPack(
       context,
@@ -773,6 +818,7 @@ export async function hydratePromisedBlobs(
       throw new GitError("EFETCHFAIL", "promisor remote did not return every requested blob");
     }
     for (const oid of wants) {
+      throwIfAborted(options.signal);
       const metadata = repo.store.typeAndSize(oid);
       if (metadata?.type !== "blob") {
         throw new CorruptError(`promisor returned a non-blob object for ${oid}`);
@@ -786,9 +832,12 @@ export async function withPromisorHydration<T>(
   context: GitContext,
   repo: Repository,
   body: () => T,
+  options: AbortableNetworkOptions = {},
 ): Promise<T> {
+  validateAbortableNetworkOptions(options);
   const requested = new Set<string>();
   for (;;) {
+    throwIfAborted(options.signal);
     try {
       return body();
     } catch (error) {
@@ -803,7 +852,7 @@ export async function withPromisorHydration<T>(
           `operation requires more than ${MAX_PROTOCOL_NEGOTIATION_ENTRIES} promised blobs`,
         );
       }
-      await hydratePromisedBlobs(context, repo, oids);
+      await hydratePromisedBlobs(context, repo, oids, options);
     }
   }
 }
@@ -814,8 +863,11 @@ export async function hydrateTreeBlobs(
   repo: Repository,
   treeOid: string,
   paths: string[] | undefined,
-  options: RemoteAuthOptions = {},
+  options: RemoteAuthOptions & AbortableNetworkOptions = {},
 ): Promise<void> {
+  validateRemoteAuthOptions(options);
+  validateAbortableNetworkOptions(options);
+  throwIfAborted(options.signal);
   const promised = new Set<string>();
   let candidates: string[] = [];
   const flush = (): void => {
@@ -831,6 +883,7 @@ export async function hydrateTreeBlobs(
     candidates = [];
   };
   for (const entry of treeStream(repo, treeOid)) {
+    throwIfAborted(options.signal);
     if (entry.mode === "160000" || !matchesPaths(entry.path, paths)) continue;
     candidates.push(entry.oid);
     if (candidates.length === PROMISOR_LOOKUP_PAGE) flush();
@@ -840,12 +893,17 @@ export async function hydrateTreeBlobs(
 }
 
 /** Build one authenticated remote session. */
-export function createRemoteAuth(context: GitContext, options: RemoteAuthOptions) {
+export function createRemoteAuth(
+  context: GitContext,
+  options: RemoteAuthOptions,
+  signal?: AbortSignal,
+) {
   validateRemoteAuthOptions(options);
   const onAuth = options.onAuth;
   return {
     ...(context.http === undefined ? {} : { http: context.http }),
     ...(options.headers === undefined ? {} : { headers: options.headers }),
+    ...(signal === undefined ? {} : { signal }),
     ...(onAuth === undefined
       ? {}
       : {
@@ -865,7 +923,7 @@ export function createRemoteAuth(context: GitContext, options: RemoteAuthOptions
 }
 
 function fetchAuth(context: GitContext, options: FetchOperationOptions) {
-  return createRemoteAuth(context, options);
+  return createRemoteAuth(context, options, options.signal);
 }
 
 function fetchProgressSink(
@@ -898,11 +956,12 @@ function isPublicFetchNetworkError(error: unknown): boolean {
 
 async function fetchAdvertisement(
   url: string,
-  auth: Parameters<typeof discover>[2],
+  auth: NonNullable<Parameters<typeof discover>[2]>,
 ): Promise<Advertisement> {
   try {
     return await discover(url, "git-upload-pack", auth);
   } catch (error) {
+    throwIfAborted(auth.signal);
     if (isPublicFetchNetworkError(error)) throw error;
     throw new GitError("EHTTP", "upload-pack discovery request failed", { cause: error });
   }
@@ -1075,15 +1134,20 @@ export async function fetchInto(
   behavior: FetchBehavior = {},
 ): Promise<FetchResult> {
   if (isMappedFetchOptions(options)) validateFetchOptions(options);
+  else {
+    validateRemoteAuthOptions(options);
+    validateAbortableNetworkOptions(options);
+  }
+  throwIfAborted(options.signal);
   const compiler = isMappedFetchOptions(options)
     ? compileFetchRefspecs(options.refspecs)
     : undefined;
   const { remote, url } = fetchRemoteUrl(repo, options);
   if (options.filter !== undefined) requirePartialFetchTarget(repo, remote, url);
   const auth = fetchAuth(context, options);
-  const beforeDiscovery = behavior.checkpoint?.("before-discovery");
-  if (beforeDiscovery !== undefined) await beforeDiscovery;
+  await runFetchCheckpoint(behavior.checkpoint, "before-discovery", options.signal);
   const advertisement = await fetchAdvertisement(url, auth);
+  throwIfAborted(options.signal);
   if (isMappedFetchOptions(options)) {
     if (compiler === undefined) throw new Error("mapped fetch lost its compiled refspecs");
     return await fetchMappedInto(
@@ -1121,12 +1185,11 @@ async function fetchMappedInto(
   remote: string,
   url: string,
   advertisement: Advertisement,
-  auth: Parameters<typeof uploadPack>[1],
+  auth: NonNullable<Parameters<typeof uploadPack>[1]>,
   refs: readonly ExpandedFetchRefspec[],
 ): Promise<FetchResult> {
   if (refs.length === 0) {
-    const afterDiscovery = behavior.checkpoint?.("after-discovery");
-    if (afterDiscovery !== undefined) await afterDiscovery;
+    await runFetchCheckpoint(behavior.checkpoint, "after-discovery", options.signal);
     return {
       mode: "mapped",
       defaultBranch: advertisement.headRef,
@@ -1142,8 +1205,7 @@ async function fetchMappedInto(
   );
   try {
     preflightMappedUpdates(refs, publication);
-    const afterDiscovery = behavior.checkpoint?.("after-discovery");
-    if (afterDiscovery !== undefined) await afterDiscovery;
+    await runFetchCheckpoint(behavior.checkpoint, "after-discovery", options.signal);
 
     const tags = mappedTagTargets(advertisement, refs);
     const wants = [
@@ -1173,8 +1235,8 @@ async function fetchMappedInto(
     requireMappedUpdateRules(repo, refs, publication, types);
     authenticateTags(repo, tags);
 
-    const beforeRefs = behavior.checkpoint?.("before-ref-publication");
-    if (beforeRefs !== undefined) await beforeRefs;
+    await runFetchCheckpoint(behavior.checkpoint, "before-ref-publication", options.signal);
+    throwIfAborted(options.signal);
     repo.publishFetchRefs(
       publication,
       {
@@ -1214,7 +1276,7 @@ async function prepareLegacyFetchPublication(
   remote: string,
   url: string,
   advertisement: Advertisement,
-  auth: Parameters<typeof uploadPack>[1],
+  auth: NonNullable<Parameters<typeof uploadPack>[1]>,
 ): Promise<PreparedLegacyFetchPublication> {
   const defaultBranch = advertisement.headRef;
   const requestedRef = options.remoteRef ?? options.ref;
@@ -1245,8 +1307,7 @@ async function prepareLegacyFetchPublication(
 
   try {
     preflightAllTags(publication, requiredTags);
-    const afterDiscovery = behavior.checkpoint?.("after-discovery");
-    if (afterDiscovery !== undefined) await afterDiscovery;
+    await runFetchCheckpoint(behavior.checkpoint, "after-discovery", options.signal);
 
     const say = fetchProgressSink(options.onProgress, options.onMessage);
     const initialAutoTags =
@@ -1355,8 +1416,7 @@ async function prepareLegacyFetchPublication(
     } else if (options.prune === true) {
       remoteHead = null;
     }
-    const beforeRefs = behavior.checkpoint?.("before-ref-publication");
-    if (beforeRefs !== undefined) await beforeRefs;
+    await runFetchCheckpoint(behavior.checkpoint, "before-ref-publication", options.signal);
     const updates: [] = [];
     const result: LegacyFetchResult = {
       mode: "legacy",
@@ -1391,7 +1451,7 @@ async function fetchLegacyInto(
   remote: string,
   url: string,
   advertisement: Advertisement,
-  auth: Parameters<typeof uploadPack>[1],
+  auth: NonNullable<Parameters<typeof uploadPack>[1]>,
 ): Promise<FetchResult> {
   const prepared = await prepareLegacyFetchPublication(
     context,
@@ -1406,6 +1466,7 @@ async function fetchLegacyInto(
   let plan = prepared.plan;
   try {
     if (plan === null) throw new Error("legacy fetch lost its publication plan");
+    throwIfAborted(options.signal);
     repo.store.publishFetchRefs(
       prepared.publication,
       plan,
@@ -1470,6 +1531,9 @@ function requireCloneTargetsAbsent(
 }
 
 export async function clone(context: GitContext, options: CloneOptions): Promise<void> {
+  validateRemoteAuthOptions(options);
+  validateAbortableNetworkOptions(options);
+  throwIfAborted(options.signal);
   const root = normalizePath(options.dir ?? "/");
   if (options.filter !== undefined && options.filter !== "blob:none") {
     throw new GitError("EUNSUPPORTED", "clone filter is not supported");
@@ -1501,11 +1565,13 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     leaseExpiresAt = context.database.renewProvisionalClone(owner, now);
   };
   const checkpoint = (): Promise<void> | undefined => {
+    throwIfAborted(options.signal);
     heartbeat();
     const yieldNow = context.yieldNow;
     if (yieldNow === undefined) return;
     return (async () => {
       await yieldNow();
+      throwIfAborted(options.signal);
       heartbeat();
     })();
   };
@@ -1535,6 +1601,7 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
         ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
         ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
         ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       },
       "clone: fetch",
       { checkpoint },
@@ -1544,6 +1611,7 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     const tip = result.fetchHead;
     if (tip === null) throw new GitError("EFETCHFAIL", "remote advertised no usable ref");
 
+    throwIfAborted(options.signal);
     heartbeat();
     repo.store.db.transactionSync(() => {
       repo.mutateRefs(
@@ -1573,6 +1641,7 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
       return undefined;
     };
     try {
+      throwIfAborted(options.signal);
       context.database.publishProvisionalClone(owner, context.now(), () => {
         const initial = options.paths === undefined && tryInitialClone(context, repo, tree);
         if (!initial) return fallback();
@@ -1580,6 +1649,7 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
       });
     } catch (error) {
       if (!isInitialCheckoutFallback(error)) throw error;
+      throwIfAborted(options.signal);
       context.database.publishProvisionalClone(owner, context.now(), fallback);
     }
   } catch (error) {

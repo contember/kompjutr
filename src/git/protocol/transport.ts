@@ -3,12 +3,14 @@
 // fetch (proxies, custom auth, egress policy).
 
 import { GitError } from "../common/errors.js";
+import { abortable, throwIfAborted } from "./stream.js";
 
 export interface GitHttpRequest {
   url: string;
   method: "GET" | "POST";
   headers: Record<string, string>;
   body?: Uint8Array | AsyncIterable<Uint8Array>;
+  signal?: AbortSignal;
 }
 
 export interface GitHttpResponse {
@@ -41,17 +43,35 @@ export class HttpError extends GitError {
   }
 }
 
-async function* streamOf(response: Response): AsyncGenerator<Uint8Array> {
+async function* streamOf(
+  response: Response,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<Uint8Array> {
   const body = response.body;
   if (body === null) return;
   const reader = body.getReader();
+  let finished = false;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
+      const result = await reader.read().catch((error: unknown) => {
+        throwIfAborted(signal);
+        throw error;
+      });
+      const { done, value } = result;
+      if (done) {
+        finished = true;
+        return;
+      }
       if (value !== undefined && value.length > 0) yield value;
     }
   } finally {
+    if (!finished) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The source failure remains authoritative after cancellation.
+      }
+    }
     reader.releaseLock();
   }
 }
@@ -81,6 +101,7 @@ interface StreamingRequestInit extends RequestInit {
 
 /** The default transport: the platform's global `fetch`. */
 export const fetchHttpClient: GitHttpClient = async (request) => {
+  throwIfAborted(request.signal);
   const streaming = request.body !== undefined && !(request.body instanceof Uint8Array);
   const init: StreamingRequestInit = {
     method: request.method,
@@ -92,9 +113,16 @@ export const fetchHttpClient: GitHttpClient = async (request) => {
           ? request.body
           : requestStream(request.body),
     redirect: "follow",
+    signal: request.signal,
     ...(streaming ? { duplex: "half" } : {}),
   };
-  const response = await fetch(request.url, init);
+  let response: Response;
+  try {
+    response = await fetch(request.url, init);
+  } catch (error) {
+    throwIfAborted(request.signal);
+    throw error;
+  }
   const headers: Record<string, string> = {};
   response.headers.forEach((value, key) => {
     headers[key.toLowerCase()] = value;
@@ -103,7 +131,7 @@ export const fetchHttpClient: GitHttpClient = async (request) => {
     status: response.status,
     statusText: response.statusText,
     headers,
-    body: streamOf(response),
+    body: streamOf(response, request.signal),
   };
 };
 
@@ -117,6 +145,7 @@ export interface RemoteRequestOptions {
   http?: GitHttpClient;
   headers?: Record<string, string>;
   onAuth?: AuthCallback;
+  signal?: AbortSignal;
 }
 
 export type GitHttpRequestFactory = () => GitHttpRequest;
@@ -135,6 +164,8 @@ export class RemoteAuthSession {
   ): Promise<GitHttpResponse> {
     const http = options.http ?? fetchHttpClient;
     const firstRequest = openRequest(request);
+    const signal = firstRequest.signal ?? options.signal;
+    throwIfAborted(signal);
     const headers = {
       ...firstRequest.headers,
       ...options.headers,
@@ -143,16 +174,30 @@ export class RemoteAuthSession {
     };
     let first: GitHttpResponse;
     try {
-      first = await http({ ...firstRequest, headers });
+      first = await abortable(http({ ...firstRequest, headers, signal }), signal);
     } catch (error) {
+      throwIfAborted(signal);
       if (firstRequest.method !== "GET") throw error;
       const retryRequest = openRequest(request);
-      first = await http({ ...retryRequest, headers: { ...retryRequest.headers, ...headers } });
+      first = await abortable(
+        http({
+          ...retryRequest,
+          headers: { ...retryRequest.headers, ...headers },
+          signal,
+        }),
+        signal,
+      );
     }
+    throwIfAborted(signal);
     if (first.status !== 401 || options.onAuth === undefined) return first;
 
-    await drain(first.body);
-    const auth = await options.onAuth(firstRequest.url, this.#auth ?? {});
+    await drain(first.body, signal);
+    throwIfAborted(signal);
+    const auth = await abortable(
+      Promise.resolve(options.onAuth(firstRequest.url, this.#auth ?? {})),
+      signal,
+    );
+    throwIfAborted(signal);
     if (auth === undefined) return first;
     this.#auth = auth;
 
@@ -163,16 +208,29 @@ export class RemoteAuthSession {
       ...basicAuth(auth),
       ...auth.headers,
     };
-    return http({ ...retryRequest, headers: retryHeaders });
+    return abortable(
+      http({ ...retryRequest, headers: retryHeaders, signal }),
+      signal,
+    );
   }
 }
 
-async function drain(body: AsyncIterable<Uint8Array>): Promise<void> {
+async function drain(
+  body: AsyncIterable<Uint8Array>,
+  signal: AbortSignal | undefined,
+): Promise<void> {
   try {
-    for await (const _chunk of body) {
-      // discard
+    const iterator = body[Symbol.asyncIterator]();
+    try {
+      for (;;) {
+        const next = await abortable(iterator.next(), signal);
+        if (next.done === true) break;
+      }
+    } finally {
+      await iterator.return?.();
     }
-  } catch {
+  } catch (error) {
+    throwIfAborted(signal);
     // A rejected response may itself be truncated.
   }
 }

@@ -379,6 +379,71 @@ describe("provisional clone publication", () => {
     expect(cold.database.checkoutAt("/repo")?.repoId).toBe(published.repoId);
   });
 
+  it("discards only the aborted owner at the clone publication boundary and retries cleanly", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("file.txt", "abort before clone publication\n");
+    const head = fixture.commit("abortable clone");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    const controller = new AbortController();
+    const reason = new Error("stop before clone publication");
+    const context: GitContext = {
+      ...workspace.context,
+      yieldNow: (): Promise<void> => {
+        const localRef = workspace.database.db.scalar<number>(
+          "SELECT COUNT(*) FROM git_refs WHERE name = 'refs/heads/main'",
+        );
+        if (localRef === 1) controller.abort(reason);
+        return Promise.resolve();
+      },
+    };
+    try {
+      await expect(
+        clone(context, { url: server.url, dir: "/repo", signal: controller.signal }),
+      ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+      expect(workspace.database.db.scalar<number>("SELECT COUNT(*) FROM git_repositories")).toBe(0);
+      expect(workspace.worktree.stat("/repo/file.txt")).toBeNull();
+
+      await clone(workspace.context, { url: server.url, dir: "/repo" });
+      expect(openRepository(workspace.context, "/repo").revParse("HEAD")).toBe(head);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("returns clone success when cancellation happens inside synchronous publication", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("file.txt", "published despite late abort\n");
+    const head = fixture.commit("late clone abort");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    const controller = new AbortController();
+    const worktree: Worktree = {
+      ...workspace.worktree,
+      writeFiles(entries, options) {
+        workspace.worktree.writeFiles(entries, options);
+        controller.abort(new Error("publication already started"));
+      },
+    };
+    try {
+      await expect(
+        clone(
+          { ...workspace.context, worktree },
+          { url: server.url, dir: "/repo", signal: controller.signal },
+        ),
+      ).resolves.toBeUndefined();
+      expect(controller.signal.aborted).toBe(true);
+      expect(openRepository(workspace.context, "/repo").revParse("HEAD")).toBe(head);
+      expect(workspace.worktree.readFile("/repo/file.txt")).toEqual(
+        utf8.encode("published despite late abort\n"),
+      );
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
   it("revalidates a rolled-back prepare cache before a second publication attempt", () => {
     const workspace = makeWorkspace({ startTime: 15_000 });
     const owner = workspace.database.beginProvisionalClone(

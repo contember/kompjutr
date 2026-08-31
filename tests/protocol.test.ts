@@ -11,7 +11,11 @@ import {
 import { receivePack } from "../src/git/protocol/receive-pack.js";
 import { AGENT, discover, normalizeRemoteUrl, uploadPack } from "../src/git/protocol/remote.js";
 import { ByteReader, pktText } from "../src/git/protocol/stream.js";
-import type { GitHttpClient, GitHttpResponse } from "../src/git/protocol/transport.js";
+import {
+  fetchHttpClient,
+  type GitHttpClient,
+  type GitHttpResponse,
+} from "../src/git/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 
@@ -90,6 +94,23 @@ function bufferedBody(body: Uint8Array | AsyncIterable<Uint8Array> | undefined):
 }
 
 const OID = "1".repeat(40);
+
+describe("abortable transport", () => {
+  it("rejects a pre-aborted default request with the signal reason", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller stopped discovery");
+    controller.abort(reason);
+
+    await expect(
+      fetchHttpClient({
+        url: "http://127.0.0.1:1/repo",
+        method: "GET",
+        headers: {},
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+  });
+});
 
 describe("pkt-lines", () => {
   it("frames payloads the way git does", () => {
@@ -332,6 +353,35 @@ describe("discovery", () => {
         },
       }),
     ).rejects.toThrow("credential store unavailable");
+  });
+
+  it("cancels a confirmed 401 before opening the authenticated retry", async () => {
+    const controller = new AbortController();
+    const reason = new Error("credentials no longer needed");
+    const rejected = trackedBody([utf8.encode("auth required")]);
+    const signals: (AbortSignal | undefined)[] = [];
+    const http: GitHttpClient = (request) => {
+      signals.push(request.signal);
+      return Promise.resolve({
+        status: 401,
+        statusText: "Unauthorized",
+        headers: {},
+        body: rejected.body,
+      });
+    };
+
+    await expect(
+      discover("http://host/repo", "git-upload-pack", {
+        http,
+        signal: controller.signal,
+        onAuth: () => {
+          controller.abort(reason);
+          return { username: "unused" };
+        },
+      }),
+    ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+    expect(signals).toEqual([controller.signal]);
+    expect(rejected.returnCalls()).toBe(1);
   });
 
   it("treats an empty repository as zero refs", async () => {
@@ -690,6 +740,34 @@ describe("upload-pack", () => {
     );
 
     await expect(collect(result.pack)).rejects.toThrow("progress sink failed");
+    expect(source.returnCalls()).toBe(1);
+  });
+
+  it("finalizes an unfinished upload source when the caller aborts", async () => {
+    const controller = new AbortController();
+    const reason = new Error("stop receiving pack");
+    const body = concat([
+      pkt("NAK\n"),
+      pkt(concat([new Uint8Array([1]), PACK])),
+      pkt(concat([new Uint8Array([1]), PACK])),
+      FLUSH,
+    ]);
+    const source = trackedBody([body]);
+    const result = await uploadPack(
+      { url: "http://host/repo", wants: [OID], advertised: new Set(["side-band-64k"]) },
+      {
+        signal: controller.signal,
+        http: canned(() => ({
+          status: 200,
+          statusText: "OK",
+          headers: { "content-type": "application/x-git-upload-pack-result" },
+          body: source.body,
+        })),
+      },
+    );
+
+    controller.abort(reason);
+    await expect(collect(result.pack)).rejects.toMatchObject({ code: "EABORTED", cause: reason });
     expect(source.returnCalls()).toBe(1);
   });
 

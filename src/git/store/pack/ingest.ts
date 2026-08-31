@@ -56,6 +56,16 @@ import {
   requireLifecycleResult,
 } from "./shared.js";
 
+interface AbortablePackIngestOptions extends PackIngestOptions {
+  signal?: AbortSignal;
+}
+
+function throwIfIngestAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new GitError("EABORTED", "network operation aborted", { cause: signal.reason });
+  }
+}
+
 export class PackIngestEngine {
   readonly #db: SqlDatabase;
   readonly #repoId: number;
@@ -104,14 +114,14 @@ export class PackIngestEngine {
    */
   async ingest(
     source: AsyncIterable<Uint8Array>,
-    options: PackIngestOptions = {},
+    options: AbortablePackIngestOptions = {},
   ): Promise<PackIngestResult> {
     return this.#ingest(source, options);
   }
 
   async #ingest(
     source: AsyncIterable<Uint8Array>,
-    options: PackIngestOptions,
+    options: AbortablePackIngestOptions,
   ): Promise<PackIngestResult> {
     const reclaimPending = options.reclaimPending ?? true;
     if (typeof reclaimPending !== "boolean") {
@@ -121,10 +131,12 @@ export class PackIngestEngine {
     const say = options.onProgress ?? (() => {});
     const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
     const yieldNow = options.yieldNow ?? (() => Promise.resolve());
+    const signal = options.signal;
     const memory: PackIngestMemory = { pool: new ChunkPool() };
     let activePackId: number | undefined;
     let lease: PackIngestLease | null = null;
     try {
+      throwIfIngestAborted(signal);
       const reservation = this.#lifecycle.reservePending(
         requireIngestTime(now),
         options.lifecycle,
@@ -149,7 +161,9 @@ export class PackIngestEngine {
         yieldNow,
         heartbeat,
         memory,
+        signal,
       );
+      throwIfIngestAborted(signal);
       heartbeat();
       const { count, commits, membership } = await this.#indexPack(
         reservation.packId,
@@ -158,11 +172,13 @@ export class PackIngestEngine {
         yieldNow,
         heartbeat,
         memory,
+        signal,
       );
       heartbeat();
       const result = { packId: reservation.packId, count, bytes: total };
       const publishingLease = lease;
 
+      throwIfIngestAborted(signal);
       this.#db.transactionSync(() => {
         if (publishingLease !== null) this.#lifecycle.renewIngestLease(publishingLease, now);
         const published = this.#db.one<Record<string, unknown>>(
@@ -216,6 +232,7 @@ export class PackIngestEngine {
     yieldNow: () => Promise<void>,
     heartbeat: () => void,
     memory: PackIngestMemory,
+    signal: AbortSignal | undefined,
   ): Promise<number> {
     const sha = new Sha1();
     let tail = new Uint8Array(0); // rolling 20-byte lookbehind: the trailer
@@ -256,15 +273,18 @@ export class PackIngestEngine {
 
     const SLICE = 4 * 1024 * 1024;
     for await (const data of source) {
+      throwIfIngestAborted(signal);
       heartbeat();
       if (data.length === 0) continue;
       for (let offset = 0; offset < data.length; offset += SLICE) {
         feed(data.subarray(offset, offset + SLICE));
         memory.pool.assertIdle();
         await yieldNow();
+        throwIfIngestAborted(signal);
         heartbeat();
       }
     }
+    throwIfIngestAborted(signal);
     heartbeat();
     if (filled > 0) this.#writeChunk(packId, seq++, buffer.slice(0, filled));
 
@@ -291,6 +311,7 @@ export class PackIngestEngine {
     yieldNow: () => Promise<void>,
     heartbeat: () => void,
     memory: PackIngestMemory,
+    signal: AbortSignal | undefined,
   ): Promise<{
     count: number;
     commits: PackCommitIndex;
@@ -301,6 +322,7 @@ export class PackIngestEngine {
       packId,
       total,
     );
+    throwIfIngestAborted(signal);
     const magic = reader.take(4);
     if (magic[0] !== 0x50 || magic[1] !== 0x41 || magic[2] !== 0x43 || magic[3] !== 0x4b) {
       throw new CorruptError("bad pack signature");
@@ -325,6 +347,7 @@ export class PackIngestEngine {
 
     let deferred = 0;
     for (let i = 0; i < count; i++) {
+      throwIfIngestAborted(signal);
       const header = reader.entryHeader();
       membership.addOffset(i, header.offset);
       const entryType = header.kind === null ? NUMBER_TYPE[header.type]! : null;
@@ -448,6 +471,7 @@ export class PackIngestEngine {
         pendingIndex.flush();
         memory.pool.assertIdle();
         await yieldNow();
+        throwIfIngestAborted(signal);
         heartbeat();
         if ((i & 65535) === 65535) {
           say(`Resolving deltas: ${i + 1}/${count}\n`);
@@ -471,6 +495,7 @@ export class PackIngestEngine {
       yieldNow,
       heartbeat,
       memory,
+      signal,
     );
     heartbeat();
     objectIndex.flush();
@@ -489,6 +514,7 @@ export class PackIngestEngine {
     yieldNow: () => Promise<void>,
     heartbeat: () => void,
     memory: PackIngestMemory,
+    signal: AbortSignal | undefined,
   ): Promise<void> {
     let remaining =
       this.#db.scalar<number>(
@@ -497,6 +523,7 @@ export class PackIngestEngine {
         packId,
       ) ?? 0;
     while (remaining > 0) {
+      throwIfIngestAborted(signal);
       let progressed = 0;
       let after = -1;
       for (;;) {
@@ -516,6 +543,7 @@ export class PackIngestEngine {
         );
         if (page.length === 0) break;
         for (const row of page) validatePendingRow(row);
+        throwIfIngestAborted(signal);
         const last = page[page.length - 1]!;
         after = last.offset;
 
@@ -649,6 +677,7 @@ export class PackIngestEngine {
         }
         try {
           for (let cursor = 0; cursor < ready.length; cursor++) {
+            throwIfIngestAborted(signal);
             const { row, baseOid } = ready[cursor]!;
             const base = bases.get(baseOid);
             if (base === undefined) continue;
@@ -746,6 +775,7 @@ export class PackIngestEngine {
         memory.pool.assertIdle();
         memory.pool.dispose();
         await yieldNow();
+        throwIfIngestAborted(signal);
         heartbeat();
       }
       objectIndex.flush();

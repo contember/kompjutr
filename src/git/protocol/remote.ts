@@ -9,7 +9,7 @@ import { isOid, utf8Decoder } from "../common/bytes.js";
 import { CorruptError, GitError } from "../common/errors.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../common/ref-name.js";
 import { FLUSH, pkt } from "./pktline.js";
-import { ByteReader, type Pkt, pktText } from "./stream.js";
+import { ByteReader, type Pkt, pktText, throwIfAborted } from "./stream.js";
 import {
   type GitHttpResponse,
   HttpError,
@@ -84,17 +84,22 @@ function resolvedProtocolEntryLimit(value: number | undefined): number {
   return Math.min(value, MAX_PROTOCOL_NEGOTIATION_ENTRIES);
 }
 
-async function readErrorPrefix(body: AsyncIterable<Uint8Array>): Promise<string> {
+async function readErrorPrefix(
+  body: AsyncIterable<Uint8Array>,
+  signal: AbortSignal | undefined,
+): Promise<string> {
   const prefix = new Uint8Array(ERROR_PREFIX_BYTES);
   let length = 0;
+  const reader = new ByteReader(body, signal);
   try {
-    for await (const chunk of body) {
+    for await (const chunk of reader.rest()) {
       if (length >= prefix.length) continue;
       const take = Math.min(chunk.length, prefix.length - length);
       prefix.set(chunk.subarray(0, take), length);
       length += take;
     }
-  } catch {
+  } catch (error) {
+    if (signal?.aborted === true) throw error;
     // The retained prefix is still useful when the error body is truncated.
   }
   return utf8Decoder.decode(prefix.subarray(0, length)).slice(0, ERROR_PREFIX_CHARACTERS);
@@ -146,7 +151,7 @@ export async function discover(
     options.authSession,
   );
   if (response.status !== 200) {
-    const body = await readErrorPrefix(response.body);
+    const body = await readErrorPrefix(response.body, options.signal);
     throw new HttpError(
       response.status,
       `${service} discovery failed: ${response.status} ${response.statusText}${body === "" ? "" : ` — ${body.slice(0, 200)}`}`,
@@ -159,13 +164,13 @@ export async function discover(
   const contentType = response.headers["content-type"] ?? "";
   const mediaType = contentType.split(";")[0]?.trim() ?? "";
   if (!mediaType.startsWith(`application/x-${service}-advertisement`)) {
-    await drain(response.body);
+    await drain(response.body, options.signal);
     throw new CorruptError(
       `not a smart HTTP ref advertisement (content-type: ${contentType === "" ? "none" : contentType})`,
     );
   }
 
-  const reader = new ByteReader(response.body);
+  const reader = new ByteReader(response.body, options.signal);
   try {
     const first = await reader.readPkt();
     if (first === null) throw new CorruptError("empty ref advertisement");
@@ -186,12 +191,17 @@ export async function discover(
   }
 }
 
-export async function drain(body: AsyncIterable<Uint8Array>): Promise<void> {
+export async function drain(
+  body: AsyncIterable<Uint8Array>,
+  signal?: AbortSignal,
+): Promise<void> {
+  const reader = new ByteReader(body, signal);
   try {
-    for await (const _chunk of body) {
+    for await (const _chunk of reader.rest()) {
       // discard
     }
-  } catch {
+  } catch (error) {
+    if (signal?.aborted === true) throw error;
     // A remote that hung up has nothing left to drain.
   }
 }
@@ -434,20 +444,20 @@ export async function uploadPack(
       options.authSession,
     );
   }
+  if (response.status !== 200) {
+    const text = await readErrorPrefix(response.body, options.signal);
+    throw new HttpError(
+      response.status,
+      `git-upload-pack failed: ${response.status} ${response.statusText}${text === "" ? "" : ` — ${text.slice(0, 200)}`}`,
+    );
+  }
   const budget = new NegotiationBudget(entryLimit);
-  const reader = new ByteReader(response.body);
+  const reader = new ByteReader(response.body, options.signal);
   const shallow: string[] = [];
   const unshallow: string[] = [];
   const useSideband = capabilities.includes("side-band-64k");
 
   try {
-    if (response.status !== 200) {
-      const text = await readErrorPrefix(response.body);
-      throw new HttpError(
-        response.status,
-        `git-upload-pack failed: ${response.status} ${response.statusText}${text === "" ? "" : ` — ${text.slice(0, 200)}`}`,
-      );
-    }
 
     // Acknowledgement and shallow sections, then the pack. `done` was sent,
     // so the server answers in one shot and the ack details do not change
@@ -460,7 +470,13 @@ export async function uploadPack(
         return {
           shallow,
           unshallow,
-          pack: sideband(reader, line.payload, request.onProgress, request.onMessage),
+          pack: sideband(
+            reader,
+            line.payload,
+            request.onProgress,
+            request.onMessage,
+            options.signal,
+          ),
         };
       }
       const text = ownedPktText(line);
@@ -506,10 +522,12 @@ async function* sideband(
   first: Uint8Array,
   onProgress?: (message: string) => void,
   onMessage?: (message: string) => void,
+  signal?: AbortSignal,
 ): AsyncGenerator<Uint8Array> {
   try {
     let frame: Uint8Array | null = first;
     for (;;) {
+      throwIfAborted(signal);
       if (frame === null) {
         const line = await reader.readPkt();
         if (line === null || line.kind === "flush") return;

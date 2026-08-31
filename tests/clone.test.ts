@@ -1494,6 +1494,96 @@ describe("clone", () => {
     }
   });
 
+  it("validates and honors a pre-aborted clone signal before reservation", async () => {
+    const workspace = makeWorkspace();
+    const invalid = { url: "http://host/repo", dir: "/invalid", signal: {} };
+    await expect(Reflect.apply(clone, undefined, [workspace.context, invalid])).rejects.toMatchObject(
+      { code: "EINVAL" },
+    );
+
+    const controller = new AbortController();
+    const reason = new Error("clone no longer wanted");
+    controller.abort(reason);
+    await expect(
+      clone(workspace.context, {
+        url: "http://127.0.0.1:1/repo",
+        dir: "/work",
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+    expect(tableRows(workspace, "SELECT root FROM git_checkouts")).toEqual([]);
+  });
+
+  it("releases an aborted ingest owner and permits a clean clone retry", async () => {
+    const { fixture, head } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    const controller = new AbortController();
+    const reason = new Error("stop pack ingest");
+    let abortOnYield = true;
+    const context = {
+      ...workspace.context,
+      yieldNow: (): Promise<void> => {
+        if (abortOnYield) {
+          abortOnYield = false;
+          controller.abort(reason);
+        }
+        return Promise.resolve();
+      },
+    };
+    try {
+      await expect(
+        clone(context, { url: server.url, dir: "/work", signal: controller.signal }),
+      ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+      expect(tableRows(workspace, "SELECT root FROM git_checkouts")).toEqual([]);
+      expect(tableRows(workspace, "SELECT pack_id FROM git_pack_meta")).toEqual([]);
+      expect(workspace.worktree.stat("/work/README.md")).toBeNull();
+
+      await clone(workspace.context, { url: server.url, dir: "/work" });
+      expect(openRepository(workspace.context, "/work").revParse("HEAD")).toBe(head);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("cancels shared checkout hydration without publishing the provisional clone", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("current.txt", "hydrate me\n");
+    const head = fixture.commit("filtered clone hydration");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    const controller = new AbortController();
+    const reason = new Error("stop checkout hydration");
+    const context = {
+      ...workspace.context,
+      yieldNow: (): Promise<void> => {
+        const posts = server.requests.filter((request) => request.method === "POST").length;
+        if (posts >= 2) controller.abort(reason);
+        return Promise.resolve();
+      },
+    };
+    try {
+      await expect(
+        clone(context, {
+          url: server.url,
+          dir: "/work",
+          filter: "blob:none",
+          signal: controller.signal,
+        }),
+      ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+      expect(tableRows(workspace, "SELECT root FROM git_checkouts")).toEqual([]);
+      expect(workspace.worktree.stat("/work/current.txt")).toBeNull();
+
+      await clone(workspace.context, { url: server.url, dir: "/work", filter: "blob:none" });
+      expect(openRepository(workspace.context, "/work").revParse("HEAD")).toBe(head);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
   it("removes provisional clone history when checkout fails after ref publication", async () => {
     const { fixture } = makeFixture();
     const server = await startGitServer(fixture.dir);

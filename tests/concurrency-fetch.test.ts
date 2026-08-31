@@ -370,6 +370,141 @@ describe("fetch publication concurrency", () => {
     }
   });
 
+  it("releases an interrupted ingest and reclaims it on a clean retry", async () => {
+    const { fixture, head } = commitFixture("abort-ingest");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    const controller = new AbortController();
+    const reason = new Error("stop fetch ingest");
+    try {
+      await expect(
+        fetchInto(
+          workspace.context,
+          workspace.repo,
+          {
+            remote: "origin",
+            url: server.url,
+            singleBranch: false,
+            tags: false,
+            signal: controller.signal,
+          },
+          "fetch",
+          {
+            checkpoint(stage) {
+              if (stage === "pack-ingest") controller.abort(reason);
+              return undefined;
+            },
+          },
+        ),
+      ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+      expect(workspace.repo.store.getRef("refs/remotes/origin/main")).toBeNull();
+      expect(workspace.repo.shallow()).toEqual(new Set());
+      expect(
+        workspace.repo.store.db.all<{ state: string }>(
+          "SELECT state FROM git_pack_meta ORDER BY pack_id",
+        ),
+      ).toEqual([{ state: "pending" }]);
+
+      await fetchInto(workspace.context, workspace.repo, {
+        remote: "origin",
+        url: server.url,
+        singleBranch: false,
+        tags: false,
+      });
+      expect(workspace.repo.store.getRef("refs/remotes/origin/main")).toBe(head);
+      expect(
+        workspace.repo.store.db.all<{ state: string }>(
+          "SELECT state FROM git_pack_meta ORDER BY pack_id",
+        ),
+      ).toEqual([{ state: "complete" }]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("disposes the fetch token when aborted immediately before publication", async () => {
+    const { fixture, head } = commitFixture("abort-publication");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    const controller = new AbortController();
+    const reason = new Error("stop before fetch publication");
+    try {
+      await expect(
+        fetchInto(
+          workspace.context,
+          workspace.repo,
+          {
+            remote: "origin",
+            url: server.url,
+            singleBranch: false,
+            tags: false,
+            depth: 1,
+            signal: controller.signal,
+          },
+          "fetch",
+          {
+            checkpoint(stage) {
+              if (stage === "before-ref-publication") controller.abort(reason);
+              return undefined;
+            },
+          },
+        ),
+      ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+      expect(workspace.repo.store.getRef("refs/remotes/origin/main")).toBeNull();
+      expect(workspace.repo.shallow()).toEqual(new Set());
+
+      await fetchInto(workspace.context, workspace.repo, {
+        remote: "origin",
+        url: server.url,
+        singleBranch: false,
+        tags: false,
+        depth: 1,
+      });
+      expect(workspace.repo.store.getRef("refs/remotes/origin/main")).toBe(head);
+      expect(workspace.repo.shallow()).toEqual(new Set([head]));
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("returns fetch success when cancellation follows synchronous publication", async () => {
+    const { fixture, head } = commitFixture("abort-after-publication");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    const controller = new AbortController();
+    try {
+      await expect(
+        fetchInto(
+          workspace.context,
+          workspace.repo,
+          {
+            remote: "origin",
+            url: server.url,
+            singleBranch: false,
+            tags: false,
+            signal: controller.signal,
+          },
+          "fetch",
+          {
+            checkpoint(stage) {
+              if (stage === "after-ref-publication") {
+                controller.abort(new Error("fetch already committed"));
+              }
+              return undefined;
+            },
+          },
+        ),
+      ).resolves.toBeDefined();
+      expect(controller.signal.aborted).toBe(true);
+      expect(workspace.repo.store.getRef("refs/remotes/origin/main")).toBe(head);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
   it("renegotiates a shallow boundary after response loss before publication", async () => {
     const fixture = new GitFixture().init();
     fixture.write("first.txt", "first\n");
