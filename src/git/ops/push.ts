@@ -37,6 +37,9 @@ import {
   type CompiledPushRefspecs,
   compilePushRefspecs,
   type ExpandedPushRefspec,
+  type NormalizedPushLease,
+  normalizePushLeases,
+  type PushLeaseExpectation,
   type PushPlanningUpdate,
   type PushRefspec,
   type PushResult,
@@ -66,6 +69,7 @@ export type PushOptions = RemoteAuthOptions &
   AbortableNetworkOptions &
   RemoteTarget & {
     readonly atomic?: boolean;
+    readonly leases?: Readonly<Record<string, PushLeaseExpectation>>;
     readonly pushOptions?: readonly string[];
   } & (MappedPushSelection | LegacyPushSelection);
 
@@ -250,6 +254,52 @@ function joinAdvertisement(
     updates.push({ ...mapping, oldOid, noop });
   }
   return { updates, remoteOids, capabilities };
+}
+
+function snapshotPushLeases(
+  repo: Repository,
+  leases: readonly NormalizedPushLease[],
+  target: { readonly remote: string; readonly configured: boolean },
+): ReadonlyMap<string, string | null> {
+  const snapshot = new Map<string, string | null>();
+  let raw: Map<string, string> | null = null;
+  for (const lease of leases) {
+    if ("expected" in lease.expectation) {
+      snapshot.set(lease.destination, lease.expectation.expected);
+      continue;
+    }
+    if (!target.configured) {
+      throw new GitError("EINVAL", "tracking push leases require a configured named remote");
+    }
+    if (!lease.destination.startsWith("refs/heads/")) {
+      throw new GitError("EINVAL", "tracking push leases require branch destinations");
+    }
+    if (raw === null) {
+      raw = new Map<string, string>();
+      for (const row of repo.store.iterateRefs()) raw.set(row.name, row.target);
+    }
+    const tracking = trackingName(`refs/remotes/${target.remote}/`, lease.destination);
+    const expected = resolveRawLocalRef(tracking, raw);
+    if (expected === null) {
+      throw new GitError("EREFNOTFOUND", `tracking ref not found for push lease: ${tracking}`);
+    }
+    snapshot.set(lease.destination, expected);
+  }
+  return snapshot;
+}
+
+function verifyPushLeases(
+  updates: readonly JoinedPushUpdate[],
+  leases: ReadonlyMap<string, string | null>,
+): void {
+  for (const update of updates) {
+    if (!leases.has(update.destination)) continue;
+    const expected = leases.get(update.destination) ?? null;
+    const advertised = update.oldOid === ZERO_OID ? null : update.oldOid;
+    if (advertised !== expected) {
+      throw new GitError("ESTALELEASE", `push lease is stale for ${update.destination}`);
+    }
+  }
 }
 
 function commandSet(updates: readonly JoinedPushUpdate[]): ReceivePackCommand[] {
@@ -445,13 +495,16 @@ export async function push(
     const localRefs = needsLocalRefs(refspecs) ? localRefSnapshot(repo) : [];
     const mappings = compiler.expand(localRefs);
     localRefs.length = 0;
+    const leases = normalizePushLeases(options.leases, mappings);
     if (mappings.length === 0) return emptyPushResult();
 
     const target = pushTarget(repo, options);
+    const leaseSnapshot = snapshotPushLeases(repo, leases, target);
     const auth = createRemoteAuth(context, options, options.signal);
     let advertisement: Advertisement | null = await discover(target.url, "git-receive-pack", auth);
     throwIfAborted(options.signal);
     const joined = joinAdvertisement(mappings, advertisement);
+    verifyPushLeases(joined.updates, leaseSnapshot);
     const activeUpdates = activePlanningUpdates(joined.updates);
     if (activeUpdates.length === 0) {
       plan = null;

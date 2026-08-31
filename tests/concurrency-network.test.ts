@@ -219,6 +219,89 @@ describe("push and pull concurrency", () => {
     }
   });
 
+  it("snapshots a tracking lease before discovery can interleave a local tracking mutation", async () => {
+    const { fixture } = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    const discovery = bufferedHttpResponseBarrier(fetchHttpClient, {
+      name: "tracking lease discovery",
+      select: (request) => request.method === "GET",
+    });
+    let pushing: Promise<unknown> | null = null;
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        depth: 0,
+        noTags: true,
+      });
+      const repo = openRepository(workspace.context, "/work");
+      const pushed = await localCommit(gitFor(workspace), workspace, "tracking snapshot\n");
+
+      pushing = push({ ...workspace.context, http: discovery.http }, repo, {
+        leases: { main: { tracking: true } },
+      });
+      await awaitBarrierEntry(discovery, pushing);
+      repo.store.setRef("refs/remotes/origin/main", pushed);
+      discovery.release();
+
+      await expect(pushing).resolves.toMatchObject({ ok: true });
+      expect(fixture.git("rev-parse", "main")).toBe(pushed);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(pushed);
+      assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
+    } finally {
+      discovery.release();
+      await Promise.allSettled([pushing].filter((value) => value !== null));
+      await server.close();
+    }
+  });
+
+  it("preserves discovery CAS when the remote changes after a matching lease check", async () => {
+    const { fixture, initial } = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    const post = pauseBeforeFirstPost("leased push after remote race");
+    let pushing: Promise<unknown> | null = null;
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        depth: 0,
+        noTags: true,
+      });
+      const repo = openRepository(workspace.context, "/work");
+      const pushed = await localCommit(gitFor(workspace), workspace, "leased local\n");
+
+      pushing = push({ ...workspace.context, http: post.http }, repo, {
+        force: true,
+        leases: { main: { expected: initial } },
+      });
+      await awaitBarrierEntry(post.barrier, pushing);
+      fixture.write("remote-race.txt", "remote race\n");
+      const raced = fixture.commit("remote race after discovery");
+      post.barrier.release();
+
+      await expect(pushing).resolves.toMatchObject({
+        ok: false,
+        refs: [
+          {
+            ref: "refs/heads/main",
+            ok: false,
+            error: "incorrect old value provided",
+          },
+        ],
+      });
+      expect(fixture.git("rev-parse", "main")).toBe(raced);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(initial);
+      expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: pushed });
+      assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
+    } finally {
+      post.barrier.release();
+      await Promise.allSettled([pushing].filter((value) => value !== null));
+      await server.close();
+    }
+  });
+
   it.each(COMPLETION_ORDERS)(
     "does not let delayed push tracking regress a newer fetch in %s order",
     async (order) => {

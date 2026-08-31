@@ -15,7 +15,13 @@ import {
   type SQLStorageLike,
 } from "../src/db/db.js";
 import type { ScanEntry } from "../src/fs/types.js";
-import { createGit, type Git, type GitScratchIndex } from "../src/git/client.js";
+import {
+  createGit,
+  type Git,
+  type GitPushOptions,
+  type GitScratchIndex,
+  type PushLeaseExpectation,
+} from "../src/git/client.js";
 import { Repository } from "../src/git/ops/repository.js";
 import type { Worktree } from "../src/git/ops/worktree.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
@@ -954,6 +960,9 @@ describe("createSqliteGitClient", () => {
         refs: [{ ref: "refs/heads/main", ok: true, error: null }],
         tracking: { outcome: "unchanged" },
       });
+      const trackingLease: PushLeaseExpectation = { tracking: true };
+      const leasedPush: GitPushOptions = { leases: { main: trackingLease } };
+      await expect(native.push(leasedPush)).resolves.toMatchObject({ ok: true });
     } finally {
       await server.close();
     }

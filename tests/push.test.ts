@@ -189,7 +189,7 @@ describe("push", () => {
     }
   });
 
-  it("rejects a non-fast-forward before POST and force updates with a fresh lease", async () => {
+  it("rejects stale tracking leases and does not let a matching lease imply force", async () => {
     const fixture = remoteFixture();
     const server = await startGitServer(fixture.dir);
     try {
@@ -199,7 +199,7 @@ describe("push", () => {
       const local = await localCommit(ws, "local\n", "local");
 
       fixture.write("README.md", "remote\n");
-      fixture.commit("remote");
+      const remote = fixture.commit("remote");
       const postsBefore = server.requests.filter((request) => request.method === "POST").length;
       const trackingEntries = reflog(storage, "refs/remotes/origin/main").length;
       await expect(ws.git.push({})).rejects.toMatchObject({ code: "ENONFASTFORWARD" });
@@ -208,8 +208,132 @@ describe("push", () => {
       );
       expect(reflog(storage, "refs/remotes/origin/main")).toHaveLength(trackingEntries);
 
-      await expect(ws.git.push({ force: true })).resolves.toMatchObject({ ok: true });
+      const git = nativeGit(ws, storage);
+      await expect(
+        git.push({ force: true, leases: { main: { tracking: true } } }),
+      ).rejects.toMatchObject({ code: "ESTALELEASE" });
+      expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(
+        postsBefore,
+      );
+
+      await expect(
+        git.push({ leases: { "refs/heads/main": { expected: remote } } }),
+      ).rejects.toMatchObject({ code: "ENONFASTFORWARD" });
+      expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(
+        postsBefore,
+      );
+
+      await expect(
+        git.push({ force: true, leases: { main: { expected: remote } } }),
+      ).resolves.toMatchObject({ ok: true });
       expect(fixture.git("rev-parse", "main")).toBe(local);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("leases wildcard creations, deletions, and no-op destinations independently", async () => {
+    const fixture = remoteFixture();
+    const initial = fixture.git("rev-parse", "main");
+    const server = await startGitServer(fixture.dir);
+    try {
+      const storage = new SqliteTestStorage();
+      const ws = workspace(storage);
+      await ws.git.clone({ url: server.url, dir: "/" });
+      await ws.git.branch({ name: "topic" });
+      const git = nativeGit(ws, storage);
+      const posts = server.requests.filter((request) => request.method === "POST").length;
+
+      await expect(
+        git.push({
+          refspecs: [{ source: "refs/heads/main", destination: "refs/heads/main" }],
+          leases: { main: { expected: null } },
+        }),
+      ).rejects.toMatchObject({ code: "ESTALELEASE" });
+      expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(posts);
+
+      await expect(
+        git.push({
+          refspecs: [{ source: "refs/heads/*", destination: "refs/heads/*" }],
+          leases: { topic: { expected: null } },
+        }),
+      ).resolves.toMatchObject({
+        ok: true,
+        refs: [
+          { ref: "refs/heads/main", ok: true, error: null },
+          { ref: "refs/heads/topic", ok: true, error: null },
+        ],
+      });
+      expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(
+        posts + 1,
+      );
+      expect(fixture.git("rev-parse", "refs/heads/topic")).toBe(initial);
+
+      await expect(
+        git.push({
+          refspecs: [{ source: null, destination: "refs/heads/topic" }],
+          leases: { topic: { expected: initial } },
+        }),
+      ).resolves.toMatchObject({ ok: true });
+      expect(fixture.gitResult("show-ref", "--verify", "refs/heads/topic").status).not.toBe(0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects malformed, colliding, excessive, and unused leases before HTTP", async () => {
+    const fixture = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    try {
+      const storage = new SqliteTestStorage();
+      const ws = workspace(storage);
+      await ws.git.clone({ url: server.url, dir: "/" });
+      const git = nativeGit(ws, storage);
+      const requests = server.requests.length;
+      const invalid = [
+        { leases: null },
+        { leases: { main: { expected: "invalid" } } },
+        { leases: { main: { expected: null, tracking: true } } },
+        { leases: { main: { tracking: false } } },
+        { leases: { missing: { expected: null } } },
+        {
+          leases: {
+            main: { tracking: true },
+            "refs/heads/main": { tracking: true },
+          },
+        },
+      ];
+      for (const options of invalid) {
+        await expect(Reflect.apply(git.push, git, [options])).rejects.toMatchObject({
+          code: "EINVAL",
+        });
+      }
+
+      const excessive: Record<string, { expected: null }> = {};
+      for (let index = 0; index < 1_025; index++) {
+        excessive[`refs/heads/lease-${index}`] = { expected: null };
+      }
+      await expect(Reflect.apply(git.push, git, [{ leases: excessive }])).rejects.toMatchObject({
+        code: "E2BIG",
+      });
+      await expect(
+        git.push({
+          url: server.url,
+          leases: { main: { tracking: true } },
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      await expect(
+        git.push({
+          refspecs: [{ source: "refs/heads/main", destination: "refs/tags/release" }],
+          leases: { "refs/tags/release": { tracking: true } },
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+
+      await git.updateRef({ ref: "refs/remotes/origin/main", delete: true });
+      await expect(git.push({ leases: { main: { tracking: true } } })).rejects.toMatchObject({
+        code: "EREFNOTFOUND",
+      });
+      expect(server.requests).toHaveLength(requests);
     } finally {
       await server.close();
     }
@@ -466,6 +590,8 @@ describe("push", () => {
         { source: null, destination: first },
         ...destinations.slice(1).map((destination) => ({ source: null, destination })),
       ];
+      const leases: Record<string, { expected: string }> = {};
+      for (const destination of destinations) leases[destination] = { expected: remoteOid };
       const requestsBefore = server.requests.length;
       workspace.storage.resetCounters();
 
@@ -473,6 +599,7 @@ describe("push", () => {
         remote: "origin",
         onAuth: () => ({ username: "agent", password: "secret" }),
         refspecs,
+        leases,
       });
 
       expect(result.ok).toBe(true);

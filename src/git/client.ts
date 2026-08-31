@@ -80,6 +80,7 @@ export type {
   FetchRefUpdate,
   FetchResult,
   LsRemoteResult,
+  PushLeaseExpectation,
   PushRefStatus,
   PushRefspec,
   PushResult,
