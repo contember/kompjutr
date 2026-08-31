@@ -5,6 +5,7 @@ import type { SqlDatabase } from "../../db/db.js";
 import { CorruptError } from "../common/errors.js";
 import { BLOB_ID_GENERATION_EXHAUSTED, MAX_BLOB_ID_CACHE_ROWS } from "./blob-id-cache.js";
 import { OPERATION_STATE_TABLE } from "./operation-schema.js";
+import { MAX_PROMISOR_REMOTE_NAME_BYTES, MAX_PROMISOR_URL_BYTES } from "./promisor.js";
 import { REFLOG_SCHEMA_STATEMENTS } from "./reflog-schema.js";
 
 export {
@@ -262,6 +263,37 @@ const STATEMENTS = [
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
 
+  `CREATE TABLE IF NOT EXISTS git_promisor_remotes (
+     repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
+     remote_name TEXT NOT NULL CHECK (
+       typeof(remote_name) = 'text'
+       AND length(CAST(remote_name AS BLOB)) BETWEEN 1 AND ${MAX_PROMISOR_REMOTE_NAME_BYTES}
+       AND instr(remote_name, char(0)) = 0
+     ),
+     url TEXT NOT NULL CHECK (
+       typeof(url) = 'text'
+       AND length(CAST(url AS BLOB)) BETWEEN 1 AND ${MAX_PROMISOR_URL_BYTES}
+       AND instr(url, char(0)) = 0
+     ),
+     filter TEXT NOT NULL CHECK (typeof(filter) = 'text' AND filter = 'blob:none'),
+     PRIMARY KEY (repo_id, remote_name),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
+   ) WITHOUT ROWID`,
+
+  `CREATE TABLE IF NOT EXISTS git_promised_blobs (
+     repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
+     oid TEXT NOT NULL CHECK (
+       typeof(oid) = 'text'
+       AND length(CAST(oid AS BLOB)) = 40
+       AND oid NOT GLOB '*[^0-9a-f]*'
+     ),
+     remote_name TEXT NOT NULL,
+     type TEXT NOT NULL CHECK (typeof(type) = 'text' AND type = 'blob'),
+     PRIMARY KEY (repo_id, oid),
+     FOREIGN KEY (repo_id, remote_name)
+       REFERENCES git_promisor_remotes (repo_id, remote_name) ON DELETE CASCADE
+   ) WITHOUT ROWID`,
+
   // Git's logical index, not the .git/index binary format. The trailing
   // columns cache what the working tree looked like when the entry was
   // written, so an unchanged file does not have to be re-hashed.
@@ -496,6 +528,13 @@ const STATEMENTS = [
      PRIMARY KEY (repo_id, oid),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
+
+  `CREATE TRIGGER IF NOT EXISTS git_promised_blobs_loose_present
+   AFTER INSERT ON git_objects
+   BEGIN
+     DELETE FROM git_promised_blobs
+      WHERE repo_id = NEW.repo_id AND oid = NEW.oid;
+   END`,
 
   // Full parsed commits for graph walks and reads. This remains a derived
   // cache: source metadata is validated before a row can be returned.

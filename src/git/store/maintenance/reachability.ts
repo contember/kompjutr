@@ -40,6 +40,7 @@ interface ReachabilityEdge {
   oid: string;
   type: ObjectType;
   optionalMissing: boolean;
+  allowPromisedMissing: boolean;
   physicalOnly: boolean;
 }
 
@@ -588,6 +589,7 @@ function packedBaseEdge(
     oid: packed.baseOid,
     type: expectedType,
     optionalMissing: false,
+    allowPromisedMissing: false,
     physicalOnly: true,
   };
 }
@@ -612,6 +614,7 @@ function headerExpansion(
         oid: parsed.tagOid,
         type: parsed.tagType,
         optionalMissing: false,
+        allowPromisedMissing: false,
         physicalOnly: false,
       },
     ];
@@ -639,6 +642,7 @@ function headerExpansion(
       oid: parsed.treeOid,
       type: "tree",
       optionalMissing: false,
+      allowPromisedMissing: false,
       physicalOnly: false,
     });
   }
@@ -649,6 +653,7 @@ function headerExpansion(
         oid: parent,
         type: "commit",
         optionalMissing: false,
+        allowPromisedMissing: false,
         physicalOnly: false,
       });
     }
@@ -690,10 +695,13 @@ function treeEdge(
   ) {
     throw new CorruptError("tree edge mode is invalid");
   }
+  const type =
+    mode === "40000" || mode === "040000" ? "tree" : mode === "160000" ? "commit" : "blob";
   return {
     oid: oidField(row.oid, "tree edge OID"),
-    type: mode === "40000" || mode === "040000" ? "tree" : mode === "160000" ? "commit" : "blob",
+    type,
     optionalMissing: mode === "160000",
+    allowPromisedMissing: type === "blob",
     physicalOnly: false,
   };
 }
@@ -770,6 +778,7 @@ function physicalExpansion(store: SharedRepoStore, object: QueueObject): ObjectE
         oid: packed.baseOid,
         type: packed.sourceType,
         optionalMissing: false,
+        allowPromisedMissing: false,
         physicalOnly: true,
       },
     ],
@@ -795,6 +804,7 @@ function normalizeAndValidateEdges(
       oid: edge.oid,
       type: edge.type,
       optionalMissing: (previous?.optionalMissing ?? true) && edge.optionalMissing,
+      allowPromisedMissing: (previous?.allowPromisedMissing ?? true) && edge.allowPromisedMissing,
       physicalOnly: (previous?.physicalOnly ?? true) && edge.physicalOnly,
       present: true,
     });
@@ -823,16 +833,20 @@ function validateEdgeTargets(store: SharedRepoStore, wanted: readonly Normalized
   const seen = new Set<string>();
   for (const row of store.db.iterate(
     `SELECT /* maintenance-edge-targets */ input.value AS oid,
-            CASE WHEN loose.oid IS NOT NULL THEN 'loose'
-                 WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
-            CASE WHEN loose.oid IS NOT NULL THEN loose.type ELSE packed.type END AS type
+             CASE WHEN loose.oid IS NOT NULL THEN 'loose'
+                  WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
+             CASE WHEN loose.oid IS NOT NULL THEN loose.type ELSE packed.type END AS type,
+             promised.oid AS promised_oid
        FROM json_each(?) input
        LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = input.value
        LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = input.value
        LEFT JOIN git_pack_meta pack
          ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-        AND pack.state = 'complete'`,
+         AND pack.state = 'complete'
+       LEFT JOIN git_promised_blobs promised
+         ON promised.repo_id = ? AND promised.oid = input.value`,
     JSON.stringify(wanted.map((edge) => edge.oid)),
+    store.repoId,
     store.repoId,
     store.repoId,
   )) {
@@ -842,6 +856,11 @@ function validateEdgeTargets(store: SharedRepoStore, wanted: readonly Normalized
       throw new CorruptError("reachable edge validation returned inconsistent rows");
     }
     if (row.source !== "loose" && row.source !== "pack") {
+      if (edge.allowPromisedMissing && row.promised_oid === edge.oid) {
+        edge.present = false;
+        seen.add(oid);
+        continue;
+      }
       throw new CorruptError(`reachable edge references a missing object ${edge.oid}`);
     }
     const type = objectType(row.type, "reachable edge type");

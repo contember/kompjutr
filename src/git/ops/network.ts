@@ -7,7 +7,7 @@
 // existing ref valid and one reclaimable pending pack.
 
 import { isOid } from "../common/bytes.js";
-import { CorruptError, GitError, hasErrorCode } from "../common/errors.js";
+import { CorruptError, GitError, hasErrorCode, promisedObjectOids } from "../common/errors.js";
 import {
   hashObject,
   type ObjectType,
@@ -22,8 +22,10 @@ import { type MessageCallback, type ProgressCallback, progressSink } from "../pr
 import {
   type Advertisement,
   discover,
+  MAX_PROTOCOL_NEGOTIATION_ENTRIES,
   normalizeRemoteUrl,
   type RemoteRef,
+  type UploadPackFilter,
   uploadPack,
 } from "../protocol/remote.js";
 import { type AuthCallback, type GitAuth, RemoteAuthSession } from "../protocol/transport.js";
@@ -35,6 +37,7 @@ import {
   PACK_BLOB_BATCH_TARGET_BYTES,
   PROVISIONAL_CLONE_LEASE_MS,
   PROVISIONAL_CLONE_RENEW_WINDOW_MS,
+  type PromisedBlob,
 } from "../store/index.js";
 import { checkoutTree, matchesPaths, type TargetEntry } from "./checkout.js";
 import type { GitContext } from "./context.js";
@@ -56,6 +59,7 @@ import { walkWorktreeEntriesStream } from "./worktree-io.js";
 const HAVE_BUDGET = 256;
 const TAG_OBJECT_PAGE = 4_096;
 const TAG_PEEL_HOPS = 16;
+const PROMISOR_LOOKUP_PAGE = 4_096;
 const tagHeaderDecoder = new TextDecoder("utf-8", { fatal: true });
 
 export interface RemoteAuthOptions {
@@ -90,6 +94,7 @@ export interface CloneOptions extends RemoteAuthOptions {
   singleBranch?: boolean;
   noTags?: boolean;
   remote?: string;
+  filter?: UploadPackFilter;
 }
 
 interface MappedFetchSelection {
@@ -112,7 +117,10 @@ interface LegacyFetchSelection {
   readonly tags?: boolean;
 }
 
-export type FetchOptions = RemoteAuthOptions & { readonly dir?: string } & RemoteTarget &
+export type FetchOptions = RemoteAuthOptions & {
+  readonly dir?: string;
+  readonly filter?: UploadPackFilter;
+} & RemoteTarget &
   (MappedFetchSelection | LegacyFetchSelection);
 
 export type FetchResult = StructuredFetchResult;
@@ -122,6 +130,7 @@ type FetchOperationOptions = RemoteAuthOptions & {
   readonly dir?: string;
   readonly remote?: string;
   readonly url?: string;
+  readonly filter?: UploadPackFilter;
 } & (MappedFetchSelection | LegacyFetchSelection);
 
 function isMappedFetchOptions(
@@ -150,6 +159,10 @@ export function validateFetchOptions(options: unknown): void {
     throw new GitError("EINVAL", "fetch url must be a string");
   }
   const refspecs = Reflect.get(options, "refspecs");
+  const filter = Reflect.get(options, "filter");
+  if (filter !== undefined && filter !== "blob:none") {
+    throw new GitError("EUNSUPPORTED", "fetch filter is not supported");
+  }
   if (refspecs !== undefined) {
     if (!Array.isArray(refspecs)) throw new GitError("EINVAL", "fetch refspecs must be an array");
     for (const field of ["depth", "ref", "remoteRef", "singleBranch", "prune", "tags"]) {
@@ -494,6 +507,7 @@ async function ingestPack(
   pack: AsyncIterable<Uint8Array>,
   say: ((text: string) => void) | undefined,
   checkpoint: ((stage: FetchCheckpointStage) => Promise<void> | undefined) | undefined,
+  promisor: { remote: string; url: string } | undefined,
 ): Promise<void> {
   const yieldNow =
     checkpoint === undefined
@@ -506,6 +520,16 @@ async function ingestPack(
     ...(say === undefined ? {} : { onProgress: say }),
     now: context.now,
     ...(yieldNow === undefined ? {} : { yieldNow }),
+    ...(promisor === undefined
+      ? {}
+      : {
+          lifecycle: {
+            reserved() {},
+            published(result) {
+              recordPartialFetch(repo, promisor.remote, promisor.url, result.packId);
+            },
+          },
+        }),
   });
 }
 
@@ -518,6 +542,9 @@ async function transferPack(
     shallows: string[];
     depth?: number;
     includeTag?: boolean;
+    filter?: UploadPackFilter;
+    thinPack?: boolean;
+    promisorRemote?: string;
     advertised: Set<string>;
     haves?: string[];
     useLocalHaves?: boolean;
@@ -546,6 +573,8 @@ async function transferPack(
         advertised: request.advertised,
         ...(request.depth === undefined ? {} : { depth: request.depth }),
         ...(request.includeTag === undefined ? {} : { includeTag: request.includeTag }),
+        ...(request.filter === undefined ? {} : { filter: request.filter }),
+        ...(request.thinPack === undefined ? {} : { thinPack: request.thinPack }),
         ...(say === undefined ? {} : { onProgress: say, onMessage: say }),
       },
       auth,
@@ -556,7 +585,16 @@ async function transferPack(
   }
   const beforeIngest = checkpoint?.("before-ingest");
   if (beforeIngest !== undefined) await beforeIngest;
-  await ingestPack(context, repo, fetchPackStream(result.pack), say, checkpoint);
+  await ingestPack(
+    context,
+    repo,
+    fetchPackStream(result.pack),
+    say,
+    checkpoint,
+    request.promisorRemote === undefined
+      ? undefined
+      : { remote: request.promisorRemote, url: request.url },
+  );
   const afterIngest = checkpoint?.("after-ingest");
   if (afterIngest !== undefined) await afterIngest;
   if (result.shallow.length > 0 || result.unshallow.length > 0) {
@@ -645,6 +683,162 @@ function fetchRemoteUrl(
   return { remote, url };
 }
 
+function recordPartialFetch(repo: Repository, remote: string, url: string, packId: number): void {
+  repo.store.registerPromisorRemote(remote, url);
+  repo.store.addPromisedBlobsFromPackTrees(remote, packId);
+}
+
+function requirePartialFetchTarget(repo: Repository, remote: string, url: string): void {
+  const configured = remoteUrlFor(repo, remote);
+  if (configured === undefined || normalizeRemoteUrl(configured) !== normalizeRemoteUrl(url)) {
+    throw new GitError(
+      "EPROMISORREMOTE",
+      `filtered fetch requires configured remote ${remote} at the requested URL`,
+    );
+  }
+  const existing = repo.store.readPromisorRemote(remote);
+  if (existing !== null && existing.url !== normalizeRemoteUrl(url)) {
+    throw new GitError("EPROMISORREMOTE", `promisor remote ${remote} changed since clone`);
+  }
+}
+
+function promisedBlobDetails(repo: Repository, oids: readonly string[]): PromisedBlob[] {
+  const promised: PromisedBlob[] = [];
+  for (let offset = 0; offset < oids.length; offset += PROMISOR_LOOKUP_PAGE) {
+    promised.push(
+      ...repo.store.promisedMissingDetails(oids.slice(offset, offset + PROMISOR_LOOKUP_PAGE)),
+    );
+  }
+  return promised;
+}
+
+/** Fetch one bounded exact set of promised blobs as self-contained packs. */
+export async function hydratePromisedBlobs(
+  context: GitContext,
+  repo: Repository,
+  oids: readonly string[],
+  options: RemoteAuthOptions = {},
+): Promise<void> {
+  const unique = [...new Set(oids)];
+  if (unique.length > MAX_PROTOCOL_NEGOTIATION_ENTRIES) {
+    throw new GitError(
+      "E2BIG",
+      `promisor hydration exceeds ${MAX_PROTOCOL_NEGOTIATION_ENTRIES} objects`,
+    );
+  }
+  const promised = promisedBlobDetails(repo, unique);
+  if (promised.length === 0) return;
+  const byRemote = new Map<string, string[]>();
+  for (const blob of promised) {
+    const group = byRemote.get(blob.remoteName);
+    if (group === undefined) byRemote.set(blob.remoteName, [blob.oid]);
+    else group.push(blob.oid);
+  }
+  for (const [remote, wants] of byRemote) {
+    const promisor = repo.store.readPromisorRemote(remote);
+    if (promisor === null) throw new CorruptError(`promisor remote ${remote} is missing`);
+    const configured = remoteUrlFor(repo, remote);
+    if (configured === undefined || normalizeRemoteUrl(configured) !== promisor.url) {
+      throw new GitError("EPROMISORREMOTE", `promisor remote ${remote} changed since clone`);
+    }
+    const headers = options.headers ?? context.promisorHeaders;
+    const onAuth = options.onAuth ?? context.promisorAuth;
+    const auth = createRemoteAuth(context, {
+      ...(headers === undefined ? {} : { headers }),
+      ...(onAuth === undefined ? {} : { onAuth }),
+      ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+      ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
+    });
+    const advertisement = await fetchAdvertisement(promisor.url, auth);
+    const transfer = await transferPack(
+      context,
+      repo,
+      {
+        url: promisor.url,
+        wants,
+        shallows: [],
+        advertised: advertisement.capabilities,
+        useLocalHaves: false,
+        thinPack: false,
+      },
+      auth,
+      fetchProgressSink(options.onProgress, options.onMessage),
+      undefined,
+    );
+    if (transfer.shallow.length > 0 || transfer.unshallow.length > 0) {
+      throw new CorruptError("promisor hydration received an unsolicited shallow response");
+    }
+    const missing = repo.store.missing(wants);
+    if (missing.length > 0) {
+      throw new GitError("EFETCHFAIL", "promisor remote did not return every requested blob");
+    }
+    for (const oid of wants) {
+      const metadata = repo.store.typeAndSize(oid);
+      if (metadata?.type !== "blob") {
+        throw new CorruptError(`promisor returned a non-blob object for ${oid}`);
+      }
+    }
+  }
+}
+
+/** Retry one synchronous operation after bounded exact-OID hydration batches. */
+export async function withPromisorHydration<T>(
+  context: GitContext,
+  repo: Repository,
+  body: () => T,
+): Promise<T> {
+  const requested = new Set<string>();
+  for (;;) {
+    try {
+      return body();
+    } catch (error) {
+      const oids = promisedObjectOids(error);
+      if (oids === null) throw error;
+      const before = requested.size;
+      for (const oid of oids) requested.add(oid);
+      if (requested.size === before) throw error;
+      if (requested.size > MAX_PROTOCOL_NEGOTIATION_ENTRIES) {
+        throw new GitError(
+          "E2BIG",
+          `operation requires more than ${MAX_PROTOCOL_NEGOTIATION_ENTRIES} promised blobs`,
+        );
+      }
+      await hydratePromisedBlobs(context, repo, oids);
+    }
+  }
+}
+
+/** Hydrate all promised blobs selected for one checkout in one bounded negotiation. */
+export async function hydrateTreeBlobs(
+  context: GitContext,
+  repo: Repository,
+  treeOid: string,
+  paths: string[] | undefined,
+  options: RemoteAuthOptions = {},
+): Promise<void> {
+  const promised = new Set<string>();
+  let candidates: string[] = [];
+  const flush = (): void => {
+    for (const oid of repo.store.promisedMissing(candidates)) {
+      promised.add(oid);
+      if (promised.size > MAX_PROTOCOL_NEGOTIATION_ENTRIES) {
+        throw new GitError(
+          "E2BIG",
+          `checkout requires more than ${MAX_PROTOCOL_NEGOTIATION_ENTRIES} promised blobs`,
+        );
+      }
+    }
+    candidates = [];
+  };
+  for (const entry of treeStream(repo, treeOid)) {
+    if (entry.mode === "160000" || !matchesPaths(entry.path, paths)) continue;
+    candidates.push(entry.oid);
+    if (candidates.length === PROMISOR_LOOKUP_PAGE) flush();
+  }
+  flush();
+  await hydratePromisedBlobs(context, repo, [...promised], options);
+}
+
 /** Build one authenticated remote session. */
 export function createRemoteAuth(context: GitContext, options: RemoteAuthOptions) {
   validateRemoteAuthOptions(options);
@@ -697,6 +891,7 @@ function isPublicFetchNetworkError(error: unknown): boolean {
     error.code === "ECORRUPT" ||
     error.code === "E2BIG" ||
     error.code === "EAUTH" ||
+    error.code === "EUNSUPPORTED" ||
     error.code === "EURLSCHEME"
   );
 }
@@ -884,6 +1079,7 @@ export async function fetchInto(
     ? compileFetchRefspecs(options.refspecs)
     : undefined;
   const { remote, url } = fetchRemoteUrl(repo, options);
+  if (options.filter !== undefined) requirePartialFetchTarget(repo, remote, url);
   const auth = fetchAuth(context, options);
   const beforeDiscovery = behavior.checkpoint?.("before-discovery");
   if (beforeDiscovery !== undefined) await beforeDiscovery;
@@ -963,6 +1159,8 @@ async function fetchMappedInto(
         shallows: [],
         advertised: advertisement.capabilities,
         useLocalHaves: false,
+        ...(options.filter === undefined ? {} : { filter: options.filter }),
+        ...(options.filter === undefined ? {} : { promisorRemote: remote }),
       },
       auth,
       say,
@@ -971,7 +1169,6 @@ async function fetchMappedInto(
     if (transfer.shallow.length > 0 || transfer.unshallow.length > 0) {
       throw new CorruptError("mapped fetch received an unsolicited shallow response");
     }
-
     const types = authenticateMappedRoots(repo, refs);
     requireMappedUpdateRules(repo, refs, publication, types);
     authenticateTags(repo, tags);
@@ -1086,6 +1283,8 @@ async function prepareLegacyFetchPublication(
           advertised: advertisement.capabilities,
           ...(options.depth === undefined ? {} : { depth: options.depth }),
           ...(autoTags ? { includeTag: true } : {}),
+          ...(options.filter === undefined ? {} : { filter: options.filter }),
+          ...(options.filter === undefined ? {} : { promisorRemote: remote }),
         },
         auth,
         say,
@@ -1110,6 +1309,8 @@ async function prepareLegacyFetchPublication(
             shallows: effectiveShallows(shallows, shallow),
             advertised: advertisement.capabilities,
             haves: eligible.filter((tag) => wanted.has(tag.ref.oid)).map((tag) => tag.peeledOid),
+            ...(options.filter === undefined ? {} : { filter: options.filter }),
+            ...(options.filter === undefined ? {} : { promisorRemote: remote }),
           },
           auth,
           say,
@@ -1270,6 +1471,9 @@ function requireCloneTargetsAbsent(
 
 export async function clone(context: GitContext, options: CloneOptions): Promise<void> {
   const root = normalizePath(options.dir ?? "/");
+  if (options.filter !== undefined && options.filter !== "blob:none") {
+    throw new GitError("EUNSUPPORTED", "clone filter is not supported");
+  }
   if (context.worktree.db !== context.database.db) {
     throw new GitError(
       "EUNSUPPORTED",
@@ -1326,6 +1530,7 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
         ...(options.noTags === true ? { tags: false } : singleBranch ? {} : { tags: true }),
         ...(options.ref === undefined ? {} : { ref: options.ref }),
         ...(depth === undefined ? {} : { depth }),
+        ...(options.filter === undefined ? {} : { filter: options.filter }),
         ...(options.headers === undefined ? {} : { headers: options.headers }),
         ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
         ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
@@ -1355,6 +1560,9 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     if (afterLocalRefs !== undefined) await afterLocalRefs;
 
     const tree = repo.readCommit(repo.peel(tip)).tree;
+    if (options.filter !== undefined) {
+      await hydrateTreeBlobs(context, repo, tree, options.paths, options);
+    }
     const beforeMaterialization = checkpoint();
     if (beforeMaterialization !== undefined) await beforeMaterialization;
     const fallback = (): undefined => {

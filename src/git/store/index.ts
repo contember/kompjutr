@@ -26,6 +26,8 @@ export type {
   ObjectReadBatch,
   ObjectReadInfo,
   OwnedObjectBatch,
+  PromisedBlob,
+  PromisorRemote,
   ProvisionalCloneOwner,
   RefLogActor,
   RefLogEntry,

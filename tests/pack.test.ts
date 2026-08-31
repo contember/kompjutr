@@ -1499,11 +1499,14 @@ describe("synthetic pack ingest", () => {
     expect(error.code).toBe("ECORRUPT");
   });
 
-  it("makes staged commit batches visible on final completion", async () => {
+  it("keeps promises through staged batches and removes them on final completion", async () => {
     const store = open();
     const chunks: Uint8Array[] = [];
     const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(500);
+    const promisedData = utf8.encode("promised through staging\n");
+    const promisedOid = hashObject("blob", promisedData);
+    writer.header(501);
+    writer.object("blob", promisedData);
     let firstOid = "";
     for (let index = 0; index < 500; index++) {
       const data = syntheticCommit(index, `${"s".repeat(10_000)} ${index}\n`);
@@ -1511,10 +1514,29 @@ describe("synthetic pack ingest", () => {
       writer.object("commit", data);
     }
     writer.finish();
+    const pack = concat(chunks);
+    store.registerPromisorRemote("origin", "https://example.test/repo.git");
+    store.addPromisedBlobs("origin", [promisedOid]);
 
-    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    await expect(
+      store.packs.ingest(slices(pack, 64 * 1024), {
+        lifecycle: {
+          reserved: () => undefined,
+          published: () => {
+            throw new Error("reject final publication");
+          },
+        },
+      }),
+    ).rejects.toThrow("reject final publication");
+    expect(store.promisedMissing([promisedOid])).toEqual([promisedOid]);
+    expect(
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'"),
+    ).toBe(0);
+
+    await store.packs.ingest(slices(pack, 64 * 1024));
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(500);
     expect(store.cachedCommit(firstOid)).not.toBeNull();
+    expect(store.promisedMissing([promisedOid])).toEqual([]);
   });
 });
 

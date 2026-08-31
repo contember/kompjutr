@@ -62,6 +62,33 @@ export class ObjectNotFoundError extends GitError {
   }
 }
 
+/** Blob bytes intentionally omitted by a partial clone. */
+export class PromisedObjectError extends GitError {
+  constructor(
+    readonly oids: readonly string[],
+    options?: { cause?: unknown },
+  ) {
+    super("EPROMISED", `promised blob content is not present: ${oids.join(", ")}`, options);
+    this.name = "PromisedObjectError";
+  }
+}
+
+/** Recover promised OIDs through operation-specific error wrappers without relying on class identity. */
+export function promisedObjectOids(error: unknown, depth = 0): string[] | null {
+  if (depth > 4 || typeof error !== "object" || error === null) return null;
+  if (hasErrorCode(error, "EPROMISED")) {
+    const value = Reflect.get(error, "oids");
+    if (!Array.isArray(value)) return null;
+    const oids: string[] = [];
+    for (const oid of value) {
+      if (typeof oid !== "string") return null;
+      oids.push(oid);
+    }
+    return oids;
+  }
+  return promisedObjectOids(Reflect.get(error, "cause"), depth + 1);
+}
+
 /** A ref or revision expression that does not resolve. */
 export class RefNotFoundError extends GitError {
   constructor(ref: string, options?: { cause?: unknown }) {

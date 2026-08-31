@@ -30,6 +30,8 @@ import type {
   ObjectReadBatch,
   ObjectReadInfo,
   OwnedObjectBatch,
+  PromisedBlob,
+  PromisorRemote,
   RefLogEntry,
   RefLogMetadata,
   RefLogReadOptions,
@@ -45,6 +47,7 @@ import { advanceCheckoutRevision, requireScratchIndexName } from "./lifecycle.js
 import { bumpMaintenanceRootEpoch } from "./maintenance/control.js";
 import { ObjectTable } from "./objects.js";
 import { PackStore } from "./packs.js";
+import { PromisorTable } from "./promisor.js";
 import { activeRefLogOids, type Clock, RefLogWriter, readRefLog } from "./reflog.js";
 import { type HeadOwner, RefTable } from "./refs.js";
 import { MAX_SCRATCH_INDEXES_PER_REPOSITORY } from "./schema.js";
@@ -140,6 +143,7 @@ export class SharedRepoStore {
   readonly #shallowTable: ShallowTable;
   readonly #refs: RefTable;
   readonly #fetchPublication: FetchPublicationTable;
+  readonly #promisor: PromisorTable;
   readonly #scratchTransactions: ScratchTransactionCoordinator;
   readonly #packs: PackStore;
   #objectTable: ObjectTable | null = null;
@@ -190,6 +194,7 @@ export class SharedRepoStore {
         bumpMaintenanceRootEpoch(db, repoId);
       },
     });
+    this.#promisor = new PromisorTable(db, repoId);
     this.#scratchTransactions = scratchTransactionsFor(db);
     this.cacheNamespace = `${repoId}:${storeGeneration}`;
     this.#packs = new PackStore(
@@ -429,6 +434,38 @@ export class SharedRepoStore {
 
   missing(oids: Iterable<string>): string[] {
     return this.#objectOps().missing(oids);
+  }
+
+  registerPromisorRemote(remoteName: string, url: string): PromisorRemote {
+    return this.#promisor.register(remoteName, url);
+  }
+
+  readPromisorRemote(remoteName: string): PromisorRemote | null {
+    return this.#promisor.read(remoteName);
+  }
+
+  addPromisedBlobs(remoteName: string, oids: Iterable<string>): void {
+    this.#promisor.addBlobs(remoteName, oids);
+  }
+
+  addPromisedBlobsFromPackTrees(remoteName: string, packId: number): void {
+    this.#promisor.addBlobsFromPackTrees(remoteName, packId);
+  }
+
+  promisedMissing(oids: readonly string[]): string[] {
+    return this.#promisor.promisedMissing(oids);
+  }
+
+  promisedMissingDetails(oids: readonly string[]): PromisedBlob[] {
+    return this.#promisor.promisedMissingDetails(oids);
+  }
+
+  promisedBlobCount(): number {
+    return this.#promisor.count();
+  }
+
+  *iteratePromisedBlobs(): Generator<PromisedBlob> {
+    yield* this.#promisor.iterate();
   }
 
   typeAndSize(oid: string): { type: ObjectType; size: number } | null {

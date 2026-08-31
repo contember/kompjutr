@@ -34,3 +34,4 @@ a commit message suffices.
 - [0017 — Measure cost in benchmarks and bound only real failures](0017-measure-query-cost-and-bound-real-failures.md) — accepted (2026-08-29, rewritten 2026-08-30)
 - [0018 — Trust stored rows and validate at the boundary](0018-trust-stored-rows-validate-at-the-boundary.md) — accepted (2026-08-30)
 - [0019 — Organize source by domain with bottom-up layers](0019-organize-source-by-domain-with-bottom-up-layers.md) — accepted (2026-08-30)
+- [0020 — Model partial-clone blobs as durable promises](0020-model-partial-clone-blobs-as-durable-promises.md) — accepted (2026-08-31)

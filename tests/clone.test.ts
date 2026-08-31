@@ -5,10 +5,12 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
+import { createGit } from "../src/git/client.js";
 import { GitError } from "../src/git/common/errors.js";
 import { openRepository } from "../src/git/ops/context.js";
 import { divergence, mergeBase } from "../src/git/ops/merge-base.js";
 import { clone, fetchInto, remoteUrlFor } from "../src/git/ops/network.js";
+import { push } from "../src/git/ops/push.js";
 import { log, lsTree } from "../src/git/ops/reads.js";
 import type { Repository } from "../src/git/ops/repository.js";
 import { gitModeFor, type Worktree } from "../src/git/ops/worktree.js";
@@ -17,6 +19,7 @@ import {
   type GitHttpClient,
   type GitHttpRequest,
 } from "../src/git/protocol/transport.js";
+import { Workspace } from "../src/runtime/workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServerOptions, startGitServer, startStubServer } from "./helpers/http-backend.js";
 import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
@@ -94,6 +97,32 @@ function makeFixture(): { fixture: GitFixture; first: string; head: string } {
   fixture.remove("deep/nested/note.txt");
   const head = fixture.commit("second");
   return { fixture, first, head };
+}
+
+function makePromisorScaleFixture(blobBytes: number): {
+  fixture: GitFixture;
+  topicTip: string;
+  sideBlob: string;
+} {
+  const fixture = new GitFixture().init();
+  fixture.write("current.txt", "current\n");
+  fixture.commit("main");
+  fixture.git("checkout", "-q", "-b", "topic");
+  for (let index = 0; index < 1_001; index++) {
+    fixture.write(
+      `bulk/file-${String(index).padStart(4, "0")}.txt`,
+      `${index}:${"x".repeat(blobBytes)}\n`,
+    );
+  }
+  const topicTip = fixture.commit("topic");
+  fixture.git("checkout", "-q", "main");
+  fixture.git("checkout", "-q", "-b", "side");
+  fixture.write("side.txt", "unrelated\n");
+  fixture.commit("side");
+  const sideBlob = fixture.git("rev-parse", "HEAD:side.txt");
+  fixture.git("checkout", "-q", "main");
+  fixture.git("config", "uploadpack.allowFilter", "true");
+  return { fixture, topicTip, sideBlob };
 }
 
 function makeCloneSelectionFixture(): {
@@ -316,6 +345,480 @@ function allSegments(worktree: Worktree, root: string): string[] {
 }
 
 describe("clone", () => {
+  it("clones blobless history and lazily hydrates an old blob", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("old.txt", "historical\n");
+    const first = fixture.commit("first");
+    const oldBlob = fixture.git("rev-parse", `${first}:old.txt`);
+    fixture.remove("old.txt");
+    fixture.write("current.txt", "current\n");
+    fixture.commit("second");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        filter: "blob:none",
+      });
+
+      const repo = openRepository(workspace.context, "/work");
+      expect(new TextDecoder().decode(workspace.worktree.readFile("/work/current.txt"))).toBe(
+        "current\n",
+      );
+      expect(repo.has(oldBlob)).toBe(false);
+      expect(repo.store.promisedBlobCount()).toBe(1);
+      expect(server.requests.map((request) => request.method)).toEqual([
+        "GET",
+        "POST",
+        "GET",
+        "POST",
+      ]);
+
+      const requestsBeforeRead = server.requests.length;
+      expect(repo.revParse(`${first}:old.txt`)).toBe(oldBlob);
+      expect(server.requests).toHaveLength(requestsBeforeRead);
+      const git = createGit()({
+        database: workspace.database,
+        worktree: workspace.worktree,
+        now: workspace.context.now,
+        timezoneOffset: workspace.context.timezoneOffset,
+        http: fetchHttpClient,
+      });
+      await expect(git.diff({ dir: "/work" })).resolves.toBe("");
+      expect(repo.store.promisedBlobCount()).toBe(1);
+      expect(server.requests).toHaveLength(requestsBeforeRead);
+      const result = await git.catFile({ dir: "/work", oid: first, filepath: "old.txt" });
+
+      expect(new TextDecoder().decode(result.bytes)).toBe("historical\n");
+      expect(repo.has(oldBlob)).toBe(true);
+      expect(repo.store.promisedBlobCount()).toBe(0);
+      expect(server.requests.slice(requestsBeforeRead).map((request) => request.method)).toEqual([
+        "GET",
+        "POST",
+      ]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("rejects blobless clone before upload when the server omits filter", async () => {
+    const { fixture } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await expect(
+        clone(workspace.context, { url: server.url, dir: "/work", filter: "blob:none" }),
+      ).rejects.toMatchObject({ code: "EUNSUPPORTED" });
+      expect(server.requests.map((request) => request.method)).toEqual(["GET"]);
+      expect(workspace.database.findCheckout("/work")).toBeNull();
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("keeps shallow history boundaries independent from blob promises", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("old.txt", "old\n");
+    const first = fixture.commit("first");
+    fixture.write("current.txt", "current\n");
+    const head = fixture.commit("second");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        depth: 1,
+        filter: "blob:none",
+        paths: ["current.txt"],
+      });
+
+      const repo = openRepository(workspace.context, "/work");
+      expect(repo.shallow()).toEqual(new Set([head]));
+      expect(repo.has(first)).toBe(false);
+      expect(repo.store.promisedBlobCount()).toBe(1);
+      expect(new TextDecoder().decode(workspace.worktree.readFile("/work/current.txt"))).toBe(
+        "current\n",
+      );
+      expect(workspace.worktree.exists("/work/old.txt")).toBe(false);
+      const git = createGit()({
+        database: workspace.database,
+        worktree: workspace.worktree,
+        now: workspace.context.now,
+        timezoneOffset: workspace.context.timezoneOffset,
+        http: fetchHttpClient,
+      });
+      const old = await git.catFile({ dir: "/work", oid: head, filepath: "old.txt" });
+      expect(new TextDecoder().decode(old.bytes)).toBe("old\n");
+      expect(repo.shallow()).toEqual(new Set([head]));
+      expect(repo.store.promisedBlobCount()).toBe(0);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("hydrates a many-blob checkout with one upload-pack request", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("current.txt", "current\n");
+    fixture.commit("main");
+    fixture.git("checkout", "-q", "-b", "topic");
+    for (let index = 0; index < 1_001; index++) {
+      fixture.write(`bulk/file-${String(index).padStart(4, "0")}.txt`, `content ${index}\n`);
+    }
+    fixture.commit("topic");
+    fixture.git("checkout", "-q", "main");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        filter: "blob:none",
+      });
+      const repo = openRepository(workspace.context, "/work");
+      expect(repo.store.promisedBlobCount()).toBe(1_001);
+      const requestsBeforeCheckout = server.requests.length;
+      const git = createGit()({
+        database: workspace.database,
+        worktree: workspace.worktree,
+        now: workspace.context.now,
+        timezoneOffset: workspace.context.timezoneOffset,
+        http: fetchHttpClient,
+      });
+
+      await git.checkout({ dir: "/work", ref: "origin/topic" });
+
+      expect(repo.store.promisedBlobCount()).toBe(0);
+      expect(
+        server.requests.slice(requestsBeforeCheckout).map((request) => request.method),
+      ).toEqual(["GET", "POST"]);
+      expect(
+        new TextDecoder().decode(workspace.worktree.readFile("/work/bulk/file-1000.txt")),
+      ).toBe("content 1000\n");
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("hydrates diff windows in exact batches and leaves unrelated promises", async () => {
+    const { fixture, sideBlob } = makePromisorScaleFixture(0);
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        filter: "blob:none",
+      });
+      const repo = openRepository(workspace.context, "/work");
+      expect(repo.store.promisedBlobCount()).toBe(1_002);
+      const requestsBeforeDiff = server.requests.length;
+      const git = createGit()({
+        database: workspace.database,
+        worktree: workspace.worktree,
+        now: workspace.context.now,
+        timezoneOffset: workspace.context.timezoneOffset,
+        http: fetchHttpClient,
+      });
+
+      const patch = await git.diff({ dir: "/work", ref: "origin/topic" });
+
+      expect(patch).toContain("bulk/file-1000.txt");
+      expect(repo.store.promisedMissing([sideBlob])).toEqual([sideBlob]);
+      expect(repo.store.promisedBlobCount()).toBe(1);
+      expect(
+        server.requests.slice(requestsBeforeDiff).filter((request) => request.method === "POST"),
+      ).toHaveLength(2);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("hydrates the exact selected push closure and leaves unrelated promises", async () => {
+    const { fixture, topicTip, sideBlob } = makePromisorScaleFixture(10_000);
+    const destination = join(fixture.dir, "destination.git");
+    fixture.git("init", "--bare", destination);
+    fixture.git(`--git-dir=${destination}`, "config", "http.receivepack", "true");
+    const sourceServer = await startGitServer(fixture.dir);
+    const destinationServer = await startGitServer(destination);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, {
+        url: sourceServer.url,
+        dir: "/work",
+        filter: "blob:none",
+      });
+      const repo = openRepository(workspace.context, "/work");
+      expect(repo.store.promisedBlobCount()).toBe(1_002);
+      const requestsBeforePush = sourceServer.requests.length;
+
+      await push(workspace.context, repo, {
+        url: destinationServer.url,
+        refspecs: [
+          {
+            source: "refs/remotes/origin/topic",
+            destination: "refs/heads/topic",
+          },
+        ],
+      });
+
+      expect(fixture.git(`--git-dir=${destination}`, "rev-parse", "refs/heads/topic")).toBe(
+        topicTip,
+      );
+      expect(repo.store.promisedMissing([sideBlob])).toEqual([sideBlob]);
+      expect(repo.store.promisedBlobCount()).toBe(1);
+      expect(
+        sourceServer.requests
+          .slice(requestsBeforePush)
+          .filter((request) => request.method === "POST").length,
+      ).toBe(1);
+    } finally {
+      await destinationServer.close();
+      await sourceServer.close();
+      fixture.dispose();
+    }
+  });
+
+  it("rejects checkout target drift while promised blobs hydrate", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("old.txt", "historical\n");
+    const first = fixture.commit("first");
+    fixture.git("branch", "topic", first);
+    fixture.remove("old.txt");
+    fixture.write("current.txt", "current\n");
+    const head = fixture.commit("second");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    let signalHydration = (): void => {};
+    const hydrationStarted = new Promise<void>((resolve) => {
+      signalHydration = resolve;
+    });
+    let releaseHydration = (): void => {};
+    const hydrationGate = new Promise<void>((resolve) => {
+      releaseHydration = resolve;
+    });
+    let blockDiscovery = true;
+    const blockingHttp: GitHttpClient = async (request) => {
+      if (blockDiscovery && request.method === "GET") {
+        blockDiscovery = false;
+        signalHydration();
+        await hydrationGate;
+      }
+      return fetchHttpClient(request);
+    };
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        filter: "blob:none",
+      });
+      const binding = {
+        database: workspace.database,
+        worktree: workspace.worktree,
+        now: workspace.context.now,
+        timezoneOffset: workspace.context.timezoneOffset,
+      };
+      const checkoutClient = createGit()({ ...binding, http: blockingHttp });
+      const mutationClient = createGit()({ ...binding, http: fetchHttpClient });
+      const checkingOut = checkoutClient.checkout({ dir: "/work", ref: "origin/topic" });
+      await hydrationStarted;
+
+      await mutationClient.updateRef({
+        dir: "/work",
+        ref: "refs/remotes/origin/topic",
+        value: head,
+        force: true,
+      });
+      releaseHydration();
+
+      await expect(checkingOut).rejects.toMatchObject({ code: "ESTALE" });
+      expect(new TextDecoder().decode(workspace.worktree.readFile("/work/current.txt"))).toBe(
+        "current\n",
+      );
+      expect(workspace.worktree.stat("/work/old.txt")).toBeNull();
+    } finally {
+      releaseHydration();
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("rejects checkout when an operation journal starts during hydration", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("old.txt", "historical\n");
+    const first = fixture.commit("first");
+    fixture.git("branch", "topic", first);
+    fixture.remove("old.txt");
+    fixture.write("current.txt", "current\n");
+    const head = fixture.commit("second");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    let signalHydration = (): void => {};
+    const hydrationStarted = new Promise<void>((resolve) => {
+      signalHydration = resolve;
+    });
+    let releaseHydration = (): void => {};
+    const hydrationGate = new Promise<void>((resolve) => {
+      releaseHydration = resolve;
+    });
+    let blockDiscovery = true;
+    const blockingHttp: GitHttpClient = async (request) => {
+      if (blockDiscovery && request.method === "GET") {
+        blockDiscovery = false;
+        signalHydration();
+        await hydrationGate;
+      }
+      return fetchHttpClient(request);
+    };
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        filter: "blob:none",
+      });
+      const repo = openRepository(workspace.context, "/work");
+      const checkoutClient = createGit()({
+        database: workspace.database,
+        worktree: workspace.worktree,
+        now: workspace.context.now,
+        timezoneOffset: workspace.context.timezoneOffset,
+        http: blockingHttp,
+      });
+      const checkingOut = checkoutClient.checkout({ dir: "/work", ref: "origin/topic" });
+      await hydrationStarted;
+
+      repo.checkout.writeOperationState(
+        {
+          kind: "cherry-pick",
+          originalHeadRef: "refs/heads/main",
+          originalHeadOid: head,
+          phase: "empty",
+          emptyReason: "result",
+          sourceOid: head,
+          selectedParentOid: first,
+          mainline: null,
+          currentLabel: "HEAD",
+          incomingLabel: head.slice(0, 7),
+          message: "second\n",
+          author: null,
+          committer: null,
+        },
+        [],
+      );
+      releaseHydration();
+
+      await expect(checkingOut).rejects.toMatchObject({ code: "EOPACTIVE" });
+      expect(new TextDecoder().decode(workspace.worktree.readFile("/work/current.txt"))).toBe(
+        "current\n",
+      );
+      expect(workspace.worktree.stat("/work/old.txt")).toBeNull();
+    } finally {
+      releaseHydration();
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("hydrates promised history before pushing a partial clone to another remote", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("old.txt", "historical\n");
+    fixture.commit("first");
+    fixture.remove("old.txt");
+    fixture.write("current.txt", "current\n");
+    const head = fixture.commit("second");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const destination = join(fixture.dir, "destination.git");
+    fixture.git("init", "--bare", destination);
+    fixture.git(`--git-dir=${destination}`, "config", "http.receivepack", "true");
+    const sourceServer = await startGitServer(fixture.dir);
+    const destinationServer = await startGitServer(destination);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, {
+        url: sourceServer.url,
+        dir: "/work",
+        filter: "blob:none",
+      });
+      const repo = openRepository(workspace.context, "/work");
+      expect(repo.store.promisedBlobCount()).toBe(1);
+
+      repo.store.configSet("remote.origin.url", destinationServer.url);
+      await expect(
+        push(workspace.context, repo, {
+          url: destinationServer.url,
+          ref: "main",
+          remoteRef: "main",
+        }),
+      ).rejects.toMatchObject({ code: "EPROMISORREMOTE" });
+      expect(destinationServer.requests.some((request) => request.method === "POST")).toBe(false);
+      repo.store.configSet("remote.origin.url", sourceServer.url);
+
+      await push(workspace.context, repo, {
+        url: destinationServer.url,
+        ref: "main",
+        remoteRef: "main",
+      });
+
+      expect(repo.store.promisedBlobCount()).toBe(0);
+      expect(fixture.git(`--git-dir=${destination}`, "rev-parse", "refs/heads/main")).toBe(head);
+      expect(destinationServer.requests.some((request) => request.method === "POST")).toBe(true);
+    } finally {
+      await destinationServer.close();
+      await sourceServer.close();
+      fixture.dispose();
+    }
+  });
+
+  it("reacquires promisor credentials after rebuilding the client", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("old.txt", "historical\n");
+    const first = fixture.commit("first");
+    fixture.remove("old.txt");
+    fixture.write("current.txt", "current\n");
+    fixture.commit("second");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir, { requireAuth: true });
+    const workspace = makeWorkspace();
+    let authCalls = 0;
+    const onAuth = (): { username: string; password: string } => {
+      authCalls++;
+      return { username: "reader", password: "secret" };
+    };
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        filter: "blob:none",
+        onAuth,
+      });
+      const cold = new Workspace({
+        storage: workspace.storage,
+        git: createGit(),
+        http: fetchHttpClient,
+        promisorAuth: onAuth,
+      });
+
+      const result = await cold.git.catFile({ dir: "/work", oid: first, filepath: "old.txt" });
+
+      expect(new TextDecoder().decode(result.bytes)).toBe("historical\n");
+      expect(authCalls).toBeGreaterThanOrEqual(3);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
   it("materialises the same working tree as a native git clone", async () => {
     const { fixture, head } = makeFixture();
     const server = await startGitServer(fixture.dir);
@@ -1107,6 +1610,66 @@ describe("clone", () => {
 });
 
 describe("fetch", () => {
+  it("publishes filtered-pack promises atomically before refs", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("old.txt", "historical\n");
+    fixture.commit("first");
+    fixture.write("current.txt", "current\n");
+    fixture.commit("second");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    workspace.repo.store.configSet("remote.origin.url", server.url);
+    workspace.repo.store.configSet("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+    const injected = new Error("stop after filtered pack publication");
+    try {
+      await expect(
+        fetchInto(
+          workspace.context,
+          workspace.repo,
+          { remote: "origin", filter: "blob:none" },
+          "fetch",
+          {
+            checkpoint(stage) {
+              if (stage === "after-ingest") throw injected;
+              return undefined;
+            },
+          },
+        ),
+      ).rejects.toBe(injected);
+
+      expect(workspace.repo.store.promisedBlobCount()).toBe(2);
+      expect(workspace.repo.store.listRefs("refs/remotes/origin/")).toEqual([]);
+      expect(tableRows(workspace, "SELECT state FROM git_pack_meta ORDER BY pack_id")).toEqual([
+        { state: "complete" },
+      ]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("rejects an unconfigured explicit-URL filtered fetch before discovery", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("file.txt", "content\n");
+    fixture.commit("one");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    try {
+      await expect(
+        fetchInto(workspace.context, workspace.repo, {
+          url: server.url,
+          filter: "blob:none",
+        }),
+      ).rejects.toMatchObject({ code: "EPROMISORREMOTE" });
+      expect(server.requests).toEqual([]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
   it("transfers only the new objects, then nothing at all", async () => {
     const { fixture, head } = makeFixture();
     const server = await startGitServer(fixture.dir);

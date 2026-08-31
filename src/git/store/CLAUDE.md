@@ -14,6 +14,7 @@ shared.ts            repository-scoped facade and scratch transactions
 checkout.ts          composition root for one checkout-bound store
 objects.ts           loose objects and object batching
 config.ts            repository configuration
+promisor.ts          partial-clone remotes and promised missing blobs
 shallow.ts           shallow boundaries
 blob-ids.ts          disposable filesystem-content to Git-OID cache
 reflog.ts            shared ref and checkout HEAD histories
@@ -52,6 +53,8 @@ maintenance roots. This boundary is ADR-0009.
   undefined behavior (ADR-0018).
 - Caller mistakes are `GitError`, never corruption. Keep that distinction when
   moving validation between a family and its facade.
+- Promised blobs are metadata, not physical objects or maintenance roots. Only
+  complete object publication removes their promise rows.
 - Traversals use `db.iterate()`. `db.all()` is only for bounded result sets.
 - Bound allocation with fixed page, batch, cache, queue, and structural caps.
   Do not introduce projected statement admission or a byte-accounting ledger.

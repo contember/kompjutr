@@ -1,6 +1,6 @@
 import { NotARepositoryError } from "../common/errors.js";
 import { normalizePath } from "../common/paths.js";
-import type { GitHttpClient } from "../protocol/transport.js";
+import type { AuthCallback, GitHttpClient } from "../protocol/transport.js";
 import type { SqliteGitDatabase } from "../store/index.js";
 import { Repository } from "./repository.js";
 import type {
@@ -83,6 +83,9 @@ export interface GitContext {
   selectedPaths?: SelectedPathSource;
   commitTrees?: CommitTreeSnapshotSource;
   http?: GitHttpClient;
+  /** Reacquire credentials when a later read hydrates blobs from a promisor remote. */
+  promisorAuth?: AuthCallback;
+  promisorHeaders?: Record<string, string>;
   now: () => number;
   /** Minutes west of UTC, for commit timestamps. */
   timezoneOffset: () => number;

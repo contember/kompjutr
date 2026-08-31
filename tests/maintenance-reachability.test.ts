@@ -172,6 +172,20 @@ function seedMark(
   }
 }
 
+function promiseBlob(db: TestDatabase, repoId: number, oid: string): void {
+  db.run(
+    `INSERT INTO git_promisor_remotes (repo_id, remote_name, url, filter)
+     VALUES (?, 'origin', 'https://example.com/repo.git', 'blob:none')`,
+    repoId,
+  );
+  db.run(
+    `INSERT INTO git_promised_blobs (repo_id, oid, remote_name, type)
+     VALUES (?, ?, 'origin', 'blob')`,
+    repoId,
+    oid,
+  );
+}
+
 function commit(tree: string, parent: string[] = [], message = "fixture\n"): Uint8Array {
   return serializeCommit({
     tree,
@@ -1040,6 +1054,8 @@ describe("maintenance reachability", () => {
   it("fails closed on missing mandatory edges", () => {
     const missing = open();
     const absent = "e".repeat(40);
+    const other = missing.database.createRepository("/other", "ref: refs/heads/main");
+    promiseBlob(missing.db, other.repoId, absent);
     const missingTree = missing.store.write(
       "tree",
       serializeTree([{ mode: MODE_FILE, name: "missing", oid: absent }]),
@@ -1056,6 +1072,91 @@ describe("maintenance reachability", () => {
         missingTree,
       ),
     ).toBe(0);
+  });
+
+  it("accepts a repository-owned promised blob as an unmarked tree-edge terminal", () => {
+    const { db, checkout, store } = open();
+    const promised = "a".repeat(40);
+    const tree = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "promised", oid: promised }]),
+    );
+    promiseBlob(db, checkout.repoId, promised);
+    seedMark(db, checkout.repoId, [{ oid: tree }]);
+
+    expect(advanceMaintenanceReachability(store.shared)).toMatchObject({
+      processedOid: tree,
+      discoveredObjects: 0,
+      discoveredLogicalObjects: 0,
+    });
+    drain(db, store.shared);
+
+    expect(marks(db, checkout.repoId)).toEqual([
+      { oid: tree, expanded: 1, physical_only: 0, edge_cursor: 1 },
+    ]);
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
+        checkout.repoId,
+        promised,
+      ),
+    ).toBe(0);
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_maintenance_repack_objects WHERE repo_id = ? AND oid = ?",
+        checkout.repoId,
+        promised,
+      ),
+    ).toBe(0);
+    expect(
+      db.one<{ phase: string; reachable_objects: number; queued_objects: number }>(
+        `SELECT phase, reachable_objects, queued_objects
+           FROM git_maintenance_runs WHERE repo_id = ?`,
+        checkout.repoId,
+      ),
+    ).toEqual({ phase: "classify-loose", reachable_objects: 1, queued_objects: 0 });
+  });
+
+  it("does not apply blob promises to missing non-blob edges or roots", () => {
+    const nonBlob = open();
+    const promisedTree = "b".repeat(40);
+    const tree = nonBlob.store.write(
+      "tree",
+      serializeTree([{ mode: "40000", name: "missing-tree", oid: promisedTree }]),
+    );
+    promiseBlob(nonBlob.db, nonBlob.checkout.repoId, promisedTree);
+    seedMark(nonBlob.db, nonBlob.checkout.repoId, [{ oid: tree }]);
+
+    expect(() => advanceMaintenanceReachability(nonBlob.store.shared)).toThrow(
+      /references a missing object/,
+    );
+
+    const tagEdge = open();
+    const promisedTagTarget = "d".repeat(40);
+    const tag = tagEdge.store.write(
+      "tag",
+      serializeTag({
+        object: promisedTagTarget,
+        type: "blob",
+        tag: "missing-blob",
+        message: "\n",
+      }),
+    );
+    promiseBlob(tagEdge.db, tagEdge.checkout.repoId, promisedTagTarget);
+    seedMark(tagEdge.db, tagEdge.checkout.repoId, [{ oid: tag }]);
+
+    expect(() => advanceMaintenanceReachability(tagEdge.store.shared)).toThrow(
+      /references a missing object/,
+    );
+
+    const root = open();
+    const promisedRoot = "c".repeat(40);
+    promiseBlob(root.db, root.checkout.repoId, promisedRoot);
+    seedMark(root.db, root.checkout.repoId, [{ oid: promisedRoot }]);
+
+    expect(() => advanceMaintenanceReachability(root.store.shared)).toThrow(
+      /reachable object .* is missing/,
+    );
   });
 
   it("returns root-changed without publishing or changing counters", () => {

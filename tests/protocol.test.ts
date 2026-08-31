@@ -9,7 +9,7 @@ import {
   pktLines,
 } from "../src/git/protocol/pktline.js";
 import { receivePack } from "../src/git/protocol/receive-pack.js";
-import { discover, normalizeRemoteUrl, uploadPack } from "../src/git/protocol/remote.js";
+import { AGENT, discover, normalizeRemoteUrl, uploadPack } from "../src/git/protocol/remote.js";
 import { ByteReader, pktText } from "../src/git/protocol/stream.js";
 import type { GitHttpClient, GitHttpResponse } from "../src/git/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
@@ -812,6 +812,98 @@ describe("upload-pack", () => {
     expect(sent).toContain(`have ${"6".repeat(40)}\n`);
     expect(sent.endsWith("0009done\n")).toBe(true);
     expect(lines.length).toBeGreaterThan(3);
+  });
+
+  it("frames blob:none after wants and depth with the exact filter capability", async () => {
+    const otherWant = "5".repeat(40);
+    const shallow = "6".repeat(40);
+    const have = "7".repeat(40);
+    let sent: Uint8Array = new Uint8Array(0);
+    const responseBody = concat([pkt("NAK\n"), pkt(concat([new Uint8Array([1]), PACK])), FLUSH]);
+    const result = await uploadPack(
+      {
+        url: "http://host/repo",
+        wants: [OID, otherWant],
+        haves: [have],
+        shallows: [shallow],
+        depth: 7,
+        filter: "blob:none",
+        advertised: new Set(["side-band-64k", "thin-pack", "ofs-delta", "shallow", "filter"]),
+      },
+      {
+        http: (request) => {
+          sent = bufferedBody(request.body);
+          return Promise.resolve(respond(responseBody, "application/x-git-upload-pack-result"));
+        },
+      },
+    );
+
+    expect(sent).toEqual(
+      concat([
+        pkt(`want ${OID} side-band-64k thin-pack ofs-delta shallow filter agent=${AGENT}\n`),
+        pkt(`want ${otherWant}\n`),
+        pkt(`shallow ${shallow}\n`),
+        pkt("deepen 7\n"),
+        pkt("filter blob:none\n"),
+        FLUSH,
+        pkt(`have ${have}\n`),
+        pkt("done\n"),
+      ]),
+    );
+    expect(await collect(result.pack)).toEqual(PACK);
+  });
+
+  it("rejects unavailable and unsupported filters before POST", async () => {
+    let calls = 0;
+    const http: GitHttpClient = () => {
+      calls++;
+      return Promise.resolve(respond(new Uint8Array(0), "application/x-git-upload-pack-result"));
+    };
+
+    await expect(
+      uploadPack(
+        {
+          url: "http://host/repo",
+          wants: [OID],
+          filter: "blob:none",
+          advertised: new Set(["filter=blob:none"]),
+        },
+        { http },
+      ),
+    ).rejects.toMatchObject({ code: "EUNSUPPORTED" });
+
+    const unsupported = {
+      url: "http://host/repo",
+      wants: [OID],
+      filter: "tree:0",
+      advertised: new Set(["filter"]),
+    };
+    await expect(
+      Reflect.apply(uploadPack, undefined, [unsupported, { http }]),
+    ).rejects.toMatchObject({ code: "EUNSUPPORTED" });
+    expect(calls).toBe(0);
+  });
+
+  it("can disable thin-pack while preserving the enabled default", async () => {
+    const sent: string[] = [];
+    const responseBody = concat([pkt("NAK\n"), pkt(concat([new Uint8Array([1]), PACK])), FLUSH]);
+    const http: GitHttpClient = (request) => {
+      sent.push(new TextDecoder().decode(bufferedBody(request.body)));
+      return Promise.resolve(respond(responseBody, "application/x-git-upload-pack-result"));
+    };
+    const request = {
+      url: "http://host/repo",
+      wants: [OID],
+      advertised: new Set(["side-band-64k", "thin-pack"]),
+    };
+
+    const defaultResult = await uploadPack(request, { http });
+    await collect(defaultResult.pack);
+    const fullResult = await uploadPack({ ...request, thinPack: false }, { http });
+    await collect(fullResult.pack);
+
+    expect(sent[0]).toContain(" thin-pack ");
+    expect(sent[1]).not.toContain("thin-pack");
   });
 
   it("bounds structural outbound entries before sending the request", async () => {

@@ -20,6 +20,7 @@ import {
   type RemoteAuthOptions,
   remoteUrlFor,
   validateRemoteAuthOptions,
+  withPromisorHydration,
 } from "./network.js";
 import {
   authenticatePushBranchTargets,
@@ -425,10 +426,13 @@ export async function push(
     let advertisement: Advertisement | null = await discover(target.url, "git-receive-pack", auth);
     const joined = joinAdvertisement(mappings, advertisement);
     const activeUpdates = activePlanningUpdates(joined.updates);
-    plan =
-      activeUpdates.length === 0
-        ? null
-        : planPushUpdates(repo, activeUpdates, { remoteOids: joined.remoteOids });
+    if (activeUpdates.length === 0) {
+      plan = null;
+    } else {
+      plan = await withPromisorHydration(context, repo, () =>
+        planPushUpdates(repo, activeUpdates, { remoteOids: joined.remoteOids }),
+      );
+    }
     activeUpdates.length = 0;
     joined.remoteOids.length = 0;
     advertisement = null;

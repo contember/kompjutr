@@ -7,6 +7,7 @@ import {
   GitError,
   hasErrorCode,
   ObjectNotFoundError,
+  PromisedObjectError,
   RefNotFoundError,
 } from "../common/errors.js";
 import {
@@ -312,7 +313,10 @@ export class Repository {
 
   read(oid: string): RawObject {
     const object = this.store.read(oid);
-    if (object === null) throw new ObjectNotFoundError(oid);
+    if (object === null) {
+      if (this.store.promisedMissing([oid]).length > 0) throw new PromisedObjectError([oid]);
+      throw new ObjectNotFoundError(oid);
+    }
     return object;
   }
 
@@ -322,7 +326,10 @@ export class Repository {
 
   typeOf(oid: string): ObjectType {
     const found = this.store.typeAndSize(oid);
-    if (found === null) throw new ObjectNotFoundError(oid);
+    if (found === null) {
+      if (this.store.promisedMissing([oid]).length > 0) throw new PromisedObjectError([oid]);
+      throw new ObjectNotFoundError(oid);
+    }
     return found.type;
   }
 
@@ -383,11 +390,15 @@ export class Repository {
 
   /** Read a bounded prefix of blobs without scalar object lookups. */
   readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {
+    const promised = this.store.promisedMissing(oids);
+    if (promised.length > 0) throw new PromisedObjectError(promised);
     return this.store.readBlobs(oids, options);
   }
 
   /** Read a bounded prefix of mixed objects without scalar lookups. */
   readObjects(oids: readonly string[], options: { budgetBytes?: number } = {}): ObjectReadBatch {
+    const promised = this.store.promisedMissing(oids);
+    if (promised.length > 0) throw new PromisedObjectError(promised);
     return this.store.readObjects(oids, options);
   }
 
@@ -727,9 +738,23 @@ export class Repository {
     if (path === "") return { state: treeState, mode: "40000" };
     const entry = this.resolveTreePath(treeState.oid, path);
     if (entry === null) return undefined;
+    const expected = typeForMode(entry.mode);
+    if (expected === "blob") {
+      const metadata = this.store.typeAndSize(entry.oid);
+      if (metadata === null) {
+        if (this.store.promisedMissing([entry.oid]).length === 0) {
+          throw new ObjectNotFoundError(entry.oid);
+        }
+      } else if (metadata.type !== expected) {
+        throw new CorruptError(`tree entry ${entry.oid} is a ${metadata.type}, not a ${expected}`);
+      }
+      return {
+        state: { oid: entry.oid, promised: true, type: expected },
+        mode: entry.mode,
+      };
+    }
     const object = this.#readRevisionObject({ oid: entry.oid, promised: true });
     if (object === undefined) throw new ObjectNotFoundError(entry.oid);
-    const expected = typeForMode(entry.mode);
     if (object.type !== expected) {
       throw new CorruptError(`tree entry ${entry.oid} is a ${object.type}, not a ${expected}`);
     }

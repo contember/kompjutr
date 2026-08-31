@@ -31,6 +31,8 @@ import type {
   ObjectBatchOptions,
   ObjectReadBatch,
   ObjectReadInfo,
+  PromisedBlob,
+  PromisorRemote,
   RefLogEntry,
   RefLogMetadata,
   RefLogReadOptions,
@@ -224,6 +226,38 @@ export class CheckoutStore implements IndexStore {
 
   missing(oids: Iterable<string>): string[] {
     return this.shared.missing(oids);
+  }
+
+  registerPromisorRemote(remoteName: string, url: string): PromisorRemote {
+    return this.shared.registerPromisorRemote(remoteName, url);
+  }
+
+  readPromisorRemote(remoteName: string): PromisorRemote | null {
+    return this.shared.readPromisorRemote(remoteName);
+  }
+
+  addPromisedBlobs(remoteName: string, oids: Iterable<string>): void {
+    this.shared.addPromisedBlobs(remoteName, oids);
+  }
+
+  addPromisedBlobsFromPackTrees(remoteName: string, packId: number): void {
+    this.shared.addPromisedBlobsFromPackTrees(remoteName, packId);
+  }
+
+  promisedMissing(oids: readonly string[]): string[] {
+    return this.shared.promisedMissing(oids);
+  }
+
+  promisedMissingDetails(oids: readonly string[]): PromisedBlob[] {
+    return this.shared.promisedMissingDetails(oids);
+  }
+
+  promisedBlobCount(): number {
+    return this.shared.promisedBlobCount();
+  }
+
+  *iteratePromisedBlobs(): Generator<PromisedBlob> {
+    yield* this.shared.iteratePromisedBlobs();
   }
 
   typeAndSize(oid: string): { type: ObjectType; size: number } | null {

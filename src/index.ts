@@ -43,6 +43,7 @@ export {
   type GitBranchRenameOptions,
   type GitCherryPickContinueOptions,
   type GitCherryPickOptions,
+  type GitCloneOptions,
   type GitCommitTreeOptions,
   type GitDivergenceOptions,
   type GitFactory,
@@ -55,6 +56,7 @@ export {
   type GitMergeBaseOptions,
   type GitMergeContinueOptions,
   type GitMergeOptions,
+  type GitPromisorAuth,
   type GitPullOptions,
   type GitPushOptions,
   type GitReadRefOptions,
@@ -92,6 +94,7 @@ export {
   ObjectNotFoundError,
   PathOutsideRepoError,
   PathspecNotFoundError,
+  PromisedObjectError,
   RefNotFoundError,
   UnsupportedOperationError,
 } from "./git/common/errors.js";

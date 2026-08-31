@@ -320,6 +320,8 @@ function advertisedRefName(name: string): boolean {
   return name.startsWith("refs/") && hasCanonicalRefSyntax(name);
 }
 
+export type UploadPackFilter = "blob:none";
+
 export interface UploadPackRequest {
   url: string;
   wants: string[];
@@ -329,6 +331,10 @@ export interface UploadPackRequest {
   depth?: number;
   /** Ask for tags pointing at fetched objects. */
   includeTag?: boolean;
+  /** Limit the server response to objects allowed by this partial-clone filter. */
+  filter?: UploadPackFilter;
+  /** Ask for a thin pack. Defaults to true. */
+  thinPack?: boolean;
   advertised: Set<string>;
   onProgress?: (message: string) => void;
   onMessage?: (message: string) => void;
@@ -346,17 +352,29 @@ function negotiate(advertised: Set<string>, wanted: string[]): string[] {
   return wanted.filter((capability) => advertised.has(capability));
 }
 
+function uploadPackFilter(filter: unknown): UploadPackFilter | undefined {
+  if (filter === undefined || filter === "blob:none") return filter;
+  throw new GitError("EUNSUPPORTED", "unsupported upload-pack filter");
+}
+
 export async function uploadPack(
   request: UploadPackRequest,
   options: ProtocolRequestOptions = {},
 ): Promise<UploadPackResult> {
   const entryLimit = resolvedProtocolEntryLimit(options.protocolLimits?.entries);
   const base = normalizeRemoteUrl(request.url);
-  const wanted = ["side-band-64k", "thin-pack", "ofs-delta", "no-done"];
+  const filter = uploadPackFilter(request.filter);
+  if (filter !== undefined && !request.advertised.has("filter")) {
+    throw new GitError("EUNSUPPORTED", "remote does not support upload-pack filter");
+  }
+  const wanted = ["side-band-64k"];
+  if (request.thinPack !== false) wanted.push("thin-pack");
+  wanted.push("ofs-delta", "no-done");
   if (request.includeTag === true) wanted.push("include-tag");
   const shallows = request.shallows ?? [];
   if (request.depth !== undefined || shallows.length > 0) wanted.push("shallow");
   if (request.onProgress === undefined) wanted.push("no-progress");
+  if (filter !== undefined) wanted.push("filter");
   const capabilities = negotiate(request.advertised, wanted);
   capabilities.push(`agent=${AGENT}`);
 
@@ -391,6 +409,9 @@ export async function uploadPack(
     }
     if (request.depth !== undefined) {
       pushLine(() => `deepen ${request.depth}\n`);
+    }
+    if (filter !== undefined) {
+      pushLine(() => `filter ${filter}\n`);
     }
     body.push(FLUSH);
     for (const oid of haves) {

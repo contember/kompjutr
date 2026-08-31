@@ -1,7 +1,7 @@
 // Bounded outbound closure and replayable full-object pack generation.
 
 import { isOid } from "../common/bytes.js";
-import { CorruptError, GitError, hasErrorCode } from "../common/errors.js";
+import { CorruptError, GitError, hasErrorCode, PromisedObjectError } from "../common/errors.js";
 import {
   hashObject,
   type ObjectType,
@@ -285,6 +285,8 @@ function hydrateObjects(
       if (entry === undefined) throw new CorruptError("push hydration page lost an entry");
       oids.push(entry[0]);
     }
+    const promised = repo.store.promisedMissing(oids);
+    if (promised.length > 0) throw new PromisedObjectError(promised);
     const info = repo.store.objectInfo(oids);
     for (let index = 0; index < page.length; index++) {
       const entry = page[index];
@@ -343,6 +345,8 @@ function authenticateObjects(
   tracker.set("root-auth-input", 2 * CONTAINER_BASE_BYTES + oids.length * 2 * SET_ENTRY_BYTES);
   let remaining = oids.filter((oid) => !state.types.has(oid));
   while (remaining.length > 0) {
+    const promised = repo.store.promisedMissing(remaining);
+    if (promised.length > 0) throw new PromisedObjectError(promised);
     const info = repo.store.objectInfo(remaining);
     let selectedBytes = 0;
     let selected = 0;

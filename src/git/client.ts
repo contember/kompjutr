@@ -65,7 +65,9 @@ import {
   clone as cloneOp,
   type FetchOptions,
   fetchInto,
+  hydrateTreeBlobs,
   validateFetchOptions,
+  withPromisorHydration,
 } from "./ops/network.js";
 import type {
   FetchResult as StructuredFetchResult,
@@ -199,7 +201,7 @@ import {
   worktreePrune as worktreePruneOp,
   worktreeRemove as worktreeRemoveOp,
 } from "./ops/worktrees.js";
-import type { GitHttpClient } from "./protocol/transport.js";
+import type { AuthCallback, GitHttpClient } from "./protocol/transport.js";
 import type { SqliteGitDatabase } from "./store/index.js";
 
 export interface GitDirOptions {
@@ -207,6 +209,7 @@ export interface GitDirOptions {
 }
 
 export type GitCloneOptions = CloneOptions;
+export type GitPromisorAuth = AuthCallback;
 export type GitFetchOptions = GitDirOptions & FetchOptions;
 export type GitLsRemoteOptions = GitDirOptions & LsRemoteOptions;
 export type GitInitOptions = InitOptions;
@@ -381,6 +384,8 @@ export interface GitWorkspaceBinding {
   timezoneOffset: () => number;
   defaultIdentity?: GitIdentity;
   http?: GitHttpClient;
+  promisorAuth?: AuthCallback;
+  promisorHeaders?: Record<string, string>;
   yieldNow?: () => Promise<void>;
 }
 
@@ -418,6 +423,8 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
   if (binding.defaultIdentity !== undefined) context.defaultIdentity = binding.defaultIdentity;
   if (binding.exactRootStates !== undefined) context.exactRootStates = binding.exactRootStates;
   if (binding.http !== undefined) context.http = binding.http;
+  if (binding.promisorAuth !== undefined) context.promisorAuth = binding.promisorAuth;
+  if (binding.promisorHeaders !== undefined) context.promisorHeaders = binding.promisorHeaders;
   if (binding.initialWorktree !== undefined) context.initialWorktree = binding.initialWorktree;
   if (binding.indexTracker !== undefined) context.indexTracker = binding.indexTracker;
   if (binding.sparseWorkspace !== undefined) context.sparseWorkspace = binding.sparseWorkspace;
@@ -468,10 +475,16 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return branch === true ? { entries, branch: statusBranch(repo) } : { entries };
     },
     async diff(input = {}) {
-      return diffOp(at(input.dir), context.worktree, input, context.sparseWorkspace);
+      const repo = at(input.dir);
+      return withPromisorHydration(context, repo, () =>
+        diffOp(repo, context.worktree, input, context.sparseWorkspace),
+      );
     },
     async diffSummary(input = {}) {
-      return diffSummaryOp(at(input.dir), context.worktree, input, context.sparseWorkspace);
+      const repo = at(input.dir);
+      return withPromisorHydration(context, repo, () =>
+        diffSummaryOp(repo, context.worktree, input, context.sparseWorkspace),
+      );
     },
     async clean(input = {}) {
       const repo = at(input.dir);
@@ -611,6 +624,14 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async checkout(input) {
       const repo = at(input.dir);
       repo.checkout.requireNoOperationState();
+      const commit = repo.peel(repo.revParse(input.ref));
+      const tree = repo.readCommit(commit).tree;
+      await hydrateTreeBlobs(context, repo, tree, input.paths);
+      repo.checkout.requireNoOperationState();
+      const currentCommit = repo.peel(repo.revParse(input.ref));
+      if (currentCommit !== commit || repo.readCommit(currentCommit).tree !== tree) {
+        throw new GitError("ESTALE", `checkout target ${input.ref} changed during blob hydration`);
+      }
       checkoutOp(context, repo, context.worktree, input);
     },
     async remoteAdd(input) {
@@ -639,10 +660,11 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async catFile(input) {
       const repo = at(input.dir);
-      const result =
+      const result = await withPromisorHydration(context, repo, () =>
         input.filepath === undefined
           ? catFileOp(repo, input)
-          : catFileRead(repo, input.oid, input.filepath);
+          : catFileRead(repo, input.oid, input.filepath),
+      );
       return { oid: result.oid, bytes: result.bytes };
     },
     async readTree(input) {

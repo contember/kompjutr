@@ -283,9 +283,11 @@ function tagOwned(context: GitContext, repo: Repository, options: TagOptions): v
   if (options.force !== true && exists) {
     throw new GitError("ETAGFAIL", `tag '${options.name}' already exists`);
   }
+  const target = repo.revParse(options.object ?? "HEAD");
+  repo.typeOf(target);
   mutateRefsOwned(
     repo.checkout,
-    { puts: [{ name: full, target: repo.revParse(options.object ?? "HEAD") }] },
+    { puts: [{ name: full, target }] },
     operationRefLogMetadata(context, repo, exists ? "tag: update" : "tag: create"),
   );
 }

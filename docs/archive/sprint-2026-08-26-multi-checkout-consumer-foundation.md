@@ -285,7 +285,8 @@ models overlap.
 - Multi-ref checkpoint pushes, partial clone, wildcard refspec fetch, remote ref
   discovery, scratch indexes, and patch interchange remain in backlog
   [08](sprint-2026-08-28-refspec-transport.md),
-  [41](../backlog/41-partial-clone.md),
+  partial clone (subsequently shipped under
+  [ADR-0020](../decisions/0020-model-partial-clone-blobs-as-durable-promises.md)),
   [42](sprint-2026-08-28-refspec-transport.md),
   the later [index and object write plumbing sprint](sprint-2026-08-28-index-and-object-write-plumbing.md), and
   then-open backlog 44. They belong to the broader checkpoint workload, not the

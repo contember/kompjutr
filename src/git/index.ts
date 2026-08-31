@@ -39,6 +39,7 @@ export {
   type GitMergeBaseOptions,
   type GitMergeContinueOptions,
   type GitMergeOptions,
+  type GitPromisorAuth,
   type GitPullOptions,
   type GitPushOptions,
   type GitReadRefOptions,
@@ -83,6 +84,7 @@ export {
   ObjectNotFoundError,
   PathOutsideRepoError,
   PathspecNotFoundError,
+  PromisedObjectError,
   RefNotFoundError,
   UnsupportedOperationError,
 } from "./common/errors.js";

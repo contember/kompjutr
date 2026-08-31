@@ -77,7 +77,7 @@ view, and nested checkout roots are excluded from parent worktree scans.
 
 | Owner | State |
 | --- | --- |
-| Repository (`repo_id`) | objects, packs, refs, ordinary config, shallow and fetch state, direct-ref reflogs, tree/commit projections, blob-ID cache, maintenance |
+| Repository (`repo_id`) | objects, packs, refs, ordinary config, shallow, fetch and promisor state, direct-ref reflogs, tree/commit projections, blob-ID cache, maintenance |
 | Checkout (`checkout_id`) | canonical root, raw `HEAD`, index, tracker state, operation journal, checkout `HEAD` reflog |
 | Source surrogate | `git_tree_entries` for one exact loose or packed tree source |
 | Synchronous scratch transaction | named scratch indexes; rows never survive the callback and are not maintenance roots |
@@ -173,11 +173,20 @@ sparse status path hydrates only the bounded dirty and baseline-to-HEAD
 candidates and classifies exact renames from those rows; fallback full status
 and `statusStream()` retain the ordered HEAD/index/worktree merge.
 
+`blob:none` partial clones keep the complete commit/tree graph and record absent
+blob OIDs in `git_promised_blobs`. Promises are metadata, not physical objects:
+ordinary object availability remains false until a complete loose object or pack
+atomically removes the promise. Async content operations hydrate exact missing
+OID batches under one aggregate operation cap and ingest self-contained backfill
+packs; synchronous reads fail with `EPROMISED`. Maintenance accepts promised
+missing blobs only as terminal leaves.
+
 ## Concurrency seams
 
 Local mutations finish inside synchronous SQLite transactions. Code never emits
-SQL transaction statements. Only clone, fetch, push, pull, and maintenance
-repack cross asynchronous boundaries after repository state has opened.
+SQL transaction statements. Clone, fetch, push, pull, maintenance repack, and
+promise-hydrating content operations cross asynchronous boundaries after
+repository state has opened.
 
 - Clone hides partial state behind a renewable provisional owner generation.
 - Ordinary pack ingest uses one renewable five-minute generation lease per

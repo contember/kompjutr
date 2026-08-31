@@ -56,10 +56,9 @@ workload would need gained, or routed differently.
 
 The native surface supports several isolated session checkouts over one shared
 store, bounded divergence against a caller-selected base, offline raw ref reads,
-atomic checkpoint transport, and remote ref discovery. A consumer adapter
-belongs to the consumer repository, not this package. Partial clone remains the
-main network gap. Local snapshot replay is available without textual patch
-interchange.
+atomic checkpoint transport, remote ref discovery, and `blob:none` partial
+clone. A consumer adapter belongs to the consumer repository, not this package.
+Local snapshot replay is available without textual patch interchange.
 
 ## Strict local argv runner
 
@@ -153,12 +152,14 @@ native and Computer surfaces use this database-only creation path.
 | `--origin <name>` | `remote` (default `origin`) | ✔ |
 | — | `paths` | ✔ check out only these paths (kompjutr extension) |
 | auth | `headers`, `onAuth`, `onProgress`, `onMessage` | ★ ✔ a per-command credential helper maps onto `onAuth` |
-| `--filter=<spec>` (partial clone) | — | ★ ✘ the reference workload clones every project `--filter=blob:none` and backfills blobs lazily |
+| `--filter=blob:none` | `filter: "blob:none"` | ★ ✔ keeps complete commit/tree history, hydrates selected checkout blobs, and records the rest as durable promises |
 | `--bare`, `--mirror`, `--recurse-submodules`, `--reference` | — | ✘ |
 
 Clone sets `remote.<name>.url`, `remote.<name>.fetch`,
 `branch.<name>.remote` and `branch.<name>.merge`. A clone that fails leaves no
-repository behind.
+repository behind. Later lazy reads use binding-level `promisorHeaders` or
+`promisorAuth`; changing the configured promisor URL fails with
+`EPROMISORREMOTE` instead of fetching from the replacement.
 
 ## Working tree and index
 
@@ -535,8 +536,9 @@ stored values are authenticated before either operation returns or mutates.
 | `--tags` | `tags: true` | ✔ fetches every advertised tag |
 | `--no-tags` | `tags: false` | ✔ disables automatic tag following |
 | `--prune` | `prune` | ✔ |
+| `--filter=blob:none` | `filter: "blob:none"` | ✔ protocol-v0 filtered fetch with durable promises |
 | mapped `--depth`, mapped `--prune` | — | ✘ rejected rather than mixed with typed mappings |
-| `--all`, `--unshallow`, `--deepen`, `--filter`, `--recurse-submodules` | — | ✘ |
+| `--all`, `--unshallow`, `--deepen`, other filters, `--recurse-submodules` | — | ✘ |
 
 Legacy fetch returns `{ mode: "legacy", defaultBranch, fetchHead, updates: [] }`.
 Mapped fetch returns `{ mode: "mapped", defaultBranch, fetchHead: null,
@@ -549,6 +551,10 @@ publication authenticates annotated chains and never clobbers a different
 existing local tag. Auto-follow silently preserves an existing local tag, while
 `tags: true` and an explicitly selected tag reject a different local target
 with `ETAGFAIL` and publish no refs.
+
+Filtered fetch requires a configured remote whose current URL matches the
+requested URL. An unconfigured explicit URL, or a configured remote repointed
+after its first filtered fetch, fails with `EPROMISORREMOTE` before discovery.
 
 ### `git pull` — `pull()`
 
@@ -775,7 +781,7 @@ on the surface.
 - **Packaging:** `archive`, `bundle`
 - **Mechanisms:** hooks, GPG/SSH signing, credential helpers ★, `.gitattributes`
   (no filters, no eol conversion, no merge drivers), `.mailmap`, Git LFS,
-  `git://` and `ssh://` transports, `--filter` partial clone ★
+  `git://` and `ssh://` transports
 
 ## Surface differences
 
@@ -872,7 +878,6 @@ consumer adapter is outside this package.
 | Missing | What issues it |
 |---|---|
 | `worktree repair` / `unlock` | the broader Git-layout recovery and lock lifecycle; the SQLite-native admission path has no pointer or lock state to repair |
-| `--filter=blob:none` partial clone | the initial clone of every project repository ([backlog 41](../backlog/41-partial-clone.md)) |
 | `diff -z` | NUL-framed diff path lists parsed by the orchestrator; status formatters already provide NUL framing |
 
 ### Adaptable — the capability exists under another shape

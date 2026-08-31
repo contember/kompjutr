@@ -252,8 +252,8 @@ missing contract found during planning.
 - Force-with-lease remains [`13`](../backlog/13-force-with-lease.md). Local
   concurrency expectations do not widen the public push refspec contract.
 - Clone depth/deepening and partial-clone behavior remain
-  [`38`](../backlog/38-clone-depth-and-deepening.md) and
-  [`41`](../backlog/41-partial-clone.md).
+  [`38`](../backlog/38-clone-depth-and-deepening.md); partial clone subsequently
+  shipped under [ADR-0020](../decisions/0020-model-partial-clone-blobs-as-durable-promises.md).
 - General workflow scheduling, distributed multi-Durable-Object locking, and a
   repository-wide mutex are excluded. Coordination is scoped to one repository
   in one Durable Object storage and only to the failing seam.

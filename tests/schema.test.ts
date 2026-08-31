@@ -27,6 +27,8 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_reflog_state", "shared"],
   ["git_reflog_entries", "shared"],
   ["git_config", "shared"],
+  ["git_promisor_remotes", "shared"],
+  ["git_promised_blobs", "shared"],
   ["git_scratch_indexes", "shared"],
   ["git_scratch_index_entries", "shared"],
   ["git_blob_id_state", "shared"],
@@ -110,6 +112,9 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_pack_objects" },
   { type: "index", name: "git_pack_objects_loc" },
   { type: "table", name: "git_pack_pending" },
+  { type: "table", name: "git_promised_blobs" },
+  { type: "trigger", name: "git_promised_blobs_loose_present" },
+  { type: "table", name: "git_promisor_remotes" },
   { type: "table", name: "git_reflog_entries" },
   { type: "index", name: "git_reflog_entries_by_ref" },
   { type: "index", name: "git_reflog_entries_by_timestamp" },
@@ -190,6 +195,8 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
     ],
   ],
   ["git_config", ["repo_id", "path", "seq", "value"]],
+  ["git_promisor_remotes", ["repo_id", "remote_name", "url", "filter"]],
+  ["git_promised_blobs", ["repo_id", "oid", "remote_name", "type"]],
   ["git_index", ["checkout_id", "path", "stage", "mode", "oid", "size", "mtime", "ino", "rev"]],
   ["git_scratch_indexes", ["repo_id", "name"]],
   [
@@ -517,6 +524,8 @@ describe("git schema", () => {
     expect(primaryKeyOf(db, "git_checkouts")).toEqual(["id"]);
     expect(primaryKeyOf(db, "git_fetch_namespaces")).toEqual(["repo_id", "tracking_prefix"]);
     expect(primaryKeyOf(db, "git_tracking_ref_revisions")).toEqual(["repo_id", "ref_name"]);
+    expect(primaryKeyOf(db, "git_promisor_remotes")).toEqual(["repo_id", "remote_name"]);
+    expect(primaryKeyOf(db, "git_promised_blobs")).toEqual(["repo_id", "oid"]);
     expect(primaryKeyOf(db, "git_index")).toEqual(["checkout_id", "path", "stage"]);
     expect(primaryKeyOf(db, "git_scratch_indexes")).toEqual(["repo_id", "name"]);
     expect(primaryKeyOf(db, "git_scratch_index_entries")).toEqual([
@@ -542,6 +551,13 @@ describe("git schema", () => {
     ]);
     expect(cascadeForeignKeysOf(db, "git_tracking_ref_revisions")).toEqual([
       { table: "git_repositories", from: "repo_id", to: "id" },
+    ]);
+    expect(cascadeForeignKeysOf(db, "git_promisor_remotes")).toEqual([
+      { table: "git_repositories", from: "repo_id", to: "id" },
+    ]);
+    expect(cascadeForeignKeysOf(db, "git_promised_blobs")).toEqual([
+      { table: "git_promisor_remotes", from: "repo_id", to: "repo_id" },
+      { table: "git_promisor_remotes", from: "remote_name", to: "remote_name" },
     ]);
     expect(cascadeForeignKeysOf(db, "git_scratch_indexes")).toEqual([
       { table: "git_repositories", from: "repo_id", to: "id" },

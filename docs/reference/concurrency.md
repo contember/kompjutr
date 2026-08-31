@@ -2,13 +2,13 @@
 
 kompjutr relies on SQLite transactions for local mutations and explicit durable
 checkpoints for work that must cross an asynchronous boundary. A returned
-`Promise` does not by itself make an operation concurrent: only `clone`,
-`fetch`, `push`, `pull`, and the repack phase of `maintenance` await after they
-have opened repository state.
+`Promise` does not by itself make an operation concurrent. `clone`, `fetch`,
+`push`, `pull`, the repack phase of `maintenance`, and content operations that
+hydrate promised blobs await after they have opened repository state.
 
 All other public Git methods finish their core mutation synchronously before
-their async wrapper returns. They can run while one of the five asynchronous
-owners is paused, but they cannot interleave inside another local transaction.
+their async wrapper returns. They can run while an asynchronous owner is paused,
+but they cannot interleave inside another local transaction.
 
 ## Outcomes
 
@@ -38,6 +38,7 @@ The conformance suite uses these outcomes:
 | `push` | Local OID snapshot; remote receive-pack side effect; configured-remote tracking publication. |
 | `pull` | HEAD and upstream snapshot; all fetch checkpoints; snapshot revalidation; synchronous merge publication. |
 | `maintenance` | Run allocation; root pages; mark pages; repack selection, pack publication, and finalization; sweep pages; finish or rollover. |
+| promised blob hydration | Pinned promisor discovery; exact non-thin pack ingest; atomic physical publication and promise removal; synchronous operation retry. |
 
 Pack data and index checkpoints are durable but invisible to object reads until
 the pack becomes complete. Ref, HEAD, reflog, checkout, journal, and individual
@@ -92,6 +93,12 @@ does not re-hash stored objects. Page and read sizes shape the work, but
 accumulated pages or projected reads do not reject it. Deletion rejects when a
 surviving delta chain would lose its base or a real pack-cardinality, format,
 delta, corruption, or structural bound is exhausted.
+
+Promise rows do not become maintenance roots. A missing blob reached through a
+tree is a valid terminal leaf only while the same repository owns its promise.
+Hydration publishes a complete pack and removes matching promises in one
+transaction; an interrupted pack leaves every promise intact. A mutable
+`remote.<name>.url` must still match the pinned promisor URL before discovery.
 
 ## Current compatibility matrix
 

@@ -53,6 +53,8 @@ export {
 } from "./pack/shared.js";
 
 export class PackStore {
+  readonly #db: SqlDatabase;
+  readonly #repoId: number;
   readonly #read: PackReadEngine;
   readonly #lifecycle: PackLifecycle;
   readonly #ingest: PackIngestEngine;
@@ -68,6 +70,8 @@ export class PackStore {
     externalMetadata: ExternalMetadataResolver,
     options: PackCacheOptions = {},
   ) {
+    this.#db = db;
+    this.#repoId = repoId;
     this.#now = options.now ?? Date.now;
     const maxBufferedEntry = Math.min(
       options.maxBufferedEntry ?? DEFAULT_MAX_BUFFERED_ENTRY,
@@ -217,6 +221,26 @@ export class PackStore {
     source: AsyncIterable<Uint8Array>,
     options: PackIngestOptions = {},
   ): Promise<PackIngestResult> {
-    return this.#ingest.ingest(source, options);
+    const lifecycle = options.lifecycle;
+    return this.#ingest.ingest(source, {
+      ...options,
+      lifecycle: {
+        reserved(packId) {
+          return lifecycle?.reserved(packId);
+        },
+        published: (result) => {
+          this.#db.run(
+            `DELETE FROM git_promised_blobs
+              WHERE repo_id = ? AND oid IN (
+                SELECT oid FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?
+              )`,
+            this.#repoId,
+            this.#repoId,
+            result.packId,
+          );
+          return lifecycle?.published(result);
+        },
+      },
+    });
   }
 }

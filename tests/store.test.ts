@@ -114,6 +114,8 @@ describe("repository registry", () => {
       "git_pack_meta",
       "git_pack_objects",
       "git_pack_pending",
+      "git_promised_blobs",
+      "git_promisor_remotes",
       "git_reflog_entries",
       "git_reflog_state",
       "git_refs",

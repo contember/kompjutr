@@ -38,6 +38,17 @@ export interface RefRow {
   target: string;
 }
 
+export interface PromisorRemote {
+  readonly remoteName: string;
+  readonly url: string;
+  readonly filter: "blob:none";
+}
+
+export interface PromisedBlob {
+  readonly oid: string;
+  readonly remoteName: string;
+}
+
 export interface RefLogActor {
   name: string;
   email: string;

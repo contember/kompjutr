@@ -26,7 +26,6 @@ not effort: a wrong answer outranks a missing one.
   [37](37-history-reads-patch-and-paths.md) ·
   [38](38-clone-depth-and-deepening.md) ·
   [39](39-plumbing-read-surface.md) ·
-  [41](41-partial-clone.md) ·
   [06](06-stash-operations.md) ·
   [18](18-branch-and-remote-management.md) ·
   [28](28-pull-rebase.md)
@@ -72,7 +71,7 @@ Coverage of the calls that decide whether Phase 1 is usable:
 | a full-history clone that later runs `merge-base`, `rebase`, `rev-list --count` | both | Served: optionless clone is complete; [38](38-clone-depth-and-deepening.md) now retains only explicit shallow deepening |
 | `branch -m`, `remote set-url` | both | Served by typed native operations; [18](18-branch-and-remote-management.md) now retains only no-caller management |
 | `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'` | builder | Served by native cached/untracked selection and repository `.gitignore` filtering; [36](36-glob-pathspecs.md) now retains mutating globs only |
-| `clone --filter=blob:none` | both | [41](41-partial-clone.md) — scale, not a correctness gate; `depth: 0` serves the workflow today |
+| `clone --filter=blob:none` | both | Served by native filtered clone/fetch, durable promises, and bounded lazy backfill (ADR-0020) |
 | `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | Served by the strict synchronous runner, bounded per-run stdin/env, and the explicit `kompjutr/git/shell` adapter |
 
 Everything else both consumers issue is served, or routes through another
@@ -90,19 +89,17 @@ A blocked item must not move ahead of its blocker.
 
 **Phase 1** package work is complete. The real adapter now reruns its workflow as
 the integration gate. Everything below the gate is re-planned from that result.
-**Phase 2** is production scale. **Phase 3** is Git parity that no consumer
-issues; it stays filed and unscheduled until a caller appears.
+**Phase 2** is production scale; partial clone shipped directly outside a sprint.
+**Phase 3** is Git parity that no consumer issues; it stays filed and unscheduled
+until a caller appears.
 
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
 | **Phase 1 — a consumer can run** | | | | |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
-| **Cleanup** | | | | |
-| 1 | [Trusted store and domain restructure](../sprints/sprint-2026-08-30-trusted-store-and-domain-restructure.md) **(active)** | — | long | Before Phase 2 adds a promisor state to every read path: adopt the trusted-store contract (ADR-0018), remove the memory ledger (ADR-0017), restructure into domains (ADR-0019), finish the store split. Successor of the archived budget sprint. |
 | **Phase 2 — production scale** | | | | |
-| 2 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
-| 3 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
-| 4 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
+| 1 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
+| 2 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Audit the settled physical, shallow, and promisor storage shapes. |
 | **Phase 3 — parity without a caller (unscheduled)** | | | | |
 | — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
 | — | Everyday reads | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md) | long | Staged diff and log path filters; both consumers route through `diffSummary({ ref })` and `log` with a stop oid today. |
@@ -135,7 +132,6 @@ units over the same files, and a long sprint does not make that safe.
 - [37 — Complete history reads — patch output for `show`, path filter for `log`](37-history-reads-patch-and-paths.md)
 - [38 — Deepen and unshallow repositories](38-clone-depth-and-deepening.md)
 - [39 — Complete the remaining plumbing reads](39-plumbing-read-surface.md)
-- [41 — Add partial clone with lazy blob backfill](41-partial-clone.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
 - [63 — Bound packed dependency graph traversal](63-bound-packed-dependency-graph-traversal.md)
