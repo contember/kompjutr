@@ -372,7 +372,7 @@ describe("exact fetch publication", () => {
   });
 
   it("rejects invalid candidate authority and token ownership without mutation", () => {
-    const { db, database, store } = open();
+    const { database, store } = open();
     expect(() =>
       store.beginFetchPublication("refs/remotes/origin/", [
         "refs/checkpoints/duplicate",
@@ -436,7 +436,6 @@ describe("exact fetch publication", () => {
       expect.objectContaining({ code: "ESTALEFETCH" }),
     );
     expect(store.getRef(issued)).toBeNull();
-
   });
 
   it("fences create-attached/remove ABA with no checkout reflog evidence", () => {

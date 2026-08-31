@@ -85,5 +85,4 @@ describe("branch upstream resolver", () => {
       expect.objectContaining({ code: "EINVAL" }),
     );
   });
-
 });
