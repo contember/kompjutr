@@ -265,7 +265,7 @@ describe("parsed commit cache", () => {
     });
   });
 
-  it("lazily inserts once and validates the raw source before returning a row", () => {
+  it("lazily inserts once and checks source witnesses only while writing", () => {
     const store = open();
     const commit = fixture();
     const data = serializeCommit(commit);
@@ -293,12 +293,16 @@ describe("parsed commit cache", () => {
       expect(store.cachedCommit(oid)?.commit).toEqual(commit);
     }
 
+    store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oid);
     store.db.run("UPDATE git_objects SET size = size + 1 WHERE repo_id = ? AND oid = ?", 1, oid);
-    expect(store.cachedCommit(oid)).toBeNull();
+    expect(indexCommitSource(store.db, { repoId: 1, oid, data })).toBeNull();
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
     store.db.run("UPDATE git_objects SET size = size - 1 WHERE repo_id = ? AND oid = ?", 1, oid);
-    expect(store.cachedCommit(oid)?.commit).toEqual(commit);
+    expect(indexCommitSource(store.db, { repoId: 1, oid, data })?.commit).toEqual(commit);
+    store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oid);
     store.db.run("DELETE FROM git_objects WHERE repo_id = ? AND oid = ?", 1, oid);
-    expect(store.cachedCommit(oid)).toBeNull();
+    expect(indexCommitSource(store.db, { repoId: 1, oid, data })).toBeNull();
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
   });
 
   it("batch-inserts prepared point misses through the shared-store seam", () => {
@@ -328,7 +332,7 @@ describe("parsed commit cache", () => {
     ]);
   });
 
-  it("fails closed on corrupted cached fields and byte accounting", () => {
+  it("decodes cached fields and trusts stored projection values", () => {
     const store = open();
     const data = serializeCommit(fixture());
     const oid = store.write("commit", data);
@@ -341,13 +345,6 @@ describe("parsed commit cache", () => {
     );
     store.db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() => store.cachedCommit(oid)).toThrow(/invalid parents/);
-    store.db.run(
-      "UPDATE git_commits SET parents = ?, cache_bytes = cache_bytes + 1 WHERE repo_id = ? AND oid = ?",
-      JSON.stringify(fixture().parent),
-      1,
-      oid,
-    );
-    expect(() => store.cachedCommit(oid)).toThrow(/invalid byte charge/);
     expect(store.cacheCommit(oid, data)?.commit).toEqual(fixture());
     expect(store.cachedCommit(oid)?.commit).toEqual(fixture());
     store.db.run(
@@ -452,11 +449,14 @@ describe("parsed commit cache", () => {
 
     indexCommitSource(db, { repoId: 1, oid, data });
     expect(store.cachedCommit(oid)?.commit).toEqual(commit);
+    db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oid);
     db.run("UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = ? AND pack_id = ?", 1, 7);
-    expect(store.cachedCommit(oid)).toBeNull();
+    expect(indexCommitSource(db, { repoId: 1, oid, data })).toBeNull();
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
     db.run("UPDATE git_pack_meta SET state = 'complete' WHERE repo_id = ? AND pack_id = ?", 1, 7);
     db.run("UPDATE git_pack_objects SET size = size + 1 WHERE repo_id = ? AND oid = ?", 1, oid);
-    expect(store.cachedCommit(oid)).toBeNull();
+    expect(indexCommitSource(db, { repoId: 1, oid, data })).toBeNull();
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
   });
 
   it("batches 3,293 commits within row and binding limits", () => {
@@ -562,36 +562,6 @@ describe("parsed commit cache", () => {
     expect(() => walk.next()).toThrow(/cache is unavailable/);
   });
 
-  it("fails a corrupt tail row before returning the valid root", () => {
-    const store = open();
-    const [parent, root] = commitChain(store, 2);
-    store.db.run("PRAGMA ignore_check_constraints = ON");
-    store.db.run(
-      "UPDATE git_commits SET parents = 'not-json' WHERE repo_id = ? AND oid = ?",
-      1,
-      parent,
-    );
-    store.db.run("PRAGMA ignore_check_constraints = OFF");
-    const walk = store.commitGraph(root!)[Symbol.iterator]();
-
-    expect(() => walk.next()).toThrow(/cache is corrupt/);
-  });
-
-  it("never falls back from a corrupt cache row", () => {
-    const store = open();
-    const oid = commitChain(store, 1)[0]!;
-    store.db.run("PRAGMA ignore_check_constraints = ON");
-    store.db.run(
-      "UPDATE git_commits SET parents = 'not-json' WHERE repo_id = ? AND oid = ?",
-      1,
-      oid,
-    );
-    store.db.run("PRAGMA ignore_check_constraints = OFF");
-    const repo = new Repository(store);
-
-    expect(() => [...repo.walkIndexed(oid)]).toThrow(/cache is corrupt/);
-  });
-
   it("releases graph iterators on early return", () => {
     const store = open();
     const oid = commitChain(store, 2)[1]!;
@@ -628,8 +598,6 @@ describe("parsed commit cache", () => {
         oid,
         50_000,
         32 * 1024 * 1024,
-        32 * 1024 * 1024,
-        1024 * 1024,
         512,
         64,
       )
