@@ -20,3 +20,7 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
+- [`sprint-2026-08-31-deepening-and-network-safety.md`](sprint-2026-08-31-deepening-and-network-safety.md)
+  — deepen and unshallow repositories, protect multi-ref pushes with
+  per-destination leases, and cancel network operations without unsafe local
+  publication or false remote certainty.

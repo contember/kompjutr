@@ -16,7 +16,10 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None right now.
+- [`sprints/sprint-2026-08-31-deepening-and-network-safety.md`](sprints/sprint-2026-08-31-deepening-and-network-safety.md)
+  — deepen and unshallow repositories, protect multi-ref pushes with
+  per-destination leases, and cancel network operations at safe publication
+  boundaries.
 
 ## Specs
 
