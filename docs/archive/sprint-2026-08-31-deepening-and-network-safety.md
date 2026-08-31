@@ -1,7 +1,18 @@
-<!--
-On close, prepend an OUTCOME block here, then move this file to ../archive/.
-Record the WU commit map, verification, closed backlog, and deferred work.
--->
+> **OUTCOME — shipped 2026-08-31.** Native clone, fetch, and push now support
+> stable cancellation; shallow repositories can deepen and unshallow with graph
+> proof before publication; and legacy, multi-ref, and wildcard pushes can protect
+> each destination with explicit or tracking-derived leases. Commit map: plan →
+> `c178eed`; WU1 → `3f8a0d9`; WU2 → `22ec43a`; WU3 → `f68fcdb`; WU4 →
+> `1171bf8`; WU5 → `57b7417`; closure fixes → `84384b1`, `c71d8e3`.
+> Verification: narrow four-path safety review approved; focused witnesses passed
+> WU1 132, WU2 59, WU3 242, WU4 75, WU5 65 tests; smoke passed 164 tests;
+> typecheck, Biome check, and build passed. The exhaustive runner passed every
+> root, protocol, pack, filesystem, and shell slice; its final E2E slice passed
+> separately at 96/96 after the outer 15-minute command limit terminated the
+> combined process. Backlog closed: 13, 15, 38. Deferred: full-suite scheduling
+> performance → [backlog 64](../backlog/64-speed-up-full-test-suite.md); the
+> sprint's explicit protocol-v2, SSH, mapped-fetch deepening, pull/ls-remote
+> cancellation, and Computer API exclusions remain out of scope.
 
 # Sprint — Deepening and network safety (2026-08-31)
 
@@ -9,9 +20,7 @@ Record the WU commit map, verification, closed backlog, and deferred work.
 push destinations from stale observations, and cancel clone, fetch, and push
 without publishing incomplete local state or concealing an uncertain remote result.
 
-**Theme.** Backlog [38](../backlog/38-clone-depth-and-deepening.md),
-[13](../backlog/13-force-with-lease.md), and
-[15](../backlog/15-abortable-network-operations.md) harden the same settled
+**Theme.** Backlog 38, 13, and 15 harden the same settled
 Smart HTTP flow: discover, transfer or plan, authenticate, then publish.
 
 ## Refs re-verified at HEAD (2026-08-31)
@@ -261,4 +270,9 @@ Keep WU commits separate. Land any genuinely shared type seam before parallel wo
 
 ## Run log
 
-<!-- Record only implementation discoveries, deviations, and blockers here. -->
+- The exhaustive gate exposed a pre-sprint store-export witness omission and two
+  Biome failures. Commit `c71d8e3` restored the baseline before the gate rerun.
+- The combined exhaustive command exceeded its outer 15-minute limit in the final
+  E2E slice after every earlier slice passed. The exact remaining E2E slice then
+  passed 96/96. Full-suite scheduling work graduated to
+  [backlog 64](../backlog/64-speed-up-full-test-suite.md).

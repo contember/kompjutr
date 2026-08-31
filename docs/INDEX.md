@@ -16,10 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-31-deepening-and-network-safety.md`](sprints/sprint-2026-08-31-deepening-and-network-safety.md)
-  — deepen and unshallow repositories, protect multi-ref pushes with
-  per-destination leases, and cancel network operations at safe publication
-  boundaries.
+None right now.
 
 ## Specs
 
@@ -79,6 +76,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-31-deepening-and-network-safety.md`](archive/sprint-2026-08-31-deepening-and-network-safety.md)
+  — relative deepening and unshallow, per-destination push leases, and abortable
+  clone, fetch, and push with explicit local and remote certainty boundaries.
 - [`archive/sprint-2026-08-30-trusted-store-and-domain-restructure.md`](archive/sprint-2026-08-30-trusted-store-and-domain-restructure.md)
   — trusted stored rows, the deleted memory ledger, the fs/shell/git domain
   restructure over a shared storage kernel, and the finished store split.

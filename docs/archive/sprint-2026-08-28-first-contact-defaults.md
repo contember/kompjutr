@@ -176,8 +176,8 @@ are binding.
 
 ## Out of scope (explicit)
 
-- `fetch --deepen` and `--unshallow` remain in
-  [backlog 38](../backlog/38-clone-depth-and-deepening.md).
+- `fetch --deepen` and `--unshallow` subsequently shipped in the
+  [deepening and network safety sprint](sprint-2026-08-31-deepening-and-network-safety.md).
 - Upstream management, remote rename, separate push URLs, and tracking-ref
   cleanup remain in
   [backlog 18](../backlog/18-branch-and-remote-management.md).

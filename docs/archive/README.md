@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Deepening and network safety](sprint-2026-08-31-deepening-and-network-safety.md)
+  — relative deepening and unshallow, per-destination push leases, and abortable
+  clone, fetch, and push with explicit local and remote certainty boundaries.
 - [Shell run inputs](sprint-2026-08-29-shell-run-inputs.md)
   — bounded caller stdin, frozen injected-command env and Git identity
   forwarding through one run-owned input lifetime.

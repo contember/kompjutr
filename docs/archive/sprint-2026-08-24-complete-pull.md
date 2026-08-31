@@ -225,8 +225,9 @@ Consumed backlog items 01 and 03, which were deleted on ship.
   tracking cleanup remain in
   [backlog item 18](../backlog/18-branch-and-remote-management.md). Pull consumes
   the configuration clone already writes and callers can set through `configSet`.
-- Cancellation of fetch or integration remains in
-  [backlog item 15](../backlog/15-abortable-network-operations.md).
+- Fetch cancellation subsequently shipped in the
+  [deepening and network safety sprint](sprint-2026-08-31-deepening-and-network-safety.md);
+  pull integration cancellation remains out of scope.
 - The systematic all-operation interleaving matrix shipped later in the
   [concurrency sprint](sprint-2026-08-27-concurrency-and-restart-conformance.md).
   This sprint covers the pull-specific await boundary and stale-HEAD/upstream

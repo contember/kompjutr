@@ -246,13 +246,10 @@ missing contract found during planning.
 
 ## Out of scope (explicit)
 
-- Cancellation and `AbortSignal` support remain
-  [`15`](../backlog/15-abortable-network-operations.md). This sprint tests
-  interruption and cold recovery; it does not add cooperative cancellation.
-- Force-with-lease remains [`13`](../backlog/13-force-with-lease.md). Local
-  concurrency expectations do not widen the public push refspec contract.
-- Clone depth/deepening and partial-clone behavior remain
-  [`38`](../backlog/38-clone-depth-and-deepening.md); partial clone subsequently
+- Cancellation, force-with-lease, and clone deepening subsequently shipped in the
+  [deepening and network safety sprint](sprint-2026-08-31-deepening-and-network-safety.md).
+  This sprint tests interruption and cold recovery; it does not add cooperative
+  cancellation or widen the public push contract. Partial clone subsequently
   shipped under [ADR-0020](../decisions/0020-model-partial-clone-blobs-as-durable-promises.md).
 - General workflow scheduling, distributed multi-Durable-Object locking, and a
   repository-wide mutex are excluded. Coordination is scoped to one repository
