@@ -2,6 +2,7 @@ import type { SqlDatabase } from "../../db/db.js";
 import { CorruptError, GitError } from "../common/errors.js";
 import { expectSafeInteger, expectText, int, nullable, RowShape, text } from "../common/rows.js";
 import type { RefLogActor, RefLogEntry, RefLogMetadata, RefLogReadOptions } from "./contracts.js";
+import { jsonPages } from "./json-pages.js";
 import { requireSafeId } from "./lifecycle.js";
 import { refTextBytes, requireRefName } from "./ref-validation.js";
 import { MAX_REFLOG_ORDINAL, MAX_REFLOG_TIMEZONE_MINUTES } from "./reflog-schema.js";
@@ -28,6 +29,81 @@ export interface RefLogEvent {
 
 export interface CheckoutRefLogEvent extends RefLogEvent {
   checkoutId: number;
+}
+
+export class RefLogWriter {
+  constructor(
+    private readonly db: SqlDatabase,
+    private readonly repoId: number,
+  ) {}
+
+  append(events: readonly RefLogEvent[]): void {
+    for (const page of jsonPages(events, "reflog entry")) {
+      this.db.run(
+        `INSERT INTO git_reflog_entries
+           (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+            actor_name, actor_email, timestamp, timezone, reason)
+         SELECT ?,
+                json_extract(value, '$.refName'),
+                json_extract(value, '$.ordinal'),
+                json_extract(value, '$.oldRaw'),
+                json_extract(value, '$.newRaw'),
+                json_extract(value, '$.oldOid'),
+                json_extract(value, '$.newOid'),
+                json_extract(value, '$.actorName'),
+                json_extract(value, '$.actorEmail'),
+                json_extract(value, '$.timestamp'),
+                json_extract(value, '$.timezoneOffset'),
+                json_extract(value, '$.reason')
+           FROM json_each(?)`,
+        this.repoId,
+        page,
+      );
+    }
+  }
+
+  advance(expectedOrdinal: number, finalOrdinal: number): void {
+    const state = this.db.one<{ next_ordinal: unknown }>(
+      `UPDATE git_reflog_state SET next_ordinal = ?
+        WHERE repo_id = ? AND next_ordinal = ?
+        RETURNING next_ordinal`,
+      finalOrdinal,
+      this.repoId,
+      expectedOrdinal,
+    );
+    if (state === undefined || state.next_ordinal !== finalOrdinal) {
+      throw new CorruptError("reflog state changed during atomic ref mutation");
+    }
+  }
+
+  pruneExpired(cutoff: number): void {
+    this.db.run(
+      "DELETE FROM git_reflog_entries WHERE repo_id = ? AND timestamp < ?",
+      this.repoId,
+      cutoff,
+    );
+  }
+
+  pruneRetained(events: readonly RefLogEvent[]): void {
+    const touchedRefs = events.map((event) => event.refName);
+    for (const page of jsonPages(touchedRefs, "reflog retention ref")) {
+      this.db.run(
+        `DELETE FROM git_reflog_entries AS entry
+          WHERE entry.repo_id = ?
+            AND entry.ref_name IN (SELECT value FROM json_each(?))
+            AND entry.ordinal < coalesce((
+              SELECT retained.ordinal
+                FROM git_reflog_entries retained INDEXED BY git_reflog_entries_by_ref
+               WHERE retained.repo_id = entry.repo_id
+                 AND retained.ref_name = entry.ref_name
+               ORDER BY retained.ordinal DESC
+               LIMIT 1 OFFSET ${REFLOG_RETENTION_ROWS - 1}
+            ), 0)`,
+        this.repoId,
+        page,
+      );
+    }
+  }
 }
 
 const REFLOG_ENTRY_ROW = new RowShape({

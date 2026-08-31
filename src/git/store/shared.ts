@@ -6,7 +6,6 @@ import { CorruptError, GitError } from "../common/errors.js";
 import type { ByteLru } from "../common/lru.js";
 import type { ObjectType, RawObject } from "../common/objects.js";
 import { BlobIdTable } from "./blob-ids.js";
-import type { CheckoutStore } from "./checkout.js";
 import {
   type CommitCacheEntry,
   type CommitCacheWriteResult,
@@ -39,12 +38,15 @@ import type {
   StoreOptions,
   TrackingRefPublicationToken,
 } from "./contracts.js";
+import { FetchPublicationTable } from "./fetch-publication.js";
 import { ScratchIndexStore } from "./index-table.js";
 import { isThenableResult, requireBooleanProbe } from "./json-pages.js";
-import { requireScratchIndexName } from "./lifecycle.js";
+import { advanceCheckoutRevision, requireScratchIndexName } from "./lifecycle.js";
+import { bumpMaintenanceRootEpoch } from "./maintenance/control.js";
 import { ObjectTable } from "./objects.js";
 import { PackStore } from "./packs.js";
-import { activeRefLogOids, type Clock, readRefLog } from "./reflog.js";
+import { activeRefLogOids, type Clock, RefLogWriter, readRefLog } from "./reflog.js";
+import { type HeadOwner, RefTable } from "./refs.js";
 import { MAX_SCRATCH_INDEXES_PER_REPOSITORY } from "./schema.js";
 import { ShallowTable } from "./shallow.js";
 import {
@@ -58,6 +60,13 @@ import {
 
 interface ScratchStorageCache {
   revalidateStorageCaches(): void;
+}
+
+interface CheckoutOperations {
+  readonly sharedRepoId: number;
+  readonly checkoutId: number;
+  readonly isPrimary: boolean;
+  destroy(): void;
 }
 
 class ScratchTransactionCoordinator {
@@ -129,10 +138,13 @@ export class SharedRepoStore {
   readonly #config: ConfigTable;
   readonly #blobIds: BlobIdTable;
   readonly #shallowTable: ShallowTable;
+  readonly #refs: RefTable;
+  readonly #fetchPublication: FetchPublicationTable;
   readonly #scratchTransactions: ScratchTransactionCoordinator;
   readonly #packs: PackStore;
   #objectTable: ObjectTable | null = null;
-  #operations: CheckoutStore | null = null;
+  #operations: CheckoutOperations | null = null;
+  #headOwner: HeadOwner | null = null;
   #cacheGeneration = 0;
   #hasLoose: boolean;
   #shallow: Set<string> | null = null;
@@ -154,6 +166,30 @@ export class SharedRepoStore {
     this.#config = new ConfigTable(db, repoId);
     this.#blobIds = new BlobIdTable(db, repoId);
     this.#shallowTable = new ShallowTable(db, repoId);
+    this.#refs = new RefTable(db, repoId, {
+      revisions: {
+        readRefMutationRevisionState: () => this.#fetchPublication.readRefMutationRevisionState(),
+        bumpTrackingRefRevisions: (changedNames) =>
+          this.#fetchPublication.bumpTrackingRefRevisions(changedNames),
+        bumpFetchNamespaceRevisions: (changedNames) =>
+          this.#fetchPublication.bumpFetchNamespaceRevisions(changedNames),
+      },
+      advanceCheckoutRevision: (expectedRevision) => {
+        advanceCheckoutRevision(db, repoId, 1, expectedRevision);
+      },
+      bumpMaintenanceRootEpoch: () => {
+        bumpMaintenanceRootEpoch(db, repoId);
+      },
+      reflogWriter: new RefLogWriter(db, repoId),
+      clock,
+    });
+    this.#fetchPublication = new FetchPublicationTable(db, repoId, this.#refs, {
+      headOwner: () => this.#heads(),
+      invalidateShallow: () => this.invalidateShallow(),
+      bumpMaintenanceRootEpoch: () => {
+        bumpMaintenanceRootEpoch(db, repoId);
+      },
+    });
     this.#scratchTransactions = scratchTransactionsFor(db);
     this.cacheNamespace = `${repoId}:${storeGeneration}`;
     this.#packs = new PackStore(
@@ -181,15 +217,19 @@ export class SharedRepoStore {
     this.#hasLoose = availability.has_loose === 1;
   }
 
-  bindCheckoutOperations(operations: CheckoutStore): void {
+  bindCheckoutOperations(operations: CheckoutOperations, headOwner: HeadOwner): void {
     if (operations.sharedRepoId !== this.repoId) {
       throw new CorruptError("shared operations facade belongs to another repository");
+    }
+    if (headOwner.checkoutId !== operations.checkoutId) {
+      throw new CorruptError("shared HEAD owner belongs to another checkout");
     }
     if (this.#operations === null) {
       if (!operations.isPrimary) {
         throw new CorruptError("shared operations facade must use the primary checkout");
       }
       this.#operations = operations;
+      this.#headOwner = headOwner;
     }
   }
 
@@ -288,11 +328,18 @@ export class SharedRepoStore {
     }
   }
 
-  #ops(): CheckoutStore {
+  #ops(): CheckoutOperations {
     if (this.#operations === null) {
       throw new CorruptError("shared repository operations facade is unavailable");
     }
     return this.#operations;
+  }
+
+  #heads(): HeadOwner {
+    if (this.#headOwner === null) {
+      throw new CorruptError("shared repository HEAD owner is unavailable");
+    }
+    return this.#headOwner;
   }
 
   #objectOps(): ObjectTable {
@@ -464,37 +511,41 @@ export class SharedRepoStore {
 
   getRef(name: string): string | null {
     if (name === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
-    return this.#ops().getRef(name);
+    return this.#refs.getRef(name);
   }
 
   setRef(name: string, target: string): void {
     if (name === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
-    this.#ops().setRef(name, target);
+    this.#refs.setRef(this.#heads(), name, target);
   }
 
   updateRefExpected(name: string, expectedOid: string, targetOid: string): void {
-    this.#ops().updateRefExpected(name, expectedOid, targetOid);
+    this.#refs.updateRefExpected(this.#heads(), name, expectedOid, targetOid);
   }
 
   deleteRef(name: string): void {
     if (name === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
-    this.#ops().deleteRef(name);
+    this.#refs.deleteRef(this.#heads(), name);
   }
 
   updateRefs(puts: Iterable<RefRow>, deletes: Iterable<string> = []): void {
-    this.#ops().updateRefs(puts, deletes);
+    this.#refs.updateRefs(this.#heads(), puts, deletes);
   }
 
   mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
     if (mutation.head !== undefined) throw new GitError("EINVAL", "HEAD belongs to a checkout");
-    return this.#ops().mutateRefs(mutation, metadata);
+    return this.#refs.mutateRefs(this.#heads(), mutation, metadata);
+  }
+
+  mutateRefsOwned(headOwner: HeadOwner, mutation: RefMutation, metadata: RefLogMetadata): boolean {
+    return this.#refs.mutateRefs(headOwner, mutation, metadata);
   }
 
   beginTrackingRefPublication(
     trackingPrefix: string,
     refName: string,
   ): TrackingRefPublicationToken {
-    return this.#ops().beginTrackingRefPublication(trackingPrefix, refName);
+    return this.#fetchPublication.beginTrackingRefPublication(trackingPrefix, refName);
   }
 
   publishTrackingRef(
@@ -502,14 +553,14 @@ export class SharedRepoStore {
     target: string | null,
     metadata: RefLogMetadata,
   ): boolean {
-    return this.#ops().publishTrackingRef(token, target, metadata);
+    return this.#fetchPublication.publishTrackingRef(token, target, metadata);
   }
 
   beginFetchPublication(
     trackingPrefix: string,
     candidateExactRefs: Iterable<string> = [],
   ): FetchPublicationToken {
-    return this.#ops().beginFetchPublication(trackingPrefix, candidateExactRefs);
+    return this.#fetchPublication.beginFetchPublication(trackingPrefix, candidateExactRefs);
   }
 
   publishFetchRefs(
@@ -517,16 +568,16 @@ export class SharedRepoStore {
     plan: FetchPublicationPlan,
     metadata: RefLogMetadata,
   ): boolean {
-    return this.#ops().publishFetchRefs(token, plan, metadata);
+    return this.#fetchPublication.publishFetchRefs(token, plan, metadata);
   }
 
   listRefs(prefix = ""): RefRow[] {
-    return this.#ops().listRefs(prefix);
+    return this.#refs.listRefs(prefix);
   }
 
   /** Stream one validated, repository-scoped raw-ref snapshot in Git byte order. */
   *iterateRefs(): Generator<RefRow> {
-    yield* this.#ops().iterateRefs();
+    yield* this.#refs.iterateRefs();
   }
 
   reflog(refName: string, options: RefLogReadOptions = {}): RefLogEntry[] {

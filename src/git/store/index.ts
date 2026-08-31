@@ -1,10 +1,7 @@
 // Compatibility facade for the SQLite repository store.
 
 export { contentIdKey } from "./blob-ids.js";
-export {
-  CheckoutStore,
-  mutateRefsOwned,
-} from "./checkout.js";
+export { CheckoutStore } from "./checkout.js";
 export {
   CONFIG_SECTION_MOVE_UPDATE_SQL,
   configGetOwned,
@@ -60,6 +57,7 @@ export {
 } from "./operation-journal.js";
 export { PACK_BLOB_BATCH_TARGET_BYTES } from "./packs.js";
 export { MAX_REFLOG_ROOT_SCAN_ENTRIES } from "./reflog.js";
+export { mutateRefsOwned } from "./refs.js";
 export { readShallowOwned } from "./shallow.js";
 export { SharedRepoStore } from "./shared.js";
 export type { WalkTreeDiffEntry, WalkTreeDiffObject, WalkTreeEntry } from "./tree-walk.js";
