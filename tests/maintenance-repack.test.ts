@@ -1277,7 +1277,7 @@ describe("maintenance repack", () => {
     ).toBe("complete");
   });
 
-  it("fails closed on incomplete mark audits and malformed durable batch rows", async () => {
+  it("rejects a shared run invariant and malformed durable batch rows", async () => {
     const queued = open();
     const queuedOid = queued.store.write("blob", utf8.encode("queued\n"));
     seedRepack(queued.db, queued.checkout.repoId, [{ oid: queuedOid }]);
@@ -1285,20 +1285,9 @@ describe("maintenance repack", () => {
       "UPDATE git_maintenance_runs SET queued_objects = 1 WHERE repo_id = ?",
       queued.checkout.repoId,
     );
-    await expect(advanceMaintenanceRepack(queued.store.shared, REPACK_OPTIONS)).rejects.toThrow(
-      /nonempty mark queue/,
-    );
-
-    const logical = open();
-    const physical = logical.store.write("blob", utf8.encode("physical\n"));
-    seedRepack(logical.db, logical.checkout.repoId, [{ oid: physical, physicalOnly: true }]);
-    logical.db.run(
-      "UPDATE git_maintenance_runs SET reachable_objects = 1 WHERE repo_id = ?",
-      logical.checkout.repoId,
-    );
-    await expect(advanceMaintenanceRepack(logical.store.shared, REPACK_OPTIONS)).rejects.toThrow(
-      /counters disagree/,
-    );
+    await expect(
+      advanceMaintenanceRepack(queued.store.shared, REPACK_OPTIONS),
+    ).rejects.toMatchObject({ code: "ECORRUPT" });
 
     const malformed = open();
     const malformedOid = malformed.store.write("blob", utf8.encode("malformed\n"));

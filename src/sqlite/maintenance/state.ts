@@ -35,6 +35,8 @@ export interface MaintenanceRunView {
   restarted: boolean;
 }
 
+export type MaintenanceMarkReconciliation = "initial" | "complete";
+
 const ABSENT_RUN_FIELDS = [
   "run_repo_id",
   "run_id",
@@ -297,6 +299,74 @@ export function readMaintenanceRunView(db: SqlDatabase, repoId: number): Mainten
   );
   if (row === undefined) throw new GitError("ENOTFOUND", "repository does not exist");
   return requireRunView(row, repoId);
+}
+
+/** Require a run phase while preserving the caller's public error code. */
+export function expectPhase<const Phases extends readonly MaintenancePhase[]>(
+  view: MaintenanceRunView,
+  allowed: Phases,
+  message: string,
+  code = "EINVAL",
+): asserts view is MaintenanceRunView & { phase: Phases[number] } {
+  for (const phase of allowed) {
+    if (view.phase === phase) return;
+  }
+  throw new GitError(code, message);
+}
+
+/** Require root discovery to be settled before a downstream maintenance phase. */
+export function expectRootsSettled(view: MaintenanceRunView): void {
+  if (
+    view.rootSource !== "done" ||
+    view.cursorCheckoutId !== null ||
+    view.cursorText !== null ||
+    view.cursorOrdinal !== null
+  ) {
+    throw new CorruptError("completed maintenance roots retained a cursor");
+  }
+}
+
+/** Reconcile durable mark rows with their run counters at a mark boundary. */
+export function reconcileMaintenanceMark(
+  db: SqlDatabase,
+  view: MaintenanceRunView,
+  boundary: MaintenanceMarkReconciliation,
+): number {
+  const row = db.one<Record<string, unknown>>(
+    `SELECT coalesce(sum(CASE WHEN expanded = 0 THEN 1 ELSE 0 END), 0) AS queued,
+            coalesce(sum(CASE WHEN physical_only = 0 THEN 1 ELSE 0 END), 0) AS logical,
+            coalesce(sum(CASE WHEN physical_only != 0 OR expanded != 0 OR edge_cursor != 0
+                              THEN 1 ELSE 0 END), 0) AS non_initial
+       FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?`,
+    view.repoId,
+    view.runId,
+  );
+  if (row === undefined) throw new CorruptError("maintenance mark count returned no row");
+  const counts = decodeRow(
+    row,
+    {
+      queued: int(0, Number.MAX_SAFE_INTEGER, "maintenance queued mark count is invalid"),
+      logical: int(0, Number.MAX_SAFE_INTEGER, "maintenance logical mark count is invalid"),
+      non_initial: int(0, Number.MAX_SAFE_INTEGER, "maintenance initial mark state is invalid"),
+    },
+    "maintenance mark count is malformed",
+  );
+  if (boundary === "initial") {
+    if (counts.queued !== view.queuedObjects || counts.logical !== counts.queued) {
+      throw new CorruptError("initial maintenance counters disagree with their root marks");
+    }
+    if (counts.non_initial !== 0) {
+      throw new CorruptError("uninitialized maintenance roots already contain traversal state");
+    }
+    return counts.logical;
+  }
+  if (view.queuedObjects !== 0) {
+    throw new CorruptError("maintenance mark queue is empty but its counter is not zero");
+  }
+  if (counts.queued !== 0 || counts.logical !== view.reachableObjects) {
+    throw new CorruptError("completed maintenance counters disagree with their mark rows");
+  }
+  return counts.logical;
 }
 
 function clearRunOwnedReachability(db: SqlDatabase, repoId: number, runId: number): void {

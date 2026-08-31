@@ -1,11 +1,17 @@
-import { isOid, toHex } from "../../core/bytes.js";
+import { isOid } from "../../core/bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../../core/errors.js";
 import type { ObjectType } from "../../core/objects.js";
 import { InflateStream } from "../../core/zlib.js";
 import type { SqlDatabase } from "../db.js";
 import { MAX_DELTA_DEPTH } from "../packs.js";
 import type { ObjectReadInfo, SharedRepoStore } from "../store.js";
-import { TREE_QUEUE_ROW_FIXED_BYTES } from "../tree-index.js";
+import {
+  expectPhase,
+  expectRootsSettled,
+  type MaintenanceRunView,
+  readMaintenanceRunView,
+  reconcileMaintenanceMark,
+} from "./state.js";
 
 const EDGE_PAGE = 256;
 const HEADER_LINE_PREFIX_BYTES = 128;
@@ -20,18 +26,7 @@ export interface MaintenanceReachabilityProgress {
   discoveredLogicalObjects: number;
 }
 
-interface RunState {
-  runId: number;
-  observedRootEpoch: number;
-  rootEpoch: number;
-  phase: string;
-  rootSource: string;
-  cursorCheckoutId: number | null;
-  cursorText: string | null;
-  cursorOrdinal: number | null;
-  reachableObjects: number;
-  queuedObjects: number;
-}
+type RunState = MaintenanceRunView;
 
 interface QueueObject {
   oid: string;
@@ -78,19 +73,8 @@ interface PublicationResult {
   discoveredLogicalObjects: number;
 }
 
-interface TreeEdgeMetadata {
-  sourceKey: number;
-  ordinal: number;
-  mode: string;
-  nameLength: number;
-  oid: string;
-  rawLength: number;
-  cumulativeBase: number;
-}
-
 interface ReachabilityObjectInfo extends ObjectReadInfo {
   stored: "raw" | "zlib" | null;
-  largestChunk: number;
 }
 
 function safeInteger(
@@ -108,10 +92,6 @@ function safeInteger(
     throw new CorruptError(`${label} is not a bounded safe integer`);
   }
   return value;
-}
-
-function nullableInteger(value: unknown, label: string): number | null {
-  return value === null ? null : safeInteger(value, label, 0);
 }
 
 function booleanInteger(value: unknown, label: string): boolean {
@@ -134,79 +114,15 @@ function oidField(value: unknown, label: string): string {
 }
 
 function readRun(db: SqlDatabase, repoId: number): RunState {
-  const row = db.one<Record<string, unknown>>(
-    `SELECT run.repo_id, run.run_id, run.observed_root_epoch, run.phase, run.root_source,
-            run.cursor_checkout_id, run.cursor_text, run.cursor_ordinal,
-            run.reachable_objects, run.queued_objects, control.root_epoch
-       FROM git_maintenance_runs run
-       JOIN git_maintenance_control control ON control.repo_id = run.repo_id
-      WHERE run.repo_id = ?`,
-    repoId,
-  );
-  if (row === undefined) throw new GitError("ENOTFOUND", "maintenance run does not exist");
-  if (row.repo_id !== repoId) throw new CorruptError("maintenance run crossed repositories");
-  const cursorText = row.cursor_text;
-  if (cursorText !== null && typeof cursorText !== "string") {
-    throw new CorruptError("maintenance run text cursor is invalid");
-  }
-  const run: RunState = {
-    runId: safeInteger(row.run_id, "maintenance run id", 1),
-    observedRootEpoch: safeInteger(row.observed_root_epoch, "maintenance observed root epoch", 0),
-    rootEpoch: safeInteger(row.root_epoch, "maintenance root epoch", 0),
-    phase: typeof row.phase === "string" ? row.phase : "",
-    rootSource: typeof row.root_source === "string" ? row.root_source : "",
-    cursorCheckoutId: nullableInteger(row.cursor_checkout_id, "maintenance checkout cursor"),
-    cursorText,
-    cursorOrdinal: nullableInteger(row.cursor_ordinal, "maintenance ordinal cursor"),
-    reachableObjects: safeInteger(row.reachable_objects, "maintenance reachable count", 0),
-    queuedObjects: safeInteger(row.queued_objects, "maintenance queued count", 0),
-  };
-  if (
-    run.phase !== "roots" &&
-    run.phase !== "mark" &&
-    run.phase !== "classify-loose" &&
-    run.phase !== "repack" &&
-    run.phase !== "classify-packs" &&
-    run.phase !== "sweep-loose" &&
-    run.phase !== "sweep-packs" &&
-    run.phase !== "finish"
-  ) {
-    throw new CorruptError("maintenance run phase is invalid");
-  }
-  if (
-    run.rootSource !== "done" ||
-    run.cursorCheckoutId !== null ||
-    run.cursorText !== null ||
-    run.cursorOrdinal !== null
-  ) {
-    throw new CorruptError("maintenance mark run retained a root cursor");
-  }
+  const run = readMaintenanceRunView(db, repoId);
+  if (run === null) throw new GitError("ENOTFOUND", "maintenance run does not exist");
+  expectRootsSettled(run);
   return run;
 }
 
-function initializeAndValidateCounters(db: SqlDatabase, repoId: number, run: RunState): RunState {
+function initializeCounters(db: SqlDatabase, repoId: number, run: RunState): RunState {
   if (run.reachableObjects !== 0 || run.queuedObjects === 0) return run;
-  const counts = db.one<Record<string, unknown>>(
-    `SELECT coalesce(sum(CASE WHEN expanded = 0 THEN 1 ELSE 0 END), 0) AS queued,
-            coalesce(sum(CASE WHEN physical_only = 0 THEN 1 ELSE 0 END), 0) AS logical,
-            coalesce(sum(CASE WHEN physical_only != 0 OR expanded != 0 OR edge_cursor != 0
-                              THEN 1 ELSE 0 END), 0) AS invalid
-       FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?`,
-    repoId,
-    run.runId,
-  );
-  if (counts === undefined) {
-    throw new CorruptError("maintenance initialization count returned no row");
-  }
-  const queued = safeInteger(counts.queued, "initial maintenance queued count", 0);
-  const logical = safeInteger(counts.logical, "initial maintenance logical count", 0);
-  const invalid = safeInteger(counts.invalid, "invalid initialized maintenance count", 0);
-  if (queued !== run.queuedObjects || logical !== queued) {
-    throw new CorruptError("initial maintenance counters disagree with their root marks");
-  }
-  if (invalid !== 0) {
-    throw new CorruptError("uninitialized maintenance roots already contain traversal state");
-  }
+  const logical = reconcileMaintenanceMark(db, run, "initial");
   const updated = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_runs SET reachable_objects = ?
       WHERE repo_id = ? AND run_id = ? AND phase = 'mark'
@@ -406,136 +322,50 @@ class StreamingHeaders {
 }
 
 function requireObjectInfo(store: SharedRepoStore, oid: string): ReachabilityObjectInfo {
-  let result: ReachabilityObjectInfo | null = null;
-  let rows = 0;
-  for (const row of store.db.iterate(
+  const row = store.db.one<Record<string, unknown>>(
     `SELECT /* maintenance-object-info */ input.oid,
-             CASE WHEN loose.oid IS NOT NULL THEN 'loose'
-                  WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
-             CASE WHEN loose.oid IS NOT NULL AND typeof(loose.type) = 'text'
-                       AND length(CAST(loose.type AS BLOB)) <= 6 THEN loose.type
-                  WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
-                       AND typeof(packed.type) = 'text'
-                       AND length(CAST(packed.type AS BLOB)) <= 6 THEN packed.type END AS type,
-             CASE WHEN loose.oid IS NOT NULL AND typeof(loose.size) = 'integer'
-                       AND loose.size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER} THEN loose.size
-                  WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
-                       AND typeof(packed.size) = 'integer'
-                       AND packed.size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                       THEN packed.size END AS size,
-             CASE WHEN loose.oid IS NOT NULL AND typeof(loose.stored) = 'text'
-                       AND length(CAST(loose.stored AS BLOB)) <= 4 THEN loose.stored END AS stored,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE (
-               SELECT CASE WHEN count(*) <= ${Number.MAX_SAFE_INTEGER} THEN count(*) END
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.oid
-             ) END AS chunk_rows,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE (
-               SELECT CASE WHEN count(*) <= ${Number.MAX_SAFE_INTEGER} THEN count(*) END
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.oid
-                  AND (typeof(chunk.seq) != 'integer'
-                       OR chunk.seq NOT BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                       OR typeof(chunk.data) != 'blob' OR length(chunk.data) > 1048576)
-             ) END AS invalid_chunk_rows,
-             CASE WHEN loose.oid IS NULL THEN NULL ELSE (
-               SELECT min(CASE WHEN typeof(seq) = 'integer'
-                                     AND seq BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER} THEN seq END)
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.oid
-             ) END AS first_chunk,
-             CASE WHEN loose.oid IS NULL THEN NULL ELSE (
-               SELECT max(CASE WHEN typeof(seq) = 'integer'
-                                     AND seq BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER} THEN seq END)
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.oid
-             ) END AS last_chunk,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE coalesce((
-               SELECT max(CASE WHEN typeof(data) = 'blob' AND length(data) <= 1048576
-                               THEN length(data) END)
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.oid
-             ), 0) END AS largest_chunk,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE coalesce((
-               SELECT CASE WHEN typeof(sum(length(data))) = 'integer'
-                                  AND sum(length(data)) BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                           THEN sum(length(data)) END
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.oid
-             ), 0) END AS stored_bytes
+            CASE WHEN loose.oid IS NOT NULL THEN 'loose'
+                 WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
+            CASE WHEN loose.oid IS NOT NULL THEN loose.type ELSE packed.type END AS type,
+            CASE WHEN loose.oid IS NOT NULL THEN loose.size ELSE packed.size END AS size,
+            loose.stored,
+            CASE WHEN loose.oid IS NULL THEN 0 ELSE (
+              SELECT count(*) FROM git_object_chunks chunk
+               WHERE chunk.repo_id = ? AND chunk.oid = input.oid
+            ) END AS chunk_rows
        FROM (SELECT ? AS oid) input
        LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = input.oid
        LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = input.oid
        LEFT JOIN git_pack_meta pack
          ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-        AND pack.state = 'complete'
-      LIMIT 2`,
-    store.repoId,
-    store.repoId,
-    store.repoId,
-    store.repoId,
-    store.repoId,
+        AND pack.state = 'complete'`,
     store.repoId,
     oid,
     store.repoId,
     store.repoId,
-  )) {
-    rows++;
-    if (rows > 1 || row.oid !== oid) {
-      throw new CorruptError("reachable object metadata returned inconsistent rows");
-    }
-    if (row.source !== "loose" && row.source !== "pack") {
-      if (row.source === null) throw new CorruptError(`reachable object ${oid} is missing`);
-      throw new CorruptError("reachable object metadata returned an invalid source");
-    }
-    const type = objectType(row.type, "reachable object type");
-    const size = safeInteger(row.size, "reachable object size", 0);
-    const chunkRows = safeInteger(row.chunk_rows, "reachable object chunk count", 0);
-    const invalidChunkRows = safeInteger(
-      row.invalid_chunk_rows,
-      "reachable object invalid chunk count",
-      0,
-    );
-    const largestChunk = safeInteger(row.largest_chunk, "reachable object chunk size", 0);
-    const storedBytes = safeInteger(row.stored_bytes, "reachable object stored size", 0);
-    if (
-      (row.source === "loose" && row.stored !== "raw" && row.stored !== "zlib") ||
-      (row.source === "loose" && chunkRows <= 0) ||
-      (row.source === "loose" && invalidChunkRows !== 0) ||
-      (row.source === "loose" && row.first_chunk !== 0) ||
-      (row.source === "loose" && row.last_chunk !== chunkRows - 1) ||
-      (row.source === "loose" && largestChunk > 1024 * 1024) ||
-      (row.source === "loose" && row.stored === "raw" && storedBytes !== size) ||
-      (row.source === "loose" && row.stored === "zlib" && storedBytes === 0) ||
-      (row.source === "pack" &&
-        (row.stored !== null ||
-          chunkRows !== 0 ||
-          row.first_chunk !== null ||
-          row.last_chunk !== null ||
-          largestChunk !== 0 ||
-          storedBytes !== 0))
-    ) {
-      throw new CorruptError("reachable object metadata returned invalid fields");
-    }
-    result = {
-      oid,
-      type,
-      size,
-      source: row.source,
-      chunkRows,
-      stored:
-        row.source === "loose" && (row.stored === "raw" || row.stored === "zlib")
-          ? row.stored
-          : null,
-      largestChunk,
-    };
-  }
-  if (rows !== 1 || result === null) {
+  );
+  if (row === undefined || row.oid !== oid) {
     throw new CorruptError("reachable object metadata returned an incomplete result");
   }
-  return result;
+  if (row.source !== "loose" && row.source !== "pack") {
+    throw new CorruptError(`reachable object ${oid} is missing`);
+  }
+  let stored: "raw" | "zlib" | null = null;
+  if (row.source === "loose") {
+    if (row.stored !== "raw" && row.stored !== "zlib") {
+      throw new CorruptError("reachable loose object encoding is invalid");
+    }
+    stored = row.stored;
+  }
+  return {
+    oid,
+    type: objectType(row.type, "reachable object type"),
+    size: safeInteger(row.size, "reachable object size", 0),
+    source: row.source,
+    chunkRows: safeInteger(row.chunk_rows, "reachable object chunk count", 0),
+    stored,
+  };
 }
-
 function scanHeaders(
   store: SharedRepoStore,
   info: ReachabilityObjectInfo,
@@ -571,19 +401,12 @@ function streamLooseHeaders(
   try {
     const source = store.db.iterate(
       `SELECT /* maintenance-loose-headers */ object.repo_id, object.oid,
-             CASE WHEN typeof(object.stored) = 'text'
-                       AND length(CAST(object.stored AS BLOB)) <= 4 THEN object.stored END AS stored,
-             CASE WHEN typeof(chunk.seq) = 'integer'
-                       AND chunk.seq BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                  THEN chunk.seq END AS seq,
-             CASE WHEN typeof(chunk.data) = 'blob' AND length(chunk.data) <= ?
-                  THEN chunk.data END AS data
+             object.stored, chunk.seq, chunk.data
        FROM git_objects object
        JOIN git_object_chunks chunk
          ON chunk.repo_id = object.repo_id AND chunk.oid = object.oid
       WHERE object.repo_id = ? AND object.oid = ?
       ORDER BY chunk.seq LIMIT ?`,
-      info.largestChunk,
       store.repoId,
       info.oid,
       info.chunkRows + 1,
@@ -607,9 +430,6 @@ function streamLooseHeaders(
       }
       stored = row.stored;
       const data = bytesField(row.data, "loose header chunk");
-      if (data.length > info.largestChunk) {
-        throw new CorruptError("loose header chunk exceeds its admitted metadata");
-      }
       if (stored === "raw") parser.push(data);
       else {
         if (inflater === null) {
@@ -659,23 +479,15 @@ function validatedPackedBaseChain(store: SharedRepoStore, oid: string): PackedBa
   const chain = new Map<string, PackedChainRow>();
   for (const row of store.db.iterate(
     `WITH RECURSIVE /* maintenance-pack-chain */ packed_chain(
-       repo_id, oid, pack_id, type, size, base_oid, pack_repo_id, pack_state
+       repo_id, oid, type, base_oid, pack_repo_id, pack_state
      ) AS (
-       SELECT object.repo_id, object.oid, object.pack_id, object.type,
-              CASE WHEN typeof(object.size) = 'integer'
-                        AND object.size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                   THEN object.size END,
-              object.base_oid, pack.repo_id, pack.state
+       SELECT object.repo_id, object.oid, object.type, object.base_oid, pack.repo_id, pack.state
          FROM git_pack_objects object
          JOIN git_pack_meta pack
            ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
         WHERE object.repo_id = ? AND object.oid = ? AND pack.state = 'complete'
        UNION
-       SELECT next.repo_id, next.oid, next.pack_id, next.type,
-              CASE WHEN typeof(next.size) = 'integer'
-                        AND next.size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                   THEN next.size END,
-              next.base_oid, pack.repo_id, pack.state
+       SELECT next.repo_id, next.oid, next.type, next.base_oid, pack.repo_id, pack.state
          FROM packed_chain current
          JOIN git_pack_objects next
            ON next.repo_id = ? AND next.oid = current.base_oid
@@ -683,80 +495,9 @@ function validatedPackedBaseChain(store: SharedRepoStore, oid: string): PackedBa
            ON pack.repo_id = next.repo_id AND pack.pack_id = next.pack_id
           AND pack.state = 'complete'
      )
-     SELECT CASE WHEN typeof(chain.repo_id) = 'integer'
-                       AND chain.repo_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
-                  THEN chain.repo_id END AS repo_id,
-             CASE WHEN typeof(chain.oid) = 'text' AND length(CAST(chain.oid AS BLOB)) = 40
-                  THEN chain.oid END AS oid,
-             CASE WHEN typeof(chain.pack_id) = 'integer'
-                       AND chain.pack_id BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                  THEN chain.pack_id END AS pack_id,
-             CASE WHEN typeof(chain.type) = 'text' AND length(CAST(chain.type AS BLOB)) <= 6
-                  THEN chain.type END AS type,
-             CASE WHEN typeof(chain.size) = 'integer'
-                       AND chain.size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                  THEN chain.size END AS size,
-             CASE WHEN chain.base_oid IS NULL THEN NULL
-                  WHEN typeof(chain.base_oid) = 'text'
-                       AND length(CAST(chain.base_oid AS BLOB)) = 40 THEN chain.base_oid END AS base_oid,
-             chain.base_oid IS NOT NULL AS has_base_oid,
-             CASE WHEN typeof(chain.pack_repo_id) = 'integer'
-                       AND chain.pack_repo_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
-                  THEN chain.pack_repo_id END AS pack_repo_id,
-             CASE WHEN typeof(chain.pack_state) = 'text'
-                       AND length(CAST(chain.pack_state AS BLOB)) <= 8 THEN chain.pack_state END AS pack_state,
-             CASE WHEN loose.repo_id IS NULL THEN NULL
-                  WHEN typeof(loose.repo_id) = 'integer'
-                       AND loose.repo_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
-                  THEN loose.repo_id END AS loose_repo_id,
-             CASE WHEN loose.oid IS NULL THEN NULL
-                  WHEN typeof(loose.oid) = 'text' AND length(CAST(loose.oid AS BLOB)) = 40
-                  THEN loose.oid END AS loose_oid,
-             CASE WHEN loose.oid IS NOT NULL AND typeof(loose.type) = 'text'
-                       AND length(CAST(loose.type AS BLOB)) <= 6 THEN loose.type END AS loose_type,
-             CASE WHEN loose.oid IS NOT NULL AND typeof(loose.size) = 'integer'
-                       AND loose.size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                  THEN loose.size END AS loose_size,
-             CASE WHEN loose.oid IS NOT NULL AND typeof(loose.stored) = 'text'
-                       AND length(CAST(loose.stored AS BLOB)) <= 4 THEN loose.stored END AS loose_stored,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE (
-               SELECT CASE WHEN count(*) <= ${Number.MAX_SAFE_INTEGER} THEN count(*) END
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = chain.base_oid
-             ) END AS loose_chunk_rows,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE (
-               SELECT CASE WHEN count(*) <= ${Number.MAX_SAFE_INTEGER} THEN count(*) END
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = chain.base_oid
-                  AND (typeof(chunk.seq) != 'integer'
-                       OR chunk.seq NOT BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                       OR typeof(chunk.data) != 'blob' OR length(chunk.data) > 1048576)
-             ) END AS loose_invalid_chunk_rows,
-             CASE WHEN loose.oid IS NULL THEN NULL ELSE (
-               SELECT min(CASE WHEN typeof(seq) = 'integer'
-                                     AND seq BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER} THEN seq END)
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = chain.base_oid
-             ) END AS loose_first_chunk,
-             CASE WHEN loose.oid IS NULL THEN NULL ELSE (
-               SELECT max(CASE WHEN typeof(seq) = 'integer'
-                                     AND seq BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER} THEN seq END)
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = chain.base_oid
-             ) END AS loose_last_chunk,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE coalesce((
-               SELECT max(CASE WHEN typeof(data) = 'blob' AND length(data) <= 1048576
-                               THEN length(data) END)
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = chain.base_oid
-             ), 0) END AS loose_largest_chunk,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE coalesce((
-               SELECT CASE WHEN typeof(sum(length(data))) = 'integer'
-                                  AND sum(length(data)) BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                           THEN sum(length(data)) END
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = chain.base_oid
-             ), 0) END AS loose_stored_bytes
+     SELECT chain.repo_id, chain.oid, chain.type, chain.base_oid,
+            chain.pack_repo_id, chain.pack_state,
+            loose.repo_id AS loose_repo_id, loose.oid AS loose_oid, loose.type AS loose_type
        FROM packed_chain chain
        LEFT JOIN git_objects loose
          ON loose.repo_id = ? AND loose.oid = chain.base_oid
@@ -773,12 +514,6 @@ function validatedPackedBaseChain(store: SharedRepoStore, oid: string): PackedBa
     store.repoId,
     store.repoId,
     store.repoId,
-    store.repoId,
-    store.repoId,
-    store.repoId,
-    store.repoId,
-    store.repoId,
-    store.repoId,
   )) {
     if (chain.size >= MAX_DELTA_DEPTH + 1) {
       throw new CorruptError(`packed delta chain for ${oid} exceeds its depth bound`);
@@ -791,60 +526,14 @@ function validatedPackedBaseChain(store: SharedRepoStore, oid: string): PackedBa
     }
     const rowOid = oidField(row.oid, "packed delta chain OID");
     if (chain.has(rowOid)) throw new CorruptError("packed delta chain returned duplicate rows");
-    safeInteger(row.pack_id, "packed delta chain pack id", 0);
     const type = objectType(row.type, "packed delta chain type");
-    safeInteger(row.size, "packed delta chain size", 0);
     const baseOid = nullableOidField(row.base_oid, "packed delta chain base OID");
-    if (booleanInteger(row.has_base_oid, "packed delta chain base marker") !== (baseOid !== null)) {
-      throw new CorruptError("packed delta chain base OID projection is invalid");
-    }
     let looseType: ObjectType | null = null;
     if (row.loose_oid !== null) {
       if (row.loose_repo_id !== store.repoId || row.loose_oid !== baseOid) {
         throw new CorruptError("packed delta terminal crossed object boundaries");
       }
       looseType = objectType(row.loose_type, "packed delta terminal type");
-      const looseSize = safeInteger(row.loose_size, "packed delta terminal size", 0);
-      const chunkRows = safeInteger(row.loose_chunk_rows, "packed delta terminal chunks", 1);
-      const invalidChunkRows = safeInteger(
-        row.loose_invalid_chunk_rows,
-        "packed delta terminal invalid chunks",
-        0,
-      );
-      const largestChunk = safeInteger(
-        row.loose_largest_chunk,
-        "packed delta terminal chunk size",
-        0,
-      );
-      const storedBytes = safeInteger(
-        row.loose_stored_bytes,
-        "packed delta terminal stored size",
-        0,
-      );
-      if (
-        (row.loose_stored !== "raw" && row.loose_stored !== "zlib") ||
-        invalidChunkRows !== 0 ||
-        row.loose_first_chunk !== 0 ||
-        row.loose_last_chunk !== chunkRows - 1 ||
-        largestChunk > 1024 * 1024 ||
-        (row.loose_stored === "raw" && storedBytes !== looseSize) ||
-        (row.loose_stored === "zlib" && storedBytes === 0)
-      ) {
-        throw new CorruptError("packed delta terminal has invalid loose metadata");
-      }
-    } else if (
-      row.loose_repo_id !== null ||
-      row.loose_type !== null ||
-      row.loose_size !== null ||
-      row.loose_stored !== null ||
-      row.loose_chunk_rows !== 0 ||
-      row.loose_invalid_chunk_rows !== 0 ||
-      row.loose_first_chunk !== null ||
-      row.loose_last_chunk !== null ||
-      row.loose_largest_chunk !== 0 ||
-      row.loose_stored_bytes !== 0
-    ) {
-      throw new CorruptError("absent packed delta terminal returned loose metadata");
     }
     chain.set(rowOid, { oid: rowOid, type, baseOid, looseType });
   }
@@ -884,7 +573,6 @@ function validatedPackedBaseChain(store: SharedRepoStore, oid: string): PackedBa
   }
   return { sourceType: source.type, baseOid: source.baseOid };
 }
-
 function packedBaseEdge(
   store: SharedRepoStore,
   oid: string,
@@ -984,20 +672,11 @@ function bytesField(value: unknown, label: string): Uint8Array {
   throw new CorruptError(`${label} is not a BLOB`);
 }
 
-function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
-  if (left.length !== right.length) return false;
-  for (let index = 0; index < left.length; index++) {
-    if (left[index] !== right[index]) return false;
-  }
-  return true;
-}
-
-function validateTreeEntryMetadata(
+function treeEdge(
   row: Record<string, unknown>,
   sourceKey: number,
   ordinal: number,
-  previousBase: number,
-): TreeEdgeMetadata {
+): ReachabilityEdge {
   if (row.source_key !== sourceKey) throw new CorruptError("tree edge crossed source boundaries");
   if (row.ordinal !== ordinal) throw new CorruptError("tree edge ordinals are not contiguous");
   const mode = row.mode;
@@ -1011,67 +690,10 @@ function validateTreeEntryMetadata(
   ) {
     throw new CorruptError("tree edge mode is invalid");
   }
-  if (row.name_type !== "blob") {
-    throw new CorruptError("tree edge name is invalid");
-  }
-  const nameLength = safeInteger(row.name_length, "tree edge name length", 1);
-  const oid = oidField(row.oid, "tree edge OID");
-  if (row.raw_type !== "blob") {
-    throw new CorruptError("tree raw edge is invalid");
-  }
-  const rawLength = safeInteger(row.raw_length, "tree raw edge length", 0);
-  const cumulativeBase = safeInteger(row.cumulative_base, "tree cumulative edge cost", 0);
-  const expectedBase =
-    previousBase + TREE_QUEUE_ROW_FIXED_BYTES + nameLength + mode.length + oid.length;
-  if (!Number.isSafeInteger(expectedBase) || cumulativeBase !== expectedBase) {
-    throw new CorruptError("tree cumulative edge cost is inconsistent");
-  }
-  return { sourceKey, ordinal, mode, nameLength, oid, rawLength, cumulativeBase };
-}
-
-function validateTreeEntryPayload(
-  row: Record<string, unknown>,
-  metadata: TreeEdgeMetadata,
-): ReachabilityEdge {
-  if (row.source_key !== metadata.sourceKey || row.ordinal !== metadata.ordinal) {
-    throw new CorruptError("tree edge payload changed its metadata order");
-  }
-  const name = bytesField(row.name_bytes, "tree edge name");
-  if (name.length !== metadata.nameLength || name.includes(0) || name.includes(0x2f)) {
-    throw new CorruptError("tree edge name is invalid");
-  }
-  try {
-    new TextDecoder("utf-8", { fatal: true }).decode(name);
-  } catch (error) {
-    throw new CorruptError("tree edge name is not valid UTF-8", { cause: error });
-  }
-  const raw = bytesField(row.raw_entry, "tree raw edge");
-  if (raw.length !== metadata.rawLength) {
-    throw new CorruptError("tree raw edge length changed after its metadata read");
-  }
-  const modeBytes = new TextEncoder().encode(metadata.mode);
-  const expectedLength = modeBytes.length + name.length + 22;
-  const nameAt = modeBytes.length + 1;
-  const oidAt = nameAt + name.length + 1;
-  if (
-    raw.length !== expectedLength ||
-    !equalBytes(raw.subarray(0, modeBytes.length), modeBytes) ||
-    raw[modeBytes.length] !== 0x20 ||
-    !equalBytes(raw.subarray(nameAt, oidAt - 1), name) ||
-    raw[oidAt - 1] !== 0 ||
-    toHex(raw.subarray(oidAt)) !== metadata.oid
-  ) {
-    throw new CorruptError("tree raw edge disagrees with its indexed fields");
-  }
   return {
-    oid: metadata.oid,
-    type:
-      metadata.mode === "40000" || metadata.mode === "040000"
-        ? "tree"
-        : metadata.mode === "160000"
-          ? "commit"
-          : "blob",
-    optionalMissing: metadata.mode === "160000",
+    oid: oidField(row.oid, "tree edge OID"),
+    type: mode === "40000" || mode === "040000" ? "tree" : mode === "160000" ? "commit" : "blob",
+    optionalMissing: mode === "160000",
     physicalOnly: false,
   };
 }
@@ -1080,150 +702,54 @@ function treeExpansion(
   db: SqlDatabase,
   store: SharedRepoStore,
   object: QueueObject,
-  info: ObjectReadInfo,
 ): ObjectExpansion {
-  let source: Record<string, unknown> | null = null;
-  let sourceRows = 0;
-  for (const row of db.iterate(
-    `SELECT effective.repo_id, effective.tree_oid, effective.source_key AS effective_source_key,
-            source.source_key, source.storage, source.source_id, source.complete,
-            source.object_size, source.entry_count, source.base_cost
+  const source = db.one<Record<string, unknown>>(
+    `SELECT effective.repo_id, effective.tree_oid, source.source_key,
+            source.complete, source.entry_count
        FROM git_tree_effective effective
        JOIN git_tree_sources source ON source.source_key = effective.source_key
-      WHERE effective.repo_id = ? AND effective.tree_oid = ? LIMIT 2`,
+      WHERE effective.repo_id = ? AND effective.tree_oid = ?`,
     store.repoId,
     object.oid,
-  )) {
-    sourceRows++;
-    if (sourceRows > 1) throw new CorruptError("effective tree source is not unique");
-    source = row;
+  );
+  if (source === undefined) {
+    throw new CorruptError(`tree ${object.oid} has no effective parsed source`);
   }
-  if (source === null) throw new CorruptError(`tree ${object.oid} has no effective parsed source`);
   if (source.repo_id !== store.repoId || source.tree_oid !== object.oid) {
     throw new CorruptError("effective tree source crossed object boundaries");
-  }
-  const sourceKey = safeInteger(source.source_key, "tree source key", 1);
-  if (source.effective_source_key !== sourceKey) {
-    throw new CorruptError("effective tree marker disagrees with its source");
-  }
-  const storage = source.storage;
-  if (storage !== "loose" && storage !== "pack") {
-    throw new CorruptError("tree source storage is invalid");
-  }
-  if (storage !== info.source) throw new CorruptError("tree source is not authoritative");
-  const sourceId = safeInteger(source.source_id, "tree source id", 0);
-  if (storage === "loose" && sourceId !== 0) {
-    throw new CorruptError("loose tree source has a pack id");
-  }
-  if (storage === "pack") {
-    const packed = store.packs.completePackedEntry(object.oid);
-    if (packed === null || packed.packId !== sourceId || packed.type !== "tree") {
-      throw new CorruptError("packed tree source is not complete and source-qualified");
-    }
   }
   if (!booleanInteger(source.complete, "tree source completion marker")) {
     throw new CorruptError("tree source is incomplete");
   }
-  const objectSize = safeInteger(source.object_size, "tree source object size", 0);
-  if (objectSize !== info.size) throw new CorruptError("tree source size is stale");
+  const sourceKey = safeInteger(source.source_key, "tree source key", 1);
   const entryCount = safeInteger(source.entry_count, "tree source entry count", 0);
-  const baseCost = safeInteger(source.base_cost, "tree source base cost", 0);
   if (object.edgeCursor > entryCount) throw new CorruptError("tree edge cursor exceeds its marker");
 
-  let previousBase = 0;
-  if (object.edgeCursor > 0) {
-    const previous = db.one<Record<string, unknown>>(
-      `SELECT source_key, ordinal, cumulative_base FROM git_tree_entries
-        WHERE source_key = ? AND ordinal = ?`,
-      sourceKey,
-      object.edgeCursor - 1,
-    );
-    if (
-      previous === undefined ||
-      previous.source_key !== sourceKey ||
-      previous.ordinal !== object.edgeCursor - 1
-    ) {
-      throw new CorruptError("tree edge cursor lost its preceding row");
-    }
-    previousBase = safeInteger(previous.cumulative_base, "preceding tree cumulative cost", 0);
-  }
-
-  const metadata: TreeEdgeMetadata[] = [];
+  const edges: ReachabilityEdge[] = [];
+  let rows = 0;
   for (const row of db.iterate(
-    `SELECT /* maintenance-tree-edge-metadata */ source_key, ordinal,
-            CASE WHEN typeof(mode) = 'text' AND length(CAST(mode AS BLOB)) <= 6
-                 THEN mode ELSE NULL END AS mode,
-            typeof(name_bytes) AS name_type, length(name_bytes) AS name_length,
-            CASE WHEN typeof(oid) = 'text' AND length(oid) <= 40
-                 THEN oid ELSE NULL END AS oid,
-            typeof(raw_entry) AS raw_type, length(raw_entry) AS raw_length,
-            cumulative_base
+    `SELECT /* maintenance-tree-edges */ source_key, ordinal, mode, oid
        FROM git_tree_entries WHERE source_key = ? AND ordinal >= ?
       ORDER BY ordinal LIMIT ${EDGE_PAGE + 1}`,
     sourceKey,
     object.edgeCursor,
   )) {
-    const checked = validateTreeEntryMetadata(
-      row,
-      sourceKey,
-      object.edgeCursor + metadata.length,
-      previousBase,
-    );
-    previousBase = checked.cumulativeBase;
-    metadata.push(checked);
-    if (object.edgeCursor + metadata.length > entryCount) {
+    const edge = treeEdge(row, sourceKey, object.edgeCursor + rows);
+    if (rows < EDGE_PAGE) edges.push(edge);
+    rows++;
+    if (object.edgeCursor + rows > entryCount) {
       throw new CorruptError("tree source has rows beyond its completion marker");
     }
   }
   const remaining = entryCount - object.edgeCursor;
-  if (metadata.length !== Math.min(remaining, EDGE_PAGE + 1)) {
+  if (rows !== Math.min(remaining, EDGE_PAGE + 1)) {
     throw new CorruptError("tree source rows are incomplete");
   }
   const nextCursor = object.edgeCursor + Math.min(remaining, EDGE_PAGE);
   const semanticComplete = nextCursor === entryCount;
-  if (semanticComplete && previousBase !== baseCost) {
-    throw new CorruptError("tree source completion cost is inconsistent");
-  }
-  const expectedPayloads = JSON.stringify(
-    metadata.map((entry) => ({ q: entry.ordinal, n: entry.nameLength, r: entry.rawLength })),
-  );
-  const edges: ReachabilityEdge[] = [];
-  let payloadOrdinal = 0;
-  for (const row of db.iterate(
-    `WITH expected AS (
-       SELECT CAST(json_extract(value, '$.q') AS INTEGER) AS ordinal,
-              CAST(json_extract(value, '$.n') AS INTEGER) AS name_length,
-              CAST(json_extract(value, '$.r') AS INTEGER) AS raw_length
-         FROM json_each(?)
-     )
-     SELECT /* maintenance-tree-edge-payloads */ entry.source_key, entry.ordinal,
-            CASE WHEN typeof(entry.name_bytes) = 'blob'
-                       AND length(entry.name_bytes) = expected.name_length
-                 THEN entry.name_bytes ELSE NULL END AS name_bytes,
-            CASE WHEN typeof(entry.raw_entry) = 'blob'
-                       AND length(entry.raw_entry) = expected.raw_length
-                 THEN entry.raw_entry ELSE NULL END AS raw_entry
-       FROM expected
-       JOIN git_tree_entries entry
-         ON entry.source_key = ? AND entry.ordinal = expected.ordinal
-      ORDER BY entry.ordinal`,
-    expectedPayloads,
-    sourceKey,
-  )) {
-    const expected = metadata[payloadOrdinal];
-    if (expected === undefined) {
-      throw new CorruptError("tree edge payloads exceed their metadata page");
-    }
-    const edge = validateTreeEntryPayload(row, expected);
-    if (edges.length < EDGE_PAGE) edges.push(edge);
-    payloadOrdinal++;
-  }
-  if (payloadOrdinal !== metadata.length) {
-    throw new CorruptError("tree edge payload page is incomplete");
-  }
   let complete = semanticComplete;
   if (semanticComplete) {
-    const base = packedBaseEdge(store, object.oid, info.type);
+    const base = packedBaseEdge(store, object.oid, "tree");
     if (base !== null) {
       if (edges.length < EDGE_PAGE) edges.push(base);
       else complete = false;
@@ -1231,7 +757,6 @@ function treeExpansion(
   }
   return { edges, nextCursor, complete };
 }
-
 function physicalExpansion(store: SharedRepoStore, object: QueueObject): ObjectExpansion {
   const packed = validatedPackedBaseChain(store, object.oid);
   if (packed === null) {
@@ -1294,128 +819,41 @@ function normalizeAndValidateEdges(
 }
 
 function validateEdgeTargets(store: SharedRepoStore, wanted: readonly NormalizedEdge[]): void {
-  let ordinal = 0;
+  const expected = new Map(wanted.map((edge) => [edge.oid, edge]));
+  const seen = new Set<string>();
   for (const row of store.db.iterate(
-    `SELECT /* maintenance-edge-targets */ CAST(input.key AS INTEGER) AS ordinal, input.value AS oid,
-             CASE WHEN loose.oid IS NOT NULL THEN 'loose'
-                  WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
-             CASE WHEN loose.oid IS NOT NULL AND typeof(loose.type) = 'text'
-                       AND length(CAST(loose.type AS BLOB)) <= 6 THEN loose.type
-                  WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
-                       AND typeof(packed.type) = 'text'
-                       AND length(CAST(packed.type AS BLOB)) <= 6 THEN packed.type END AS type,
-             CASE WHEN loose.oid IS NOT NULL AND typeof(loose.size) = 'integer'
-                       AND loose.size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER} THEN loose.size
-                  WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
-                       AND typeof(packed.size) = 'integer'
-                       AND packed.size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                       THEN packed.size END AS size,
-             CASE WHEN loose.oid IS NOT NULL AND typeof(loose.stored) = 'text'
-                       AND length(CAST(loose.stored AS BLOB)) <= 4 THEN loose.stored END AS stored,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE (
-               SELECT CASE WHEN count(*) <= ${Number.MAX_SAFE_INTEGER} THEN count(*) END
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.value
-             ) END AS chunk_rows,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE (
-               SELECT CASE WHEN count(*) <= ${Number.MAX_SAFE_INTEGER} THEN count(*) END
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.value
-                  AND (typeof(chunk.seq) != 'integer'
-                       OR chunk.seq NOT BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                       OR typeof(chunk.data) != 'blob' OR length(chunk.data) > 1048576)
-             ) END AS invalid_chunk_rows,
-             CASE WHEN loose.oid IS NULL THEN NULL ELSE (
-               SELECT min(CASE WHEN typeof(seq) = 'integer'
-                                     AND seq BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER} THEN seq END)
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.value
-             ) END AS first_chunk,
-             CASE WHEN loose.oid IS NULL THEN NULL ELSE (
-               SELECT max(CASE WHEN typeof(seq) = 'integer'
-                                     AND seq BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER} THEN seq END)
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.value
-             ) END AS last_chunk,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE coalesce((
-               SELECT max(CASE WHEN typeof(data) = 'blob' AND length(data) <= 1048576
-                               THEN length(data) END)
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.value
-             ), 0) END AS largest_chunk,
-             CASE WHEN loose.oid IS NULL THEN 0 ELSE coalesce((
-               SELECT CASE WHEN typeof(sum(length(data))) = 'integer'
-                                  AND sum(length(data)) BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                           THEN sum(length(data)) END
-                 FROM git_object_chunks chunk
-                WHERE chunk.repo_id = ? AND chunk.oid = input.value
-             ), 0) END AS stored_bytes
+    `SELECT /* maintenance-edge-targets */ input.value AS oid,
+            CASE WHEN loose.oid IS NOT NULL THEN 'loose'
+                 WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
+            CASE WHEN loose.oid IS NOT NULL THEN loose.type ELSE packed.type END AS type
        FROM json_each(?) input
        LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = input.value
        LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = input.value
        LEFT JOIN git_pack_meta pack
          ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-        AND pack.state = 'complete'
-      ORDER BY CAST(input.key AS INTEGER)`,
-    store.repoId,
-    store.repoId,
-    store.repoId,
-    store.repoId,
-    store.repoId,
-    store.repoId,
+        AND pack.state = 'complete'`,
     JSON.stringify(wanted.map((edge) => edge.oid)),
     store.repoId,
     store.repoId,
   )) {
-    const edge = wanted[ordinal];
-    if (row.ordinal !== ordinal || edge === undefined || row.oid !== edge.oid) {
-      throw new CorruptError("reachable edge validation changed its order");
+    const oid = oidField(row.oid, "reachable edge OID");
+    const edge = expected.get(oid);
+    if (edge === undefined || seen.has(oid)) {
+      throw new CorruptError("reachable edge validation returned inconsistent rows");
     }
     if (row.source !== "loose" && row.source !== "pack") {
-      if (row.source === null) {
-        throw new CorruptError(`reachable edge references a missing object ${edge.oid}`);
-      }
-      throw new CorruptError("reachable edge validation returned an invalid source");
+      throw new CorruptError(`reachable edge references a missing object ${edge.oid}`);
     }
     const type = objectType(row.type, "reachable edge type");
-    const size = safeInteger(row.size, "reachable edge size", 0);
-    const chunkRows = safeInteger(row.chunk_rows, "reachable edge chunk count", 0);
-    const invalidChunkRows = safeInteger(
-      row.invalid_chunk_rows,
-      "reachable edge invalid chunk count",
-      0,
-    );
-    const largestChunk = safeInteger(row.largest_chunk, "reachable edge chunk size", 0);
-    const storedBytes = safeInteger(row.stored_bytes, "reachable edge stored size", 0);
     if (type !== edge.type) {
       throw new CorruptError(`reachable object ${edge.oid} is ${type}, expected ${edge.type}`);
     }
-    if (
-      (row.source === "loose" && row.stored !== "raw" && row.stored !== "zlib") ||
-      (row.source === "loose" && chunkRows <= 0) ||
-      (row.source === "loose" && invalidChunkRows !== 0) ||
-      (row.source === "loose" && row.first_chunk !== 0) ||
-      (row.source === "loose" && row.last_chunk !== chunkRows - 1) ||
-      (row.source === "loose" && largestChunk > 1024 * 1024) ||
-      (row.source === "loose" && row.stored === "raw" && storedBytes !== size) ||
-      (row.source === "loose" && row.stored === "zlib" && storedBytes === 0) ||
-      (row.source === "pack" &&
-        (row.stored !== null ||
-          chunkRows !== 0 ||
-          row.first_chunk !== null ||
-          row.last_chunk !== null ||
-          largestChunk !== 0 ||
-          storedBytes !== 0))
-    ) {
-      throw new CorruptError("reachable edge validation returned invalid object metadata");
-    }
-    ordinal++;
+    seen.add(oid);
   }
-  if (ordinal !== wanted.length) {
+  if (seen.size !== wanted.length) {
     throw new CorruptError("reachable edge validation returned an incomplete page");
   }
 }
-
 function existingMarks(
   db: SqlDatabase,
   repoId: number,
@@ -1596,27 +1034,8 @@ function publishExpansionOwned(
   return { discoveredObjects, discoveredLogicalObjects };
 }
 
-function auditCompletedMark(db: SqlDatabase, repoId: number, run: RunState): void {
-  if (run.queuedObjects !== 0) {
-    throw new CorruptError("maintenance mark queue is empty but its counter is not zero");
-  }
-  const counts = db.one<Record<string, unknown>>(
-    `SELECT coalesce(sum(CASE WHEN expanded = 0 THEN 1 ELSE 0 END), 0) AS queued,
-            coalesce(sum(CASE WHEN physical_only = 0 THEN 1 ELSE 0 END), 0) AS logical
-       FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?`,
-    repoId,
-    run.runId,
-  );
-  if (counts === undefined) throw new CorruptError("maintenance completion count returned no row");
-  const queued = safeInteger(counts.queued, "completed maintenance queued count", 0);
-  const logical = safeInteger(counts.logical, "completed maintenance logical count", 0);
-  if (queued !== 0 || logical !== run.reachableObjects) {
-    throw new CorruptError("completed maintenance counters disagree with their mark rows");
-  }
-}
-
 function finishMark(db: SqlDatabase, repoId: number, run: RunState): void {
-  auditCompletedMark(db, repoId, run);
+  reconcileMaintenanceMark(db, run, "complete");
   const row = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_runs SET phase = 'classify-loose'
       WHERE repo_id = ? AND run_id = ? AND phase = 'mark' AND observed_root_epoch = ?
@@ -1661,8 +1080,12 @@ export function advanceMaintenanceReachability(
         discoveredLogicalObjects: 0,
       };
     }
+    expectPhase(
+      run,
+      ["mark", "classify-loose"],
+      `maintenance reachability cannot advance phase ${run.phase}`,
+    );
     if (run.phase === "classify-loose") {
-      auditCompletedMark(store.db, store.repoId, run);
       return {
         runId: run.runId,
         status: "complete",
@@ -1671,10 +1094,7 @@ export function advanceMaintenanceReachability(
         discoveredLogicalObjects: 0,
       };
     }
-    if (run.phase !== "mark") {
-      throw new GitError("EINVAL", `maintenance reachability cannot advance phase ${run.phase}`);
-    }
-    run = initializeAndValidateCounters(store.db, store.repoId, run);
+    run = initializeCounters(store.db, store.repoId, run);
     const object = readNextObject(store.db, store.repoId, run.runId);
     if (object === null) {
       finishMark(store.db, store.repoId, run);
@@ -1699,7 +1119,7 @@ export function advanceMaintenanceReachability(
       }
       expansion =
         info.type === "tree"
-          ? treeExpansion(store.db, store, object, info)
+          ? treeExpansion(store.db, store, object)
           : headerExpansion(store, object, info);
     }
     const published = publishExpansion(store.db, store, run, object, expansion);

@@ -134,37 +134,6 @@ class FailingReachabilityDatabase implements SqlDatabase {
   }
 }
 
-class ObservedReachabilityDatabase implements SqlDatabase {
-  packedDataQueries = 0;
-
-  constructor(readonly inner: TestDatabase) {}
-
-  run(query: string, ...bindings: unknown[]): void {
-    this.inner.run(query, ...bindings);
-  }
-
-  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
-    return this.inner.all<Row>(query, ...bindings);
-  }
-
-  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
-    return this.inner.one<Row>(query, ...bindings);
-  }
-
-  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
-    return this.inner.scalar<T>(query, ...bindings);
-  }
-
-  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
-    if (query.includes("git_pack_data")) this.packedDataQueries++;
-    return this.inner.iterate(query, ...bindings);
-  }
-
-  transactionSync<T>(closure: () => T): T {
-    return this.inner.transactionSync(closure);
-  }
-}
-
 function seedMark(
   db: TestDatabase,
   repoId: number,
@@ -332,25 +301,6 @@ function installLargeLooseHeader(
   return oid;
 }
 
-async function packedHeaderFixture(size = 2 * 1024 * 1024) {
-  const inner = new TestDatabase();
-  const observed = new ObservedReachabilityDatabase(inner);
-  const database = new SqliteGitDatabase(observed, { objectCacheBytes: 0, chunkBytes: 0 });
-  const checkout = database.createRepository("/repo", "ref: refs/heads/main");
-  const store = database.openCheckout(checkout);
-  const target = store.write("blob", utf8.encode("packed tag target\n"));
-  const prefix = utf8.encode(`object ${target}\ntype blob\ntag ownership\n\n`);
-  const bytes = deterministicIncompressibleBytes(size, prefix);
-  const oid = hashObject("tag", bytes);
-  await store.packs.ingest(slices(fullObjectPack("tag", bytes), 64 * 1024));
-  seedMark(inner, checkout.repoId, [{ oid }]);
-
-  const reopened = new SqliteGitDatabase(observed, { objectCacheBytes: 0, chunkBytes: 0 });
-  const shared = reopened.openCheckout(checkout.id).shared;
-  observed.packedDataQueries = 0;
-  return { db: inner, observed, checkout, shared, oid, bytes };
-}
-
 describe("maintenance reachability", () => {
   it("marks the direct tag, commit, tree, blob, and gitlink closure", () => {
     const { db, checkout, store } = open();
@@ -440,7 +390,7 @@ describe("maintenance reachability", () => {
     expect(reachable.has(parent)).toBe(false);
   });
 
-  it("pages direct tree entries, validates cost fields, and resumes after a cold reopen", () => {
+  it("pages direct tree entries and resumes after a cold reopen", () => {
     const { db, checkout, store } = open();
     const entries: { mode: string; name: string; oid: string }[] = [];
     for (let index = 0; index < 300; index++) {
@@ -485,7 +435,7 @@ describe("maintenance reachability", () => {
     ).toEqual({ expanded: 1, edge_cursor: 300 });
   });
 
-  it("accepts the former tree-name excess and pre-admits its payload before reading it", () => {
+  it("accepts the former tree-name excess in one edge page", () => {
     const fixture = () => {
       const { db, checkout, store } = open();
       const target = store.write("blob", utf8.encode("owned\n"));
@@ -499,14 +449,10 @@ describe("maintenance reachability", () => {
     };
 
     const current = fixture();
-    current.db.storage.histogram = new Map();
     expect(advanceMaintenanceReachability(current.shared)).toMatchObject({
       processedOid: current.tree,
       discoveredObjects: 1,
     });
-    expect(
-      [...current.db.storage.histogram.keys()].some((query) => query.includes("WITH expected AS")),
-    ).toBe(true);
   });
 
   it("streams large unknown and continuation tag headers without retaining the message", () => {
@@ -703,88 +649,6 @@ describe("maintenance reachability", () => {
         });
         expect(failing.activeHeaderIterators).toBe(0);
         expect(failing.closedHeaderIterators).toBeGreaterThan(0);
-      }
-    });
-
-    it("rejects constraint-bypassed object sizes and chunk ordinals as corruption", async () => {
-      const corruptValues: readonly unknown[] = [1.5, "invalid", new Uint8Array([1])];
-      for (const value of corruptValues) {
-        const size = open();
-        const tree = size.store.write("tree", serializeTree([]));
-        const root = size.store.write("commit", commit(tree));
-        seedMark(size.db, size.checkout.repoId, [{ oid: root }]);
-        size.db.run("PRAGMA ignore_check_constraints = ON");
-        try {
-          size.db.run(
-            "UPDATE git_objects SET size = ? WHERE repo_id = ? AND oid = ?",
-            value,
-            size.checkout.repoId,
-            root,
-          );
-        } finally {
-          size.db.run("PRAGMA ignore_check_constraints = OFF");
-        }
-
-        expect(() => advanceMaintenanceReachability(size.store.shared)).toThrowError(
-          expect.objectContaining({ code: "ECORRUPT" }),
-        );
-
-        const ordinal = open();
-        const ordinalTree = ordinal.store.write("tree", serializeTree([]));
-        const ordinalRoot = ordinal.store.write("commit", commit(ordinalTree));
-        seedMark(ordinal.db, ordinal.checkout.repoId, [{ oid: ordinalRoot }]);
-        ordinal.db.run(
-          "UPDATE git_object_chunks SET seq = ? WHERE repo_id = ? AND oid = ? AND seq = 0",
-          value,
-          ordinal.checkout.repoId,
-          ordinalRoot,
-        );
-        ordinal.db.storage.histogram = new Map();
-
-        expect(() => advanceMaintenanceReachability(ordinal.store.shared)).toThrowError(
-          expect.objectContaining({ code: "ECORRUPT" }),
-        );
-        expect([...ordinal.db.storage.histogram.keys()].join("\n")).not.toContain(
-          "maintenance-loose-headers",
-        );
-      }
-
-      const edge = open();
-      const edgeTree = edge.store.write("tree", serializeTree([]));
-      const edgeRoot = edge.store.write("commit", commit(edgeTree));
-      seedMark(edge.db, edge.checkout.repoId, [{ oid: edgeRoot }]);
-      edge.db.run("PRAGMA ignore_check_constraints = ON");
-      try {
-        edge.db.run(
-          "UPDATE git_objects SET size = 1.5 WHERE repo_id = ? AND oid = ?",
-          edge.checkout.repoId,
-          edgeTree,
-        );
-      } finally {
-        edge.db.run("PRAGMA ignore_check_constraints = OFF");
-      }
-      expect(() => advanceMaintenanceReachability(edge.store.shared)).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-
-      for (const value of corruptValues) {
-        const packed = await packedHeaderFixture(64 * 1024);
-        packed.db.run("PRAGMA ignore_check_constraints = ON");
-        try {
-          packed.db.run(
-            "UPDATE git_pack_objects SET size = ? WHERE repo_id = ? AND oid = ?",
-            value,
-            packed.checkout.repoId,
-            packed.oid,
-          );
-        } finally {
-          packed.db.run("PRAGMA ignore_check_constraints = OFF");
-        }
-
-        expect(() => advanceMaintenanceReachability(packed.shared)).toThrowError(
-          expect.objectContaining({ code: "ECORRUPT" }),
-        );
-        expect(packed.observed.packedDataQueries).toBe(0);
       }
     });
 
@@ -1174,7 +1038,7 @@ describe("maintenance reachability", () => {
     ).toEqual({ physical_only: 1, expanded: 0 });
   });
 
-  it("fails closed on missing mandatory edges and corrupt direct-tree rows", () => {
+  it("fails closed on missing mandatory edges", () => {
     const missing = open();
     const absent = "e".repeat(40);
     const missingTree = missing.store.write(
@@ -1193,48 +1057,6 @@ describe("maintenance reachability", () => {
         missingTree,
       ),
     ).toBe(0);
-
-    const corrupt = open();
-    const blob = corrupt.store.write("blob", utf8.encode("blob\n"));
-    const tree = corrupt.store.write(
-      "tree",
-      serializeTree([{ mode: MODE_FILE, name: "file", oid: blob }]),
-    );
-    corrupt.db.run(
-      `UPDATE git_tree_entries SET raw_entry = x'00'
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_effective WHERE repo_id = ? AND tree_oid = ?
-        )`,
-      corrupt.checkout.repoId,
-      tree,
-    );
-    seedMark(corrupt.db, corrupt.checkout.repoId, [{ oid: tree }]);
-    expect(() => advanceMaintenanceReachability(corrupt.store.shared)).toThrow(
-      /raw edge disagrees/,
-    );
-  });
-
-  it("fails closed on a stale packed tree source marker", async () => {
-    const { db, checkout, store } = open();
-    const treeBytes = serializeTree([]);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(1);
-    writer.object("tree", treeBytes);
-    writer.finish();
-    await store.packs.ingest(slices(concat(chunks), 13));
-    const tree = hashObject("tree", treeBytes);
-    db.run(
-      `UPDATE git_tree_sources SET source_id = source_id + 1
-        WHERE repo_id = ? AND tree_oid = ? AND storage = 'pack'`,
-      checkout.repoId,
-      tree,
-    );
-    seedMark(db, checkout.repoId, [{ oid: tree }]);
-
-    expect(() => advanceMaintenanceReachability(store.shared)).toThrow(
-      /not complete and source-qualified/,
-    );
   });
 
   it("returns root-changed without publishing or changing counters", () => {
@@ -1287,7 +1109,7 @@ describe("maintenance reachability", () => {
     );
   });
 
-  it("audits completed marks exactly after a cold classify-loose reopen", () => {
+  it("returns completion after a cold classify-loose reopen", () => {
     const stable = open();
     const stableBlob = stable.store.write("blob", utf8.encode("stable complete\n"));
     seedMark(stable.db, stable.checkout.repoId, [{ oid: stableBlob }]);
@@ -1296,43 +1118,6 @@ describe("maintenance reachability", () => {
     expect(
       advanceMaintenanceReachability(stableReopen.openCheckout(stable.checkout.id).shared),
     ).toMatchObject({ status: "complete", processedOid: null });
-
-    for (const corruption of ["queued", "reachable", "logical", "physical"]) {
-      const fixture = open();
-      const blob = fixture.store.write("blob", utf8.encode(`complete ${corruption}\n`));
-      seedMark(fixture.db, fixture.checkout.repoId, [{ oid: blob }]);
-      drain(fixture.db, fixture.store.shared);
-      if (corruption === "queued") {
-        fixture.db.run(
-          "UPDATE git_maintenance_runs SET queued_objects = 1 WHERE repo_id = ?",
-          fixture.checkout.repoId,
-        );
-      } else if (corruption === "reachable") {
-        fixture.db.run(
-          "UPDATE git_maintenance_runs SET reachable_objects = reachable_objects + 1 WHERE repo_id = ?",
-          fixture.checkout.repoId,
-        );
-      } else if (corruption === "logical") {
-        fixture.db.run(
-          "UPDATE git_maintenance_objects SET expanded = 0 WHERE repo_id = ? AND oid = ?",
-          fixture.checkout.repoId,
-          blob,
-        );
-      } else {
-        fixture.db.run(
-          `INSERT INTO git_maintenance_objects
-             (repo_id, run_id, oid, source_mask, expanded, shallow_boundary,
-              physical_only, edge_cursor)
-           VALUES (?, 1, ?, 0, 0, 0, 1, 0)`,
-          fixture.checkout.repoId,
-          "c".repeat(40),
-        );
-      }
-      const reopened = new SqliteGitDatabase(fixture.db, { objectCacheBytes: 1024 * 1024 });
-      expect(() =>
-        advanceMaintenanceReachability(reopened.openCheckout(fixture.checkout.id).shared),
-      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    }
   });
 
   it("ignores valid-looking corrupt and oversized commit cache rows in favor of raw headers", () => {

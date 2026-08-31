@@ -9,6 +9,12 @@ import {
 import type { SqlDatabase } from "../db.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES, type PackIngestResult } from "../packs.js";
 import type { SharedRepoStore } from "../store.js";
+import {
+  expectPhase,
+  expectRootsSettled,
+  type MaintenanceRunView,
+  readMaintenanceRunView,
+} from "./state.js";
 
 const MAX_REPACK_OBJECTS = 2_048;
 const MAX_REPACK_INFLATED_BYTES = 32 * 1024 * 1024;
@@ -42,14 +48,7 @@ interface RepackLimits {
   readBatchBytes: number;
 }
 
-interface RepackRun {
-  runId: number;
-  observedRootEpoch: number;
-  rootEpoch: number;
-  reachableObjects: number;
-  queuedObjects: number;
-  repackedObjects: number;
-}
+type RepackRun = MaintenanceRunView & { phase: "repack" };
 
 interface RepackBatch {
   batchId: number;
@@ -133,66 +132,13 @@ function limits(options: MaintenanceRepackOptions): RepackLimits {
 }
 
 function readRun(db: SqlDatabase, repoId: number): RepackRun {
-  let result: RepackRun | null = null;
-  let rows = 0;
-  for (const row of db.iterate(
-    `SELECT run.repo_id, run.run_id, run.observed_root_epoch, run.phase,
-            run.root_source, run.cursor_checkout_id, run.cursor_text, run.cursor_ordinal,
-            run.reachable_objects, run.queued_objects, run.repacked_objects,
-            control.root_epoch
-       FROM git_maintenance_runs run
-       JOIN git_maintenance_control control ON control.repo_id = run.repo_id
-      WHERE run.repo_id = ? LIMIT 2`,
-    repoId,
-  )) {
-    rows++;
-    if (rows > 1 || row.repo_id !== repoId) {
-      throw new CorruptError("maintenance repack run crossed repository boundaries");
-    }
-    if (row.phase !== "repack") {
-      if (typeof row.phase !== "string") throw new CorruptError("maintenance phase is invalid");
-      throw new GitError("EINVAL", `maintenance repack cannot advance phase ${row.phase}`);
-    }
-    if (
-      row.root_source !== "done" ||
-      row.cursor_checkout_id !== null ||
-      row.cursor_text !== null ||
-      row.cursor_ordinal !== null
-    ) {
-      throw new CorruptError("maintenance repack retained a root cursor");
-    }
-    result = {
-      runId: safeInteger(row.run_id, "maintenance run id", 1),
-      observedRootEpoch: safeInteger(row.observed_root_epoch, "maintenance observed root epoch", 0),
-      rootEpoch: safeInteger(row.root_epoch, "maintenance root epoch", 0),
-      reachableObjects: safeInteger(row.reachable_objects, "maintenance reachable count", 0),
-      queuedObjects: safeInteger(row.queued_objects, "maintenance queued count", 0),
-      repackedObjects: safeInteger(row.repacked_objects, "maintenance repacked count", 0),
-    };
-  }
-  if (rows !== 1 || result === null) {
+  const run = readMaintenanceRunView(db, repoId);
+  if (run === null) {
     throw new GitError("ENOTFOUND", "maintenance repack run does not exist");
   }
-  return result;
-}
-
-function auditStableMark(db: SqlDatabase, repoId: number, run: RepackRun): void {
-  if (run.queuedObjects !== 0) {
-    throw new CorruptError("maintenance repack started with a nonempty mark queue");
-  }
-  const row = db.one<Record<string, unknown>>(
-    `SELECT coalesce(sum(CASE WHEN expanded = 0 THEN 1 ELSE 0 END), 0) AS queued,
-            coalesce(sum(CASE WHEN physical_only = 0 THEN 1 ELSE 0 END), 0) AS logical
-       FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?`,
-    repoId,
-    run.runId,
-  );
-  if (row === undefined) throw new CorruptError("maintenance repack audit returned no row");
-  const queued = safeInteger(row.queued, "maintenance repack queued audit", 0);
-  const logical = safeInteger(row.logical, "maintenance repack reachable audit", 0);
-  if (queued !== 0 || logical !== run.reachableObjects) {
-    throw new CorruptError("maintenance repack counters disagree with the completed mark");
-  }
+  expectPhase(run, ["repack"], `maintenance repack cannot advance phase ${run.phase}`);
+  expectRootsSettled(run);
+  return run;
 }
 
 function currentRootEpoch(db: SqlDatabase, repoId: number): number {
@@ -1372,7 +1318,6 @@ export async function advanceMaintenanceRepack(
     return publishBatch(store, run, batch, selectedLimits, options, nowMs);
   }
 
-  auditStableMark(store.db, store.repoId, run);
   const selected = selectCandidates(store.db, store.repoId, run, selectedLimits);
   if (selected.objects.length === 0) {
     transitionToClassifyPacks(store.db, store.repoId, run);

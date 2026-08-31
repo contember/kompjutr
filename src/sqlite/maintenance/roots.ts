@@ -6,6 +6,7 @@ import { comparePaths } from "../../core/streams.js";
 import type { SqlDatabase } from "../db.js";
 import { requireRawRefTarget, requireRefName } from "../ref-validation.js";
 import { ensureMaintenanceControl } from "./control.js";
+import { type MaintenanceRunView, readMaintenanceRunView } from "./state.js";
 
 const RETAINED_REFLOG_SECONDS = 90 * 24 * 60 * 60;
 const RETAINED_REFLOG_ROWS = 1_024;
@@ -52,18 +53,7 @@ export interface MaintenanceRootSnapshotProgress {
   restarted: boolean;
 }
 
-interface RunState {
-  repoId: number;
-  runId: number;
-  observedRootEpoch: number;
-  phase: string;
-  startedMs: number;
-  rootSource: MaintenanceRootSource;
-  cursorCheckoutId: number | null;
-  cursorText: string | null;
-  cursorOrdinal: number | null;
-  restarted: boolean;
-}
+type RunState = MaintenanceRunView;
 
 export interface MaintenanceRootCursorState {
   phase: string;
@@ -117,91 +107,6 @@ function requireSafeInteger(
     throw new CorruptError(`${label} is not a bounded safe integer`);
   }
   return value;
-}
-
-function requireSource(value: unknown): MaintenanceRootSource {
-  for (const source of ROOT_SOURCES) {
-    if (value === source) return source;
-  }
-  throw new CorruptError("maintenance root source is invalid");
-}
-
-function requireNullableInteger(value: unknown, label: string): number | null {
-  return value === null ? null : requireSafeInteger(value, label, 0);
-}
-
-function requireCursorMetadata(row: Record<string, unknown>): number | null {
-  if (row.cursor_text_type === "null") {
-    if (row.cursor_text_bytes !== null) {
-      throw new CorruptError("absent maintenance text cursor returned byte metadata");
-    }
-    return null;
-  }
-  if (row.cursor_text_type !== "text") {
-    throw new CorruptError("maintenance text cursor storage type is invalid");
-  }
-  return requireSafeInteger(row.cursor_text_bytes, "maintenance text cursor bytes", 0);
-}
-
-function requireNullableText(
-  value: unknown,
-  label: string,
-  admittedBytes: number | null,
-): string | null {
-  if (admittedBytes === null) {
-    if (value !== null) throw new CorruptError(`${label} appeared after metadata preflight`);
-    return null;
-  }
-  if (typeof value !== "string" || utf8Bytes(value, Number.MAX_SAFE_INTEGER) !== admittedBytes) {
-    throw new CorruptError(`${label} is invalid`);
-  }
-  return value;
-}
-
-function requireRun(
-  row: Record<string, unknown>,
-  repoId: number,
-  admittedCursorBytes: number | null,
-): RunState {
-  if (row.repo_id !== repoId) throw new CorruptError("maintenance run crossed repositories");
-  const phase = row.phase;
-  if (
-    phase !== "roots" &&
-    phase !== "mark" &&
-    phase !== "classify-loose" &&
-    phase !== "repack" &&
-    phase !== "classify-packs" &&
-    phase !== "sweep-loose" &&
-    phase !== "sweep-packs" &&
-    phase !== "finish"
-  ) {
-    throw new CorruptError("maintenance run phase is invalid");
-  }
-  if (row.restarted !== 0 && row.restarted !== 1) {
-    throw new CorruptError("maintenance root restart marker is invalid");
-  }
-  const run: RunState = {
-    repoId,
-    runId: requireSafeInteger(row.run_id, "maintenance run id", 1),
-    observedRootEpoch: requireSafeInteger(
-      row.observed_root_epoch,
-      "maintenance observed root epoch",
-      0,
-    ),
-    phase,
-    startedMs: requireSafeInteger(row.started_ms, "maintenance start time", 0),
-    rootSource: requireSource(row.root_source),
-    cursorCheckoutId: requireNullableInteger(row.cursor_checkout_id, "maintenance checkout cursor"),
-    cursorText: requireNullableText(
-      row.cursor_text,
-      "maintenance text cursor",
-      admittedCursorBytes,
-    ),
-    cursorOrdinal: requireNullableInteger(row.cursor_ordinal, "maintenance ordinal cursor"),
-    restarted: row.restarted === 1,
-  };
-  validateMaintenanceRootCursor(run);
-  return run;
 }
 
 /** Validate the phase-specific durable root cursor shape. */
@@ -280,26 +185,7 @@ export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): 
 }
 
 function readRun(db: SqlDatabase, repoId: number): RunState | null {
-  const metadata = db.one<Record<string, unknown>>(
-    `SELECT typeof(cursor_text) AS cursor_text_type,
-            length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes
-       FROM git_maintenance_runs WHERE repo_id = ?`,
-    repoId,
-  );
-  if (metadata === undefined) return null;
-  const cursorBytes = requireCursorMetadata(metadata);
-  const row = db.one<Record<string, unknown>>(
-    `SELECT repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
-            cursor_checkout_id, cursor_text, typeof(cursor_text) AS cursor_text_type,
-            length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes, cursor_ordinal, restarted
-       FROM git_maintenance_runs WHERE repo_id = ?`,
-    repoId,
-  );
-  if (row === undefined) throw new CorruptError("maintenance run changed after metadata preflight");
-  if (requireCursorMetadata(row) !== cursorBytes) {
-    throw new CorruptError("maintenance text cursor changed after metadata preflight");
-  }
-  return requireRun(row, repoId, cursorBytes);
+  return readMaintenanceRunView(db, repoId);
 }
 
 function createRun(
@@ -357,18 +243,17 @@ function restartRun(db: SqlDatabase, run: RunState, rootEpoch: number): RunState
             cursor_checkout_id = NULL, cursor_text = NULL, cursor_ordinal = NULL,
             reachable_objects = 0, queued_objects = 0, restarted = 1
       WHERE repo_id = ? AND run_id = ?
-      RETURNING repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
-                cursor_checkout_id, cursor_text, typeof(cursor_text) AS cursor_text_type,
-                length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes,
-                cursor_ordinal, restarted`,
+      RETURNING run_id`,
     rootEpoch,
     run.repoId,
     run.runId,
   );
   if (row === undefined) throw new CorruptError("maintenance root restart lost its run");
-  const cursorBytes = requireCursorMetadata(row);
-  if (cursorBytes !== null) throw new CorruptError("maintenance root restart retained its cursor");
-  return requireRun(row, run.repoId, cursorBytes);
+  const restarted = readRun(db, run.repoId);
+  if (restarted === null || restarted.runId !== run.runId) {
+    throw new CorruptError("maintenance root restart lost its run");
+  }
+  return restarted;
 }
 
 function utf8Bytes(value: string, maximum = Number.MAX_SAFE_INTEGER): number {
@@ -1442,33 +1327,24 @@ function publishPage(
           SET phase = 'mark', root_source = 'done', cursor_checkout_id = NULL,
               cursor_text = NULL, cursor_ordinal = NULL, queued_objects = ?
         WHERE repo_id = ? AND run_id = ? AND observed_root_epoch = ? AND phase = 'roots'
-        RETURNING repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
-                  cursor_checkout_id, cursor_text, typeof(cursor_text) AS cursor_text_type,
-                  length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes,
-                  cursor_ordinal, restarted`,
+        RETURNING run_id`,
       queuedObjects,
       repoId,
       run.runId,
       rootEpoch,
     );
     if (row === undefined) throw new CorruptError("maintenance root completion lost its epoch");
-    const cursorBytes = requireCursorMetadata(row);
-    if (cursorBytes !== null)
-      throw new CorruptError("completed maintenance roots retained a cursor");
-    return requireRun(row, repoId, cursorBytes);
+    const completed = readRun(db, repoId);
+    if (completed === null || completed.runId !== run.runId) {
+      throw new CorruptError("maintenance root completion lost its run");
+    }
+    return completed;
   }
-  const nextCursor = page.hasMore ? page.cursorText : null;
-  const nextCursorBytes =
-    nextCursor === null ? null : utf8Bytes(nextCursor, Number.MAX_SAFE_INTEGER);
-  if (nextCursorBytes === -1) throw new CorruptError("maintenance text cursor is invalid");
   const row = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_runs
         SET root_source = ?, cursor_checkout_id = ?, cursor_text = ?, cursor_ordinal = ?
       WHERE repo_id = ? AND run_id = ? AND observed_root_epoch = ? AND phase = 'roots'
-      RETURNING repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
-                cursor_checkout_id, cursor_text, typeof(cursor_text) AS cursor_text_type,
-                length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes,
-                cursor_ordinal, restarted`,
+      RETURNING run_id`,
     source,
     page.hasMore ? page.cursorCheckoutId : null,
     page.hasMore ? page.cursorText : null,
@@ -1478,11 +1354,11 @@ function publishPage(
     rootEpoch,
   );
   if (row === undefined) throw new CorruptError("maintenance root cursor lost its epoch");
-  const returnedCursorBytes = requireCursorMetadata(row);
-  if (returnedCursorBytes !== nextCursorBytes) {
-    throw new CorruptError("maintenance root cursor changed while it was published");
+  const advanced = readRun(db, repoId);
+  if (advanced === null || advanced.runId !== run.runId) {
+    throw new CorruptError("maintenance root cursor lost its run");
   }
-  return requireRun(row, repoId, returnedCursorBytes);
+  return advanced;
 }
 
 /** Advance one durable, bounded root-discovery page. */

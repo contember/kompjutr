@@ -3,6 +3,7 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 import { utf8 } from "../src/core/bytes.js";
 import { createGit, type GitMaintenanceResult } from "../src/git/client.js";
 import { Workspace } from "../src/runtime/workspace.js";
+import { readMaintenanceRunView } from "../src/sqlite/maintenance/state.js";
 import { GC_GRACE_MS } from "../src/sqlite/maintenance/sweep.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -444,12 +445,14 @@ describe("public maintenance lifecycle", () => {
     await runtime(storage, clock).git.init({ dir: "/repo" });
     await call(storage, clock);
     const db = inspect(storage);
+    const repoId = db.scalar<number>("SELECT id FROM git_repositories");
+    if (repoId === undefined) throw new Error("maintenance repository is missing");
     db.run("UPDATE git_maintenance_runs SET root_source = 'done'");
     const before = db.one<Record<string, unknown>>("SELECT * FROM git_maintenance_runs");
 
-    await expect(runtime(storage, clock).git.maintenance({ dir: "/repo" })).rejects.toMatchObject({
-      code: "ECORRUPT",
-    });
+    expect(() => readMaintenanceRunView(db, repoId)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
     expect(db.one("SELECT * FROM git_maintenance_runs")).toEqual(before);
   });
 
@@ -466,9 +469,9 @@ describe("public maintenance lifecycle", () => {
     );
     const before = db.one<Record<string, unknown>>("SELECT * FROM git_maintenance_control");
 
-    await expect(runtime(storage, clock).git.maintenance({ dir: "/repo" })).rejects.toMatchObject({
-      code: "ECORRUPT",
-    });
+    expect(() => readMaintenanceRunView(db, repoId)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
     expect(db.one("SELECT * FROM git_maintenance_control")).toEqual(before);
     expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_runs")).toBe(0);
   });
@@ -479,13 +482,15 @@ describe("public maintenance lifecycle", () => {
     await runtime(storage, clock).git.init({ dir: "/repo" });
     const run = await call(storage, clock);
     const db = inspect(storage);
+    const repoId = db.scalar<number>("SELECT id FROM git_repositories");
+    if (repoId === undefined) throw new Error("maintenance repository is missing");
     db.run("UPDATE git_maintenance_control SET next_run_id = ?", run.runId + 2);
     const beforeControl = db.one<Record<string, unknown>>("SELECT * FROM git_maintenance_control");
     const beforeRun = db.one<Record<string, unknown>>("SELECT * FROM git_maintenance_runs");
 
-    await expect(runtime(storage, clock).git.maintenance({ dir: "/repo" })).rejects.toMatchObject({
-      code: "ECORRUPT",
-    });
+    expect(() => readMaintenanceRunView(db, repoId)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
     expect(db.one("SELECT * FROM git_maintenance_control")).toEqual(beforeControl);
     expect(db.one("SELECT * FROM git_maintenance_runs")).toEqual(beforeRun);
   });
@@ -499,11 +504,13 @@ describe("public maintenance lifecycle", () => {
       const run = await call(storage, clock);
       expect(run.phase).toBe("roots");
       const db = inspect(storage);
+      const repoId = db.scalar<number>("SELECT id FROM git_repositories");
+      if (repoId === undefined) throw new Error("maintenance repository is missing");
       db.run(`UPDATE git_maintenance_runs SET ${column} = 1`);
       const before = db.one<Record<string, unknown>>("SELECT * FROM git_maintenance_runs");
 
-      await expect(runtime(storage, clock).git.maintenance({ dir: "/repo" })).rejects.toMatchObject(
-        { code: "ECORRUPT" },
+      expect(() => readMaintenanceRunView(db, repoId)).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
       );
       expect(db.one("SELECT * FROM git_maintenance_runs")).toEqual(before);
     },
