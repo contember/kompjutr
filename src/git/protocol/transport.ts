@@ -208,10 +208,7 @@ export class RemoteAuthSession {
       ...basicAuth(auth),
       ...auth.headers,
     };
-    return abortable(
-      http({ ...retryRequest, headers: retryHeaders, signal }),
-      signal,
-    );
+    return abortable(http({ ...retryRequest, headers: retryHeaders, signal }), signal);
   }
 }
 
@@ -229,7 +226,7 @@ async function drain(
     } finally {
       await iterator.return?.();
     }
-  } catch (error) {
+  } catch {
     throwIfAborted(signal);
     // A rejected response may itself be truncated.
   }
