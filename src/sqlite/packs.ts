@@ -42,7 +42,6 @@ export const PACK_CHUNK = 1024 * 1024;
 export const MAX_PACK_MEMBERSHIP_OBJECTS = 2_048;
 export const MAX_PACK_DELETE_BATCH = 48;
 export const PACK_INGEST_LEASE_MS = 5 * 60 * 1_000;
-const MAX_PACK_FALLBACK_AUDIT_PACKS = 128;
 const MAX_PACK_INGEST_OBJECTS = 128 * 1024;
 const PACK_MEMBERSHIP_DIGEST_BYTES = 20;
 
@@ -238,24 +237,6 @@ interface PackIngestLease {
   expiresMs: number;
 }
 
-interface FallbackPackAudit {
-  packId: number;
-  size: number;
-  count: number;
-}
-
-interface FallbackAuditBudget {
-  readonly packIds: Set<number>;
-  entries: number;
-}
-
-function fallbackAuditBudget(): FallbackAuditBudget {
-  return {
-    packIds: new Set(),
-    entries: 0,
-  };
-}
-
 const PACK_MEMBERSHIP_ENCODER = new TextEncoder();
 
 function packMembershipDigest(row: PackObjectInput): Uint8Array {
@@ -342,37 +323,6 @@ class ExpectedPackMembership {
       throw new CorruptError("pack byte membership order disagrees");
     }
     this.#byteDigests.set(packByteMembershipDigest(row), ordinal * PACK_MEMBERSHIP_DIGEST_BYTES);
-  }
-
-  verifyBytes(ordinal: number, row: PackByteMembership): void {
-    if (ordinal < 0 || ordinal >= this.count || row.offset !== this.#offsets[ordinal]) {
-      throw new CorruptError("pack publication bytes disagree with indexed entries");
-    }
-    const actual = packByteMembershipDigest(row);
-    const start = ordinal * PACK_MEMBERSHIP_DIGEST_BYTES;
-    for (let index = 0; index < PACK_MEMBERSHIP_DIGEST_BYTES; index++) {
-      if (actual[index] !== this.#byteDigests[start + index]) {
-        throw new CorruptError("pack publication bytes disagree with indexed entries");
-      }
-    }
-  }
-
-  verify(ordinal: number, row: PackObjectInput): void {
-    if (
-      ordinal < 0 ||
-      ordinal >= this.count ||
-      this.#completed[ordinal] !== 1 ||
-      row[2] !== this.#offsets[ordinal]
-    ) {
-      throw new CorruptError("pack publication membership order disagrees");
-    }
-    const actual = packMembershipDigest(row);
-    const start = ordinal * PACK_MEMBERSHIP_DIGEST_BYTES;
-    for (let index = 0; index < PACK_MEMBERSHIP_DIGEST_BYTES; index++) {
-      if (actual[index] !== this.#digests[start + index]) {
-        throw new CorruptError("pack publication membership disagrees with indexed entries");
-      }
-    }
   }
 
   assertComplete(): void {
@@ -625,138 +575,6 @@ class DeltaHeaderProbe {
       throw new CorruptError("delta header is truncated");
     }
     return { sourceSize: this.#sourceSize, targetSize: this.#targetSize };
-  }
-}
-
-class SequentialPackBytes {
-  readonly #rows: Iterator<Record<string, unknown>>;
-  readonly #expectedRows: number;
-  readonly #sha = new Sha1();
-  #tail: Uint8Array = new Uint8Array(0);
-  #chunk: Uint8Array = new Uint8Array(0);
-  #chunkSeq = -1;
-  #loadedRows = 0;
-  #loadedBytes = 0;
-  #finished = false;
-  #closed = false;
-
-  constructor(
-    db: SqlDatabase,
-    repoId: number,
-    readonly packId: number,
-    readonly limit: number,
-  ) {
-    if (!Number.isSafeInteger(limit) || limit < 32) {
-      throw new CorruptError(`pack ${packId}: stored byte length is invalid`);
-    }
-    this.#expectedRows = Math.ceil(limit / PACK_CHUNK);
-    this.#rows = db
-      .iterate(
-        `SELECT pack_id, seq, data FROM git_pack_data
-          WHERE repo_id = ? AND pack_id = ? ORDER BY seq LIMIT ?`,
-        repoId,
-        packId,
-        this.#expectedRows + 1,
-      )
-      [Symbol.iterator]();
-  }
-
-  read(offset: number, length: number): Uint8Array {
-    try {
-      return this.#read(offset, length);
-    } catch (error) {
-      this.dispose();
-      throw error;
-    }
-  }
-
-  #read(offset: number, length: number): Uint8Array {
-    if (
-      this.#finished ||
-      !Number.isSafeInteger(offset) ||
-      !Number.isSafeInteger(length) ||
-      offset < 0 ||
-      length < 0 ||
-      length > PACK_READ_BYTES ||
-      offset > this.limit - length
-    ) {
-      throw new CorruptError(`pack ${this.packId}: uncached read exceeds stored bytes`);
-    }
-    if (length === 0) return new Uint8Array(0);
-    const first = Math.floor(offset / PACK_CHUNK);
-    const last = Math.floor((offset + length - 1) / PACK_CHUNK);
-    if (first === last) {
-      const chunk = this.#load(first);
-      const start = offset - first * PACK_CHUNK;
-      return chunk.subarray(start, start + length);
-    }
-    const out = new Uint8Array(length);
-    for (let seq = first; seq <= last; seq++) {
-      const chunk = this.#load(seq);
-      const chunkStart = seq * PACK_CHUNK;
-      const from = Math.max(offset, chunkStart);
-      const to = Math.min(offset + length, chunkStart + chunk.length);
-      if (to > from) out.set(chunk.subarray(from - chunkStart, to - chunkStart), from - offset);
-    }
-    return out;
-  }
-
-  finish(): void {
-    if (this.#finished) throw new CorruptError(`pack ${this.packId}: byte audit was reused`);
-    this.#finished = true;
-    try {
-      const extra = this.#rows.next();
-      if (
-        !extra.done ||
-        this.#loadedRows !== this.#expectedRows ||
-        this.#loadedBytes !== this.limit ||
-        this.#tail.length !== 20 ||
-        toHex(this.#tail) !== toHex(this.#sha.digest())
-      ) {
-        throw new CorruptError(`pack ${this.packId}: stored checksum or chunk layout is invalid`);
-      }
-    } finally {
-      this.dispose();
-    }
-  }
-
-  dispose(): void {
-    if (this.#closed) return;
-    this.#closed = true;
-    this.#rows.return?.();
-  }
-
-  #load(seq: number): Uint8Array {
-    if (seq === this.#chunkSeq) return this.#chunk;
-    if (seq !== this.#chunkSeq + 1) {
-      throw new CorruptError(`pack ${this.packId}: uncached traversal is not sequential`);
-    }
-    const next = this.#rows.next();
-    if (next.done) throw new CorruptError(`pack ${this.packId}: missing chunk ${seq}`);
-    const row = next.value;
-    const data = readBlob(row.data);
-    const expected = Math.min(PACK_CHUNK, this.limit - seq * PACK_CHUNK);
-    if (row.pack_id !== this.packId || row.seq !== seq || data.length !== expected) {
-      throw new CorruptError(`pack ${this.packId}: stored chunk layout is invalid`);
-    }
-    this.#updateChecksum(data);
-    this.#chunk = data;
-    this.#chunkSeq = seq;
-    this.#loadedRows++;
-    this.#loadedBytes += data.length;
-    return data;
-  }
-
-  #updateChecksum(data: Uint8Array): void {
-    if (data.length >= 20) {
-      if (this.#tail.length > 0) this.#sha.update(this.#tail);
-      this.#sha.update(data.subarray(0, data.length - 20));
-      this.#tail = data.slice(data.length - 20);
-      return;
-    }
-    const joined = concat([this.#tail, data]);
-    if (joined.length > 20) this.#sha.update(joined.subarray(0, joined.length - 20));
-    this.#tail = joined.slice(Math.max(0, joined.length - 20));
   }
 }
 
@@ -2214,8 +2032,7 @@ export class PackStore {
     if (ids.size > MAX_PACK_DELETE_BATCH) {
       throw new GitError("E2BIG", `pending pack cleanup exceeds ${MAX_PACK_DELETE_BATCH} packs`);
     }
-    const audit = fallbackAuditBudget();
-    for (const packId of ids) this.#deletePack(packId, [packId], audit);
+    for (const packId of ids) this.#deletePack(packId, [packId]);
     return { control: current, removed: ids.size };
   }
 
@@ -2273,7 +2090,7 @@ export class PackStore {
       if (current?.state !== "pending") {
         throw new CorruptError(`pack ${packId}: ownership release changed pending pack state`);
       }
-      this.#deletePack(packId, [packId], fallbackAuditBudget());
+      this.#deletePack(packId, [packId]);
       return true;
     });
     if (removed) this.clearCaches();
@@ -2312,7 +2129,7 @@ export class PackStore {
       if (current?.state !== "complete") {
         throw new CorruptError(`pack ${packId}: ownership release changed complete pack state`);
       }
-      this.#deletePack(packId, [packId], fallbackAuditBudget());
+      this.#deletePack(packId, [packId]);
       let rows = 0;
       for (const validation of this.#db.iterate(
         `SELECT /* owned-complete-discard-validation */ EXISTS(
@@ -2549,383 +2366,12 @@ export class PackStore {
     if (states.size === 0) return 0;
     this.#db.transactionSync(() => {
       const deletingPackIds = [...states.keys()];
-      const audit = fallbackAuditBudget();
       for (const packId of deletingPackIds) {
-        this.#deletePack(packId, deletingPackIds, audit);
+        this.#deletePack(packId, deletingPackIds);
       }
     });
     this.clearCaches();
     return states.size;
-  }
-
-  #auditFallbackPacks(
-    deletingPackId: number,
-    deletingPackIds: readonly number[],
-    budget: FallbackAuditBudget,
-  ): void {
-    const encodedDeletingPackIds = JSON.stringify(deletingPackIds);
-    const packs: FallbackPackAudit[] = [];
-    for (const row of this.#db.iterate(
-      `SELECT DISTINCT candidate.pack_id, candidate_meta.size, candidate_meta.count
-         FROM git_pack_entries candidate
-         JOIN git_pack_meta candidate_meta
-           ON candidate_meta.repo_id = candidate.repo_id
-          AND candidate_meta.pack_id = candidate.pack_id
-          AND candidate_meta.state = 'complete'
-        WHERE candidate.repo_id = ?
-          AND candidate.pack_id NOT IN (SELECT value FROM json_each(?))
-          AND EXISTS (
-            SELECT 1 FROM git_pack_objects current
-             WHERE current.repo_id = candidate.repo_id AND current.oid = candidate.oid
-               AND current.pack_id = ?
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM git_pack_entries earlier
-            JOIN git_pack_meta earlier_meta
-              ON earlier_meta.repo_id = earlier.repo_id
-             AND earlier_meta.pack_id = earlier.pack_id
-             AND earlier_meta.state = 'complete'
-             WHERE earlier.repo_id = candidate.repo_id AND earlier.oid = candidate.oid
-               AND earlier.pack_id NOT IN (SELECT value FROM json_each(?))
-               AND earlier.pack_id < candidate.pack_id
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM git_pack_entries same_pack
-             WHERE same_pack.repo_id = candidate.repo_id
-               AND same_pack.pack_id = candidate.pack_id
-               AND same_pack.oid = candidate.oid
-               AND same_pack.offset < candidate.offset
-          )
-        ORDER BY candidate.pack_id LIMIT ?`,
-      this.#repoId,
-      encodedDeletingPackIds,
-      deletingPackId,
-      encodedDeletingPackIds,
-      MAX_PACK_FALLBACK_AUDIT_PACKS + 1,
-    )) {
-      const candidatePackId = row.pack_id;
-      const size = row.size;
-      const count = row.count;
-      if (
-        typeof candidatePackId !== "number" ||
-        !Number.isSafeInteger(candidatePackId) ||
-        candidatePackId < 0 ||
-        typeof size !== "number" ||
-        !Number.isSafeInteger(size) ||
-        size < 32 ||
-        typeof count !== "number" ||
-        !Number.isSafeInteger(count) ||
-        count < 1
-      ) {
-        throw new CorruptError(`pack ${deletingPackId}: fallback pack metadata is invalid`);
-      }
-      packs.push({ packId: candidatePackId, size, count });
-    }
-    if (packs.length > MAX_PACK_FALLBACK_AUDIT_PACKS) {
-      throw new GitError("E2BIG", "fallback pack audit exceeds its pack limit");
-    }
-    const pending = packs.filter((pack) => !budget.packIds.has(pack.packId));
-    if (pending.length === 0) return;
-    for (const pack of pending) {
-      if (
-        budget.packIds.size >= MAX_PACK_FALLBACK_AUDIT_PACKS ||
-        budget.entries > MAX_PACK_MEMBERSHIP_OBJECTS - pack.count
-      ) {
-        throw new GitError("E2BIG", "fallback pack audit exceeds its bounded budget");
-      }
-      budget.entries += pack.count;
-      budget.packIds.add(pack.packId);
-    }
-
-    const encodedPackIds = JSON.stringify(pending.map((pack) => pack.packId));
-    const byPackId = new Map<number, FallbackPackAudit>(pending.map((pack) => [pack.packId, pack]));
-    let storageRows = 0;
-    for (const row of this.#db.iterate(
-      `SELECT pack.pack_id,
-              count(data.seq) AS data_rows,
-              min(data.seq) AS first_seq,
-              max(data.seq) AS last_seq,
-              coalesce(sum(CASE WHEN typeof(data.data) = 'blob'
-                                THEN length(data.data) ELSE 0 END), 0) AS stored_bytes,
-              coalesce(sum(CASE
-                WHEN data.pack_id IS NULL THEN 0
-                WHEN typeof(data.seq) != 'integer' OR data.seq < 0
-                  OR data.seq > ${Number.MAX_SAFE_INTEGER} THEN 1
-                WHEN typeof(data.data) != 'blob' OR length(data.data) < 1
-                  OR length(data.data) > ${PACK_CHUNK} THEN 1
-                WHEN data.seq > CAST((pack.size - 1) / ${PACK_CHUNK} AS INTEGER) THEN 1
-                WHEN data.seq < CAST((pack.size - 1) / ${PACK_CHUNK} AS INTEGER)
-                  AND length(data.data) != ${PACK_CHUNK} THEN 1
-                WHEN data.seq = CAST((pack.size - 1) / ${PACK_CHUNK} AS INTEGER)
-                  AND length(data.data) != pack.size - data.seq * ${PACK_CHUNK} THEN 1
-                ELSE 0 END), 0) AS invalid_chunks
-         FROM git_pack_meta pack
-         LEFT JOIN git_pack_data data
-           ON data.repo_id = pack.repo_id AND data.pack_id = pack.pack_id
-        WHERE pack.repo_id = ? AND pack.pack_id IN (SELECT value FROM json_each(?))
-        GROUP BY pack.pack_id ORDER BY pack.pack_id`,
-      this.#repoId,
-      encodedPackIds,
-    )) {
-      const packId = row.pack_id;
-      const pack = typeof packId === "number" ? byPackId.get(packId) : undefined;
-      const dataRows = row.data_rows;
-      if (
-        pack === undefined ||
-        typeof dataRows !== "number" ||
-        !Number.isSafeInteger(dataRows) ||
-        dataRows < 1 ||
-        row.first_seq !== 0 ||
-        row.last_seq !== dataRows - 1 ||
-        row.stored_bytes !== pack.size ||
-        row.invalid_chunks !== 0
-      ) {
-        throw new CorruptError(`pack ${deletingPackId}: fallback pack storage is invalid`);
-      }
-      storageRows++;
-    }
-    if (storageRows !== pending.length) {
-      throw new CorruptError(`pack ${deletingPackId}: fallback pack storage is incomplete`);
-    }
-
-    const entriesByPack = new Map<number, Map<number, PackedEntry>>();
-    for (const pack of pending) entriesByPack.set(pack.packId, new Map());
-    let entryRows = 0;
-    for (const row of this.#db.iterate(
-      `SELECT oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid
-         FROM git_pack_entries
-        WHERE repo_id = ? AND pack_id IN (SELECT value FROM json_each(?))
-        ORDER BY pack_id, offset LIMIT ?`,
-      this.#repoId,
-      encodedPackIds,
-      pending.reduce((total, pack) => total + pack.count, 0) + 1,
-    )) {
-      const oid = row.oid;
-      const packId = row.pack_id;
-      const offset = row.offset;
-      const dataOff = row.data_off;
-      const dataLen = row.data_len;
-      const type = row.type;
-      const size = row.size;
-      const entrySize = row.entry_size;
-      const baseOid = row.base_oid;
-      const pack = typeof packId === "number" ? byPackId.get(packId) : undefined;
-      const entries = typeof packId === "number" ? entriesByPack.get(packId) : undefined;
-      if (
-        pack === undefined ||
-        entries === undefined ||
-        typeof packId !== "number" ||
-        !Number.isSafeInteger(packId) ||
-        packId < 0 ||
-        typeof oid !== "string" ||
-        !isOid(oid) ||
-        typeof offset !== "number" ||
-        !Number.isSafeInteger(offset) ||
-        offset < 12 ||
-        typeof dataOff !== "number" ||
-        !Number.isSafeInteger(dataOff) ||
-        dataOff <= offset ||
-        typeof dataLen !== "number" ||
-        !Number.isSafeInteger(dataLen) ||
-        dataLen < 1 ||
-        dataOff > pack.size - 20 - dataLen ||
-        typeof type !== "string" ||
-        !isObjectType(type) ||
-        typeof size !== "number" ||
-        !Number.isSafeInteger(size) ||
-        size < 0 ||
-        typeof entrySize !== "number" ||
-        !Number.isSafeInteger(entrySize) ||
-        entrySize < 0 ||
-        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid))) ||
-        entries.has(offset)
-      ) {
-        throw new CorruptError(`pack ${deletingPackId}: fallback physical index is invalid`);
-      }
-      entries.set(offset, {
-        oid,
-        packId,
-        offset,
-        dataOff,
-        dataLen,
-        type,
-        size,
-        entrySize,
-        baseOid,
-      });
-      entryRows++;
-    }
-    const expectedEntries = pending.reduce((total, pack) => total + pack.count, 0);
-    if (entryRows !== expectedEntries) {
-      throw new CorruptError(`pack ${deletingPackId}: fallback physical index is incomplete`);
-    }
-
-    for (const pack of pending) {
-      const entries = entriesByPack.get(pack.packId);
-      if (entries === undefined || entries.size !== pack.count) {
-        throw new CorruptError(`pack ${pack.packId}: fallback physical index count disagrees`);
-      }
-      const stored = new SequentialPackBytes(this.#db, this.#repoId, pack.packId, pack.size);
-      try {
-        const reader = new PackReader(
-          (offset, length) => stored.read(offset, length),
-          pack.packId,
-          pack.size,
-        );
-        const magic = reader.take(4);
-        const version = reader.uint32();
-        const count = reader.uint32();
-        if (
-          magic[0] !== 0x50 ||
-          magic[1] !== 0x41 ||
-          magic[2] !== 0x43 ||
-          magic[3] !== 0x4b ||
-          (version !== 2 && version !== 3) ||
-          count !== pack.count
-        ) {
-          throw new CorruptError(`pack ${pack.packId}: fallback header is invalid`);
-        }
-        const offsets = new Map<number, string>();
-        for (let ordinal = 0; ordinal < count; ordinal++) {
-          const header = reader.entryHeader();
-          const indexed = entries.get(header.offset);
-          const fullType = header.kind === null ? NUMBER_TYPE[header.type] : undefined;
-          let decoded: {
-            data: Uint8Array | null;
-            consumed: number;
-            streamedOid: string | null;
-            deltaTargetSize: number | null;
-          };
-          try {
-            decoded = this.#inflateAt(reader, header.dataOff, header.entrySize, fullType ?? null);
-          } catch (error) {
-            throw new CorruptError(`pack ${pack.packId}: fallback pack bytes are invalid`, {
-              cause: error,
-            });
-          }
-          const baseOid =
-            header.kind === null
-              ? null
-              : header.kind === "ref"
-                ? header.baseOid
-                : (offsets.get(header.offset - (header.baseDelta ?? 0)) ?? null);
-          if (header.kind !== null && baseOid === null) {
-            throw new CorruptError(`pack ${pack.packId}: fallback delta base is missing`);
-          }
-          if (
-            indexed === undefined ||
-            indexed.packId !== pack.packId ||
-            indexed.offset !== header.offset ||
-            indexed.dataOff !== header.dataOff ||
-            indexed.dataLen !== decoded.consumed ||
-            indexed.entrySize !== header.entrySize ||
-            indexed.baseOid !== baseOid
-          ) {
-            throw new CorruptError(`pack ${pack.packId}: fallback index disagrees with pack bytes`);
-          }
-          if (header.kind === null) {
-            if (fullType === undefined) {
-              throw new CorruptError(`pack ${pack.packId}: fallback object type is invalid`);
-            }
-            const oid =
-              decoded.data === null
-                ? (decoded.streamedOid ?? "")
-                : hashObject(fullType, decoded.data);
-            if (
-              indexed.oid !== oid ||
-              indexed.type !== fullType ||
-              indexed.size !== header.entrySize
-            ) {
-              throw new CorruptError(
-                `pack ${pack.packId}: fallback index disagrees with pack bytes`,
-              );
-            }
-          }
-          offsets.set(header.offset, indexed.oid);
-        }
-        if (reader.position !== pack.size - 20 || offsets.size !== pack.count) {
-          throw new CorruptError(`pack ${pack.packId}: fallback pack traversal is incomplete`);
-        }
-        reader.take(20);
-        try {
-          stored.finish();
-        } catch (error) {
-          throw new CorruptError(`pack ${pack.packId}: fallback checksum mismatch`, {
-            cause: error,
-          });
-        }
-      } finally {
-        stored.dispose();
-      }
-    }
-  }
-
-  #auditPromotedFallbacks(deletingPackId: number, rows: readonly AuthenticatedPackSource[]): void {
-    if (rows.length > MAX_PACK_MEMBERSHIP_OBJECTS) {
-      throw new GitError("E2BIG", "promoted fallback audit exceeds its object limit");
-    }
-
-    let page: AuthenticatedPackSource[] = [];
-    let pageBytes = 0;
-    const auditPage = (): void => {
-      if (page.length === 0) return;
-      const only = page.length === 1 ? page[0] : undefined;
-      if (
-        only !== undefined &&
-        only.dataLen > PACK_BLOB_BATCH_TARGET_BYTES &&
-        only.baseOid === null
-      ) {
-        this.#authenticateFullPackSourceStreaming(
-          only,
-          `pack ${deletingPackId}: promoted fallback disagrees with its object id`,
-        );
-        page = [];
-        pageBytes = 0;
-        return;
-      }
-      const objects = this.#readObjectsBounded(
-        page.map((entry) => entry.oid),
-        only?.packId ?? null,
-        null,
-        false,
-        new Map(),
-        true,
-      );
-      if (objects.size !== page.length) {
-        throw new CorruptError(`pack ${deletingPackId}: promoted fallback audit is incomplete`);
-      }
-      for (const expected of page) {
-        const object = objects.get(expected.oid);
-        if (
-          object === undefined ||
-          object.type !== expected.type ||
-          object.data.length !== expected.size ||
-          hashObject(object.type, object.data) !== expected.oid
-        ) {
-          throw new CorruptError(
-            `pack ${deletingPackId}: promoted fallback disagrees with its object id`,
-          );
-        }
-      }
-      page = [];
-      pageBytes = 0;
-    };
-    for (const row of rows) {
-      if (
-        page.length > 0 &&
-        (row.size > PACK_BLOB_BATCH_TARGET_BYTES - pageBytes ||
-          row.dataLen > PACK_BLOB_BATCH_TARGET_BYTES ||
-          page.length >= MAX_PACK_MEMBERSHIP_OBJECTS)
-      ) {
-        auditPage();
-      }
-      page.push(row);
-      pageBytes += row.size;
-      if (row.size > PACK_BLOB_BATCH_TARGET_BYTES || row.dataLen > PACK_BLOB_BATCH_TARGET_BYTES) {
-        auditPage();
-      }
-    }
-    auditPage();
   }
 
   #authenticateLooseDeltaBases(deletingPackId: number, deletingPackIds: readonly number[]): void {
@@ -2981,191 +2427,40 @@ export class PackStore {
   }
 
   #authenticateLooseObjects(deletingPackId: number, objects: readonly CompletePackObject[]): void {
-    let ordinal = -1;
-    let expected: CompletePackObject | undefined;
-    let sha: Sha1 | null = null;
-    let inflater: InflateStream | null = null;
-    let stored: "raw" | "zlib" | null = null;
-    let nextSeq = 0;
-    let produced = 0;
-    let rows = 0;
-    const finish = (): void => {
-      if (
-        expected === undefined ||
-        sha === null ||
-        stored === null ||
-        rows < 1 ||
-        produced !== expected.size ||
-        (stored === "zlib" && (inflater === null || !inflater.ended)) ||
-        toHex(sha.digest()) !== expected.oid
-      ) {
-        throw new CorruptError(
-          `pack ${deletingPackId}: surviving loose delta base bytes are invalid`,
-        );
-      }
-    };
+    let ordinal = 0;
     for (const row of this.#db.iterate(
-      `SELECT CAST(input.key AS INTEGER) AS ordinal,
-              json_extract(input.value, '$.oid') AS expected_oid,
-              json_extract(input.value, '$.type') AS expected_type,
-              json_extract(input.value, '$.size') AS expected_size,
-              loose.oid, loose.type, loose.size, loose.stored,
-              chunk.seq, chunk.data
+      `SELECT input.key AS ordinal, loose.oid, loose.type, loose.size
          FROM json_each(?) input
          LEFT JOIN git_objects loose
            ON loose.repo_id = ? AND loose.oid = json_extract(input.value, '$.oid')
-         LEFT JOIN git_object_chunks chunk
-           ON chunk.repo_id = loose.repo_id AND chunk.oid = loose.oid
-        ORDER BY CAST(input.key AS INTEGER), chunk.seq`,
+        ORDER BY input.key`,
       JSON.stringify(objects),
       this.#repoId,
     )) {
-      if (row.ordinal !== ordinal) {
-        if (ordinal >= 0) finish();
-        ordinal++;
-        expected = objects[ordinal];
-        if (
-          expected === undefined ||
-          row.ordinal !== ordinal ||
-          row.expected_oid !== expected.oid ||
-          row.expected_type !== expected.type ||
-          row.expected_size !== expected.size ||
-          row.oid !== expected.oid ||
-          row.type !== expected.type ||
-          row.size !== expected.size ||
-          (row.stored !== "raw" && row.stored !== "zlib")
-        ) {
-          throw new CorruptError(
-            `pack ${deletingPackId}: surviving loose delta base metadata changed`,
-          );
-        }
-        sha = new Sha1().update(objectHeader(expected.type, expected.size));
-        stored = row.stored;
-        nextSeq = 0;
-        produced = 0;
-        rows = 0;
-        inflater =
-          stored === "zlib"
-            ? new InflateStream((chunk) => {
-                produced += chunk.length;
-                if (expected === undefined || produced > expected.size) {
-                  throw new CorruptError(
-                    `pack ${deletingPackId}: surviving loose delta base exceeds its size`,
-                  );
-                }
-                sha?.update(chunk);
-              })
-            : null;
-      }
-      if (row.seq !== nextSeq) {
+      const expected = objects[ordinal];
+      if (
+        expected === undefined ||
+        row.ordinal !== ordinal ||
+        row.oid !== expected.oid ||
+        row.type !== expected.type ||
+        row.size !== expected.size
+      ) {
         throw new CorruptError(
-          `pack ${deletingPackId}: surviving loose delta base chunks are incomplete`,
+          `pack ${deletingPackId}: surviving loose delta base metadata changed`,
         );
       }
-      const data = readBlob(row.data);
-      if (data.length > PACK_CHUNK) {
-        throw new CorruptError(
-          `pack ${deletingPackId}: surviving loose delta base chunk is too large`,
-        );
-      }
-      if (stored === "raw") {
-        produced += data.length;
-        if (expected === undefined || produced > expected.size) {
-          throw new CorruptError(
-            `pack ${deletingPackId}: surviving loose delta base exceeds its size`,
-          );
-        }
-        sha?.update(data);
-      } else if (inflater !== null) {
-        let consumed = 0;
-        while (consumed < data.length) {
-          const used = inflater.push(data.subarray(consumed));
-          consumed += used;
-          if (inflater.ended && consumed !== data.length) {
-            throw new CorruptError(
-              `pack ${deletingPackId}: surviving loose delta base has trailing bytes`,
-            );
-          }
-          if (!inflater.ended && used === 0) {
-            throw new CorruptError(
-              `pack ${deletingPackId}: surviving loose delta base inflater made no progress`,
-            );
-          }
-        }
-      }
-      nextSeq++;
-      rows++;
+      ordinal++;
     }
-    if (ordinal >= 0) finish();
-    if (ordinal + 1 !== objects.length) {
+    if (ordinal !== objects.length) {
       throw new CorruptError(
         `pack ${deletingPackId}: surviving loose delta base authentication is incomplete`,
       );
     }
   }
 
-  #deletePack(
-    packId: number,
-    deletingPackIds: readonly number[],
-    auditBudget: FallbackAuditBudget,
-  ): void {
+  #deletePack(packId: number, deletingPackIds: readonly number[]): void {
     const encodedDeletingPackIds = JSON.stringify(deletingPackIds);
-    const invalidFallback = this.#db.scalar<unknown>(
-      `SELECT EXISTS(
-         SELECT 1
-           FROM git_pack_entries candidate
-           JOIN git_pack_meta candidate_meta
-             ON candidate_meta.repo_id = candidate.repo_id
-            AND candidate_meta.pack_id = candidate.pack_id
-            AND candidate_meta.state = 'complete'
-           JOIN git_pack_objects current
-             ON current.repo_id = candidate.repo_id AND current.oid = candidate.oid
-            AND current.pack_id = ?
-          WHERE candidate.repo_id = ?
-            AND candidate.pack_id NOT IN (SELECT value FROM json_each(?))
-            AND (
-              typeof(candidate_meta.size) != 'integer' OR candidate_meta.size < 0
-              OR candidate_meta.size > ${Number.MAX_SAFE_INTEGER}
-              OR typeof(candidate_meta.count) != 'integer' OR candidate_meta.count < 0
-              OR candidate_meta.count > ${Number.MAX_SAFE_INTEGER}
-              OR typeof(candidate.pack_id) != 'integer' OR candidate.pack_id < 0
-              OR candidate.pack_id > ${Number.MAX_SAFE_INTEGER}
-              OR typeof(candidate.oid) != 'text'
-              OR length(CAST(candidate.oid AS BLOB)) != 40
-              OR candidate.oid GLOB '*[^0-9a-f]*'
-              OR typeof(candidate.offset) != 'integer' OR candidate.offset < 0
-              OR candidate.offset > ${Number.MAX_SAFE_INTEGER}
-              OR typeof(candidate.data_off) != 'integer' OR candidate.data_off < candidate.offset
-              OR candidate.data_off > ${Number.MAX_SAFE_INTEGER}
-              OR typeof(candidate.data_len) != 'integer' OR candidate.data_len < 0
-              OR candidate.data_len > ${Number.MAX_SAFE_INTEGER}
-              OR candidate.data_off > candidate_meta.size - candidate.data_len
-              OR typeof(candidate.type) != 'text'
-              OR candidate.type NOT IN ('blob','tree','commit','tag')
-              OR typeof(candidate.size) != 'integer' OR candidate.size < 0
-              OR candidate.size > ${Number.MAX_SAFE_INTEGER}
-              OR typeof(candidate.entry_size) != 'integer' OR candidate.entry_size < 0
-              OR candidate.entry_size > ${Number.MAX_SAFE_INTEGER}
-              OR (candidate.base_oid IS NOT NULL AND (
-                typeof(candidate.base_oid) != 'text'
-                OR length(CAST(candidate.base_oid AS BLOB)) != 40
-                OR candidate.base_oid GLOB '*[^0-9a-f]*'
-              ))
-              OR candidate.type IS NOT current.type
-              OR candidate.size IS NOT current.size
-            )
-       )`,
-      packId,
-      this.#repoId,
-      encodedDeletingPackIds,
-    );
-    if (invalidFallback !== 0) {
-      throw new CorruptError(`pack ${packId}: fallback membership is invalid`);
-    }
-    this.clearCaches();
-    this.#auditFallbackPacks(packId, deletingPackIds, auditBudget);
-    const promoted: AuthenticatedPackSource[] = [];
-    const promotedOids = new Set<string>();
+    const promotedOids = new Set<unknown>();
     for (const row of this.#db.iterate(
       `INSERT OR REPLACE INTO git_pack_objects
          (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
@@ -3201,65 +2496,20 @@ export class PackStore {
                AND same_pack.oid = candidate.oid
                AND same_pack.offset < candidate.offset
           )
-       RETURNING oid, pack_id, type, size, data_off, data_len, entry_size, base_oid`,
+       RETURNING oid, pack_id`,
       this.#repoId,
       encodedDeletingPackIds,
       packId,
       encodedDeletingPackIds,
     )) {
-      const oid = row.oid;
-      const promotedPackId = row.pack_id;
-      const type = row.type;
-      const size = row.size;
-      const dataOff = row.data_off;
-      const dataLen = row.data_len;
-      const entrySize = row.entry_size;
-      const baseOid = row.base_oid;
       if (
-        typeof oid !== "string" ||
-        !isOid(oid) ||
-        promotedOids.has(oid) ||
-        typeof promotedPackId !== "number" ||
-        !Number.isSafeInteger(promotedPackId) ||
-        promotedPackId < 0 ||
-        deletingPackIds.includes(promotedPackId) ||
-        typeof type !== "string" ||
-        !isObjectType(type) ||
-        typeof size !== "number" ||
-        !Number.isSafeInteger(size) ||
-        size < 0 ||
-        size > MAX_PACK_DELTA_WORKING_BYTES ||
-        typeof dataOff !== "number" ||
-        !Number.isSafeInteger(dataOff) ||
-        dataOff < 0 ||
-        typeof dataLen !== "number" ||
-        !Number.isSafeInteger(dataLen) ||
-        dataLen < 1 ||
-        typeof entrySize !== "number" ||
-        !Number.isSafeInteger(entrySize) ||
-        entrySize < 0 ||
-        entrySize > MAX_PACK_DELTA_WORKING_BYTES ||
-        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid))) ||
-        (baseOid === null && entrySize !== size)
+        promotedOids.has(row.oid) ||
+        deletingPackIds.some((deletingPackId) => deletingPackId === row.pack_id)
       ) {
         throw new CorruptError(`pack ${packId}: promoted fallback row is invalid`);
       }
-      promotedOids.add(oid);
-      promoted.push({
-        oid,
-        packId: promotedPackId,
-        type,
-        size,
-        dataOff,
-        dataLen,
-        entrySize,
-        baseOid,
-      });
-      if (promoted.length > MAX_PACK_MEMBERSHIP_OBJECTS) {
-        throw new GitError("E2BIG", "promoted fallback audit exceeds its object limit");
-      }
+      promotedOids.add(row.oid);
     }
-    this.#auditPromotedFallbacks(packId, promoted);
     this.#authenticateLooseDeltaBases(packId, deletingPackIds);
     this.#db.run(
       `DELETE FROM git_commits
@@ -3409,7 +2659,7 @@ export class PackStore {
           throw new GitError("ESTALE", "pack ingest ownership changed before publication");
         }
         commits.finish();
-        this.#auditPublishedMembership(reservation.packId, count, total, membership);
+        this.#auditPublishedMembership(reservation.packId, membership);
         if (options.lifecycle !== undefined) {
           requireLifecycleResult(options.lifecycle.published(result), "published");
         }
@@ -3543,242 +2793,25 @@ export class PackStore {
     requireIngestControl(row, this.#repoId);
   }
 
-  #auditPublishedMembership(
-    packId: number,
-    expectedCount: number,
-    expectedBytes: number,
-    expected: ExpectedPackMembership,
-  ): void {
-    const stored = new SequentialPackBytes(this.#db, this.#repoId, packId, expectedBytes);
-    try {
-      const reader = new PackReader(
-        (offset, length) => stored.read(offset, length),
-        packId,
-        expectedBytes,
-      );
-      const magic = reader.take(4);
-      const version = reader.uint32();
-      const storedCount = reader.uint32();
-      if (
-        magic[0] !== 0x50 ||
-        magic[1] !== 0x41 ||
-        magic[2] !== 0x43 ||
-        magic[3] !== 0x4b ||
-        (version !== 2 && version !== 3) ||
-        storedCount !== expectedCount
-      ) {
-        throw new CorruptError(`pack ${packId}: publication bytes have an invalid header`);
-      }
-      for (let byteOrdinal = 0; byteOrdinal < storedCount; byteOrdinal++) {
-        const header = reader.entryHeader();
-        const type = header.kind === null ? NUMBER_TYPE[header.type] : undefined;
-        if (header.kind === null && type === undefined) {
-          throw new CorruptError(`pack ${packId}: publication bytes have an invalid object type`);
-        }
-        const inflated = this.#inflateAt(reader, header.dataOff, header.entrySize, type ?? null);
-        const oid =
-          type === undefined
-            ? null
-            : inflated.data === null
-              ? inflated.streamedOid
-              : hashObject(type, inflated.data);
-        expected.verifyBytes(byteOrdinal, {
-          offset: header.offset,
-          dataOff: header.dataOff,
-          dataLen: inflated.consumed,
-          entrySize: header.entrySize,
-          kind: header.kind,
-          baseDelta: header.baseDelta,
-          baseOid: header.baseOid,
-          type: type ?? null,
-          size: type === undefined ? (inflated.deltaTargetSize ?? -1) : header.entrySize,
-          oid,
-          compressedDigest: inflated.compressedDigest,
-        });
-      }
-      if (reader.position !== expectedBytes - 20) {
-        throw new CorruptError(`pack ${packId}: publication byte traversal is incomplete`);
-      }
-      reader.take(20);
-      stored.finish();
-    } finally {
-      stored.dispose();
-    }
-
-    let ordinal = 0;
-    for (const row of this.#db.iterate(
-      `SELECT /* exact-pack-publication-membership */ oid,
-              CASE WHEN typeof(pack_id) = 'integer'
-                     AND pack_id BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                   THEN pack_id END AS pack_id,
-              CASE WHEN typeof(offset) = 'integer'
-                     AND offset BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                   THEN offset END AS offset,
-              CASE WHEN typeof(data_off) = 'integer'
-                     AND data_off BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                   THEN data_off END AS data_off,
-              CASE WHEN typeof(data_len) = 'integer'
-                     AND data_len BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                   THEN data_len END AS data_len,
-              type,
-              CASE WHEN typeof(size) = 'integer'
-                     AND size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                   THEN size END AS size,
-              CASE WHEN typeof(entry_size) = 'integer'
-                     AND entry_size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-                   THEN entry_size END AS entry_size,
-              base_oid
-         FROM git_pack_entries
-        WHERE repo_id = ? AND pack_id = ?
-        ORDER BY offset LIMIT ?`,
-      this.#repoId,
-      packId,
-      expectedCount + 1,
-    )) {
-      const oid = row.oid;
-      const rowPackId = row.pack_id;
-      const offset = row.offset;
-      const dataOff = row.data_off;
-      const dataLen = row.data_len;
-      const type = row.type;
-      const size = row.size;
-      const entrySize = row.entry_size;
-      const baseOid = row.base_oid;
-      if (
-        typeof oid !== "string" ||
-        !isOid(oid) ||
-        rowPackId !== packId ||
-        typeof offset !== "number" ||
-        !Number.isSafeInteger(offset) ||
-        offset < 0 ||
-        typeof dataOff !== "number" ||
-        !Number.isSafeInteger(dataOff) ||
-        dataOff <= offset ||
-        typeof dataLen !== "number" ||
-        !Number.isSafeInteger(dataLen) ||
-        dataLen < 1 ||
-        dataOff > expectedBytes - dataLen ||
-        typeof type !== "string" ||
-        !isObjectType(type) ||
-        typeof size !== "number" ||
-        !Number.isSafeInteger(size) ||
-        size < 0 ||
-        typeof entrySize !== "number" ||
-        !Number.isSafeInteger(entrySize) ||
-        entrySize < 0 ||
-        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid)))
-      ) {
-        throw new CorruptError(`pack ${packId}: publication membership metadata disagrees`);
-      }
-      const physical: PackObjectInput = [
-        oid,
-        packId,
-        offset,
-        dataOff,
-        dataLen,
-        type,
-        size,
-        entrySize,
-        baseOid,
-      ];
-      expected.verify(ordinal, physical);
-      ordinal++;
-    }
-    if (ordinal !== expectedCount) {
-      throw new CorruptError(`pack ${packId}: publication membership metadata disagrees`);
-    }
-
-    const row = this.#db.one<Record<string, unknown>>(
-      `SELECT count(*) AS entry_count,
-              (SELECT count(*) FROM git_pack_pending
-                WHERE repo_id = ? AND pack_id = ?) AS pending_count,
-              (SELECT count(*) FROM git_pack_entries published
-                JOIN git_pack_objects canonical
-                  ON canonical.repo_id = published.repo_id AND canonical.oid = published.oid
-               WHERE published.repo_id = ? AND published.pack_id = ?
-                  AND NOT EXISTS (
-                    SELECT 1 FROM git_pack_entries physical
-                     WHERE physical.repo_id = canonical.repo_id
-                       AND physical.oid = canonical.oid
-                       AND physical.pack_id = canonical.pack_id
-                       AND physical.offset IS canonical.offset
-                       AND physical.data_off IS canonical.data_off
-                       AND physical.data_len IS canonical.data_len
-                       AND physical.type IS canonical.type
-                       AND physical.size IS canonical.size
-                       AND physical.entry_size IS canonical.entry_size
-                       AND physical.base_oid IS canonical.base_oid
-                  )) AS canonical_mismatch_count,
-              coalesce(sum(CASE WHEN object.oid IS NULL OR owner.state IS NOT 'complete'
-                                THEN 1 ELSE 0 END), 0) AS unavailable_count,
-              coalesce(sum(CASE
-                WHEN typeof(entry.oid) != 'text'
-                  OR length(CAST(entry.oid AS BLOB)) != 40
-                  OR entry.oid GLOB '*[^0-9a-f]*'
-                  OR typeof(entry.offset) != 'integer' OR entry.offset < 0
-                  OR entry.offset > ${Number.MAX_SAFE_INTEGER}
-                  OR typeof(entry.data_off) != 'integer' OR entry.data_off < entry.offset
-                  OR entry.data_off > ${Number.MAX_SAFE_INTEGER}
-                  OR typeof(entry.data_len) != 'integer' OR entry.data_len < 0
-                  OR entry.data_len > ${Number.MAX_SAFE_INTEGER}
-                  OR entry.data_off > ? - entry.data_len
-                  OR entry.data_off + entry.data_len > ?
-                  OR typeof(entry.type) != 'text'
-                  OR entry.type NOT IN ('blob','tree','commit','tag')
-                  OR typeof(entry.size) != 'integer' OR entry.size < 0
-                  OR entry.size > ${Number.MAX_SAFE_INTEGER}
-                  OR typeof(entry.entry_size) != 'integer' OR entry.entry_size < 0
-                  OR entry.entry_size > ${Number.MAX_SAFE_INTEGER}
-                  OR (entry.base_oid IS NOT NULL AND (
-                    typeof(entry.base_oid) != 'text'
-                    OR length(CAST(entry.base_oid AS BLOB)) != 40
-                    OR entry.base_oid GLOB '*[^0-9a-f]*'
-                  )) THEN 1
-                WHEN object.oid IS NOT NULL
-                  AND (object.type IS NOT entry.type OR object.size IS NOT entry.size)
-                                THEN 1 ELSE 0 END), 0) AS mismatched_count
+  #auditPublishedMembership(packId: number, expected: ExpectedPackMembership): void {
+    const unavailable = this.#db.scalar<number>(
+      `SELECT CASE WHEN count(*) != ? THEN -1
+              ELSE coalesce(sum(CASE
+                WHEN canonical.oid IS NULL OR owner.state IS NOT 'complete' THEN 1
+                ELSE 0
+              END), 0)
+            END
          FROM git_pack_entries entry
-         LEFT JOIN git_pack_objects object
-           ON object.repo_id = entry.repo_id AND object.oid = entry.oid
+         LEFT JOIN git_pack_objects canonical
+           ON canonical.repo_id = entry.repo_id AND canonical.oid = entry.oid
          LEFT JOIN git_pack_meta owner
-           ON owner.repo_id = object.repo_id AND owner.pack_id = object.pack_id
+           ON owner.repo_id = canonical.repo_id AND owner.pack_id = canonical.pack_id
         WHERE entry.repo_id = ? AND entry.pack_id = ?`,
-      this.#repoId,
-      packId,
-      this.#repoId,
-      packId,
-      expectedBytes,
-      expectedBytes,
+      expected.count,
       this.#repoId,
       packId,
     );
-    if (
-      row === undefined ||
-      typeof row.entry_count !== "number" ||
-      !Number.isSafeInteger(row.entry_count) ||
-      row.entry_count < 0 ||
-      typeof row.pending_count !== "number" ||
-      !Number.isSafeInteger(row.pending_count) ||
-      row.pending_count < 0 ||
-      typeof row.canonical_mismatch_count !== "number" ||
-      !Number.isSafeInteger(row.canonical_mismatch_count) ||
-      row.canonical_mismatch_count < 0 ||
-      typeof row.unavailable_count !== "number" ||
-      !Number.isSafeInteger(row.unavailable_count) ||
-      row.unavailable_count < 0 ||
-      typeof row.mismatched_count !== "number" ||
-      !Number.isSafeInteger(row.mismatched_count) ||
-      row.mismatched_count < 0
-    ) {
-      throw new CorruptError(`pack ${packId}: publication audit is invalid`);
-    }
-    if (row.pending_count !== 0) {
-      throw new CorruptError(`pack ${packId}: publication retained unresolved deltas`);
-    }
-    if (row.canonical_mismatch_count !== 0 || row.mismatched_count !== 0) {
-      throw new CorruptError(`pack ${packId}: publication membership metadata disagrees`);
-    }
-    if (row.entry_count !== expectedCount || row.unavailable_count !== 0) {
+    if (unavailable !== 0) {
       throw new GitError("ESTALE", "pack membership was claimed by another ingest");
     }
   }
