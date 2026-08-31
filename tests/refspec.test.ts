@@ -233,10 +233,10 @@ describe("structured refspecs", () => {
     ]);
   });
 
-  it("keeps stored-ref acceptance and caller-specific errors unchanged", () => {
+  it("keeps ref-name acceptance and the EINVAL rejection code unchanged", () => {
     expect(requireRefName("main", "stored ref", "stored")).toBe("main");
     expect(requireRefName("refs/heads/main", "stored ref", "stored")).toBe("refs/heads/main");
-    expectCode(() => requireRefName("refs/heads/.hidden", "stored ref", "stored"), "ECORRUPT");
+    expectCode(() => requireRefName("refs/heads/.hidden", "stored ref", "stored"), "EINVAL");
     expectCode(() => requireRefName("refs/heads/.hidden", "input ref", "input"), "EINVAL");
     const formerFirstExcess = `refs/heads/${"a".repeat(1_025 - "refs/heads/".length)}`;
     expect(requireRefName(formerFirstExcess, "stored ref", "stored")).toBe(formerFirstExcess);
