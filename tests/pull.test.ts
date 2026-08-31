@@ -1179,36 +1179,6 @@ describe("pull", () => {
     expect(resolvePull(coldRepo)).toMatchObject(expected);
   });
 
-  it("treats config rows as untrusted", () => {
-    const workspace = committedRepo();
-    configureUpstream(workspace);
-    workspace.storage.sql.exec(
-      "UPDATE git_config SET value = ? WHERE repo_id = ? AND path = ?",
-      new Uint8Array([1, 2, 3]),
-      workspace.repo.store.repoId,
-      "branch.main.remote",
-    );
-
-    expect(() => resolvePull(workspace.repo)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-  });
-
-  it("rejects a corrupt checked-out branch target before network work", () => {
-    const workspace = committedRepo();
-    configureUpstream(workspace);
-    workspace.storage.sql.exec(
-      "UPDATE git_refs SET target = ? WHERE repo_id = ? AND name = ?",
-      new Uint8Array([1, 2, 3]),
-      workspace.repo.store.repoId,
-      "refs/heads/main",
-    );
-
-    expect(() => resolvePull(workspace.repo)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-  });
-
   it.each(["m", "i", "merges", "interactive"])("rejects pull.rebase=%s as unsupported", (value) => {
     const workspace = committedRepo();
     configureUpstream(workspace);

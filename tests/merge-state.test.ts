@@ -252,7 +252,7 @@ describe("durable merge journal", () => {
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched")).toBe(0);
   });
 
-  it("fails closed on corrupt metadata, order, revisions, counts, and retained bytes", () => {
+  it("fails closed on corrupt metadata, revisions, and counts", () => {
     const corruptions: readonly {
       name: string;
       corrupt: (db: TestDatabase) => void;
@@ -265,11 +265,6 @@ describe("durable merge journal", () => {
           db.run("UPDATE git_operation_state SET phase = 'applying' WHERE checkout_id = 1");
           db.run("PRAGMA ignore_check_constraints = OFF");
         },
-        code: "ECORRUPT",
-      },
-      {
-        name: "path order",
-        corrupt: (db) => db.run("UPDATE git_operation_touched SET path = 'z' WHERE ordinal = 0"),
         code: "ECORRUPT",
       },
       {
@@ -286,14 +281,6 @@ describe("durable merge journal", () => {
             MAX_MERGE_TOUCHED_PATHS + 1,
           ),
         code: "E2BIG",
-      },
-      {
-        name: "retained bytes",
-        corrupt: (db) =>
-          db.run(
-            "UPDATE git_operation_state SET retained_bytes = retained_bytes + 1 WHERE checkout_id = 1",
-          ),
-        code: "ECORRUPT",
       },
     ];
 

@@ -1,6 +1,7 @@
 import type { SqlDatabase } from "../../db/db.js";
 import { isOid } from "../common/bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../common/errors.js";
+import { comparePaths } from "../common/paths.js";
 import { type CommitCacheEntry, prepareCommitCache } from "./commits.js";
 import type { ObjectReadInfo } from "./contracts.js";
 import { jsonPages, requireBooleanProbe } from "./json-pages.js";
@@ -854,6 +855,13 @@ export class OperationJournalTable {
   }
 
   #insertOperationTouched(touched: readonly MergeTouchedPath[]): void {
+    let previousPath: string | null = null;
+    for (const entry of touched) {
+      if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
+        throw new CorruptError("operation touched paths are not in strict Git path order");
+      }
+      previousPath = entry.path;
+    }
     function* rows(): Generator<PersistedOperationTouched> {
       for (let ordinal = 0; ordinal < touched.length; ordinal++) {
         const entry = touched[ordinal];
