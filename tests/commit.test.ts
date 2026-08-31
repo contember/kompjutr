@@ -631,13 +631,13 @@ describe("identity", () => {
       message: "configured",
     });
     const configReadStatements = [...histogram].reduce(
-      (total, [query, count]) => total + (query.includes("typeof(seq) AS seq_type") ? count : 0),
+      (total, [query, count]) => total + (query.includes("FROM git_config") ? count : 0),
       0,
     );
 
     expect(result.oid).toBe(workspace.repo.head().oid);
     expect(workspace.repo.readCommit(result.oid).author.name).toBe(configuredName);
-    expect(configReadStatements).toBe(4);
+    expect(configReadStatements).toBe(2);
     expect(publicationState(workspace)).not.toEqual(before);
   });
 });
