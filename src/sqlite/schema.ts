@@ -189,8 +189,25 @@ const STATEMENTS = [
 
   `CREATE TABLE IF NOT EXISTS git_refs (
      repo_id INTEGER NOT NULL,
-     name TEXT NOT NULL,
-     target TEXT NOT NULL,
+     name TEXT NOT NULL CHECK (
+       typeof(name) = 'text' AND length(CAST(name AS BLOB)) >= 1
+     ),
+     target TEXT NOT NULL CHECK (
+       typeof(target) = 'text'
+       AND length(CAST(target AS BLOB)) >= 1
+       AND instr(target, char(0)) = 0
+       AND instr(target, char(10)) = 0
+       AND instr(target, char(13)) = 0
+       AND (
+         (length(CAST(target AS BLOB)) = 40 AND target NOT GLOB '*[^0-9a-f]*')
+         OR (
+           substr(target, 1, 5) = 'ref: '
+           AND length(CAST(target AS BLOB)) > 5
+           AND substr(target, 6) != 'HEAD'
+           AND substr(target, 6, 5) != 'ref: '
+         )
+       )
+     ),
      PRIMARY KEY (repo_id, name),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
@@ -244,8 +261,8 @@ const STATEMENTS = [
        typeof(path) = 'text'
        AND length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
      ),
-     seq INTEGER NOT NULL,
-     value TEXT NOT NULL,
+     seq INTEGER NOT NULL CHECK (typeof(seq) = 'integer' AND seq >= 0),
+     value TEXT NOT NULL CHECK (typeof(value) = 'text'),
      PRIMARY KEY (repo_id, path, seq),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
@@ -259,13 +276,19 @@ const STATEMENTS = [
        typeof(path) = 'text'
        AND length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
      ),
-     stage INTEGER NOT NULL,
-     mode INTEGER NOT NULL,
-     oid TEXT NOT NULL,
-     size INTEGER,
-     mtime INTEGER,
-     ino INTEGER,
-     rev INTEGER,
+     stage INTEGER NOT NULL CHECK (typeof(stage) = 'integer' AND stage BETWEEN 0 AND 3),
+     mode INTEGER NOT NULL CHECK (
+       typeof(mode) = 'integer' AND mode IN (33188, 33261, 40960, 57344)
+     ),
+     oid TEXT NOT NULL CHECK (
+       typeof(oid) = 'text'
+       AND length(CAST(oid AS BLOB)) = 40
+       AND oid NOT GLOB '*[^0-9a-f]*'
+     ),
+     size INTEGER CHECK (size IS NULL OR (typeof(size) = 'integer' AND size >= 0)),
+     mtime INTEGER CHECK (mtime IS NULL OR (typeof(mtime) = 'integer' AND mtime >= 0)),
+     ino INTEGER CHECK (ino IS NULL OR (typeof(ino) = 'integer' AND ino >= 0)),
+     rev INTEGER CHECK (rev IS NULL OR (typeof(rev) = 'integer' AND rev >= 0)),
      PRIMARY KEY (checkout_id, path, stage),
      FOREIGN KEY (checkout_id) REFERENCES git_checkouts (id) ON DELETE CASCADE
    )`,
@@ -454,7 +477,11 @@ const STATEMENTS = [
   // walk stops dead at one of these.
   `CREATE TABLE IF NOT EXISTS git_shallow (
      repo_id INTEGER NOT NULL,
-     oid TEXT NOT NULL,
+     oid TEXT NOT NULL CHECK (
+       typeof(oid) = 'text'
+       AND length(CAST(oid AS BLOB)) = 40
+       AND oid NOT GLOB '*[^0-9a-f]*'
+     ),
      PRIMARY KEY (repo_id, oid),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,

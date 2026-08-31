@@ -712,35 +712,26 @@ describe("blob id batches", () => {
     );
   });
 
-  it("rejects invalid expected identities and fails closed on corrupt mappings", () => {
+  it("rejects invalid expected identities and ignores oversized mappings", () => {
     const { store } = open();
     const contentId = new Uint8Array([9]);
-    expect(() => store.blobIdMismatches([{ contentId, oid: "not-an-oid" }])).toThrow(
-      /invalid blob oid/,
+    expect(() => store.blobIdMismatches([{ contentId, oid: "not-an-oid" }])).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
     );
+    expect(() => store.upsertBlobIds([{ contentId, oid: "not-an-oid" }])).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    expect(() =>
+      store.tryCreateInitialState((session) => {
+        session.addBlobId({ contentId, oid: "not-an-oid" });
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
     const longId = new Uint8Array(BLOB_ID_CACHE_ELIGIBILITY_BYTES + 1).fill(7);
     store.upsertBlobIds([{ contentId: longId, oid: "1".repeat(40) }]);
     expect(store.db.scalar<number>("SELECT count(*) FROM git_blob_ids")).toBe(0);
     expect(store.lookupBlobIds([longId])).toEqual(new Map());
     expect(store.blobIdMismatches([{ contentId: longId, oid: "1".repeat(40) }])).toEqual(
       new Map([[0, null]]),
-    );
-
-    store.upsertBlobIds([{ contentId, oid: "1".repeat(40) }]);
-    store.db.run(
-      "INSERT INTO git_blob_ids (repo_id, content_id, oid, generation) VALUES (?, ?, ?, ?)",
-      1,
-      blob(longId),
-      "1".repeat(40),
-      1,
-    );
-    expect(store.db.scalar<number>("SELECT count(*) FROM git_blob_ids")).toBe(2);
-    expect(store.lookupBlobIds([longId])).toEqual(new Map());
-    store.db.run("PRAGMA ignore_check_constraints = ON");
-    store.db.run("UPDATE git_blob_ids SET oid = 'broken' WHERE repo_id = ?", 1);
-    store.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() => store.blobIdMismatches([{ contentId, oid: "2".repeat(40) }])).toThrow(
-      /invalid mapping/,
     );
   });
 
@@ -1406,94 +1397,6 @@ describe("refs, config and index", () => {
       { name: privateUse, target: direct },
       { name: supplementary, target: direct },
     ]);
-  });
-
-  it.each([
-    ["name", "UPDATE git_refs SET name = '' WHERE repo_id = 1"],
-    ["target", "UPDATE git_refs SET target = 'broken' WHERE repo_id = 1"],
-    ["name type", "UPDATE git_refs SET name = CAST('refs/heads/main' AS BLOB) WHERE repo_id = 1"],
-    [
-      "target type",
-      "UPDATE git_refs SET target = CAST(printf('%040d', 0) AS BLOB) WHERE repo_id = 1",
-    ],
-  ])("rejects a corrupt stored ref %s while streaming", (_field, corruption) => {
-    const { db, store } = open();
-    store.setRef("refs/heads/main", "1".repeat(40));
-    db.run(corruption);
-
-    expect(() => [...store.shared.iterateRefs()]).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-  });
-
-  it.each([
-    [
-      "name",
-      "UPDATE git_refs SET name = CAST(x'726566732f68656164732ff09080' AS TEXT) WHERE repo_id = 1",
-    ],
-    ["target", "UPDATE git_refs SET target = CAST(x'f09080' AS TEXT) WHERE repo_id = 1"],
-  ])("rejects non-canonical UTF-8 in a stored ref %s", (field, corruption) => {
-    const { db, store } = open();
-    store.setRef("refs/heads/main", "1".repeat(40));
-    db.run("PRAGMA ignore_check_constraints = ON");
-    db.run(corruption);
-    db.run("PRAGMA ignore_check_constraints = OFF");
-
-    expect(() => store.listRefs()).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    expect(() => [...store.shared.iterateRefs()]).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    if (field === "target") {
-      expect(() => store.getRef("refs/heads/main")).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-    }
-  });
-
-  it.each([
-    ["non-canonical UTF-8", "CAST(x'f09080' AS TEXT)"],
-    ["a non-text type", "CAST(printf('%040d', 0) AS BLOB)"],
-  ])("rejects %s in persisted HEAD state", (_case, expression) => {
-    const { db, database, store } = open();
-    db.run("PRAGMA ignore_check_constraints = ON");
-    db.run(`UPDATE git_checkouts SET head = ${expression} WHERE repo_id = 1`);
-    db.run("PRAGMA ignore_check_constraints = OFF");
-
-    expect(() => store.head()).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    expect(() => database.checkoutAt("/repo")).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(() => store.reflog("HEAD")).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-  });
-
-  it("rejects non-canonical UTF-8 in tracking control rows", () => {
-    const revision = open();
-    revision.store
-      .beginTrackingRefPublication("refs/remotes/origin/", "refs/remotes/origin/main")
-      .dispose();
-    revision.db.run("PRAGMA ignore_check_constraints = ON");
-    revision.db.run(
-      `UPDATE git_tracking_ref_revisions
-          SET ref_name = CAST(x'726566732f72656d6f7465732f6f726967696e2ff09080' AS TEXT)
-        WHERE repo_id = 1`,
-    );
-    revision.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() => revision.store.beginFetchPublication("refs/remotes/origin/")).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-
-    const namespace = open();
-    namespace.store.beginFetchPublication("refs/remotes/origin/").dispose();
-    namespace.db.run("PRAGMA ignore_check_constraints = ON");
-    namespace.db.run(
-      `UPDATE git_fetch_namespaces
-          SET tracking_prefix = CAST(x'726566732f72656d6f7465732ff090802f' AS TEXT)
-        WHERE repo_id = 1`,
-    );
-    namespace.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() => namespace.store.beginFetchPublication("refs/remotes/upstream/")).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
   });
 
   it("lets only the newest same-namespace fetch publish, including after its raw no-op", () => {
@@ -2650,38 +2553,6 @@ describe("refs, config and index", () => {
     );
   });
 
-  it("rejects corrupt old/new endpoints, identity, and ordinal shapes on reads", () => {
-    const corruptions = [
-      "old_oid = NULL",
-      `old_oid = '${"3".repeat(40)}'`,
-      `old_oid = '${"A".repeat(40)}'`,
-      "new_oid = NULL",
-      `new_oid = '${"3".repeat(40)}'`,
-      `new_oid = '${"B".repeat(40)}'`,
-      "old_raw = NULL, old_oid = '1111111111111111111111111111111111111111'",
-      "new_raw = NULL, new_oid = '2222222222222222222222222222222222222222'",
-      "actor_name = zeroblob(1), actor_email = 'actor@example.com'",
-      "actor_name = 'Actor', actor_email = NULL",
-      "ordinal = 0",
-      "reason = zeroblob(1)",
-    ];
-    for (const corruption of corruptions) {
-      const { db, store } = open({ now: () => 1_800_000_000_000 });
-      store.setRef("refs/tags/x", "1".repeat(40));
-      store.setRef("refs/tags/x", "2".repeat(40));
-      db.run("PRAGMA ignore_check_constraints = ON");
-      db.run(
-        `UPDATE git_reflog_entries SET ${corruption}
-          WHERE ref_name = 'refs/tags/x' AND ordinal = 2`,
-      );
-      db.run("PRAGMA ignore_check_constraints = OFF");
-
-      expect(() => store.reflog("refs/tags/x"), corruption).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-    }
-  });
-
   it("rejects malformed symbolic raw shapes at both DDL endpoints", () => {
     const { db } = open();
     const direct = "1".repeat(40);
@@ -2718,21 +2589,14 @@ describe("refs, config and index", () => {
     expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
   });
 
-  it("rejects corrupt reflog allocation state before mutating refs", () => {
-    const corruptions = ["next_ordinal = zeroblob(1)", "next_ordinal = -1", "next_ordinal = 0"];
-    for (const corruption of corruptions) {
-      const { db, store } = open({ now: () => 1_800_000_000_000 });
-      store.setRef("refs/tags/x", "1".repeat(40));
-      db.run("PRAGMA ignore_check_constraints = ON");
-      db.run(`UPDATE git_reflog_state SET ${corruption} WHERE repo_id = 1`);
-      db.run("PRAGMA ignore_check_constraints = OFF");
-
-      expect(() => store.setRef("refs/tags/y", "2".repeat(40)), corruption).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-      expect(store.getRef("refs/tags/y")).toBeNull();
-      expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(1);
+  it("rejects malformed reflog allocation state at write time", () => {
+    const { db } = open();
+    for (const corruption of ["next_ordinal = zeroblob(1)", "next_ordinal = -1"]) {
+      expect(() => db.run(`UPDATE git_reflog_state SET ${corruption} WHERE repo_id = 1`)).toThrow();
     }
+    expect(db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1")).toBe(
+      0,
+    );
   });
 
   it("retains only the newest 1,024 entries per ref", () => {
@@ -2824,31 +2688,6 @@ describe("refs, config and index", () => {
     db.storage.resetCounters();
     expect(store.configGetSingleBounded(path, 8_192)).toEqual({ kind: "multiple" });
     expect(db.storage.statementCount).toBeLessThan(1_000);
-  });
-
-  it("rejects corrupt config value types and non-canonical UTF-8", () => {
-    const path = "remote.origin.url";
-    const blobValue = open();
-    blobValue.store.configSet(path, "old");
-    blobValue.db.run(
-      "UPDATE git_config SET value = zeroblob(4) WHERE repo_id = 1 AND path = ?",
-      path,
-    );
-    blobValue.db.storage.resetCounters();
-    expect(() => blobValue.store.configGetSingleBounded(path, 8_192)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(blobValue.db.storage.statementCount).toBeLessThan(1_000);
-
-    const invalidUtf8 = open();
-    invalidUtf8.store.configSet(path, "old");
-    invalidUtf8.db.run(
-      "UPDATE git_config SET value = CAST(x'f09080' AS TEXT) WHERE repo_id = 1 AND path = ?",
-      path,
-    );
-    expect(() => invalidUtf8.store.configGetSingleBounded(path, 8_192)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
   });
 
   it("moves an exact config section while preserving paths and sequences", () => {
@@ -3001,64 +2840,13 @@ describe("refs, config and index", () => {
     expect(over.store.configPaths("branch.new.")).toEqual([]);
   });
 
-  it("rejects corrupt config section rows before mutation", () => {
-    const corruptValue = open();
-    corruptValue.store.configSet("branch.old.remote", "origin");
-    corruptValue.db.run(
-      "UPDATE git_config SET value = zeroblob(4) WHERE repo_id = 1 AND path = 'branch.old.remote'",
-    );
-    expect(() => corruptValue.store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(corruptValue.db.scalar<number>("SELECT count(*) FROM git_config")).toBe(1);
-
-    const corruptSequence = open();
-    corruptSequence.store.configSet("branch.old.remote", "origin");
-    corruptSequence.db.run(
-      "UPDATE git_config SET seq = 0.5 WHERE repo_id = 1 AND path = 'branch.old.remote'",
-    );
-    expect(() =>
-      corruptSequence.store.configMoveSection("branch.old.", "branch.new."),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    expect(corruptSequence.db.scalar<number>("SELECT count(*) FROM git_config")).toBe(1);
-
+  it("rejects an empty config variable before mutation", () => {
     const emptyVariable = open();
     emptyVariable.store.configSet("branch.old.", "invalid");
     expect(() => emptyVariable.store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
     expect(emptyVariable.db.scalar<number>("SELECT count(*) FROM git_config")).toBe(1);
-
-    const invalidValueUtf8 = open();
-    invalidValueUtf8.store.configSet("branch.old.remote", "old");
-    invalidValueUtf8.db.run(
-      `UPDATE git_config SET value = CAST(x'f09080' AS TEXT)
-        WHERE repo_id = 1 AND path = 'branch.old.remote'`,
-    );
-    expect(() =>
-      invalidValueUtf8.store.configMoveSection("branch.old.", "branch.new."),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    expect(invalidValueUtf8.db.scalar<number>("SELECT count(*) FROM git_config")).toBe(1);
-
-    const invalidPathUtf8 = open();
-    invalidPathUtf8.store.configSet("branch.old.remote", "origin");
-    invalidPathUtf8.db.run(
-      `UPDATE git_config SET path = CAST(x'6272616e63682e6f6c642ef09080' AS TEXT)
-        WHERE repo_id = 1 AND path = 'branch.old.remote'`,
-    );
-    expect(() =>
-      invalidPathUtf8.store.configMoveSection("branch.old.", "branch.new."),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    expect(invalidPathUtf8.db.scalar<number>("SELECT count(*) FROM git_config")).toBe(1);
-
-    const forbiddenVariable = open();
-    const nulPath = "branch.old.bad\0name";
-    forbiddenVariable.store.configSet(nulPath, "origin");
-    expect(() =>
-      forbiddenVariable.store.configMoveSection("branch.old.", "branch.new."),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    expect(forbiddenVariable.store.configGet(nulPath)).toBe("origin");
-    expect(forbiddenVariable.store.configPaths("branch.new.")).toEqual([]);
   });
 
   it("keeps a config section move in the caller's transaction rollback", () => {

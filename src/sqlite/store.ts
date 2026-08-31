@@ -8,7 +8,6 @@ export {
   contentIdKey,
   indexScanOwned,
   MAX_CONFIG_SECTION_MOVE_ROWS,
-  MAX_REFLOG_ROOT_SCAN_BYTES,
   MAX_REFLOG_ROOT_SCAN_ENTRIES,
   mutateRefsOwned,
   normalizeRoot,

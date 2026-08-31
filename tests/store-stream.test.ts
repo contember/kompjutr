@@ -192,42 +192,6 @@ describe("indexScan", () => {
       expect([...scratch.indexScan({ pageSize: 2_048 })]).toEqual([entry("scratch.txt")]);
     });
   });
-
-  it("rejects corrupt rows from checkout and scratch scans", () => {
-    const corruptions = [
-      "path = zeroblob(1)",
-      "stage = 4",
-      "mode = 0",
-      "oid = 'invalid'",
-      "size = -1",
-      "mtime = -1",
-      "ino = -1",
-      "rev = -1",
-    ];
-    for (const corruption of corruptions) {
-      const checkoutInner = new TestDatabase();
-      const checkout = open(checkoutInner);
-      checkout.indexPut(entry("corrupt.txt"));
-      checkoutInner.run("PRAGMA ignore_check_constraints = ON");
-      checkoutInner.run(`UPDATE git_index SET ${corruption}`);
-      checkoutInner.run("PRAGMA ignore_check_constraints = OFF");
-      expect(() => [...checkout.indexScan()], `checkout: ${corruption}`).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-
-      const scratchInner = new TestDatabase();
-      const scratchStore = open(scratchInner);
-      scratchStore.shared.withScratchIndex("corrupt", (scratch) => {
-        scratch.indexReplace([entry("corrupt.txt")]);
-        scratchInner.run("PRAGMA ignore_check_constraints = ON");
-        scratchInner.run(`UPDATE git_scratch_index_entries SET ${corruption}`);
-        scratchInner.run("PRAGMA ignore_check_constraints = OFF");
-        expect(() => [...scratch.indexScan()], `scratch: ${corruption}`).toThrowError(
-          expect.objectContaining({ code: "ECORRUPT" }),
-        );
-      });
-    }
-  });
 });
 
 describe("indexApply", () => {

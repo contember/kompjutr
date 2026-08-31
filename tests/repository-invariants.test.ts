@@ -22,6 +22,19 @@ function addReadableState(): ReturnType<typeof makeRepo> {
   return workspace;
 }
 
+function runIgnoringChecks(
+  workspace: ReturnType<typeof makeRepo>,
+  query: string,
+  ...bindings: unknown[]
+): void {
+  workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
+  try {
+    workspace.database.db.run(query, ...bindings);
+  } finally {
+    workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
+  }
+}
+
 describe("repository interleaving invariants", () => {
   it("reopens fresh handles over the same durable repository state", () => {
     const workspace = addReadableState();
@@ -70,7 +83,8 @@ describe("repository interleaving invariants", () => {
 
   it("guards an oversized stored ref target before returning it to JavaScript", () => {
     const workspace = addReadableState();
-    workspace.database.db.run(
+    runIgnoringChecks(
+      workspace,
       "UPDATE git_refs SET target = zeroblob(2097152) WHERE repo_id = ? AND name = ?",
       workspace.repo.store.repoId,
       "refs/tags/durable",

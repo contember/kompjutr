@@ -765,10 +765,15 @@ describe("branch", () => {
     const main = ws.repo.store.getRef("refs/heads/main");
     if (main === null) throw new Error("main is missing");
     ws.repo.store.configSet("branch.main.remote", "origin");
-    ws.repo.store.db.run(
-      "INSERT INTO git_refs (repo_id, name, target) VALUES (?, 'refs/tags/corrupt', zeroblob(40))",
-      ws.repo.store.repoId,
-    );
+    ws.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
+    try {
+      ws.repo.store.db.run(
+        "INSERT INTO git_refs (repo_id, name, target) VALUES (?, 'refs/tags/corrupt', zeroblob(40))",
+        ws.repo.store.repoId,
+      );
+    } finally {
+      ws.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");
+    }
 
     expect(() => branchRename(ws.context, ws.repo, { newName: "primary" })).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
@@ -2011,42 +2016,13 @@ describe("plumbing", () => {
     });
   });
 
-  it("accepts a former first-excess raw ref and fails closed on malformed stored targets", () => {
+  it("accepts a former first-excess raw ref and rejects malformed caller refs", () => {
     const exactBound = `refs/${"a".repeat(1_019)}`;
     expect(readRef(ws.repo, { ref: exactBound })).toEqual({ kind: "absent" });
     expect(readRef(ws.repo, { ref: `${exactBound}a` })).toEqual({ kind: "absent" });
     for (const ref of ["main", "refs/", "HEAD^", "refs/heads/main\nother"]) {
       expect(() => readRef(ws.repo, { ref })).toThrow(expect.objectContaining({ code: "EINVAL" }));
     }
-
-    const corruptRef = "refs/remotes/origin/corrupt";
-    ws.repo.store.setRef(corruptRef, fixture.git("rev-parse", "main"));
-    ws.database.db.run(
-      "UPDATE git_refs SET target = 'malformed' WHERE repo_id = ? AND name = ?",
-      ws.repo.store.repoId,
-      corruptRef,
-    );
-    expect(() => readRef(ws.repo, { ref: corruptRef })).toThrow(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(() => ws.repo.resolveRef(corruptRef)).toThrow(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-
-    ws.database.db.run("PRAGMA ignore_check_constraints = ON");
-    try {
-      ws.database.db.run(
-        "UPDATE git_checkouts SET head = 'malformed' WHERE id = ?",
-        ws.repo.checkout.checkoutId,
-      );
-    } finally {
-      ws.database.db.run("PRAGMA ignore_check_constraints = OFF");
-    }
-    expect(ws.database.db.scalar<unknown>("PRAGMA ignore_check_constraints")).toBe(0);
-    expect(() => readRef(ws.repo, { ref: "HEAD" })).toThrow(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(() => ws.repo.head()).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
   it("finds the repository root and refuses outside one", () => {

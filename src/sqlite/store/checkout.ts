@@ -48,6 +48,16 @@ import {
   type RevertJournal,
 } from "../../core/ops/operation-state.js";
 import { hasCanonicalRefSyntax } from "../../core/ref-name.js";
+import {
+  expectSafeInteger,
+  expectText,
+  int,
+  nullable,
+  OptionsSchema,
+  oneOf,
+  RowShape,
+  text,
+} from "../../core/rows.js";
 import { Sha1 } from "../../core/sha1.js";
 import { comparePaths } from "../../core/streams.js";
 import { deflate, InflateInto, InflateSizeError, InflateStream } from "../../core/zlib.js";
@@ -168,15 +178,7 @@ export const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 export const REFLOG_RETENTION_SECONDS = 90 * 24 * 60 * 60;
 export const REFLOG_RETENTION_ROWS = 1_024;
-export const MAX_REFLOG_ROOT_SCAN_BYTES = 88_080_383;
-const REFLOG_ROOT_SCAN_FIXED_BYTES = 8 * 1024 * 1024;
-/** Legacy per-row envelope retained only to preserve the reviewed structural row cap. */
-const REFLOG_ROOT_ENDPOINT_BYTES = 4_096;
-/** Numeric slots, row handles, and sort/group metadata retained per physical row. */
-const REFLOG_ROOT_ROW_FIXED_BYTES = 512;
-export const MAX_REFLOG_ROOT_SCAN_ENTRIES = Math.floor(
-  (MAX_REFLOG_ROOT_SCAN_BYTES - REFLOG_ROOT_SCAN_FIXED_BYTES) / (2 * REFLOG_ROOT_ENDPOINT_BYTES),
-);
+export const MAX_REFLOG_ROOT_SCAN_ENTRIES = 9_727;
 export const MAX_REF_MUTATION_INPUTS = 100_000;
 export const MAX_FETCH_NAMESPACES = 1_024;
 export const MAX_FETCH_PUBLICATION_INPUTS = 100_000;
@@ -197,13 +199,6 @@ export const PROVISIONAL_CLONE_RENEW_WINDOW_MS = PROVISIONAL_CLONE_LEASE_MS / 2;
 export interface ConfigSectionCandidateMetadata {
   readonly path: string;
   readonly seq: number;
-  readonly pathBytes: number;
-  readonly valueType: unknown;
-  readonly valueBytes: number | null;
-}
-
-export interface ConfigSectionMoveMetadata extends ConfigSectionCandidateMetadata {
-  readonly valueBytes: number;
 }
 
 export type OwnedRefMutation = (mutation: RefMutation, metadata: RefLogMetadata) => boolean;
@@ -434,6 +429,62 @@ export interface ExpectedOperationObject {
   label: string;
 }
 
+const CHECKOUT_ROW = new RowShape({
+  checkout_id: int(1),
+  repo_id: int(1),
+  root: text(),
+  head: text(),
+  is_primary: oneOf([0, 1]),
+});
+
+const REFLOG_ENTRY_ROW = new RowShape({
+  ref_name: text(),
+  ordinal: int(1, MAX_REFLOG_ORDINAL),
+  old_raw: nullable(text()),
+  new_raw: nullable(text()),
+  old_oid: nullable(text()),
+  new_oid: nullable(text()),
+  actor_name: nullable(text()),
+  actor_email: nullable(text()),
+  timestamp: int(0, MAX_REFLOG_ORDINAL),
+  timezone: int(-MAX_REFLOG_TIMEZONE_MINUTES, MAX_REFLOG_TIMEZONE_MINUTES),
+  reason: text(),
+});
+
+const INDEX_ENTRY_FIELDS = {
+  path: text(),
+  stage: int(0, 3),
+  mode: oneOf([0o100644, 0o100755, 0o120000, 0o160000]),
+  oid: text(),
+  size: nullable(int(0)),
+  mtime: nullable(int(0)),
+  ino: nullable(int(0)),
+  rev: nullable(int(0)),
+};
+
+const INDEX_ENTRY_ROW = new RowShape(INDEX_ENTRY_FIELDS);
+const INDEX_ENTRY_INPUT = new OptionsSchema(INDEX_ENTRY_FIELDS, "index scan row is invalid");
+
+const REF_ROW = new RowShape({ name: text(), target: text() });
+const CONFIG_SECTION_ROW = new RowShape({ path: text(), seq: int(0) });
+const OBJECT_READ_ROW = new RowShape({
+  source: nullable(oneOf(["loose", "pack"])),
+  type: nullable(oneOf(["blob", "tree", "commit", "tag"])),
+  size: nullable(int(0)),
+  stored: nullable(oneOf(["raw", "zlib"])),
+});
+const OBJECT_INFO_ROW = new RowShape({
+  source: nullable(oneOf(["loose", "pack"])),
+  type: nullable(oneOf(["blob", "tree", "commit", "tag"])),
+  size: nullable(int(0)),
+  stored: nullable(oneOf(["raw", "zlib"])),
+  chunk_rows: int(0),
+  first_chunk: nullable(int(0)),
+  last_chunk: nullable(int(0)),
+  largest_chunk: int(0),
+  stored_bytes: int(0),
+});
+
 /** Stable, collision-free key for an opaque binary content id. */
 export function contentIdKey(contentId: Uint8Array): string {
   return toHex(contentId);
@@ -502,64 +553,12 @@ export function readAuthenticatedObjectOwned(
 
 /** Internal shallow-boundary snapshot through the installed shared-store seam. */
 export function readShallowOwned(store: SharedRepoStore): Set<string> {
-  const metadata = store.db.one<{
-    rows: unknown;
-    text_bytes: unknown;
-    max_oid_bytes: unknown;
-  }>(
-    `SELECT count(*) AS rows,
-            coalesce(sum(length(CAST(oid AS BLOB))), 0) AS text_bytes,
-            coalesce(max(length(CAST(oid AS BLOB))), 0) AS max_oid_bytes
-       FROM git_shallow WHERE repo_id = ?`,
-    store.repoId,
-  );
-  if (
-    metadata === undefined ||
-    typeof metadata.rows !== "number" ||
-    !Number.isSafeInteger(metadata.rows) ||
-    metadata.rows < 0 ||
-    typeof metadata.text_bytes !== "number" ||
-    !Number.isSafeInteger(metadata.text_bytes) ||
-    metadata.text_bytes < 0 ||
-    typeof metadata.max_oid_bytes !== "number" ||
-    !Number.isSafeInteger(metadata.max_oid_bytes) ||
-    metadata.max_oid_bytes < 0 ||
-    (metadata.rows === 0) !== (metadata.max_oid_bytes === 0)
-  ) {
-    throw new CorruptError("shallow boundary metadata is invalid");
-  }
   const boundary = new Set<string>();
-  let previous: string | null = null;
-  let observedBytes = 0;
   for (const row of store.db.iterate(
-    `SELECT repo_id, typeof(oid) AS oid_type,
-            length(CAST(oid AS BLOB)) AS oid_bytes,
-            CAST(oid AS BLOB) AS oid_blob
-       FROM git_shallow WHERE repo_id = ? ORDER BY oid`,
+    "SELECT oid FROM git_shallow WHERE repo_id = ? ORDER BY oid",
     store.repoId,
   )) {
-    if (row.repo_id !== store.repoId || boundary.size >= metadata.rows) {
-      throw new CorruptError("shallow boundary crossed repositories or changed cardinality");
-    }
-    const oidBytes = requireStoredTextByteLength(
-      row.oid_type,
-      row.oid_bytes,
-      "stored shallow object id",
-    );
-    if (oidBytes > metadata.max_oid_bytes) {
-      throw new CorruptError("shallow boundary changed after metadata preflight");
-    }
-    const oid = requireCanonicalStoredText(row.oid_type, row.oid_blob, "stored shallow object id");
-    if (!isOid(oid)) throw new CorruptError(`invalid shallow object id ${oid}`);
-    if (previous !== null && comparePaths(previous, oid) >= 0) {
-      throw new CorruptError("shallow object ids are not in strict byte order");
-    }
-    boundary.add(oid);
-    previous = oid;
-    observedBytes += oidBytes;
-  }
-  if (boundary.size !== metadata.rows || observedBytes !== metadata.text_bytes) {
-    throw new CorruptError("shallow boundary changed after metadata preflight");
+    boundary.add(expectText(row.oid, "stored shallow object id"));
   }
   return boundary;
 }
@@ -748,10 +747,6 @@ export function isObjectType(value: string | null): value is ObjectType {
 }
 
 export const JSON_ENCODER = new TextEncoder();
-export const CANONICAL_TEXT_DECODER = new TextDecoder("utf-8", {
-  fatal: true,
-  ignoreBOM: true,
-});
 export const JSON_BATCH_ROWS = 2_048;
 export const JSON_BATCH_BYTES = 1_500_000;
 export function utf8ByteLength(value: string): number {
@@ -779,30 +774,6 @@ export function requireCheckoutRootInput(value: unknown): string {
     if (value.charCodeAt(index) === 0) {
       throw new GitError("EINVAL", "checkout root is invalid");
     }
-  }
-  return value;
-}
-
-export function requireStoredTextByteLength(
-  type: unknown,
-  bytes: unknown,
-  label: string,
-  minimum = 1,
-): number {
-  if (
-    type !== "text" ||
-    typeof bytes !== "number" ||
-    !Number.isSafeInteger(bytes) ||
-    bytes < minimum
-  ) {
-    throw new CorruptError(`${label} has invalid text metadata`);
-  }
-  return bytes;
-}
-
-export function requireMaximumStoredTextBytes(value: unknown, label: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new CorruptError(`${label} metadata is invalid`);
   }
   return value;
 }
@@ -907,155 +878,35 @@ export function* jsonPages<T>(items: Iterable<T>, _label: string): Generator<str
   if (rows.length > 0) yield* emit();
 }
 
-export function requireNullableRawRefTarget(value: unknown, label: string): string | null {
-  return value === null ? null : requireRawRefTarget(value, label, "stored");
-}
-
-export function requireNullableRefLogOid(value: unknown, label: string): string | null {
-  if (value === null) return null;
-  if (typeof value !== "string" || !isOid(value)) {
-    throw new CorruptError(`${label} is not a valid object id`);
-  }
-  return value;
-}
-
-export function requireStoredRefLogEndpoint(
-  rawValue: unknown,
-  oidValue: unknown,
-  label: string,
-): { raw: string | null; oid: string | null } {
-  const raw = requireNullableRawRefTarget(rawValue, `reflog ${label} raw target`);
-  const oid = requireNullableRefLogOid(oidValue, `reflog ${label} OID`);
-  if (raw === null) {
-    if (oid !== null) throw new CorruptError(`reflog ${label} absent endpoint has an OID`);
-    return { raw, oid };
-  }
-  if (isOid(raw)) {
-    if (oid !== raw) throw new CorruptError(`reflog ${label} direct endpoint OID does not match`);
-    return { raw, oid };
-  }
-  if (rawSymbolicTarget(raw) === null) {
-    throw new CorruptError(`reflog ${label} symbolic endpoint is invalid`);
-  }
-  return { raw, oid };
-}
-
 export function requireSafeRefLogInteger(
   value: unknown,
   label: string,
   minimum: number,
   maximum: number,
 ): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < minimum ||
-    value > maximum
-  ) {
-    throw new CorruptError(`${label} is not a bounded safe integer`);
-  }
-  return value;
+  return expectSafeInteger(value, minimum, maximum, label);
 }
 
-export function requireRefLogIdentityText(value: unknown, label: string): string {
-  if (typeof value !== "string" || value === "") {
-    throw new CorruptError(`${label} is invalid`);
-  }
-  refTextBytes(value, label, "stored");
-  if (value.includes("<") || value.includes(">")) {
-    throw new CorruptError(`${label} is invalid`);
-  }
-  return value;
-}
-
-export function requireStoredRefLogEntry(
-  row: Record<string, unknown>,
-  repoId: number,
-): RefLogEntry {
-  if (row.repo_id !== repoId) throw new CorruptError("reflog row belongs to another repository");
-  const refName = requireRefName(
-    requireCanonicalStoredText(row.ref_name_type, row.ref_name_blob, "reflog ref name"),
-    "reflog ref name",
-    "stored",
-    true,
-  );
-  const ordinal = requireSafeRefLogInteger(row.ordinal, "reflog ordinal", 1, MAX_REFLOG_ORDINAL);
-  const oldEndpoint = requireStoredRefLogEndpoint(
-    requireNullableCanonicalStoredText(row.old_raw_type, row.old_raw_blob, "reflog old raw target"),
-    requireNullableCanonicalStoredText(row.old_oid_type, row.old_oid_blob, "reflog old OID"),
-    "old",
-  );
-  const newEndpoint = requireStoredRefLogEndpoint(
-    requireNullableCanonicalStoredText(row.new_raw_type, row.new_raw_blob, "reflog new raw target"),
-    requireNullableCanonicalStoredText(row.new_oid_type, row.new_oid_blob, "reflog new OID"),
-    "new",
-  );
-  if (
-    refName !== "HEAD" &&
-    oldEndpoint.raw === newEndpoint.raw &&
-    oldEndpoint.oid === newEndpoint.oid
-  ) {
-    throw new CorruptError("reflog row does not change either endpoint");
-  }
-  let actor: RefLogActor | null;
-  if (
-    row.actor_name_type === "null" &&
-    row.actor_name_blob === null &&
-    row.actor_email_type === "null" &&
-    row.actor_email_blob === null
-  ) {
-    actor = null;
-  } else if (
-    row.actor_name_type === "text" &&
-    row.actor_name_blob !== null &&
-    row.actor_email_type === "text" &&
-    row.actor_email_blob !== null
-  ) {
-    actor = {
-      name: requireRefLogIdentityText(
-        requireCanonicalStoredText(row.actor_name_type, row.actor_name_blob, "reflog actor name"),
-        "reflog actor name",
-      ),
-      email: requireRefLogIdentityText(
-        requireCanonicalStoredText(
-          row.actor_email_type,
-          row.actor_email_blob,
-          "reflog actor email",
-        ),
-        "reflog actor email",
-      ),
-    };
-  } else {
-    throw new CorruptError("reflog actor is incomplete");
-  }
-  const timestamp = requireSafeRefLogInteger(
-    row.timestamp,
-    "reflog timestamp",
-    0,
-    MAX_REFLOG_ORDINAL,
-  );
-  const timezoneOffset = requireSafeRefLogInteger(
-    row.timezone,
-    "reflog timezone",
-    -MAX_REFLOG_TIMEZONE_MINUTES,
-    MAX_REFLOG_TIMEZONE_MINUTES,
-  );
-  const reason = requireCanonicalStoredText(row.reason_type, row.reason_blob, "reflog reason");
-  if (reason === "") {
-    throw new CorruptError("reflog reason is invalid");
-  }
-  refTextBytes(reason, "reflog reason", "stored");
+export function requireStoredRefLogEntry(row: unknown): RefLogEntry {
+  const stored = REFLOG_ENTRY_ROW.decode(row);
+  const actor: RefLogActor | null =
+    stored.actor_name === null
+      ? null
+      : {
+          name: stored.actor_name,
+          email: expectText(stored.actor_email, "reflog actor email"),
+        };
   return {
-    refName,
-    ordinal,
-    oldRaw: oldEndpoint.raw,
-    newRaw: newEndpoint.raw,
-    oldOid: oldEndpoint.oid,
-    newOid: newEndpoint.oid,
+    refName: stored.ref_name,
+    ordinal: stored.ordinal,
+    oldRaw: stored.old_raw,
+    newRaw: stored.new_raw,
+    oldOid: stored.old_oid,
+    newOid: stored.new_oid,
     actor,
-    timestamp,
-    timezoneOffset,
-    reason,
+    timestamp: stored.timestamp,
+    timezoneOffset: stored.timezone,
+    reason: stored.reason,
   };
 }
 
@@ -1083,50 +934,6 @@ export function requireRefLogLimit(value: unknown): number {
   return requireRefLogReadInteger(value, "reflog limit", 0, 1_000);
 }
 
-export function validateRefLogRootScanBudget(
-  value:
-    | { rows: unknown; text_bytes: unknown; max_row_bytes: unknown; head_bytes: unknown }
-    | undefined,
-): void {
-  if (
-    value === undefined ||
-    typeof value.rows !== "number" ||
-    !Number.isSafeInteger(value.rows) ||
-    value.rows < 0 ||
-    typeof value.text_bytes !== "number" ||
-    !Number.isSafeInteger(value.text_bytes) ||
-    value.text_bytes < 0 ||
-    typeof value.max_row_bytes !== "number" ||
-    !Number.isSafeInteger(value.max_row_bytes) ||
-    value.max_row_bytes < 0 ||
-    value.max_row_bytes > value.text_bytes ||
-    typeof value.head_bytes !== "number" ||
-    !Number.isSafeInteger(value.head_bytes) ||
-    value.head_bytes < 1
-  ) {
-    throw new CorruptError("reflog root budget query returned invalid metadata");
-  }
-  const rowStateBytes = value.rows * REFLOG_ROOT_ROW_FIXED_BYTES;
-  const payloadBytes = value.text_bytes + value.head_bytes;
-  const sqlSlotBytes = rowStateBytes + payloadBytes;
-  const currentRowBytes = Math.max(value.max_row_bytes, value.head_bytes);
-  // The current BLOB coexists with a worst-case two-byte-per-input-byte JS string.
-  const currentRowRetainedBytes = 3 * currentRowBytes;
-  const scanRetainedBytes =
-    REFLOG_ROOT_SCAN_FIXED_BYTES + 2 * sqlSlotBytes + currentRowRetainedBytes;
-  if (
-    value.rows > MAX_REFLOG_ROOT_SCAN_ENTRIES ||
-    !Number.isSafeInteger(rowStateBytes) ||
-    !Number.isSafeInteger(payloadBytes) ||
-    !Number.isSafeInteger(sqlSlotBytes) ||
-    !Number.isSafeInteger(currentRowRetainedBytes) ||
-    !Number.isSafeInteger(scanRetainedBytes) ||
-    scanRetainedBytes > MAX_REFLOG_ROOT_SCAN_BYTES
-  ) {
-    throw new GitError("E2BIG", "active reflog root scan exceeds its bounded SQL state");
-  }
-}
-
 export function isAttachedBranchUniqueConstraint(error: unknown): boolean {
   return (
     error instanceof Error &&
@@ -1141,27 +948,17 @@ export function isCheckoutRootUniqueConstraint(error: unknown): boolean {
 }
 
 export function requireRefLogHeader(row: Record<string, unknown>, repoId: number): number {
-  if (row.repo_id !== repoId) throw new CorruptError("reflog header belongs to another repository");
-  requireRawRefTarget(
-    requireCanonicalStoredText(row.head_type, row.head_blob, "stored HEAD target"),
-    "stored HEAD target",
-    "stored",
-  );
-  const nextOrdinal = requireSafeRefLogInteger(
-    row.next_ordinal,
-    "reflog next ordinal",
-    0,
-    MAX_REFLOG_ORDINAL,
-  );
-  const latest =
-    row.latest_ordinal === null
-      ? null
-      : requireSafeRefLogInteger(
-          row.latest_ordinal,
-          "newest reflog ordinal",
-          1,
-          MAX_REFLOG_ORDINAL,
-        );
+  const stored = new RowShape({
+    repo_id: int(1),
+    head: text(),
+    next_ordinal: int(0, MAX_REFLOG_ORDINAL),
+    latest_ordinal: nullable(int(1, MAX_REFLOG_ORDINAL)),
+  }).decode(row);
+  if (stored.repo_id !== repoId) {
+    throw new CorruptError("reflog header belongs to another repository");
+  }
+  const nextOrdinal = stored.next_ordinal;
+  const latest = stored.latest_ordinal;
   if ((nextOrdinal === 0 && latest !== null) || (latest ?? 0) > nextOrdinal) {
     throw new CorruptError("reflog state precedes its newest entry");
   }
@@ -1205,8 +1002,7 @@ export function validateRefLogMetadata(metadata: RefLogMetadata): RefLogMetadata
   return metadata;
 }
 
-export function invalidFetchTrackingPrefix(source: "input" | "stored"): never {
-  if (source === "stored") throw new CorruptError("stored fetch tracking prefix is invalid");
+export function invalidFetchTrackingPrefix(_source: "input" | "stored"): never {
   throw new GitError("EINVAL", "fetch tracking prefix must identify refs/remotes/<remote>/");
 }
 
@@ -1238,64 +1034,16 @@ export function requireFetchGeneration(value: unknown, label: string, minimum: n
   return value;
 }
 
-export function requireRefReadMetadata(
-  value: { rows: unknown; name_bytes: unknown; target_bytes: unknown } | undefined,
-  label: string,
-): { rows: number; nameBytes: number; targetBytes: number } {
-  if (
-    value === undefined ||
-    typeof value.rows !== "number" ||
-    !Number.isSafeInteger(value.rows) ||
-    value.rows < 0 ||
-    typeof value.name_bytes !== "number" ||
-    !Number.isSafeInteger(value.name_bytes) ||
-    value.name_bytes < 0 ||
-    typeof value.target_bytes !== "number" ||
-    !Number.isSafeInteger(value.target_bytes) ||
-    value.target_bytes < 0
-  ) {
-    throw new CorruptError(`${label} metadata is invalid`);
-  }
-  return {
-    rows: value.rows,
-    nameBytes: value.name_bytes,
-    targetBytes: value.target_bytes,
-  };
-}
-
-export function requireRefLogReadMetadata(
-  value: { rows: unknown; text_bytes: unknown; head_bytes: unknown } | undefined,
-): { rows: number; textBytes: number; headBytes: number } {
-  if (
-    value === undefined ||
-    typeof value.rows !== "number" ||
-    !Number.isSafeInteger(value.rows) ||
-    value.rows < 0 ||
-    typeof value.text_bytes !== "number" ||
-    !Number.isSafeInteger(value.text_bytes) ||
-    value.text_bytes < 0 ||
-    typeof value.head_bytes !== "number" ||
-    !Number.isSafeInteger(value.head_bytes) ||
-    value.head_bytes < 1
-  ) {
-    throw new CorruptError("reflog read metadata is invalid");
-  }
-  return { rows: value.rows, textBytes: value.text_bytes, headBytes: value.head_bytes };
-}
-
 export function readCheckoutRevision(db: SqlDatabase, repoId: number): number {
   if (!Number.isSafeInteger(repoId) || repoId < 1) {
     throw new CorruptError("checkout revision repository id is invalid");
   }
-  const stored = db.one<{ repo_id: unknown; checkout_revision: unknown }>(
-    "SELECT id AS repo_id, checkout_revision FROM git_repositories WHERE id = ?",
+  const stored = db.scalar<unknown>(
+    "SELECT checkout_revision FROM git_repositories WHERE id = ?",
     repoId,
   );
   if (stored === undefined) throw new CorruptError("checkout revision repository is missing");
-  if (requireSafeId(stored.repo_id, "checkout revision repository id") !== repoId) {
-    throw new CorruptError("checkout revision crossed repository boundaries");
-  }
-  return requireFetchGeneration(stored.checkout_revision, "stored checkout revision", 0);
+  return expectSafeInteger(stored, 0, Number.MAX_SAFE_INTEGER, "stored checkout revision");
 }
 
 export function advanceCheckoutRevision(
@@ -2064,7 +1812,7 @@ export class InitialBlobIdBuffer {
   }
 
   validate(mapping: BlobIdMapping): void {
-    if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
+    if (!isOid(mapping.oid)) throw new GitError("EINVAL", `invalid blob oid ${mapping.oid}`);
   }
 
   add(mapping: BlobIdMapping): void {
@@ -2128,7 +1876,7 @@ export function* scanGenericIndexOwned(
   let previousPath: string | null = null;
   let previousStage = -1;
   for (const raw of entries) {
-    const entry = requireStoredIndexEntry({
+    const entry = INDEX_ENTRY_INPUT.decode({
       path: raw.path,
       stage: raw.stage,
       mode: raw.mode,
@@ -2158,44 +1906,8 @@ export function requireIndexPageSize(value: number): number {
   return value;
 }
 
-export function requireStoredIndexFact(value: unknown, label: string): number | null {
-  if (value === null) return null;
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new CorruptError(`stored index ${label} is invalid`);
-  }
-  return value;
-}
-
-export function requireStoredIndexEntry(row: Record<string, unknown>): IndexEntry {
-  const path = row.path;
-  if (typeof path !== "string") throw new CorruptError("stored index path is invalid");
-  try {
-    initialPathJsonBytes(path, MAX_INDEX_PATH_BYTES);
-  } catch {
-    throw new CorruptError("stored index path is invalid");
-  }
-  const stage = row.stage;
-  if (typeof stage !== "number" || !Number.isSafeInteger(stage) || stage < 0 || stage > 3) {
-    throw new CorruptError("stored index stage is invalid");
-  }
-  const mode = row.mode;
-  if (mode !== 0o100644 && mode !== 0o100755 && mode !== 0o120000 && mode !== 0o160000) {
-    throw new CorruptError("stored index mode is invalid");
-  }
-  const oid = row.oid;
-  if (typeof oid !== "string" || !isOid(oid)) {
-    throw new CorruptError("stored index oid is invalid");
-  }
-  return {
-    path,
-    stage,
-    mode,
-    oid,
-    size: requireStoredIndexFact(row.size, "size"),
-    mtime: requireStoredIndexFact(row.mtime, "mtime"),
-    ino: requireStoredIndexFact(row.ino, "inode"),
-    rev: requireStoredIndexFact(row.rev, "revision"),
-  };
+export function requireStoredIndexEntry(row: unknown): IndexEntry {
+  return INDEX_ENTRY_ROW.decode(row);
 }
 
 export type OwnedIndexSource =
@@ -2213,64 +1925,32 @@ export function* scanIndexOwned(
   const prefix = options.prefix;
   let path = options.after?.path ?? "";
   let stage = options.after?.stage ?? -1;
-  let previousPath: string | null = null;
-  let previousStage = -1;
   for (;;) {
     requireActive();
     const query =
       source.kind === "checkout"
         ? prefix === undefined || prefix === ""
-          ? `SELECT checkout.repo_id,
-                      typeof(entry.path) AS path_type,
-                      length(CAST(entry.path AS BLOB)) AS path_bytes,
-                      CAST(entry.path AS BLOB) AS path_blob,
-                      entry.stage, entry.mode,
-                      typeof(entry.oid) AS oid_type,
-                      length(CAST(entry.oid AS BLOB)) AS oid_bytes,
-                      CAST(entry.oid AS BLOB) AS oid_blob,
+          ? `SELECT entry.path, entry.stage, entry.mode, entry.oid,
                       entry.size, entry.mtime, entry.ino, entry.rev
                  FROM git_index entry
-                 JOIN git_checkouts checkout ON checkout.id = entry.checkout_id
                 WHERE entry.checkout_id = ?
                   AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
                 ORDER BY entry.path, entry.stage LIMIT ?`
-          : `SELECT checkout.repo_id,
-                      typeof(entry.path) AS path_type,
-                      length(CAST(entry.path AS BLOB)) AS path_bytes,
-                      CAST(entry.path AS BLOB) AS path_blob,
-                      entry.stage, entry.mode,
-                      typeof(entry.oid) AS oid_type,
-                      length(CAST(entry.oid AS BLOB)) AS oid_bytes,
-                      CAST(entry.oid AS BLOB) AS oid_blob,
+          : `SELECT entry.path, entry.stage, entry.mode, entry.oid,
                       entry.size, entry.mtime, entry.ino, entry.rev
                  FROM git_index entry
-                 JOIN git_checkouts checkout ON checkout.id = entry.checkout_id
                 WHERE entry.checkout_id = ?
                   AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
                   AND (entry.path = ? OR (entry.path >= ? AND entry.path < ?))
                 ORDER BY entry.path, entry.stage LIMIT ?`
         : prefix === undefined || prefix === ""
-          ? `SELECT entry.repo_id,
-                      typeof(entry.path) AS path_type,
-                      length(CAST(entry.path AS BLOB)) AS path_bytes,
-                      CAST(entry.path AS BLOB) AS path_blob,
-                      entry.stage, entry.mode,
-                      typeof(entry.oid) AS oid_type,
-                      length(CAST(entry.oid AS BLOB)) AS oid_bytes,
-                      CAST(entry.oid AS BLOB) AS oid_blob,
+          ? `SELECT entry.path, entry.stage, entry.mode, entry.oid,
                       entry.size, entry.mtime, entry.ino, entry.rev
                  FROM git_scratch_index_entries entry
                 WHERE entry.repo_id = ? AND entry.name = ?
                   AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
                 ORDER BY entry.path, entry.stage LIMIT ?`
-          : `SELECT entry.repo_id,
-                      typeof(entry.path) AS path_type,
-                      length(CAST(entry.path AS BLOB)) AS path_bytes,
-                      CAST(entry.path AS BLOB) AS path_blob,
-                      entry.stage, entry.mode,
-                      typeof(entry.oid) AS oid_type,
-                      length(CAST(entry.oid AS BLOB)) AS oid_bytes,
-                      CAST(entry.oid AS BLOB) AS oid_blob,
+          : `SELECT entry.path, entry.stage, entry.mode, entry.oid,
                       entry.size, entry.mtime, entry.ino, entry.rev
                  FROM git_scratch_index_entries entry
                 WHERE entry.repo_id = ? AND entry.name = ?
@@ -2315,41 +1995,10 @@ export function* scanIndexOwned(
           break;
         }
         const row = next.value;
-        if (row.repo_id !== source.repoId || pageRows >= pageSize) {
-          throw new CorruptError("index scan returned invalid repository or page cardinality");
+        if (pageRows >= pageSize) {
+          throw new CorruptError("index scan returned invalid page cardinality");
         }
-        const pathBytes = requireStoredTextByteLength(
-          row.path_type,
-          row.path_bytes,
-          "stored index path",
-        );
-        const oidBytes = requireStoredTextByteLength(
-          row.oid_type,
-          row.oid_bytes,
-          "stored index oid",
-        );
-        if (pathBytes > MAX_INDEX_PATH_BYTES || oidBytes !== 40) {
-          throw new CorruptError("stored index path or oid exceeds its structural bound");
-        }
-        const entry = requireStoredIndexEntry({
-          path: requireCanonicalStoredText(row.path_type, row.path_blob, "stored index path"),
-          stage: row.stage,
-          mode: row.mode,
-          oid: requireCanonicalStoredText(row.oid_type, row.oid_blob, "stored index oid"),
-          size: row.size,
-          mtime: row.mtime,
-          ino: row.ino,
-          rev: row.rev,
-        });
-        if (
-          previousPath !== null &&
-          (comparePaths(previousPath, entry.path) > 0 ||
-            (previousPath === entry.path && previousStage >= entry.stage))
-        ) {
-          throw new CorruptError("index scan rows are not in strict path and stage order");
-        }
-        previousPath = entry.path;
-        previousStage = entry.stage;
+        const entry = requireStoredIndexEntry(row);
         last = entry;
         pageRows++;
         yield entry;
@@ -2482,10 +2131,8 @@ export const CHECKOUT_LIFECYCLE_CARDINALITY_SQL = `
 
 export function requireStoredCheckoutLifecycle(
   row: Record<string, unknown>,
-  admittedRootBytes: number,
-  admittedHeadBytes: number,
 ): StoredCheckoutLifecycle {
-  const checkout = requireStoredCheckoutRow(row, admittedRootBytes, admittedHeadBytes);
+  const checkout = requireStoredCheckoutRow(row);
   const repository = requireStoredRepositoryLifecycle(row);
   if (checkout.repoId !== repository.repoId) {
     throw new CorruptError("checkout lifecycle crossed repository boundaries");
@@ -2552,46 +2199,15 @@ export function requireCheckoutRoot(value: unknown, source: "input" | "stored"):
   return normalizeRoot(value);
 }
 
-export function requireStoredCheckoutRow(
-  row: Record<string, unknown>,
-  admittedRootBytes: number,
-  admittedHeadBytes: number,
-): CheckoutRow {
-  const id = requireSafeId(row.checkout_id, "checkout id");
-  const repoId = requireSafeId(row.repo_id, "checkout repository id");
-  const rootBytes = requireStoredTextByteLength(
-    row.root_type,
-    row.root_bytes,
-    "stored checkout root",
-  );
-  if (rootBytes > admittedRootBytes) {
-    throw new CorruptError("stored checkout root changed after metadata preflight");
-  }
-  const root = requireCheckoutRoot(row.root, "stored");
-  if (utf8ByteLength(root) !== rootBytes) {
-    throw new CorruptError("stored checkout root changed after metadata preflight");
-  }
-  const headBytes = requireStoredTextByteLength(
-    row.head_type,
-    row.head_bytes,
-    "stored HEAD target",
-  );
-  if (headBytes > admittedHeadBytes) {
-    throw new CorruptError("stored HEAD target changed after metadata preflight");
-  }
-  const headBlob = requireStoredTextBytes(row.head_type, row.head_blob, "stored HEAD target");
-  if (headBlob.byteLength !== headBytes) {
-    throw new CorruptError("stored HEAD target changed after metadata preflight");
-  }
-  const head = requireRawRefTarget(
-    decodeCanonicalText(headBlob, "stored HEAD target"),
-    "stored HEAD target",
-    "stored",
-  );
-  if (row.is_primary !== 0 && row.is_primary !== 1) {
-    throw new CorruptError("checkout primary marker is invalid");
-  }
-  return { id, repoId, root, head, isPrimary: row.is_primary === 1 };
+export function requireStoredCheckoutRow(row: unknown): CheckoutRow {
+  const stored = CHECKOUT_ROW.decode(row);
+  return {
+    id: stored.checkout_id,
+    repoId: stored.repo_id,
+    root: stored.root,
+    head: stored.head,
+    isPrimary: stored.is_primary === 1,
+  };
 }
 
 /** Every ancestor of `path`, nearest first, ending at "/". */
@@ -2887,9 +2503,7 @@ export class CheckoutStore implements IndexStore {
   ) {
     if (
       requireSafeId(checkout.id, "checkout id") < 1 ||
-      requireSafeId(checkout.repoId, "checkout repository id") !== shared.repoId ||
-      requireCheckoutRoot(checkout.root, "stored") !== checkout.root ||
-      requireRawRefTarget(checkout.head, "stored HEAD target", "stored") !== checkout.head
+      requireSafeId(checkout.repoId, "checkout repository id") !== shared.repoId
     ) {
       throw new CorruptError("checkout facade identity is invalid");
     }
@@ -3020,11 +2634,8 @@ export class CheckoutStore implements IndexStore {
         JSON.stringify(page.rows),
         this.#repoId,
       )) {
-        const contentKey = row.content_key;
-        const oid = row.oid;
-        if (typeof contentKey !== "string" || typeof oid !== "string" || !isOid(oid)) {
-          throw new CorruptError("blob id lookup returned an invalid mapping");
-        }
+        const contentKey = expectText(row.content_key, "blob content key");
+        const oid = expectText(row.oid, "stored blob object id");
         found.set(contentKey, oid);
       }
     }
@@ -3043,7 +2654,7 @@ export class CheckoutStore implements IndexStore {
     const mismatches = new Map<number, string | null>();
     let capturedCount = 0;
     for (const mapping of expected) {
-      if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
+      if (!isOid(mapping.oid)) throw new GitError("EINVAL", `invalid blob oid ${mapping.oid}`);
       const cacheable = mapping.contentId.length <= BLOB_ID_CACHE_ELIGIBILITY_BYTES;
       if (cacheable) {
         retained.push({
@@ -3076,21 +2687,8 @@ export class CheckoutStore implements IndexStore {
         JSON.stringify(page.rows),
         this.#repoId,
       )) {
-        const returnedOrdinal = row.ordinal;
-        const oid = row.oid;
-        if (
-          typeof returnedOrdinal !== "number" ||
-          !Number.isSafeInteger(returnedOrdinal) ||
-          returnedOrdinal < 0 ||
-          returnedOrdinal >= capturedCount ||
-          !page.rows.some((candidate) => candidate.i === returnedOrdinal) ||
-          (oid !== null && (typeof oid !== "string" || !isOid(oid)))
-        ) {
-          throw new CorruptError("blob id comparison returned an invalid mapping");
-        }
-        if (mismatches.has(returnedOrdinal)) {
-          throw new CorruptError("blob id comparison returned a duplicate ordinal");
-        }
+        const returnedOrdinal = expectSafeInteger(row.ordinal, 0, capturedCount - 1);
+        const oid = row.oid === null ? null : expectText(row.oid, "stored blob object id");
         mismatches.set(returnedOrdinal, oid);
       }
     }
@@ -3101,7 +2699,7 @@ export class CheckoutStore implements IndexStore {
   upsertBlobIds(mappings: Iterable<BlobIdMapping>): void {
     const unique = new Map<string, BlobIdMapping>();
     for (const mapping of mappings) {
-      if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
+      if (!isOid(mapping.oid)) throw new GitError("EINVAL", `invalid blob oid ${mapping.oid}`);
       if (mapping.contentId.length > BLOB_ID_CACHE_ELIGIBILITY_BYTES) continue;
       const snapshot: BlobIdMapping = {
         contentId: mapping.contentId.slice(),
@@ -3239,19 +2837,7 @@ export class CheckoutStore implements IndexStore {
     for (const oid of wanted) {
       if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
     }
-    const rows = this.#db.all<{
-      ordinal: number;
-      oid: string;
-      source: string | null;
-      type: string | null;
-      size: number | null;
-      stored: string | null;
-      chunk_rows: number;
-      first_chunk: number | null;
-      last_chunk: number | null;
-      largest_chunk: number;
-      stored_bytes: number;
-    }>(
+    const rows = this.#db.all<Record<string, unknown>>(
       `WITH wanted(ordinal, oid) AS MATERIALIZED (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
        ), chunks AS MATERIALIZED (
@@ -3263,21 +2849,13 @@ export class CheckoutStore implements IndexStore {
           WHERE chunk.repo_id = ?
           GROUP BY chunk.oid
        )
-       SELECT w.ordinal, w.oid,
-              CASE WHEN loose.oid IS NOT NULL THEN 'loose'
+       SELECT CASE WHEN loose.oid IS NOT NULL THEN 'loose'
                    WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
-              CASE WHEN loose.oid IS NOT NULL
-                         AND typeof(loose.type) = 'text'
-                         AND length(CAST(loose.type AS BLOB)) <= 6 THEN loose.type
-                   WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
-                         AND typeof(packed.type) = 'text'
-                         AND length(CAST(packed.type AS BLOB)) <= 6 THEN packed.type END AS type,
-              CASE WHEN loose.oid IS NOT NULL AND typeof(loose.size) = 'integer' THEN loose.size
-                   WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
-                         AND typeof(packed.size) = 'integer' THEN packed.size END AS size,
-              CASE WHEN loose.oid IS NOT NULL
-                         AND typeof(loose.stored) = 'text'
-                         AND length(CAST(loose.stored AS BLOB)) <= 4 THEN loose.stored END AS stored,
+              CASE WHEN loose.oid IS NOT NULL THEN loose.type
+                   WHEN pack.pack_id IS NOT NULL THEN packed.type END AS type,
+              CASE WHEN loose.oid IS NOT NULL THEN loose.size
+                   WHEN pack.pack_id IS NOT NULL THEN packed.size END AS size,
+              CASE WHEN loose.oid IS NOT NULL THEN loose.stored END AS stored,
               CASE WHEN loose.oid IS NULL THEN 0 ELSE COALESCE(chunks.chunk_rows, 0) END AS chunk_rows,
               CASE WHEN loose.oid IS NULL THEN NULL ELSE chunks.first_chunk END AS first_chunk,
               CASE WHEN loose.oid IS NULL THEN NULL ELSE chunks.last_chunk END AS last_chunk,
@@ -3299,24 +2877,14 @@ export class CheckoutStore implements IndexStore {
     if (rows.length !== wanted.length) {
       throw new CorruptError("object metadata lookup returned the wrong row count");
     }
-    return rows.map((row, ordinal) => {
+    return rows.map((raw, ordinal) => {
+      const row = OBJECT_INFO_ROW.decode(raw);
+      const oid = wanted[ordinal];
+      if (oid === undefined) throw new CorruptError("object metadata lookup returned a sparse row");
       if (
-        row.ordinal !== ordinal ||
-        row.oid !== wanted[ordinal] ||
-        (row.source !== "loose" && row.source !== "pack") ||
-        (row.type !== "blob" &&
-          row.type !== "tree" &&
-          row.type !== "commit" &&
-          row.type !== "tag") ||
-        !Number.isSafeInteger(row.size) ||
+        row.source === null ||
+        row.type === null ||
         row.size === null ||
-        row.size < 0 ||
-        !Number.isSafeInteger(row.chunk_rows) ||
-        row.chunk_rows < 0 ||
-        !Number.isSafeInteger(row.largest_chunk) ||
-        row.largest_chunk < 0 ||
-        !Number.isSafeInteger(row.stored_bytes) ||
-        row.stored_bytes < 0 ||
         (row.source === "loose" && row.stored !== "raw" && row.stored !== "zlib") ||
         (row.source === "loose" && row.chunk_rows <= 0) ||
         (row.source === "loose" && row.first_chunk !== 0) ||
@@ -3332,11 +2900,11 @@ export class CheckoutStore implements IndexStore {
             row.largest_chunk !== 0 ||
             row.stored_bytes !== 0))
       ) {
-        if (row.source === null) throw new ObjectNotFoundError(wanted[ordinal]!);
+        if (row.source === null) throw new ObjectNotFoundError(oid);
         throw new CorruptError("object metadata lookup returned an invalid row");
       }
       return {
-        oid: row.oid,
+        oid,
         type: row.type,
         size: row.size,
         source: row.source,
@@ -3381,21 +2949,13 @@ export class CheckoutStore implements IndexStore {
       `WITH wanted(ordinal, oid) AS (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
        )
-       SELECT w.ordinal, w.oid,
-               CASE WHEN loose.oid IS NOT NULL THEN 'loose'
+       SELECT CASE WHEN loose.oid IS NOT NULL THEN 'loose'
                     WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
-               CASE WHEN loose.oid IS NOT NULL
-                          AND typeof(loose.type) = 'text'
-                          AND length(CAST(loose.type AS BLOB)) <= 6 THEN loose.type
-                    WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
-                          AND typeof(packed.type) = 'text'
-                          AND length(CAST(packed.type AS BLOB)) <= 6 THEN packed.type END AS type,
-               CASE WHEN loose.oid IS NOT NULL AND typeof(loose.size) = 'integer' THEN loose.size
-                    WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
-                          AND typeof(packed.size) = 'integer' THEN packed.size END AS size,
-               CASE WHEN loose.oid IS NOT NULL
-                          AND typeof(loose.stored) = 'text'
-                          AND length(CAST(loose.stored AS BLOB)) <= 4 THEN loose.stored END AS stored
+               CASE WHEN loose.oid IS NOT NULL THEN loose.type
+                    WHEN pack.pack_id IS NOT NULL THEN packed.type END AS type,
+               CASE WHEN loose.oid IS NOT NULL THEN loose.size
+                    WHEN pack.pack_id IS NOT NULL THEN packed.size END AS size,
+               CASE WHEN loose.oid IS NOT NULL THEN loose.stored END AS stored
           FROM wanted w
           LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = w.oid
           LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = w.oid
@@ -3413,31 +2973,17 @@ export class CheckoutStore implements IndexStore {
 
     const metadata: ObjectReadMetadata[] = [];
     for (let index = 0; index < rawMetadata.length; index++) {
-      const row = rawMetadata[index];
-      if (row === undefined) throw new CorruptError("object metadata lookup returned a sparse row");
-      const oid = row.oid;
-      const source = row.source;
-      if (row.ordinal !== index || typeof oid !== "string" || oid !== wanted[index]) {
-        throw new CorruptError("object metadata lookup returned an invalid identity");
-      }
-      if (source !== "loose" && source !== "pack") {
-        if (source === null) throw new ObjectNotFoundError(oid);
-        throw new CorruptError("object metadata lookup returned an invalid source");
-      }
-      if (
-        row.type !== "blob" &&
-        row.type !== "tree" &&
-        row.type !== "commit" &&
-        row.type !== "tag"
-      ) {
-        throw new CorruptError(`object ${oid} has an invalid indexed type`);
-      }
-      const { size } = row;
-      if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
-        throw new CorruptError(`object ${oid} has an invalid indexed size`);
+      const raw = rawMetadata[index];
+      if (raw === undefined) throw new CorruptError("object metadata lookup returned a sparse row");
+      const row = OBJECT_READ_ROW.decode(raw);
+      const oid = wanted[index];
+      if (oid === undefined) throw new CorruptError("object metadata lookup returned a sparse row");
+      if (row.source === null) throw new ObjectNotFoundError(oid);
+      if (row.type === null || row.size === null) {
+        throw new CorruptError(`object ${oid} has invalid indexed metadata`);
       }
       let stored: "raw" | "zlib" | null;
-      if (source === "loose") {
+      if (row.source === "loose") {
         if (row.stored !== "raw" && row.stored !== "zlib") {
           throw new CorruptError(`object ${oid} has invalid storage metadata`);
         }
@@ -3451,9 +2997,9 @@ export class CheckoutStore implements IndexStore {
       metadata.push({
         ordinal: index,
         oid,
-        source,
+        source: row.source,
         type: row.type,
-        size,
+        size: row.size,
         stored,
       });
     }
@@ -4320,70 +3866,12 @@ export class CheckoutStore implements IndexStore {
   getRef(name: string): string | null {
     const checkedName = requireRefName(name, "ref name", "input", true);
     if (checkedName === "HEAD") return this.head();
-    const metadata = this.#db.one<{
-      repo_id: unknown;
-      name_type: unknown;
-      name_bytes: unknown;
-      target_type: unknown;
-      target_bytes: unknown;
-    }>(
-      `SELECT repo_id, typeof(name) AS name_type,
-              length(CAST(name AS BLOB)) AS name_bytes,
-              typeof(target) AS target_type,
-              length(CAST(target AS BLOB)) AS target_bytes
-         FROM git_refs WHERE repo_id = ? AND name = ?`,
-      this.#repoId,
-      checkedName,
-    );
-    if (metadata === undefined) return null;
-    if (
-      metadata.repo_id !== this.#repoId ||
-      metadata.name_type !== "text" ||
-      typeof metadata.name_bytes !== "number" ||
-      !Number.isSafeInteger(metadata.name_bytes) ||
-      metadata.name_bytes < 1 ||
-      metadata.target_type !== "text" ||
-      typeof metadata.target_bytes !== "number" ||
-      !Number.isSafeInteger(metadata.target_bytes) ||
-      metadata.target_bytes < 1
-    ) {
-      throw new CorruptError(`stored target of ${checkedName} has invalid text metadata`);
-    }
     const row = this.#db.one<Record<string, unknown>>(
-      `SELECT repo_id, typeof(name) AS name_type,
-                length(CAST(name AS BLOB)) AS name_bytes,
-                CAST(name AS BLOB) AS name_blob,
-                typeof(target) AS target_type,
-                length(CAST(target AS BLOB)) AS target_bytes,
-                CAST(target AS BLOB) AS target_blob
-           FROM git_refs WHERE repo_id = ? AND name = ?`,
+      "SELECT target FROM git_refs WHERE repo_id = ? AND name = ?",
       this.#repoId,
       checkedName,
     );
-    if (
-      row === undefined ||
-      row.repo_id !== this.#repoId ||
-      row.name_type !== "text" ||
-      row.name_bytes !== metadata.name_bytes ||
-      row.target_type !== "text" ||
-      row.target_bytes !== metadata.target_bytes
-    ) {
-      throw new CorruptError(`stored ref ${checkedName} changed after validation`);
-    }
-    const storedName = requireRefName(
-      decodeCanonicalStoredText(row.name_blob, "stored ref name"),
-      "stored ref name",
-      "stored",
-    );
-    if (storedName !== checkedName) {
-      throw new CorruptError(`stored ref ${checkedName} crossed a ref boundary`);
-    }
-    const checked = requireRawRefTarget(
-      decodeCanonicalStoredText(row.target_blob, `stored target of ${checkedName}`),
-      `stored target of ${checkedName}`,
-      "stored",
-    );
-    return checked;
+    return row === undefined ? null : expectText(row.target, `stored target of ${checkedName}`);
   }
 
   setRef(name: string, target: string): void {
@@ -4418,92 +3906,41 @@ export class CheckoutStore implements IndexStore {
   }
 
   #readTrackingRefRevision(refName: string): number | null {
-    const metadata = this.#db.one<{
-      ref_name_type: unknown;
-      ref_name_bytes: unknown;
-    }>(
-      `SELECT typeof(ref_name) AS ref_name_type,
-              length(CAST(ref_name AS BLOB)) AS ref_name_bytes
-         FROM git_tracking_ref_revisions
+    const revision = this.#db.scalar<unknown>(
+      `SELECT revision FROM git_tracking_ref_revisions
         WHERE repo_id = ? AND ref_name = ?`,
       this.#repoId,
       refName,
     );
-    if (metadata === undefined) return null;
-    if (
-      metadata.ref_name_type !== "text" ||
-      typeof metadata.ref_name_bytes !== "number" ||
-      !Number.isSafeInteger(metadata.ref_name_bytes) ||
-      metadata.ref_name_bytes < 1
-    ) {
-      throw new CorruptError("stored tracking revision ref metadata is invalid");
-    }
-    const row = this.#db.one<Record<string, unknown>>(
-      `SELECT repo_id, typeof(ref_name) AS ref_name_type,
-                length(CAST(ref_name AS BLOB)) AS ref_name_bytes,
-                CAST(ref_name AS BLOB) AS ref_name_blob, revision
-           FROM git_tracking_ref_revisions
-          WHERE repo_id = ? AND ref_name = ?`,
-      this.#repoId,
-      refName,
-    );
-    if (
-      row === undefined ||
-      row.repo_id !== this.#repoId ||
-      row.ref_name_type !== "text" ||
-      row.ref_name_bytes !== metadata.ref_name_bytes
-    ) {
-      throw new CorruptError("tracking revision changed after metadata preflight");
-    }
-    const storedName = requireRefName(
-      decodeCanonicalStoredText(row.ref_name_blob, "stored tracking revision ref"),
-      "stored tracking revision ref",
-      "stored",
-    );
-    if (storedName !== refName) {
-      throw new CorruptError("tracking revision crossed repository or ref boundaries");
-    }
-    return requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
+    return revision === undefined
+      ? null
+      : expectSafeInteger(revision, 0, Number.MAX_SAFE_INTEGER, "stored tracking ref revision");
   }
 
   #trackingRefRevisionCount(): number {
-    const row = this.#db.one<{ repo_id: unknown; revision_rows: unknown }>(
-      `SELECT id AS repo_id,
-              (SELECT count(*) FROM (
-                 SELECT 1 FROM git_tracking_ref_revisions
-                  WHERE repo_id = ? LIMIT ${MAX_TRACKING_REF_REVISIONS + 1}
-               )) AS revision_rows
-         FROM git_repositories WHERE id = ?`,
-      this.#repoId,
+    const stored = this.#db.scalar<unknown>(
+      `SELECT count(*) FROM (
+         SELECT 1 FROM git_tracking_ref_revisions
+          WHERE repo_id = ? LIMIT ${MAX_TRACKING_REF_REVISIONS + 1}
+       )`,
       this.#repoId,
     );
-    if (row === undefined) throw new CorruptError("tracking repository is missing");
-    if (requireSafeId(row.repo_id, "tracking repository id") !== this.#repoId) {
-      throw new CorruptError("tracking revision count crossed repository boundaries");
-    }
-    const count = row.revision_rows;
-    if (
-      typeof count !== "number" ||
-      !Number.isSafeInteger(count) ||
-      count < 0 ||
-      count > MAX_TRACKING_REF_REVISIONS
-    ) {
-      throw new CorruptError("tracking revision count is invalid");
-    }
-    return count;
+    return expectSafeInteger(stored, 0, MAX_TRACKING_REF_REVISIONS + 1, "tracking revision count");
   }
 
   #ensureTrackingRefRevision(refName: string): number {
     const count = this.#trackingRefRevisionCount();
     const existing = this.#readTrackingRefRevision(refName);
     if (existing !== null) return existing;
-    if (count === MAX_TRACKING_REF_REVISIONS) {
+    if (count >= MAX_TRACKING_REF_REVISIONS) {
       throw new GitError("E2BIG", "repository tracking revision count exceeds 100,000");
     }
     this.#db.run(
-      "INSERT INTO git_tracking_ref_revisions (repo_id, ref_name, revision) VALUES (?, ?, 0)",
+      `INSERT INTO git_tracking_ref_revisions (repo_id, ref_name, revision)
+       SELECT ?, ?, 0 WHERE EXISTS (SELECT 1 FROM git_repositories WHERE id = ?)`,
       this.#repoId,
       refName,
+      this.#repoId,
     );
     const created = this.#readTrackingRefRevision(refName);
     if (created !== 0) throw new CorruptError("tracking revision creation failed");
@@ -4512,150 +3949,53 @@ export class CheckoutStore implements IndexStore {
 
   #advanceTrackingRefObservations(trackingPrefix: string, count: number): void {
     if (count === 0) return;
-    const metadata = this.#db.one<{ rows: unknown; ref_name_bytes: unknown }>(
-      `SELECT count(*) AS rows,
-              coalesce(max(length(CAST(ref_name AS BLOB))), 0) AS ref_name_bytes
-         FROM git_tracking_ref_revisions
+    const matched = expectSafeInteger(
+      this.#db.scalar<unknown>(
+        `SELECT count(*) FROM git_tracking_ref_revisions
         WHERE repo_id = ? AND substr(ref_name, 1, length(?)) = ?`,
-      this.#repoId,
-      trackingPrefix,
-      trackingPrefix,
+        this.#repoId,
+        trackingPrefix,
+        trackingPrefix,
+      ),
+      0,
+      count,
+      "tracking observation count",
     );
-    if (
-      metadata === undefined ||
-      typeof metadata.rows !== "number" ||
-      !Number.isSafeInteger(metadata.rows) ||
-      metadata.rows < 0 ||
-      metadata.rows > count ||
-      typeof metadata.ref_name_bytes !== "number" ||
-      !Number.isSafeInteger(metadata.ref_name_bytes) ||
-      metadata.ref_name_bytes < 0
-    ) {
-      throw new CorruptError("tracking observation metadata is invalid");
-    }
-    let matched = 0;
-    let previousNameBytes: Uint8Array | null = null;
-    for (const row of this.#db.iterate(
-      `SELECT repo_id, typeof(ref_name) AS ref_name_type,
-                CAST(ref_name AS BLOB) AS ref_name_blob, revision
-           FROM git_tracking_ref_revisions
-          WHERE repo_id = ? AND substr(ref_name, 1, length(?)) = ?
-          ORDER BY ref_name`,
-      this.#repoId,
-      trackingPrefix,
-      trackingPrefix,
-    )) {
-      const nameBytes = requireStoredTextBytes(
-        row.ref_name_type,
-        row.ref_name_blob,
-        "stored tracking revision ref",
-      );
-      const name = requireRefName(
-        decodeCanonicalText(nameBytes, "stored tracking revision ref"),
-        "stored tracking revision ref",
-        "stored",
-      );
-      if (
-        row.repo_id !== this.#repoId ||
-        !name.startsWith(trackingPrefix) ||
-        (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0)
-      ) {
-        throw new CorruptError("tracking observation scan crossed or reordered repositories");
-      }
-      previousNameBytes = nameBytes;
-      matched++;
-      if (matched > metadata.rows) {
-        throw new CorruptError("tracking observation count is invalid");
-      }
-      const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
-      if (revision === Number.MAX_SAFE_INTEGER) {
-        throw new GitError("E2BIG", "tracking ref revision is exhausted");
-      }
-    }
-    if (matched !== metadata.rows) {
-      throw new CorruptError("tracking observation changed after metadata preflight");
-    }
     if (matched === 0) return;
     this.#db.run(
       `UPDATE git_tracking_ref_revisions SET revision = revision + 1
-        WHERE repo_id = ? AND substr(ref_name, 1, length(?)) = ?`,
+        WHERE repo_id = ? AND substr(ref_name, 1, length(?)) = ?
+          AND revision < ${Number.MAX_SAFE_INTEGER}`,
       this.#repoId,
       trackingPrefix,
       trackingPrefix,
     );
+    const changed = expectSafeInteger(this.#db.scalar<unknown>("SELECT changes()"), 0, matched);
+    if (changed !== matched) throw new GitError("E2BIG", "tracking ref revision is exhausted");
   }
 
   #bumpTrackingRefRevisions(changedNames: ReadonlySet<string>): void {
     if (changedNames.size === 0) return;
-    const affected: string[] = [];
     for (const page of jsonPages(changedNames, "tracking ref revision lookup")) {
-      const metadata = this.#db.one<{ max_ref_name_bytes: unknown }>(
-        `SELECT coalesce(max(length(CAST(ref_name AS BLOB))), 0) AS max_ref_name_bytes
-           FROM git_tracking_ref_revisions
+      const affected = expectSafeInteger(
+        this.#db.scalar<unknown>(
+          `SELECT count(*) FROM git_tracking_ref_revisions
           WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))`,
-        this.#repoId,
-        page,
+          this.#repoId,
+          page,
+        ),
+        0,
       );
-      const maxRefNameBytes = requireMaximumStoredTextBytes(
-        metadata?.max_ref_name_bytes,
-        "tracking revision scan",
-      );
-      let observedMaxRefNameBytes = 0;
-      for (const row of this.#db.iterate(
-        `SELECT repo_id, typeof(ref_name) AS ref_name_type,
-                  length(CAST(ref_name AS BLOB)) AS ref_name_bytes,
-                  CAST(ref_name AS BLOB) AS ref_name_blob, revision
-             FROM git_tracking_ref_revisions
-            WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))
-            ORDER BY ref_name`,
-        this.#repoId,
-        page,
-      )) {
-        if (row.repo_id !== this.#repoId) {
-          throw new CorruptError("tracking revision scan crossed repository boundaries");
-        }
-        const nameByteLength = requireStoredTextByteLength(
-          row.ref_name_type,
-          row.ref_name_bytes,
-          "stored tracking revision ref",
-        );
-        if (nameByteLength > maxRefNameBytes) {
-          throw new CorruptError("tracking revision scan changed after metadata preflight");
-        }
-        const nameBytes = requireStoredTextBytes(
-          row.ref_name_type,
-          row.ref_name_blob,
-          "stored tracking revision ref",
-        );
-        if (nameBytes.byteLength !== nameByteLength) {
-          throw new CorruptError("stored tracking revision ref changed after validation");
-        }
-        const name = requireRefName(
-          decodeCanonicalText(nameBytes, "stored tracking revision ref"),
-          "stored tracking revision ref",
-          "stored",
-        );
-        if (!changedNames.has(name)) {
-          throw new CorruptError("tracking revision scan crossed ref boundaries");
-        }
-        const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
-        if (revision === Number.MAX_SAFE_INTEGER) {
-          throw new GitError("E2BIG", "tracking ref revision is exhausted");
-        }
-        observedMaxRefNameBytes = Math.max(observedMaxRefNameBytes, nameByteLength);
-        affected.push(name);
-      }
-      if (observedMaxRefNameBytes !== maxRefNameBytes) {
-        throw new CorruptError("tracking revision scan changed after metadata preflight");
-      }
-    }
-    for (const page of jsonPages(affected, "tracking ref revision update")) {
+      if (affected === 0) continue;
       this.#db.run(
         `UPDATE git_tracking_ref_revisions SET revision = revision + 1
-          WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))`,
+          WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))
+            AND revision < ${Number.MAX_SAFE_INTEGER}`,
         this.#repoId,
         page,
       );
+      const changed = expectSafeInteger(this.#db.scalar<unknown>("SELECT changes()"), 0, affected);
+      if (changed !== affected) throw new GitError("E2BIG", "tracking ref revision is exhausted");
     }
   }
 
@@ -4672,24 +4012,11 @@ export class CheckoutStore implements IndexStore {
     const snapshot = this.#db.transactionSync(() => {
       const refRevision = this.#ensureTrackingRefRevision(name);
       const row = this.#db.one<Record<string, unknown>>(
-        `SELECT typeof(target) AS target_type,
-                CAST(target AS BLOB) AS target_blob
-           FROM git_refs WHERE repo_id = ? AND name = ?`,
+        "SELECT target FROM git_refs WHERE repo_id = ? AND name = ?",
         this.#repoId,
         name,
       );
-      const target =
-        row === undefined
-          ? null
-          : requireRawRefTarget(
-              requireCanonicalStoredText(
-                row.target_type,
-                row.target_blob,
-                "stored tracking target",
-              ),
-              "stored tracking target",
-              "stored",
-            );
+      const target = row === undefined ? null : expectText(row.target, "stored tracking target");
       return { refName: name, target, refRevision, disposed: false };
     });
     let issuedToken: TrackingRefPublicationToken | null = null;
@@ -4780,14 +4107,8 @@ export class CheckoutStore implements IndexStore {
     }
 
     const snapshot = this.#db.transactionSync(() => {
-      const repository = this.#db.one<{
-        repo_id: unknown;
-        fetch_generation: unknown;
-        shallow_revision: unknown;
-        checkout_revision: unknown;
-        tracking_ref_revision_rows: unknown;
-      }>(
-        `SELECT id AS repo_id, fetch_generation, shallow_revision, checkout_revision,
+      const repository = this.#db.one<Record<string, unknown>>(
+        `SELECT fetch_generation, shallow_revision, checkout_revision,
                   (SELECT count(*) FROM (
                      SELECT 1 FROM git_tracking_ref_revisions
                       WHERE repo_id = ? LIMIT ${MAX_TRACKING_REF_REVISIONS + 1}
@@ -4797,31 +4118,32 @@ export class CheckoutStore implements IndexStore {
         this.#repoId,
       );
       if (repository === undefined) throw new CorruptError("fetch repository is missing");
-      if (requireSafeId(repository.repo_id, "fetch repository id") !== this.#repoId) {
-        throw new CorruptError("fetch generation crossed repository boundaries");
-      }
-      const currentGeneration = requireFetchGeneration(
+      const currentGeneration = expectSafeInteger(
         repository.fetch_generation,
+        0,
+        Number.MAX_SAFE_INTEGER,
         "stored fetch generation",
-        0,
       );
-      const shallowRevision = requireFetchGeneration(
+      const shallowRevision = expectSafeInteger(
         repository.shallow_revision,
+        0,
+        Number.MAX_SAFE_INTEGER,
         "stored shallow revision",
-        0,
       );
-      const checkoutRevision = requireFetchGeneration(
+      const checkoutRevision = expectSafeInteger(
         repository.checkout_revision,
-        "stored checkout revision",
         0,
+        Number.MAX_SAFE_INTEGER,
+        "stored checkout revision",
       );
       if (currentGeneration === Number.MAX_SAFE_INTEGER) {
         throw new GitError("E2BIG", "fetch publication generation is exhausted");
       }
-      const trackingRefRevisionCount = requireFetchGeneration(
+      const trackingRefRevisionCount = expectSafeInteger(
         repository.tracking_ref_revision_rows,
-        "stored tracking ref revision count",
         0,
+        MAX_TRACKING_REF_REVISIONS + 1,
+        "stored tracking ref revision count",
       );
       if (trackingRefRevisionCount > MAX_TRACKING_REF_REVISIONS) {
         throw new CorruptError("tracking ref revision count exceeds its bound");
@@ -4843,7 +4165,7 @@ export class CheckoutStore implements IndexStore {
       const tracking = new Map<string, string>();
       const trackingRows: Readonly<RefRow>[] = [];
       let rows = 0;
-      for (const { name, target } of this.#iterateStoredRefs("fetch ref snapshot")) {
+      for (const { name, target } of this.#iterateStoredRefs()) {
         rows++;
         if (rows > MAX_REFLOG_STATE_ROWS) {
           throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
@@ -4864,22 +4186,15 @@ export class CheckoutStore implements IndexStore {
       }
 
       const shallowRows: string[] = [];
-      let previousShallow: string | null = null;
       for (const row of this.#db.iterate(
-        "SELECT repo_id, oid FROM git_shallow WHERE repo_id = ? ORDER BY oid",
+        "SELECT oid FROM git_shallow WHERE repo_id = ? ORDER BY oid",
         this.#repoId,
       )) {
-        if (row.repo_id !== this.#repoId || typeof row.oid !== "string" || !isOid(row.oid)) {
-          throw new CorruptError("fetch shallow snapshot contains an invalid row");
-        }
-        if (previousShallow !== null && comparePaths(previousShallow, row.oid) >= 0) {
-          throw new CorruptError("stored shallow boundaries are not in strict object-id order");
-        }
-        previousShallow = row.oid;
+        const oid = expectText(row.oid, "stored shallow object id");
         if (candidateInputs + tracking.size + shallowRows.length >= MAX_FETCH_PUBLICATION_INPUTS) {
           throw new GitError("E2BIG", "fetch snapshot exceeds its retained input count bound");
         }
-        shallowRows.push(row.oid);
+        shallowRows.push(oid);
       }
 
       const generation = currentGeneration + 1;
@@ -5050,65 +4365,30 @@ export class CheckoutStore implements IndexStore {
       latestGeneration: number;
       revision: number;
     }[] = [];
-    const metadata = this.#db.one<{ rows: unknown; tracking_prefix_bytes: unknown }>(
-      `SELECT count(*) AS rows,
-              coalesce(max(length(CAST(tracking_prefix AS BLOB))), 0) AS tracking_prefix_bytes
-         FROM git_fetch_namespaces WHERE repo_id = ?`,
-      this.#repoId,
-    );
-    if (
-      metadata === undefined ||
-      typeof metadata.rows !== "number" ||
-      !Number.isSafeInteger(metadata.rows) ||
-      metadata.rows < 0 ||
-      typeof metadata.tracking_prefix_bytes !== "number" ||
-      !Number.isSafeInteger(metadata.tracking_prefix_bytes) ||
-      metadata.tracking_prefix_bytes < 0
-    ) {
-      throw new CorruptError("fetch namespace metadata is invalid");
-    }
-    if (metadata.rows > MAX_FETCH_NAMESPACES) {
-      throw new GitError("E2BIG", "repository fetch namespace count exceeds 1,024");
-    }
-    let previousPrefix: string | null = null;
     for (const row of this.#db.iterate(
-      `SELECT repo_id, typeof(tracking_prefix) AS tracking_prefix_type,
-                CAST(tracking_prefix AS BLOB) AS tracking_prefix_blob,
-                latest_generation, revision
+      `SELECT tracking_prefix, latest_generation, revision
            FROM git_fetch_namespaces WHERE repo_id = ? ORDER BY tracking_prefix
            LIMIT ${MAX_FETCH_NAMESPACES + 1}`,
       this.#repoId,
     )) {
-      if (row.repo_id !== this.#repoId) {
-        throw new CorruptError("fetch namespace scan crossed repository boundaries");
+      if (namespaces.length >= MAX_FETCH_NAMESPACES) {
+        throw new GitError("E2BIG", "repository fetch namespace count exceeds 1,024");
       }
-      const storedPrefix = requireFetchTrackingPrefix(
-        requireCanonicalStoredText(
-          row.tracking_prefix_type,
-          row.tracking_prefix_blob,
-          "stored fetch tracking prefix",
-        ),
-        "stored",
-      );
-      if (previousPrefix !== null && comparePaths(previousPrefix, storedPrefix) >= 0) {
-        throw new CorruptError("fetch namespaces are not in strict Git byte order");
-      }
-      previousPrefix = storedPrefix;
       namespaces.push({
-        trackingPrefix: storedPrefix,
-        latestGeneration: requireFetchGeneration(
+        trackingPrefix: expectText(row.tracking_prefix, "stored fetch tracking prefix"),
+        latestGeneration: expectSafeInteger(
           row.latest_generation,
-          "stored fetch namespace generation",
           1,
+          Number.MAX_SAFE_INTEGER,
+          "stored fetch namespace generation",
         ),
-        revision: requireFetchGeneration(row.revision, "stored fetch namespace revision", 0),
+        revision: expectSafeInteger(
+          row.revision,
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "stored fetch namespace revision",
+        ),
       });
-      if (namespaces.length > metadata.rows) {
-        throw new CorruptError("fetch namespace count changed after metadata preflight");
-      }
-    }
-    if (namespaces.length !== metadata.rows) {
-      throw new CorruptError("fetch namespaces changed after metadata preflight");
     }
     return namespaces;
   }
@@ -5165,62 +4445,31 @@ export class CheckoutStore implements IndexStore {
       [...selectedExactRefs].filter((name) => name.startsWith("refs/heads/")),
     );
     if (selectedBranches.size > 0) {
-      const repository = this.#db.one<{ repo_id: unknown; checkout_revision: unknown }>(
-        "SELECT id AS repo_id, checkout_revision FROM git_repositories WHERE id = ?",
+      const checkoutRevision = this.#db.scalar<unknown>(
+        "SELECT checkout_revision FROM git_repositories WHERE id = ?",
         this.#repoId,
       );
-      if (repository === undefined) {
+      if (checkoutRevision === undefined) {
         throw new CorruptError("fetch checkout revision repository is missing");
       }
       if (
-        requireSafeId(repository.repo_id, "fetch checkout revision repository id") !== this.#repoId
+        expectSafeInteger(
+          checkoutRevision,
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "stored checkout revision",
+        ) !== state.checkoutRevision
       ) {
-        throw new CorruptError("fetch checkout revision crossed repository boundaries");
-      }
-      const checkoutRevision = requireFetchGeneration(
-        repository.checkout_revision,
-        "stored checkout revision",
-        0,
-      );
-      if (checkoutRevision !== state.checkoutRevision) {
         throw staleFetch("the repository checkout state changed after fetch preflight");
       }
-      const checkoutMetadata = this.#db.one<{
-        max_root_bytes: unknown;
-        max_head_bytes: unknown;
-      }>(
-        `SELECT coalesce(max(length(CAST(root AS BLOB))), 0) AS max_root_bytes,
-                coalesce(max(length(CAST(head AS BLOB))), 0) AS max_head_bytes
-           FROM git_checkouts WHERE repo_id = ?`,
-        this.#repoId,
-      );
-      if (checkoutMetadata === undefined) {
-        throw new CorruptError("fetch checkout text metadata row is missing");
-      }
-      const maxRootBytes = requireMaximumStoredTextBytes(
-        checkoutMetadata.max_root_bytes,
-        "fetch checkout root maximum",
-      );
-      const maxHeadBytes = requireMaximumStoredTextBytes(
-        checkoutMetadata.max_head_bytes,
-        "fetch checkout HEAD maximum",
-      );
       let checkoutRows = 0;
-      let previousCheckoutId = 0;
       for (const row of this.#db.iterate(
-        `SELECT id AS checkout_id, repo_id, root, typeof(root) AS root_type,
-                  length(CAST(root AS BLOB)) AS root_bytes, typeof(head) AS head_type,
-                  length(CAST(head AS BLOB)) AS head_bytes,
-                  CAST(head AS BLOB) AS head_blob, is_primary
+        `SELECT id AS checkout_id, repo_id, root, head, is_primary
              FROM git_checkouts WHERE repo_id = ? ORDER BY id
              LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
         this.#repoId,
       )) {
-        const checkout = requireStoredCheckoutRow(row, maxRootBytes, maxHeadBytes);
-        if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
-          throw new CorruptError("fetch checkout scan crossed or reordered repositories");
-        }
-        previousCheckoutId = checkout.id;
+        const checkout = requireStoredCheckoutRow(row);
         checkoutRows++;
         if (checkoutRows > MAX_CHECKOUTS_PER_REPOSITORY) {
           throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
@@ -5234,7 +4483,7 @@ export class CheckoutStore implements IndexStore {
     const presentExactRefs = new Set<string>();
     let rows = 0;
     let trackingRows = 0;
-    for (const { name, target } of this.#iterateStoredRefs("fetch publication preflight")) {
+    for (const { name, target } of this.#iterateStoredRefs()) {
       rows++;
       if (rows > MAX_REFLOG_STATE_ROWS) {
         throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
@@ -5424,41 +4673,16 @@ export class CheckoutStore implements IndexStore {
 
       const checkouts: CheckoutRow[] = [];
       let selected: CheckoutRow | null = null;
-      let previousCheckoutId = 0;
-      const checkoutMetadata = this.#db.one<{
-        max_root_bytes: unknown;
-        max_head_bytes: unknown;
-      }>(
-        `SELECT coalesce(max(length(CAST(root AS BLOB))), 0) AS max_root_bytes,
-                coalesce(max(length(CAST(head AS BLOB))), 0) AS max_head_bytes
-           FROM git_checkouts WHERE repo_id = ?`,
-        this.#repoId,
-      );
-      if (checkoutMetadata === undefined) {
-        throw new CorruptError("ref mutation checkout text metadata row is missing");
-      }
-      const maxCheckoutRootBytes = requireMaximumStoredTextBytes(
-        checkoutMetadata.max_root_bytes,
-        "ref mutation checkout root maximum",
-      );
-      const maxCheckoutHeadBytes = requireMaximumStoredTextBytes(
-        checkoutMetadata.max_head_bytes,
-        "ref mutation checkout HEAD maximum",
-      );
       for (const raw of this.#db.iterate(
-        `SELECT id AS checkout_id, repo_id, root, typeof(root) AS root_type,
-                  length(CAST(root AS BLOB)) AS root_bytes, typeof(head) AS head_type,
-                  length(CAST(head AS BLOB)) AS head_bytes,
-                  CAST(head AS BLOB) AS head_blob, is_primary
+        `SELECT id AS checkout_id, repo_id, root, head, is_primary
              FROM git_checkouts WHERE repo_id = ? ORDER BY id
              LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
         this.#repoId,
       )) {
-        const checkout = requireStoredCheckoutRow(raw, maxCheckoutRootBytes, maxCheckoutHeadBytes);
-        if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
-          throw new CorruptError("reflog checkout scan crossed or reordered repositories");
+        const checkout = requireStoredCheckoutRow(raw);
+        if (checkout.repoId !== this.#repoId) {
+          throw new CorruptError("reflog checkout scan crossed repositories");
         }
-        previousCheckoutId = checkout.id;
         checkouts.push(checkout);
         if (checkout.id === this.#checkoutId) selected = checkout;
         if (checkouts.length > MAX_CHECKOUTS_PER_REPOSITORY) {
@@ -5471,7 +4695,7 @@ export class CheckoutStore implements IndexStore {
 
       const before = new Map<string, string>();
       let rows = 0;
-      for (const { name, target } of this.#iterateStoredRefs("ref state query")) {
+      for (const { name, target } of this.#iterateStoredRefs()) {
         rows++;
         if (rows > MAX_REFLOG_STATE_ROWS) {
           throw new GitError("E2BIG", "repository ref state exceeds its structural row bound");
@@ -5500,39 +4724,8 @@ export class CheckoutStore implements IndexStore {
       const newAttachedBranch = rawSymbolicTarget(newHead);
       const attachedBranchOwner = (): CheckoutRow | null => {
         if (newAttachedBranch?.startsWith("refs/heads/") !== true) return null;
-        const metadata = this.#db.one<{
-          root_type: unknown;
-          root_bytes: unknown;
-          head_type: unknown;
-          head_bytes: unknown;
-        }>(
-          `SELECT typeof(root) AS root_type,
-                  length(CAST(root AS BLOB)) AS root_bytes,
-                  typeof(head) AS head_type,
-                  length(CAST(head AS BLOB)) AS head_bytes
-             FROM git_checkouts
-            WHERE repo_id = ? AND head = ? AND id != ?
-            LIMIT 1`,
-          this.#repoId,
-          newHead,
-          this.#checkoutId,
-        );
-        if (metadata === undefined) return null;
-        const rootBytes = requireStoredTextByteLength(
-          metadata.root_type,
-          metadata.root_bytes,
-          "attached checkout root",
-        );
-        const headBytes = requireStoredTextByteLength(
-          metadata.head_type,
-          metadata.head_bytes,
-          "attached checkout HEAD",
-        );
         const owner = this.#db.one<Record<string, unknown>>(
-          `SELECT id AS checkout_id, repo_id, root, typeof(root) AS root_type,
-                    length(CAST(root AS BLOB)) AS root_bytes, typeof(head) AS head_type,
-                    length(CAST(head AS BLOB)) AS head_bytes,
-                    CAST(head AS BLOB) AS head_blob, is_primary
+          `SELECT id AS checkout_id, repo_id, root, head, is_primary
                FROM git_checkouts
               WHERE repo_id = ? AND head = ? AND id != ?
               LIMIT 1`,
@@ -5540,10 +4733,8 @@ export class CheckoutStore implements IndexStore {
           newHead,
           this.#checkoutId,
         );
-        if (owner === undefined) {
-          throw new CorruptError("attached checkout changed after metadata preflight");
-        }
-        const checkedOwner = requireStoredCheckoutRow(owner, rootBytes, headBytes);
+        if (owner === undefined) return null;
+        const checkedOwner = requireStoredCheckoutRow(owner);
         if (checkedOwner.repoId !== this.#repoId || checkedOwner.head !== newHead) {
           throw new CorruptError("attached branch ownership crossed a repository boundary");
         }
@@ -5661,19 +4852,13 @@ export class CheckoutStore implements IndexStore {
         );
       }
       if (newHead !== oldHead) {
-        const updatedRootBytes = utf8ByteLength(this.#root);
-        const updatedHeadBytes = refTextBytes(newHead, "updated HEAD target", "input");
         let updated: Record<string, unknown> | undefined;
         {
           try {
             updated = this.#db.one<Record<string, unknown>>(
               `UPDATE git_checkouts SET head = ?
                 WHERE id = ? AND repo_id = ? AND head = ?
-                RETURNING id AS checkout_id, repo_id, root, typeof(root) AS root_type,
-                          length(CAST(root AS BLOB)) AS root_bytes,
-                          typeof(head) AS head_type,
-                          length(CAST(head AS BLOB)) AS head_bytes,
-                          CAST(head AS BLOB) AS head_blob, is_primary`,
+                RETURNING id AS checkout_id, repo_id, root, head, is_primary`,
               newHead,
               this.#checkoutId,
               this.#repoId,
@@ -5694,7 +4879,7 @@ export class CheckoutStore implements IndexStore {
           }
           if (updated === undefined)
             throw new CorruptError("selected checkout HEAD changed during ref mutation");
-          const checked = requireStoredCheckoutRow(updated, updatedRootBytes, updatedHeadBytes);
+          const checked = requireStoredCheckoutRow(updated);
           if (checked.id !== this.#checkoutId || checked.repoId !== this.#repoId) {
             throw new CorruptError("HEAD update crossed a checkout boundary");
           }
@@ -5814,242 +4999,60 @@ export class CheckoutStore implements IndexStore {
     });
   }
 
-  *#iterateStoredRefs(label: string): Generator<RefRow> {
-    const metadata = this.#db.one<{
-      rows: unknown;
-      name_bytes: unknown;
-      target_bytes: unknown;
-    }>(
-      `SELECT count(*) AS rows,
-              coalesce(max(length(CAST(name AS BLOB))), 0) AS name_bytes,
-              coalesce(max(length(CAST(target AS BLOB))), 0) AS target_bytes
-         FROM git_refs WHERE repo_id = ?`,
-      this.#repoId,
-    );
-    const measured = requireRefReadMetadata(metadata, label);
-    if (measured.rows > MAX_REFLOG_STATE_ROWS) {
-      throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
-    }
+  *#iterateStoredRefs(): Generator<RefRow> {
     let rows = 0;
-    let previousNameBytes: Uint8Array | null = null;
     for (const row of this.#db.iterate(
-      `SELECT repo_id, typeof(name) AS name_type, CAST(name AS BLOB) AS name_blob,
-                typeof(target) AS target_type, CAST(target AS BLOB) AS target_blob
-           FROM git_refs
+      `SELECT name, target FROM git_refs
           WHERE repo_id = ?
           ORDER BY name
           LIMIT ${MAX_REFLOG_STATE_ROWS + 1}`,
       this.#repoId,
     )) {
-      if (row.repo_id !== this.#repoId) {
-        throw new CorruptError(`${label} crossed repository boundaries`);
-      }
-      const nameBytes = requireStoredTextBytes(row.name_type, row.name_blob, "stored ref name");
-      const name = requireRefName(
-        decodeCanonicalText(nameBytes, "stored ref name"),
-        "stored ref name",
-        "stored",
-      );
-      const target = requireRawRefTarget(
-        requireCanonicalStoredText(row.target_type, row.target_blob, `stored target of ${name}`),
-        `stored target of ${name}`,
-        "stored",
-      );
-      if (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0) {
-        throw new CorruptError("stored refs are not in strict Git byte order");
-      }
       rows++;
       if (rows > MAX_REFLOG_STATE_ROWS) {
         throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
       }
-      previousNameBytes = nameBytes;
-      yield { name, target };
-    }
-    if (rows !== measured.rows) {
-      throw new CorruptError(`${label} changed after metadata preflight`);
+      yield REF_ROW.decode(row);
     }
   }
 
   listRefs(prefix = ""): RefRow[] {
     let upper: string | undefined;
     if (prefix !== "") upper = nextPrefix(prefix);
-    const metadata = this.#db.one<{
-      rows: unknown;
-      name_bytes: unknown;
-      target_bytes: unknown;
-      max_row_bytes: unknown;
-    }>(
-      prefix === ""
-        ? `SELECT count(*) AS rows,
-                    coalesce(sum(length(CAST(name AS BLOB))), 0) AS name_bytes,
-                    coalesce(sum(length(CAST(target AS BLOB))), 0) AS target_bytes,
-                    coalesce(max(
-                      length(CAST(name AS BLOB)) + length(CAST(target AS BLOB))
-                    ), 0) AS max_row_bytes
-               FROM git_refs WHERE repo_id = ?`
-        : `SELECT count(*) AS rows,
-                    coalesce(sum(length(CAST(name AS BLOB))), 0) AS name_bytes,
-                    coalesce(sum(length(CAST(target AS BLOB))), 0) AS target_bytes,
-                    coalesce(max(
-                      length(CAST(name AS BLOB)) + length(CAST(target AS BLOB))
-                    ), 0) AS max_row_bytes
-               FROM git_refs WHERE repo_id = ? AND name >= ? AND name < ?`,
-      this.#repoId,
-      ...(upper === undefined ? [] : [prefix, upper]),
-    );
-    const measured = requireRefReadMetadata(metadata, "ref list");
-    if (measured.rows > MAX_REFLOG_STATE_ROWS) {
-      throw new GitError("E2BIG", "repository ref state exceeds 100,000 rows");
-    }
-    const maxRowBytes = requireMaximumStoredTextBytes(metadata?.max_row_bytes, "ref list row");
-    if ((measured.rows === 0) !== (maxRowBytes === 0)) {
-      throw new CorruptError("ref list row metadata is inconsistent");
-    }
     const result: RefRow[] = [];
     const sql =
       prefix === ""
-        ? `SELECT repo_id, typeof(name) AS name_type,
-                    length(CAST(name AS BLOB)) AS name_bytes, CAST(name AS BLOB) AS name_blob,
-                    typeof(target) AS target_type,
-                    length(CAST(target AS BLOB)) AS target_bytes,
-                    CAST(target AS BLOB) AS target_blob
-               FROM git_refs WHERE repo_id = ? ORDER BY name`
-        : `SELECT repo_id, typeof(name) AS name_type,
-                    length(CAST(name AS BLOB)) AS name_bytes, CAST(name AS BLOB) AS name_blob,
-                    typeof(target) AS target_type,
-                    length(CAST(target AS BLOB)) AS target_bytes,
-                    CAST(target AS BLOB) AS target_blob
-               FROM git_refs WHERE repo_id = ? AND name >= ? AND name < ? ORDER BY name`;
-    let actualNameBytes = 0;
-    let actualTargetBytes = 0;
-    let previousNameBytes: Uint8Array | null = null;
+        ? `SELECT name, target FROM git_refs WHERE repo_id = ? ORDER BY name
+             LIMIT ${MAX_REFLOG_STATE_ROWS + 1}`
+        : `SELECT name, target FROM git_refs
+            WHERE repo_id = ? AND name >= ? AND name < ? ORDER BY name
+            LIMIT ${MAX_REFLOG_STATE_ROWS + 1}`;
     for (const row of this.#db.iterate(
       sql,
       this.#repoId,
       ...(upper === undefined ? [] : [prefix, upper]),
     )) {
-      if (row.repo_id !== this.#repoId) {
-        throw new CorruptError("ref list crossed repository boundaries");
+      if (result.length >= MAX_REFLOG_STATE_ROWS) {
+        throw new GitError("E2BIG", "repository ref state exceeds 100,000 rows");
       }
-      const nameByteLength = requireStoredTextByteLength(
-        row.name_type,
-        row.name_bytes,
-        "stored ref name",
-      );
-      const targetByteLength = requireStoredTextByteLength(
-        row.target_type,
-        row.target_bytes,
-        "stored ref target",
-      );
-      const currentRowBytes = nameByteLength + targetByteLength;
-      if (!Number.isSafeInteger(currentRowBytes) || currentRowBytes > maxRowBytes) {
-        throw new CorruptError("ref list row changed after metadata preflight");
-      }
-      const nameBytes = requireStoredTextBytes(row.name_type, row.name_blob, "stored ref name");
-      if (nameBytes.byteLength !== nameByteLength) {
-        throw new CorruptError("stored ref name changed after validation");
-      }
-      if (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0) {
-        throw new CorruptError("stored refs are not in strict Git byte order");
-      }
-      const name = requireRefName(
-        decodeCanonicalText(nameBytes, "stored ref name"),
-        "stored ref name",
-        "stored",
-      );
-      const targetBytes = requireStoredTextBytes(
-        row.target_type,
-        row.target_blob,
-        `stored target of ${name}`,
-      );
-      if (targetBytes.byteLength !== targetByteLength) {
-        throw new CorruptError(`stored target of ${name} changed after validation`);
-      }
-      const target = requireRawRefTarget(
-        decodeCanonicalText(targetBytes, `stored target of ${name}`),
-        `stored target of ${name}`,
-        "stored",
-      );
-      actualNameBytes += nameByteLength;
-      actualTargetBytes += targetByteLength;
-      if (!Number.isSafeInteger(actualNameBytes) || !Number.isSafeInteger(actualTargetBytes)) {
-        throw new CorruptError("ref list byte totals are invalid");
-      }
-      previousNameBytes = nameBytes;
-      result.push({ name, target });
-    }
-    if (
-      result.length !== measured.rows ||
-      actualNameBytes !== measured.nameBytes ||
-      actualTargetBytes !== measured.targetBytes
-    ) {
-      throw new CorruptError("ref list changed after metadata preflight");
+      result.push(REF_ROW.decode(row));
     }
     return result;
   }
 
   /** Stream all raw refs without materializing repository ref state. */
   *iterateRefs(): Generator<RefRow> {
-    const metadata = this.#db.one<{
-      rows: unknown;
-      name_bytes: unknown;
-      target_bytes: unknown;
-    }>(
-      `SELECT count(*) AS rows,
-              coalesce(max(length(CAST(name AS BLOB))), 0) AS name_bytes,
-              coalesce(max(length(CAST(target AS BLOB))), 0) AS target_bytes
-         FROM git_refs WHERE repo_id = ?`,
-      this.#repoId,
-    );
-    const measured = requireRefReadMetadata(metadata, "ref iteration");
-    if (measured.rows > MAX_REFLOG_STATE_ROWS) {
-      throw new GitError("E2BIG", "repository ref state exceeds 100,000 rows");
-    }
-    yield* this.#iterateStoredRefs("ref iteration");
+    yield* this.#iterateStoredRefs();
   }
 
   head(): string {
-    const metadata = this.#db.one<Record<string, unknown>>(
-      `SELECT id AS checkout_id, repo_id, typeof(head) AS head_type,
-              length(CAST(head AS BLOB)) AS head_bytes
-         FROM git_checkouts WHERE id = ? AND repo_id = ?`,
-      this.#checkoutId,
-      this.#repoId,
-    );
-    if (metadata === undefined) throw new CorruptError("checkout HEAD row is missing");
-    if (
-      metadata.checkout_id !== this.#checkoutId ||
-      metadata.repo_id !== this.#repoId ||
-      metadata.head_type !== "text" ||
-      typeof metadata.head_bytes !== "number" ||
-      !Number.isSafeInteger(metadata.head_bytes) ||
-      metadata.head_bytes < 1
-    ) {
-      throw new CorruptError("HEAD read crossed a checkout boundary");
-    }
     const row = this.#db.one<Record<string, unknown>>(
-      `SELECT id AS checkout_id, repo_id, typeof(head) AS head_type,
-                length(CAST(head AS BLOB)) AS head_bytes,
-                CAST(head AS BLOB) AS head_blob
-           FROM git_checkouts WHERE id = ? AND repo_id = ?`,
+      "SELECT head FROM git_checkouts WHERE id = ? AND repo_id = ?",
       this.#checkoutId,
       this.#repoId,
     );
-    if (
-      row === undefined ||
-      row.checkout_id !== this.#checkoutId ||
-      row.repo_id !== this.#repoId ||
-      row.head_type !== "text" ||
-      row.head_bytes !== metadata.head_bytes
-    ) {
-      throw new CorruptError("checkout HEAD changed after validation");
-    }
-    const checked = requireRawRefTarget(
-      decodeCanonicalStoredText(row.head_blob, "stored HEAD target"),
-      "stored HEAD target",
-      "stored",
-    );
-    return checked;
+    if (row === undefined) throw new CorruptError("checkout HEAD row is missing");
+    return expectText(row.head, "stored HEAD target");
   }
 
   setHead(value: string): void {
@@ -6070,86 +5073,11 @@ export class CheckoutStore implements IndexStore {
         ? undefined
         : requireRefLogReadInteger(options.before, "reflog cursor", 1, MAX_REFLOG_ORDINAL);
     const cutoff = Math.max(0, now - REFLOG_RETENTION_SECONDS);
-    const metadata = this.#db.one<{
-      rows: unknown;
-      text_bytes: unknown;
-      max_text_bytes: unknown;
-      head_bytes: unknown;
-    }>(
-      name === "HEAD"
-        ? `SELECT count(*) AS rows,
-                  coalesce(sum(
-                    length(CAST('HEAD' AS BLOB)) +
-                    coalesce(length(CAST(old_raw AS BLOB)), 0) +
-                    coalesce(length(CAST(new_raw AS BLOB)), 0) +
-                    coalesce(length(CAST(old_oid AS BLOB)), 0) +
-                    coalesce(length(CAST(new_oid AS BLOB)), 0) +
-                    coalesce(length(CAST(actor_name AS BLOB)), 0) +
-                    coalesce(length(CAST(actor_email AS BLOB)), 0) +
-                    length(CAST(reason AS BLOB))
-                  ), 0) AS text_bytes,
-                  coalesce(max(
-                    length(CAST('HEAD' AS BLOB)) +
-                    coalesce(length(CAST(old_raw AS BLOB)), 0) +
-                    coalesce(length(CAST(new_raw AS BLOB)), 0) +
-                    coalesce(length(CAST(old_oid AS BLOB)), 0) +
-                    coalesce(length(CAST(new_oid AS BLOB)), 0) +
-                    coalesce(length(CAST(actor_name AS BLOB)), 0) +
-                    coalesce(length(CAST(actor_email AS BLOB)), 0) +
-                    length(CAST(reason AS BLOB))
-                  ), 0) AS max_text_bytes,
-                  (SELECT length(CAST(head AS BLOB)) FROM git_checkouts
-                    WHERE id = ? AND repo_id = ?) AS head_bytes
-             FROM git_checkout_reflog_entries
-            WHERE repo_id = ? AND checkout_id = ?`
-        : `SELECT count(*) AS rows,
-                  coalesce(sum(
-                    length(CAST(ref_name AS BLOB)) +
-                    coalesce(length(CAST(old_raw AS BLOB)), 0) +
-                    coalesce(length(CAST(new_raw AS BLOB)), 0) +
-                    coalesce(length(CAST(old_oid AS BLOB)), 0) +
-                    coalesce(length(CAST(new_oid AS BLOB)), 0) +
-                    coalesce(length(CAST(actor_name AS BLOB)), 0) +
-                    coalesce(length(CAST(actor_email AS BLOB)), 0) +
-                    length(CAST(reason AS BLOB))
-                  ), 0) AS text_bytes,
-                  coalesce(max(
-                    length(CAST(ref_name AS BLOB)) +
-                    coalesce(length(CAST(old_raw AS BLOB)), 0) +
-                    coalesce(length(CAST(new_raw AS BLOB)), 0) +
-                    coalesce(length(CAST(old_oid AS BLOB)), 0) +
-                    coalesce(length(CAST(new_oid AS BLOB)), 0) +
-                    coalesce(length(CAST(actor_name AS BLOB)), 0) +
-                    coalesce(length(CAST(actor_email AS BLOB)), 0) +
-                    length(CAST(reason AS BLOB))
-                  ), 0) AS max_text_bytes,
-                  (SELECT length(CAST(head AS BLOB)) FROM git_checkouts
-                    WHERE id = ? AND repo_id = ?) AS head_bytes
-             FROM git_reflog_entries
-            WHERE repo_id = ? AND ref_name = ?`,
-      this.#checkoutId,
-      this.#repoId,
-      this.#repoId,
-      name === "HEAD" ? this.#checkoutId : name,
-    );
-    const measured = requireRefLogReadMetadata(metadata);
-    if (measured.rows > REFLOG_RETENTION_ROWS) {
-      throw new CorruptError("reflog row count exceeds its retained history bound");
-    }
-    const maxTextBytes = requireMaximumStoredTextBytes(
-      metadata?.max_text_bytes,
-      "reflog retained entry",
-    );
-    if ((measured.rows === 0) !== (maxTextBytes === 0)) {
-      throw new CorruptError("reflog retained entry metadata is inconsistent");
-    }
     const active: RefLogEntry[] = [];
     let headerSeen = false;
     let nextOrdinal = 0;
-    let previousOrdinal: number | null = null;
-    const headerSql = `SELECT 0 AS kind, repository.id AS repo_id,
-              typeof(checkout.head) AS head_type,
-              CAST(checkout.head AS BLOB) AS head_blob,
+    let entryCount = 0;
+    const headerSql = `SELECT 0 AS kind, repository.id AS repo_id, checkout.head,
               state.next_ordinal,
               (SELECT max(ordinal) FROM (
                  SELECT direct.ordinal FROM git_reflog_entries direct
@@ -6158,15 +5086,9 @@ export class CheckoutStore implements IndexStore {
                  SELECT local.ordinal FROM git_checkout_reflog_entries local
                   WHERE local.repo_id = repository.id
                )) AS latest_ordinal,
-              NULL AS ref_name_type, NULL AS ref_name_blob, NULL AS ordinal,
-              NULL AS old_raw_type, NULL AS old_raw_blob,
-              NULL AS new_raw_type, NULL AS new_raw_blob,
-              NULL AS old_oid_type, NULL AS old_oid_blob,
-              NULL AS new_oid_type, NULL AS new_oid_blob,
-              NULL AS actor_name_type, NULL AS actor_name_blob,
-              NULL AS actor_email_type, NULL AS actor_email_blob,
-              NULL AS timestamp, NULL AS timezone,
-              NULL AS reason_type, NULL AS reason_blob
+              NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
+              NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
+              NULL AS timestamp, NULL AS timezone, NULL AS reason
          FROM git_repositories repository
          JOIN git_reflog_state state ON state.repo_id = repository.id
          JOIN git_checkouts checkout ON checkout.repo_id = repository.id
@@ -6176,28 +5098,15 @@ export class CheckoutStore implements IndexStore {
         ? this.#db.iterate(
             `${headerSql}
              UNION ALL
-             SELECT 1 AS kind, entry.repo_id, NULL AS head_type, NULL AS head_blob,
-                    NULL AS next_ordinal,
-                    NULL AS latest_ordinal, 'text' AS ref_name_type,
-                    CAST('HEAD' AS BLOB) AS ref_name_blob, entry.ordinal,
-                    typeof(entry.old_raw) AS old_raw_type,
-                    CAST(entry.old_raw AS BLOB) AS old_raw_blob,
-                    typeof(entry.new_raw) AS new_raw_type,
-                    CAST(entry.new_raw AS BLOB) AS new_raw_blob,
-                    typeof(entry.old_oid) AS old_oid_type,
-                    CAST(entry.old_oid AS BLOB) AS old_oid_blob,
-                    typeof(entry.new_oid) AS new_oid_type,
-                    CAST(entry.new_oid AS BLOB) AS new_oid_blob,
-                    typeof(entry.actor_name) AS actor_name_type,
-                    CAST(entry.actor_name AS BLOB) AS actor_name_blob,
-                    typeof(entry.actor_email) AS actor_email_type,
-                    CAST(entry.actor_email AS BLOB) AS actor_email_blob,
-                    entry.timestamp, entry.timezone, typeof(entry.reason) AS reason_type,
-                    CAST(entry.reason AS BLOB) AS reason_blob
+             SELECT 1 AS kind, NULL AS repo_id, NULL AS head, NULL AS next_ordinal,
+                    NULL AS latest_ordinal, 'HEAD' AS ref_name, entry.ordinal,
+                    entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
+                    entry.actor_name, entry.actor_email, entry.timestamp, entry.timezone,
+                    entry.reason
                FROM git_checkout_reflog_entries entry
               WHERE entry.repo_id = ? AND entry.checkout_id = ?
               ORDER BY kind, ordinal DESC
-              LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
+              LIMIT ${REFLOG_RETENTION_ROWS + 2}`,
             this.#repoId,
             this.#checkoutId,
             this.#repoId,
@@ -6206,28 +5115,15 @@ export class CheckoutStore implements IndexStore {
         : this.#db.iterate(
             `${headerSql}
              UNION ALL
-             SELECT 1 AS kind, entry.repo_id, NULL AS head_type, NULL AS head_blob,
-              NULL AS next_ordinal,
-              NULL AS latest_ordinal, typeof(entry.ref_name) AS ref_name_type,
-              CAST(entry.ref_name AS BLOB) AS ref_name_blob, entry.ordinal,
-              typeof(entry.old_raw) AS old_raw_type,
-              CAST(entry.old_raw AS BLOB) AS old_raw_blob,
-              typeof(entry.new_raw) AS new_raw_type,
-              CAST(entry.new_raw AS BLOB) AS new_raw_blob,
-              typeof(entry.old_oid) AS old_oid_type,
-              CAST(entry.old_oid AS BLOB) AS old_oid_blob,
-              typeof(entry.new_oid) AS new_oid_type,
-              CAST(entry.new_oid AS BLOB) AS new_oid_blob,
-              typeof(entry.actor_name) AS actor_name_type,
-              CAST(entry.actor_name AS BLOB) AS actor_name_blob,
-              typeof(entry.actor_email) AS actor_email_type,
-              CAST(entry.actor_email AS BLOB) AS actor_email_blob,
-              entry.timestamp, entry.timezone, typeof(entry.reason) AS reason_type,
-              CAST(entry.reason AS BLOB) AS reason_blob
+             SELECT 1 AS kind, NULL AS repo_id, NULL AS head, NULL AS next_ordinal,
+                    NULL AS latest_ordinal, entry.ref_name, entry.ordinal,
+                    entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
+                    entry.actor_name, entry.actor_email, entry.timestamp, entry.timezone,
+                    entry.reason
                FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
               WHERE entry.repo_id = ? AND entry.ref_name = ?
               ORDER BY kind, ordinal DESC
-              LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
+              LIMIT ${REFLOG_RETENTION_ROWS + 2}`,
             this.#repoId,
             this.#checkoutId,
             this.#repoId,
@@ -6243,15 +5139,15 @@ export class CheckoutStore implements IndexStore {
       if (row.kind !== 1 || !headerSeen) {
         throw new CorruptError("reflog query returned an invalid row sequence");
       }
-      const entry = requireStoredRefLogEntry(row, this.#repoId);
+      entryCount++;
+      if (entryCount > REFLOG_RETENTION_ROWS) {
+        throw new GitError("E2BIG", "reflog row count exceeds its retained history bound");
+      }
+      const entry = requireStoredRefLogEntry(row);
       if (entry.refName !== name) throw new CorruptError("reflog query returned another ref");
       if (entry.ordinal > nextOrdinal) {
         throw new CorruptError("reflog entry exceeds the repository allocation state");
       }
-      if (previousOrdinal !== null && previousOrdinal <= entry.ordinal) {
-        throw new CorruptError("reflog entries are not in strict descending ordinal order");
-      }
-      previousOrdinal = entry.ordinal;
       if (entry.timestamp >= cutoff) active.push(entry);
     }
     if (!headerSeen) throw new CorruptError("repository is missing its reflog state");
@@ -6270,69 +5166,8 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("EINVAL", "reflog clock must return a safe nonnegative epoch time");
     }
     const cutoff = Math.max(0, now - REFLOG_RETENTION_SECONDS);
-    const scanMetadata = this.#db.one<{
-      rows: unknown;
-      text_bytes: unknown;
-      max_row_bytes: unknown;
-      head_bytes: unknown;
-    }>(
-      `SELECT direct.rows + local.rows AS rows,
-              direct.text_bytes + local.text_bytes AS text_bytes,
-              max(direct.max_row_bytes, local.max_row_bytes) AS max_row_bytes,
-              (SELECT length(CAST(head AS BLOB)) FROM git_checkouts
-                WHERE id = ? AND repo_id = ?) AS head_bytes
-         FROM (
-           SELECT count(*) AS rows,
-                  coalesce(sum(row_bytes), 0) AS text_bytes,
-                  coalesce(max(CASE WHEN retained_rank <= ${REFLOG_RETENTION_ROWS}
-                                    THEN row_bytes END), 0) AS max_row_bytes
-             FROM (
-               SELECT coalesce(length(CAST(ref_name AS BLOB)), 0) +
-                      coalesce(length(CAST(old_raw AS BLOB)), 0) +
-                      coalesce(length(CAST(new_raw AS BLOB)), 0) +
-                      coalesce(length(CAST(old_oid AS BLOB)), 0) +
-                      coalesce(length(CAST(new_oid AS BLOB)), 0) +
-                      coalesce(length(CAST(actor_name AS BLOB)), 0) +
-                      coalesce(length(CAST(actor_email AS BLOB)), 0) +
-                      coalesce(length(CAST(reason AS BLOB)), 0) AS row_bytes,
-                      row_number() OVER (
-                        PARTITION BY ref_name ORDER BY ordinal DESC
-                      ) AS retained_rank
-                 FROM git_reflog_entries INDEXED BY git_reflog_entries_by_ref
-                WHERE repo_id = ?
-             ) direct_ranked
-         ) direct
-         CROSS JOIN (
-           SELECT count(*) AS rows,
-                  coalesce(sum(row_bytes), 0) AS text_bytes,
-                  coalesce(max(CASE WHEN retained_rank <= ${REFLOG_RETENTION_ROWS}
-                                    THEN row_bytes END), 0) AS max_row_bytes
-             FROM (
-               SELECT 4 +
-                      coalesce(length(CAST(old_raw AS BLOB)), 0) +
-                      coalesce(length(CAST(new_raw AS BLOB)), 0) +
-                      coalesce(length(CAST(old_oid AS BLOB)), 0) +
-                      coalesce(length(CAST(new_oid AS BLOB)), 0) +
-                      coalesce(length(CAST(actor_name AS BLOB)), 0) +
-                      coalesce(length(CAST(actor_email AS BLOB)), 0) +
-                      coalesce(length(CAST(reason AS BLOB)), 0) AS row_bytes,
-                      row_number() OVER (
-                        PARTITION BY checkout_id ORDER BY ordinal DESC
-                      ) AS retained_rank
-                 FROM git_checkout_reflog_entries
-                WHERE repo_id = ?
-             ) local_ranked
-         ) local`,
-      this.#checkoutId,
-      this.#repoId,
-      this.#repoId,
-      this.#repoId,
-    );
-    validateRefLogRootScanBudget(scanMetadata);
     const header = this.#db.one<Record<string, unknown>>(
-      `SELECT repository.id AS repo_id, typeof(checkout.head) AS head_type,
-              CAST(checkout.head AS BLOB) AS head_blob,
-              state.next_ordinal,
+      `SELECT repository.id AS repo_id, checkout.head, state.next_ordinal,
               (SELECT max(ordinal) FROM (
                  SELECT direct.ordinal FROM git_reflog_entries direct
                   WHERE direct.repo_id = repository.id
@@ -6350,70 +5185,56 @@ export class CheckoutStore implements IndexStore {
     if (header === undefined) throw new CorruptError("repository is missing its reflog state");
     const nextOrdinal = requireRefLogHeader(header, this.#repoId);
     let previousRef: string | null = null;
-    let previousDirectOrdinal: number | null = null;
     let directEntriesForRef = 0;
-    let previousCheckoutId = 0;
-    let previousCheckoutOrdinal: number | null = null;
+    let previousCheckoutId: number | null = null;
     let checkoutEntries = 0;
-    let previousOid: string | null = null;
+    let scannedEntries = 0;
     for (const row of this.#db.iterate(
       `WITH direct_ranked AS (
-         SELECT entry.*, NULL AS checkout_id, NULL AS owner_repo_id,
+         SELECT entry.*, NULL AS checkout_id,
                 row_number() OVER (
                   PARTITION BY entry.ref_name ORDER BY entry.ordinal DESC
                 ) AS retained_rank
            FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
           WHERE entry.repo_id = ?
        ), checkout_ranked AS (
-         SELECT entry.*, 'HEAD' AS ref_name, checkout.repo_id AS owner_repo_id,
+         SELECT entry.*, 'HEAD' AS ref_name,
                 row_number() OVER (
                   PARTITION BY entry.checkout_id ORDER BY entry.ordinal DESC
                 ) AS retained_rank
            FROM git_checkout_reflog_entries entry
-           LEFT JOIN git_checkouts checkout ON checkout.id = entry.checkout_id
           WHERE entry.repo_id = ?
        ), retained AS (
-         SELECT 0 AS kind, repo_id, checkout_id, owner_repo_id, ref_name, ordinal,
+         SELECT 0 AS kind, checkout_id, ref_name, ordinal,
                 old_raw, new_raw, old_oid, new_oid, actor_name, actor_email,
                 timestamp, timezone, reason
            FROM direct_ranked WHERE retained_rank <= ${REFLOG_RETENTION_ROWS}
          UNION ALL
-         SELECT 1 AS kind, repo_id, checkout_id, owner_repo_id, ref_name, ordinal,
+         SELECT 1 AS kind, checkout_id, ref_name, ordinal,
                 old_raw, new_raw, old_oid, new_oid, actor_name, actor_email,
                 timestamp, timezone, reason
            FROM checkout_ranked WHERE retained_rank <= ${REFLOG_RETENTION_ROWS}
+       ), retained_limited AS MATERIALIZED (
+         SELECT * FROM retained
+          ORDER BY kind, ref_name COLLATE BINARY, checkout_id, ordinal DESC
+          LIMIT ${MAX_REFLOG_ROOT_SCAN_ENTRIES + 1}
        ), output AS (
-         SELECT retained.*, NULL AS root_oid FROM retained
+         SELECT retained_limited.*, NULL AS root_oid FROM retained_limited
          UNION ALL
-         SELECT 2 AS kind, NULL AS repo_id, NULL AS checkout_id, NULL AS owner_repo_id,
-                NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
+         SELECT 2 AS kind, NULL AS checkout_id, NULL AS ref_name, NULL AS ordinal,
+                NULL AS old_raw, NULL AS new_raw,
                 NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
                 NULL AS timestamp, NULL AS timezone, NULL AS reason, endpoint.oid AS root_oid
            FROM (
              SELECT oid FROM (
-               SELECT old_oid AS oid FROM retained WHERE timestamp >= ?
+               SELECT old_oid AS oid FROM retained_limited WHERE timestamp >= ?
                UNION ALL
-               SELECT new_oid AS oid FROM retained WHERE timestamp >= ?
+               SELECT new_oid AS oid FROM retained_limited WHERE timestamp >= ?
              ) WHERE oid IS NOT NULL GROUP BY oid
            ) endpoint
        )
-       SELECT kind, repo_id, checkout_id, owner_repo_id,
-              typeof(ref_name) AS ref_name_type, CAST(ref_name AS BLOB) AS ref_name_blob, ordinal,
-              typeof(old_raw) AS old_raw_type,
-              CAST(old_raw AS BLOB) AS old_raw_blob,
-              typeof(new_raw) AS new_raw_type,
-              CAST(new_raw AS BLOB) AS new_raw_blob,
-              typeof(old_oid) AS old_oid_type,
-              CAST(old_oid AS BLOB) AS old_oid_blob,
-              typeof(new_oid) AS new_oid_type,
-              CAST(new_oid AS BLOB) AS new_oid_blob,
-              typeof(actor_name) AS actor_name_type,
-              CAST(actor_name AS BLOB) AS actor_name_blob,
-              typeof(actor_email) AS actor_email_type,
-              CAST(actor_email AS BLOB) AS actor_email_blob,
-              timestamp, timezone, typeof(reason) AS reason_type,
-              CAST(reason AS BLOB) AS reason_blob,
-              CAST(root_oid AS BLOB) AS root_oid_blob
+       SELECT kind, checkout_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+              actor_name, actor_email, timestamp, timezone, reason, root_oid
          FROM output
        ORDER BY kind, ref_name COLLATE BINARY, checkout_id, ordinal DESC, root_oid COLLATE BINARY`,
       this.#repoId,
@@ -6422,22 +5243,18 @@ export class CheckoutStore implements IndexStore {
       cutoff,
     )) {
       if (row.kind === 0) {
-        const entry = requireStoredRefLogEntry(row, this.#repoId);
+        scannedEntries++;
+        if (scannedEntries > MAX_REFLOG_ROOT_SCAN_ENTRIES) {
+          throw new GitError("E2BIG", "reflog root scan exceeds its structural row bound");
+        }
+        const entry = requireStoredRefLogEntry(row);
         if (entry.ordinal > nextOrdinal) {
           throw new CorruptError("reflog entry exceeds the repository allocation state");
         }
         if (previousRef === null || entry.refName !== previousRef) {
-          if (previousRef !== null && comparePaths(previousRef, entry.refName) >= 0) {
-            throw new CorruptError("reflog entries are not in strict ref byte order");
-          }
           previousRef = entry.refName;
-          previousDirectOrdinal = null;
           directEntriesForRef = 0;
         }
-        if (previousDirectOrdinal !== null && previousDirectOrdinal <= entry.ordinal) {
-          throw new CorruptError("reflog entries are not in strict descending ordinal order");
-        }
-        previousDirectOrdinal = entry.ordinal;
         directEntriesForRef++;
         if (directEntriesForRef > REFLOG_RETENTION_ROWS) {
           throw new CorruptError("reflog root query exceeded its retained row bound");
@@ -6445,26 +5262,19 @@ export class CheckoutStore implements IndexStore {
         continue;
       }
       if (row.kind === 1) {
-        const checkoutId = requireSafeId(row.checkout_id, "checkout reflog owner id");
-        if (row.owner_repo_id !== this.#repoId) {
-          throw new CorruptError("checkout reflog owner belongs to another repository");
+        scannedEntries++;
+        if (scannedEntries > MAX_REFLOG_ROOT_SCAN_ENTRIES) {
+          throw new GitError("E2BIG", "reflog root scan exceeds its structural row bound");
         }
-        const entry = requireStoredRefLogEntry(row, this.#repoId);
+        const checkoutId = requireSafeId(row.checkout_id, "checkout reflog owner id");
+        const entry = requireStoredRefLogEntry(row);
         if (entry.refName !== "HEAD" || entry.ordinal > nextOrdinal) {
           throw new CorruptError("checkout reflog entry is invalid");
         }
         if (checkoutId !== previousCheckoutId) {
-          if (checkoutId <= previousCheckoutId) {
-            throw new CorruptError("checkout reflog owners are not in strict order");
-          }
           previousCheckoutId = checkoutId;
-          previousCheckoutOrdinal = null;
           checkoutEntries = 0;
         }
-        if (previousCheckoutOrdinal !== null && previousCheckoutOrdinal <= entry.ordinal) {
-          throw new CorruptError("checkout reflog entries are not in descending ordinal order");
-        }
-        previousCheckoutOrdinal = entry.ordinal;
         checkoutEntries++;
         if (checkoutEntries > REFLOG_RETENTION_ROWS) {
           throw new CorruptError("checkout reflog query exceeded its retained row bound");
@@ -6474,15 +5284,7 @@ export class CheckoutStore implements IndexStore {
       if (row.kind !== 2) {
         throw new CorruptError("reflog root query returned an invalid object id");
       }
-      const rootOid = decodeCanonicalStoredText(row.root_oid_blob, "reflog root object id");
-      if (!isOid(rootOid)) {
-        throw new CorruptError("reflog root query returned an invalid object id");
-      }
-      if (previousOid !== null && comparePaths(previousOid, rootOid) >= 0) {
-        throw new CorruptError("reflog roots are not in strict byte order");
-      }
-      previousOid = rootOid;
-      yield rootOid;
+      yield expectText(row.root_oid, "reflog root object id");
     }
   }
 
@@ -6490,12 +5292,12 @@ export class CheckoutStore implements IndexStore {
 
   configGetAll(path: string): string[] {
     return this.#db
-      .all<{ value: string }>(
+      .all<{ value: unknown }>(
         "SELECT value FROM git_config WHERE repo_id = ? AND path = ? ORDER BY seq",
         this.#repoId,
         path,
       )
-      .map((row) => row.value);
+      .map((row) => expectText(row.value, `config ${path}`));
   }
 
   configGet(path: string): string | undefined {
@@ -6511,77 +5313,26 @@ export class CheckoutStore implements IndexStore {
     return this.configGetBounded(path);
   }
 
-  /** Read one config value only after SQLite proves its text metadata. */
+  /** Read one config value with an optional payload limit. */
   configGetBounded(path: string, maxBytes?: number): string | undefined {
     if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
       throw new GitError("EINVAL", "config byte limit must be a non-negative safe integer");
     }
-    const info = this.#db.one<{
-      repo_id: unknown;
-      seq_type: unknown;
-      seq: unknown;
-      value_type: unknown;
-      value_bytes: unknown;
-    }>(
-      `SELECT repo_id, typeof(seq) AS seq_type,
-              CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
-              typeof(value) AS value_type,
-              length(CAST(value AS BLOB)) AS value_bytes
-         FROM git_config
-        WHERE repo_id = ? AND path = ?
-        ORDER BY seq DESC
-        LIMIT 1`,
+    const row = this.#db.one<{ value: unknown }>(
+      `SELECT value FROM git_config
+        WHERE repo_id = ? AND path = ? ORDER BY seq DESC LIMIT 1`,
       this.#repoId,
       path,
     );
-    if (info === undefined) return undefined;
-    if (
-      info.repo_id !== this.#repoId ||
-      info.seq_type !== "integer" ||
-      typeof info.seq !== "number" ||
-      !Number.isSafeInteger(info.seq) ||
-      info.seq < 0 ||
-      info.value_type !== "text" ||
-      typeof info.value_bytes !== "number" ||
-      !Number.isSafeInteger(info.value_bytes) ||
-      info.value_bytes < 0
-    ) {
-      throw new CorruptError(`config ${path} has invalid text metadata`);
-    }
-    if (maxBytes !== undefined && info.value_bytes > maxBytes) {
+    if (row === undefined) return undefined;
+    const value = expectText(row.value, `config ${path}`);
+    if (maxBytes !== undefined && utf8ByteLength(value) > maxBytes) {
       throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
     }
-    const row = this.#db.one<Record<string, unknown>>(
-      `SELECT repo_id, typeof(seq) AS seq_type,
-                CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
-                typeof(value) AS value_type,
-                length(CAST(value AS BLOB)) AS value_bytes,
-                CAST(value AS BLOB) AS value_blob
-           FROM git_config
-          WHERE repo_id = ? AND path = ? AND seq = ?
-          LIMIT 1`,
-      this.#repoId,
-      path,
-      info.seq,
-    );
-    if (
-      row === undefined ||
-      row.repo_id !== this.#repoId ||
-      row.seq_type !== "integer" ||
-      row.seq !== info.seq ||
-      row.value_type !== "text" ||
-      row.value_bytes !== info.value_bytes
-    ) {
-      throw new CorruptError(`config ${path} changed after validation`);
-    }
-    const bytes = readBlob(row.value_blob);
-    if (bytes.byteLength !== info.value_bytes) {
-      throw new CorruptError(`config ${path} changed after validation`);
-    }
-    return decodeCanonicalText(bytes, `config ${path}`);
+    return value;
   }
 
-  /** Read zero or one canonical value without materialising a multi-valued key. */
+  /** Read zero or one value without materialising an unbounded multi-valued key. */
   configGetSingleBounded(path: string, maxBytes?: number): BoundedSingleConfigValue {
     if (typeof path !== "string" || path === "") {
       throw new GitError("EINVAL", "bounded config path must be a non-empty string");
@@ -6591,76 +5342,18 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("EINVAL", "config byte limit must be a non-negative safe integer");
     }
 
-    const metadata: { seq: number; bytes: number }[] = [];
-    for (const row of this.#db.iterate(
-      `SELECT repo_id, typeof(seq) AS seq_type,
-              CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
-              typeof(value) AS value_type,
-              length(CAST(value AS BLOB)) AS value_bytes
-         FROM git_config
-        WHERE repo_id = ? AND path = ?
-        ORDER BY seq
-        LIMIT 2`,
+    const rows = this.#db.all<{ value: unknown }>(
+      `SELECT value FROM git_config
+        WHERE repo_id = ? AND path = ? ORDER BY seq LIMIT 2`,
       this.#repoId,
       path,
-    )) {
-      if (row.repo_id !== this.#repoId) {
-        throw new CorruptError(`config ${path} crossed repository boundaries`);
-      }
-      if (
-        row.seq_type !== "integer" ||
-        typeof row.seq !== "number" ||
-        !Number.isSafeInteger(row.seq) ||
-        row.seq < 0 ||
-        row.value_type !== "text" ||
-        typeof row.value_bytes !== "number" ||
-        !Number.isSafeInteger(row.value_bytes) ||
-        row.value_bytes < 0
-      ) {
-        throw new CorruptError(`config ${path} has invalid value metadata`);
-      }
-      if (maxBytes !== undefined && row.value_bytes > maxBytes) {
-        throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
-      }
-      metadata.push({ seq: row.seq, bytes: row.value_bytes });
-    }
-    const expected = metadata[0];
-    if (expected === undefined) return { kind: "missing" };
-    if (metadata.length !== 1) return { kind: "multiple" };
-
-    const row = this.#db.one<Record<string, unknown>>(
-      `SELECT repo_id, typeof(seq) AS seq_type,
-              CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
-              typeof(value) AS value_type,
-              length(CAST(value AS BLOB)) AS value_bytes,
-              CAST(value AS BLOB) AS value_blob
-         FROM git_config
-        WHERE repo_id = ? AND path = ? AND seq = ?
-        LIMIT 1`,
-      this.#repoId,
-      path,
-      expected.seq,
     );
-    if (
-      row === undefined ||
-      row.repo_id !== this.#repoId ||
-      row.seq_type !== "integer" ||
-      row.seq !== expected.seq ||
-      row.value_type !== "text" ||
-      row.value_bytes !== expected.bytes
-    ) {
-      throw new CorruptError(`config ${path} changed after validation`);
+    if (rows.length === 0) return { kind: "missing" };
+    if (rows.length !== 1) return { kind: "multiple" };
+    const value = expectText(rows[0]?.value, `config ${path}`);
+    if (maxBytes !== undefined && utf8ByteLength(value) > maxBytes) {
+      throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
     }
-    let bytes: Uint8Array;
-    try {
-      bytes = readBlob(row.value_blob);
-    } catch (error) {
-      throw new CorruptError(`config ${path} has an invalid value BLOB`, { cause: error });
-    }
-    if (bytes.byteLength !== expected.bytes) {
-      throw new CorruptError(`config ${path} changed after validation`);
-    }
-    const value = decodeCanonicalText(bytes, `config ${path}`);
     return { kind: "single", value };
   }
 
@@ -6670,34 +5363,12 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("EINVAL", "config path must be a non-empty string");
     }
     boundedCanonicalUtf8Bytes(path, MAX_INDEX_PATH_BYTES, "config path");
-    let rows = 0;
-    for (const row of this.#db.iterate(
-      `SELECT repo_id, typeof(seq) AS seq_type,
-              CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
-              typeof(value) AS value_type,
-              length(CAST(value AS BLOB)) AS value_bytes
-         FROM git_config
-        WHERE repo_id = ? AND path = ?
-        ORDER BY seq
-        LIMIT 2`,
+    const rows = this.#db.all<{ value: unknown }>(
+      `SELECT value FROM git_config
+        WHERE repo_id = ? AND path = ? ORDER BY seq LIMIT 2`,
       this.#repoId,
       path,
-    )) {
-      if (
-        row.repo_id !== this.#repoId ||
-        row.seq_type !== "integer" ||
-        typeof row.seq !== "number" ||
-        !Number.isSafeInteger(row.seq) ||
-        row.seq < 0 ||
-        row.value_type !== "text" ||
-        typeof row.value_bytes !== "number" ||
-        !Number.isSafeInteger(row.value_bytes) ||
-        row.value_bytes < 0
-      ) {
-        throw new CorruptError(`config ${path} has invalid value metadata`);
-      }
-      rows++;
-    }
+    ).length;
     return rows === 0 ? "missing" : rows === 1 ? "single" : "multiple";
   }
 
@@ -6738,13 +5409,13 @@ export class CheckoutStore implements IndexStore {
   /** Distinct config paths under a dotted prefix, e.g. "remote.". */
   configPaths(prefix: string): string[] {
     return this.#db
-      .all<{ path: string }>(
+      .all<{ path: unknown }>(
         "SELECT DISTINCT path FROM git_config WHERE repo_id = ? AND path >= ? AND path < ? ORDER BY path",
         this.#repoId,
         prefix,
         nextPrefix(prefix),
       )
-      .map((row) => row.path);
+      .map((row) => expectText(row.path, "stored config path"));
   }
 
   /** Validate and move one exact dotted config section without changing value order. */
@@ -6770,13 +5441,13 @@ export class CheckoutStore implements IndexStore {
             `config section ${destination} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
           );
         }
-        const candidate = requireConfigSectionMetadata(row, this.#repoId, destination);
+        const candidate = requireConfigSectionMetadata(row);
         if (configSectionVariable(candidate.path, destination) !== null) {
           throw new GitError("EEXIST", `config section ${destination} already exists`);
         }
       }
 
-      const metadata: ConfigSectionMoveMetadata[] = [];
+      const metadata: ConfigSectionCandidateMetadata[] = [];
       let sourceCandidates = 0;
       for (const row of this.#db.iterate(
         configSectionMetadataSql(),
@@ -6791,134 +5462,11 @@ export class CheckoutStore implements IndexStore {
             `config section ${source} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
           );
         }
-        const candidate = requireConfigSectionMetadata(row, this.#repoId, source);
+        const candidate = requireConfigSectionMetadata(row);
         const variable = configSectionVariable(candidate.path, source);
         if (variable === null) continue;
-        if (
-          candidate.valueType !== "text" ||
-          candidate.valueBytes === null ||
-          candidate.valueBytes < 0
-        ) {
-          throw new CorruptError(`config section ${source} has an invalid stored value`);
-        }
         configSectionDestinationBytes(destination, variable);
-        metadata.push({ ...candidate, valueBytes: candidate.valueBytes });
-      }
-
-      function* validationRows(): Generator<{
-        ordinal: number;
-        path: string;
-        seq: number;
-        valueBytes: number;
-      }> {
-        for (let ordinal = 0; ordinal < metadata.length; ordinal++) {
-          const candidate = metadata[ordinal];
-          if (candidate === undefined) throw new CorruptError("config section metadata is sparse");
-          yield {
-            ordinal,
-            path: candidate.path,
-            seq: candidate.seq,
-            valueBytes: candidate.valueBytes,
-          };
-        }
-      }
-      let validatedValues = 0;
-      for (const page of jsonPages(validationRows(), "config section value validation")) {
-        let currentOrdinal = -1;
-        let expectedOffset = 0;
-        let decoder = new TextDecoder("utf-8", { fatal: true });
-        const finishDecoder = (candidate: ConfigSectionMoveMetadata): void => {
-          try {
-            decoder.decode();
-          } catch (error) {
-            throw new CorruptError(`config value at ${candidate.path} is not canonical UTF-8`, {
-              cause: error,
-            });
-          }
-        };
-        for (const row of this.#db.iterate(
-          `WITH RECURSIVE wanted(ordinal, path, seq, value_bytes) AS MATERIALIZED (
-                 SELECT json_extract(value, '$.ordinal'), json_extract(value, '$.path'),
-                        json_extract(value, '$.seq'), json_extract(value, '$.valueBytes')
-                   FROM json_each(?)
-               ), chunks(ordinal, path, seq, value_bytes, offset) AS (
-                 SELECT ordinal, path, seq, value_bytes, 0 FROM wanted
-                 UNION ALL
-                 SELECT ordinal, path, seq, value_bytes, offset + ${OBJECT_PAYLOAD}
-                   FROM chunks WHERE offset + ${OBJECT_PAYLOAD} < value_bytes
-               )
-               SELECT chunks.ordinal, chunks.path, chunks.seq, chunks.offset,
-                      typeof(config.value) AS value_type,
-                      length(CAST(config.value AS BLOB)) AS value_bytes,
-                      substr(CAST(config.value AS BLOB), chunks.offset + 1,
-                             min(${OBJECT_PAYLOAD}, chunks.value_bytes - chunks.offset)) AS chunk
-                 FROM chunks
-                 JOIN git_config config
-                   ON config.repo_id = ? AND config.path = chunks.path AND config.seq = chunks.seq
-                ORDER BY chunks.ordinal, chunks.offset`,
-          page,
-          this.#repoId,
-        )) {
-          const ordinal = row.ordinal;
-          if (
-            typeof ordinal !== "number" ||
-            !Number.isSafeInteger(ordinal) ||
-            ordinal < 0 ||
-            ordinal >= metadata.length
-          ) {
-            throw new CorruptError(`config section ${source} changed after validation`);
-          }
-          const candidate = metadata[ordinal];
-          if (candidate === undefined) {
-            throw new CorruptError(`config section ${source} changed after validation`);
-          }
-          if (ordinal !== currentOrdinal) {
-            if (currentOrdinal >= 0) {
-              const previous = metadata[currentOrdinal];
-              if (previous === undefined || expectedOffset !== previous.valueBytes) {
-                throw new CorruptError(`config section ${source} changed after validation`);
-              }
-              finishDecoder(previous);
-            }
-            currentOrdinal = ordinal;
-            expectedOffset = 0;
-            decoder = new TextDecoder("utf-8", { fatal: true });
-            validatedValues++;
-          }
-          const chunk = readBlob(row.chunk);
-          const expectedChunkBytes = Math.min(
-            OBJECT_PAYLOAD,
-            candidate.valueBytes - expectedOffset,
-          );
-          if (
-            row.path !== candidate.path ||
-            row.seq !== candidate.seq ||
-            row.offset !== expectedOffset ||
-            row.value_type !== "text" ||
-            row.value_bytes !== candidate.valueBytes ||
-            chunk.byteLength !== expectedChunkBytes
-          ) {
-            throw new CorruptError(`config section ${source} changed after validation`);
-          }
-          try {
-            decoder.decode(chunk, { stream: true });
-          } catch (error) {
-            throw new CorruptError(`config value at ${candidate.path} is not canonical UTF-8`, {
-              cause: error,
-            });
-          }
-          expectedOffset += chunk.byteLength;
-        }
-        if (currentOrdinal >= 0) {
-          const current = metadata[currentOrdinal];
-          if (current === undefined || expectedOffset !== current.valueBytes) {
-            throw new CorruptError(`config section ${source} changed after validation`);
-          }
-          finishDecoder(current);
-        }
-      }
-      if (validatedValues !== metadata.length) {
-        throw new CorruptError(`config section ${source} changed after validation`);
+        metadata.push(candidate);
       }
       if (metadata.length === 0) return;
 
@@ -7103,7 +5651,6 @@ export class CheckoutStore implements IndexStore {
     const state = operationMetadataFromRow(row, steps);
 
     const touched: MergeTouchedPath[] = [];
-    let previousPath: string | null = null;
     for (const raw of this.#db.iterate(
       `SELECT ordinal,
               CASE WHEN typeof(path) = 'text'
@@ -7156,11 +5703,7 @@ export class CheckoutStore implements IndexStore {
         throw new CorruptError("merge journal yielded too many touched paths");
       }
       const entry = operationTouchedFromRow(touchedRow);
-      if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
-        throw new CorruptError("merge touched paths are not in strict Git path order");
-      }
       touched.push(entry);
-      previousPath = entry.path;
     }
     if (touched.length !== touchedCount) {
       throw new CorruptError("merge journal touched-path count does not match its rows");
@@ -7198,13 +5741,6 @@ export class CheckoutStore implements IndexStore {
   ): void {
     if (state.kind === "rebase") requireInitialRebaseJournal(state, steps, touched);
     const integrityOid = operationJournalIntegrityOid(state, touched, steps);
-    let previousPath: string | null = null;
-    for (const entry of touched) {
-      if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
-        throw new CorruptError("operation touched paths are not in strict Git path order");
-      }
-      previousPath = entry.path;
-    }
 
     this.#db.transactionSync(() => {
       const active = this.#readOperationStateOwned();
@@ -7611,13 +6147,6 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("EINVAL", "expected operation integrity identity is invalid");
     }
     const integrityOid = operationJournalIntegrityOid(state, touched, steps);
-    let previousPath: string | null = null;
-    for (const entry of touched) {
-      if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
-        throw new CorruptError("operation touched paths are not in strict Git path order");
-      }
-      previousPath = entry.path;
-    }
     this.#db.transactionSync(() => {
       const current = this.#readOperationStateOwned();
       if (current === null) throw operationNotActive(state.kind);
@@ -8074,8 +6603,8 @@ export class CheckoutStore implements IndexStore {
   shallow(): Set<string> {
     return new Set(
       this.#db
-        .all<{ oid: string }>("SELECT oid FROM git_shallow WHERE repo_id = ?", this.#repoId)
-        .map((row) => row.oid),
+        .all<{ oid: unknown }>("SELECT oid FROM git_shallow WHERE repo_id = ?", this.#repoId)
+        .map((row) => expectText(row.oid, "stored shallow object id")),
     );
   }
 
@@ -8207,61 +6736,14 @@ export function boundedCanonicalUtf8Bytes(value: string, limit: number, label: s
 }
 
 export function configSectionMetadataSql(): string {
-  return `SELECT
-                CASE WHEN typeof(repo_id) = 'integer' THEN repo_id END AS repo_id,
-                typeof(path) AS path_type,
-                length(CAST(path AS BLOB)) AS path_bytes,
-                CASE WHEN typeof(path) = 'text'
-                           AND length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
-                     THEN path END AS path,
-                typeof(seq) AS seq_type,
-                CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
-                typeof(value) AS value_type,
-                length(CAST(value AS BLOB)) AS value_bytes
-           FROM git_config
+  return `SELECT path, seq FROM git_config
           WHERE repo_id = ? AND path >= ? AND path < ?
           ORDER BY path COLLATE BINARY, seq
           LIMIT ${MAX_CONFIG_SECTION_MOVE_ROWS + 1}`;
 }
 
-export function requireConfigSectionMetadata(
-  row: Record<string, unknown>,
-  repoId: number,
-  prefix: string,
-): ConfigSectionCandidateMetadata {
-  if (row.repo_id !== repoId) {
-    throw new CorruptError("config section scan crossed repository boundaries");
-  }
-  if (
-    row.path_type !== "text" ||
-    typeof row.path !== "string" ||
-    typeof row.path_bytes !== "number" ||
-    !Number.isSafeInteger(row.path_bytes) ||
-    row.path_bytes < 1 ||
-    row.path_bytes > MAX_INDEX_PATH_BYTES ||
-    !row.path.startsWith(prefix)
-  ) {
-    throw new CorruptError(`config section ${prefix} has an invalid stored path`);
-  }
-  if (
-    row.seq_type !== "integer" ||
-    typeof row.seq !== "number" ||
-    !Number.isSafeInteger(row.seq) ||
-    row.seq < 0
-  ) {
-    throw new CorruptError(`config section ${prefix} has an invalid sequence`);
-  }
-  const valueBytes =
-    typeof row.value_bytes === "number" && Number.isSafeInteger(row.value_bytes)
-      ? row.value_bytes
-      : null;
-  return {
-    path: row.path,
-    seq: row.seq,
-    pathBytes: row.path_bytes,
-    valueType: row.value_type,
-    valueBytes,
-  };
+export function requireConfigSectionMetadata(row: unknown): ConfigSectionCandidateMetadata {
+  return CONFIG_SECTION_ROW.decode(row);
 }
 
 export function configSectionVariable(path: string, prefix: string): string | null {
@@ -8287,69 +6769,4 @@ export function configSectionDestinationBytes(destination: string, variable: str
     throw new CorruptError("config section has an invalid stored variable name", { cause: error });
   }
   return destinationBytes + variableBytes;
-}
-
-export function decodeCanonicalText(bytes: Uint8Array, label: string): string {
-  let value: string;
-  try {
-    value = CANONICAL_TEXT_DECODER.decode(bytes);
-  } catch (error) {
-    throw new CorruptError(`${label} is not canonical UTF-8`, { cause: error });
-  }
-  const canonical = JSON_ENCODER.encode(value);
-  if (canonical.byteLength !== bytes.byteLength) {
-    throw new CorruptError(`${label} is not canonical UTF-8`);
-  }
-  for (let index = 0; index < canonical.byteLength; index++) {
-    if (canonical[index] !== bytes[index]) {
-      throw new CorruptError(`${label} is not canonical UTF-8`);
-    }
-  }
-  return value;
-}
-
-export function requireStoredTextBytes(type: unknown, value: unknown, label: string): Uint8Array {
-  if (type !== "text") throw new CorruptError(`${label} has an invalid stored type`);
-  try {
-    return readBlob(value);
-  } catch (error) {
-    throw new CorruptError(`${label} has an invalid text BLOB`, { cause: error });
-  }
-}
-
-export function compareByteArrays(left: Uint8Array, right: Uint8Array): number {
-  const shared = Math.min(left.byteLength, right.byteLength);
-  for (let index = 0; index < shared; index++) {
-    const leftByte = left[index] ?? -1;
-    const rightByte = right[index] ?? -1;
-    if (leftByte !== rightByte) return leftByte < rightByte ? -1 : 1;
-  }
-  return left.byteLength === right.byteLength ? 0 : left.byteLength < right.byteLength ? -1 : 1;
-}
-
-export function decodeCanonicalStoredText(value: unknown, label: string): string {
-  let bytes: Uint8Array;
-  try {
-    bytes = readBlob(value);
-  } catch (error) {
-    throw new CorruptError(`${label} has an invalid text BLOB`, { cause: error });
-  }
-  return decodeCanonicalText(bytes, label);
-}
-
-export function requireCanonicalStoredText(type: unknown, value: unknown, label: string): string {
-  if (type !== "text") throw new CorruptError(`${label} has an invalid stored type`);
-  return decodeCanonicalStoredText(value, label);
-}
-
-export function requireNullableCanonicalStoredText(
-  type: unknown,
-  value: unknown,
-  label: string,
-): string | null {
-  if (type === "null" && value === null) return null;
-  if (type !== "text" || value === null) {
-    throw new CorruptError(`${label} has an invalid stored type`);
-  }
-  return decodeCanonicalStoredText(value, label);
 }

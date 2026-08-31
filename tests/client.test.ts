@@ -812,45 +812,6 @@ describe("createSqliteGitClient", () => {
     ]);
   });
 
-  it("fails closed on a non-canonical persisted remote URL across a cold reopen", async () => {
-    const { git, workspace } = makeNativeGit();
-    const dir = "/corrupt-url-remote";
-    const path = "remote.origin.url";
-    const replacement = "https://example.invalid/replacement.git";
-    await git.init({ dir });
-    await git.remoteAdd({ dir, name: "origin", url: "https://example.invalid/original.git" });
-
-    const checkout = workspace.database.findCheckout(dir);
-    if (checkout === null) throw new Error("corrupt remote checkout is missing");
-    const persistedValue = (database: SqliteGitDatabase): Record<string, unknown> | undefined =>
-      database.db.one<Record<string, unknown>>(
-        `SELECT typeof(value) AS value_type, hex(CAST(value AS BLOB)) AS value_hex
-           FROM git_config
-          WHERE repo_id = ? AND path = ?`,
-        checkout.repoId,
-        path,
-      );
-    workspace.database.db.run(
-      "UPDATE git_config SET value = CAST(x'f09080' AS TEXT) WHERE repo_id = ? AND path = ?",
-      checkout.repoId,
-      path,
-    );
-    const corrupt = { value_type: "text", value_hex: "F09080" };
-    expect(persistedValue(workspace.database)).toEqual(corrupt);
-
-    await expect(git.remoteSetUrl({ dir, name: "origin", url: replacement })).rejects.toMatchObject(
-      { code: "ECORRUPT" },
-    );
-    expect(persistedValue(workspace.database)).toEqual(corrupt);
-
-    const coldDatabase = new SqliteGitDatabase(new TestDatabase(workspace.storage));
-    const coldGit = bindNativeGitDatabase(workspace, coldDatabase);
-    expect(persistedValue(coldDatabase)).toEqual(corrupt);
-    await expect(coldGit.remoteGetUrl({ dir, name: "origin" })).rejects.toMatchObject({
-      code: "ECORRUPT",
-    });
-  });
-
   it("rolls remote config back after coded SQLite value failures", async () => {
     const workspace = makeTestWorkspace();
     const faultStorage = new CodedTooBigStorage(workspace.storage);

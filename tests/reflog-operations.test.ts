@@ -126,18 +126,16 @@ describe("operation reflog metadata", () => {
     });
   });
 
-  it("fails closed on corrupt stored config", () => {
+  it("rejects malformed stored config writes", () => {
     const workspace = repository();
     workspace.repo.store.configSet("user.name", "Valid");
-    workspace.repo.store.db.run(
-      "UPDATE git_config SET value = x'00' WHERE repo_id = ? AND path = 'user.name'",
-      workspace.repo.store.repoId,
-    );
-
-    expect(
-      () => operationRefLogMetadata(workspace.context, workspace.repo, "checkout"),
-      "corrupt SQL identity must not be treated as optional absence",
-    ).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(() =>
+      workspace.repo.store.db.run(
+        "UPDATE git_config SET value = x'00' WHERE repo_id = ? AND path = 'user.name'",
+        workspace.repo.store.repoId,
+      ),
+    ).toThrow(/CHECK/);
+    expect(workspace.repo.store.configGet("user.name")).toBe("Valid");
   });
 });
 

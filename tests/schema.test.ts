@@ -676,6 +676,55 @@ describe("git schema", () => {
     );
   });
 
+  it("rejects malformed ref, shallow, config, and index rows at write time", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+    const oid = "1".repeat(40);
+    db.run(
+      "INSERT INTO git_refs (repo_id, name, target) VALUES (?, 'refs/heads/main', ?)",
+      checkout.repoId,
+      oid,
+    );
+    db.run("INSERT INTO git_shallow (repo_id, oid) VALUES (?, ?)", checkout.repoId, oid);
+    db.run(
+      "INSERT INTO git_config (repo_id, path, seq, value) VALUES (?, 'user.email', 0, 'a@b')",
+      checkout.repoId,
+    );
+    db.run(
+      `INSERT INTO git_index (checkout_id, path, stage, mode, oid, size, mtime, ino, rev)
+       VALUES (?, 'file', 0, 33188, ?, 1, 2, 3, 4)`,
+      checkout.id,
+      oid,
+    );
+
+    const invalidUpdates = [
+      "UPDATE git_refs SET name = ''",
+      "UPDATE git_refs SET name = zeroblob(1)",
+      "UPDATE git_refs SET target = 'broken'",
+      "UPDATE git_refs SET target = 'ref: HEAD'",
+      "UPDATE git_refs SET target = zeroblob(40)",
+      "UPDATE git_shallow SET oid = 'broken'",
+      "UPDATE git_shallow SET oid = zeroblob(40)",
+      "UPDATE git_config SET seq = -1",
+      "UPDATE git_config SET seq = 0.5",
+      "UPDATE git_config SET value = zeroblob(1)",
+      "UPDATE git_index SET stage = 4",
+      "UPDATE git_index SET stage = 0.5",
+      "UPDATE git_index SET mode = 0",
+      "UPDATE git_index SET oid = 'broken'",
+      "UPDATE git_index SET oid = zeroblob(40)",
+      "UPDATE git_index SET size = -1",
+      "UPDATE git_index SET mtime = -1",
+      "UPDATE git_index SET ino = -1",
+      "UPDATE git_index SET rev = -1",
+      "UPDATE git_index SET size = 0.5",
+    ];
+    for (const update of invalidUpdates) {
+      expect(() => db.run(update), update).toThrow(/CHECK/);
+    }
+  });
+
   it("bounds the repository checkout-state revision", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);

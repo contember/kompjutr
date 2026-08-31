@@ -11,7 +11,6 @@ import {
   type SqlDatabase,
 } from "../src/sqlite/db.js";
 import {
-  MAX_REFLOG_ROOT_SCAN_BYTES,
   MAX_REFLOG_ROOT_SCAN_ENTRIES,
   type RefLogMetadata,
   SqliteGitDatabase,
@@ -301,10 +300,6 @@ class GuardedDatabase implements SqlDatabase {
   iterateCalls = 0;
   closedIterators = 0;
   forbidAll = false;
-  rootScanRows = 0;
-  rootScanTextBytes: number | null = null;
-  rootScanMaxRowBytes = 0;
-  rootScanHeadBytes = 1;
 
   run(query: string, ...bindings: unknown[]): void {
     this.inner.run(query, ...bindings);
@@ -316,19 +311,6 @@ class GuardedDatabase implements SqlDatabase {
   }
 
   one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
-    if (
-      this.rootScanTextBytes !== null &&
-      query.includes("direct.rows + local.rows AS rows") &&
-      query.includes("AS max_row_bytes")
-    ) {
-      return this.inner.one<Row>(
-        "SELECT ? AS rows, ? AS text_bytes, ? AS max_row_bytes, ? AS head_bytes",
-        this.rootScanRows,
-        this.rootScanTextBytes,
-        this.rootScanMaxRowBytes,
-        this.rootScanHeadBytes,
-      );
-    }
     return this.inner.one<Row>(query, ...bindings);
   }
 
@@ -448,30 +430,20 @@ describe("public reflog listing", () => {
     ]);
   });
 
-  it("orders equal and backward timestamps by ordinal and validates corrupt off-page rows", () => {
+  it("orders equal and backward timestamps by ordinal", () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     const ref = "refs/tags/timestamps";
     seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, ref, 3);
     expect(workspace.repo.reflog(ref, { limit: 1 }).map((entry) => entry.ordinal)).toEqual([3]);
-
-    workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
-    workspace.repo.store.db.run(
-      "UPDATE git_reflog_entries SET reason = zeroblob(1) WHERE repo_id = ? AND ordinal = 1",
-      workspace.repo.store.repoId,
-    );
-    workspace.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() => workspace.repo.reflog(ref, { limit: 1 })).toThrow(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
   });
 
-  it("uses one metadata preflight and one payload read for a complete page", () => {
+  it("uses one statement for a complete page", () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 100);
     workspace.storage.resetCounters();
 
     expect(workspace.repo.reflog("HEAD", { limit: 100 })).toHaveLength(100);
-    expect(workspace.storage.statementCount).toBe(2);
+    expect(workspace.storage.statementCount).toBe(1);
   });
 });
 
@@ -805,56 +777,6 @@ describe("reflog recovery", () => {
 });
 
 describe("active reflog roots", () => {
-  it.each([
-    [
-      "ref name",
-      `UPDATE git_reflog_entries
-          SET ref_name = CAST(x'726566732f746167732ff09080' AS TEXT)
-        WHERE repo_id = ?`,
-    ],
-    [
-      "raw endpoint",
-      `UPDATE git_reflog_entries SET old_raw = CAST(x'f09080' AS TEXT) WHERE repo_id = ?`,
-    ],
-    [
-      "identity",
-      `UPDATE git_reflog_entries
-          SET actor_name = CAST(x'f09080' AS TEXT), actor_email = 'actor@example.test'
-        WHERE repo_id = ?`,
-    ],
-    ["reason", `UPDATE git_reflog_entries SET reason = CAST(x'f09080' AS TEXT) WHERE repo_id = ?`],
-    [
-      "reason type",
-      `UPDATE git_reflog_entries SET reason = CAST('reason' AS BLOB) WHERE repo_id = ?`,
-    ],
-  ])("rejects non-canonical UTF-8 in a persisted reflog %s", (_field, corruption) => {
-    const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
-    seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "refs/tags/source", 1);
-    workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
-    workspace.repo.store.db.run(corruption, workspace.repo.store.repoId);
-    workspace.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");
-
-    expect(() => workspace.repo.activeRefLogOids().next()).toThrow(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-  });
-
-  it("preflights unbounded persisted text against the fixed scan cap", () => {
-    const db = new GuardedDatabase();
-    const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
-    const repository = database.createRepository("/repo", "ref: refs/heads/main");
-    const store = database.openCheckout(repository);
-    db.rootScanRows = 1;
-    db.rootScanTextBytes = MAX_REFLOG_ROOT_SCAN_BYTES;
-    db.rootScanMaxRowBytes = MAX_REFLOG_ROOT_SCAN_BYTES;
-    db.iterateCalls = 0;
-
-    expect(() => store.activeRefLogOids().next()).toThrow(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(db.iterateCalls).toBe(0);
-  });
-
   it("deduplicates active non-null endpoints in SQL and excludes expired roots", () => {
     let now = NOW_MILLISECONDS;
     const workspace = makeRepo("/", { now: () => now });
@@ -872,9 +794,7 @@ describe("active reflog roots", () => {
   it("fails closed on a persisted 1,025th row without cleaning it up", () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 1_025);
-    expect(() => workspace.repo.reflog("HEAD")).toThrow(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
+    expect(() => workspace.repo.reflog("HEAD")).toThrow(expect.objectContaining({ code: "E2BIG" }));
     expect(
       workspace.repo.store.db.scalar<number>(
         "SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?",
@@ -886,7 +806,7 @@ describe("active reflog roots", () => {
     const coldCheckout = coldDatabase.checkoutAt("/");
     if (coldCheckout === null) throw new Error("reopened corrupt reflog checkout is missing");
     expect(() => coldDatabase.openCheckout(coldCheckout).reflog("HEAD")).toThrow(
-      expect.objectContaining({ code: "ECORRUPT" }),
+      expect.objectContaining({ code: "E2BIG" }),
     );
   });
 
@@ -991,80 +911,56 @@ describe("active reflog roots", () => {
     db.closedIterators = 0;
     const over = store.activeRefLogOids();
     expect(() => over.next()).toThrow(expect.objectContaining({ code: "E2BIG" }));
-    expect(db.iterateCalls).toBe(0);
-    expect(db.closedIterators).toBe(0);
+    expect(db.iterateCalls).toBe(1);
+    expect(db.closedIterators).toBe(1);
   });
 
-  it("validates every retained row before yielding a root", () => {
-    const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
-    seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 3);
-    workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
-    workspace.repo.store.db.run(
-      "UPDATE git_checkout_reflog_entries SET old_oid = NULL WHERE repo_id = ? AND ordinal = 1",
-      workspace.repo.store.repoId,
-    );
-    workspace.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");
-
-    const roots = workspace.repo.activeRefLogOids();
-    expect(() => roots.next()).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
-  });
-
-  it("fails closed on persisted cross-owner checkout reflog corruption", () => {
+  it("rejects cross-owner checkout reflog writes", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
     const first = database.createRepository("/first", "ref: refs/heads/main");
     const second = database.createRepository("/second", "ref: refs/heads/main");
-    const secondStore = database.openCheckout(second);
-    db.run(
-      `INSERT INTO git_checkout_reflog_entries
-         (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
-          actor_name, actor_email, timestamp, timezone, reason)
-       VALUES (?, ?, 1, ?, ?, ?, ?, NULL, NULL, ?, 0, 'cross-owner')`,
-      first.id,
-      first.repoId,
-      FIRST,
-      SECOND,
-      FIRST,
-      SECOND,
-      NOW_SECONDS,
-    );
-    db.run("UPDATE git_reflog_state SET next_ordinal = 1 WHERE repo_id = ?", first.repoId);
-    db.run("PRAGMA foreign_keys = OFF");
-    try {
+    expect(() =>
       db.run(
-        "UPDATE git_checkout_reflog_entries SET repo_id = ? WHERE checkout_id = ?",
-        second.repoId,
+        `INSERT INTO git_checkout_reflog_entries
+           (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
+            actor_name, actor_email, timestamp, timezone, reason)
+         VALUES (?, ?, 1, ?, ?, ?, ?, NULL, NULL, ?, 0, 'cross-owner')`,
         first.id,
-      );
-      db.run("UPDATE git_reflog_state SET next_ordinal = 0 WHERE repo_id = ?", first.repoId);
-      db.run("UPDATE git_reflog_state SET next_ordinal = 1 WHERE repo_id = ?", second.repoId);
-    } finally {
-      db.run("PRAGMA foreign_keys = ON");
-    }
-    expect(db.scalar<unknown>("PRAGMA foreign_keys")).toBe(1);
-
-    expect(() => secondStore.activeRefLogOids().next()).toThrow(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
+        second.repoId,
+        FIRST,
+        SECOND,
+        FIRST,
+        SECOND,
+        NOW_SECONDS,
+      ),
+    ).toThrow();
+    expect(db.scalar<number>("SELECT count(*) FROM git_checkout_reflog_entries")).toBe(0);
   });
 
-  it("routes negative and non-integer ordinals through corruption validation", () => {
-    const corruptions: readonly unknown[] = [-1, new Uint8Array([1])];
-    for (const ordinal of corruptions) {
-      const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
-      seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 3);
-      workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
-      workspace.repo.store.db.run(
-        "UPDATE git_checkout_reflog_entries SET ordinal = ? WHERE repo_id = ? AND ordinal = 1",
-        ordinal,
-        workspace.repo.store.repoId,
-      );
-      workspace.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");
-
-      expect(() => workspace.repo.activeRefLogOids().next(), String(ordinal)).toThrow(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
+  it("rejects negative and non-integer reflog ordinals at write time", () => {
+    const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
+    for (const ordinal of [-1, new Uint8Array([1])]) {
+      expect(() =>
+        workspace.repo.store.db.run(
+          `INSERT INTO git_checkout_reflog_entries
+             (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
+              actor_name, actor_email, timestamp, timezone, reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, 'invalid ordinal')`,
+          workspace.repo.checkout.checkoutId,
+          workspace.repo.store.repoId,
+          ordinal,
+          FIRST,
+          SECOND,
+          FIRST,
+          SECOND,
+          NOW_SECONDS,
+        ),
+      ).toThrow();
     }
+    expect(
+      workspace.repo.store.db.scalar<number>("SELECT count(*) FROM git_checkout_reflog_entries"),
+    ).toBe(0);
   });
 
   it("validates allocation state before listing or yielding roots", () => {

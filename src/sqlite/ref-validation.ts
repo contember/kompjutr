@@ -1,11 +1,10 @@
 import { isOid } from "../core/bytes.js";
-import { CorruptError, GitError } from "../core/errors.js";
+import { GitError } from "../core/errors.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../core/ref-name.js";
 
 export type RefValueSource = "input" | "stored";
 
-function invalidRefValue(source: RefValueSource, message: string): never {
-  if (source === "stored") throw new CorruptError(message);
+function invalidRefValue(_source: RefValueSource, message: string): never {
   throw new GitError("EINVAL", message);
 }
 
