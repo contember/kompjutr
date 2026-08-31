@@ -839,12 +839,13 @@ One repository admits at most 16 simultaneous scratch-index names, each at most
 255 UTF-8 bytes. A scratch callback is synchronous and cannot escape its owning
 transaction. `writeTree()` admits at most 10,000 entries in one materialized
 tree object and 4,096 tree objects. Cumulative path and serialized-tree bytes
-are diagnostics; the shared operation owner charges the live directory stack,
-current serialization, and staged objects. `commitTree()` accepts at most two
+are diagnostics; the live directory stack is bounded by the per-tree entry cap,
+and objects flush through fixed batches. `commitTree()` accepts at most two
 ordered parents and eight cumulative revision traversals. Recursive `lsTree()`
-returns at most 10,000 rows and 16 MiB of charged result state. Snapshot replay
-inherits the 1,000-entry, 200,000-source-row, 32 MiB retained plan, and shared
-64 MiB memory bounds of the integration engine.
+returns at most 10,000 rows. Snapshot replay inherits the 1,000-entry and
+200,000-source-row integration caps. Text merges separately cap one input at 8
+MiB, total input at 24 MiB, output at 32 MiB, and algorithm working memory at 64
+MiB. There is no global operation byte ledger.
 
 ## Path and ordering rules
 

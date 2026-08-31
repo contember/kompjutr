@@ -8,7 +8,7 @@ decisions → reference → archive.
 
 - [`reference/`](reference/README.md) — how the system works now.
 - [`ideas/`](ideas/README.md) — proposals, no commitment.
-- [`decisions/`](decisions/README.md) — ADRs (the *why*), immutable.
+- [`decisions/`](decisions/README.md) — living ADRs (the *why*).
 - [`backlog/`](backlog/README.md) — decided work, not yet scheduled.
 - [`sprints/`](sprints/README.md) — active thematic work-plans.
 - [`specs/`](specs/README.md) — accepted pre-build and frozen specs.
@@ -43,7 +43,7 @@ decisions → reference → archive.
 
 ## Key reference
 
-- [`reference/architecture.md`](reference/architecture.md) — current runtime architecture and limits.
+- [`reference/architecture.md`](reference/architecture.md) — domains, shared database kernel, trust model, structural bounds, and concurrency seams.
 - [`reference/benchmark-current.md`](reference/benchmark-current.md) — current native benchmark snapshot.
 - [`reference/concurrency.md`](reference/concurrency.md) — async owners, durable seams, and restart outcomes.
 - [`reference/git-support.md`](reference/git-support.md) — what of Git is supported, command by command.

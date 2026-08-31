@@ -9,74 +9,73 @@ date: 2026-08-30
 
 ## Context
 
-`src/` mixes two kinds of directory at one level: real domains (`fs/`,
-`shell/`) next to implementation slices of the Git domain (`core/`, `sqlite/`,
-`git/`). The 2026-08-30 architecture review measured what the flat layout
-allowed to grow:
-
-- The Git engine and its store are bidirectionally coupled at the value level
-  (`sqlite/store.ts` imports journal codecs from `core/ops/*`), so the
-  documented "core reaches sqlite through `SharedRepoStore`" seam is two
-  concrete classes plus 34 `db.transactionSync` call sites in 13 ops files.
-- Private capabilities cross the seam through WeakMap "owned" friend functions
-  bound by construction order; four different binding policies on one facade
-  produced a confirmed user-visible defect (object writes fail after
-  `worktreeRemove`).
-- Nothing bounded file growth: `store.ts` reached 12,971 lines, `packs.ts`
-  5,583, `sparse-workspace.ts` 3,537.
+The filesystem and Git store use the same Durable Object SQLite database. A
+storage adapter inside either domain would force the other domain to depend on
+it. Git also contains several kinds of code with different dependency needs:
+pure primitives, independent algorithms and wire codecs, persistence, command
+operations, and public surfaces. A flat source layout does not express those
+ownership or dependency boundaries and does not prevent store-to-operation
+cycles or unbounded file growth.
 
 ## Decision
 
-We will organize `src/` by domain, with layered slices inside a domain and
-one-way dependencies from the bottom up.
+We organize `src/` into behavior domains over one shared storage kernel.
 
-- **Domains:** `fs/`, `shell/`, `git/`. Composition stays outside domains:
-  `runtime/` (Workspace), `compat/`, and `memory.ts` (the shared memory
-  kernel, importable by every domain).
-- **Inside `git/`,** bottom-up: `common/` (pure primitives: bytes, sha1, zlib,
-  lru, errors, streams, paths, ref-name grammar, object codecs) → `diff/`
-  (LGPL xdiff port, keeps its LICENSE and SPDX headers), `ignore/`,
-  `protocol/` (wire only) → `store/` (SQLite: adapter, schema, table families,
-  projections, maintenance) → `ops/` (command families, `repository.ts`,
-  `worktree.ts`, `context.ts`) → `client.ts` (the public facade).
-- **Dependency rules:** a slice imports only slices below it. `store/` never
-  imports `ops/` — persisted formats (operation journals, index entries,
-  capability contracts) are defined in `store/` and imported downward by
-  `ops/`. Across domains: `git` and `shell` may depend on `fs`; `fs` depends
-  on neither; `shell` never imports `git`.
-- **The store exposes an explicit internal API** — exported functions and
-  interfaces from `store/` modules that are not re-exported by the package —
-  replacing WeakMap friend dispatch. Repo-scoped operations are owned by the
-  shared store, never rebound to whichever checkout was constructed last.
-- **Every source file stays at or under 2,000 lines.**
-- **The rules are suite witnesses, not conventions:** a static import-graph
-  test enforces the layer order and a file-ceiling test enforces the line
-  limit. Public package exports (`kompjutr`, `/fs`, `/git`, `/shell`,
-  `/compat/computer`) are unchanged by the move.
+- `db/` is below every domain. It owns the Durable Object SQLite adapter,
+  structural SQL interfaces, SQLite error normalization, and shared routing
+  limits. `GitError` is defined in `db/db.ts` because the adapter normalizes
+  SQLite failures to stable Git-facing codes; `git/common/errors.ts` re-exports
+  it and defines Git-specific subclasses.
+- `fs/`, `shell/`, and `git/` are domains. `runtime/` composes them and
+  `compat/` contains the optional external adapter.
+- Git uses bottom-up slices: `common` → `diff | ignore | protocol` → `store` →
+  `ops` → surface. The surface is `client.ts`, `cli/`, entrypoints, and Git-side
+  adapters.
+- `store/` owns persisted formats and explicit internal capabilities. It never
+  imports `ops/`. Repository-scoped operations stay on the shared store;
+  checkout-scoped operations stay on the checkout composition root.
+- `diff/` remains an LGPL-2.1-or-later boundary with its own license and SPDX
+  headers.
+- Every TypeScript source file stays at or below 2,000 lines.
+
+`tests/import-graph.test.ts` enforces these rules exactly:
+
+1. `src/db` may not import any other recognized source domain.
+2. `src/fs` may import only `src/fs` and `src/db`.
+3. `src/shell` may import only `src/shell`, `src/fs`, and `src/db`.
+4. Git slices may import their own slice or a lower-ranked Git slice. `common`
+   is rank 0; `diff`, `ignore`, and `protocol` are independent rank-1 peers;
+   `store` is rank 2; `ops` is rank 3; all other files below `git/` are the
+   rank-4 surface.
+5. `src/git/store` may not import `src/git/ops`.
+6. Only `src/compat` may import `@cloudflare/computer`.
+
+The import witness covers relative TypeScript imports, exports, dynamic imports,
+and import types. A separate source-file witness enforces the line ceiling.
+`tests/public-exports.test.ts` protects the published entrypoint surface.
 
 ## Consequences
 
-- The tree explains itself: three domains, and every further cut lives inside
-  its domain. "What are ops, what is the store, what depends on what" is
-  answered by the directory listing.
-- The move itself is mechanical (`git mv` + import rewrites) but touches every
-  Git-side import; it must land as its own commit with the public-export
-  witness green.
-- Resolving the store↔ops cycle relocates journal codecs and shared contracts
-  into `store/`; the WeakMap dispatch removal is a behavior change covered by
-  a regression test.
-- New files start under the ceiling or the suite fails; `packs.ts`,
-  `sparse-workspace.ts`, and `staging.ts` must be split.
-- `git/diff/` remains a license boundary: LGPL-2.1-or-later code never moves
-  into an unmarked directory.
+- The directory tree states ownership: shared storage kernel, three domains,
+  and explicit layers inside Git.
+- Filesystem code can share the database adapter and routing policy without
+  depending on Git.
+- Persisted journal codecs and store contracts live below operations, so the
+  store-to-ops value cycle cannot return.
+- Internal table-family APIs are explicit without becoming package exports.
+- The package keeps one release unit while tests provide package-like dependency
+  boundaries.
+- New source files that violate dependency direction or the 2,000-line ceiling
+  fail the suite.
 
 ## Alternatives considered
 
-- **Keep the flat layout.** Rejected: it already failed to communicate the
-  structure, and the measured coupling grew under it.
-- **Split into workspace packages.** Rejected: publishing and tooling overhead
-  without a consumer that needs separately versioned packages; directories
-  plus witness tests give the same boundaries.
-- **A softer file-size guideline.** Rejected: a guideline already existed
-  implicitly and produced a 12,971-line file; only an enforced ceiling changes
-  behavior.
+- **Put the database adapter in Git.** Rejected: the filesystem uses the same
+  adapter and must not depend on Git.
+- **Duplicate adapters per domain.** Rejected: transaction behavior, row
+  normalization, SQLite error handling, and routing limits are shared policy.
+- **Split domains into workspace packages.** Rejected: no consumer needs
+  separately versioned packages; directories plus witnesses enforce the needed
+  boundaries without publishing overhead.
+- **Use guidelines without tests.** Rejected: dependency cycles and oversized
+  files are easy to reintroduce when the rule is not executable.

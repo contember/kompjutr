@@ -1,72 +1,72 @@
-# src/core — the Git engine
+# src/git — the Git domain
 
-> **Direction change (2026-08-30).** ADR-0018 replaced the untrusted-row
-> doctrine and ADR-0017 (rewritten) removes the memory-reservation ledger; the
-> layout moves into `src/git/` per ADR-0019. Where the rules below conflict
-> with those ADRs or root `CLAUDE.md`, the ADRs win.
+Git operations and Smart HTTP over a `Repository` and a `Worktree`. Nothing in
+this domain knows about Durable Objects or `@cloudflare/computer`; HTTP stays
+behind `GitHttpClient`.
 
-Git operations and Smart HTTP over a `Repository` and a `Worktree`. Nothing here
-knows about Durable Objects or `@cloudflare/computer`; HTTP stays behind `GitHttpClient`.
+## Layers
 
-## Layout
-
-```
-ops/         one file per command family; each takes (repo, worktree, options)
-repository.ts  objects and refs reachable from the store
-worktree.ts    the working-tree interface ops write through
-objects.ts     parse/serialise blobs, trees, commits, tags
-pack/          delta resolution and pack writing
-protocol/      Smart HTTP: pkt-line, negotiation, transport
-diff/          LGPL-2.1-or-later port of git's xdiff — see below
-ignore/        gitignore discovery and byte-oriented matchers
-streams.ts     comparePaths, joinSorted, joinSorted3 — the merge-join primitives
+```text
+common/                      bytes, objects, errors, rows, paths, streams, hashes
+diff/ | ignore/ | protocol/  independent algorithm and wire slices
+store/                       SQLite tables, packs, projections, maintenance
+ops/                         command families, Repository, Worktree, context
+client.ts | cli/             public client and synchronous argv surface
 ```
 
-`src/git/client.ts` alone assembles ops into the public API. Ops throw
-`UnsupportedOperationError` instead of falling back.
+Dependencies point down this list. `diff`, `ignore`, and `protocol` may use
+`common` but not one another. `store` never imports `ops`. `client.ts` assembles
+ops into the public API; ops throw `UnsupportedOperationError` instead of
+falling back.
 
-## Cost model — this is the point of the module
+`common/rows.ts` is the shared decoder kit. Stored-row shape failures become
+`CorruptError`; caller-option failures become `GitError`. Reads decode only to
+refine driver values: they do not re-authenticate stored data or add SQL
+`typeof` witnesses. Write validation and schema `CHECK`s establish the trusted
+store premise. Out-of-band database mutation is undefined behavior (ADR-0018).
 
-A hot op merges **sorted streams**; it never issues a read per path.
+`common/paths.ts` is the single home for Git-side path construction,
+normalization, ancestry, prefix checks, and `comparePaths`. Do not add local
+path kits in ops or store modules.
+
+## Cost model
+
+A hot op merges sorted streams; it never issues a read per path.
 
 - `status` merges the HEAD tree stream, one bounded index snapshot, and
   filesystem metadata through `joinSorted3`.
 - `diff` batches unresolved working-tree hashes and blob reads.
-- three-way integration joins three tree streams, then batch-reads only divergent regular files.
+- Three-way integration joins three tree streams, then batch-reads only
+  divergent regular files.
 - `checkout` batches removals, object reads, writes, and index mutations.
-- `add`, `reset`, `commit` write through bounded index and object sinks.
+- `add`, `reset`, and `commit` write through bounded index and object sinks.
 
-A file is hashed only when the stat data cached in `git_index` no longer holds,
-so a repeated `status` over an untouched tree reads no content at all. Adding a
-per-path `readFile` or a scalar SQL lookup inside a loop is the regression this
-module exists to prevent.
+A file is hashed only when its cached `git_index` stat data no longer holds, so
+repeated status over an untouched tree reads no file content. A scalar SQL or
+filesystem read inside a path loop is a regression.
 
 SQL cost is measured in `bench/`. At most 1,000 statements is a performance
-target, not admission: a miss is optimization evidence and never a reason to
-project, reserve, or refuse query work. Runtime failures protect only real
-memory, format, platform, corruption, or structural limits.
+target, not admission. Memory is bounded structurally by streams, fixed batches,
+caches, queues, and caps tied to real failures; there is no runtime byte ledger.
 
 ## Rules
 
-- **Tree traversal reads no object BLOBs.** `ops/tree-stream.ts` walks the parsed
-  edge index (`git_tree_*`) through primary-key lookups in one recursive cursor.
-- **Loose sources shadow packed sources, and rows stay source-qualified.** A
-  corrupt loose duplicate must not borrow a valid packed projection, and a packed
-  delta base must not resolve through an unrelated loose cache entry.
-- **Pack ingest is provisional.** Only a complete, trailer-validated pack is
+- Tree traversal reads no object BLOBs. `ops/tree-stream.ts` walks parsed
+  `git_tree_*` edges through the store cursor.
+- Loose sources shadow packed sources, and projection rows stay
+  source-qualified.
+- Pack ingest is provisional. Only a complete, trailer-validated pack is
   readable; interrupted or rejected ingest never moves a ref.
-- **Push preflights both pack passes before POST.** Reopen a pack only for a 401
-  auth retry; never replay a network-failed POST. Move tracking refs only after
-  complete `report-status`; uncertain results leave them untouched.
-- **A new commit must produce a valid cache projection atomically with object
-  visibility.** Reject malformed, oversized, or unsafe-numeric commits instead of
-  storing an object the cache cannot represent.
-- Give Git paths and traversals no component byte ceiling. Validate grammar,
-  and surface only real memory, format, platform, corruption, or structural
-  failures.
+- Push preflights both pack passes before POST. Reopen only for a 401 retry;
+  never replay a network-failed POST. Move tracking refs only after complete
+  `report-status`.
+- A new commit must publish a valid cache projection atomically with object
+  visibility.
+- Do not add an arbitrary Git-path component ceiling. A path cap survives only
+  when it names a real format, platform, memory, or structural failure.
 
 ## diff/ is not MIT
 
-`src/core/diff/` is LGPL-2.1-or-later, ported from git's xdiff. Keep the SPDX
-headers, keep `src/core/diff/LICENSE`, and do not move this code into an
-MIT-licensed directory.
+`src/git/diff/` is LGPL-2.1-or-later, ported from Git's xdiff. Keep the SPDX
+headers and `src/git/diff/LICENSE`; never move this code into an MIT-only
+directory.

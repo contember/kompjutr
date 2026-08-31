@@ -11,11 +11,11 @@ date: 2026-08-29
 
 The runtime originally adopted two invented currencies to stay clear of
 platform limits: a 1,000-SQL-statement operation ceiling and a hand-maintained
-retained-byte ledger (`MemoryCoordinator` reservations, scope trees, ownership
-checks, `TransportOperationBudget`). Both inverted their intent. Statement
-projections refused calls the platform would have served — a valid clone
-already uses a median of 1,586 statements. The byte ledger modeled JavaScript
-object sizes with hand-computed constants, threaded reservation parameters
+retained-byte ledger with scoped reservations, ownership checks, and a separate
+transport budget. Both inverted their intent. Statement projections refused
+calls the platform would have served; representative valid operations exceed
+the performance target and still complete. The byte ledger modeled JavaScript
+object sizes with hand-computed constants, threaded accounting parameters
 through most signatures, and repeatedly failed its own reviews
 (allocation-before-admission gaps), while the actual protection against
 Durable Object OOM came from streaming discipline and fixed caps, not from the

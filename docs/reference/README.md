@@ -10,7 +10,7 @@ behaviour.
 
 <!-- index the reference docs here, one line each -->
 
-- [`architecture.md`](architecture.md) — runtime boundaries, storage model, invariants, and limits.
+- [`architecture.md`](architecture.md) — domains, shared database kernel, trusted storage, structural bounds, and concurrency seams.
 - [`benchmark-current.md`](benchmark-current.md) — current native Next.js workflow snapshot.
 - [`concurrency.md`](concurrency.md) — asynchronous owners, durable seams, restart outcomes, and invariants.
 - [`git-support.md`](git-support.md) — per-command checklist of the supported Git surface and its options.

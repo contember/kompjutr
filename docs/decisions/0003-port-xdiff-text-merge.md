@@ -19,7 +19,7 @@ Git's complete `merge-ort` strategy is not a suitable unit to port. It is couple
 to Git's object database, index, attributes, rename detection, refs, and working
 tree. The low-level `xdiff/xmerge.c` component is a separable LibXDiff algorithm
 under LGPL-2.1-or-later. The repository already isolates a TypeScript port of
-Git's xdiff line differ under the same licence in `src/core/diff/`.
+Git's xdiff line differ under the same licence in `src/git/diff/`.
 
 ## Decision
 

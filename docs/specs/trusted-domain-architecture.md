@@ -17,7 +17,7 @@ src/
     client.ts      public facade — assembles ops into the kompjutr/git surface
     common/        pure primitives: bytes, sha1, zlib, lru, errors, streams
                    (comparePaths, joinSorted*), paths, ref-name, object codecs,
-                   retained; the shared guard/decoder kit
+                   and the shared guard/decoder kit
     diff/          LGPL-2.1-or-later xdiff port — keeps LICENSE + SPDX headers
     ignore/        gitignore discovery and byte-oriented matchers
     protocol/      Smart HTTP wire: pkt-line, stream, transport, remote,
@@ -37,23 +37,23 @@ common  →  diff | ignore | protocol  →  store  →  ops  →  client.ts
 ```
 
 Cross-domain: `git` and `shell` may depend on `fs`; `fs` on neither; `shell`
-never imports `git`. `src/memory.ts` (the dynamic accounting ledger) is
-deleted per ADR-0017; structural caps live beside the seams they bound.
+never imports `git`. The dynamic accounting module is deleted per ADR-0017;
+structural caps live beside the seams they bound.
 
 ## Mapping (old → new)
 
 | Old | New |
 |---|---|
-| `src/core/{bytes,sha1,zlib,lru,errors,streams,paths,ref-name,objects,retained}.ts` | `src/git/common/` |
-| `src/core/diff/` | `src/git/diff/` (license boundary intact) |
-| `src/core/ignore/` | `src/git/ignore/` |
-| `src/core/protocol/` | `src/git/protocol/` |
-| `src/core/pack/` | `src/git/store/pack/` (pack parsing serves the store) |
-| `src/sqlite/*` (adapter, schema, families, projections, maintenance) | `src/git/store/` |
-| `src/core/ops/`, `src/core/{repository,worktree,context,sparse-workspace}.ts` | `src/git/ops/` |
+| Legacy Git primitive modules | `src/git/common/` |
+| Legacy Git diff slice | `src/git/diff/` (license boundary intact) |
+| Legacy Git ignore slice | `src/git/ignore/` |
+| Legacy Git protocol slice | `src/git/protocol/` |
+| Legacy Git pack parser | `src/git/store/pack/` (pack parsing serves the store) |
+| Legacy Git SQLite slice (adapter, schema, families, projections, maintenance) | `src/git/store/` |
+| Legacy Git operation, repository, worktree, context, and sparse-workspace modules | `src/git/ops/` |
 | `src/git/client.ts` | `src/git/client.ts` (unchanged path, new siblings) |
-| journal codecs in `src/core/ops/{merge-state,operation-state}.ts` | persisted-format half moves to `src/git/store/operations.ts`; op logic stays in `ops/` |
-| `IndexEntry`, capability contracts (`core/sparse-workspace.ts` types) | `src/git/store/contracts.ts` |
+| Journal codecs in the legacy merge and operation state modules | persisted-format half moves to `src/git/store/operations.ts`; op logic stays in `ops/` |
+| `IndexEntry` and legacy sparse-workspace capability contracts | `src/git/store/contracts.ts` |
 
 Public package exports (`kompjutr`, `kompjutr/fs`, `kompjutr/git`,
 `kompjutr/shell`, `kompjutr/compat/computer`) are byte-stable across the whole
@@ -70,7 +70,7 @@ restructure; `tests/public-exports.test.ts` is the witness.
 | Traversal cycle/termination guards; CAS, revisions, epochs, leases, provisional states | keep — algorithm and concurrency correctness |
 | Structural caps: batch/queue/cache sizes, single-value limits naming a real failure, `E2BIG` on caller-unbounded enumerations | keep — the memory model (ADR-0017) |
 | Structural delta-closure check on pack deletion | keep |
-| Dynamic memory accounting: `MemoryCoordinator`, `MemoryReservation` scopes/transfer/ownership checks, `TransportOperationBudget`, hand-computed JS-size constants | delete (ADR-0017) |
+| Dynamic memory accounting: coordinator and reservation scopes, transfer/ownership checks, transport budget, hand-computed JS-size constants | delete (ADR-0017) |
 | SQL `typeof(...)` storage-class witnesses on reads | delete |
 | `CAST(... AS BLOB)` canonical text reads + canonical re-encode | delete |
 | Two-phase metadata → payload read preflights | delete |
@@ -154,3 +154,11 @@ The rules are tests, not conventions:
 - `bench/` paths and docs references update with the move; benchmarks are
   informative during the restructure (clone is expected to improve when the
   publication re-audit goes).
+
+## Amendments at close
+
+The final layout adds `src/db/` below the domains for the shared SQLite adapter,
+error normalization, and routing limits. `GitError` is defined in `db/db.ts`
+because SQLite error normalization lives in that kernel, then re-exported by
+`git/common/errors.ts`. [ADR-0019](../decisions/0019-organize-source-by-domain-with-bottom-up-layers.md)
+is the living record for the final tree and enforced dependency rules.

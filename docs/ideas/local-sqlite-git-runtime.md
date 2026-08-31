@@ -26,9 +26,9 @@ replacement for the `git` executable.
 
 Most of the storage separation already exists:
 
-- Git core consumes the structural [`Worktree`](../../src/core/worktree.ts)
-  interface and has no Durable Object dependency.
-- [`SqliteGitDatabase`](../../src/sqlite/store.ts) consumes `SqlDatabase`, not
+- Git operations consume the structural [`Worktree`](../../src/git/ops/worktree.ts)
+  interface and have no Durable Object dependency.
+- [`SqliteGitDatabase`](../../src/git/store/database.ts) consumes `SqlDatabase`, not
   Durable Object storage directly.
 - The test stack already runs the database through `node:sqlite` in
   [`tests/helpers/storage.ts`](../../tests/helpers/storage.ts).

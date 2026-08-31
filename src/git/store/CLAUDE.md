@@ -1,55 +1,73 @@
-# src/sqlite — the store
+# src/git/store — the Git SQLite store
 
-> **Direction change (2026-08-30).** ADR-0018 replaced the untrusted-row
-> doctrine: validate at the boundary, trust stored rows; ADR-0017 (rewritten)
-> removed the memory-reservation ledger. The ADRs and root `CLAUDE.md` define
-> the current rules.
+The Git-owned schema and table families. The Durable Object adapter and shared
+routing limits live below the domains in `src/db/`; the filesystem owns its own
+`fs_*` schema.
 
-Every table the Git side owns, plus the adapter under all of them. `src/fs/`
-keeps its own schema and shares only `Database`. `src/core/` reaches this layer
-through `SharedRepoStore`; the two direct `git_refs` existence checks in
-`core/repository.ts` and `core/ops/refs.ts` are the exception, not a pattern.
+## Module map
 
+```text
+index.ts             internal compatibility facade; consumers use this seam
+contracts.ts         shared store contracts, tokens, and row value types
+database.ts          schema ownership and repository/checkout registry
+shared.ts            repository-scoped facade and scratch transactions
+checkout.ts          composition root for one checkout-bound store
+objects.ts           loose objects and object batching
+config.ts            repository configuration
+shallow.ts           shallow boundaries
+blob-ids.ts          disposable filesystem-content to Git-OID cache
+reflog.ts            shared ref and checkout HEAD histories
+refs.ts              ref mutation, validation, and CAS publication
+fetch-publication.ts discovery snapshots and atomic fetch publication
+index-table.ts       checkout and scratch indexes
+operation-journal.ts restartable merge/replay/rebase state
+lifecycle.ts         identities, checkout lifecycle, provisional clones
+json-pages.ts        shared bounded JSON-page helpers
+pack/                pack read, ingest, publication, deletion, delta workspace
+sparse/              sparse snapshots, selection, index rows, tree resolution
+maintenance/         roots, reachability, repack, sweep, durable run control
+tree-index.ts        parsed tree projections
+tree-walk.ts         streaming tree and tree-diff traversals
+commits.ts           commit projections and bounded graph reads
+schema.ts            editable schema version 1; no migrations
+../../db/            Database adapter, GitError base, routing limits
 ```
-db.ts             Database — the DurableObjectStorageLike adapter, cursor refinement
-schema.ts         every CREATE TABLE, the version, and the shared row limits
-store.ts          compatibility facade; consumers import only this public seam
-store/            contracts, database routing, shared repository, checkout implementation
-packs.ts          pack-native object storage (derived from dgit — keep the header)
-tree-index.ts     parsed tree edges · tree-walk.ts walks them · commits.ts caches commits
-index-tracker.ts  index dirty state · sparse-workspace.ts · pack-ingest-index.ts
-maintenance/      one durable GC run: roots → reachability → repack → sweep
-```
-
-`docs/reference/architecture.md` carries the full table ownership map and the
-maintenance lifecycle. Read it before changing either.
 
 ## Row ownership
 
-`repo_id` marks a shared row; `checkout_id` marks a row private to one working
-tree. Checkout views of one store share objects, packs, refs, config, shallow,
-fetch and cache state, and keep worktrees, indexes, tracker state and operation
-journals apart. Two rows do not follow the rule: `git_tree_entries` is owned
-through its source surrogate, and `git_scratch_index*` rows are
-transaction-local — they never survive the callback, so they are neither
-checkout state nor a maintenance root.
+`repo_id` owns shared objects, packs, refs, ordinary config, shallow state,
+fetch state, direct-ref reflogs, projections, blob IDs, and maintenance.
+`checkout_id` owns the root, raw `HEAD`, index and tracker state, operation
+journals, and `HEAD` reflog. `git_tree_entries` is owned through its source
+surrogate. `git_scratch_index*` rows are transaction-local and never become
+maintenance roots. This boundary is ADR-0009.
 
-## Rules
+## Trust and cost rules
 
-- **A bad stored row is `CorruptError`; bad caller input is `GitError`.**
-  `ref-validation.ts` carries the distinction as `RefValueSource`. Collapsing
-  the two turns a caller's typo into a corruption report, and hides real
-  corruption behind an argument error.
-- **`SCHEMA_VERSION` is 1 and there are no migrations.** Edit `schema.ts` in
-  place; do not add a migration step.
-- **A pack is stored verbatim, still compressed, in fixed 64 KiB chunk rows.** A
-  read pulls only the chunks the object spans, so nothing inflates a whole
-  repository. A new read path that widens that span is the regression to avoid.
-- **Bound allocation with fixed batch, row, byte, and traversal-state caps.**
-  Keep refusal paths tied to the real payload or recursive state they protect.
-- **One `maintenance()` call advances one bounded durable action.** A
-  root-changing transaction bumps the repository epoch; drift restarts at the
-  root seam instead of continuing on a stale mark. Sweep eligibility is fixed at
-  14 days (`GC_GRACE_MS`) after classification.
-- `packs.ts` is derived from dgit (MIT), as are seven files in `src/core/`. Keep
-  the attribution header when you edit it.
+- Validate caller input before storage and untrusted network bytes at ingest.
+  Schema `CHECK`s and write-path validation establish the stored-row premise.
+- Reads trust rows. Decode driver values through `common/rows.ts`; a shape
+  mismatch is `CorruptError`. Do not add SQL `typeof` witnesses, two-phase
+  metadata preflights, or read-time re-authentication. Out-of-band mutation is
+  undefined behavior (ADR-0018).
+- Caller mistakes are `GitError`, never corruption. Keep that distinction when
+  moving validation between a family and its facade.
+- Traversals use `db.iterate()`. `db.all()` is only for bounded result sets.
+- Bound allocation with fixed page, batch, cache, queue, and structural caps.
+  Do not introduce projected statement admission or a byte-accounting ledger.
+
+## Packs and maintenance
+
+Received packs stay compressed in 1 MiB `git_pack_data` rows. The delta
+workspace separately uses operation-local 64 KiB chunks. Publication validates
+the trailer and compares stored membership with digests recorded during parse;
+it does not re-read and re-inflate the pack. Only complete packs are readable.
+
+Ordinary ingest uses a renewable five-minute repository lease and monotonic pack
+IDs. Maintenance has exact batch ownership instead. One `maintenance()` call
+advances one bounded durable action. Root mutations bump the repository epoch;
+epoch drift restarts discovery before destructive work. Sweep eligibility is 14
+days after stable classification.
+
+Pack code derives from dgit (MIT). Keep the attribution headers when splitting
+or moving it. `src/git/diff/` is a separate LGPL boundary.

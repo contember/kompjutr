@@ -82,6 +82,10 @@ contract as `git fsck` and `PRAGMA integrity_check`.
 - A kompjutr write-path bug now surfaces later — at use, or in the opt-in
   audit — instead of at the next read. Write-time `CHECK`s, the parity
   harnesses, and the suite are the compensating controls.
+- `git_refs`, `git_shallow`, `git_config`, and `git_index` carry `CHECK`
+  constraints for their stored grammar, types, and ranges. These constraints
+  anchor the write-time premise for the row families most affected by the
+  trusted-read change.
 - An application that corrupts its own rows gets undefined results, not
   `CorruptError`. This is the documented contract.
 - Root invariant 4 is rewritten; module trust-rule docs follow in the

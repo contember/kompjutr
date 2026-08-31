@@ -84,16 +84,14 @@ already made the advertised tip complete.
 duplicate OIDs. `git_pack_objects` remains the single canonical read location
 for each OID. Publication compares the exact ordered rows with the digest made
 while parsing and requires every entry's canonical owner to be complete.
-Deleting that owner bypasses warm caches, validates the selected pack bytes,
-promotes one complete fallback entry atomically, and hashes the promoted object
-before the old pack disappears. The closure check covers canonical and
-non-canonical physical delta entries and hashes any surviving loose base.
-Oversized full entries are authenticated through bounded uncached inflate
-windows instead of the bulk compressed-byte buffer. Page and read sizes shape
-the work, but accumulated pages or projected uncached reads do not reject it.
-Deletion rejects when any surviving delta chain would lose its base or when a
-real pack-cardinality, compressed-size, delta, corruption, or retained-memory
-bound is exhausted.
+Deleting that owner promotes one complete fallback entry atomically before the
+old rows disappear. The structural closure check covers canonical and
+non-canonical physical delta entries and requires every surviving dependency to
+retain a base. Publication trusts the parse-time membership digests; deletion
+does not re-hash stored objects. Page and read sizes shape the work, but
+accumulated pages or projected reads do not reject it. Deletion rejects when a
+surviving delta chain would lose its base or a real pack-cardinality, format,
+delta, corruption, or structural bound is exhausted.
 
 ## Current compatibility matrix
 
@@ -131,9 +129,9 @@ reason to invalidate an otherwise correct durable outcome.
 
 | Durable seam | Direct evidence | Cold and cost evidence |
 |---|---|---|
-| Repository route and readiness | [`concurrency-clone.test.ts`](../../tests/concurrency-clone.test.ts): “fences the real clone flow at every durable publication checkpoint”, “keeps reservation, complete pack, refs, and worktree private until the ready CAS”, and exact-expiry/collision/identity witnesses. | The real-flow witness replaces the evicted owner with a fresh `Workspace` and asserts the pack memory high-water ceiling; clone statement cost is measured separately. |
-| Ordinary pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): same-store overlap, separate-store active rejection, failed-owner retry, exact-expiry takeover, and duplicate/canonical ownership witnesses. | Reopened stores prove readable winner and fallback objects while focused tests retain the shared operation-memory boundary; pack statement cost is measured separately. |
-| Maintenance pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): pending dependency rejection; [`maintenance-repack.test.ts`](../../tests/maintenance-repack.test.ts): ordinary-winner finalization and selected/pending/published settlement; [`maintenance-qualification.test.ts`](../../tests/maintenance-qualification.test.ts): pending fetch preservation. | Cold finalization tests authenticate every retained object and counter transition; the maintenance benchmark reports statement-target status and retained-memory evidence. |
+| Repository route and readiness | [`concurrency-clone.test.ts`](../../tests/concurrency-clone.test.ts): “fences the real clone flow at every durable publication checkpoint”, “keeps reservation, complete pack, refs, and worktree private until the ready CAS”, and exact-expiry/collision/identity witnesses. | The real-flow witness replaces the evicted owner with a fresh `Workspace`; clone statement and composed-memory cost are measured separately. |
+| Ordinary pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): same-store overlap, separate-store active rejection, failed-owner retry, exact-expiry takeover, and duplicate/canonical ownership witnesses. | Reopened stores prove readable winner and fallback objects; pack statement and composed-memory cost are measured separately. |
+| Maintenance pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): pending dependency rejection; [`maintenance-repack.test.ts`](../../tests/maintenance-repack.test.ts): ordinary-winner finalization and selected/pending/published settlement; [`maintenance-qualification.test.ts`](../../tests/maintenance-qualification.test.ts): pending fetch preservation. | Cold finalization tests authenticate every retained object and counter transition; the maintenance benchmark reports statement-target status and process-memory evidence. |
 | Tracking refs, tags, prune, and shallow boundaries | [`concurrency-fetch.test.ts`](../../tests/concurrency-fetch.test.ts): both same-remote orders, prune, local tracking ABA, response loss, disjoint namespaces, selected tags, and both shallow orders. | Every terminal schedule reopens and runs the shared repository oracle. [`store.test.ts`](../../tests/store.test.ts) exercises 9,329 tracking refs and the real memory/input bounds; `fetch.publication` owns representative query cost. |
 | Remote push CAS and local tracking | [`concurrency-network.test.ts`](../../tests/concurrency-network.test.ts): both push/fetch orders, same-OID fetch ABA, a buffered refresh losing to a post-snapshot fetch, a no-op push fencing an older fetch, both same-ref push orders, authoritative refreshed/no-op commit reads, refresh failure, and preservation of HEAD/index/journal/maintenance state; [`push.test.ts`](../../tests/push.test.ts): rejection, response loss, delete, no-op, and explicit URL. | Every concurrency schedule cold-reopens through the shared oracle; [`store.test.ts`](../../tests/store.test.ts) directly proves exact revision creation, prefix-scoped fetch observations, idempotent fencing, historical narrow/broad disjointness, maximal namespaces, and token ownership. `transport.push` measures configured and no-op push query cost without reserving a statement currency. |
 | Pull snapshot | [`concurrency-network.test.ts`](../../tests/concurrency-network.test.ts): overlapping staged/dirty rejection and unrelated negative control; [`pull.test.ts`](../../tests/pull.test.ts): HEAD, branch OID, upstream, and journal drift. | Concurrency schedules retain the fetch then cold-reopen through the shared oracle. The fetched pack and synchronous integration use the pack and checkout publication bounds. |
@@ -142,12 +140,12 @@ reason to invalidate an otherwise correct durable outcome.
 | Concurrent maintenance | [`concurrency-maintenance.test.ts`](../../tests/concurrency-maintenance.test.ts): selected owner to pending barrier, same-runtime `EBUSY`, once-only finalization, and cold selected/pending/published settlement. | Owner prefix/tail and rival calls are measured separately; every settled state is read through a fresh `Workspace`. |
 
 The implementation seams are
-[`network.ts`](../../src/core/ops/network.ts),
-[`push.ts`](../../src/core/ops/push.ts),
-[`pull.ts`](../../src/core/ops/pull.ts),
-[`maintenance.ts`](../../src/core/ops/maintenance.ts), and
-[`packs.ts`](../../src/sqlite/packs.ts), with durable ownership in
-[`store.ts`](../../src/sqlite/store.ts).
+[`network.ts`](../../src/git/ops/network.ts),
+[`push.ts`](../../src/git/ops/push.ts),
+[`pull.ts`](../../src/git/ops/pull.ts),
+[`maintenance.ts`](../../src/git/ops/maintenance.ts), and
+[`packs.ts`](../../src/git/store/packs.ts), with durable ownership in the
+[`store/`](../../src/git/store/) families.
 
 ## Deterministic test model
 
@@ -196,7 +194,8 @@ after a cold reopen:
   deletion of a newer root.
 - Statement cost is observable in benchmarks against the at-most-1,000 target;
   a miss does not change the durable outcome or authorize a runtime refusal.
-- Each public call remains subject to the real 64 MiB operation memory limit.
+- Each public call remains subject to the fixed batch, cache, queue, format, and
+  structural result caps at the seams it crosses.
 
 The qualification record and direct witness map are maintained in the archived
 [concurrency and restart sprint](../archive/sprint-2026-08-27-concurrency-and-restart-conformance.md).

@@ -27,28 +27,37 @@ Benchmarks have their own rules. Read `bench/CLAUDE.md` before running one.
 ## Project structure
 
 ```
-src/core/      Git engine: ops, object store, packs, protocol, diff, ignore
-src/fs/        The filesystem over Durable Object SQLite
+src/db/        Shared SQLite adapter, error normalization, and routing limits
+src/fs/        Filesystem domain over Durable Object SQLite
 src/shell/     kompjutr/shell — bash-shaped commands compiled to queries
-src/sqlite/    The Git store: adapter, schema, objects, packs, caches, maintenance
-src/runtime/   Workspace: composes db + filesystem + git
-src/git/       Git client facade over core/ops
+src/git/       Git domain
+  common/      Bytes, objects, errors, rows, paths, streams, hashes, compression
+  diff/        LGPL xdiff port
+  ignore/      Gitignore discovery and matching
+  protocol/    Smart HTTP wire and transport
+  store/       SQLite schema, table families, packs, projections, maintenance
+  ops/         Git command families, repository, and worktree abstractions
+  cli/         Synchronous Git argv surface
+  client.ts    Public Git facade
+src/runtime/   Workspace composition over db + filesystem + Git
 src/compat/    Migration adapter; the only entry allowed to import @cloudflare/computer
 tests/         Vitest suite, parity and conformance harnesses
 bench/         Standalone benchmark harness
 docs/          Architecture, current benchmarks, plans, and historical records
 ```
 
-Layering is one-way: `shell` and `git` may depend on `fs`, never the reverse,
-and `shell` never imports `git`.
+Layering is bottom-up: `db` sits below the domains; `fs` may import only `fs`
+or `db`; `shell` may import only `shell`, `fs`, or `db`; and Git follows
+`common → diff|ignore|protocol → store → ops → client/cli`. The import-graph
+suite enforces the exact rules.
 
 ## Conventions
 
 - ESM with explicit `.js` extensions on relative imports. `import type` for
   type-only imports (`verbatimModuleSyntax`, `isolatedModules`).
 - Target is the Workers runtime. `node:` imports only where the platform
-  provides them — `node:zlib` in `src/core/zlib.ts`, `node:buffer` in the compat
-  facades. Do not add others.
+  provides them — `node:zlib` in `src/git/common/zlib.ts`, `node:buffer` in the
+  compat facades. Do not add others.
 - Errors carry a stable `code`. Git errors subclass `GitError`; filesystem
   errors come from `filesystemError()`. Callers branch on `error.code`, never
   `instanceof` — the compat classes are re-declared, so identity does not hold.
@@ -56,7 +65,7 @@ and `shell` never imports `git`.
   existing density; do not exceed it.
 - No `any`, no `as` casts, no `@ts-expect-error`. `noUncheckedIndexedAccess` is on.
 - Source files stay at or under 2,000 lines; split along a seam before you get
-  there. The restructure sprint adds a suite witness for this.
+  there. A suite witness enforces this.
 - Recurring checks and comparisons go through the shared guard/decoder and path
   kits; do not hand-roll multi-operand `typeof` chains or local path helpers.
 
@@ -64,8 +73,9 @@ and `shell` never imports `git`.
 
 1. **Never order paths with `<`, `>`, or a bare `.sort()`.** JavaScript compares
    UTF-16 code units; Git trees and SQLite `BINARY` compare UTF-8 bytes, and the
-   two disagree above the BMP. Use `comparePaths` (`src/core/streams.ts` for the
-   git side, `src/fs/path.ts` for the filesystem side).
+   two disagree above the BMP. Use `comparePaths`
+   (`src/git/common/{streams,paths}.ts` for the git side, `src/fs/path.ts` for
+   the filesystem side).
 2. **Never emit `BEGIN`, `COMMIT`, or `ROLLBACK`.** The platform rejects SQL
    transaction statements. Use `db.transactionSync()`, which delegates every
    nesting level to Durable Object storage.
@@ -94,10 +104,10 @@ and `shell` never imports `git`.
 
 Read the file for a directory before changing code in it:
 
-- `src/core/CLAUDE.md` — op structure, merge-join cost model, packs, trust rules
+- `src/git/CLAUDE.md` — Git layers, merge-join cost model, shared kits, trust rules
+- `src/git/store/CLAUDE.md` — row ownership, table families, packs, maintenance
 - `src/fs/CLAUDE.md` — POSIX semantics, handles and revalidation, the bulk API
 - `src/shell/CLAUDE.md` — a command is a query; parse → plan → execute
-- `src/sqlite/CLAUDE.md` — row ownership, pack storage, maintenance, trust rules
 - `tests/CLAUDE.md` — parity against real binaries, conformance against `node:fs`
 - `bench/CLAUDE.md` — measurement rules; a number measured wrong is worse than none
 
@@ -110,7 +120,7 @@ Project docs live in [`docs/`](./docs/) and follow a fixed structure — start a
 [`docs/INDEX.md`](./docs/INDEX.md) (the map). In short:
 
 - `docs/reference/` — how the system works now.
-- `docs/decisions/` — ADRs (the *why*), immutable.
+- `docs/decisions/` — living ADRs (the *why*).
 - `docs/backlog/` — decided work not yet scheduled · `docs/sprints/` — active
   work-plans · `docs/archive/` — shipped.
 - `docs/ideas/` — proposals, no commitment.
