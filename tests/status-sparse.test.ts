@@ -5,6 +5,7 @@ import { commit } from "../src/git/ops/commit.js";
 import type { GitContext, IndexTrackerSeedEntry } from "../src/git/ops/context.js";
 import { openRepository } from "../src/git/ops/context.js";
 import type { SparseWorkspaceSource } from "../src/git/ops/sparse-workspace.js";
+import { add } from "../src/git/ops/staging.js";
 import { eagerStatus, type StatusOptions, status, statusStream } from "../src/git/ops/status.js";
 import { sparseStatus } from "../src/git/ops/status-sparse.js";
 import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
@@ -111,6 +112,12 @@ function bareIndexEntry(path: string, mode = 0o100644): IndexEntry {
     mtime: null,
     ino: null,
   };
+}
+
+function expectNoFullStatusStreams(histogram: ReadonlyMap<string, number>): void {
+  const statements = [...histogram.keys()].join("\n");
+  expect(statements).not.toContain("WITH RECURSIVE params(repo_id, root_oid");
+  expect(statements).not.toContain("FROM git_index entr");
 }
 
 interface AncestorIndexCorruption {
@@ -304,19 +311,32 @@ describe("sparse eager status", () => {
     expect(workspace.storage.rowCount).toBeLessThan(10);
   });
 
-  it("hashes one hundred modified tracked paths without a refresh scan", () => {
+  it("classifies one hundred modified paths without full-repository streams", () => {
     const workspace = makeRepo("/");
-    const paths = Array.from(
-      { length: 100 },
-      (_, index) => `src/f${index.toString().padStart(3, "0")}.txt`,
+    const trackedPaths = Array.from(
+      { length: 2_000 },
+      (_, index) => `src/f${index.toString().padStart(4, "0")}.txt`,
     );
-    for (const path of paths) writeWorkFile(workspace, `/${path}`, "before\n");
-    commitFiles(workspace, paths);
+    const paths = trackedPaths.slice(0, 100);
+    const encoder = new TextEncoder();
+    workspace.worktree.writeFiles(
+      trackedPaths.map((path) => ({
+        path: `/${path}`,
+        bytes: encoder.encode("before\n"),
+        mode: 0o644,
+      })),
+    );
+    configureFixtureIdentity(workspace);
+    add(workspace.repo, workspace.worktree, { all: true, paths: [] }, workspace.context);
+    commit(workspace.context, workspace.repo, { message: "fixture" });
     sealIndexTracker(workspace);
     workspace.tick(60_000);
-    for (const path of paths) writeWorkFile(workspace, `/${path}`, "after\n");
+    workspace.worktree.writeFiles(
+      paths.map((path) => ({ path: `/${path}`, bytes: encoder.encode("after\n"), mode: 0o644 })),
+    );
     const worktree = new NoScanWorktree(workspace.worktree);
 
+    workspace.storage.histogram = new Map();
     workspace.storage.resetCounters();
     const rows = eagerStatus(
       workspace.repo,
@@ -329,7 +349,8 @@ describe("sparse eager status", () => {
     expect(rows.every((row) => row.index === " " && row.worktree === "M")).toBe(true);
     expect(worktree.bulkReadPaths).toHaveLength(100);
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
-    expect(workspace.storage.rowCount).toBeLessThan(10_000);
+    expect(workspace.storage.rowCount).toBeLessThan(3_000);
+    expectNoFullStatusStreams(workspace.storage.histogram);
     expect([
       ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.checkout.checkoutId),
     ]).toEqual(paths.map((path) => ({ path, flags: WORKTREE_DIRTY })));
@@ -386,26 +407,27 @@ describe("sparse eager status", () => {
     ]).toContainEqual({ path: "conflict.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY });
   });
 
-  it("matches full status for an exact staged rename", () => {
+  it("matches full status for an exact staged rename whose source remains", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/old.txt", "same\n");
     commitFiles(workspace, ["old.txt"]);
     sealIndexTracker(workspace);
 
-    workspace.worktree.unlink("/old.txt");
     workspace.repo.checkout.indexRemove("old.txt");
     writeWorkFile(workspace, "/new.txt", "same\n");
     stageWorktreePaths(workspace, ["new.txt"]);
 
     const expected = status(workspace.repo, workspace.worktree, { untrackedFiles: "all" });
-    expect(
-      eagerStatus(
-        workspace.repo,
-        new NoScanWorktree(workspace.worktree),
-        { untrackedFiles: "all" },
-        sparseTrackerContext(workspace),
-      ),
-    ).toEqual(expected);
+    workspace.storage.histogram = new Map();
+    workspace.storage.resetCounters();
+    const actual = eagerStatus(
+      workspace.repo,
+      new NoScanWorktree(workspace.worktree),
+      { untrackedFiles: "all" },
+      sparseTrackerContext(workspace),
+    );
+    expect(actual).toEqual(expected);
+    expectNoFullStatusStreams(workspace.storage.histogram);
     expect(expected).toEqual([
       expect.objectContaining({
         path: "new.txt",
@@ -414,6 +436,7 @@ describe("sparse eager status", () => {
         index: "R",
         worktree: " ",
       }),
+      expect.objectContaining({ path: "old.txt", index: " ", worktree: "?" }),
     ]);
   });
 
@@ -1015,7 +1038,10 @@ describe("sparse eager status", () => {
         fixture.context,
         fixture.state.baselineTreeOid,
       ),
-    ).toEqual([expect.objectContaining({ path: "a.txt", worktree: "M" })]);
+    ).toEqual({
+      details: [expect.objectContaining({ path: "a.txt", worktree: "M" })],
+      renames: expect.objectContaining({ kind: "classified", renames: [] }),
+    });
     expect(worktree.bulkReadPaths).toEqual(["/a.txt"]);
     expect(fixture.reseals()).toBe(1);
   });

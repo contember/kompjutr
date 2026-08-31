@@ -9,6 +9,11 @@ import {
 } from "../store/sparse-workspace.js";
 import type { TargetEntry } from "./checkout.js";
 import type { GitContext, IndexTrackerSeedEntry } from "./context.js";
+import {
+  type ExactRenameClassification,
+  ExactRenameClassifier,
+  renameDetectionEnabled,
+} from "./rename-detection.js";
 import type { Repository } from "./repository.js";
 import type {
   SparseIndexAncestorFact,
@@ -125,7 +130,7 @@ export function sparseStatus(
   options: StatusOptions,
   context: Pick<GitContext, "sparseWorkspace" | "indexTracker">,
   baselineTreeOid: string | null,
-): StatusDetail[] | null {
+): SparseStatusResult | null {
   const source = context.sparseWorkspace;
   const tracker = context.indexTracker;
   if (source === undefined || tracker === undefined) return null;
@@ -140,11 +145,17 @@ export function sparseStatus(
   if (prepared.reseal !== null) {
     tracker.reseal(repo.checkout.checkoutId, prepared.reseal.currentTreeOid, prepared.reseal.seed);
   }
-  return prepared.details;
+  return { details: prepared.details, renames: prepared.renames };
+}
+
+export interface SparseStatusResult {
+  details: StatusDetail[];
+  renames: ExactRenameClassification | undefined;
 }
 
 interface PreparedSparseStatus {
   details: StatusDetail[];
+  renames: ExactRenameClassification | undefined;
   reseal: { currentTreeOid: string | null; seed: IndexTrackerSeedEntry[] } | null;
 }
 
@@ -171,7 +182,12 @@ function prepareSparseStatus(
     throw error;
   }
   if (candidates === null) return null;
-  if (candidates.length === 0) return { details: [], reseal: null };
+  const renameClassifier = renameDetectionEnabled(repo, "status", options.renames)
+    ? new ExactRenameClassifier()
+    : undefined;
+  if (candidates.length === 0) {
+    return { details: [], renames: renameClassifier?.finish(), reseal: null };
+  }
 
   const hydrated: SparseWorkspaceResult = hydrateSparseWorkspaceOwned(source, {
     repoId: repo.store.repoId,
@@ -187,6 +203,7 @@ function prepareSparseStatus(
   }
   const untrackedMode = options.untrackedFiles ?? "normal";
   let ignores = options.ignores;
+  let classifyingRenames = renameClassifier !== undefined;
   const ignoredUntracked = new Set<string>();
   const reportableUntracked: string[] = [];
   for (let index = 0; index < candidates.length; index++) {
@@ -196,6 +213,20 @@ function prepareSparseStatus(
       throw new CorruptError("sparse status hydration returned unordered rows");
     }
     const group = oneStatusIndexGroup(row.index, row.path);
+    if (renameClassifier !== undefined && classifyingRenames && group?.kind !== "unmerged") {
+      const stage = group?.entry;
+      let retained = true;
+      if (row.current !== null && stage === undefined && isRenameMode(row.current.mode)) {
+        retained = renameClassifier.addSource({ path, ...row.current });
+      } else if (row.current === null && stage !== undefined && stage.mode !== 0o160000) {
+        retained = renameClassifier.addDestination({
+          path,
+          mode: octalMode(stage.mode),
+          oid: stage.oid,
+        });
+      }
+      if (!retained) classifyingRenames = false;
+    }
     if (group !== undefined || sparseWorktreePath(row) === undefined || untrackedMode === "no") {
       continue;
     }
@@ -279,7 +310,15 @@ function prepareSparseStatus(
     const flags = retained.get(path);
     if (flags !== undefined) seed.push({ path, flags });
   }
-  return { details, reseal: { currentTreeOid, seed } };
+  return {
+    details,
+    renames: renameClassifier?.finish(),
+    reseal: { currentTreeOid, seed },
+  };
+}
+
+function isRenameMode(mode: string): boolean {
+  return mode === "100644" || mode === "100755" || mode === "120000";
 }
 
 function sparseIndexDirty(row: SparseWorkspaceRow, group: StatusIndexGroup | undefined): boolean {

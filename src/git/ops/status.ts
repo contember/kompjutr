@@ -214,12 +214,7 @@ export function eagerStatus(
 
   const sparse = sparseStatus(repo, worktree, options, context, state.baselineTreeOid);
   if (sparse === null) return status(repo, worktree, options);
-  if (sparse.length === 0) {
-    renameDetectionEnabled(repo, "status", options.renames);
-    return sparse;
-  }
-  const renames = classifyStatusRenames(repo, repo.headTree(), options);
-  return sortStatusDetails([...applyStatusRenames(sparse, renames)]);
+  return sortStatusDetails([...applyStatusRenames(sparse.details, sparse.renames)]);
 }
 
 /**
@@ -293,39 +288,6 @@ function fullStatusPrepass(
     }
   }
   return { snapshot, excluded, renames: classifier.finish() };
-}
-
-function classifyStatusRenames(
-  repo: Repository,
-  headTreeOid: string | null,
-  options: StatusOptions,
-): ExactRenameClassification | undefined {
-  if (!renameDetectionEnabled(repo, "status", options.renames)) return undefined;
-  const classifier = new ExactRenameClassifier();
-  for (const row of joinSorted(
-    treeStream(repo, headTreeOid),
-    statusIndexGroups(repo.checkout.indexScan()),
-    {
-      left: (entry) => entry.path,
-      right: (entry) => entry.path,
-    },
-  )) {
-    if (!matchesPaths(row.path, options.paths) || row.right?.kind === "unmerged") continue;
-    const head = row.left;
-    const index = row.right?.entry;
-    let retained = true;
-    if (head !== undefined && index === undefined && isRenameMode(head.mode)) {
-      retained = classifier.addSource({ path: row.path, mode: head.mode, oid: head.oid });
-    } else if (head === undefined && index !== undefined && index.mode !== 0o160000) {
-      retained = classifier.addDestination({
-        path: row.path,
-        mode: octalMode(index.mode),
-        oid: index.oid,
-      });
-    }
-    if (!retained) break;
-  }
-  return classifier.finish();
 }
 
 function* applyStatusRenames(

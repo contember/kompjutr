@@ -43,9 +43,7 @@ not effort: a wrong answer outranks a missing one.
   config scopes, `clean -x`, SSH transport. Reopen a case for one only with a
   concrete workload behind it. Textual `apply` is not filed because local
   snapshot replay serves the current workload.
-- **Not a parity gap.** [62](62-sparse-status-rename-classification.md) is
-  performance: a tracker-backed `status` still pays a whole-repository join for
-  rename detection. [63](63-bound-packed-dependency-graph-traversal.md)
+- **Not a parity gap.** [63](63-bound-packed-dependency-graph-traversal.md)
   retains non-regression scaling found while closing the budget sprint.
 
 ## Consumer demand
@@ -140,5 +138,4 @@ units over the same files, and a long sprint does not make that safe.
 - [41 — Add partial clone with lazy blob backfill](41-partial-clone.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
-- [62 — Classify status renames over the sparse candidates, not the whole repository](62-sparse-status-rename-classification.md)
 - [63 — Bound packed dependency graph traversal](63-bound-packed-dependency-graph-traversal.md)

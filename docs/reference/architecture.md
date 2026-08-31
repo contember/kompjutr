@@ -168,7 +168,10 @@ Tree objects are parsed into source-qualified edge rows when they become
 visible. Tree walks use one recursive SQLite cursor and read no object BLOBs.
 Commit projections are written atomically with new commit visibility. Hot
 status, diff, checkout, add, reset, and commit paths merge ordered streams and
-batch unresolved content reads and writes.
+batch unresolved content reads and writes. The successful eager tracker-backed
+sparse status path hydrates only the bounded dirty and baseline-to-HEAD
+candidates and classifies exact renames from those rows; fallback full status
+and `statusStream()` retain the ordered HEAD/index/worktree merge.
 
 ## Concurrency seams
 

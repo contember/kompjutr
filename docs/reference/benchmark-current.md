@@ -1,9 +1,10 @@
 # Current benchmark snapshot
 
 Measured in three clean runs on 2026-08-31 from the working tree based on commit
-`dd7f0f3f1504d837bc23d851bb7bdd21d3500f88`, including the clone lease-window
-change recorded with this snapshot. The host used Node v24.4.0, SQLite 3.50.2,
-git 2.54.0, Linux 6.17.0-41-generic x64, and an AMD Ryzen 7 PRO 8840HS:
+`92513df8962b0d687ba3ed3fa4ffed7b60b99e08`, including the sparse status rename
+classification change recorded with this snapshot. The host used Node v24.4.0,
+SQLite 3.50.2, git 2.54.0, Linux 6.17.0-41-generic x64, and an AMD Ryzen 7 PRO
+8840HS:
 
 ```bash
 cpu-lease run -n 2 --no-smt -- npm run bench:nextjs
@@ -24,34 +25,39 @@ proof of a production isolate limit.
 
 | Operation | Median wall | SQL | Rows |
 | --- | ---: | ---: | ---: |
-| `git.clone` | 11,334.516 ms | 906 | 78,558 |
-| `git.status` — clean clone | 3.975 ms | 14 | 12 |
-| `git.branch` | 5.067 ms | 29 | 19 |
-| `fs.writeFiles` — 100 | 29.420 ms | 6 | 288 |
-| `git.status` — 100 modified | 619.453 ms | 61 | 49,540 |
-| `git.diffSummary` — 100 | 70.051 ms | 29 | 1,575 |
-| `git.diff` — 100 | 69.355 ms | 28 | 1,573 |
-| `git.add` — 100 | 77.207 ms | 17 | 1,752 |
-| `git.status` — 100 staged | 574.037 ms | 60 | 49,194 |
-| `git.commit` — 100 | 53.048 ms | 49 | 725 |
-| `git.push` — 100 | 423.362 ms | 47 | 763 |
-| `git.status` — clean commit | 27.151 ms | 25 | 685 |
-| `git.checkout main` | 80.399 ms | 67 | 826 |
-| `git.checkout main --force` | 67.368 ms | 68 | 926 |
-| `git.status` — clean main | 0.815 ms | 11 | 8 |
-| `git.checkout bench-work` | 69.828 ms | 66 | 1,025 |
-| `git.checkout bench-work --force` | 67.672 ms | 66 | 1,025 |
-| `git.status` — clean work | 0.738 ms | 10 | 8 |
+| `git.clone` | 11,502.434 ms | 906 | 78,558 |
+| `git.status` — clean clone | 4.186 ms | 14 | 12 |
+| `git.branch` | 5.747 ms | 29 | 19 |
+| `fs.writeFiles` — 100 | 30.294 ms | 6 | 288 |
+| `git.status` — 100 modified | 46.442 ms | 30 | 1,031 |
+| `git.diffSummary` — 100 | 66.815 ms | 29 | 1,575 |
+| `git.diff` — 100 | 63.387 ms | 28 | 1,573 |
+| `git.add` — 100 | 72.186 ms | 17 | 1,752 |
+| `git.status` — 100 staged | 31.330 ms | 27 | 685 |
+| `git.commit` — 100 | 51.597 ms | 49 | 725 |
+| `git.push` — 100 | 391.914 ms | 47 | 763 |
+| `git.status` — clean commit | 27.447 ms | 25 | 685 |
+| `git.checkout main` | 80.013 ms | 67 | 826 |
+| `git.checkout main --force` | 69.912 ms | 68 | 926 |
+| `git.status` — clean main | 0.975 ms | 11 | 8 |
+| `git.checkout bench-work` | 70.971 ms | 66 | 1,025 |
+| `git.checkout bench-work --force` | 83.724 ms | 66 | 1,025 |
+| `git.status` — clean work | 0.834 ms | 10 | 8 |
 
 Every phase met the at-most-1,000-statement benchmark target in all three runs,
 and every operation and status assertion passed. Target status is performance
 evidence, not a runtime admission rule. Every one of the three runs for each
-required row was below 100 ms: maxima were 90.140 ms for add, 57.715 ms for
-commit, 28.108 ms for clean post-commit status, 82.985 ms for checkout to main,
-and 76.114 ms for checkout to bench-work. Both real force transitions were also
-below 100 ms in all three runs, with maxima of 71.589 and 68.191 ms. The modified
-and staged status rows remain full-repository paths and do not meet that wall
-target.
+required row was below 100 ms: maxima were 48.749 ms for modified status,
+32.969 ms for staged status, 83.291 ms for add, 58.080 ms for commit, 28.373 ms
+for clean post-commit status, 98.065 ms for checkout to main, and 92.330 ms for
+checkout to bench-work. Both real force transitions were also below 100 ms in
+all three runs, with maxima of 79.478 and 94.081 ms.
+
+Tracker-backed status now classifies exact renames from the hydrated sparse
+candidates instead of streaming HEAD and the whole index. Against the preceding
+snapshot this removes 31 statements and 48,509 rows from modified status, and
+33 statements and 48,509 rows from staged status. Both status rows now read
+fewer rows and complete sooner than the corresponding diff rows.
 
 ## Clone statement profile
 
