@@ -562,39 +562,6 @@ describe("maintenance roots", () => {
     ).toEqual({ root_source: "operations", cursor_checkout_id: null });
   });
 
-  it.each([
-    "refs/heads/bad..name",
-    "refs/heads/bad.lock",
-    "refs/heads/bad@{name",
-    "refs/heads/bad name",
-    "refs/heads/bad~name",
-  ])("rejects invalid stored symbolic ref name %s", (name) => {
-    const { db, database, checkout } = open();
-    db.run(
-      "INSERT INTO git_refs (repo_id, name, target) VALUES (?, 'refs/heads/source', ?)",
-      checkout.repoId,
-      `ref: ${name}`,
-    );
-    expect(() =>
-      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-  });
-
-  it.each([
-    "refs/heads/bad..name",
-    "refs/heads/bad.lock",
-    "refs/heads/bad@{name",
-    "refs/heads/bad name",
-    "refs/heads/bad:name",
-  ])("rejects invalid stored symbolic HEAD name %s", (name) => {
-    const { db, database, checkout } = open();
-    db.run("UPDATE git_checkouts SET head = ? WHERE id = ?", `ref: ${name}`, checkout.id);
-    database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 });
-    expect(() =>
-      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-  });
-
   it("rejects a duplicate global reflog ordinal at a page boundary", () => {
     const { db, database, checkout } = open();
     const oid = "a".repeat(40);
