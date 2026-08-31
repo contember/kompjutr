@@ -61,6 +61,7 @@ import {
   mergeBase as mergeBaseOp,
 } from "./ops/merge-base.js";
 import {
+  type AbortableNetworkOptions,
   type CloneOptions,
   clone as cloneOp,
   type FetchOptions,
@@ -205,10 +206,14 @@ import {
 import type { AuthCallback, GitHttpClient } from "./protocol/transport.js";
 import type { SqliteGitDatabase } from "./store/index.js";
 
+export type { AbortableNetworkOptions, CloneOptions, FetchOptions } from "./ops/network.js";
+export type { PushOptions } from "./ops/push.js";
+
 export interface GitDirOptions {
   dir?: string;
 }
 
+export type GitAbortableNetworkOptions = AbortableNetworkOptions;
 export type GitCloneOptions = CloneOptions;
 export type GitPromisorAuth = AuthCallback;
 export type GitFetchOptions = GitDirOptions & FetchOptions;

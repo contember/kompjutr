@@ -1,4 +1,10 @@
 import { Workspace } from "@cloudflare/computer";
+import type {
+  GitCloneOptions as ComputerCloneOptions,
+  GitFetchOptions as ComputerFetchOptions,
+  GitPushOptions as ComputerPushOptions,
+  GitClientFactory,
+} from "@cloudflare/computer/git";
 import { describe, expect, it } from "vitest";
 
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
@@ -15,6 +21,35 @@ function tableNames(storage: SqliteTestStorage): string[] {
 }
 
 describe("Computer client operation interlocks", () => {
+  it("retains the installed Computer factory and network option contracts", () => {
+    type CloneHasSignal = "signal" extends keyof ComputerCloneOptions ? true : false;
+    type FetchHasDeepen = "deepen" extends keyof ComputerFetchOptions ? true : false;
+    type FetchHasUnshallow = "unshallow" extends keyof ComputerFetchOptions ? true : false;
+    type PushHasLeases = "leases" extends keyof ComputerPushOptions ? true : false;
+    const factory: GitClientFactory = createSqliteGitClient();
+    const clone: ComputerCloneOptions = {
+      url: "https://example.test/repo.git",
+      depth: 1,
+    };
+    const fetch: ComputerFetchOptions = { depth: 1 };
+    const push: ComputerPushOptions = { force: true };
+    const cloneHasSignal: CloneHasSignal = false;
+    const fetchHasDeepen: FetchHasDeepen = false;
+    const fetchHasUnshallow: FetchHasUnshallow = false;
+    const pushHasLeases: PushHasLeases = false;
+
+    expect([
+      typeof factory,
+      clone.depth,
+      fetch.depth,
+      push.force,
+      cloneHasSignal,
+      fetchHasDeepen,
+      fetchHasUnshallow,
+      pushHasLeases,
+    ]).toEqual(["function", 1, 1, true, false, false, false, false]);
+  });
+
   it("revalidates a canonical handle beyond the former 4096-unit boundary", async () => {
     const storage = new SqliteTestStorage();
     const workspace = new Workspace({ storage });

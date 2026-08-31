@@ -1,16 +1,22 @@
 import { describe, expect, it } from "vitest";
 import type {
+  GitAbortableNetworkOptions,
   GitBranchRenameOptions,
   GitCherryPickContinueOptions,
   GitCherryPickOptions,
+  GitCloneOptions,
   GitCommitTreeOptions,
+  AbortableNetworkOptions as GitCoreAbortableNetworkOptions,
+  CloneOptions as GitCoreCloneOptions,
   CommitTreeOptions as GitCoreCommitTreeOptions,
   DivergenceOptions as GitCoreDivergenceOptions,
+  FetchOptions as GitCoreFetchOptions,
   IndexStore as GitCoreIndexStore,
   LsTreeOptions as GitCoreLsTreeOptions,
   MergeBaseKind as GitCoreMergeBaseKind,
   MergeBaseOptions as GitCoreMergeBaseOptions,
   MergeBaseResult as GitCoreMergeBaseResult,
+  PushOptions as GitCorePushOptions,
   ReadRefOptions as GitCoreReadRefOptions,
   ReadTreeOptions as GitCoreReadTreeOptions,
   ReplaySnapshotConflict as GitCoreReplaySnapshotConflict,
@@ -42,6 +48,7 @@ import type {
   LsRemoteResult as GitLsRemoteResult,
   GitLsTreeOptions,
   GitMergeBaseOptions,
+  PushLeaseExpectation as GitPushLeaseExpectation,
   GitPushOptions,
   PushRefStatus as GitPushRefStatus,
   PushRefspec as GitPushRefspec,
@@ -760,6 +767,36 @@ describe("public status exports", () => {
 });
 
 describe("public structured refspec exports", () => {
+  it("exposes native cancellation, deepening, unshallow, and lease contracts", () => {
+    const signal = new AbortController().signal;
+    const coreAbortable: GitCoreAbortableNetworkOptions = { signal };
+    const abortable: GitAbortableNetworkOptions = coreAbortable;
+    const coreClone: GitCoreCloneOptions = {
+      url: "https://example.test/repo.git",
+      ...abortable,
+    };
+    const clone: GitCloneOptions = coreClone;
+    const coreDeepen: GitCoreFetchOptions = { remote: "origin", deepen: 3, ...abortable };
+    const deepen: GitFetchOptions = coreDeepen;
+    const coreUnshallow: GitCoreFetchOptions = { remote: "origin", unshallow: true };
+    const unshallow: GitFetchOptions = coreUnshallow;
+    const lease: GitPushLeaseExpectation = { expected: "1".repeat(40) };
+    const corePush: GitCorePushOptions = {
+      remote: "origin",
+      leases: { main: lease },
+      ...abortable,
+    };
+    const push: GitPushOptions = corePush;
+
+    expect([
+      clone.signal,
+      deepen.deepen,
+      unshallow.unshallow,
+      push.signal,
+      push.leases?.main,
+    ]).toEqual([signal, 3, true, signal, lease]);
+  });
+
   it("exposes matching frozen mapping, result, target, and limit types", () => {
     const fetch: RootFetchRefspec = {
       source: "refs/heads/*",

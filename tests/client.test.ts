@@ -18,6 +18,9 @@ import type { ScanEntry } from "../src/fs/types.js";
 import {
   createGit,
   type Git,
+  type GitAbortableNetworkOptions,
+  type GitCloneOptions,
+  type GitFetchOptions,
   type GitPushOptions,
   type GitScratchIndex,
   type PushLeaseExpectation,
@@ -288,6 +291,23 @@ afterAll(() => {
 });
 
 describe("createSqliteGitClient", () => {
+  it("exposes native cancellation, deepening, unshallow, and lease options", () => {
+    const signal = new AbortController().signal;
+    const abortable: GitAbortableNetworkOptions = { signal };
+    const clone: GitCloneOptions = { url: "https://example.test/repo.git", ...abortable };
+    const deepen: GitFetchOptions = { remote: "origin", deepen: 2, ...abortable };
+    const unshallow: GitFetchOptions = { remote: "origin", unshallow: true };
+    const lease: PushLeaseExpectation = { tracking: true };
+    const push: GitPushOptions = { remote: "origin", leases: { main: lease }, ...abortable };
+
+    expect([clone.signal, deepen.deepen, unshallow.unshallow, push.leases?.main]).toEqual([
+      signal,
+      2,
+      true,
+      lease,
+    ]);
+  });
+
   it("exposes native status options and keeps nested repositories excluded", async () => {
     const { git, workspace } = makeNativeGit();
     await git.init({ dir: "/" });

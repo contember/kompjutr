@@ -6,9 +6,13 @@ export type {
   GitCliRunOptions,
 } from "./cli/types.js";
 export {
+  type AbortableNetworkOptions,
+  type CloneOptions,
   type CreateGitOptions,
   createGit,
+  type FetchOptions,
   type Git,
+  type GitAbortableNetworkOptions,
   type GitAddOptions,
   type GitBranchDeleteOptions,
   type GitBranchOptions,
@@ -74,6 +78,8 @@ export {
   type GitWorktreeAddOptions,
   type GitWorktreeRemoveOptions,
   type GitWriteTreeOptions,
+  type PushLeaseExpectation,
+  type PushOptions,
 } from "./client.js";
 export {
   AlreadyInitializedError,

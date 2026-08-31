@@ -152,6 +152,7 @@ native and Computer surfaces use this database-only creation path.
 | `--origin <name>` | `remote` (default `origin`) | ✔ |
 | — | `paths` | ✔ check out only these paths (kompjutr extension) |
 | auth | `headers`, `onAuth`, `onProgress`, `onMessage` | ★ ✔ a per-command credential helper maps onto `onAuth` |
+| cancel | `signal` | ✔ aborts with `EABORTED` before local clone publication begins |
 | `--filter=blob:none` | `filter: "blob:none"` | ★ ✔ keeps complete commit/tree history, hydrates selected checkout blobs, and records the rest as durable promises |
 | `--bare`, `--mirror`, `--recurse-submodules`, `--reference` | — | ✘ |
 
@@ -488,6 +489,26 @@ rolled-back movements record nothing.
 Transport is Smart HTTP over `http(s)` only. Authentication is `headers` or an
 `onAuth` callback; there are no credential helpers and no `.netrc`.
 
+Native `clone()`, `fetch()`, and `push()` accept an `AbortSignal` as `signal`.
+`pull()` and `lsRemote()` do not. A confirmed cancellation throws `EABORTED`
+with `signal.reason` as its cause. Clone and fetch check immediately before
+their synchronous local publication; once publication starts, it completes and
+the operation succeeds even if the signal is aborted afterwards. Interrupted
+pack ingest remains invisible, and a retry renegotiates from published state.
+
+Push has a stricter certainty boundary. Cancellation before receive-pack POST
+invocation is `EABORTED`. After invocation, an abort, transport failure,
+non-401 HTTP response, malformed response, or incomplete or invalid
+`report-status` is `EPUSHUNCERTAIN`: the remote may have applied the update, so
+callers must inspect remote state rather than automatically retry. Known-local
+request-body failures remain `E2BIG` or `EPUSHLOCAL`; authentication failure
+remains `EAUTH`; and a fully consumed 401 is safe to authenticate and retry, or
+to return `EABORTED` if cancelled before that retry. Complete `report-status`
+always returns the confirmed `PushResult`. A later abort or failure during
+configured-remote tracking reconciliation appears only as
+`tracking: { outcome: "failed", code, message }`; it does not replace the
+confirmed remote result with `EABORTED` or `EPUSHUNCERTAIN`.
+
 ### `git ls-remote` — `lsRemote()`
 
 | Git | kompjutr | |
@@ -531,14 +552,17 @@ stored values are authenticated before either operation returns or mutates.
 | one or more refspecs | `refspecs: [{ source, destination, force? }]` | ★ ✔ full `refs/...` names, exact and one-star wildcard mappings |
 | `FETCH_HEAD` | `fetchHead` in the result | ★ ~ an oid, not a written ref: `reset --hard FETCH_HEAD` becomes `reset({ ref: fetchHead })` |
 | `--depth <n>` | `depth` | ✔ shallow boundaries are recorded and honoured |
+| `--deepen <n>` | `deepen` | ✔ positive safe integer; relative to the captured shallow boundary and mutually exclusive with `depth` and `unshallow` |
+| `--unshallow` | `unshallow: true` | ✔ removes the complete authenticated boundary; a complete repository fails with `EINVAL` before network |
 | `--single-branch` | `singleBranch: true` | ✔ |
 | default tag following | `tags: undefined` | ✔ auto-follows advertised tags whose peeled targets were already held or become held through the selected coverage; an explicit ref selector does not auto-follow other tags |
 | `--tags` | `tags: true` | ✔ fetches every advertised tag |
 | `--no-tags` | `tags: false` | ✔ disables automatic tag following |
 | `--prune` | `prune` | ✔ |
 | `--filter=blob:none` | `filter: "blob:none"` | ✔ protocol-v0 filtered fetch with durable promises |
+| cancel | `signal` | ✔ confirmed cancellation is `EABORTED`; no refs or shallow boundary publish |
 | mapped `--depth`, mapped `--prune` | — | ✘ rejected rather than mixed with typed mappings |
-| `--all`, `--unshallow`, `--deepen`, other filters, `--recurse-submodules` | — | ✘ |
+| `--all`, mapped deepening, other filters, `--recurse-submodules` | — | ✘ |
 
 Legacy fetch returns `{ mode: "legacy", defaultBranch, fetchHead, updates: [] }`.
 Mapped fetch returns `{ mode: "mapped", defaultBranch, fetchHead: null,
@@ -595,9 +619,11 @@ visible even if the integration afterwards refuses (`ESTALEHEAD`,
 | explicit URL | `url` | ✔ also honours `remote.<n>.pushurl` |
 | `--force` | legacy `force`, or per-mapping `force` | ★ ✔ |
 | `--delete` | legacy `delete`, or `{ source: null, destination }` | ★ ✔ several explicit deletions may share one request |
-| `--force-with-lease` | — | ~ implicit: the advertised old oid is always sent, so the server rejects a concurrent remote update |
+| `--force-with-lease=<ref>:<expect>` | `leases: { [destination]: { expected: oidOrNull } }` | ✔ partial per-destination map; `null` expects absence |
+| tracking-derived lease | `leases: { [branch]: { tracking: true } }` | ✔ named remotes and branch destinations only; snapshots the tracking OID before discovery |
 | `--atomic` | `atomic` | ★ ✔ requires the advertised capability |
 | `--push-option=<text>` | `pushOptions` | ✔ bounded protocol-v0 push options |
+| cancel | `signal` | ✔ outcome follows the pre-POST, uncertain POST, and confirmed-status states above |
 | `--tags`, `--all`, `--mirror`, `--set-upstream` | — | ✘ |
 
 Returns ordered `PushResult` with overall `ok`/`error`, unpack status, one row
@@ -610,6 +636,14 @@ branch destinations after status; custom refs and explicit URLs never create
 tracking refs. Reconciliation reports `updated`, `unchanged`, `stale`,
 `deferred`, or `failed` without hiding a confirmed remote result. Pushing from a
 detached HEAD without an explicit legacy `ref` throws `EDETACHED`.
+
+Lease keys normalize to expanded destination refs. Every listed destination,
+including a no-op, is compared with discovery before hydration, pack planning,
+or POST. Any mismatch throws `ESTALELEASE`, sends no receive-pack POST, and
+leaves every destination unchanged. A matching lease does not imply force;
+ordinary non-fast-forward checks still require explicit `force`. The discovered
+OID remains the receive-pack command's expected old value, so a remote update
+after lease comparison is still rejected by the server-side request CAS.
 
 ## Integration
 
