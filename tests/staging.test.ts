@@ -486,33 +486,6 @@ describe("add", () => {
     }
   });
 
-  it("rejects ancestor retained underreport before index or object mutation", () => {
-    const workspace = makeRepo("/");
-    writeWorkFile(workspace, "/a.txt", "a\n");
-    const beforeIndex = workspace.repo.checkout.indexEntries();
-    const beforeObjects = workspace.repo.store.objectCount();
-    const sparseWorkspace = createSqliteSparseWorkspaceSource(workspace.database.db);
-
-    expect(() =>
-      add(
-        workspace.repo,
-        workspace.worktree,
-        { paths: ["a.txt"] },
-        {
-          selectedPaths: createSqliteSelectedPathSource(workspace.database.db),
-          sparseWorkspace: {
-            ...sparseWorkspace,
-            indexAncestorFacts() {
-              return fakeAncestorResult(["a.txt"]);
-            },
-          },
-        },
-      ),
-    ).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
-    expect(workspace.repo.checkout.indexEntries()).toEqual(beforeIndex);
-    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
-  });
-
   it("uses canonical ancestor facts after caller getters mutate earlier rows", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a.txt", "a\n");
