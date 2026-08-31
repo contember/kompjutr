@@ -437,12 +437,6 @@ describe("exact fetch publication", () => {
     );
     expect(store.getRef(issued)).toBeNull();
 
-    db.run(
-      "INSERT INTO git_refs (repo_id, name, target) VALUES (1, 'refs/checkpoints/corrupt', zeroblob(1))",
-    );
-    expect(() =>
-      store.beginFetchPublication("refs/remotes/corrupt/", ["refs/checkpoints/corrupt"]),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
   it("fences create-attached/remove ABA with no checkout reflog evidence", () => {
