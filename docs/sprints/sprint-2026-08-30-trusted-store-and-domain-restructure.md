@@ -352,3 +352,22 @@ spec and this plan are authoritative; tests are the only gate.
   min 1.1 MiB; three `core.*` SQL-target misses are report-only. The
   `git_tree_entries_by_name_bytes` index is now unconditional (wave-3 seam for
   deleting its `typeof` join predicates).
+- 2026-08-31 — Trust waves WU5–WU7 landed as five parallel units in isolated
+  worktrees: commit cache/graph (`b7ef540`), tree projections (`956525d`),
+  maintenance run rows (`c058bb6`), pack publication from parse-time digests
+  (`40ab7fc`), and store row reads (`47316e8`); wave net ≈ −6,700 lines. New
+  `CHECK` constraints on `git_refs`/`git_shallow`/`git_config`/`git_index`
+  anchor the write-time trust; blob-id caller input now fails `EINVAL`.
+  Informative leased `bench:nextjs` row after WU7: clone 9,872 ms / 2,330
+  statements / 79,982 rows vs the 2026-08-27 reference median 11,629 ms / 824 /
+  78,537 — wall −15 % (publication re-audit gone); the statement growth is a
+  closure-comparison item (suspect: the commit cache now always flushes).
+  Incidents: three of five isolated worktrees were created on a stale base
+  (59 commits behind) — two agents fast-forwarded themselves, the pack unit
+  needed one redo round; a rerere entry recorded during the conflict cleanup
+  was purged and `rerere` disabled repo-locally for the sprint. Leftovers:
+  `ref-validation.ts` keeps its dual-source parameter spelling until the
+  restructure (some callers still pass "stored"); the commit-identity
+  config-read counter re-anchored to the single-read shape (`a212078`); one
+  out-of-band config-corruption block in `tests/client.test.ts` deleted per
+  ADR-0018.
