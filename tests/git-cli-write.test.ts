@@ -632,7 +632,7 @@ describe("mutating git CLI handlers", () => {
       undefined,
       {
         maxRows: 1,
-        maxRetainedBytes: Number.MAX_SAFE_INTEGER,
+        maxRetainedBytes: 8 * 1024 * 1024,
       },
     );
     if (summaryRow === undefined) throw new Error("diff summary row is missing");

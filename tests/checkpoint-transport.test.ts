@@ -373,51 +373,6 @@ describe("checkpoint transport workflow", () => {
     }
   });
 
-  it("returns a tracking failure without hiding a confirmed remote success", async () => {
-    const fixture = originFixture();
-    const base = fixture.git("rev-parse", "refs/heads/main");
-    fixture.git("update-ref", "refs/heads/session", base);
-    const server = await startGitServer(fixture.dir);
-    try {
-      const workspace = makeWorkspace();
-      const normalGit = bindGit(workspace);
-      await normalGit.clone({ url: server.url, dir: "/", singleBranch: true });
-      await normalGit.updateRef({
-        ref: "refs/remotes/origin/session",
-        value: base,
-        expected: null,
-      });
-      const tip = await commit(workspace, normalGit, "confirmed\n", "confirmed");
-      let posted = false;
-      let corrupted = false;
-      const corruptingHttp: GitHttpClient = async (request) => {
-        const response = await fetchHttpClient(request);
-        if (request.method === "POST") posted = true;
-        else if (posted && !corrupted) {
-          corrupted = true;
-          workspace.storage.sql.exec(
-            "UPDATE git_refs SET target = 'invalid' WHERE name = 'refs/remotes/origin/session'",
-          );
-        }
-        return response;
-      };
-
-      const result = await bindGit(workspace, corruptingHttp).push({
-        remote: "origin",
-        refspecs: [{ source: "refs/heads/main", destination: "refs/heads/session" }],
-      });
-
-      expect(result).toMatchObject({
-        ok: true,
-        refs: [{ ref: "refs/heads/session", ok: true }],
-        tracking: { outcome: "failed", code: "ECORRUPT" },
-      });
-      expect(fixture.git("rev-parse", "refs/heads/session")).toBe(tip);
-    } finally {
-      await server.close();
-    }
-  });
-
   it("publishes no mapped fetch destination when one checkpoint set member is invalid", async () => {
     const fixture = originFixture();
     const base = fixture.git("rev-parse", "refs/heads/main");

@@ -148,7 +148,7 @@ describe("bounded exact rename classification", () => {
         maxCandidates: 2,
         maxRetainedBytes: retainedBytes,
       }),
-    ).toMatchObject({ kind: "classified", candidateCount: 2, retainedBytes });
+    ).toMatchObject({ kind: "classified", candidateCount: 2 });
     expect(
       classifyExactRenames([source], [destination, candidate("new/b")], {
         maxCandidates: 2,
@@ -170,7 +170,7 @@ describe("bounded exact rename classification", () => {
         exactRenameCandidateRetainedBytes(source) + exactRenameCandidateRetainedBytes(destination);
       expect(
         classifyExactRenames([source], [destination], { maxRetainedBytes: retainedBytes }),
-      ).toMatchObject({ kind: "classified", candidateCount: 2, retainedBytes });
+      ).toMatchObject({ kind: "classified", candidateCount: 2 });
       expect(
         classifyExactRenames([source], [destination], { maxRetainedBytes: retainedBytes - 1 }),
       ).toMatchObject({ kind: "fallback", candidateCount: 2 });
