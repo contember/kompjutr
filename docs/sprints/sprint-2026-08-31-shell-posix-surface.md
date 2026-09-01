@@ -310,3 +310,6 @@ shell tests, and shell reference docs are serialized by the sprint leader.
 ## Run log
 
 <!-- Append as you work. -->
+
+- 2026-09-01 — WU1 landed (`92f3dbb`): byte-exact, per-run-isolated Bash parity
+  harness; focused witness 6/6, typecheck passed, independent review clean.
