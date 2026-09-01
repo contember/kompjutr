@@ -189,6 +189,32 @@ function stageWorkspace(pair: Pair, path: string): void {
   pair.workspace.repo.checkout.indexPut(indexEntryFor(path, hashed));
 }
 
+async function stagedFixture(): Promise<Pair> {
+  const pair = await open((fixture) => {
+    fixture.write("delete.txt", "delete me\n");
+    fixture.write("mixed.txt", "mixed base\n");
+    fixture.write("mode.txt", "mode content\n");
+    fixture.write("modify.txt", "modify base\n");
+    fixture.write("src/selected.txt", "selected base\n");
+    fixture.write("unstaged-only.txt", "unstaged base\n");
+    fixture.commit("base");
+  });
+  writeBoth(pair, "add.txt", "added\n");
+  removeBoth(pair, "delete.txt");
+  writeBoth(pair, "mixed.txt", "mixed staged\n");
+  chmodBoth(pair, "mode.txt", 0o755);
+  writeBoth(pair, "modify.txt", "modify staged\n");
+  writeBoth(pair, "src/selected.txt", "selected staged\n");
+  pair.fixture.git("add", "-A");
+  pair.workspace.repo.checkout.indexRemove("delete.txt");
+  for (const path of ["add.txt", "mixed.txt", "mode.txt", "modify.txt", "src/selected.txt"]) {
+    stageWorkspace(pair, path);
+  }
+  writeBoth(pair, "mixed.txt", "mixed unstaged\n");
+  writeBoth(pair, "unstaged-only.txt", "unstaged only\n");
+  return pair;
+}
+
 /** git's own bytes, untrimmed. */
 function gitDiff(pair: Pair, ...args: string[]): string {
   return pair.fixture.gitBinary("diff", ...args).toString("utf8");
@@ -228,6 +254,24 @@ class BulkOnlyWorktree extends CountingWorktree {
 
   override readlink(path: string): never {
     throw new Error(`scalar readlink is forbidden during diff: ${path}`);
+  }
+}
+
+class NoTraversalWorktree extends BulkOnlyWorktree {
+  override readdir(path: string): never {
+    throw new Error(`worktree readdir is forbidden during staged diff: ${path}`);
+  }
+
+  override scan(root: string): never {
+    throw new Error(`worktree scan is forbidden during staged diff: ${root}`);
+  }
+
+  override discoverFiles(root: string): never {
+    throw new Error(`worktree discovery is forbidden during staged diff: ${root}`);
+  }
+
+  override glob(root: string): never {
+    throw new Error(`worktree glob is forbidden during staged diff: ${root}`);
   }
 }
 
@@ -430,6 +474,63 @@ describe("diff", () => {
     expect(diff(pair.workspace.repo, pair.workspace.worktree)).toBe(gitDiff(pair));
   });
 
+  it("matches staged add, delete, modification, mode, mixed worktree, and path selection", async () => {
+    const pair = await stagedFixture();
+
+    expect(diff(pair.workspace.repo, pair.workspace.worktree, { staged: true })).toBe(
+      gitDiff(pair, "--cached"),
+    );
+    expect(diff(pair.workspace.repo, pair.workspace.worktree, { staged: true })).not.toContain(
+      "mixed unstaged",
+    );
+    expect(
+      diff(pair.workspace.repo, pair.workspace.worktree, { staged: true, paths: ["src"] }),
+    ).toBe(gitDiff(pair, "--cached", "--", "src"));
+  });
+
+  it("refuses an unmerged index instead of silently selecting stage zero", async () => {
+    const pair = await open((fixture) => {
+      fixture.write("conflict.txt", "base\n");
+      fixture.commit("base");
+    });
+    pair.fixture.git("checkout", "-q", "-b", "side");
+    pair.fixture.write("conflict.txt", "side\n").commit("side");
+    pair.fixture.git("checkout", "-q", "main");
+    pair.fixture.write("conflict.txt", "main\n").commit("main");
+    expect(() => pair.fixture.git("merge", "side")).toThrow();
+    expect(gitDiff(pair, "--cached")).toBe("* Unmerged path conflict.txt\n");
+
+    const current = pair.workspace.repo.store.write("blob", utf8.encode("main\n"));
+    const incoming = pair.workspace.repo.store.write("blob", utf8.encode("side\n"));
+    const conflicts: IndexEntry[] = [
+      {
+        path: "conflict.txt",
+        stage: 2,
+        mode: 0o100644,
+        oid: current,
+        size: null,
+        mtime: null,
+        ino: null,
+      },
+      {
+        path: "conflict.txt",
+        stage: 3,
+        mode: 0o100644,
+        oid: incoming,
+        size: null,
+        mtime: null,
+        ino: null,
+      },
+    ];
+    pair.workspace.repo.checkout.indexReplace(conflicts);
+    expect(() => diff(pair.workspace.repo, pair.workspace.worktree, { staged: true })).toThrowError(
+      expect.objectContaining({ code: "EUNMERGED" }),
+    );
+    expect(() =>
+      diffSummary(pair.workspace.repo, pair.workspace.worktree, { staged: true }),
+    ).toThrowError(expect.objectContaining({ code: "EUNMERGED" }));
+  });
+
   it("matches Git's exact rename patch, mode headers, filters, and option precedence", async () => {
     const pair = await open((fixture) => {
       fixture.write("plain.txt", "same\n");
@@ -528,6 +629,41 @@ describe("diffSummary", () => {
     expect(summary.map((entry) => `${entry.status}\t${entry.path}`)).toEqual(
       nameStatus(pair, "HEAD~1", "HEAD"),
     );
+  });
+
+  it("matches Git's staged structured summary", async () => {
+    const pair = await stagedFixture();
+    const summary = diffSummary(pair.workspace.repo, pair.workspace.worktree, { staged: true });
+
+    expect(
+      summary.map((entry) => `${entry.insertions}\t${entry.deletions}\t${entry.path}`),
+    ).toEqual(numstat(pair, "--cached"));
+    expect(summary.map((entry) => `${entry.status}\t${entry.path}`)).toEqual(
+      nameStatus(pair, "--cached"),
+    );
+  });
+
+  it("does not traverse the worktree or issue a scalar index query for staged diff", () => {
+    const { workspace, entries } = buildDiffScale(2_000, 200);
+    const changedOid = workspace.repo.store.write("blob", utf8.encode("staged\n"));
+    workspace.repo.checkout.indexReplace(
+      entries.map((entry, index) => (index < 1_000 ? { ...entry, oid: changedOid } : entry)),
+    );
+    const worktree = new NoTraversalWorktree(workspace.worktree);
+    workspace.storage.histogram = new Map();
+    workspace.storage.resetCounters();
+
+    const summary = diffSummary(workspace.repo, worktree, { staged: true, renames: false });
+
+    expect(summary).toHaveLength(1_000);
+    expect(worktree.reads).toBe(0);
+    expect(worktree.bulkReadPaths).toEqual([]);
+    expect(workspace.storage.statementCount).toBeLessThan(100);
+    expect(
+      [...workspace.storage.histogram.keys()].some((query) =>
+        query.includes("FROM git_index WHERE checkout_id = ? AND path = ?"),
+      ),
+    ).toBe(false);
   });
 
   it("reports one exact rename with its source and no line delta", async () => {

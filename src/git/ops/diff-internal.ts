@@ -7,6 +7,8 @@ export interface DiffOptions {
   ref?: string;
   /** The "to" side. Set it to diff two commits instead of the working tree. */
   to?: string;
+  /** Compare the selected ref to the stage-0 index. */
+  staged?: boolean;
   /** Exact-or-directory-prefix path filter. No globs. */
   paths?: string[];
   /** Context lines around each hunk. */

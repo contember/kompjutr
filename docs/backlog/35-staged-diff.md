@@ -6,17 +6,16 @@ blocked-by: []
 
 # 35 — Add a staged diff mode
 
-**Summary.** Tier A (missing capability). There is no `git diff --cached`, so
-what is about to be committed cannot be inspected.
+**Summary.** WU2 implements the capability; keep this item open until the
+Everyday Git shell sprint closes. `git diff --cached` now inspects what is about
+to be committed.
 
 ## Problem
 
-`DiffOptions` (`src/core/ops/diff-internal.ts`) offers `ref` and `to` only, and
-`collect()` in `src/core/ops/diff.ts` builds either a tree-to-tree comparison or
-a tree-to-working-tree one. The index is read as a hashing shortcut for the
-working-tree side, never as an endpoint of its own. A caller that stages
-selectively cannot see the staged result, which is the standard review step
-before `commit()`.
+`DiffOptions` (`src/git/ops/diff-internal.ts`) now offers an explicit `staged`
+endpoint. `collect()` in `src/git/ops/diff.ts` merges the selected tree with the
+ordered index and rejects conflict stages. The sprint still needs to close and
+graduate this item through the normal docs lifecycle.
 
 ## Approach / acceptance
 
@@ -32,6 +31,6 @@ before `commit()`.
 
 ## Touch points
 
-`src/core/ops/diff.ts`, `src/core/ops/diff-internal.ts`, `src/git/client.ts`,
+`src/git/ops/diff.ts`, `src/git/ops/diff-internal.ts`, `src/git/client.ts`,
 `src/compat/computer/client.ts`, `tests/diff.test.ts`,
 `docs/reference/git-support.md`

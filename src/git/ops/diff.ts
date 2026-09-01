@@ -1,7 +1,7 @@
 // `diff` and `diffSummary`.
 //
-// Three modes, matching Computer: working tree vs HEAD, working tree vs a
-// ref, and a commit pair. The patch text itself comes from
+// Four modes: working tree vs HEAD, working tree vs a ref, a commit pair,
+// and a selected tree vs the index. The patch text itself comes from
 // `src/git/diff/`; this file decides *what* is compared and writes the
 // `diff --git` headers around it.
 
@@ -840,7 +840,23 @@ function* collect(
   indexBase = false,
 ): Generator<PatchChange> {
   if (indexBase) {
+    if (options.staged === true || options.ref !== undefined || options.to !== undefined) {
+      throw new GitError("EINVAL", "index-worktree diff does not accept tree endpoints");
+    }
     yield* indexWorktreePatchChanges(repo, worktree, options);
+    return;
+  }
+  if (options.staged === true) {
+    if (options.to !== undefined) {
+      throw new GitError("EINVAL", "staged diff accepts only one tree endpoint");
+    }
+    const classification = classifyDiffRenames(repo, options, stagedPendingChanges(repo, options));
+    yield* collectPendingChanges(
+      repo,
+      worktree,
+      stagedPendingChanges(repo, options),
+      classification,
+    );
     return;
   }
   const sparse = boundedSparsePendingChanges(repo, worktree, options, sparseWorkspace);
@@ -864,6 +880,23 @@ function* collect(
     pendingChanges(repo, worktree, options, false),
     classification,
   );
+}
+
+function* stagedPendingChanges(repo: Repository, options: DiffOptions): Generator<PendingChange> {
+  const from = treeStream(repo, resolveFrom(repo, options));
+  for (const row of joinSorted(from, statusIndexGroups(repo.checkout.indexScan()), {
+    left: (entry) => entry.path,
+    right: (group) => group.path,
+  })) {
+    const group = row.right;
+    if (group?.kind === "unmerged") {
+      throw new GitError("EUNMERGED", `cannot diff staged contents with conflict at ${row.path}`);
+    }
+    if (!matchesPaths(row.path, options.paths)) continue;
+    const after = group === undefined ? null : treeIdentity(indexTarget(group.entry));
+    const change = compareIdentities(row.path, treeIdentity(row.left), after);
+    if (change !== null) yield change;
+  }
 }
 
 function* collectPendingChanges(

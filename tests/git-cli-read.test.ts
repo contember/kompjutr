@@ -4,8 +4,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runGitCli } from "../src/git/cli/index.js";
 import { createGitCliReadHandlers } from "../src/git/cli/read.js";
 import type { GitCliResult } from "../src/git/cli/types.js";
+import { createGit } from "../src/git/client.js";
 import { checkoutTree } from "../src/git/ops/checkout.js";
 import { commit } from "../src/git/ops/commit.js";
+import { openRepository } from "../src/git/ops/context.js";
 import {
   diff as coreDiff,
   DIFF_COMBINED_MAX_LINES,
@@ -16,10 +18,17 @@ import {
 import { rebase } from "../src/git/ops/rebase.js";
 import { add } from "../src/git/ops/staging.js";
 import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
+import { fetchHttpClient } from "../src/git/protocol/transport.js";
 import type { IndexEntry } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
+import { startGitServer } from "./helpers/http-backend.js";
 import { importFixture } from "./helpers/import.js";
-import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
+import {
+  makeRepo,
+  makeWorkspace,
+  type TestRepository,
+  writeWorkFile,
+} from "./helpers/workspace.js";
 
 const fixtures: GitFixture[] = [];
 const ENCODER = new TextEncoder();
@@ -421,6 +430,104 @@ describe("plain git diff semantics and cumulative bounds", () => {
     await expect(
       runGitCli({ argv: ["diff"], cwd: "/repo" }, handlers, { maxStdoutBytes: bytes - 1 }),
     ).rejects.toThrowError(expect.objectContaining({ code: "E2BIG" }));
+  });
+  it("matches staged aliases, refs, paths, two refs, and joined context", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("root.txt", "root base\n");
+    fixture.write("src/file.txt", "line 1\nline 2\nline 3\n");
+    fixture.commit("base");
+    fixture.git("tag", "base");
+    fixture.write("root.txt", "root committed\n");
+    fixture.write("src/file.txt", "line 1\ncommitted\nline 3\n");
+    fixture.commit("second");
+    const workspace = await importAt(fixture);
+
+    for (const argv of [
+      ["diff", "base"],
+      ["diff", "base", "HEAD"],
+      ["diff", "-U0", "base", "HEAD", "--", "src"],
+    ]) {
+      expect(await nativeRun(workspace, argv)).toEqual(gitResultAt(fixture, argv));
+    }
+
+    workspace.tick(1000);
+    fixture.write("src/file.txt", "line 1\nstaged\nline 3\n");
+    fixture.git("add", "src/file.txt");
+    writeWorkFile(workspace, "/repo/src/file.txt", "line 1\nstaged\nline 3\n");
+    add(workspace.repo, workspace.worktree, { paths: ["src/file.txt"] }, workspace.context);
+    workspace.tick(1000);
+    fixture.write("src/file.txt", "line 1\nunstaged\nline 3\n");
+    writeWorkFile(workspace, "/repo/src/file.txt", "line 1\nunstaged\nline 3\n");
+    for (const argv of [
+      ["diff", "--cached"],
+      ["diff", "--staged", "base"],
+      ["diff", "-U0", "--cached", "--", "src/file.txt"],
+    ]) {
+      expect(await nativeRun(workspace, argv)).toEqual(gitResultAt(fixture, argv));
+    }
+    expect(await nativeRun(workspace, ["diff", "--cached", "--", "file.txt"], "/repo/src")).toEqual(
+      gitResultAt(fixture, ["diff", "--cached", "--", "src/file.txt"]),
+    );
+  });
+  it("preflights staged output at the exact configured byte ceiling", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("file.txt", "base\n").commit("base");
+    const workspace = await importAt(fixture);
+    fixture.write("file.txt", "staged\n");
+    fixture.git("add", "file.txt");
+    writeWorkFile(workspace, "/repo/file.txt", "staged\n");
+    add(workspace.repo, workspace.worktree, { paths: ["file.txt"] }, workspace.context);
+    const argv = ["diff", "--cached"];
+    const expected = fixture.gitBinary(...argv).toString("utf8");
+    const bytes = ENCODER.encode(expected).byteLength;
+    const handlers = createGitCliReadHandlers(workspace.context);
+
+    expect(await runGitCli({ argv, cwd: "/repo" }, handlers, { maxStdoutBytes: bytes })).toEqual({
+      stdout: expected,
+      stderr: "",
+      exitCode: 0,
+      truncated: false,
+    });
+    await expect(
+      runGitCli({ argv, cwd: "/repo" }, handlers, { maxStdoutBytes: bytes - 1 }),
+    ).rejects.toThrowError(expect.objectContaining({ code: "E2BIG" }));
+  });
+  it("hydrates only selected historical blobs for staged CLI diff", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("selected.txt", "selected old\n");
+    fixture.write("unselected.txt", "unselected old\n");
+    const first = fixture.commit("first");
+    const selectedBlob = fixture.git("rev-parse", `${first}:selected.txt`);
+    const unselectedBlob = fixture.git("rev-parse", `${first}:unselected.txt`);
+    fixture.write("selected.txt", "selected current\n");
+    fixture.remove("unselected.txt");
+    fixture.write("current.txt", "current\n");
+    fixture.commit("second");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const target = makeWorkspace();
+    const git = createGit()({ ...target.context, http: fetchHttpClient });
+    try {
+      await git.clone({ url: server.url, dir: "/repo", filter: "blob:none" });
+      const repo = openRepository(target.context, "/repo");
+      expect(repo.has(selectedBlob)).toBe(false);
+      expect(repo.has(unselectedBlob)).toBe(false);
+      const requestsBeforeDiff = server.requests.length;
+
+      const argv = ["diff", "--cached", first, "--", "selected.txt"];
+      expect(await git.runCli({ argv, cwd: "/repo" })).toEqual(gitResultAt(fixture, argv));
+      expect(repo.has(selectedBlob)).toBe(true);
+      expect(repo.has(unselectedBlob)).toBe(false);
+      expect(server.requests.slice(requestsBeforeDiff).map((request) => request.method)).toEqual([
+        "GET",
+        "POST",
+      ]);
+    } finally {
+      await server.close();
+    }
   });
   it("matches Git combined diff while a rebase conflict is unresolved", async () => {
     const fixture = new GitFixture().init();

@@ -64,6 +64,23 @@ describe("injected git command", () => {
       expected.stdout,
     );
   });
+  it("routes staged diff aliases without exposing later worktree edits", async () => {
+    subject.workspace.filesystem.writeFile("/repo/file.txt", ENCODER.encode("staged\n"));
+    await subject.workspace.git.add({ dir: "/repo", paths: ["file.txt"] });
+    subject.workspace.filesystem.writeFile("/repo/file.txt", ENCODER.encode("unstaged\n"));
+    const expected = await subject.workspace.git.runCli({
+      argv: ["diff", "--cached"],
+      cwd: "/repo",
+    });
+
+    expect(await subject.shell.run("git diff --staged")).toMatchObject({
+      stdout: expected.stdout,
+      stderr: "",
+      exitCode: 0,
+    });
+    expect(expected.stdout).toContain("+staged");
+    expect(expected.stdout).not.toContain("unstaged");
+  });
   it("preserves exit status through AND-OR lists", async () => {
     expect(await subject.shell.run("git diff && echo clean")).toMatchObject({
       stdout: "clean\n",

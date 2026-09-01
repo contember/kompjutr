@@ -74,7 +74,7 @@ The accepted argv grammar is exact:
 | Command | Accepted argv |
 |---|---|
 | `status` | Exactly one of `--porcelain`, `--porcelain=v1`, `--short`, `-s` |
-| `diff` | No operands or options |
+| `diff` | Plain diff with zero, one, or two refs, optional joined `-U<n>`, and optional `-- <literal-paths>`; staged diff as `--cached|--staged [<ref>] [-- <literal-paths>]` |
 | `log` | At most one of `-1`, `-n <count>`, `--max-count=<count>`; at most one of `--oneline`, `--format=<template>`; then at most one ref or admitted `<a>..<b>` range |
 | `rev-list` | Exactly `--count <a>..<b>` |
 | `symbolic-ref` | Exactly `--short <ref>` |
@@ -117,7 +117,9 @@ ceilings are 16 MiB stdout, 1 MiB stderr, and 16 MiB combined. Run options can
 only tighten those ceilings, discard stderr, or provide a log count hint up to
 50,000. Plain `diff` scans at most 100,000 worktree source rows, including
 untracked rows it must discard, and renders unmerged paths in Git's combined
-format. The first excess fails with `E2BIG`; semantic output is never truncated.
+format. Staged diff merges the selected tree with the ordered stage-0 index,
+does not traverse the worktree, and refuses an unmerged index with `EUNMERGED`.
+The first excess fails with `E2BIG`; semantic output is never truncated.
 The installed Computer interface still exposes scalar worktree metadata reads:
 a 1,001-file plain-diff probe uses 10,019 statements. That is a measured target
 miss, not a runtime rejection, and the runner adds no projected-count refusal.
@@ -321,7 +323,7 @@ registered nested repository root.
 | `git diff` | `{}` | ✔ working tree vs HEAD |
 | `git diff <ref>` | `{ ref }` | ★ ✔ working tree vs a commit |
 | `git diff <a> <b>` | `{ ref, to }` | ✔ commit vs commit |
-| `git diff --cached` / `--staged` | — | ✘ there is no index-vs-HEAD mode |
+| `git diff --cached` / `--staged [<ref>]` | `{ staged: true, ref? }` | ✔ selected tree (HEAD by default) vs stage-0 index; refuses unmerged indexes |
 | `-U<n>` | `context` | ✔ |
 | `--abbrev=<n>` | `abbrev` (default 7) | ✔ |
 | `-- <paths>` | `paths` | ~ exact or directory prefix, no globs |

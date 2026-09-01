@@ -1,8 +1,10 @@
 import { GitError, hasErrorCode } from "../common/errors.js";
+import { joinPath, normalizePath, relativeTo } from "../common/paths.js";
 import { type GitContext, nestedRoots, openRepository } from "../ops/context.js";
 import { diff } from "../ops/diff.js";
 import type { StatusEntry } from "../ops/kinds.js";
 import { divergence } from "../ops/merge-base.js";
+import { withPromisorHydration } from "../ops/network.js";
 import { readRef } from "../ops/plumbing.js";
 import { type CommitView, linearLogRange, log } from "../ops/reads.js";
 import { eagerStatus } from "../ops/status.js";
@@ -55,17 +57,37 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
       });
     },
     async diff(invocation, runOptions) {
-      return withRepository(context, invocation.cwd, outputContext(runOptions), (repo) => {
+      return withRepository(context, invocation.cwd, outputContext(runOptions), async (repo) => {
+        const command = invocation.command;
         const quotePath = statusFormatOptions(repo).quotePath ?? true;
-        return gitCliResult(
-          diff(repo, context.worktree, {}, context.sparseWorkspace, {
-            quotePaths: true,
-            quoteNonAscii: quotePath,
-            indexBase: true,
-            maxOutputBytes: Math.min(runOptions.maxStdoutBytes, runOptions.maxCombinedOutputBytes),
-          }),
-          "",
-          0,
+        const paths = resolveDiffPaths(repo.root, invocation.cwd, command.paths);
+        return withPromisorHydration(context, repo, () =>
+          gitCliResult(
+            diff(
+              repo,
+              context.worktree,
+              {
+                staged: command.staged,
+                ref: command.ref,
+                to: command.to,
+                paths,
+                context: command.context,
+              },
+              context.sparseWorkspace,
+              {
+                quotePaths: true,
+                quoteNonAscii: quotePath,
+                indexBase:
+                  command.staged !== true && command.ref === undefined && command.to === undefined,
+                maxOutputBytes: Math.min(
+                  runOptions.maxStdoutBytes,
+                  runOptions.maxCombinedOutputBytes,
+                ),
+              },
+            ),
+            "",
+            0,
+          ),
         );
       });
     },
@@ -165,14 +187,14 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
   };
 }
 
-function withRepository(
+async function withRepository(
   context: GitContext,
   cwd: string,
   output: GitCliOutputContext,
-  body: (repo: ReturnType<typeof openRepository>) => GitCliResult,
-): GitCliResult {
+  body: (repo: ReturnType<typeof openRepository>) => GitCliResult | Promise<GitCliResult>,
+): Promise<GitCliResult> {
   try {
-    return body(openRepository(context, cwd));
+    return await body(openRepository(context, cwd));
   } catch (error) {
     if (hasErrorCode(error, "ENOTAREPO")) {
       return gitCliDiagnosticResult(
@@ -185,6 +207,22 @@ function withRepository(
     }
     throw error;
   }
+}
+
+function resolveDiffPaths(
+  root: string,
+  cwd: string,
+  inputs: readonly string[] | undefined,
+): string[] | undefined {
+  if (inputs === undefined) return undefined;
+  return inputs.map((input) => {
+    const absolute = input.startsWith("/") ? normalizePath(input) : joinPath(cwd, input);
+    const path = relativeTo(root, absolute);
+    if (path === null) {
+      throw new GitError("EINVAL", `diff path '${input}' is outside repository at '${root}'`);
+    }
+    return path;
+  });
 }
 
 function missingRevision(

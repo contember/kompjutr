@@ -27,6 +27,7 @@ import {
 const INPUT_KEYS = new Set(["argv", "cwd", "env", "stdin"]);
 const NETWORK_COMMANDS = new Set(["fetch", "push", "pull", "clone", "ls-remote"]);
 const DECIMAL_COUNT = /^[0-9]+$/;
+const DIFF_CONTEXT = /^-U([0-9]+)$/;
 const GLOB_PATHSPEC = /[*?[]/;
 
 export interface ValidatedGitCliInput {
@@ -154,8 +155,58 @@ function parseStatus(argv: readonly string[]): ParsedGitCliCommand | undefined {
 }
 
 function parseDiff(argv: readonly string[]): ParsedGitCliCommand | undefined {
-  if (argv.length !== 1) return undefined;
-  return { kind: "diff" };
+  if (argv.length === 1) return { kind: "diff" };
+  let staged = false;
+  let context: number | undefined;
+  const revisions: string[] = [];
+  const paths: string[] = [];
+  let pathMode = false;
+  let optionMode = true;
+  for (let index = 1; index < argv.length; index++) {
+    const argument = argv[index];
+    if (argument === undefined) return undefined;
+    if (!pathMode && argument === "--") {
+      pathMode = true;
+      optionMode = false;
+      continue;
+    }
+    if (pathMode) {
+      if (!validLiteralPathspec(argument)) return undefined;
+      paths.push(argument);
+      continue;
+    }
+    if (optionMode && (argument === "--cached" || argument === "--staged")) {
+      if (staged) return undefined;
+      staged = true;
+      continue;
+    }
+    if (optionMode) {
+      const match = DIFF_CONTEXT.exec(argument);
+      if (match !== null) {
+        if (context !== undefined) return undefined;
+        const value = match[1];
+        if (value === undefined) return undefined;
+        context = parseSafeDecimal(value);
+        if (context === undefined) return undefined;
+        continue;
+      }
+    }
+    if (argument.startsWith("-") || argument.length === 0) return undefined;
+    optionMode = false;
+    revisions.push(argument);
+    if (revisions.length > (staged ? 1 : 2)) return undefined;
+  }
+  if (pathMode && paths.length === 0) return undefined;
+  const ref = revisions[0];
+  const to = revisions[1];
+  return {
+    kind: "diff",
+    ...(staged ? { staged: true } : {}),
+    ...(ref === undefined ? {} : { ref }),
+    ...(to === undefined ? {} : { to }),
+    ...(paths.length === 0 ? {} : { paths }),
+    ...(context === undefined ? {} : { context }),
+  };
 }
 
 function parseLog(
@@ -304,7 +355,7 @@ function parseAdd(argv: readonly string[]): ParsedGitCliCommand | undefined {
       continue;
     }
     if (!endOptions && argument.startsWith("-")) return undefined;
-    if (argument.length === 0 || GLOB_PATHSPEC.test(argument) || argument.startsWith(":")) {
+    if (!validLiteralPathspec(argument)) {
       return undefined;
     }
     paths.push(argument);
@@ -394,6 +445,16 @@ function parseCount(value: string): number | undefined {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed > GIT_CLI_MAX_LOG_COUNT) return undefined;
   return parsed;
+}
+
+function parseSafeDecimal(value: string): number | undefined {
+  if (!DECIMAL_COUNT.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+function validLiteralPathspec(value: string): boolean {
+  return value.length > 0 && !GLOB_PATHSPEC.test(value) && !value.startsWith(":");
 }
 
 function validateLogFormat(template: string): void {

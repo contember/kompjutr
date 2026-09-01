@@ -28,7 +28,12 @@ import {
 import { diff as diffOp, diffSummary as diffSummaryOp } from "../../git/ops/diff.js";
 import { initRepository } from "../../git/ops/init.js";
 import { merge as mergeOp } from "../../git/ops/merge.js";
-import { clone as cloneOp, fetchInto, validateFetchOptions } from "../../git/ops/network.js";
+import {
+  clone as cloneOp,
+  fetchInto,
+  validateFetchOptions,
+  withPromisorHydration,
+} from "../../git/ops/network.js";
 import {
   catFile as catFileOp,
   hashObject as hashObjectOp,
@@ -156,11 +161,15 @@ export function createSqliteGitClient(
         });
       },
       async diff(input = {}) {
-        return diffOp(at(input.dir), ctx().worktree, { ...input, renames: false });
+        const repo = at(input.dir);
+        return withPromisorHydration(ctx(), repo, () =>
+          diffOp(repo, ctx().worktree, { ...input, renames: false }),
+        );
       },
       async diffSummary(input = {}) {
-        return diffSummaryOp(at(input.dir), ctx().worktree, { ...input, renames: false }).map(
-          (row) => {
+        const repo = at(input.dir);
+        return withPromisorHydration(ctx(), repo, () =>
+          diffSummaryOp(repo, ctx().worktree, { ...input, renames: false }).map((row) => {
             if (row.status === "R") {
               throw new GitError(
                 "EUNSUPPORTED",
@@ -173,7 +182,7 @@ export function createSqliteGitClient(
               insertions: row.insertions,
               deletions: row.deletions,
             };
-          },
+          }),
         );
       },
       async clean(input = {}) {

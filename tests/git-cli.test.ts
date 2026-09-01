@@ -26,6 +26,7 @@ describe("git argv grammar", () => {
     [["status", "--short"], { kind: "status", format: "short" }],
     [["status", "-s"], { kind: "status", format: "short" }],
     [["diff"], { kind: "diff" }],
+    [["diff", "HEAD"], { kind: "diff", ref: "HEAD" }],
     [["log"], { kind: "log", count: undefined, format: { kind: "default" }, revision: undefined }],
     [
       ["log", "-1", "--oneline", "HEAD"],
@@ -64,7 +65,6 @@ describe("git argv grammar", () => {
     ["plain status", ["status"]],
     ["status extra operand", ["status", "--short", "path"]],
     ["status v2", ["status", "--porcelain=v2"]],
-    ["diff operand", ["diff", "HEAD"]],
     ["diff separator", ["diff", "--"]],
     ["joined count", ["log", "-n1"]],
     ["duplicate count", ["log", "-1", "-n", "1"]],

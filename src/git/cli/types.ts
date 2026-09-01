@@ -51,6 +51,11 @@ export interface GitCliStatusCommand {
 
 export interface GitCliDiffCommand {
   readonly kind: "diff";
+  readonly staged?: boolean;
+  readonly ref?: string;
+  readonly to?: string;
+  readonly paths?: readonly string[];
+  readonly context?: number;
 }
 
 export type GitCliLogFormat =
