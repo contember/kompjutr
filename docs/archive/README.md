@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Everyday Git shell](sprint-2026-08-31-everyday-git-shell.md)
+  — asynchronous bounded shell execution and exact everyday Git reads,
+  mutations, history, network commands, and pull-rebase.
 - [Shell POSIX surface](sprint-2026-08-31-shell-posix-surface.md)
   — bounded `printf`, `exit`, ordered `1>&2`, and named parameter expansion with
   byte-exact Bash parity.

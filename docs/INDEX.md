@@ -16,8 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-31-everyday-git-shell.md`](sprints/sprint-2026-08-31-everyday-git-shell.md)
-  — async shell execution and a bounded everyday Git argv surface.
+None.
 
 ## Specs
 
@@ -37,9 +36,9 @@ decisions → reference → archive.
   [`benchmark-current`](reference/benchmark-current.md#clone-statement-profile).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0020).
-- The active everyday Git shell sprint makes command execution asynchronous,
-  adds staged diff and history reads, exposes existing local/network operations,
-  and composes pull with the restart-safe rebase lifecycle.
+- The completed everyday Git shell sprint made command execution asynchronous,
+  added staged diff and history reads, exposed exact local/network operations,
+  and composed pull with the restart-safe rebase lifecycle.
 - The completed POSIX shell sprint admitted bounded `printf`, `exit`, `1>&2`,
   and named parameter expansion with Bash parity as the standing gate
   (ADR-0021).
@@ -84,6 +83,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-31-everyday-git-shell.md`](archive/sprint-2026-08-31-everyday-git-shell.md)
+  — asynchronous bounded shell execution and exact everyday Git reads,
+  mutations, history, network commands, and pull-rebase.
 - [`archive/sprint-2026-08-31-shell-posix-surface.md`](archive/sprint-2026-08-31-shell-posix-surface.md)
   — bounded `printf`, `exit`, ordered `1>&2`, and named parameter expansion with
   byte-exact Bash parity.

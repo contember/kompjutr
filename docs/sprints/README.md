@@ -20,6 +20,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [`sprint-2026-08-31-everyday-git-shell.md`](sprint-2026-08-31-everyday-git-shell.md)
-  — async shell execution and a bounded everyday Git argv surface, including
-  staged diff, history reads, network commands, and pull-rebase.
+None.

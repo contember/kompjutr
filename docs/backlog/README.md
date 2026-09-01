@@ -22,12 +22,9 @@ not effort: a wrong answer outranks a missing one.
   returns a different one or refuses. Nothing warns the caller. No current item.
 - **A — blocks a common workflow, loudly.** The call fails or the capability is
   absent; no data is at risk.
-  [35](35-staged-diff.md) ·
-  [37](37-history-reads-patch-and-paths.md) ·
   [39](39-plumbing-read-surface.md) ·
   [06](06-stash-operations.md) ·
-  [18](18-branch-and-remote-management.md) ·
-  [28](28-pull-rebase.md)
+  [18](18-branch-and-remote-management.md)
 - **B — real gap, narrower audience or a workaround exists.**
   [36](36-glob-pathspecs.md) ·
   [25](25-rebase-targets-and-roots.md) ·
@@ -71,7 +68,7 @@ Coverage of the calls that decide whether Phase 1 is usable:
 | `branch -m`, `remote set-url` | both | Served by typed native operations; [18](18-branch-and-remote-management.md) now retains only no-caller management |
 | `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'` | builder | Served by native cached/untracked selection and repository `.gitignore` filtering; [36](36-glob-pathspecs.md) now retains mutating globs only |
 | `clone --filter=blob:none` | both | Served by native filtered clone/fetch, durable promises, and bounded lazy backfill (ADR-0020) |
-| `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | Served by the strict synchronous runner, bounded per-run stdin/env, and the explicit `kompjutr/git/shell` adapter |
+| `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | Served by the strict awaitable runner, bounded per-run stdin/env, and the explicit `kompjutr/git/shell` adapter |
 
 Everything else both consumers issue is served, or routes through another
 spelling listed under
@@ -89,9 +86,8 @@ A blocked item must not move ahead of its blocker.
 **Phase 1** package work is complete. The real adapter now reruns its workflow as
 the integration gate. Everything below the gate is re-planned from that result.
 **Phase 2** is production scale; partial clone shipped directly outside a sprint.
-An explicit product decision has scheduled the everyday Git shell surface before
-the remaining parity work. The three consumed items remain here until the active
-sprint closes; closure deletes or rescopes them from the shipped result.
+The everyday Git shell sprint is complete. The remaining parity work stays
+unscheduled until the external consumer integration gate provides new evidence.
 
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
@@ -99,8 +95,6 @@ sprint closes; closure deletes or rescopes them from the shipped result.
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Phase 2 — production scale** | | | | |
 | 1 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Audit the settled physical, shallow, and promisor storage shapes. |
-| **Everyday Git shell — active** | | | | |
-| active | [Everyday Git shell](../sprints/sprint-2026-08-31-everyday-git-shell.md) | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md), [28](28-pull-rebase.md) | long | Make shell execution async, expose the bounded ordinary argv surface, and close its three native gaps. |
 | **Remaining parity without a caller (unscheduled)** | | | | |
 | — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
 | — | Plumbing reads | [39](39-plumbing-read-surface.md) | normal | Type/size probes, tree/blob filters, ref enumeration, and general commit enumeration have no current caller. |
@@ -123,11 +117,8 @@ units over the same files, and a long sprint does not make that safe.
 - [25 — Add explicit rebase targets and roots](25-rebase-targets-and-roots.md)
 - [26 — Add programmable interactive rebase](26-interactive-rebase.md)
 - [27 — Replay merge topology during rebase](27-rebase-merges.md)
-- [28 — Compose pull with native rebase](28-pull-rebase.md)
 - [29 — Update dependent refs after rebase](29-rebase-update-refs.md)
-- [35 — Add a staged diff mode](35-staged-diff.md)
 - [36 — Add mutating glob pathspecs](36-glob-pathspecs.md)
-- [37 — Complete history reads — patch output for `show`, path filter for `log`](37-history-reads-patch-and-paths.md)
 - [39 — Complete the remaining plumbing reads](39-plumbing-read-surface.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)

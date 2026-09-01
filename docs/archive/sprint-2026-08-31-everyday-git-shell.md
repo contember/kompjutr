@@ -1,10 +1,13 @@
-<!--
-On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
-
-> **OUTCOME — shipped YYYY-MM-DD.** <one-paragraph result.> Commit map: WU1 → <sha>,
-> WU2 → <sha>, … Verification: <the gate command + numbers>. Backlog closed:
-> <ids deleted/rescoped>. Deferred: <honest notes>.
--->
+> **OUTCOME — shipped 2026-09-01.** The shell and Git argv runner are asynchronous
+> and bounded, with exact everyday reads, mutations, history, network commands,
+> and restart-safe pull-rebase. Commit map: WU1 → `739608f`; WU2 → `0d940a4`;
+> WU3 → `1aa25ce`; WU4 → `e11ec4c`; WU5 → `9431d76`; WU6 → `28486b3`;
+> WU7 → `14b1dbb`; WU8 → `f6cd733`; closure export witness → `6b5cbf6`.
+> Verification: WU8 focused 452/452; smoke 165/165, typecheck, Biome check,
+> build, and package smoke passed; the exhaustive runner passed all eight root shards,
+> protocol, five pack slices, filesystem, shell, and E2E. Backlog closed: 28, 35,
+> and 37. Deferred: stash, advanced rebase forms, general plumbing reads, mutating
+> glob pathspecs, and remaining remote management stay explicitly out of scope.
 
 # Sprint — Everyday Git shell (2026-08-31)
 
