@@ -5,10 +5,11 @@ import { isOid } from "../common/bytes.js";
 import { CorruptError, GitError, UnsupportedOperationError } from "../common/errors.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../common/ref-name.js";
 import { normalizeRemoteUrl } from "../protocol/remote.js";
-import type { GitContext, GitIdentity } from "./context.js";
-import type { MergeResult } from "./kinds.js";
+import { type GitContext, type GitIdentity, nestedRoots } from "./context.js";
+import type { PullResult } from "./kinds.js";
 import { type MergeBehavior, mergeOwned } from "./merge.js";
 import { type AbortableNetworkOptions, fetchInto, type RemoteAuthOptions } from "./network.js";
+import { startRebaseExcluding } from "./rebase-lifecycle.js";
 import { type Repository, resolveHeadOwned } from "./repository.js";
 import type { Worktree } from "./worktree.js";
 
@@ -23,6 +24,7 @@ export interface PullOptions extends RemoteAuthOptions, AbortableNetworkOptions 
   ref?: string;
   /** Remote branch to fetch and integrate. */
   remoteRef?: string;
+  rebase?: boolean;
   fastForward?: boolean;
   fastForwardOnly?: boolean;
   singleBranch?: boolean;
@@ -36,6 +38,7 @@ export interface PullOptions extends RemoteAuthOptions, AbortableNetworkOptions 
 }
 
 export interface PullPlan {
+  strategy: "merge" | "rebase";
   headRef: string;
   headOid: string;
   branch: string;
@@ -49,6 +52,10 @@ export interface PullPlan {
   fetchAutoTags: boolean;
   fastForward?: boolean;
   fastForwardOnly?: boolean;
+}
+
+export interface PullBehavior extends MergeBehavior {
+  afterFetch?: () => void;
 }
 
 function canonicalText(value: string, label: string): string {
@@ -151,13 +158,20 @@ function fastForwardOptions(
   return { fastForward: parseBooleanConfig(normalized, "pull.ff") };
 }
 
-function requireMergeStrategy(repo: Repository): void {
+function pullStrategy(repo: Repository, options: PullOptions): PullPlan["strategy"] {
+  const explicit: unknown = options.rebase;
+  if (explicit !== undefined) {
+    if (typeof explicit !== "boolean") {
+      throw new GitError("EINVAL", "pull rebase must be a boolean");
+    }
+    return explicit ? "rebase" : "merge";
+  }
   const rebase = configured(repo, "pull.rebase");
-  if (rebase === undefined) return;
+  if (rebase === undefined) return "merge";
   const normalized = rebase.trim().toLowerCase();
-  if (FALSE_CONFIG_VALUES.has(normalized)) return;
+  if (FALSE_CONFIG_VALUES.has(normalized)) return "merge";
+  if (TRUE_CONFIG_VALUES.has(normalized)) return "rebase";
   if (
-    TRUE_CONFIG_VALUES.has(normalized) ||
     normalized === "m" ||
     normalized === "merges" ||
     normalized === "i" ||
@@ -166,6 +180,14 @@ function requireMergeStrategy(repo: Repository): void {
     throw new UnsupportedOperationError("rebase-based pull");
   }
   throw new GitError("EINVAL", `config pull.rebase has invalid value ${rebase}`);
+}
+
+function requireRebaseOptions(options: PullOptions): void {
+  for (const name of ["author", "commit", "message", "fastForward", "fastForwardOnly"]) {
+    if (Reflect.get(options, name) !== undefined) {
+      throw new GitError("EINVAL", `pull ${name} is unavailable with rebase`);
+    }
+  }
 }
 
 function pullFetchShape(
@@ -239,9 +261,11 @@ function resolvePullOwned(repo: Repository, options: PullOptions): PullPlan {
   if (urlValue === undefined) throw new GitError("ENOREMOTE", `no such remote: ${remote}`);
   const resolvedUrl = pullUrl(urlValue);
   const fetchShape = pullFetchShape(repo, remote, remoteRef, options);
+  const strategy = pullStrategy(repo, options);
+  if (strategy === "rebase") requireRebaseOptions(options);
 
-  requireMergeStrategy(repo);
   const plan: PullPlan = {
+    strategy,
     headRef,
     headOid: head.oid,
     branch,
@@ -250,13 +274,14 @@ function resolvePullOwned(repo: Repository, options: PullOptions): PullPlan {
     remoteRef,
     remoteBranch,
     ...fetchShape,
-    ...fastForwardOptions(repo, options),
+    ...(strategy === "merge" ? fastForwardOptions(repo, options) : {}),
   };
   return plan;
 }
 
 function sameTarget(left: PullPlan, right: PullPlan): boolean {
   return (
+    left.strategy === right.strategy &&
     left.remote === right.remote &&
     left.url === right.url &&
     left.remoteRef === right.remoteRef &&
@@ -298,14 +323,14 @@ export function validatePullAfterFetch(
   }
 }
 
-/** Fetch one upstream and integrate it through the existing merge lifecycle. */
+/** Fetch one upstream and integrate it through the selected native lifecycle. */
 export async function pull(
   context: GitContext,
   repo: Repository,
   worktree: Worktree,
   options: PullOptions = {},
-  behavior: MergeBehavior & { afterFetch?: () => void } = {},
-): Promise<MergeResult> {
+  behavior: PullBehavior = {},
+): Promise<PullResult> {
   const plan = resolvePullOwned(repo, options);
   const fetched = await fetchInto(
     context,
@@ -335,8 +360,26 @@ export async function pull(
   }
   validatePullAfterFetch(repo, options, plan);
 
+  if (plan.strategy === "rebase") {
+    const rebaseOptions = {
+      upstream: fetched.fetchHead,
+      ...(options.committer === undefined ? {} : { committer: options.committer }),
+      ...(options.env === undefined ? {} : { env: options.env }),
+    };
+    return {
+      strategy: "rebase",
+      result: startRebaseExcluding(
+        context,
+        repo,
+        worktree,
+        nestedRoots(context, repo.root),
+        rebaseOptions,
+      ),
+    };
+  }
+
   const message = options.message === undefined ? defaultPullMessage(plan) : options.message;
-  return await mergeOwned(
+  const result = await mergeOwned(
     context,
     repo,
     worktree,
@@ -357,4 +400,5 @@ export async function pull(
       origin: "pull",
     },
   );
+  return { strategy: "merge", result };
 }

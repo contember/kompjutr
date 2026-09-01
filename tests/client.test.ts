@@ -936,6 +936,7 @@ describe("createSqliteGitClient", () => {
       const { workspace } = makeWorkspace();
       const git = workspace.git;
       await git.clone({ url: server.url, dir: "/", depth: 0 });
+      await git.configSet({ path: "pull.rebase", value: "true" });
       fixture.write("remote.txt", "remote\n");
       const fastForward = fixture.commit("remote fast-forward");
       await expect(git.pull({})).resolves.toBeUndefined();

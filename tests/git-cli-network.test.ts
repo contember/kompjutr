@@ -154,6 +154,143 @@ describe("Git network argv", () => {
     expect(server.requests).toHaveLength(before);
   });
 
+  it("runs pull --rebase over Smart HTTP and leaves conflicts recoverable", async () => {
+    const fixture = remoteFixture();
+    const server = await serverFor(fixture);
+    const workspace = runtime();
+    await workspace.git.runCli({ argv: ["clone", server.url, "clean"], cwd: "/" });
+    await workspace.git.runCli({ argv: ["clone", server.url, "compact"], cwd: "/" });
+    workspace.filesystem.writeFile("/clean/local.txt", ENCODER.encode("local\n"));
+    await workspace.git.add({ dir: "/clean", paths: ["local.txt"] });
+    await workspace.git.commit({ dir: "/clean", message: "local" });
+    fixture.write("remote.txt", "remote\n");
+    const incoming = fixture.commit("remote");
+
+    const fastForward = await workspace.git.runCli({
+      argv: ["pull", "--rebase"],
+      cwd: "/compact",
+    });
+    expect(fastForward.exitCode, fastForward.stderr).toBe(0);
+    expect(fastForward.stderr).toContain("Fast-forward\n");
+    expect(await workspace.git.revParse({ dir: "/compact", ref: "HEAD" })).toBe(incoming);
+    const upToDate = await workspace.git.runCli({ argv: ["pull", "--rebase"], cwd: "/compact" });
+    expect(upToDate.exitCode, upToDate.stderr).toBe(0);
+    expect(upToDate.stderr).toContain("Already up to date.\n");
+
+    await workspace.git.configSet({ dir: "/clean", path: "pull.rebase", value: "true" });
+    const rebased = await workspace.git.runCli({ argv: ["pull"], cwd: "/clean" });
+    expect(rebased.exitCode, rebased.stderr).toBe(0);
+    expect(rebased.stderr).toContain("Successfully rebased");
+    const cleanHead = await workspace.git.revParse({ dir: "/clean", ref: "HEAD" });
+    expect(
+      (await workspace.git.log({ dir: "/clean", ref: cleanHead, depth: 1 }))[0]?.parent,
+    ).toEqual([incoming]);
+
+    await workspace.git.runCli({ argv: ["clone", server.url, "conflict"], cwd: "/" });
+    workspace.filesystem.writeFile("/conflict/README.md", ENCODER.encode("local\n"));
+    await workspace.git.add({ dir: "/conflict", paths: ["README.md"] });
+    const local = await workspace.git.commit({ dir: "/conflict", message: "local conflict" });
+    fixture.write("README.md", "remote\n");
+    const remoteConflict = fixture.commit("remote conflict");
+
+    const conflicted = await workspace.git.runCli({
+      argv: ["pull", "--rebase", "origin", "main"],
+      cwd: "/conflict",
+    });
+    expect(conflicted.exitCode).not.toBe(0);
+    expect(conflicted.stderr).toContain("could not apply");
+    expect(await workspace.git.revParse({ dir: "/conflict", ref: "HEAD" })).toBe(local.oid);
+    expect(
+      await workspace.git.revParse({ dir: "/conflict", ref: "refs/remotes/origin/main" }),
+    ).toBe(remoteConflict);
+    expect(
+      await workspace.git.runCli({ argv: ["rebase", "--abort"], cwd: "/conflict" }),
+    ).toMatchObject({ exitCode: 0 });
+    expect(await workspace.git.status({ dir: "/conflict" })).toEqual([]);
+  });
+
+  it("truncates pull-rebase output only after fetch and replay publication", async () => {
+    const fixture = remoteFixture();
+    const server = await serverFor(fixture);
+    const workspace = runtime();
+    await workspace.git.runCli({ argv: ["clone", server.url, "repo"], cwd: "/" });
+    workspace.filesystem.writeFile("/repo/local.txt", ENCODER.encode("local\n"));
+    await workspace.git.add({ dir: "/repo", paths: ["local.txt"] });
+    const local = await workspace.git.commit({ dir: "/repo", message: "local" });
+    fixture.write("remote.txt", "remote\n");
+    const incoming = fixture.commit("remote");
+    await workspace.git.fetch({ dir: "/repo" });
+
+    const result = await workspace.git.runCli(
+      { argv: ["pull", "--rebase"], cwd: "/repo" },
+      { maxStderrBytes: 0, maxCombinedOutputBytes: 0 },
+    );
+
+    expect(result).toEqual({ stdout: "", stderr: "", exitCode: 0, truncated: true });
+    const head = await workspace.git.revParse({ dir: "/repo", ref: "HEAD" });
+    expect(head).not.toBe(local.oid);
+    expect((await workspace.git.log({ dir: "/repo", ref: head, depth: 1 }))[0]?.parent).toEqual([
+      incoming,
+    ]);
+  });
+
+  it("keeps a conflicted rebase journal when post-publication output is full", async () => {
+    const fixture = remoteFixture();
+    const server = await serverFor(fixture);
+    const workspace = runtime();
+    await workspace.git.runCli({ argv: ["clone", server.url, "repo"], cwd: "/" });
+    workspace.filesystem.writeFile("/repo/README.md", ENCODER.encode("local\n"));
+    await workspace.git.add({ dir: "/repo", paths: ["README.md"] });
+    const local = await workspace.git.commit({ dir: "/repo", message: "local" });
+    fixture.write("README.md", "remote\n");
+    const incoming = fixture.commit("remote");
+    await workspace.git.fetch({ dir: "/repo" });
+
+    const result = await workspace.git.runCli(
+      { argv: ["pull", "--rebase"], cwd: "/repo" },
+      { maxStderrBytes: 0, maxCombinedOutputBytes: 0 },
+    );
+
+    expect(result).toEqual({ stdout: "", stderr: "", exitCode: 1, truncated: true });
+    expect(await workspace.git.revParse({ dir: "/repo", ref: "HEAD" })).toBe(local.oid);
+    expect(await workspace.git.revParse({ dir: "/repo", ref: "refs/remotes/origin/main" })).toBe(
+      incoming,
+    );
+    await expect(workspace.git.rebaseContinue({ dir: "/repo" })).rejects.toMatchObject({
+      code: "EUNMERGED",
+    });
+    await expect(workspace.git.rebaseAbort({ dir: "/repo" })).resolves.toBeUndefined();
+  });
+
+  it("preserves a nested checkout when pull --rebase targets its parent path", async () => {
+    const fixture = remoteFixture();
+    fixture.write("nested/outer.txt", "outer\n");
+    const base = fixture.commit("nested base");
+    const server = await serverFor(fixture);
+    const workspace = runtime();
+    await workspace.git.runCli({ argv: ["clone", server.url, "repo"], cwd: "/" });
+    await workspace.git.init({ dir: "/repo/nested" });
+    workspace.filesystem.writeFile("/repo/nested/foreign.txt", ENCODER.encode("foreign\n"));
+    const outer = workspace.filesystem.readFile("/repo/nested/outer.txt");
+    const foreign = workspace.filesystem.readFile("/repo/nested/foreign.txt");
+    fixture.write("nested/outer.txt", "incoming\n");
+    const incoming = fixture.commit("change nested path");
+    await workspace.git.fetch({ dir: "/repo" });
+
+    const result = await workspace.git.runCli(
+      { argv: ["pull", "--rebase"], cwd: "/repo" },
+      { maxStderrBytes: 0, maxCombinedOutputBytes: 0 },
+    );
+
+    expect(result).toEqual({ stdout: "", stderr: "", exitCode: 128, truncated: true });
+    expect(await workspace.git.revParse({ dir: "/repo", ref: "HEAD" })).toBe(base);
+    expect(await workspace.git.revParse({ dir: "/repo", ref: "refs/remotes/origin/main" })).toBe(
+      incoming,
+    );
+    expect(workspace.filesystem.readFile("/repo/nested/outer.txt")).toEqual(outer);
+    expect(workspace.filesystem.readFile("/repo/nested/foreign.txt")).toEqual(foreign);
+  });
+
   it("rejects argv credentials and propagates cancellation through every network command", async () => {
     const fixture = remoteFixture();
     const server = await serverFor(fixture);
@@ -181,6 +318,7 @@ describe("Git network argv", () => {
       ["ls-remote", "origin"],
       ["fetch", "origin"],
       ["pull", "--ff-only"],
+      ["pull", "--rebase"],
       ["push", "origin", "main:main"],
     ]) {
       expect(await workspace.git.runCli({ argv, cwd: "/configured" })).toMatchObject({
@@ -218,6 +356,7 @@ describe("Git network argv", () => {
       ["ls-remote", "origin"],
       ["fetch", "origin"],
       ["pull", "--ff-only"],
+      ["pull", "--rebase"],
       ["push", "origin", "main:main"],
     ]) {
       await expect(cancellable.git.runCli({ argv, cwd: "/repo" })).rejects.toMatchObject({

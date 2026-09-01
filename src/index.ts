@@ -107,6 +107,7 @@ export type {
   CommitResult,
   DiffSummaryEntry,
   MergeResult,
+  PullResult,
   RebaseResult,
   RemoteView,
   ReplayEmptyReason,

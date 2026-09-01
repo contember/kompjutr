@@ -94,7 +94,7 @@ The accepted argv grammar is exact:
 | `remote` | Optionless or `-v`; `add <name> <url>`; `remove\|rm <name>`; `get-url <name>`; `set-url <name> <url>` |
 | `ls-remote` | `[<remote-or-http(s)-url> [<patterns>...]]` |
 | `fetch` | `[--depth <n>\|--deepen <n>\|--unshallow] [--single-branch] [--prune] [--tags\|--no-tags] [--filter=blob:none] [<remote-or-http(s)-url> [<selector>]]`, or one or more full `<src>:<dst>` refspecs; mapped refspecs cannot use legacy selection options |
-| `pull` | `[--ff\|--no-ff\|--ff-only] [<remote> [<branch>]]`; merge strategy only |
+| `pull` | `[--rebase\|--ff\|--no-ff\|--ff-only] [<remote> [<branch>]]`; rebase and fast-forward options are mutually exclusive |
 | `push` | `[--force] [--delete] [--atomic] [--force-with-lease=<ref>[:<expect>]] [--push-option=<text>] [<remote-or-http(s)-url> [<selector-or-full-refspec>...]]` |
 
 Status, ls-files, and log path operands are literals or directory prefixes; glob
@@ -662,7 +662,7 @@ after its first filtered fetch, fails with `EPROMISORREMOTE` before discovery.
 | `--ff-only` | `fastForwardOnly` | ✔ |
 | `--no-commit` | `commit: false` | ~ native only |
 | `-m <msg>` | `message` | ~ native only |
-| `--rebase` / `pull.rebase=true` | — | ✘ throws `UnsupportedOperationError` |
+| `--rebase` / `pull.rebase=true` | `rebase: true` | ✔ non-interactive linear replay; `merges`/`m` and `interactive`/`i` are unsupported |
 | local-path remote | — | ✘ throws `UnsupportedOperationError` |
 | `--autostash`, `--recurse-submodules` | — | ✘ |
 
@@ -677,6 +677,18 @@ upstream still auto-follows tags whose peeled targets were already held or
 become held through that coverage, while an explicit `remoteRef` defaults to
 exact, tagless coverage unless `singleBranch: false` requests canonical
 coverage.
+
+`pull()` returns `PullResult`, discriminated by `strategy`, with either the
+existing `MergeResult` or the restart-safe `RebaseResult`. An explicit `rebase`
+boolean overrides `pull.rebase`; merge remains the default. Rebase pull rejects
+merge-only author, message, commit, and fast-forward options and ignores
+`pull.ff`.
+
+Fetch publication completes before local merge or replay begins. Pull captures
+the fetched upstream OID, then revalidates HEAD, upstream configuration, and
+strategy before integration. A replay conflict or later local failure leaves
+remote-tracking publication intact. A pending rebase journal keeps that captured
+OID even if the tracking ref or pull configuration later moves.
 
 Because no SQLite transaction spans an HTTP await, a successful fetch stays
 visible even if the integration afterwards refuses (`ESTALEHEAD`,
@@ -858,7 +870,7 @@ Keys the engine actually reads:
 | `remote.<name>.fetch` | written by clone; pull's all-head coverage requires the canonical mapping, status and safe branch deletion recognise its tracking namespace, and standalone `fetch()` does not parse it |
 | `branch.<name>.remote`, `branch.<name>.merge` | upstream for pull, push, status metadata, and safe branch deletion |
 | `pull.ff` | pull fast-forward policy |
-| `pull.rebase` | recognised, then rejected |
+| `pull.rebase` | `1`, `true`, `yes`, or `on` select rebase; empty, `0`, `false`, `no`, or `off` select merge; `m`, `merges`, `i`, and `interactive` are unsupported |
 | `core.quotePath` | read by `statusFormatOptions()`; defaults to true |
 | `status.renames`, `diff.renames` | default exact-rename detection for the respective operation |
 | `core.bare` | recorded by `init({ bare: true })`, otherwise inert |
@@ -924,7 +936,7 @@ differences:
 - `fetch()` and `push()` retain Computer's legacy single-selection inputs and
   result shapes. The adapter projects the native structured push status to its
   ref-keyed record and does not expose unpack or tracking reconciliation;
-- `pull` returns `void` rather than a `MergeResult`.
+- `pull` returns `void` rather than the native `PullResult`.
 
 ## Limits
 

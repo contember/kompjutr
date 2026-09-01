@@ -428,16 +428,23 @@ function parseFetchSelection(
 }
 
 function parsePull(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  let rebase = false;
   let fastForward: boolean | undefined;
   let fastForwardOnly = false;
   const operands: string[] = [];
   for (let index = 1; index < argv.length; index++) {
     const argument = argv[index];
-    if (argument === "--ff" || argument === "--no-ff") {
-      if (fastForward !== undefined || fastForwardOnly || operands.length > 0) return undefined;
+    if (argument === "--rebase") {
+      if (rebase || fastForward !== undefined || fastForwardOnly || operands.length > 0)
+        return undefined;
+      rebase = true;
+    } else if (argument === "--ff" || argument === "--no-ff") {
+      if (rebase || fastForward !== undefined || fastForwardOnly || operands.length > 0)
+        return undefined;
       fastForward = argument === "--ff";
     } else if (argument === "--ff-only") {
-      if (fastForward !== undefined || fastForwardOnly || operands.length > 0) return undefined;
+      if (rebase || fastForward !== undefined || fastForwardOnly || operands.length > 0)
+        return undefined;
       fastForwardOnly = true;
     } else {
       if (argument === undefined || argument.startsWith("-") || operands.length === 2)
@@ -449,6 +456,7 @@ function parsePull(argv: readonly string[]): ParsedGitCliCommand | undefined {
     kind: "pull",
     ...(operands[0] === undefined ? {} : { remote: operands[0] }),
     ...(operands[1] === undefined ? {} : { branch: operands[1] }),
+    ...(rebase ? { rebase: true } : {}),
     ...(fastForward === undefined ? {} : { fastForward }),
     ...(fastForwardOnly ? { fastForwardOnly: true } : {}),
   };

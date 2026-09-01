@@ -219,6 +219,10 @@ describe("git argv grammar", () => {
       { kind: "pull", remote: "origin", branch: "main", fastForwardOnly: true },
     ],
     [
+      ["pull", "--rebase", "origin", "main"],
+      { kind: "pull", remote: "origin", branch: "main", rebase: true },
+    ],
+    [
       [
         "push",
         "--atomic",
@@ -303,7 +307,9 @@ describe("git argv grammar", () => {
       "fetch mixed mapped depth",
       ["fetch", "--depth", "1", "origin", "refs/heads/main:refs/remotes/origin/main"],
     ],
-    ["pull rebase", ["pull", "--rebase"]],
+    ["duplicate pull rebase", ["pull", "--rebase", "--rebase"]],
+    ["pull rebase with ff", ["pull", "--rebase", "--ff"]],
+    ["pull ff with rebase", ["pull", "--ff-only", "--rebase"]],
     ["push unsupported tags", ["push", "--tags"]],
     ["push bare lease", ["push", "--force-with-lease"]],
   ])("rejects %s", (_name, argv) => {

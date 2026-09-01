@@ -234,6 +234,7 @@ export interface GitCliPullCommand {
   readonly kind: "pull";
   readonly remote?: string;
   readonly branch?: string;
+  readonly rebase?: boolean;
   readonly fastForward?: boolean;
   readonly fastForwardOnly?: boolean;
 }

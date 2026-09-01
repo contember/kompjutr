@@ -92,3 +92,7 @@ export type RebaseResult =
       fastForward: boolean;
     }
   | { outcome: "conflicted"; replayed: number; skipped: number };
+
+export type PullResult =
+  | { strategy: "merge"; result: MergeResult }
+  | { strategy: "rebase"; result: RebaseResult };

@@ -323,7 +323,18 @@ export function createSqliteGitClient(
       async pull(input = {}) {
         const repo = at(input.dir);
         repo.checkout.requireNoOperationState();
-        await pullOp(ctx(), repo, ctx().worktree, input, { persistConflicts: false });
+        const pulled = await pullOp(
+          ctx(),
+          repo,
+          ctx().worktree,
+          { ...input, rebase: false },
+          {
+            persistConflicts: false,
+          },
+        );
+        if (pulled.strategy !== "merge") {
+          throw new Error("merge-only compatibility pull selected rebase");
+        }
       },
       async merge(input) {
         const repo = at(input.dir);

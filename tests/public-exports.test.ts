@@ -53,6 +53,7 @@ import type {
   LsRemoteResult as GitLsRemoteResult,
   GitLsTreeOptions,
   GitMergeBaseOptions,
+  PullResult as GitPullResult,
   PushLeaseExpectation as GitPushLeaseExpectation,
   GitPushOptions,
   PushRefStatus as GitPushRefStatus,
@@ -171,6 +172,7 @@ import type {
   GitWorktreeRemoveOptions as RootGitWorktreeRemoveOptions,
   GitLsFilesOptions as RootLsFilesOptions,
   LsRemoteResult as RootLsRemoteResult,
+  PullResult as RootPullResult,
   PushRefStatus as RootPushRefStatus,
   PushRefspec as RootPushRefspec,
   PushTrackingResult as RootPushTrackingResult,
@@ -672,6 +674,18 @@ interface ReplayMethods {
   rebaseSkip(input?: RootRebaseContinueOptions): Promise<RootRebaseResult>;
   rebaseAbort(input?: { dir?: string }): Promise<void>;
 }
+
+interface PullMethod {
+  pull(input?: { dir?: string; rebase?: boolean }): Promise<RootPullResult>;
+}
+
+function rootPullMethod(git: RootGit): PullMethod {
+  return { pull: git.pull };
+}
+
+function gitEntrypointPullMethod(git: GitEntrypointGit): PullMethod {
+  return { pull: git.pull };
+}
 function rootReplayMethods(git: RootGit): ReplayMethods {
   return {
     cherryPick: git.cherryPick,
@@ -728,6 +742,13 @@ describe("public replay exports", () => {
       skipped: 0,
     };
     const gitRebaseResult: GitRebaseResult = rootRebaseResult;
+    const rootPullResult: RootPullResult = {
+      strategy: "rebase",
+      result: rootRebaseResult,
+    };
+    const gitPullResult: GitPullResult = rootPullResult;
+    void rootPullMethod;
+    void gitEntrypointPullMethod;
     expect([
       gitCherryPick.source,
       gitCherryContinue.message,
@@ -738,6 +759,7 @@ describe("public replay exports", () => {
       gitRebase.upstream,
       gitRebaseContinue.dir,
       gitRebaseResult.outcome,
+      gitPullResult.strategy,
     ]).toEqual([
       "HEAD",
       "continue",
@@ -748,6 +770,7 @@ describe("public replay exports", () => {
       "main",
       "/repo",
       "conflicted",
+      "rebase",
     ]);
     expect([rootReplayMethods, gitEntrypointReplayMethods]).toHaveLength(2);
   });

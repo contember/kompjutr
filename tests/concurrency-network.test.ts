@@ -807,45 +807,117 @@ describe("push and pull concurrency", () => {
     }
   });
 
-  it.each([
-    { kind: "staged", stage: true },
-    { kind: "dirty", stage: false },
-  ])("rejects an interleaved overlapping $kind change after retaining fetch", async ({ stage }) => {
+  it("lets the second pull-rebase owner publish and rejects the first stale owner", async () => {
     const { fixture, initial } = remoteFixture();
     const server = await startGitServer(fixture.dir);
     const workspace = makeWorkspace();
-    const discovery = oneShotBarrier(`pull overlapping ${stage ? "staged" : "dirty"}`);
-    let blockDiscovery = false;
-    const http: GitHttpClient = async (request) => {
-      if (blockDiscovery && request.method === "GET") await discovery.wait();
+    const firstDiscovery = oneShotBarrier("first pull-rebase discovery");
+    const secondDiscovery = oneShotBarrier("second pull-rebase discovery");
+    let firstBlocked = false;
+    let secondBlocked = false;
+    const firstHttp: GitHttpClient = async (request) => {
+      if (firstBlocked && request.method === "GET") await firstDiscovery.wait();
       return fetchHttpClient(request);
     };
-    let pulling: Promise<unknown> | null = null;
+    const secondHttp: GitHttpClient = async (request) => {
+      if (secondBlocked && request.method === "GET") await secondDiscovery.wait();
+      return fetchHttpClient(request);
+    };
+    let firstPull: ReturnType<Git["pull"]> | null = null;
+    let secondPull: ReturnType<Git["pull"]> | null = null;
     try {
-      const git = gitFor(workspace, http);
-      await git.clone({ url: server.url, dir: "/work", depth: 0, noTags: true });
+      const firstGit = gitFor(workspace, firstHttp);
+      const secondGit = gitFor(workspace, secondHttp);
+      await firstGit.clone({ url: server.url, dir: "/work", depth: 0, noTags: true });
       const repo = openRepository(workspace.context, "/work");
-      fixture.write("base.txt", "incoming\n");
+      const local = await localCommit(firstGit, workspace, "local replay\n");
+      fixture.write("incoming.txt", "incoming\n");
       const incoming = fixture.commit("incoming");
-      blockDiscovery = true;
+      firstBlocked = true;
+      secondBlocked = true;
 
-      pulling = git.pull({ dir: "/work" });
-      await awaitBarrierEntry(discovery, pulling);
-      await workspace.workspace.fs.writeFile("/work/base.txt", "local\n");
-      if (stage) await git.add({ dir: "/work", paths: ["base.txt"] });
-      discovery.release();
+      firstPull = firstGit.pull({ dir: "/work", rebase: true });
+      await awaitBarrierEntry(firstDiscovery, firstPull);
+      secondPull = secondGit.pull({ dir: "/work", rebase: true });
+      await awaitBarrierEntry(secondDiscovery, secondPull);
 
-      await expect(pulling).rejects.toMatchObject({ code: "ECHECKOUTFAIL" });
-      expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: initial });
+      secondDiscovery.release();
+      const winner = await secondPull;
+      expect(winner).toMatchObject({
+        strategy: "rebase",
+        result: { outcome: "completed", replayed: 1, skipped: 0, fastForward: false },
+      });
+      if (winner.strategy !== "rebase" || winner.result.outcome !== "completed") {
+        throw new Error("winning pull-rebase did not complete replay");
+      }
+      const winnerOid = winner.result.oid;
+      firstDiscovery.release();
+      await expect(firstPull).rejects.toMatchObject({ code: "ESTALEHEAD" });
+
+      expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: winnerOid });
+      expect(repo.store.getRef("refs/heads/main")).toBe(winnerOid);
+      expect(repo.readCommit(winnerOid).parent).toEqual([incoming]);
+      expect(winnerOid).not.toBe(local);
+      expect(winnerOid).not.toBe(initial);
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
-      expect(await workspace.workspace.fs.readFile("/work/base.txt", "utf8")).toBe("local\n");
-      assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
+      expect(repo.checkout.readOperationState()).toBeNull();
+      const cold = reopenTestRepository(workspace, "/work");
+      expect(cold.repo.head()).toEqual({ ref: "refs/heads/main", oid: winnerOid });
+      expect(cold.repo.checkout.readOperationState()).toBeNull();
+      assertRepositoryReadable(cold.repo);
     } finally {
-      discovery.release();
-      await Promise.allSettled([pulling].filter((value) => value !== null));
+      firstDiscovery.release();
+      secondDiscovery.release();
+      await Promise.allSettled([firstPull, secondPull].filter((value) => value !== null));
       await server.close();
     }
   });
+
+  it.each([
+    { kind: "staged", stage: true, rebase: false, strategy: "merge" },
+    { kind: "dirty", stage: false, rebase: false, strategy: "merge" },
+    { kind: "staged", stage: true, rebase: true, strategy: "rebase" },
+    { kind: "dirty", stage: false, rebase: true, strategy: "rebase" },
+  ])(
+    "rejects an interleaved overlapping $kind change during $strategy pull after retaining fetch",
+    async ({ stage, rebase }) => {
+      const { fixture, initial } = remoteFixture();
+      const server = await startGitServer(fixture.dir);
+      const workspace = makeWorkspace();
+      const discovery = oneShotBarrier(`pull overlapping ${stage ? "staged" : "dirty"}`);
+      let blockDiscovery = false;
+      const http: GitHttpClient = async (request) => {
+        if (blockDiscovery && request.method === "GET") await discovery.wait();
+        return fetchHttpClient(request);
+      };
+      let pulling: Promise<unknown> | null = null;
+      try {
+        const git = gitFor(workspace, http);
+        await git.clone({ url: server.url, dir: "/work", depth: 0, noTags: true });
+        const repo = openRepository(workspace.context, "/work");
+        fixture.write("base.txt", "incoming\n");
+        const incoming = fixture.commit("incoming");
+        blockDiscovery = true;
+
+        pulling = git.pull({ dir: "/work", rebase });
+        await awaitBarrierEntry(discovery, pulling);
+        await workspace.workspace.fs.writeFile("/work/base.txt", "local\n");
+        if (stage) await git.add({ dir: "/work", paths: ["base.txt"] });
+        discovery.release();
+
+        await expect(pulling).rejects.toMatchObject({ code: "ECHECKOUTFAIL" });
+        expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: initial });
+        expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
+        expect(await workspace.workspace.fs.readFile("/work/base.txt", "utf8")).toBe("local\n");
+        expect(repo.checkout.readOperationState()).toBeNull();
+        assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
+      } finally {
+        discovery.release();
+        await Promise.allSettled([pulling].filter((value) => value !== null));
+        await server.close();
+      }
+    },
+  );
 
   it("allows unrelated staged and dirty changes introduced during pull fetch", async () => {
     const { fixture } = remoteFixture();
@@ -873,7 +945,10 @@ describe("push and pull concurrency", () => {
       await workspace.workspace.fs.writeFile("/work/other.txt", "dirty\n");
       discovery.release();
 
-      await expect(pulling).resolves.toMatchObject({ fastForward: true, oid: incoming });
+      await expect(pulling).resolves.toMatchObject({
+        strategy: "merge",
+        result: { fastForward: true, oid: incoming },
+      });
       expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: incoming });
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
       expect(await workspace.workspace.fs.readFile("/work/base.txt", "utf8")).toBe("incoming\n");

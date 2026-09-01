@@ -21,7 +21,7 @@ import { createWorld, type E2EStep, type E2EWorld, WORK } from "../helpers/e2e.j
  */
 async function pullBothSides(target: E2EWorld): Promise<void> {
   const result = await target.git.pull({ dir: WORK, message: "merge origin" });
-  expect(result.conflicted).toBe(true);
+  expect(result).toMatchObject({ strategy: "merge", result: { conflicted: true } });
 
   let conflicted = false;
   try {

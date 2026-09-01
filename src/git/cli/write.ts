@@ -1269,7 +1269,7 @@ function formatRebaseContinue(
   return gitCliResult(stdout, formattedStderr, mutation.result.outcome === "completed" ? 0 : 1);
 }
 
-function formatRebaseResult(repo: Repository, result: RebaseResult): GitCliResult {
+export function formatRebaseResult(repo: Repository, result: RebaseResult): GitCliResult {
   if (result.outcome === "up-to-date") {
     return gitCliResult("", "Current branch is up to date.\n", 0);
   }

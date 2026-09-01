@@ -39,6 +39,7 @@ import type {
   CommitResult,
   DiffSummaryEntry,
   MergeResult,
+  PullResult,
   RebaseResult,
   RemoteView,
   ReplayResult,
@@ -128,10 +129,10 @@ import {
 import {
   type RebaseContinueOptions,
   type RebaseStartOptions,
-  rebaseAbort as rebaseAbortOp,
-  rebaseContinue as rebaseContinueOp,
-  rebase as rebaseOp,
-  rebaseSkip as rebaseSkipOp,
+  rebaseAbortExcluding as rebaseAbortOp,
+  rebaseContinueExcluding as rebaseContinueOp,
+  rebaseExcluding as rebaseOp,
+  rebaseSkipExcluding as rebaseSkipOp,
 } from "./ops/rebase.js";
 import {
   type RecoverRefOptions,
@@ -210,6 +211,7 @@ import {
 import type { AuthCallback, GitHttpClient } from "./protocol/transport.js";
 import type { SqliteGitDatabase } from "./store/index.js";
 
+export type { PullResult } from "./ops/kinds.js";
 export type { AbortableNetworkOptions, CloneOptions, FetchOptions } from "./ops/network.js";
 export type { PushOptions } from "./ops/push.js";
 
@@ -362,7 +364,7 @@ export interface Git extends GitCliRunner {
   withScratchIndex<T>(input: GitScratchIndexOptions, body: GitScratchIndexCallback<T>): Promise<T>;
   updateRef(input: GitUpdateRefOptions): Promise<void>;
   push(input?: GitPushOptions): Promise<StructuredPushResult>;
-  pull(input?: GitPullOptions): Promise<MergeResult>;
+  pull(input?: GitPullOptions): Promise<PullResult>;
   merge(input: GitMergeOptions): Promise<MergeResult>;
   mergeContinue(input?: GitMergeContinueOptions): Promise<MergeResult>;
   mergeAbort(input?: GitDirOptions): Promise<void>;
@@ -786,16 +788,20 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       revertAbortOp(at(input.dir), context.worktree);
     },
     async rebase(input) {
-      return rebaseOp(context, at(input.dir), context.worktree, input);
+      const repo = at(input.dir);
+      return rebaseOp(context, repo, context.worktree, excludeRoots(repo), input);
     },
     async rebaseContinue(input = {}) {
-      return rebaseContinueOp(context, at(input.dir), context.worktree, input);
+      const repo = at(input.dir);
+      return rebaseContinueOp(context, repo, context.worktree, excludeRoots(repo), input);
     },
     async rebaseSkip(input = {}) {
-      return rebaseSkipOp(context, at(input.dir), context.worktree, input);
+      const repo = at(input.dir);
+      return rebaseSkipOp(context, repo, context.worktree, excludeRoots(repo), input);
     },
     async rebaseAbort(input = {}) {
-      rebaseAbortOp(at(input.dir), context.worktree);
+      const repo = at(input.dir);
+      rebaseAbortOp(repo, context.worktree, excludeRoots(repo));
     },
     async stashPush() {
       throw new UnsupportedOperationError("stash push");

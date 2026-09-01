@@ -23,6 +23,7 @@ import type {
   GitCliResult,
   ResolvedGitCliRunOptions,
 } from "./types.js";
+import { formatRebaseResult } from "./write.js";
 
 type NetworkHandlers = Pick<
   GitCliHandlers,
@@ -237,6 +238,7 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
         const pullOptions = {
           ...(command.remote === undefined ? {} : { remote: command.remote }),
           ...(command.branch === undefined ? {} : { remoteRef: command.branch }),
+          ...(command.rebase ? { rebase: true } : {}),
           ...(command.fastForward === undefined ? {} : { fastForward: command.fastForward }),
           ...(command.fastForwardOnly ? { fastForwardOnly: true } : {}),
           ...networkBinding(context),
@@ -248,13 +250,27 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
           afterFetch: () => (published = true),
         });
         published = true;
-        if (result.conflicted)
+        if (result.strategy === "rebase") {
+          if (result.result.outcome === "up-to-date") {
+            output.appendPublished("Already up to date.\n");
+            return output.published(0);
+          }
+          if (result.result.outcome === "completed" && result.result.fastForward) {
+            output.appendPublished("Fast-forward\n");
+            return output.published(0);
+          }
+          const formatted = formatRebaseResult(repo, result.result);
+          output.appendPublished(formatted.stderr);
+          return output.published(formatted.exitCode);
+        }
+        const merged = result.result;
+        if (merged.conflicted)
           output.appendPublished(
             "Automatic merge failed; fix conflicts and then commit the result.\n",
           );
-        else if (result.alreadyMerged) output.appendPublished("Already up to date.\n");
-        else if (result.fastForward) output.appendPublished("Fast-forward\n");
-        return output.published(result.conflicted ? 1 : 0);
+        else if (merged.alreadyMerged) output.appendPublished("Already up to date.\n");
+        else if (merged.fastForward) output.appendPublished("Fast-forward\n");
+        return output.published(merged.conflicted ? 1 : 0);
       } catch (error) {
         return networkFailure(error, output, published);
       }

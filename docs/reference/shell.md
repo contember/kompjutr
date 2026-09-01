@@ -195,7 +195,10 @@ for every other command.
 Clone, fetch, pull, ls-remote, and push remain transport operations owned by the
 Git layer. Their published-result certainty and truncation policy is documented
 in [Git support](git-support.md#strict-argv-runner); the shell only propagates
-the settled result.
+the settled result. `git pull --rebase [<remote> [<branch>]]` enters the durable
+rebase lifecycle after fetch publication. A conflict exits non-zero and remains
+recoverable through `git rebase --continue`, `--skip`, or `--abort`, including
+after the workspace is reopened.
 
 ## Deliberate boundaries
 

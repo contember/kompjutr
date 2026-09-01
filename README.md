@@ -113,7 +113,14 @@ or missing operation state.
 replayed/skipped counts. The branch remains at its original OID while replay is
 in progress. Continue, skip, and abort survive a workspace restart, and the
 completed branch publishes once after every step succeeds. Interactive rebase,
-merge replay, `--onto`, `--root`, and pull-rebase are not part of this surface.
+merge replay, `--onto`, and `--root` are not part of this surface.
+
+`pull({ rebase: true })` and `pull.rebase=true` fetch first, then enter the same
+restart-safe rebase lifecycle with the fetched OID captured in its journal.
+`pull()` returns a `PullResult` discriminated by `strategy`, wrapping either a
+`MergeResult` or `RebaseResult`. Merge remains the default. The typed Computer
+compatibility pull method remains merge-only, while its shared `cli` supports
+the exact pull-rebase command surface.
 
 Push creates, fast-forwards, force-updates, or deletes one `refs/heads/*` ref.
 It streams a replayable full-object pack and updates the local remote-tracking
@@ -172,11 +179,14 @@ const workspace = new Workspace({
 `@cloudflare/computer` is an optional peer dependency. It is not loaded by
 `kompjutr`, `kompjutr/fs`, `kompjutr/git`, or `kompjutr/testing`.
 
-Native pull returns the same structured outcomes as merge and preserves
-restart-safe conflict or no-commit state. The compatibility interface returns
-`void` as declared by Computer; if integration conflicts, it rolls back the local
+Native pull returns `PullResult`, which wraps a `MergeResult` or `RebaseResult`
+under its selected strategy. Merge pull preserves restart-safe conflict or
+no-commit state; rebase pull uses the restart-safe rebase journal. The
+typed compatibility pull method returns `void` as declared by Computer and
+remains merge-only. Its shared `cli` still supports the exact CLI, including
+`pull --rebase`. If typed pull integration conflicts, it rolls back the local
 index and worktree while retaining the successful fetch and tracking ref. The
-installed Computer Git contract has no rebase methods; rebase is native-only.
+installed Computer Git contract has no typed rebase methods.
 
 ## Resource model
 

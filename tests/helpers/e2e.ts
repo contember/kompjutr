@@ -686,15 +686,16 @@ async function applyToKompjutr(world: E2EWorld, step: E2EStep): Promise<Outcome>
     case "fetch":
       await git.fetch({ dir, remote: step.remote, prune: step.prune, tags: step.tags });
       return CLEAN;
-    case "pull":
-      return mergeOutcome(
-        await git.pull({
-          dir,
-          message: step.message,
-          fastForward: step.fastForward,
-          fastForwardOnly: step.fastForwardOnly,
-        }),
-      );
+    case "pull": {
+      const pulled = await git.pull({
+        dir,
+        message: step.message,
+        fastForward: step.fastForward,
+        fastForwardOnly: step.fastForwardOnly,
+      });
+      if (pulled.strategy !== "merge") throw new Error("merge pull selected rebase");
+      return mergeOutcome(pulled.result);
+    }
     case "push": {
       const result = await git.push({
         dir,
