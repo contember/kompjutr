@@ -111,15 +111,14 @@ function intersectsExcluded(path: string, roots: readonly string[]): boolean {
 }
 
 function requireExcludedIndexIdentity(
-  repo: Repository,
-  treeOid: string | null,
+  target: () => Iterable<TargetEntry>,
   index: IndexStore,
   excludeRoots: readonly string[],
   maxSourceRows: number | undefined,
 ): void {
   if (excludeRoots.length === 0) return;
   for (const row of joinSorted(
-    boundedCheckoutSourceRows(treeStream(repo, treeOid), maxSourceRows, "tree"),
+    boundedCheckoutSourceRows(target(), maxSourceRows, "tree"),
     boundedCheckoutSourceRows(index.indexScan(), maxSourceRows, "index"),
     {
       left: (entry) => entry.path,
@@ -154,7 +153,13 @@ export function checkoutTree(
   options: CheckoutOptions = {},
   index: IndexStore = repo.checkout,
 ): void {
-  checkoutTreeInternal(repo, worktree, treeOid, checkoutInternalOptions(repo, options, []), index);
+  checkoutTreeInternal(
+    repo,
+    worktree,
+    () => treeStream(repo, treeOid),
+    checkoutInternalOptions(repo, options, []),
+    index,
+  );
 }
 
 /** Materialize while preserving registered checkout roots owned by another repository view. */
@@ -169,22 +174,79 @@ export function checkoutTreeExcluding(
   checkoutTreeInternal(
     repo,
     worktree,
-    treeOid,
+    () => treeStream(repo, treeOid),
     checkoutInternalOptions(repo, options, excludeRoots),
     index,
   );
 }
 
-function checkoutTreeInternal(
+/** Restore selected worktree paths from a tree without changing index rows. */
+export function checkoutWorktreePathsExcluding(
   repo: Repository,
   worktree: Worktree,
   treeOid: string | null,
+  paths: string[],
+  excludeRoots: readonly string[],
+): void {
+  checkoutTreeExcluding(
+    repo,
+    worktree,
+    treeOid,
+    excludeRoots,
+    { paths, prune: true, restoreStructure: true },
+    readOnlyIndex(repo),
+  );
+}
+
+/** Restore selected worktree paths from stage 0 without changing any index row. */
+export function checkoutIndexPathsExcluding(
+  repo: Repository,
+  worktree: Worktree,
+  paths: string[],
+  excludeRoots: readonly string[],
+): void {
+  checkoutTreeInternal(
+    repo,
+    worktree,
+    () => targetFromIndex(repo.checkout.indexScan()),
+    checkoutInternalOptions(repo, { paths, prune: true, restoreStructure: true }, excludeRoots),
+    readOnlyIndex(repo),
+  );
+}
+
+function readOnlyIndex(repo: Repository): IndexStore {
+  return {
+    indexScan: (options) => repo.checkout.indexScan(options),
+    indexApply: (body) => body(NOOP_INDEX_SINK),
+    indexReplace: () => {
+      throw new Error("worktree-only checkout cannot replace the index");
+    },
+    hasConflicts: () => repo.checkout.hasConflicts(),
+  };
+}
+
+function* targetFromIndex(entries: Iterable<IndexEntry>): Generator<TargetEntry> {
+  for (const entry of entries) {
+    if (entry.stage !== 0) continue;
+    yield { path: entry.path, mode: entry.mode.toString(8), oid: entry.oid };
+  }
+}
+
+const NOOP_INDEX_SINK: IndexSink = {
+  put() {},
+  remove() {},
+  flush() {},
+};
+
+function checkoutTreeInternal(
+  repo: Repository,
+  worktree: Worktree,
+  target: () => Iterable<TargetEntry>,
   options: CheckoutInternalOptions,
   index: IndexStore,
 ): void {
   requireExcludedIndexIdentity(
-    repo,
-    treeOid,
+    target,
     index,
     options.relativeExcludeRoots,
     options.maxSourceRowsPerPass,
@@ -202,7 +264,7 @@ function checkoutTreeInternal(
   }
   const preservedRemovals =
     options.restoreStructure === true
-      ? restoreStructuralConflicts(repo, worktree, treeOid, options, index)
+      ? restoreStructuralConflicts(repo, worktree, target, options, index)
       : new Set<string>();
   const removed: string[] = [];
   let prunePlan: CheckoutPrunePlan | undefined;
@@ -212,7 +274,7 @@ function checkoutTreeInternal(
   index.indexApply((sink) => {
     let retainedBytes = 0;
     for (const row of joinSorted(
-      boundedCheckoutSourceRows(treeStream(repo, treeOid), options.maxSourceRowsPerPass, "tree"),
+      boundedCheckoutSourceRows(target(), options.maxSourceRowsPerPass, "tree"),
       stageZero(
         boundedCheckoutSourceRows(index.indexScan(), options.maxSourceRowsPerPass, "index"),
       ),
@@ -254,7 +316,7 @@ function checkoutTreeInternal(
   const candidates: CheckoutCandidate[] = [];
   index.indexApply((sink) => {
     for (const row of joinSorted3(
-      boundedCheckoutSourceRows(treeStream(repo, treeOid), options.maxSourceRowsPerPass, "tree"),
+      boundedCheckoutSourceRows(target(), options.maxSourceRowsPerPass, "tree"),
       stageZero(
         boundedCheckoutSourceRows(index.indexScan(), options.maxSourceRowsPerPass, "index"),
       ),
@@ -354,7 +416,7 @@ interface StructuralPath {
 function restoreStructuralConflicts(
   repo: Repository,
   worktree: Worktree,
-  treeOid: string | null,
+  targetEntries: () => Iterable<TargetEntry>,
   options: CheckoutInternalOptions,
   index: IndexStore,
 ): Set<string> {
@@ -364,7 +426,7 @@ function restoreStructuralConflicts(
   let activeBytes = 0;
   const activeLeaves: Array<{ path: string; upper: string; bytes: number }> = [];
   for (const row of joinSorted3(
-    boundedCheckoutSourceRows(treeStream(repo, treeOid), options.maxSourceRowsPerPass, "tree"),
+    boundedCheckoutSourceRows(targetEntries(), options.maxSourceRowsPerPass, "tree"),
     stageZero(boundedCheckoutSourceRows(index.indexScan(), options.maxSourceRowsPerPass, "index")),
     walkStructuralPaths(worktree, repo.root, options.maxWorktreeRowsPerPass, options.excludeRoots),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },

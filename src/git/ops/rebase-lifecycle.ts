@@ -9,7 +9,7 @@ import {
   replaceOperationJournalOwned,
   writeOperationJournalOwned,
 } from "../store/index.js";
-import { checkoutTree, checkoutTreeExcluding } from "./checkout.js";
+import { checkoutTreeExcluding } from "./checkout.js";
 import { resolveIdentity, writeUnpublishedCommit } from "./commit.js";
 import type { GitContext, GitIdentity } from "./context.js";
 import {
@@ -198,6 +198,7 @@ function materializeTree(
   worktree: Worktree,
   baselineTree: string,
   target: BaselineTransition,
+  exclusions: RebaseExclusions,
 ): void {
   const blockers = checkoutBlockersAgainstOwned(
     repo,
@@ -207,6 +208,7 @@ function materializeTree(
     undefined,
     true,
     checkoutGuardLimits(),
+    exclusions.absolute,
   );
   if (blockers.tracked.length > 0) {
     throw new GitError(
@@ -220,7 +222,7 @@ function materializeTree(
       `untracked working tree files would be overwritten by rebase: ${blockers.untracked.join(", ")}`,
     );
   }
-  checkoutTree(repo, worktree, target.treeOid, {
+  checkoutTreeExcluding(repo, worktree, target.treeOid, exclusions.absolute, {
     preserveMatchingIndex: true,
     maxWorktreeRowsPerPass: 50_000,
   });
@@ -663,13 +665,39 @@ export function startRebase(
   worktree: Worktree,
   options: RebaseStartOptions,
 ): RebaseLifecycleResult {
+  return startRebaseInternal(context, repo, worktree, options, NO_REBASE_EXCLUSIONS);
+}
+
+export function startRebaseExcluding(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  excludeRoots: readonly string[],
+  options: RebaseStartOptions,
+): RebaseLifecycleResult {
+  return startRebaseInternal(
+    context,
+    repo,
+    worktree,
+    options,
+    rebaseExclusions(repo, excludeRoots),
+  );
+}
+
+function startRebaseInternal(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  options: RebaseStartOptions,
+  exclusions: RebaseExclusions,
+): RebaseLifecycleResult {
   const started = repo.store.db.transactionSync(() => {
     repo.checkout.requireNoOperationState();
     const head = requireHead(repo);
     const originalTree = repo.readCommit(head.oid).tree;
     requireRebaseIndex(repo);
     requireCleanIntegrationIndex(repo, originalTree, "rebase");
-    requireCleanIntegrationWorktree(repo, worktree, "rebase");
+    requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
     const plan = planRebase(repo, { upstream: options.upstream, currentOid: head.oid });
     if (plan.relation === "up-to-date") {
       return { relation: plan.relation, oid: head.oid };
@@ -680,7 +708,7 @@ export function startRebase(
     if (plan.relation === "replay") {
       preflightBaselineTransition(repo, originalTree);
     }
-    materializeTree(repo, worktree, originalTree, baseline);
+    materializeTree(repo, worktree, originalTree, baseline, exclusions);
     const observed = repo.head();
     if (observed.ref !== head.ref || observed.oid !== head.oid) {
       throw new GitError("ESTALEHEAD", "HEAD changed while rebase was being prepared");
@@ -718,7 +746,7 @@ export function startRebase(
       fastForward: true,
     };
   }
-  return driveRebase(context, repo, worktree, options, NO_REBASE_EXCLUSIONS);
+  return driveRebase(context, repo, worktree, options, exclusions);
 }
 
 type PreparedContinuation = { phase: "running" } | { phase: "conflicted"; integrityOid: string };
@@ -835,6 +863,26 @@ export function skipRebase(
   worktree: Worktree,
   options: RebaseContinueOptions = {},
 ): RebaseLifecycleResult {
+  return skipRebaseInternal(context, repo, worktree, options, NO_REBASE_EXCLUSIONS);
+}
+
+export function skipRebaseExcluding(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  excludeRoots: readonly string[],
+  options: RebaseContinueOptions = {},
+): RebaseLifecycleResult {
+  return skipRebaseInternal(context, repo, worktree, options, rebaseExclusions(repo, excludeRoots));
+}
+
+function skipRebaseInternal(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  options: RebaseContinueOptions,
+  exclusions: RebaseExclusions,
+): RebaseLifecycleResult {
   const prepared = prepareSkip(repo, worktree);
   repo.store.db.transactionSync(() => {
     const current = requireRebaseJournal(repo);
@@ -842,16 +890,10 @@ export function skipRebase(
       throw new GitError("EOPMISMATCH", "rebase conflict changed before skip");
     }
     requireOriginalHead(repo, current.state);
-    hardMaterializeTree(
-      repo,
-      worktree,
-      prepared.currentTree,
-      prepared.baseline,
-      NO_REBASE_EXCLUSIONS,
-    );
+    hardMaterializeTree(repo, worktree, prepared.currentTree, prepared.baseline, exclusions);
     advance(repo, current, "skipped", null);
   });
-  return driveRebase(context, repo, worktree, options, NO_REBASE_EXCLUSIONS);
+  return driveRebase(context, repo, worktree, options, exclusions);
 }
 
 interface PreparedAbort {

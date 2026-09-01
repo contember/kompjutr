@@ -43,6 +43,17 @@ describe("git argv grammar", () => {
     [["rev-parse", "--show-toplevel"], { kind: "rev-parse", showToplevel: true }],
     [["branch", "--show-current"], { kind: "branch", action: "show-current" }],
     [["branch", "--list"], { kind: "branch", action: "list" }],
+    [["branch"], { kind: "branch", action: "list" }],
+    [
+      ["branch", "topic", "HEAD~1"],
+      { kind: "branch", action: "create", name: "topic", startPoint: "HEAD~1" },
+    ],
+    [["branch", "-d", "topic"], { kind: "branch", action: "delete", name: "topic" }],
+    [["branch", "-D", "topic"], { kind: "branch", action: "delete", name: "topic", force: true }],
+    [
+      ["branch", "-m", "old", "new"],
+      { kind: "branch", action: "rename", oldName: "old", newName: "new" },
+    ],
     [["ls-files"], { kind: "ls-files" }],
     [
       ["ls-files", "--cached", "--others", "--exclude-standard", "--", "src"],
@@ -94,8 +105,38 @@ describe("git argv grammar", () => {
       ["commit", "--allow-empty", "--amend", "--all", "-m", "message"],
       { kind: "commit", message: "message", all: true, amend: true, allowEmpty: true },
     ],
+    [["reset"], { kind: "reset", mode: "mixed" }],
+    [["reset", "--mixed", "main"], { kind: "reset", mode: "mixed", ref: "main" }],
+    [["reset", "--hard", "HEAD~1"], { kind: "reset", mode: "hard", ref: "HEAD~1" }],
+    [
+      ["reset", "main", "--", "src", "a.txt"],
+      { kind: "reset", mode: "mixed", ref: "main", paths: ["src", "a.txt"] },
+    ],
+    [
+      ["checkout", "-f", "main"],
+      { kind: "checkout", action: "checkout", ref: "main", force: true },
+    ],
+    [
+      ["checkout", "-b", "topic", "main"],
+      { kind: "checkout", action: "create", name: "topic", startPoint: "main" },
+    ],
+    [
+      ["checkout", "main", "--", "src"],
+      { kind: "checkout", action: "checkout", ref: "main", paths: ["src"] },
+    ],
+    [["switch", "main"], { kind: "switch", action: "switch", name: "main" }],
+    [["switch", "-c", "topic"], { kind: "switch", action: "create", name: "topic" }],
+    [
+      ["restore", "--source=main", "--", "src"],
+      { kind: "restore", source: "main", paths: ["src"] },
+    ],
+    [["restore", "a.txt"], { kind: "restore", paths: ["a.txt"] }],
+    [["rebase", "main"], { kind: "rebase", action: "start", upstream: "main" }],
     [["rebase", "--continue"], { kind: "rebase", action: "continue" }],
+    [["rebase", "--skip"], { kind: "rebase", action: "skip" }],
     [["rebase", "--abort"], { kind: "rebase", action: "abort" }],
+    [["merge", "--continue"], { kind: "merge", action: "continue" }],
+    [["merge", "--abort"], { kind: "merge", action: "abort" }],
   ])("accepts %j without a partial parse", (argv, expected) => {
     expect(parsed(argv)).toEqual(expected);
   });
@@ -105,8 +146,10 @@ describe("git argv grammar", () => {
     ["rev-parse missing revision", ["rev-parse", "--verify"]],
     ["rev-parse quiet without verify", ["rev-parse", "--quiet", "HEAD"]],
     ["rev-parse extra revision", ["rev-parse", "HEAD", "main"]],
-    ["branch without selector", ["branch"]],
     ["branch extra operand", ["branch", "--list", "main"]],
+    ["branch force create short", ["branch", "-f", "topic"]],
+    ["branch force create long", ["branch", "--force", "topic", "HEAD"]],
+    ["branch force rename", ["branch", "-M", "old", "new"]],
     ["ls-files exclude without others", ["ls-files", "--exclude-standard"]],
     ["ls-files glob", ["ls-files", "--", "*.ts"]],
     ["diff separator", ["diff", "--"]],
@@ -130,8 +173,23 @@ describe("git argv grammar", () => {
     ["add long-form magic", ["add", ":(glob)file"]],
     ["add magic after separator", ["add", "--", ":file"]],
     ["commit duplicate", ["commit", "-m", "a", "-m", "b"]],
-    ["rebase start", ["rebase", "main"]],
+    ["reset unsupported mode", ["reset", "--soft", "HEAD"]],
+    ["reset mode with paths", ["reset", "--hard", "--", "file"]],
+    ["reset path without separator", ["reset", "HEAD", "file"]],
+    ["reset glob", ["reset", "--", "*.ts"]],
+    ["checkout paths without ref", ["checkout", "--", "file"]],
+    ["checkout force paths", ["checkout", "-f", "HEAD", "--", "file"]],
+    ["checkout create extra", ["checkout", "-b", "topic", "main", "extra"]],
+    ["switch detached", ["switch", "--detach", "HEAD"]],
+    ["switch create start", ["switch", "-c", "topic", "main"]],
+    ["restore separated source", ["restore", "--source", "HEAD", "file"]],
+    ["restore glob", ["restore", "*.ts"]],
+    ["restore without paths", ["restore", "--source=HEAD"]],
+    ["rebase target branch", ["rebase", "main", "topic"]],
+    ["rebase onto", ["rebase", "--onto", "main"]],
     ["rebase extra", ["rebase", "--abort", "extra"]],
+    ["merge start", ["merge", "main"]],
+    ["merge optionless", ["merge"]],
   ])("rejects %s", (_name, argv) => {
     expect(rejected(argv).exitCode).not.toBe(0);
   });
@@ -159,6 +217,23 @@ describe("git argv grammar", () => {
     [["ls-files", "--cached"], "lsFilesWithWorktree"],
     [["ls-files", "--others", "--exclude-standard"], "lsFilesWithWorktree"],
   ])("accepts the pinned WU3 form %j via %s", (argv, _native) => {
+    expect(parseGitCliCommand(argv).ok).toBe(true);
+  });
+  it.each([
+    [["reset", "--hard", "HEAD~1"], "reset({ hard: true, ref })"],
+    [["reset", "HEAD", "--", "file"], "reset({ ref, paths })"],
+    [["checkout", "main"], "checkout({ ref })"],
+    [["checkout", "-b", "topic", "main"], "branch + checkout"],
+    [["switch", "-c", "topic"], "branch + checkout"],
+    [["restore", "--source=HEAD", "file"], "checkout({ ref, paths })"],
+    [["branch", "topic", "HEAD"], "branch({ name, startPoint })"],
+    [["branch", "-d", "topic"], "branchDelete({ name })"],
+    [["branch", "-m", "topic", "renamed"], "branchRename({ oldName, newName })"],
+    [["rebase", "main"], "rebase({ upstream })"],
+    [["rebase", "--skip"], "rebaseSkip()"],
+    [["merge", "--continue"], "mergeContinue()"],
+    [["merge", "--abort"], "mergeAbort()"],
+  ])("accepts the pinned WU5 form %j via %s", (argv, _native) => {
     expect(parseGitCliCommand(argv).ok).toBe(true);
   });
   it("accepts the full format allowlist and rejects every other placeholder", () => {
@@ -922,8 +997,23 @@ describe("git CLI result bounds and dispatch", () => {
       commit(_invocation, options) {
         return record("commit", options);
       },
+      reset(_invocation, options) {
+        return record("reset", options);
+      },
+      checkout(_invocation, options) {
+        return record("checkout", options);
+      },
+      switch(_invocation, options) {
+        return record("switch", options);
+      },
+      restore(_invocation, options) {
+        return record("restore", options);
+      },
       rebase(_invocation, options) {
         return record("rebase", options);
+      },
+      merge(_invocation, options) {
+        return record("merge", options);
       },
     });
     const commands = [
@@ -937,7 +1027,12 @@ describe("git CLI result bounds and dispatch", () => {
       ["symbolic-ref", "--short", "HEAD"],
       ["add", "file"],
       ["commit", "-m", "message"],
+      ["reset"],
+      ["checkout", "main"],
+      ["switch", "main"],
+      ["restore", "file"],
       ["rebase", "--abort"],
+      ["merge", "--abort"],
     ];
     const defaults = resolveGitCliRunOptions(undefined);
     for (const argv of commands) await runner.runCli({ argv });
@@ -966,7 +1061,7 @@ describe("git CLI result bounds and dispatch", () => {
     for (const argv of [
       ["status", "--short", "--porcelain=v2"],
       ["rev-parse", "--quiet", "HEAD"],
-      ["branch"],
+      ["branch", "--contains", "HEAD"],
       ["ls-files", "--exclude-standard"],
       ["diff", "--"],
       ["log", "-n", "bad"],
@@ -974,7 +1069,8 @@ describe("git CLI result bounds and dispatch", () => {
       ["symbolic-ref", "HEAD"],
       ["add", ":file"],
       ["commit", "-m"],
-      ["rebase", "--skip"],
+      ["rebase", "--onto", "main"],
+      ["merge", "main"],
       ["push"],
       ["unknown"],
     ]) {

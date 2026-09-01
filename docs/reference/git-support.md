@@ -75,7 +75,7 @@ The accepted argv grammar is exact:
 |---|---|
 | `status` | Optionless human status, or one of `--porcelain`, `--porcelain=v1`, `--porcelain=v2`, `--short`, `-s`; optional `-b|--branch` and literal paths |
 | `rev-parse` | One revision, optionally preceded by `--verify` and `--quiet`, or exactly `--show-toplevel` |
-| `branch` | Exactly `--show-current` or `--list` |
+| `branch` | Optionless or `--list`; create as `<name> [<start>]`; delete as `-d|--delete <name>` or `-D <name>`; rename as `-m|--move [<old>] <new>`; exactly `--show-current` |
 | `ls-files` | Optional `--cached`, `--others`, and `--exclude-standard` selection plus bounded literal paths |
 | `diff` | Plain diff with zero, one, or two refs, optional joined `-U<n>`, and optional `-- <literal-paths>`; staged diff as `--cached|--staged [<ref>] [-- <literal-paths>]` |
 | `log` | At most one of `-1`, `-n <count>`, `--max-count=<count>`; at most one of `--oneline`, `--format=<template>`; then at most one ref or admitted `<a>..<b>` range |
@@ -83,7 +83,12 @@ The accepted argv grammar is exact:
 | `symbolic-ref` | Exactly `--short <ref>` |
 | `add` | One or more literal paths, optionally with `-f|--force`; or repository-wide `-A|--all` or `-u|--update`, optionally with force; `--` ends option parsing |
 | `commit` | Exactly one `-m|--message <message>` or `--message=<message>`, plus optional `-a|--all`, `--amend`, and `--allow-empty` |
-| `rebase` | Exactly `--continue` or `--abort` |
+| `reset` | `[--mixed|--hard] [<ref>]`, or `[<ref>] -- <literal-paths>...` |
+| `checkout` | `[-f|--force] <ref>`, `-b <name> [<start>]`, or `<ref> -- <literal-paths>...` |
+| `switch` | Exactly `<branch>` or `-c <name>` |
+| `restore` | `[--source=<ref>] [--] <literal-paths>...` |
+| `rebase` | Exactly one upstream, `--continue`, `--skip`, or `--abort` |
+| `merge` | Exactly `--continue` or `--abort` |
 
 Status and ls-files path operands are literals or directory prefixes; glob and
 pathspec-magic spellings are rejected by this argv surface. `--exclude-standard`
@@ -135,8 +140,8 @@ The installed Computer interface still exposes scalar worktree metadata reads:
 a 1,001-file plain-diff probe uses 10,019 statements. That is a measured target
 miss, not a runtime rejection, and the runner adds no projected-count refusal.
 
-`add`, `commit`, and both rebase actions execute their mutation, format their
-success output, and preflight all retained output inside one database
+Local mutating commands execute their mutation, format their success output,
+and preflight all retained output inside one database
 transaction. `commit -a|--all` performs its tracked-only staging inside that
 same outer transaction. An output failure therefore rolls back index, worktree,
 refs, objects, reflogs, and operation state. The promise-returning dispatcher
@@ -308,16 +313,27 @@ registered nested repository root.
 | `-- <paths>` | `paths` | ✔ unstage those paths; clears their conflict stages |
 | `--soft`, `--merge`, `--keep` | — | ✘ |
 
+The strict argv runner also moves the current symbolic branch or detached HEAD
+for whole-tree mixed and hard resets, matching Git. Path reset leaves HEAD and
+the worktree unchanged. Registered nested repository roots are excluded from
+hard-reset worktree changes.
+
 ### `git checkout` / `git switch` — `checkout()`, `branch()`
 
 | Git | kompjutr | |
 |---|---|---|
 | `git checkout <ref>` | `checkout({ ref })` | ★ ✔ branch, tag or commit; a commit detaches HEAD |
-| `git checkout -- <paths>` | `checkout({ ref, paths })` | ★ ✔ HEAD stays put; absent paths are not pruned |
+| `git checkout <ref> -- <paths>` | `checkout({ ref, paths })` | ★ ✔ HEAD stays put; absent paths are not pruned |
 | `git checkout -f` | `force` | ✔ otherwise a blocking local change throws `ECHECKOUTFAIL` |
-| `git checkout -b <name>` | `branch({ name, checkout: true })` | ★ ~ points HEAD at the new branch but does not move the working tree; follow with `checkout()` when `startPoint` differs from HEAD |
-| `git switch`, `git restore` | — | ✘ no separate spelling |
+| `git checkout -b <name> [<start>]` | strict argv composition | ★ ✔ atomically creates and checks out the branch and selected tree |
+| `git switch <branch>` / `git switch -c <name>` | strict argv aliases | ✔ switches only to an existing local branch, or creates one with `-c` |
+| `git restore [--source=<ref>] <paths>...` | strict argv alias | ✔ restores only worktree bytes from stage-0 index by default or the selected tree; the index stays unchanged |
 | `--orphan`, `--track`, `--merge`, `--patch` | — | ✘ |
+
+All worktree-changing forms preserve registered nested repository roots. The
+argv runner resolves literal paths from `cwd`; path checkout updates index and
+worktree, while restore is worktree-only. An explicit restore source removes a
+selected tracked worktree path that is absent from that source.
 
 ### `git clean` — `clean()`
 
@@ -452,7 +468,7 @@ selection.
 | Git | kompjutr | |
 |---|---|---|
 | `git branch <name> [<start>]` | `name`, `startPoint` | ★ ✔ start point peels annotated tags |
-| `-f`, `--force` | `force` | ✔ |
+| `-f`, `--force` | `force` | ✔ typed API only; the strict argv runner rejects force-create/reset |
 | `-d` | `branchDelete({ name })` | ★ ✔ deletes only when the tip is provably reachable from the comparison commit; retains bounded recovery history |
 | `-D` | `branchDelete({ name, force: true })` | ✔ bypasses only the reachability proof |
 | `-m <new>` / `-m <old> <new>` | `branchRename({ newName })` / `branchRename({ oldName, newName })` | ★ ✔ atomically moves the direct ref, selected symbolic `HEAD`, and bounded `branch.<name>.*` config |
@@ -477,6 +493,10 @@ Rename has no force mode. It rejects an occupied destination, a detached
 selected checkout, a source attached to another checkout, destination branch
 config, and an active operation. Upstream management and remote rename remain
 separate, unsupported operations.
+
+The strict argv runner exposes normal create, safe and force delete, rename,
+list, and show-current through the exact spellings in [Strict local argv
+runner](#strict-local-argv-runner).
 
 ### `git tag` — `tag()`, `tagDelete()`, `tagList()`
 
@@ -696,6 +716,8 @@ cannot be materialised and fails atomically with `EUNSUPPORTED`.
 
 Conflicts write index stages 1–3 plus marker bytes. A file/directory conflict
 also relocates the file side to a collision-checked `~<label>` path.
+The strict argv runner admits only `merge --continue` and `merge --abort`; merge
+start remains available only through the typed API and pull orchestration.
 
 ### `git cherry-pick` — `cherryPick()` + `…Continue/Skip/Abort()`
 
@@ -751,6 +773,9 @@ OID while the authenticated journal owns the unpublished results. Completion
 publishes the branch once; continue, skip, and abort work after a cold reopen.
 Source-empty commits are retained, while commits whose patch becomes empty on
 the new parent are skipped.
+The strict argv runner exposes start, continue, skip, and abort. Its worktree
+materialization excludes registered nested repository roots, including after a
+cold reopen.
 
 ## Maintenance
 

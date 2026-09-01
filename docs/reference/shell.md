@@ -182,11 +182,11 @@ stderr retains and charges nothing. The Git runner then applies its intrinsic
 16 MiB stdout, 1 MiB stderr, and 16 MiB combined maxima. The first excess fails
 with an output limit instead of publishing a partial semantic result.
 
-For `git add`, `git commit`, and both admitted rebase actions, mutation and
-output preflight share one database transaction. A terminal, pipeline, merged,
-or redirect overflow therefore leaves no partial index, worktree, ref, or
-operation-state change. Redirect publication remains atomic as for every other
-command.
+Every admitted local mutating Git argv command performs its mutation, success
+formatting, and output preflight in one database transaction. A terminal,
+pipeline, merged, or redirect overflow therefore leaves no partial index,
+worktree, ref, or operation-state change. Redirect publication remains atomic as
+for every other command.
 
 ## Deliberate boundaries
 

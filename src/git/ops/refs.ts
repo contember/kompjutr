@@ -14,7 +14,7 @@ import {
   mutateRefsOwned,
 } from "../store/index.js";
 import { resolveBranchUpstream } from "./branch-upstream.js";
-import { checkoutTree, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
+import { checkoutTreeExcluding, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
 import type { GitContext } from "./context.js";
 import { isInitialCheckoutFallback, tryInitialCheckout } from "./initial-checkout.js";
 import { selectMergeBases } from "./merge-base.js";
@@ -331,20 +331,54 @@ export function checkout(
   worktree: Worktree,
   options: CheckoutOptions,
 ): void {
+  checkoutInternal(context, repo, worktree, options, []);
+}
+
+/** Checkout while preserving registered repository roots below this worktree. */
+export function checkoutExcluding(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  options: CheckoutOptions,
+  excludeRoots: readonly string[],
+): void {
+  checkoutInternal(context, repo, worktree, options, excludeRoots);
+}
+
+function checkoutInternal(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  options: CheckoutOptions,
+  excludeRoots: readonly string[],
+): void {
   const paths = options.paths !== undefined && options.paths.length > 0 ? options.paths : undefined;
   const commit = repo.peel(repo.revParse(options.ref));
   const tree = treeOf(repo, commit);
 
   if (paths !== undefined) {
-    requireCheckoutAllowed(repo, worktree, tree, paths, false, options.force === true);
+    requireCheckoutAllowed(
+      repo,
+      worktree,
+      tree,
+      paths,
+      false,
+      options.force === true,
+      excludeRoots,
+    );
     // Path checkout restores named targets without pruning absent ones.
-    checkoutTree(repo, worktree, tree, { paths, prune: false, restoreStructure: true });
+    checkoutTreeExcluding(repo, worktree, tree, excludeRoots, {
+      paths,
+      prune: false,
+      restoreStructure: true,
+    });
     return;
   }
 
   try {
     repo.store.db.transactionSync(() => {
       if (
+        excludeRoots.length === 0 &&
         tryInitialCheckout(context, repo, tree, {
           requireSharedDatabase: true,
           fallbackOnCapacity: true,
@@ -354,19 +388,19 @@ export function checkout(
         return;
       }
       const tracker = context.indexTracker;
-      if (tracker !== undefined) {
+      if (tracker !== undefined && excludeRoots.length === 0) {
         if (trySparseCleanCheckout(context, repo, worktree, tree)) {
           moveHead(context, repo, options.ref, commit);
           tracker.reseal(repo.checkout.checkoutId, tree, []);
           return;
         }
       }
-      checkoutLegacy(context, repo, worktree, options, tree, commit);
+      checkoutLegacy(context, repo, worktree, options, tree, commit, excludeRoots);
     });
   } catch (error) {
     if (!isInitialCheckoutFallback(error)) throw error;
     repo.store.db.transactionSync(() => {
-      checkoutLegacy(context, repo, worktree, options, tree, commit);
+      checkoutLegacy(context, repo, worktree, options, tree, commit, excludeRoots);
     });
   }
 }
@@ -378,9 +412,18 @@ function checkoutLegacy(
   options: CheckoutOptions,
   tree: string,
   commit: string,
+  excludeRoots: readonly string[],
 ): void {
-  requireCheckoutAllowed(repo, worktree, tree, undefined, true, options.force === true);
-  checkoutTree(repo, worktree, tree, {
+  requireCheckoutAllowed(
+    repo,
+    worktree,
+    tree,
+    undefined,
+    true,
+    options.force === true,
+    excludeRoots,
+  );
+  checkoutTreeExcluding(repo, worktree, tree, excludeRoots, {
     preserveMatchingIndex: options.force !== true,
     restoreStructure: options.force === true,
   });
@@ -394,9 +437,19 @@ function requireCheckoutAllowed(
   paths: string[] | undefined,
   prune: boolean,
   force: boolean,
+  excludeRoots: readonly string[],
 ): void {
   if (force) return;
-  const blocked = checkoutBlockers(repo, worktree, tree, paths, prune);
+  const blocked = checkoutBlockersAgainstOwned(
+    repo,
+    worktree,
+    repo.headTree(),
+    tree,
+    paths,
+    prune,
+    undefined,
+    [...excludeRoots],
+  );
   if (blocked.tracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",
@@ -424,12 +477,23 @@ export function switchBranch(
   worktree: Worktree,
   options: SwitchOptions,
 ): void {
+  switchBranchExcluding(context, repo, worktree, options, []);
+}
+
+/** Switch while preserving registered repository roots below this worktree. */
+export function switchBranchExcluding(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  options: SwitchOptions,
+  excludeRoots: readonly string[],
+): void {
   repo.store.db.transactionSync(() => {
     // The branch is created first, so a name collision leaves the tree alone.
     if (options.create === true) {
       branch(context, repo, { name: options.name, startPoint: options.startPoint });
     }
-    checkout(context, repo, worktree, { ref: options.name });
+    checkoutExcluding(context, repo, worktree, { ref: options.name }, excludeRoots);
   });
 }
 

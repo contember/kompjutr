@@ -3,16 +3,42 @@ import { GitError, hasErrorCode } from "../common/errors.js";
 import { joinPath, normalizePath, relativeTo } from "../common/paths.js";
 import { diffText } from "../diff/index.js";
 import { isBinary } from "../diff/lines.js";
+import {
+  checkoutIndexPathsExcluding,
+  checkoutWorktreePathsExcluding,
+  matchesPaths,
+  stageZero,
+} from "../ops/checkout.js";
 import { commit as commitOp } from "../ops/commit.js";
 import { type GitContext, nestedRoots, openRepository } from "../ops/context.js";
 import { diffHeaderPath, diffSummaryBounded } from "../ops/diff.js";
 import type { DiffSummaryEntry, RebaseResult } from "../ops/kinds.js";
+import { mergeAbort, mergeContinue } from "../ops/merge.js";
 import type { RebaseJournal } from "../ops/operation-state.js";
-import { rebaseAbortExcluding, rebaseContinueExcluding } from "../ops/rebase.js";
+import {
+  rebaseAbortExcluding,
+  rebaseContinueExcluding,
+  rebaseExcluding,
+  rebaseSkipExcluding,
+} from "../ops/rebase.js";
+import { operationRefLogMetadata } from "../ops/ref-log.js";
+import {
+  branch,
+  branchDelete,
+  branchRename,
+  checkoutExcluding,
+  switchBranchExcluding,
+} from "../ops/refs.js";
 import type { Repository, ResolvedHead } from "../ops/repository.js";
-import { type AddLiteralPathsResult, addLiteralPaths, add as addOp } from "../ops/staging.js";
+import {
+  type AddLiteralPathsResult,
+  addLiteralPaths,
+  add as addOp,
+  reset,
+} from "../ops/staging.js";
 import { eagerStatus } from "../ops/status.js";
 import { formatCommitRefusalStatus, statusFormatOptions } from "../ops/status-format.js";
+import { treeStream } from "../ops/tree-stream.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES, type WalkTreeDiffEntry } from "../store/index.js";
 import {
   boundedGitCliResult,
@@ -34,7 +60,10 @@ const SUMMARY_WINDOW_ROWS = 1_000;
 const SUMMARY_MAX_ROWS = 50_000;
 const SUMMARY_MIN_RETAINED_BYTES = 64 * 1024;
 
-type WriteHandlers = Pick<GitCliHandlers, "add" | "commit" | "rebase">;
+type WriteHandlers = Pick<
+  GitCliHandlers,
+  "add" | "commit" | "branch" | "reset" | "checkout" | "switch" | "restore" | "rebase" | "merge"
+>;
 type MutationPhase = "native-operation" | "format-success" | "preflight";
 
 interface CommitMutation {
@@ -92,7 +121,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
               const result: AddLiteralPathsResult = { outcome: "staged" };
               return result;
             }
-            paths = resolveAddPaths(repo, invocation.cwd, invocation.command.paths);
+            paths = resolveMutationPaths(repo, invocation.cwd, invocation.command.paths);
             return addLiteralPaths(
               repo,
               context.worktree,
@@ -115,6 +144,21 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
           repo,
           options,
           () => {
+            const operation = repo.checkout.readOperationState();
+            if (operation?.kind === "merge") {
+              if (invocation.command.amend === true) {
+                throw new GitError("EINVAL", "cannot amend while continuing a merge");
+              }
+              const previousHead = repo.head();
+              const result = mergeContinue(context, repo, {
+                message: invocation.command.message,
+                env: environmentRecord(invocation.env),
+              });
+              if (result.oid === undefined) {
+                throw new GitError("ECORRUPT", "merge continuation did not create a commit");
+              }
+              return { oid: result.oid, previousHead, amended: false };
+            }
             const hasConflicts = repo.checkout.hasConflicts();
             if (!hasConflicts) repo.checkout.requireNoOperationState();
             if (invocation.command.all && !hasConflicts) {
@@ -154,6 +198,199 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         ),
       );
     },
+    async branch(invocation, options) {
+      return withRepository(context, invocation.cwd, options, (repo) =>
+        runMutation(
+          repo,
+          options,
+          () => {
+            repo.checkout.requireNoOperationState();
+            const command = invocation.command;
+            if (command.action === "create") {
+              if (command.name === undefined)
+                throw new Error("parsed branch creation lost its name");
+              branch(context, repo, {
+                name: command.name,
+                ...(command.startPoint === undefined ? {} : { startPoint: command.startPoint }),
+              });
+              return "";
+            }
+            if (command.action === "delete") {
+              if (command.name === undefined)
+                throw new Error("parsed branch deletion lost its name");
+              const oid = repo.peel(repo.revParse(command.name));
+              branchDelete(context, repo, {
+                name: command.name,
+                ...(command.force ? { force: true } : {}),
+              });
+              return `Deleted branch ${command.name} (was ${abbreviate(repo, oid)}).\n`;
+            }
+            if (command.action === "rename") {
+              if (command.newName === undefined)
+                throw new Error("parsed branch rename lost its name");
+              branchRename(context, repo, {
+                newName: command.newName,
+                ...(command.oldName === undefined ? {} : { oldName: command.oldName }),
+              });
+              return "";
+            }
+            throw new Error(`write handler received branch ${command.action}`);
+          },
+          (stdout) => gitCliResult(stdout, "", 0),
+          (error) => mapLocalMutationFailure(error, outputContext(options)),
+        ),
+      );
+    },
+    async reset(invocation, options) {
+      return withRepository(context, invocation.cwd, options, (repo) => {
+        const command = invocation.command;
+        const paths = resolveMutationPaths(repo, invocation.cwd, command.paths ?? []);
+        return runMutation(
+          repo,
+          options,
+          () => {
+            const exclusions = nestedRoots(context, repo.root);
+            if (command.mode === "hard") {
+              requireTransactionalWorktree(context, repo);
+              reset(context, repo, context.worktree, {
+                hard: true,
+                ...(command.ref === undefined ? {} : { ref: command.ref }),
+                excludeRoots: exclusions,
+              });
+              repo.checkout.clearOperationState();
+            } else {
+              repo.checkout.requireNoOperationState();
+              if (paths.length > 0) requireResetPaths(repo, command.ref, paths);
+              if (paths.length === 0 && command.ref !== undefined)
+                moveResetHead(context, repo, command.ref);
+              reset(context, repo, context.worktree, {
+                ...(command.ref === undefined ? {} : { ref: command.ref }),
+                ...(paths.length === 0 ? {} : { paths: paths.map((path) => path.path) }),
+              });
+            }
+            return command.mode === "hard" ? repo.head().oid : null;
+          },
+          (oid) => {
+            if (oid === null) return gitCliResult("", "", 0);
+            const commit = repo.readCommit(oid);
+            return gitCliResult(
+              `HEAD is now at ${abbreviate(repo, oid)} ${subject(commit.message)}\n`,
+              "",
+              0,
+            );
+          },
+          (error) => mapPathMutationFailure(error, paths, outputContext(options)),
+        );
+      });
+    },
+    async checkout(invocation, options) {
+      return withRepository(context, invocation.cwd, options, (repo) => {
+        requireTransactionalWorktree(context, repo);
+        const command = invocation.command;
+        const paths = resolveMutationPaths(repo, invocation.cwd, command.paths ?? []);
+        return runMutation(
+          repo,
+          options,
+          () => {
+            repo.checkout.requireNoOperationState();
+            const exclusions = nestedRoots(context, repo.root);
+            if (command.action === "create") {
+              if (command.name === undefined)
+                throw new Error("parsed checkout creation lost its name");
+              switchBranchExcluding(
+                context,
+                repo,
+                context.worktree,
+                {
+                  name: command.name,
+                  create: true,
+                  ...(command.startPoint === undefined ? {} : { startPoint: command.startPoint }),
+                },
+                exclusions,
+              );
+              return `Switched to a new branch '${command.name}'\n`;
+            }
+            if (command.ref === undefined) throw new Error("parsed checkout lost its ref");
+            if (paths.length > 0) requireTreePaths(repo, command.ref, paths);
+            checkoutExcluding(
+              context,
+              repo,
+              context.worktree,
+              {
+                ref: command.ref,
+                ...(paths.length === 0 ? {} : { paths: paths.map((path) => path.path) }),
+                ...(command.force ? { force: true } : {}),
+              },
+              exclusions,
+            );
+            if (paths.length > 0) return "";
+            const head = repo.head();
+            return head.ref === null
+              ? `HEAD is now at ${head.oid === null ? "unknown" : abbreviate(repo, head.oid)}\n`
+              : `Switched to branch '${head.ref.slice("refs/heads/".length)}'\n`;
+          },
+          (stderr) => gitCliResult("", stderr, 0),
+          (error) => mapPathMutationFailure(error, paths, outputContext(options)),
+        );
+      });
+    },
+    async switch(invocation, options) {
+      return withRepository(context, invocation.cwd, options, (repo) => {
+        requireTransactionalWorktree(context, repo);
+        return runMutation(
+          repo,
+          options,
+          () => {
+            repo.checkout.requireNoOperationState();
+            if (
+              invocation.command.action === "switch" &&
+              repo.store.getRef(`${HEADS}${invocation.command.name}`) === null
+            ) {
+              throw new GitError("EBRANCHFAIL", `invalid reference: ${invocation.command.name}`);
+            }
+            switchBranchExcluding(
+              context,
+              repo,
+              context.worktree,
+              {
+                name: invocation.command.name,
+                ...(invocation.command.action === "create" ? { create: true } : {}),
+              },
+              nestedRoots(context, repo.root),
+            );
+            return invocation.command.action === "create"
+              ? `Switched to a new branch '${invocation.command.name}'\n`
+              : `Switched to branch '${invocation.command.name}'\n`;
+          },
+          (stderr) => gitCliResult("", stderr, 0),
+          (error) => mapLocalMutationFailure(error, outputContext(options)),
+        );
+      });
+    },
+    async restore(invocation, options) {
+      return withRepository(context, invocation.cwd, options, (repo) => {
+        requireTransactionalWorktree(context, repo);
+        const paths = resolveMutationPaths(repo, invocation.cwd, invocation.command.paths);
+        return runMutation(
+          repo,
+          options,
+          () => {
+            repo.checkout.requireNoOperationState();
+            const selected = paths.map((path) => path.path);
+            const exclusions = nestedRoots(context, repo.root);
+            if (invocation.command.source === undefined) {
+              requireIndexPaths(repo, paths);
+              checkoutIndexPathsExcluding(repo, context.worktree, selected, exclusions);
+            } else {
+              const tree = requireTreePaths(repo, invocation.command.source, paths);
+              checkoutWorktreePathsExcluding(repo, context.worktree, tree, selected, exclusions);
+            }
+          },
+          () => gitCliResult("", "", 0),
+          (error) => mapPathMutationFailure(error, paths, outputContext(options)),
+        );
+      });
+    },
     async rebase(invocation, options) {
       return withRepository(context, invocation.cwd, options, (repo) => {
         requireTransactionalWorktree(context, repo);
@@ -164,6 +401,41 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
             () => rebaseAbortExcluding(repo, context.worktree, nestedRoots(context, repo.root)),
             () => gitCliResult("", "", 0),
             mapRebaseFailure,
+          );
+        }
+        if (invocation.command.action === "start") {
+          return runMutation(
+            repo,
+            options,
+            () => {
+              const upstream = invocation.command.upstream;
+              if (upstream === undefined) throw new Error("parsed rebase start lost its upstream");
+              return rebaseExcluding(
+                context,
+                repo,
+                context.worktree,
+                nestedRoots(context, repo.root),
+                { upstream, env: environmentRecord(invocation.env) },
+              );
+            },
+            (result) => formatRebaseResult(repo, result),
+            (error) => mapLocalMutationFailure(error, outputContext(options)),
+          );
+        }
+        if (invocation.command.action === "skip") {
+          return runMutation(
+            repo,
+            options,
+            () =>
+              rebaseSkipExcluding(
+                context,
+                repo,
+                context.worktree,
+                nestedRoots(context, repo.root),
+                { env: environmentRecord(invocation.env) },
+              ),
+            (result) => formatRebaseResult(repo, result),
+            (error) => mapRebaseContinueFailure(repo, error, options),
           );
         }
         return runMutation(
@@ -182,6 +454,44 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
           },
           (mutation) => formatRebaseContinue(repo, context.worktree, mutation, options),
           (error) => mapRebaseContinueFailure(repo, error, options),
+        );
+      });
+    },
+    async merge(invocation, options) {
+      return withRepository(context, invocation.cwd, options, (repo) => {
+        requireTransactionalWorktree(context, repo);
+        if (invocation.command.action === "abort") {
+          return runMutation(
+            repo,
+            options,
+            () => mergeAbort(repo, context.worktree),
+            () => gitCliResult("", "", 0),
+            (error) => mapMergeFailure(error, outputContext(options)),
+          );
+        }
+        return runMutation(
+          repo,
+          options,
+          () => {
+            const previousHead = repo.head();
+            const result = mergeContinue(context, repo, { env: environmentRecord(invocation.env) });
+            if (result.oid === undefined) {
+              throw new GitError("ECORRUPT", "merge continuation did not create a commit");
+            }
+            return { oid: result.oid, previousHead, amended: false };
+          },
+          (mutation) =>
+            gitCliResult(
+              formatCommitSummary(
+                repo,
+                context.worktree,
+                mutation,
+                retainedStdoutCeiling(options, 0),
+              ),
+              "",
+              0,
+            ),
+          (error) => mapMergeFailure(error, outputContext(options)),
         );
       });
     },
@@ -241,12 +551,12 @@ function requireTransactionalWorktree(context: GitContext, repo: Repository): vo
   if (context.worktree.db !== repo.store.db) {
     throw new GitError(
       "EUNSUPPORTED",
-      "git CLI rebase requires the worktree and repository to share one database",
+      "git CLI worktree mutation requires the worktree and repository to share one database",
     );
   }
 }
 
-function resolveAddPaths(
+function resolveMutationPaths(
   repo: Repository,
   cwd: string,
   inputs: readonly string[],
@@ -264,6 +574,63 @@ function resolveAddPaths(
     paths.push({ input, path });
   }
   return paths;
+}
+
+function requireTreePaths(
+  repo: Repository,
+  ref: string,
+  paths: readonly ResolvedAddPath[],
+): string {
+  const commit = repo.peel(repo.revParse(ref));
+  const tree = repo.readCommit(commit).tree;
+  requirePathsInSources(paths, treeStream(repo, tree), repo.checkout.indexScan());
+  return tree;
+}
+
+function requireIndexPaths(repo: Repository, paths: readonly ResolvedAddPath[]): void {
+  requirePathsInSources(paths, stageZero(repo.checkout.indexScan()), []);
+}
+
+function requireResetPaths(
+  repo: Repository,
+  ref: string | undefined,
+  paths: readonly ResolvedAddPath[],
+): void {
+  const head =
+    ref === undefined || ref === "HEAD" ? repo.head().oid : repo.peel(repo.revParse(ref));
+  const tree = head === null ? null : repo.readCommit(repo.peel(head)).tree;
+  requirePathsInSources(paths, treeStream(repo, tree), repo.checkout.indexScan());
+}
+
+function requirePathsInSources(
+  paths: readonly ResolvedAddPath[],
+  first: Iterable<{ path: string }>,
+  second: Iterable<{ path: string }>,
+): void {
+  const matched = paths.map(() => false);
+  const visit = (path: string): void => {
+    for (let index = 0; index < paths.length; index++) {
+      const requested = paths[index];
+      if (requested !== undefined && matchesPaths(path, [requested.path])) matched[index] = true;
+    }
+  };
+  for (const entry of first) visit(entry.path);
+  for (const entry of second) visit(entry.path);
+  for (let index = 0; index < paths.length; index++) {
+    const requested = paths[index];
+    if (requested !== undefined && matched[index] !== true) {
+      throw new GitError("EPATHSPEC", `pathspec '${requested.path}' did not match any files`);
+    }
+  }
+}
+
+function moveResetHead(context: GitContext, repo: Repository, ref: string): void {
+  const commit = repo.peel(repo.revParse(ref));
+  const head = repo.head();
+  repo.mutateRefs(
+    head.ref === null ? { head: commit } : { puts: [{ name: head.ref, target: commit }] },
+    operationRefLogMetadata(context, repo, "reset: hard"),
+  );
 }
 
 function formatAddResult(
@@ -387,6 +754,92 @@ function mapRebaseFailure(error: unknown): GitCliResult | undefined {
     return gitCliResult("", "fatal: no rebase in progress\n", 128);
   }
   return undefined;
+}
+
+function mapMergeFailure(error: unknown, output: GitCliOutputContext): GitCliResult | undefined {
+  if (hasErrorCode(error, "EUNMERGED")) {
+    return gitCliDiagnosticResult(
+      "fatal: Exiting because of an unresolved conflict.\n",
+      "",
+      "",
+      128,
+      output,
+    );
+  }
+  if (hasErrorCode(error, "EOPMISMATCH") || hasErrorCode(error, "ENOMERGE")) {
+    return gitCliDiagnosticResult(
+      "fatal: There is no merge in progress (MERGE_HEAD missing).\n",
+      "",
+      "",
+      128,
+      output,
+    );
+  }
+  return mapLocalMutationFailure(error, output);
+}
+
+function mapPathMutationFailure(
+  error: unknown,
+  paths: readonly ResolvedAddPath[],
+  output: GitCliOutputContext,
+): GitCliResult | undefined {
+  const message = untrustedErrorMessage(error);
+  if (hasErrorCode(error, "EPATHSPEC") && message !== undefined) {
+    for (const path of paths) {
+      if (message.includes(`'${path.path}'`)) {
+        return gitCliDiagnosticResult(
+          "error: pathspec '",
+          path.input,
+          "' did not match any file(s) known to git\n",
+          1,
+          output,
+        );
+      }
+    }
+  }
+  return mapLocalMutationFailure(error, output);
+}
+
+function mapLocalMutationFailure(
+  error: unknown,
+  output: GitCliOutputContext,
+): GitCliResult | undefined {
+  const code = untrustedErrorCode(error);
+  const message = untrustedErrorMessage(error);
+  if (code === undefined || message === undefined || !LOCAL_FAILURE_CODES.has(code))
+    return undefined;
+  return gitCliDiagnosticResult("fatal: ", message, "\n", 128, output);
+}
+
+const LOCAL_FAILURE_CODES = new Set([
+  "EINVAL",
+  "ENOTFOUND",
+  "ENOCOMMIT",
+  "EBRANCHFAIL",
+  "ECHECKOUTFAIL",
+  "EPATHSPEC",
+  "EPATHOUTSIDE",
+  "EOPACTIVE",
+  "EOPMISMATCH",
+  "ENOREBASE",
+  "EUNMERGED",
+  "EDETACHED",
+  "ESHALLOW",
+  "ESTALE",
+  "ESTALEHEAD",
+  "EWRONGHEAD",
+]);
+
+function untrustedErrorCode(error: unknown): string | undefined {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) {
+    return undefined;
+  }
+  try {
+    const code: unknown = Reflect.get(error, "code");
+    return typeof code === "string" ? code : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function mapRebaseContinueFailure(
@@ -814,6 +1267,26 @@ function formatRebaseContinue(
           retainedStdoutCeiling(options, gitCliUtf8ByteLength(formattedStderr, "stderr", false)),
         );
   return gitCliResult(stdout, formattedStderr, mutation.result.outcome === "completed" ? 0 : 1);
+}
+
+function formatRebaseResult(repo: Repository, result: RebaseResult): GitCliResult {
+  if (result.outcome === "up-to-date") {
+    return gitCliResult("", "Current branch is up to date.\n", 0);
+  }
+  if (result.outcome === "completed") {
+    const ref = repo.head().ref;
+    const destination = ref === null ? "detached HEAD" : ref;
+    return gitCliResult("", `Successfully rebased and updated ${destination}.\n`, 0);
+  }
+  const journal = repo.checkout.requireOperationState("rebase");
+  const step = journal.steps[journal.state.currentStep];
+  if (step === undefined) throw new Error("conflicted rebase has no current step");
+  const source = repo.readCommit(step.sourceOid);
+  return gitCliResult(
+    "",
+    `error: could not apply ${step.sourceOid.slice(0, 7)}... ${subject(source.message)}\n`,
+    1,
+  );
 }
 
 function continuedCommitOid(repo: Repository, mutation: RebaseMutation): string | undefined {

@@ -61,7 +61,12 @@ export interface GitCliRevParseCommand {
 
 export interface GitCliBranchCommand {
   readonly kind: "branch";
-  readonly action: "show-current" | "list";
+  readonly action: "show-current" | "list" | "create" | "delete" | "rename";
+  readonly name?: string;
+  readonly startPoint?: string;
+  readonly oldName?: string;
+  readonly newName?: string;
+  readonly force?: boolean;
 }
 
 export interface GitCliLsFilesCommand {
@@ -124,8 +129,43 @@ export interface GitCliCommitCommand {
   readonly allowEmpty?: boolean;
 }
 
+export interface GitCliResetCommand {
+  readonly kind: "reset";
+  readonly mode: "mixed" | "hard";
+  readonly ref?: string;
+  readonly paths?: readonly string[];
+}
+
+export interface GitCliCheckoutCommand {
+  readonly kind: "checkout";
+  readonly action: "checkout" | "create";
+  readonly ref?: string;
+  readonly name?: string;
+  readonly startPoint?: string;
+  readonly paths?: readonly string[];
+  readonly force?: boolean;
+}
+
+export interface GitCliSwitchCommand {
+  readonly kind: "switch";
+  readonly action: "switch" | "create";
+  readonly name: string;
+}
+
+export interface GitCliRestoreCommand {
+  readonly kind: "restore";
+  readonly source?: string;
+  readonly paths: readonly string[];
+}
+
 export interface GitCliRebaseCommand {
   readonly kind: "rebase";
+  readonly action: "start" | "continue" | "skip" | "abort";
+  readonly upstream?: string;
+}
+
+export interface GitCliMergeCommand {
+  readonly kind: "merge";
   readonly action: "continue" | "abort";
 }
 
@@ -140,7 +180,12 @@ export type ParsedGitCliCommand =
   | GitCliSymbolicRefCommand
   | GitCliAddCommand
   | GitCliCommitCommand
-  | GitCliRebaseCommand;
+  | GitCliResetCommand
+  | GitCliCheckoutCommand
+  | GitCliSwitchCommand
+  | GitCliRestoreCommand
+  | GitCliRebaseCommand
+  | GitCliMergeCommand;
 
 export interface GitCliInvocation<Command extends ParsedGitCliCommand = ParsedGitCliCommand> {
   readonly command: Command;
@@ -164,7 +209,12 @@ export interface GitCliHandlers {
   readonly symbolicRef?: GitCliCommandHandler<GitCliSymbolicRefCommand>;
   readonly add?: GitCliCommandHandler<GitCliAddCommand>;
   readonly commit?: GitCliCommandHandler<GitCliCommitCommand>;
+  readonly reset?: GitCliCommandHandler<GitCliResetCommand>;
+  readonly checkout?: GitCliCommandHandler<GitCliCheckoutCommand>;
+  readonly switch?: GitCliCommandHandler<GitCliSwitchCommand>;
+  readonly restore?: GitCliCommandHandler<GitCliRestoreCommand>;
   readonly rebase?: GitCliCommandHandler<GitCliRebaseCommand>;
+  readonly merge?: GitCliCommandHandler<GitCliMergeCommand>;
 }
 
 export type GitCliParseResult =

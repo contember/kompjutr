@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import type { GitPullOptions as ComputerPullOptions } from "@cloudflare/computer/git";
 import { describe, expect, it } from "vitest";
+import { createFilesystem } from "../src/fs/filesystem.js";
 import { createGit, type Git, type GitPullOptions } from "../src/git/client.js";
 import { commit } from "../src/git/ops/commit.js";
 import { openRepository } from "../src/git/ops/context.js";
@@ -8,7 +9,9 @@ import type { MergeStateMetadata } from "../src/git/ops/merge-state.js";
 import { pull as pullCore, resolvePull, validatePullAfterFetch } from "../src/git/ops/pull.js";
 import type { Repository } from "../src/git/ops/repository.js";
 import { fetchHttpClient, type GitHttpClient } from "../src/git/protocol/transport.js";
+import { createGitCommand } from "../src/git/shell.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { createShell } from "../src/shell/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
@@ -62,15 +65,20 @@ function gitFor(workspace: TestWorkspace, http?: GitHttpClient): Git {
   });
 }
 
-function reopenedGit(workspace: TestWorkspace): Git {
-  return createGit()({
-    database: new SqliteGitDatabase(new TestDatabase(workspace.storage), {
-      now: workspace.context.now,
-    }),
-    worktree: workspace.worktree,
+function reopenedShell(workspace: TestWorkspace) {
+  const db = new TestDatabase(workspace.storage);
+  const worktree = createFilesystem(db, { now: workspace.context.now });
+  const git = createGit()({
+    database: new SqliteGitDatabase(db, { now: workspace.context.now }),
+    worktree,
     now: workspace.context.now,
     timezoneOffset: workspace.context.timezoneOffset,
     defaultIdentity: IDENTITY,
+  });
+  return createShell({
+    fs: worktree,
+    cwd: "/work",
+    commands: new Map([["git", createGitCommand(git)]]),
   });
 }
 
@@ -1020,20 +1028,23 @@ describe("pull", () => {
       );
       if (priorOrdinal === undefined) throw new Error("reflog state missing before continuation");
 
-      const cold = reopenedGit(workspace);
+      const shell = reopenedShell(workspace);
       await workspace.workspace.fs.writeFile("/work/conflict.txt", "resolved\n");
-      await cold.add({ dir: "/work", paths: ["conflict.txt"] });
-      const continued = await cold.commit({ dir: "/work", message: "resolved pull" });
-      expect(repo.readCommit(continued.oid).parent).toEqual([local.oid, incoming]);
+      expect((await shell.run("git add conflict.txt")).exitCode).toBe(0);
+      const continued = await shell.run("git merge --continue");
+      expect(continued.exitCode, continued.stderr).toBe(0);
+      const continuedOid = repo.head().oid;
+      if (continuedOid === null) throw new Error("continued pull did not move HEAD");
+      expect(repo.readCommit(continuedOid).parent).toEqual([local.oid, incoming]);
       expect(repo.checkout.readMergeState()).toBeNull();
       expect(repo.store.reflog("refs/heads/main")).toHaveLength(branchEntries + 1);
       expect(repo.store.reflog("refs/heads/main")[0]).toEqual({
         refName: "refs/heads/main",
         ordinal: priorOrdinal + 1,
         oldRaw: local.oid,
-        newRaw: continued.oid,
+        newRaw: continuedOid,
         oldOid: local.oid,
-        newOid: continued.oid,
+        newOid: continuedOid,
         actor: IDENTITY,
         timestamp: 1_577_836_800,
         timezoneOffset: 0,
@@ -1045,7 +1056,7 @@ describe("pull", () => {
         oldRaw: "ref: refs/heads/main",
         newRaw: "ref: refs/heads/main",
         oldOid: local.oid,
-        newOid: continued.oid,
+        newOid: continuedOid,
         actor: IDENTITY,
         timestamp: 1_577_836_800,
         timezoneOffset: 0,
@@ -1079,7 +1090,9 @@ describe("pull", () => {
       expect(repo.checkout.requireMergeState().state.phase).toBe("ready");
       expect(await workspace.workspace.fs.readFile("/work/remote.txt", "utf8")).toBe("remote\n");
 
-      await reopenedGit(workspace).mergeAbort({ dir: "/work" });
+      const shell = reopenedShell(workspace);
+      const aborted = await shell.run("git merge --abort");
+      expect(aborted.exitCode, aborted.stderr).toBe(0);
       expect(repo.head().oid).toBe(local.oid);
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
       expect(repo.checkout.readMergeState()).toBeNull();

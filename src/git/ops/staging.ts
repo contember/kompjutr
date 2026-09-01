@@ -47,7 +47,7 @@ import {
 } from "../store/sparse-workspace.js";
 import {
   type CompiledPathspecMatcher,
-  checkoutTree,
+  checkoutTreeExcluding,
   indexFromTree,
   matchesPaths,
 } from "./checkout.js";
@@ -1650,12 +1650,9 @@ export interface ResetOptions {
   hard?: boolean;
   /** Commit-ish to reset to. Defaults to HEAD. */
   ref?: string;
+  excludeRoots?: readonly string[];
 }
 
-/**
- * `paths` and `hard` are documented as mutually exclusive; `hard` wins if
- * both arrive. A bare reset unstages everything without moving any ref.
- */
 export function reset(
   context: GitContext,
   repo: Repository,
@@ -1663,7 +1660,7 @@ export function reset(
   options: ResetOptions = {},
 ): void {
   if (options.hard === true) {
-    hardReset(context, repo, worktree, options.ref);
+    hardReset(context, repo, worktree, options);
     return;
   }
 
@@ -1857,10 +1854,14 @@ function* indexPaths(repo: Repository, prefixes: readonly string[] | null): Gene
   }
 }
 
-/** Restore index and working tree to `ref`, dragging the current branch along. */
-function hardReset(context: GitContext, repo: Repository, worktree: Worktree, ref?: string): void {
+function hardReset(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  options: ResetOptions,
+): void {
   repo.store.db.transactionSync(() => {
-    const commit = targetCommit(repo, ref);
+    const commit = targetCommit(repo, options.ref);
     const tree = commit === null ? null : repo.readCommit(commit).tree;
     const head = repo.head();
     if (commit !== null) {
@@ -1869,7 +1870,7 @@ function hardReset(context: GitContext, repo: Repository, worktree: Worktree, re
         head.ref === null ? { head: commit } : { puts: [{ name: head.ref, target: commit }] };
       repo.mutateRefs(mutation, metadata);
     }
-    checkoutTree(repo, worktree, tree, {
+    checkoutTreeExcluding(repo, worktree, tree, options.excludeRoots ?? [], {
       discardUnmerged: true,
       restoreStructure: true,
     });
@@ -1907,7 +1908,7 @@ function normalizeAddSpecs(paths: string[]): string[] {
 function normalizeSpecs(paths: string[]): string[] {
   const out: string[] = [];
   for (const raw of paths) {
-    let spec = raw.trim();
+    let spec = raw;
     while (spec.startsWith("./")) spec = spec.slice(2);
     spec = spec.replace(/\/+$/, "");
     if (spec === ".") spec = "";

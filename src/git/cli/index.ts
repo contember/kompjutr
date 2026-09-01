@@ -39,9 +39,18 @@ export function createGitCliRunner(handlers: GitCliHandlers): GitCliRunner {
 
 /** Bind the complete argv dispatcher to one Git context. */
 export function createContextGitCliRunner(context: GitContext): GitCliRunner {
+  const reads = createGitCliReadHandlers(context);
+  const writes = createGitCliWriteHandlers(context);
   return createGitCliRunner({
-    ...createGitCliReadHandlers(context),
-    ...createGitCliWriteHandlers(context),
+    ...reads,
+    ...writes,
+    branch(invocation, options) {
+      const handler =
+        invocation.command.action === "show-current" || invocation.command.action === "list"
+          ? reads.branch
+          : writes.branch;
+      return requireHandler(handler, "branch")(invocation, options);
+    },
   });
 }
 
@@ -111,7 +120,37 @@ async function dispatch(
       options,
     );
   }
-  return await requireHandler(handlers.rebase, command.kind)(
+  if (command.kind === "reset") {
+    return await requireHandler(handlers.reset, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "checkout") {
+    return await requireHandler(handlers.checkout, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "switch") {
+    return await requireHandler(handlers.switch, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "restore") {
+    return await requireHandler(handlers.restore, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "rebase") {
+    return await requireHandler(handlers.rebase, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  return await requireHandler(handlers.merge, command.kind)(
     specificInvocation(invocation, command),
     options,
   );

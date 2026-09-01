@@ -17,12 +17,14 @@ import {
   GIT_CLI_MAX_ENV_ENTRIES,
   GIT_CLI_MAX_LOG_COUNT,
   type GitCliAddCommand,
+  type GitCliCheckoutCommand,
   type GitCliCommitCommand,
   type GitCliEnvironment,
   type GitCliInvocation,
   type GitCliLogCommand,
   type GitCliLogFormat,
   type GitCliParseResult,
+  type GitCliRestoreCommand,
   type GitCliRevision,
   type GitCliStatusCommand,
   type ParsedGitCliCommand,
@@ -143,7 +145,12 @@ function parseGitCliCommandInternal(
   else if (name === "symbolic-ref") command = parseSymbolicRef(argv);
   else if (name === "add") return parseAdd(argv, outputContext);
   else if (name === "commit") return parseCommit(argv, outputContext);
+  else if (name === "reset") command = parseReset(argv);
+  else if (name === "checkout") command = parseCheckout(argv);
+  else if (name === "switch") command = parseSwitch(argv);
+  else if (name === "restore") command = parseRestore(argv);
   else if (name === "rebase") command = parseRebase(argv);
+  else if (name === "merge") command = parseMerge(argv);
   else return { ok: false, result: gitCliUnknownCommand(name, outputContext) };
   if (command === undefined) return invalidInvocation(name, argv, outputContext);
   return invocation(command);
@@ -223,10 +230,38 @@ function parseRevParse(argv: readonly string[]): ParsedGitCliCommand | undefined
 }
 
 function parseBranch(argv: readonly string[]): ParsedGitCliCommand | undefined {
-  if (argv.length !== 2) return undefined;
+  if (argv.length === 1) return { kind: "branch", action: "list" };
   if (argv[1] === "--show-current") return { kind: "branch", action: "show-current" };
-  if (argv[1] === "--list") return { kind: "branch", action: "list" };
-  return undefined;
+  if (argv[1] === "--list" && argv.length === 2) return { kind: "branch", action: "list" };
+  if (
+    (argv[1] === "-d" || argv[1] === "--delete") &&
+    validNameOperand(argv[2]) &&
+    argv.length === 3
+  ) {
+    return { kind: "branch", action: "delete", name: argv[2] };
+  }
+  if (argv[1] === "-D" && validNameOperand(argv[2]) && argv.length === 3) {
+    return { kind: "branch", action: "delete", name: argv[2], force: true };
+  }
+  if (argv[1] === "-m" || argv[1] === "--move") {
+    if (validNameOperand(argv[2]) && argv.length === 3) {
+      return { kind: "branch", action: "rename", newName: argv[2] };
+    }
+    if (validNameOperand(argv[2]) && validNameOperand(argv[3]) && argv.length === 4) {
+      return { kind: "branch", action: "rename", oldName: argv[2], newName: argv[3] };
+    }
+    return undefined;
+  }
+  const name = argv[1];
+  const startPoint = argv[2];
+  if (!validNameOperand(name) || argv.length > 3) return undefined;
+  if (startPoint !== undefined && !validRevisionOperand(startPoint)) return undefined;
+  return {
+    kind: "branch",
+    action: "create",
+    name,
+    ...(startPoint === undefined ? {} : { startPoint }),
+  };
 }
 
 function parseLsFiles(argv: readonly string[]): ParsedGitCliCommand | undefined {
@@ -601,6 +636,100 @@ function parseCommit(
   return invocation(command);
 }
 
+function parseReset(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  const separator = argv.indexOf("--", 1);
+  if (separator !== -1) {
+    const before = argv.slice(1, separator);
+    const paths = argv.slice(separator + 1);
+    if (
+      before.length > 1 ||
+      paths.length === 0 ||
+      paths.some((path) => !validLiteralPathspec(path))
+    ) {
+      return undefined;
+    }
+    const ref = before[0];
+    if (ref !== undefined && !validRevisionOperand(ref)) return undefined;
+    return {
+      kind: "reset",
+      mode: "mixed",
+      ...(ref === undefined ? {} : { ref }),
+      paths,
+    };
+  }
+  let mode: "mixed" | "hard" = "mixed";
+  let offset = 1;
+  if (argv[1] === "--mixed" || argv[1] === "--hard") {
+    mode = argv[1] === "--hard" ? "hard" : "mixed";
+    offset++;
+  }
+  const ref = argv[offset];
+  if (argv.length > offset + 1 || (ref !== undefined && !validRevisionOperand(ref)))
+    return undefined;
+  return { kind: "reset", mode, ...(ref === undefined ? {} : { ref }) };
+}
+
+function parseCheckout(argv: readonly string[]): GitCliCheckoutCommand | undefined {
+  if (argv[1] === "-b") {
+    const name = argv[2];
+    const startPoint = argv[3];
+    if (!validNameOperand(name) || argv.length > 4) return undefined;
+    if (startPoint !== undefined && !validRevisionOperand(startPoint)) return undefined;
+    return {
+      kind: "checkout",
+      action: "create",
+      name,
+      ...(startPoint === undefined ? {} : { startPoint }),
+    };
+  }
+  let force = false;
+  let offset = 1;
+  if (argv[1] === "-f" || argv[1] === "--force") {
+    force = true;
+    offset++;
+  }
+  const ref = argv[offset];
+  if (!validRevisionOperand(ref)) return undefined;
+  if (argv.length === offset + 1) {
+    return { kind: "checkout", action: "checkout", ref, ...(force ? { force: true } : {}) };
+  }
+  if (force || argv[offset + 1] !== "--") return undefined;
+  const paths = argv.slice(offset + 2);
+  if (paths.length === 0 || paths.some((path) => !validLiteralPathspec(path))) return undefined;
+  return { kind: "checkout", action: "checkout", ref, paths };
+}
+
+function parseSwitch(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  if (argv.length === 2 && validNameOperand(argv[1])) {
+    return { kind: "switch", action: "switch", name: argv[1] };
+  }
+  if (argv.length === 3 && argv[1] === "-c" && validNameOperand(argv[2])) {
+    return { kind: "switch", action: "create", name: argv[2] };
+  }
+  return undefined;
+}
+
+function parseRestore(argv: readonly string[]): GitCliRestoreCommand | undefined {
+  let source: string | undefined;
+  let offset = 1;
+  const first = argv[offset];
+  if (first?.startsWith("--source=") === true) {
+    source = first.slice("--source=".length);
+    if (!validRevisionOperand(source)) return undefined;
+    offset++;
+  }
+  const separated = argv[offset] === "--";
+  if (separated) offset++;
+  const paths = argv.slice(offset);
+  if (
+    paths.length === 0 ||
+    paths.some((path) => !validLiteralPathspec(path) || (!separated && path.startsWith("-")))
+  ) {
+    return undefined;
+  }
+  return { kind: "restore", ...(source === undefined ? {} : { source }), paths };
+}
+
 function parseRebase(argv: readonly string[]): ParsedGitCliCommand | undefined {
   if (argv.length !== 2) return undefined;
   if (argv[1] === "--continue") {
@@ -609,6 +738,15 @@ function parseRebase(argv: readonly string[]): ParsedGitCliCommand | undefined {
   if (argv[1] === "--abort") {
     return { kind: "rebase", action: "abort" };
   }
+  if (argv[1] === "--skip") return { kind: "rebase", action: "skip" };
+  if (!validRevisionOperand(argv[1])) return undefined;
+  return { kind: "rebase", action: "start", upstream: argv[1] };
+}
+
+function parseMerge(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  if (argv.length !== 2) return undefined;
+  if (argv[1] === "--continue") return { kind: "merge", action: "continue" };
+  if (argv[1] === "--abort") return { kind: "merge", action: "abort" };
   return undefined;
 }
 
@@ -639,7 +777,12 @@ function invalidInvocation(
     command === "symbolic-ref" ||
     command === "add" ||
     command === "commit" ||
-    command === "rebase"
+    command === "reset" ||
+    command === "checkout" ||
+    command === "switch" ||
+    command === "restore" ||
+    command === "rebase" ||
+    command === "merge"
   ) {
     const option = argv.find(
       (argument, index) => index > 0 && argument !== "--" && argument.startsWith("-"),
@@ -683,6 +826,14 @@ function parseSafeDecimal(value: string): number | undefined {
 
 function validLiteralPathspec(value: string): boolean {
   return value.length > 0 && !GLOB_PATHSPEC.test(value) && !value.startsWith(":");
+}
+
+function validNameOperand(value: string | undefined): value is string {
+  return value !== undefined && value.length > 0 && !value.startsWith("-");
+}
+
+function validRevisionOperand(value: string | undefined): value is string {
+  return validNameOperand(value);
 }
 
 function validateLogFormat(template: string): void {
