@@ -315,3 +315,9 @@ shell tests, and shell reference docs are serialized by the sprint leader.
   harness; focused witness 6/6, typecheck passed, independent review clean.
 - 2026-09-01 — Cross-sprint async executor dependency landed as `739608f`; POSIX
   WU2-WU5 now target the reviewed seam.
+- 2026-09-01 — WU2 landed (`af74f50`): ordered descriptor bindings with
+  left-to-right `1>&2` semantics. Focused redirection/planner witness 36/36,
+  shell 372/372, smoke 164/164, typecheck/check passed.
+- 2026-09-01 — WU3 landed (`8b9c425`): bounded `printf` with `%s`, `%%`, `%d`,
+  admitted escapes, format recycling, and explicit local refusals. Focused
+  witness 16/16, smoke 164/164, typecheck/check passed.

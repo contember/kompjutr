@@ -411,3 +411,7 @@ sprint risk. Resolve blocking findings before implementation.
   runner, generic truncation propagation, and async API migration. Focused 63/63,
   shell 344/344, smoke 164/164, typecheck/check/package smoke passed; independent
   lifecycle review clean after one fix round.
+- 2026-09-01 — WU2 landed (`0d940a4`): staged diff over the ordered stage-0
+  index, exact bounded CLI grammar, and promisor hydration. Focused 180/180,
+  smoke 164/164, typecheck/check passed; the cost witness performs no worktree
+  traversal or scalar index lookup.
