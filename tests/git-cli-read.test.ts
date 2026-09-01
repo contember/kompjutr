@@ -213,6 +213,45 @@ describe("read-only git argv handlers", () => {
       });
     }
   });
+  it("matches show patches and first-parent/path-selected history", async () => {
+    for (const argv of [
+      ["show"],
+      ["show", "base"],
+      ["show", "--first-parent", "base"],
+      ["log", "--first-parent", "--format=%H"],
+      ["log", "-n", "1", "--format=%H", "--", "second.txt"],
+    ]) {
+      expect(await nativeRun(workspace, argv), argv.join(" ")).toEqual(gitResultAt(fixture, argv));
+    }
+    const nestedArgv = ["log", "--format=%H", "--", "žluťoučký.txt"];
+    expect(await nativeRun(workspace, nestedArgv, "/repo/src")).toEqual({
+      stdout: gitBytesAt(fixture, "src", nestedArgv),
+      stderr: "",
+      exitCode: 0,
+      truncated: false,
+    });
+  });
+  it("requires an explicit first parent for a merge show", async () => {
+    const merged = new GitFixture().init();
+    fixtures.push(merged);
+    merged.write("base.txt", "base\n").commit("base");
+    merged.git("checkout", "-q", "-b", "side");
+    merged.write("side.txt", "side\n").commit("side");
+    merged.git("checkout", "-q", "main");
+    merged.write("main.txt", "main\n").commit("main");
+    merged.git("merge", "-q", "--no-ff", "-m", "merge", "side");
+    const target = await importAt(merged);
+
+    expect(await nativeRun(target, ["show", "--first-parent"])).toEqual(
+      gitResultAt(merged, ["show", "--first-parent"]),
+    );
+    expect(await nativeRun(target, ["show"])).toEqual({
+      stdout: "",
+      stderr: "fatal: merge show requires --first-parent\n",
+      exitCode: 128,
+      truncated: false,
+    });
+  });
   it("matches rev-list count and symbolic-ref from a nested cwd", async () => {
     expect(await nativeRun(workspace, ["rev-list", "--count", "base..HEAD"], "/repo/src")).toEqual({
       stdout: gitBytesAt(fixture, "src", ["rev-list", "--count", "base..HEAD"]),
@@ -274,19 +313,23 @@ describe("read-only git argv handlers", () => {
     ).rejects.toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
   it("preflights stdout bounds without a partial result", async () => {
-    const argv = ["log", "-1", "--oneline"];
-    const expected = fixture.gitBinary(...argv).toString("utf8");
-    const bytes = ENCODER.encode(expected).byteLength;
     const handlers = createGitCliReadHandlers(workspace.context);
-    expect(await runGitCli({ argv, cwd: "/repo" }, handlers, { maxStdoutBytes: bytes })).toEqual({
-      stdout: expected,
-      stderr: "",
-      exitCode: 0,
-      truncated: false,
-    });
-    await expect(
-      runGitCli({ argv, cwd: "/repo" }, handlers, { maxStdoutBytes: bytes - 1 }),
-    ).rejects.toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    for (const argv of [
+      ["log", "-1", "--oneline"],
+      ["show", "base"],
+    ]) {
+      const expected = fixture.gitBinary(...argv).toString("utf8");
+      const bytes = ENCODER.encode(expected).byteLength;
+      expect(await runGitCli({ argv, cwd: "/repo" }, handlers, { maxStdoutBytes: bytes })).toEqual({
+        stdout: expected,
+        stderr: "",
+        exitCode: 0,
+        truncated: false,
+      });
+      await expect(
+        runGitCli({ argv, cwd: "/repo" }, handlers, { maxStdoutBytes: bytes - 1 }),
+      ).rejects.toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    }
   });
   it("preflights a lower status ceiling before constructing its complete output", async () => {
     const target = makeRepo("/repo");
@@ -691,6 +734,51 @@ describe("plain git diff semantics and cumulative bounds", () => {
         "GET",
         "POST",
       ]);
+    } finally {
+      await server.close();
+    }
+  });
+  it("hydrates show patch blobs while path log leaves unrelated promises intact", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("selected.txt", "selected old\n");
+    fixture.write("unrelated.txt", "unrelated\n");
+    fixture.commit("first");
+    fixture.write("selected.txt", "selected current\n");
+    const second = fixture.commit("second");
+    const selectedOld = fixture.git("rev-parse", `${second}^:selected.txt`);
+    const unrelated = fixture.git("rev-parse", `${second}:unrelated.txt`);
+    fixture.remove("unrelated.txt");
+    fixture.commit("third");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const target = makeWorkspace();
+    const git = createGit()({ ...target.context, http: fetchHttpClient });
+    try {
+      await git.clone({ url: server.url, dir: "/repo", filter: "blob:none" });
+      const repo = openRepository(target.context, "/repo");
+      expect(repo.has(selectedOld)).toBe(false);
+      expect(repo.has(unrelated)).toBe(false);
+
+      const requestsBeforeShow = server.requests.length;
+      const shown = await git.show({ dir: "/repo", ref: second, patch: true });
+      expect(shown.patch?.trimEnd()).toBe(fixture.git("show", "--format=", second));
+      expect(repo.has(selectedOld)).toBe(true);
+      expect(repo.has(unrelated)).toBe(false);
+      expect(server.requests.slice(requestsBeforeShow).map((request) => request.method)).toEqual([
+        "GET",
+        "POST",
+      ]);
+
+      expect(await git.runCli({ argv: ["show", second], cwd: "/repo" })).toEqual(
+        gitResultAt(fixture, ["show", second]),
+      );
+      const requestsBeforeLog = server.requests.length;
+      expect(
+        await git.runCli({ argv: ["log", "--format=%H", "--", "selected.txt"], cwd: "/repo" }),
+      ).toEqual(gitResultAt(fixture, ["log", "--format=%H", "--", "selected.txt"]));
+      expect(server.requests).toHaveLength(requestsBeforeLog);
+      expect(repo.has(unrelated)).toBe(false);
     } finally {
       await server.close();
     }

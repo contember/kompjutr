@@ -2,6 +2,7 @@
 
 export { contentIdKey } from "./blob-ids.js";
 export { CheckoutStore } from "./checkout.js";
+export { MAX_LOG_COMMITS } from "./commits.js";
 export {
   CONFIG_SECTION_MOVE_UPDATE_SQL,
   configGetOwned,

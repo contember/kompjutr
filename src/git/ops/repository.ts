@@ -263,7 +263,18 @@ type OwnedIndexedWalk = (
   limits?: CommitGraphLimits,
 ) => Iterable<{ oid: string; commit: Commit }>;
 
+export interface PrunedCommitWalkDecision {
+  include: boolean;
+  parents: readonly string[];
+}
+
+type OwnedPrunedWalk = (
+  oid: string,
+  select: (entry: { oid: string; commit: Commit }) => PrunedCommitWalkDecision,
+) => Iterable<{ oid: string; commit: Commit; include: boolean }>;
+
 const OWNED_INDEXED_WALKS = new WeakMap<Repository, OwnedIndexedWalk>();
+const OWNED_PRUNED_WALKS = new WeakMap<Repository, OwnedPrunedWalk>();
 const OWNED_WALKS = new WeakMap<Repository, OwnedWalk>();
 
 /** Internal point walk retained under an existing repository operation. */
@@ -287,12 +298,24 @@ export function walkIndexedOwned(
   return walk(oid, limits);
 }
 
+/** Internal point walk whose caller selects the parent frontier after each commit. */
+export function walkPrunedOwned(
+  repo: Repository,
+  oid: string,
+  select: (entry: { oid: string; commit: Commit }) => PrunedCommitWalkDecision,
+): Iterable<{ oid: string; commit: Commit; include: boolean }> {
+  const walk = OWNED_PRUNED_WALKS.get(repo);
+  if (walk === undefined) throw new GitError("EINVAL", "repository graph owner is unavailable");
+  return walk(oid, select);
+}
+
 export class Repository {
   readonly store: SharedRepoStore;
 
   constructor(readonly checkout: CheckoutStore) {
     this.store = checkout.shared;
     OWNED_INDEXED_WALKS.set(this, (oid, limits) => this.#walkIndexedOwned(oid, limits));
+    OWNED_PRUNED_WALKS.set(this, (oid, select) => this.#walkPrunedOwned(oid, select));
     OWNED_WALKS.set(this, (oid) => this.#walkOwned(oid));
   }
 
@@ -853,6 +876,45 @@ export class Repository {
         yield { oid: next.oid, commit: next.commit };
         if (boundary.has(next.oid)) continue;
         for (const parent of next.commit.parent) push(parent);
+      }
+    } finally {
+      fill.flush();
+    }
+  }
+
+  *#walkPrunedOwned(
+    oid: string,
+    select: (entry: { oid: string; commit: Commit }) => PrunedCommitWalkDecision,
+  ): Generator<{ oid: string; commit: Commit; include: boolean }> {
+    const fill = new CommitFillBuffer(this.store);
+    try {
+      const seen = new Set<string>();
+      const queue = new CommitHeap();
+      let sequence = 0;
+      const push = (candidate: string): void => {
+        if (seen.has(candidate)) return;
+        if (seen.size >= MAX_LOG_COMMITS) {
+          throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
+        }
+        const entry = this.#readCommitEntryOwned(candidate, fill);
+        seen.add(candidate);
+        queue.push({ oid: candidate, commit: entry.commit, sequence: sequence++ });
+      };
+
+      push(this.peel(oid));
+      const boundary = readShallowOwned(this.store);
+      while (queue.size > 0) {
+        const next = queue.pop();
+        if (next === undefined) throw new CorruptError("commit graph heap lost its next row");
+        const decision = select({ oid: next.oid, commit: next.commit });
+        yield { oid: next.oid, commit: next.commit, include: decision.include };
+        if (boundary.has(next.oid)) continue;
+        for (const parent of decision.parents) {
+          if (!next.commit.parent.includes(parent)) {
+            throw new CorruptError("pruned commit walk selected a non-parent oid");
+          }
+          push(parent);
+        }
       }
     } finally {
       fill.flush();

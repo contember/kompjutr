@@ -9,7 +9,7 @@ import { utf8 } from "../src/git/common/bytes.js";
 import { diffText } from "../src/git/diff/index.js";
 import { checkoutTree } from "../src/git/ops/checkout.js";
 import { commit } from "../src/git/ops/commit.js";
-import { diff, diffSummary } from "../src/git/ops/diff.js";
+import { diff, diffSummary, diffTrees } from "../src/git/ops/diff.js";
 import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
 import type { IndexEntry } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
@@ -415,6 +415,17 @@ describe("diff", () => {
     expect(diff(pair.workspace.repo, pair.workspace.worktree, { ref: "HEAD~1", to: "HEAD" })).toBe(
       gitDiff(pair, "HEAD~1", "HEAD"),
     );
+    const before = pair.workspace.repo.resolveTreeRevision("HEAD~1");
+    const after = pair.workspace.repo.resolveTreeRevision("HEAD");
+    const patch = diffTrees(pair.workspace.repo, before, after);
+    expect(patch).toBe(gitDiff(pair, "HEAD~1", "HEAD"));
+    const bytes = utf8.encode(patch).length;
+    expect(diffTrees(pair.workspace.repo, before, after, {}, { maxOutputBytes: bytes })).toBe(
+      patch,
+    );
+    expect(() =>
+      diffTrees(pair.workspace.repo, before, after, {}, { maxOutputBytes: bytes - 1 }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
 
   it("preserves tree-ish tag peeling and blob endpoint errors", async () => {

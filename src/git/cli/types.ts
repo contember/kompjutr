@@ -100,6 +100,14 @@ export interface GitCliLogCommand {
   readonly count?: number;
   readonly format: GitCliLogFormat;
   readonly revision?: GitCliRevision;
+  readonly firstParent?: boolean;
+  readonly paths?: readonly string[];
+}
+
+export interface GitCliShowCommand {
+  readonly kind: "show";
+  readonly ref?: string;
+  readonly firstParent?: boolean;
 }
 
 export interface GitCliRevListCommand {
@@ -176,6 +184,7 @@ export type ParsedGitCliCommand =
   | GitCliLsFilesCommand
   | GitCliDiffCommand
   | GitCliLogCommand
+  | GitCliShowCommand
   | GitCliRevListCommand
   | GitCliSymbolicRefCommand
   | GitCliAddCommand
@@ -205,6 +214,7 @@ export interface GitCliHandlers {
   readonly lsFiles?: GitCliCommandHandler<GitCliLsFilesCommand>;
   readonly diff?: GitCliCommandHandler<GitCliDiffCommand>;
   readonly log?: GitCliCommandHandler<GitCliLogCommand>;
+  readonly show?: GitCliCommandHandler<GitCliShowCommand>;
   readonly revList?: GitCliCommandHandler<GitCliRevListCommand>;
   readonly symbolicRef?: GitCliCommandHandler<GitCliSymbolicRefCommand>;
   readonly add?: GitCliCommandHandler<GitCliAddCommand>;

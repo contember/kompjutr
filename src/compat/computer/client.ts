@@ -225,7 +225,7 @@ export function createSqliteGitClient(
         return logOp(at(input.dir), input);
       },
       async show(input) {
-        return showOp(at(input.dir), input.ref);
+        return showOp(at(input.dir), { ref: input.ref }).commit;
       },
       async revParse(input) {
         return at(input.dir).revParse(input.ref);

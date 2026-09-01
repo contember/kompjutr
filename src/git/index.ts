@@ -35,6 +35,7 @@ export {
   type GitFetchOptions,
   type GitHashObjectOptions,
   type GitInitOptions,
+  type GitLogOptions,
   type GitLsFilesOptions,
   type GitLsRemoteOptions,
   type GitLsTreeOptions,
@@ -68,6 +69,8 @@ export {
   type GitScratchIndexOptions,
   type GitScratchReadTreeOptions,
   type GitScratchReplaySnapshotOptions,
+  type GitShowOptions,
+  type GitShowResult,
   type GitStatusOptions,
   type GitStatusReport,
   type GitStatusReportOptions,
@@ -136,7 +139,14 @@ export {
   updateRef,
   writeTree,
 } from "./ops/plumbing.js";
-export type { CommitView, LsTreeOptions, TreeEntryView } from "./ops/reads.js";
+export type {
+  CommitView,
+  LogOptions,
+  LsTreeOptions,
+  ShowOptions,
+  ShowResult,
+  TreeEntryView,
+} from "./ops/reads.js";
 export {
   type RecoverRefOptions,
   type RefLogEndpoint,

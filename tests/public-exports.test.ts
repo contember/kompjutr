@@ -12,6 +12,7 @@ import type {
   DivergenceOptions as GitCoreDivergenceOptions,
   FetchOptions as GitCoreFetchOptions,
   IndexStore as GitCoreIndexStore,
+  LogOptions as GitCoreLogOptions,
   LsTreeOptions as GitCoreLsTreeOptions,
   MergeBaseKind as GitCoreMergeBaseKind,
   MergeBaseOptions as GitCoreMergeBaseOptions,
@@ -22,6 +23,8 @@ import type {
   ReplaySnapshotConflict as GitCoreReplaySnapshotConflict,
   ReplaySnapshotOptions as GitCoreReplaySnapshotOptions,
   ReplaySnapshotResult as GitCoreReplaySnapshotResult,
+  ShowOptions as GitCoreShowOptions,
+  ShowResult as GitCoreShowResult,
   StatusReport as GitCoreStatusReport,
   UpdateRefDeleteOptions as GitCoreUpdateRefDeleteOptions,
   UpdateRefGuardedOptions as GitCoreUpdateRefGuardedOptions,
@@ -43,6 +46,7 @@ import type {
   GitFetchOptions,
   FetchRefspec as GitFetchRefspec,
   FetchRefUpdate as GitFetchRefUpdate,
+  GitLogOptions,
   GitLsFilesOptions,
   GitLsRemoteOptions,
   LsRemoteResult as GitLsRemoteResult,
@@ -81,6 +85,8 @@ import type {
   GitScratchIndexOptions,
   GitScratchReadTreeOptions,
   GitScratchReplaySnapshotOptions,
+  GitShowOptions,
+  GitShowResult,
   StatusFormatOptions as GitStatusFormatOptions,
   FetchResult as GitStructuredFetchResult,
   PushResult as GitStructuredPushResult,
@@ -119,6 +125,7 @@ import type {
   CommitTreeOptions as RootCoreCommitTreeOptions,
   DivergenceOptions as RootCoreDivergenceOptions,
   IndexStore as RootCoreIndexStore,
+  LogOptions as RootCoreLogOptions,
   LsTreeOptions as RootCoreLsTreeOptions,
   MergeBaseKind as RootCoreMergeBaseKind,
   MergeBaseOptions as RootCoreMergeBaseOptions,
@@ -128,6 +135,8 @@ import type {
   ReplaySnapshotConflict as RootCoreReplaySnapshotConflict,
   ReplaySnapshotOptions as RootCoreReplaySnapshotOptions,
   ReplaySnapshotResult as RootCoreReplaySnapshotResult,
+  ShowOptions as RootCoreShowOptions,
+  ShowResult as RootCoreShowResult,
   StatusReport as RootCoreStatusReport,
   UpdateRefDeleteOptions as RootCoreUpdateRefDeleteOptions,
   UpdateRefGuardedOptions as RootCoreUpdateRefGuardedOptions,
@@ -146,12 +155,15 @@ import type {
   GitCliRunOptions as RootGitCliRunOptions,
   GitDivergenceOptions as RootGitDivergenceOptions,
   GitFetchOptions as RootGitFetchOptions,
+  GitLogOptions as RootGitLogOptions,
   GitLsRemoteOptions as RootGitLsRemoteOptions,
   GitLsTreeOptions as RootGitLsTreeOptions,
   GitMergeBaseOptions as RootGitMergeBaseOptions,
   GitPushOptions as RootGitPushOptions,
   GitReadRefOptions as RootGitReadRefOptions,
   GitRevParseOptions as RootGitRevParseOptions,
+  GitShowOptions as RootGitShowOptions,
+  GitShowResult as RootGitShowResult,
   GitUpdateRefOptions as RootGitUpdateRefOptions,
   GitWorktreeAddOptions as RootGitWorktreeAddOptions,
   GitWorktreeRemoveOptions as RootGitWorktreeRemoveOptions,
@@ -444,6 +456,40 @@ describe("public bounded read exports", () => {
       rootMethods,
       rootMergeBase,
     ]);
+  });
+  it("exposes matching history read types from both entrypoints", () => {
+    const coreLog: RootCoreLogOptions = { ref: "HEAD", paths: ["src"], firstParent: true };
+    const gitCoreLog: GitCoreLogOptions = coreLog;
+    const logOptions: RootGitLogOptions = { ...coreLog, dir: "/repo" };
+    const gitLogOptions: GitLogOptions = logOptions;
+    const coreShow: RootCoreShowOptions = { ref: "HEAD", patch: true, mainline: 1 };
+    const gitCoreShow: GitCoreShowOptions = coreShow;
+    const showOptions: RootGitShowOptions = { ...coreShow, dir: "/repo" };
+    const gitShowOptions: GitShowOptions = showOptions;
+    const commit = {
+      oid: "1".repeat(40),
+      message: "message\n",
+      tree: "2".repeat(40),
+      parent: [],
+      author: { name: "Author", email: "author@example.test", timestamp: 1, timezoneOffset: 0 },
+      committer: {
+        name: "Committer",
+        email: "committer@example.test",
+        timestamp: 1,
+        timezoneOffset: 0,
+      },
+    };
+    const showResult: RootGitShowResult = { commit, patch: "" };
+    const rootCoreResult: RootCoreShowResult = showResult;
+    const gitShowResult: GitShowResult = rootCoreResult;
+    const gitCoreResult: GitCoreShowResult = gitShowResult;
+    expect([
+      gitCoreLog.firstParent,
+      gitLogOptions.dir,
+      gitCoreShow.mainline,
+      gitShowOptions.patch,
+      gitCoreResult.commit.oid,
+    ]).toEqual([true, "/repo", 1, true, "1".repeat(40)]);
   });
 });
 describe("public guarded ref exports", () => {

@@ -141,6 +141,7 @@ function parseGitCliCommandInternal(
   else if (name === "ls-files") command = parseLsFiles(argv);
   else if (name === "diff") command = parseDiff(argv);
   else if (name === "log") return parseLog(argv, logLimitHint, outputContext);
+  else if (name === "show") command = parseShow(argv);
   else if (name === "rev-list") command = parseRevList(argv);
   else if (name === "symbolic-ref") command = parseSymbolicRef(argv);
   else if (name === "add") return parseAdd(argv, outputContext);
@@ -368,9 +369,21 @@ function parseLog(
   let format: GitCliLogFormat = { kind: "default" };
   let hasFormat = false;
   let revision: GitCliRevision | undefined;
+  let firstParent = false;
+  let pathMode = false;
+  const paths: string[] = [];
   for (let index = 1; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === undefined) throw new Error("git CLI argv changed during parsing");
+    if (pathMode) {
+      if (!validLiteralPathspec(argument)) return invalidInvocation("log", argv, outputContext);
+      paths.push(argument);
+      continue;
+    }
+    if (argument === "--") {
+      pathMode = true;
+      continue;
+    }
     if (revision !== undefined) {
       return {
         ok: false,
@@ -436,6 +449,11 @@ function parseLog(
       format = { kind: "oneline" };
       continue;
     }
+    if (argument === "--first-parent") {
+      if (firstParent) return duplicateLogSelector("first-parent", outputContext);
+      firstParent = true;
+      continue;
+    }
     if (argument.startsWith("--format=")) {
       if (hasFormat) return duplicateLogSelector("format", outputContext);
       const template = argument.slice("--format=".length);
@@ -471,11 +489,39 @@ function parseLog(
     }
     revision = parsedRevision;
   }
+  if (pathMode && paths.length === 0) return invalidInvocation("log", argv, outputContext);
   if (logLimitHint !== undefined && (count === undefined || logLimitHint < count)) {
     count = logLimitHint;
   }
-  const command: GitCliLogCommand = { kind: "log", count, format, revision };
+  const command: GitCliLogCommand = {
+    kind: "log",
+    count,
+    format,
+    revision,
+    ...(firstParent ? { firstParent: true } : {}),
+    ...(paths.length === 0 ? {} : { paths }),
+  };
   return invocation(command);
+}
+
+function parseShow(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  let firstParent = false;
+  let ref: string | undefined;
+  for (let index = 1; index < argv.length; index++) {
+    const argument = argv[index];
+    if (argument === "--first-parent") {
+      if (firstParent || ref !== undefined) return undefined;
+      firstParent = true;
+      continue;
+    }
+    if (!validRevisionOperand(argument) || ref !== undefined) return undefined;
+    ref = argument;
+  }
+  return {
+    kind: "show",
+    ...(ref === undefined ? {} : { ref }),
+    ...(firstParent ? { firstParent: true } : {}),
+  };
 }
 
 function parseRevList(argv: readonly string[]): ParsedGitCliCommand | undefined {

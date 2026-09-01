@@ -94,10 +94,13 @@ async function prepareForceCheckout(
   const headOid = await harness.git.revParse({ dir: REPO, ref: "HEAD" });
   const sourceCommit = await harness.git.show({ dir: REPO, ref: source });
   const targetCommit = await harness.git.show({ dir: REPO, ref: target });
-  if (branch !== source || headOid !== sourceCommit.oid) {
+  if (branch !== source || headOid !== sourceCommit.commit.oid) {
     throw new Error(`${label} setup did not leave HEAD on ${source}`);
   }
-  if (sourceCommit.oid === targetCommit.oid || sourceCommit.tree === targetCommit.tree) {
+  if (
+    sourceCommit.commit.oid === targetCommit.commit.oid ||
+    sourceCommit.commit.tree === targetCommit.commit.tree
+  ) {
     throw new Error(`${label} requires distinct source and target commits and trees`);
   }
 }

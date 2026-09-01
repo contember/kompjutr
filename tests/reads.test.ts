@@ -358,12 +358,122 @@ describe("log", () => {
   });
 
   it("reads authorship the way git records it", () => {
-    const head = show(repo, "HEAD");
+    const head = show(repo, { ref: "HEAD" }).commit;
     expect(head.author.name).toBe("Fixture");
     expect(head.author.email).toBe("fixture@example.com");
     expect(head.author.timestamp).toBe(Number(fixture.git("show", "-s", "--format=%at", "HEAD")));
     expect(head.message.trim()).toBe("merge side");
     expect(head.parent).toHaveLength(2);
+  });
+
+  it("matches first-parent and literal path history without reading blob payloads", () => {
+    const expected = (args: string[]): string[] => {
+      const output = fixture.git("log", "--format=%H", ...args);
+      return output === "" ? [] : output.split("\n");
+    };
+
+    expect(log(repo, { firstParent: true }).map((entry) => entry.oid)).toEqual(
+      expected(["--first-parent"]),
+    );
+    for (const path of ["src/a.ts", "side.txt", "missing.txt"]) {
+      expect(
+        log(repo, { paths: [path] }).map((entry) => entry.oid),
+        path,
+      ).toEqual(expected(["--", path]));
+    }
+    expect(log(repo, { paths: ["src/a.ts"], depth: 1 }).map((entry) => entry.oid)).toEqual(
+      expected(["-n", "1", "--", "src/a.ts"]),
+    );
+    expect(log(repo, { paths: ["side.txt"], firstParent: true }).map((entry) => entry.oid)).toEqual(
+      expected(["--first-parent", "--", "side.txt"]),
+    );
+
+    fixtureDb.storage.histogram = new Map();
+    fixtureDb.storage.resetCounters();
+    log(repo, { paths: ["src/a.ts"] });
+    expect([...fixtureDb.storage.histogram.keys()].join("\n")).not.toContain("git_object_chunks");
+  });
+
+  it("matches root, one-parent, and explicit merge-mainline patches", () => {
+    const cases = [
+      {
+        ref: "HEAD~2",
+        ours: show(repo, { ref: "HEAD~2", patch: true }).patch,
+        theirs: fixture.git("show", "--format=", "--root", "HEAD~2"),
+      },
+      {
+        ref: "HEAD^",
+        ours: show(repo, { ref: "HEAD^", patch: true }).patch,
+        theirs: fixture.git("show", "--format=", "HEAD^"),
+      },
+      {
+        ref: "HEAD mainline 1",
+        ours: show(repo, { ref: "HEAD", patch: true, mainline: 1 }).patch,
+        theirs: fixture.git("show", "--format=", "--first-parent", "HEAD"),
+      },
+      {
+        ref: "HEAD mainline 2",
+        ours: show(repo, { ref: "HEAD", patch: true, mainline: 2 }).patch,
+        theirs: fixture.git("diff", "HEAD^2", "HEAD"),
+      },
+    ];
+    for (const entry of cases) expect(entry.ours?.trimEnd(), entry.ref).toBe(entry.theirs);
+    expect(() => show(repo, { ref: "HEAD", patch: true })).toThrow(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+  });
+
+  it("matches exact rename and move-plus-edit path selection without following names", async () => {
+    const renamed = new GitFixture().init();
+    try {
+      renamed.write("old.txt", "content\n").commit("base");
+      renamed.git("mv", "old.txt", "new.txt");
+      renamed.commit("rename");
+      renamed.git("mv", "new.txt", "moved.txt");
+      renamed.write("moved.txt", "changed\n").commit("move and edit");
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db);
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      );
+      await importFixture(renamed, store);
+      const local = new Repository(store);
+      for (const path of ["old.txt", "new.txt", "moved.txt"]) {
+        const expected = renamed.git("log", "--format=%H", "--", path);
+        expect(
+          log(local, { paths: [path] }).map((entry) => entry.oid),
+          path,
+        ).toEqual(expected === "" ? [] : expected.split("\n"));
+      }
+    } finally {
+      renamed.dispose();
+    }
+  });
+
+  it("prunes a merge parent whose selected-path change was discarded", async () => {
+    const merged = new GitFixture().init();
+    try {
+      merged.write("tracked.txt", "base\n").commit("base");
+      merged.git("checkout", "-q", "-b", "side");
+      merged.write("tracked.txt", "side\n");
+      const discarded = merged.commit("discarded side change");
+      merged.git("checkout", "-q", "main");
+      merged.write("main.txt", "main\n").commit("main");
+      merged.git("merge", "-q", "--no-ff", "-s", "ours", "-m", "discard side", "side");
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db);
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      );
+      await importFixture(merged, store);
+      const local = new Repository(store);
+      const expected = merged.git("log", "--format=%H", "--", "tracked.txt").split("\n");
+      const actual = log(local, { paths: ["tracked.txt"] }).map((entry) => entry.oid);
+      expect(actual).toEqual(expected);
+      expect(actual).not.toContain(discarded);
+    } finally {
+      merged.dispose();
+    }
   });
 });
 
@@ -407,6 +517,16 @@ describe("bounded commit graph reads", () => {
       statements.filter(([query]) => query.startsWith("WITH RECURSIVE params(repo_id, root_oid")),
     ).toHaveLength(1);
     expect(statements.map(([query]) => query).join("\n")).not.toContain("git_object_chunks");
+    expect(db.storage.statementCount).toBeLessThan(1_000);
+
+    db.storage.histogram = new Map();
+    db.storage.resetCounters();
+    expect(log(repo, { depth: 257, firstParent: true })).toHaveLength(257);
+    expect(
+      [...db.storage.histogram.keys()].filter((query) =>
+        query.startsWith("WITH RECURSIVE params(repo_id, root_oid"),
+      ),
+    ).toHaveLength(1);
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 

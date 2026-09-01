@@ -80,6 +80,8 @@ export interface DiffFormatOptions {
   maxOutputBytes?: number;
 }
 
+export type TreeDiffOptions = Pick<DiffOptions, "paths" | "context" | "abbrev" | "renames">;
+
 /** One side of a file's change; null means the file is absent there. */
 interface Endpoint {
   mode: string;
@@ -124,15 +126,43 @@ export function diff(
   sparseWorkspace?: SparseWorkspaceSource,
   formatOptions: DiffFormatOptions = {},
 ): string {
+  return renderPatch(
+    collect(repo, worktree, options, sparseWorkspace, formatOptions.indexBase === true),
+    options,
+    formatOptions,
+  );
+}
+
+/** Render a patch between two selected trees without consulting the worktree. */
+export function diffTrees(
+  repo: Repository,
+  beforeTree: string | null,
+  afterTree: string | null,
+  options: TreeDiffOptions = {},
+  formatOptions: DiffFormatOptions = {},
+): string {
+  const changes = (): Generator<PendingChange> =>
+    treePendingChanges(repo, beforeTree, afterTree, options);
+  return renderPatch(
+    collectPendingChanges(
+      repo,
+      undefined,
+      changes(),
+      classifyDiffRenames(repo, options, changes()),
+    ),
+    options,
+    formatOptions,
+  );
+}
+
+function renderPatch(
+  changes: Iterable<PatchChange>,
+  options: TreeDiffOptions,
+  formatOptions: DiffFormatOptions,
+): string {
   const abbrev = options.abbrev ?? DEFAULT_ABBREV;
   const out = new DiffOutput(formatOptions.maxOutputBytes);
-  for (const change of collect(
-    repo,
-    worktree,
-    options,
-    sparseWorkspace,
-    formatOptions.indexBase === true,
-  )) {
+  for (const change of changes) {
     if (isUnmergedFileChange(change)) {
       out.append(`* Unmerged path ${diffHeaderPath(change.path, "", formatOptions)}\n`);
       continue;
@@ -901,7 +931,7 @@ function* stagedPendingChanges(repo: Repository, options: DiffOptions): Generato
 
 function* collectPendingChanges(
   repo: Repository,
-  worktree: Worktree,
+  worktree: Worktree | undefined,
   changes: Iterable<PendingChange>,
   classification: ExactRenameClassification | undefined,
 ): Generator<FileChange> {
@@ -930,7 +960,7 @@ function* collectPendingChanges(
 
 function classifyDiffRenames(
   repo: Repository,
-  options: DiffOptions,
+  options: TreeDiffOptions,
   changes: Iterable<PendingChange>,
 ): ExactRenameClassification | undefined {
   if (!renameDetectionEnabled(repo, "diff", options.renames)) return undefined;
@@ -953,6 +983,26 @@ function classifyDiffRenames(
     if (!retained) break;
   }
   return classifier.finish();
+}
+
+function* treePendingChanges(
+  repo: Repository,
+  beforeTree: string | null,
+  afterTree: string | null,
+  options: TreeDiffOptions,
+): Generator<PendingChange> {
+  for (const row of repo.walkTreeDiff(beforeTree, afterTree)) {
+    if (!matchesPaths(row.path, options.paths)) continue;
+    const before = treeDiffIdentity(row.beforeMode, row.beforeOid);
+    const after = treeDiffIdentity(row.afterMode, row.afterOid);
+    const change = compareIdentities(row.path, before, after);
+    if (change !== null) yield change;
+  }
+}
+
+function treeDiffIdentity(mode: string | null, oid: string | null): EndpointIdentity | null {
+  if (mode === null || oid === null || mode === "160000") return null;
+  return { mode, oid, worktree: null };
 }
 
 function boundedSparsePendingChanges(
@@ -1471,12 +1521,12 @@ function cachedWorktreeOid(
 
 function* hydrateChanges(
   repo: Repository,
-  worktree: Worktree,
+  worktree: Worktree | undefined,
   changes: PendingChange[],
 ): Generator<FileChange> {
   if (changes.length === 0) return;
   const pending = changes.splice(0);
-  const root = worktree.realpath(repo.root);
+  const root = worktree?.realpath(repo.root);
   let offset = 0;
 
   while (offset < pending.length) {
@@ -1527,7 +1577,10 @@ function* hydrateChanges(
       );
     }
     const group = proposed.slice(0, ready);
-    const worktreeContents = readWorktreeContents(worktree, root, group);
+    const worktreeContents =
+      worktree === undefined || root === undefined
+        ? new Map<string, Uint8Array>()
+        : readWorktreeContents(worktree, root, group);
     for (const change of group) {
       yield {
         path: change.path,

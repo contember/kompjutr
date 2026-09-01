@@ -114,10 +114,13 @@ import { type PushOptions, push as pushOp } from "./ops/push.js";
 import {
   type CommitView,
   catFile as catFileRead,
+  type LogOptions,
   type LsTreeOptions,
   log as logOp,
   lsFilesAtRef,
   lsTree as lsTreeOp,
+  type ShowOptions,
+  type ShowResult,
   show as showOp,
   type TreeEntryView,
 } from "./ops/reads.js";
@@ -220,6 +223,9 @@ export type GitFetchOptions = GitDirOptions & FetchOptions;
 export type GitLsRemoteOptions = GitDirOptions & LsRemoteOptions;
 export type GitInitOptions = InitOptions;
 export type GitDiffOptions = DiffOptions & GitDirOptions;
+export type GitLogOptions = LogOptions & GitDirOptions;
+export type GitShowOptions = ShowOptions & GitDirOptions;
+export type GitShowResult = ShowResult;
 export type GitCleanOptions = Omit<CleanOptions, "excludeRoots" | "ignores"> & GitDirOptions;
 export type GitStatusOptions = Omit<StatusOptions, "excludeRoots" | "ignores"> & GitDirOptions;
 export type GitStatusReportOptions = Omit<StatusReportOptions, "excludeRoots" | "ignores"> &
@@ -314,8 +320,8 @@ export interface Git extends GitCliRunner {
   rm(input: GitRmOptions): Promise<void>;
   reset(input?: GitResetOptions): Promise<void>;
   commit(input: GitCommitOptions): Promise<CommitResult>;
-  log(input?: GitDirOptions & { ref?: string; depth?: number }): Promise<CommitView[]>;
-  show(input: GitDirOptions & { ref: string }): Promise<CommitView>;
+  log(input?: GitLogOptions): Promise<CommitView[]>;
+  show(input: GitShowOptions): Promise<GitShowResult>;
   revParse(input: GitRevParseOptions): Promise<string>;
   tryRevParse(input: GitRevParseOptions): Promise<string | undefined>;
   divergence(input: GitDivergenceOptions): Promise<DivergenceResult>;
@@ -537,7 +543,8 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return logOp(at(input.dir), input);
     },
     async show(input) {
-      return showOp(at(input.dir), input.ref);
+      const repo = at(input.dir);
+      return withPromisorHydration(context, repo, () => showOp(repo, input));
     },
     async revParse(input) {
       return at(input.dir).revParse(input.ref);

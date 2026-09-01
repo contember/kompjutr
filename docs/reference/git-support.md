@@ -78,7 +78,8 @@ The accepted argv grammar is exact:
 | `branch` | Optionless or `--list`; create as `<name> [<start>]`; delete as `-d|--delete <name>` or `-D <name>`; rename as `-m|--move [<old>] <new>`; exactly `--show-current` |
 | `ls-files` | Optional `--cached`, `--others`, and `--exclude-standard` selection plus bounded literal paths |
 | `diff` | Plain diff with zero, one, or two refs, optional joined `-U<n>`, and optional `-- <literal-paths>`; staged diff as `--cached|--staged [<ref>] [-- <literal-paths>]` |
-| `log` | At most one of `-1`, `-n <count>`, `--max-count=<count>`; at most one of `--oneline`, `--format=<template>`; then at most one ref or admitted `<a>..<b>` range |
+| `log` | At most one of `-1`, `-n <count>`, `--max-count=<count>`; at most one of `--oneline`, `--format=<template>`; optional `--first-parent`; then at most one ref or admitted `<a>..<b>` range and optional `-- <literal-paths>...` |
+| `show` | `[--first-parent] [<ref>]`; a merge requires `--first-parent` rather than silently choosing a parent |
 | `rev-list` | Exactly `--count <a>..<b>` |
 | `symbolic-ref` | Exactly `--short <ref>` |
 | `add` | One or more literal paths, optionally with `-f|--force`; or repository-wide `-A|--all` or `-u|--update`, optionally with force; `--` ends option parsing |
@@ -90,8 +91,8 @@ The accepted argv grammar is exact:
 | `rebase` | Exactly one upstream, `--continue`, `--skip`, or `--abort` |
 | `merge` | Exactly `--continue` or `--abort` |
 
-Status and ls-files path operands are literals or directory prefixes; glob and
-pathspec-magic spellings are rejected by this argv surface. `--exclude-standard`
+Status, ls-files, and log path operands are literals or directory prefixes; glob
+and pathspec-magic spellings are rejected by this argv surface. `--exclude-standard`
 requires `--others`. Add path operands are also literal or directory-prefix
 selections. Repository-wide add/update modes do not accept path operands, and
 `-A|--all` is incompatible with `-u|--update`. `--quiet` is admitted only with
@@ -102,6 +103,8 @@ shorthand. Custom log formats accept literal UTF-8 plus `%H`, `%h`, `%P`, `%s`,
 `%B`, `%an`, `%ae`, `%at`, `%cn`, `%ce`, `%ct`, `%n`, and `%%`. A log range is
 admitted only when the right tip reaches the left OID through a single-parent
 chain. Merge, divergent, unrelated, and shallow-boundary ranges fail closed.
+Path-selected log compares tree metadata only, never blob content; count applies
+to matching commits. `--first-parent` follows only the first-parent chain.
 `rev-list --count` retains its bounded two-sided graph semantics and therefore
 also handles merge and divergent histories.
 
@@ -135,6 +138,8 @@ only tighten those ceilings, discard stderr, or provide a log count hint up to
 untracked rows it must discard, and renders unmerged paths in Git's combined
 format. Staged diff merges the selected tree with the ordered stage-0 index,
 does not traverse the worktree, and refuses an unmerged index with `EUNMERGED`.
+Show patch output reuses the same 16 MiB tree-diff renderer and lazily hydrates
+only promised blobs required by the selected parent comparison.
 The first excess fails with `E2BIG`; semantic output is never truncated.
 The installed Computer interface still exposes scalar worktree metadata reads:
 a 1,001-file plain-diff probe uses 10,019 statements. That is a measured target
@@ -402,14 +407,20 @@ without an ordinary tree change.
 |---|---|---|
 | `<ref>` | `ref` (default HEAD) | ★ ✔ |
 | `-n <count>`, `--max-count` | `depth` | ★ ✔ |
+| `--first-parent` | `firstParent: true` | ✔ follows only the first-parent chain |
+| `-- <paths>` | `paths` | ✔ literal exact-or-directory-prefix selection; tree metadata only, no blob hydration |
 | `--format`, `--pretty`, `--oneline` | — | ★ ~ returns `CommitView[]`, never formatted text; the caller formats |
 | `<a>..<b>` (commit range) | — | ★ ✘ `log()` walks back from one tip; a range has to be bounded by the caller |
-| `-- <paths>`, `--follow`, `--all`, `--graph` | — | ✘ |
+| `--follow`, `--all`, `--graph` | — | ✘ |
 
 ### `git show` — `show()`
 
-Returns the commit's `CommitView` (oid, message, tree, parents, author,
-committer). ✘ no patch output, ✘ no tree/blob display.
+Returns `{ commit: CommitView, patch?: string }`. `patch: true` compares a root
+with the empty tree, a one-parent commit with its parent, and a merge with the
+explicit one-indexed `mainline`; a merge patch without `mainline` fails loudly.
+Patch reads use bounded tree traversal, exact rename detection, batched blob
+reads, and promisor hydration. The Computer compatibility facade projects
+`commit` to preserve its metadata-only contract. Tree/blob display remains ✘.
 
 ### `git rev-parse` — `revParse()`
 

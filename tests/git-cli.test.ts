@@ -90,6 +90,19 @@ describe("git argv grammar", () => {
       ["log", "--max-count=0", "--format="],
       { kind: "log", count: 0, format: { kind: "template", template: "" }, revision: undefined },
     ],
+    [
+      ["log", "--first-parent", "HEAD", "--", "src", "README.md"],
+      {
+        kind: "log",
+        count: undefined,
+        format: { kind: "default" },
+        revision: { kind: "ref", ref: "HEAD" },
+        firstParent: true,
+        paths: ["src", "README.md"],
+      },
+    ],
+    [["show"], { kind: "show" }],
+    [["show", "--first-parent", "HEAD~1"], { kind: "show", ref: "HEAD~1", firstParent: true }],
     [["rev-list", "--count", "main..HEAD"], { kind: "rev-list", left: "main", right: "HEAD" }],
     [["symbolic-ref", "--short", "HEAD"], { kind: "symbolic-ref", ref: "HEAD" }],
     [["add", "a", "dir/file"], { kind: "add", paths: ["a", "dir/file"] }],
@@ -159,6 +172,12 @@ describe("git argv grammar", () => {
     ["option after revision", ["log", "HEAD", "--oneline"]],
     ["two revisions", ["log", "HEAD", "main"]],
     ["symmetric range", ["log", "a...b"]],
+    ["log path glob", ["log", "--", "*.ts"]],
+    ["log empty path list", ["log", "--"]],
+    ["duplicate first parent", ["log", "--first-parent", "--first-parent"]],
+    ["show unsupported option", ["show", "--stat"]],
+    ["show option after revision", ["show", "HEAD", "--first-parent"]],
+    ["show extra revision", ["show", "HEAD", "main"]],
     ["rev-list enumeration", ["rev-list", "HEAD"]],
     ["rev-list symmetric range", ["rev-list", "--count", "a...b"]],
     ["symbolic-ref write", ["symbolic-ref", "HEAD", "refs/heads/main"]],
@@ -985,6 +1004,9 @@ describe("git CLI result bounds and dispatch", () => {
       log(_invocation, options) {
         return record("log", options);
       },
+      show(_invocation, options) {
+        return record("show", options);
+      },
       revList(_invocation, options) {
         return record("rev-list", options);
       },
@@ -1023,6 +1045,7 @@ describe("git CLI result bounds and dispatch", () => {
       ["ls-files"],
       ["diff"],
       ["log"],
+      ["show"],
       ["rev-list", "--count", "main..HEAD"],
       ["symbolic-ref", "--short", "HEAD"],
       ["add", "file"],
@@ -1065,6 +1088,7 @@ describe("git CLI result bounds and dispatch", () => {
       ["ls-files", "--exclude-standard"],
       ["diff", "--"],
       ["log", "-n", "bad"],
+      ["show", "--stat"],
       ["rev-list", "HEAD"],
       ["symbolic-ref", "HEAD"],
       ["add", ":file"],

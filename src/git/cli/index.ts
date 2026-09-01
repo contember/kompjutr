@@ -96,6 +96,12 @@ async function dispatch(
       options,
     );
   }
+  if (command.kind === "show") {
+    return await requireHandler(handlers.show, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
   if (command.kind === "rev-list") {
     return await requireHandler(handlers.revList, command.kind)(
       specificInvocation(invocation, command),

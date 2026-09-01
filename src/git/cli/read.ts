@@ -5,7 +5,7 @@ import { diff } from "../ops/diff.js";
 import { divergence } from "../ops/merge-base.js";
 import { withPromisorHydration } from "../ops/network.js";
 import { readRef } from "../ops/plumbing.js";
-import { type CommitView, linearLogRange, log } from "../ops/reads.js";
+import { type CommitView, linearLogRange, log, show } from "../ops/reads.js";
 import { branchList, currentBranch } from "../ops/refs.js";
 import { lsFilesWithWorktree } from "../ops/staging.js";
 import { eagerStatus, statusBranch } from "../ops/status.js";
@@ -37,7 +37,7 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 
 type ReadHandlers = Pick<
   GitCliHandlers,
-  "status" | "revParse" | "branch" | "lsFiles" | "diff" | "log" | "revList" | "symbolicRef"
+  "status" | "revParse" | "branch" | "lsFiles" | "diff" | "log" | "show" | "revList" | "symbolicRef"
 >;
 
 export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
@@ -197,6 +197,7 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
       return withRepository(context, invocation.cwd, output, (repo) => {
         const command = invocation.command;
         const revision = command.revision;
+        const paths = resolveLiteralPaths(repo.root, invocation.cwd, command.paths, "log");
         if (revision === undefined && repo.head().oid === null) {
           return unbornLogFailure(repo.head().ref, output);
         }
@@ -211,6 +212,7 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
               revision.left,
               revision.right,
               command.count ?? GIT_CLI_MAX_LOG_COUNT,
+              { paths },
             );
           } catch (error) {
             if (hasErrorCode(error, "EUNSUPPORTED")) {
@@ -230,6 +232,8 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
           commits = log(repo, {
             ref: revision?.kind === "ref" ? revision.ref : undefined,
             depth: command.count,
+            paths,
+            firstParent: command.firstParent,
           });
         }
         return gitCliResult(
@@ -240,6 +244,45 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
           ),
           "",
           0,
+        );
+      });
+    },
+    async show(invocation, runOptions) {
+      const output = outputContext(runOptions);
+      return withRepository(context, invocation.cwd, output, async (repo) => {
+        const ref = invocation.command.ref ?? "HEAD";
+        if (repo.head().oid === null && invocation.command.ref === undefined) {
+          return unbornLogFailure(repo.head().ref, output);
+        }
+        const revision: GitCliRevision = { kind: "ref", ref };
+        if (missingRevision(repo, revision)) return ambiguousRevision(revision, output);
+        const oid = repo.peel(repo.revParse(ref));
+        if (
+          repo.readCommit(oid).parent.length > 1 &&
+          !repo.shallow().has(oid) &&
+          invocation.command.firstParent !== true
+        ) {
+          return gitCliDiagnosticResult(
+            "fatal: merge show requires --first-parent\n",
+            "",
+            "",
+            128,
+            output,
+          );
+        }
+        const result = await withPromisorHydration(context, repo, () =>
+          show(repo, {
+            ref,
+            patch: true,
+            ...(invocation.command.firstParent === true ? { mainline: 1 } : {}),
+          }),
+        );
+        const maximum = stdoutCeiling(runOptions);
+        const metadata = formatLog([result.commit], { kind: "default" }, maximum);
+        const patch = result.patch ?? "";
+        return gitCliStdoutPartsResult(
+          patch === "" ? [metadata] : [metadata, "\n", patch],
+          maximum,
         );
       });
     },
