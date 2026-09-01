@@ -11,6 +11,8 @@
 // intrinsic variables (`PWD`, `SHLVL`, `RANDOM`, `BASH_*`, etc.) and special
 // parameters (`$?`, `$$`, `$1`, etc.) are rejected rather than normalized.
 // Stdout, stderr, and exit status are compared exactly, with output kept as bytes.
+// The printf-invalid helper only removes Bash's fixed `bash: line 1: ` location
+// prefix from the exact `%Z` diagnostic; the remaining diagnostic stays byte-exact.
 
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
@@ -250,5 +252,16 @@ function seedHostTree(directory: string, tree: ShellTree): WriteEntry[] {
 export function agreeWithBash(parity: ShellParity): void {
   expect(parity.ours.stdout).toEqual(parity.bash.stdout);
   expect(parity.ours.stderr).toEqual(parity.bash.stderr);
+  expect(parity.ours.exitCode).toBe(parity.bash.exitCode);
+}
+
+export function agreeWithBashInvalidPrintfFormat(parity: ShellParity): void {
+  const bashDiagnostic = new TextDecoder().decode(parity.bash.stderr);
+  const normalized = bashDiagnostic.replace(
+    /^bash: line 1: (?=printf: `Z': invalid format character\n$)/,
+    "",
+  );
+  expect(parity.ours.stdout).toEqual(parity.bash.stdout);
+  expect(parity.ours.stderr).toEqual(ENCODER.encode(normalized));
   expect(parity.ours.exitCode).toBe(parity.bash.exitCode);
 }

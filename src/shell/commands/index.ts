@@ -11,6 +11,7 @@ import { fileCommands } from "./files.js";
 import { UsageError } from "./flags.js";
 import { grep } from "./grep.js";
 import { listCommands } from "./list.js";
+import { printf } from "./printf.js";
 import { readCommands } from "./read.js";
 import { rg } from "./rg.js";
 import { registerKnownCommands, textCommands } from "./text.js";
@@ -20,6 +21,7 @@ export function builtinCommands(): Map<string, Command> {
   const raw = new Map<string, Command>([
     ["grep", grep],
     ["rg", rg],
+    ["printf", printf],
     ["xargs", xargs],
     ...readCommands,
     ...listCommands,
