@@ -16,6 +16,8 @@ import {
   GIT_CLI_MAX_ARGV_ENTRIES,
   GIT_CLI_MAX_ENV_ENTRIES,
   GIT_CLI_MAX_LOG_COUNT,
+  type GitCliAddCommand,
+  type GitCliCommitCommand,
   type GitCliEnvironment,
   type GitCliInvocation,
   type GitCliLogCommand,
@@ -139,8 +141,8 @@ function parseGitCliCommandInternal(
   else if (name === "log") return parseLog(argv, logLimitHint, outputContext);
   else if (name === "rev-list") command = parseRevList(argv);
   else if (name === "symbolic-ref") command = parseSymbolicRef(argv);
-  else if (name === "add") command = parseAdd(argv);
-  else if (name === "commit") command = parseCommit(argv);
+  else if (name === "add") return parseAdd(argv, outputContext);
+  else if (name === "commit") return parseCommit(argv, outputContext);
   else if (name === "rebase") command = parseRebase(argv);
   else return { ok: false, result: gitCliUnknownCommand(name, outputContext) };
   if (command === undefined) return invalidInvocation(name, argv, outputContext);
@@ -457,39 +459,146 @@ function parseSymbolicRef(argv: readonly string[]): ParsedGitCliCommand | undefi
   return { kind: "symbolic-ref", ref };
 }
 
-function parseAdd(argv: readonly string[]): ParsedGitCliCommand | undefined {
+function parseAdd(argv: readonly string[], outputContext?: GitCliOutputContext): GitCliParseResult {
   const paths: string[] = [];
+  let all = false;
+  let update = false;
+  let force = false;
   let endOptions = false;
   for (let index = 1; index < argv.length; index++) {
     const argument = argv[index];
-    if (argument === undefined) return undefined;
+    if (argument === undefined) return invalidInvocation("add", argv, outputContext);
     if (!endOptions && argument === "--") {
       endOptions = true;
       continue;
     }
-    if (!endOptions && argument.startsWith("-")) return undefined;
+    if (!endOptions && (argument === "-A" || argument === "--all")) {
+      if (all) return invalidInvocation("add", argv, outputContext);
+      all = true;
+      continue;
+    }
+    if (!endOptions && (argument === "-u" || argument === "--update")) {
+      if (update) return invalidInvocation("add", argv, outputContext);
+      update = true;
+      continue;
+    }
+    if (!endOptions && (argument === "-f" || argument === "--force")) {
+      if (force) return invalidInvocation("add", argv, outputContext);
+      force = true;
+      continue;
+    }
+    if (!endOptions && argument.startsWith("-")) {
+      return {
+        ok: false,
+        result: gitCliUnknownOptionFailure("add", argument, outputContext),
+      };
+    }
     if (!validLiteralPathspec(argument)) {
-      return undefined;
+      return invalidInvocation("add", argv, outputContext);
     }
     paths.push(argument);
   }
-  if (paths.length === 0) return undefined;
-  return { kind: "add", paths };
+  if (all && update) {
+    return {
+      ok: false,
+      result: gitCliDiagnosticResult(
+        "fatal: options '-A' and '-u' cannot be used together\n",
+        "",
+        "",
+        128,
+        outputContext,
+      ),
+    };
+  }
+  if ((all || update) && paths.length > 0) {
+    return invalidInvocation("add", argv, outputContext);
+  }
+  if (!all && !update && paths.length === 0) {
+    return invalidInvocation("add", argv, outputContext);
+  }
+  const command: GitCliAddCommand = {
+    kind: "add",
+    paths,
+    ...(all ? { all: true } : {}),
+    ...(update ? { update: true } : {}),
+    ...(force ? { force: true } : {}),
+  };
+  return invocation(command);
 }
 
-function parseCommit(argv: readonly string[]): ParsedGitCliCommand | undefined {
-  if (argv.length === 3 && argv[1] === "-m") {
-    const message = argv[2];
-    if (message === undefined) return undefined;
-    validateCommitMessage(message);
-    return { kind: "commit", message };
+function parseCommit(
+  argv: readonly string[],
+  outputContext?: GitCliOutputContext,
+): GitCliParseResult {
+  let message: string | undefined;
+  let all = false;
+  let amend = false;
+  let allowEmpty = false;
+  for (let index = 1; index < argv.length; index++) {
+    const argument = argv[index];
+    if (argument === undefined) return invalidInvocation("commit", argv, outputContext);
+    if (argument === "-m" || argument === "--message") {
+      if (message !== undefined) return invalidInvocation("commit", argv, outputContext);
+      const value = argv[index + 1];
+      if (value === undefined) {
+        return {
+          ok: false,
+          result:
+            argument === "-m"
+              ? gitCliCommitMessageRequired(outputContext)
+              : gitCliDiagnosticResult(
+                  "error: option `message' requires a value\n",
+                  "",
+                  "",
+                  129,
+                  outputContext,
+                ),
+        };
+      }
+      validateCommitMessage(value);
+      message = value;
+      index++;
+      continue;
+    }
+    if (argument.startsWith("--message=")) {
+      if (message !== undefined) return invalidInvocation("commit", argv, outputContext);
+      const value = argument.slice("--message=".length);
+      validateCommitMessage(value);
+      message = value;
+      continue;
+    }
+    if (argument === "-a" || argument === "--all") {
+      if (all) return invalidInvocation("commit", argv, outputContext);
+      all = true;
+      continue;
+    }
+    if (argument === "--amend") {
+      if (amend) return invalidInvocation("commit", argv, outputContext);
+      amend = true;
+      continue;
+    }
+    if (argument === "--allow-empty") {
+      if (allowEmpty) return invalidInvocation("commit", argv, outputContext);
+      allowEmpty = true;
+      continue;
+    }
+    if (argument.startsWith("-")) {
+      return {
+        ok: false,
+        result: gitCliUnknownOptionFailure("commit", argument, outputContext),
+      };
+    }
+    return invalidInvocation("commit", argv, outputContext);
   }
-  if (argv.length === 2 && argv[1]?.startsWith("--message=")) {
-    const message = argv[1].slice("--message=".length);
-    validateCommitMessage(message);
-    return { kind: "commit", message };
-  }
-  return undefined;
+  if (message === undefined) return invalidInvocation("commit", argv, outputContext);
+  const command: GitCliCommitCommand = {
+    kind: "commit",
+    message,
+    ...(all ? { all: true } : {}),
+    ...(amend ? { amend: true } : {}),
+    ...(allowEmpty ? { allowEmpty: true } : {}),
+  };
+  return invocation(command);
 }
 
 function parseRebase(argv: readonly string[]): ParsedGitCliCommand | undefined {

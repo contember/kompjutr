@@ -10,7 +10,7 @@ import type { DiffSummaryEntry, RebaseResult } from "../ops/kinds.js";
 import type { RebaseJournal } from "../ops/operation-state.js";
 import { rebaseAbortExcluding, rebaseContinueExcluding } from "../ops/rebase.js";
 import type { Repository, ResolvedHead } from "../ops/repository.js";
-import { type AddLiteralPathsResult, addLiteralPaths } from "../ops/staging.js";
+import { type AddLiteralPathsResult, addLiteralPaths, add as addOp } from "../ops/staging.js";
 import { eagerStatus } from "../ops/status.js";
 import { formatCommitRefusalStatus, statusFormatOptions } from "../ops/status-format.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES, type WalkTreeDiffEntry } from "../store/index.js";
@@ -40,6 +40,7 @@ type MutationPhase = "native-operation" | "format-success" | "preflight";
 interface CommitMutation {
   oid: string;
   previousHead: ResolvedHead;
+  amended: boolean;
 }
 
 interface RebaseMutation {
@@ -75,12 +76,29 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
           repo,
           options,
           () => {
+            if (invocation.command.all || invocation.command.update) {
+              addOp(
+                repo,
+                context.worktree,
+                {
+                  paths: [],
+                  all: true,
+                  ...(invocation.command.update ? { trackedOnly: true } : {}),
+                  ...(invocation.command.force ? { force: true } : {}),
+                  excludeRoots: nestedRoots(context, repo.root),
+                },
+                context,
+              );
+              const result: AddLiteralPathsResult = { outcome: "staged" };
+              return result;
+            }
             paths = resolveAddPaths(repo, invocation.cwd, invocation.command.paths);
             return addLiteralPaths(
               repo,
               context.worktree,
               {
                 paths: paths.map((path) => path.path),
+                ...(invocation.command.force ? { force: true } : {}),
                 excludeRoots: nestedRoots(context, repo.root),
               },
               context,
@@ -97,13 +115,29 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
           repo,
           options,
           () => {
-            if (!repo.checkout.hasConflicts()) repo.checkout.requireNoOperationState();
+            const hasConflicts = repo.checkout.hasConflicts();
+            if (!hasConflicts) repo.checkout.requireNoOperationState();
+            if (invocation.command.all && !hasConflicts) {
+              addOp(
+                repo,
+                context.worktree,
+                {
+                  paths: [],
+                  all: true,
+                  trackedOnly: true,
+                  excludeRoots: nestedRoots(context, repo.root),
+                },
+                context,
+              );
+            }
             const previousHead = repo.head();
             const result = commitOp(context, repo, {
               message: invocation.command.message,
               env: environmentRecord(invocation.env),
+              ...(invocation.command.amend ? { amend: true } : {}),
+              ...(invocation.command.allowEmpty ? { allowEmpty: true } : {}),
             });
-            return { oid: result.oid, previousHead };
+            return { oid: result.oid, previousHead, amended: invocation.command.amend === true };
           },
           (mutation) =>
             gitCliResult(
@@ -342,6 +376,9 @@ function mapCommitFailure(
   if (hasErrorCode(error, "EOPACTIVE")) {
     return gitCliResult("", "fatal: cannot commit while another operation is in progress\n", 128);
   }
+  if (hasErrorCode(error, "ENOCOMMIT")) {
+    return gitCliResult("", "fatal: You have nothing to amend.\n", 128);
+  }
   return undefined;
 }
 
@@ -436,6 +473,7 @@ function formatCommitSummary(
     mutation.oid,
     branchLabel(mutation.previousHead.ref),
     maximum,
+    mutation.amended,
   );
 }
 
@@ -445,6 +483,7 @@ function formatCommit(
   oid: string,
   label: string,
   maximum: number,
+  amended = false,
 ): string {
   const commit = repo.readCommit(oid);
   const quoteNonAscii = statusFormatOptions(repo).quotePath ?? true;
@@ -459,7 +498,8 @@ function formatCommit(
   const root = commit.parent.length === 0 ? " (root-commit)" : "";
   const out = new BoundedSummaryOutput(maximum, "git CLI commit summary");
   out.append(`[${label}${root} ${abbreviate(repo, oid)}] ${subject(commit.message)}\n`);
-  out.append(` ${shortStat(summary)}\n`);
+  if (amended) out.append(` Date: ${mediumDate(commit.author)}\n`);
+  if (summary.files > 0) out.append(` ${shortStat(summary)}\n`);
   for (const detail of summary.details) out.append(` ${detail}\n`);
   return out.finish();
 }
@@ -693,6 +733,43 @@ function shortStat(summary: CommitSummary): string {
     }
   }
   return parts.join(", ");
+}
+
+function mediumDate(person: { timestamp: number; timezoneOffset: number }): string {
+  const localSeconds = person.timestamp - person.timezoneOffset * 60;
+  const milliseconds = localSeconds * 1000;
+  if (!Number.isSafeInteger(milliseconds)) {
+    throw new GitError("EINVAL", "git CLI commit identity date is outside the supported range");
+  }
+  const date = new Date(milliseconds);
+  const weekday = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][date.getUTCDay()];
+  const month = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ][date.getUTCMonth()];
+  if (weekday === undefined || month === undefined || Number.isNaN(date.getTime())) {
+    throw new GitError("EINVAL", "git CLI commit identity date is outside the supported range");
+  }
+  const east = -person.timezoneOffset;
+  const sign = east < 0 ? "-" : "+";
+  const absolute = Math.abs(east);
+  const twoDigits = (value: number): string => String(value).padStart(2, "0");
+  return (
+    `${weekday} ${month} ${date.getUTCDate()} ` +
+    `${twoDigits(date.getUTCHours())}:${twoDigits(date.getUTCMinutes())}:` +
+    `${twoDigits(date.getUTCSeconds())} ${date.getUTCFullYear()} ${sign}` +
+    `${twoDigits(Math.floor(absolute / 60))}${twoDigits(absolute % 60)}`
+  );
 }
 
 function formatRebaseContinue(

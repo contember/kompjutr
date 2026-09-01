@@ -77,6 +77,25 @@ describe("injected git command", () => {
       "On branch main\nnothing to commit, working tree clean\n",
     );
   });
+  it("routes whole-tree staging and tracked-only commits", async () => {
+    subject.workspace.filesystem.writeFile("/repo/file.txt", ENCODER.encode("staged\n"));
+    subject.workspace.filesystem.writeFile("/repo/new.txt", ENCODER.encode("new\n"));
+    expect(await subject.shell.run("git add --all")).toMatchObject({
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+    });
+    expect((await subject.shell.run("git commit --message staged")).exitCode).toBe(0);
+
+    subject.workspace.filesystem.writeFile("/repo/file.txt", ENCODER.encode("tracked\n"));
+    subject.workspace.filesystem.writeFile("/repo/later.txt", ENCODER.encode("later\n"));
+    expect((await subject.shell.run("git commit --all -m tracked")).exitCode).toBe(0);
+    expect(await subject.shell.run("git status --short")).toMatchObject({
+      stdout: "?? later.txt\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
   it("redirects diff bytes atomically", async () => {
     subject.workspace.filesystem.writeFile("/repo/file.txt", ENCODER.encode("changed\n"));
     const expected = await subject.workspace.git.runCli({ argv: ["diff"], cwd: "/repo" });

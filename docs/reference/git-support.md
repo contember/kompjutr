@@ -81,13 +81,16 @@ The accepted argv grammar is exact:
 | `log` | At most one of `-1`, `-n <count>`, `--max-count=<count>`; at most one of `--oneline`, `--format=<template>`; then at most one ref or admitted `<a>..<b>` range |
 | `rev-list` | Exactly `--count <a>..<b>` |
 | `symbolic-ref` | Exactly `--short <ref>` |
-| `add` | One or more literal paths; an optional `--` ends option parsing |
-| `commit` | Exactly `-m <message>` or `--message=<message>` |
+| `add` | One or more literal paths, optionally with `-f|--force`; or repository-wide `-A|--all` or `-u|--update`, optionally with force; `--` ends option parsing |
+| `commit` | Exactly one `-m|--message <message>` or `--message=<message>`, plus optional `-a|--all`, `--amend`, and `--allow-empty` |
 | `rebase` | Exactly `--continue` or `--abort` |
 
 Status and ls-files path operands are literals or directory prefixes; glob and
 pathspec-magic spellings are rejected by this argv surface. `--exclude-standard`
-requires `--others`. `--quiet` is admitted only with `rev-parse --verify`.
+requires `--others`. Add path operands are also literal or directory-prefix
+selections. Repository-wide add/update modes do not accept path operands, and
+`-A|--all` is incompatible with `-u|--update`. `--quiet` is admitted only with
+`rev-parse --verify`.
 
 `log` counts are ASCII decimals from 0 through 50,000; `-1` is the only joined
 shorthand. Custom log formats accept literal UTF-8 plus `%H`, `%h`, `%P`, `%s`,
@@ -134,10 +137,11 @@ miss, not a runtime rejection, and the runner adds no projected-count refusal.
 
 `add`, `commit`, and both rebase actions execute their mutation, format their
 success output, and preflight all retained output inside one database
-transaction. An output failure therefore rolls back index, worktree, refs, and
-operation state. The promise-returning dispatcher awaits only after this
-synchronous transaction callback has completed. Expected operation failures are
-mapped only after rollback and cache revalidation.
+transaction. `commit -a|--all` performs its tracked-only staging inside that
+same outer transaction. An output failure therefore rolls back index, worktree,
+refs, objects, reflogs, and operation state. The promise-returning dispatcher
+awaits only after this synchronous transaction callback has completed. Expected
+operation failures are mapped only after rollback and cache revalidation.
 
 ## Repository creation
 
@@ -360,8 +364,8 @@ operation and returns the complete add/delete output.
 | `--author` | `author` | ✔ |
 | committer override | `committer` | ✔ |
 | `GIT_AUTHOR_*` / `GIT_COMMITTER_*` | `env` | ~ read from the passed record only, never from `process.env` |
-| `-a` | `add({ all: true, trackedOnly: true })` first | ~ separate call |
-| `--allow-empty` | `allowEmpty: true` | ★ ✔ native only |
+| `-a` | `add({ all: true, trackedOnly: true })` first | ✔ the argv runner composes staging and commit in one transaction |
+| `--allow-empty` | `allowEmpty: true` | ★ ✔ |
 | continue a merge | `commit()` during a pending merge finalizes it | ✔ `--amend` is rejected there |
 | `-F <file>`, `-S`, `--fixup`, `--squash`, `--no-verify` | — | ✘ (no hooks and no signing exist) |
 

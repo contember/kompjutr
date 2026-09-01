@@ -83,8 +83,17 @@ describe("git argv grammar", () => {
     [["symbolic-ref", "--short", "HEAD"], { kind: "symbolic-ref", ref: "HEAD" }],
     [["add", "a", "dir/file"], { kind: "add", paths: ["a", "dir/file"] }],
     [["add", "--", "-literal"], { kind: "add", paths: ["-literal"] }],
+    [["add", "-A"], { kind: "add", paths: [], all: true }],
+    [["add", "--all", "-f", "--"], { kind: "add", paths: [], all: true, force: true }],
+    [["add", "--update"], { kind: "add", paths: [], update: true }],
+    [["add", "--force", "ignored.log"], { kind: "add", paths: ["ignored.log"], force: true }],
     [["commit", "-m", "message"], { kind: "commit", message: "message" }],
+    [["commit", "--message", "message"], { kind: "commit", message: "message" }],
     [["commit", "--message="], { kind: "commit", message: "" }],
+    [
+      ["commit", "--allow-empty", "--amend", "--all", "-m", "message"],
+      { kind: "commit", message: "message", all: true, amend: true, allowEmpty: true },
+    ],
     [["rebase", "--continue"], { kind: "rebase", action: "continue" }],
     [["rebase", "--abort"], { kind: "rebase", action: "abort" }],
   ])("accepts %j without a partial parse", (argv, expected) => {
@@ -111,7 +120,8 @@ describe("git argv grammar", () => {
     ["rev-list symmetric range", ["rev-list", "--count", "a...b"]],
     ["symbolic-ref write", ["symbolic-ref", "HEAD", "refs/heads/main"]],
     ["add without path", ["add"]],
-    ["add option", ["add", "--all"]],
+    ["add incompatible modes", ["add", "--all", "--update"]],
+    ["add whole-tree mode with path", ["add", "--all", "file"]],
     ["add glob", ["add", "*.ts"]],
     ["add leading-colon pathspec", ["add", ":file"]],
     ["add exclude shorthand", ["add", ":!file"]],
@@ -119,12 +129,25 @@ describe("git argv grammar", () => {
     ["add root shorthand", ["add", ":/"]],
     ["add long-form magic", ["add", ":(glob)file"]],
     ["add magic after separator", ["add", "--", ":file"]],
-    ["commit separated long message", ["commit", "--message", "message"]],
     ["commit duplicate", ["commit", "-m", "a", "-m", "b"]],
     ["rebase start", ["rebase", "main"]],
     ["rebase extra", ["rebase", "--abort", "extra"]],
   ])("rejects %s", (_name, argv) => {
     expect(rejected(argv).exitCode).not.toBe(0);
+  });
+  it.each([
+    ["add all short", ["add", "-A"]],
+    ["add all long", ["add", "--all"]],
+    ["add update short", ["add", "-u"]],
+    ["add update long", ["add", "--update"]],
+    ["add force short", ["add", "-f", "ignored.log"]],
+    ["add force long", ["add", "--force", "ignored.log"]],
+    ["commit all short", ["commit", "-a", "-m", "message"]],
+    ["commit all long", ["commit", "--all", "-m", "message"]],
+    ["commit amend", ["commit", "--amend", "-m", "message"]],
+    ["commit allow-empty", ["commit", "--allow-empty", "-m", "message"]],
+  ])("accepts the pinned WU4 form %s", (_name, argv) => {
+    expect(parseGitCliCommand(argv).ok).toBe(true);
   });
   it.each([
     [["status"], "eagerStatus + formatCliStatus"],
@@ -259,6 +282,18 @@ describe("git argv grammar", () => {
       stdout: "",
       stderr: "error: switch `m' requires a value\n",
       exitCode: 129,
+      truncated: false,
+    });
+    expect(rejected(["commit", "--message"])).toEqual({
+      stdout: "",
+      stderr: "error: option `message' requires a value\n",
+      exitCode: 129,
+      truncated: false,
+    });
+    expect(rejected(["add", "-A", "-u"])).toEqual({
+      stdout: "",
+      stderr: "fatal: options '-A' and '-u' cannot be used together\n",
+      exitCode: 128,
       truncated: false,
     });
   });

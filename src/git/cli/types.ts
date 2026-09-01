@@ -111,11 +111,17 @@ export interface GitCliSymbolicRefCommand {
 export interface GitCliAddCommand {
   readonly kind: "add";
   readonly paths: readonly string[];
+  readonly all?: boolean;
+  readonly update?: boolean;
+  readonly force?: boolean;
 }
 
 export interface GitCliCommitCommand {
   readonly kind: "commit";
   readonly message: string;
+  readonly all?: boolean;
+  readonly amend?: boolean;
+  readonly allowEmpty?: boolean;
 }
 
 export interface GitCliRebaseCommand {

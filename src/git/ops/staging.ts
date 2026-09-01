@@ -250,7 +250,10 @@ export function addLiteralPaths(
     }
     compilePathspecsOwned(options.paths);
     const specs = uniqueSpecs(options.paths);
-    const preflight = preflightLiteralAdd(repo, worktree, specs, options.excludeRoots);
+    const preflight =
+      options.force === true
+        ? { ignored: [] }
+        : preflightLiteralAdd(repo, worktree, specs, options.excludeRoots);
     runAdd(repo, worktree, options, specs, context, repo.checkout, preflight.ignores);
     return preflight.ignored.length === 0
       ? { outcome: "staged" }
