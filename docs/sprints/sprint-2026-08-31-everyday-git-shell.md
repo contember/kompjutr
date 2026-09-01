@@ -415,3 +415,7 @@ sprint risk. Resolve blocking findings before implementation.
   index, exact bounded CLI grammar, and promisor hydration. Focused 180/180,
   smoke 164/164, typecheck/check passed; the cost witness performs no worktree
   traversal or scalar index lookup.
+- 2026-09-01 — WU3 landed (`1aa25ce`): bounded everyday status, rev-parse,
+  branch, and ls-files argv with cwd-relative paths and human status output.
+  Focused 191/191, smoke 164/164 after correcting one stale nested-cwd witness,
+  typecheck/check passed.

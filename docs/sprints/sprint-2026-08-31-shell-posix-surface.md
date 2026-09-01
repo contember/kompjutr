@@ -321,3 +321,7 @@ shell tests, and shell reference docs are serialized by the sprint leader.
 - 2026-09-01 — WU3 landed (`8b9c425`): bounded `printf` with `%s`, `%%`, `%d`,
   admitted escapes, format recycling, and explicit local refusals. Focused
   witness 16/16, smoke 164/164, typecheck/check passed.
+- 2026-09-01 — WU4 landed (`f484426`): run-terminating `exit [N]` with current
+  status, modulo-256 operands, exact Bash diagnostics, and explicit pipeline
+  refusal. Focused 55/55, shell 392/392, smoke 164/164, typecheck/check passed;
+  cleanup stayed inside the existing executor and run-input `finally` seams.
