@@ -55,6 +55,28 @@ describe("injected git command", () => {
     expect(log.exitCode, log.stderr).toBe(0);
     expect(log.stdout.trim().split("\n")).toHaveLength(3);
   });
+  it("routes everyday repository, branch, revision, and index reads", async () => {
+    expect(await subject.shell.run("git rev-parse --show-toplevel")).toMatchObject({
+      stdout: "/repo\n",
+      stderr: "",
+      exitCode: 0,
+    });
+    expect(await subject.shell.run("git branch --show-current")).toMatchObject({
+      stdout: "main\n",
+      exitCode: 0,
+    });
+    expect(await subject.shell.run("git branch --list | wc -l")).toMatchObject({
+      stdout: "1\n",
+      exitCode: 0,
+    });
+    expect(await subject.shell.run("git ls-files --cached")).toMatchObject({
+      stdout: "file.txt\n",
+      exitCode: 0,
+    });
+    expect((await subject.shell.run("git status")).stdout).toBe(
+      "On branch main\nnothing to commit, working tree clean\n",
+    );
+  });
   it("redirects diff bytes atomically", async () => {
     subject.workspace.filesystem.writeFile("/repo/file.txt", ENCODER.encode("changed\n"));
     const expected = await subject.workspace.git.runCli({ argv: ["diff"], cwd: "/repo" });

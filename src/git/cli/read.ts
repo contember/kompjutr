@@ -1,20 +1,24 @@
 import { GitError, hasErrorCode } from "../common/errors.js";
-import { joinPath, normalizePath, relativeTo } from "../common/paths.js";
+import { joinPath, normalizePath, relativePath, relativeTo } from "../common/paths.js";
 import { type GitContext, nestedRoots, openRepository } from "../ops/context.js";
 import { diff } from "../ops/diff.js";
-import type { StatusEntry } from "../ops/kinds.js";
 import { divergence } from "../ops/merge-base.js";
 import { withPromisorHydration } from "../ops/network.js";
 import { readRef } from "../ops/plumbing.js";
 import { type CommitView, linearLogRange, log } from "../ops/reads.js";
-import { eagerStatus } from "../ops/status.js";
-import { formatPorcelainV1, formatShort, statusFormatOptions } from "../ops/status-format.js";
+import { branchList, currentBranch } from "../ops/refs.js";
+import { lsFilesWithWorktree } from "../ops/staging.js";
+import { eagerStatus, statusBranch } from "../ops/status.js";
+import { formatCliPathLines, formatCliStatus, statusFormatOptions } from "../ops/status-format.js";
+import type { StatusDetail } from "../ops/status-rows.js";
 import {
   type GitCliOutputContext,
   gitCliDiagnosticResult,
   gitCliDiagnosticResultParts,
   gitCliDiagnosticSliceResult,
   gitCliResult,
+  gitCliRevisionRequired,
+  gitCliStdoutPartsResult,
   gitCliUtf8ByteLength,
 } from "./result.js";
 import {
@@ -31,29 +35,126 @@ const MAX_FORMAT_OPERATIONS = 1_000_000;
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-type ReadHandlers = Pick<GitCliHandlers, "status" | "diff" | "log" | "revList" | "symbolicRef">;
+type ReadHandlers = Pick<
+  GitCliHandlers,
+  "status" | "revParse" | "branch" | "lsFiles" | "diff" | "log" | "revList" | "symbolicRef"
+>;
 
 export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
   return {
     async status(invocation, runOptions) {
       return withRepository(context, invocation.cwd, outputContext(runOptions), (repo) => {
+        const command = invocation.command;
+        const paths = resolveLiteralPaths(repo.root, invocation.cwd, command.paths, "status");
         const rows = eagerStatus(
           repo,
           context.worktree,
-          { excludeRoots: nestedRoots(context, repo.root) },
+          { paths, excludeRoots: nestedRoots(context, repo.root) },
           context,
         );
-        const options = statusFormatOptions(repo);
-        preflightStatusOutput(
+        relativizeStatusRows(repo.root, invocation.cwd, rows);
+        const branch =
+          command.format === "default" || command.branch === true
+            ? statusBranch(repo)
+            : { oid: null, head: null };
+        const stdout = formatCliStatus(
           rows,
-          options.quotePath ?? true,
-          Math.min(runOptions.maxStdoutBytes, runOptions.maxCombinedOutputBytes),
+          branch,
+          command.format,
+          command.branch === true,
+          statusFormatOptions(repo),
+          stdoutCeiling(runOptions),
         );
-        const stdout =
-          invocation.command.format === "short"
-            ? formatShort(rows, options)
-            : formatPorcelainV1(rows, options);
         return gitCliResult(stdout, "", 0);
+      });
+    },
+    async revParse(invocation, runOptions) {
+      const output = outputContext(runOptions);
+      return withRepository(context, invocation.cwd, output, async (repo) => {
+        const command = invocation.command;
+        if (command.showToplevel === true) {
+          return gitCliStdoutPartsResult([`${repo.root}\n`], stdoutCeiling(runOptions));
+        }
+        const revision = command.revision;
+        if (revision === undefined) return gitCliRevisionRequired(output);
+        let oid: string | undefined;
+        try {
+          oid = await withPromisorHydration(context, repo, () => repo.tryRevParse(revision));
+        } catch (error) {
+          if (!hasErrorCode(error, "ENOTFOUND")) throw error;
+        }
+        if (oid !== undefined) {
+          return gitCliStdoutPartsResult([`${oid}\n`], stdoutCeiling(runOptions));
+        }
+        if (command.quiet === true) return gitCliResult("", "", 1);
+        if (command.verify === true) return gitCliRevisionRequired(output);
+        const failure = ambiguousRevision({ kind: "ref", ref: revision }, output);
+        return gitCliStdoutPartsResult(
+          [`${revision}\n`],
+          stdoutCeiling(runOptions),
+          failure.exitCode,
+          failure.stderr,
+        );
+      });
+    },
+    async branch(invocation, runOptions) {
+      return withRepository(context, invocation.cwd, outputContext(runOptions), (repo) => {
+        const current = currentBranch(repo);
+        if (invocation.command.action === "show-current") {
+          return gitCliStdoutPartsResult(
+            current === undefined ? [] : [`${current}\n`],
+            stdoutCeiling(runOptions),
+          );
+        }
+        const parts: string[] = [];
+        const head = repo.head();
+        if (head.ref === null && head.oid !== null) {
+          parts.push(`* (HEAD detached at ${head.oid.slice(0, 7)})\n`);
+        }
+        for (const name of branchList(repo)) {
+          parts.push(`${name === current ? "*" : " "} ${name}\n`);
+        }
+        return gitCliStdoutPartsResult(parts, stdoutCeiling(runOptions));
+      });
+    },
+    async lsFiles(invocation, runOptions) {
+      return withRepository(context, invocation.cwd, outputContext(runOptions), (repo) => {
+        const command = invocation.command;
+        let paths = resolveLiteralPaths(repo.root, invocation.cwd, command.paths, "ls-files");
+        if (paths === undefined) {
+          const cwdPath = relativeTo(repo.root, invocation.cwd);
+          if (cwdPath === null) throw new GitError("EINVAL", "ls-files cwd is outside repository");
+          if (cwdPath !== "") paths = [cwdPath];
+        }
+        const selection = {
+          paths,
+          excludeRoots: nestedRoots(context, repo.root),
+        };
+        const selected =
+          command.cached === true && command.others === true
+            ? [
+                ...lsFilesWithWorktree(repo, context.worktree, {
+                  ...selection,
+                  others: true,
+                  excludeStandard: command.excludeStandard,
+                }),
+                ...lsFilesWithWorktree(repo, context.worktree, {
+                  ...selection,
+                  cached: true,
+                }),
+              ]
+            : lsFilesWithWorktree(repo, context.worktree, {
+                ...selection,
+                cached: command.cached,
+                others: command.others,
+                excludeStandard: command.excludeStandard,
+              });
+        const displayed = selected.map((path) => pathFromCwd(repo.root, invocation.cwd, path));
+        return gitCliResult(
+          formatCliPathLines(displayed, statusFormatOptions(repo), stdoutCeiling(runOptions)),
+          "",
+          0,
+        );
       });
     },
     async diff(invocation, runOptions) {
@@ -225,6 +326,43 @@ function resolveDiffPaths(
   });
 }
 
+function resolveLiteralPaths(
+  root: string,
+  cwd: string,
+  inputs: readonly string[] | undefined,
+  command: string,
+): string[] | undefined {
+  if (inputs === undefined) return undefined;
+  return inputs.map((input) => {
+    const absolute = input.startsWith("/") ? normalizePath(input) : joinPath(cwd, input);
+    const path = relativeTo(root, absolute);
+    if (path === null) {
+      throw new GitError("EINVAL", `${command} path '${input}' is outside repository at '${root}'`);
+    }
+    return path;
+  });
+}
+
+function relativizeStatusRows(root: string, cwd: string, rows: StatusDetail[]): void {
+  for (const row of rows) {
+    row.path = pathFromCwd(root, cwd, row.path);
+    if ("originalPath" in row && row.originalPath !== undefined) {
+      row.originalPath = pathFromCwd(root, cwd, row.originalPath);
+    }
+  }
+}
+
+function pathFromCwd(root: string, cwd: string, path: string): string {
+  const directory = path.endsWith("/");
+  const relative = relativePath(cwd, joinPath(root, path));
+  if (!directory) return relative;
+  return relative === "." ? "./" : `${relative}/`;
+}
+
+function stdoutCeiling(options: ResolvedGitCliRunOptions): number {
+  return Math.min(options.maxStdoutBytes, options.maxCombinedOutputBytes);
+}
+
 function missingRevision(
   repo: ReturnType<typeof openRepository>,
   revision: GitCliRevision,
@@ -294,107 +432,6 @@ function shortRef(ref: string): string {
   if (ref.startsWith("refs/tags/")) return ref.slice("refs/tags/".length);
   if (ref.startsWith("refs/remotes/")) return ref.slice("refs/remotes/".length);
   return ref.startsWith(REFS) ? ref.slice(REFS.length) : ref;
-}
-
-function preflightStatusOutput(
-  rows: readonly StatusEntry[],
-  quotePath: boolean,
-  maximum: number,
-): void {
-  for (const row of rows) {
-    validateStatusPath(row.path);
-    if (row.originalPath !== undefined) validateStatusPath(row.originalPath);
-  }
-  let bytes = 0;
-  const addRow = (row: StatusEntry, prefixBytes: number): void => {
-    bytes = statusOutputAdd(bytes, prefixBytes, maximum);
-    if (row.originalPath === undefined) {
-      bytes = statusOutputAdd(bytes, statusPathBytes(row.path, quotePath, true, false), maximum);
-    } else {
-      bytes = statusOutputAdd(
-        bytes,
-        statusPathBytes(row.originalPath, quotePath, true, true),
-        maximum,
-      );
-      bytes = statusOutputAdd(bytes, 4, maximum);
-      bytes = statusOutputAdd(bytes, statusPathBytes(row.path, quotePath, true, true), maximum);
-    }
-    bytes = statusOutputAdd(bytes, 1, maximum);
-  };
-  for (const row of rows) {
-    if (row.worktree === "?" || row.worktree === "!") continue;
-    addRow(row, 3);
-  }
-  for (const row of rows) {
-    if (row.worktree === "?") addRow(row, 3);
-  }
-  for (const row of rows) {
-    if (row.worktree === "!") addRow(row, 3);
-  }
-}
-
-function validateStatusPath(path: string): void {
-  for (let index = 0; index < path.length; index++) {
-    const code = path.charCodeAt(index);
-    if (code === 0) throw invalidStatusPath();
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const low = path.charCodeAt(index + 1);
-      if (low < 0xdc00 || low > 0xdfff) throw invalidStatusPath();
-      index++;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      throw invalidStatusPath();
-    }
-  }
-}
-
-function invalidStatusPath(): GitError {
-  return new GitError("EINVAL", "status paths must be NUL-free well-formed UTF-16");
-}
-
-function statusPathBytes(
-  path: string,
-  quotePath: boolean,
-  quoteEdgeSpaces: boolean,
-  quoteRenameSeparator: boolean,
-): number {
-  let quoted =
-    (quoteEdgeSpaces && (path.startsWith(" ") || path.endsWith(" "))) ||
-    (quoteRenameSeparator && path.includes(" -> "));
-  let bytes = 0;
-  for (let index = 0; index < path.length; index++) {
-    const code = path.charCodeAt(index);
-    if (code < 0x80) {
-      const escapedBytes = statusAsciiBytes(code);
-      if (escapedBytes !== 1) quoted = true;
-      bytes += escapedBytes;
-      continue;
-    }
-    let sourceBytes = code <= 0x7ff ? 2 : 3;
-    if (code >= 0xd800 && code <= 0xdbff) {
-      sourceBytes = 4;
-      index++;
-    }
-    if (quotePath) {
-      quoted = true;
-      bytes += sourceBytes * 4;
-    } else {
-      bytes += sourceBytes;
-    }
-  }
-  return bytes + (quoted ? 2 : 0);
-}
-
-function statusAsciiBytes(code: number): number {
-  if ((code >= 0x07 && code <= 0x0d) || code === 0x22 || code === 0x5c) return 2;
-  if (code < 0x20 || code === 0x7f) return 4;
-  return 1;
-}
-
-function statusOutputAdd(current: number, additional: number, maximum: number): number {
-  if (additional > maximum - current) {
-    throw new GitError("E2BIG", `git CLI status output exceeds ${maximum} bytes`);
-  }
-  return current + additional;
 }
 
 function formatLog(

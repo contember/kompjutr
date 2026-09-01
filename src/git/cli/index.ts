@@ -57,6 +57,24 @@ async function dispatch(
       options,
     );
   }
+  if (command.kind === "rev-parse") {
+    return await requireHandler(handlers.revParse, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "branch") {
+    return await requireHandler(handlers.branch, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "ls-files") {
+    return await requireHandler(handlers.lsFiles, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
   if (command.kind === "diff") {
     return await requireHandler(handlers.diff, command.kind)(
       specificInvocation(invocation, command),

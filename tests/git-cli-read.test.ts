@@ -54,9 +54,9 @@ function gitBytesAt(fixture: GitFixture, cwd: string, argv: string[]): string {
     encoding: "utf8",
   });
 }
-function gitResultAt(fixture: GitFixture, argv: string[]): GitCliResult {
+function gitResultAt(fixture: GitFixture, argv: string[], cwd = ""): GitCliResult {
   const result = spawnSync("git", argv, {
-    cwd: fixture.dir,
+    cwd: join(fixture.dir, cwd),
     env: {
       ...process.env,
       GIT_CONFIG_GLOBAL: "/dev/null",
@@ -186,11 +186,12 @@ describe("read-only git argv handlers", () => {
     fixture.write("src/untracked.txt", "new\n");
     writeWorkFile(workspace, "/repo/src/žluťoučký.txt", "changed\n");
     writeWorkFile(workspace, "/repo/src/untracked.txt", "new\n");
-    for (const argv of [["status", "--porcelain"], ["status", "--short"], ["diff"]]) {
-      const expected = fixture.gitBinary(...argv).toString("utf8");
-      const actual = await nativeRun(workspace, argv, "/repo/src");
-      expect(actual).toEqual({ stdout: expected, stderr: "", exitCode: 0, truncated: false });
-    }
+    expect(await nativeRun(workspace, ["diff"], "/repo/src")).toEqual({
+      stdout: fixture.gitBinary("diff").toString("utf8"),
+      stderr: "",
+      exitCode: 0,
+      truncated: false,
+    });
     fixture.git("config", "core.quotePath", "false");
     workspace.repo.store.configSet("core.quotePath", "false");
     expect((await nativeRun(workspace, ["diff"])).stdout).toBe(
@@ -342,6 +343,171 @@ describe("read-only git argv handlers", () => {
       ),
     ).toEqual([[expect.any(String), 1]]);
     expect(workspace.storage.statementCount).toBeLessThan(1000);
+  });
+});
+describe("everyday read argv parity", () => {
+  async function everydayFixture(): Promise<{
+    fixture: GitFixture;
+    workspace: TestRepository;
+  }> {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write(".gitignore", "ignored.txt\n");
+    fixture.write("root.txt", "root\n");
+    fixture.write("nested/tracked.txt", "tracked\n");
+    fixture.commit("base");
+    fixture.git("branch", "side");
+    const workspace = await importAt(fixture);
+    fixture.write("root.txt", "changed\n");
+    fixture.write("nested/untracked.txt", "untracked\n");
+    fixture.write("ignored.txt", "ignored\n");
+    writeWorkFile(workspace, "/repo/root.txt", "changed\n");
+    writeWorkFile(workspace, "/repo/nested/untracked.txt", "untracked\n");
+    writeWorkFile(workspace, "/repo/ignored.txt", "ignored\n");
+    return { fixture, workspace };
+  }
+
+  it("matches every admitted status form, branch read, revision read, and ls-files selection", async () => {
+    const { fixture, workspace } = await everydayFixture();
+    const rootCommands = [
+      ["status"],
+      ["status", "--short"],
+      ["status", "--porcelain=v1", "--branch"],
+      ["status", "--porcelain=v2", "--branch"],
+      ["status", "--short", "--", "root.txt"],
+      ["rev-parse", "HEAD"],
+      ["rev-parse", "--verify", "HEAD^0"],
+      ["rev-parse", "--quiet", "--verify", "HEAD"],
+      ["rev-parse", "--show-toplevel"],
+      ["branch", "--show-current"],
+      ["branch", "--list"],
+      ["ls-files"],
+      ["ls-files", "--cached"],
+      ["ls-files", "--others"],
+      ["ls-files", "--others", "--exclude-standard"],
+      ["ls-files", "--cached", "--others", "--exclude-standard"],
+      ["ls-files", "--cached", "--", "nested"],
+    ];
+    for (const argv of rootCommands) {
+      const gitExpected = gitResultAt(fixture, argv);
+      const expected =
+        argv[1] === "--show-toplevel" ? { ...gitExpected, stdout: "/repo\n" } : gitExpected;
+      expect(await nativeRun(workspace, argv), argv.join(" ")).toEqual(expected);
+    }
+
+    const nestedCommands = [
+      ["status"],
+      ["status", "--short"],
+      ["status", "--porcelain=v2", "--branch", "--", "../root.txt", "."],
+      ["ls-files"],
+      ["ls-files", "--others", "--exclude-standard"],
+      ["ls-files", "--cached", "--", "../root.txt", "."],
+    ];
+    for (const argv of nestedCommands) {
+      expect(await nativeRun(workspace, argv, "/repo/nested"), argv.join(" ")).toEqual(
+        gitResultAt(fixture, argv, "nested"),
+      );
+    }
+  });
+
+  it("matches unborn and detached HEAD results, missing revisions, and no matches", async () => {
+    const unbornFixture = new GitFixture().init();
+    fixtures.push(unbornFixture);
+    const unborn = makeRepo("/repo");
+    for (const argv of [
+      ["status"],
+      ["status", "--short", "--branch"],
+      ["status", "--porcelain=v2", "--branch"],
+      ["branch", "--show-current"],
+      ["branch", "--list"],
+      ["rev-parse", "HEAD"],
+      ["rev-parse", "--verify", "HEAD"],
+      ["rev-parse", "--verify", "--quiet", "HEAD"],
+      ["ls-files", "--cached", "--", "missing"],
+    ]) {
+      expect(await nativeRun(unborn, argv), `unborn: ${argv.join(" ")}`).toEqual(
+        gitResultAt(unbornFixture, argv),
+      );
+    }
+
+    const { fixture, workspace } = await everydayFixture();
+    const oid = fixture.git("rev-parse", "HEAD");
+    fixture.git("checkout", "--detach", "-q");
+    workspace.repo.checkout.setHead(oid);
+    for (const argv of [
+      ["status"],
+      ["status", "--short", "--branch"],
+      ["status", "--porcelain=v2", "--branch"],
+      ["branch", "--show-current"],
+      ["branch", "--list"],
+    ]) {
+      expect(await nativeRun(workspace, argv), `detached: ${argv.join(" ")}`).toEqual(
+        gitResultAt(fixture, argv),
+      );
+    }
+  });
+
+  it("matches optionless status for staged additions, edits, deletions, and renames", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("deleted.txt", "delete\n");
+    fixture.write("modified.txt", "before\n");
+    fixture.write("renamed.txt", "rename\n");
+    fixture.commit("base");
+    const workspace = await importAt(fixture);
+
+    fixture.remove("deleted.txt");
+    fixture.write("modified.txt", "after\n");
+    fixture.write("added.txt", "add\n");
+    fixture.git("mv", "renamed.txt", "moved.txt");
+    fixture.git("add", "-A");
+    workspace.worktree.removeFiles(["/repo/deleted.txt"]);
+    workspace.worktree.rename("/repo/renamed.txt", "/repo/moved.txt");
+    writeWorkFile(workspace, "/repo/modified.txt", "after\n");
+    writeWorkFile(workspace, "/repo/added.txt", "add\n");
+    add(workspace.repo, workspace.worktree, { paths: [], all: true }, workspace.context);
+
+    expect(await nativeRun(workspace, ["status"])).toEqual(gitResultAt(fixture, ["status"]));
+  });
+
+  it("matches exact and first-excess output ceilings for each read family", async () => {
+    const { fixture, workspace } = await everydayFixture();
+    const handlers = createGitCliReadHandlers(workspace.context);
+    for (const argv of [
+      ["status"],
+      ["status", "--porcelain=v2", "--branch"],
+      ["rev-parse", "HEAD"],
+      ["branch", "--list"],
+      ["ls-files", "--cached", "--others", "--exclude-standard"],
+    ]) {
+      const expected = gitResultAt(fixture, argv);
+      const bytes = ENCODER.encode(expected.stdout).byteLength;
+      expect(
+        await runGitCli({ argv, cwd: "/repo" }, handlers, {
+          maxStdoutBytes: bytes,
+          maxCombinedOutputBytes: bytes,
+        }),
+        argv.join(" "),
+      ).toEqual(expected);
+      await expect(
+        runGitCli({ argv, cwd: "/repo" }, handlers, {
+          maxStdoutBytes: bytes - 1,
+          maxCombinedOutputBytes: bytes - 1,
+        }),
+      ).rejects.toMatchObject({ code: "E2BIG" });
+    }
+  });
+
+  it("matches Git's exact malformed verification and status-option results", async () => {
+    const { fixture, workspace } = await everydayFixture();
+    for (const argv of [
+      ["rev-parse", "--verify"],
+      ["status", "--definitely-unknown"],
+      ["branch", "--definitely-unknown"],
+      ["ls-files", "--definitely-unknown"],
+    ]) {
+      expect(await nativeRun(workspace, argv)).toEqual(gitResultAt(fixture, argv));
+    }
   });
 });
 describe("git diff header path quoting", () => {

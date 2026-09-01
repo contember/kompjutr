@@ -73,7 +73,10 @@ The accepted argv grammar is exact:
 
 | Command | Accepted argv |
 |---|---|
-| `status` | Exactly one of `--porcelain`, `--porcelain=v1`, `--short`, `-s` |
+| `status` | Optionless human status, or one of `--porcelain`, `--porcelain=v1`, `--porcelain=v2`, `--short`, `-s`; optional `-b|--branch` and literal paths |
+| `rev-parse` | One revision, optionally preceded by `--verify` and `--quiet`, or exactly `--show-toplevel` |
+| `branch` | Exactly `--show-current` or `--list` |
+| `ls-files` | Optional `--cached`, `--others`, and `--exclude-standard` selection plus bounded literal paths |
 | `diff` | Plain diff with zero, one, or two refs, optional joined `-U<n>`, and optional `-- <literal-paths>`; staged diff as `--cached|--staged [<ref>] [-- <literal-paths>]` |
 | `log` | At most one of `-1`, `-n <count>`, `--max-count=<count>`; at most one of `--oneline`, `--format=<template>`; then at most one ref or admitted `<a>..<b>` range |
 | `rev-list` | Exactly `--count <a>..<b>` |
@@ -81,6 +84,10 @@ The accepted argv grammar is exact:
 | `add` | One or more literal paths; an optional `--` ends option parsing |
 | `commit` | Exactly `-m <message>` or `--message=<message>` |
 | `rebase` | Exactly `--continue` or `--abort` |
+
+Status and ls-files path operands are literals or directory prefixes; glob and
+pathspec-magic spellings are rejected by this argv surface. `--exclude-standard`
+requires `--others`. `--quiet` is admitted only with `rev-parse --verify`.
 
 `log` counts are ASCII decimals from 0 through 50,000; `-1` is the only joined
 shorthand. Custom log formats accept literal UTF-8 plus `%H`, `%h`, `%P`, `%s`,
@@ -102,8 +109,9 @@ stdout. A successful rebase continuation places the commit summary on stdout
 and completion text on stderr. Unexpected implementation errors still throw.
 
 `cwd` is an absolute checkout path and defaults to `/`; the input does not
-accept the typed API's `dir` field. Paths resolve from `cwd`, cannot escape the
-selected checkout, and keep repository-root-relative output. Accepted commands
+accept the typed API's `dir` field. Paths resolve from `cwd` and cannot escape the
+selected checkout. Status and ls-files render selected paths relative to `cwd`,
+including `../` and `./` where Git does. Accepted commands
 do not read stdin; a supplied string is validated and ignored. Only
 `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
 `GIT_COMMITTER_EMAIL` affect commit identity. Complete environment identities
@@ -137,6 +145,7 @@ mapped only after rollback and cache revalidation.
 
 | Git | kompjutr | |
 |---|---|---|
+| optionless human status | strict argv runner | ✔ branch/detached/unborn headings, staged, unmerged, unstaged, untracked, and clean summaries |
 | `--initial-branch=<name>` | `defaultBranch` (default `main`) | ★ ✔ |
 | `--bare` | `bare` | ~ recorded as `core.bare` only; every repository is effectively bare, since the object database is never a directory |
 | working directory, `git -C <dir>` | `dir` (default `/`) | ★ ~ several repositories may share one workspace; `init()` records the checkout in SQLite but does not create `dir` in the filesystem |

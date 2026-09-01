@@ -5,6 +5,7 @@ import {
   gitCliDiagnosticResult,
   gitCliLogFailure,
   gitCliNetworkRefusal,
+  gitCliRevisionRequired,
   gitCliUnknownCommand,
   gitCliUnknownOptionFailure,
   gitCliUsageFailure,
@@ -21,6 +22,7 @@ import {
   type GitCliLogFormat,
   type GitCliParseResult,
   type GitCliRevision,
+  type GitCliStatusCommand,
   type ParsedGitCliCommand,
 } from "./types.js";
 
@@ -130,6 +132,9 @@ function parseGitCliCommandInternal(
   }
   let command: ParsedGitCliCommand | undefined;
   if (name === "status") command = parseStatus(argv);
+  else if (name === "rev-parse") command = parseRevParse(argv);
+  else if (name === "branch") command = parseBranch(argv);
+  else if (name === "ls-files") command = parseLsFiles(argv);
   else if (name === "diff") command = parseDiff(argv);
   else if (name === "log") return parseLog(argv, logLimitHint, outputContext);
   else if (name === "rev-list") command = parseRevList(argv);
@@ -143,15 +148,123 @@ function parseGitCliCommandInternal(
 }
 
 function parseStatus(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  let format: GitCliStatusCommand["format"] = "default";
+  let hasFormat = false;
+  let branch = false;
+  const paths: string[] = [];
+  let pathMode = false;
+  for (let index = 1; index < argv.length; index++) {
+    const argument = argv[index];
+    if (argument === undefined) return undefined;
+    if (!pathMode && argument === "--") {
+      pathMode = true;
+      continue;
+    }
+    if (pathMode || !argument.startsWith("-")) {
+      pathMode = true;
+      if (!validLiteralPathspec(argument)) return undefined;
+      paths.push(argument);
+      continue;
+    }
+    if (argument === "-b" || argument === "--branch") {
+      if (branch) return undefined;
+      branch = true;
+      continue;
+    }
+    let selected: GitCliStatusCommand["format"] | undefined;
+    if (argument === "--porcelain" || argument === "--porcelain=v1") {
+      selected = "porcelain-v1";
+    } else if (argument === "--porcelain=v2") selected = "porcelain-v2";
+    else if (argument === "--short" || argument === "-s") selected = "short";
+    if (selected === undefined || hasFormat) return undefined;
+    format = selected;
+    hasFormat = true;
+  }
+  return {
+    kind: "status",
+    format,
+    ...(branch ? { branch: true } : {}),
+    ...(paths.length === 0 ? {} : { paths }),
+  };
+}
+
+function parseRevParse(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  if (argv.length === 2 && argv[1] === "--show-toplevel") {
+    return { kind: "rev-parse", showToplevel: true };
+  }
+  let verify = false;
+  let quiet = false;
+  let revision: string | undefined;
+  for (let index = 1; index < argv.length; index++) {
+    const argument = argv[index];
+    if (argument === undefined) return undefined;
+    if (argument === "--verify") {
+      if (verify || revision !== undefined) return undefined;
+      verify = true;
+      continue;
+    }
+    if (argument === "--quiet") {
+      if (quiet || revision !== undefined) return undefined;
+      quiet = true;
+      continue;
+    }
+    if (argument.startsWith("-") || argument === "" || revision !== undefined) return undefined;
+    revision = argument;
+  }
+  if (revision === undefined || (quiet && !verify)) return undefined;
+  return {
+    kind: "rev-parse",
+    revision,
+    ...(verify ? { verify: true } : {}),
+    ...(quiet ? { quiet: true } : {}),
+  };
+}
+
+function parseBranch(argv: readonly string[]): ParsedGitCliCommand | undefined {
   if (argv.length !== 2) return undefined;
-  const option = argv[1];
-  if (option === "--porcelain" || option === "--porcelain=v1") {
-    return { kind: "status", format: "porcelain-v1" };
-  }
-  if (option === "--short" || option === "-s") {
-    return { kind: "status", format: "short" };
-  }
+  if (argv[1] === "--show-current") return { kind: "branch", action: "show-current" };
+  if (argv[1] === "--list") return { kind: "branch", action: "list" };
   return undefined;
+}
+
+function parseLsFiles(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  let cached = false;
+  let others = false;
+  let excludeStandard = false;
+  const paths: string[] = [];
+  let pathMode = false;
+  for (let index = 1; index < argv.length; index++) {
+    const argument = argv[index];
+    if (argument === undefined) return undefined;
+    if (!pathMode && argument === "--") {
+      pathMode = true;
+      continue;
+    }
+    if (pathMode || !argument.startsWith("-")) {
+      pathMode = true;
+      if (!validLiteralPathspec(argument)) return undefined;
+      paths.push(argument);
+      continue;
+    }
+    if (argument === "--cached") {
+      if (cached) return undefined;
+      cached = true;
+    } else if (argument === "--others") {
+      if (others) return undefined;
+      others = true;
+    } else if (argument === "--exclude-standard") {
+      if (excludeStandard) return undefined;
+      excludeStandard = true;
+    } else return undefined;
+  }
+  if (excludeStandard && !others) return undefined;
+  return {
+    kind: "ls-files",
+    ...(cached ? { cached: true } : {}),
+    ...(others ? { others: true } : {}),
+    ...(excludeStandard ? { excludeStandard: true } : {}),
+    ...(paths.length === 0 ? {} : { paths }),
+  };
 }
 
 function parseDiff(argv: readonly string[]): ParsedGitCliCommand | undefined {
@@ -404,8 +517,14 @@ function invalidInvocation(
   if (command === "commit" && argv.length === 2 && argv[1] === "-m") {
     return { ok: false, result: gitCliCommitMessageRequired(outputContext) };
   }
+  if (command === "rev-parse" && argv.length === 2 && argv[1] === "--verify") {
+    return { ok: false, result: gitCliRevisionRequired(outputContext) };
+  }
   if (
     command === "status" ||
+    command === "rev-parse" ||
+    command === "branch" ||
+    command === "ls-files" ||
     command === "diff" ||
     command === "rev-list" ||
     command === "symbolic-ref" ||

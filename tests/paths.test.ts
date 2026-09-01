@@ -8,6 +8,7 @@ import {
   isPathRoot,
   joinPath,
   normalizePath,
+  relativePath,
   splitPath,
 } from "../src/git/common/paths.js";
 
@@ -16,6 +17,9 @@ describe("git path kit", () => {
     expect(normalizePath("repo/./src/../test.ts")).toBe("/repo/test.ts");
     expect(joinPath("/repo/", "src/index.ts")).toBe("/repo/src/index.ts");
     expect(splitPath("/repo/src/index.ts")).toEqual(["repo", "src", "index.ts"]);
+    expect(relativePath("/repo/src", "/repo/src/index.ts")).toBe("index.ts");
+    expect(relativePath("/repo/src", "/repo/README.md")).toBe("../README.md");
+    expect(relativePath("/repo/src", "/repo/src")).toBe(".");
     expect(ancestorsOf("/repo/src/index.ts")).toEqual(["/repo/src", "/repo", "/"]);
   });
 

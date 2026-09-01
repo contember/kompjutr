@@ -46,7 +46,30 @@ export interface GitCliEnvironment {
 
 export interface GitCliStatusCommand {
   readonly kind: "status";
-  readonly format: "porcelain-v1" | "short";
+  readonly format: "default" | "porcelain-v1" | "porcelain-v2" | "short";
+  readonly branch?: boolean;
+  readonly paths?: readonly string[];
+}
+
+export interface GitCliRevParseCommand {
+  readonly kind: "rev-parse";
+  readonly revision?: string;
+  readonly verify?: boolean;
+  readonly quiet?: boolean;
+  readonly showToplevel?: boolean;
+}
+
+export interface GitCliBranchCommand {
+  readonly kind: "branch";
+  readonly action: "show-current" | "list";
+}
+
+export interface GitCliLsFilesCommand {
+  readonly kind: "ls-files";
+  readonly cached?: boolean;
+  readonly others?: boolean;
+  readonly excludeStandard?: boolean;
+  readonly paths?: readonly string[];
 }
 
 export interface GitCliDiffCommand {
@@ -102,6 +125,9 @@ export interface GitCliRebaseCommand {
 
 export type ParsedGitCliCommand =
   | GitCliStatusCommand
+  | GitCliRevParseCommand
+  | GitCliBranchCommand
+  | GitCliLsFilesCommand
   | GitCliDiffCommand
   | GitCliLogCommand
   | GitCliRevListCommand
@@ -123,6 +149,9 @@ export type GitCliCommandHandler<Command extends ParsedGitCliCommand> = (
 
 export interface GitCliHandlers {
   readonly status?: GitCliCommandHandler<GitCliStatusCommand>;
+  readonly revParse?: GitCliCommandHandler<GitCliRevParseCommand>;
+  readonly branch?: GitCliCommandHandler<GitCliBranchCommand>;
+  readonly lsFiles?: GitCliCommandHandler<GitCliLsFilesCommand>;
   readonly diff?: GitCliCommandHandler<GitCliDiffCommand>;
   readonly log?: GitCliCommandHandler<GitCliLogCommand>;
   readonly revList?: GitCliCommandHandler<GitCliRevListCommand>;

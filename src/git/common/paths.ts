@@ -37,6 +37,17 @@ export function relativeTo(root: string, path: string): string | null {
   return target.slice(prefix.length);
 }
 
+/** `target` expressed from `base`, including parent traversal when needed. */
+export function relativePath(base: string, target: string): string {
+  const from = splitPath(base);
+  const to = splitPath(target);
+  let shared = 0;
+  while (shared < from.length && shared < to.length && from[shared] === to[shared]) shared++;
+  const parts = new Array<string>(from.length - shared).fill("..");
+  parts.push(...to.slice(shared));
+  return parts.length === 0 ? "." : parts.join("/");
+}
+
 export function dirnameOf(path: string): string {
   const normalized = normalizePath(path);
   const slash = normalized.lastIndexOf("/");

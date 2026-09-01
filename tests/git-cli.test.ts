@@ -21,10 +21,39 @@ import {
 const ENCODER = new TextEncoder();
 describe("git argv grammar", () => {
   it.each([
+    [["status"], { kind: "status", format: "default" }],
     [["status", "--porcelain"], { kind: "status", format: "porcelain-v1" }],
     [["status", "--porcelain=v1"], { kind: "status", format: "porcelain-v1" }],
     [["status", "--short"], { kind: "status", format: "short" }],
     [["status", "-s"], { kind: "status", format: "short" }],
+    [
+      ["status", "--porcelain=v2", "--branch", "--", "src", "README.md"],
+      {
+        kind: "status",
+        format: "porcelain-v2",
+        branch: true,
+        paths: ["src", "README.md"],
+      },
+    ],
+    [["rev-parse", "HEAD^0"], { kind: "rev-parse", revision: "HEAD^0" }],
+    [
+      ["rev-parse", "--quiet", "--verify", "main"],
+      { kind: "rev-parse", revision: "main", verify: true, quiet: true },
+    ],
+    [["rev-parse", "--show-toplevel"], { kind: "rev-parse", showToplevel: true }],
+    [["branch", "--show-current"], { kind: "branch", action: "show-current" }],
+    [["branch", "--list"], { kind: "branch", action: "list" }],
+    [["ls-files"], { kind: "ls-files" }],
+    [
+      ["ls-files", "--cached", "--others", "--exclude-standard", "--", "src"],
+      {
+        kind: "ls-files",
+        cached: true,
+        others: true,
+        excludeStandard: true,
+        paths: ["src"],
+      },
+    ],
     [["diff"], { kind: "diff" }],
     [["diff", "HEAD"], { kind: "diff", ref: "HEAD" }],
     [["log"], { kind: "log", count: undefined, format: { kind: "default" }, revision: undefined }],
@@ -62,9 +91,15 @@ describe("git argv grammar", () => {
     expect(parsed(argv)).toEqual(expected);
   });
   it.each([
-    ["plain status", ["status"]],
-    ["status extra operand", ["status", "--short", "path"]],
-    ["status v2", ["status", "--porcelain=v2"]],
+    ["duplicate status format", ["status", "--short", "--porcelain=v2"]],
+    ["status glob", ["status", "--", "*.ts"]],
+    ["rev-parse missing revision", ["rev-parse", "--verify"]],
+    ["rev-parse quiet without verify", ["rev-parse", "--quiet", "HEAD"]],
+    ["rev-parse extra revision", ["rev-parse", "HEAD", "main"]],
+    ["branch without selector", ["branch"]],
+    ["branch extra operand", ["branch", "--list", "main"]],
+    ["ls-files exclude without others", ["ls-files", "--exclude-standard"]],
+    ["ls-files glob", ["ls-files", "--", "*.ts"]],
     ["diff separator", ["diff", "--"]],
     ["joined count", ["log", "-n1"]],
     ["duplicate count", ["log", "-1", "-n", "1"]],
@@ -90,6 +125,18 @@ describe("git argv grammar", () => {
     ["rebase extra", ["rebase", "--abort", "extra"]],
   ])("rejects %s", (_name, argv) => {
     expect(rejected(argv).exitCode).not.toBe(0);
+  });
+  it.each([
+    [["status"], "eagerStatus + formatCliStatus"],
+    [["status", "--porcelain=v2"], "eagerStatus + formatPorcelainV2"],
+    [["rev-parse", "HEAD"], "Repository.tryRevParse"],
+    [["rev-parse", "--show-toplevel"], "Repository.root"],
+    [["branch", "--show-current"], "currentBranch"],
+    [["branch", "--list"], "branchList"],
+    [["ls-files", "--cached"], "lsFilesWithWorktree"],
+    [["ls-files", "--others", "--exclude-standard"], "lsFilesWithWorktree"],
+  ])("accepts the pinned WU3 form %j via %s", (argv, _native) => {
+    expect(parseGitCliCommand(argv).ok).toBe(true);
   });
   it("accepts the full format allowlist and rejects every other placeholder", () => {
     expect(parsed(["log", "--format=%H%h%P%s%B%an%ae%at%cn%ce%ct%n%%"])).toMatchObject({
@@ -813,6 +860,15 @@ describe("git CLI result bounds and dispatch", () => {
       status(_invocation, options) {
         return record("status", options);
       },
+      revParse(_invocation, options) {
+        return record("rev-parse", options);
+      },
+      branch(_invocation, options) {
+        return record("branch", options);
+      },
+      lsFiles(_invocation, options) {
+        return record("ls-files", options);
+      },
       diff(_invocation, options) {
         return record("diff", options);
       },
@@ -837,6 +893,9 @@ describe("git CLI result bounds and dispatch", () => {
     });
     const commands = [
       ["status", "--porcelain"],
+      ["rev-parse", "HEAD"],
+      ["branch", "--show-current"],
+      ["ls-files"],
       ["diff"],
       ["log"],
       ["rev-list", "--count", "main..HEAD"],
@@ -870,7 +929,10 @@ describe("git CLI result bounds and dispatch", () => {
     );
     const calls = seen.length;
     for (const argv of [
-      ["status"],
+      ["status", "--short", "--porcelain=v2"],
+      ["rev-parse", "--quiet", "HEAD"],
+      ["branch"],
+      ["ls-files", "--exclude-standard"],
       ["diff", "--"],
       ["log", "-n", "bad"],
       ["rev-list", "HEAD"],
@@ -917,7 +979,9 @@ describe("git CLI result bounds and dispatch", () => {
       },
     };
     const runner = createGitCliRunner(handlers);
-    expect((await runner.runCli({ argv: ["status", "--short", "extra"] })).exitCode).toBe(129);
+    expect((await runner.runCli({ argv: ["status", "--short", "--porcelain=v2"] })).exitCode).toBe(
+      129,
+    );
     for (const argv of [
       ["add", ":file"],
       ["add", ":!file"],

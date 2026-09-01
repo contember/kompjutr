@@ -1487,7 +1487,7 @@ describe("createSqliteGitClient", () => {
     expect(await nativeGit.cli(statusInput)).toEqual(nativeStatus);
     expect(await computerGit.cli(statusInput)).toEqual(nativeStatus);
     expect(nativeStatus).toEqual({
-      stdout: "?? sub/\n",
+      stdout: "?? ./\n",
       stderr: "",
       exitCode: 0,
       truncated: false,
