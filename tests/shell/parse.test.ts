@@ -75,9 +75,27 @@ describe("words and quoting", () => {
 
   it("reads a character class as one glob part", () => {
     const word = parse("ls file[0-9].txt").statements[0]?.pipeline.commands[0]?.words[1];
-    expect(word?.parts.map((part) => part.value)).toEqual(["file", "[0-9]", ".txt"]);
+    expect(word?.parts.map((part) => (part.kind === "Parameter" ? part.name : part.value))).toEqual(
+      ["file", "[0-9]", ".txt"],
+    );
     // An unclosed `[` is an ordinary character, as in bash.
     expect(hasGlob(parse("ls a[b").statements[0]!.pipeline.commands[0]!.words[1]!)).toBe(false);
+  });
+
+  it("preserves named parameters in order with quote context", () => {
+    const word = parse(`echo pre$ONE-"\${TWO}"-'$THREE'-\\$FOUR`).statements[0]?.pipeline
+      .commands[0]?.words[1];
+    expect(word?.parts).toEqual([
+      { kind: "Literal", value: "pre" },
+      { kind: "Parameter", name: "ONE", quoted: false },
+      { kind: "Literal", value: "-" },
+      { kind: "Parameter", name: "TWO", quoted: true },
+      { kind: "Literal", value: "-" },
+      { kind: "SingleQuoted", value: "$THREE" },
+      { kind: "Literal", value: "-" },
+      { kind: "Escaped", value: "$" },
+      { kind: "Literal", value: "FOUR" },
+    ]);
   });
 });
 
@@ -156,8 +174,19 @@ describe("rejections name the construct", () => {
     ["echo $(date)", "command substitution"],
     ["echo `date`", "command substitution"],
     ["echo $((1+1))", "arithmetic expansion"],
-    [`echo \${HOME}`, "parameter expansion"],
-    ["echo $HOME", "parameter expansion"],
+    ["echo $1", "parameter expansion"],
+    ["echo $@", "parameter expansion"],
+    ["echo $*", "parameter expansion"],
+    ["echo $#", "parameter expansion"],
+    ["echo $?", "parameter expansion"],
+    ["echo $!", "parameter expansion"],
+    ["echo $-", "parameter expansion"],
+    ["echo $$", "parameter expansion"],
+    ['echo "$*"', "parameter expansion"],
+    ['echo "$#"', "parameter expansion"],
+    ['echo "$!"', "parameter expansion"],
+    ['echo "$-"', "parameter expansion"],
+    [`echo \${HOME:-fallback}`, "parameter expansion operator"],
     ["diff <(ls a) <(ls b)", "process substitution"],
     ["cat <<EOF", "here-document"],
     ["[[ -f x ]]", "conditional expression"],

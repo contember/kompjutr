@@ -47,6 +47,27 @@ async function cost(fixture: Fixture, source: string): Promise<number> {
   if (run.exitCode > 1) throw new Error(`${source} failed: ${run.stderr}`);
   return fixture.storage.statementCount - before;
 }
+describe("the no-parameter operations baseline", () => {
+  it("keeps the curated corpus exact", async () => {
+    const fixture = tree(100);
+    const corpus: ReadonlyArray<readonly [string, number]> = [
+      ["echo plain", 0],
+      [`echo "quoted *" '*.ts'`, 0],
+      ["echo src/*.ts | head -1", 1],
+      ["ls /repo/docs", 2],
+      [`find /repo/src -name '*.ts'`, 2],
+      ["cat /repo/src/mod00000.ts", 1],
+      ["grep -rl NEEDLE /repo/src --include=*.ts | head -20", 4],
+      ["echo hi > /repo/out.txt", 1],
+    ];
+
+    for (const [source, operations] of corpus) {
+      const run = await fixture.shell.run(source);
+      expect(run.exitCode, source).toBeLessThan(2);
+      expect(run.operations, source).toBe(operations);
+    }
+  });
+});
 describe("a search does not scale with the tree", () => {
   it("stays within the statement target on a 10x bigger tree", async () => {
     const small = tree(200);

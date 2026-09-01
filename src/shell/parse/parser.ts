@@ -11,6 +11,7 @@ import {
   type SimpleCommand,
   type Statement,
   type Word,
+  wordText,
 } from "./ast.js";
 import { type Token, tokenize } from "./lexer.js";
 
@@ -140,7 +141,14 @@ class Parser {
       if (target?.type !== "word") {
         throw new ShellSyntaxError("redirection", "expected a descriptor after >&", offset);
       }
-      const text = target.word.parts.map((part) => part.value).join("");
+      if (target.word.parts.some((part) => part.kind === "Parameter")) {
+        throw new ShellSyntaxError(
+          "parameter expansion",
+          "parameters in redirection targets are not supported",
+          target.offset,
+        );
+      }
+      const text = wordText(target.word);
       if (!/^[0-9]+$/.test(text)) {
         throw new ShellSyntaxError("redirection", `\`>&${text}\` is not a descriptor`, offset);
       }

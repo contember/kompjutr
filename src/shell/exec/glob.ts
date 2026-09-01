@@ -13,13 +13,9 @@ interface Matcher {
   test(path: string): boolean;
 }
 
-/**
- * Compile a shell glob. `*` and `?` never cross `/`; `**` does, which is how
- * `--include='**\/*.ts'` is written even though plain `*.ts` is far more
- * common in the corpus.
- */
+/** Compile a pathname glob with Bash's default `globstar` and `dotglob` disabled. */
 export function compileGlob(pattern: string): Matcher {
-  return { test: buildRegExp(pattern) };
+  return { test: buildRegExp(pattern, false, true) };
 }
 
 /**
@@ -28,7 +24,7 @@ export function compileGlob(pattern: string): Matcher {
  * both grep and rg do, and it is why `--include='*.ts'` finds nested files.
  */
 export function compileIncludeGlob(pattern: string): Matcher {
-  const test = buildRegExp(pattern);
+  const test = buildRegExp(pattern, true, false);
   if (!pattern.includes("/")) {
     return {
       test: (path: string) => test(path.slice(path.lastIndexOf("/") + 1)),
@@ -37,17 +33,31 @@ export function compileIncludeGlob(pattern: string): Matcher {
   return { test };
 }
 
-function buildRegExp(pattern: string): (value: string) => boolean {
+function buildRegExp(
+  pattern: string,
+  recursiveStars: boolean,
+  protectLeadingDots: boolean,
+): (value: string) => boolean {
   let source = "";
   let index = 0;
+  let componentStart = true;
   while (index < pattern.length) {
     const char = pattern.charAt(index);
+    if (char === "/") {
+      source += "/";
+      index++;
+      componentStart = true;
+      continue;
+    }
+    if (componentStart && protectLeadingDots && char !== ".") source += "(?!\\.)";
+    componentStart = false;
     if (char === "*") {
-      if (pattern.charAt(index + 1) === "*") {
+      if (recursiveStars && pattern.charAt(index + 1) === "*") {
         // `**` crosses separators; `**/` also matches zero directories.
         if (pattern.charAt(index + 2) === "/") {
           source += "(?:.*/)?";
           index += 3;
+          componentStart = true;
           continue;
         }
         source += ".*";
@@ -55,7 +65,8 @@ function buildRegExp(pattern: string): (value: string) => boolean {
         continue;
       }
       source += "[^/]*";
-      index++;
+      do index++;
+      while (!recursiveStars && pattern.charAt(index) === "*");
       continue;
     }
     if (char === "?") {

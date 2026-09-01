@@ -35,14 +35,13 @@ const REJECTED: ReadonlyArray<{ prefix: string; construct: string }> = [
   { prefix: ">(", construct: "process substitution" },
   { prefix: "<<", construct: "here-document" },
   { prefix: "[[", construct: "conditional expression" },
-  { prefix: "${", construct: "parameter expansion" },
 ];
 
 /** Longest first, so `>>` wins over `>` and `||` over `|`. */
 const OPERATORS: ReadonlyArray<Operator | "&"> = [">>", ">&", "&&", "||", "|", ";", ">", "<", "&"];
 
 const IDENTIFIER_START = /[A-Za-z_]/;
-const IDENTIFIER_OR_BRACE = /[A-Za-z_{]/;
+const IDENTIFIER_CONTINUE = /[A-Za-z0-9_]/;
 const DIGIT = /[0-9]/;
 
 function reject(construct: string, at: number): never {
@@ -68,11 +67,6 @@ export function tokenize(source: string): Token[] {
 
     for (const { prefix, construct } of REJECTED) {
       if (source.startsWith(prefix, index)) reject(construct, index);
-    }
-
-    // `$name` without braces. `${` is caught above; a lone `$` is literal.
-    if (char === "$" && IDENTIFIER_START.test(source.charAt(index + 1))) {
-      reject("parameter expansion", index);
     }
 
     if (char === "(" || char === ")") reject("subshell", index);
@@ -175,9 +169,19 @@ function readWord(source: string, start: number): WordScan {
     if (char === '"') {
       const scan = readDoubleQuoted(source, index);
       flushLiteral();
-      parts.push({ kind: "DoubleQuoted", value: scan.value });
+      parts.push(...scan.parts);
       index = scan.end;
       continue;
+    }
+
+    if (char === "$") {
+      const parameter = readParameter(source, index, false);
+      if (parameter !== null) {
+        flushLiteral();
+        parts.push(parameter.part);
+        index = parameter.end;
+        continue;
+      }
     }
 
     // Unquoted glob metacharacters. A `[` only opens a class if it closes.
@@ -197,9 +201,6 @@ function readWord(source: string, start: number): WordScan {
       }
     }
 
-    if (char === "$" && IDENTIFIER_OR_BRACE.test(source.charAt(index + 1))) {
-      reject("parameter expansion", index);
-    }
     if (char === "`") reject("command substitution", index);
 
     literal += char;
@@ -210,12 +211,22 @@ function readWord(source: string, start: number): WordScan {
   return { parts, end: index };
 }
 
-function readDoubleQuoted(source: string, start: number): { value: string; end: number } {
+function readDoubleQuoted(source: string, start: number): WordScan {
+  const parts: WordPart[] = [];
   let value = "";
   let index = start + 1;
+  const flushValue = (keepEmpty = false): void => {
+    if (value !== "" || keepEmpty) {
+      parts.push({ kind: "DoubleQuoted", value });
+      value = "";
+    }
+  };
   while (index < source.length) {
     const char = source.charAt(index);
-    if (char === '"') return { value, end: index + 1 };
+    if (char === '"') {
+      flushValue(parts.length === 0);
+      return { parts, end: index + 1 };
+    }
     if (char === "\\") {
       if (index + 1 >= source.length) break;
       const escaped = source.charAt(index + 1);
@@ -225,14 +236,83 @@ function readDoubleQuoted(source: string, start: number): { value: string; end: 
       index += 2;
       continue;
     }
-    if (char === "$" && IDENTIFIER_OR_BRACE.test(source.charAt(index + 1))) {
-      reject("parameter expansion", index);
+    if (char === "$") {
+      const parameter = readParameter(source, index, true);
+      if (parameter !== null) {
+        flushValue();
+        parts.push(parameter.part);
+        index = parameter.end;
+        continue;
+      }
     }
     if (char === "`") reject("command substitution", index);
     value += char;
     index++;
   }
   throw new ShellSyntaxError("quote", "unterminated double quote", start);
+}
+
+function readParameter(
+  source: string,
+  start: number,
+  quoted: boolean,
+): { readonly part: WordPart; readonly end: number } | null {
+  const next = source.charAt(start + 1);
+  if (DIGIT.test(next)) {
+    throw new ShellSyntaxError(
+      "parameter expansion",
+      `parameter expansion for positional parameter $${next} is not supported`,
+      start,
+    );
+  }
+  if (next !== "" && "*@#?-$!".includes(next)) {
+    throw new ShellSyntaxError(
+      "parameter expansion",
+      `parameter expansion for special parameter $${next} is not supported`,
+      start,
+    );
+  }
+  if (next === "{") return readBracedParameter(source, start, quoted);
+  if (!IDENTIFIER_START.test(next)) return null;
+
+  let end = start + 2;
+  while (IDENTIFIER_CONTINUE.test(source.charAt(end))) end++;
+  return {
+    part: { kind: "Parameter", name: source.slice(start + 1, end), quoted },
+    end,
+  };
+}
+
+function readBracedParameter(
+  source: string,
+  start: number,
+  quoted: boolean,
+): { readonly part: WordPart; readonly end: number } {
+  const close = source.indexOf("}", start + 2);
+  if (close === -1) {
+    throw new ShellSyntaxError("parameter expansion", "unterminated parameter expansion", start);
+  }
+  const body = source.slice(start + 2, close);
+  if (!IDENTIFIER_START.test(body.charAt(0))) {
+    throw new ShellSyntaxError(
+      "parameter expansion",
+      `parameter \${${body}} is not supported`,
+      start,
+    );
+  }
+  let nameEnd = 1;
+  while (nameEnd < body.length && IDENTIFIER_CONTINUE.test(body.charAt(nameEnd))) nameEnd++;
+  if (nameEnd !== body.length) {
+    throw new ShellSyntaxError(
+      "parameter expansion operator",
+      `parameter expansion operator in \${${body}} is not supported`,
+      start,
+    );
+  }
+  return {
+    part: { kind: "Parameter", name: body, quoted },
+    end: close + 1,
+  };
 }
 
 /** The end of a `[...]` class, or -1 when it never closes. */

@@ -67,9 +67,20 @@ function planCommand(command: SimpleCommand): PlannedCommand {
   if (nameWord === undefined) {
     throw new ShellSyntaxError("command", "missing command name", 0);
   }
+  if (isAssignment(nameWord)) {
+    throw new ShellSyntaxError("assignment", "variable assignment is not supported", 0);
+  }
+  if (hasParameter(nameWord)) {
+    throw new ShellSyntaxError(
+      "parameter expansion",
+      "parameters in command names are not supported",
+      0,
+    );
+  }
+  const name = literalText(nameWord);
 
   return {
-    name: literalText(nameWord),
+    name,
     args: argWords.map(toArgument),
     redirections: command.redirections.map(planRedirection),
   };
@@ -95,6 +106,13 @@ function planRedirection(redirection: Redirection): PlannedRedirection {
     );
   }
 
+  if (hasParameter(redirection.target)) {
+    throw new ShellSyntaxError(
+      "parameter expansion",
+      "parameters in redirection targets are not supported",
+      0,
+    );
+  }
   const target = toArgument(redirection.target);
 
   if (redirection.op === "<") {
@@ -108,7 +126,7 @@ function planRedirection(redirection: Redirection): PlannedRedirection {
   if (redirection.fd === 2) {
     // `2>/dev/null` is 145 of 614 corpus lines' worth of noise suppression.
     // Recognising the sink means never allocating the buffer at all.
-    if (target.kind === "literal" && target.value === "/dev/null") {
+    if (argumentLiteral(target) === "/dev/null") {
       return { kind: "write", fd: 2, path: target, append };
     }
     throw new ShellSyntaxError(
@@ -169,14 +187,17 @@ function headCount(args: readonly Argument[]): number | null {
   let count = 10;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
-    if (arg === undefined || arg.kind !== "literal") return null;
-    const value = arg.value;
+    if (arg === undefined) return null;
+    const value = argumentLiteral(arg);
+    if (value === null) return null;
     // `-c` bounds bytes, not lines; that is not a line demand.
     if (value === "-c" || value.startsWith("-c")) return null;
     if (value === "-n") {
       const next = args[index + 1];
-      if (next === undefined || next.kind !== "literal") return null;
-      const parsed = Number(next.value);
+      if (next === undefined) return null;
+      const nextValue = argumentLiteral(next);
+      if (nextValue === null) return null;
+      const parsed = Number(nextValue);
       if (!Number.isInteger(parsed) || parsed < 0) return null;
       count = parsed;
       index++;
@@ -260,9 +281,10 @@ function xargsCommand(
   args: readonly Argument[],
 ): { name: string; args: readonly Argument[] } | null {
   const first = args[0];
-  if (first === undefined || first.kind !== "literal") return null;
-  if (first.value.startsWith("-")) return null;
-  return { name: first.value, args: args.slice(1) };
+  if (first === undefined) return null;
+  const name = argumentLiteral(first);
+  if (name === null || name.startsWith("-")) return null;
+  return { name, args: args.slice(1) };
 }
 
 /** `find <root> -name <pattern>` and nothing else. */
@@ -273,31 +295,34 @@ function simpleFind(args: readonly Argument[]): { root: string; pattern: string 
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (arg === undefined) return null;
-    if (arg.kind === "glob") return null;
-    if (arg.value === "-name") {
+    if (argumentGlobPattern(arg) !== null) return null;
+    const value = argumentLiteral(arg);
+    if (value === null) return null;
+    if (value === "-name") {
       const next = args[index + 1];
       if (next === undefined) return null;
-      pattern = next.kind === "glob" ? next.pattern : next.value;
+      pattern = argumentGlobPattern(next) ?? argumentLiteral(next);
+      if (pattern === null) return null;
       index++;
       continue;
     }
-    if (arg.value === "-type") {
+    if (value === "-type") {
       const next = args[index + 1];
       // Only `-type f` matches what a search reads anyway.
-      if (next === undefined || next.kind !== "literal" || next.value !== "f") return null;
+      if (next === undefined || argumentLiteral(next) !== "f") return null;
       index++;
       continue;
     }
-    if (arg.value.startsWith("-")) return null;
+    if (value.startsWith("-")) return null;
     if (root !== null) return null;
-    root = arg.value;
+    root = value;
   }
 
   return root === null ? null : { root, pattern };
 }
 
 function literal(value: string): Argument {
-  return { kind: "literal", value };
+  return { kind: "word", parts: [{ kind: "literal", value, quoted: false }] };
 }
 
 function hasInputRedirection(command: PlannedCommand): boolean {
@@ -310,20 +335,21 @@ function hasOutputRedirection(command: PlannedCommand): boolean {
   );
 }
 
-/**
- * A word becomes one argument. A word carrying any unquoted glob part
- * becomes a glob pattern for the executor to expand; the quoted parts are
- * escaped so `"*.ts"*` matches a literal `*.ts` followed by anything.
- */
 function toArgument(word: Word): Argument {
-  const hasGlobPart = word.parts.some((part) => part.kind === "Glob");
-  if (!hasGlobPart) return literal(word.parts.map((part) => part.value).join(""));
-
-  let pattern = "";
-  for (const part of word.parts) {
-    pattern += part.kind === "Glob" ? part.value : escapeGlob(part.value);
-  }
-  return { kind: "glob", pattern };
+  return {
+    kind: "word",
+    parts: word.parts.map((part) => {
+      if (part.kind === "Parameter") {
+        return { kind: "parameter", name: part.name, quoted: part.quoted };
+      }
+      if (part.kind === "Glob") return { kind: "glob", value: part.value };
+      return {
+        kind: "literal",
+        value: part.value,
+        quoted: part.kind !== "Literal",
+      };
+    }),
+  };
 }
 
 /** `[` is the only metacharacter a bracket-free escape has to hide. */
@@ -332,5 +358,45 @@ function escapeGlob(value: string): string {
 }
 
 function literalText(word: Word): string {
-  return word.parts.map((part) => part.value).join("");
+  let text = "";
+  for (const part of word.parts) {
+    if (part.kind === "Parameter") {
+      throw new ShellSyntaxError("parameter expansion", "parameter is not literal text", 0);
+    }
+    text += part.value;
+  }
+  return text;
+}
+
+function hasParameter(word: Word): boolean {
+  return word.parts.some((part) => part.kind === "Parameter");
+}
+
+function isAssignment(word: Word): boolean {
+  const first = word.parts[0];
+  return first?.kind === "Literal" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(first.value);
+}
+
+function argumentLiteral(argument: Argument): string | null {
+  let value = "";
+  for (const part of argument.parts) {
+    if (part.kind !== "literal") return null;
+    value += part.value;
+  }
+  return value;
+}
+
+function argumentGlobPattern(argument: Argument): string | null {
+  let pattern = "";
+  let hasGlobPart = false;
+  for (const part of argument.parts) {
+    if (part.kind === "parameter") return null;
+    if (part.kind === "glob") {
+      hasGlobPart = true;
+      pattern += part.value;
+    } else {
+      pattern += escapeGlob(part.value);
+    }
+  }
+  return hasGlobPart ? pattern : null;
 }

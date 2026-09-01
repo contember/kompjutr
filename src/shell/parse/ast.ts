@@ -18,6 +18,7 @@ export type WordPart =
   | { readonly kind: "SingleQuoted"; readonly value: string }
   | { readonly kind: "DoubleQuoted"; readonly value: string }
   | { readonly kind: "Escaped"; readonly value: string }
+  | { readonly kind: "Parameter"; readonly name: string; readonly quoted: boolean }
   /** An unquoted `*`, `?` or `[...]`. Quoted ones are `Literal`. */
   | { readonly kind: "Glob"; readonly value: string };
 
@@ -95,7 +96,9 @@ export class ShellSyntaxError extends Error {
 /** Flatten a word to text. Only valid once globs are resolved or ignored. */
 export function wordText(word: Word): string {
   let text = "";
-  for (const part of word.parts) text += part.value;
+  for (const part of word.parts) {
+    text += part.kind === "Parameter" ? `$${part.name}` : part.value;
+  }
   return text;
 }
 

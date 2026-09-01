@@ -180,7 +180,7 @@ async function runPipeline(
         };
       }
 
-      const expanded = expandArguments(planned.args, env.fs, env.cwd);
+      const expanded = expandArguments(planned.args, env.fs, env.cwd, env.inputs?.env);
       const argv = expanded.argv;
 
       let redirections: ResolvedRedirections;
@@ -975,20 +975,17 @@ function* empty(): ByteStream {
   // A redirected stage contributes no stdout to the following pipe.
 }
 
-/**
- * Expand the arguments a command sees. A literal passes through; a glob
- * becomes zero or more paths.
- *
- * A glob that matches nothing is passed through as its own text, which is
- * bash's default (`nullglob` off) and is what makes `ls *.md` in an empty
- * directory report "no such file" rather than listing everything.
- */
 interface ExpandedArguments {
   readonly argv: readonly string[];
   release(): void;
 }
 
-function expandArguments(args: readonly Argument[], fs: BoundedFs, cwd: string): ExpandedArguments {
+function expandArguments(
+  args: readonly Argument[],
+  fs: BoundedFs,
+  cwd: string,
+  env?: Readonly<Record<string, string>>,
+): ExpandedArguments {
   const out: string[] = [];
   const releases: Array<() => void> = [];
   const push = (value: string): void => {
@@ -1005,16 +1002,19 @@ function expandArguments(args: readonly Argument[], fs: BoundedFs, cwd: string):
 
   try {
     for (const arg of args) {
-      if (arg.kind === "literal") {
-        push(arg.value);
-        continue;
+      for (const field of expandWord(arg, env)) {
+        const value = fieldText(field);
+        if (!fieldHasGlob(field)) {
+          push(value);
+          continue;
+        }
+        let matched = false;
+        for (const match of expandGlob(fieldPattern(field), fs, cwd)) {
+          push(match);
+          matched = true;
+        }
+        if (!matched) push(value);
       }
-      let matched = false;
-      for (const match of expandGlob(arg.pattern, fs, cwd)) {
-        push(match);
-        matched = true;
-      }
-      if (!matched) push(arg.pattern);
     }
   } catch (error) {
     for (const release of releases) release();
@@ -1041,6 +1041,88 @@ function single(arg: Argument, fs: BoundedFs, cwd: string): string {
   }
 }
 
+interface FieldPart {
+  readonly value: string;
+  readonly globActive: boolean;
+}
+
+type ExpandedField = readonly FieldPart[];
+
+function* expandWord(
+  argument: Argument,
+  env: Readonly<Record<string, string>> | undefined,
+): Generator<ExpandedField> {
+  let field: FieldPart[] = [];
+  let preserveEmpty = false;
+
+  for (const part of argument.parts) {
+    if (part.kind === "literal") {
+      if (part.value !== "") field.push({ value: part.value, globActive: false });
+      preserveEmpty ||= part.quoted;
+      continue;
+    }
+    if (part.kind === "glob") {
+      field.push({ value: part.value, globActive: true });
+      continue;
+    }
+
+    const value = environmentValue(env, part.name);
+    if (part.quoted) {
+      if (value !== "") field.push({ value, globActive: false });
+      preserveEmpty = true;
+      continue;
+    }
+
+    let start = 0;
+    for (let index = 0; index <= value.length; index++) {
+      if (index < value.length && !isIfsWhitespace(value.charAt(index))) continue;
+      if (index > start) {
+        field.push({ value: value.slice(start, index), globActive: true });
+      }
+      if (index < value.length) {
+        if (field.length > 0 || preserveEmpty) yield field;
+        field = [];
+        preserveEmpty = false;
+        while (isIfsWhitespace(value.charAt(index + 1))) index++;
+      }
+      start = index + 1;
+    }
+  }
+
+  if (field.length > 0 || preserveEmpty) yield field;
+}
+
+function environmentValue(env: Readonly<Record<string, string>> | undefined, name: string): string {
+  if (env === undefined || !Object.hasOwn(env, name)) return "";
+  return env[name] ?? "";
+}
+
+function isIfsWhitespace(value: string): boolean {
+  return value === " " || value === "\t" || value === "\n";
+}
+
+function fieldText(field: ExpandedField): string {
+  let value = "";
+  for (const part of field) value += part.value;
+  return value;
+}
+
+function fieldPattern(field: ExpandedField): string {
+  let pattern = "";
+  for (const part of field) {
+    pattern += part.globActive ? part.value : escapeGlob(part.value);
+  }
+  return pattern;
+}
+
+function fieldHasGlob(field: ExpandedField): boolean {
+  return field.some((part) => part.globActive && /[*?[]/.test(part.value));
+}
+
+function escapeGlob(value: string): string {
+  return value.replace(/[*?[]/g, (match) => `[${match}]`);
+}
+
 /**
  * Paths matching `pattern`, relative to `cwd` when the pattern is relative.
  *
@@ -1049,10 +1131,12 @@ function single(arg: Argument, fs: BoundedFs, cwd: string): string {
  * subtree is scanned instead — correct either way, only slower.
  */
 function* expandGlob(pattern: string, fs: BoundedFs, cwd: string): Generator<string> {
-  const absolute = pattern.startsWith("/") ? normalize(pattern) : join(cwd, pattern);
+  const isAbsolute = pattern.startsWith("/");
+  const absolute = isAbsolute ? normalize(pattern) : join(cwd, pattern);
   const fixed = absolute.slice(0, Math.max(0, absolute.search(/[*?[]/)));
   const root = fixed.includes("/") ? fixed.slice(0, fixed.lastIndexOf("/")) || "/" : "/";
   const matcher = compileGlob(absolute);
+  const displayRoot = isAbsolute ? null : relativeGlobRoot(pattern);
 
   const sql = sqlGlobFor(absolute);
   if (sql !== null) {
@@ -1064,7 +1148,7 @@ function* expandGlob(pattern: string, fs: BoundedFs, cwd: string): Generator<str
         after === undefined ? { limit: PATH_PAGE_MAX } : { after, limit: PATH_PAGE_MAX },
       );
       for (const path of page.paths) {
-        if (matcher.test(path)) yield path;
+        if (matcher.test(path)) yield projectGlobMatch(path, root, displayRoot);
       }
       if (page.next === null) return;
       after = page.next;
@@ -1078,12 +1162,26 @@ function* expandGlob(pattern: string, fs: BoundedFs, cwd: string): Generator<str
       after === undefined ? { limit: PATH_PAGE_MAX } : { after, limit: PATH_PAGE_MAX },
     );
     for (const entry of page) {
-      if (matcher.test(entry.path)) yield entry.path;
+      if (matcher.test(entry.path)) yield projectGlobMatch(entry.path, root, displayRoot);
     }
     if (page.length < PATH_PAGE_MAX) return;
     after = page[page.length - 1]?.path;
     if (after === undefined) return;
   }
+}
+
+function relativeGlobRoot(pattern: string): string {
+  const metacharacter = pattern.search(/[*?[]/);
+  const fixed = pattern.slice(0, Math.max(0, metacharacter));
+  const slash = fixed.lastIndexOf("/");
+  return slash === -1 ? "" : fixed.slice(0, slash);
+}
+
+function projectGlobMatch(path: string, root: string, displayRoot: string | null): string {
+  if (displayRoot === null) return path;
+  const suffix = root === "/" ? path.slice(1) : path.slice(root.length + 1);
+  if (displayRoot === "") return suffix;
+  return `${displayRoot}/${suffix}`;
 }
 
 export function resolve(cwd: string, path: string): string {

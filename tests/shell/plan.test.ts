@@ -20,7 +20,33 @@ function names(pipeline: PlannedPipeline): string[] {
 }
 
 function text(args: readonly Argument[]): string[] {
-  return args.map((arg) => (arg.kind === "literal" ? arg.value : `glob:${arg.pattern}`));
+  return args.map((arg) => {
+    let literal = "";
+    let pattern = "";
+    let glob = false;
+    for (const part of arg.parts) {
+      if (part.kind === "parameter") {
+        literal += `$${part.name}`;
+        pattern += `$${part.name}`;
+      } else if (part.kind === "glob") {
+        glob = true;
+        literal += part.value;
+        pattern += part.value;
+      } else {
+        literal += part.value;
+        pattern += globEscape(part.value);
+      }
+    }
+    return glob ? `glob:${pattern}` : literal;
+  });
+}
+
+function globEscape(value: string): string {
+  return value.replace(/[*?[]/g, (match) => `[${match}]`);
+}
+
+function word(value: string): Argument {
+  return { kind: "word", parts: [{ kind: "literal", value, quoted: false }] };
 }
 
 function rejects(source: string): ShellSyntaxError {
@@ -135,7 +161,7 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
       {
         kind: "write",
         fd: 2,
-        path: { kind: "literal", value: "/dev/null" },
+        path: word("/dev/null"),
         append: false,
       },
     ]);
@@ -155,7 +181,7 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
       {
         kind: "write",
         fd: 1,
-        path: { kind: "literal", value: "out.txt" },
+        path: word("out.txt"),
         append: false,
       },
     ]);
@@ -163,7 +189,7 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
       {
         kind: "write",
         fd: 1,
-        path: { kind: "literal", value: "out.txt" },
+        path: word("out.txt"),
         append: true,
       },
     ]);
@@ -175,7 +201,7 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
       {
         kind: "write",
         fd: 2,
-        path: { kind: "literal", value: "/dev/null" },
+        path: word("/dev/null"),
         append: false,
       },
     ]);
@@ -183,7 +209,7 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
       {
         kind: "write",
         fd: 2,
-        path: { kind: "literal", value: "/dev/null" },
+        path: word("/dev/null"),
         append: false,
       },
       { kind: "duplicate", fd: 1, targetFd: 2 },
@@ -209,6 +235,25 @@ describe("arguments", () => {
   it("escapes the quoted half of a mixed word", () => {
     // `"a*b"*` matches a literal `a*b` followed by anything.
     expect(text(planOne('ls "a*b"*').commands[0]!.args)).toEqual(["glob:a[*]b*"]);
+  });
+
+  it("retains ordered literal, parameter, and glob parts", () => {
+    expect(planOne(`echo pre${"$"}{ONE}"x${"$"}{TWO}"*.ts`).commands[0]?.args[0]?.parts).toEqual([
+      { kind: "literal", value: "pre", quoted: false },
+      { kind: "parameter", name: "ONE", quoted: false },
+      { kind: "literal", value: "x", quoted: true },
+      { kind: "parameter", name: "TWO", quoted: true },
+      { kind: "glob", value: "*" },
+      { kind: "literal", value: ".ts", quoted: false },
+    ]);
+  });
+
+  it("rejects parameters at static-only boundaries", () => {
+    expect(rejects("$COMMAND arg").message).toContain("command names");
+    expect(rejects("echo out > $TARGET").message).toContain("redirection targets");
+    expect(rejects("echo out 1>&$TARGET").message).toContain("redirection targets");
+    expect(rejects("NAME=value echo out").construct).toBe("assignment");
+    expect(rejects("NAME=$VALUE echo out").construct).toBe("assignment");
   });
 });
 

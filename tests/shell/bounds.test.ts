@@ -60,10 +60,9 @@ describe("a glob too long for SQLite to narrow with", () => {
     expect((await shell.run(`echo /repo/${LONG}/*.ts`)).stdout).toBe(`/repo/${LONG}/x.ts\n`);
     expect((await shell.run("echo /repo/short/*.ts")).stdout).toBe("/repo/short/x.ts\n");
   });
-  it("still crosses directories for **", async () => {
+  it("treats repeated stars as one star in the scan fallback", async () => {
     expect((await shell.run(`echo /repo/${LONG}/**/*.ts`)).stdout.trim().split(" ")).toEqual([
       `/repo/${LONG}/nested/z.ts`,
-      `/repo/${LONG}/x.ts`,
     ]);
   });
   it("searches a deep root, where the include narrowing degrades too", async () => {

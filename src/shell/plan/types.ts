@@ -8,13 +8,16 @@
 
 import type { Connector } from "../parse/ast.js";
 
-/**
- * One argument. A glob cannot be resolved without the filesystem, so it is
- * carried as a pattern rather than flattened to text.
- */
-export type Argument =
-  | { readonly kind: "literal"; readonly value: string }
-  | { readonly kind: "glob"; readonly pattern: string };
+export type ArgumentPart =
+  | { readonly kind: "literal"; readonly value: string; readonly quoted: boolean }
+  | { readonly kind: "parameter"; readonly name: string; readonly quoted: boolean }
+  | { readonly kind: "glob"; readonly value: string };
+
+/** One argument retained as ordered parts until its run environment is known. */
+export interface Argument {
+  readonly kind: "word";
+  readonly parts: readonly ArgumentPart[];
+}
 
 /** One descriptor binding, retained in source order for left-to-right resolution. */
 export type PlannedRedirection =
