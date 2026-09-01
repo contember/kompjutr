@@ -435,3 +435,11 @@ sprint risk. Resolve blocking findings before implementation.
   typecheck/check/build passed. Blobless show hydrated only its required patch
   blob, path log issued no HTTP request or blob read, and a 257-commit
   first-parent walk stayed below 1,000 statements through one graph cursor.
+- 2026-09-01 — WU7 landed (`14b1dbb`): exact repository/network argv,
+  binding-only auth and cancellation, and publication-aware output certainty.
+  Real Smart HTTP witnesses cover auth retry, cancellation, clone/fetch/pull/push,
+  stale leases, response-loss uncertainty, shell pipelines/redirects, output
+  ceilings, and cold reopen. The focused matrix passed 401/401 and smoke 165/165;
+  typecheck, check, build, and package smoke passed. Independent certainty and
+  network reviews are clean after fixes for argv semantics, credential disclosure,
+  cancellation propagation, bounded iteration, and pre/post-publication results.
