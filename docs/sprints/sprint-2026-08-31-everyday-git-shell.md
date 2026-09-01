@@ -419,3 +419,7 @@ sprint risk. Resolve blocking findings before implementation.
   branch, and ls-files argv with cwd-relative paths and human status output.
   Focused 191/191, smoke 164/164 after correcting one stale nested-cwd witness,
   typecheck/check passed.
+- 2026-09-01 — WU4 landed (`e11ec4c`): whole-tree, tracked-only, and forced
+  staging plus commit-all, amend, and allow-empty argv. Focused 191/191, smoke
+  164/164, typecheck/check passed; failure and output-overflow witnesses preserve
+  complete repository state.

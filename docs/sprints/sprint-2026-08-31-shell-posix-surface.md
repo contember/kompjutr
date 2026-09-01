@@ -325,3 +325,9 @@ shell tests, and shell reference docs are serialized by the sprint leader.
   status, modulo-256 operands, exact Bash diagnostics, and explicit pipeline
   refusal. Focused 55/55, shell 392/392, smoke 164/164, typecheck/check passed;
   cleanup stayed inside the existing executor and run-input `finally` seams.
+- 2026-09-01 — WU5 landed (`b23b58a`): named parameter expansion with quote
+  context, default-IFS splitting, Bash-default pathname globbing, relative argv,
+  and generated-field bounds. Focused 157/157, shell 451/451, smoke 164/164,
+  typecheck/check passed; all eight no-parameter operation baselines stayed exact.
+  Independent review (`ses_fa2fa2c73ffe2kE4SNDACvB3Ck`) was clean after one
+  fix round for special parameters, dotfiles, pathname `**`, and boundary tests.
