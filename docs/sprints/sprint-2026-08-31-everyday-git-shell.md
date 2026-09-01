@@ -406,3 +406,8 @@ sprint risk. Resolve blocking findings before implementation.
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). After graduating,
      trim to a one-line pointer ("→ ADR-0007"). -->
+
+- 2026-09-01 — WU1 landed (`739608f`): await-aware shell streams and Git argv
+  runner, generic truncation propagation, and async API migration. Focused 63/63,
+  shell 344/344, smoke 164/164, typecheck/check/package smoke passed; independent
+  lifecycle review clean after one fix round.

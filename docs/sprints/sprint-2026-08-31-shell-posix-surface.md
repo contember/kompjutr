@@ -313,3 +313,5 @@ shell tests, and shell reference docs are serialized by the sprint leader.
 
 - 2026-09-01 — WU1 landed (`92f3dbb`): byte-exact, per-run-isolated Bash parity
   harness; focused witness 6/6, typecheck passed, independent review clean.
+- 2026-09-01 — Cross-sprint async executor dependency landed as `739608f`; POSIX
+  WU2-WU5 now target the reviewed seam.
