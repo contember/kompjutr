@@ -428,3 +428,10 @@ sprint risk. Resolve blocking findings before implementation.
   found no remaining blocker after fixing index-source restore, source deletions,
   unsupported branch force-reset, remote switch targets, and literal paths with
   spaces.
+- 2026-09-01 — WU6 landed (`28486b3`): native and CLI show patches, explicit
+  merge mainlines, first-parent history, and literal path-selected log with
+  TREESAME parent pruning. The Computer facade retains its metadata-only show
+  shape. Acceptance witnesses passed 118/118, parser 211/211, and smoke 165/165;
+  typecheck/check/build passed. Blobless show hydrated only its required patch
+  blob, path log issued no HTTP request or blob read, and a 257-commit
+  first-parent walk stayed below 1,000 statements through one graph cursor.
