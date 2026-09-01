@@ -276,7 +276,7 @@ arbitrary Git compatibility.
   has returned and the old owner is dead. Directed concurrency tests prove stale
   owners cannot publish, while tracking movement after journal creation does not
   change its captured target. The existing merge-based pull behavior remains
-  unchanged. `npx vitest run tests/pull.test.ts tests/rebase.test.ts tests/rebase-restart.test.ts tests/concurrency-network.test.ts tests/shell/git.test.ts` passes.
+  unchanged. `npx vitest run tests/pull.test.ts tests/rebase.test.ts tests/rebase-restart.test.ts tests/concurrency-network.test.ts tests/git-cli.test.ts tests/git-cli-network.test.ts tests/shell/git.test.ts` passes.
 - **Touch points.** `src/git/ops/pull.ts`, rebase lifecycle and operation-state
   modules, `src/git/client.ts`, `src/git/cli/`, compat only if its installed
   contract can represent recovery, pull/rebase/concurrency/CLI tests, and Git
@@ -443,3 +443,10 @@ sprint risk. Resolve blocking findings before implementation.
   typecheck, check, build, and package smoke passed. Independent certainty and
   network reviews are clean after fixes for argv semantics, credential disclosure,
   cancellation propagation, bounded iteration, and pre/post-publication results.
+- 2026-09-01 — WU8 landed (`f6cd733`): explicit and configured pull-rebase now
+  captures the published fetch target and enters the existing restart-safe rebase
+  lifecycle through native and exact CLI surfaces. The focused matrix passed
+  452/452; typecheck/check passed. Independent ownership, recovery, witness, and
+  API reviews are clean after fixes for nested-checkout timing and recovery,
+  persistent final-CAS failure, overlapping owners, cancellation, and bounded
+  post-publication output.
