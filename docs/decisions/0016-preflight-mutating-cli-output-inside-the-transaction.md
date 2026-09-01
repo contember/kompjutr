@@ -49,14 +49,32 @@ returned. The transaction callback performs mutation, formatting, and preflight
 without an await. The dispatcher then keeps its final `boundedGitCliResult()`
 call as defense in depth.
 
+Network argv uses a different policy because no transaction can roll back an
+HTTP side effect or an already-published fetch. Four boundaries are explicit:
+
+1. Local-only `init` and mutating `remote` forms retain transactional preflight.
+2. Read-only `ls-remote`, and clone/fetch/pull before publication, may fail with
+   `E2BIG` because no durable command outcome must be reported.
+3. Clone/fetch/pull after local publication return bounded bytes with
+   `truncated: true`; output limits do not replace success, conflict, or later
+   integration failure.
+4. Push may fail known output preflight before receive-pack invocation. After
+   invocation, native transport certainty is authoritative: confirmed status,
+   `EPUSHUNCERTAIN`, and tracking reconciliation are preserved, with output
+   truncation recorded separately.
+
+Network authentication is supplied by binding headers and callbacks. The argv
+environment is not a credential source.
+
 ## Consequences
 
-- A destination-specific output overflow cannot publish an index, worktree,
-  ref, reflog, object, or operation-state mutation.
+- A destination-specific `E2BIG` from a local-only command or a network command
+  before publication cannot publish an index, worktree, ref, reflog, object, or
+  operation-state mutation.
 - Existing nested operation transactions remain the only mutation
   implementation; the CLI adds one outer rollback boundary.
-- New mutating CLI handlers must use the shared wrapper and prove rollback for
-  stdout, retained stderr, and combined-output overflow. With
+- New local mutating CLI handlers must use the shared wrapper and prove rollback
+  for stdout, retained stderr, and combined-output overflow. With
   `discardStderr: true`, stderr is neither validated nor charged: the mutation
   commits when stdout and the resulting combined output fit.
 - Worktree-mutating commands are unavailable to custom Worktree adapters that
@@ -65,6 +83,9 @@ call as defense in depth.
   The narrow public runner capability remains unchanged.
 - Making the runner promise-returning does not make local transaction ownership
   asynchronous; no transaction spans an await.
+- A caller can distinguish presentation loss from operation uncertainty.
+  `truncated` means only that output was bounded; `EPUSHUNCERTAIN` still means
+  receive-pack was invoked without a safely retained final status.
 
 ## Alternatives considered
 

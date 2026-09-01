@@ -86,12 +86,19 @@ export interface GitContext {
   /** Reacquire credentials when a later read hydrates blobs from a promisor remote. */
   promisorAuth?: AuthCallback;
   promisorHeaders?: Record<string, string>;
+  cliNetwork?: GitCliNetworkBinding;
   now: () => number;
   /** Minutes west of UTC, for commit timestamps. */
   timezoneOffset: () => number;
   defaultIdentity?: GitIdentity;
   /** Awaited during long ingest loops so the runtime can flush writes. */
   yieldNow?: () => Promise<void>;
+}
+
+export interface GitCliNetworkBinding {
+  headers?: Record<string, string>;
+  onAuth?: AuthCallback;
+  signal?: () => AbortSignal | undefined;
 }
 
 export function openRepository(context: GitContext, dir = "/"): Repository {

@@ -8,7 +8,7 @@ import { normalizeRemoteUrl } from "../protocol/remote.js";
 import type { GitContext, GitIdentity } from "./context.js";
 import type { MergeResult } from "./kinds.js";
 import { type MergeBehavior, mergeOwned } from "./merge.js";
-import { fetchInto, type RemoteAuthOptions } from "./network.js";
+import { type AbortableNetworkOptions, fetchInto, type RemoteAuthOptions } from "./network.js";
 import { type Repository, resolveHeadOwned } from "./repository.js";
 import type { Worktree } from "./worktree.js";
 
@@ -16,7 +16,7 @@ const HEADS = "refs/heads/";
 const FALSE_CONFIG_VALUES = new Set(["", "0", "false", "no", "off"]);
 const TRUE_CONFIG_VALUES = new Set(["1", "true", "yes", "on"]);
 
-export interface PullOptions extends RemoteAuthOptions {
+export interface PullOptions extends RemoteAuthOptions, AbortableNetworkOptions {
   remote?: string;
   url?: string;
   /** Local branch to validate. Pull never targets an inactive branch. */
@@ -304,7 +304,7 @@ export async function pull(
   repo: Repository,
   worktree: Worktree,
   options: PullOptions = {},
-  behavior: MergeBehavior = {},
+  behavior: MergeBehavior & { afterFetch?: () => void } = {},
 ): Promise<MergeResult> {
   const plan = resolvePullOwned(repo, options);
   const fetched = await fetchInto(
@@ -317,18 +317,22 @@ export async function pull(
       ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
       ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
       ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
     },
     "fetch",
     {
       ...(plan.fetchSingleBranch ? { coverageRef: plan.remoteRef } : {}),
       resultRef: plan.remoteRef,
       autoTags: plan.fetchAutoTags,
+      checkpoint(stage) {
+        if (stage === "after-ref-publication") behavior.afterFetch?.();
+        return undefined;
+      },
     },
   );
   if (fetched.fetchHead === null) {
     throw new GitError("EFETCHFAIL", `remote ${plan.remote} advertised no usable upstream ref`);
   }
-
   validatePullAfterFetch(repo, options, plan);
 
   const message = options.message === undefined ? defaultPullMessage(plan) : options.message;

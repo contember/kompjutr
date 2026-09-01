@@ -36,6 +36,7 @@ import type {
   DivergenceRelationship as GitDivergenceRelationship,
   DivergenceResult as GitDivergenceResult,
   GitCliInput as GitEntrypointCliInput,
+  GitCliNetworkBinding as GitEntrypointCliNetworkBinding,
   GitCliResult as GitEntrypointCliResult,
   GitCliRunner as GitEntrypointCliRunner,
   GitCliRunOptions as GitEntrypointCliRunOptions,
@@ -150,6 +151,7 @@ import type {
   FetchRefUpdate as RootFetchRefUpdate,
   Git as RootGit,
   GitCliInput as RootGitCliInput,
+  GitCliNetworkBinding as RootGitCliNetworkBinding,
   GitCliResult as RootGitCliResult,
   GitCliRunner as RootGitCliRunner,
   GitCliRunOptions as RootGitCliRunOptions,
@@ -1003,6 +1005,11 @@ describe("public Git CLI exports", () => {
     const gitInput: GitEntrypointCliInput = rootInput;
     const rootOptions: RootGitCliRunOptions = { logLimitHint: 3 };
     const gitOptions: GitEntrypointCliRunOptions = rootOptions;
+    const rootNetwork: RootGitCliNetworkBinding = {
+      headers: { Authorization: "Bearer token" },
+      signal: () => undefined,
+    };
+    const gitNetwork: GitEntrypointCliNetworkBinding = rootNetwork;
     const rootResult: RootGitCliResult = {
       stdout: "",
       stderr: "",
@@ -1019,6 +1026,7 @@ describe("public Git CLI exports", () => {
     };
     const gitRunner: GitEntrypointCliRunner = rootRunner;
     expect(await gitRunner.runCli(gitInput, gitOptions)).toBe(gitResult);
+    expect(gitNetwork.headers?.Authorization).toBe("Bearer token");
     expect(typeof createGitCommand).toBe("function");
   });
 });

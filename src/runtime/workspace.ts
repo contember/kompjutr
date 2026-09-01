@@ -5,7 +5,7 @@ import { createFilesystem } from "../fs/filesystem.js";
 import { createInitialWorktreeWriter } from "../fs/store/initial-write.js";
 import type { Filesystem } from "../fs/types.js";
 import type { Git, GitFactory, GitPromisorAuth } from "../git/client.js";
-import type { GitIdentity, IndexTrackerWriter } from "../git/ops/context.js";
+import type { GitCliNetworkBinding, GitIdentity, IndexTrackerWriter } from "../git/ops/context.js";
 import type { GitHttpClient } from "../git/protocol/transport.js";
 import { SqliteGitDatabase, type StoreOptions } from "../git/store/index.js";
 import {
@@ -29,6 +29,7 @@ export interface WorkspaceOptions extends StoreOptions {
   http?: GitHttpClient;
   promisorAuth?: GitPromisorAuth;
   promisorHeaders?: Record<string, string>;
+  cliNetwork?: GitCliNetworkBinding;
   yieldNow?: () => Promise<void>;
 }
 
@@ -87,6 +88,7 @@ export class Workspace {
         http: this.#options.http,
         promisorAuth: this.#options.promisorAuth,
         promisorHeaders: this.#options.promisorHeaders,
+        cliNetwork: this.#options.cliNetwork,
         yieldNow: this.#options.yieldNow,
       };
       this.#git = factory(binding);

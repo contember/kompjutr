@@ -177,6 +177,89 @@ export interface GitCliMergeCommand {
   readonly action: "continue" | "abort";
 }
 
+export interface GitCliInitCommand {
+  readonly kind: "init";
+  readonly directory?: string;
+  readonly defaultBranch?: string;
+  readonly bare?: boolean;
+}
+
+export interface GitCliCloneCommand {
+  readonly kind: "clone";
+  readonly url: string;
+  readonly directory?: string;
+  readonly depth?: number;
+  readonly singleBranch?: boolean;
+  readonly noTags?: boolean;
+  readonly ref?: string;
+  readonly remote?: string;
+  readonly filter?: "blob:none";
+}
+
+export interface GitCliRemoteCommand {
+  readonly kind: "remote";
+  readonly action: "list" | "add" | "remove" | "get-url" | "set-url";
+  readonly verbose?: boolean;
+  readonly name?: string;
+  readonly url?: string;
+}
+
+export interface GitCliLsRemoteCommand {
+  readonly kind: "ls-remote";
+  readonly target?: string;
+  readonly patterns: readonly string[];
+}
+
+export interface GitCliFetchRefspec {
+  readonly source: string;
+  readonly destination: string;
+  readonly force?: boolean;
+}
+
+export interface GitCliFetchCommand {
+  readonly kind: "fetch";
+  readonly target?: string;
+  readonly selector?: string;
+  readonly refspecs?: readonly [GitCliFetchRefspec, ...GitCliFetchRefspec[]];
+  readonly depth?: number;
+  readonly deepen?: number;
+  readonly unshallow?: boolean;
+  readonly singleBranch?: boolean;
+  readonly prune?: boolean;
+  readonly tags?: boolean;
+  readonly filter?: "blob:none";
+}
+
+export interface GitCliPullCommand {
+  readonly kind: "pull";
+  readonly remote?: string;
+  readonly branch?: string;
+  readonly fastForward?: boolean;
+  readonly fastForwardOnly?: boolean;
+}
+
+export type GitCliPushRefspec =
+  | { readonly source: string; readonly destination: string; readonly force?: boolean }
+  | { readonly source: null; readonly destination: string; readonly force?: never };
+
+export interface GitCliPushLease {
+  readonly destination: string;
+  readonly expected?: string | null;
+  readonly tracking?: true;
+}
+
+export interface GitCliPushCommand {
+  readonly kind: "push";
+  readonly target?: string;
+  readonly selector?: string;
+  readonly refspecs?: readonly [GitCliPushRefspec, ...GitCliPushRefspec[]];
+  readonly force?: boolean;
+  readonly delete?: boolean;
+  readonly atomic?: boolean;
+  readonly leases: readonly GitCliPushLease[];
+  readonly pushOptions: readonly string[];
+}
+
 export type ParsedGitCliCommand =
   | GitCliStatusCommand
   | GitCliRevParseCommand
@@ -194,7 +277,14 @@ export type ParsedGitCliCommand =
   | GitCliSwitchCommand
   | GitCliRestoreCommand
   | GitCliRebaseCommand
-  | GitCliMergeCommand;
+  | GitCliMergeCommand
+  | GitCliInitCommand
+  | GitCliCloneCommand
+  | GitCliRemoteCommand
+  | GitCliLsRemoteCommand
+  | GitCliFetchCommand
+  | GitCliPullCommand
+  | GitCliPushCommand;
 
 export interface GitCliInvocation<Command extends ParsedGitCliCommand = ParsedGitCliCommand> {
   readonly command: Command;
@@ -225,6 +315,13 @@ export interface GitCliHandlers {
   readonly restore?: GitCliCommandHandler<GitCliRestoreCommand>;
   readonly rebase?: GitCliCommandHandler<GitCliRebaseCommand>;
   readonly merge?: GitCliCommandHandler<GitCliMergeCommand>;
+  readonly init?: GitCliCommandHandler<GitCliInitCommand>;
+  readonly clone?: GitCliCommandHandler<GitCliCloneCommand>;
+  readonly remote?: GitCliCommandHandler<GitCliRemoteCommand>;
+  readonly lsRemote?: GitCliCommandHandler<GitCliLsRemoteCommand>;
+  readonly fetch?: GitCliCommandHandler<GitCliFetchCommand>;
+  readonly pull?: GitCliCommandHandler<GitCliPullCommand>;
+  readonly push?: GitCliCommandHandler<GitCliPushCommand>;
 }
 
 export type GitCliParseResult =

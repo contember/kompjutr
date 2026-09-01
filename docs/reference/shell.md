@@ -127,11 +127,13 @@ const shell = createShell({
 ```
 
 The shell layer never imports the Git layer and the root entry does not install
-the command implicitly. The adapter exposes only the strict local argv subset
-listed in [Git support](git-support.md#strict-local-argv-runner). It closes an
+the command implicitly. The adapter exposes only the strict argv subset
+listed in [Git support](git-support.md#strict-argv-runner). It closes an
 upstream stdin stream without reading it, because no accepted Git command reads
 stdin. When a run supplies env, the adapter forwards its snapshot to the Git
 runner; only the four documented Git identity variables affect commits.
+Network authentication, headers, and abort signals come from the Git workspace
+binding, never from the shell environment.
 
 Git stdout remains pipeline bytes. The adapter awaits the runner before exposing
 its settled result. Git stderr uses the raw diagnostic seam, so
@@ -179,14 +181,21 @@ redirect gets the atomic redirect ceiling; an upstream pipeline gets Git's
 intrinsic ceiling and any trailing-`head` demand hint. Direct stderr gets the
 remaining stderr sink, merged stderr shares the stage-output budget, and dropped
 stderr retains and charges nothing. The Git runner then applies its intrinsic
-16 MiB stdout, 1 MiB stderr, and 16 MiB combined maxima. The first excess fails
-with an output limit instead of publishing a partial semantic result.
+16 MiB stdout, 1 MiB stderr, and 16 MiB combined maxima. Read-only and
+pre-publication excess fails with an output limit. A network command that has
+already published local or remote state instead returns the bounded prefix and
+contributes `truncated: true` to the shell result.
 
 Every admitted local mutating Git argv command performs its mutation, success
 formatting, and output preflight in one database transaction. A terminal,
 pipeline, merged, or redirect overflow therefore leaves no partial index,
 worktree, ref, or operation-state change. Redirect publication remains atomic as
 for every other command.
+
+Clone, fetch, pull, ls-remote, and push remain transport operations owned by the
+Git layer. Their published-result certainty and truncation policy is documented
+in [Git support](git-support.md#strict-argv-runner); the shell only propagates
+the settled result.
 
 ## Deliberate boundaries
 

@@ -25,6 +25,7 @@ import {
 } from "./ops/config.js";
 import {
   type ExactRootStateSource,
+  type GitCliNetworkBinding,
   type GitContext,
   type GitIdentity,
   type IndexTrackerWriter,
@@ -398,6 +399,7 @@ export interface GitWorkspaceBinding {
   http?: GitHttpClient;
   promisorAuth?: AuthCallback;
   promisorHeaders?: Record<string, string>;
+  cliNetwork?: GitCliNetworkBinding;
   yieldNow?: () => Promise<void>;
 }
 
@@ -437,6 +439,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
   if (binding.http !== undefined) context.http = binding.http;
   if (binding.promisorAuth !== undefined) context.promisorAuth = binding.promisorAuth;
   if (binding.promisorHeaders !== undefined) context.promisorHeaders = binding.promisorHeaders;
+  if (binding.cliNetwork !== undefined) context.cliNetwork = binding.cliNetwork;
   if (binding.initialWorktree !== undefined) context.initialWorktree = binding.initialWorktree;
   if (binding.indexTracker !== undefined) context.indexTracker = binding.indexTracker;
   if (binding.sparseWorkspace !== undefined) context.sparseWorkspace = binding.sparseWorkspace;

@@ -7,7 +7,7 @@ matter.
 
 kompjutr has no external process or general Git command line. Its primary API is
 the typed `Git` interface from `kompjutr/git` (and the narrower `GitClient` from
-`kompjutr/compat/computer`). A strict local argv runner covers the agent command
+`kompjutr/compat/computer`). A strict argv runner covers the agent command
 subset described below. It never falls back to a binary or admits an unlisted
 command.
 
@@ -45,11 +45,10 @@ authenticates per command with a short-lived token, and keeps state in refs
 outside `refs/heads/*` — `refs/checkpoints/<id>`, `refs/backups/<id>/<ts>`,
 `refs/recovery/…`.
 
-**The agent**, inside the sandbox, runs local Git only: `status --short`,
+**The agent**, inside the sandbox, normally runs local Git only: `status --short`,
 `add <paths>`, `commit -m`, `log`, `diff`, and conflict resolution during a
-rebase (`add <file>`, `rebase --continue`, `rebase --abort`). Every network
-subcommand is refused before it runs, because the sandbox holds no credentials —
-so `push`, `fetch`, `pull`, `clone` and `ls-remote` never appear on that side.
+rebase (`add <file>`, `rebase --continue`, `rebase --abort`). Network argv uses
+only binding-provided authentication and does not inspect environment credentials.
 
 [Reference workload coverage](#reference-workload-coverage) collects what that
 workload would need gained, or routed differently.
@@ -60,7 +59,7 @@ atomic checkpoint transport, remote ref discovery, and `blob:none` partial
 clone. A consumer adapter belongs to the consumer repository, not this package.
 Local snapshot replay is available without textual patch interchange.
 
-## Strict local argv runner
+## Strict argv runner
 
 Native `Git` implements
 `runCli(input, options?): Promise<GitCliResult>`; `cli(input)` uses the same
@@ -90,6 +89,13 @@ The accepted argv grammar is exact:
 | `restore` | `[--source=<ref>] [--] <literal-paths>...` |
 | `rebase` | Exactly one upstream, `--continue`, `--skip`, or `--abort` |
 | `merge` | Exactly `--continue` or `--abort` |
+| `init` | `[--bare] [--initial-branch=<name>] [<directory>]` |
+| `clone` | `[--depth <n>] [--single-branch\|--no-single-branch] [--no-tags] [--branch <ref>] [--origin <name>] [--filter=blob:none] <http(s)-url> [<directory>]`; `-b` and `-o` aliases are accepted |
+| `remote` | Optionless or `-v`; `add <name> <url>`; `remove\|rm <name>`; `get-url <name>`; `set-url <name> <url>` |
+| `ls-remote` | `[<remote-or-http(s)-url> [<patterns>...]]` |
+| `fetch` | `[--depth <n>\|--deepen <n>\|--unshallow] [--single-branch] [--prune] [--tags\|--no-tags] [--filter=blob:none] [<remote-or-http(s)-url> [<selector>]]`, or one or more full `<src>:<dst>` refspecs; mapped refspecs cannot use legacy selection options |
+| `pull` | `[--ff\|--no-ff\|--ff-only] [<remote> [<branch>]]`; merge strategy only |
+| `push` | `[--force] [--delete] [--atomic] [--force-with-lease=<ref>[:<expect>]] [--push-option=<text>] [<remote-or-http(s)-url> [<selector-or-full-refspec>...]]` |
 
 Status, ls-files, and log path operands are literals or directory prefixes; glob
 and pathspec-magic spellings are rejected by this argv surface. `--exclude-standard`
@@ -114,8 +120,7 @@ Expected command and Git-domain failures are returned as a command-specific
 semantic output. Results are not collapsed into one generic
 usage result. For example, unknown `status` and `diff` options exit 129 with
 usage on stderr; invalid `log` options and counts exit 128 with a fatal line; an
-unknown subcommand exits 1; and `fetch`, `push`, `pull`, `clone`, and `ls-remote`
-exit 128 without reaching transport. Commit refusals may report status on
+unknown subcommand exits 1. Commit refusals may report status on
 stdout. A successful rebase continuation places the commit summary on stdout
 and completion text on stderr. Unexpected implementation errors still throw.
 
@@ -128,6 +133,10 @@ do not read stdin; a supplied string is validated and ignored. Only
 `GIT_COMMITTER_EMAIL` affect commit identity. Complete environment identities
 win over repository config and the binding default. Unlike Git, a partial
 environment identity is not completed field-by-field from config.
+Network headers, authentication, and cancellation come from
+`GitWorkspaceBinding.cliNetwork` (or `WorkspaceOptions.cliNetwork`). The signal
+callback runs once per abortable argv invocation. No credential environment
+variable is admitted.
 
 Input limits are 256 argv entries and 1 MiB of argv bytes, 256 environment
 entries and 1 MiB of environment key/value bytes, 1 MiB of stdin, 4,096 cwd
@@ -140,7 +149,10 @@ format. Staged diff merges the selected tree with the ordered stage-0 index,
 does not traverse the worktree, and refuses an unmerged index with `EUNMERGED`.
 Show patch output reuses the same 16 MiB tree-diff renderer and lazily hydrates
 only promised blobs required by the selected parent comparison.
-The first excess fails with `E2BIG`; semantic output is never truncated.
+Reads and pre-publication commands fail the first excess with `E2BIG`. Once
+clone, fetch, or pull has published local state, or push has invoked
+receive-pack, the durable outcome remains authoritative: returned bytes fit the
+destination and `truncated` is true.
 The installed Computer interface still exposes scalar worktree metadata reads:
 a 1,001-file plain-diff probe uses 10,019 statements. That is a measured target
 miss, not a runtime rejection, and the runner adds no projected-count refusal.
@@ -153,13 +165,23 @@ refs, objects, reflogs, and operation state. The promise-returning dispatcher
 awaits only after this synchronous transaction callback has completed. Expected
 operation failures are mapped only after rollback and cache revalidation.
 
+Network argv has explicit output certainty boundaries. `init` and mutating
+`remote` forms preflight in their local transaction. `ls-remote` is read-only
+and may fail with `E2BIG`. Clone, fetch, and pull fail known output overflow
+before publication; after publication they preserve state and return bounded
+output with `truncated: true`. Push preflights known output before transport.
+After receive-pack invocation, `EABORTED`, `EPUSHUNCERTAIN`, confirmed report
+status, and tracking reconciliation retain their native meanings; output
+truncation never replaces them. A thrown `EPUSHUNCERTAIN` carries its bounded
+`GitCliResult` as `error.result`, including the independent `truncated` bit.
+
 ## Repository creation
 
 ### `git init` — `init()`
 
 | Git | kompjutr | |
 |---|---|---|
-| optionless human status | strict argv runner | ✔ branch/detached/unborn headings, staged, unmerged, unstaged, untracked, and clean summaries |
+| exact forms above | strict argv runner | ✔ database-only creation with transactional output preflight |
 | `--initial-branch=<name>` | `defaultBranch` (default `main`) | ★ ✔ |
 | `--bare` | `bare` | ~ recorded as `core.bare` only; every repository is effectively bare, since the object database is never a directory |
 | working directory, `git -C <dir>` | `dir` (default `/`) | ★ ~ several repositories may share one workspace; `init()` records the checkout in SQLite but does not create `dir` in the filesystem |
@@ -507,7 +529,7 @@ separate, unsupported operations.
 
 The strict argv runner exposes normal create, safe and force delete, rename,
 list, and show-current through the exact spellings in [Strict local argv
-runner](#strict-local-argv-runner).
+runner](#strict-argv-runner).
 
 ### `git tag` — `tag()`, `tagDelete()`, `tagList()`
 
@@ -539,8 +561,8 @@ rolled-back movements record nothing.
 Transport is Smart HTTP over `http(s)` only. Authentication is `headers` or an
 `onAuth` callback; there are no credential helpers and no `.netrc`.
 
-Native `clone()`, `fetch()`, and `push()` accept an `AbortSignal` as `signal`.
-`pull()` and `lsRemote()` do not. A confirmed cancellation throws `EABORTED`
+Native `clone()`, `fetch()`, `pull()`, `push()`, and `lsRemote()` accept an
+`AbortSignal` as `signal`. A confirmed cancellation throws `EABORTED`
 with `signal.reason` as its cause. Clone and fetch check immediately before
 their synchronous local publication; once publication starts, it completes and
 the operation succeeds even if the signal is aborted afterwards. Interrupted
@@ -579,7 +601,7 @@ but discovery has no upload or side-band events to emit through them.
 
 | Git | kompjutr | |
 |---|---|---|
-| `remote add [-f] <name> <url>` | `remoteAdd({ name, url, force })` | ★ ✔ |
+| `remote add <name> <url>` | `remoteAdd({ name, url })` | ★ ✔ |
 | `remote remove <name>` | `remoteRemove()` | ★ ✔ |
 | `remote`, `remote -v` | `remoteList()` | ★ ✔ `{ name, url }[]` |
 | `remote get-url <name>` | `remoteGetUrl({ name })` | ★ ✔ fetch URL |

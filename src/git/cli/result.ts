@@ -14,6 +14,16 @@ const OPTION_KEYS = new Set([
   "logLimitHint",
 ]);
 const USAGE = {
+  init: "usage: git init [--bare] [--initial-branch=<name>] [<directory>]\n",
+  clone:
+    "usage: git clone [--depth <n>] [--single-branch|--no-single-branch] [--no-tags] [--branch <ref>] [--origin <name>] [--filter=blob:none] <url> [<directory>]\n",
+  remote:
+    "usage: git remote [-v] | add <name> <url> | remove <name> | get-url <name> | set-url <name> <url>\n",
+  "ls-remote": "usage: git ls-remote [<repository> [<patterns>...]]\n",
+  fetch:
+    "usage: git fetch [--depth <n>|--deepen <n>|--unshallow] [--single-branch] [--prune] [--tags|--no-tags] [--filter=blob:none] [<repository> [<refspec>...]]\n",
+  pull: "usage: git pull [--ff|--no-ff|--ff-only] [<repository> [<refspec>]]\n",
+  push: "usage: git push [--force] [--delete] [--atomic] [--force-with-lease=<ref>[:<expect>]] [--push-option=<text>] [<repository> [<refspec>...]]\n",
   status:
     "usage: git status [<options>] [--] [<pathspec>...]\n\n    -v, --[no-]verbose    be verbose\n    -s, --[no-]short      show status concisely\n    -b, --[no-]branch     show branch information\n    --[no-]show-stash     show stash information\n    --[no-]ahead-behind   compute full ahead/behind values\n    --[no-]porcelain[=<version>]\n                          machine-readable output\n    --[no-]long           show status in long format (default)\n    -z, --[no-]null       terminate entries with NUL\n    -u, --[no-]untracked-files[=<mode>]\n                          show untracked files, optional modes: all, normal, no. (Default: all)\n    --[no-]ignored[=<mode>]\n                          show ignored files, optional modes: traditional, matching, no. (Default: traditional)\n    --[no-]ignore-submodules[=<when>]\n                          ignore changes to submodules, optional when: all, dirty, untracked. (Default: all)\n    --[no-]column[=<style>]\n                          list untracked files in columns\n    --no-renames          do not detect renames\n    --renames             opposite of --no-renames\n    -M, --find-renames[=<n>]\n                          detect renames, optionally set similarity index\n\n",
   diff: "usage: git diff [<options>] [<commit>] [--] [<path>...]\n   or: git diff [<options>] --cached [--merge-base] [<commit>] [--] [<path>...]\n   or: git diff [<options>] [--merge-base] <commit> [<commit>...] <commit> [--] [<path>...]\n   or: git diff [<options>] <commit>...<commit> [--] [<path>...]\n   or: git diff [<options>] <blob> <blob>\n   or: git diff [<options>] --no-index [--] <path> <path> [<pathspec>...]\n\ncommon diff options:\n  -z            output diff-raw with lines terminated with NUL.\n  -p            output patch format.\n  -u            synonym for -p.\n  --patch-with-raw\n                output both a patch and the diff-raw format.\n  --stat        show diffstat instead of patch.\n  --numstat     show numeric diffstat instead of patch.\n  --patch-with-stat\n                output a patch and prepend its diffstat.\n  --name-only   show only names of changed files.\n  --name-status show names and status of changed files.\n  --full-index  show full object name on index lines.\n  --abbrev=<n>  abbreviate object names in diff-tree header and diff-raw.\n  -R            swap input file pairs.\n  -B            detect complete rewrites.\n  -M            detect renames.\n  -C            detect copies.\n  --find-copies-harder\n                try unchanged files as candidate for copy detection.\n  -l<n>         limit rename attempts up to <n> paths.\n  -O<file>      reorder diffs according to the <file>.\n  -S<string>    find filepair whose only one side contains the string.\n  --pickaxe-all\n                show all files diff when -S is used and hit is found.\n  -a  --text    treat all files as text.\n\n",
@@ -256,6 +266,49 @@ export function boundedGitCliResult(
     );
   }
   return { stdout, stderr, exitCode, truncated };
+}
+
+/** Preserve a published network outcome while fitting its presentation to the destination. */
+export function boundedPublishedGitCliResult(
+  result: GitCliResult,
+  options: ResolvedGitCliRunOptions,
+): GitCliResult {
+  const stdoutLimit = Math.min(options.maxStdoutBytes, options.maxCombinedOutputBytes);
+  const stdout = utf8Prefix(result.stdout, stdoutLimit);
+  const stdoutBytes = gitCliUtf8ByteLength(stdout, "git CLI stdout", false);
+  if (options.discardStderr) {
+    return {
+      stdout,
+      stderr: "",
+      exitCode: result.exitCode,
+      truncated: result.truncated || stdout !== result.stdout,
+    };
+  }
+  const stderrLimit = Math.min(
+    options.maxStderrBytes,
+    Math.max(0, options.maxCombinedOutputBytes - stdoutBytes),
+  );
+  const stderr = utf8Prefix(result.stderr, stderrLimit);
+  return {
+    stdout,
+    stderr,
+    exitCode: result.exitCode,
+    truncated: result.truncated || stdout !== result.stdout || stderr !== result.stderr,
+  };
+}
+
+function utf8Prefix(value: string, maximum: number): string {
+  if (gitCliUtf8ByteLength(value, "git CLI output", false) <= maximum) return value;
+  const bytes = new TextEncoder().encode(value);
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  for (let end = Math.min(maximum, bytes.length); end >= 0; end--) {
+    try {
+      return decoder.decode(bytes.subarray(0, end));
+    } catch {
+      // Continue to the prior complete UTF-8 boundary.
+    }
+  }
+  return "";
 }
 
 export function gitCliUtf8ByteLength(value: string, label: string, rejectNul: boolean): number {

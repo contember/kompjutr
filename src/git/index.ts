@@ -97,7 +97,7 @@ export {
   RefNotFoundError,
   UnsupportedOperationError,
 } from "./common/errors.js";
-export type { GitContext, GitIdentity } from "./ops/context.js";
+export type { GitCliNetworkBinding, GitContext, GitIdentity } from "./ops/context.js";
 export { findRepository, nestedRoots, openRepository } from "./ops/context.js";
 export type {
   CommitResult,

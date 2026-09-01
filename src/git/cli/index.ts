@@ -1,4 +1,5 @@
 import type { GitContext } from "../ops/context.js";
+import { createGitCliNetworkHandlers } from "./network.js";
 import { parseGitCliInput } from "./parse.js";
 import { createGitCliReadHandlers } from "./read.js";
 import { boundedGitCliResult, resolveGitCliRunOptions } from "./result.js";
@@ -41,9 +42,11 @@ export function createGitCliRunner(handlers: GitCliHandlers): GitCliRunner {
 export function createContextGitCliRunner(context: GitContext): GitCliRunner {
   const reads = createGitCliReadHandlers(context);
   const writes = createGitCliWriteHandlers(context);
+  const network = createGitCliNetworkHandlers(context);
   return createGitCliRunner({
     ...reads,
     ...writes,
+    ...network,
     branch(invocation, options) {
       const handler =
         invocation.command.action === "show-current" || invocation.command.action === "list"
@@ -60,6 +63,48 @@ async function dispatch(
   options: ResolvedGitCliRunOptions,
 ): Promise<GitCliResult> {
   const command = invocation.command;
+  if (command.kind === "init") {
+    return await requireHandler(handlers.init, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "clone") {
+    return await requireHandler(handlers.clone, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "remote") {
+    return await requireHandler(handlers.remote, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "ls-remote") {
+    return await requireHandler(handlers.lsRemote, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "fetch") {
+    return await requireHandler(handlers.fetch, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "pull") {
+    return await requireHandler(handlers.pull, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
+  if (command.kind === "push") {
+    return await requireHandler(handlers.push, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
+  }
   if (command.kind === "status") {
     return await requireHandler(handlers.status, command.kind)(
       specificInvocation(invocation, command),

@@ -4,7 +4,13 @@ import { checkRefText } from "../common/ref-name.js";
 import { discover, MAX_PROTOCOL_NEGOTIATION_ENTRIES, type RemoteRef } from "../protocol/remote.js";
 import { type GitAuth, RemoteAuthSession } from "../protocol/transport.js";
 import type { GitContext } from "./context.js";
-import { type RemoteAuthOptions, remoteUrlFor, validateRemoteAuthOptions } from "./network.js";
+import {
+  type AbortableNetworkOptions,
+  type RemoteAuthOptions,
+  remoteUrlFor,
+  validateAbortableNetworkOptions,
+  validateRemoteAuthOptions,
+} from "./network.js";
 import type { LsRemoteResult, RemoteTarget } from "./refspec.js";
 import type { Repository } from "./repository.js";
 
@@ -12,6 +18,7 @@ export const MAX_LS_REMOTE_PATTERNS = 1_024;
 export const MAX_LS_REMOTE_REFS = MAX_PROTOCOL_NEGOTIATION_ENTRIES;
 
 export type LsRemoteOptions = RemoteAuthOptions &
+  AbortableNetworkOptions &
   RemoteTarget & {
     readonly patterns?: readonly string[];
   };
@@ -217,7 +224,7 @@ function selectRefs(
   return selected;
 }
 
-function resolveRemoteUrl(repo: Repository, options: LsRemoteOptions): string {
+function resolveRemoteUrl(repo: Repository | null, options: LsRemoteOptions): string {
   if (options.remote !== undefined && options.url !== undefined) {
     throw new GitError("EINVAL", "ls-remote accepts either remote or url, not both");
   }
@@ -226,6 +233,7 @@ function resolveRemoteUrl(repo: Repository, options: LsRemoteOptions): string {
       throw new GitError("EINVAL", "ls-remote url must be a string");
     return options.url;
   }
+  if (repo === null) throw new GitError("ENOTAREPO", "ls-remote remote name requires a repository");
   if (
     options.remote !== undefined &&
     (typeof options.remote !== "string" || options.remote === "")
@@ -273,6 +281,7 @@ async function discoverRefs(context: GitContext, url: string, options: LsRemoteO
   const auth = {
     ...(context.http === undefined ? {} : { http: context.http }),
     ...(options.headers === undefined ? {} : { headers: options.headers }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
     ...(onAuth === undefined
       ? {}
       : {
@@ -305,6 +314,7 @@ function isPublicDiscoveryError(error: unknown): boolean {
     error.code === "ECORRUPT" ||
     error.code === "E2BIG" ||
     error.code === "EAUTH" ||
+    error.code === "EABORTED" ||
     error.code === "EURLSCHEME"
   );
 }
@@ -312,10 +322,11 @@ function isPublicDiscoveryError(error: unknown): boolean {
 /** Read and project one validated upload-pack advertisement without repository mutation. */
 export async function lsRemote(
   context: GitContext,
-  repo: Repository,
+  repo: Repository | null,
   options: LsRemoteOptions = {},
 ): Promise<LsRemoteResult> {
   validateRemoteAuthOptions(options);
+  validateAbortableNetworkOptions(options);
   const patterns = compilePatterns(options.patterns);
   const url = resolveRemoteUrl(repo, options);
   const advertisement = await discoverRefs(context, url, options);

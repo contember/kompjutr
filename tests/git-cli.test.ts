@@ -150,6 +150,92 @@ describe("git argv grammar", () => {
     [["rebase", "--abort"], { kind: "rebase", action: "abort" }],
     [["merge", "--continue"], { kind: "merge", action: "continue" }],
     [["merge", "--abort"], { kind: "merge", action: "abort" }],
+    [["init"], { kind: "init" }],
+    [
+      ["init", "--bare", "--initial-branch=trunk", "repo"],
+      { kind: "init", bare: true, defaultBranch: "trunk", directory: "repo" },
+    ],
+    [
+      [
+        "clone",
+        "--depth",
+        "1",
+        "--single-branch",
+        "--no-tags",
+        "--branch",
+        "main",
+        "--origin=upstream",
+        "--filter=blob:none",
+        "https://example.test/repo.git",
+        "work",
+      ],
+      {
+        kind: "clone",
+        url: "https://example.test/repo.git",
+        directory: "work",
+        depth: 1,
+        singleBranch: true,
+        noTags: true,
+        ref: "main",
+        remote: "upstream",
+        filter: "blob:none",
+      },
+    ],
+    [["remote"], { kind: "remote", action: "list" }],
+    [["remote", "-v"], { kind: "remote", action: "list", verbose: true }],
+    [
+      ["remote", "add", "origin", "https://example.test/repo.git"],
+      {
+        kind: "remote",
+        action: "add",
+        name: "origin",
+        url: "https://example.test/repo.git",
+      },
+    ],
+    [["remote", "remove", "origin"], { kind: "remote", action: "remove", name: "origin" }],
+    [["remote", "get-url", "origin"], { kind: "remote", action: "get-url", name: "origin" }],
+    [
+      ["remote", "set-url", "origin", "https://example.test/next.git"],
+      { kind: "remote", action: "set-url", name: "origin", url: "https://example.test/next.git" },
+    ],
+    [
+      ["ls-remote", "origin", "main", "refs/tags/*"],
+      { kind: "ls-remote", target: "origin", patterns: ["main", "refs/tags/*"] },
+    ],
+    [
+      ["fetch", "--prune", "--tags", "origin", "main"],
+      { kind: "fetch", target: "origin", selector: "main", prune: true, tags: true },
+    ],
+    [
+      ["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"],
+      {
+        kind: "fetch",
+        target: "origin",
+        refspecs: [{ source: "refs/heads/*", destination: "refs/remotes/origin/*", force: true }],
+      },
+    ],
+    [
+      ["pull", "--ff-only", "origin", "main"],
+      { kind: "pull", remote: "origin", branch: "main", fastForwardOnly: true },
+    ],
+    [
+      [
+        "push",
+        "--atomic",
+        "--force-with-lease=main",
+        "--push-option=ci.skip",
+        "origin",
+        "+refs/heads/main:refs/heads/main",
+      ],
+      {
+        kind: "push",
+        target: "origin",
+        refspecs: [{ source: "refs/heads/main", destination: "refs/heads/main", force: true }],
+        atomic: true,
+        leases: [{ destination: "main", tracking: true }],
+        pushOptions: ["ci.skip"],
+      },
+    ],
   ])("accepts %j without a partial parse", (argv, expected) => {
     expect(parsed(argv)).toEqual(expected);
   });
@@ -209,6 +295,17 @@ describe("git argv grammar", () => {
     ["rebase extra", ["rebase", "--abort", "extra"]],
     ["merge start", ["merge", "main"]],
     ["merge optionless", ["merge"]],
+    ["clone without URL", ["clone", "--depth", "1"]],
+    ["clone unsupported scheme option", ["clone", "--mirror", "https://example.test/repo.git"]],
+    ["remote unsupported action", ["remote", "rename", "a", "b"]],
+    ["remote add fetch", ["remote", "add", "-f", "origin", "https://example.test/repo.git"]],
+    [
+      "fetch mixed mapped depth",
+      ["fetch", "--depth", "1", "origin", "refs/heads/main:refs/remotes/origin/main"],
+    ],
+    ["pull rebase", ["pull", "--rebase"]],
+    ["push unsupported tags", ["push", "--tags"]],
+    ["push bare lease", ["push", "--force-with-lease"]],
   ])("rejects %s", (_name, argv) => {
     expect(rejected(argv).exitCode).not.toBe(0);
   });
@@ -279,7 +376,7 @@ describe("git argv grammar", () => {
       });
     },
   );
-  it("pins unknown and network command framing", () => {
+  it("pins unknown command framing", () => {
     expect(rejected([])).toEqual({
       stdout: "",
       stderr: "git: no command specified\n",
@@ -292,28 +389,6 @@ describe("git argv grammar", () => {
       exitCode: 1,
       truncated: false,
     });
-    expect(rejected(["push"])).toEqual({
-      stdout: "",
-      stderr:
-        "fatal: No configured push destination.\n" +
-        "Either specify the URL from the command-line or configure a remote repository using\n" +
-        "\n" +
-        "    git remote add <name> <url>\n" +
-        "\n" +
-        "and then push using the remote name\n" +
-        "\n" +
-        "    git push <name>\n",
-      exitCode: 128,
-      truncated: false,
-    });
-    for (const command of ["fetch", "pull", "clone", "ls-remote"]) {
-      expect(rejected([command])).toEqual({
-        stdout: "",
-        stderr: `fatal: network command '${command}' is not supported\n`,
-        exitCode: 128,
-        truncated: false,
-      });
-    }
   });
   it.each([
     [
@@ -1037,6 +1112,27 @@ describe("git CLI result bounds and dispatch", () => {
       merge(_invocation, options) {
         return record("merge", options);
       },
+      init(_invocation, options) {
+        return record("init", options);
+      },
+      clone(_invocation, options) {
+        return record("clone", options);
+      },
+      remote(_invocation, options) {
+        return record("remote", options);
+      },
+      lsRemote(_invocation, options) {
+        return record("ls-remote", options);
+      },
+      fetch(_invocation, options) {
+        return record("fetch", options);
+      },
+      pull(_invocation, options) {
+        return record("pull", options);
+      },
+      push(_invocation, options) {
+        return record("push", options);
+      },
     });
     const commands = [
       ["status", "--porcelain"],
@@ -1056,6 +1152,13 @@ describe("git CLI result bounds and dispatch", () => {
       ["restore", "file"],
       ["rebase", "--abort"],
       ["merge", "--abort"],
+      ["init"],
+      ["clone", "https://example.test/repo.git"],
+      ["remote"],
+      ["ls-remote"],
+      ["fetch"],
+      ["pull"],
+      ["push"],
     ];
     const defaults = resolveGitCliRunOptions(undefined);
     for (const argv of commands) await runner.runCli({ argv });
@@ -1095,7 +1198,7 @@ describe("git CLI result bounds and dispatch", () => {
       ["commit", "-m"],
       ["rebase", "--onto", "main"],
       ["merge", "main"],
-      ["push"],
+      ["push", "--tags"],
       ["unknown"],
     ]) {
       await runner.runCli({ argv });
@@ -1147,7 +1250,7 @@ describe("git CLI result bounds and dispatch", () => {
     ]) {
       expect((await runner.runCli({ argv })).exitCode).toBe(129);
     }
-    expect((await runner.runCli({ argv: ["push"] })).exitCode).toBe(128);
+    expect((await runner.runCli({ argv: ["push", "--tags"] })).exitCode).toBe(129);
     expect((await runner.runCli({ argv: ["unknown"] })).exitCode).toBe(1);
     expect(calls).toBe(0);
   });
