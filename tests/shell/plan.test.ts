@@ -129,27 +129,71 @@ describe("R2 — find | xargs grep is one search", () => {
   });
 });
 
-describe("R4 — redirections become flags", () => {
-  it("recognises the stderr sink instead of buffering it", () => {
-    const pipeline = planOne("grep -r x . 2>/dev/null");
-    expect(pipeline.commands[0]?.stderr).toBe("drop");
+describe("R4 — redirections remain ordered descriptor bindings", () => {
+  it("retains the stderr sink operation", () => {
+    expect(planOne("grep -r x . 2>/dev/null").commands[0]?.redirections).toEqual([
+      {
+        kind: "write",
+        fd: 2,
+        path: { kind: "literal", value: "/dev/null" },
+        append: false,
+      },
+    ]);
   });
 
-  it("recognises the merge", () => {
-    expect(planOne("bun run build 2>&1").commands[0]?.stderr).toBe("merge");
+  it("retains descriptor duplication in both directions", () => {
+    expect(planOne("bun run build 2>&1").commands[0]?.redirections).toEqual([
+      { kind: "duplicate", fd: 2, targetFd: 1 },
+    ]);
+    expect(planOne("echo failed 1>&2").commands[0]?.redirections).toEqual([
+      { kind: "duplicate", fd: 1, targetFd: 2 },
+    ]);
   });
 
   it("carries a stdout file target", () => {
-    const target = planOne("echo hi > out.txt").commands[0]?.stdout;
-    expect(target?.append).toBe(false);
-    expect(target?.path).toEqual({ kind: "literal", value: "out.txt" });
-    expect(planOne("echo hi >> out.txt").commands[0]?.stdout?.append).toBe(true);
+    expect(planOne("echo hi > out.txt").commands[0]?.redirections).toEqual([
+      {
+        kind: "write",
+        fd: 1,
+        path: { kind: "literal", value: "out.txt" },
+        append: false,
+      },
+    ]);
+    expect(planOne("echo hi >> out.txt").commands[0]?.redirections).toEqual([
+      {
+        kind: "write",
+        fd: 1,
+        path: { kind: "literal", value: "out.txt" },
+        append: true,
+      },
+    ]);
+  });
+
+  it("does not collapse ordering-sensitive bindings", () => {
+    expect(planOne("echo out 1>&2 2>/dev/null").commands[0]?.redirections).toEqual([
+      { kind: "duplicate", fd: 1, targetFd: 2 },
+      {
+        kind: "write",
+        fd: 2,
+        path: { kind: "literal", value: "/dev/null" },
+        append: false,
+      },
+    ]);
+    expect(planOne("echo out 2>/dev/null 1>&2").commands[0]?.redirections).toEqual([
+      {
+        kind: "write",
+        fd: 2,
+        path: { kind: "literal", value: "/dev/null" },
+        append: false,
+      },
+      { kind: "duplicate", fd: 1, targetFd: 2 },
+    ]);
   });
 
   it("refuses a stderr redirection it cannot honour", () => {
     expect(rejects("ls 2> errors.log").construct).toBe("redirection");
     expect(rejects("ls 3> x").construct).toBe("redirection");
-    expect(rejects("ls 1>&2").construct).toBe("redirection");
+    expect(rejects("ls 1>&1").construct).toBe("redirection");
   });
 });
 

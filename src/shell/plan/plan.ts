@@ -26,12 +26,11 @@ import {
 } from "../parse/ast.js";
 import {
   type Argument,
-  type FileTarget,
   type Plan,
   type PlannedCommand,
   type PlannedPipeline,
+  type PlannedRedirection,
   type PlannedStep,
-  type StderrMode,
   traitsFor,
 } from "./types.js";
 
@@ -69,46 +68,25 @@ function planCommand(command: SimpleCommand): PlannedCommand {
     throw new ShellSyntaxError("command", "missing command name", 0);
   }
 
-  let stderr: StderrMode = "inherit";
-  let stdout: FileTarget | null = null;
-  let stdin: Argument | null = null;
-
-  for (const redirection of command.redirections) {
-    applyRedirection(redirection, {
-      setStderr: (mode) => {
-        stderr = mode;
-      },
-      setStdout: (target) => {
-        stdout = target;
-      },
-      setStdin: (target) => {
-        stdin = target;
-      },
-    });
-  }
-
   return {
     name: literalText(nameWord),
     args: argWords.map(toArgument),
-    stderr,
-    stdout,
-    stdin,
+    redirections: command.redirections.map(planRedirection),
   };
 }
 
-interface RedirectionSink {
-  setStderr(mode: StderrMode): void;
-  setStdout(target: FileTarget): void;
-  setStdin(target: Argument): void;
-}
-
-function applyRedirection(redirection: Redirection, sink: RedirectionSink): void {
+function planRedirection(redirection: Redirection): PlannedRedirection {
   if (redirection.op === ">&") {
-    // `2>&1` merges; `1>&2` is the mirror. Anything else names a descriptor
-    // this shell does not have.
-    if (redirection.fd === 2 && redirection.targetFd === 1) {
-      sink.setStderr("merge");
-      return;
+    if (
+      (redirection.fd === 1 || redirection.fd === 2) &&
+      (redirection.targetFd === 1 || redirection.targetFd === 2) &&
+      redirection.fd !== redirection.targetFd
+    ) {
+      return {
+        kind: "duplicate",
+        fd: redirection.fd,
+        targetFd: redirection.targetFd,
+      };
     }
     throw new ShellSyntaxError(
       "redirection",
@@ -120,8 +98,10 @@ function applyRedirection(redirection: Redirection, sink: RedirectionSink): void
   const target = toArgument(redirection.target);
 
   if (redirection.op === "<") {
-    sink.setStdin(target);
-    return;
+    if (redirection.fd !== 0) {
+      throw new ShellSyntaxError("redirection", `descriptor ${redirection.fd} is not supported`, 0);
+    }
+    return { kind: "read", fd: 0, path: target };
   }
 
   const append = redirection.op === ">>";
@@ -129,8 +109,7 @@ function applyRedirection(redirection: Redirection, sink: RedirectionSink): void
     // `2>/dev/null` is 145 of 614 corpus lines' worth of noise suppression.
     // Recognising the sink means never allocating the buffer at all.
     if (target.kind === "literal" && target.value === "/dev/null") {
-      sink.setStderr("drop");
-      return;
+      return { kind: "write", fd: 2, path: target, append };
     }
     throw new ShellSyntaxError(
       "redirection",
@@ -141,7 +120,7 @@ function applyRedirection(redirection: Redirection, sink: RedirectionSink): void
   if (redirection.fd !== 1) {
     throw new ShellSyntaxError("redirection", `descriptor ${redirection.fd} is not supported`, 0);
   }
-  sink.setStdout({ path: target, append });
+  return { kind: "write", fd: 1, path: target, append };
 }
 
 /**
@@ -168,7 +147,7 @@ function liftTrailingLimit(
   const last = commands[commands.length - 1];
   if (last === undefined || !traitsFor(last.name).limiter) return null;
   // A `head` that writes to a file or reads from one is not a pipeline stage.
-  if (last.stdout !== null || last.stdin !== null) return null;
+  if (hasOutputRedirection(last) || hasInputRedirection(last)) return null;
 
   const limit = headCount(last.args);
   if (limit === null) return null;
@@ -237,7 +216,8 @@ function fuseFindIntoSearch(
   const xargs = commands[1];
   if (find === undefined || xargs === undefined) return null;
   if (find.name !== "find" || xargs.name !== "xargs") return null;
-  if (find.stdout !== null || xargs.stdout !== null || xargs.stdin !== null) return null;
+  if (hasOutputRedirection(find) || hasOutputRedirection(xargs) || hasInputRedirection(xargs))
+    return null;
 
   const inner = xargsCommand(xargs.args);
   if (inner === null) return null;
@@ -262,9 +242,7 @@ function fuseFindIntoSearch(
   const search: PlannedCommand = {
     name: inner.name,
     args,
-    stderr: xargs.stderr,
-    stdout: null,
-    stdin: null,
+    redirections: xargs.redirections,
   };
 
   return {
@@ -320,6 +298,16 @@ function simpleFind(args: readonly Argument[]): { root: string; pattern: string 
 
 function literal(value: string): Argument {
   return { kind: "literal", value };
+}
+
+function hasInputRedirection(command: PlannedCommand): boolean {
+  return command.redirections.some((redirection) => redirection.kind === "read");
+}
+
+function hasOutputRedirection(command: PlannedCommand): boolean {
+  return command.redirections.some(
+    (redirection) => redirection.kind !== "read" && redirection.fd === 1,
+  );
 }
 
 /**

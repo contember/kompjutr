@@ -16,23 +16,22 @@ export type Argument =
   | { readonly kind: "literal"; readonly value: string }
   | { readonly kind: "glob"; readonly pattern: string };
 
-/** Where a stream goes. `merge` is `2>&1`; `drop` is `2>/dev/null`. */
-export type StderrMode = "inherit" | "drop" | "merge";
-
-export interface FileTarget {
-  readonly path: Argument;
-  readonly append: boolean;
-}
+/** One descriptor binding, retained in source order for left-to-right resolution. */
+export type PlannedRedirection =
+  | { readonly kind: "read"; readonly fd: 0; readonly path: Argument }
+  | {
+      readonly kind: "write";
+      readonly fd: 1 | 2;
+      readonly path: Argument;
+      readonly append: boolean;
+    }
+  | { readonly kind: "duplicate"; readonly fd: 1 | 2; readonly targetFd: 1 | 2 };
 
 export interface PlannedCommand {
   readonly name: string;
   /** Arguments after the name. */
   readonly args: readonly Argument[];
-  readonly stderr: StderrMode;
-  /** `> file` / `>> file`. Null means the stage's own stdout. */
-  readonly stdout: FileTarget | null;
-  /** `< file`. Null means the previous stage, or empty for the first. */
-  readonly stdin: Argument | null;
+  readonly redirections: readonly PlannedRedirection[];
 }
 
 export interface PlannedPipeline {

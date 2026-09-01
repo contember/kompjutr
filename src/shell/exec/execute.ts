@@ -130,6 +130,27 @@ interface PipelineResult {
   readonly truncated: boolean;
 }
 
+interface FileDestination {
+  readonly kind: "file";
+  readonly path: string;
+  readonly append: boolean;
+  opened: boolean;
+}
+
+type OutputDestination =
+  | { readonly kind: "output" }
+  | { readonly kind: "diagnostic" }
+  | { readonly kind: "drop" }
+  | FileDestination;
+
+interface ResolvedRedirections {
+  readonly stdin: string | null;
+  readonly output: OutputDestination;
+  readonly stdout: OutputDestination;
+  readonly stderr: OutputDestination;
+  readonly files: readonly FileDestination[];
+}
+
 async function runPipeline(
   pipeline: PlannedPipeline,
   env: PipelineEnvironment,
@@ -154,7 +175,20 @@ async function runPipeline(
       const expanded = expandArguments(planned.args, env.fs, env.cwd);
       const argv = expanded.argv;
 
-      if (planned.stdin !== null) {
+      let redirections: ResolvedRedirections;
+      try {
+        redirections = resolveRedirections(planned, env.fs, env.cwd);
+        await openRedirectionFiles(redirections, env.fs);
+      } catch (error) {
+        expanded.release();
+        if (isFilesystemError(error)) {
+          env.errors.writeBytes(line(`${planned.name}: ${error.message}`));
+          return { exitCode: 1, truncated: results.some(commandResultTruncated) };
+        }
+        throw error;
+      }
+
+      if (redirections.stdin !== null) {
         const priorInput = stream;
         stream = null;
         let priorClosed = false;
@@ -164,9 +198,8 @@ async function runPipeline(
           await close(priorInput);
         };
         try {
-          const path = resolve(env.cwd, single(planned.stdin, env.fs, env.cwd));
           await closePrior();
-          stream = readWholeFile(env.fs, path);
+          stream = readWholeFile(env.fs, redirections.stdin);
         } catch (error) {
           try {
             await closePrior();
@@ -177,22 +210,23 @@ async function runPipeline(
         }
       }
 
-      const mergedErrors: HeldChunk[] = [];
+      const routedDiagnostics = new Map<OutputDestination, HeldChunk[]>();
       const stageInput = stream;
       const context = commandContext(
         planned,
+        redirections,
         index === pipeline.commands.length - 1,
         argv,
         stageInput,
         pipeline.limitHint,
         env,
-        mergedErrors,
+        routedDiagnostics,
       );
       let produced: CommandResult;
       try {
         produced = await command(context);
       } catch (error) {
-        rethrowAfterCommandCleanup(error, expanded, mergedErrors);
+        rethrowAfterCommandCleanup(error, expanded, routedDiagnostics);
       }
       const releaseStage = isAsyncByteStreamOrNull(stageInput)
         ? async (): Promise<void> => {
@@ -211,38 +245,22 @@ async function runPipeline(
           };
       const output = stageOutput(
         produced.stdout,
-        mergedErrors,
+        diagnosticsFor(routedDiagnostics, redirections.stdout),
         releaseStage,
         isAsyncByteStreamOrNull(stageInput),
       );
       results.push(produced);
-      if (planned.stdout === null) {
-        stream = output;
-      } else {
-        let target: string;
-        try {
-          target = resolve(env.cwd, single(planned.stdout.path, env.fs, env.cwd));
-        } catch (error) {
-          await close(output);
-          throw error;
+      try {
+        stream = await routeStageOutput(output, redirections, routedDiagnostics, env);
+      } catch (error) {
+        await close(output);
+        releaseDiagnostics(routedDiagnostics);
+        if (error instanceof UpstreamError) throw error.original;
+        if (isFilesystemError(error)) {
+          env.errors.writeBytes(line(`${planned.name}: ${error.message}`));
+          return { exitCode: 1, truncated: results.some(commandResultTruncated) };
         }
-        try {
-          await writeStream(env.fs, target, planned.stdout.append, protectUpstream(output));
-        } catch (error) {
-          await close(output);
-          if (error instanceof UpstreamError) throw error.original;
-          if (
-            error instanceof Error &&
-            "code" in error &&
-            typeof error.code === "string" &&
-            error.code.startsWith("E")
-          ) {
-            env.errors.writeBytes(line(`${planned.name}: ${error.message}`));
-            return { exitCode: 1, truncated: results.some(commandResultTruncated) };
-          }
-          throw error;
-        }
-        stream = empty();
+        throw error;
       }
     }
 
@@ -465,24 +483,172 @@ function protectUpstream(stream: ByteStream): ByteStream {
   })();
 }
 
+function resolveRedirections(
+  planned: PlannedCommand,
+  fs: BoundedFs,
+  cwd: string,
+): ResolvedRedirections {
+  const output: OutputDestination = { kind: "output" };
+  const diagnostic: OutputDestination = { kind: "diagnostic" };
+  let stdin: string | null = null;
+  let stdout: OutputDestination = output;
+  let stderr: OutputDestination = diagnostic;
+  const files: FileDestination[] = [];
+
+  for (const redirection of planned.redirections) {
+    if (redirection.kind === "read") {
+      stdin = resolve(cwd, single(redirection.path, fs, cwd));
+      continue;
+    }
+    if (redirection.kind === "duplicate") {
+      const destination: OutputDestination = redirection.targetFd === 1 ? stdout : stderr;
+      if (redirection.fd === 1) stdout = destination;
+      else stderr = destination;
+      continue;
+    }
+    const path = resolve(cwd, single(redirection.path, fs, cwd));
+    const destination: OutputDestination =
+      path === "/dev/null"
+        ? { kind: "drop" }
+        : {
+            kind: "file",
+            path,
+            append: redirection.append,
+            opened: false,
+          };
+    if (destination.kind === "file") files.push(destination);
+    if (redirection.fd === 1) stdout = destination;
+    else stderr = destination;
+  }
+
+  return { stdin, output, stdout, stderr, files };
+}
+
+async function openRedirectionFiles(
+  redirections: ResolvedRedirections,
+  fs: BoundedFs,
+): Promise<void> {
+  const deferred =
+    redirections.stdout.kind === "file"
+      ? redirections.files[redirections.files.length - 1]
+      : undefined;
+  for (const file of redirections.files) {
+    if (file === deferred) continue;
+    await writeStream(fs, file.path, file.append, empty());
+    file.opened = true;
+  }
+}
+
+async function routeStageOutput(
+  stdout: ByteStream,
+  redirections: ResolvedRedirections,
+  diagnostics: Map<OutputDestination, HeldChunk[]>,
+  env: PipelineEnvironment,
+): Promise<ByteStream> {
+  if (redirections.stdout.kind === "output") {
+    const sideFiles = activeSideFiles(redirections);
+    if (sideFiles.length === 0) return stdout;
+    return outputWithSideFiles(stdout, sideFiles, diagnostics, env.fs);
+  }
+
+  if (redirections.stdout.kind === "diagnostic") {
+    await env.errors.write(stdout);
+  } else if (redirections.stdout.kind === "drop") {
+    await drain(stdout);
+  } else {
+    await writeStream(
+      env.fs,
+      redirections.stdout.path,
+      redirections.stdout.append || redirections.stdout.opened,
+      protectUpstream(stdout),
+    );
+    redirections.stdout.opened = true;
+  }
+
+  await flushSideFiles(activeSideFiles(redirections), diagnostics, env.fs);
+  const pipelineDiagnostics = diagnosticsFor(diagnostics, redirections.output);
+  releaseDiagnostics(diagnostics, pipelineDiagnostics);
+  return stageOutput(empty(), pipelineDiagnostics, () => {}, false);
+}
+
+function activeSideFiles(redirections: ResolvedRedirections): FileDestination[] {
+  if (redirections.stderr.kind !== "file" || redirections.stderr === redirections.stdout) return [];
+  return [redirections.stderr];
+}
+
+function outputWithSideFiles(
+  stdout: ByteStream,
+  files: readonly FileDestination[],
+  diagnostics: Map<OutputDestination, HeldChunk[]>,
+  fs: BoundedFs,
+): ByteStream {
+  return (async function* (): ByteStream {
+    try {
+      for await (const chunk of stdout) yield chunk;
+    } finally {
+      try {
+        await close(stdout);
+        await flushSideFiles(files, diagnostics, fs);
+      } finally {
+        releaseDiagnostics(diagnostics);
+      }
+    }
+  })();
+}
+
+async function flushSideFiles(
+  files: readonly FileDestination[],
+  diagnostics: Map<OutputDestination, HeldChunk[]>,
+  fs: BoundedFs,
+): Promise<void> {
+  for (const file of files) {
+    const chunks = diagnosticsFor(diagnostics, file);
+    if (chunks.length === 0) continue;
+    await writeStream(
+      fs,
+      file.path,
+      true,
+      stageOutput(empty(), chunks, () => {}, false),
+    );
+  }
+}
+
+async function drain(stream: ByteStream): Promise<void> {
+  for await (const _chunk of stream) {
+    // Pull to completion so lazy status and cleanup settle.
+  }
+}
+
+function isFilesystemError(error: unknown): error is Error & { readonly code: string } {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    error.code.startsWith("E")
+  );
+}
+
 function commandContext(
   planned: PlannedCommand,
+  redirections: ResolvedRedirections,
   lastStage: boolean,
   argv: readonly string[],
   stdin: ByteStream | null,
   limitHint: number | null,
   env: PipelineEnvironment,
-  mergedErrors: HeldChunk[],
+  routedDiagnostics: Map<OutputDestination, HeldChunk[]>,
 ): CommandContext {
-  const output = commandOutput(planned, lastStage, env);
+  const output = commandOutput(redirections, lastStage, env);
   const diagnostic = (bytes: Uint8Array): void => {
-    if (planned.stderr === "drop" || bytes.length === 0) return;
-    if (planned.stderr === "merge") {
-      mergedErrors.push({
+    if (bytes.length === 0 || redirections.stderr.kind === "drop") return;
+    if (redirections.stderr.kind === "diagnostic") {
+      env.errors.writeBytes(bytes);
+    } else {
+      diagnosticsFor(routedDiagnostics, redirections.stderr).push({
         bytes,
-        release: env.fs.retained.retain(bytes.length, "merged stderr"),
+        release: env.fs.retained.retain(bytes.length, "routed diagnostic"),
       });
-    } else env.errors.writeBytes(bytes);
+    }
   };
   const context: CommandContext = {
     fs: env.fs,
@@ -494,7 +660,7 @@ function commandContext(
     output,
     diagnostic,
     warn: (message: string) => {
-      if (planned.stderr === "drop") return;
+      if (redirections.stderr.kind === "drop") return;
       const bytes = line(`${planned.name}: ${message}`);
       diagnostic(bytes);
     },
@@ -511,22 +677,24 @@ function commandContext(
 }
 
 function commandOutput(
-  planned: PlannedCommand,
+  redirections: ResolvedRedirections,
   lastStage: boolean,
   env: PipelineEnvironment,
 ): CommandContext["output"] {
-  const destination = planned.stdout !== null ? "redirect" : lastStage ? "terminal" : "pipeline";
-  const destinationBytes = destination === "terminal" ? env.out.remaining : Number.MAX_SAFE_INTEGER;
-  const maxStdoutBytes = Math.min(destinationBytes, env.fs.retained.available);
-  const discardStderr = planned.stderr === "drop";
-  const maxStderrBytes = discardStderr
-    ? 0
-    : planned.stderr === "merge"
-      ? maxStdoutBytes
-      : env.errors.remaining;
+  const destination =
+    redirections.stdout.kind === "output"
+      ? lastStage
+        ? "terminal"
+        : "pipeline"
+      : redirections.stdout.kind === "diagnostic"
+        ? "terminal"
+        : "redirect";
+  const maxStdoutBytes = destinationLimit(redirections.stdout, lastStage, env);
+  const maxStderrBytes = destinationLimit(redirections.stderr, lastStage, env);
+  const discardStderr = redirections.stderr.kind === "drop";
   const maxCombinedOutputBytes =
-    discardStderr || planned.stderr === "merge"
-      ? maxStdoutBytes
+    redirections.stdout === redirections.stderr
+      ? Math.max(maxStdoutBytes, maxStderrBytes)
       : safeSum(maxStdoutBytes, maxStderrBytes);
   return {
     destination,
@@ -535,6 +703,21 @@ function commandOutput(
     maxCombinedOutputBytes,
     discardStderr,
   };
+}
+
+function destinationLimit(
+  destination: OutputDestination,
+  lastStage: boolean,
+  env: PipelineEnvironment,
+): number {
+  if (destination.kind === "drop") return 0;
+  const available =
+    destination.kind === "diagnostic"
+      ? env.errors.remaining
+      : destination.kind === "output" && lastStage
+        ? env.out.remaining
+        : Number.MAX_SAFE_INTEGER;
+  return Math.min(available, env.fs.retained.available);
 }
 
 function safeSum(left: number, right: number): number {
@@ -546,23 +729,44 @@ interface HeldChunk {
   release(): void;
 }
 
+function diagnosticsFor(
+  diagnostics: Map<OutputDestination, HeldChunk[]>,
+  destination: OutputDestination,
+): HeldChunk[] {
+  const existing = diagnostics.get(destination);
+  if (existing !== undefined) return existing;
+  const created: HeldChunk[] = [];
+  diagnostics.set(destination, created);
+  return created;
+}
+
+function releaseDiagnostics(
+  diagnostics: Map<OutputDestination, HeldChunk[]>,
+  except?: HeldChunk[],
+): void {
+  for (const chunks of diagnostics.values()) {
+    if (chunks === except) continue;
+    for (const chunk of chunks) chunk.release();
+  }
+}
+
 function rethrowAfterCommandCleanup(
   error: unknown,
   expanded: ExpandedArguments,
-  mergedErrors: HeldChunk[],
+  diagnostics: Map<OutputDestination, HeldChunk[]>,
 ): never {
   try {
     expanded.release();
   } catch {
     // Cleanup must not replace the command's observable failure.
   }
-  for (;;) {
-    const held = mergedErrors.pop();
-    if (held === undefined) break;
-    try {
-      held.release();
-    } catch {
-      // Keep releasing later owners, then rethrow the command failure.
+  for (const chunks of diagnostics.values()) {
+    for (const held of chunks) {
+      try {
+        held.release();
+      } catch {
+        // Keep releasing later owners, then rethrow the command failure.
+      }
     }
   }
   throw error;
