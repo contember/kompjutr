@@ -86,7 +86,7 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
     matched = true;
   };
 
-  const stream = (function* (): ByteStream {
+  const stream = (async function* (): ByteStream {
     const includeMatchers = request.include.map(compileIncludeGlob);
     const excludeMatchers = request.exclude.map(compileIncludeGlob);
     // Whether a name is printed follows what is *searched*, not what was
@@ -110,7 +110,7 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
         try {
           const bytes = fs.readFile(root);
           // Named on the command line: searched whatever it holds.
-          yield* emit(
+          for await (const chunk of emit(
             root,
             bytes,
             request,
@@ -118,7 +118,9 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
             noteMatch,
             "report",
             fs.retained,
-          );
+          )) {
+            yield chunk;
+          }
         } finally {
           release();
         }
@@ -141,7 +143,7 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
           yield encode(`${file.path}\n`);
           continue;
         }
-        yield* emit(
+        for await (const chunk of emit(
           file.path,
           file.bytes,
           request,
@@ -149,7 +151,9 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
           noteMatch,
           request.walkedBinaries,
           fs.retained,
-        );
+        )) {
+          yield chunk;
+        }
       }
     }
   })();
@@ -350,7 +354,7 @@ function accepted(
 }
 
 /** One file's contribution to the output. */
-function* emit(
+async function* emit(
   path: string,
   bytes: Uint8Array,
   request: SearchRequest,
@@ -358,7 +362,7 @@ function* emit(
   noteMatch: () => void,
   binary: "report" | "skip",
   retained: BoundedFs["retained"],
-): Generator<Uint8Array, void, undefined> {
+): AsyncGenerator<Uint8Array, void, undefined> {
   // Only the line-printing mode substitutes a notice for the content. Both
   // real greps count and list a binary file exactly as they would a text
   // one — `-l` names it and `-c` counts it — because neither answer would
@@ -367,7 +371,7 @@ function* emit(
     const nul = firstNul(bytes);
     if (nul >= 0) {
       if (binary === "skip") return;
-      if (!matchesAnywhere(bytes, request, retained)) return;
+      if (!(await matchesAnywhere(bytes, request, retained))) return;
       noteMatch();
       const notice = request.reportBinary(path, nul, withFilename);
       if (notice !== null) yield notice;
@@ -376,7 +380,7 @@ function* emit(
   }
 
   if (request.mode === "files" || request.mode === "files-without-match") {
-    const hit = matchesAnywhere(bytes, request, retained);
+    const hit = await matchesAnywhere(bytes, request, retained);
     // `-L` still exits 0 when the pattern was found: it changes which files
     // are named, not what counts as a match.
     if (hit) noteMatch();
@@ -384,7 +388,8 @@ function* emit(
     return;
   }
 
-  const all = [...lines(chunk(bytes))];
+  const all: Uint8Array[] = [];
+  for await (const text of lines(chunk(bytes))) all.push(text);
   const hits = new Set<number>();
   for (let index = 0; index < all.length; index++) {
     const text = all[index];
@@ -442,12 +447,12 @@ function render(
   return out;
 }
 
-function matchesAnywhere(
+async function matchesAnywhere(
   bytes: Uint8Array,
   request: SearchRequest,
   retained: BoundedFs["retained"],
-): boolean {
-  for (const text of lines(chunk(bytes))) {
+): Promise<boolean> {
+  for await (const text of lines(chunk(bytes))) {
     if (test(text, request, retained)) return true;
   }
   return false;

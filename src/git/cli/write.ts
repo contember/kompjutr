@@ -67,7 +67,7 @@ interface RootSummaryRow {
 
 export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
   return {
-    add(invocation, options) {
+    async add(invocation, options) {
       const output = outputContext(options);
       return withRepository(context, invocation.cwd, options, (repo) => {
         let paths: ResolvedAddPath[] = [];
@@ -91,7 +91,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         );
       });
     },
-    commit(invocation, options) {
+    async commit(invocation, options) {
       return withRepository(context, invocation.cwd, options, (repo) =>
         runMutation(
           repo,
@@ -120,7 +120,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         ),
       );
     },
-    rebase(invocation, options) {
+    async rebase(invocation, options) {
       return withRepository(context, invocation.cwd, options, (repo) => {
         requireTransactionalWorktree(context, repo);
         if (invocation.command.action === "abort") {

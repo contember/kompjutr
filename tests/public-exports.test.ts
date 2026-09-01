@@ -257,7 +257,6 @@ describe("public object-write plumbing exports", () => {
       "withScratchIndex",
     ];
     const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
-
     expect([
       gitCoreRead.tree,
       gitRead.dir,
@@ -298,7 +297,6 @@ describe("public object-write plumbing exports", () => {
       rootCommitTree,
     ]);
   });
-
   it("exposes matching scratch snapshot replay contracts", () => {
     const coreOptions: RootCoreReplaySnapshotOptions = { snapshot: "checkpoint", onto: "HEAD" };
     const gitCoreOptions: GitCoreReplaySnapshotOptions = coreOptions;
@@ -317,7 +315,6 @@ describe("public object-write plumbing exports", () => {
     const gitResult: GitCoreReplaySnapshotResult = result;
     const methods: readonly (keyof RootScratchIndex)[] = ["replaySnapshot"];
     const gitMethods: readonly (keyof GitScratchIndex)[] = methods;
-
     expect([
       gitCoreOptions.snapshot,
       gitScratchOptions.onto,
@@ -328,7 +325,6 @@ describe("public object-write plumbing exports", () => {
     ]).toEqual(["checkpoint", "HEAD", 2, "conflicted", methods, rootReplaySnapshot]);
   });
 });
-
 describe("public bounded read exports", () => {
   it("exposes matching branch-rename and ls-files facade contracts", () => {
     const rootRename: RootBranchRenameOptions = {
@@ -345,7 +341,6 @@ describe("public bounded read exports", () => {
     const gitLsFiles: GitLsFilesOptions = rootLsFiles;
     const rootMethods: readonly (keyof RootGit)[] = ["branchRename", "lsFiles"];
     const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
-
     expect([
       gitRename.oldName,
       gitRename.newName,
@@ -354,7 +349,6 @@ describe("public bounded read exports", () => {
       gitMethods,
     ]).toEqual(["main", "primary", "HEAD", ["src/*.ts"], rootMethods]);
   });
-
   it("exposes matching divergence and raw-ref operations from both entrypoints", () => {
     const coreDivergence: RootCoreDivergenceOptions = { current: "HEAD", upstream: "main" };
     const gitCoreDivergence: GitCoreDivergenceOptions = coreDivergence;
@@ -364,7 +358,6 @@ describe("public bounded read exports", () => {
     const gitRelationship: GitDivergenceRelationship = relationship;
     const result: RootDivergenceResult = { relationship, ahead: 3, behind: 2 };
     const gitResult: GitDivergenceResult = result;
-
     const coreRead: RootCoreReadRefOptions = { ref: "refs/remotes/origin/HEAD" };
     const gitCoreRead: GitCoreReadRefOptions = coreRead;
     const read: RootGitReadRefOptions = { ...coreRead, dir: "/repo" };
@@ -380,7 +373,6 @@ describe("public bounded read exports", () => {
     const gitResolved: GitRevisionResolution = resolved;
     const rootMethods: readonly (keyof RootGit)[] = ["revParse", "tryRevParse"];
     const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
-
     expect([
       gitCoreDivergence.current,
       gitOptions.dir,
@@ -413,7 +405,6 @@ describe("public bounded read exports", () => {
       rootReadRef,
     ]);
   });
-
   it("exposes matching merge-base and recursive tree types from both entrypoints", () => {
     const coreMergeBase: RootCoreMergeBaseOptions = { current: "HEAD", incoming: "main" };
     const gitCoreMergeBase: GitCoreMergeBaseOptions = coreMergeBase;
@@ -434,7 +425,6 @@ describe("public bounded read exports", () => {
     const gitLsTreeOptions: GitLsTreeOptions = lsTreeOptions;
     const rootMethods: readonly (keyof RootGit)[] = ["mergeBase", "lsTree"];
     const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
-
     expect([
       gitCoreMergeBase.current,
       gitMergeBaseOptions.dir,
@@ -456,7 +446,6 @@ describe("public bounded read exports", () => {
     ]);
   });
 });
-
 describe("public guarded ref exports", () => {
   it("exposes matching write, guarded, delete, and facade unions", () => {
     const write: RootCoreUpdateRefWriteOptions = {
@@ -484,7 +473,6 @@ describe("public guarded ref exports", () => {
     const gitFacade: GitUpdateRefOptions = facade;
     const rootMethods: readonly (keyof RootGit)[] = ["updateRef"];
     const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
-
     expect([
       gitWrite.symbolic,
       gitGuarded.expected,
@@ -504,12 +492,10 @@ describe("public guarded ref exports", () => {
     ]);
   });
 });
-
 describe("public status formatting exports", () => {
   it("exposes matching options and configuration resolvers from both entrypoints", () => {
     const options: RootStatusFormatOptions = { quotePath: false, zeroTerminate: true };
     const gitOptions: GitStatusFormatOptions = options;
-
     expect([gitOptions.quotePath, gitOptions.zeroTerminate, gitStatusFormatOptions]).toEqual([
       false,
       true,
@@ -517,7 +503,6 @@ describe("public status formatting exports", () => {
     ]);
   });
 });
-
 describe("public worktree lifecycle exports", () => {
   it("exposes matching core operations, public options, results, and Git methods", () => {
     const target: RootWorktreeAddTarget = {
@@ -549,7 +534,6 @@ describe("public worktree lifecycle exports", () => {
       "worktreePrune",
     ];
     const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
-
     expect([
       gitTarget.kind,
       gitCoreAdd.root,
@@ -585,7 +569,6 @@ describe("public worktree lifecycle exports", () => {
     ]);
   });
 });
-
 describe("public reflog exports", () => {
   it("exposes matching listing and recovery types from both entrypoints", () => {
     const endpoint: RootRefLogEndpoint = "old";
@@ -618,7 +601,6 @@ describe("public reflog exports", () => {
       reason: "commit (initial)",
     };
     const gitEntry: GitRefLogEntry = entry;
-
     expect([
       gitEndpoint,
       gitSource.ordinal,
@@ -628,7 +610,6 @@ describe("public reflog exports", () => {
     ]).toEqual(["old", 7, 100, "refs/heads/main", "1".repeat(40)]);
   });
 });
-
 interface ReplayMethods {
   cherryPick(input: RootCherryPickOptions): Promise<RootReplayResult>;
   cherryPickContinue(input?: RootCherryPickContinueOptions): Promise<RootReplayResult>;
@@ -643,7 +624,6 @@ interface ReplayMethods {
   rebaseSkip(input?: RootRebaseContinueOptions): Promise<RootRebaseResult>;
   rebaseAbort(input?: { dir?: string }): Promise<void>;
 }
-
 function rootReplayMethods(git: RootGit): ReplayMethods {
   return {
     cherryPick: git.cherryPick,
@@ -660,7 +640,6 @@ function rootReplayMethods(git: RootGit): ReplayMethods {
     rebaseAbort: git.rebaseAbort,
   };
 }
-
 function gitEntrypointReplayMethods(git: GitEntrypointGit): ReplayMethods {
   return {
     cherryPick: git.cherryPick,
@@ -677,7 +656,6 @@ function gitEntrypointReplayMethods(git: GitEntrypointGit): ReplayMethods {
     rebaseAbort: git.rebaseAbort,
   };
 }
-
 describe("public replay exports", () => {
   it("exposes matching types from the root and git source entrypoints", () => {
     const rootCherryPick: RootCherryPickOptions = { source: "HEAD", dir: "/repo" };
@@ -702,7 +680,6 @@ describe("public replay exports", () => {
       skipped: 0,
     };
     const gitRebaseResult: GitRebaseResult = rootRebaseResult;
-
     expect([
       gitCherryPick.source,
       gitCherryContinue.message,
@@ -727,7 +704,6 @@ describe("public replay exports", () => {
     expect([rootReplayMethods, gitEntrypointReplayMethods]).toHaveLength(2);
   });
 });
-
 describe("public status exports", () => {
   it("exposes matching native option and report types from both entrypoints", () => {
     const rootOptions: RootStatusOptions = {
@@ -755,7 +731,6 @@ describe("public status exports", () => {
     const gitReport: GitEntrypointStatusReport = rootReport;
     const rootCore: RootCoreStatusReport = { entries: [], branch: rootReport.branch };
     const gitCore: GitCoreStatusReport = rootCore;
-
     expect([
       gitOptions.dir,
       gitOptions.renames,
@@ -765,7 +740,6 @@ describe("public status exports", () => {
     ]).toEqual(["/repo", true, true, "old.txt", "main"]);
   });
 });
-
 describe("public structured refspec exports", () => {
   it("exposes native cancellation, deepening, unshallow, and lease contracts", () => {
     const signal = new AbortController().signal;
@@ -787,7 +761,6 @@ describe("public structured refspec exports", () => {
       ...abortable,
     };
     const push: GitPushOptions = corePush;
-
     expect([
       clone.signal,
       deepen.deepen,
@@ -796,7 +769,6 @@ describe("public structured refspec exports", () => {
       push.leases?.main,
     ]).toEqual([signal, 3, true, signal, lease]);
   });
-
   it("exposes matching frozen mapping, result, target, and limit types", () => {
     const fetch: RootFetchRefspec = {
       source: "refs/heads/*",
@@ -886,7 +858,6 @@ describe("public structured refspec exports", () => {
       pushResult;
     const rootPushMethod: RootGit["push"] = pushMethod;
     const gitPushMethod: GitEntrypointGit["push"] = rootPushMethod;
-
     expect([
       gitFetch.destination,
       fetchOptions.url,
@@ -933,18 +904,17 @@ describe("public structured refspec exports", () => {
       "not-applicable",
       true,
       "function",
-      1_024,
-      1_024,
-      1_024,
-      1_024,
-      1_024,
-      16_384,
-      1_024,
-      16_384,
+      1024,
+      1024,
+      1024,
+      1024,
+      1024,
+      16384,
+      1024,
+      16384,
     ]);
   });
 });
-
 describe("retired fixed policy exports", () => {
   it("does not expose retired fixed ref and config policies", async () => {
     const [gitEntrypoint, rootEntrypoint] = await Promise.all([
@@ -962,7 +932,6 @@ describe("retired fixed policy exports", () => {
     }
   });
 });
-
 describe("public remote URL exports", () => {
   it("exposes matching typed get and set options from both entrypoints", () => {
     const rootGet: RootRemoteGetUrlOptions = { dir: "/repo", name: "origin" };
@@ -975,7 +944,6 @@ describe("public remote URL exports", () => {
     const gitSet: GitRemoteSetUrlOptions = rootSet;
     const rootMethods: readonly (keyof RootGit)[] = ["remoteGetUrl", "remoteSetUrl"];
     const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
-
     expect([gitGet.name, gitSet.url, gitMethods]).toEqual([
       "origin",
       "https://example.test/repo.git",
@@ -983,25 +951,28 @@ describe("public remote URL exports", () => {
     ]);
   });
 });
-
 describe("public Git CLI exports", () => {
-  it("exposes one runner contract and the explicit shell adapter subpath", () => {
+  it("exposes one runner contract and the explicit shell adapter subpath", async () => {
     const rootInput: RootGitCliInput = { argv: ["status", "--porcelain"], cwd: "/repo" };
     const gitInput: GitEntrypointCliInput = rootInput;
     const rootOptions: RootGitCliRunOptions = { logLimitHint: 3 };
     const gitOptions: GitEntrypointCliRunOptions = rootOptions;
-    const rootResult: RootGitCliResult = { stdout: "", stderr: "", exitCode: 0 };
+    const rootResult: RootGitCliResult = {
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      truncated: false,
+    };
     const gitResult: GitEntrypointCliResult = rootResult;
     const rootRunner: RootGitCliRunner = {
-      runCli(input, options) {
+      async runCli(input, options) {
         expect(input).toBe(rootInput);
         expect(options).toBe(rootOptions);
         return rootResult;
       },
     };
     const gitRunner: GitEntrypointCliRunner = rootRunner;
-
-    expect(gitRunner.runCli(gitInput, gitOptions)).toBe(gitResult);
+    expect(await gitRunner.runCli(gitInput, gitOptions)).toBe(gitResult);
     expect(typeof createGitCommand).toBe("function");
   });
 });

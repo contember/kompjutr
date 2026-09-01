@@ -48,9 +48,9 @@ export interface RunResult {
 
 export interface Shell {
   /** Run one command line. Text in, text out. */
-  run(source: string, options?: ShellRunOptions): RunResult;
+  run(source: string, options?: ShellRunOptions): Promise<RunResult>;
   /** Run one command line, keeping stdout as bytes. */
-  exec(source: string, options?: ShellRunOptions): ExecResult;
+  exec(source: string, options?: ShellRunOptions): Promise<ExecResult>;
   cwd(): string;
 }
 
@@ -64,7 +64,7 @@ export function createShell(options: ShellOptions): Shell {
     for (const [name, command] of options.commands) commands.set(name, command);
   }
 
-  const exec = (source: string, runOptions?: ShellRunOptions): ExecResult => {
+  const exec = async (source: string, runOptions?: ShellRunOptions): Promise<ExecResult> => {
     const before = session.cwd();
     let plan: ReturnType<typeof planScript>;
     try {
@@ -87,7 +87,7 @@ export function createShell(options: ShellOptions): Shell {
       throw error;
     }
 
-    const outcome = execute(plan, {
+    const outcome = await execute(plan, {
       fs: options.fs,
       cwd: before,
       commands,
@@ -101,8 +101,8 @@ export function createShell(options: ShellOptions): Shell {
 
   return {
     exec,
-    run: (source: string, runOptions?: ShellRunOptions): RunResult => {
-      const outcome = exec(source, runOptions);
+    run: async (source: string, runOptions?: ShellRunOptions): Promise<RunResult> => {
+      const outcome = await exec(source, runOptions);
       return {
         stdout: decode(outcome.stdout),
         stderr: decode(outcome.stderr),
@@ -117,6 +117,7 @@ export function createShell(options: ShellOptions): Shell {
   };
 }
 
+export type { ByteStream } from "./exec/bytes.js";
 export type { CommandContext, CommandResult } from "./exec/context.js";
 export type { Command, ExecResult, Limits };
 export { DEFAULT_LIMITS, ShellSyntaxError };

@@ -45,8 +45,8 @@ function seed({ harness, count, variant }: ScenarioContext): void {
 }
 
 /** Run a line and refuse to record a measurement of nothing. */
-function run(source: string, expect: "output" | "silent" = "output"): void {
-  const outcome = current().run(source);
+async function run(source: string, expect: "output" | "silent" = "output"): Promise<void> {
+  const outcome = await current().run(source);
   if (expect === "output" && outcome.stdout === "") {
     throw new Error(`${source}: produced no output, so the measurement is empty`);
   }
@@ -66,7 +66,7 @@ function scenario(name: string, source: string, expect: "output" | "silent" = "o
       {
         name,
         async run() {
-          run(source, expect);
+          await run(source, expect);
         },
       },
     ],

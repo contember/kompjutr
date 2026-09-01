@@ -1,12 +1,9 @@
 // The acceptance test for the whole experiment: a real Computer Workspace
 // configured with `createSqliteGitClient()`, driven only through
 // `workspace.git`, with no Computer fork anywhere.
-
 import { join } from "node:path";
-
 import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
-
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
 import {
   Database,
@@ -41,13 +38,11 @@ import {
 
 const IDENTITY = { name: "Agent", email: "agent@example.com" };
 const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
-
 class CodedTooBigStorage implements DurableObjectStorageLike {
   readonly sql: SQLStorageLike;
   #queryFragment: string | null = null;
   #binding: unknown;
   writesBeforeFailure = 0;
-
   constructor(private readonly inner: SqliteTestStorage) {
     this.sql = {
       exec: <Row extends object>(query: string, ...bindings: unknown[]): SQLCursorLike<Row> => {
@@ -68,19 +63,16 @@ class CodedTooBigStorage implements DurableObjectStorageLike {
       },
     };
   }
-
   arm(queryFragment: string, binding: unknown): void {
     this.#queryFragment = queryFragment;
     this.#binding = binding;
     this.writesBeforeFailure = 0;
   }
-
   transactionSync<T>(closure: () => T): T {
     return this.inner.transactionSync(closure);
   }
 }
-
-function makeWorkspace(now = 1_600_000_000_000): {
+function makeWorkspace(now = 1600000000000): {
   workspace: Workspace;
   storage: SqliteTestStorage;
 } {
@@ -92,16 +84,16 @@ function makeWorkspace(now = 1_600_000_000_000): {
   });
   return { workspace, storage };
 }
-
-function makeNativeGit(): { git: Git; workspace: TestWorkspace } {
+function makeNativeGit(): {
+  git: Git;
+  workspace: TestWorkspace;
+} {
   const workspace = makeTestWorkspace();
   return { git: bindNativeGit(workspace), workspace };
 }
-
 function bindNativeGit(workspace: TestWorkspace): Git {
   return bindNativeGitDatabase(workspace, workspace.database);
 }
-
 function bindNativeGitDatabase(workspace: TestWorkspace, database: SqliteGitDatabase): Git {
   return createGit()({
     database,
@@ -111,7 +103,6 @@ function bindNativeGitDatabase(workspace: TestWorkspace, database: SqliteGitData
     defaultIdentity: IDENTITY,
   });
 }
-
 function maintenanceState(database: SqliteGitDatabase, repoId: number) {
   const db = database.db;
   return {
@@ -150,7 +141,6 @@ function maintenanceState(database: SqliteGitDatabase, repoId: number) {
     ),
   };
 }
-
 function clientControlState(
   workspace: TestWorkspace,
   dir: string,
@@ -183,9 +173,8 @@ function clientControlState(
     ),
   };
 }
-
 function clientWorktreeState(workspace: TestWorkspace, root: string) {
-  return workspace.worktree.scan(root, { limit: 1_000 }).map((entry) => ({
+  return workspace.worktree.scan(root, { limit: 1000 }).map((entry) => ({
     path: entry.path,
     type: entry.type,
     mode: entry.mode,
@@ -193,7 +182,6 @@ function clientWorktreeState(workspace: TestWorkspace, root: string) {
     bytes: entry.type === "file" ? [...workspace.worktree.readFile(entry.path)] : [],
   }));
 }
-
 function syntheticCachedWorktree(inner: Worktree, count: number, contentId: Uint8Array): Worktree {
   return {
     ...inner,
@@ -222,7 +210,6 @@ function syntheticCachedWorktree(inner: Worktree, count: number, contentId: Uint
     },
   };
 }
-
 async function commitFile(
   git: Git,
   workspace: TestWorkspace,
@@ -235,7 +222,6 @@ async function commitFile(
   await git.add({ dir, paths: [path] });
   return (await git.commit({ dir, message })).oid;
 }
-
 async function conflictingRebase(): Promise<{
   git: Git;
   workspace: TestWorkspace;
@@ -261,7 +247,6 @@ async function conflictingRebase(): Promise<{
   });
   return { git, workspace, dir, original, upstream };
 }
-
 async function modifyDeleteRebase(): Promise<{
   git: Git;
   workspace: TestWorkspace;
@@ -284,12 +269,10 @@ async function modifyDeleteRebase(): Promise<{
   });
   return { git, workspace, dir, original };
 }
-
 const fixtures: GitFixture[] = [];
 afterAll(() => {
   for (const fixture of fixtures) fixture.dispose();
 });
-
 describe("createSqliteGitClient", () => {
   it("exposes native cancellation, deepening, unshallow, and lease options", () => {
     const signal = new AbortController().signal;
@@ -299,7 +282,6 @@ describe("createSqliteGitClient", () => {
     const unshallow: GitFetchOptions = { remote: "origin", unshallow: true };
     const lease: PushLeaseExpectation = { tracking: true };
     const push: GitPushOptions = { remote: "origin", leases: { main: lease }, ...abortable };
-
     expect([clone.signal, deepen.deepen, unshallow.unshallow, push.leases?.main]).toEqual([
       signal,
       2,
@@ -307,7 +289,6 @@ describe("createSqliteGitClient", () => {
       lease,
     ]);
   });
-
   it("exposes native status options and keeps nested repositories excluded", async () => {
     const { git, workspace } = makeNativeGit();
     await git.init({ dir: "/" });
@@ -317,7 +298,6 @@ describe("createSqliteGitClient", () => {
     writeWorkFile(workspace, "/debug.log", "ignored\n");
     writeWorkFile(workspace, "/fresh/a.txt", "a\n");
     writeWorkFile(workspace, "/fresh/b.txt", "b\n");
-
     await expect(git.status()).resolves.toEqual([{ path: "fresh/", index: " ", worktree: "?" }]);
     await expect(git.status({ paths: ["fresh"], untrackedFiles: "all" })).resolves.toEqual([
       { path: "fresh/a.txt", index: " ", worktree: "?" },
@@ -334,7 +314,6 @@ describe("createSqliteGitClient", () => {
     await expect(git.statusReport({ paths: ["fresh"] })).resolves.toEqual({
       entries: [{ path: "fresh/", index: " ", worktree: "?" }],
     });
-
     await commitFile(git, workspace, "/", "cached.txt", "cached\n", "cached fixture");
     await git.rm({ paths: ["cached.txt"], cached: true });
     await expect(git.status({ paths: ["cached.txt"], untrackedFiles: "all" })).resolves.toEqual([
@@ -345,7 +324,6 @@ describe("createSqliteGitClient", () => {
       git.status({ paths: ["cached.txt"], untrackedFiles: "no", includeIgnored: true }),
     ).resolves.toEqual([{ path: "cached.txt", index: "D", worktree: " " }]);
   });
-
   it("exposes divergence and raw ref reads for symbolic and detached HEAD", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/reads";
@@ -353,7 +331,6 @@ describe("createSqliteGitClient", () => {
     const base = await commitFile(git, workspace, dir, "file.txt", "base\n", "base");
     await git.branch({ dir, name: "base" });
     const tip = await commitFile(git, workspace, dir, "file.txt", "tip\n", "tip");
-
     await expect(git.divergence({ dir, current: "HEAD", upstream: "base" })).resolves.toEqual({
       relationship: "ahead",
       ahead: 1,
@@ -370,7 +347,6 @@ describe("createSqliteGitClient", () => {
       kind: "symbolic",
       target: "refs/heads/main",
     });
-
     await git.updateRef({
       dir,
       ref: "refs/remotes/origin/main",
@@ -398,7 +374,6 @@ describe("createSqliteGitClient", () => {
     await expect(git.readRef({ dir, ref: "refs/remotes/missing/HEAD" })).resolves.toEqual({
       kind: "absent",
     });
-
     await git.checkout({ dir, ref: base });
     await expect(git.readRef({ dir, ref: "HEAD" })).resolves.toEqual({
       kind: "direct",
@@ -410,14 +385,12 @@ describe("createSqliteGitClient", () => {
       behind: 1,
     });
   });
-
   it("exposes typed, path, and quiet revision resolution", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/revision";
     await git.init({ dir });
     const head = await commitFile(git, workspace, dir, "nested/file.txt", "value\n", "base");
     const phantom = "f".repeat(40);
-
     await expect(git.revParse({ dir, ref: "HEAD^{commit}" })).resolves.toBe(head);
     await expect(git.revParse({ dir, ref: "HEAD:nested/file.txt" })).resolves.toMatch(
       /^[0-9a-f]{40}$/,
@@ -430,7 +403,6 @@ describe("createSqliteGitClient", () => {
       code: "ENOTFOUND",
     });
   });
-
   it("exposes guarded direct-ref update and deletion", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/guarded-ref";
@@ -438,7 +410,6 @@ describe("createSqliteGitClient", () => {
     const first = await commitFile(git, workspace, dir, "file.txt", "first\n", "first");
     const second = await commitFile(git, workspace, dir, "file.txt", "second\n", "second");
     const ref = "refs/heads/checkpoint";
-
     await git.updateRef({ dir, ref, value: first, expected: null });
     await expect(git.readRef({ dir, ref })).resolves.toEqual({ kind: "direct", oid: first });
     await expect(git.updateRef({ dir, ref, value: second, expected: null })).rejects.toMatchObject({
@@ -449,7 +420,6 @@ describe("createSqliteGitClient", () => {
     await git.updateRef({ dir, ref, delete: true, expected: second });
     await expect(git.readRef({ dir, ref })).resolves.toEqual({ kind: "absent" });
   });
-
   it("selects checkout-local HEAD while sharing refs across an unequal-id cold reopen", async () => {
     const { git, workspace } = makeNativeGit();
     await git.init({ dir: "/primary" });
@@ -482,7 +452,6 @@ describe("createSqliteGitClient", () => {
       kind: "direct",
       oid,
     });
-
     const cold = bindNativeGitDatabase(workspace, new SqliteGitDatabase(workspace.database.db));
     await expect(cold.readRef({ dir: "/primary", ref: "HEAD" })).resolves.toEqual({
       kind: "symbolic",
@@ -497,7 +466,6 @@ describe("createSqliteGitClient", () => {
       oid,
     });
   });
-
   it("reports exact renames natively without widening the Computer facade", async () => {
     const { workspace, storage } = makeWorkspace();
     const compat = workspace.git;
@@ -505,15 +473,13 @@ describe("createSqliteGitClient", () => {
     await workspace.fs.writeFile("/old.txt", "same\n");
     await compat.add({ paths: ["old.txt"] });
     await compat.commit({ message: "base" });
-
     await workspace.fs.rm("/old.txt");
     await workspace.fs.writeFile("/new.txt", "same\n");
     await compat.add({ paths: ["."], all: true });
-
     const native = createGit()({
       database: new SqliteGitDatabase(new TestDatabase(storage)),
       worktree: new ComputerWorktree(workspace.provider()),
-      now: () => 1_600_000_000_000,
+      now: () => 1600000000000,
       timezoneOffset: () => 0,
       defaultIdentity: IDENTITY,
     });
@@ -539,7 +505,6 @@ describe("createSqliteGitClient", () => {
     await expect(native.diff()).resolves.toContain(
       "similarity index 100%\nrename from old.txt\nrename to new.txt\n",
     );
-
     await expect(compat.status()).resolves.toEqual([
       { path: "new.txt", index: "A", worktree: " " },
       { path: "old.txt", index: "D", worktree: " " },
@@ -550,58 +515,50 @@ describe("createSqliteGitClient", () => {
     ]);
     await expect(compat.diff()).resolves.not.toContain("similarity index");
   });
-
   it("drives a full local cycle through workspace.git", async () => {
     const { workspace, storage } = makeWorkspace();
     const git = workspace.git;
-
     await git.init({ dir: "/" });
     expect(await git.currentBranch()).toBe("main");
-
     await workspace.fs.writeFile("/README.md", "# demo\n");
     await workspace.fs.mkdir("/src", { recursive: true });
     await workspace.fs.writeFile("/src/a.ts", "export const a = 1;\n");
-
     // Exactly the interface's shape, with nothing extra riding along.
     expect(await git.status()).toEqual([
       { path: "README.md", index: " ", worktree: "?" },
       { path: "src/", index: " ", worktree: "?" },
     ]);
-
     await git.add({ paths: ["."], all: true });
     const { oid } = await git.commit({ message: "first" });
     expect(await git.revParse({ ref: "HEAD" })).toBe(oid);
     expect(await git.status()).toEqual([]);
-
     await workspace.fs.writeFile("/src/a.ts", "export const a = 2;\n");
     expect(await git.status()).toEqual([{ path: "src/a.ts", index: " ", worktree: "M" }]);
     expect(await git.diff()).toContain("-export const a = 1;");
     expect(await git.diffSummary()).toEqual([
       { path: "src/a.ts", status: "M", insertions: 1, deletions: 1 },
     ]);
-
     await git.add({ paths: ["src/a.ts"] });
     const second = await git.commit({ message: "second" });
     expect((await git.log()).map((entry) => entry.message.trim())).toEqual(["second", "first"]);
     expect((await git.show({ ref: "HEAD" })).oid).toBe(second.oid);
     expect(await git.lsFiles()).toEqual(["README.md", "src/a.ts"]);
-
     await git.branch({ name: "topic" });
     expect(await git.branchList()).toEqual(["main", "topic"]);
     await git.checkout({ ref: "topic" });
     expect(await git.currentBranch()).toBe("topic");
-
     // Nothing about this repository lives on disk.
     const paths = await workspace.fs.ls("/");
     expect(paths.some((path) => path.includes(".git"))).toBe(false);
     const tables = storage.sql
-      .exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .exec<{
+        name: string;
+      }>("SELECT name FROM sqlite_master WHERE type = 'table'")
       .toArray()
       .map((row) => row.name);
     expect(tables).toContain("git_repositories");
     expect(tables).toContain("git_index");
   });
-
   it("supports branch rename for current and inactive branches through the native facade", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/branch-rename";
@@ -610,16 +567,12 @@ describe("createSqliteGitClient", () => {
     await git.configSet({ dir, path: "branch.main.remote", value: "origin" });
     await git.branch({ dir, name: "topic" });
     await git.configSet({ dir, path: "branch.topic.merge", value: "refs/heads/topic" });
-
     await git.branchRename({ dir, newName: "primary" });
-
     await expect(git.currentBranch({ dir })).resolves.toBe("primary");
     await expect(git.branchList({ dir })).resolves.toEqual(["primary", "topic"]);
     await expect(git.configGet({ dir, path: "branch.primary.remote" })).resolves.toBe("origin");
     await expect(git.configGet({ dir, path: "branch.main.remote" })).resolves.toBeUndefined();
-
     await git.branchRename({ dir, oldName: "topic", newName: "feature" });
-
     await expect(git.currentBranch({ dir })).resolves.toBe("primary");
     await expect(git.branchList({ dir })).resolves.toEqual(["feature", "primary"]);
     await expect(git.configGet({ dir, path: "branch.feature.merge" })).resolves.toBe(
@@ -627,7 +580,6 @@ describe("createSqliteGitClient", () => {
     );
     await expect(git.configGet({ dir, path: "branch.topic.merge" })).resolves.toBeUndefined();
   });
-
   it("selects index and ref paths through lsFiles pathspecs", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/ls-files-pathspec";
@@ -640,7 +592,6 @@ describe("createSqliteGitClient", () => {
     await git.commit({ dir, message: "tracked paths" });
     writeWorkFile(workspace, `${dir}/dir/staged.ts`, "staged\n");
     await git.add({ dir, paths: ["dir/staged.ts"] });
-
     await expect(git.lsFiles({ dir, paths: ["dir/*.ts"] })).resolves.toEqual([
       "dir/nested/two.ts",
       "dir/one.ts",
@@ -651,7 +602,6 @@ describe("createSqliteGitClient", () => {
       "dir/one.ts",
     ]);
   });
-
   it("selects cached and non-ignored untracked builder files", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/ls-files-builder";
@@ -664,7 +614,6 @@ describe("createSqliteGitClient", () => {
     writeWorkFile(workspace, `${dir}/src/ignored.tmp`, "ignored\n");
     writeWorkFile(workspace, `${dir}/nested/foreign.ts`, "nested\n");
     await git.init({ dir: `${dir}/nested` });
-
     await expect(git.lsFiles({ dir })).resolves.toEqual([".gitignore", "tracked.ts"]);
     await expect(
       git.lsFiles({
@@ -681,7 +630,6 @@ describe("createSqliteGitClient", () => {
     ]);
     await expect(git.lsFiles({ dir, cached: false, others: false })).resolves.toEqual([]);
   });
-
   it("rejects worktree lsFiles selection at a ref", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/ls-files-ref-selection";
@@ -689,7 +637,6 @@ describe("createSqliteGitClient", () => {
     writeWorkFile(workspace, `${dir}/tracked.ts`, "tracked\n");
     await git.add({ dir, paths: ["tracked.ts"] });
     await git.commit({ dir, message: "tracked" });
-
     await expect(git.lsFiles({ dir, ref: "HEAD", others: true })).rejects.toMatchObject({
       code: "EINVAL",
     });
@@ -700,7 +647,6 @@ describe("createSqliteGitClient", () => {
       "tracked.ts",
     ]);
   });
-
   it("uses the workspace's default identity when nothing else supplies one", async () => {
     const { workspace } = makeWorkspace();
     await workspace.git.init({});
@@ -710,7 +656,6 @@ describe("createSqliteGitClient", () => {
     const view = await workspace.git.show({ ref: oid });
     expect(view.author).toMatchObject(IDENTITY);
   });
-
   it("keeps native rm inside its repository and nested-root boundaries", async () => {
     const { git, workspace } = makeNativeGit();
     await git.init({ dir: "/" });
@@ -719,22 +664,18 @@ describe("createSqliteGitClient", () => {
     await git.add({ dir: "/", paths: ["."], all: true });
     await git.commit({ dir: "/", message: "parent" });
     await git.init({ dir: "/nested" });
-
     await git.rm({ dir: "/", paths: ["."], recursive: true });
-
     await expect(git.lsFiles({ dir: "/" })).resolves.toEqual(["nested/owned-by-parent.txt"]);
     expect(workspace.worktree.stat("/top.txt")).toBeNull();
     expect(workspace.worktree.stat("/nested/owned-by-parent.txt")).not.toBeNull();
     await expect(git.repoRoot({ dir: "/nested" })).resolves.toBe("/nested");
   });
-
   it("clones a remote and reports structured progress", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
     fixture.write("README.md", "# remote\n");
     fixture.write("lib/index.ts", "export const x = 1;\n");
     fixture.commit("remote work");
-
     const server = await startGitServer(fixture.dir);
     try {
       const { workspace } = makeWorkspace();
@@ -746,7 +687,6 @@ describe("createSqliteGitClient", () => {
         onProgress: (event) => phases.push(event.phase),
         onMessage: (message) => messages.push(message),
       });
-
       expect(await workspace.fs.readFile("/README.md", "utf8")).toBe("# remote\n");
       expect(await workspace.git.revParse({ ref: "HEAD" })).toBe(fixture.git("rev-parse", "HEAD"));
       expect(await workspace.git.lsFiles()).toEqual(["README.md", "lib/index.ts"]);
@@ -758,35 +698,29 @@ describe("createSqliteGitClient", () => {
       await server.close();
     }
   });
-
   it("gets and sets the remote URL used by fetch and push", async () => {
     const original = new GitFixture().init();
     fixtures.push(original);
     original.write("README.md", "original\n");
     const originalHead = original.commit("original");
-
     const replacement = new GitFixture();
     fixtures.push(replacement);
     replacement.git("clone", "-q", original.dir, ".");
     replacement.write("replacement.txt", "replacement\n");
     const replacementHead = replacement.commit("replacement");
-
     const originalServer = await startGitServer(original.dir);
     const replacementServer = await startGitServer(replacement.dir);
     try {
       const { git } = makeNativeGit();
       const dir = "/typed-remote";
       await git.clone({ dir, url: originalServer.url });
-
       await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(originalServer.url);
       await git.remoteSetUrl({ dir, name: "origin", url: replacementServer.url });
       await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(replacementServer.url);
-
       await git.fetch({ dir, remote: "origin" });
       await expect(git.revParse({ dir, ref: "refs/remotes/origin/main" })).resolves.toBe(
         replacementHead,
       );
-
       await expect(git.configGet({ dir, path: "remote.origin.pushurl" })).resolves.toBeUndefined();
       await expect(
         git.push({ dir, remote: "origin", ref: "main", remoteRef: "typed-fallback" }),
@@ -797,12 +731,10 @@ describe("createSqliteGitClient", () => {
       await Promise.all([originalServer.close(), replacementServer.close()]);
     }
   });
-
   it("rejects a missing remote URL without creating a partial section", async () => {
     const { git } = makeNativeGit();
     const dir = "/missing-remote";
     await git.init({ dir });
-
     await expect(git.remoteGetUrl({ dir, name: "missing" })).rejects.toMatchObject({
       code: "EREMOTEFAIL",
     });
@@ -813,7 +745,6 @@ describe("createSqliteGitClient", () => {
     await expect(git.configGet({ dir, path: "remote.missing.fetch" })).resolves.toBeUndefined();
     await expect(git.remoteList({ dir })).resolves.toEqual([]);
   });
-
   it("rejects a multi-valued remote URL without replacing its values", async () => {
     const { git } = makeNativeGit();
     const dir = "/multi-url-remote";
@@ -825,7 +756,6 @@ describe("createSqliteGitClient", () => {
       value: "https://example.invalid/two.git",
       append: true,
     });
-
     await expect(git.remoteGetUrl({ dir, name: "origin" })).rejects.toMatchObject({
       code: "EUNSUPPORTED",
     });
@@ -837,7 +767,6 @@ describe("createSqliteGitClient", () => {
       "https://example.invalid/two.git",
     ]);
   });
-
   it("rolls remote config back after coded SQLite value failures", async () => {
     const workspace = makeTestWorkspace();
     const faultStorage = new CodedTooBigStorage(workspace.storage);
@@ -849,7 +778,6 @@ describe("createSqliteGitClient", () => {
       database.db.all<Record<string, unknown>>(
         "SELECT path, seq, value FROM git_config WHERE repo_id = 1 ORDER BY path, seq",
       );
-
     const beforeAdd = configState();
     faultStorage.arm("INSERT INTO git_config", "remote.origin.fetch");
     await expect(
@@ -857,7 +785,6 @@ describe("createSqliteGitClient", () => {
     ).rejects.toMatchObject({ name: "GitError", code: "E2BIG" });
     expect(faultStorage.writesBeforeFailure).toBeGreaterThan(0);
     expect(configState()).toEqual(beforeAdd);
-
     const original = "https://example.invalid/original.git";
     await git.remoteAdd({ dir, name: "origin", url: original });
     const beforeSet = configState();
@@ -868,7 +795,6 @@ describe("createSqliteGitClient", () => {
     expect(faultStorage.writesBeforeFailure).toBeGreaterThan(0);
     expect(configState()).toEqual(beforeSet);
     await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(original);
-
     const coldDatabase = new SqliteGitDatabase(new TestDatabase(workspace.storage));
     const coldGit = bindNativeGitDatabase(workspace, coldDatabase);
     await expect(coldGit.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(original);
@@ -876,23 +802,19 @@ describe("createSqliteGitClient", () => {
       "+refs/heads/*:refs/remotes/origin/*",
     );
   });
-
   it("round-trips the former remote URL first excess through a cold reopen", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/bounded-url-remote";
     const original = "https://example.invalid/original.git";
     await git.init({ dir });
     await git.remoteAdd({ dir, name: "origin", url: original });
-
-    const formerFirstExcess = "x".repeat(8_193);
+    const formerFirstExcess = "x".repeat(8193);
     await expect(
       git.remoteSetUrl({ dir, name: "origin", url: formerFirstExcess }),
     ).resolves.toBeUndefined();
     await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(formerFirstExcess);
-
     const coldGit = bindNativeGitDatabase(workspace, new SqliteGitDatabase(workspace.database.db));
     await expect(coldGit.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(formerFirstExcess);
-
     await git.configSet({
       dir,
       path: "remote.origin.url",
@@ -902,14 +824,12 @@ describe("createSqliteGitClient", () => {
     await expect(git.remoteSetUrl({ dir, name: "origin", url: original })).resolves.toBeUndefined();
     await expect(git.configGet({ dir, path: "remote.origin.url" })).resolves.toBe(original);
   });
-
   it("preserves long remote names and empty URL values accepted by real Git", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/long-name-remote";
-    const name = "r".repeat(2_190);
+    const name = "r".repeat(2190);
     await git.init({ dir });
     await git.remoteAdd({ dir, name, url: "https://example.invalid/original.git" });
-
     await expect(git.remoteList({ dir })).resolves.toEqual([
       { name, url: "https://example.invalid/original.git" },
     ]);
@@ -922,12 +842,10 @@ describe("createSqliteGitClient", () => {
     await expect(coldGit.remoteList({ dir })).resolves.toEqual([{ name, url: "" }]);
     await expect(coldGit.remoteGetUrl({ dir, name })).resolves.toBe("");
   });
-
   it("validates remote URL options before constructing config paths", async () => {
     const { git } = makeNativeGit();
     const dir = "/invalid-url-options";
     await git.init({ dir });
-
     await expect(
       Reflect.apply(git.remoteGetUrl, git, [{ dir, name: "invalid\ud800" }]),
     ).rejects.toMatchObject({ code: "EINVAL" });
@@ -939,14 +857,12 @@ describe("createSqliteGitClient", () => {
     });
     await expect(git.remoteList({ dir })).resolves.toEqual([]);
   });
-
   it("keeps Computer push legacy while native push returns structured status", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
     fixture.write("README.md", "before\n");
     fixture.commit("initial");
     fixture.git("config", "receive.denyCurrentBranch", "updateInstead");
-
     const server = await startGitServer(fixture.dir);
     try {
       const { storage, workspace } = makeWorkspace();
@@ -954,7 +870,6 @@ describe("createSqliteGitClient", () => {
       await workspace.fs.writeFile("/README.md", "after\n");
       await workspace.git.add({ paths: ["README.md"] });
       const local = await workspace.git.commit({ message: "local change" });
-
       const result = await workspace.git.push({});
       expect(result).toEqual({
         ok: true,
@@ -965,11 +880,10 @@ describe("createSqliteGitClient", () => {
       expect(result).not.toHaveProperty("tracking");
       expect(fixture.git("rev-parse", "refs/heads/main")).toBe(local.oid);
       expect(fixture.git("show", "HEAD:README.md")).toBe("after");
-
       const native = createGit()({
         database: new SqliteGitDatabase(new TestDatabase(storage)),
         worktree: new ComputerWorktree(workspace.provider()),
-        now: () => 1_600_000_000_000,
+        now: () => 1600000000000,
         timezoneOffset: () => 0,
         defaultIdentity: IDENTITY,
       });
@@ -987,13 +901,11 @@ describe("createSqliteGitClient", () => {
       await server.close();
     }
   });
-
   it("projects a confirmed Computer push rejection without native fields", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
     fixture.write("README.md", "before\n");
     fixture.commit("initial");
-
     const server = await startGitServer(fixture.dir);
     try {
       const { workspace } = makeWorkspace();
@@ -1001,7 +913,6 @@ describe("createSqliteGitClient", () => {
       await workspace.fs.writeFile("/README.md", "after\n");
       await workspace.git.add({ paths: ["README.md"] });
       await workspace.git.commit({ message: "local change" });
-
       const result = await workspace.git.push({});
       expect(result.ok).toBe(false);
       if (result.error === null) throw new Error("rejected push did not report an error");
@@ -1015,7 +926,6 @@ describe("createSqliteGitClient", () => {
       await server.close();
     }
   });
-
   it("pulls through the compatibility surface and rolls conflicts back locally", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
@@ -1026,18 +936,15 @@ describe("createSqliteGitClient", () => {
       const { workspace } = makeWorkspace();
       const git = workspace.git;
       await git.clone({ url: server.url, dir: "/", depth: 0 });
-
       fixture.write("remote.txt", "remote\n");
       const fastForward = fixture.commit("remote fast-forward");
       await expect(git.pull({})).resolves.toBeUndefined();
       expect(await git.revParse({ ref: "HEAD" })).toBe(fastForward);
-
       await workspace.fs.writeFile("/conflict.txt", "local\n");
       await git.add({ paths: ["conflict.txt"] });
       const local = await git.commit({ message: "local" });
       fixture.write("conflict.txt", "incoming\n");
       const incoming = fixture.commit("incoming");
-
       await expect(git.pull({})).rejects.toMatchObject({ code: "EMERGEFAIL" });
       expect(await git.revParse({ ref: "HEAD" })).toBe(local.oid);
       expect(await git.revParse({ ref: "refs/remotes/origin/main" })).toBe(incoming);
@@ -1047,7 +954,6 @@ describe("createSqliteGitClient", () => {
       await server.close();
     }
   });
-
   it("rolls a compatibility merge conflict back without pending state", async () => {
     const { workspace } = makeWorkspace();
     const git = workspace.git;
@@ -1064,14 +970,12 @@ describe("createSqliteGitClient", () => {
     await workspace.fs.writeFile("/conflict.txt", "current\n");
     await git.add({ paths: ["conflict.txt"] });
     const current = await git.commit({ message: "main" });
-
     await expect(git.merge({ theirs: "topic" })).rejects.toMatchObject({ code: "EMERGEFAIL" });
     expect(await git.revParse({ ref: "HEAD" })).toBe(current.oid);
     expect(await workspace.fs.readFile("/conflict.txt", "utf8")).toBe("current\n");
     expect(await git.status()).toEqual([]);
     await expect(git.merge({ theirs: "topic" })).rejects.toMatchObject({ code: "EMERGEFAIL" });
   });
-
   it("blocks compatibility commit while a native merge is pending", async () => {
     const { workspace, storage } = makeWorkspace();
     const compat = workspace.git;
@@ -1088,18 +992,16 @@ describe("createSqliteGitClient", () => {
     await workspace.fs.writeFile("/main.txt", "main\n");
     await compat.add({ paths: ["main.txt"] });
     const current = await compat.commit({ message: "main" });
-
     const native = createGit()({
       database: new SqliteGitDatabase(new TestDatabase(storage)),
       worktree: new ComputerWorktree(workspace.provider()),
-      now: () => 1_600_000_000_000,
+      now: () => 1600000000000,
       timezoneOffset: () => 0,
       defaultIdentity: IDENTITY,
     });
     await expect(native.merge({ theirs: "topic", commit: false })).resolves.toEqual({
       pendingCommit: true,
     });
-
     await expect(
       compat.commit({ message: "must not bypass merge continuation" }),
     ).rejects.toMatchObject({
@@ -1110,7 +1012,6 @@ describe("createSqliteGitClient", () => {
       code: "EMERGEACTIVE",
     });
   });
-
   it("reports native conflicts after reopen and rejects them on the Computer facade", async () => {
     const { workspace, storage } = makeWorkspace();
     const compat = workspace.git;
@@ -1127,11 +1028,10 @@ describe("createSqliteGitClient", () => {
     await workspace.fs.writeFile("/conflict.txt", "current\n");
     await compat.add({ paths: ["conflict.txt"] });
     await compat.commit({ message: "main" });
-
     const binding = {
       database: new SqliteGitDatabase(new TestDatabase(storage)),
       worktree: new ComputerWorktree(workspace.provider()),
-      now: () => 1_600_000_000_000,
+      now: () => 1600000000000,
       timezoneOffset: () => 0,
       defaultIdentity: IDENTITY,
     };
@@ -1141,13 +1041,11 @@ describe("createSqliteGitClient", () => {
       pendingCommit: true,
     });
     const reopened = createGit()(binding);
-
     await expect(reopened.status()).resolves.toEqual([
       { path: "conflict.txt", index: "U", worktree: "U" },
     ]);
     await expect(compat.status()).rejects.toMatchObject({ code: "EUNMERGED" });
   });
-
   it("blocks ordinary native commit during replay and lets hard reset clear it", async () => {
     const { workspace, storage } = makeWorkspace();
     await workspace.git.init({});
@@ -1179,11 +1077,10 @@ describe("createSqliteGitClient", () => {
     const native = createGit()({
       database,
       worktree: new ComputerWorktree(workspace.provider()),
-      now: () => 1_600_000_000_000,
+      now: () => 1600000000000,
       timezoneOffset: () => 0,
       defaultIdentity: IDENTITY,
     });
-
     await expect(native.commit({ message: "must not continue replay" })).rejects.toMatchObject({
       code: "EOPACTIVE",
     });
@@ -1191,7 +1088,6 @@ describe("createSqliteGitClient", () => {
     expect(store.readOperationState()).toBeNull();
     expect(store.getRef("refs/heads/main")).toBe(original.oid);
   });
-
   it("routes clean cherry-pick and revert through a selected repository", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/nested/repo";
@@ -1201,18 +1097,13 @@ describe("createSqliteGitClient", () => {
     await git.checkout({ dir, ref: "topic" });
     const source = await commitFile(git, workspace, dir, "topic.txt", "topic\n", "topic");
     await git.checkout({ dir, ref: "main" });
-
     const picked = await git.cherryPick({ dir, source });
-
     expect(picked.outcome).toBe("committed");
     expect(workspace.workspace.fs.readFileSync(`${dir}/topic.txt`, "utf8")).toBe("topic\n");
-
     const reverted = await git.revert({ dir, source });
-
     expect(reverted.outcome).toBe("committed");
     expect(workspace.workspace.fs.existsSync(`${dir}/topic.txt`)).toBe(false);
   });
-
   it("routes conflicted cherry-pick and revert continuations", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/nested/repo";
@@ -1223,7 +1114,6 @@ describe("createSqliteGitClient", () => {
     const source = await commitFile(git, workspace, dir, "conflict.txt", "incoming\n", "topic");
     await git.checkout({ dir, ref: "main" });
     await commitFile(git, workspace, dir, "conflict.txt", "current\n", "main");
-
     await expect(git.cherryPick({ dir, source })).resolves.toEqual({ outcome: "conflicted" });
     await expect(git.status({ dir })).resolves.toEqual([
       { path: "conflict.txt", index: "U", worktree: "U" },
@@ -1231,7 +1121,6 @@ describe("createSqliteGitClient", () => {
     writeWorkFile(workspace, `${dir}/conflict.txt`, "resolved\n");
     await git.add({ dir, paths: ["conflict.txt"] });
     await expect(git.cherryPickContinue({ dir })).resolves.toMatchObject({ outcome: "committed" });
-
     await expect(git.revert({ dir, source })).resolves.toEqual({ outcome: "conflicted" });
     await expect(git.status({ dir })).resolves.toEqual([
       { path: "conflict.txt", index: "U", worktree: "U" },
@@ -1243,7 +1132,6 @@ describe("createSqliteGitClient", () => {
     await git.add({ dir, paths: ["conflict.txt"] });
     await expect(git.revertContinue({ dir })).resolves.toMatchObject({ outcome: "committed" });
   });
-
   it("routes replay cancellation, wrong-kind, and no-active calls", async () => {
     const { git, workspace } = makeNativeGit();
     const dir = "/nested/repo";
@@ -1254,7 +1142,6 @@ describe("createSqliteGitClient", () => {
     const source = await commitFile(git, workspace, dir, "same.txt", "same\n", "topic");
     await git.checkout({ dir, ref: "main" });
     await commitFile(git, workspace, dir, "same.txt", "same\n", "main");
-
     await expect(git.cherryPick({ dir, source })).resolves.toEqual({
       outcome: "empty",
       reason: "result",
@@ -1263,7 +1150,6 @@ describe("createSqliteGitClient", () => {
     await expect(git.revertSkip({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
     await expect(git.revertAbort({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
     await expect(git.cherryPickSkip({ dir })).resolves.toBeUndefined();
-
     await expect(git.cherryPick({ dir, source })).resolves.toMatchObject({ outcome: "empty" });
     await expect(git.cherryPickAbort({ dir })).resolves.toBeUndefined();
     await expect(git.cherryPickContinue({ dir })).rejects.toMatchObject({
@@ -1272,7 +1158,6 @@ describe("createSqliteGitClient", () => {
     await expect(git.revertSkip({ dir })).rejects.toMatchObject({ code: "ENOREVERT" });
     await expect(git.revertAbort({ dir })).rejects.toMatchObject({ code: "ENOREVERT" });
   });
-
   it("routes rebase continue, skip, and abort through a reopened native client", async () => {
     const continued = await conflictingRebase();
     const continuedGit = bindNativeGit(continued.workspace);
@@ -1290,7 +1175,6 @@ describe("createSqliteGitClient", () => {
     expect(
       continued.workspace.workspace.fs.readFileSync(`${continued.dir}/shared.txt`, "utf8"),
     ).toBe("resolved\n");
-
     const skipped = await conflictingRebase();
     const skippedGit = bindNativeGit(skipped.workspace);
     await expect(skippedGit.rebaseSkip({ dir: skipped.dir })).resolves.toEqual({
@@ -1303,7 +1187,6 @@ describe("createSqliteGitClient", () => {
     expect(skipped.workspace.workspace.fs.readFileSync(`${skipped.dir}/shared.txt`, "utf8")).toBe(
       "upstream\n",
     );
-
     const aborted = await conflictingRebase();
     const abortedGit = bindNativeGit(aborted.workspace);
     await expect(abortedGit.rebaseAbort({ dir: aborted.dir })).resolves.toBeUndefined();
@@ -1323,11 +1206,9 @@ describe("createSqliteGitClient", () => {
       code: "ENOREBASE",
     });
   });
-
   it("enforces rebase operation interlocks and lets hard reset clear recovery state", async () => {
     const { git, workspace, dir, original } = await conflictingRebase();
     const source = await git.revParse({ dir, ref: "upstream" });
-
     await expect(git.status({ dir })).resolves.toEqual([
       { path: "shared.txt", index: "U", worktree: "U" },
     ]);
@@ -1335,7 +1216,6 @@ describe("createSqliteGitClient", () => {
     writeWorkFile(workspace, `${dir}/added.txt`, "resolution work\n");
     await expect(git.add({ dir, paths: ["added.txt"] })).resolves.toBeUndefined();
     await expect(git.rm({ dir, paths: ["added.txt"], force: true })).resolves.toBeUndefined();
-
     const blocked = [
       () => git.fetch({ dir }),
       () => git.clean({ dir }),
@@ -1363,15 +1243,12 @@ describe("createSqliteGitClient", () => {
       code: "EOPMISMATCH",
     });
     await expect(git.revertContinue({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
-
     await git.reset({ dir, hard: true });
-
     await expect(git.revParse({ dir, ref: "HEAD" })).resolves.toBe(original);
     const repository = workspace.database.findCheckout(dir);
     if (repository === null) throw new Error("rebase repository is missing");
     expect(workspace.database.openCheckout(repository).readOperationState()).toBeNull();
   });
-
   it("hard reset removes modify-delete conflict content before clearing rebase recovery", async () => {
     const { git, workspace, dir, original } = await modifyDeleteRebase();
     const repository = workspace.database.findCheckout(dir);
@@ -1379,16 +1256,13 @@ describe("createSqliteGitClient", () => {
     const store = workspace.database.openCheckout(repository);
     expect(store.hasConflicts()).toBe(true);
     expect(workspace.worktree.stat(`${dir}/deleted.txt`)).not.toBeNull();
-
     await git.reset({ dir, hard: true });
-
     await expect(git.revParse({ dir, ref: "HEAD" })).resolves.toBe(original);
     expect(store.indexEntries()).toEqual([]);
     expect(store.hasConflicts()).toBe(false);
     expect(workspace.worktree.stat(`${dir}/deleted.txt`)).toBeNull();
     expect(store.readOperationState()).toBeNull();
   });
-
   it("matches a Git alternate-index snapshot and preserves every checkout control", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
@@ -1399,7 +1273,6 @@ describe("createSqliteGitClient", () => {
       .symlink("changed.txt", "link");
     const expectedBase = fixture.commit("base");
     const expectedBaseTree = fixture.git("rev-parse", `${expectedBase}^{tree}`);
-
     const { git, workspace } = makeNativeGit();
     const dir = "/snapshot";
     await git.init({ dir });
@@ -1417,7 +1290,6 @@ describe("createSqliteGitClient", () => {
       })
     ).oid;
     expect(base).toBe(expectedBase);
-
     await git.readTree({ dir, tree: "HEAD" });
     await expect(git.writeTree({ dir })).resolves.toBe(expectedBaseTree);
     const beforeDetached = clientControlState(workspace, dir);
@@ -1441,7 +1313,6 @@ describe("createSqliteGitClient", () => {
     ).resolves.toBe(expectedDetached);
     expect(clientControlState(workspace, dir)).toEqual(beforeDetached);
     expect(clientWorktreeState(workspace, dir)).toEqual(beforeDetachedWorktree);
-
     writeWorkFile(workspace, `${dir}/changed.txt`, "staged\n");
     await git.add({ dir, paths: ["changed.txt"] });
     writeWorkFile(workspace, `${dir}/changed.txt`, "worktree\n");
@@ -1450,7 +1321,6 @@ describe("createSqliteGitClient", () => {
     writeWorkFile(workspace, `${dir}/bin/run`, "not executable\n");
     workspace.worktree.unlink(`${dir}/link`);
     workspace.worktree.symlink("new/deep.txt", `${dir}/link`);
-
     fixture
       .write("changed.txt", "worktree\n")
       .remove("removed.txt")
@@ -1471,7 +1341,6 @@ describe("createSqliteGitClient", () => {
       "-p",
       base,
     );
-
     const checkout = workspace.database.findCheckout(dir);
     if (checkout === null) throw new Error("snapshot repository is missing");
     const store = workspace.database.openCheckout(checkout);
@@ -1493,14 +1362,12 @@ describe("createSqliteGitClient", () => {
       },
       [],
     );
-
     const beforeControl = clientControlState(workspace, dir);
     const beforeWorktree = clientWorktreeState(workspace, dir);
     const beforeObjects = workspace.database.db.scalar<number>(
       "SELECT count(*) FROM git_objects WHERE repo_id = ?",
       checkout.repoId,
     );
-
     await expect(
       git.withScratchIndex({ dir, name: "failed-snapshot" }, (scratch) => {
         scratch.readTree({ tree: "HEAD" });
@@ -1524,7 +1391,6 @@ describe("createSqliteGitClient", () => {
     ).toBe(beforeObjects);
     expect(clientControlState(workspace, dir)).toEqual(beforeControl);
     expect(clientWorktreeState(workspace, dir)).toEqual(beforeWorktree);
-
     const afterFailureDatabase = new SqliteGitDatabase(workspace.database.db);
     expect(clientControlState(workspace, dir, afterFailureDatabase)).toEqual(beforeControl);
     await expect(
@@ -1535,7 +1401,6 @@ describe("createSqliteGitClient", () => {
       }),
     ).rejects.toMatchObject({ code: "EINVAL" });
     expect(clientControlState(workspace, dir)).toEqual(beforeControl);
-
     let leaked: GitScratchIndex | undefined;
     const beforeStatements = workspace.storage.statementCount;
     const snapshot = await git.withScratchIndex({ dir, name: "snapshot" }, (scratch) => {
@@ -1553,7 +1418,7 @@ describe("createSqliteGitClient", () => {
       });
     });
     const statements = workspace.storage.statementCount - beforeStatements;
-    expect(statements).toBeLessThan(1_000);
+    expect(statements).toBeLessThan(1000);
     expect(snapshot).toBe(expectedSnapshot);
     const captured = leaked;
     if (captured === undefined) throw new Error("scratch handle was not captured");
@@ -1561,7 +1426,6 @@ describe("createSqliteGitClient", () => {
     expect(() =>
       captured.commitTree({ tree: expectedTree, message: "leaked\n", parent: [base] }),
     ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
-
     expect((await git.catFile({ dir, oid: snapshot })).bytes).toEqual(
       new Uint8Array(fixture.gitBinary("cat-file", "commit", expectedSnapshot)),
     );
@@ -1570,7 +1434,6 @@ describe("createSqliteGitClient", () => {
     );
     expect(clientControlState(workspace, dir)).toEqual(beforeControl);
     expect(clientWorktreeState(workspace, dir)).toEqual(beforeWorktree);
-
     const coldDatabase = new SqliteGitDatabase(workspace.database.db);
     const coldGit = bindNativeGitDatabase(workspace, coldDatabase);
     expect(clientControlState(workspace, dir, coldDatabase)).toEqual(beforeControl);
@@ -1578,7 +1441,6 @@ describe("createSqliteGitClient", () => {
       new Uint8Array(fixture.gitBinary("cat-file", "commit", expectedSnapshot)),
     );
   });
-
   it("keeps the maximal public scratch snapshot below the SQL budget", async () => {
     const workspace = makeTestWorkspace();
     const setupGit = bindNativeGit(workspace);
@@ -1591,28 +1453,25 @@ describe("createSqliteGitClient", () => {
     repo.store.upsertBlobIds([{ contentId, oid: blob }]);
     const git = createGit()({
       database: workspace.database,
-      worktree: syntheticCachedWorktree(workspace.worktree, 10_000, contentId),
+      worktree: syntheticCachedWorktree(workspace.worktree, 10000, contentId),
       now: workspace.context.now,
       timezoneOffset: workspace.context.timezoneOffset,
       defaultIdentity: IDENTITY,
     });
     const beforeControl = clientControlState(workspace, "/");
     const beforeStatements = workspace.storage.statementCount;
-
     const oid = await git.withScratchIndex({ name: "maximal" }, (scratch) => {
       scratch.readTree({ empty: true });
       scratch.add({ paths: [], all: true });
       const tree = scratch.writeTree();
       return scratch.commitTree({ tree, message: "maximal snapshot\n" });
     });
-
     expect(oid).toMatch(/^[0-9a-f]{40}$/);
-    expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1_000);
+    expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1000);
     expect(clientControlState(workspace, "/")).toEqual(beforeControl);
   });
-
   it("routes native and Computer argv CLI through the same dispatcher", async () => {
-    const clock = 1_577_836_800_000;
+    const clock = 1577836800000;
     const native = makeNativeGit();
     const { workspace: computer } = makeWorkspace(clock);
     const nativeGit = native.git;
@@ -1623,13 +1482,16 @@ describe("createSqliteGitClient", () => {
     writeWorkFile(native.workspace, `${dir}/sub/file.txt`, "one\n");
     await computer.fs.mkdir(`${dir}/sub`, { recursive: true });
     await computer.fs.writeFile(`${dir}/sub/file.txt`, "one\n");
-
     const statusInput = { argv: ["status", "--porcelain"], cwd: `${dir}/sub` };
-    const nativeStatus = nativeGit.runCli(statusInput);
+    const nativeStatus = await nativeGit.runCli(statusInput);
     expect(await nativeGit.cli(statusInput)).toEqual(nativeStatus);
     expect(await computerGit.cli(statusInput)).toEqual(nativeStatus);
-    expect(nativeStatus).toEqual({ stdout: "?? sub/\n", stderr: "", exitCode: 0 });
-
+    expect(nativeStatus).toEqual({
+      stdout: "?? sub/\n",
+      stderr: "",
+      exitCode: 0,
+      truncated: false,
+    });
     const addInput = { argv: ["add", "file.txt"], cwd: `${dir}/sub` };
     expect(await computerGit.cli(addInput)).toEqual(await nativeGit.cli(addInput));
     const env = {
@@ -1640,7 +1502,6 @@ describe("createSqliteGitClient", () => {
     };
     const commitInput = { argv: ["commit", "-m", "from argv"], cwd: dir, env };
     expect(await computerGit.cli(commitInput)).toEqual(await nativeGit.cli(commitInput));
-
     for (const input of [
       { argv: ["symbolic-ref", "--short", "HEAD"], cwd: `${dir}/sub` },
       { argv: ["log", "-1", "--format=%an <%ae>%n%cn <%ce>"], cwd: dir },
@@ -1649,26 +1510,23 @@ describe("createSqliteGitClient", () => {
       { argv: ["unknown"], cwd: dir },
       { argv: ["status", "--porcelain"], cwd: "/outside" },
     ]) {
-      expect(await computerGit.cli(input)).toEqual(nativeGit.runCli(input));
+      expect(await computerGit.cli(input)).toEqual(await nativeGit.runCli(input));
     }
-
     const legacyInput = { argv: ["status", "--porcelain"], cwd: dir, dir };
-    expect(() => nativeGit.runCli(legacyInput)).toThrowError(
+    await expect(nativeGit.runCli(legacyInput)).rejects.toThrowError(
       expect.objectContaining({ code: "EINVAL" }),
     );
     await expect(computerGit.cli(legacyInput)).rejects.toMatchObject({ code: "EINVAL" });
-
     const unexpected = new Error("unexpected argv getter failure");
     const throwingInput = {
       get argv(): string[] {
         throw unexpected;
       },
     };
-    expect(() => nativeGit.runCli(throwingInput)).toThrow(unexpected);
+    await expect(nativeGit.runCli(throwingInput)).rejects.toThrow(unexpected);
     await expect(nativeGit.cli(throwingInput)).rejects.toBe(unexpected);
     await expect(computerGit.cli(throwingInput)).rejects.toBe(unexpected);
   });
-
   it("fails explicitly for methods that remain unsupported", async () => {
     const { workspace } = makeWorkspace();
     await workspace.git.init({});

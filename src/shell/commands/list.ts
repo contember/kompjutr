@@ -53,7 +53,7 @@ export const ls: Command = (context) => {
       }
     })();
 
-    return { stdout: stream, status: () => status };
+    return { stdout: stream, status: () => status, truncated: () => false };
   } catch (error) {
     if (error instanceof UsageError) return fail(context, error.message, 2);
     throw error;
@@ -274,7 +274,7 @@ export const stat: Command = (context) => {
       );
     }
   })();
-  return { stdout: stream, status: () => status };
+  return { stdout: stream, status: () => status, truncated: () => false };
 };
 
 export const listCommands: ReadonlyMap<string, Command> = new Map([

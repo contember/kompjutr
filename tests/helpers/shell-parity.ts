@@ -13,14 +13,7 @@
 // Stdout, stderr, and exit status are compared exactly, with output kept as bytes.
 
 import { spawnSync } from "node:child_process";
-import {
-  chmodSync,
-  mkdirSync,
-  mkdtempSync,
-  rmSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
 
@@ -161,7 +154,9 @@ function validateTree(tree: ShellTree): void {
       posix.normalize(relative) !== relative ||
       segments.some((segment) => segment === "" || segment === "." || segment === "..")
     ) {
-      throw new Error(`shell parity tree path must be a normalized non-empty relative file: ${relative}`);
+      throw new Error(
+        `shell parity tree path must be a normalized non-empty relative file: ${relative}`,
+      );
     }
   }
 }
@@ -181,10 +176,7 @@ function controlledEnvironment(
   return { ...BASE_ENV, ...caseEnvironment };
 }
 
-function validateParameterExpansions(
-  source: string,
-  env: Readonly<Record<string, string>>,
-): void {
+function validateParameterExpansions(source: string, env: Readonly<Record<string, string>>): void {
   let singleQuoted = false;
   let doubleQuoted = false;
   for (let index = 0; index < source.length; index++) {
@@ -244,7 +236,10 @@ function seedHostTree(directory: string, tree: ShellTree): WriteEntry[] {
     mkdirSync(onDisk, { recursive: true });
     directories.push({ path: `${ROOT}/${relative}`, mode: DIRECTORY_MODE, mtime: MTIME });
   }
-  for (const onDisk of [directory, ...Array.from(relativeDirectories, (path) => join(directory, path))]) {
+  for (const onDisk of [
+    directory,
+    ...Array.from(relativeDirectories, (path) => join(directory, path)),
+  ]) {
     chmodSync(onDisk, DIRECTORY_MODE);
     utimesSync(onDisk, MTIME_DATE, MTIME_DATE);
   }

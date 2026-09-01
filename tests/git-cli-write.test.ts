@@ -1,9 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-
 import { Workspace as ComputerWorkspace } from "@cloudflare/computer";
 import { afterEach, describe, expect, it } from "vitest";
-
 import { ComputerWorktree } from "../src/compat/computer/worktree.js";
 import { iterateSqlCursor, type SqlDatabase } from "../src/db/db.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
@@ -28,7 +26,7 @@ import {
   writeWorkFile,
 } from "./helpers/workspace.js";
 
-const FIXED_TIME = 1_577_836_800_000;
+const FIXED_TIME = 1577836800000;
 const IDENTITY = { name: "Fixture", email: "fixture@example.com" };
 const IDENTITY_ENV = {
   GIT_AUTHOR_NAME: IDENTITY.name,
@@ -47,19 +45,15 @@ const REAL_GIT_ENV = {
   GIT_SEQUENCE_EDITOR: "true",
   LC_ALL: "C",
 };
-
 const fixtures: GitFixture[] = [];
-
 afterEach(() => {
   while (fixtures.length > 0) fixtures.pop()?.dispose();
 });
-
 function fixture(): GitFixture {
   const source = new GitFixture().init();
   fixtures.push(source);
   return source;
 }
-
 function gitResult(
   source: GitFixture,
   argv: readonly string[],
@@ -76,21 +70,22 @@ function gitResult(
   if (result.status === null) throw new Error(`git terminated by signal ${result.signal}`);
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
-
 function nativeRepository(root = "/repo"): TestRepository {
   const workspace = makeRepo(root, { startTime: FIXED_TIME });
   workspace.context.defaultIdentity = IDENTITY;
   return workspace;
 }
-
 function runner(context: GitContext) {
   return createGitCliRunner(createGitCliWriteHandlers(context));
 }
-
 function cliResult(result: GitCommandResult) {
-  return { stdout: result.stdout, stderr: result.stderr, exitCode: result.status };
+  return {
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitCode: result.status,
+    truncated: false,
+  };
 }
-
 function divergent(source: GitFixture, withNested = false): void {
   source.write("shared.txt", "base\n");
   if (withNested) source.write("nested/outer.txt", "outer\n");
@@ -102,7 +97,6 @@ function divergent(source: GitFixture, withNested = false): void {
   source.write("shared.txt", "current\n");
   source.commit("current");
 }
-
 async function conflictedNative(
   resolve = true,
   withNested = false,
@@ -132,12 +126,11 @@ async function conflictedNative(
     writeWorkFile(workspace, "/shared.txt", "resolved\n");
     expect(gitResult(source, ["add", "shared.txt"]).status).toBe(0);
     expect(
-      runner(workspace.context).runCli({ argv: ["add", "shared.txt"], env: IDENTITY_ENV }),
-    ).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+      await runner(workspace.context).runCli({ argv: ["add", "shared.txt"], env: IDENTITY_ENV }),
+    ).toEqual({ stdout: "", stderr: "", exitCode: 0, truncated: false });
   }
   return { source, workspace, repo: workspace.repo };
 }
-
 function reopenNative(
   workspace: TestWorkspace,
   root = "/",
@@ -156,7 +149,6 @@ function reopenNative(
   };
   return { context, repo: openRepository(context, root) };
 }
-
 function computerContext(workspace: ComputerWorkspace): GitContext {
   const provider = workspace.provider();
   const computerDb = provider.db;
@@ -188,16 +180,16 @@ function computerContext(workspace: ComputerWorkspace): GitContext {
     defaultIdentity: IDENTITY,
   };
 }
-
 type BackendKind = "native" | "computer";
-
 interface ReopenableBackend {
   context: GitContext;
   repo: Repository;
   write(path: string, content: string): Promise<void>;
-  reopen(): { context: GitContext; repo: Repository };
+  reopen(): {
+    context: GitContext;
+    repo: Repository;
+  };
 }
-
 async function backend(kind: BackendKind): Promise<ReopenableBackend> {
   if (kind === "native") {
     const workspace = nativeRepository("/");
@@ -229,14 +221,12 @@ async function backend(kind: BackendKind): Promise<ReopenableBackend> {
     },
   };
 }
-
 async function stagedCommitBackend(kind: BackendKind): Promise<ReopenableBackend> {
   const target = await backend(kind);
   await target.write("/file.txt", "one\n");
-  runner(target.context).runCli({ argv: ["add", "file.txt"], env: IDENTITY_ENV });
+  await runner(target.context).runCli({ argv: ["add", "file.txt"], env: IDENTITY_ENV });
   return target;
 }
-
 async function conflictedBackend(kind: BackendKind): Promise<ReopenableBackend> {
   const source = fixture();
   divergent(source);
@@ -250,12 +240,11 @@ async function conflictedBackend(kind: BackendKind): Promise<ReopenableBackend> 
     }),
   ).toMatchObject({ outcome: "conflicted" });
   await target.write("/shared.txt", "resolved\n");
-  expect(runner(target.context).runCli({ argv: ["add", "shared.txt"], env: IDENTITY_ENV })).toEqual(
-    { stdout: "", stderr: "", exitCode: 0 },
-  );
+  expect(
+    await runner(target.context).runCli({ argv: ["add", "shared.txt"], env: IDENTITY_ENV }),
+  ).toEqual({ stdout: "", stderr: "", exitCode: 0, truncated: false });
   return target;
 }
-
 async function mixedIgnoredAddBackend(kind: BackendKind): Promise<ReopenableBackend> {
   const target = await backend(kind);
   await target.write("/.gitignore", "*.log\n");
@@ -263,7 +252,6 @@ async function mixedIgnoredAddBackend(kind: BackendKind): Promise<ReopenableBack
   await target.write("/ignored.log", "ignored\n");
   return target;
 }
-
 function repositoryState(context: GitContext, repo: Repository) {
   const refs = repo.store.listRefs();
   return {
@@ -275,7 +263,7 @@ function repositoryState(context: GitContext, repo: Repository) {
     ],
     index: [...repo.checkout.indexScan()],
     operation: repo.checkout.readOperationState(),
-    worktree: context.worktree.scan(repo.root, { limit: 10_000 }).map((entry) => ({
+    worktree: context.worktree.scan(repo.root, { limit: 10000 }).map((entry) => ({
       path: entry.path,
       type: entry.type,
       mode: entry.mode,
@@ -317,31 +305,26 @@ function repositoryState(context: GitContext, repo: Repository) {
     ),
   };
 }
-
 function looseOids(repo: Repository): string[] {
   return repo.store.db
-    .all<{ oid: string }>(
-      "SELECT oid FROM git_objects WHERE repo_id = ? ORDER BY oid",
-      repo.store.repoId,
-    )
+    .all<{
+      oid: string;
+    }>("SELECT oid FROM git_objects WHERE repo_id = ? ORDER BY oid", repo.store.repoId)
     .map((row) => row.oid);
 }
-
 function newLooseOids(before: readonly string[], repo: Repository): string[] {
   const prior = new Set(before);
   return looseOids(repo).filter((oid) => !prior.has(oid));
 }
-
-function expectE2Big(run: () => unknown): void {
+async function expectE2Big(run: () => Promise<unknown>): Promise<void> {
   try {
-    run();
+    await run();
   } catch (error) {
     expect(error).toMatchObject({ code: "E2BIG" });
     return;
   }
   throw new Error("expected E2BIG");
 }
-
 function expectObjectAbsent(repo: Repository, oid: string): void {
   expect(repo.has(oid)).toBe(false);
   expect(repo.store.cachedCommit(oid)).toBeNull();
@@ -353,13 +336,11 @@ function expectObjectAbsent(repo: Repository, oid: string): void {
   }
   throw new Error(`expected object ${oid} to be unreadable`);
 }
-
 function expectObjectsAbsent(repo: Repository, oids: readonly string[]): void {
   for (const oid of oids) expectObjectAbsent(repo, oid);
 }
-
 describe("mutating git CLI handlers", () => {
-  it("matches Git for cwd-relative add and an ordinary initial commit", () => {
+  it("matches Git for cwd-relative add and an ordinary initial commit", async () => {
     const source = fixture();
     source.write("nested/a.txt", "one\n");
     source.write("root.txt", "root\n");
@@ -367,17 +348,15 @@ describe("mutating git CLI handlers", () => {
     writeWorkFile(workspace, "/repo/nested/a.txt", "one\n");
     writeWorkFile(workspace, "/repo/root.txt", "root\n");
     const native = runner(workspace.context);
-
     const expectedAdd = gitResult(source, ["add", ".", "../root.txt"], join(source.dir, "nested"));
-    const actualAdd = native.runCli({
+    const actualAdd = await native.runCli({
       argv: ["add", ".", "../root.txt"],
       cwd: "/repo/nested",
       env: IDENTITY_ENV,
     });
     expect(actualAdd).toEqual(cliResult(expectedAdd));
-
     const expectedCommit = gitResult(source, ["commit", "-m", "initial"]);
-    const actualCommit = native.runCli({
+    const actualCommit = await native.runCli({
       argv: ["commit", "-m", "initial"],
       cwd: "/repo",
       env: IDENTITY_ENV,
@@ -385,50 +364,49 @@ describe("mutating git CLI handlers", () => {
     expect(actualCommit).toEqual(cliResult(expectedCommit));
     expect(workspace.repo.head().oid).toBe(source.git("rev-parse", "HEAD"));
   });
-
-  it("summarizes a root blob above the repository batching target", () => {
+  it("summarizes a root blob above the repository batching target", async () => {
     const workspace = nativeRepository();
     const content = new Uint8Array(PACK_BLOB_BATCH_TARGET_BYTES + 1).fill(0x61);
     content[0] = 0;
     workspace.worktree.writeFiles([{ path: "/repo/large.bin", bytes: content }]);
     const git = runner(workspace.context);
-
-    expect(git.runCli({ argv: ["add", "large.bin"], cwd: "/repo", env: IDENTITY_ENV })).toEqual({
+    expect(
+      await git.runCli({ argv: ["add", "large.bin"], cwd: "/repo", env: IDENTITY_ENV }),
+    ).toEqual({
       stdout: "",
       stderr: "",
       exitCode: 0,
+      truncated: false,
     });
-    const result = git.runCli({
+    const result = await git.runCli({
       argv: ["commit", "-m", "large root"],
       cwd: "/repo",
       env: IDENTITY_ENV,
     });
-
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("1 file changed, 0 insertions(+), 0 deletions(-)");
     expect(result.stdout).toContain("create mode 100644 large.bin");
   });
-
-  it("maps missing and outside path operands without changing the index", () => {
+  it("maps missing and outside path operands without changing the index", async () => {
     const workspace = nativeRepository();
     const native = runner(workspace.context);
     const before = [...workspace.repo.checkout.indexScan()];
-
-    expect(native.runCli({ argv: ["add", "missing"], cwd: "/repo" })).toEqual({
+    expect(await native.runCli({ argv: ["add", "missing"], cwd: "/repo" })).toEqual({
       stdout: "",
       stderr: "fatal: pathspec 'missing' did not match any files\n",
       exitCode: 128,
+      truncated: false,
     });
-    expect(native.runCli({ argv: ["add", "../../outside"], cwd: "/repo/sub" })).toEqual({
+    expect(await native.runCli({ argv: ["add", "../../outside"], cwd: "/repo/sub" })).toEqual({
       stdout: "",
       stderr: "fatal: ../../outside: '../../outside' is outside repository at '/repo'\n",
       exitCode: 128,
+      truncated: false,
     });
     expect([...workspace.repo.checkout.indexScan()]).toEqual(before);
   });
-
-  it("preserves literal add operands and matches ignored-path behavior", () => {
+  it("preserves literal add operands and matches ignored-path behavior", async () => {
     const source = fixture();
     source.write(" spaced ", "literal\n");
     source.write("spaced", "plain\n");
@@ -452,20 +430,18 @@ describe("mutating git CLI handlers", () => {
     writeWorkFile(workspace, "/repo/folder/keep.txt", "keep\n");
     writeWorkFile(workspace, "/repo/folder/drop.log", "drop\n");
     const native = runner(workspace.context);
-
-    expect(native.runCli({ argv: ["add", " spaced "], cwd: "/repo" })).toEqual(
+    expect(await native.runCli({ argv: ["add", " spaced "], cwd: "/repo" })).toEqual(
       cliResult(gitResult(source, ["add", " spaced "])),
     );
     expect([...workspace.repo.checkout.indexScan()].map((entry) => entry.path)).toEqual([
       " spaced ",
     ]);
-
     const beforeIgnored = repositoryState(workspace.context, workspace.repo);
-    expect(native.runCli({ argv: ["add", "ignored.log"], cwd: "/repo" })).toEqual(
+    expect(await native.runCli({ argv: ["add", "ignored.log"], cwd: "/repo" })).toEqual(
       cliResult(gitResult(source, ["add", "ignored.log"])),
     );
     expect(repositoryState(workspace.context, workspace.repo)).toEqual(beforeIgnored);
-    expect(native.runCli({ argv: ["add", "good.txt", "ignored.log"], cwd: "/repo" })).toEqual(
+    expect(await native.runCli({ argv: ["add", "good.txt", "ignored.log"], cwd: "/repo" })).toEqual(
       cliResult(gitResult(source, ["add", "good.txt", "ignored.log"])),
     );
     expect([...workspace.repo.checkout.indexScan()].map((entry) => entry.path)).toEqual([
@@ -473,15 +449,14 @@ describe("mutating git CLI handlers", () => {
       "good.txt",
     ]);
     const afterMixed = repositoryState(workspace.context, workspace.repo);
-    expect(native.runCli({ argv: ["add", "é.log", "a b.log", "é.log"], cwd: "/repo" })).toEqual(
-      cliResult(gitResult(source, ["add", "é.log", "a b.log", "é.log"])),
-    );
-    expect(native.runCli({ argv: ["add", "nested.log"], cwd: "/repo/sub" })).toEqual(
+    expect(
+      await native.runCli({ argv: ["add", "é.log", "a b.log", "é.log"], cwd: "/repo" }),
+    ).toEqual(cliResult(gitResult(source, ["add", "é.log", "a b.log", "é.log"])));
+    expect(await native.runCli({ argv: ["add", "nested.log"], cwd: "/repo/sub" })).toEqual(
       cliResult(gitResult(source, ["add", "nested.log"], join(source.dir, "sub"))),
     );
     expect(repositoryState(workspace.context, workspace.repo)).toEqual(afterMixed);
-
-    expect(native.runCli({ argv: ["add", "folder"], cwd: "/repo" })).toEqual(
+    expect(await native.runCli({ argv: ["add", "folder"], cwd: "/repo" })).toEqual(
       cliResult(gitResult(source, ["add", "folder"])),
     );
     expect([...workspace.repo.checkout.indexScan()].map((entry) => entry.path)).toEqual([
@@ -490,7 +465,6 @@ describe("mutating git CLI handlers", () => {
       "good.txt",
     ]);
   });
-
   it("stages tracked children while reporting an explicit ignored directory", async () => {
     const source = fixture();
     source.write(".gitignore", "ignored-dir/\n");
@@ -499,7 +473,6 @@ describe("mutating git CLI handlers", () => {
     source.commit("base");
     source.write("ignored-dir/tracked.txt", "changed\n");
     source.write("ignored-dir/untracked.txt", "untracked\n");
-
     const workspace = nativeRepository();
     await importFixture(source, workspace.repo.checkout);
     checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
@@ -507,9 +480,8 @@ describe("mutating git CLI handlers", () => {
     writeWorkFile(workspace, "/repo/ignored-dir/tracked.txt", "changed\n");
     writeWorkFile(workspace, "/repo/ignored-dir/untracked.txt", "untracked\n");
     const native = runner(workspace.context);
-
     expect(
-      native.runCli({
+      await native.runCli({
         argv: ["add", "ignored-dir", "ignored-dir/tracked.txt", "ignored-dir"],
         cwd: "/repo",
       }),
@@ -523,15 +495,14 @@ describe("mutating git CLI handlers", () => {
     );
     expect(workspace.repo.checkout.indexGet("ignored-dir/untracked.txt", 0)).toBeNull();
   });
-
-  it("uses complete env identities and keeps the partial-env divergence", () => {
+  it("uses complete env identities and keeps the partial-env divergence", async () => {
     const workspace = nativeRepository();
     workspace.repo.store.configSet("user.name", "Configured");
     workspace.repo.store.configSet("user.email", "configured@example.com");
     writeWorkFile(workspace, "/repo/file.txt", "one\n");
     const native = runner(workspace.context);
-    native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
-    native.runCli({
+    await native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
+    await native.runCli({
       argv: ["commit", "-m", "partial"],
       cwd: "/repo",
       env: { GIT_AUTHOR_NAME: "Environment" },
@@ -544,10 +515,9 @@ describe("mutating git CLI handlers", () => {
       name: "Configured",
       email: "configured@example.com",
     });
-
     writeWorkFile(workspace, "/repo/file.txt", "two\n");
-    native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
-    native.runCli({
+    await native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
+    await native.runCli({
       argv: ["commit", "-m", "complete"],
       cwd: "/repo",
       env: {
@@ -566,8 +536,7 @@ describe("mutating git CLI handlers", () => {
       email: "committer@example.com",
     });
   });
-
-  it("matches quoted, brace-compressed rename and endpoint mode summaries", () => {
+  it("matches quoted, brace-compressed rename and endpoint mode summaries", async () => {
     const source = fixture();
     const original = "dir/old/naïve\tname.txt";
     const renamed = "dir/new/renamed\tname.txt";
@@ -580,9 +549,8 @@ describe("mutating git CLI handlers", () => {
     writeWorkFile(workspace, `/repo/${original}`, "same\n");
     writeWorkFile(workspace, `/repo/${compactOriginal}`, "compact\n");
     const native = runner(workspace.context);
-    native.runCli({ argv: ["add", "dir", "pkg"], cwd: "/repo" });
-    native.runCli({ argv: ["commit", "-m", "base"], cwd: "/repo", env: IDENTITY_ENV });
-
+    await native.runCli({ argv: ["add", "dir", "pkg"], cwd: "/repo" });
+    await native.runCli({ argv: ["commit", "-m", "base"], cwd: "/repo", env: IDENTITY_ENV });
     source.write("dir/new/.keep", "").remove("dir/new/.keep");
     source.write("pkg/new/.keep", "").remove("pkg/new/.keep");
     workspace.worktree.mkdir("/repo/dir/new", { recursive: true });
@@ -594,34 +562,31 @@ describe("mutating git CLI handlers", () => {
     workspace.worktree.rename(`/repo/${original}`, `/repo/${renamed}`);
     workspace.worktree.rename(`/repo/${compactOriginal}`, `/repo/${compactRenamed}`);
     workspace.worktree.chmod(`/repo/${renamed}`, 0o755);
-    native.runCli({ argv: ["add", "dir", "pkg"], cwd: "/repo" });
-
+    await native.runCli({ argv: ["add", "dir", "pkg"], cwd: "/repo" });
     expect(
-      native.runCli({ argv: ["commit", "-m", "rename"], cwd: "/repo", env: IDENTITY_ENV }),
+      await native.runCli({ argv: ["commit", "-m", "rename"], cwd: "/repo", env: IDENTITY_ENV }),
     ).toEqual(cliResult(gitResult(source, ["commit", "-m", "rename"])));
-
     source.git("config", "core.quotePath", "false");
     workspace.repo.store.configSet("core.quotePath", "false");
     source.chmod(renamed, 0o644);
     workspace.worktree.chmod(`/repo/${renamed}`, 0o644);
     expect(gitResult(source, ["add", renamed]).status).toBe(0);
-    native.runCli({ argv: ["add", renamed], cwd: "/repo" });
+    await native.runCli({ argv: ["add", renamed], cwd: "/repo" });
     expect(
-      native.runCli({ argv: ["commit", "-m", "mode"], cwd: "/repo", env: IDENTITY_ENV }),
+      await native.runCli({ argv: ["commit", "-m", "mode"], cwd: "/repo", env: IDENTITY_ENV }),
     ).toEqual(cliResult(gitResult(source, ["commit", "-m", "mode"])));
   });
-
-  it("bounds commit-summary rows and retained bytes before materializing them", () => {
+  it("bounds commit-summary rows and retained bytes before materializing them", async () => {
     const workspace = nativeRepository();
     const native = runner(workspace.context);
     writeWorkFile(workspace, "/repo/file.txt", "one\n");
-    native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
-    native.runCli({ argv: ["commit", "-m", "base"], cwd: "/repo", env: IDENTITY_ENV });
+    await native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
+    await native.runCli({ argv: ["commit", "-m", "base"], cwd: "/repo", env: IDENTITY_ENV });
     const parent = workspace.repo.head().oid;
     if (parent === null) throw new Error("base commit is missing");
     writeWorkFile(workspace, "/repo/file.txt", "two\n");
-    native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
-    native.runCli({ argv: ["commit", "-m", "change"], cwd: "/repo", env: IDENTITY_ENV });
+    await native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
+    await native.runCli({ argv: ["commit", "-m", "change"], cwd: "/repo", env: IDENTITY_ENV });
     const current = workspace.repo.head().oid;
     if (current === null) throw new Error("changed commit is missing");
     const options = { ref: parent, to: current, renames: false };
@@ -637,7 +602,6 @@ describe("mutating git CLI handlers", () => {
     );
     if (summaryRow === undefined) throw new Error("diff summary row is missing");
     const exactBytes = diffSummaryEntryRetainedBytes(summaryRow);
-
     expect(
       diffSummaryBounded(workspace.repo, workspace.worktree, options, undefined, {
         maxRows: 1,
@@ -657,13 +621,12 @@ describe("mutating git CLI handlers", () => {
       }),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
-
-  it("keeps the typed dirty-path file-row ceiling independent of directory rows", () => {
+  it("keeps the typed dirty-path file-row ceiling independent of directory rows", async () => {
     const workspace = nativeRepository();
     const native = runner(workspace.context);
     writeWorkFile(workspace, "/repo/file.txt", "one\n");
-    native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
-    native.runCli({ argv: ["commit", "-m", "base"], cwd: "/repo", env: IDENTITY_ENV });
+    await native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
+    await native.runCli({ argv: ["commit", "-m", "base"], cwd: "/repo", env: IDENTITY_ENV });
     for (let ordinal = 0; ordinal < 100; ordinal++) {
       workspace.worktree.mkdir(`/repo/d${ordinal.toString().padStart(3, "0")}`);
     }
@@ -677,23 +640,24 @@ describe("mutating git CLI handlers", () => {
       maxHashBytes: 1024,
       hashBytes: 0,
     };
-
     expect([...dirtyPathStream(workspace.repo, workspace.worktree, undefined, limits)]).toEqual([]);
     expect(limits).toMatchObject({ indexRows: 1, worktreeRows: 1 });
   });
-
   it("matches Git's empty, clean-index, and unmerged commit refusals", async () => {
     const emptySource = fixture();
     emptySource.write("file.txt", "one\n");
     const empty = nativeRepository();
     writeWorkFile(empty, "/repo/file.txt", "one\n");
     const emptyRunner = runner(empty.context);
-    emptyRunner.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
+    await emptyRunner.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
     expect(gitResult(emptySource, ["add", "file.txt"]).status).toBe(0);
     expect(
-      emptyRunner.runCli({ argv: ["commit", "-m", "   \n"], cwd: "/repo", env: IDENTITY_ENV }),
+      await emptyRunner.runCli({
+        argv: ["commit", "-m", "   \n"],
+        cwd: "/repo",
+        env: IDENTITY_ENV,
+      }),
     ).toEqual(cliResult(gitResult(emptySource, ["commit", "-m", "   \n"])));
-
     const cleanSource = fixture();
     cleanSource.write("file.txt", "one\n");
     cleanSource.commit("base");
@@ -701,39 +665,36 @@ describe("mutating git CLI handlers", () => {
     await importFixture(cleanSource, clean.repo.checkout);
     checkoutTree(clean.repo, clean.worktree, clean.repo.headTree());
     expect(
-      runner(clean.context).runCli({
+      await runner(clean.context).runCli({
         argv: ["commit", "-m", "clean"],
         cwd: "/repo",
         env: IDENTITY_ENV,
       }),
     ).toEqual(cliResult(gitResult(cleanSource, ["commit", "-m", "clean"])));
-
     cleanSource.write("file.txt", "two\n");
     cleanSource.write("untracked.txt", "new\n");
     writeWorkFile(clean, "/repo/file.txt", "two\n");
     writeWorkFile(clean, "/repo/untracked.txt", "new\n");
     expect(
-      runner(clean.context).runCli({
+      await runner(clean.context).runCli({
         argv: ["commit", "-m", "dirty"],
         cwd: "/repo",
         env: IDENTITY_ENV,
       }),
     ).toEqual(cliResult(gitResult(cleanSource, ["commit", "-m", "dirty"])));
-
     const conflict = await conflictedNative(false);
     expect(
-      runner(conflict.workspace.context).runCli({
+      await runner(conflict.workspace.context).runCli({
         argv: ["commit", "-m", "not yet"],
         env: IDENTITY_ENV,
       }),
     ).toEqual(cliResult(gitResult(conflict.source, ["commit", "-m", "not yet"])));
   });
-
   it("matches Git for add plus rebase continue and aborts after reopen", async () => {
     const unresolved = await conflictedNative(false);
     const unresolvedBefore = repositoryState(unresolved.workspace.context, unresolved.repo);
     expect(
-      runner(unresolved.workspace.context).runCli({
+      await runner(unresolved.workspace.context).runCli({
         argv: ["rebase", "--continue"],
         env: IDENTITY_ENV,
       }),
@@ -741,35 +702,34 @@ describe("mutating git CLI handlers", () => {
     expect(repositoryState(unresolved.workspace.context, unresolved.repo)).toEqual(
       unresolvedBefore,
     );
-
     const continued = await conflictedNative();
     const expected = gitResult(continued.source, ["rebase", "--continue"]);
-    const actual = runner(continued.workspace.context).runCli({
+    const actual = await runner(continued.workspace.context).runCli({
       argv: ["rebase", "--continue"],
       env: IDENTITY_ENV,
     });
     expect(actual).toEqual(cliResult(expected));
     expect(continued.repo.head().oid).toBe(continued.source.git("rev-parse", "HEAD"));
-
     const aborted = await conflictedNative();
     const beforeHead = aborted.repo.checkout.requireOperationState("rebase").state.originalHeadOid;
     const reopened = reopenNative(aborted.workspace);
     const expectedAbort = gitResult(aborted.source, ["rebase", "--abort"]);
-    const actualAbort = runner(reopened.context).runCli({ argv: ["rebase", "--abort"] });
+    const actualAbort = await runner(reopened.context).runCli({ argv: ["rebase", "--abort"] });
     expect(actualAbort).toEqual(cliResult(expectedAbort));
     expect(reopened.repo.head().oid).toBe(beforeHead);
     expect(reopened.repo.checkout.readOperationState()).toBeNull();
     expect([...reopened.repo.checkout.indexScan()].some((entry) => entry.stage > 0)).toBe(false);
   });
-
   it("preserves foreign nested checkouts during rebase continue and abort", async () => {
     const continued = await conflictedNative(true, true);
     const continuedNested = continued.workspace.worktree.scan("/nested", { limit: 100 });
     expect(
-      runner(continued.workspace.context).runCli({
-        argv: ["rebase", "--continue"],
-        env: IDENTITY_ENV,
-      }).exitCode,
+      (
+        await runner(continued.workspace.context).runCli({
+          argv: ["rebase", "--continue"],
+          env: IDENTITY_ENV,
+        })
+      ).exitCode,
     ).toBe(0);
     expect(continued.workspace.worktree.scan("/nested", { limit: 100 })).toEqual(continuedNested);
     expect(
@@ -778,11 +738,12 @@ describe("mutating git CLI handlers", () => {
     expect(
       new TextDecoder().decode(continued.workspace.worktree.readFile("/nested/foreign.txt")),
     ).toBe("foreign\n");
-
     const aborted = await conflictedNative(true, true);
     const abortedNested = aborted.workspace.worktree.scan("/nested", { limit: 100 });
     const reopened = reopenNative(aborted.workspace);
-    expect(runner(reopened.context).runCli({ argv: ["rebase", "--abort"] }).exitCode).toBe(0);
+    expect((await runner(reopened.context).runCli({ argv: ["rebase", "--abort"] })).exitCode).toBe(
+      0,
+    );
     expect(reopened.context.worktree.scan("/nested", { limit: 100 })).toEqual(abortedNested);
     expect(new TextDecoder().decode(reopened.context.worktree.readFile("/nested/outer.txt"))).toBe(
       "outer\n",
@@ -791,11 +752,10 @@ describe("mutating git CLI handlers", () => {
       new TextDecoder().decode(reopened.context.worktree.readFile("/nested/foreign.txt")),
     ).toBe("foreign\n");
   });
-
   it("bounds mixed ignored add output and rolls back its staged paths across reopen", async () => {
     const control = await mixedIgnoredAddBackend("native");
     const controlLooseBefore = looseOids(control.repo);
-    const controlResult = runner(control.context).runCli({
+    const controlResult = await runner(control.context).runCli({
       argv: ["add", "good.txt", "ignored.log"],
     });
     const orphanOids = newLooseOids(controlLooseBefore, control.repo);
@@ -811,22 +771,24 @@ describe("mutating git CLI handlers", () => {
         firstExcess: { maxCombinedOutputBytes: stderrBytes - 1 },
       },
     ];
-
     for (const kind of ["native", "computer"] satisfies BackendKind[]) {
       for (const ceiling of ceilings) {
         const exact = await mixedIgnoredAddBackend(kind);
         expect(
-          runner(exact.context).runCli({ argv: ["add", "good.txt", "ignored.log"] }, ceiling.exact),
+          await runner(exact.context).runCli(
+            { argv: ["add", "good.txt", "ignored.log"] },
+            ceiling.exact,
+          ),
         ).toEqual(controlResult);
         expect(exact.repo.checkout.indexGet("good.txt", 0)).not.toBeNull();
-
         const overflow = await mixedIgnoredAddBackend(kind);
         const before = repositoryState(overflow.context, overflow.repo);
-        expectE2Big(() =>
-          runner(overflow.context).runCli(
-            { argv: ["add", "good.txt", "ignored.log"] },
-            ceiling.firstExcess,
-          ),
+        await expectE2Big(
+          async () =>
+            await runner(overflow.context).runCli(
+              { argv: ["add", "good.txt", "ignored.log"] },
+              ceiling.firstExcess,
+            ),
         );
         expectObjectsAbsent(overflow.repo, orphanOids);
         const reopened = overflow.reopen();
@@ -835,11 +797,10 @@ describe("mutating git CLI handlers", () => {
       }
     }
   });
-
   it("rolls back commit output overflow across reopen for native and Computer worktrees", async () => {
     const control = await stagedCommitBackend("native");
     const controlLooseBefore = looseOids(control.repo);
-    const controlResult = runner(control.context).runCli({
+    const controlResult = await runner(control.context).runCli({
       argv: ["commit", "-m", "commit"],
       env: IDENTITY_ENV,
     });
@@ -858,24 +819,23 @@ describe("mutating git CLI handlers", () => {
         firstExcess: { maxCombinedOutputBytes: stdoutBytes - 1 },
       },
     ];
-
     for (const kind of ["native", "computer"] satisfies BackendKind[]) {
       for (const ceiling of ceilings) {
         const exact = await stagedCommitBackend(kind);
         expect(
-          runner(exact.context).runCli(
+          await runner(exact.context).runCli(
             { argv: ["commit", "-m", "commit"], env: IDENTITY_ENV },
             ceiling.exact,
           ),
         ).toEqual(controlResult);
-
         const overflow = await stagedCommitBackend(kind);
         const before = repositoryState(overflow.context, overflow.repo);
-        expectE2Big(() =>
-          runner(overflow.context).runCli(
-            { argv: ["commit", "-m", "commit"], env: IDENTITY_ENV },
-            ceiling.firstExcess,
-          ),
+        await expectE2Big(
+          async () =>
+            await runner(overflow.context).runCli(
+              { argv: ["commit", "-m", "commit"], env: IDENTITY_ENV },
+              ceiling.firstExcess,
+            ),
         );
         expectObjectsAbsent(overflow.repo, orphanOids);
         const reopened = overflow.reopen();
@@ -884,11 +844,10 @@ describe("mutating git CLI handlers", () => {
       }
     }
   });
-
   it("rolls back every retained rebase output overflow and can discard stderr", async () => {
     const control = await conflictedBackend("native");
     const controlLooseBefore = looseOids(control.repo);
-    const controlResult = runner(control.context).runCli({
+    const controlResult = await runner(control.context).runCli({
       argv: ["rebase", "--continue"],
       env: IDENTITY_ENV,
     });
@@ -913,33 +872,31 @@ describe("mutating git CLI handlers", () => {
         firstExcess: { maxCombinedOutputBytes: combinedBytes - 1 },
       },
     ];
-
     for (const kind of ["native", "computer"] satisfies BackendKind[]) {
       for (const ceiling of ceilings) {
         const exact = await conflictedBackend(kind);
         expect(
-          runner(exact.context).runCli(
+          await runner(exact.context).runCli(
             { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
             ceiling.exact,
           ),
         ).toEqual(controlResult);
-
         const overflow = await conflictedBackend(kind);
         const before = repositoryState(overflow.context, overflow.repo);
-        expectE2Big(() =>
-          runner(overflow.context).runCli(
-            { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
-            ceiling.firstExcess,
-          ),
+        await expectE2Big(
+          async () =>
+            await runner(overflow.context).runCli(
+              { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
+              ceiling.firstExcess,
+            ),
         );
         expectObjectsAbsent(overflow.repo, orphanOids);
         const reopened = overflow.reopen();
         expect(repositoryState(reopened.context, reopened.repo)).toEqual(before);
         expectObjectsAbsent(reopened.repo, orphanOids);
       }
-
       const discarded = await conflictedBackend(kind);
-      const discardedResult = runner(discarded.context).runCli(
+      const discardedResult = await runner(discarded.context).runCli(
         { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
         {
           maxStderrBytes: 0,
@@ -951,19 +908,20 @@ describe("mutating git CLI handlers", () => {
         stdout: controlResult.stdout,
         stderr: "",
         exitCode: 0,
+        truncated: false,
       });
-
       for (const options of [
         { maxStdoutBytes: stdoutBytes - 1, discardStderr: true },
         { maxCombinedOutputBytes: stdoutBytes - 1, discardStderr: true },
       ]) {
         const overflow = await conflictedBackend(kind);
         const before = repositoryState(overflow.context, overflow.repo);
-        expectE2Big(() =>
-          runner(overflow.context).runCli(
-            { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
-            options,
-          ),
+        await expectE2Big(
+          async () =>
+            await runner(overflow.context).runCli(
+              { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
+              options,
+            ),
         );
         expectObjectsAbsent(overflow.repo, orphanOids);
         const reopened = overflow.reopen();
@@ -972,7 +930,6 @@ describe("mutating git CLI handlers", () => {
       }
     }
   });
-
   it("keeps rejected mutating argv non-mutating", async () => {
     const target = await conflictedNative(false);
     const native = runner(target.workspace.context);
@@ -982,11 +939,10 @@ describe("mutating git CLI handlers", () => {
       ["commit", "-m"],
       ["rebase", "--skip"],
     ]) {
-      expect(native.runCli({ argv, env: IDENTITY_ENV }).exitCode).toBe(129);
+      expect((await native.runCli({ argv, env: IDENTITY_ENV })).exitCode).toBe(129);
       expect(repositoryState(target.workspace.context, target.repo)).toEqual(before);
     }
   });
-
   it("fails closed when rebase worktree transaction affinity is absent", async () => {
     const target = await conflictedNative();
     const context: GitContext = {
@@ -994,7 +950,7 @@ describe("mutating git CLI handlers", () => {
       worktree: { ...target.workspace.worktree, db: undefined },
     };
     const before = repositoryState(target.workspace.context, target.repo);
-    expect(() => runner(context).runCli({ argv: ["rebase", "--abort"] })).toThrowError(
+    await expect(runner(context).runCli({ argv: ["rebase", "--abort"] })).rejects.toThrowError(
       /share one database/,
     );
     expect(repositoryState(target.workspace.context, target.repo)).toEqual(before);

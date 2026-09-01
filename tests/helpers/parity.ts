@@ -19,65 +19,54 @@
 // recursive cases compare as sets — `agree(parity, { ordered: false })`.
 // That the shell's own order is sorted is asserted separately; it is a
 // property of the shell, not something inherited from either binary.
-
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-
 import { expect } from "vitest";
-
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
 import { createShell, type Shell } from "../../src/shell/index.js";
 import { TestDatabase } from "./db.js";
-
 /** Where the corpus lives inside kompjutr. The on-disk root maps onto it. */
 export const ROOT = "/repo";
-
 const ENCODER = new TextEncoder();
-
 function probe(binary: string): string {
   const run = spawnSync(binary, ["--version"], { encoding: "utf8" });
   if (run.error !== undefined || run.status !== 0) return "";
   return run.stdout;
 }
-
 // Resolved once. `spawnSync` does not go through a shell, so a `grep` alias
 // in the developer's profile — ugrep is a common one — cannot substitute
 // itself here the way it does at an interactive prompt.
 export const REAL_GREP = /^grep \(GNU grep\)/.test(probe("grep"));
 export const REAL_RG = /^ripgrep /.test(probe("rg"));
-
 export interface Run {
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode: number;
 }
-
 export interface Parity {
   readonly real: Run;
   readonly ours: Run;
 }
-
 export type Corpus = Readonly<Record<string, string | Uint8Array>>;
-
 /** Wrap for the shell's lexer. Everything is a single-quoted word. */
 function quote(argument: string): string {
   return `'${argument.replaceAll("'", `'\\''`)}'`;
 }
-
 export class ParityFixture {
   /** The on-disk corpus root. Appears in the real binaries' output. */
   readonly dir: string;
   readonly fs: Filesystem;
   readonly shell: Shell;
-
   constructor(corpus: Corpus) {
     this.dir = mkdtempSync(join(tmpdir(), "kompjutr-parity-"));
-    this.fs = createFilesystem(new TestDatabase(), { now: () => 1_700_000_000_000 });
-
-    const entries: Array<{ path: string; bytes: Uint8Array }> = [];
+    this.fs = createFilesystem(new TestDatabase(), { now: () => 1700000000000 });
+    const entries: Array<{
+      path: string;
+      bytes: Uint8Array;
+    }> = [];
     for (const [relative, content] of Object.entries(corpus)) {
       const bytes = typeof content === "string" ? ENCODER.encode(content) : content;
       const onDisk = join(this.dir, relative);
@@ -88,16 +77,14 @@ export class ParityFixture {
     this.fs.writeFiles(entries);
     this.shell = createShell({ fs: this.fs, cwd: ROOT });
   }
-
   /**
    * The same argv through both implementations. `{root}` stands for the
    * corpus root and is substituted per side, so the two see the same
    * command with the only difference that cannot be avoided.
    */
-  compare(binary: "grep" | "rg", ...argv: readonly string[]): Parity {
-    return { real: this.#real(binary, argv), ours: this.#ours(binary, argv) };
+  async compare(binary: "grep" | "rg", ...argv: readonly string[]): Promise<Parity> {
+    return { real: this.#real(binary, argv), ours: await this.#ours(binary, argv) };
   }
-
   #real(binary: "grep" | "rg", argv: readonly string[]): Run {
     const args = argv.map((argument) => argument.replaceAll("{root}", this.dir));
     const controlled = binary === "rg" ? ["--no-ignore", "--sort", "path"] : [];
@@ -113,27 +100,22 @@ export class ParityFixture {
       exitCode: run.status ?? -1,
     };
   }
-
-  #ours(binary: "grep" | "rg", argv: readonly string[]): Run {
+  async #ours(binary: "grep" | "rg", argv: readonly string[]): Promise<Run> {
     const source = [binary, ...argv.map((a) => quote(a.replaceAll("{root}", ROOT)))].join(" ");
-    const run = this.shell.run(source);
+    const run = await this.shell.run(source);
     return { stdout: run.stdout, stderr: run.stderr, exitCode: run.exitCode };
   }
-
   /** Rewrite the on-disk root to the kompjutr one so paths are comparable. */
   #normalize(text: string): string {
     return text.replaceAll(this.dir, ROOT);
   }
-
   cleanup(): void {
     rmSync(this.dir, { recursive: true, force: true });
   }
 }
-
 export function lines(text: string): string[] {
   return text.split("\n").filter((entry) => entry !== "");
 }
-
 /**
  * Both sides produced the same stdout and the same exit status.
  *
@@ -141,7 +123,12 @@ export function lines(text: string): string[] {
  * recursive cases whose walk order is readdir's rather than anything either
  * implementation promises.
  */
-export function agree(parity: Parity, options: { ordered?: boolean } = {}): void {
+export function agree(
+  parity: Parity,
+  options: {
+    ordered?: boolean;
+  } = {},
+): void {
   const ordered = options.ordered ?? true;
   const ours = ordered ? parity.ours.stdout : lines(parity.ours.stdout).sort().join("\n");
   const real = ordered ? parity.real.stdout : lines(parity.real.stdout).sort().join("\n");

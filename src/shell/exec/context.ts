@@ -296,7 +296,7 @@ export interface CommandContext {
    *
    * Returns null when no such command is registered.
    */
-  invoke(name: string, argv: readonly string[]): CommandResult | null;
+  invoke(name: string, argv: readonly string[]): Promise<CommandResult | null>;
 }
 
 export interface CommandOutput {
@@ -309,15 +309,17 @@ export interface CommandOutput {
 
 export interface CommandResult {
   readonly stdout: ByteStream;
-  /** Valid once stdout is fully drained. */
+  /** Valid once stdout is drained or closed. */
   status(): number;
+  /** Valid once stdout is drained or closed. */
+  truncated?(): boolean;
 }
 
-export type Command = (context: CommandContext) => CommandResult;
+export type Command = (context: CommandContext) => CommandResult | Promise<CommandResult>;
 
 /** A command that produces its whole output at once. */
 export function result(stdout: ByteStream, status = 0): CommandResult {
-  return { stdout, status: () => status };
+  return { stdout, status: () => status, truncated: () => false };
 }
 
 /**
@@ -329,11 +331,11 @@ export function deferred(build: (setStatus: (code: number) => void) => ByteStrea
   const stdout = build((code) => {
     status = code;
   });
-  return { stdout, status: () => status };
+  return { stdout, status: () => status, truncated: () => false };
 }
 
 /** A failed command: a diagnostic on stderr and a non-zero status. */
 export function fail(context: CommandContext, message: string, status = 1): CommandResult {
   context.warn(message);
-  return { stdout: (function* () {})(), status: () => status };
+  return { stdout: (function* () {})(), status: () => status, truncated: () => false };
 }

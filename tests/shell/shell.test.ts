@@ -1,7 +1,5 @@
 // End to end over a real SQLite-backed filesystem.
-
 import { beforeEach, describe, expect, it } from "vitest";
-
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
 import { encode } from "../../src/shell/exec/bytes.js";
@@ -10,18 +8,15 @@ import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 
 const ENCODER = new TextEncoder();
-
 function file(path: string, text: string) {
   return { path, bytes: ENCODER.encode(text) };
 }
-
 let fs: Filesystem;
 let storage: SqliteTestStorage;
 let shell: Shell;
-
 beforeEach(() => {
   storage = new SqliteTestStorage();
-  fs = createFilesystem(new TestDatabase(storage), { now: () => 1_700_000_000_000 });
+  fs = createFilesystem(new TestDatabase(storage), { now: () => 1700000000000 });
   fs.writeFiles([
     file("/repo/README.md", "# Project\nA line about widgets.\n"),
     file("/repo/src/alpha.ts", "export const alpha = 1;\n// TODO: widgets\n"),
@@ -33,266 +28,234 @@ beforeEach(() => {
   ]);
   shell = createShell({ fs, cwd: "/repo" });
 });
-
 describe("reading", () => {
-  it("cats a file", () => {
-    expect(shell.run("cat README.md").stdout).toBe("# Project\nA line about widgets.\n");
+  it("cats a file", async () => {
+    expect((await shell.run("cat README.md")).stdout).toBe("# Project\nA line about widgets.\n");
   });
-
-  it("heads and tails", () => {
-    expect(shell.run("head -2 docs/guide.md").stdout).toBe("line1\nline2\n");
-    expect(shell.run("tail -2 docs/guide.md").stdout).toBe("line4\nline5\n");
-    expect(shell.run("head -n 1 docs/guide.md").stdout).toBe("line1\n");
+  it("heads and tails", async () => {
+    expect((await shell.run("head -2 docs/guide.md")).stdout).toBe("line1\nline2\n");
+    expect((await shell.run("tail -2 docs/guide.md")).stdout).toBe("line4\nline5\n");
+    expect((await shell.run("head -n 1 docs/guide.md")).stdout).toBe("line1\n");
   });
-
-  it("counts", () => {
-    expect(shell.run("wc -l docs/guide.md").stdout).toBe("5\n");
+  it("counts", async () => {
+    expect((await shell.run("wc -l docs/guide.md")).stdout).toBe("5\n");
     fs.writeFiles([file("/repo/unicode.txt", "é x\n")]);
-    expect(shell.run("wc -m unicode.txt").stdout.trim()).toBe("4");
-    expect(shell.run("wc -cm unicode.txt").stdout.trim().split(/\s+/)).toEqual(["4", "5"]);
+    expect((await shell.run("wc -m unicode.txt")).stdout.trim()).toBe("4");
+    expect((await shell.run("wc -cm unicode.txt")).stdout.trim().split(/\s+/)).toEqual(["4", "5"]);
   });
-
-  it("heads each file independently and controls headings", () => {
-    expect(shell.run("head -1 README.md docs/guide.md").stdout).toBe(
+  it("heads each file independently and controls headings", async () => {
+    expect((await shell.run("head -1 README.md docs/guide.md")).stdout).toBe(
       "==> README.md <==\n# Project\n\n==> docs/guide.md <==\nline1\n",
     );
-    expect(shell.run("head -q -1 README.md docs/guide.md").stdout).toBe("# Project\nline1\n");
-    expect(shell.run("head -v -1 README.md").stdout).toBe("==> README.md <==\n# Project\n");
+    expect((await shell.run("head -q -1 README.md docs/guide.md")).stdout).toBe(
+      "# Project\nline1\n",
+    );
+    expect((await shell.run("head -v -1 README.md")).stdout).toBe("==> README.md <==\n# Project\n");
   });
-
-  it("reports a missing file without crashing", () => {
-    const run = shell.run("cat nope.txt");
+  it("reports a missing file without crashing", async () => {
+    const run = await shell.run("cat nope.txt");
     expect(run.exitCode).toBe(1);
     expect(run.stderr).toContain("No such file");
     expect(run.stdout).toBe("");
   });
 });
-
 describe("listing", () => {
-  it("lists a directory", () => {
-    expect(shell.run("ls src").stdout.split("\n").filter(Boolean).sort()).toEqual([
+  it("lists a directory", async () => {
+    expect((await shell.run("ls src")).stdout.split("\n").filter(Boolean).sort()).toEqual([
       "alpha.ts",
       "beta.ts",
       "gamma.js",
       "nested",
     ]);
   });
-
-  it("hides dotfiles unless asked", () => {
-    expect(shell.run("ls").stdout).not.toContain(".hidden");
-    expect(shell.run("ls -a").stdout).toContain(".hidden");
+  it("hides dotfiles unless asked", async () => {
+    expect((await shell.run("ls")).stdout).not.toContain(".hidden");
+    expect((await shell.run("ls -a")).stdout).toContain(".hidden");
   });
-
-  it("finds by name", () => {
-    const found = shell.run("find /repo/src -name '*.ts'").stdout.split("\n").filter(Boolean);
+  it("finds by name", async () => {
+    const found = (await shell.run("find /repo/src -name '*.ts'")).stdout
+      .split("\n")
+      .filter(Boolean);
     expect(found.sort()).toEqual([
       "/repo/src/alpha.ts",
       "/repo/src/beta.ts",
       "/repo/src/nested/delta.ts",
     ]);
   });
-
-  it("renders long listings from bulk metadata", () => {
-    const run = shell.run("ls -l src");
+  it("renders long listings from bulk metadata", async () => {
+    const run = await shell.run("ls -l src");
     expect(run.stdout).toContain("alpha.ts");
     expect(run.stdout).toContain("nested");
     expect(run.operations).toBeLessThanOrEqual(2);
   });
-
-  it("renders recursive groups including an empty directory", () => {
+  it("renders recursive groups including an empty directory", async () => {
     fs.mkdir("/repo/src/empty");
-    expect(shell.run("ls -R src").stdout).toBe(
+    expect((await shell.run("ls -R src")).stdout).toBe(
       "/repo/src:\nalpha.ts\nbeta.ts\nempty\ngamma.js\nnested\n\n" +
         "/repo/src/empty:\n\n/repo/src/nested:\ndelta.ts\n",
     );
   });
-
-  it("prunes hidden recursive groups unless requested", () => {
-    const hidden = shell.run("ls -R /repo").stdout;
+  it("prunes hidden recursive groups unless requested", async () => {
+    const hidden = (await shell.run("ls -R /repo")).stdout;
     expect(hidden).not.toContain(".hidden");
     expect(hidden).not.toContain("secret.ts");
-    expect(shell.run("ls -Ra /repo").stdout).toContain("/repo/.hidden:\nsecret.ts\n");
+    expect((await shell.run("ls -Ra /repo")).stdout).toContain("/repo/.hidden:\nsecret.ts\n");
   });
 });
-
 describe("grep", () => {
-  it("searches one file", () => {
-    expect(shell.run("grep widgets README.md").stdout).toBe("A line about widgets.\n");
+  it("searches one file", async () => {
+    expect((await shell.run("grep widgets README.md")).stdout).toBe("A line about widgets.\n");
   });
-
-  it("needs -r for a directory, like GNU grep", () => {
-    expect(shell.run("grep TODO src").exitCode).toBe(2);
-    expect(shell.run("grep -r TODO src").exitCode).toBe(0);
+  it("needs -r for a directory, like GNU grep", async () => {
+    expect((await shell.run("grep TODO src")).exitCode).toBe(2);
+    expect((await shell.run("grep -r TODO src")).exitCode).toBe(0);
   });
-
-  it("prefixes the filename when searching several files", () => {
-    const out = shell.run("grep -r TODO /repo/src").stdout.split("\n").filter(Boolean);
+  it("prefixes the filename when searching several files", async () => {
+    const out = (await shell.run("grep -r TODO /repo/src")).stdout.split("\n").filter(Boolean);
     expect(out).toHaveLength(3);
     expect(out.every((row) => row.startsWith("/repo/src/"))).toBe(true);
   });
-
-  it("filters with --include", () => {
-    const out = shell.run("grep -rl TODO /repo/src --include=*.ts").stdout;
+  it("filters with --include", async () => {
+    const out = (await shell.run("grep -rl TODO /repo/src --include=*.ts")).stdout;
     expect(out).toContain("alpha.ts");
     expect(out).toContain("delta.ts");
     expect(out).not.toContain("gamma.js");
   });
-
-  it("searches dotfiles, unlike rg", () => {
-    expect(shell.run("grep -rl TODO /repo").stdout).toContain("/repo/.hidden/secret.ts");
+  it("searches dotfiles, unlike rg", async () => {
+    expect((await shell.run("grep -rl TODO /repo")).stdout).toContain("/repo/.hidden/secret.ts");
   });
-
-  it("counts, inverts and numbers", () => {
-    expect(shell.run("grep -c line docs/guide.md").stdout).toBe("5\n");
-    expect(shell.run("grep -v line1 docs/guide.md").stdout).toBe("line2\nline3\nline4\nline5\n");
-    expect(shell.run("grep -n line3 docs/guide.md").stdout).toBe("3:line3\n");
+  it("counts, inverts and numbers", async () => {
+    expect((await shell.run("grep -c line docs/guide.md")).stdout).toBe("5\n");
+    expect((await shell.run("grep -v line1 docs/guide.md")).stdout).toBe(
+      "line2\nline3\nline4\nline5\n",
+    );
+    expect((await shell.run("grep -n line3 docs/guide.md")).stdout).toBe("3:line3\n");
   });
-
-  it("carries context lines", () => {
-    expect(shell.run("grep -C1 line3 docs/guide.md").stdout).toBe("line2\nline3\nline4\n");
+  it("carries context lines", async () => {
+    expect((await shell.run("grep -C1 line3 docs/guide.md")).stdout).toBe("line2\nline3\nline4\n");
   });
-
-  it("returns 1 when nothing matched", () => {
-    expect(shell.run("grep -r nothinghere /repo/src").exitCode).toBe(1);
+  it("returns 1 when nothing matched", async () => {
+    expect((await shell.run("grep -r nothinghere /repo/src")).exitCode).toBe(1);
   });
-
-  it("treats the pattern as BRE by default", () => {
+  it("treats the pattern as BRE by default", async () => {
     // `\|` is alternation in GNU BRE; a bare `|` is literal.
-    expect(shell.run(String.raw`grep -c 'line1\|line2' docs/guide.md`).stdout).toBe("2\n");
-    expect(shell.run("grep -c 'line1|line2' docs/guide.md").stdout).toBe("0\n");
-    expect(shell.run("grep -cE 'line1|line2' docs/guide.md").stdout).toBe("2\n");
+    expect((await shell.run(String.raw`grep -c 'line1\|line2' docs/guide.md`)).stdout).toBe("2\n");
+    expect((await shell.run("grep -c 'line1|line2' docs/guide.md")).stdout).toBe("0\n");
+    expect((await shell.run("grep -cE 'line1|line2' docs/guide.md")).stdout).toBe("2\n");
   });
-
-  it("ORs repeated grep patterns in files and stdin", () => {
-    expect(shell.run("grep -e line1 -e line3 docs/guide.md").stdout).toBe("line1\nline3\n");
-    expect(shell.run("cat docs/guide.md | grep -e line2 -e line4").stdout).toBe("line2\nline4\n");
+  it("ORs repeated grep patterns in files and stdin", async () => {
+    expect((await shell.run("grep -e line1 -e line3 docs/guide.md")).stdout).toBe("line1\nline3\n");
+    expect((await shell.run("cat docs/guide.md | grep -e line2 -e line4")).stdout).toBe(
+      "line2\nline4\n",
+    );
   });
-
-  it("names a pattern construct it will not fake", () => {
-    const run = shell.run("grep -E '(?=x)' README.md");
+  it("names a pattern construct it will not fake", async () => {
+    const run = await shell.run("grep -E '(?=x)' README.md");
     expect(run.exitCode).toBe(2);
     expect(run.stderr).toContain("lookaround");
   });
 });
-
 describe("rg is its own surface", () => {
-  it("is recursive by default", () => {
-    expect(shell.run("rg -l TODO /repo/src").exitCode).toBe(0);
+  it("is recursive by default", async () => {
+    expect((await shell.run("rg -l TODO /repo/src")).exitCode).toBe(0);
   });
-
-  it("skips dotfiles where grep does not", () => {
-    expect(shell.run("rg -l TODO /repo").stdout).not.toContain(".hidden");
-    expect(shell.run("rg -l --hidden TODO /repo").stdout).toContain(".hidden");
+  it("skips dotfiles where grep does not", async () => {
+    expect((await shell.run("rg -l TODO /repo")).stdout).not.toContain(".hidden");
+    expect((await shell.run("rg -l --hidden TODO /repo")).stdout).toContain(".hidden");
   });
-
-  it("filters with -g and -t", () => {
-    expect(shell.run("rg -l TODO -g '*.js' /repo/src").stdout.trim()).toBe("/repo/src/gamma.js");
-    expect(shell.run("rg -l TODO -t ts /repo/src").stdout).not.toContain("gamma.js");
+  it("filters with -g and -t", async () => {
+    expect((await shell.run("rg -l TODO -g '*.js' /repo/src")).stdout.trim()).toBe(
+      "/repo/src/gamma.js",
+    );
+    expect((await shell.run("rg -l TODO -t ts /repo/src")).stdout).not.toContain("gamma.js");
   });
-
-  it("excludes with a ! glob", () => {
-    expect(shell.run("rg -l TODO -g '!*.js' /repo/src").stdout).not.toContain("gamma.js");
+  it("excludes with a ! glob", async () => {
+    expect((await shell.run("rg -l TODO -g '!*.js' /repo/src")).stdout).not.toContain("gamma.js");
   });
-
-  it("applies smart case only with -S", () => {
-    expect(shell.run("rg -c todo /repo/src").exitCode).toBe(1);
-    expect(shell.run("rg -lS todo /repo/src").exitCode).toBe(0);
+  it("applies smart case only with -S", async () => {
+    expect((await shell.run("rg -c todo /repo/src")).exitCode).toBe(1);
+    expect((await shell.run("rg -lS todo /repo/src")).exitCode).toBe(0);
     // An uppercase letter in the pattern turns smart case back off.
-    expect(shell.run("rg -lS TODO /repo/src").exitCode).toBe(0);
+    expect((await shell.run("rg -lS TODO /repo/src")).exitCode).toBe(0);
   });
-
-  it("treats the pattern as ERE without -E", () => {
-    expect(shell.run("rg -c 'line1|line2' docs/guide.md").stdout).toBe("2\n");
+  it("treats the pattern as ERE without -E", async () => {
+    expect((await shell.run("rg -c 'line1|line2' docs/guide.md")).stdout).toBe("2\n");
   });
-
-  it("ORs repeated rg patterns in files and stdin", () => {
-    expect(shell.run("rg -e line1 -e line3 docs/guide.md").stdout).toBe("line1\nline3\n");
-    expect(shell.run("cat docs/guide.md | rg -e line2 -e line4").stdout).toBe("line2\nline4\n");
+  it("ORs repeated rg patterns in files and stdin", async () => {
+    expect((await shell.run("rg -e line1 -e line3 docs/guide.md")).stdout).toBe("line1\nline3\n");
+    expect((await shell.run("cat docs/guide.md | rg -e line2 -e line4")).stdout).toBe(
+      "line2\nline4\n",
+    );
   });
-
-  it("searches the working directory when given no path", () => {
-    expect(shell.run("rg -l TODO").exitCode).toBe(0);
+  it("searches the working directory when given no path", async () => {
+    expect((await shell.run("rg -l TODO")).exitCode).toBe(0);
   });
 });
-
 describe("pipelines", () => {
-  it("pipes into head", () => {
-    expect(shell.run("cat docs/guide.md | head -2").stdout).toBe("line1\nline2\n");
+  it("pipes into head", async () => {
+    expect((await shell.run("cat docs/guide.md | head -2")).stdout).toBe("line1\nline2\n");
   });
-
-  it("filters a listing without a second query", () => {
-    expect(shell.run("ls src | grep beta").stdout).toBe("beta.ts\n");
+  it("filters a listing without a second query", async () => {
+    expect((await shell.run("ls src | grep beta")).stdout).toBe("beta.ts\n");
   });
-
-  it("chains two greps", () => {
-    expect(shell.run("cat docs/guide.md | grep line | grep 3").stdout).toBe("line3\n");
+  it("chains two greps", async () => {
+    expect((await shell.run("cat docs/guide.md | grep line | grep 3")).stdout).toBe("line3\n");
   });
-
-  it("fuses find into a search", () => {
-    const out = shell.run("find /repo/src -name '*.ts' | xargs grep -l TODO").stdout;
+  it("fuses find into a search", async () => {
+    const out = (await shell.run("find /repo/src -name '*.ts' | xargs grep -l TODO")).stdout;
     expect(out).toContain("alpha.ts");
     expect(out).not.toContain("gamma.js");
   });
-
-  it("sorts and uniques", () => {
-    expect(shell.run("ls src | sort -r").stdout.split("\n")[0]).toBe("nested");
+  it("sorts and uniques", async () => {
+    expect((await shell.run("ls src | sort -r")).stdout.split("\n")[0]).toBe("nested");
   });
-
-  it("sorts text by UTF-8 bytes instead of UTF-16 code units", () => {
+  it("sorts text by UTF-8 bytes instead of UTF-16 code units", async () => {
     fs.writeFiles([file("/repo/order.txt", "𐀀\n\n")]);
-    expect(shell.run("sort order.txt").stdout).toBe("\n𐀀\n");
+    expect((await shell.run("sort order.txt")).stdout).toBe("\n𐀀\n");
   });
 });
-
 describe("connectors and redirection", () => {
-  it("short-circuits on &&", () => {
-    expect(shell.run("cat nope && echo reached").stdout).toBe("");
-    expect(shell.run("cat README.md > /dev/null && echo reached").exitCode).toBe(0);
+  it("short-circuits on &&", async () => {
+    expect((await shell.run("cat nope && echo reached")).stdout).toBe("");
+    expect((await shell.run("cat README.md > /dev/null && echo reached")).exitCode).toBe(0);
   });
-
-  it("runs the right-hand side of || only on failure", () => {
-    expect(shell.run("grep -r zzz /repo/src || echo fallback").stdout).toBe("fallback\n");
+  it("runs the right-hand side of || only on failure", async () => {
+    expect((await shell.run("grep -r zzz /repo/src || echo fallback")).stdout).toBe("fallback\n");
   });
-
-  it("evaluates mixed AND-OR lists left to right", () => {
-    expect(shell.run("false && echo no || echo yes")).toMatchObject({
+  it("evaluates mixed AND-OR lists left to right", async () => {
+    expect(await shell.run("false && echo no || echo yes")).toMatchObject({
       stdout: "yes\n",
       exitCode: 0,
     });
-    expect(shell.run("true || echo no && echo yes")).toMatchObject({
+    expect(await shell.run("true || echo no && echo yes")).toMatchObject({
       stdout: "yes\n",
       exitCode: 0,
     });
   });
-
-  it("continues after a skipped pipeline at a semicolon", () => {
-    expect(shell.run("false && echo no; echo final")).toMatchObject({
+  it("continues after a skipped pipeline at a semicolon", async () => {
+    expect(await shell.run("false && echo no; echo final")).toMatchObject({
       stdout: "final\n",
       exitCode: 0,
     });
-    expect(shell.run("true || echo no; echo final")).toMatchObject({
+    expect(await shell.run("true || echo no; echo final")).toMatchObject({
       stdout: "final\n",
       exitCode: 0,
     });
   });
-
-  it("drops stderr on request", () => {
-    expect(shell.run("cat nope 2>/dev/null").stderr).toBe("");
-    expect(shell.run("cat nope").stderr).not.toBe("");
+  it("drops stderr on request", async () => {
+    expect((await shell.run("cat nope 2>/dev/null")).stderr).toBe("");
+    expect((await shell.run("cat nope")).stderr).not.toBe("");
   });
-
-  it("merges stderr into stdout on 2>&1", () => {
-    expect(shell.run("cat nope 2>&1").stdout).toContain("No such file");
+  it("merges stderr into stdout on 2>&1", async () => {
+    expect((await shell.run("cat nope 2>&1")).stdout).toContain("No such file");
   });
-
-  it("merges stderr before the downstream stage", () => {
-    const run = shell.run("cat no1 no2 2>&1 | head -1");
+  it("merges stderr before the downstream stage", async () => {
+    const run = await shell.run("cat no1 no2 2>&1 | head -1");
     expect(run.stdout).toContain("no1");
     expect(run.stdout).not.toContain("no2");
     expect(run.stderr).toBe("");
   });
-
-  it("preserves merged stream order from an injected command", () => {
+  it("preserves merged stream order from an injected command", async () => {
     const alternating: Command = (context) => ({
       stdout: (function* () {
         context.warn("before");
@@ -306,61 +269,52 @@ describe("connectors and redirection", () => {
       cwd: "/repo",
       commands: new Map([["alternating", alternating]]),
     });
-
-    expect(injected.run("alternating 2>&1").stdout).toBe(
+    expect((await injected.run("alternating 2>&1")).stdout).toBe(
       "alternating: before\nstdout\nalternating: after\n",
     );
   });
-
-  it("writes and appends to a file", () => {
-    shell.run("echo one > /repo/out.txt");
-    shell.run("echo two >> /repo/out.txt");
-    expect(shell.run("cat /repo/out.txt").stdout).toBe("one\ntwo\n");
+  it("writes and appends to a file", async () => {
+    await shell.run("echo one > /repo/out.txt");
+    await shell.run("echo two >> /repo/out.txt");
+    expect((await shell.run("cat /repo/out.txt")).stdout).toBe("one\ntwo\n");
   });
-
-  it("applies stdout redirection to an intermediate stage", () => {
-    expect(shell.run("echo piped > /repo/intermediate.txt | cat").stdout).toBe("");
-    expect(shell.run("cat /repo/intermediate.txt").stdout).toBe("piped\n");
-
-    expect(shell.run("echo appended >> /repo/intermediate.txt | cat").stdout).toBe("");
-    expect(shell.run("cat /repo/intermediate.txt").stdout).toBe("piped\nappended\n");
+  it("applies stdout redirection to an intermediate stage", async () => {
+    expect((await shell.run("echo piped > /repo/intermediate.txt | cat")).stdout).toBe("");
+    expect((await shell.run("cat /repo/intermediate.txt")).stdout).toBe("piped\n");
+    expect((await shell.run("echo appended >> /repo/intermediate.txt | cat")).stdout).toBe("");
+    expect((await shell.run("cat /repo/intermediate.txt")).stdout).toBe("piped\nappended\n");
   });
 });
-
 describe("writing", () => {
-  it("copies, moves and removes", () => {
-    expect(shell.run("cp README.md copy.md").exitCode).toBe(0);
-    expect(shell.run("cat copy.md").stdout).toContain("# Project");
-    expect(shell.run("mv copy.md moved.md").exitCode).toBe(0);
-    expect(shell.run("cat copy.md").exitCode).toBe(1);
-    expect(shell.run("rm moved.md").exitCode).toBe(0);
-    expect(shell.run("cat moved.md").exitCode).toBe(1);
+  it("copies, moves and removes", async () => {
+    expect((await shell.run("cp README.md copy.md")).exitCode).toBe(0);
+    expect((await shell.run("cat copy.md")).stdout).toContain("# Project");
+    expect((await shell.run("mv copy.md moved.md")).exitCode).toBe(0);
+    expect((await shell.run("cat copy.md")).exitCode).toBe(1);
+    expect((await shell.run("rm moved.md")).exitCode).toBe(0);
+    expect((await shell.run("cat moved.md")).exitCode).toBe(1);
   });
-
-  it("copies a tree with -r", () => {
-    expect(shell.run("cp -r src /repo/backup").exitCode).toBe(0);
-    expect(shell.run("cat /repo/backup/nested/delta.ts").stdout).toContain("delta");
+  it("copies a tree with -r", async () => {
+    expect((await shell.run("cp -r src /repo/backup")).exitCode).toBe(0);
+    expect((await shell.run("cat /repo/backup/nested/delta.ts")).stdout).toContain("delta");
   });
-
-  it("refuses to remove a directory without -r", () => {
-    expect(shell.run("rm src").exitCode).toBe(1);
-    expect(shell.run("rm -r src").exitCode).toBe(0);
-    expect(shell.run("ls src").exitCode).toBe(2);
+  it("refuses to remove a directory without -r", async () => {
+    expect((await shell.run("rm src")).exitCode).toBe(1);
+    expect((await shell.run("rm -r src")).exitCode).toBe(0);
+    expect((await shell.run("ls src")).exitCode).toBe(2);
   });
-
-  it("makes directories", () => {
-    expect(shell.run("mkdir -p /repo/a/b/c").exitCode).toBe(0);
-    expect(shell.run("ls /repo/a/b").stdout).toBe("c\n");
+  it("makes directories", async () => {
+    expect((await shell.run("mkdir -p /repo/a/b/c")).exitCode).toBe(0);
+    expect((await shell.run("ls /repo/a/b")).stdout).toBe("c\n");
   });
-
-  it("touches files, directories, and symlink targets without reading content", () => {
-    let current = 2_000;
+  it("touches files, directories, and symlink targets without reading content", async () => {
+    let current = 2000;
     const touchFs = createFilesystem(new TestDatabase(), { now: () => current });
     const contentId = new Uint8Array([9, 8, 7]);
     touchFs.writeFiles([
-      { path: "/repo/file", bytes: ENCODER.encode("content"), mtime: 1_000, contentId },
-      { path: "/repo/directory", mtime: 1_000 },
-      { path: "/repo/link", target: "/repo/file", mtime: 1_000 },
+      { path: "/repo/file", bytes: ENCODER.encode("content"), mtime: 1000, contentId },
+      { path: "/repo/directory", mtime: 1000 },
+      { path: "/repo/link", target: "/repo/file", mtime: 1000 },
     ]);
     const guarded: Filesystem = {
       ...touchFs,
@@ -372,48 +326,43 @@ describe("writing", () => {
       },
     };
     const touchShell = createShell({ fs: guarded, cwd: "/repo" });
-    current = 3_000;
-
-    expect(touchShell.run("touch file directory link missing").exitCode).toBe(0);
-    expect(touchFs.stat("/repo/file")).toMatchObject({ mtime: 3_000, contentId });
-    expect(touchFs.stat("/repo/directory")?.mtime).toBe(3_000);
-    expect(touchFs.stat("/repo/link")?.mtime).toBe(1_000);
+    current = 3000;
+    expect((await touchShell.run("touch file directory link missing")).exitCode).toBe(0);
+    expect(touchFs.stat("/repo/file")).toMatchObject({ mtime: 3000, contentId });
+    expect(touchFs.stat("/repo/directory")?.mtime).toBe(3000);
+    expect(touchFs.stat("/repo/link")?.mtime).toBe(1000);
     expect(touchFs.stat("/repo/missing")).toMatchObject({ type: "file", size: 0 });
-    expect(touchShell.run("touch -h file").exitCode).toBe(2);
+    expect((await touchShell.run("touch -h file")).exitCode).toBe(2);
   });
 });
-
 describe("sed ships two forms", () => {
-  it("substitutes", () => {
-    expect(shell.run("cat README.md | sed 's/widgets/gadgets/'").stdout).toContain("gadgets");
+  it("substitutes", async () => {
+    expect((await shell.run("cat README.md | sed 's/widgets/gadgets/'")).stdout).toContain(
+      "gadgets",
+    );
   });
-
-  it("prints a line range", () => {
-    expect(shell.run("sed -n 2,3p docs/guide.md").stdout).toBe("line2\nline3\n");
-    expect(shell.run("sed 2p docs/guide.md").stdout).toBe(
+  it("prints a line range", async () => {
+    expect((await shell.run("sed -n 2,3p docs/guide.md")).stdout).toBe("line2\nline3\n");
+    expect((await shell.run("sed 2p docs/guide.md")).stdout).toBe(
       "line1\nline2\nline2\nline3\nline4\nline5\n",
     );
   });
-
-  it("points at the container for anything else", () => {
-    const run = shell.run("cat README.md | sed '/widgets/d'");
+  it("points at the container for anything else", async () => {
+    const run = await shell.run("cat README.md | sed '/widgets/d'");
     expect(run.exitCode).toBe(2);
     expect(run.stderr).toContain("container");
   });
 });
-
 describe("rejections", () => {
-  it("names an unsupported construct", () => {
-    expect(shell.run("echo $(date)").stderr).toContain("command substitution");
-    expect(shell.run("for f in a b; do echo x; done").stderr).toContain("`for`");
+  it("names an unsupported construct", async () => {
+    expect((await shell.run("echo $(date)")).stderr).toContain("command substitution");
+    expect((await shell.run("for f in a b; do echo x; done")).stderr).toContain("`for`");
   });
-
-  it("reports an unknown command", () => {
-    const run = shell.run("bun run build");
+  it("reports an unknown command", async () => {
+    const run = await shell.run("bun run build");
     expect(run.exitCode).toBe(127);
     expect(run.stderr).toContain("command not found");
   });
-
   it.each([
     "ls -h",
     "ls -t",
@@ -425,28 +374,25 @@ describe("rejections", () => {
     "mkdir -v made",
     "mkdir -m 700 made",
     "xargs -t echo",
-  ])("rejects a previously ignored flag: %s", (source) => {
-    expect(shell.run(source)).toMatchObject({ exitCode: 2, stdout: "" });
+  ])("rejects a previously ignored flag: %s", async (source) => {
+    expect(await shell.run(source)).toMatchObject({ exitCode: 2, stdout: "" });
   });
-
   it.each(["wc --unknown", "sort --unknown", "uniq --unknown"])(
     "returns usage errors instead of throwing: %s",
-    (source) => {
-      expect(shell.run(source)).toMatchObject({ exitCode: 2, stdout: "" });
+    async (source) => {
+      expect(await shell.run(source)).toMatchObject({ exitCode: 2, stdout: "" });
     },
   );
-
-  it("returns expected lazy filesystem failures", () => {
-    const run = shell.run("uniq src");
+  it("returns expected lazy filesystem failures", async () => {
+    const run = await shell.run("uniq src");
     expect(run.exitCode).toBe(1);
     expect(run.stderr).toContain("EISDIR");
   });
-
-  it("does not hide arbitrary injected-command exceptions", () => {
+  it("does not hide arbitrary injected-command exceptions", async () => {
     const broken: Command = () => {
       throw new Error("injected defect");
     };
     const injected = createShell({ fs, cwd: "/repo", commands: new Map([["broken", broken]]) });
-    expect(() => injected.run("broken")).toThrow("injected defect");
+    await expect(injected.run("broken")).rejects.toThrow("injected defect");
   });
 });

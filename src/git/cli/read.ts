@@ -33,7 +33,7 @@ type ReadHandlers = Pick<GitCliHandlers, "status" | "diff" | "log" | "revList" |
 
 export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
   return {
-    status(invocation, runOptions) {
+    async status(invocation, runOptions) {
       return withRepository(context, invocation.cwd, outputContext(runOptions), (repo) => {
         const rows = eagerStatus(
           repo,
@@ -54,7 +54,7 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
         return gitCliResult(stdout, "", 0);
       });
     },
-    diff(invocation, runOptions) {
+    async diff(invocation, runOptions) {
       return withRepository(context, invocation.cwd, outputContext(runOptions), (repo) => {
         const quotePath = statusFormatOptions(repo).quotePath ?? true;
         return gitCliResult(
@@ -69,7 +69,7 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
         );
       });
     },
-    log(invocation, runOptions) {
+    async log(invocation, runOptions) {
       const output = outputContext(runOptions);
       return withRepository(context, invocation.cwd, output, (repo) => {
         const command = invocation.command;
@@ -120,7 +120,7 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
         );
       });
     },
-    revList(invocation, runOptions) {
+    async revList(invocation, runOptions) {
       const output = outputContext(runOptions);
       return withRepository(context, invocation.cwd, output, (repo) => {
         if (
@@ -139,7 +139,7 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
         return gitCliResult(`${result.behind}\n`, "", 0);
       });
     },
-    symbolicRef(invocation, runOptions) {
+    async symbolicRef(invocation, runOptions) {
       const output = outputContext(runOptions);
       return withRepository(context, invocation.cwd, output, (repo) => {
         const ref = invocation.command.ref;

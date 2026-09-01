@@ -8,25 +8,86 @@
 
 import type { RetainedBudget } from "./context.js";
 
-/** A stage's output. Sync because the whole filesystem API is sync. */
-export type ByteStream = Generator<Uint8Array, void, undefined>;
+/** A stage's output. Producers may be synchronous or asynchronous. */
+export type ByteStream =
+  | IterableIterator<Uint8Array, void, undefined>
+  | AsyncIterableIterator<Uint8Array, void, undefined>;
 
-const RESTORE_UNUSED = Symbol("kompjutr.shell.restore-unused");
+const UNUSED_RESTORERS = new WeakMap<ByteStream, (bytes: Uint8Array) => void>();
 
 /** Attach a private pushback seam used by a run-owned stdin borrow. */
 export function withUnusedRestorer(
   stream: ByteStream,
   restore: (bytes: Uint8Array) => void,
 ): ByteStream {
-  Object.defineProperty(stream, RESTORE_UNUSED, { value: restore });
+  UNUSED_RESTORERS.set(stream, restore);
   return stream;
 }
 
 /** Return a suffix when a consumer stops inside one chunk. */
 export function restoreUnused(stream: ByteStream, bytes: Uint8Array): void {
-  if (bytes.length === 0 || !(RESTORE_UNUSED in stream)) return;
-  const restore = stream[RESTORE_UNUSED];
-  if (typeof restore === "function") restore(bytes);
+  if (bytes.length === 0) return;
+  UNUSED_RESTORERS.get(stream)?.(bytes);
+}
+
+export function isAsyncByteStream(
+  stream: ByteStream,
+): stream is AsyncIterableIterator<Uint8Array, void, undefined> {
+  return Symbol.asyncIterator in stream;
+}
+
+export async function close(stream: ByteStream | null): Promise<void> {
+  if (stream?.return !== undefined) await stream.return();
+}
+
+/** Release owned resources on completion, rejection, or an unstarted close. */
+export function owned(stream: ByteStream, release: () => void): ByteStream {
+  return new OwnedByteStream(stream, release);
+}
+
+class OwnedByteStream implements AsyncIterableIterator<Uint8Array, void, undefined> {
+  #closed = false;
+
+  constructor(
+    private readonly source: ByteStream,
+    private readonly release: () => void,
+  ) {}
+
+  [Symbol.asyncIterator](): AsyncIterableIterator<Uint8Array, void, undefined> {
+    return this;
+  }
+
+  async next(..._args: [] | [undefined]): Promise<IteratorResult<Uint8Array, void>> {
+    if (this.#closed) return { done: true, value: undefined };
+    try {
+      const next = await this.source.next();
+      if (next.done) await this.#finish(false);
+      return next;
+    } catch (error) {
+      await this.#finish(true);
+      throw error;
+    }
+  }
+
+  async return(_value?: undefined): Promise<IteratorResult<Uint8Array, void>> {
+    await this.#finish(true);
+    return { done: true, value: undefined };
+  }
+
+  async throw(error: unknown): Promise<IteratorResult<Uint8Array, void>> {
+    await this.#finish(true);
+    throw error;
+  }
+
+  async #finish(closeSource: boolean): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    try {
+      if (closeSource) await close(this.source);
+    } finally {
+      this.release();
+    }
+  }
 }
 
 export const NEWLINE = 0x0a;
@@ -55,8 +116,10 @@ export function concat(chunks: readonly Uint8Array[]): Uint8Array {
 }
 
 /** Everything a stream produces, in one buffer. */
-export function drain(stream: ByteStream): Uint8Array {
-  return concat([...stream]);
+export async function drain(stream: ByteStream): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return concat(chunks);
 }
 
 export interface HeldBytes {
@@ -65,11 +128,15 @@ export interface HeldBytes {
 }
 
 /** Drain semantic input under the shared retained-memory ceiling. */
-export function drainBounded(stream: ByteStream, budget: RetainedBudget, label: string): HeldBytes {
+export async function drainBounded(
+  stream: ByteStream,
+  budget: RetainedBudget,
+  label: string,
+): Promise<HeldBytes> {
   const chunks: Uint8Array[] = [];
   const releases: Array<() => void> = [];
   try {
-    for (const chunk of stream) {
+    for await (const chunk of stream) {
       releases.push(budget.retain(chunk.length, label));
       chunks.push(chunk);
     }
@@ -119,14 +186,14 @@ function idempotent(release: () => void): () => void {
  * two — and `sawTrailingNewline` records which it was, so a stage can put
  * the file back the way it found it.
  */
-export function* lines(
+export async function* lines(
   stream: ByteStream,
   budget?: RetainedBudget,
-): Generator<Uint8Array, void, undefined> {
+): AsyncGenerator<Uint8Array, void, undefined> {
   let carry: Uint8Array | null = null;
   let releaseCarry: (() => void) | null = null;
   try {
-    for (const chunk of stream) {
+    for await (const chunk of stream) {
       let start = 0;
       for (let index = 0; index < chunk.length; index++) {
         if (chunk[index] !== NEWLINE) continue;
@@ -178,8 +245,10 @@ export function* lines(
 }
 
 /** Re-join lines, each terminated. The inverse of `lines` for text input. */
-export function* terminated(source: Iterable<Uint8Array>): Generator<Uint8Array, void, undefined> {
-  for (const line of source) {
+export async function* terminated(
+  source: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+): AsyncGenerator<Uint8Array, void, undefined> {
+  for await (const line of source) {
     const out = new Uint8Array(line.length + 1);
     out.set(line, 0);
     out[line.length] = NEWLINE;

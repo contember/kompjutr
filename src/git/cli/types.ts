@@ -14,6 +14,7 @@ export interface GitCliResult {
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode: number;
+  readonly truncated: boolean;
 }
 
 export interface GitCliRunOptions {
@@ -25,7 +26,7 @@ export interface GitCliRunOptions {
 }
 
 export interface GitCliRunner {
-  runCli(input: GitCliInput, options?: GitCliRunOptions): GitCliResult;
+  runCli(input: GitCliInput, options?: GitCliRunOptions): Promise<GitCliResult>;
 }
 
 export interface ResolvedGitCliRunOptions {
@@ -113,7 +114,7 @@ export interface GitCliInvocation<Command extends ParsedGitCliCommand = ParsedGi
 export type GitCliCommandHandler<Command extends ParsedGitCliCommand> = (
   invocation: GitCliInvocation<Command>,
   options: ResolvedGitCliRunOptions,
-) => GitCliResult;
+) => GitCliResult | Promise<GitCliResult>;
 
 export interface GitCliHandlers {
   readonly status?: GitCliCommandHandler<GitCliStatusCommand>;

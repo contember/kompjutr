@@ -7,16 +7,20 @@ runtime. Unsupported syntax and options fail explicitly.
 ## Execution model
 
 Commands pass through `parse → plan → execute`. Planning is pure and has no
-filesystem dependency. Execution is pull-based: when `head` stops pulling, an
-upstream scan, search, or listing stops issuing pages.
+filesystem dependency. Execution is asynchronous and pull-based: when `head`
+stops pulling, an upstream scan, search, or listing stops issuing pages.
+`ByteStream` is the public union of synchronous and asynchronous byte iterators;
+consumers await each pull and close.
 
 The grammar supports simple commands, quotes and escapes, unquoted path globs,
 pipelines, and flat left-associative `&&`, `||`, and `;` lists. Pipeline status
 is the last stage's status; there is no `pipefail`. Each stage owns its
 redirections:
 
-- `< file`, `> file`, and `>> file` stream without retaining the complete file.
-  Output writes are atomic, including rollback when an upstream stage fails.
+- `< file`, `> file`, and `>> file` preserve atomic publication. Synchronous
+  output streams feed the filesystem transaction incrementally. Asynchronous
+  output is pulled sequentially under `maxRetainedBytes` before the one
+  synchronous filesystem publication; an upstream rejection publishes nothing.
 - `2>&1` merges that stage's diagnostics before the downstream pipe consumes
   them.
 - `2>/dev/null` drops diagnostics without allocating an intermediate buffer.
@@ -29,10 +33,10 @@ Exceptions from injected commands remain visible to the caller.
 input through `ShellRunOptions`:
 
 ```ts
-const counted = shell.run("cat | wc -c", {
+const counted = await shell.run("cat | wc -c", {
   stdin: "bytes or text",
 });
-const committed = shell.run("git commit -m update", {
+const committed = await shell.run("git commit -m update", {
   env: {
     GIT_AUTHOR_NAME: "Agent",
     GIT_AUTHOR_EMAIL: "agent@example.com",
@@ -43,7 +47,8 @@ const committed = shell.run("git commit -m update", {
 Caller stdin is one cursor for the complete run. Selected pipelines borrow its
 remaining bytes without replaying consumed input. Closing a pipeline borrow
 does not close the run cursor, and `< file` replaces input only for that stage.
-The run closes its cursor on every result or exception.
+The run awaits cursor and stream cleanup on every result or exception. Pipeline
+status and list sequencing are evaluated only after drain or close completes.
 
 Environment values are a frozen snapshot of the caller's own enumerable
 properties. Built-ins and the parser do not expand them. Injected commands read
@@ -110,7 +115,8 @@ upstream stdin stream without reading it, because no accepted Git command reads
 stdin. When a run supplies env, the adapter forwards its snapshot to the Git
 runner; only the four documented Git identity variables affect commits.
 
-Git stdout remains pipeline bytes. Git stderr uses the raw diagnostic seam, so
+Git stdout remains pipeline bytes. The adapter awaits the runner before exposing
+its settled result. Git stderr uses the raw diagnostic seam, so
 the adapter adds no command prefix, newline, or decoding. It therefore preserves
 Git's command-specific bytes under direct stderr, `2>&1`, and `2>/dev/null`.
 Existing built-ins keep using the prefixed `warn()` seam.
@@ -139,9 +145,10 @@ one logical filesystem revision per mutating call.
 | Caller stdin | 1 MiB | UTF-8 text is measured before encoding; binary input is copied only after the combined input reservation succeeds. |
 | Caller env | 256 own entries and 1 MiB cumulative UTF-8 key/value bytes | The frozen snapshot and stdin share one `maxRetainedBytes` reservation for the complete run. |
 | Expanded argv | 10,000 entries and 1,000,000 UTF-8 bytes | The first excess entry or byte fails with an `E2BIG`-shaped result before invocation. |
-| Redirect input | 96 MiB | Content streams in bounded batches. The complete transaction rolls back on byte overflow or upstream failure; accumulated statement count does not reject it. |
+| Async redirect input | `maxRetainedBytes` | Input is pulled sequentially before atomic publication. Synchronous producers continue to stream incrementally without retaining the complete output. |
 
-`RunResult.operations` reports the shell-visible filesystem call count.
+`RunResult.truncated` is the OR of public sink truncation and every settled
+command's truncation signal. `RunResult.operations` reports the shell-visible filesystem call count.
 `RunResult.peakRetainedBytes` reports the measured peak intermediate-byte
 reservation for the run. It excludes public stdout and stderr, because those
 have their own caps. An injected Git command performs separately bounded SQL

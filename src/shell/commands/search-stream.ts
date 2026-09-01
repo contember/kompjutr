@@ -29,7 +29,7 @@ export function searchStream(
 ): CommandResult {
   let matched = false;
 
-  const stream = (function* (): ByteStream {
+  const stream = (async function* (): ByteStream {
     const label = options.name ?? "(standard input)";
     const history: Array<{ bytes: Uint8Array; release(): void }> = [];
     const context = options.before > 0 || options.after > 0;
@@ -47,7 +47,7 @@ export function searchStream(
     }
 
     try {
-      for (const text of lines(stdin, retained)) {
+      for await (const text of lines(stdin, retained)) {
         number++;
         const releaseDecoded = retained.retain(text.length * 2, "search decoded line");
         let hit: boolean;
@@ -101,7 +101,7 @@ export function searchStream(
     if (options.mode === "files-without-match" && !matched) yield encode(`${label}\n`);
   })();
 
-  return { stdout: stream, status: () => (matched ? 0 : 1) };
+  return { stdout: stream, status: () => (matched ? 0 : 1), truncated: () => false };
 }
 
 function render(

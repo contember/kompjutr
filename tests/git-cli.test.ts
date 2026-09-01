@@ -1,7 +1,5 @@
 import { createHash } from "node:crypto";
-
 import { describe, expect, it } from "vitest";
-
 import {
   boundedGitCliResult,
   createGitCliRunner,
@@ -21,7 +19,6 @@ import {
 } from "../src/git/cli/index.js";
 
 const ENCODER = new TextEncoder();
-
 describe("git argv grammar", () => {
   it.each([
     [["status", "--porcelain"], { kind: "status", format: "porcelain-v1" }],
@@ -63,7 +60,6 @@ describe("git argv grammar", () => {
   ])("accepts %j without a partial parse", (argv, expected) => {
     expect(parsed(argv)).toEqual(expected);
   });
-
   it.each([
     ["plain status", ["status"]],
     ["status extra operand", ["status", "--short", "path"]],
@@ -95,7 +91,6 @@ describe("git argv grammar", () => {
   ])("rejects %s", (_name, argv) => {
     expect(rejected(argv).exitCode).not.toBe(0);
   });
-
   it("accepts the full format allowlist and rejects every other placeholder", () => {
     expect(parsed(["log", "--format=%H%h%P%s%B%an%ae%at%cn%ce%ct%n%%"])).toMatchObject({
       kind: "log",
@@ -106,11 +101,9 @@ describe("git argv grammar", () => {
       );
     }
   });
-
   it.each(["0", "00", "1", "50000"])("accepts decimal log count %s", (value) => {
     expect(parsed(["log", "-n", value])).toMatchObject({ kind: "log", count: Number(value) });
   });
-
   it.each(["", "+1", "-1", " 1", "1 ", "1.0", "0x10", "50001"])(
     "rejects non-admitted log count %j",
     (value) => {
@@ -118,20 +111,22 @@ describe("git argv grammar", () => {
         stdout: "",
         stderr: `fatal: '${value}': not an integer\n`,
         exitCode: 128,
+        truncated: false,
       });
     },
   );
-
   it("pins unknown and network command framing", () => {
     expect(rejected([])).toEqual({
       stdout: "",
       stderr: "git: no command specified\n",
       exitCode: 1,
+      truncated: false,
     });
     expect(rejected(["frobnicate"])).toEqual({
       stdout: "",
       stderr: "git: 'frobnicate' is not a git command. See 'git --help'.\n",
       exitCode: 1,
+      truncated: false,
     });
     expect(rejected(["push"])).toEqual({
       stdout: "",
@@ -145,26 +140,27 @@ describe("git argv grammar", () => {
         "\n" +
         "    git push <name>\n",
       exitCode: 128,
+      truncated: false,
     });
     for (const command of ["fetch", "pull", "clone", "ls-remote"]) {
       expect(rejected([command])).toEqual({
         stdout: "",
         stderr: `fatal: network command '${command}' is not supported\n`,
         exitCode: 128,
+        truncated: false,
       });
     }
   });
-
   it.each([
     [
       "status",
-      1_249,
+      1249,
       "742609d57c5b33e9deaf00bf6e6ce8e0b53b9fb041d57391fc9c855b31014fd8",
       "error: unknown option `definitely-unknown'\nusage: git status",
     ],
     [
       "diff",
-      1_648,
+      1648,
       "61c6eaf4dfe10da6bc6c3b4ab6c3b7b0a907fd91881b5f62f47ec0dcadd4bab7",
       "error: invalid option: --definitely-unknown\nusage: git diff",
     ],
@@ -182,19 +178,19 @@ describe("git argv grammar", () => {
     ],
     [
       "add",
-      1_676,
+      1676,
       "eb915d729dc063b6519916ad41f0de7d213a20816e54061cd177f9f2e319801f",
       "error: unknown option `definitely-unknown'\nusage: git add",
     ],
     [
       "commit",
-      3_594,
+      3594,
       "f2f8aca47d4a2605fcbddd53d62878b5a35c3e3863862230e1f2f4969a244762",
       "error: unknown option `definitely-unknown'\nusage: git commit",
     ],
     [
       "rebase",
-      3_470,
+      3470,
       "b06007a7e1e649983a5b8318ae8b9d527ca5f238f6b2742a11bf51810235d6ba",
       "error: unknown option `definitely-unknown'\nusage: git rebase",
     ],
@@ -205,23 +201,23 @@ describe("git argv grammar", () => {
     expect(ENCODER.encode(result.stderr).byteLength).toBe(bytes);
     expect(createHash("sha256").update(result.stderr).digest("hex")).toBe(hash);
   });
-
   it("keeps log and missing commit-message framing command-specific", () => {
     expect(rejected(["log", "--graph"])).toEqual({
       stdout: "",
       stderr: "fatal: unrecognized argument: --graph\n",
       exitCode: 128,
+      truncated: false,
     });
     expect(rejected(["commit", "-m"])).toEqual({
       stdout: "",
       stderr: "error: switch `m' requires a value\n",
       exitCode: 129,
+      truncated: false,
     });
   });
 });
-
 describe("git CLI runtime validation and bounds", () => {
-  it("keeps argv cardinality structural without a byte-component refusal", () => {
+  it("keeps argv cardinality structural without a byte-component refusal", async () => {
     expect(
       validateGitCliInput({ argv: Array(GIT_CLI_MAX_ARGV_ENTRIES).fill("") }).argv,
     ).toHaveLength(GIT_CLI_MAX_ARGV_ENTRIES);
@@ -230,10 +226,9 @@ describe("git CLI runtime validation and bounds", () => {
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     const argument = "x".repeat(1024 * 1024 + 1);
     expect(validateGitCliInput({ argv: [argument] }).argv).toEqual([argument]);
-    expect(createGitCliRunner({}).runCli({ argv: [argument] }).exitCode).toBe(1);
+    expect((await createGitCliRunner({}).runCli({ argv: [argument] })).exitCode).toBe(1);
   });
-
-  it("rejects argv mutation after capturing its checked length", () => {
+  it("rejects argv mutation after capturing its checked length", async () => {
     let calls = 0;
     const runner = createGitCliRunner({
       status() {
@@ -249,8 +244,7 @@ describe("git CLI runtime validation and bounds", () => {
         return "status";
       },
     });
-
-    expect(() => runner.runCli({ argv })).toThrowError(
+    await expect(runner.runCli({ argv })).rejects.toThrowError(
       expect.objectContaining({
         code: "EINVAL",
         message: "git CLI argv changed during validation",
@@ -258,8 +252,7 @@ describe("git CLI runtime validation and bounds", () => {
     );
     expect(calls).toBe(0);
   });
-
-  it("accepts cwd, stdin, and env crossing their former component thresholds", () => {
+  it("accepts cwd, stdin, and env crossing their former component thresholds", async () => {
     const cwd = `/${"x".repeat(4 * 1024)}`;
     const stdin = "x".repeat(1024 * 1024 + 1);
     const env = { K: "x".repeat(1024 * 1024 + 1) };
@@ -275,12 +268,12 @@ describe("git CLI runtime validation and bounds", () => {
       stdin,
     });
     expect(
-      createGitCliRunner({
+      await createGitCliRunner({
         status(invocation) {
           return gitCliResult(invocation.cwd, "", 0);
         },
       }).runCli({ argv: ["status", "--porcelain"], cwd, stdin, env }),
-    ).toEqual({ stdout: cwd, stderr: "", exitCode: 0 });
+    ).toEqual({ stdout: cwd, stderr: "", exitCode: 0, truncated: false });
     const entries: Array<readonly [string, string]> = [];
     for (let index = 0; index < GIT_CLI_MAX_ENV_ENTRIES; index++) entries.push([`K${index}`, ""]);
     expect(validateGitCliInput({ argv: [], env: Object.fromEntries(entries) }).env).toBeDefined();
@@ -289,8 +282,7 @@ describe("git CLI runtime validation and bounds", () => {
       expect.objectContaining({ code: "E2BIG" }),
     );
   });
-
-  it("accepts commit messages and log formats crossing their former component thresholds", () => {
+  it("accepts commit messages and log formats crossing their former component thresholds", async () => {
     const message = "é".repeat((1024 * 1024) / 2 + 1);
     const format = "é".repeat((64 * 1024) / 2 + 1);
     expect(parsed(["commit", "-m", message])).toMatchObject({ kind: "commit", message });
@@ -311,10 +303,9 @@ describe("git CLI runtime validation and bounds", () => {
         );
       },
     });
-    expect(runner.runCli({ argv: ["commit", "-m", message] }).exitCode).toBe(0);
-    expect(runner.runCli({ argv: ["log", `--format=${format}`] }).exitCode).toBe(0);
+    expect((await runner.runCli({ argv: ["commit", "-m", message] })).exitCode).toBe(0);
+    expect((await runner.runCli({ argv: ["log", `--format=${format}`] })).exitCode).toBe(0);
   });
-
   it("accepts NUL only in ignored stdin and output-compatible strings", () => {
     expect(validateGitCliInput({ argv: [], stdin: "before\0after" }).stdin).toBe("before\0after");
     for (const input of [
@@ -333,7 +324,6 @@ describe("git CLI runtime validation and bounds", () => {
     expect(() => parsed(["log", "--format=bad\0format"])).toThrowError(
       expect.objectContaining({ code: "EINVAL" }),
     );
-
     expect(
       boundedGitCliResult(
         gitCliResult("out\0put", "err\0or", 0),
@@ -343,9 +333,8 @@ describe("git CLI runtime validation and bounds", () => {
           maxCombinedOutputBytes: 13,
         }),
       ),
-    ).toEqual({ stdout: "out\0put", stderr: "err\0or", exitCode: 0 });
+    ).toEqual({ stdout: "out\0put", stderr: "err\0or", exitCode: 0, truncated: false });
   });
-
   it("rejects malformed UTF-16 in every retained text class", () => {
     const malformed = String.fromCharCode(0xd800);
     for (const input of [
@@ -377,7 +366,6 @@ describe("git CLI runtime validation and bounds", () => {
       expect.objectContaining({ code: "EINVAL" }),
     );
   });
-
   it.each([
     null,
     [],
@@ -398,7 +386,6 @@ describe("git CLI runtime validation and bounds", () => {
       expect.objectContaining({ code: "EINVAL" }),
     );
   });
-
   it("rejects inherited input fields", () => {
     for (const input of [
       recordWithPrototype({ argv: [] }, {}),
@@ -411,7 +398,6 @@ describe("git CLI runtime validation and bounds", () => {
       );
     }
   });
-
   it("rejects inherited environment fields", () => {
     for (const env of [
       recordWithPrototype({ GIT_AUTHOR_NAME: "Inherited" }, {}),
@@ -422,7 +408,6 @@ describe("git CLI runtime validation and bounds", () => {
       );
     }
   });
-
   it("accepts null-prototype input and environment records", () => {
     const env = recordWithPrototype(null, {
       GIT_AUTHOR_NAME: "Author",
@@ -434,7 +419,6 @@ describe("git CLI runtime validation and bounds", () => {
       env,
       stdin: "ignored",
     });
-
     expect(validateGitCliInput(input)).toEqual({
       argv: ["commit", "-m", "message"],
       cwd: "/repo",
@@ -447,7 +431,6 @@ describe("git CLI runtime validation and bounds", () => {
       stdin: "ignored",
     });
   });
-
   it("retains only the four recognized bounded environment entries", () => {
     const parsedInput = parseGitCliInput({
       argv: ["commit", "-m", "m"],
@@ -473,7 +456,6 @@ describe("git CLI runtime validation and bounds", () => {
       },
     });
   });
-
   it("runtime-validates every run option at its intrinsic bound", () => {
     expect(
       resolveGitCliRunOptions({
@@ -507,7 +489,6 @@ describe("git CLI runtime validation and bounds", () => {
       );
     }
   });
-
   it.each([
     ["maxStdoutBytes", GIT_CLI_MAX_COMBINED_OUTPUT_BYTES],
     ["maxStderrBytes", GIT_CLI_MAX_COMBINED_OUTPUT_BYTES],
@@ -523,7 +504,6 @@ describe("git CLI runtime validation and bounds", () => {
       expect.objectContaining({ code: "EINVAL" }),
     );
   });
-
   it("accepts both discardStderr booleans and rejects non-booleans", () => {
     expect(resolveGitCliRunOptions({ discardStderr: false }).discardStderr).toBe(false);
     expect(resolveGitCliRunOptions({ discardStderr: true }).discardStderr).toBe(true);
@@ -533,7 +513,6 @@ describe("git CLI runtime validation and bounds", () => {
       );
     }
   });
-
   it("rejects inherited run options and accepts a null-prototype options record", () => {
     for (const options of [
       recordWithPrototype({ maxStdoutBytes: 1 }, {}),
@@ -543,7 +522,6 @@ describe("git CLI runtime validation and bounds", () => {
         expect.objectContaining({ code: "EINVAL" }),
       );
     }
-
     expect(
       resolveGitCliRunOptions(
         recordWithPrototype(null, { maxStdoutBytes: 1, discardStderr: true }),
@@ -551,14 +529,12 @@ describe("git CLI runtime validation and bounds", () => {
     ).toMatchObject({ maxStdoutBytes: 1, discardStderr: true });
   });
 });
-
 describe("git CLI result bounds and dispatch", () => {
-  it("does not return a discarded huge parser diagnostic", () => {
+  it("does not return a discarded huge parser diagnostic", async () => {
     const command = "x".repeat(GIT_CLI_MAX_COMBINED_OUTPUT_BYTES + 1);
     const runner = createGitCliRunner({});
-
     expect(
-      runner.runCli(
+      await runner.runCli(
         { argv: [command] },
         {
           discardStderr: true,
@@ -567,13 +543,11 @@ describe("git CLI result bounds and dispatch", () => {
           maxCombinedOutputBytes: 0,
         },
       ),
-    ).toEqual({ stdout: "", stderr: "", exitCode: 1 });
-
-    expect(() => runner.runCli({ argv: [command] }, { maxCombinedOutputBytes: 1 })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+    ).toEqual({ stdout: "", stderr: "", exitCode: 1, truncated: false });
+    await expect(
+      runner.runCli({ argv: [command] }, { maxCombinedOutputBytes: 1 }),
+    ).rejects.toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
-
   it("preflights stdout, stderr, and the combined ceiling", () => {
     const options = resolveGitCliRunOptions({
       maxStdoutBytes: 3,
@@ -584,6 +558,7 @@ describe("git CLI result bounds and dispatch", () => {
       stdout: "abc",
       stderr: "de",
       exitCode: 7,
+      truncated: false,
     });
     expect(() => boundedGitCliResult(gitCliResult("abcd", "", 1), options)).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
@@ -595,13 +570,12 @@ describe("git CLI result bounds and dispatch", () => {
       expect.objectContaining({ code: "E2BIG" }),
     );
   });
-
   it("snapshots mutable handler result fields once and returns a fresh plain result", () => {
-    const reads = { stdout: 0, stderr: 0, exitCode: 0 };
+    const reads = { stdout: 0, stderr: 0, exitCode: 0, truncated: 0 };
     let stdout = "first stdout";
     let stderr = "first stderr";
     let exitCode = 7;
-    const source: GitCliResult = { stdout: "", stderr: "", exitCode: 0 };
+    const source: GitCliResult = { stdout: "", stderr: "", exitCode: 0, truncated: false };
     Object.defineProperties(source, {
       stdout: {
         get() {
@@ -627,42 +601,53 @@ describe("git CLI result bounds and dispatch", () => {
           return snapshot;
         },
       },
+      truncated: {
+        get() {
+          reads.truncated++;
+          return false;
+        },
+      },
     });
-
     const checked = boundedGitCliResult(source, resolveGitCliRunOptions(undefined));
     const snapshotReads = { ...reads };
-    expect(checked).toEqual({ stdout: "first stdout", stderr: "first stderr", exitCode: 7 });
+    expect(checked).toEqual({
+      stdout: "first stdout",
+      stderr: "first stderr",
+      exitCode: 7,
+      truncated: false,
+    });
     expect(checked).not.toBe(source);
     expect(Object.getPrototypeOf(checked)).toBe(Object.prototype);
-    expect(snapshotReads).toEqual({ stdout: 1, stderr: 1, exitCode: 1 });
+    expect(snapshotReads).toEqual({ stdout: 1, stderr: 1, exitCode: 1, truncated: 1 });
   });
-
   it.each([
     ["direct", ["unknown-command"]],
     ["sliced", ["status", "--unknown-option"]],
-  ])("preserves stderr then combined diagnostic precedence for %s diagnostics", (_name, argv) => {
-    const runner = createGitCliRunner({});
-    expect(() =>
-      runner.runCli({ argv }, { maxStderrBytes: 2, maxCombinedOutputBytes: 1 }),
-    ).toThrowError(
-      expect.objectContaining({
-        code: "E2BIG",
-        message: "git CLI stderr exceeds 2 bytes",
-      }),
-    );
-    expect(() =>
-      runner.runCli(
-        { argv },
-        { maxStderrBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES, maxCombinedOutputBytes: 1 },
-      ),
-    ).toThrowError(
-      expect.objectContaining({
-        code: "E2BIG",
-        message: "git CLI combined output exceeds 1 bytes",
-      }),
-    );
-  });
-
+  ])(
+    "preserves stderr then combined diagnostic precedence for %s diagnostics",
+    async (_name, argv) => {
+      const runner = createGitCliRunner({});
+      await expect(
+        runner.runCli({ argv }, { maxStderrBytes: 2, maxCombinedOutputBytes: 1 }),
+      ).rejects.toThrowError(
+        expect.objectContaining({
+          code: "E2BIG",
+          message: "git CLI stderr exceeds 2 bytes",
+        }),
+      );
+      await expect(
+        runner.runCli(
+          { argv },
+          { maxStderrBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES, maxCombinedOutputBytes: 1 },
+        ),
+      ).rejects.toThrowError(
+        expect.objectContaining({
+          code: "E2BIG",
+          message: "git CLI combined output exceeds 1 bytes",
+        }),
+      );
+    },
+  );
   it("accounts multibyte output at exact and first-excess byte ceilings", () => {
     expect(
       boundedGitCliResult(
@@ -673,7 +658,7 @@ describe("git CLI result bounds and dispatch", () => {
           maxCombinedOutputBytes: 3,
         }),
       ),
-    ).toEqual({ stdout: "é", stderr: "x", exitCode: 0 });
+    ).toEqual({ stdout: "é", stderr: "x", exitCode: 0, truncated: false });
     expect(() =>
       boundedGitCliResult(gitCliResult("é", "", 0), resolveGitCliRunOptions({ maxStdoutBytes: 1 })),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
@@ -687,8 +672,7 @@ describe("git CLI result bounds and dispatch", () => {
       ),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
-
-  it("accepts exact combined stdout and stderr and rejects the first excess", () => {
+  it("accepts exact combined stdout and stderr and rejects the first excess", async () => {
     const stdout = "o".repeat(GIT_CLI_MAX_COMBINED_OUTPUT_BYTES / 2);
     const stderr = "e".repeat(GIT_CLI_MAX_COMBINED_OUTPUT_BYTES / 2);
     let excess = false;
@@ -697,55 +681,51 @@ describe("git CLI result bounds and dispatch", () => {
         return gitCliResult(stdout, excess ? `${stderr}x` : stderr, 0);
       },
     });
-
-    expect(runner.runCli({ argv: ["status", "--porcelain"] })).toEqual({
+    expect(await runner.runCli({ argv: ["status", "--porcelain"] })).toEqual({
       stdout,
       stderr,
       exitCode: 0,
+      truncated: false,
     });
-
     excess = true;
-    expect(() => runner.runCli({ argv: ["status", "--porcelain"] })).toThrowError(
+    await expect(runner.runCli({ argv: ["status", "--porcelain"] })).rejects.toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
   });
-
-  it("propagates parser, handler, and output errors", () => {
+  it("propagates parser, handler, and output errors", async () => {
     const runner = createGitCliRunner({
       status() {
         throw new Error("handler failed");
       },
     });
-
-    expect(runner.runCli({ argv: ["unknown"] }).exitCode).toBe(1);
-    expect(() => runner.runCli({ argv: [String.fromCharCode(0xd800)] })).toThrowError(
+    expect((await runner.runCli({ argv: ["unknown"] })).exitCode).toBe(1);
+    await expect(runner.runCli({ argv: [String.fromCharCode(0xd800)] })).rejects.toThrowError(
       expect.objectContaining({ code: "EINVAL" }),
     );
-    expect(() => runner.runCli({ argv: ["status", "--porcelain"] })).toThrow("handler failed");
-
+    await expect(runner.runCli({ argv: ["status", "--porcelain"] })).rejects.toThrow(
+      "handler failed",
+    );
     const outputRunner = createGitCliRunner({
       status() {
         return gitCliResult("xx", "", 0);
       },
     });
-    expect(() =>
+    await expect(
       outputRunner.runCli({ argv: ["status", "--porcelain"] }, { maxStdoutBytes: 1 }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-
+    ).rejects.toThrowError(expect.objectContaining({ code: "E2BIG" }));
     const slicedOutputRunner = createGitCliRunner({
       commit() {
         return gitCliResult("output", "", 0);
       },
     });
-    expect(() =>
+    await expect(
       slicedOutputRunner.runCli(
-        { argv: ["commit", `--message=${"x".repeat(4_096)}`] },
+        { argv: ["commit", `--message=${"x".repeat(4096)}`] },
         { maxStdoutBytes: 1 },
       ),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    ).rejects.toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
-
-  it("does not return or UTF-8 validate discarded stderr", () => {
+  it("does not return or UTF-8 validate discarded stderr", async () => {
     const result = boundedGitCliResult(
       gitCliResult("abc", "diagnostic larger than every configured bound", 128),
       resolveGitCliRunOptions({
@@ -755,8 +735,7 @@ describe("git CLI result bounds and dispatch", () => {
         discardStderr: true,
       }),
     );
-    expect(result).toEqual({ stdout: "abc", stderr: "", exitCode: 128 });
-
+    expect(result).toEqual({ stdout: "abc", stderr: "", exitCode: 128, truncated: false });
     const malformed = String.fromCharCode(0xd800);
     expect(
       boundedGitCliResult(
@@ -768,22 +747,20 @@ describe("git CLI result bounds and dispatch", () => {
           discardStderr: true,
         }),
       ),
-    ).toEqual({ stdout: "é", stderr: "", exitCode: 1 });
-
-    const injectedStderr = "diagnostic".repeat(1_000);
+    ).toEqual({ stdout: "é", stderr: "", exitCode: 1, truncated: false });
+    const injectedStderr = "diagnostic".repeat(1000);
     const runner = createGitCliRunner({
       status() {
         return gitCliResult("", injectedStderr, 1);
       },
     });
     expect(
-      runner.runCli(
+      await runner.runCli(
         { argv: ["status", "--porcelain"] },
         { discardStderr: true, maxStderrBytes: 0 },
       ),
-    ).toEqual({ stdout: "", stderr: "", exitCode: 1 });
+    ).toEqual({ stdout: "", stderr: "", exitCode: 1, truncated: false });
   });
-
   it("validates result runtime shapes and exit status", () => {
     expect(() => Reflect.apply(gitCliResult, undefined, [1, "", 0])).toThrowError(
       expect.objectContaining({ code: "EINVAL" }),
@@ -797,8 +774,7 @@ describe("git CLI result bounds and dispatch", () => {
       );
     }
   });
-
-  it("passes cwd/env once, tightens log count by hint, and ignores stdin", () => {
+  it("passes cwd/env once, tightens log count by hint, and ignores stdin", async () => {
     let seenCwd = "";
     let seenCount: number | undefined;
     const runner = createGitCliRunner({
@@ -809,7 +785,7 @@ describe("git CLI result bounds and dispatch", () => {
       },
     });
     expect(
-      runner.runCli(
+      await runner.runCli(
         {
           argv: ["log", "-n", "20"],
           cwd: "/repo/nested",
@@ -818,15 +794,17 @@ describe("git CLI result bounds and dispatch", () => {
         },
         { logLimitHint: 3 },
       ),
-    ).toEqual({ stdout: "A", stderr: "", exitCode: 0 });
+    ).toEqual({ stdout: "A", stderr: "", exitCode: 0, truncated: false });
     expect(seenCwd).toBe("/repo/nested");
     expect(seenCount).toBe(3);
-    runner.runCli({ argv: ["log", "-n", "2"] }, { logLimitHint: 3 });
+    await runner.runCli({ argv: ["log", "-n", "2"] }, { logLimitHint: 3 });
     expect(seenCount).toBe(2);
   });
-
-  it("passes exact resolved defaults and overrides to every handler", () => {
-    const seen: Array<{ command: string; options: ResolvedGitCliRunOptions }> = [];
+  it("passes exact resolved defaults and overrides to every handler", async () => {
+    const seen: Array<{
+      command: string;
+      options: ResolvedGitCliRunOptions;
+    }> = [];
     function record(command: string, options: ResolvedGitCliRunOptions): GitCliResult {
       seen.push({ command, options });
       return gitCliResult("", "", 0);
@@ -868,14 +846,13 @@ describe("git CLI result bounds and dispatch", () => {
       ["rebase", "--abort"],
     ];
     const defaults = resolveGitCliRunOptions(undefined);
-    for (const argv of commands) runner.runCli({ argv });
+    for (const argv of commands) await runner.runCli({ argv });
     expect(seen).toEqual(
       commands.map((argv) => ({
         command: argv[0],
         options: defaults,
       })),
     );
-
     const overrides = {
       maxStdoutBytes: 7,
       maxStderrBytes: 8,
@@ -884,14 +861,13 @@ describe("git CLI result bounds and dispatch", () => {
       logLimitHint: 2,
     };
     const resolvedOverrides = resolveGitCliRunOptions(overrides);
-    for (const argv of commands) runner.runCli({ argv }, overrides);
+    for (const argv of commands) await runner.runCli({ argv }, overrides);
     expect(seen.slice(commands.length)).toEqual(
       commands.map((argv) => ({
         command: argv[0],
         options: resolvedOverrides,
       })),
     );
-
     const calls = seen.length;
     for (const argv of [
       ["status"],
@@ -905,12 +881,11 @@ describe("git CLI result bounds and dispatch", () => {
       ["push"],
       ["unknown"],
     ]) {
-      runner.runCli({ argv });
+      await runner.runCli({ argv });
     }
     expect(seen).toHaveLength(calls);
   });
-
-  it("freezes handler options and preserves the caller ceiling", () => {
+  it("freezes handler options and preserves the caller ceiling", async () => {
     let frozen = false;
     let changed = true;
     const runner = createGitCliRunner({
@@ -920,17 +895,16 @@ describe("git CLI result bounds and dispatch", () => {
         return gitCliResult("xx", "", 0);
       },
     });
-    expect(() =>
+    await expect(
       runner.runCli(
         { argv: ["status", "--porcelain"] },
         { maxStdoutBytes: 1, maxCombinedOutputBytes: 1 },
       ),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    ).rejects.toThrowError(expect.objectContaining({ code: "E2BIG" }));
     expect(frozen).toBe(true);
     expect(changed).toBe(false);
   });
-
-  it("returns every parser refusal without invoking an operation", () => {
+  it("returns every parser refusal without invoking an operation", async () => {
     let calls = 0;
     const handlers: GitCliHandlers = {
       status(_invocation, _options) {
@@ -943,7 +917,7 @@ describe("git CLI result bounds and dispatch", () => {
       },
     };
     const runner = createGitCliRunner(handlers);
-    expect(runner.runCli({ argv: ["status", "--short", "extra"] }).exitCode).toBe(129);
+    expect((await runner.runCli({ argv: ["status", "--short", "extra"] })).exitCode).toBe(129);
     for (const argv of [
       ["add", ":file"],
       ["add", ":!file"],
@@ -952,44 +926,39 @@ describe("git CLI result bounds and dispatch", () => {
       ["add", ":(glob)file"],
       ["add", "--", ":file"],
     ]) {
-      expect(runner.runCli({ argv }).exitCode).toBe(129);
+      expect((await runner.runCli({ argv })).exitCode).toBe(129);
     }
-    expect(runner.runCli({ argv: ["push"] }).exitCode).toBe(128);
-    expect(runner.runCli({ argv: ["unknown"] }).exitCode).toBe(1);
+    expect((await runner.runCli({ argv: ["push"] })).exitCode).toBe(128);
+    expect((await runner.runCli({ argv: ["unknown"] })).exitCode).toBe(1);
     expect(calls).toBe(0);
   });
-
-  it("keeps missing handlers as unexpected programming errors", () => {
+  it("keeps missing handlers as unexpected programming errors", async () => {
     const runner = createGitCliRunner({});
-    expect(() => runner.runCli({ argv: ["diff"] })).toThrowError(
+    await expect(runner.runCli({ argv: ["diff"] })).rejects.toThrowError(
       "missing git CLI handler for diff",
     );
   });
-
-  it("runtime-validates the public runner despite its static input type", () => {
+  it("runtime-validates the public runner despite its static input type", async () => {
     const runner = createGitCliRunner({});
-    expect(() => Reflect.apply(runner.runCli, runner, [{ argv: [], dir: "/" }])).toThrowError(
-      expect.objectContaining({ code: "EINVAL" }),
-    );
-    expect(() =>
+    await expect(
+      Reflect.apply(runner.runCli, runner, [{ argv: [], dir: "/" }]),
+    ).rejects.toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    await expect(
       Reflect.apply(runner.runCli, runner, [{ argv: ["diff"] }, { maxStdoutBytes: "1" }]),
-    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    ).rejects.toThrowError(expect.objectContaining({ code: "EINVAL" }));
   });
 });
-
 function parsed(argv: readonly string[]): ParsedGitCliCommand {
   const result = parseGitCliCommand(argv);
   if (!result.ok) throw new Error(`expected accepted argv, received ${result.result.stderr}`);
   return result.invocation.command;
 }
-
 function rejected(argv: readonly string[]): GitCliResult {
   const result = parseGitCliCommand(argv);
   if (result.ok)
     throw new Error(`expected rejected argv, received ${result.invocation.command.kind}`);
   return result.result;
 }
-
 function recordWithPrototype(
   prototype: object | null,
   properties: Readonly<Record<string, unknown>>,

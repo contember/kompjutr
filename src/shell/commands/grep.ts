@@ -214,7 +214,7 @@ export const grep: Command = (context) => {
     };
 
     const outcome = search(context.fs, request);
-    return { stdout: outcome.stream, status: outcome.status };
+    return { stdout: outcome.stream, status: outcome.status, truncated: () => false };
   } catch (error) {
     if (error instanceof UsageError || error instanceof PatternError) {
       return fail(context, error.message, 2);

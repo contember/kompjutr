@@ -1,8 +1,6 @@
 // One mixed workflow proving that control flow, streaming, set mutations, and
 // shared limits compose rather than only passing in isolation.
-
 import { expect, it } from "vitest";
-
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import { encode } from "../../src/shell/exec/bytes.js";
 import { type Command, createShell } from "../../src/shell/index.js";
@@ -10,8 +8,7 @@ import { TestDatabase } from "../helpers/db.js";
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder();
-
-it("composes the complete bounded shell contract", () => {
+it("composes the complete bounded shell contract", async () => {
   let now = 100;
   const fs = createFilesystem(new TestDatabase(), { now: () => now });
   fs.writeFiles([
@@ -25,7 +22,6 @@ it("composes the complete bounded shell contract", () => {
     { path: "/repo/src/nested/d.txt", bytes: ENCODER.encode("beta\n") },
   ]);
   now = 200;
-
   const announce: Command = (context) => ({
     stdout: (function* () {
       context.warn("warning");
@@ -44,8 +40,7 @@ it("composes the complete bounded shell contract", () => {
       maxRetainedBytes: 256,
     },
   });
-
-  const run = shell.run(
+  const run = await shell.run(
     "false && echo skipped || echo recovered; " +
       "announce 2>&1 | head -2; " +
       "find src -name '*.txt' | head -2 > found; " +
@@ -54,7 +49,6 @@ it("composes the complete bounded shell contract", () => {
       "touch copy/a.txt copy; " +
       "sort found | xargs echo selected: > summary",
   );
-
   expect(run).toMatchObject({
     stdout:
       "recovered\n" +
@@ -73,7 +67,6 @@ it("composes the complete bounded shell contract", () => {
   expect(run.operations).toBeLessThanOrEqual(16);
   expect(run.peakRetainedBytes).toBeGreaterThan(0);
   expect(run.peakRetainedBytes).toBeLessThanOrEqual(256);
-
   expect(DECODER.decode(fs.readFile("/repo/found"))).toBe("/repo/src/a.txt\n/repo/src/b.txt\n");
   expect(DECODER.decode(fs.readFile("/repo/summary"))).toBe(
     "selected: /repo/src/a.txt /repo/src/b.txt\n",

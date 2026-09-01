@@ -257,7 +257,7 @@ export const rg: Command = (context) => {
           `${withName ? `${path}: ` : ""}binary file matches (found "\\0" byte around offset ${offset})\n`,
         ),
     });
-    return { stdout: outcome.stream, status: outcome.status };
+    return { stdout: outcome.stream, status: outcome.status, truncated: () => false };
   } catch (error) {
     if (error instanceof UsageError || error instanceof PatternError) {
       return fail(context, error.message, 2);

@@ -1,4 +1,4 @@
-import type { ByteStream } from "../shell/exec/bytes.js";
+import { close } from "../shell/exec/bytes.js";
 import { type Command, ShellLimitError } from "../shell/exec/context.js";
 import {
   GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
@@ -9,10 +9,10 @@ import {
 
 const ENCODER = new TextEncoder();
 
-/** Adapt the synchronous Git argv runner to one injected shell command. */
+/** Adapt the Git argv runner to one injected shell command. */
 export function createGitCommand(runner: GitCliRunner): Command {
-  return (context) => {
-    context.stdin?.return();
+  return async (context) => {
+    await close(context.stdin);
     const options = runOptions(context);
     let cliResult: GitCliResult;
     try {
@@ -20,7 +20,7 @@ export function createGitCommand(runner: GitCliRunner): Command {
         context.env === undefined
           ? { argv: context.argv, cwd: context.cwd }
           : { argv: context.argv, cwd: context.cwd, env: context.env };
-      cliResult = runner.runCli(input, options);
+      cliResult = await runner.runCli(input, options);
     } catch (error) {
       const mapped = shellLimit(error);
       if (mapped === null) throw error;
@@ -33,12 +33,13 @@ export function createGitCommand(runner: GitCliRunner): Command {
     return {
       stdout: new GitOutput(stdout, stderr, context.diagnostic, releaseStdout),
       status: () => cliResult.exitCode,
+      truncated: () => cliResult.truncated,
     };
   };
 }
 
 /** Own result bytes even when a downstream stage closes before the first pull. */
-class GitOutput implements ByteStream {
+class GitOutput implements IterableIterator<Uint8Array, void, undefined> {
   #stdoutPending: boolean;
   #settled = false;
 
@@ -51,7 +52,7 @@ class GitOutput implements ByteStream {
     this.#stdoutPending = stdout.length > 0;
   }
 
-  [Symbol.iterator](): ByteStream {
+  [Symbol.iterator](): IterableIterator<Uint8Array, void, undefined> {
     return this;
   }
 

@@ -55,11 +55,11 @@ plumbing operations exposed by `Git`. Pull fetches the configured upstream and
 delegates fast-forward or divergent integration to the native merge lifecycle.
 Merge supports fast-forward, forced merge commits, clean and conflicted
 integration, `commit: false`, restart-safe continue, and path-scoped abort for
-the checked-out branch. `runCli()` and async `cli()` expose a strict local subset
-for status, diff, log, rev-list count, symbolic-ref reads, add, commit, and
-rebase continue/abort. Unsupported typed operations throw `EUNSUPPORTED`; the
-argv runner returns command-specific Git-shaped results. Neither surface falls
-back to another implementation.
+the checked-out branch. Promise-returning `runCli()` and `cli()` expose a strict
+local subset for status, diff, log, rev-list count, symbolic-ref reads, add,
+commit, and rebase continue/abort. Unsupported typed operations throw
+`EUNSUPPORTED`; the argv runner returns command-specific Git-shaped results.
+Neither surface falls back to another implementation.
 
 ```ts
 await workspace.git.init({ dir: "/" });
@@ -136,7 +136,7 @@ const shell = createShell({
   fs: workspace.filesystem,
   commands: new Map([["git", createGitCommand(workspace.git)]]),
 });
-const { stdout, operations } = shell.run("git status --porcelain | wc -l", {
+const { stdout, operations } = await shell.run("git status --porcelain | wc -l", {
   env: {
     GIT_AUTHOR_NAME: "Agent",
     GIT_AUTHOR_EMAIL: "agent@example.com",

@@ -11,14 +11,14 @@
 // Every sub-invocation shares the caller's `BoundedFs`, so the operation
 // ceiling still bounds the whole thing however many groups there are.
 
-import { type ByteStream, decode, drainBounded } from "../exec/bytes.js";
-import { type Command, fail } from "../exec/context.js";
+import { type ByteStream, close, decode, drainBounded, owned } from "../exec/bytes.js";
+import { type Command, type CommandResult, fail } from "../exec/context.js";
 import { count, UsageError } from "./flags.js";
 
 /** GNU's exit code for "a command xargs ran failed". */
 const CHILD_FAILED = 123;
 
-export const xargs: Command = (context) => {
+export const xargs: Command = async (context) => {
   try {
     // Flags are read by hand, and only until the first operand. The general
     // parser would keep going and swallow the *invoked* command's flags:
@@ -66,7 +66,7 @@ export const xargs: Command = (context) => {
     const held =
       context.stdin === null
         ? { bytes: new Uint8Array(0), release: () => {} }
-        : drainBounded(context.stdin, context.fs.retained, "xargs input");
+        : await drainBounded(context.stdin, context.fs.retained, "xargs input");
     const releases = [held.release];
     let items: string[];
     try {
@@ -89,7 +89,7 @@ export const xargs: Command = (context) => {
       // runs on empty input, because there would be nothing to substitute.
       if (skipWhenEmpty || replace !== null) {
         release();
-        return { stdout: empty(), status: () => 0 };
+        return { stdout: empty(), status: () => 0, truncated: () => false };
       }
       return runGroups(context, name, [fixed], release);
     }
@@ -153,32 +153,44 @@ function replacedLength(value: string, marker: string, replacement: string): num
  * Lazily, so a `xargs … | head -5` still stops after the group that
  * satisfies it rather than running every group first. The status follows
  * GNU: 123 when any invocation failed, and it is only valid once the stream
- * has been drained, because until then most of the groups have not run.
+ * has been drained or closed, because until then most groups have not run.
  */
 function runGroups(
   context: Parameters<Command>[0],
   name: string,
   groups: ReadonlyArray<readonly string[]>,
   release: () => void,
-): ReturnType<Command> {
+): CommandResult {
   let status = 0;
-  const stdout = (function* (): ByteStream {
-    try {
+  let truncated = false;
+  const stdout = owned(
+    (async function* (): ByteStream {
       for (const argv of groups) {
-        const produced = context.invoke(name, argv);
+        const produced = await context.invoke(name, argv);
         if (produced === null) {
           context.warn(`${name}: command not found`);
           status = 127;
           return;
         }
-        yield* produced.stdout;
-        if (produced.status() !== 0) status = CHILD_FAILED;
+        try {
+          for (;;) {
+            const next = await produced.stdout.next();
+            if (next.done) break;
+            yield next.value;
+          }
+        } finally {
+          try {
+            await close(produced.stdout);
+          } finally {
+            if (produced.status() !== 0) status = CHILD_FAILED;
+            truncated ||= produced.truncated?.() ?? false;
+          }
+        }
       }
-    } finally {
-      release();
-    }
-  })();
-  return { stdout, status: () => status };
+    })(),
+    release,
+  );
+  return { stdout, status: () => status, truncated: () => truncated };
 }
 
 const VALUED = new Set(["-n", "-I", "-d", "--max-args", "--replace", "--delimiter"]);

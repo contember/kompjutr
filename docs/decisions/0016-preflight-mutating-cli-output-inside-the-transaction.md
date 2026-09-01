@@ -9,7 +9,7 @@ date: 2026-08-28
 
 ## Context
 
-ADR 0015 requires the synchronous Git argv runner to enforce caller-supplied
+ADR 0015 requires the asynchronous Git argv runner to enforce caller-supplied
 stdout, stderr, and combined-output ceilings before it returns a result. The
 initial kernel validated those ceilings after a command handler returned. That
 is sufficient for reads, but not for mutations: `commit` or
@@ -24,9 +24,9 @@ rollback because an operation may have observed newly written objects.
 
 ## Decision
 
-The dispatcher will pass the resolved `GitCliRunOptions` to each command
-handler. Read-only handlers may ignore them. Every mutating handler will use one
-shared wrapper with this order:
+The dispatcher passes the resolved `GitCliRunOptions` to each awaitable command
+handler. Every local mutating handler uses one shared synchronous wrapper with
+this order:
 
 1. Open an outer transaction on the selected repository database.
 2. Mark the current phase, then run the existing native operation, format its
@@ -44,9 +44,10 @@ Missing or different database capabilities fail closed before mutation. The
 native Workspace and Computer adapters construct both sides over the same
 database object.
 
-The dispatcher keeps its final `boundedGitCliResult()` call as defense in depth.
-The public `GitCliRunner` and `GitCliRunOptions` interfaces from ADR 0015 do not
-change.
+The dispatcher awaits the handler only after any local transaction callback has
+returned. The transaction callback performs mutation, formatting, and preflight
+without an await. The dispatcher then keeps its final `boundedGitCliResult()`
+call as defense in depth.
 
 ## Consequences
 
@@ -62,6 +63,8 @@ change.
   do not expose the selected repository database by identity.
 - Handler implementations receive resolved ceilings even when they only read.
   The narrow public runner capability remains unchanged.
+- Making the runner promise-returning does not make local transaction ownership
+  asynchronous; no transaction spans an await.
 
 ## Alternatives considered
 

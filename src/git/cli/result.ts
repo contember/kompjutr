@@ -50,7 +50,7 @@ export function gitCliResult(stdout: string, stderr: string, exitCode: number): 
   if (!Number.isSafeInteger(exitCode) || exitCode < 0 || exitCode > 255) {
     throw new GitError("EINVAL", "git CLI exit code must be a safe integer from 0 through 255");
   }
-  return { stdout, stderr, exitCode };
+  return { stdout, stderr, exitCode, truncated: false };
 }
 
 export function gitCliUsageFailure(
@@ -190,9 +190,13 @@ export function boundedGitCliResult(
   const stdout: unknown = Reflect.get(result, "stdout");
   const stderr: unknown = Reflect.get(result, "stderr");
   const exitCode: unknown = Reflect.get(result, "exitCode");
+  const truncated: unknown = Reflect.get(result, "truncated");
   validateResultString(stdout, "stdout");
   validateResultString(stderr, "stderr");
   validateExitCode(exitCode);
+  if (typeof truncated !== "boolean") {
+    throw new GitError("EINVAL", "git CLI truncated must be a boolean");
+  }
   const stdoutBytes = gitCliUtf8ByteLength(stdout, "git CLI stdout", false);
   if (stdoutBytes > options.maxStdoutBytes) {
     throw new GitError("E2BIG", `git CLI stdout exceeds ${options.maxStdoutBytes} bytes`);
@@ -204,7 +208,7 @@ export function boundedGitCliResult(
         `git CLI combined output exceeds ${options.maxCombinedOutputBytes} bytes`,
       );
     }
-    return { stdout, stderr: "", exitCode };
+    return { stdout, stderr: "", exitCode, truncated };
   }
   const stderrBytes = gitCliUtf8ByteLength(stderr, "git CLI stderr", false);
   if (stderrBytes > options.maxStderrBytes) {
@@ -216,7 +220,7 @@ export function boundedGitCliResult(
       `git CLI combined output exceeds ${options.maxCombinedOutputBytes} bytes`,
     );
   }
-  return { stdout, stderr, exitCode };
+  return { stdout, stderr, exitCode, truncated };
 }
 
 export function gitCliUtf8ByteLength(value: string, label: string, rejectNul: boolean): number {

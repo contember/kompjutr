@@ -5,9 +5,7 @@
 // each pinned here as a *difference from grep's answer on the same corpus*,
 // so aliasing the two would fail loudly rather than quietly returning the
 // wrong set of files.
-
 import { afterAll, describe, expect, it } from "vitest";
-
 import { agree, lines, ParityFixture, REAL_RG } from "../helpers/parity.js";
 
 const CORPUS = {
@@ -23,187 +21,148 @@ const CORPUS = {
   ".hidden.ts": "NEEDLE in a dotfile\n",
   "bin.dat": new Uint8Array([78, 69, 69, 68, 76, 69, 0, 116, 97, 105, 108, 10]),
 };
-
 const fixture = REAL_RG ? new ParityFixture(CORPUS) : null;
-
 afterAll(() => {
   fixture?.cleanup();
 });
-
 describe("the parity suite has something to compare against", () => {
   it("found ripgrep", () => {
     expect(REAL_RG).toBe(true);
   });
 });
-
 describe.skipIf(!REAL_RG)("rg matches ripgrep", () => {
   function compare(...argv: string[]): ReturnType<ParityFixture["compare"]> {
     if (fixture === null) throw new Error("no fixture");
     return fixture.compare("rg", ...argv);
   }
-
   describe("the defaults that differ from grep", () => {
-    it("searches recursively with no -r", () => {
-      agree(compare("-l", "NEEDLE", "{root}"));
+    it("searches recursively with no -r", async () => {
+      agree(await compare("-l", "NEEDLE", "{root}"));
     });
-
-    it("skips dotfiles", () => {
-      const parity = compare("-l", "NEEDLE", "{root}");
+    it("skips dotfiles", async () => {
+      const parity = await compare("-l", "NEEDLE", "{root}");
       agree(parity);
       expect(lines(parity.ours.stdout)).not.toContain("/repo/.hidden.ts");
     });
-
-    it("--hidden brings them back", () => {
-      const parity = compare("--hidden", "-l", "NEEDLE", "{root}");
+    it("--hidden brings them back", async () => {
+      const parity = await compare("--hidden", "-l", "NEEDLE", "{root}");
       agree(parity);
       expect(lines(parity.ours.stdout)).toContain("/repo/.hidden.ts");
     });
-
-    it("is ERE, so + is an operator with no -E", () => {
-      agree(compare("-l", "NEEDLE+", "{root}"));
+    it("is ERE, so + is an operator with no -E", async () => {
+      agree(await compare("-l", "NEEDLE+", "{root}"));
     });
-
-    it("-c lists only files that matched, where grep prints zeros", () => {
-      const parity = compare("-c", "NEEDLE", "{root}");
+    it("-c lists only files that matched, where grep prints zeros", async () => {
+      const parity = await compare("-c", "NEEDLE", "{root}");
       agree(parity);
       expect(parity.ours.stdout).not.toContain(":0");
     });
   });
-
   describe("selecting what to search", () => {
-    it("-g", () => {
-      agree(compare("-l", "-g", "*.ts", "NEEDLE", "{root}"));
+    it("-g", async () => {
+      agree(await compare("-l", "-g", "*.ts", "NEEDLE", "{root}"));
     });
-
-    it("-g with a ! prefix excludes", () => {
-      agree(compare("-l", "-g", "!*.md", "NEEDLE", "{root}"));
+    it("-g with a ! prefix excludes", async () => {
+      agree(await compare("-l", "-g", "!*.md", "NEEDLE", "{root}"));
     });
-
-    it("--glob", () => {
-      agree(compare("-l", "--glob=*.md", "NEEDLE", "{root}"));
+    it("--glob", async () => {
+      agree(await compare("-l", "--glob=*.md", "NEEDLE", "{root}"));
     });
-
-    it("-t", () => {
-      agree(compare("-l", "-t", "ts", "NEEDLE", "{root}"));
+    it("-t", async () => {
+      agree(await compare("-l", "-t", "ts", "NEEDLE", "{root}"));
     });
-
-    it("--type", () => {
-      agree(compare("-l", "--type=md", "NEEDLE", "{root}"));
+    it("--type", async () => {
+      agree(await compare("-l", "--type=md", "NEEDLE", "{root}"));
     });
-
-    it("one explicit file gets no name prefix", () => {
-      agree(compare("NEEDLE", "{root}/a.ts"));
+    it("one explicit file gets no name prefix", async () => {
+      agree(await compare("NEEDLE", "{root}/a.ts"));
     });
   });
-
   describe("what to print", () => {
-    it("-n", () => {
-      agree(compare("-n", "NEEDLE", "{root}/sub/c.ts"));
+    it("-n", async () => {
+      agree(await compare("-n", "NEEDLE", "{root}/sub/c.ts"));
     });
-
-    it("-N", () => {
-      agree(compare("-N", "NEEDLE", "{root}/sub/c.ts"));
+    it("-N", async () => {
+      agree(await compare("-N", "NEEDLE", "{root}/sub/c.ts"));
     });
-
-    it("-l", () => {
-      agree(compare("-l", "NEEDLE", "{root}"));
+    it("-l", async () => {
+      agree(await compare("-l", "NEEDLE", "{root}"));
     });
-
-    it("--files-with-matches", () => {
-      agree(compare("--files-with-matches", "NEEDLE", "{root}"));
+    it("--files-with-matches", async () => {
+      agree(await compare("--files-with-matches", "NEEDLE", "{root}"));
     });
-
-    it("--no-filename", () => {
-      agree(compare("--no-filename", "NEEDLE", "{root}"));
+    it("--no-filename", async () => {
+      agree(await compare("--no-filename", "NEEDLE", "{root}"));
     });
-
-    it("--with-filename", () => {
-      agree(compare("--with-filename", "NEEDLE", "{root}/a.ts"));
+    it("--with-filename", async () => {
+      agree(await compare("--with-filename", "NEEDLE", "{root}/a.ts"));
     });
-
-    it("--no-heading is already the piped shape", () => {
-      agree(compare("--no-heading", "-n", "NEEDLE", "{root}/a.ts"));
+    it("--no-heading is already the piped shape", async () => {
+      agree(await compare("--no-heading", "-n", "NEEDLE", "{root}/a.ts"));
     });
   });
-
   describe("what counts as a match", () => {
-    it("-i", () => {
-      agree(compare("-i", "-l", "needle", "{root}"));
+    it("-i", async () => {
+      agree(await compare("-i", "-l", "needle", "{root}"));
     });
-
-    it("-S is insensitive on a lowercase pattern", () => {
-      agree(compare("-S", "-l", "needle", "{root}"));
+    it("-S is insensitive on a lowercase pattern", async () => {
+      agree(await compare("-S", "-l", "needle", "{root}"));
     });
-
-    it("-S is sensitive once the pattern carries an uppercase letter", () => {
-      agree(compare("-S", "-l", "Needle", "{root}"));
+    it("-S is sensitive once the pattern carries an uppercase letter", async () => {
+      agree(await compare("-S", "-l", "Needle", "{root}"));
     });
-
-    it("-s forces sensitivity back on", () => {
-      agree(compare("-s", "-l", "needle", "{root}"));
+    it("-s forces sensitivity back on", async () => {
+      agree(await compare("-s", "-l", "needle", "{root}"));
     });
-
-    it("-v", () => {
-      agree(compare("-v", "NEEDLE", "{root}/a.ts"));
+    it("-v", async () => {
+      agree(await compare("-v", "NEEDLE", "{root}/a.ts"));
     });
-
-    it("-F", () => {
-      agree(compare("-F", "-l", "NEED.E", "{root}"));
+    it("-F", async () => {
+      agree(await compare("-F", "-l", "NEED.E", "{root}"));
     });
-
-    it("-w", () => {
-      agree(compare("-w", "NEEDLE", "{root}/word.ts"));
+    it("-w", async () => {
+      agree(await compare("-w", "NEEDLE", "{root}/word.ts"));
     });
-
-    it("-x", () => {
-      agree(compare("-x", "NEEDLE", "{root}/sub/c.ts"));
+    it("-x", async () => {
+      agree(await compare("-x", "NEEDLE", "{root}/sub/c.ts"));
     });
-
-    it("-e", () => {
-      agree(compare("-e", "NEEDLE", "{root}/a.ts"));
+    it("-e", async () => {
+      agree(await compare("-e", "NEEDLE", "{root}/a.ts"));
     });
-
-    it("ORs repeated -e patterns", () => {
-      agree(compare("-e", "NEEDLE", "-e", "plain", "{root}/a.ts"));
+    it("ORs repeated -e patterns", async () => {
+      agree(await compare("-e", "NEEDLE", "-e", "plain", "{root}/a.ts"));
     });
   });
-
   describe("context lines", () => {
-    it("-A", () => {
-      agree(compare("-A", "1", "HIT", "{root}/ctx.txt"));
+    it("-A", async () => {
+      agree(await compare("-A", "1", "HIT", "{root}/ctx.txt"));
     });
-
-    it("-B", () => {
-      agree(compare("-B", "1", "HIT", "{root}/ctx.txt"));
+    it("-B", async () => {
+      agree(await compare("-B", "1", "HIT", "{root}/ctx.txt"));
     });
-
-    it("-C with line numbers", () => {
-      agree(compare("-n", "-C", "1", "HIT", "{root}/ctx.txt"));
+    it("-C with line numbers", async () => {
+      agree(await compare("-n", "-C", "1", "HIT", "{root}/ctx.txt"));
     });
-
-    it("adjacent matches inside one window stay match lines", () => {
-      const parity = compare("-n", "-C", "1", "HIT", "{root}/adj.txt");
+    it("adjacent matches inside one window stay match lines", async () => {
+      const parity = await compare("-n", "-C", "1", "HIT", "{root}/adj.txt");
       agree(parity);
       expect(parity.ours.stdout).toContain("3:HIT");
     });
   });
-
   describe("awkward files", () => {
-    it("reports a binary file on stdout, where grep uses stderr", () => {
-      const parity = compare("NEEDLE", "{root}/bin.dat");
+    it("reports a binary file on stdout, where grep uses stderr", async () => {
+      const parity = await compare("NEEDLE", "{root}/bin.dat");
       agree(parity);
       expect(parity.ours.stdout).toContain("binary file matches");
       expect(parity.ours.stderr).toBe("");
     });
-
-    it("names the binary file when more than one is searched", () => {
-      agree(compare("NEEDLE", "{root}/a.ts", "{root}/bin.dat"));
+    it("names the binary file when more than one is searched", async () => {
+      agree(await compare("NEEDLE", "{root}/a.ts", "{root}/bin.dat"));
     });
   });
-
   describe("failures", () => {
-    it("no match exits 1", () => {
-      const parity = compare("-l", "ABSENT", "{root}");
+    it("no match exits 1", async () => {
+      const parity = await compare("-l", "ABSENT", "{root}");
       agree(parity);
       expect(parity.ours.exitCode).toBe(1);
     });

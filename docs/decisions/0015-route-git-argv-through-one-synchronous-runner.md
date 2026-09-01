@@ -1,19 +1,18 @@
 ---
 id: 0015
-title: Route Git argv through one synchronous runner
+title: Route Git argv through one asynchronous runner
 status: accepted
 date: 2026-08-28
 ---
 
-# 0015 — Route Git argv through one synchronous runner
+# 0015 — Route Git argv through one asynchronous runner
 
 ## Context
 
-The public Git clients expose promise-returning methods, while an injected shell
-command must return a synchronous generator. The operations needed by an agent
-are already synchronous below the facade, but exposing each one directly to the
-shell would duplicate argv parsing, error mapping, output accounting, and
-identity handling across the native client, the Computer adapter, and pipelines.
+The shell accepts synchronous and asynchronous command streams. Exposing each
+Git operation directly to it would duplicate argv parsing, error mapping, output
+accounting, and identity handling across the native client, the Computer adapter,
+and pipelines.
 
 The shell must remain independent of Git. Its command injection seam is a useful
 general boundary, and importing the Git runtime into the shell would reverse the
@@ -22,19 +21,17 @@ Durable Object and would bypass the SQLite-native runtime in any case.
 
 ## Decision
 
-Git will own one strict synchronous argv dispatcher behind this public narrow
+Git owns one strict asynchronous argv dispatcher behind this public narrow
 capability:
 
 ```ts
 interface GitCliRunner {
-  runCli(input: GitCliInput, options?: GitCliRunOptions): GitCliResult;
+  runCli(input: GitCliInput, options?: GitCliRunOptions): Promise<GitCliResult>;
 }
 ```
 
-Native `Git` will implement that capability. Its promise-returning `Git.cli()`
-will wrap the same dispatcher. The Computer adapter will construct the same
-runner internally and wrap it without adding the runner to Computer's public
-interface.
+Native `Git` implements that capability. `Git.cli()` and the Computer adapter use
+the same dispatcher rather than a second parser or handler set.
 
 The dedicated `kompjutr/git/shell` entry may depend on shell command types and
 will export `createGitCommand(runner: GitCliRunner): Command`. The shell package
@@ -73,10 +70,16 @@ options. It preserves `resolveIdentity()`'s complete-source precedence, includin
 its deliberate difference from Git's field-by-field handling of partial env
 identities.
 
-Results preserve the command-specific Git 2.54.0 stdout, stderr, and exit-code
-triplet. There is no common diagnostic stream or common usage status. Expected
-Git-domain refusals are returned as bounded results; unexpected programming
-errors remain exceptions.
+Results preserve command-specific Git 2.54.0 stdout, stderr, and exit code and
+carry an explicit `truncated` signal. Existing local handlers always return
+`truncated: false`: they either fit their destination or fail before publication.
+Expected Git-domain refusals are returned as bounded results; unexpected
+programming errors remain exceptions.
+
+Handlers are awaitable and dispatch awaits them. Existing local handlers execute
+their operation, formatting, and output preflight synchronously. An outer
+`transactionSync()` callback never returns a promise and no transaction crosses
+an await boundary.
 
 The optional public run options are exactly:
 
@@ -100,7 +103,7 @@ demand without reparsing argv.
 ## Consequences
 
 - Native, Computer, and shell callers share one grammar and one result mapper.
-- Shell pipelines stay synchronous, and Git does not become a shell dependency.
+- Shell pipelines remain pull-based, and Git does not become a shell dependency.
 - Raw diagnostic bytes can retain Git's stream split through redirects and
   `2>&1`; the existing human-oriented shell warning path remains unchanged.
 - Git's separately bounded SQL work does not appear in shell filesystem
@@ -112,8 +115,8 @@ demand without reparsing argv.
 
 ## Alternatives considered
 
-- Make every shell command asynchronous. This would change the shell execution
-  model, lazy pipeline behavior, and every existing command for one adapter.
+- Keep a second synchronous runner for local commands. Two runner contracts would
+  drift as asynchronous commands are added.
 - Implement separate dispatchers in the native client, Computer adapter, and
   shell command. Their grammars, diagnostics, and limits would drift.
 - Let the shell import and construct Git. This reverses the dependency boundary

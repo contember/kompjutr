@@ -80,6 +80,7 @@ describe("Computer client operation interlocks", () => {
       stdout: "",
       stderr: "fatal: not a git repository (or any of the parent directories): .git\n",
       exitCode: 128,
+      truncated: false,
     });
     expect(tableNames(storage)).toContain("git_repositories");
   });

@@ -62,8 +62,9 @@ Local snapshot replay is available without textual patch interchange.
 
 ## Strict local argv runner
 
-Native `Git` implements synchronous
-`runCli(input, options?): GitCliResult`; `cli(input)` is its asynchronous wrapper.
+Native `Git` implements
+`runCli(input, options?): Promise<GitCliResult>`; `cli(input)` uses the same
+asynchronous dispatcher.
 The Computer compatibility client's `cli(input)` invokes the same dispatcher.
 `GitCliRunner`, `GitCliInput`, `GitCliResult`, and `GitCliRunOptions` are public
 types from `kompjutr` and `kompjutr/git`.
@@ -90,7 +91,9 @@ chain. Merge, divergent, unrelated, and shallow-boundary ranges fail closed.
 also handles merge and divergent histories.
 
 Expected command and Git-domain failures are returned as a command-specific
-`{ stdout, stderr, exitCode }` triplet. They are not collapsed into one generic
+`{ stdout, stderr, exitCode, truncated }` result. Local handlers return
+`truncated: false`; they fail output preflight rather than publishing partial
+semantic output. Results are not collapsed into one generic
 usage result. For example, unknown `status` and `diff` options exit 129 with
 usage on stderr; invalid `log` options and counts exit 128 with a fatal line; an
 unknown subcommand exits 1; and `fetch`, `push`, `pull`, `clone`, and `ls-remote`
@@ -122,8 +125,9 @@ miss, not a runtime rejection, and the runner adds no projected-count refusal.
 `add`, `commit`, and both rebase actions execute their mutation, format their
 success output, and preflight all retained output inside one database
 transaction. An output failure therefore rolls back index, worktree, refs, and
-operation state. Expected operation failures are mapped only after rollback and
-cache revalidation.
+operation state. The promise-returning dispatcher awaits only after this
+synchronous transaction callback has completed. Expected operation failures are
+mapped only after rollback and cache revalidation.
 
 ## Repository creation
 

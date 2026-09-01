@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
 import type { ByteStream } from "../../src/shell/exec/bytes.js";
@@ -11,7 +10,6 @@ const MIB = 1024 * 1024;
 const FORMER_REDIRECT_BYTES_MAX = 96 * MIB;
 const STREAM_BYTES = FORMER_REDIRECT_BYTES_MAX + 1;
 const CHUNK = new Uint8Array(MIB).fill(0x5a);
-
 interface Published {
   readonly path: string;
   readonly append: boolean;
@@ -19,7 +17,6 @@ interface Published {
   readonly fullChunks: number;
   readonly finalByte: number;
 }
-
 interface StreamSink {
   readonly fs: Filesystem;
   readonly state: {
@@ -27,7 +24,6 @@ interface StreamSink {
     published: Published;
   };
 }
-
 function streamSink(failAfterDrain = false): StreamSink {
   const base = createFilesystem(new TestDatabase());
   base.mkdir("/repo");
@@ -62,7 +58,6 @@ function streamSink(failAfterDrain = false): StreamSink {
   };
   return { fs, state };
 }
-
 function producer(failAfterLimit: boolean, observe: (retained: RetainedBudget) => void): Command {
   return (context) => {
     observe(context.fs.retained);
@@ -89,7 +84,6 @@ function producer(failAfterLimit: boolean, observe: (retained: RetainedBudget) =
     return result(stdout);
   };
 }
-
 function shellFor(sink: StreamSink, command: Command) {
   return createShell({
     fs: sink.fs,
@@ -103,9 +97,8 @@ function shellFor(sink: StreamSink, command: Command) {
     },
   });
 }
-
 describe("streamed shell redirects", () => {
-  it("passes an exact total above the former 96 MiB limit to BoundedFs", () => {
+  it("passes an exact total above the former 96 MiB limit to BoundedFs", async () => {
     const sink = streamSink();
     let retained: RetainedBudget | undefined;
     const shell = shellFor(
@@ -114,9 +107,7 @@ describe("streamed shell redirects", () => {
         retained = owner;
       }),
     );
-
-    const run = shell.run("produce > target");
-
+    const run = await shell.run("produce > target");
     expect(run).toMatchObject({ exitCode: 0, stdout: "", operations: 1 });
     expect(sink.state.calls).toBe(1);
     expect(sink.state.published).toEqual({
@@ -129,8 +120,7 @@ describe("streamed shell redirects", () => {
     expect(run.peakRetainedBytes).toBe(MIB);
     expect(retained?.available).toBe(retained?.max);
   });
-
-  it("leaves the target atomic and releases shell ownership after a late source failure", () => {
+  it("leaves the target atomic and releases shell ownership after a late source failure", async () => {
     const sink = streamSink();
     let retained: RetainedBudget | undefined;
     const shell = shellFor(
@@ -139,14 +129,12 @@ describe("streamed shell redirects", () => {
         retained = owner;
       }),
     );
-
-    expect(() => shell.run("produce > target")).toThrow("injected late source failure");
+    await expect(shell.run("produce > target")).rejects.toThrow("injected late source failure");
     expect(sink.state.calls).toBe(1);
     expect(sink.state.published.size).toBe(3);
     expect(retained?.available).toBe(retained?.max);
   });
-
-  it("leaves the target atomic and releases shell ownership after a late filesystem failure", () => {
+  it("leaves the target atomic and releases shell ownership after a late filesystem failure", async () => {
     const sink = streamSink(true);
     let retained: RetainedBudget | undefined;
     const shell = shellFor(
@@ -155,13 +143,33 @@ describe("streamed shell redirects", () => {
         retained = owner;
       }),
     );
-
-    const run = shell.run("produce > target");
-
+    const run = await shell.run("produce > target");
     expect(run).toMatchObject({ exitCode: 1, stdout: "", operations: 1 });
     expect(run.stderr).toContain("injected late filesystem failure");
     expect(sink.state.calls).toBe(1);
     expect(sink.state.published.size).toBe(3);
     expect(retained?.available).toBe(retained?.max);
+  });
+
+  it("awaits an async source before one atomic redirect publication", async () => {
+    const base = createFilesystem(new TestDatabase());
+    base.mkdir("/repo");
+    const delayed: Command = () =>
+      result(
+        (async function* (): ByteStream {
+          await Promise.resolve();
+          yield new TextEncoder().encode("first");
+          await Promise.resolve();
+          yield new TextEncoder().encode("second");
+        })(),
+      );
+    const shell = createShell({
+      fs: base,
+      cwd: "/repo",
+      commands: new Map([["delayed", delayed]]),
+    });
+
+    expect(await shell.run("delayed > target")).toMatchObject({ exitCode: 0, operations: 1 });
+    expect(new TextDecoder().decode(base.readFile("/repo/target"))).toBe("firstsecond");
   });
 });

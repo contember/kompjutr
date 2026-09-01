@@ -6,7 +6,7 @@
 // else is a named error pointing at the container. See §2 of the plan.
 
 import { comparePaths, normalize } from "../../fs/path.js";
-import { type ByteStream, decode, encode, lines, terminated } from "../exec/bytes.js";
+import { type ByteStream, decode, encode, lines, owned, terminated } from "../exec/bytes.js";
 import { type Command, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { parseFlags, UsageError } from "./flags.js";
@@ -59,7 +59,7 @@ export const which: Command = (context) => {
       else status = 1;
     }
   })();
-  return { stdout: stream, status: () => status };
+  return { stdout: stream, status: () => status, truncated: () => false };
 };
 
 /** Names `which` will admit to. Filled in by the registry at load. */
@@ -69,7 +69,7 @@ export function registerKnownCommands(names: Iterable<string>): void {
   for (const name of names) KNOWN.add(name);
 }
 
-export const sort: Command = (context) => {
+export const sort: Command = async (context) => {
   const parsed = parseFlags(context.argv, {
     boolean: new Set(["-r", "-n", "-u", "-f", "--reverse", "--numeric-sort", "--unique"]),
     valued: new Set(),
@@ -84,39 +84,42 @@ export const sort: Command = (context) => {
   if (source === null) return result(nothing());
 
   const releases: Array<() => void> = [];
+  const release = releaseAll(releases);
   const collected: string[] = [];
   try {
-    for (const text of lines(source, context.fs.retained)) {
+    for await (const text of lines(source, context.fs.retained)) {
       releases.push(context.fs.retained.retain(text.length * 2, "sort input"));
       collected.push(decode(text));
     }
+    collected.sort((left, right) => {
+      if (numeric) {
+        const difference = Number.parseFloat(left) - Number.parseFloat(right);
+        if (!Number.isNaN(difference) && difference !== 0) return difference;
+      }
+      const a = fold ? left.toLowerCase() : left;
+      const b = fold ? right.toLowerCase() : right;
+      return comparePaths(a, b);
+    });
+    if (reverse) collected.reverse();
+
+    const out = unique
+      ? collected.filter((value, index) => value !== collected[index - 1])
+      : collected;
+    return result(owned(terminated(out.map((value) => encode(value))), release));
   } catch (error) {
-    for (const release of releases) release();
+    release();
     throw error;
   }
-  collected.sort((left, right) => {
-    if (numeric) {
-      const difference = Number.parseFloat(left) - Number.parseFloat(right);
-      if (!Number.isNaN(difference) && difference !== 0) return difference;
-    }
-    const a = fold ? left.toLowerCase() : left;
-    const b = fold ? right.toLowerCase() : right;
-    return comparePaths(a, b);
-  });
-  if (reverse) collected.reverse();
-
-  const out = unique
-    ? collected.filter((value, index) => value !== collected[index - 1])
-    : collected;
-  const stdout = (function* (): ByteStream {
-    try {
-      yield* terminated(out.map((value) => encode(value)));
-    } finally {
-      for (const release of releases) release();
-    }
-  })();
-  return result(stdout);
 };
+
+function releaseAll(releases: ReadonlyArray<() => void>): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    for (const release of releases) release();
+  };
+}
 
 export const uniq: Command = (context) => {
   const parsed = parseFlags(context.argv, {
@@ -131,7 +134,7 @@ export const uniq: Command = (context) => {
   const source = sourceFor(context, parsed.operands);
   if (source === null) return result(nothing());
 
-  const stream = (function* (): ByteStream {
+  const stream = (async function* (): ByteStream {
     let previous: string | null = null;
     let releasePrevious: (() => void) | null = null;
     let run = 0;
@@ -142,7 +145,7 @@ export const uniq: Command = (context) => {
       yield encode(withCount ? `${String(run).padStart(7)} ${previous}\n` : `${previous}\n`);
     };
     try {
-      for (const text of lines(source, context.fs.retained)) {
+      for await (const text of lines(source, context.fs.retained)) {
         const release = context.fs.retained.retain(text.length * 2, "uniq line");
         const value = decode(text);
         if (value === previous) {
@@ -251,7 +254,7 @@ function parseSubstitution(script: string): Substitution | null {
   };
 }
 
-function* applySubstitution(
+async function* applySubstitution(
   source: ByteStream,
   substitution: Substitution,
   quiet: boolean,
@@ -261,7 +264,7 @@ function* applySubstitution(
     ? substitution.pattern.flags
     : substitution.pattern.flags.replace("g", "");
   const pattern = new RegExp(substitution.pattern.source, flags);
-  for (const text of lines(source, retained)) {
+  for await (const text of lines(source, retained)) {
     const release = retained.retain(text.length * 2, "sed decoded line");
     try {
       const value = decode(text);
@@ -274,7 +277,7 @@ function* applySubstitution(
   }
 }
 
-function* printRange(
+async function* printRange(
   source: ByteStream,
   from: number,
   to: number,
@@ -282,7 +285,7 @@ function* printRange(
   retained: Parameters<Command>[0]["fs"]["retained"],
 ): ByteStream {
   let number = 0;
-  for (const text of lines(source, retained)) {
+  for await (const text of lines(source, retained)) {
     number++;
     const inRange = number >= from && number <= to;
     const release = retained.retain(text.length * 2, "sed decoded line");

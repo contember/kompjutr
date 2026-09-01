@@ -81,7 +81,7 @@ export const cat: Command = (context) => {
       pending = batch.remaining;
     }
   })();
-  return { stdout: stream, status: () => status };
+  return { stdout: stream, status: () => status, truncated: () => false };
 };
 
 export const head: Command = (context) => {
@@ -117,7 +117,7 @@ export const head: Command = (context) => {
       const stdout = headFiles(context, operands, wanted, unit, headings, () => {
         status = 1;
       });
-      return { stdout, status: () => status };
+      return { stdout, status: () => status, truncated: () => false };
     }
 
     const source = context.stdin;
@@ -161,9 +161,9 @@ function* headFiles(
   }
 }
 
-function* headed(name: string, source: ByteStream): ByteStream {
+async function* headed(name: string, source: ByteStream): ByteStream {
   yield encode(`==> ${name} <==\n`);
-  yield* source;
+  for await (const chunk of source) yield chunk;
 }
 
 export const tail: Command = (context) => {
@@ -209,7 +209,7 @@ export const tail: Command = (context) => {
   }
 };
 
-export const wc: Command = (context) => {
+export const wc: Command = async (context) => {
   const parsed = parseFlags(context.argv, {
     boolean: new Set(["-l", "-c", "-w", "-m", "--lines", "--bytes", "--words", "--chars"]),
     valued: new Set(),
@@ -226,7 +226,7 @@ export const wc: Command = (context) => {
   let characterCount = 0;
   let inWord = false;
   const decoder = new TextDecoder();
-  for (const chunk of source) {
+  for await (const chunk of source) {
     byteCount += chunk.length;
     for (const _character of decoder.decode(chunk, { stream: true })) characterCount++;
     for (let index = 0; index < chunk.length; index++) {
@@ -308,10 +308,10 @@ function* streamFile(
  * `head -N file` without reading the file: read a probe from the front and
  * extend only if it held fewer than N newlines.
  */
-function* takeLines(source: ByteStream, wanted: number): ByteStream {
+async function* takeLines(source: ByteStream, wanted: number): ByteStream {
   if (wanted === 0) return;
   let seen = 0;
-  for (const chunk of source) {
+  for await (const chunk of source) {
     for (let index = 0; index < chunk.length; index++) {
       if (chunk[index] !== NEWLINE) continue;
       seen++;
@@ -328,10 +328,10 @@ function* takeLines(source: ByteStream, wanted: number): ByteStream {
   }
 }
 
-function* takeBytes(source: ByteStream, wanted: number): ByteStream {
+async function* takeBytes(source: ByteStream, wanted: number): ByteStream {
   if (wanted === 0) return;
   let sent = 0;
-  for (const chunk of source) {
+  for await (const chunk of source) {
     const room = wanted - sent;
     if (room <= 0) return;
     if (chunk.length <= room) {
@@ -349,7 +349,7 @@ function* takeBytes(source: ByteStream, wanted: number): ByteStream {
 }
 
 /** A bounded ring buffer: memory is O(N), not O(input). */
-function* lastLines(
+async function* lastLines(
   source: ByteStream,
   wanted: number,
   retained: CommandContext["fs"]["retained"],
@@ -357,12 +357,12 @@ function* lastLines(
   if (wanted === 0) return;
   const held: Array<{ bytes: Uint8Array; release(): void }> = [];
   try {
-    for (const text of lines(source, retained)) {
+    for await (const text of lines(source, retained)) {
       const release = retained.retain(text.length, "tail line buffer");
       held.push({ bytes: text.slice(), release });
       if (held.length > wanted) held.shift()?.release();
     }
-    yield* terminated(held.map((entry) => entry.bytes));
+    for await (const chunk of terminated(held.map((entry) => entry.bytes))) yield chunk;
   } finally {
     for (const entry of held) entry.release();
   }
@@ -402,7 +402,7 @@ function* headOfFile(
   }
 }
 
-function* tailOfFile(
+async function* tailOfFile(
   context: CommandContext,
   path: string,
   size: number,
@@ -417,11 +417,11 @@ function* tailOfFile(
       const bytes = context.fs.readRange(path, offset, span);
       const newlines = countNewlines(bytes, offset === 0);
       if (newlines >= wanted || offset === 0) {
-        yield* lastLines(one(bytes), wanted, context.fs.retained);
+        for await (const chunk of lastLines(one(bytes), wanted, context.fs.retained)) yield chunk;
         return;
       }
       if (span >= size) {
-        yield* lastLines(one(bytes), wanted, context.fs.retained);
+        for await (const chunk of lastLines(one(bytes), wanted, context.fs.retained)) yield chunk;
         return;
       }
     } finally {

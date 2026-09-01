@@ -796,7 +796,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async stashPop() {
       throw new UnsupportedOperationError("stash pop");
     },
-    runCli(input: GitCliInput, runOptions?: GitCliRunOptions) {
+    async runCli(input: GitCliInput, runOptions?: GitCliRunOptions) {
       return cliRunner.runCli(input, runOptions);
     },
     async cli(input) {

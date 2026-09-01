@@ -10,7 +10,14 @@ import { join, normalize } from "../../fs/path.js";
 import type { Filesystem } from "../../fs/types.js";
 import { ShellSyntaxError } from "../parse/ast.js";
 import type { Argument, Plan, PlannedCommand, PlannedPipeline } from "../plan/types.js";
-import { type ByteStream, concat, line, withUnusedRestorer } from "./bytes.js";
+import {
+  type ByteStream,
+  close,
+  concat,
+  isAsyncByteStream,
+  line,
+  withUnusedRestorer,
+} from "./bytes.js";
 import {
   BoundedFs,
   type Command,
@@ -49,7 +56,7 @@ export interface ExecResult {
   readonly peakRetainedBytes: number;
 }
 
-export function execute(plan: Plan, options: ExecOptions): ExecResult {
+export async function execute(plan: Plan, options: ExecOptions): Promise<ExecResult> {
   const limits = options.limits ?? DEFAULT_LIMITS;
   const fs = new BoundedFs(options.fs, limits);
   const out = new Sink(limits.maxOutputBytes);
@@ -58,6 +65,7 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
   let exitCode = 0;
   let previousConnector: "&&" | "||" | ";" | null = null;
   let runInput: RunInputOwner | null = null;
+  let commandTruncated = false;
 
   try {
     try {
@@ -68,7 +76,7 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
           previousConnector === ";" ||
           (previousConnector === "&&" ? exitCode === 0 : exitCode !== 0);
         if (selected) {
-          exitCode = runPipeline(step.pipeline, {
+          const outcome = await runPipeline(step.pipeline, {
             fs,
             cwd,
             commands: options.commands,
@@ -79,6 +87,8 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
               cwd = path;
             },
           });
+          exitCode = outcome.exitCode;
+          commandTruncated ||= outcome.truncated;
         }
         previousConnector = step.connector;
       }
@@ -96,7 +106,7 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
       stderr: errors.bytes(),
       exitCode,
       cwd,
-      truncated: out.truncated || errors.truncated,
+      truncated: commandTruncated || out.truncated || errors.truncated,
       operations: fs.operations,
       peakRetainedBytes: fs.retained.peak,
     };
@@ -115,9 +125,17 @@ interface PipelineEnvironment {
   chdir(path: string): void;
 }
 
-function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): number {
+interface PipelineResult {
+  readonly exitCode: number;
+  readonly truncated: boolean;
+}
+
+async function runPipeline(
+  pipeline: PlannedPipeline,
+  env: PipelineEnvironment,
+): Promise<PipelineResult> {
   let stream: ByteStream | null = env.inputs?.borrow() ?? null;
-  const statuses: Array<() => number> = [];
+  const results: CommandResult[] = [];
   let settled = false;
 
   try {
@@ -128,7 +146,9 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
       const command = env.commands.get(planned.name);
       if (command === undefined) {
         env.errors.writeBytes(line(`kompjutr: ${planned.name}: command not found`));
-        return 127;
+        await close(stream);
+        settled = true;
+        return { exitCode: 127, truncated: results.some(commandResultTruncated) };
       }
 
       const expanded = expandArguments(planned.args, env.fs, env.cwd);
@@ -138,18 +158,18 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
         const priorInput = stream;
         stream = null;
         let priorClosed = false;
-        const closePrior = (): void => {
+        const closePrior = async (): Promise<void> => {
           if (priorClosed) return;
           priorClosed = true;
-          priorInput?.return();
+          await close(priorInput);
         };
         try {
           const path = resolve(env.cwd, single(planned.stdin, env.fs, env.cwd));
-          closePrior();
+          await closePrior();
           stream = readWholeFile(env.fs, path);
         } catch (error) {
           try {
-            closePrior();
+            await closePrior();
           } finally {
             expanded.release();
           }
@@ -170,17 +190,32 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
       );
       let produced: CommandResult;
       try {
-        produced = command(context);
+        produced = await command(context);
       } catch (error) {
         rethrowAfterCommandCleanup(error, expanded, mergedErrors);
       }
-      const output = stageOutput(produced.stdout, mergedErrors, () => {
-        try {
-          stageInput?.return();
-        } finally {
-          expanded.release();
-        }
-      });
+      const releaseStage = isAsyncByteStreamOrNull(stageInput)
+        ? async (): Promise<void> => {
+            try {
+              await close(stageInput);
+            } finally {
+              expanded.release();
+            }
+          }
+        : (): void => {
+            try {
+              stageInput?.return?.();
+            } finally {
+              expanded.release();
+            }
+          };
+      const output = stageOutput(
+        produced.stdout,
+        mergedErrors,
+        releaseStage,
+        isAsyncByteStreamOrNull(stageInput),
+      );
+      results.push(produced);
       if (planned.stdout === null) {
         stream = output;
       } else {
@@ -188,13 +223,13 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
         try {
           target = resolve(env.cwd, single(planned.stdout.path, env.fs, env.cwd));
         } catch (error) {
-          output.return();
+          await close(output);
           throw error;
         }
         try {
-          writeStream(env.fs, target, planned.stdout.append, protectUpstream(output));
+          await writeStream(env.fs, target, planned.stdout.append, protectUpstream(output));
         } catch (error) {
-          output.return();
+          await close(output);
           if (error instanceof UpstreamError) throw error.original;
           if (
             error instanceof Error &&
@@ -203,28 +238,40 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
             error.code.startsWith("E")
           ) {
             env.errors.writeBytes(line(`${planned.name}: ${error.message}`));
-            return 1;
+            return { exitCode: 1, truncated: results.some(commandResultTruncated) };
           }
           throw error;
         }
         stream = empty();
       }
-      statuses.push(produced.status);
     }
 
     if (stream === null) {
       settled = true;
-      return 0;
+      return { exitCode: 0, truncated: false };
     }
-    env.out.write(stream);
+    await env.out.write(stream);
     settled = true;
 
     // A pipeline's status is its last stage's, as in bash without pipefail.
-    const last = statuses[statuses.length - 1];
-    return last === undefined ? 0 : last();
+    const last = results[results.length - 1];
+    return {
+      exitCode: last === undefined ? 0 : last.status(),
+      truncated: results.some(commandResultTruncated),
+    };
   } finally {
-    if (!settled) stream?.return();
+    if (!settled) await close(stream);
   }
+}
+
+function commandResultTruncated(result: CommandResult): boolean {
+  return result.truncated?.() ?? false;
+}
+
+function isAsyncByteStreamOrNull(
+  stream: ByteStream | null,
+): stream is AsyncIterableIterator<Uint8Array, void, undefined> {
+  return stream !== null && isAsyncByteStream(stream);
 }
 
 /** Own caller inputs and their retained-memory reservation for one complete run. */
@@ -399,12 +446,23 @@ class UpstreamError extends Error {
   }
 }
 
-function* protectUpstream(stream: ByteStream): ByteStream {
-  try {
-    yield* stream;
-  } catch (error) {
-    throw new UpstreamError(error);
+function protectUpstream(stream: ByteStream): ByteStream {
+  if (!isAsyncByteStream(stream)) {
+    return (function* (): ByteStream {
+      try {
+        yield* stream;
+      } catch (error) {
+        throw new UpstreamError(error);
+      }
+    })();
   }
+  return (async function* (): ByteStream {
+    try {
+      for await (const chunk of stream) yield chunk;
+    } catch (error) {
+      throw new UpstreamError(error);
+    }
+  })();
 }
 
 function commandContext(
@@ -441,7 +499,7 @@ function commandContext(
       diagnostic(bytes);
     },
     chdir: env.chdir,
-    invoke: (name: string, subArgv: readonly string[]): CommandResult | null => {
+    invoke: async (name: string, subArgv: readonly string[]): Promise<CommandResult | null> => {
       const command = env.commands.get(name);
       if (command === undefined) return null;
       // No stdin and no demand hint: the sub-invocation's arguments already
@@ -514,25 +572,28 @@ function rethrowAfterCommandCleanup(
 function stageOutput(
   stdout: ByteStream,
   mergedErrors: HeldChunk[],
-  releaseStage: () => void,
+  releaseStage: () => void | Promise<void>,
+  asyncRelease: boolean,
 ): ByteStream {
-  return new StageOutput(stdout, mergedErrors, releaseStage);
+  return isAsyncByteStream(stdout) || asyncRelease
+    ? new AsyncStageOutput(stdout, mergedErrors, releaseStage)
+    : new SyncStageOutput(stdout, mergedErrors, releaseStage);
 }
 
 /** A generator whose unstarted `return()` still closes its source and reservations. */
-class StageOutput implements ByteStream {
+class SyncStageOutput implements IterableIterator<Uint8Array, void, undefined> {
   #warningIndex = 0;
   #pending: IteratorResult<Uint8Array, void> | null = null;
   #releaseYielded: (() => void) | null = null;
   #closed = false;
 
   constructor(
-    private readonly stdout: ByteStream,
+    private readonly stdout: IterableIterator<Uint8Array, void, undefined>,
     private readonly mergedErrors: HeldChunk[],
-    private readonly releaseStage: () => void,
+    private readonly releaseStage: () => void | Promise<void>,
   ) {}
 
-  [Symbol.iterator](): ByteStream {
+  [Symbol.iterator](): IterableIterator<Uint8Array, void, undefined> {
     return this;
   }
 
@@ -583,13 +644,89 @@ class StageOutput implements ByteStream {
     if (this.#closed) return;
     this.#closed = true;
     this.#releaseLastYield();
+    let closeError: { readonly value: unknown } | null = null;
     try {
-      if (closeSource) this.stdout.return();
+      if (closeSource) this.stdout.return?.();
+    } catch (error) {
+      closeError = { value: error };
+    }
+    for (; this.#warningIndex < this.mergedErrors.length; this.#warningIndex++) {
+      this.mergedErrors[this.#warningIndex]?.release();
+    }
+    const released = this.releaseStage();
+    if (released instanceof Promise) {
+      throw new Error("synchronous stage cleanup became asynchronous");
+    }
+    if (closeError !== null) throw closeError.value;
+  }
+}
+
+class AsyncStageOutput implements AsyncIterableIterator<Uint8Array, void, undefined> {
+  #warningIndex = 0;
+  #pending: IteratorResult<Uint8Array, void> | null = null;
+  #releaseYielded: (() => void) | null = null;
+  #closed = false;
+
+  constructor(
+    private readonly stdout: ByteStream,
+    private readonly mergedErrors: HeldChunk[],
+    private readonly releaseStage: () => void | Promise<void>,
+  ) {}
+
+  [Symbol.asyncIterator](): AsyncIterableIterator<Uint8Array, void, undefined> {
+    return this;
+  }
+
+  async next(..._args: [] | [undefined]): Promise<IteratorResult<Uint8Array, void>> {
+    this.#releaseLastYield();
+    if (this.#closed) return { done: true, value: undefined };
+    try {
+      if (this.#pending === null) this.#pending = await this.stdout.next();
+      const warning = this.mergedErrors[this.#warningIndex];
+      if (warning !== undefined) {
+        this.#warningIndex++;
+        this.#releaseYielded = warning.release;
+        return { done: false, value: warning.bytes };
+      }
+      const pending = this.#pending;
+      this.#pending = null;
+      if (pending.done) {
+        await this.#finish(false);
+        return { done: true, value: undefined };
+      }
+      return pending;
+    } catch (error) {
+      await this.#finish(true);
+      throw error;
+    }
+  }
+
+  async return(_value?: undefined): Promise<IteratorResult<Uint8Array, void>> {
+    await this.#finish(true);
+    return { done: true, value: undefined };
+  }
+
+  async throw(error: unknown): Promise<IteratorResult<Uint8Array, void>> {
+    await this.#finish(true);
+    throw error;
+  }
+
+  #releaseLastYield(): void {
+    this.#releaseYielded?.();
+    this.#releaseYielded = null;
+  }
+
+  async #finish(closeSource: boolean): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#releaseLastYield();
+    try {
+      if (closeSource) await this.stdout.return?.();
     } finally {
       for (; this.#warningIndex < this.mergedErrors.length; this.#warningIndex++) {
         this.mergedErrors[this.#warningIndex]?.release();
       }
-      this.releaseStage();
+      await this.releaseStage();
     }
   }
 }
@@ -738,14 +875,33 @@ function* readWholeFile(fs: BoundedFs, path: string): ByteStream {
   }
 }
 
-function writeStream(fs: BoundedFs, path: string, append: boolean, stream: ByteStream): void {
+async function writeStream(
+  fs: BoundedFs,
+  path: string,
+  append: boolean,
+  stream: ByteStream,
+): Promise<void> {
   if (path === "/dev/null") {
-    for (const _chunk of stream) {
+    for await (const _chunk of stream) {
       // Drain so lazy status and diagnostics still settle.
     }
     return;
   }
-  fs.writeFileStream(path, stream, { append });
+  if (!isAsyncByteStream(stream)) {
+    fs.writeFileStream(path, stream, { append });
+    return;
+  }
+  const chunks: Uint8Array[] = [];
+  const releases: Array<() => void> = [];
+  try {
+    for await (const chunk of stream) {
+      releases.push(fs.retained.retain(chunk.length, "async redirect"));
+      chunks.push(chunk.slice());
+    }
+    fs.writeFileStream(path, chunks, { append });
+  } finally {
+    for (const release of releases) release();
+  }
 }
 
 /** stdout, with the ceiling enforced as it is written rather than after. */
@@ -775,8 +931,8 @@ class Sink {
     this.truncated = true;
   }
 
-  write(stream: ByteStream): void {
-    for (const chunk of stream) {
+  async write(stream: ByteStream): Promise<void> {
+    for await (const chunk of stream) {
       this.writeBytes(chunk);
       // Stop pulling: the source stops issuing queries with it.
       if (this.truncated) return;

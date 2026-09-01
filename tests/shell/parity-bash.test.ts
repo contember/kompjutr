@@ -5,7 +5,9 @@ import { describe, expect, it } from "vitest";
 import { agreeWithBash, compareWithBash, REAL_BASH } from "../helpers/shell-parity.js";
 
 const TREE = {
-  "message.bin": new Uint8Array([0, 102, 105, 114, 115, 116, 10, 255, 115, 101, 99, 111, 110, 100, 10]),
+  "message.bin": new Uint8Array([
+    0, 102, 105, 114, 115, 116, 10, 255, 115, 101, 99, 111, 110, 100, 10,
+  ]),
 };
 
 describe("the shell parity suite has something to compare against", () => {

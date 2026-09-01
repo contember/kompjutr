@@ -11,7 +11,7 @@ common/                      bytes, objects, errors, rows, paths, streams, hashe
 diff/ | ignore/ | protocol/  independent algorithm and wire slices
 store/                       SQLite tables, packs, projections, maintenance
 ops/                         command families, Repository, Worktree, context
-client.ts | cli/             public client and synchronous argv surface
+client.ts | cli/             public client and asynchronous argv surface
 ```
 
 Dependencies point down this list. `diff`, `ignore`, and `protocol` may use
