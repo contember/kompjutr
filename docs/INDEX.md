@@ -16,7 +16,10 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None right now.
+- [`sprints/sprint-2026-08-31-everyday-git-shell.md`](sprints/sprint-2026-08-31-everyday-git-shell.md)
+  — async shell execution and a bounded everyday Git argv surface.
+- [`sprints/sprint-2026-08-31-shell-posix-surface.md`](sprints/sprint-2026-08-31-shell-posix-surface.md)
+  — bash-parity additions to the shell language and built-ins.
 
 ## Specs
 
@@ -36,6 +39,11 @@ None right now.
   [`benchmark-current`](reference/benchmark-current.md#clone-statement-profile).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0020).
+- The active everyday Git shell sprint makes command execution asynchronous,
+  adds staged diff and history reads, exposes existing local/network operations,
+  and composes pull with the restart-safe rebase lifecycle.
+- The parallel POSIX shell sprint adds `printf`, `exit`, `1>&2`, and named
+  parameter expansion after the async executor seam settles.
 - Next is the external consumer integration gate outside this public repository;
   its provider still lacks the bulk worktree scan needed for an efficient
   implementation without crossing private storage boundaries. Phase 2 is

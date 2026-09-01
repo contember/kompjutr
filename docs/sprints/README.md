@@ -19,3 +19,10 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
    [`../INDEX.md`](../INDEX.md).
 
 ## Active
+
+- [`sprint-2026-08-31-everyday-git-shell.md`](sprint-2026-08-31-everyday-git-shell.md)
+  — async shell execution and a bounded everyday Git argv surface, including
+  staged diff, history reads, network commands, and pull-rebase.
+- [`sprint-2026-08-31-shell-posix-surface.md`](sprint-2026-08-31-shell-posix-surface.md)
+  — bash-parity `printf`, `exit`, `1>&2`, and named parameter expansion; its
+  executor work follows the Git shell sprint's async foundation.

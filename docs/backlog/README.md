@@ -89,8 +89,9 @@ A blocked item must not move ahead of its blocker.
 **Phase 1** package work is complete. The real adapter now reruns its workflow as
 the integration gate. Everything below the gate is re-planned from that result.
 **Phase 2** is production scale; partial clone shipped directly outside a sprint.
-**Phase 3** is Git parity that no consumer issues; it stays filed and unscheduled
-until a caller appears.
+An explicit product decision has scheduled the everyday Git shell surface before
+the remaining parity work. The three consumed items remain here until the active
+sprint closes; closure deletes or rescopes them from the shipped result.
 
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
@@ -98,12 +99,13 @@ until a caller appears.
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Phase 2 — production scale** | | | | |
 | 1 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Audit the settled physical, shallow, and promisor storage shapes. |
-| **Phase 3 — parity without a caller (unscheduled)** | | | | |
+| **Everyday Git shell — active** | | | | |
+| active | [Everyday Git shell](../sprints/sprint-2026-08-31-everyday-git-shell.md) | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md), [28](28-pull-rebase.md) | long | Make shell execution async, expose the bounded ordinary argv surface, and close its three native gaps. |
+| **Remaining parity without a caller (unscheduled)** | | | | |
 | — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
-| — | Everyday reads | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md) | long | Staged diff and log path filters; both consumers route through `diffSummary({ ref })` and `log` with a stop oid today. |
 | — | Plumbing reads | [39](39-plumbing-read-surface.md) | normal | Type/size probes, tree/blob filters, ref enumeration, and general commit enumeration have no current caller. |
 | — | Mutating glob pathspecs | [36](36-glob-pathspecs.md) | normal | Read selection is served; no consumer currently issues glob-shaped add/rm/reset/checkout/clean/diff/status mutations. |
-| — | Rebase extensions | [25](25-rebase-targets-and-roots.md), [28](28-pull-rebase.md), [29](29-rebase-update-refs.md) | long | Both consumers issue `rebase <upstream>` and nothing else. |
+| — | Rebase extensions | [25](25-rebase-targets-and-roots.md), [29](29-rebase-update-refs.md) | long | Both consumers issue `rebase <upstream>` and nothing else. |
 | — | Interactive rebase | [26](26-interactive-rebase.md) | long | |
 | — | Rebase merge topology | [27](27-rebase-merges.md) | long | |
 | — | Branch and remote management, rest | [18](18-branch-and-remote-management.md) (rest) | normal | Upstream set/unset, remote rename, separate push URLs. |
