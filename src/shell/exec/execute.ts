@@ -83,12 +83,14 @@ export async function execute(plan: Plan, options: ExecOptions): Promise<ExecRes
             out,
             errors,
             inputs: runInput,
+            currentStatus: exitCode,
             chdir: (path: string) => {
               cwd = path;
             },
           });
           exitCode = outcome.exitCode;
           commandTruncated ||= outcome.truncated;
+          if (outcome.terminateRun) break;
         }
         previousConnector = step.connector;
       }
@@ -122,12 +124,14 @@ interface PipelineEnvironment {
   readonly out: Sink;
   readonly errors: Sink;
   readonly inputs: RunInputOwner | null;
+  readonly currentStatus: number;
   chdir(path: string): void;
 }
 
 interface PipelineResult {
   readonly exitCode: number;
   readonly truncated: boolean;
+  readonly terminateRun: boolean;
 }
 
 interface FileDestination {
@@ -169,7 +173,11 @@ async function runPipeline(
         env.errors.writeBytes(line(`kompjutr: ${planned.name}: command not found`));
         await close(stream);
         settled = true;
-        return { exitCode: 127, truncated: results.some(commandResultTruncated) };
+        return {
+          exitCode: 127,
+          truncated: results.some(commandResultTruncated),
+          terminateRun: false,
+        };
       }
 
       const expanded = expandArguments(planned.args, env.fs, env.cwd);
@@ -183,7 +191,11 @@ async function runPipeline(
         expanded.release();
         if (isFilesystemError(error)) {
           env.errors.writeBytes(line(`${planned.name}: ${error.message}`));
-          return { exitCode: 1, truncated: results.some(commandResultTruncated) };
+          return {
+            exitCode: 1,
+            truncated: results.some(commandResultTruncated),
+            terminateRun: false,
+          };
         }
         throw error;
       }
@@ -216,6 +228,7 @@ async function runPipeline(
         planned,
         redirections,
         index === pipeline.commands.length - 1,
+        pipeline.commands.length === 1,
         argv,
         stageInput,
         pipeline.limitHint,
@@ -258,15 +271,28 @@ async function runPipeline(
         if (error instanceof UpstreamError) throw error.original;
         if (isFilesystemError(error)) {
           env.errors.writeBytes(line(`${planned.name}: ${error.message}`));
-          return { exitCode: 1, truncated: results.some(commandResultTruncated) };
+          return {
+            exitCode: 1,
+            truncated: results.some(commandResultTruncated),
+            terminateRun: false,
+          };
         }
         throw error;
+      }
+      if (produced.control?.kind === "exit") {
+        await env.out.write(stream);
+        settled = true;
+        return {
+          exitCode: produced.status(),
+          truncated: results.some(commandResultTruncated),
+          terminateRun: produced.control.terminateRun,
+        };
       }
     }
 
     if (stream === null) {
       settled = true;
-      return { exitCode: 0, truncated: false };
+      return { exitCode: 0, truncated: false, terminateRun: false };
     }
     await env.out.write(stream);
     settled = true;
@@ -276,6 +302,7 @@ async function runPipeline(
     return {
       exitCode: last === undefined ? 0 : last.status(),
       truncated: results.some(commandResultTruncated),
+      terminateRun: false,
     };
   } finally {
     if (!settled) await close(stream);
@@ -632,6 +659,7 @@ function commandContext(
   planned: PlannedCommand,
   redirections: ResolvedRedirections,
   lastStage: boolean,
+  mayExitRun: boolean,
   argv: readonly string[],
   stdin: ByteStream | null,
   limitHint: number | null,
@@ -656,6 +684,8 @@ function commandContext(
     argv,
     stdin,
     env: env.inputs?.env,
+    currentStatus: env.currentStatus,
+    mayExitRun,
     limitHint,
     output,
     diagnostic,
@@ -670,7 +700,13 @@ function commandContext(
       if (command === undefined) return null;
       // No stdin and no demand hint: the sub-invocation's arguments already
       // carry everything it is meant to see.
-      return command({ ...context, argv: subArgv, stdin: null, limitHint: null });
+      return command({
+        ...context,
+        argv: subArgv,
+        stdin: null,
+        limitHint: null,
+        mayExitRun: false,
+      });
     },
   };
   return context;

@@ -275,6 +275,10 @@ export interface CommandContext {
   readonly stdin: ByteStream | null;
   /** A frozen snapshot supplied for this run; built-ins do not expand it. */
   readonly env?: Readonly<Record<string, string>>;
+  /** Status of the most recently selected pipeline in the current list. */
+  readonly currentStatus: number;
+  /** True only for a direct command that may terminate this run. */
+  readonly mayExitRun: boolean;
   /** From a lifted `head -N`. Sizes the first discovery page. */
   readonly limitHint: number | null;
   /** Planned stream destinations and the bytes still available to this stage. */
@@ -313,6 +317,8 @@ export interface CommandResult {
   status(): number;
   /** Valid once stdout is drained or closed. */
   truncated?(): boolean;
+  /** Shell-level control requested after this command has settled. */
+  readonly control?: { readonly kind: "exit"; readonly terminateRun: boolean };
 }
 
 export type Command = (context: CommandContext) => CommandResult | Promise<CommandResult>;

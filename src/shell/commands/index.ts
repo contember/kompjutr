@@ -7,6 +7,7 @@
 
 import { type ByteStream, isAsyncByteStream } from "../exec/bytes.js";
 import { type Command, type CommandResult, fail } from "../exec/context.js";
+import { exit } from "./control.js";
 import { fileCommands } from "./files.js";
 import { UsageError } from "./flags.js";
 import { grep } from "./grep.js";
@@ -22,6 +23,7 @@ export function builtinCommands(): Map<string, Command> {
     ["grep", grep],
     ["rg", rg],
     ["printf", printf],
+    ["exit", exit],
     ["xargs", xargs],
     ...readCommands,
     ...listCommands,
@@ -53,6 +55,7 @@ function normalizeFailures(command: Command): Command {
       stdout,
       status: () => failed ?? produced.status(),
       truncated: () => produced.truncated?.() ?? false,
+      ...(produced.control === undefined ? {} : { control: produced.control }),
     };
   };
 }

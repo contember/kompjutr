@@ -151,6 +151,42 @@ describe("caller stdin", () => {
       close.mockRestore();
     }
   });
+  it.each([
+    ["exit", 0],
+    ["false; exit", 1],
+    ["exit 300", 44],
+    ["exit -1", 255],
+    ["exit nope", 2],
+    ["exit | cat", 2],
+    ["cat | exit", 2],
+  ])("closes and releases every exit path exactly once: %s", async (source, exitCode) => {
+    const subject = fixture();
+    const close = vi.spyOn(RunInputOwner.prototype, "close");
+    const originalRetain = RetainedBudget.prototype.retain;
+    const releaseCalls: number[] = [];
+    const retain = vi.spyOn(RetainedBudget.prototype, "retain").mockImplementation(function (
+      this: RetainedBudget,
+      bytes,
+      label,
+    ) {
+      const release = originalRetain.call(this, bytes, label);
+      const index = releaseCalls.push(0) - 1;
+      return () => {
+        releaseCalls[index] = (releaseCalls[index] ?? 0) + 1;
+        release();
+      };
+    });
+    try {
+      const run = await subject.shell.run(source, { stdin: "caller", env: { A: "b" } });
+      expect(run.exitCode).toBe(exitCode);
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(releaseCalls.length).toBeGreaterThan(0);
+      expect(releaseCalls.every((calls) => calls === 1)).toBe(true);
+    } finally {
+      retain.mockRestore();
+      close.mockRestore();
+    }
+  });
   it("parses before creating or measuring a run input", async () => {
     const subject = fixture();
     const close = vi.spyOn(RunInputOwner.prototype, "close");

@@ -68,6 +68,15 @@ describe("cwd persists", () => {
     expect((await shell.run("false && cd src || cd src; pwd")).stdout).toBe("/repo/src\n");
     expect(shell.cwd()).toBe("/repo/src");
   });
+  it("persists cwd from before an exited run and skips later changes", async () => {
+    const shell = createShell({ fs: workspace(), cwd: "/repo" });
+    expect(await shell.run("cd src; exit 7; cd ..")).toMatchObject({
+      exitCode: 7,
+      cwd: "/repo/src",
+    });
+    expect(shell.cwd()).toBe("/repo/src");
+    expect((await shell.run("pwd")).stdout).toBe("/repo/src\n");
+  });
   it("still honours an explicit cd prefix", async () => {
     // Agents will keep writing it out of habit; it has to keep working.
     const shell = createShell({ fs: workspace(), cwd: "/" });
