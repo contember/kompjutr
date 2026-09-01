@@ -369,12 +369,10 @@ publish state with the wrong certainty.
 
 ## Cross-sprint boundary
 
-The concurrent [shell POSIX surface sprint](sprint-2026-08-31-shell-posix-surface.md)
-owns new shell syntax and built-ins. Its parity-harness WU may proceed immediately;
-its executor-changing WUs start only after WU1 here lands and is reviewed. After
-that seam settles, its POSIX work and WU2-WU8 here are independent apart from
-short, serialized edits to `src/shell/commands/index.ts`, shell reference docs,
-and shared shell tests. Neither sprint absorbs or closes the other's work.
+The completed [shell POSIX surface sprint](../archive/sprint-2026-08-31-shell-posix-surface.md)
+owns new shell syntax and built-ins. Its executor work built on WU1's reviewed
+async seam; this sprint continues to own the Git argv surface and does not absorb
+the POSIX work.
 
 ## Sequencing
 
@@ -423,3 +421,10 @@ sprint risk. Resolve blocking findings before implementation.
   staging plus commit-all, amend, and allow-empty argv. Focused 191/191, smoke
   164/164, typecheck/check passed; failure and output-overflow witnesses preserve
   complete repository state.
+- 2026-09-01 — WU5 landed (`9431d76`): bounded reset, checkout, switch,
+  restore, branch mutation, rebase lifecycle, and merge recovery argv. Focused
+  219/219, parser 202/202, shell smoke 164/164, typecheck/check/build passed;
+  differential state and cold-reopen recovery witnesses passed. A focused review
+  found no remaining blocker after fixing index-source restore, source deletions,
+  unsupported branch force-reset, remote switch targets, and literal paths with
+  spaces.

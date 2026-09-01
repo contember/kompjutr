@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Shell POSIX surface](sprint-2026-08-31-shell-posix-surface.md)
+  — bounded `printf`, `exit`, ordered `1>&2`, and named parameter expansion with
+  byte-exact Bash parity.
 - [Deepening and network safety](sprint-2026-08-31-deepening-and-network-safety.md)
   — relative deepening and unshallow, per-destination push leases, and abortable
   clone, fetch, and push with explicit local and remote certainty boundaries.

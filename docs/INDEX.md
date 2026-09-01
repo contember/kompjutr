@@ -18,8 +18,6 @@ decisions → reference → archive.
 
 - [`sprints/sprint-2026-08-31-everyday-git-shell.md`](sprints/sprint-2026-08-31-everyday-git-shell.md)
   — async shell execution and a bounded everyday Git argv surface.
-- [`sprints/sprint-2026-08-31-shell-posix-surface.md`](sprints/sprint-2026-08-31-shell-posix-surface.md)
-  — bash-parity additions to the shell language and built-ins.
 
 ## Specs
 
@@ -42,7 +40,7 @@ decisions → reference → archive.
 - The active everyday Git shell sprint makes command execution asynchronous,
   adds staged diff and history reads, exposes existing local/network operations,
   and composes pull with the restart-safe rebase lifecycle.
-- The parallel POSIX shell sprint has admitted bounded `printf`, `exit`, `1>&2`,
+- The completed POSIX shell sprint admitted bounded `printf`, `exit`, `1>&2`,
   and named parameter expansion with Bash parity as the standing gate
   (ADR-0021).
 - Next is the external consumer integration gate outside this public repository;
@@ -86,6 +84,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-31-shell-posix-surface.md`](archive/sprint-2026-08-31-shell-posix-surface.md)
+  — bounded `printf`, `exit`, ordered `1>&2`, and named parameter expansion with
+  byte-exact Bash parity.
 - [`archive/sprint-2026-08-31-deepening-and-network-safety.md`](archive/sprint-2026-08-31-deepening-and-network-safety.md)
   — relative deepening and unshallow, per-destination push leases, and abortable
   clone, fetch, and push with explicit local and remote certainty boundaries.

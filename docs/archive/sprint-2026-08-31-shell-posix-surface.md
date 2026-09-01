@@ -1,3 +1,17 @@
+> **OUTCOME — shipped 2026-09-01.** The shell now admits bounded `printf`,
+> `exit`, ordered `1>&2`, and named parameter expansion, with byte-exact Bash
+> parity as the standing gate for future syntax. Commit map: plan → `a6dc8f4`;
+> WU1 → `92f3dbb`; WU2 → `af74f50`; WU3 → `8b9c425`; WU4 → `f484426`; WU5 →
+> `b23b58a`; WU6 → `5140e4e`; shared async foundation → `739608f`.
+> Verification: focused witnesses passed WU1 6, WU2 36, WU3 16, WU4 55, and
+> WU5 157 tests; shell passed 451 tests and smoke passed 164 tests; typecheck,
+> Biome check, build, and package smoke passed. The exhaustive runner passed all
+> eight root shards, protocol, five pack slices, filesystem, shell, and E2E; the
+> final slices passed separately after the outer 10-minute command limit stopped
+> the combined process. Backlog closed: none. Deferred: timeout semantics,
+> per-run cwd, assignment and advanced parameter forms, and elapsed-time commands
+> remain explicitly out of scope.
+
 # Sprint — shell POSIX surface (2026-08-31)
 
 **Goal.** Add `printf`, `exit`, `1>&2`, and named parameter expansion to
@@ -331,3 +345,11 @@ shell tests, and shell reference docs are serialized by the sprint leader.
   typecheck/check passed; all eight no-parameter operation baselines stayed exact.
   Independent review (`ses_fa2fa2c73ffe2kE4SNDACvB3Ck`) was clean after one
   fix round for special parameters, dotfiles, pathname `**`, and boundary tests.
+- 2026-09-01 — WU6 landed (`5140e4e`): ADR-0021 and the shell reference now
+  describe the bounded POSIX surface and its intentional divergences; Biome check
+  passed.
+- 2026-09-01 — Closure passed typecheck, Biome check, build, package smoke, and
+  every exhaustive test slice. The combined runner reached its outer 10-minute
+  limit after six root shards; root shards 7–8, protocol, all five pack slices,
+  filesystem 456/456, shell 451/451, and E2E 96/96 then passed under one CPU
+  lease with no test failure.
