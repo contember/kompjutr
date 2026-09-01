@@ -42,8 +42,9 @@ decisions → reference → archive.
 - The active everyday Git shell sprint makes command execution asynchronous,
   adds staged diff and history reads, exposes existing local/network operations,
   and composes pull with the restart-safe rebase lifecycle.
-- The parallel POSIX shell sprint adds `printf`, `exit`, `1>&2`, and named
-  parameter expansion after the async executor seam settles.
+- The parallel POSIX shell sprint has admitted bounded `printf`, `exit`, `1>&2`,
+  and named parameter expansion with Bash parity as the standing gate
+  (ADR-0021).
 - Next is the external consumer integration gate outside this public repository;
   its provider still lacks the bulk worktree scan needed for an efficient
   implementation without crossing private storage boundaries. Phase 2 is
@@ -81,6 +82,7 @@ decisions → reference → archive.
 - [`decisions/0018-trust-stored-rows-validate-at-the-boundary.md`](decisions/0018-trust-stored-rows-validate-at-the-boundary.md)
 - [`decisions/0019-organize-source-by-domain-with-bottom-up-layers.md`](decisions/0019-organize-source-by-domain-with-bottom-up-layers.md)
 - [`decisions/0020-model-partial-clone-blobs-as-durable-promises.md`](decisions/0020-model-partial-clone-blobs-as-durable-promises.md)
+- [`decisions/0021-admit-a-bounded-posix-shell-surface.md`](decisions/0021-admit-a-bounded-posix-shell-surface.md)
 
 ## Historical records
 

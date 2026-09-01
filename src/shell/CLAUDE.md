@@ -13,12 +13,13 @@ and rationale are in `docs/archive/plans/shell.md`; read §5.1 there before
 ## Pipeline
 
 ```
-parse/    source → AST (11 node kinds; the corpus uses no more)
-plan/     AST → Plan. Pure: imports nothing from src/fs/. A glob is carried
-          as a pattern and marked, never resolved here.
-exec/     Plan → result. Pull-based, so a consumer that stops pulling stops
-          the source. All filesystem access goes through BoundedFs.
-commands/ the registry: grep, rg, xargs, plus read/list/file/text families
+parse/    source → quote-aware AST with literal, glob, and parameter word parts
+plan/     AST → Plan. Pure: imports nothing from src/fs/. Globs and parameters
+          remain marked, never resolved here.
+exec/     Plan → result. Resolves parameters from the frozen run env and globs
+          through BoundedFs. Pull-based, so a consumer that stops pulling stops
+          the source.
+commands/ the registry: grep, rg, printf, exit, xargs, plus read/list/file/text families
 ```
 
 Keep `plan/` free of filesystem imports — that is what makes every rewrite
@@ -35,8 +36,13 @@ plan and performed by the executor.
 - **Bounds are the executor's job, not the caller's discipline.** An agent that
   forgets `| head` must still get a bounded result. Defaults: 1 MB each for
   stdout and stderr, 10,000 operations, 1.5 MB per read statement, and 16 MiB
-  of live shell-owned intermediate bytes. Reserve before retaining and release
-  when ownership ends; semantic input fails rather than truncates.
+  of live shell-owned intermediate bytes. Expanded argv also has a 10,000-entry
+  ceiling and its UTF-8 bytes use the retained budget. Reserve before retaining
+  and release when ownership ends; semantic input fails rather than truncates.
+- **Parameter expansion is an execution concern.** Preserve ordered word parts
+  and quote context through parse and plan. Only command arguments admit named
+  parameters; unquoted values use fixed default-IFS splitting and pathname
+  expansion. Do not make planning depend on env or the filesystem.
 - **`operations` in `RunResult` is the metric that matters.** A change that
   makes output prettier and raises the operation count is a regression.
 - **A trailing `head -N` publishes a demand hint and remains a stage.** Paged
@@ -46,3 +52,7 @@ plan and performed by the executor.
 - **`grep` and `rg` are the real flags and the real output.** Their behaviour is
   not a matter of opinion — it is pinned by differential tests against the
   installed binaries. See `tests/CLAUDE.md`.
+- **Bash parity gates additions to the shell surface.** Compare admitted syntax
+  and built-ins byte-for-byte against Bash. Pin an intentional divergence as an
+  explicit local refusal; never weaken the comparison. See
+  [ADR-0021](../../docs/decisions/0021-admit-a-bounded-posix-shell-surface.md).

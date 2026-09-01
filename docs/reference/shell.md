@@ -12,19 +12,28 @@ stops pulling, an upstream scan, search, or listing stops issuing pages.
 `ByteStream` is the public union of synchronous and asynchronous byte iterators;
 consumers await each pull and close.
 
-The grammar supports simple commands, quotes and escapes, unquoted path globs,
-pipelines, and flat left-associative `&&`, `||`, and `;` lists. Pipeline status
-is the last stage's status; there is no `pipefail`. Each stage owns its
-redirections:
+The grammar supports simple commands, quotes and escapes, named parameters in
+arguments, unquoted path globs, pipelines, and flat left-associative `&&`, `||`,
+and `;` lists. Pipeline status is the last stage's status; there is no
+`pipefail`. The [baseline Bash parity suite](../../tests/shell/parity-bash.test.ts)
+pins existing `echo`, `cat`, `2>&1`, and `2>/dev/null` behavior. Each stage owns
+its redirections:
 
 - `< file`, `> file`, and `>> file` preserve atomic publication. Synchronous
   output streams feed the filesystem transaction incrementally. Asynchronous
   output is pulled sequentially under `maxRetainedBytes` before the one
   synchronous filesystem publication; an upstream rejection publishes nothing.
-- `2>&1` merges that stage's diagnostics before the downstream pipe consumes
-  them.
+- `2>&1` and `1>&2` duplicate the destination currently bound to the other
+  descriptor. Redirections resolve left to right. A file named by an earlier
+  binding is still created or truncated even if a later binding replaces it.
+  Stdout bound to stderr does not become pipeline input.
 - `2>/dev/null` drops diagnostics without allocating an intermediate buffer.
-- Redirecting stderr to a file and other descriptor duplication are rejected.
+- Redirecting stderr to a file and duplicating descriptors other than `1` and
+  `2` are rejected.
+
+The [ordered-redirection Bash parity suite](../../tests/shell/parity-bash-redirection.test.ts)
+pins descriptor routing, pipeline behavior, left-to-right ordering, and file
+side effects.
 
 Expected usage and filesystem errors from built-ins return a `RunResult`.
 Exceptions from injected commands remain visible to the caller.
@@ -51,8 +60,15 @@ The run awaits cursor and stream cleanup on every result or exception. Pipeline
 status and list sequencing are evaluated only after drain or close completes.
 
 Environment values are a frozen snapshot of the caller's own enumerable
-properties. Built-ins and the parser do not expand them. Injected commands read
-the snapshot through `CommandContext.env`, including nested invocations.
+properties. In command arguments, `$NAME` and `${NAME}` accept names matching
+`[A-Za-z_][A-Za-z0-9_]*`; an unset name expands to empty. Double-quoted
+expansion remains one field without pathname expansion. Unquoted expansion
+splits on the fixed default IFS whitespace characters (space, tab, and newline),
+then pathname-expands each generated field. Injected commands also read the
+same snapshot through `CommandContext.env`, including nested invocations. The
+[named-expansion Bash parity suite](../../tests/shell/parity-bash-expansion.test.ts)
+pins mixed words, quoting, empty values, splitting, pathname expansion, bounds,
+and the explicit rejection boundary.
 
 ## Supported commands
 
@@ -75,6 +91,8 @@ attached value, or `--long=value`.
 | `mkdir` | `-p`/`--parents`. |
 | `touch` | Files, directories, and final symlinks; creates missing files. No options. |
 | `echo` | `-n` when it is the first argument. |
+| `printf` | Required format; `%s`, `%%`, and `%d` with signed ASCII-decimal operands; `\n`, `\t`, `\r`, `\\`, and `\0`; format recycling and Bash's missing-operand defaults. Width, precision, `%b`, `%q`, `%c`, other escapes, and non-decimal numeric spellings are rejected. |
+| `exit` | `exit [N]`; no operand uses the current status, and numeric status is reduced modulo 256. It terminates the run and is accepted only as a single-stage pipeline. |
 | `pwd`, `true`, `false` | No options. |
 | `cd` | Exactly one directory; the session retains the resulting cwd. |
 | `which` | Reports built-in and injected command names as `/usr/bin/<name>`. |
@@ -144,7 +162,7 @@ one logical filesystem revision per mutating call.
 | `maxRetainedBytes` | 16 MiB | Caps live shell-owned intermediate bytes across the complete pipeline; overflow fails with exit 2 and never truncates semantic input. |
 | Caller stdin | 1 MiB | UTF-8 text is measured before encoding; binary input is copied only after the combined input reservation succeeds. |
 | Caller env | 256 own entries and 1 MiB cumulative UTF-8 key/value bytes | The frozen snapshot and stdin share one `maxRetainedBytes` reservation for the complete run. |
-| Expanded argv | 10,000 entries and 1,000,000 UTF-8 bytes | The first excess entry or byte fails with an `E2BIG`-shaped result before invocation. |
+| Expanded argv | 10,000 entries | The first excess entry fails with an `E2BIG`-shaped result before invocation. Generated UTF-8 bytes are reserved against the run's shared `maxRetainedBytes` ceiling until the command settles. |
 | Async redirect input | `maxRetainedBytes` | Input is pulled sequentially before atomic publication. Synchronous producers continue to stream incrementally without retaining the complete output. |
 
 `RunResult.truncated` is the OR of public sink truncation and every settled
@@ -172,10 +190,20 @@ command.
 
 ## Deliberate boundaries
 
-The parser rejects variables and parameter expansion, command and process
-substitution, arithmetic, grouping and subshells, conditionals and loops,
-functions, here-documents, background jobs, and compound commands. There is no
-external-process fallback.
+Named expansion is restricted to command arguments. Variable assignment,
+parameters in command names or redirection targets, `${...}` operators,
+positional parameters, and special parameters such as `$@`, `$?`, and `$$` are
+rejected. Command and process substitution, arithmetic, grouping and subshells,
+conditionals and loops, functions, here-documents, background jobs, and compound
+commands also remain rejected. There is no external-process fallback.
+
+`printf` deliberately rejects the forms listed in its command row. `exit` in a
+multi-stage pipeline is a local usage error because this shell has no subshell
+in which to run it. The [printf parity suite](../../tests/shell/parity-bash-printf.test.ts)
+and [exit parity suite](../../tests/shell/parity-bash-exit.test.ts) compare the
+admitted forms with Bash and pin these intentional refusals locally. Bash parity
+is the standing admission gate for future shell syntax and commands; see
+[ADR-0021](../decisions/0021-admit-a-bounded-posix-shell-surface.md).
 
 The completed design and historical measurements remain in the
 [archived shell plan](../archive/plans/shell.md). Agent-facing implementation

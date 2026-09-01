@@ -30,7 +30,9 @@ injected by consumers and does not create a shell-to-Git dependency.
 - Compatibility is differential for the supported surface, not a promise of
   full bash behavior.
 - Adding syntax or a command requires a bounded execution strategy and parity
-  evidence where a real binary exists.
+  evidence where a real binary exists. [ADR-0021](0021-admit-a-bounded-posix-shell-surface.md)
+  makes Bash parity the standing admission gate and records the first deliberate
+  expansion of this finite surface.
 
 ## Alternatives considered
 
