@@ -534,6 +534,31 @@ function authenticateTags(repo: Repository, tags: readonly AdvertisedTag[]): voi
   }
 }
 
+/**
+ * Authenticate every fetched ref before publication. A pack whose framing and
+ * trailer validate can still omit a requested `want`, and no ref may name an
+ * object the transfer did not deliver.
+ */
+function authenticateFetchedCoverage(
+  repo: Repository,
+  coverage: readonly RemoteRef[],
+  candidates: readonly string[],
+): ReadonlyMap<string, ObjectType> {
+  const held = repo.store.hasAll(new Set(candidates));
+  for (const ref of coverage) {
+    if (!held.has(ref.oid)) {
+      throw new GitError("EFETCHFAIL", `fetch did not receive ${ref.name}`);
+    }
+  }
+  const types = objectTypes(repo, candidates);
+  for (const ref of coverage) {
+    if (ref.name.startsWith("refs/heads/") && types.get(ref.oid) !== "commit") {
+      throw new CorruptError(`fetched branch ${ref.name} does not point to a commit`);
+    }
+  }
+  return types;
+}
+
 /** Recent commits from every local ref, as negotiation `have`s. */
 function collectHaves(repo: Repository): string[] {
   const haves: string[] = [];
@@ -1454,17 +1479,12 @@ async function prepareLegacyFetchPublication(
     const boundaryChanged =
       proposedShallow.size !== publication.shallow.length ||
       publication.shallow.some((oid) => !proposedShallow.has(oid));
+    const candidates = [
+      ...selection.coverage.map((ref) => ref.oid),
+      ...selectedTags.map((tag) => tag.peeledOid),
+    ];
+    const types = authenticateFetchedCoverage(repo, selection.coverage, candidates);
     if (boundaryRequested || boundaryChanged) {
-      const candidates = [
-        ...selection.coverage.map((ref) => ref.oid),
-        ...selectedTags.map((tag) => tag.peeledOid),
-      ];
-      const types = objectTypes(repo, candidates);
-      for (const ref of selection.coverage) {
-        if (ref.name.startsWith("refs/heads/") && types.get(ref.oid) !== "commit") {
-          throw new CorruptError(`fetched branch ${ref.name} does not point to a commit`);
-        }
-      }
       const commitRoots = candidates.filter((oid) => types.get(oid) === "commit");
       authenticateShallowTransition(repo, publication.shallow, proposedShallow, commitRoots);
     }

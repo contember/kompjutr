@@ -642,6 +642,8 @@ updates }`, with updates ordered by destination UTF-8 bytes. Exact missing
 sources fail; an unmatched wildcard is a successful discovery-only no-op. One
 complete validated pack and every selected destination publish atomically.
 Interrupted ingest, a stale candidate, or one invalid destination moves no ref.
+Every selected ref is authenticated against the received objects before
+publication; a transfer that omits one fails with `EFETCHFAIL` and moves no ref.
 A selected tag is still fetched when it is itself the explicit selector. Tag
 publication authenticates annotated chains and never clobbers a different
 existing local tag. Auto-follow silently preserves an existing local tag, while
