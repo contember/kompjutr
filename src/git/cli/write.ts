@@ -105,6 +105,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
       return withRepository(context, invocation.cwd, options, (repo) => {
         let paths: ResolvedAddPath[] = [];
         return runMutation(
+          context,
           repo,
           options,
           () => {
@@ -144,6 +145,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
     async commit(invocation, options) {
       return withRepository(context, invocation.cwd, options, (repo) =>
         runMutation(
+          context,
           repo,
           options,
           () => {
@@ -204,6 +206,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
     async branch(invocation, options) {
       return withRepository(context, invocation.cwd, options, (repo) =>
         runMutation(
+          context,
           repo,
           options,
           () => {
@@ -249,6 +252,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         const command = invocation.command;
         const paths = resolveMutationPaths(repo, invocation.cwd, command.paths ?? []);
         return runMutation(
+          context,
           repo,
           options,
           () => {
@@ -292,6 +296,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         const command = invocation.command;
         const paths = resolveMutationPaths(repo, invocation.cwd, command.paths ?? []);
         return runMutation(
+          context,
           repo,
           options,
           () => {
@@ -341,6 +346,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
       return withRepository(context, invocation.cwd, options, (repo) => {
         requireTransactionalWorktree(context, repo);
         return runMutation(
+          context,
           repo,
           options,
           () => {
@@ -375,6 +381,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         requireTransactionalWorktree(context, repo);
         const paths = resolveMutationPaths(repo, invocation.cwd, invocation.command.paths);
         return runMutation(
+          context,
           repo,
           options,
           () => {
@@ -399,6 +406,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         requireTransactionalWorktree(context, repo);
         if (invocation.command.action === "abort") {
           return runMutation(
+            context,
             repo,
             options,
             () => rebaseAbortExcluding(repo, context.worktree, nestedRoots(context, repo.root)),
@@ -408,6 +416,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         }
         if (invocation.command.action === "start") {
           return runMutation(
+            context,
             repo,
             options,
             () => {
@@ -427,6 +436,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         }
         if (invocation.command.action === "skip") {
           return runMutation(
+            context,
             repo,
             options,
             () =>
@@ -442,6 +452,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
           );
         }
         return runMutation(
+          context,
           repo,
           options,
           () => {
@@ -465,6 +476,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         requireTransactionalWorktree(context, repo);
         if (invocation.command.action === "abort") {
           return runMutation(
+            context,
             repo,
             options,
             () => mergeAbort(repo, context.worktree),
@@ -473,6 +485,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
           );
         }
         return runMutation(
+          context,
           repo,
           options,
           () => {
@@ -502,6 +515,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
 }
 
 function runMutation<Outcome>(
+  context: GitContext,
   repo: Repository,
   options: ResolvedGitCliRunOptions,
   operation: () => Outcome,
@@ -509,8 +523,9 @@ function runMutation<Outcome>(
   mapOperationFailure: (error: unknown) => GitCliResult | undefined,
 ): GitCliResult {
   let phase: MutationPhase = "native-operation";
+  // Map native refusals only after the guard transaction has rolled every staged write back.
   try {
-    return repo.store.db.transactionSync(() => {
+    return withGitMutationGuardOwned(context.database, () => {
       phase = "native-operation";
       const outcome = operation();
       phase = "format-success";
@@ -547,7 +562,7 @@ function withRepository(
       options,
     );
   }
-  return withGitMutationGuardOwned(context.database, () => body(repo));
+  return body(repo);
 }
 
 function requireTransactionalWorktree(context: GitContext, repo: Repository): void {
