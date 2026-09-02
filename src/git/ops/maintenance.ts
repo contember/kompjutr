@@ -1,6 +1,6 @@
 import { CorruptError, GitError } from "../common/errors.js";
 import { advanceMaintenanceRootSnapshotOwned } from "../store/index.js";
-import { advanceMaintenanceReachability } from "../store/maintenance/reachability.js";
+import { advanceMaintenanceMark } from "../store/maintenance/reachability.js";
 import {
   advanceMaintenanceRepack,
   settleMaintenanceRepackForRestart,
@@ -122,7 +122,7 @@ export async function maintenance(
   if (before.phase === "roots") {
     advanceMaintenanceRootSnapshotOwned(context.database, repoId, { nowMs });
   } else if (before.phase === "mark") {
-    advanceMaintenanceReachability(repo.store);
+    advanceMaintenanceMark(repo.store);
   } else if (before.phase === "repack") {
     if (context.yieldNow === undefined) {
       await advanceMaintenanceRepack(repo.store, { nowMs });

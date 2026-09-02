@@ -14,6 +14,8 @@ import {
 } from "./state.js";
 
 const EDGE_PAGE = 256;
+// Bounds one synchronous mark transaction: each expansion reads one queue row and its edge page.
+export const MARK_EXPANSIONS_PER_CALL = 64;
 const HEADER_LINE_PREFIX_BYTES = 128;
 
 export type MaintenanceReachabilityStatus = "progress" | "complete" | "root-changed";
@@ -72,6 +74,8 @@ interface ExistingMark {
 interface PublicationResult {
   discoveredObjects: number;
   discoveredLogicalObjects: number;
+  queuedObjects: number;
+  reachableObjects: number;
 }
 
 interface ReachabilityObjectInfo extends ObjectReadInfo {
@@ -1050,7 +1054,12 @@ function publishExpansionOwned(
   ) {
     throw new CorruptError("maintenance counters were not published atomically");
   }
-  return { discoveredObjects, discoveredLogicalObjects };
+  return {
+    discoveredObjects,
+    discoveredLogicalObjects,
+    queuedObjects: nextQueued,
+    reachableObjects: nextReachable,
+  };
 }
 
 function finishMark(db: SqlDatabase, repoId: number, run: RunState): void {
@@ -1081,73 +1090,121 @@ function finishMark(db: SqlDatabase, repoId: number, run: RunState): void {
   }
 }
 
-/** Advance one durable reachability edge page or the stable mark completion transition. */
-export function advanceMaintenanceReachability(
+interface MarkGate {
+  kind: "root-changed" | "complete" | "mark";
+  run: RunState;
+}
+
+function openMarkRun(store: SharedRepoStore): MarkGate {
+  const run = readRun(store.db, store.repoId);
+  if (run.observedRootEpoch !== run.rootEpoch) return { kind: "root-changed", run };
+  expectPhase(
+    run,
+    ["mark", "classify-loose"],
+    `maintenance reachability cannot advance phase ${run.phase}`,
+  );
+  if (run.phase === "classify-loose") return { kind: "complete", run };
+  return { kind: "mark", run: initializeCounters(store.db, store.repoId, run) };
+}
+
+interface MarkExpansion {
+  run: RunState;
+  processedOid: string;
+  discoveredObjects: number;
+  discoveredLogicalObjects: number;
+}
+
+function expandNextMarkObject(store: SharedRepoStore, run: RunState): MarkExpansion | null {
+  const object = readNextObject(store.db, store.repoId, run.runId);
+  if (object === null) return null;
+  if (run.queuedObjects === 0) {
+    throw new CorruptError("maintenance queued count omitted an unexpanded mark");
+  }
+  let expansion: ObjectExpansion;
+  if (object.physicalOnly) {
+    expansion = physicalExpansion(store, object);
+  } else {
+    const info = requireObjectInfo(store, object.oid);
+    if (object.shallowBoundary && info.type !== "commit") {
+      throw new CorruptError("maintenance shallow boundary is not a commit");
+    }
+    expansion =
+      info.type === "tree"
+        ? treeExpansion(store.db, store, object)
+        : headerExpansion(store, object, info);
+  }
+  const published = publishExpansion(store.db, store, run, object, expansion);
+  return {
+    run: {
+      ...run,
+      queuedObjects: published.queuedObjects,
+      reachableObjects: published.reachableObjects,
+    },
+    processedOid: object.oid,
+    discoveredObjects: published.discoveredObjects,
+    discoveredLogicalObjects: published.discoveredLogicalObjects,
+  };
+}
+
+function advanceMark(
   store: SharedRepoStore,
+  expansionBudget: number,
 ): MaintenanceReachabilityProgress {
   if (!Number.isSafeInteger(store.repoId) || store.repoId < 1) {
     throw new GitError("EINVAL", "repository id must be a safe positive integer");
   }
   return store.db.transactionSync(() => {
-    let run = readRun(store.db, store.repoId);
-    if (run.observedRootEpoch !== run.rootEpoch) {
+    const gate = openMarkRun(store);
+    let run = gate.run;
+    if (gate.kind !== "mark") {
       return {
         runId: run.runId,
-        status: "root-changed",
+        status: gate.kind,
         processedOid: null,
         discoveredObjects: 0,
         discoveredLogicalObjects: 0,
       };
     }
-    expectPhase(
-      run,
-      ["mark", "classify-loose"],
-      `maintenance reachability cannot advance phase ${run.phase}`,
-    );
-    if (run.phase === "classify-loose") {
-      return {
-        runId: run.runId,
-        status: "complete",
-        processedOid: null,
-        discoveredObjects: 0,
-        discoveredLogicalObjects: 0,
-      };
-    }
-    run = initializeCounters(store.db, store.repoId, run);
-    const object = readNextObject(store.db, store.repoId, run.runId);
-    if (object === null) {
-      finishMark(store.db, store.repoId, run);
-      return {
-        runId: run.runId,
-        status: "complete",
-        processedOid: null,
-        discoveredObjects: 0,
-        discoveredLogicalObjects: 0,
-      };
-    }
-    if (run.queuedObjects === 0) {
-      throw new CorruptError("maintenance queued count omitted an unexpanded mark");
-    }
-    let expansion: ObjectExpansion;
-    if (object.physicalOnly) {
-      expansion = physicalExpansion(store, object);
-    } else {
-      const info = requireObjectInfo(store, object.oid);
-      if (object.shallowBoundary && info.type !== "commit") {
-        throw new CorruptError("maintenance shallow boundary is not a commit");
+    let processedOid: string | null = null;
+    let discoveredObjects = 0;
+    let discoveredLogicalObjects = 0;
+    for (let expansions = 0; expansions < expansionBudget; expansions++) {
+      const expansion = expandNextMarkObject(store, run);
+      if (expansion === null) {
+        // A call that expanded leaves the settled transition to the next one, as one step does.
+        if (expansions > 0) break;
+        finishMark(store.db, store.repoId, run);
+        return {
+          runId: run.runId,
+          status: "complete",
+          processedOid,
+          discoveredObjects,
+          discoveredLogicalObjects,
+        };
       }
-      expansion =
-        info.type === "tree"
-          ? treeExpansion(store.db, store, object)
-          : headerExpansion(store, object, info);
+      run = expansion.run;
+      processedOid = expansion.processedOid;
+      discoveredObjects += expansion.discoveredObjects;
+      discoveredLogicalObjects += expansion.discoveredLogicalObjects;
     }
-    const published = publishExpansion(store.db, store, run, object, expansion);
     return {
       runId: run.runId,
       status: "progress",
-      processedOid: object.oid,
-      discoveredObjects: published.discoveredObjects,
-      discoveredLogicalObjects: published.discoveredLogicalObjects,
+      processedOid,
+      discoveredObjects,
+      discoveredLogicalObjects,
     };
   });
+}
+
+/** Advance one durable reachability edge page or the stable mark completion transition. */
+export function advanceMaintenanceReachability(
+  store: SharedRepoStore,
+): MaintenanceReachabilityProgress {
+  return advanceMark(store, 1);
+}
+
+/** Advance one bounded maintenance call: a fixed page budget of reachability expansions. */
+export function advanceMaintenanceMark(store: SharedRepoStore): MaintenanceReachabilityProgress {
+  return advanceMark(store, MARK_EXPANSIONS_PER_CALL);
 }

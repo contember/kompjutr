@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../src/db/db.js";
+import { createGit } from "../src/git/client.js";
 import { concat, utf8 } from "../src/git/common/bytes.js";
 import {
   hashObject,
@@ -12,11 +13,16 @@ import {
 } from "../src/git/common/objects.js";
 import { deflate } from "../src/git/common/zlib.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { advanceMaintenanceReachability } from "../src/git/store/maintenance/reachability.js";
+import {
+  advanceMaintenanceReachability,
+  MARK_EXPANSIONS_PER_CALL,
+} from "../src/git/store/maintenance/reachability.js";
 import { encodeDeltaHeader } from "../src/git/store/pack/delta.js";
 import { PackWriter } from "../src/git/store/pack/writer.js";
+import { Workspace } from "../src/runtime/workspace.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
+import { SqliteTestStorage } from "./helpers/storage.js";
 
 const PERSON = {
   name: "Reachability Fixture",
@@ -1374,4 +1380,57 @@ describe("maintenance reachability", () => {
       ),
     ).toBe(50_002);
   }, 300_000);
+});
+
+describe("maintenance mark batching", () => {
+  it("leaves the mark phase in batched public maintenance calls", async () => {
+    const storage = new SqliteTestStorage();
+    const workspace = new Workspace({
+      storage,
+      git: createGit(),
+      now: () => 1_900_000_000_000,
+      defaultGitIdentity: { name: PERSON.name, email: PERSON.email },
+    });
+    await workspace.git.init({ dir: "/repo" });
+    const files: { path: string; bytes: Uint8Array }[] = [];
+    for (let index = 0; index < 400; index++) {
+      files.push({
+        path: `/repo/file-${String(index).padStart(3, "0")}.txt`,
+        bytes: utf8.encode(`reachable ${index}\n`),
+      });
+    }
+    workspace.filesystem.writeFiles(files);
+    await workspace.git.add({ dir: "/repo", paths: ["."] });
+    await workspace.git.commit({ dir: "/repo", message: "wide" });
+
+    let result = await workspace.git.maintenance({ dir: "/repo" });
+    for (let call = 0; call < 100 && result.phase !== "mark"; call++) {
+      result = await workspace.git.maintenance({ dir: "/repo" });
+    }
+    expect(result.phase).toBe("mark");
+    let markCalls = 0;
+    while (result.phase === "mark") {
+      markCalls++;
+      if (markCalls > 1_000) throw new Error("the mark phase did not complete");
+      storage.resetCounters();
+      result = await workspace.git.maintenance({ dir: "/repo" });
+      expect(storage.statementCount).toBeLessThan(1_000);
+    }
+
+    expect(result.phase).toBe("classify-loose");
+    const db = new TestDatabase(storage);
+    const repoId = db.scalar<number>("SELECT repo_id FROM git_maintenance_runs");
+    if (repoId === undefined) throw new Error("the maintenance run is missing");
+    const marked = marks(db, repoId).map((row) => row.oid);
+    const stored = db
+      .all<{ oid: string }>("SELECT oid FROM git_objects WHERE repo_id = ?", repoId)
+      .map((row) => row.oid);
+    expect(stored.length).toBeGreaterThan(400);
+    expect(new Set(marked)).toEqual(new Set(stored));
+    expect(result.reachableObjects).toBe(stored.length);
+    expect(result.queuedObjects).toBe(0);
+    expect(markCalls).toBeLessThanOrEqual(Math.ceil(stored.length / MARK_EXPANSIONS_PER_CALL) + 2);
+    // One mark call per reachable object is the cost this guards against.
+    expect(markCalls).toBeLessThan(stored.length / 16);
+  });
 });
