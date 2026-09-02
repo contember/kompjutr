@@ -147,15 +147,26 @@ describe("revert lifecycle", () => {
     const current = source.commit("later");
     const workspace = await imported(source);
     const beforeObjects = workspace.repo.store.objectCount();
-    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
-    workspace.repo.mutateRefs = (mutation, metadata) => {
-      originalUpdate(mutation, metadata);
-      throw new Error("late revert publication fault");
+    const originalRun = workspace.repo.store.db.run.bind(workspace.repo.store.db);
+    let faultInjected = false;
+    workspace.repo.store.db.run = (query, ...bindings) => {
+      originalRun(query, ...bindings);
+      if (!faultInjected && query.includes("INSERT INTO git_refs")) {
+        faultInjected = true;
+        expect(
+          workspace.repo.store.db.scalar<string>(
+            "SELECT target FROM git_refs WHERE repo_id = ? AND name = 'refs/heads/main'",
+            workspace.repo.store.repoId,
+          ),
+        ).not.toBe(current);
+        throw new Error("late revert publication fault");
+      }
     };
 
     expect(() =>
       revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted }),
     ).toThrow("late revert publication fault");
+    expect(faultInjected).toBe(true);
 
     expect(workspace.repo.head().oid).toBe(current);
     expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
