@@ -1,4 +1,4 @@
-import { checkoutStoreMutations } from "../store/checkout.js";
+import { applyIndexOwned, checkoutStoreMutations } from "../store/checkout.js";
 import { sharedRepoStoreMutations } from "../store/shared.js";
 import { repositoryMutations } from "./repository.js";
 // Staging: moving working-tree facts into the SQL index.
@@ -357,7 +357,7 @@ function applyAdd(
     rows: [],
   };
   const hashCursor = createWorktreeHashCursor();
-  index.indexApply((sink) => {
+  applyIndexOwned(index, (sink) => {
     const flush = (): void => stageCandidates(repo, worktree, pending, sink, hashCursor);
     for (const row of joinSorted3(
       boundedAddWorktreeRows(walked, limits),
@@ -1355,7 +1355,7 @@ function runRm(repo: Repository, worktree: Worktree, options: RmOptions): void {
       removeRmWorktreePaths(worktree, physicalRmPaths(repo, candidates), false);
       removeRmWorktreePaths(worktree, absoluteRmPaths(repo, pruned), true);
     }
-    repo.checkout.indexApply((sink) => {
+    applyIndexOwned(repo.checkout, (sink) => {
       for (const candidate of candidates) sink.remove(candidate.path);
     });
   });
@@ -1706,7 +1706,7 @@ export function reset(
   }
 
   // Tree and index are both path-ordered, so one merge decides each path.
-  repo.checkout.indexApply((sink) => {
+  applyIndexOwned(repo.checkout, (sink) => {
     for (const row of joinSorted(indexFromTree(repo, tree), repo.checkout.indexScan(), {
       left: (entry) => entry.path,
       right: (entry) => entry.path,

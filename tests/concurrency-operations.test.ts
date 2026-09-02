@@ -288,6 +288,8 @@ describe("local operation concurrency", () => {
       timestamp: 1_577_836_800,
       timezoneOffset: 0,
     };
+    let initialCallbackCalled = false;
+    let applyCallbackCalled = false;
 
     withGitMutationGuardOwned(test.workspace.database, () => {
       expect(() =>
@@ -317,11 +319,23 @@ describe("local operation concurrency", () => {
       expect(() => test.workspace.repo.checkout.indexClear()).toThrowError(
         expect.objectContaining({ code: "EREENTRANT" }),
       );
+      expect(() =>
+        test.workspace.repo.checkout.tryCreateInitialState(() => {
+          initialCallbackCalled = true;
+        }),
+      ).toThrowError(expect.objectContaining({ code: "EREENTRANT" }));
+      expect(() =>
+        test.workspace.repo.checkout.indexApply(() => {
+          applyCallbackCalled = true;
+        }),
+      ).toThrowError(expect.objectContaining({ code: "EREENTRANT" }));
     });
 
     expect(test.workspace.database.checkoutAt("/guarded-nested")).toBeNull();
     expect(test.workspace.repo.store.getRef("refs/heads/facade-reentry")).toBeNull();
     expect(test.workspace.repo.store.configGet("guard.reentry")).toBeUndefined();
+    expect(initialCallbackCalled).toBe(false);
+    expect(applyCallbackCalled).toBe(false);
     expect(test.workspace.repo.checkout.indexEntries()).toEqual(beforeIndex);
     expect(test.workspace.repo.store.objectCount()).toBe(beforeObjects);
   });

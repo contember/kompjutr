@@ -4,6 +4,7 @@ import { isOid } from "../common/bytes.js";
 import { CorruptError, hasErrorCode } from "../common/errors.js";
 import { joinPath } from "../common/paths.js";
 import { comparePaths } from "../common/streams.js";
+import { applyIndexOwned } from "../store/checkout.js";
 import { contentIdKey, type IndexEntry } from "../store/index.js";
 import {
   hasSparseSourceReceipt,
@@ -489,7 +490,7 @@ export function checkoutSparseChanges(
     throw error;
   }
 
-  repo.checkout.indexApply((sink) => {
+  applyIndexOwned(repo.checkout, (sink) => {
     if (plan.structuralRoots.length > 0) {
       worktree.removeFiles(plan.structuralRoots, { recursive: true });
     }
@@ -500,7 +501,7 @@ export function checkoutSparseChanges(
     sink.flush();
   });
   pruneSparseDirectories(worktree, plan.pruneGroups);
-  repo.checkout.indexApply((sink) => {
+  applyIndexOwned(repo.checkout, (sink) => {
     const written = [...plan.writes];
     flushCheckoutWrites(repo, worktree, written, sink);
   });

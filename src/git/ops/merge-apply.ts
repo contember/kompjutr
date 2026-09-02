@@ -1,4 +1,4 @@
-import { checkoutStoreMutations } from "../store/checkout.js";
+import { applyIndexOwned, checkoutStoreMutations } from "../store/checkout.js";
 import { suspendRebaseOwned, writeOperationJournalOwned } from "../store/operation-journal.js";
 import { writeObjectsOwned } from "../store/shared.js";
 // Atomic low-level application and restoration of one projected merge plan.
@@ -674,7 +674,7 @@ function applyIndex(
 ): void {
   const projected = new Set<string>();
   for (const entry of entries) projected.add(entry.path);
-  index.indexApply((sink) => {
+  applyIndexOwned(index, (sink) => {
     for (const spec of specs) {
       if (!projected.has(spec.path)) sink.remove(spec.path);
     }
@@ -956,7 +956,7 @@ function abortDestructiveRoots(touched: readonly MergeTouchedPath[]): OwnedPaths
 }
 
 function restoreIndex(repo: Repository, touched: readonly MergeTouchedPath[]): void {
-  repo.checkout.indexApply((sink) => {
+  applyIndexOwned(repo.checkout, (sink) => {
     for (const entry of touched) {
       sink.remove(entry.path);
       if (entry.index !== null) {

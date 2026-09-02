@@ -3,6 +3,7 @@
 
 import { fromHex } from "../common/bytes.js";
 import { CorruptError } from "../common/errors.js";
+import { checkoutStoreMutations } from "../store/checkout.js";
 import { type InitialStateSession, PACK_BLOB_BATCH_TARGET_BYTES } from "../store/index.js";
 import type { GitContext, IndexTrackerSeedEntry, InitialWorktreeSession } from "./context.js";
 import type { Repository } from "./repository.js";
@@ -152,7 +153,7 @@ export function tryInitialCheckout(
     const worktree = writer.tryRun(
       repo.root,
       (worktreeSession) =>
-        repo.checkout.tryCreateInitialState((indexSession) =>
+        checkoutStoreMutations(repo.checkout).tryCreateInitialStateOwned((indexSession) =>
           writeInitialCheckout(repo, treeOid, worktreeSession, indexSession),
         ),
       (state) => {

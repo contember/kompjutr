@@ -140,9 +140,11 @@ interface CheckoutStoreMutations {
   clearOperationStateOwned(): boolean;
   writeMergeStateOwned(state: MergeStateMetadata, touched: readonly MergeTouchedPath[]): void;
   clearMergeStateOwned(): boolean;
+  tryCreateInitialStateOwned<T>(body: (session: InitialStateSession) => T): InitialStateResult<T>;
   indexPutOwned(entry: IndexEntry): void;
   indexRemoveOwned(path: string): void;
   indexClearOwned(): void;
+  indexApplyOwned<T>(body: (sink: IndexSink) => T, options?: IndexApplyOptions): T;
   indexReplaceOwned(entries: Iterable<IndexEntry>, options?: IndexApplyOptions): void;
   cacheCommitOwned(oid: string, data: Uint8Array): CommitCacheEntry | null;
   cacheCommitsOwned(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult;
@@ -275,9 +277,11 @@ export class CheckoutStore implements IndexStore {
       clearOperationStateOwned: () => this.clearOperationStateOwned(),
       writeMergeStateOwned: (state, touched) => this.writeMergeStateOwned(state, touched),
       clearMergeStateOwned: () => this.clearMergeStateOwned(),
+      tryCreateInitialStateOwned: (body) => this.tryCreateInitialStateOwned(body),
       indexPutOwned: (entry) => this.indexPutOwned(entry),
       indexRemoveOwned: (path) => this.indexRemoveOwned(path),
       indexClearOwned: () => this.indexClearOwned(),
+      indexApplyOwned: (body, applyOptions) => this.indexApplyOwned(body, applyOptions),
       indexReplaceOwned: (entries, applyOptions) => this.indexReplaceOwned(entries, applyOptions),
       cacheCommitOwned: (oid, data) => this.cacheCommitOwned(oid, data),
       cacheCommitsOwned: (entries) => this.cacheCommitsOwned(entries),
@@ -985,6 +989,12 @@ export class CheckoutStore implements IndexStore {
 
   /** Create clone state only while every index stage is still empty. */
   tryCreateInitialState<T>(body: (session: InitialStateSession) => T): InitialStateResult<T> {
+    return this.#mutate(() => this.tryCreateInitialStateOwned(body));
+  }
+
+  private tryCreateInitialStateOwned<T>(
+    body: (session: InitialStateSession) => T,
+  ): InitialStateResult<T> {
     return this.#indexTable.tryCreateInitialState(body);
   }
 
@@ -1033,6 +1043,10 @@ export class CheckoutStore implements IndexStore {
   }
 
   indexApply<T>(body: (sink: IndexSink) => T, options: IndexApplyOptions = {}): T {
+    return this.#mutate(() => this.indexApplyOwned(body, options));
+  }
+
+  private indexApplyOwned<T>(body: (sink: IndexSink) => T, options: IndexApplyOptions = {}): T {
     return this.#indexTable.indexApply(body, options);
   }
 
@@ -1121,4 +1135,16 @@ export class CheckoutStore implements IndexStore {
     });
     this.shared.clearCaches();
   }
+}
+
+/** Internal index mutation composition for checkout and scratch index implementations. */
+export function applyIndexOwned<T>(
+  index: IndexStore,
+  body: (sink: IndexSink) => T,
+  options: IndexApplyOptions = {},
+): T {
+  if (index instanceof CheckoutStore) {
+    return checkoutStoreMutations(index).indexApplyOwned(body, options);
+  }
+  return index.indexApply(body, options);
 }

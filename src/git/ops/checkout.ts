@@ -6,6 +6,7 @@ import { GitError } from "../common/errors.js";
 import { isTreeMode, type TreeEntry } from "../common/objects.js";
 import { joinPath, relativeTo } from "../common/paths.js";
 import { comparePaths, joinSorted, joinSorted3 } from "../common/streams.js";
+import { applyIndexOwned } from "../store/checkout.js";
 import { contentIdKey, type IndexEntry, type IndexSink, type IndexStore } from "../store/index.js";
 import { type CheckoutWriteBudget, flushCheckoutWrites } from "./checkout-writes.js";
 import type { Repository } from "./repository.js";
@@ -271,7 +272,7 @@ function checkoutTreeInternal(
 
   // Remove obsolete paths before writing replacements. This also handles a
   // directory-to-file transition without retaining the whole target tree.
-  index.indexApply((sink) => {
+  applyIndexOwned(index, (sink) => {
     let retainedBytes = 0;
     for (const row of joinSorted(
       boundedCheckoutSourceRows(target(), options.maxSourceRowsPerPass, "tree"),
@@ -314,7 +315,7 @@ function checkoutTreeInternal(
 
   const written: TargetEntry[] = [];
   const candidates: CheckoutCandidate[] = [];
-  index.indexApply((sink) => {
+  applyIndexOwned(index, (sink) => {
     for (const row of joinSorted3(
       boundedCheckoutSourceRows(target(), options.maxSourceRowsPerPass, "tree"),
       stageZero(
@@ -400,7 +401,7 @@ function discardUnmergedPaths(
   for (const batch of planWorktreeRemovalBatches(repo, physical)) {
     worktree.removeFiles(batch.map((path) => joinPath(repo.root, path)));
   }
-  index.indexApply((sink) => {
+  applyIndexOwned(index, (sink) => {
     for (let offset = 0; offset < paths.length; offset += CHECKOUT_WINDOW_ROWS) {
       for (const path of paths.slice(offset, offset + CHECKOUT_WINDOW_ROWS)) sink.remove(path);
       sink.flush();
