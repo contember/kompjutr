@@ -6,6 +6,7 @@ import { joinPath } from "../common/paths.js";
 import { comparePaths } from "../common/streams.js";
 import { contentIdKey, type IndexEntry } from "../store/index.js";
 import {
+  hasSparseSourceReceipt,
   hydrateSparseWorkspaceOwned,
   selectSparsePathsOwned,
   sparseDirtyPathsOwned,
@@ -33,6 +34,10 @@ interface SparseCheckoutCandidate {
 }
 
 type AvailableSparseWorkspaceResult = Extract<SparseWorkspaceResult, { available: true }>;
+interface SparseCheckoutHydration {
+  result: AvailableSparseWorkspaceResult;
+  trusted: boolean;
+}
 
 export interface SparseCheckoutChange {
   path: string;
@@ -66,14 +71,15 @@ export function trySparseCleanCheckout(
     if (candidates.length === 0) return true;
 
     const selected = selectSparseCheckoutRows(context, repo, candidates);
-    const hydrated =
+    const loaded =
       selected ??
       hydrateSparseCheckoutRows(source, repo, candidates, baselineTreeOid, targetTreeOid);
-    if (hydrated === null) return false;
+    if (loaded === null) return false;
+    const hydrated = loaded.result;
     if (hydrated.rows.length !== candidates.length) {
       throw new CorruptError("sparse checkout hydration returned the wrong row count");
     }
-    if (!validateSparseCheckoutRows(candidates, hydrated.rows)) return false;
+    if (!loaded.trusted && !validateSparseCheckoutRows(candidates, hydrated.rows)) return false;
     if (!sparseCheckoutWorktreeMatches(repo, worktree, hydrated.rows)) return false;
 
     const changes: SparseCheckoutChange[] = [];
@@ -104,7 +110,7 @@ function hydrateSparseCheckoutRows(
   candidates: readonly SparseCheckoutCandidate[],
   baselineTreeOid: string | null,
   targetTreeOid: string,
-): AvailableSparseWorkspaceResult | null {
+): SparseCheckoutHydration | null {
   const hydrated = hydrateSparseWorkspaceOwned(source, {
     repoId: repo.store.repoId,
     checkoutId: repo.checkout.checkoutId,
@@ -113,14 +119,19 @@ function hydrateSparseCheckoutRows(
     currentTreeOid: targetTreeOid,
     paths: candidates.map((candidate) => candidate.path),
   });
-  return hydrated.available ? hydrated : null;
+  return hydrated.available
+    ? {
+        result: hydrated,
+        trusted: hasSparseSourceReceipt(repo.checkout.db, "workspace", source),
+      }
+    : null;
 }
 
 function selectSparseCheckoutRows(
   context: GitContext,
   repo: Repository,
   candidates: readonly SparseCheckoutCandidate[],
-): AvailableSparseWorkspaceResult | null {
+): SparseCheckoutHydration | null {
   const source = context.selectedPaths;
   if (source === undefined || hasStructuralCandidates(candidates)) return null;
   const selected: SelectedPathResult = selectSparsePathsOwned(source, {
@@ -130,7 +141,8 @@ function selectSparseCheckoutRows(
     specs: candidates.map((candidate) => ({ path: candidate.path, recursive: false })),
   });
   if (!selected.available) return null;
-  return selectedSparseWorkspaceRows(candidates, selected);
+  const trusted = hasSparseSourceReceipt(repo.checkout.db, "selected-paths", source);
+  return { result: selectedSparseWorkspaceRows(candidates, selected, trusted), trusted };
 }
 
 function hasStructuralCandidates(candidates: readonly SparseCheckoutCandidate[]): boolean {
@@ -288,11 +300,14 @@ function validateSelectedFacts(
 function selectedSparseWorkspaceRows(
   candidates: readonly SparseCheckoutCandidate[],
   selected: Extract<SelectedPathResult, { available: true }>,
-): AvailableSparseWorkspaceResult | null {
-  if (!Array.isArray(selected.index) || !Array.isArray(selected.worktree)) {
-    throw new CorruptError("selected sparse checkout returned malformed facts");
+  trusted: boolean,
+): AvailableSparseWorkspaceResult {
+  if (!trusted) {
+    if (!Array.isArray(selected.index) || !Array.isArray(selected.worktree)) {
+      throw new CorruptError("selected sparse checkout returned malformed facts");
+    }
+    validateSelectedFacts(selected.index, selected.worktree, candidates.length);
   }
-  validateSelectedFacts(selected.index, selected.worktree, candidates.length);
 
   const rows: SparseWorkspaceRow[] = [];
   let indexAt = 0;

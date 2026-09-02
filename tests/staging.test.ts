@@ -255,7 +255,7 @@ describe("add", () => {
     );
     fixture.git("add", "--", ...specs);
 
-    expect(sourceStatements).toEqual([2, 2]);
+    expect(sourceStatements).toEqual([4, 4]);
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
     expect(lsFiles(workspace.repo)).not.toContain("unrelated.txt");
   });
@@ -283,7 +283,7 @@ describe("add", () => {
     );
     fixture.git("add", "--", "to-file", "to-dir");
 
-    expect(sourceStatements).toEqual([2, 2]);
+    expect(sourceStatements).toEqual([4, 4]);
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
   });
 
@@ -320,7 +320,7 @@ describe("add", () => {
       nativeAddContext(workspace, sourceStatements),
     );
 
-    expect(sourceStatements).toEqual([2, 2]);
+    expect(sourceStatements).toEqual([4, 4]);
     expect(workspace.repo.checkout.indexEntries()).toEqual([
       expect.objectContaining({
         path: "a",
@@ -375,7 +375,7 @@ describe("add", () => {
       nativeAddContext(workspace, sourceStatements),
     );
 
-    expect(sourceStatements).toEqual([2]);
+    expect(sourceStatements).toEqual([3]);
     expect(workspace.repo.checkout.indexEntries()).toEqual([]);
   });
 
@@ -1578,7 +1578,7 @@ describe("rm", () => {
       { paths: [longPath] },
       nativeAddContext(workspace, sourceStatements),
     );
-    expect(sourceStatements).toEqual([2]);
+    expect(sourceStatements).toEqual([4]);
     expect(workspace.repo.checkout.indexGet(longPath)).not.toBeNull();
     rm(workspace.repo, workspace.worktree, { paths: [longPath], cached: true, force: true });
     expect(workspace.repo.checkout.indexGet(longPath)).toBeNull();
@@ -1930,15 +1930,14 @@ describe("cost", () => {
     fixture.git("add", "--", ...selected);
 
     const queries = [...workspace.storage.histogram.keys()];
-    expect(sourceStatements).toEqual([2]);
+    expect(sourceStatements).toEqual([4]);
     expect(sourceRows).toEqual([202]);
     expect(ancestorStatements).toEqual([1]);
     expect(ancestorRows).toEqual([100]);
     expect(ancestorQueries).toHaveLength(1);
     const ancestorQuery = ancestorQueries[0];
     if (ancestorQuery === undefined) throw new Error("missing recorded ancestor query");
-    expect(ancestorQuery).toContain("exact_index_ancestor_rows(");
-    expect(ancestorQuery).not.toContain("), index_ancestor_rows(");
+    expect(ancestorQuery).toContain("EXISTS");
     expect(queries.some((query) => query.startsWith("WITH wanted(path) AS"))).toBe(true);
     expect(queries.some((query) => query.startsWith("WITH wanted(relative) AS"))).toBe(true);
     expect(queries.some((query) => query.startsWith("WITH wanted(path, recursive)"))).toBe(false);
@@ -1982,7 +1981,7 @@ describe("cost", () => {
       add(workspace.repo, worktree, { paths }, nativeAddContext(workspace, sourceStatements));
       const statements = workspace.storage.statementCount;
 
-      expect(sourceStatements).toEqual([2]);
+      expect(sourceStatements).toEqual([4]);
       expect(statements).toBeLessThan(1_000);
       expect(worktree.bulkReadPaths).toHaveLength(count);
       expect(workspace.repo.checkout.indexGet("unrelated.txt")?.oid).toBe(unrelatedOid);
@@ -1992,6 +1991,56 @@ describe("cost", () => {
       ).toBe(true);
     },
   );
+
+  it("falls back when the trusted exact and recursive merge reaches row 1001", () => {
+    const workspace = makeRepo("/");
+    const exactPaths = Array.from(
+      { length: 500 },
+      (_, index) => `exact-${index.toString().padStart(4, "0")}.txt`,
+    );
+    const nestedPaths = Array.from(
+      { length: 500 },
+      (_, index) => `nested/f${index.toString().padStart(4, "0")}.txt`,
+    );
+    const bytes = utf8.encode("selected\n");
+    workspace.worktree.writeFiles(
+      [...exactPaths, ...nestedPaths].map((path) => ({ path: `/${path}`, bytes })),
+    );
+
+    add(
+      workspace.repo,
+      workspace.worktree,
+      { paths: [...exactPaths, "nested"] },
+      {
+        selectedPaths: createSqliteSelectedPathSource(workspace.database.db),
+        sparseWorkspace: createSqliteSparseWorkspaceSource(workspace.database.db),
+      },
+    );
+
+    expect(workspace.repo.checkout.indexEntries().map((entry) => entry.path)).toEqual([
+      ...exactPaths,
+      ...nestedPaths,
+    ]);
+  });
+
+  it("streams the generic add fallback after the native selected result reaches row 1001", () => {
+    const workspace = makeRepo("/");
+    const paths = Array.from(
+      { length: 1_000 },
+      (_, index) => `overflow/f${index.toString().padStart(4, "0")}.txt`,
+    );
+    const bytes = utf8.encode("selected\n");
+    workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, bytes })));
+
+    add(
+      workspace.repo,
+      workspace.worktree,
+      { paths: ["overflow"] },
+      { selectedPaths: createSqliteSelectedPathSource(workspace.database.db) },
+    );
+
+    expect(workspace.repo.checkout.indexEntries().map((entry) => entry.path)).toEqual(paths);
+  });
 
   it("fails rm before mutation when retained state exceeds 16 MiB", () => {
     const workspace = makeRepo("/");

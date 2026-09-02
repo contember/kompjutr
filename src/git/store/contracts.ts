@@ -364,7 +364,7 @@ export type SelectedPathResult =
       worktree: SelectedWorktreeFact[];
     };
 
-/** Optional same-database selected-subtree projection. */
+/** Optional selected-subtree projection; native provenance remains internal. */
 export interface SelectedPathSource {
   select(request: SelectedPathRequest): SelectedPathResult;
 }
@@ -399,12 +399,12 @@ export type CommitTreeSnapshotResult =
       directories: CommitTreeSnapshotDirectory[];
     };
 
-/** Optional authenticated baseline projection for narrow tree rebuilds. */
+/** Optional baseline projection for narrow tree rebuilds. */
 export interface CommitTreeSnapshotSource {
   snapshot(request: CommitTreeSnapshotRequest): CommitTreeSnapshotResult;
 }
 
-/** Optional same-database fast path. Generic clients omit this capability. */
+/** Optional sparse workspace projection. Generic clients may supply their own. */
 export interface SparseWorkspaceSource {
   readState(checkoutId: number): SparseWorkspaceState;
   dirtyPaths(checkoutId: number): Iterable<SparseWorkspaceDirty>;

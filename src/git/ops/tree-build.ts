@@ -7,6 +7,7 @@
 // bottom-up pass, so the only thing held live is the directory stack of
 // the path currently being visited.
 
+import type { SqlDatabase } from "../../db/db.js";
 import { CorruptError, GitError, hasErrorCode } from "../common/errors.js";
 import {
   compareTreeEntries,
@@ -18,8 +19,9 @@ import {
 import { comparePaths } from "../common/streams.js";
 import type { IndexEntry, ObjectBatch } from "../store/index.js";
 import { writeObjectsOwned } from "../store/shared.js";
+import { hasSparseSourceReceipt } from "../store/sparse-workspace.js";
 import type { Repository } from "./repository.js";
-import type { CommitTreeSnapshotResult } from "./sparse-workspace.js";
+import type { CommitTreeSnapshotResult, CommitTreeSnapshotSource } from "./sparse-workspace.js";
 
 /** Maximum entries retained in one materialized tree object. */
 export const MAX_TREE_BUILD_LEAF_ENTRIES = 10_000;
@@ -302,19 +304,39 @@ function requireSnapshotAncestry(
 }
 
 /**
- * Plan a bounded tree rewrite from authenticated HEAD directories and exact dirty index rows.
+ * Plan a bounded tree rewrite from validated HEAD directories and exact dirty index rows.
  * No object is written until this returns a complete plan.
  */
 export function planSparseTreeBuild(
   snapshot: CommitTreeSnapshot,
   baselineTreeOid: string | null,
 ): SparseTreeBuildPlan {
+  return planSparseTreeBuildWithTrust(snapshot, baselineTreeOid, false);
+}
+
+/** Internal same-database entry; the source identity is the non-forgeable receipt. */
+export function planSparseTreeBuildFromSource(
+  database: SqlDatabase,
+  source: CommitTreeSnapshotSource,
+  snapshot: CommitTreeSnapshot,
+  baselineTreeOid: string | null,
+): SparseTreeBuildPlan {
+  return planSparseTreeBuildWithTrust(
+    snapshot,
+    baselineTreeOid,
+    hasSparseSourceReceipt(database, "commit-tree", source),
+  );
+}
+
+function planSparseTreeBuildWithTrust(
+  snapshot: CommitTreeSnapshot,
+  baselineTreeOid: string | null,
+  trusted: boolean,
+): SparseTreeBuildPlan {
   try {
-    return planSparseTreeBuildOwned(snapshot, baselineTreeOid);
+    return planSparseTreeBuildOwned(snapshot, baselineTreeOid, trusted);
   } catch (error) {
-    if (hasErrorCode(error, "E2BIG")) {
-      return { available: false };
-    }
+    if (hasErrorCode(error, "E2BIG")) return { available: false };
     throw error;
   }
 }
@@ -322,6 +344,7 @@ export function planSparseTreeBuild(
 function planSparseTreeBuildOwned(
   snapshot: CommitTreeSnapshot,
   baselineTreeOid: string | null,
+  trusted: boolean,
 ): SparseTreeBuildPlan {
   if (snapshot.baselineTreeOid !== baselineTreeOid) {
     throw new CorruptError("commit tree snapshot baseline differs from HEAD");
@@ -341,18 +364,20 @@ function planSparseTreeBuildOwned(
   const dirtyByPath = new Map<string, number>();
   let previousDirty: string | null = null;
   for (const entry of snapshot.dirty) {
-    if (typeof entry !== "object" || entry === null) {
-      throw new CorruptError("commit tree snapshot dirty row is invalid");
-    }
-    validatePathShape(entry.path);
-    utf8Length(entry.path, "commit tree snapshot dirty path");
-    if (
-      !Number.isSafeInteger(entry.flags) ||
-      entry.flags < 1 ||
-      entry.flags > 3 ||
-      (previousDirty !== null && comparePaths(previousDirty, entry.path) >= 0)
-    ) {
-      throw new CorruptError("commit tree snapshot dirty rows are malformed or unordered");
+    if (!trusted) {
+      if (typeof entry !== "object" || entry === null) {
+        throw new CorruptError("commit tree snapshot dirty row is invalid");
+      }
+      validatePathShape(entry.path);
+      utf8Length(entry.path, "commit tree snapshot dirty path");
+      if (
+        !Number.isSafeInteger(entry.flags) ||
+        entry.flags < 1 ||
+        entry.flags > 3 ||
+        (previousDirty !== null && comparePaths(previousDirty, entry.path) >= 0)
+      ) {
+        throw new CorruptError("commit tree snapshot dirty rows are malformed or unordered");
+      }
     }
     dirtyByPath.set(entry.path, entry.flags);
     previousDirty = entry.path;
@@ -361,38 +386,39 @@ function planSparseTreeBuildOwned(
   const indexByPath = new Map<string, IndexEntry[]>();
   let previousIndex: IndexEntry | null = null;
   for (const entry of snapshot.index) {
-    if (typeof entry !== "object" || entry === null) {
-      throw new CorruptError("commit tree snapshot index row is invalid");
-    }
-    validateSnapshotIndexEntry(entry);
-    if (
-      !dirtyByPath.has(entry.path) ||
-      (previousIndex !== null &&
-        (comparePaths(previousIndex.path, entry.path) > 0 ||
-          (previousIndex.path === entry.path && previousIndex.stage >= entry.stage)))
-    ) {
-      throw new CorruptError("commit tree snapshot index rows are incomplete or unordered");
+    if (!trusted) {
+      if (typeof entry !== "object" || entry === null) {
+        throw new CorruptError("commit tree snapshot index row is invalid");
+      }
+      validateSnapshotIndexEntry(entry);
+      if (
+        !dirtyByPath.has(entry.path) ||
+        (previousIndex !== null &&
+          (comparePaths(previousIndex.path, entry.path) > 0 ||
+            (previousIndex.path === entry.path && previousIndex.stage >= entry.stage)))
+      ) {
+        throw new CorruptError("commit tree snapshot index rows are incomplete or unordered");
+      }
     }
     const group = indexByPath.get(entry.path);
-    if (group === undefined) {
-      indexByPath.set(entry.path, [entry]);
-    } else {
-      group.push(entry);
-    }
+    if (group === undefined) indexByPath.set(entry.path, [entry]);
+    else group.push(entry);
     previousIndex = entry;
   }
 
   if (snapshot.dirty.length === 0) {
     if (snapshot.index.length !== 0 || snapshot.directories.length !== 0) {
-      throw new CorruptError("clean commit tree snapshot retained selected rows");
+      throw new CorruptError("clean commit tree snapshot returned selected rows");
     }
     if (capacityExceeded) return { available: false };
     return unchangedSparseTreePlan(baselineTreeOid);
   }
 
   const expectedPaths = expectedDirectoryPaths(snapshot.dirty);
-  const directories = validateSnapshotDirectories(snapshot, expectedPaths);
-  requireSnapshotAncestry(directories, baselineTreeOid);
+  const directories = trusted
+    ? new Map(snapshot.directories.map((directory) => [directory.path, directory]))
+    : validateSnapshotDirectories(snapshot, expectedPaths);
+  if (!trusted) requireSnapshotAncestry(directories, baselineTreeOid);
   if (capacityExceeded) return { available: false };
 
   const dirtyIndexPaths: string[] = [];

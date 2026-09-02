@@ -4,6 +4,7 @@ import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { contentIdKey, type IndexEntry } from "../store/index.js";
 import { sharedRepoStoreMutations } from "../store/shared.js";
 import {
+  hasSparseSourceReceipt,
   hydrateSparseWorkspaceOwned,
   sparseDirtyPathsOwned,
   sparseIndexAncestorFactsOwned,
@@ -250,7 +251,9 @@ function prepareSparseStatus(
         if (result.facts.length !== ancestors.paths.length) {
           throw new CorruptError("sparse index ancestor lookup returned the wrong fact count");
         }
-        ancestorFacts = validatedAncestorFacts(ancestors.paths, result.facts);
+        ancestorFacts = hasSparseSourceReceipt(repo.checkout.db, "workspace", source)
+          ? new Map(result.facts.map((fact) => [fact.path, fact]))
+          : validatedAncestorFacts(ancestors.paths, result.facts);
       }
     } catch (error) {
       if (hasErrorCode(error, "E2BIG")) return null;

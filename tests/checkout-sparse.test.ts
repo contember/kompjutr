@@ -138,7 +138,7 @@ class WorktreePayloadProbe implements SqlDatabase {
 
   *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
     for (const row of this.delegate.iterate(query, ...bindings)) {
-      if (row.cumulative_retained_bytes !== undefined && typeof row.link_target === "string") {
+      if (typeof row.target === "string") {
         this.rawSymlinkTargets++;
       }
       yield row;
@@ -578,7 +578,7 @@ describe("sparse checkout", () => {
     });
     expect(workspace.worktree.stat("/added.txt")).toBeNull();
     expectFile(workspace, "/deleted.txt", "deleted\n");
-    expect(calls).toMatchObject({ statements: [2, 2], hydrates: 0 });
+    expect(calls).toMatchObject({ statements: [4, 4], hydrates: 0 });
   });
 
   it("uses the exact selected path across a shallow commit boundary", () => {
@@ -595,7 +595,7 @@ describe("sparse checkout", () => {
 
     expect(fixture.workspace.repo.head().oid).toBe(fixture.target);
     expect(fixture.workspace.repo.shallow()).toEqual(new Set([fixture.base]));
-    expect(calls).toMatchObject({ statements: [2], hydrates: 0 });
+    expect(calls).toMatchObject({ statements: [4], hydrates: 0 });
   });
 
   it("uses legacy force to restore a dirty tracked path outside the tree diff", () => {
@@ -666,7 +666,7 @@ describe("sparse checkout", () => {
       expect(reverseStatements).toBeLessThan(1_000);
       const selectedReverse = checkoutState(sparse.workspace);
       expect(calls.hydrates).toBe(0);
-      expect(calls.statements).toEqual([2, 2]);
+      expect(calls.statements).toEqual([4, 4]);
       expect(calls.requests).toHaveLength(2);
       for (const request of calls.requests) {
         expect(request.specs).toHaveLength(changedFiles);

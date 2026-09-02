@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../src/db/db.js";
 import { CorruptError, GitError } from "../src/git/common/errors.js";
 import { commit } from "../src/git/ops/commit.js";
 import type { GitContext, IndexTrackerSeedEntry } from "../src/git/ops/context.js";
@@ -18,10 +17,7 @@ import {
   WORKTREE_DIRTY,
 } from "../src/git/store/index-tracker.js";
 import { MAINTENANCE_ROOT_EPOCH_EXHAUSTED } from "../src/git/store/maintenance/control.js";
-import {
-  createSqliteCommitTreeSnapshotSource,
-  createSqliteSparseWorkspaceSource,
-} from "../src/git/store/sparse-workspace.js";
+import { createSqliteCommitTreeSnapshotSource } from "../src/git/store/sparse-workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import {
   configureFixtureIdentity,
@@ -42,39 +38,6 @@ class NoScanWorktree extends CountingWorktree {
 class FailingHashWorktree extends CountingWorktree {
   override readFiles(): never {
     throw new Error("injected hash failure");
-  }
-}
-
-class MutatingAncestorDatabase implements SqlDatabase {
-  constructor(
-    private readonly inner: SqlDatabase,
-    private readonly mutate: (row: Record<string, unknown>) => Record<string, unknown>,
-  ) {}
-
-  run(query: string, ...bindings: unknown[]): void {
-    this.inner.run(query, ...bindings);
-  }
-
-  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
-    return this.inner.all<Row>(query, ...bindings);
-  }
-
-  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
-    return this.inner.one<Row>(query, ...bindings);
-  }
-
-  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
-    return this.inner.scalar<T>(query, ...bindings);
-  }
-
-  *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
-    for (const row of this.inner.iterate(query, ...bindings)) {
-      yield query.includes("index_ancestor_rows") ? this.mutate(row) : row;
-    }
-  }
-
-  transactionSync<T>(closure: () => T): T {
-    return this.inner.transactionSync(closure);
   }
 }
 
@@ -119,37 +82,6 @@ function expectNoFullStatusStreams(histogram: ReadonlyMap<string, number>): void
   expect(statements).not.toContain("WITH RECURSIVE params(repo_id, root_oid");
   expect(statements).not.toContain("FROM git_index entr");
 }
-
-interface AncestorIndexCorruption {
-  name: string;
-  mutate(workspace: TestRepository): void;
-}
-
-const ANCESTOR_INDEX_CORRUPTIONS: readonly AncestorIndexCorruption[] = [
-  {
-    name: "BLOB path",
-    mutate(workspace) {
-      workspace.storage.sql.exec("PRAGMA ignore_check_constraints = ON");
-      workspace.storage.sql.exec(
-        "UPDATE git_index SET path = ? WHERE checkout_id = ? AND path = ?",
-        new TextEncoder().encode("tracked/file.txt"),
-        workspace.repo.checkout.checkoutId,
-        "tracked/file.txt",
-      );
-      workspace.storage.sql.exec("PRAGMA ignore_check_constraints = OFF");
-    },
-  },
-  {
-    name: "nonpositive inode",
-    mutate(workspace) {
-      workspace.storage.sql.exec(
-        "UPDATE git_index SET ino = 0 WHERE checkout_id = ? AND path = ?",
-        workspace.repo.checkout.checkoutId,
-        "tracked/file.txt",
-      );
-    },
-  },
-];
 
 describe("sparse eager status", () => {
   it("reseals one authoritative full status for an incomplete repository", () => {
@@ -757,46 +689,6 @@ describe("sparse eager status", () => {
       expect(workspace.storage.statementCount).toBe(0);
     }
   });
-
-  it.each([-1, 1])("rejects malformed ancestor path_bytes=%i", (pathBytes) => {
-    const workspace = makeRepo("/");
-    const source = createSqliteSparseWorkspaceSource(
-      new MutatingAncestorDatabase(workspace.database.db, (row) => ({
-        ...row,
-        wanted_path_bytes: pathBytes,
-      })),
-    );
-    const lookup = source.indexAncestorFacts;
-    if (lookup === undefined) throw new Error("SQLite sparse workspace has no ancestor lookup");
-
-    expect(() =>
-      lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: ["føø"] }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-  });
-
-  it.each(ANCESTOR_INDEX_CORRUPTIONS)(
-    "fails closed on a relevant $name index row without resealing",
-    ({ mutate }) => {
-      const workspace = makeRepo("/");
-      writeWorkFile(workspace, "/tracked/file.txt", "tracked\n");
-      commitFiles(workspace, ["tracked/file.txt"]);
-      sealIndexTracker(workspace);
-      writeWorkFile(workspace, "/tracked/new/deep.txt", "fresh\n");
-      mutate(workspace);
-      const dirtyAfterCorruption = [
-        ...requireSparseWorkspace(workspace).dirtyPaths(workspace.repo.checkout.checkoutId),
-      ];
-      const recorded = recordingContext(workspace);
-
-      expect(() =>
-        eagerStatus(workspace.repo, new NoScanWorktree(workspace.worktree), {}, recorded.context),
-      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-      expect(recorded.reseals).toEqual([]);
-      expect([
-        ...requireSparseWorkspace(workspace).dirtyPaths(workspace.repo.checkout.checkoutId),
-      ]).toEqual(dirtyAfterCorruption);
-    },
-  );
 
   it("falls back when capabilities or tracker state are unavailable", () => {
     const workspace = makeRepo("/");

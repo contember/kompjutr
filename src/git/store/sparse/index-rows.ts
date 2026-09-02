@@ -1,56 +1,65 @@
-import { isOid } from "../../common/bytes.js";
 import { CorruptError } from "../../common/errors.js";
+import { blob, int, nullable, oneOf, RowShape, text } from "../../common/rows.js";
+import type { SparseWorktreeLeaf } from "../contracts.js";
 import type { IndexEntry } from "../index.js";
-import { parseRelativePath } from "./shared.js";
-import { numberField } from "./tree-resolution.js";
+import { requireStoredIndexEntry } from "../index-table.js";
 
-export function validStoredIndexPath(path: string, bytes: number): boolean {
-  try {
-    return parseRelativePath(path).bytes === bytes;
-  } catch {
-    return false;
-  }
+const encoder = new TextEncoder();
+
+const SPARSE_WORKTREE_ROW = new RowShape({
+  path: text(),
+  relative: text(),
+  path_inode: int(1),
+  inode: int(1),
+  type: oneOf(["file", "dir", "symlink"]),
+  mode: int(0, 0o7777),
+  size: int(0),
+  mtime: int(),
+  rev: int(0),
+  nlink: int(1),
+  target: nullable(text()),
+  content_id: nullable(blob()),
+});
+
+export function validatedSparseIndexEntry(row: unknown): IndexEntry {
+  return requireStoredIndexEntry(row);
 }
 
-export function validatedSparseIndexEntry(row: Record<string, unknown>): IndexEntry {
-  const path = row.path;
-  const pathBytes = numberField(row.path_bytes);
-  const stage = numberField(row.stage);
-  const mode = numberField(row.mode);
-  const oid = row.oid;
-  const size = numberField(row.size);
-  const mtime = numberField(row.mtime);
-  const ino = numberField(row.ino);
-  const rev = numberField(row.rev);
-  if (
-    row.path_type !== "text" ||
-    typeof path !== "string" ||
-    pathBytes === null ||
-    pathBytes < 0 ||
-    !validStoredIndexPath(path, pathBytes) ||
-    row.stage_type !== "integer" ||
-    stage === null ||
-    stage < 0 ||
-    stage > 3 ||
-    row.mode_type !== "integer" ||
-    mode === null ||
-    ![0o100644, 0o100755, 0o120000, 0o160000].includes(mode) ||
-    row.oid_type !== "text" ||
-    typeof oid !== "string" ||
-    !isOid(oid) ||
-    !["null", "integer"].includes(typeof row.size_type === "string" ? row.size_type : "") ||
-    !["null", "integer"].includes(typeof row.mtime_type === "string" ? row.mtime_type : "") ||
-    !["null", "integer"].includes(typeof row.ino_type === "string" ? row.ino_type : "") ||
-    !["null", "integer"].includes(typeof row.rev_type === "string" ? row.rev_type : "") ||
-    (row.size !== null && size === null) ||
-    (row.mtime !== null && mtime === null) ||
-    (row.ino !== null && ino === null) ||
-    (row.rev !== null && rev === null) ||
-    (size !== null && size < 0) ||
-    (ino !== null && ino <= 0) ||
-    (rev !== null && rev < 0)
-  ) {
-    throw new CorruptError("sparse index lookup returned a malformed row");
+export function decodeSparseWorktreeRow(
+  row: unknown,
+  root: string,
+): { path: string; stat: SparseWorktreeLeaf } {
+  const decoded = SPARSE_WORKTREE_ROW.decode(row);
+  const expected = root === "/" ? `/${decoded.relative}` : `${root}/${decoded.relative}`;
+  if (decoded.path !== expected || decoded.path_inode !== decoded.inode) {
+    throw new CorruptError("sparse worktree lookup returned an unrelated row");
   }
-  return { path, stage, mode, oid, size, mtime, ino, rev };
+  if (decoded.type === "dir") {
+    if (decoded.size !== 0 || decoded.target !== null || decoded.content_id !== null) {
+      throw new CorruptError("sparse worktree lookup returned malformed directory metadata");
+    }
+  } else if (decoded.type === "file") {
+    if (decoded.target !== null) {
+      throw new CorruptError("sparse worktree lookup returned malformed file metadata");
+    }
+  } else if (
+    decoded.target === null ||
+    encoder.encode(decoded.target).byteLength !== decoded.size
+  ) {
+    throw new CorruptError("sparse worktree lookup returned malformed symlink metadata");
+  }
+  return {
+    path: decoded.relative,
+    stat: {
+      type: decoded.type,
+      mode: decoded.mode,
+      size: decoded.size,
+      mtime: decoded.mtime,
+      ino: decoded.inode,
+      nlink: decoded.nlink,
+      rev: decoded.rev,
+      target: decoded.target,
+      contentId: decoded.content_id,
+    },
+  };
 }

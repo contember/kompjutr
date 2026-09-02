@@ -17,7 +17,7 @@ import {
 } from "./repository.js";
 import {
   buildTreeInBatch,
-  planSparseTreeBuild,
+  planSparseTreeBuildFromSource,
   type SparseTreeBuildPlan,
   writeSparseTreePlanInBatch,
 } from "./tree-build.js";
@@ -206,7 +206,7 @@ function sparseTreePlan(
       baselineTreeOid,
     });
     if (!snapshot.available) return null;
-    const plan = planSparseTreeBuild(snapshot, baselineTreeOid);
+    const plan = planSparseTreeBuildFromSource(repo.checkout.db, source, snapshot, baselineTreeOid);
     return plan.available ? plan : null;
   } catch (error) {
     if (hasErrorCode(error, "E2BIG")) return null;

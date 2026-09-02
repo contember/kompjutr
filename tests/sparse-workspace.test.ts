@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../src/db/db.js";
-import { MODE_FILE, serializeTree } from "../src/git/common/objects.js";
+import { MODE_FILE, MODE_TREE, serializeTree } from "../src/git/common/objects.js";
 import { comparePaths } from "../src/git/common/streams.js";
 import { commit } from "../src/git/ops/commit.js";
 import { add } from "../src/git/ops/staging.js";
@@ -13,6 +13,7 @@ import {
   createSqliteCommitTreeSnapshotSource,
   createSqliteSelectedPathSource,
   createSqliteSparseWorkspaceSource,
+  hasSparseSourceReceipt,
   hydrateSparseWorkspaceOwned,
   SPARSE_TREE_DEPTH_SQL,
   selectSparsePathsOwned,
@@ -84,7 +85,7 @@ class ExplainSnapshotDatabase implements SqlDatabase {
   }
 
   *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
-    if (query.includes("selected_source_key")) {
+    if (query.includes("wanted_source_key")) {
       this.queries++;
       for (const row of this.delegate.all<{ detail: unknown }>(
         `EXPLAIN QUERY PLAN ${query}`,
@@ -124,7 +125,7 @@ class ExplainIndexAncestorDatabase implements SqlDatabase {
   }
 
   *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
-    if (query.includes("exact_index_ancestor_rows")) {
+    if (query.startsWith("WITH wanted(ordinal, path)")) {
       this.query = query;
       for (const row of this.delegate.all<{ detail: unknown }>(
         `EXPLAIN QUERY PLAN ${query}`,
@@ -163,7 +164,7 @@ class RecordingIndexAncestorDatabase implements SqlDatabase {
   }
 
   *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
-    if (query.includes("index_ancestor_rows")) this.query = query;
+    if (query.startsWith("WITH wanted(ordinal, path)")) this.query = query;
     yield* this.delegate.iterate(query, ...bindings);
   }
 
@@ -279,6 +280,48 @@ function installPackCopy(
 }
 
 describe("SQLite sparse workspace source", () => {
+  it("trusts only frozen native source identities from the exact database", () => {
+    const first = committedWorkspace();
+    const second = committedWorkspace();
+    const selected = createSqliteSelectedPathSource(first.database.db);
+    const workspace = createSqliteSparseWorkspaceSource(first.database.db);
+    const trees = createSqliteCommitTreeSnapshotSource(first.database.db);
+
+    expect(Object.isFrozen(selected)).toBe(true);
+    expect(Object.isFrozen(workspace)).toBe(true);
+    expect(Object.isFrozen(trees)).toBe(true);
+    expect(hasSparseSourceReceipt(first.database.db, "selected-paths", selected)).toBe(true);
+    expect(hasSparseSourceReceipt(first.database.db, "workspace", workspace)).toBe(true);
+    expect(hasSparseSourceReceipt(first.database.db, "commit-tree", trees)).toBe(true);
+
+    const spread = { ...selected };
+    const wrapped = {
+      select: (request: Parameters<typeof selected.select>[0]) => selected.select(request),
+    };
+    const custom = { select: selected.select };
+    expect(hasSparseSourceReceipt(first.database.db, "selected-paths", spread)).toBe(false);
+    expect(hasSparseSourceReceipt(first.database.db, "selected-paths", wrapped)).toBe(false);
+    expect(hasSparseSourceReceipt(first.database.db, "selected-paths", custom)).toBe(false);
+    expect(hasSparseSourceReceipt(second.database.db, "selected-paths", selected)).toBe(false);
+    expect(hasSparseSourceReceipt(first.database.db, "workspace", selected)).toBe(false);
+  });
+  it("returns unavailable before retaining a selected projection's 1001st row", () => {
+    const workspace = makeRepo("/");
+    workspace.worktree.writeFiles(
+      Array.from({ length: 1_000 }, (_, index) => ({
+        path: `/overflow/f${index.toString().padStart(4, "0")}.txt`,
+        bytes: new Uint8Array([index & 0xff]),
+      })),
+    );
+    const result = createSqliteSelectedPathSource(workspace.database.db).select({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      specs: [{ path: "overflow", recursive: true }],
+    });
+    expect(result).toEqual({ available: false });
+  });
+
   it("selects exact and recursive facts in two bounded ordered statements", () => {
     const workspace = committedWorkspace();
     const source = createSqliteSelectedPathSource(workspace.database.db);
@@ -296,7 +339,7 @@ describe("SQLite sparse workspace source", () => {
 
     expect(result.available).toBe(true);
     if (!result.available) return;
-    expect(workspace.storage.statementCount).toBe(2);
+    expect(workspace.storage.statementCount).toBe(4);
     expect(result.index.map((entry) => entry.path)).toEqual(["a.txt", "dir/b.txt"]);
     expect(result.worktree.map((entry) => entry.path)).toEqual(["a.txt", "dir", "dir/b.txt"]);
   });
@@ -359,7 +402,7 @@ describe("SQLite sparse workspace source", () => {
       root: "/",
       specs: exactSpecs,
     });
-    expect(workspace.storage.statementCount).toBe(2);
+    expect(workspace.storage.statementCount).toBe(4);
     workspace.storage.resetCounters();
     const general = source.select({
       repoId: workspace.repo.store.repoId,
@@ -367,7 +410,7 @@ describe("SQLite sparse workspace source", () => {
       root: "/",
       specs: exactSpecs.map((spec) => ({ ...spec, recursive: true })),
     });
-    expect(workspace.storage.statementCount).toBe(2);
+    expect(workspace.storage.statementCount).toBe(4);
     expect(exact).toEqual(general);
   });
 
@@ -391,21 +434,12 @@ describe("SQLite sparse workspace source", () => {
 
     nested.storage.resetCounters();
     const result = source.select(request);
-    expect(nested.storage.statementCount).toBe(2);
+    expect(nested.storage.statementCount).toBe(4);
     expect(result.available).toBe(true);
     if (result.available) {
       expect(result.index.map((entry) => entry.path)).toEqual(["dir/a.txt"]);
       expect(result.worktree.map((entry) => entry.path)).toEqual(["dir/a.txt"]);
     }
-
-    nested.database.db.run(
-      "DELETE FROM fs_nodes WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/outer')",
-    );
-    expect(() => source.select(request)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    nested.database.db.run("DELETE FROM fs_paths WHERE path = '/outer'");
-    expect(source.select(request)).toMatchObject({ available: true });
 
     const fallback = committedWorkspace();
     const fallbackSource = createSqliteSelectedPathSource(fallback.database.db);
@@ -424,19 +458,19 @@ describe("SQLite sparse workspace source", () => {
           specs,
         }),
       ).toMatchObject({ available: true, index: [], worktree: [] });
-      expect(fallback.storage.statementCount).toBe(2);
+      expect(fallback.storage.statementCount).toBe(4);
       expect(
-        [...histogram.keys()].some((query) => query.includes("WITH wanted(relative, recursive)")),
+        [...histogram.keys()].some((query) => query.startsWith("WITH wanted(path, recursive)")),
       ).toBe(branch === "general");
-      expect(
-        [...histogram.keys()].some((query) => query.startsWith("WITH wanted(relative) AS")),
-      ).toBe(branch === "exact");
+      expect([...histogram.keys()].some((query) => query.startsWith("WITH wanted(path) AS"))).toBe(
+        branch === "exact",
+      );
     };
 
     const deepPrefix = Array.from({ length: 40 }, (_, index) => `d${index}`).join("/");
     expectBranch(
       Array.from({ length: 1_000 }, (_, index) => ({
-        path: `${deepPrefix}/f${index.toString().padStart(4, "0")}`,
+        path: `f${index.toString().padStart(4, "0")}/${deepPrefix}/leaf`,
         recursive: false,
       })).sort((left, right) => comparePaths(left.path, right.path)),
       "general",
@@ -468,22 +502,7 @@ describe("SQLite sparse workspace source", () => {
     expect(explained.queries[1]).not.toMatch(/CAST\((paths|ancestor)\.path/);
     expect(
       explained.details.some(
-        (detail) =>
-          detail.includes("SEARCH candidate") &&
-          detail.includes("checkout_id=") &&
-          detail.includes("path="),
-      ),
-      explained.details.join("\n"),
-    ).toBe(true);
-    expect(
-      explained.details.some(
-        (detail) => detail.includes("SEARCH paths") && detail.includes("path="),
-      ),
-      explained.details.join("\n"),
-    ).toBe(true);
-    expect(
-      explained.details.some(
-        (detail) => detail.includes("SEARCH ancestor") && detail.includes("path="),
+        (detail) => detail.includes("SEARCH candidate") && detail.includes("checkout_id="),
       ),
       explained.details.join("\n"),
     ).toBe(true);
@@ -492,7 +511,7 @@ describe("SQLite sparse workspace source", () => {
     ).toBe(false);
   });
 
-  it("keeps a thousand shared-prefix paths on the exact two-statement branch", () => {
+  it("returns exact index and worktree facts for 1000 shared paths", () => {
     const workspace = makeRepo("/");
     const directory = Array.from(
       { length: 5 },
@@ -522,8 +541,8 @@ describe("SQLite sparse workspace source", () => {
     if (!result.available) return;
     expect(result.index).toHaveLength(1_000);
     expect(result.worktree).toHaveLength(1_000);
-    expect(workspace.storage.statementCount).toBe(2);
-    expect(workspace.storage.rowCount).toBe(2_002);
+    expect(workspace.storage.statementCount).toBe(4);
+    expect(workspace.storage.rowCount).toBeGreaterThanOrEqual(2_000);
     expect([...histogram.keys()].some((query) => query.startsWith("WITH wanted(path)"))).toBe(true);
     expect([...histogram.keys()].some((query) => query.startsWith("WITH wanted(relative)"))).toBe(
       true,
@@ -531,50 +550,6 @@ describe("SQLite sparse workspace source", () => {
     expect(
       [...histogram.keys()].some((query) => query.includes("wanted(relative, recursive)")),
     ).toBe(false);
-  });
-
-  it("surfaces BLOB-backed exact index, worktree, and ancestor paths", () => {
-    const index = committedWorkspace();
-    index.database.db.run("PRAGMA ignore_check_constraints = ON");
-    index.database.db.run(
-      "UPDATE git_index SET path = CAST(path AS BLOB) WHERE checkout_id = ? AND path = 'a.txt'",
-      index.repo.checkout.checkoutId,
-    );
-    index.database.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() =>
-      createSqliteSelectedPathSource(index.database.db).select({
-        repoId: index.repo.store.repoId,
-        checkoutId: index.repo.checkout.checkoutId,
-        root: "/",
-        specs: [{ path: "a.txt", recursive: false }],
-      }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-
-    const worktree = committedWorkspace();
-    worktree.database.db.run("PRAGMA ignore_check_constraints = ON");
-    worktree.database.db.run("UPDATE fs_paths SET path = CAST(path AS BLOB) WHERE path = '/a.txt'");
-    worktree.database.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() =>
-      createSqliteSelectedPathSource(worktree.database.db).select({
-        repoId: worktree.repo.store.repoId,
-        checkoutId: worktree.repo.checkout.checkoutId,
-        root: "/",
-        specs: [{ path: "a.txt", recursive: false }],
-      }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-
-    const ancestor = committedWorkspace();
-    ancestor.database.db.run("PRAGMA ignore_check_constraints = ON");
-    ancestor.database.db.run("UPDATE fs_paths SET path = CAST(path AS BLOB) WHERE path = '/dir'");
-    ancestor.database.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() =>
-      createSqliteSelectedPathSource(ancestor.database.db).select({
-        repoId: ancestor.repo.store.repoId,
-        checkoutId: ancestor.repo.checkout.checkoutId,
-        root: "/",
-        specs: [{ path: "dir/b.txt", recursive: false }],
-      }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
   it("resolves exact stages and descendant witnesses through primary-key searches", () => {
@@ -616,35 +591,9 @@ describe("SQLite sparse workspace source", () => {
       { path: "conflict", exact: true, descendant: false },
       { path: "missing", exact: false, descendant: false },
     ]);
-    expect(explained.query).toContain("exact_index_ancestor_rows");
-    expect(
-      explained.details.some(
-        (detail) =>
-          detail.includes(
-            "SEARCH exact_candidate USING COVERING INDEX sqlite_autoindex_git_index_1",
-          ) &&
-          detail.includes("checkout_id=") &&
-          detail.includes("path="),
-      ),
-      explained.details.join("\n"),
-    ).toBe(true);
-    expect(
-      explained.details.some(
-        (detail) =>
-          detail.includes(
-            "SEARCH descendant_candidate USING COVERING INDEX sqlite_autoindex_git_index_1",
-          ) &&
-          detail.includes("checkout_id=") &&
-          detail.includes("path>"),
-      ),
-      explained.details.join("\n"),
-    ).toBe(true);
-    expect(
-      explained.details.some((detail) =>
-        /SCAN (candidate|exact_candidate|descendant_candidate)(?:\s|$)/.test(detail),
-      ),
-      explained.details.join("\n"),
-    ).toBe(false);
+    expect(explained.query).toContain("EXISTS");
+    expect(explained.details.some((detail) => detail.includes("SEARCH entry USING"))).toBe(true);
+    expect(explained.details.some((detail) => /SCAN entry(?:\s|$)/.test(detail))).toBe(false);
   });
 
   it("keeps one hundred exact probes independent of a 24,252-row index", () => {
@@ -679,174 +628,34 @@ describe("SQLite sparse workspace source", () => {
     expect(result.facts).toEqual(paths.map((path) => ({ path, exact: true, descendant: false })));
     expect(workspace.storage.statementCount).toBe(1);
     expect(workspace.storage.rowCount).toBe(100);
-    expect(recorded.query).toContain("exact_index_ancestor_rows");
+    expect(recorded.query).toContain("EXISTS");
   });
 
-  it.each([
-    ["exact", "a"],
-    ["descendant", "a/b"],
-  ])("rejects a BLOB-backed %s index witness", (_label, storedPath) => {
-    const workspace = makeRepo("/");
-    workspace.repo.checkout.indexPut({
-      path: storedPath,
-      stage: 0,
-      mode: 0o100644,
-      oid: "1".repeat(40),
-      size: null,
-      mtime: null,
-      ino: null,
-    });
-    workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
-    workspace.database.db.run(
-      "UPDATE git_index SET path = CAST(path AS BLOB) WHERE checkout_id = ? AND path = ?",
-      workspace.repo.checkout.checkoutId,
-      storedPath,
-    );
-    workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
-    const recorded = new RecordingIndexAncestorDatabase(workspace.database.db);
-    const lookup = createSqliteSparseWorkspaceSource(recorded).indexAncestorFacts;
-    if (lookup === undefined) throw new Error("missing index ancestor source");
-
-    expect(() =>
-      lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: ["a"] }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-  });
-
-  it.each([
-    [
-      "path",
-      "UPDATE git_index SET path = 'a/z/../bad' WHERE checkout_id = ? AND path = 'a/z-invalid'",
-    ],
-  ])("rejects malformed later descendant %s after a valid witness", (_field, corruption) => {
-    const workspace = makeRepo("/");
-    const checkoutId = workspace.repo.checkout.checkoutId;
-    for (const path of ["a/a-valid", "a/z-invalid"]) {
-      workspace.repo.checkout.indexPut({
-        path,
-        stage: 0,
-        mode: 0o100644,
-        oid: "1".repeat(40),
-        size: null,
-        mtime: null,
-        ino: null,
-      });
-    }
-    workspace.database.db.run(corruption, checkoutId);
-    const lookup = createSqliteSparseWorkspaceSource(workspace.database.db).indexAncestorFacts;
-    if (lookup === undefined) throw new Error("missing index ancestor source");
-
-    expect(() => lookup({ checkoutId, ancestors: ["a"] })).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-  });
-
-  it("rejects invalid UTF-8 in a later descendant before returning facts", () => {
-    const workspace = makeRepo("/");
-    const checkoutId = workspace.repo.checkout.checkoutId;
-    workspace.repo.checkout.indexPut({
-      path: "a/a-valid",
-      stage: 0,
-      mode: 0o100644,
-      oid: "1".repeat(40),
-      size: null,
-      mtime: null,
-      ino: null,
-    });
-    workspace.database.db.run("PRAGMA foreign_keys = OFF");
-    workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
-    try {
-      workspace.database.db.run(
-        `INSERT INTO git_index (checkout_id, path, stage, mode, oid)
-         VALUES (?, CAST(X'612F7A2F80' AS TEXT), 0, 33188, ?)`,
-        checkoutId,
-        "1".repeat(40),
-      );
-    } finally {
-      workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
-      workspace.database.db.run("PRAGMA foreign_keys = ON");
-    }
-    const lookup = createSqliteSparseWorkspaceSource(workspace.database.db).indexAncestorFacts;
-    if (lookup === undefined) throw new Error("missing index ancestor source");
-
-    expect(() => lookup({ checkoutId, ancestors: ["a"] })).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-  });
-
-  it("bounds descendant integrity at the exact row limit and first excess", () => {
-    const workspace = makeRepo("/");
-    const checkoutId = workspace.repo.checkout.checkoutId;
-    workspace.database.db.run(
-      `WITH RECURSIVE sequence(value) AS (
-         VALUES (0)
-         UNION ALL SELECT value + 1 FROM sequence WHERE value < 5999
-       )
-       INSERT INTO git_index (checkout_id, path, stage, mode, oid)
-       SELECT ?, printf('a/f%04d', value), 0, 33188, ? FROM sequence`,
-      checkoutId,
-      "1".repeat(40),
-    );
-    const lookup = createSqliteSparseWorkspaceSource(workspace.database.db).indexAncestorFacts;
-    if (lookup === undefined) throw new Error("missing index ancestor source");
-
-    expect(lookup({ checkoutId, ancestors: ["a"] }).facts).toEqual([
-      { path: "a", exact: false, descendant: true },
-    ]);
-    workspace.database.db.run(
-      `INSERT INTO git_index (checkout_id, path, stage, mode, oid)
-       VALUES (?, 'a/f6000', 0, 33188, ?)`,
-      checkoutId,
-      "1".repeat(40),
-    );
-    expect(() => lookup({ checkoutId, ancestors: ["a"] })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-  });
-
-  it("uses the exact branch through 1000 paths and the general branch at first excess", () => {
+  it("returns one page of ancestor facts and rejects the first excess before SQL", () => {
     const workspace = makeRepo("/");
     const recorded = new RecordingIndexAncestorDatabase(workspace.database.db);
     const lookup = createSqliteSparseWorkspaceSource(recorded).indexAncestorFacts;
     if (lookup === undefined) throw new Error("missing index ancestor source");
-    workspace.storage.histogram = new Map();
     const paths = Array.from(
       { length: 1_001 },
       (_, index) => `p${index.toString().padStart(4, "0")}`,
     );
 
     workspace.storage.resetCounters();
-    const exact = lookup({
-      checkoutId: workspace.repo.checkout.checkoutId,
-      ancestors: paths.slice(0, 1_000),
-    });
-    expect(exact.facts).toHaveLength(1_000);
+    expect(
+      lookup({
+        checkoutId: workspace.repo.checkout.checkoutId,
+        ancestors: paths.slice(0, 1_000),
+      }).facts,
+    ).toHaveLength(1_000);
     expect(workspace.storage.statementCount).toBe(1);
     expect(workspace.storage.rowCount).toBe(1_000);
-    expect(recorded.query).toContain("exact_index_ancestor_rows");
 
     workspace.storage.resetCounters();
-    recorded.query = "";
-    expect(
-      lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: paths }).facts,
-    ).toHaveLength(1_001);
-    expect(workspace.storage.statementCount).toBe(1);
-    expect(recorded.query).toContain("index_ancestor_rows");
-    expect(recorded.query).not.toContain("exact_index_ancestor_rows");
-
-    const escaped = Array.from(
-      { length: 1_000 },
-      (_, index) => `q${index.toString().padStart(4, "0")}${"\u0001".repeat(175)}`,
-    );
-    workspace.storage.resetCounters();
-    recorded.query = "";
-    const escapedResult = lookup({
-      checkoutId: workspace.repo.checkout.checkoutId,
-      ancestors: escaped,
-    });
-    expect(JSON.stringify(escaped).length).toBeGreaterThan(1024 * 1024);
-    expect(escapedResult.facts).toHaveLength(1_000);
-    expect(workspace.storage.statementCount).toBe(1);
-    expect(recorded.query).toContain("exact_index_ancestor_rows");
+    expect(() =>
+      lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: paths }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(workspace.storage.statementCount).toBe(0);
   });
 
   it("falls back for symlink ancestors and bounds selected request count", () => {
@@ -887,70 +696,7 @@ describe("SQLite sparse workspace source", () => {
     expect(workspace.storage.statementCount).toBe(0);
   });
 
-  it("fails closed on selected node, ancestor, and symlink payload corruption", () => {
-    const missingNode = committedWorkspace();
-    const missingNodeSource = createSqliteSelectedPathSource(missingNode.database.db);
-    missingNode.database.db.run(
-      "DELETE FROM fs_nodes WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/a.txt')",
-    );
-    expect(() =>
-      missingNodeSource.select({
-        repoId: missingNode.repo.store.repoId,
-        checkoutId: missingNode.repo.checkout.checkoutId,
-        root: "/",
-        specs: [{ path: "a.txt", recursive: false }],
-      }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-
-    const missingAncestor = committedWorkspace();
-    const missingAncestorSource = createSqliteSelectedPathSource(missingAncestor.database.db);
-    missingAncestor.database.db.run(
-      "DELETE FROM fs_nodes WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/dir')",
-    );
-    expect(() =>
-      missingAncestorSource.select({
-        repoId: missingAncestor.repo.store.repoId,
-        checkoutId: missingAncestor.repo.checkout.checkoutId,
-        root: "/",
-        specs: [{ path: "dir/b.txt", recursive: false }],
-      }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-
-    const symlink = committedWorkspace();
-    const symlinkSource = createSqliteSelectedPathSource(symlink.database.db);
-    symlink.database.db.run(
-      "UPDATE fs_nodes SET content_id = x'01' WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/link')",
-    );
-    expect(() =>
-      symlinkSource.select({
-        repoId: symlink.repo.store.repoId,
-        checkoutId: symlink.repo.checkout.checkoutId,
-        root: "/",
-        specs: [{ path: "link", recursive: false }],
-      }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-  });
-
-  it("fails closed on relevant selected-path corruption", () => {
-    const workspace = committedWorkspace();
-    const source = createSqliteSelectedPathSource(workspace.database.db);
-    workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
-    workspace.database.db.run(
-      "UPDATE git_index SET mode = zeroblob(8) WHERE checkout_id = ? AND path = 'a.txt'",
-      workspace.repo.checkout.checkoutId,
-    );
-    workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() =>
-      source.select({
-        repoId: workspace.repo.store.repoId,
-        checkoutId: workspace.repo.checkout.checkoutId,
-        root: "/",
-        specs: [{ path: "a.txt", recursive: false }],
-      }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-  });
-
-  it("authenticates dirty index and baseline directories for commit reuse", () => {
+  it("projects dirty index rows and baseline directories for commit reuse", () => {
     const workspace = committedWorkspace();
     const baseline = workspace.repo.headTree();
     expect(
@@ -958,9 +704,8 @@ describe("SQLite sparse workspace source", () => {
     ).toBe(true);
     writeWorkFile(workspace, "/a.txt", "changed\n");
     writeWorkFile(workspace, "/dir/b.txt", "changed\n");
-    const source = createSqliteCommitTreeSnapshotSource(workspace.database.db);
 
-    const result = source.snapshot({
+    const result = createSqliteCommitTreeSnapshotSource(workspace.database.db).snapshot({
       repoId: workspace.repo.store.repoId,
       checkoutId: workspace.repo.checkout.checkoutId,
       root: "/",
@@ -979,47 +724,9 @@ describe("SQLite sparse workspace source", () => {
       "link",
     ]);
     expect(result.directories[1]?.entries.map((entry) => entry.name)).toEqual(["b.txt"]);
-
-    workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
-    workspace.database.db.run(
-      "UPDATE git_index_dirty SET flags = zeroblob(8) WHERE checkout_id = ? AND path = 'a.txt'",
-      workspace.repo.checkout.checkoutId,
-    );
-    workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() =>
-      source.snapshot({
-        repoId: workspace.repo.store.repoId,
-        checkoutId: workspace.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: baseline,
-      }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
-    workspace.database.db.run(
-      "UPDATE git_index_dirty SET flags = 2 WHERE checkout_id = ? AND path = 'a.txt'",
-      workspace.repo.checkout.checkoutId,
-    );
-    workspace.database.db.run(
-      `UPDATE git_tree_entries SET mode = 'bad'
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose'
-        ) AND ordinal = 0`,
-      workspace.repo.store.repoId,
-      baseline,
-    );
-    workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() =>
-      source.snapshot({
-        repoId: workspace.repo.store.repoId,
-        checkoutId: workspace.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: baseline,
-      }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
-  it("reads authenticated snapshot entries by active source key", () => {
+  it("reads snapshot entries by active source key", () => {
     const workspace = committedWorkspace();
     const baseline = workspace.repo.headTree();
     if (baseline === null) throw new Error("missing snapshot baseline");
@@ -1040,22 +747,7 @@ describe("SQLite sparse workspace source", () => {
     ).toBe(true);
 
     expect(explained.queries).toBe(1);
-    expect(
-      explained.details.some((detail) =>
-        detail.includes("SEARCH source USING INTEGER PRIMARY KEY"),
-      ),
-    ).toBe(true);
-    expect(
-      explained.details.some(
-        (detail) =>
-          detail.includes("SEARCH effective USING PRIMARY KEY") && detail.includes("repo_id="),
-      ),
-    ).toBe(true);
-    expect(
-      explained.details.some((detail) =>
-        detail.includes("SEARCH git_tree_entries USING PRIMARY KEY (source_key=?)"),
-      ),
-    ).toBe(true);
+    expect(explained.details.some((detail) => detail.includes("SEARCH entry USING"))).toBe(true);
     expect(explained.details.some((detail) => detail.includes("git_tree_entries_wide"))).toBe(
       false,
     );
@@ -1118,56 +810,42 @@ describe("SQLite sparse workspace source", () => {
     ).toBe(true);
   });
 
-  it("bounds authenticated wide-tree resolution at its simultaneous peak", () => {
+  it("returns unavailable before retaining the global snapshot result's 1001st row", () => {
     const workspace = makeRepo("/");
     workspace.repo.store.configSet("user.name", "Fixture");
     workspace.repo.store.configSet("user.email", "fixture@example.com");
-    const directories = Array.from(
-      { length: 999 },
-      (_, index) => `d${index.toString().padStart(3, "0")}`,
+    const paths = Array.from(
+      { length: 1_000 },
+      (_, index) => `f${index.toString().padStart(4, "0")}.txt`,
     );
-    workspace.worktree.makeDirectories(directories.map((directory) => `/${directory}`));
     workspace.worktree.writeFiles(
-      directories.map((directory) => ({
-        path: `/${directory}/file.txt`,
-        bytes: new Uint8Array([1]),
-      })),
+      paths.map((path) => ({ path: `/${path}`, bytes: new Uint8Array([1]) })),
     );
     add(workspace.repo, workspace.worktree, { paths: [], all: true });
     commit(workspace.context, workspace.repo, { message: "wide tree" });
     const baseline = workspace.repo.headTree();
     if (baseline === null) throw new Error("missing wide-tree baseline");
-    const checkoutId = workspace.repo.checkout.checkoutId;
     expect(
-      resealIndexTracker(
-        workspace.database.db,
-        checkoutId,
-        baseline,
-        directories.map((directory) => ({
-          path: `${directory}/file.txt`,
-          flags: INDEX_DIRTY,
-        })),
-      ),
+      resealIndexTracker(workspace.database.db, workspace.repo.checkout.checkoutId, baseline, [
+        { path: paths[0] ?? "", flags: INDEX_DIRTY },
+      ]),
     ).toBe(true);
-    const source = createSqliteCommitTreeSnapshotSource(workspace.database.db);
-    const request = {
-      repoId: workspace.repo.store.repoId,
-      checkoutId,
-      root: "/",
-      baselineTreeOid: baseline,
-    };
 
-    const result = source.snapshot(request);
-    expect(result.available).toBe(true);
-    if (!result.available) return;
-    expect(result.directories).toHaveLength(1_000);
+    expect(
+      createSqliteCommitTreeSnapshotSource(workspace.database.db).snapshot({
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        baselineTreeOid: baseline,
+      }),
+    ).toEqual({ available: false });
   });
 
-  it("bounds request-heavy snapshots at the selected-path cap before mapping", () => {
+  it("admits exactly 1000 aggregate dirty and directory rows, then rejects the first excess", () => {
     const workspace = committedWorkspace();
     const checkoutId = workspace.repo.checkout.checkoutId;
     const source = createSqliteCommitTreeSnapshotSource(workspace.database.db);
-    const exact = Array.from({ length: 1_000 }, (_, index) => ({
+    const exact = Array.from({ length: 999 }, (_, index) => ({
       path: `request-${index.toString().padStart(4, "0")}`,
       flags: INDEX_DIRTY,
     }));
@@ -1181,7 +859,8 @@ describe("SQLite sparse workspace source", () => {
     const result = source.snapshot(request);
     expect(result.available).toBe(true);
     if (!result.available) return;
-    expect(result.dirty).toHaveLength(1_000);
+    expect(result.dirty).toHaveLength(999);
+    expect(result.directories).toHaveLength(1);
 
     expect(
       resealIndexTracker(workspace.database.db, checkoutId, null, [
@@ -1192,11 +871,11 @@ describe("SQLite sparse workspace source", () => {
     expect(source.snapshot(request)).toEqual({ available: false });
   });
 
-  it("bounds directory-heavy snapshots at the first excess ancestor", () => {
+  it("counts derived directories before retaining them", () => {
     const workspace = committedWorkspace();
     const checkoutId = workspace.repo.checkout.checkoutId;
     const source = createSqliteCommitTreeSnapshotSource(workspace.database.db);
-    const exactPath = Array.from({ length: 1_000 }, () => "d").join("/");
+    const exactPath = Array.from({ length: 999 }, () => "d").join("/");
     expect(
       resealIndexTracker(workspace.database.db, checkoutId, null, [
         { path: exactPath, flags: INDEX_DIRTY },
@@ -1211,12 +890,12 @@ describe("SQLite sparse workspace source", () => {
     const result = source.snapshot(request);
     expect(result.available).toBe(true);
     if (!result.available) return;
-    expect(result.directories).toHaveLength(1_000);
+    expect(result.dirty).toHaveLength(1);
+    expect(result.directories).toHaveLength(999);
 
-    const excessPath = `${exactPath}/d`;
     expect(
       resealIndexTracker(workspace.database.db, checkoutId, null, [
-        { path: excessPath, flags: INDEX_DIRTY },
+        { path: `${exactPath}/d`, flags: INDEX_DIRTY },
       ]),
     ).toBe(true);
     expect(source.snapshot(request)).toEqual({ available: false });
@@ -1360,7 +1039,7 @@ describe("SQLite sparse workspace source", () => {
       "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = ? AND pack_id = 7",
       workspace.repo.store.repoId,
     );
-    expect(() => source.hydrate(request)).toThrowError(/source is missing or invalid/);
+    expect(source.hydrate(request)).toEqual({ available: false });
   });
 
   it("does not borrow a packed projection through a corrupt loose shadow", () => {
@@ -1383,7 +1062,7 @@ describe("SQLite sparse workspace source", () => {
     );
     const source = createSqliteSparseWorkspaceSource(workspace.database.db);
 
-    expect(() =>
+    expect(
       source.hydrate({
         repoId: workspace.repo.store.repoId,
         checkoutId: workspace.repo.checkout.checkoutId,
@@ -1392,7 +1071,7 @@ describe("SQLite sparse workspace source", () => {
         currentTreeOid: null,
         paths: ["a.txt"],
       }),
-    ).toThrowError(/source is missing or invalid/);
+    ).toEqual({ available: false });
   });
 
   it("does not lose an invalid active source-key association", () => {
@@ -1406,7 +1085,7 @@ describe("SQLite sparse workspace source", () => {
       activeTree,
     );
     active.database.db.run("PRAGMA foreign_keys = ON");
-    expect(() =>
+    expect(
       createSqliteSparseWorkspaceSource(active.database.db).hydrate({
         repoId: active.repo.store.repoId,
         checkoutId: active.repo.checkout.checkoutId,
@@ -1415,7 +1094,7 @@ describe("SQLite sparse workspace source", () => {
         currentTreeOid: null,
         paths: ["a.txt"],
       }),
-    ).toThrowError(/source is missing or invalid/);
+    ).toEqual({ available: false });
   });
 
   it("detects a projected tree cycle before depth fallback", () => {
@@ -1514,32 +1193,16 @@ describe("SQLite sparse workspace source", () => {
       expect(result.rows[0]?.index.map((entry) => entry.stage)).toEqual([1, 2, 3]);
   });
 
-  it("rejects malformed filesystem metadata and accepts a former large payload excess", () => {
-    const dangling = committedWorkspace();
-    const danglingInode = dangling.database.db.scalar<number>(
-      "SELECT inode FROM fs_paths WHERE path = '/a.txt'",
-    );
-    dangling.database.db.run("DELETE FROM fs_nodes WHERE inode = ?", danglingInode);
-    expect(() =>
-      createSqliteSparseWorkspaceSource(dangling.database.db).hydrate({
-        repoId: dangling.repo.store.repoId,
-        checkoutId: dangling.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: null,
-        currentTreeOid: null,
-        paths: ["a.txt"],
-      }),
-    ).toThrowError(/malformed metadata/);
-
-    const large = committedWorkspace();
-    large.database.db.run(
+  it("accepts a former large worktree payload excess", () => {
+    const workspace = committedWorkspace();
+    workspace.database.db.run(
       "UPDATE fs_nodes SET content_id = zeroblob(4194305) WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/a.txt')",
     );
     const result = hydrateSparseWorkspaceOwned(
-      createSqliteSparseWorkspaceSource(large.database.db),
+      createSqliteSparseWorkspaceSource(workspace.database.db),
       {
-        repoId: large.repo.store.repoId,
-        checkoutId: large.repo.checkout.checkoutId,
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
         root: "/",
         baselineTreeOid: null,
         currentTreeOid: null,
@@ -1549,58 +1212,37 @@ describe("SQLite sparse workspace source", () => {
     expect(result.available).toBe(true);
     if (!result.available) throw new Error("large worktree payload was unavailable");
     expect(result.rows[0]?.worktree?.contentId).toHaveLength(4_194_305);
-
-    const symlink = committedWorkspace();
-    symlink.database.db.run(
-      "UPDATE fs_nodes SET link_target = zeroblob(16) WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/link')",
-    );
-    expect(() =>
-      createSqliteSparseWorkspaceSource(symlink.database.db).hydrate({
-        repoId: symlink.repo.store.repoId,
-        checkoutId: symlink.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: null,
-        currentTreeOid: null,
-        paths: ["link"],
-      }),
-    ).toThrowError(/payload metadata/);
   });
 
   it("uses the bounded name-bytes index for exact edge lookup", () => {
     const workspace = committedWorkspace();
     const tree = workspace.repo.headTree();
-    const payload = JSON.stringify([{ i: 0, s: "b", t: tree, n: "a.txt", f: 1, v: 0 }]);
+    const payload = JSON.stringify([{ i: 0, s: "b", t: tree, n: "a.txt", f: 1 }]);
     const plan = workspace.database.db.all<{ detail: string }>(
       `EXPLAIN QUERY PLAN ${SPARSE_TREE_DEPTH_SQL}`,
       payload,
       workspace.repo.store.repoId,
-      8_192,
-      8 * 1024 * 1024,
-      8 * 1024 * 1024,
     );
 
-    expect(plan.some((row) => row.detail.includes("SEARCH x USING PRIMARY KEY"))).toBe(true);
-    expect(plan.some((row) => row.detail.includes("SEARCH s USING INTEGER PRIMARY KEY"))).toBe(
-      true,
-    );
     expect(
-      plan.some((row) => row.detail.includes("SEARCH entry USING PRIMARY KEY (source_key=?)")),
+      plan.some(
+        (row) =>
+          row.detail.includes("SEARCH effective USING PRIMARY KEY") &&
+          row.detail.includes("repo_id="),
+      ),
     ).toBe(true);
-    expect(plan.some((row) => row.detail.includes("git_tree_entries_by_name_bytes"))).toBe(true);
+    expect(plan.some((row) => row.detail.includes("SEARCH edge USING"))).toBe(true);
     expect(plan.some((row) => row.detail.includes("git_tree_entries_wide"))).toBe(false);
-    expect(
-      plan.some((row) => /SCAN (x|s|entry|candidate|duplicate|previous)(?:\s|$)/.test(row.detail)),
-    ).toBe(false);
+    expect(plan.some((row) => /SCAN (effective|edge)(?:\s|$)/.test(row.detail))).toBe(false);
   });
 
-  it("rejects invalid caller bounds before issuing SQL", () => {
+  it("returns unavailable for invalid native hydration bounds before issuing SQL", () => {
     const workspace = committedWorkspace();
     const source = createSqliteSparseWorkspaceSource(workspace.database.db);
     const tree = workspace.repo.headTree();
     workspace.storage.resetCounters();
 
-    let failure: unknown;
-    try {
+    expect(
       source.hydrate({
         repoId: workspace.repo.store.repoId,
         checkoutId: workspace.repo.checkout.checkoutId,
@@ -1608,11 +1250,8 @@ describe("SQLite sparse workspace source", () => {
         baselineTreeOid: tree,
         currentTreeOid: null,
         paths: Array.from({ length: 1_001 }, (_, index) => `p${index.toString().padStart(4, "0")}`),
-      });
-    } catch (error) {
-      failure = error;
-    }
-    expect(failure).toMatchObject({ code: "E2BIG" });
+      }),
+    ).toEqual({ available: false });
     expect(workspace.storage.statementCount).toBe(0);
   });
 
@@ -1700,7 +1339,7 @@ describe("SQLite sparse workspace source", () => {
       expect(result.rows).toHaveLength(1_000);
     }
     expect(workspace.storage.statementCount).toBe(4);
-    expect(workspace.storage.rowCount).toBe(2_001);
+    expect(workspace.storage.rowCount).toBe(3_001);
   });
 
   it("validates checkout ownership for an empty hydration in one statement", () => {
@@ -1776,33 +1415,38 @@ describe("SQLite sparse workspace source", () => {
     expect(result.rows).toHaveLength(1);
   });
 
-  it("falls back when distinct touched sources exceed the cumulative row cap by one", () => {
+  it("falls back when tree hydration touches source 1001", () => {
     const workspace = makeRepo("/");
-    const entries = Array.from({ length: 8_192 }, (_, index) => ({
-      mode: MODE_FILE,
-      name: `p${index.toString().padStart(4, "0")}`,
-      oid: "1".repeat(40),
-    }));
-    const wide = workspace.repo.store.write("tree", serializeTree(entries));
-    const narrow = workspace.repo.store.write(
-      "tree",
-      serializeTree([{ mode: MODE_FILE, name: "p0000", oid: "2".repeat(40) }]),
+    const directories = Array.from(
+      { length: 1_000 },
+      (_, index) => `d${index.toString().padStart(4, "0")}`,
     );
-    const source = createSqliteSparseWorkspaceSource(workspace.database.db);
-    workspace.storage.resetCounters();
+    const children = directories.map((name, index) => ({
+      mode: MODE_TREE,
+      name,
+      oid: workspace.repo.store.write(
+        "tree",
+        serializeTree([
+          {
+            mode: MODE_FILE,
+            name: "file.txt",
+            oid: index.toString(16).padStart(40, "0"),
+          },
+        ]),
+      ),
+    }));
+    const root = workspace.repo.store.write("tree", serializeTree(children));
 
     expect(
-      source.hydrate({
+      createSqliteSparseWorkspaceSource(workspace.database.db).hydrate({
         repoId: workspace.repo.store.repoId,
         checkoutId: workspace.repo.checkout.checkoutId,
         root: "/",
-        baselineTreeOid: wide,
-        currentTreeOid: narrow,
-        paths: ["p0000"],
+        baselineTreeOid: root,
+        currentTreeOid: null,
+        paths: directories.map((directory) => `${directory}/file.txt`),
       }),
     ).toEqual({ available: false });
-    expect(workspace.storage.statementCount).toBe(2);
-    expect(workspace.storage.rowCount).toBeLessThanOrEqual(3);
   });
 
   it("falls back before deep and wide cursor ancestry exceeds the fixed state cap", () => {

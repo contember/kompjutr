@@ -45,6 +45,7 @@ import {
   indexScanOwned,
 } from "../store/index.js";
 import {
+  hasSparseSourceReceipt,
   selectSparsePathsOwned,
   sparseIndexAncestorFactsOwned,
 } from "../store/sparse-workspace.js";
@@ -63,6 +64,7 @@ import type {
   SelectedPathResult,
   SelectedPathSpec,
   SelectedWorktreeFact,
+  SparseIndexAncestorResult,
 } from "./sparse-workspace.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import { gitModeFor, type Worktree } from "./worktree.js";
@@ -108,6 +110,7 @@ export const MAX_LS_FILES_EXCLUDE_ROOTS = MAX_ROUTING_CHECKOUTS;
 
 interface AvailableSelectedPaths extends Extract<SelectedPathResult, { available: true }> {
   structuralBytes: number;
+  trusted: boolean;
 }
 
 interface AddIndexPath {
@@ -428,6 +431,7 @@ function selectAddPathsOwned(
     specs: requested,
   };
   const exact = selectAddSource(
+    repo,
     source,
     exactRequest,
     (path) => hasExactRequestedPath(requested, path),
@@ -453,6 +457,7 @@ function selectAddPathsOwned(
   };
   const recursiveMatcher = compilePathspecsOwned(recursive);
   const selected = selectAddSource(
+    repo,
     source,
     recursiveRequest,
     (path) => recursiveMatcher.matches(path),
@@ -477,6 +482,7 @@ function selectRecursiveAddPaths(
     specs: requested.map((spec) => ({ path: spec.path, recursive: true })),
   };
   return selectAddSource(
+    repo,
     source,
     request,
     (path) => pathspec.matches(path),
@@ -487,6 +493,7 @@ function selectRecursiveAddPaths(
 }
 
 function selectAddSource(
+  repo: Repository,
   source: NonNullable<GitContext["selectedPaths"]>,
   request: SelectedPathRequest,
   matches: (path: string) => boolean,
@@ -494,7 +501,11 @@ function selectAddSource(
   maxWorktreeRows: number,
   maxStructuralBytes: number,
 ): AvailableSelectedPaths | null {
-  const selected: unknown = selectSparsePathsOwned(source, request);
+  const selected = selectSparsePathsOwned(source, request);
+  if (hasSparseSourceReceipt(repo.checkout.db, "selected-paths", source)) {
+    if (!selected.available) return null;
+    return { ...selected, structuralBytes: 0, trusted: true };
+  }
   try {
     const validated = validateSelectedAddResult(
       selected,
@@ -527,7 +538,7 @@ function recursiveAddSpecs(
     ADD_SELECTED_RETAINED_BYTES,
     ADD_RETAINED_BYTES - exact.structuralBytes,
   );
-  let result: unknown;
+  let result: SparseIndexAncestorResult;
   try {
     result = sparseIndexAncestorFactsOwned(sparseWorkspace, {
       checkoutId: repo.checkout.checkoutId,
@@ -538,14 +549,16 @@ function recursiveAddSpecs(
     throw error;
   }
   let validated: ValidatedSelectedAncestorResult | null;
-  try {
-    validated = validateSelectedAncestorResult(result, candidates, exact.index, retainedHeadroom);
-  } catch (error) {
-    if (hasErrorCode(error, "E2BIG")) return null;
-    throw error;
-  }
-  if (validated === null) {
-    return null;
+  if (hasSparseSourceReceipt(repo.checkout.db, "workspace", sparseWorkspace)) {
+    validated = { facts: result.facts, structuralBytes: 0 };
+  } else {
+    try {
+      validated = validateSelectedAncestorResult(result, candidates, exact.index, retainedHeadroom);
+    } catch (error) {
+      if (hasErrorCode(error, "E2BIG")) return null;
+      throw error;
+    }
+    if (validated === null) return null;
   }
   const facts = validated.facts;
   for (let ordinal = 0; ordinal < candidates.length; ordinal++) {
@@ -705,6 +718,7 @@ function validateSelectedAddResult(
     index: snapshotIndex,
     worktree: snapshotWorktree,
     structuralBytes: minimumRetained,
+    trusted: false,
   };
 }
 
@@ -825,6 +839,26 @@ function mergeSelectedAddResults(
   exact: AvailableSelectedPaths,
   recursive: AvailableSelectedPaths,
 ): AvailableSelectedPaths | null {
+  if (exact.trusted && recursive.trusted) {
+    const retainedPaths = new Set<string>();
+    const retain = (path: string): boolean => {
+      if (retainedPaths.has(path)) return true;
+      if (retainedPaths.size === ADD_SELECTED_PATHS) return false;
+      retainedPaths.add(path);
+      return true;
+    };
+    const index = mergeSelectedIndexRows(exact.index, recursive.index, retain);
+    if (index === null) return null;
+    const worktree = mergeSelectedWorktreeRows(exact.worktree, recursive.worktree, retain);
+    if (worktree === null) return null;
+    return {
+      available: true,
+      index,
+      worktree,
+      structuralBytes: 0,
+      trusted: true,
+    };
+  }
   const slots =
     exact.index.length + recursive.index.length + exact.worktree.length + recursive.worktree.length;
   const mergeCharge = SELECTED_MERGE_FIXED_BYTES + slots * SELECTED_MERGE_SLOT_BYTES;
@@ -835,46 +869,56 @@ function mergeSelectedAddResults(
   ) {
     return null;
   }
+  const index = mergeSelectedIndexRows(exact.index, recursive.index);
+  const worktree = mergeSelectedWorktreeRows(exact.worktree, recursive.worktree);
+  if (index === null || worktree === null) return null;
   return {
     available: true,
-    index: mergeSelectedIndexRows(exact.index, recursive.index),
-    worktree: mergeSelectedWorktreeRows(exact.worktree, recursive.worktree),
+    index,
+    worktree,
     structuralBytes: exact.structuralBytes + recursive.structuralBytes + mergeCharge,
+    trusted: false,
   };
 }
 
 function mergeSelectedIndexRows(
   left: readonly IndexEntry[],
   right: readonly IndexEntry[],
-): IndexEntry[] {
+  retain?: (path: string) => boolean,
+): IndexEntry[] | null {
   const rows: IndexEntry[] = [];
+  const append = (row: IndexEntry): boolean => {
+    if (retain !== undefined && !retain(row.path)) return false;
+    rows.push(row);
+    return true;
+  };
   let leftAt = 0;
   let rightAt = 0;
   while (leftAt < left.length || rightAt < right.length) {
     const a = left[leftAt];
     const b = right[rightAt];
     if (a === undefined) {
-      if (b !== undefined) rows.push(b);
+      if (b !== undefined && !append(b)) return null;
       rightAt++;
       continue;
     }
     if (b === undefined) {
-      rows.push(a);
+      if (!append(a)) return null;
       leftAt++;
       continue;
     }
     const order = comparePaths(a.path, b.path) || a.stage - b.stage;
     if (order < 0) {
-      rows.push(a);
+      if (!append(a)) return null;
       leftAt++;
     } else if (order > 0) {
-      rows.push(b);
+      if (!append(b)) return null;
       rightAt++;
     } else {
       if (!sameIndexEntry(a, b)) {
         throw new GitError("ECORRUPT", "selected add index sources disagreed on a row");
       }
-      rows.push(a);
+      if (!append(a)) return null;
       leftAt++;
       rightAt++;
     }
@@ -898,35 +942,41 @@ function sameIndexEntry(left: IndexEntry, right: IndexEntry): boolean {
 function mergeSelectedWorktreeRows(
   left: readonly SelectedWorktreeFact[],
   right: readonly SelectedWorktreeFact[],
-): SelectedWorktreeFact[] {
+  retain?: (path: string) => boolean,
+): SelectedWorktreeFact[] | null {
   const rows: SelectedWorktreeFact[] = [];
+  const append = (row: SelectedWorktreeFact): boolean => {
+    if (retain !== undefined && !retain(row.path)) return false;
+    rows.push(row);
+    return true;
+  };
   let leftAt = 0;
   let rightAt = 0;
   while (leftAt < left.length || rightAt < right.length) {
     const a = left[leftAt];
     const b = right[rightAt];
     if (a === undefined) {
-      if (b !== undefined) rows.push(b);
+      if (b !== undefined && !append(b)) return null;
       rightAt++;
       continue;
     }
     if (b === undefined) {
-      rows.push(a);
+      if (!append(a)) return null;
       leftAt++;
       continue;
     }
     const order = comparePaths(a.path, b.path);
     if (order < 0) {
-      rows.push(a);
+      if (!append(a)) return null;
       leftAt++;
     } else if (order > 0) {
-      rows.push(b);
+      if (!append(b)) return null;
       rightAt++;
     } else {
       if (!sameWorktreeFact(a, b)) {
         throw new GitError("ECORRUPT", "selected add worktree sources disagreed on a row");
       }
-      rows.push(a);
+      if (!append(a)) return null;
       leftAt++;
       rightAt++;
     }

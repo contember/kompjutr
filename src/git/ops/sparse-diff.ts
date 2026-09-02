@@ -1,4 +1,3 @@
-import { utf8 } from "../common/bytes.js";
 import { CorruptError, hasErrorCode } from "../common/errors.js";
 import { comparePaths } from "../common/streams.js";
 import { matchesPaths } from "./checkout.js";
@@ -15,8 +14,6 @@ import type { TargetEntry } from "./tree-stream.js";
 import type { WorktreePath } from "./worktree-io.js";
 
 const SPARSE_DIFF_PATHS = 1000;
-const SPARSE_DIFF_RETAINED_BYTES = 16 * 1024 * 1024;
-const SPARSE_DIFF_ROW_BYTES = 1024;
 
 export function sparseCommitPair(
   repo: Repository,
@@ -26,14 +23,11 @@ export function sparseCommitPair(
 ): PendingChange[] | null {
   const changes: PendingChange[] = [];
   let matchingEntries = 0;
-  let retainedBytes = 0;
   try {
     for (const entry of repo.walkTreeDiff(beforeTreeOid, afterTreeOid)) {
       if (!matchesPaths(entry.path, options.paths)) continue;
       if (matchingEntries >= SPARSE_DIFF_PATHS) return null;
       matchingEntries++;
-      retainedBytes += SPARSE_DIFF_ROW_BYTES + utf8.encode(entry.path).length;
-      if (retainedBytes > SPARSE_DIFF_RETAINED_BYTES) return null;
       const change = compareIdentities(
         entry.path,
         treePartsIdentity(entry.beforeMode, entry.beforeOid),
@@ -111,11 +105,9 @@ function sparseWorkingPaths(
   pathspecs: string[] | undefined,
 ): string[] | null {
   const paths = new Set<string>();
-  let retainedBytes = 0;
   const add = (path: string): boolean => {
     if (!matchesPaths(path, pathspecs) || paths.has(path)) return true;
-    retainedBytes += SPARSE_DIFF_ROW_BYTES + utf8.encode(path).length;
-    if (paths.size >= SPARSE_DIFF_PATHS || retainedBytes > SPARSE_DIFF_RETAINED_BYTES) return false;
+    if (paths.size >= SPARSE_DIFF_PATHS) return false;
     paths.add(path);
     return true;
   };

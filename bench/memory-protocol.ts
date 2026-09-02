@@ -1,6 +1,7 @@
 import { CHUNK_SIZE } from "../src/fs/schema.js";
 import { MAX_OBJECT_BYTES } from "../src/git/common/objects.js";
 import { INFLATE_FEED, maximumDeflatedBytes, OBJECT_CHUNK } from "../src/git/store/objects.js";
+import { MAX_INDEX_PATH_BYTES } from "../src/git/store/schema.js";
 import { commitGraphBytes } from "./commit-graph-bytes.js";
 
 export const SQL_STATEMENT_TARGET = 1_000;
@@ -26,6 +27,8 @@ const LOOSE_STREAM_PAYLOAD_BYTES =
 const LOOSE_STREAM_RETAINED_BYTES = LOOSE_STREAM_OUTPUT_BYTES + LOOSE_STREAM_PAYLOAD_BYTES;
 export const CHECKOUT_ROOT_BYTES = 4_096;
 export const CHECKOUT_HEAD_BYTES = 1_024;
+export const SPARSE_SELECTED_PATH_COUNT = 1_000;
+export const SPARSE_SELECTED_PATH_BYTES = MAX_INDEX_PATH_BYTES;
 
 const RANGE_HASH_CHUNKS = Math.ceil(HASH_WORKLOAD_BYTES / (64 * 1024));
 const PACK_FIXTURE_OBJECT_BYTES = 1;
@@ -84,6 +87,7 @@ export type MemoryScenarioName =
   | "core.integration.guard-hash"
   | "core.rebase.baseline-hash"
   | "core.staging.add-hash"
+  | "core.sparse-selected-add"
   | "core.loose-object-stream"
   | "sqlite.maintenance.reachability"
   | "sqlite.pack.fallback-audit"
@@ -97,6 +101,7 @@ export type MemorySource =
   | "Filesystem.writeFileStream"
   | "requireCleanIntegrationWorktree"
   | "rebase"
+  | "createSqliteSelectedPathSource"
   | "add"
   | "SharedRepoStore.readBlobs"
   | "advanceMaintenanceReachability"
@@ -165,6 +170,15 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 32 * 1024 * 1024,
     verifiedContentBytes: HASH_WORKLOAD_BYTES,
     verifiedChunkCount: RANGE_HASH_CHUNKS * 2,
+  },
+  {
+    scenario: "core.sparse-selected-add",
+    operation: "core.sparse-selected-add",
+    source: "createSqliteSelectedPathSource",
+    workloadBytes: SPARSE_SELECTED_PATH_COUNT * SPARSE_SELECTED_PATH_BYTES,
+    formerLimitBytes: 64 * 1024 * 1024,
+    verifiedContentBytes: SPARSE_SELECTED_PATH_COUNT,
+    verifiedChunkCount: SPARSE_SELECTED_PATH_COUNT,
   },
   {
     scenario: "core.loose-object-stream",

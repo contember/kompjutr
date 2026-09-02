@@ -35,6 +35,8 @@ import {
 } from "../src/git/store/index.js";
 import { advanceMaintenanceReachability } from "../src/git/store/maintenance/reachability.js";
 import { INFLATE_FEED } from "../src/git/store/objects.js";
+import { MAX_SPARSE_BINDING_BYTES } from "../src/git/store/sparse/shared.js";
+import { createSqliteSelectedPathSource } from "../src/git/store/sparse-workspace.js";
 import { commitGraphBytes } from "./commit-graph-bytes.js";
 import type { Harness, Scenario } from "./harness.js";
 import {
@@ -54,6 +56,8 @@ import {
   type MemoryScenarioSpec,
   memoryScenarioSpec,
   PROCESS_TRANSIENT_TARGET_BYTES,
+  SPARSE_SELECTED_PATH_BYTES,
+  SPARSE_SELECTED_PATH_COUNT,
 } from "./memory-protocol.js";
 
 const INITIAL_SPEC = memoryScenarioSpec("fs.initial-write");
@@ -713,6 +717,60 @@ function stagingAddScenario(): Scenario {
     ],
   };
 }
+function sparseSelectedAddScenario(): Scenario {
+  const spec = memoryScenarioSpec("core.sparse-selected-add");
+  const stem = "p".repeat(SPARSE_SELECTED_PATH_BYTES - 4);
+  const paths = Array.from(
+    { length: SPARSE_SELECTED_PATH_COUNT },
+    (_, index) => `${stem}${index.toString().padStart(4, "0")}`,
+  );
+  const bindingBytes = utf8.encode(JSON.stringify(paths.map((path) => ({ p: path, r: 0 })))).length;
+  if (bindingBytes > MAX_SPARSE_BINDING_BYTES) {
+    throw new Error("sparse selected worst-case paths exceed the native selector binding cap");
+  }
+  let repo: Repository | null = null;
+  let worktree: Filesystem | null = null;
+  let verificationDigest: string | null = null;
+  return {
+    name: spec.scenario,
+    kind: "memory",
+    fileBacked: true,
+    async setup({ harness }) {
+      createRepository(harness);
+      const content = new Uint8Array([0x73]);
+      for (const path of paths) harness.workspace.filesystem.writeFile(`/${path}`, content);
+      repo = reopenRepository(harness).repo;
+      worktree = harness.workspace.filesystem;
+    },
+    phases: [
+      {
+        name: spec.operation,
+        async run({ harness }) {
+          if (repo === null || worktree === null)
+            throw new Error("sparse selected fixture is missing");
+          add(
+            repo,
+            worktree,
+            { paths },
+            { selectedPaths: createSqliteSelectedPathSource(harness.workspace.db) },
+          );
+        },
+        async verify() {
+          if (repo === null) throw new Error("sparse selected fixture is missing");
+          const entries = [...repo.checkout.indexScan()];
+          if (
+            entries.length !== SPARSE_SELECTED_PATH_COUNT ||
+            entries.some((entry, index) => entry.path !== paths[index] || entry.size !== 1)
+          ) {
+            throw new Error("sparse selected add did not preserve every worst-case path");
+          }
+          verificationDigest = digestParts(entries.map((entry) => `${entry.path}:${entry.oid}`));
+        },
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
+      },
+    ],
+  };
+}
 
 function looseObjectStreamScenario(): Scenario {
   const spec = memoryScenarioSpec("core.loose-object-stream");
@@ -1265,6 +1323,7 @@ export const MEMORY: Scenario[] = [
   integrationGuardScenario(),
   rebaseBaselineScenario(),
   stagingAddScenario(),
+  sparseSelectedAddScenario(),
   looseObjectStreamScenario(),
   maintenanceReachabilityScenario(),
   packFallbackAuditScenario(),

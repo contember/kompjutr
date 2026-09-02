@@ -1,3 +1,4 @@
+export { hasSparseSourceReceipt } from "./sparse/receipt.js";
 export {
   createSqliteSelectedPathSource,
   selectSparsePathsOwned,
