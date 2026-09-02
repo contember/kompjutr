@@ -103,30 +103,22 @@ function expectExactIndex(repo: Repository, ref: string): void {
   expect(countMatching(actual, expected)).toBe(PATH_COUNT);
 }
 
-function mutationStatements(storage: SqliteTestStorage): number {
-  let count = 0;
-  for (const [query, calls] of storage.histogram ?? []) {
-    if (query.startsWith("WITH mutation AS")) count += calls;
-  }
-  return count;
-}
-
-/** Fail only after SQLite has committed the first 512-row index mutation page. */
+/**
+ * Fail after a real index mutation page executes inside the public operation's outer transaction.
+ */
 function failAfterFirstIndexPage(storage: SqliteTestStorage): () => void {
-  const originalTransaction = storage.transactionSync.bind(storage);
-  storage.histogram = new Map();
+  const originalExec = storage.sql.exec;
   let armed = true;
-  storage.transactionSync = function transactionSync<T>(closure: () => T): T {
-    const before = mutationStatements(storage);
-    const result = originalTransaction(closure);
-    if (armed && mutationStatements(storage) > before) {
+  storage.sql.exec = function exec<Row extends object>(query: string, ...bindings: unknown[]) {
+    const cursor = originalExec<Row>(query, ...bindings);
+    if (armed && query.replace(/\s+/g, " ").trim().startsWith("WITH mutation AS")) {
       armed = false;
       throw new Error("restart after first index page");
     }
-    return result;
+    return cursor;
   };
   return () => {
-    storage.transactionSync = originalTransaction;
+    storage.sql.exec = originalExec;
   };
 }
 
@@ -140,11 +132,12 @@ function writeStagedWorktree(workspace: TestRepository): void {
 }
 
 describe("paged local restart conformance", () => {
-  it("retries add after its first durable indexApply page without duplicating objects", async () => {
+  it("rolls add back after its first indexApply page, then retries without duplicate objects", async () => {
     const workspace = await imported();
     writeStagedWorktree(workspace);
+    const indexBeforeAdd = workspace.repo.checkout.indexEntries();
     const main = expectedIndex(workspace.repo, "main");
-    const objectsBefore = workspace.repo.store.objectCount();
+    const objectsBeforeAdd = workspace.repo.store.objectCount();
     workspace.storage.resetCounters();
     const restore = failAfterFirstIndexPage(workspace.storage);
     try {
@@ -158,32 +151,30 @@ describe("paged local restart conformance", () => {
 
     const cold = reopenTestRepository(workspace);
     expect(cold.worktree).not.toBe(workspace.worktree);
-    const partial = cold.repo.checkout.indexEntries();
-    expect(partial).toHaveLength(PATH_COUNT);
-    expect(countMatching(partial, main)).toBe(1);
+    expect(cold.repo.checkout.indexEntries()).toEqual(indexBeforeAdd);
+    expect(cold.repo.store.objectCount()).toBe(objectsBeforeAdd);
     assertRepositoryReadable(cold.repo);
-    const objectsAfterPartial = cold.repo.store.objectCount();
-    expect(objectsAfterPartial).toBe(objectsBefore + PATH_COUNT);
 
     workspace.storage.resetCounters();
     const coldGit = publicGit(cold);
     await coldGit.add({ paths: [], all: true });
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
-    const complete = cold.repo.checkout.indexEntries();
-    expect(complete).toHaveLength(PATH_COUNT);
-    expect(countMatching(complete, main)).toBe(0);
-    expect(cold.repo.store.objectCount()).toBe(objectsAfterPartial);
+    const staged = cold.repo.checkout.indexEntries();
+    expect(staged).toHaveLength(PATH_COUNT);
+    expect(countMatching(staged, main)).toBe(0);
+    const objectsAfterRetry = cold.repo.store.objectCount();
+    expect(objectsAfterRetry).toBe(objectsBeforeAdd + PATH_COUNT);
     assertRepositoryReadable(cold.repo);
 
     await coldGit.add({ paths: [], all: true });
-    expect(cold.repo.store.objectCount()).toBe(objectsAfterPartial);
+    expect(cold.repo.checkout.indexEntries()).toEqual(staged);
+    expect(cold.repo.store.objectCount()).toBe(objectsAfterRetry);
   });
 
-  it("retries a path soft reset after its first durable indexApply page", async () => {
+  it("rolls a path soft reset back after its first indexApply page, then retries", async () => {
     const workspace = await imported();
     workspace.repo.checkout.indexReplace(expectedIndex(workspace.repo, "topic"));
-    const main = expectedIndex(workspace.repo, "main");
-    const topic = expectedIndex(workspace.repo, "topic");
+    const topic = workspace.repo.checkout.indexEntries();
     workspace.storage.resetCounters();
     const restore = failAfterFirstIndexPage(workspace.storage);
     try {
@@ -197,10 +188,7 @@ describe("paged local restart conformance", () => {
 
     const cold = reopenTestRepository(workspace);
     expect(cold.worktree).not.toBe(workspace.worktree);
-    const partial = cold.repo.checkout.indexEntries();
-    expect(partial).toHaveLength(PATH_COUNT);
-    expect(countMatching(partial, main)).toBe(512);
-    expect(countMatching(partial, topic)).toBe(1);
+    expect(cold.repo.checkout.indexEntries()).toEqual(topic);
     assertRepositoryReadable(cold.repo);
 
     workspace.storage.resetCounters();
@@ -210,10 +198,10 @@ describe("paged local restart conformance", () => {
     assertRepositoryReadable(cold.repo);
   });
 
-  it("retries a bare reset after its first delete-and-indexReplace page", async () => {
+  it("rolls a bare reset back after its first delete-and-indexReplace page, then retries", async () => {
     const workspace = await imported();
     workspace.repo.checkout.indexReplace(expectedIndex(workspace.repo, "topic"));
-    const main = expectedIndex(workspace.repo, "main");
+    const topic = workspace.repo.checkout.indexEntries();
     workspace.storage.resetCounters();
     const restore = failAfterFirstIndexPage(workspace.storage);
     try {
@@ -225,9 +213,7 @@ describe("paged local restart conformance", () => {
 
     const cold = reopenTestRepository(workspace);
     expect(cold.worktree).not.toBe(workspace.worktree);
-    const partial = cold.repo.checkout.indexEntries();
-    expect(partial).toHaveLength(512);
-    expect(countMatching(partial, main)).toBe(512);
+    expect(cold.repo.checkout.indexEntries()).toEqual(topic);
     assertRepositoryReadable(cold.repo);
 
     workspace.storage.resetCounters();
