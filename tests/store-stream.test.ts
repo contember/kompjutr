@@ -285,9 +285,9 @@ describe("indexApply", () => {
       return statements;
     };
 
-    expect(measure(100)).toBe(2);
-    expect(measure(1_000)).toBe(4);
-    expect(measure(9_329)).toBe(38);
+    expect(measure(100)).toBe(4);
+    expect(measure(1_000)).toBe(6);
+    expect(measure(9_329)).toBe(40);
   });
 
   it("bounds UTF-8 JSON bindings even when flushEvery is larger", () => {
