@@ -2204,6 +2204,7 @@ describe("fetch", () => {
     const workspace = makeRepo("/work");
     try {
       await fetchInto(workspace.context, workspace.repo, {
+        remote: "origin",
         url: server.url,
         remoteRef: "topic",
         singleBranch: true,

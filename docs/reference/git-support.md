@@ -650,6 +650,11 @@ existing local tag. Auto-follow silently preserves an existing local tag, while
 `tags: true` and an explicitly selected tag reject a different local target
 with `ETAGFAIL` and publish no refs.
 
+Remote-tracking refs move only for a remote the fetched URL belongs to: its
+configured URL, or a named remote that has none yet. An explicit `url` that
+contradicts the configured URL publishes `FETCH_HEAD`, tags, and mapped
+destinations alone — no `refs/remotes/<remote>/` update, HEAD, or prune.
+
 Filtered fetch requires a configured remote whose current URL matches the
 requested URL. An unconfigured explicit URL, or a configured remote repointed
 after its first filtered fetch, fails with `EPROMISORREMOTE` before discovery.

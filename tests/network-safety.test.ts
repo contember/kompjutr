@@ -6,6 +6,7 @@ import {
   type GitPushOptions,
   type PushLeaseExpectation,
 } from "../src/git/index.js";
+import { openRepository } from "../src/git/ops/context.js";
 import {
   fetchHttpClient,
   type GitHttpClient,
@@ -231,6 +232,45 @@ describe("native network safety", () => {
     } finally {
       await server.close();
       fixture.dispose();
+    }
+  });
+
+  it("keeps an explicit-URL fetch and pull out of the configured tracking namespace", async () => {
+    const origin = new GitFixture().init();
+    origin.write("origin.txt", "origin\n");
+    const originTip = origin.commit("origin base");
+    const originServer = await startGitServer(origin.dir);
+    // A second repository that shares the origin history, so pull can still integrate it.
+    const other = new GitFixture();
+    other.git("clone", "-q", origin.dir, ".");
+    other.write("other.txt", "other\n");
+    const otherTip = other.commit("other tip");
+    const otherServer = await startGitServer(other.dir);
+    const workspace = makeWorkspace();
+    const git = gitFor(workspace, fetchHttpClient);
+
+    try {
+      await git.clone({ url: originServer.url, dir: "/work", depth: 0 });
+      const repo = openRepository(workspace.context, "/work");
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(originTip);
+
+      const fetched = await git.fetch({ dir: "/work", url: otherServer.url });
+      expect(fetched.fetchHead).toBe(otherTip);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(originTip);
+      expect(repo.store.getRef("refs/remotes/origin/HEAD")).toBe("ref: refs/remotes/origin/main");
+      expect(repo.store.configGet("remote.origin.url")).toBe(originServer.url);
+
+      await git.pull({ dir: "/work", url: otherServer.url });
+      expect(repo.head().oid).toBe(otherTip);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(originTip);
+
+      await git.fetch({ dir: "/work", remote: "origin" });
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(originTip);
+    } finally {
+      await otherServer.close();
+      await originServer.close();
+      other.dispose();
+      origin.dispose();
     }
   });
 });

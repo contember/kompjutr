@@ -781,13 +781,32 @@ function validateFetchCredentials(credentials: GitAuth | undefined): void {
   validateFetchHeaders(credentials.headers, "EAUTH");
 }
 
-function fetchRemoteUrl(
-  repo: Repository,
-  options: FetchOperationOptions,
-): { readonly remote: string; readonly url: string } {
+/** A URL stored for a remote that is not an HTTP remote can never be this fetch's target. */
+function sameRemoteUrl(configured: string, url: string): boolean {
+  try {
+    return normalizeRemoteUrl(configured) === normalizeRemoteUrl(url);
+  } catch {
+    return false;
+  }
+}
+
+interface FetchTarget {
+  readonly remote: string;
+  readonly url: string;
+  /** Whether the fetched URL owns `refs/remotes/<remote>/`, as `pushTarget` decides for push. */
+  readonly configured: boolean;
+}
+
+function fetchRemoteUrl(repo: Repository, options: FetchOperationOptions): FetchTarget {
   if (options.url !== undefined) {
     if (typeof options.url !== "string") throw new GitError("EINVAL", "fetch url must be a string");
-    return { remote: options.remote ?? "origin", url: options.url };
+    const remote = options.remote ?? "origin";
+    const existing = remoteUrlFor(repo, remote);
+    // A public fetch names only a URL, and an arbitrary repository owns no tracking
+    // namespace. Naming the remote too is internal: it pins a name that is still unset.
+    const configured =
+      existing === undefined ? options.remote !== undefined : sameRemoteUrl(existing, options.url);
+    return { remote, url: options.url, configured };
   }
   if (
     options.remote !== undefined &&
@@ -798,7 +817,7 @@ function fetchRemoteUrl(
   const remote = options.remote ?? "origin";
   const url = remoteUrlFor(repo, remote);
   if (url === undefined) throw new GitError("ENOREMOTE", `no such remote: ${remote}`);
-  return { remote, url };
+  return { remote, url, configured: true };
 }
 
 function recordPartialFetch(repo: Repository, remote: string, url: string, packId: number): void {
@@ -1227,7 +1246,8 @@ export async function fetchInto(
   const compiler = isMappedFetchOptions(options)
     ? compileFetchRefspecs(options.refspecs)
     : undefined;
-  const { remote, url } = fetchRemoteUrl(repo, options);
+  const target = fetchRemoteUrl(repo, options);
+  const { remote, url } = target;
   if (options.filter !== undefined) requirePartialFetchTarget(repo, remote, url);
   const auth = fetchAuth(context, options);
   await runFetchCheckpoint(behavior.checkpoint, "before-discovery", options.signal);
@@ -1254,8 +1274,7 @@ export async function fetchInto(
     options,
     behavior,
     refLogReason,
-    remote,
-    url,
+    target,
     advertisement,
     auth,
   );
@@ -1358,11 +1377,11 @@ async function prepareLegacyFetchPublication(
   repo: Repository,
   options: FetchOperationOptions & LegacyFetchSelection,
   behavior: FetchBehavior,
-  remote: string,
-  url: string,
+  target: FetchTarget,
   advertisement: Advertisement,
   auth: NonNullable<Parameters<typeof uploadPack>[1]>,
 ): Promise<PreparedLegacyFetchPublication> {
+  const { remote, url } = target;
   const defaultBranch = advertisement.headRef;
   const requestedRef = options.remoteRef ?? options.ref;
   const coverageRef = behavior.coverageRef ?? requestedRef;
@@ -1489,16 +1508,18 @@ async function prepareLegacyFetchPublication(
       authenticateShallowTransition(repo, publication.shallow, proposedShallow, commitRoots);
     }
     const shallow = shallowMutation(publication.shallow, proposedShallow);
-    const publishedRefs = selection.coverage.filter((ref) => !ref.name.startsWith("refs/tags/"));
-
-    const trackingPuts = publishedRefs
-      .filter((ref) => ref.name.startsWith("refs/heads/"))
-      .map((ref) => ({
-        name: `${trackingPrefix}${ref.name.slice("refs/heads/".length)}`,
-        target: ref.oid,
-      }));
+    // Only the configured remote owns its tracking namespace; an explicit URL publishes
+    // FETCH_HEAD and tags alone, as an explicit push URL reconciles nothing.
+    const trackingPuts = target.configured
+      ? selection.coverage
+          .filter((ref) => ref.name.startsWith("refs/heads/"))
+          .map((ref) => ({
+            name: `${trackingPrefix}${ref.name.slice("refs/heads/".length)}`,
+            target: ref.oid,
+          }))
+      : [];
     const trackingKeep =
-      options.prune === true
+      target.configured && options.prune === true
         ? advertisement.refs
             .filter((ref) => ref.name.startsWith("refs/heads/"))
             .map((ref) => `${trackingPrefix}${ref.name.slice("refs/heads/".length)}`)
@@ -1507,19 +1528,21 @@ async function prepareLegacyFetchPublication(
     const keptTracking = new Set(trackingKeep ?? retainedTracking);
     const updatedTracking = new Set(trackingPuts.map((ref) => ref.name));
     let remoteHead: string | null | undefined;
-    const headRef = advertisement.headRef ?? "";
-    if (headRef.startsWith("refs/heads/")) {
-      const tracking = `${trackingPrefix}${headRef.slice("refs/heads/".length)}`;
-      const retained =
-        retainedTracking.has(tracking) &&
-        (trackingKeep === undefined || keptTracking.has(tracking));
-      if (updatedTracking.has(tracking) || retained) {
-        remoteHead = `ref: ${tracking}`;
+    if (target.configured) {
+      const headRef = advertisement.headRef ?? "";
+      if (headRef.startsWith("refs/heads/")) {
+        const tracking = `${trackingPrefix}${headRef.slice("refs/heads/".length)}`;
+        const retained =
+          retainedTracking.has(tracking) &&
+          (trackingKeep === undefined || keptTracking.has(tracking));
+        if (updatedTracking.has(tracking) || retained) {
+          remoteHead = `ref: ${tracking}`;
+        } else if (options.prune === true) {
+          remoteHead = null;
+        }
       } else if (options.prune === true) {
         remoteHead = null;
       }
-    } else if (options.prune === true) {
-      remoteHead = null;
     }
     await runFetchCheckpoint(behavior.checkpoint, "before-ref-publication", options.signal);
     const updates: [] = [];
@@ -1553,8 +1576,7 @@ async function fetchLegacyInto(
   options: FetchOperationOptions & LegacyFetchSelection,
   behavior: FetchBehavior,
   refLogReason: "fetch" | "clone: fetch",
-  remote: string,
-  url: string,
+  target: FetchTarget,
   advertisement: Advertisement,
   auth: NonNullable<Parameters<typeof uploadPack>[1]>,
 ): Promise<FetchResult> {
@@ -1563,8 +1585,7 @@ async function fetchLegacyInto(
     repo,
     options,
     behavior,
-    remote,
-    url,
+    target,
     advertisement,
     auth,
   );
