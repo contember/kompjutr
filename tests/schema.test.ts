@@ -437,6 +437,14 @@ function schemaDefinitions(db: TestDatabase): SchemaDefinition[] {
   );
 }
 
+function fsSchemaDefinitions(db: TestDatabase): SchemaDefinition[] {
+  return db.all<SchemaDefinition>(
+    `SELECT type, name, sql FROM sqlite_schema
+      WHERE substr(name, 1, 3) COLLATE NOCASE = 'fs_'
+      ORDER BY name COLLATE BINARY`,
+  );
+}
+
 function columnsOf(db: TestDatabase, table: string): string[] {
   return db.all<{ name: string }>(`PRAGMA table_info(${table})`).map((row) => row.name);
 }
@@ -459,10 +467,15 @@ function cascadeForeignKeysOf(
 }
 
 class FailVersionWriteDatabase implements SqlDatabase {
-  constructor(private readonly inner: TestDatabase) {}
+  constructor(
+    private readonly inner: TestDatabase,
+    private readonly versionTable = "git_meta",
+  ) {}
 
   run(query: string, ...bindings: unknown[]): void {
-    if (query.startsWith("INSERT INTO git_meta")) throw new Error("injected version failure");
+    if (query.startsWith(`INSERT INTO ${this.versionTable}`)) {
+      throw new Error("injected version failure");
+    }
     this.inner.run(query, ...bindings);
   }
 
@@ -991,6 +1004,180 @@ describe("fs schema", () => {
     expect(db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'next_inode'")).toBe(ROOT_INODE + 1);
   });
 
+  it("keeps version one only when every filesystem schema object is exact", () => {
+    const db = new TestDatabase();
+    initializeFsSchema(db, () => 1234);
+    const before = fsSchemaDefinitions(db);
+
+    expect(db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'schema_version'")).toBe(1);
+    expect(before.map(({ type, name }) => ({ type, name }))).toEqual([
+      { type: "table", name: "fs_chunks" },
+      { type: "table", name: "fs_meta" },
+      { type: "table", name: "fs_nodes" },
+      { type: "table", name: "fs_paths" },
+      { type: "index", name: "fs_paths_by_inode" },
+      { type: "index", name: "fs_paths_by_parent" },
+    ]);
+
+    initializeFsSchema(db, () => 9999);
+    expect(fsSchemaDefinitions(db)).toEqual(before);
+
+    db.run("CREATE INDEX fs_unexpected ON fs_nodes (mtime)");
+    expect(() => initializeFsSchema(db)).toThrow(/unexpected object fs_unexpected/);
+  });
+
+  it("rejects a partial filesystem schema without changing it", () => {
+    const current = new TestDatabase();
+    initializeFsSchema(current);
+    const currentMeta = current.scalar<string>(
+      "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'fs_meta'",
+    );
+    if (currentMeta === undefined) throw new Error("current fs_meta definition is missing");
+
+    const db = new TestDatabase();
+    db.run(currentMeta);
+    db.run("INSERT INTO fs_meta (k, v) VALUES ('schema_version', 1)");
+    const before = fsSchemaDefinitions(db);
+
+    expect(() => initializeFsSchema(db)).toThrow(/missing required table fs_nodes/);
+    expect(fsSchemaDefinitions(db)).toEqual(before);
+  });
+
+  it("rejects an over-bound filesystem schema definition without retaining its SQL", () => {
+    const db = new TestDatabase();
+    const columns = Array.from({ length: 400 }, (_, index) => `column_${index} TEXT`).join(", ");
+    db.run(`CREATE TABLE fs_meta (${columns})`);
+    const before = db.scalar<string>(
+      "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'fs_meta'",
+    );
+    db.storage.resetCounters();
+
+    expect(() => initializeFsSchema(db)).toThrow(/schema object exceeds its read bound/);
+    const initializationStatements = db.storage.statementCount;
+
+    expect(initializationStatements).toBe(1);
+    expect(
+      db.scalar<string>("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'fs_meta'"),
+    ).toBe(before);
+  });
+
+  it("rolls a late filesystem version-write failure back to an empty database", () => {
+    const inner = new TestDatabase();
+    const db = new FailVersionWriteDatabase(inner, "fs_meta");
+
+    expect(() => initializeFsSchema(db)).toThrow(/injected version failure/);
+
+    expect(fsSchemaDefinitions(inner)).toEqual([]);
+  });
+
+  it("rejects the former unconstrained version-one shape before changing it", () => {
+    const current = new TestDatabase();
+    initializeFsSchema(current);
+    const currentMeta = current.scalar<string>(
+      "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'fs_meta'",
+    );
+    if (currentMeta === undefined) throw new Error("current fs_meta definition is missing");
+
+    const db = new TestDatabase();
+    const former = [
+      currentMeta,
+      `CREATE TABLE fs_nodes (
+         inode INTEGER PRIMARY KEY,
+         type TEXT NOT NULL CHECK(type IN ('file','dir','symlink')),
+         mode INTEGER NOT NULL DEFAULT 420,
+         mtime INTEGER NOT NULL,
+         size INTEGER NOT NULL DEFAULT 0,
+         rev INTEGER NOT NULL DEFAULT 0,
+         nlink INTEGER NOT NULL DEFAULT 1,
+         link_target TEXT,
+         content_id BLOB
+       )`,
+      `CREATE TABLE fs_paths (
+         path TEXT NOT NULL PRIMARY KEY,
+         parent TEXT NOT NULL,
+         inode INTEGER NOT NULL
+       ) WITHOUT ROWID`,
+      "CREATE INDEX fs_paths_by_parent ON fs_paths(parent, path)",
+      "CREATE INDEX fs_paths_by_inode ON fs_paths(inode)",
+      `CREATE TABLE fs_chunks (
+         inode INTEGER NOT NULL,
+         idx INTEGER NOT NULL,
+         bytes BLOB NOT NULL,
+         PRIMARY KEY (inode, idx)
+       )`,
+    ];
+    for (const statement of former) db.run(statement);
+    db.run("INSERT INTO fs_meta (k, v) VALUES ('schema_version', 1), ('rev', 17)");
+    const before = fsSchemaDefinitions(db);
+
+    expect(() => initializeFsSchema(db)).toThrow(/fs_nodes does not match its current definition/);
+    expect(fsSchemaDefinitions(db)).toEqual(before);
+    expect(db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'rev'")).toBe(17);
+  });
+
+  it("rejects malformed sparse-read fields at the DDL write boundary", () => {
+    const db = new TestDatabase();
+    initializeFsSchema(db, () => 1234);
+    db.run(
+      `INSERT INTO fs_nodes (inode, type, mode, mtime, size, rev, nlink)
+       VALUES (2, 'file', 420, -1, 0, 0, 1)`,
+    );
+    db.run("INSERT INTO fs_paths (path, parent, inode) VALUES ('/a', '/', 2)");
+    db.run(
+      `INSERT INTO fs_nodes
+         (inode, type, mode, mtime, size, rev, nlink, link_target, content_id)
+       VALUES (3, 'symlink', 511, 0, 1, 0, 1, 'x', x'01')`,
+    );
+
+    const invalidNodeUpdates = [
+      "UPDATE fs_nodes SET inode = 0 WHERE inode = 2",
+      "UPDATE fs_nodes SET inode = 0.5 WHERE inode = 2",
+      "UPDATE fs_nodes SET type = 'socket' WHERE inode = 2",
+      "UPDATE fs_nodes SET type = zeroblob(1) WHERE inode = 2",
+      "UPDATE fs_nodes SET mode = -1 WHERE inode = 2",
+      "UPDATE fs_nodes SET mode = 4096 WHERE inode = 2",
+      "UPDATE fs_nodes SET mode = 0.5 WHERE inode = 2",
+      "UPDATE fs_nodes SET mtime = 0.5 WHERE inode = 2",
+      "UPDATE fs_nodes SET mtime = 9007199254740992 WHERE inode = 2",
+      "UPDATE fs_nodes SET size = -1 WHERE inode = 2",
+      "UPDATE fs_nodes SET size = 0.5 WHERE inode = 2",
+      "UPDATE fs_nodes SET rev = -1 WHERE inode = 2",
+      "UPDATE fs_nodes SET rev = 0.5 WHERE inode = 2",
+      "UPDATE fs_nodes SET nlink = 0 WHERE inode = 2",
+      "UPDATE fs_nodes SET nlink = 0.5 WHERE inode = 2",
+      "UPDATE fs_nodes SET link_target = 'x' WHERE inode = 2",
+      "UPDATE fs_nodes SET content_id = 'text' WHERE inode = 2",
+      `UPDATE fs_nodes SET size = 1 WHERE inode = ${ROOT_INODE}`,
+      `UPDATE fs_nodes SET content_id = x'01' WHERE inode = ${ROOT_INODE}`,
+      "UPDATE fs_nodes SET link_target = NULL WHERE inode = 3",
+      "UPDATE fs_nodes SET size = 2 WHERE inode = 3",
+      "UPDATE fs_nodes SET content_id = 'text' WHERE inode = 3",
+    ];
+    for (const update of invalidNodeUpdates) {
+      expect(() => db.run(update), update).toThrow(/CHECK|datatype mismatch/);
+    }
+
+    const invalidPathUpdates = [
+      "UPDATE fs_paths SET path = 'a' WHERE path = '/a'",
+      "UPDATE fs_paths SET path = '/a/' WHERE path = '/a'",
+      "UPDATE fs_paths SET path = '/a//b' WHERE path = '/a'",
+      "UPDATE fs_paths SET path = '/a/./b' WHERE path = '/a'",
+      "UPDATE fs_paths SET path = '/a/../b' WHERE path = '/a'",
+      "UPDATE fs_paths SET path = '/a' || char(0) || 'b' WHERE path = '/a'",
+      "UPDATE fs_paths SET path = zeroblob(2) WHERE path = '/a'",
+      "UPDATE fs_paths SET parent = '' WHERE path = '/a'",
+      "UPDATE fs_paths SET parent = '/wrong' WHERE path = '/a'",
+      "UPDATE fs_paths SET parent = zeroblob(1) WHERE path = '/a'",
+      "UPDATE fs_paths SET inode = 0 WHERE path = '/a'",
+      "UPDATE fs_paths SET inode = 0.5 WHERE path = '/a'",
+      "UPDATE fs_paths SET parent = '/' WHERE path = '/'",
+      `UPDATE fs_paths SET inode = 2 WHERE path = '/'`,
+    ];
+    for (const update of invalidPathUpdates) {
+      expect(() => db.run(update), update).toThrow(/CHECK/);
+    }
+  });
+
   it("does not re-seed or reset the revision on a second run", () => {
     const db = new TestDatabase();
     initializeFsSchema(db, () => 1);
@@ -1007,8 +1194,15 @@ describe("fs schema", () => {
   it("keeps fs_paths in BINARY path order", () => {
     const db = new TestDatabase();
     initializeFsSchema(db);
-    for (const path of ["/a/x", "/a.txt", "/a", "/b", "/a/y"]) {
-      db.run("INSERT INTO fs_paths (path, parent, inode) VALUES (?, '', 0)", path);
+    const rows = [
+      { path: "/a", parent: "/", inode: 2 },
+      { path: "/a/x", parent: "/a", inode: 3 },
+      { path: "/a.txt", parent: "/", inode: 4 },
+      { path: "/b", parent: "/", inode: 5 },
+      { path: "/a/y", parent: "/a", inode: 6 },
+    ];
+    for (const { path, parent, inode } of rows) {
+      db.run("INSERT INTO fs_paths (path, parent, inode) VALUES (?, ?, ?)", path, parent, inode);
     }
 
     expect(

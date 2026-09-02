@@ -4,7 +4,7 @@
 
 import { blob, type SqlDatabase } from "../../db/db.js";
 import { filesystemError } from "../errors.js";
-import { comparePaths } from "../path.js";
+import { comparePaths, dirname } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 
 const DEFAULT_FILE_MODE = 0o644;
@@ -462,7 +462,15 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
       );
     }
     if (!this.rootExists && this.#created === 0) {
-      this.#createPrepared(this.root, "/", "dir", DEFAULT_DIR_MODE, 0, null, null);
+      this.#createPrepared(
+        this.root,
+        this.root === "/" ? "" : dirname(this.root),
+        "dir",
+        DEFAULT_DIR_MODE,
+        0,
+        null,
+        null,
+      );
     }
 
     const segments = relative.split("/");

@@ -14,6 +14,8 @@ import { readBlob, type SqlDatabase } from "../../src/db/db.js";
 import { comparePaths } from "../../src/fs/path.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import { currentRev } from "../../src/fs/store/meta.js";
+import { realpath } from "../../src/fs/store/resolve.js";
+import { writeFileStream } from "../../src/fs/store/stream-write.js";
 import { makeDirectories, writeFiles } from "../../src/fs/store/write.js";
 import type { WriteEntry } from "../../src/fs/types.js";
 import { TestDatabase } from "../helpers/db.js";
@@ -192,6 +194,7 @@ function mixedFixture(count: number): WriteEntry[] {
       path: "/repo/odkaz-na-kůň",
       target: "/repo/kůň/nested/file-2.txt",
       mtime: 1_700_000_000_003,
+      contentId: contentId(998),
     },
     { path: "/repo/hluboký/vnořený/adresář", mode: 0o750, mtime: 1_700_000_000_004 },
     {
@@ -308,6 +311,34 @@ describe("writeFiles — round-trip parity", () => {
       if (row.path === "/") continue;
       expect(row.rev, row.path).toBe(after);
     }
+  });
+
+  it("accepts a streamed file through the constrained node and path envelope", () => {
+    const db = setup();
+    const path = realpath(db, "/streamed.bin");
+
+    writeFileStream(
+      db,
+      path,
+      [new Uint8Array(CHUNK_SIZE).fill(1), new Uint8Array([2, 3])],
+      false,
+      1_700_000_000_010,
+    );
+
+    expect(rowAt(db, path)).toMatchObject({
+      parent: "/",
+      type: "file",
+      mode: 0o644,
+      mtime: 1_700_000_000_010,
+      size: CHUNK_SIZE + 2,
+      nlink: 1,
+      link_target: null,
+      content_id: null,
+    });
+    const bytes = bytesAt(db, path);
+    expect(bytes.length).toBe(CHUNK_SIZE + 2);
+    expect(bytes.subarray(0, CHUNK_SIZE).every((byte) => byte === 1)).toBe(true);
+    expect([...bytes.subarray(CHUNK_SIZE)]).toEqual([2, 3]);
   });
 });
 

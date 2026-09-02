@@ -24,10 +24,11 @@ function setup(specs: readonly Spec[]): TestDatabase {
     db.run(
       `INSERT INTO fs_nodes
          (inode, type, mode, mtime, size, rev, nlink, link_target)
-       VALUES (?, ?, ?, 0, 0, 0, 1, ?)`,
+       VALUES (?, ?, ?, 0, ?, 0, 1, ?)`,
       first + index,
       type,
       type === "dir" ? 0o755 : type === "symlink" ? 0o777 : 0o644,
+      new TextEncoder().encode(spec.target ?? "").length,
       spec.target ?? null,
     );
     db.run(

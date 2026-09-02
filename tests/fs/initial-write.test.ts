@@ -178,6 +178,19 @@ describe("InitialWorktreeWriter", () => {
     expect(entryAt(absent, "/repo/link")?.mode).toBe(0o777);
   });
 
+  it("uses the immediate parent for an absent nested root", () => {
+    const db = setup();
+    writeFiles(db, [{ path: "/work" }], {}, () => 200);
+
+    const result = createInitialWorktreeWriter(db, () => 500).tryRun("/work/repo", (session) => {
+      session.writeFile("readme.txt", new Uint8Array([1, 2, 3]));
+    });
+
+    expect(result).toEqual({ kind: "committed", value: undefined });
+    expect(entryAt(db, "/work/repo")?.parent).toBe("/work");
+    expect(bytesAt(db, "/work/repo/readme.txt")).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
   it("owns content ids and accepts the former 1 MiB first excess", () => {
     const accepted = setup();
     const contentId = new Uint8Array([1, 2, 3, 4]);
