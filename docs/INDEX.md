@@ -16,7 +16,9 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprints/sprint-2026-09-02-git-correctness-and-scale.md`](sprints/sprint-2026-09-02-git-correctness-and-scale.md)
+  - wrong-result fixes, live cache correctness, reflog scan removal, and the
+  repository-wide tree-object cap.
 
 ## Specs
 
