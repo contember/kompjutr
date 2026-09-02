@@ -605,7 +605,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return repoRootOp(context, input);
     },
     async maintenance(input = {}) {
-      return mutate(() => maintenanceOp(context, at(input.dir)));
+      return maintenanceOp(context, at(input.dir));
     },
     async currentBranch(input = {}) {
       return currentBranchOp(at(input.dir), input);

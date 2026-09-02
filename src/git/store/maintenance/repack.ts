@@ -3,6 +3,7 @@ import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import type { ObjectType, RawObject } from "../../common/objects.js";
 import type { SharedRepoStore } from "../index.js";
+import { withGitMutationGuard } from "../mutation-guard.js";
 import {
   type FullObjectPackInput,
   type FullObjectPackReader,
@@ -58,6 +59,22 @@ interface RepackBatch {
   inflatedBytes: number;
   storedBytes: number;
   objects: FullObjectPackInput[];
+}
+type RunMutationPhase = <T>(body: () => T) => T;
+
+type RepackLocalStep =
+  | {
+      kind: "complete";
+      progress: MaintenanceRepackProgress;
+      revalidateStorage: boolean;
+    }
+  | { kind: "publish"; run: RepackRun; batch: RepackBatch };
+
+function completed(
+  progress: MaintenanceRepackProgress,
+  revalidateStorage = false,
+): RepackLocalStep {
+  return { kind: "complete", progress, revalidateStorage };
 }
 
 interface LooseCandidate extends FullObjectPackInput {
@@ -625,6 +642,7 @@ async function publishBatch(
   selectedLimits: RepackLimits,
   options: MaintenanceRepackOptions,
   nowMs: number,
+  runMutation: RunMutationPhase,
 ): Promise<MaintenanceRepackProgress> {
   requireRepackedCapacity(run, batch.objectCount);
   const reader = new RepackReader(store, selectedLimits.readBatchBytes);
@@ -635,40 +653,58 @@ async function publishBatch(
     readBatchBytes: selectedLimits.readBatchBytes,
     allowOversizedObject: true,
   });
+  const yieldNow = options.yieldNow;
+  const guardedYieldNow =
+    yieldNow === undefined
+      ? undefined
+      : (): Promise<void> => {
+          let yielded: Promise<void> | undefined;
+          runMutation(() => {
+            yielded = yieldNow();
+          });
+          if (yielded === undefined) {
+            throw new CorruptError("maintenance yield callback did not return a promise");
+          }
+          return yielded;
+        };
   let result: PackIngestResult;
   try {
     result = await store.packs.ingest(source, {
       maxBytes: selectedLimits.maxStoredBytes,
       reclaimPending: false,
       now: () => nowMs,
-      yieldNow: options.yieldNow,
+      yieldNow: guardedYieldNow,
       lifecycle: {
         reserved: (packId) => {
-          updateOwnedState(store.db, store.repoId, run, batch, "selected", "pending", packId, 0);
+          runMutation(() =>
+            updateOwnedState(store.db, store.repoId, run, batch, "selected", "pending", packId, 0),
+          );
         },
         published: (published) => {
-          if (
-            published.count !== batch.objectCount ||
-            published.bytes < 1 ||
-            published.bytes > selectedLimits.maxStoredBytes
-          ) {
-            throw new CorruptError("maintenance repack publication returned invalid bounds");
-          }
-          updateOwnedState(
-            store.db,
-            store.repoId,
-            run,
-            batch,
-            "pending",
-            "published",
-            published.packId,
-            published.bytes,
-          );
+          runMutation(() => {
+            if (
+              published.count !== batch.objectCount ||
+              published.bytes < 1 ||
+              published.bytes > selectedLimits.maxStoredBytes
+            ) {
+              throw new CorruptError("maintenance repack publication returned invalid bounds");
+            }
+            updateOwnedState(
+              store.db,
+              store.repoId,
+              run,
+              batch,
+              "pending",
+              "published",
+              published.packId,
+              published.bytes,
+            );
+          });
         },
       },
     });
   } catch (error) {
-    if (currentRootEpoch(store.db, store.repoId) !== run.observedRootEpoch) {
+    if (runMutation(() => currentRootEpoch(store.db, store.repoId)) !== run.observedRootEpoch) {
       return rootChanged(run.runId);
     }
     throw error;
@@ -1112,7 +1148,6 @@ function finalizePublished(
       releaseBatchRow(store.db, store.repoId, run.runId, batch, "published", packId);
     }
   });
-  store.revalidateStorageCaches();
   return {
     runId: run.runId,
     status: "progress",
@@ -1145,7 +1180,6 @@ function finalizeShadows(
     verifyFinalizedSources(store.db, store.repoId, finalized);
     incrementRepacked(store.db, store.repoId, run, finalized.length);
   });
-  store.revalidateStorageCaches();
   return {
     runId: run.runId,
     status: "progress",
@@ -1171,7 +1205,6 @@ function finalizeSelectedShadows(
     incrementRepacked(store.db, store.repoId, run, shadows.length);
     releaseBatchRow(store.db, store.repoId, run.runId, batch, "selected", null);
   });
-  store.revalidateStorageCaches();
   return {
     runId: run.runId,
     status: "progress",
@@ -1291,6 +1324,55 @@ export function settleMaintenanceRepackForRestart(
   });
 }
 
+function advanceMaintenanceRepackLocal(
+  store: SharedRepoStore,
+  selectedLimits: RepackLimits,
+): RepackLocalStep {
+  const run = readRun(store.db, store.repoId);
+  if (run.observedRootEpoch !== run.rootEpoch) {
+    return completed(rootChanged(run.runId));
+  }
+  const batch = readBatch(store.db, store.repoId, run.runId);
+  if (batch !== null) requireRepackedCapacity(run, batch.objectCount);
+  if (batch?.state === "pending") return completed(recoverPending(store, run, batch));
+  if (batch?.state === "published") {
+    return completed(finalizePublished(store, run, batch), true);
+  }
+  if (batch?.state === "selected") {
+    const shadows = selectedBatchShadows(store.db, store.repoId, run.runId, batch);
+    if (shadows.length > 0) {
+      return completed(finalizeSelectedShadows(store, run, batch, shadows), true);
+    }
+    return { kind: "publish", run, batch };
+  }
+
+  const selected = selectCandidates(store.db, store.repoId, run, selectedLimits);
+  if (selected.objects.length === 0) {
+    transitionToClassifyPacks(store.db, store.repoId, run);
+    return completed({
+      runId: run.runId,
+      status: "complete",
+      boundary: null,
+      batchId: null,
+      packId: null,
+      objectCount: 0,
+    });
+  }
+  requireRepackedCapacity(run, selected.objects.length);
+  if (selected.shadows) {
+    return completed(finalizeShadows(store, run, selected.objects), true);
+  }
+  const created = createBatch(store.db, store.repoId, run, selected.objects);
+  return completed({
+    runId: run.runId,
+    status: "progress",
+    boundary: "selected",
+    batchId: created.batchId,
+    packId: null,
+    objectCount: created.objectCount,
+  });
+}
+
 /** Advance one bounded durable repack boundary for the active repository run. */
 export async function advanceMaintenanceRepack(
   store: SharedRepoStore,
@@ -1304,41 +1386,11 @@ export async function advanceMaintenanceRepack(
     throw new RangeError("maintenance repack clock must be a non-negative safe integer");
   }
   const selectedLimits = limits(options);
-  const run = readRun(store.db, store.repoId);
-  if (run.observedRootEpoch !== run.rootEpoch) {
-    return rootChanged(run.runId);
+  const runMutation: RunMutationPhase = (body) => withGitMutationGuard(store.db, body);
+  const step = runMutation(() => advanceMaintenanceRepackLocal(store, selectedLimits));
+  if (step.kind === "complete") {
+    if (step.revalidateStorage) store.revalidateStorageCaches();
+    return step.progress;
   }
-  const batch = readBatch(store.db, store.repoId, run.runId);
-  if (batch !== null) requireRepackedCapacity(run, batch.objectCount);
-  if (batch?.state === "pending") return recoverPending(store, run, batch);
-  if (batch?.state === "published") return finalizePublished(store, run, batch);
-  if (batch?.state === "selected") {
-    const shadows = selectedBatchShadows(store.db, store.repoId, run.runId, batch);
-    if (shadows.length > 0) return finalizeSelectedShadows(store, run, batch, shadows);
-    return publishBatch(store, run, batch, selectedLimits, options, nowMs);
-  }
-
-  const selected = selectCandidates(store.db, store.repoId, run, selectedLimits);
-  if (selected.objects.length === 0) {
-    transitionToClassifyPacks(store.db, store.repoId, run);
-    return {
-      runId: run.runId,
-      status: "complete",
-      boundary: null,
-      batchId: null,
-      packId: null,
-      objectCount: 0,
-    };
-  }
-  requireRepackedCapacity(run, selected.objects.length);
-  if (selected.shadows) return finalizeShadows(store, run, selected.objects);
-  const created = createBatch(store.db, store.repoId, run, selected.objects);
-  return {
-    runId: run.runId,
-    status: "progress",
-    boundary: "selected",
-    batchId: created.batchId,
-    packId: null,
-    objectCount: created.objectCount,
-  };
+  return publishBatch(store, step.run, step.batch, selectedLimits, options, nowMs, runMutation);
 }

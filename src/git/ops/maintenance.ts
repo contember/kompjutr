@@ -13,6 +13,7 @@ import {
   rolloverFinishedMaintenanceRun,
 } from "../store/maintenance/state.js";
 import { advanceMaintenanceSweep } from "../store/maintenance/sweep.js";
+import { withGitMutationGuard } from "../store/mutation-guard.js";
 import type { GitContext } from "./context.js";
 import type { Repository } from "./repository.js";
 
@@ -79,15 +80,11 @@ function durableResult(repo: Repository): MaintenanceResult {
   return result(view);
 }
 
-/** Advance one bounded durable maintenance action. */
-export async function maintenance(
+function advanceSynchronousMaintenance(
   context: GitContext,
   repo: Repository,
-): Promise<MaintenanceResult> {
-  const nowMs = context.now();
-  if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
-    throw new GitError("EINVAL", "maintenance clock must return non-negative integer milliseconds");
-  }
+  nowMs: number,
+): MaintenanceResult | null {
   const repoId = repo.store.repoId;
   const before = readMaintenanceRunView(repo.store.db, repoId);
   if (before === null) {
@@ -124,13 +121,31 @@ export async function maintenance(
   } else if (before.phase === "mark") {
     advanceMaintenanceMark(repo.store);
   } else if (before.phase === "repack") {
-    if (context.yieldNow === undefined) {
-      await advanceMaintenanceRepack(repo.store, { nowMs });
-    } else {
-      await advanceMaintenanceRepack(repo.store, { nowMs, yieldNow: context.yieldNow });
-    }
+    return null;
   } else {
     advanceMaintenanceSweep(repo.store, { nowMs });
   }
   return durableResult(repo);
+}
+
+/** Advance one bounded durable maintenance action. */
+export async function maintenance(
+  context: GitContext,
+  repo: Repository,
+): Promise<MaintenanceResult> {
+  const nowMs = context.now();
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+    throw new GitError("EINVAL", "maintenance clock must return non-negative integer milliseconds");
+  }
+  const immediate = withGitMutationGuard(repo.checkout.db, () =>
+    advanceSynchronousMaintenance(context, repo, nowMs),
+  );
+  if (immediate !== null) return immediate;
+
+  if (context.yieldNow === undefined) {
+    await advanceMaintenanceRepack(repo.store, { nowMs });
+  } else {
+    await advanceMaintenanceRepack(repo.store, { nowMs, yieldNow: context.yieldNow });
+  }
+  return withGitMutationGuard(repo.checkout.db, () => durableResult(repo));
 }

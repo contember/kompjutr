@@ -431,10 +431,17 @@ describe("maintenance repack", () => {
     });
 
     let yields = 0;
+    let reentryAttempts = 0;
     const barrier = checkpointBarrier<number>("maintenance pack reserved", (value) => value === 1);
     const publishing = advanceMaintenanceRepack(store.shared, {
       nowMs: 1,
-      yieldNow: () => barrier.checkpoint(++yields),
+      yieldNow: () => {
+        reentryAttempts++;
+        expect(() => store.configSet("maintenance.yield-reentry", "blocked")).toThrowError(
+          expect.objectContaining({ code: "EREENTRANT" }),
+        );
+        return barrier.checkpoint(++yields);
+      },
     });
     await awaitBarrierEntry(barrier, publishing);
     const pendingPackId = db.scalar<number>(
@@ -455,6 +462,8 @@ describe("maintenance repack", () => {
       packId: pendingPackId,
       objectCount: 1,
     });
+    expect(reentryAttempts).toBeGreaterThan(0);
+    expect(store.configGet("maintenance.yield-reentry")).toBeUndefined();
 
     const reopened = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
     const reopenedCheckout = reopened.findCheckout("/repo");
