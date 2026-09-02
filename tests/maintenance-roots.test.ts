@@ -4,6 +4,8 @@ import { createFilesystem } from "../src/fs/filesystem.js";
 import { utf8 } from "../src/git/common/bytes.js";
 import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
 import type { MergeStateMetadata, MergeTouchedPath } from "../src/git/ops/merge-state.js";
+import type { CheckoutStore } from "../src/git/store/checkout.js";
+import type { CheckoutRow } from "../src/git/store/contracts.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
@@ -27,6 +29,12 @@ const PERSON = {
 };
 const EMPTY_TREE_BYTES = serializeTree([]);
 
+interface MaintenanceRootFixture {
+  db: TestDatabase;
+  database: SqliteGitDatabase;
+  checkout: CheckoutRow;
+  store: CheckoutStore;
+}
 function installRootRun(db: TestDatabase, repoId: number, source: MaintenanceRootSource): void {
   const rootEpoch = db.scalar<number>(
     "SELECT root_epoch FROM git_maintenance_control WHERE repo_id = ?",
@@ -62,7 +70,7 @@ function commitBytes(message: string, parent: string[] = []): Uint8Array {
   });
 }
 
-function open(now = NOW) {
+function open(now = NOW): MaintenanceRootFixture {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db, { now: () => now });
   const checkout = database.createRepository("/repo", "ref: refs/heads/main");
@@ -100,6 +108,14 @@ function hasRootSource(db: TestDatabase, repoId: number, oid: string, source: nu
   return mask !== undefined && (mask & source) === source;
 }
 
+function projectionCount(db: TestDatabase, fragment: string): number {
+  let count = 0;
+  for (const [query, calls] of db.storage.histogram ?? []) {
+    if (query.includes(fragment)) count += calls;
+  }
+  return count;
+}
+
 describe("maintenance roots", () => {
   it("keeps reservation ownership out of the public database method", () => {
     const { database } = open();
@@ -107,6 +123,115 @@ describe("maintenance roots", () => {
     expectTypeOf(database.advanceMaintenanceRootSnapshot)
       .parameter(1)
       .toEqualTypeOf<{ nowMs: number; pageRows?: number }>();
+  });
+
+  it("uses one retained SQL fingerprint for each bounded root-source projection", () => {
+    const expectSingleProjection = (
+      source: MaintenanceRootSource,
+      setup: (opened: MaintenanceRootFixture) => void,
+      fingerprint: string,
+    ): string => {
+      const opened = open();
+      setup(opened);
+      installRootRun(opened.db, opened.checkout.repoId, source);
+      opened.db.storage.histogram = new Map();
+      opened.db.storage.resetCounters();
+
+      opened.database.advanceMaintenanceRootSnapshot(opened.checkout.repoId, {
+        nowMs: NOW,
+        pageRows: 1,
+      });
+
+      const queries = [...(opened.db.storage.histogram?.keys() ?? [])].join("\n");
+      expect(projectionCount(opened.db, fingerprint)).toBe(1);
+      expect(queries).not.toContain("SELECT count(*) AS row_count");
+      return queries;
+    };
+
+    expectSingleProjection(
+      "refs",
+      ({ store }) => {
+        const oid = store.write("blob", utf8.encode("ref projection"));
+        store.setRef("refs/heads/main", oid);
+      },
+      "SELECT repo_id, name, target FROM git_refs",
+    );
+    expectSingleProjection(
+      "heads",
+      ({ store }) => {
+        store.setHead(store.write("blob", utf8.encode("HEAD projection")));
+      },
+      "SELECT id AS checkout_id, repo_id, head FROM git_checkouts",
+    );
+    expectSingleProjection(
+      "reflogs",
+      ({ store }) => {
+        const oid = store.write("blob", utf8.encode("reflog projection"));
+        store.setRef("refs/heads/main", oid);
+      },
+      "WITH direct_page AS MATERIALIZED ( SELECT 0 AS source_kind, entry.repo_id",
+    );
+    expectSingleProjection(
+      "index",
+      ({ store }) => {
+        store.indexPut({
+          path: "projection.txt",
+          stage: 0,
+          mode: 0o100644,
+          oid: store.write("blob", utf8.encode("index projection")),
+          size: null,
+          mtime: null,
+          ino: null,
+        });
+      },
+      "SELECT checkout.id AS checkout_id, checkout.repo_id, entry.path",
+    );
+    expectSingleProjection(
+      "index-baseline",
+      ({ db, checkout, store }) => {
+        const tree = store.write("tree", EMPTY_TREE_BYTES);
+        db.run(
+          `UPDATE git_index_state
+              SET baseline_tree_oid = ?, format = 1, complete = 1
+            WHERE checkout_id = ?`,
+          tree,
+          checkout.id,
+        );
+      },
+      "SELECT checkout.id AS checkout_id, checkout.repo_id, state.baseline_tree_oid",
+    );
+    expectSingleProjection(
+      "shallow",
+      ({ store }) => {
+        store.setShallow([store.write("commit", commitBytes("shallow projection"))]);
+      },
+      "SELECT repo_id, oid FROM git_shallow",
+    );
+    const operationQueries = expectSingleProjection(
+      "operations",
+      ({ store }) => {
+        const original = store.write("commit", commitBytes("operation original"));
+        const incoming = store.write("commit", commitBytes("operation incoming", [original]));
+        store.writeMergeState(
+          {
+            ...mergeMetadata(original, incoming),
+            phase: "ready",
+            mode: "no-commit",
+          },
+          [],
+        );
+      },
+      "SELECT oid, expected_type FROM ( SELECT original_head_oid AS oid",
+    );
+    expect(operationQueries).not.toContain(
+      "SELECT kind, original_head_ref, original_head_oid, phase",
+    );
+    expect(operationQueries).not.toContain(
+      "SELECT ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid",
+    );
+    expect(operationQueries).not.toContain(
+      "SELECT ordinal, path, logical_path, purpose, index_stage, index_mode, index_oid",
+    );
   });
 
   it("resumes index discovery from a path beyond the former local cursor ceiling", () => {
@@ -292,7 +417,7 @@ describe("maintenance roots", () => {
     const cutoff = Math.floor(NOW / 1_000) - 90 * 24 * 60 * 60;
     db.run(
       `WITH RECURSIVE sequence(ordinal) AS (
-         VALUES (1) UNION ALL SELECT ordinal + 1 FROM sequence WHERE ordinal < 8200
+         VALUES (1) UNION ALL SELECT ordinal + 1 FROM sequence WHERE ordinal < 8192
        )
        INSERT INTO git_reflog_entries
          (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
@@ -319,8 +444,8 @@ describe("maintenance roots", () => {
       `INSERT INTO git_reflog_entries
          (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
           actor_name, actor_email, timestamp, timezone, reason)
-       VALUES (?, 'refs/heads/expired', 8201, ?, ?, ?, ?, NULL, NULL, ?, 0, 'expired'),
-              (?, 'refs/heads/boundary', 8202, ?, ?, ?, ?, NULL, NULL, ?, 0, 'boundary')`,
+       VALUES (?, 'refs/heads/expired', 8193, ?, ?, ?, ?, NULL, NULL, ?, 0, 'expired'),
+              (?, 'refs/heads/boundary', 8194, ?, ?, ?, ?, NULL, NULL, ?, 0, 'boundary')`,
       checkout.repoId,
       left,
       expired,
@@ -334,7 +459,7 @@ describe("maintenance roots", () => {
       boundary,
       cutoff,
     );
-    db.run("UPDATE git_reflog_state SET next_ordinal = 8202 WHERE repo_id = ?", checkout.repoId);
+    db.run("UPDATE git_reflog_state SET next_ordinal = 8194 WHERE repo_id = ?", checkout.repoId);
 
     db.storage.resetCounters();
     let progress = database.advanceMaintenanceRootSnapshot(checkout.repoId, {
@@ -356,6 +481,60 @@ describe("maintenance roots", () => {
     expect(hasRootSource(db, checkout.repoId, right, 4)).toBe(true);
     expect(hasRootSource(db, checkout.repoId, boundary, 4)).toBe(true);
     expect(rootMask(db, checkout.repoId, expired)).toBeUndefined();
+  });
+
+  it("advances bounded reflog pages through expired rows before a retained endpoint", () => {
+    const { db, database, checkout, store } = open();
+    const expired = store.write("blob", utf8.encode("expired page"));
+    const boundary = store.write("blob", utf8.encode("retained page"));
+    const cutoff = Math.floor(NOW / 1_000) - 90 * 24 * 60 * 60;
+    db.run(
+      `INSERT INTO git_reflog_entries
+         (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+          actor_name, actor_email, timestamp, timezone, reason)
+       VALUES (?, 'refs/heads/main', 1, NULL, ?, NULL, ?, NULL, NULL, ?, 0, 'expired one'),
+              (?, 'refs/heads/main', 2, ?, NULL, ?, NULL, NULL, NULL, ?, 0, 'expired two'),
+              (?, 'refs/heads/main', 3, NULL, ?, NULL, ?, NULL, NULL, ?, 0, 'boundary')`,
+      checkout.repoId,
+      expired,
+      expired,
+      cutoff - 1,
+      checkout.repoId,
+      expired,
+      expired,
+      cutoff - 1,
+      checkout.repoId,
+      boundary,
+      boundary,
+      cutoff,
+    );
+    installRootRun(db, checkout.repoId, "reflogs");
+    db.storage.histogram = new Map();
+
+    for (const ordinal of [1, 2]) {
+      db.storage.resetCounters();
+      expect(
+        database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
+      ).toMatchObject({ rootSource: "reflogs", complete: false });
+      expect(
+        db.scalar<number>(
+          "SELECT cursor_ordinal FROM git_maintenance_runs WHERE repo_id = ?",
+          checkout.repoId,
+        ),
+      ).toBe(ordinal);
+      expect(
+        projectionCount(
+          db,
+          "WITH direct_page AS MATERIALIZED ( SELECT 0 AS source_kind, entry.repo_id",
+        ),
+      ).toBe(1);
+      expect(rootMask(db, checkout.repoId, expired)).toBeUndefined();
+    }
+
+    expect(
+      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
+    ).toMatchObject({ rootSource: "index", complete: false });
+    expect(hasRootSource(db, checkout.repoId, boundary, 4)).toBe(true);
   });
 
   it("increments the epoch in root-changing transactions and rolls back on exhaustion", () => {
@@ -507,7 +686,7 @@ describe("maintenance roots", () => {
     ).toBe(1);
   });
 
-  it("rejects an active operation unless the full journal validates", () => {
+  it("rejects a missing bounded operation root without advancing its cursor", () => {
     const { db, database, checkout, store } = open();
     const tree = store.write("tree", EMPTY_TREE_BYTES);
     const original = store.write("commit", commitBytes("original"));

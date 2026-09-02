@@ -41,10 +41,8 @@ import { bumpMaintenanceRootEpoch } from "./maintenance/control.js";
 import {
   advanceMaintenanceRootSnapshot as advanceRootSnapshot,
   type MaintenanceRootSnapshotProgress,
-  validatedOperationJournalRoots,
 } from "./maintenance/roots.js";
 import { withGitMutationGuard } from "./mutation-guard.js";
-import { readOperationStateOwned } from "./operation-journal.js";
 import { MAX_PACK_ROW_CACHE_BYTES } from "./packs.js";
 import { rawSymbolicTarget, requireRawRefTarget } from "./ref-validation.js";
 import { requireSafeRefLogInteger } from "./reflog.js";
@@ -1473,7 +1471,7 @@ export class SqliteGitDatabase {
     this.#checkoutRowGenerations.delete(checkoutId);
   }
 
-  /** Advance one internal maintenance root page after validating every live journal. */
+  /** Advance one internal maintenance root page through bounded source projections. */
   advanceMaintenanceRootSnapshot(
     repoId: number,
     options: MaintenanceRootAdvanceOptions,
@@ -1491,13 +1489,12 @@ export class SqliteGitDatabase {
     const rootOptions = {
       repoId,
       nowMs: options.nowMs,
-      readOperationRoots: (checkoutId: number) => {
-        const checkout = this.#checkoutById(checkoutId);
-        if (checkout.repoId !== repoId) {
+      readOperationRootPage: (checkoutId: number, cursor: number, limit: number) => {
+        const checkout = this.openCheckout(checkoutId);
+        if (checkout.sharedRepoId !== repoId) {
           throw new CorruptError("maintenance operation root crossed repositories");
         }
-        const journal = readOperationStateOwned(this.openCheckout(checkout));
-        return journal === null ? [] : validatedOperationJournalRoots(journal);
+        return checkout.operationRootPage(cursor, limit);
       },
     };
     if (options.pageRows === undefined) return advanceRootSnapshot(this.#db, rootOptions);

@@ -2,14 +2,15 @@ import type { SqlDatabase } from "../../../db/db.js";
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import type { ObjectType } from "../../common/objects.js";
+import { isCanonicalGitPath } from "../../common/paths.js";
+import { int, nullable, oneOf, RowShape, text } from "../../common/rows.js";
 import { comparePaths } from "../../common/streams.js";
-import type { OperationJournal } from "../operations.js";
-import { requireRawRefTarget, requireRefName } from "../ref-validation.js";
+import type { OperationRootPage } from "../operation-journal.js";
+import { requireRefName } from "../ref-validation.js";
+import { REFLOG_RETENTION_SECONDS } from "../reflog.js";
 import { ensureMaintenanceControl } from "./control.js";
 import { type MaintenanceRunView, readMaintenanceRunView } from "./state.js";
 
-const RETAINED_REFLOG_SECONDS = 90 * 24 * 60 * 60;
-const RETAINED_REFLOG_ROWS = 1_024;
 const DEFAULT_PAGE_ROWS = 128;
 const MAX_PAGE_ROWS = 128;
 export const MAINTENANCE_ROOT_EPOCH_DRIFTED = "maintenance roots changed after root discovery";
@@ -32,18 +33,17 @@ export type MaintenanceRootSource =
   | "operations"
   | "done";
 
-export interface MaintenanceRootInput {
-  oid: string;
-  expectedType: ObjectType;
-}
-
-export type ValidatedOperationRootReader = (checkoutId: number) => readonly MaintenanceRootInput[];
+export type OperationRootPageReader = (
+  checkoutId: number,
+  cursor: number,
+  limit: number,
+) => OperationRootPage;
 
 export interface AdvanceMaintenanceRootSnapshotOptions {
   repoId: number;
   nowMs: number;
   pageRows?: number;
-  readOperationRoots: ValidatedOperationRootReader;
+  readOperationRootPage: OperationRootPageReader;
 }
 
 export interface MaintenanceRootSnapshotProgress {
@@ -87,6 +87,50 @@ const ROOT_SOURCES: readonly MaintenanceRootSource[] = [
   "operations",
   "done",
 ];
+
+const REF_ROOT_ROW = new RowShape({
+  repo_id: int(1),
+  name: text(),
+  target: text(),
+});
+const HEAD_ROOT_ROW = new RowShape({
+  checkout_id: int(1),
+  repo_id: int(1),
+  head: text(),
+});
+const REFLOG_ROOT_ROW = new RowShape({
+  source_kind: oneOf([0, 1]),
+  repo_id: int(1),
+  ref_key: text(),
+  checkout_id: nullable(int(1)),
+  ordinal: int(1),
+  old_oid: nullable(text()),
+  new_oid: nullable(text()),
+  timestamp: int(0),
+});
+const INDEX_ROOT_ROW = new RowShape({
+  checkout_id: int(1),
+  repo_id: int(1),
+  path: text(),
+  stage: int(0, 3),
+  mode: oneOf([0o100644, 0o100755, 0o120000, 0o160000]),
+  oid: text(),
+});
+const INDEX_BASELINE_ROOT_ROW = new RowShape({
+  checkout_id: int(1),
+  repo_id: int(1),
+  baseline_tree_oid: nullable(text()),
+  format: oneOf([1]),
+  complete: oneOf([1]),
+});
+const SHALLOW_ROOT_ROW = new RowShape({
+  repo_id: int(1),
+  oid: text(),
+});
+const OPERATION_CHECKOUT_ROW = new RowShape({
+  checkout_id: int(1),
+  repo_id: int(1),
+});
 
 function isObjectType(value: unknown): value is ObjectType {
   return value === "blob" || value === "tree" || value === "commit" || value === "tag";
@@ -168,7 +212,7 @@ export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): 
       run.cursorCheckoutId === null ||
       run.cursorCheckoutId < 1 ||
       run.cursorText === null ||
-      !validIndexPath(run.cursorText) ||
+      !isCanonicalGitPath(run.cursorText) ||
       run.cursorOrdinal === null ||
       run.cursorOrdinal > 3
     ) {
@@ -256,153 +300,18 @@ function restartRun(db: SqlDatabase, run: RunState, rootEpoch: number): RunState
   return restarted;
 }
 
-function utf8Bytes(value: string, maximum = Number.MAX_SAFE_INTEGER): number {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
-    if (unit === 0 || unit === 0x0a || unit === 0x0d) return -1;
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const low = value.charCodeAt(++index);
-      if (low < 0xdc00 || low > 0xdfff) return -1;
-      bytes += 4;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      return -1;
-    } else if (unit < 0x80) bytes++;
-    else if (unit < 0x800) bytes += 2;
-    else bytes += 3;
-    if (bytes > maximum) return -1;
-  }
-  return bytes;
-}
-
-function requireNullableOid(value: unknown, label: string): string | null {
-  if (value === null) return null;
-  if (typeof value !== "string" || !isOid(value)) {
-    throw new CorruptError(`${label} is invalid`);
-  }
-  return value;
-}
-
-function requireReflogEndpoint(rawValue: unknown, oidValue: unknown): string | null {
-  if (rawValue === null) {
-    if (oidValue !== null) throw new CorruptError("absent reflog endpoint retained an OID");
-    return null;
-  }
-  const raw = requireRawRefTarget(rawValue, "stored reflog target", "stored");
-  const oid = requireNullableOid(oidValue, "reflog endpoint OID");
-  if (isOid(raw) && oid !== raw) {
-    throw new CorruptError("direct reflog endpoint OID does not match");
-  }
-  return oid;
-}
-
-function validIndexPath(path: string): boolean {
-  if (path === "" || path.startsWith("/") || path.endsWith("/") || utf8Bytes(path) < 0) {
-    return false;
-  }
-  let segmentStart = 0;
-  for (let index = 0; index <= path.length; index++) {
-    if (index !== path.length && path.charCodeAt(index) !== 0x2f) continue;
-    const segmentLength = index - segmentStart;
-    if (
-      segmentLength === 0 ||
-      (segmentLength === 1 && path.charCodeAt(segmentStart) === 0x2e) ||
-      (segmentLength === 2 &&
-        path.charCodeAt(segmentStart) === 0x2e &&
-        path.charCodeAt(segmentStart + 1) === 0x2e)
-    ) {
-      return false;
-    }
-    segmentStart = index + 1;
-  }
-  return true;
-}
-
-interface RootPageMetadata {
-  rows: number;
-  textBytes: number;
-}
-
-function requireRootPageMetadata(
-  row: Record<string, unknown> | undefined,
-  label: string,
-  maximumRows: number,
-): RootPageMetadata {
-  if (row === undefined) throw new CorruptError(`${label} metadata row is missing`);
-  const rows = requireSafeInteger(row.row_count, `${label} row count`, 0, maximumRows);
-  if (row.invalid_types !== 0) throw new CorruptError(`${label} text metadata is invalid`);
-  const textBytes = requireSafeInteger(row.text_bytes, `${label} text bytes`, 0);
-  return { rows, textBytes };
-}
-
-function requirePageText(
-  row: Record<string, unknown>,
-  valueField: string,
-  typeField: string,
-  bytesField: string,
-  label: string,
-): { value: string; bytes: number } {
-  const bytes = requireSafeInteger(row[bytesField], `${label} bytes`, 0);
-  const value = row[valueField];
-  if (row[typeField] !== "text" || typeof value !== "string" || utf8Bytes(value) !== bytes) {
-    throw new CorruptError(`${label} changed after metadata preflight`);
-  }
-  return { value, bytes };
-}
-
-function requireNullablePageText(
-  row: Record<string, unknown>,
-  valueField: string,
-  typeField: string,
-  bytesField: string,
-  label: string,
-): { value: string | null; bytes: number } {
-  if (row[typeField] === "null") {
-    if (row[valueField] !== null || row[bytesField] !== null) {
-      throw new CorruptError(`${label} changed after metadata preflight`);
-    }
-    return { value: null, bytes: 0 };
-  }
-  return requirePageText(row, valueField, typeField, bytesField, label);
-}
-
 function rootsFromRefs(
   db: SqlDatabase,
   repoId: number,
   cursor: string | null,
   pageRows: number,
 ): RootPage {
-  const metadata = requireRootPageMetadata(
-    db.one<Record<string, unknown>>(
-      `SELECT count(*) AS row_count,
-              coalesce(sum(CASE WHEN typeof(name) = 'text' AND typeof(target) = 'text'
-                THEN 0 ELSE 1 END), 0) AS invalid_types,
-              coalesce(sum(length(CAST(name AS BLOB)) +
-                           length(CAST(target AS BLOB))), 0) AS text_bytes
-         FROM (
-           SELECT name, target FROM git_refs
-            WHERE repo_id = ? AND (? IS NULL OR name > ? COLLATE BINARY)
-            ORDER BY name COLLATE BINARY LIMIT ?
-         )`,
-      repoId,
-      cursor,
-      cursor,
-      pageRows + 1,
-    ),
-    "maintenance ref root page",
-    pageRows + 1,
-  );
   const candidates: RootCandidate[] = [];
   let rows = 0;
-  let payloadRows = 0;
-  let textBytes = 0;
   let last = cursor;
   let hasMore = false;
-  for (const row of db.iterate(
-    `SELECT repo_id, name, typeof(name) AS name_type,
-            length(CAST(name AS BLOB)) AS name_bytes,
-            target, typeof(target) AS target_type,
-            length(CAST(target AS BLOB)) AS target_bytes
+  for (const raw of db.iterate(
+    `SELECT repo_id, name, target
        FROM git_refs
       WHERE repo_id = ? AND (? IS NULL OR name > ? COLLATE BINARY)
       ORDER BY name COLLATE BINARY LIMIT ?`,
@@ -411,32 +320,20 @@ function rootsFromRefs(
     cursor,
     pageRows + 1,
   )) {
-    payloadRows++;
-    const storedName = requirePageText(row, "name", "name_type", "name_bytes", "stored ref name");
-    const storedTarget = requirePageText(
-      row,
-      "target",
-      "target_type",
-      "target_bytes",
-      "stored ref target",
-    );
-    textBytes += storedName.bytes + storedTarget.bytes;
+    const row = REF_ROOT_ROW.decode(raw);
     if (row.repo_id !== repoId) throw new CorruptError("ref root crossed repositories");
+    if (last !== null && comparePaths(last, row.name) >= 0) {
+      throw new CorruptError("ref roots are not in strict byte order");
+    }
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
-    const name = requireRefName(storedName.value, "stored ref name", "stored");
-    if (last !== null && comparePaths(last, name) >= 0) {
-      throw new CorruptError("ref roots are not in strict byte order");
+    if (isOid(row.target)) {
+      candidates.push({ oid: row.target, expectedType: null, optionalMissing: false });
     }
-    const target = requireRawRefTarget(storedTarget.value, `stored target of ${name}`, "stored");
-    if (isOid(target)) candidates.push({ oid: target, expectedType: null, optionalMissing: false });
-    last = name;
+    last = row.name;
     rows++;
-  }
-  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
-    throw new CorruptError("maintenance ref root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -454,61 +351,30 @@ function rootsFromHeads(
   pageRows: number,
 ): RootPage {
   const after = cursor ?? 0;
-  const metadata = requireRootPageMetadata(
-    db.one<Record<string, unknown>>(
-      `SELECT count(*) AS row_count,
-              coalesce(sum(CASE WHEN typeof(head) = 'text' THEN 0 ELSE 1 END), 0)
-                AS invalid_types,
-              coalesce(sum(length(CAST(head AS BLOB))), 0) AS text_bytes
-         FROM (
-           SELECT head FROM git_checkouts
-            WHERE repo_id = ? AND id > ? ORDER BY id LIMIT ?
-         )`,
-      repoId,
-      after,
-      pageRows + 1,
-    ),
-    "maintenance HEAD root page",
-    pageRows + 1,
-  );
   const candidates: RootCandidate[] = [];
   let rows = 0;
-  let payloadRows = 0;
-  let textBytes = 0;
   let last = after;
   let hasMore = false;
-  for (const row of db.iterate(
-    `SELECT id AS checkout_id, repo_id, head, typeof(head) AS head_type,
-            length(CAST(head AS BLOB)) AS head_bytes
+  for (const raw of db.iterate(
+    `SELECT id AS checkout_id, repo_id, head
        FROM git_checkouts
       WHERE repo_id = ? AND id > ? ORDER BY id LIMIT ?`,
     repoId,
-    last,
+    after,
     pageRows + 1,
   )) {
-    payloadRows++;
-    const storedHead = requirePageText(
-      row,
-      "head",
-      "head_type",
-      "head_bytes",
-      "stored checkout HEAD",
-    );
-    textBytes += storedHead.bytes;
+    const row = HEAD_ROOT_ROW.decode(raw);
     if (row.repo_id !== repoId) throw new CorruptError("checkout HEAD crossed repositories");
+    if (row.checkout_id <= last) throw new CorruptError("checkout HEAD roots are unordered");
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
-    const checkoutId = requireSafeInteger(row.checkout_id, "checkout HEAD id", 1);
-    if (checkoutId <= last) throw new CorruptError("checkout HEAD roots are unordered");
-    const head = requireRawRefTarget(storedHead.value, "stored HEAD target", "stored");
-    if (isOid(head)) candidates.push({ oid: head, expectedType: null, optionalMissing: false });
-    last = checkoutId;
+    if (isOid(row.head)) {
+      candidates.push({ oid: row.head, expectedType: null, optionalMissing: false });
+    }
+    last = row.checkout_id;
     rows++;
-  }
-  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
-    throw new CorruptError("maintenance HEAD root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -526,198 +392,73 @@ function rootsFromReflogs(
   cursor: number | null,
   pageRows: number,
 ): RootPage {
-  const cutoff = Math.max(0, Math.floor(startedMs / 1_000) - RETAINED_REFLOG_SECONDS);
+  const cutoff = Math.max(0, Math.floor(startedMs / 1_000) - REFLOG_RETENTION_SECONDS);
   const after = cursor ?? 0;
-  const metadata = requireRootPageMetadata(
-    db.one<Record<string, unknown>>(
-      `SELECT count(*) AS row_count,
-              coalesce(sum(CASE
-                WHEN typeof(ref_key) = 'text'
-                 AND typeof(old_raw) IN ('null', 'text')
-                 AND typeof(new_raw) IN ('null', 'text')
-                 AND typeof(old_oid) IN ('null', 'text')
-                 AND typeof(new_oid) IN ('null', 'text')
-                THEN 0 ELSE 1 END), 0) AS invalid_types,
-              coalesce(sum(length(CAST(ref_key AS BLOB)) +
-                           coalesce(length(CAST(old_raw AS BLOB)), 0) +
-                           coalesce(length(CAST(new_raw AS BLOB)), 0) +
-                           coalesce(length(CAST(old_oid AS BLOB)), 0) +
-                           coalesce(length(CAST(new_oid AS BLOB)), 0)), 0) AS text_bytes
-         FROM (
-           SELECT source_kind, ref_key, checkout_id, ordinal, old_raw, new_raw,
-                  old_oid, new_oid, timestamp
-             FROM (
-               SELECT 0 AS source_kind, entry.ref_name AS ref_key, NULL AS checkout_id,
-                      entry.ordinal, entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
-                      entry.timestamp
-                 FROM git_reflog_entries entry
-                WHERE entry.repo_id = ? AND entry.timestamp >= ?
-               UNION ALL
-               SELECT 1 AS source_kind, 'HEAD' AS ref_key, entry.checkout_id,
-                      entry.ordinal, entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
-                      entry.timestamp
-                 FROM git_checkout_reflog_entries entry
-                WHERE entry.repo_id = ? AND entry.timestamp >= ?
-             ) retained
-            WHERE ordinal > ? ORDER BY ordinal LIMIT ?
-         )`,
-      repoId,
-      cutoff,
-      repoId,
-      cutoff,
-      after,
-      pageRows + 1,
-    ),
-    "maintenance reflog root page",
-    pageRows + 1,
-  );
   const candidates: RootCandidate[] = [];
-  const directThresholds = new Map<string, number>();
-  const checkoutThresholds = new Map<number, number>();
   let rows = 0;
-  let payloadRows = 0;
-  let textBytes = 0;
   let last = after;
   let hasMore = false;
-  for (const row of db.iterate(
-    `SELECT source_kind, ref_key, typeof(ref_key) AS ref_key_type,
-            length(CAST(ref_key AS BLOB)) AS ref_key_bytes,
-            checkout_id, ordinal,
-            old_raw, typeof(old_raw) AS old_raw_type,
-            length(CAST(old_raw AS BLOB)) AS old_raw_bytes,
-            new_raw, typeof(new_raw) AS new_raw_type,
-            length(CAST(new_raw AS BLOB)) AS new_raw_bytes,
-            old_oid, typeof(old_oid) AS old_oid_type,
-            length(CAST(old_oid AS BLOB)) AS old_oid_bytes,
-            new_oid, typeof(new_oid) AS new_oid_type,
-            length(CAST(new_oid AS BLOB)) AS new_oid_bytes, timestamp
+  for (const raw of db.iterate(
+    `WITH direct_page AS MATERIALIZED (
+       SELECT 0 AS source_kind, entry.repo_id, entry.ref_name AS ref_key,
+              NULL AS checkout_id, entry.ordinal, entry.old_oid, entry.new_oid,
+              entry.timestamp
+         FROM git_reflog_entries entry NOT INDEXED
+        WHERE entry.repo_id = ? AND entry.ordinal > ?
+        ORDER BY entry.ordinal LIMIT ?
+     ), checkout_page AS MATERIALIZED (
+       SELECT 1 AS source_kind, entry.repo_id, 'HEAD' AS ref_key,
+              entry.checkout_id, entry.ordinal, entry.old_oid, entry.new_oid,
+              entry.timestamp
+         FROM git_checkout_reflog_entries entry
+              INDEXED BY git_checkout_reflog_entries_by_ordinal
+        WHERE entry.repo_id = ? AND entry.ordinal > ?
+        ORDER BY entry.ordinal LIMIT ?
+     )
+     SELECT source_kind, repo_id, ref_key, checkout_id, ordinal, old_oid, new_oid, timestamp
        FROM (
-         SELECT 0 AS source_kind, entry.ref_name AS ref_key, NULL AS checkout_id,
-                entry.ordinal, entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
-                entry.timestamp
-           FROM git_reflog_entries entry
-          WHERE entry.repo_id = ? AND entry.timestamp >= ?
+         SELECT source_kind, repo_id, ref_key, checkout_id, ordinal, old_oid, new_oid, timestamp
+           FROM direct_page
          UNION ALL
-         SELECT 1 AS source_kind, 'HEAD' AS ref_key, entry.checkout_id,
-                entry.ordinal, entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
-                entry.timestamp
-           FROM git_checkout_reflog_entries entry
-          WHERE entry.repo_id = ? AND entry.timestamp >= ?
-       ) retained
-      WHERE ordinal > ? ORDER BY ordinal LIMIT ?`,
+         SELECT source_kind, repo_id, ref_key, checkout_id, ordinal, old_oid, new_oid, timestamp
+           FROM checkout_page
+       )
+      ORDER BY ordinal LIMIT ?`,
     repoId,
-    cutoff,
+    after,
+    pageRows + 1,
     repoId,
-    cutoff,
-    last,
+    after,
+    pageRows + 1,
     pageRows + 1,
   )) {
-    payloadRows++;
-    const refKey = requirePageText(
-      row,
-      "ref_key",
-      "ref_key_type",
-      "ref_key_bytes",
-      "stored reflog ref key",
-    );
-    const oldRaw = requireNullablePageText(
-      row,
-      "old_raw",
-      "old_raw_type",
-      "old_raw_bytes",
-      "stored reflog old target",
-    );
-    const newRaw = requireNullablePageText(
-      row,
-      "new_raw",
-      "new_raw_type",
-      "new_raw_bytes",
-      "stored reflog new target",
-    );
-    const oldOid = requireNullablePageText(
-      row,
-      "old_oid",
-      "old_oid_type",
-      "old_oid_bytes",
-      "stored reflog old OID",
-    );
-    const newOid = requireNullablePageText(
-      row,
-      "new_oid",
-      "new_oid_type",
-      "new_oid_bytes",
-      "stored reflog new OID",
-    );
-    textBytes += refKey.bytes + oldRaw.bytes + newRaw.bytes + oldOid.bytes + newOid.bytes;
-    const ordinal = requireSafeInteger(row.ordinal, "retained reflog ordinal", 1);
-    if (ordinal <= last) throw new CorruptError("retained reflog roots are unordered");
-    requireSafeInteger(row.timestamp, "retained reflog timestamp", cutoff);
-    let threshold: number;
+    const row = REFLOG_ROOT_ROW.decode(raw);
+    if (row.repo_id !== repoId) throw new CorruptError("reflog root crossed repositories");
+    if (row.ordinal <= last) throw new CorruptError("retained reflog roots are unordered");
     if (row.source_kind === 0) {
-      const refName = requireRefName(refKey.value, "stored reflog ref name", "stored");
       if (row.checkout_id !== null) {
         throw new CorruptError("direct reflog root retained a checkout id");
       }
-      const cached = directThresholds.get(refName);
-      if (cached !== undefined) {
-        threshold = cached;
-      } else {
-        const value = db.scalar<unknown>(
-          `SELECT ordinal FROM git_reflog_entries INDEXED BY git_reflog_entries_by_ref
-            WHERE repo_id = ? AND ref_name = ? AND timestamp >= ?
-            ORDER BY ordinal DESC LIMIT 1 OFFSET ${RETAINED_REFLOG_ROWS - 1}`,
-          repoId,
-          refName,
-          cutoff,
-        );
-        threshold =
-          value === undefined
-            ? 0
-            : requireSafeInteger(value, "retained direct reflog threshold", 1);
-        directThresholds.set(refName, threshold);
-      }
-    } else if (row.source_kind === 1) {
-      if (refKey.value !== "HEAD") throw new CorruptError("checkout reflog root is not HEAD");
-      const checkoutId = requireSafeInteger(row.checkout_id, "checkout reflog root id", 1);
-      const cached = checkoutThresholds.get(checkoutId);
-      if (cached !== undefined) {
-        threshold = cached;
-      } else {
-        const value = db.scalar<unknown>(
-          `SELECT ordinal FROM git_checkout_reflog_entries
-            WHERE checkout_id = ? AND timestamp >= ?
-            ORDER BY ordinal DESC LIMIT 1 OFFSET ${RETAINED_REFLOG_ROWS - 1}`,
-          checkoutId,
-          cutoff,
-        );
-        threshold =
-          value === undefined
-            ? 0
-            : requireSafeInteger(value, "retained checkout reflog threshold", 1);
-        checkoutThresholds.set(checkoutId, threshold);
-      }
     } else {
-      throw new CorruptError("retained reflog root source is invalid");
+      if (row.ref_key !== "HEAD") throw new CorruptError("checkout reflog root is not HEAD");
+      if (row.checkout_id === null) {
+        throw new CorruptError("checkout reflog root is missing its checkout id");
+      }
     }
-    const oldRoot = requireReflogEndpoint(oldRaw.value, oldOid.value);
-    const newRoot = requireReflogEndpoint(newRaw.value, newOid.value);
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
-    if (ordinal >= threshold) {
-      if (oldRoot !== null) {
-        candidates.push({ oid: oldRoot, expectedType: null, optionalMissing: false });
+    if (row.timestamp >= cutoff) {
+      if (row.old_oid !== null) {
+        candidates.push({ oid: row.old_oid, expectedType: null, optionalMissing: false });
       }
-      if (newRoot !== null) {
-        candidates.push({ oid: newRoot, expectedType: null, optionalMissing: false });
+      if (row.new_oid !== null) {
+        candidates.push({ oid: row.new_oid, expectedType: null, optionalMissing: false });
       }
     }
-    last = ordinal;
+    last = row.ordinal;
     rows++;
-  }
-  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
-    throw new CorruptError("maintenance reflog root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -739,48 +480,12 @@ function rootsFromIndex(
   let checkoutId = cursorCheckoutId ?? 0;
   let path = cursorText ?? "";
   let stage = cursorOrdinal ?? -1;
-  const metadata = requireRootPageMetadata(
-    db.one<Record<string, unknown>>(
-      `SELECT count(*) AS row_count,
-              coalesce(sum(CASE WHEN typeof(path) = 'text' AND typeof(oid) = 'text'
-                THEN 0 ELSE 1 END), 0) AS invalid_types,
-              coalesce(sum(length(CAST(path AS BLOB)) +
-                           length(CAST(oid AS BLOB))), 0) AS text_bytes
-         FROM (
-           SELECT entry.path, entry.oid
-             FROM git_index entry
-             JOIN git_checkouts checkout ON checkout.id = entry.checkout_id
-            WHERE checkout.repo_id = ? AND (
-              checkout.id > ? OR (
-                checkout.id = ? AND (
-                  entry.path > ? COLLATE BINARY OR (entry.path = ? AND entry.stage > ?)
-                )
-              )
-            )
-            ORDER BY checkout.id, entry.path COLLATE BINARY, entry.stage LIMIT ?
-         )`,
-      repoId,
-      checkoutId,
-      checkoutId,
-      path,
-      path,
-      stage,
-      pageRows + 1,
-    ),
-    "maintenance index root page",
-    pageRows + 1,
-  );
   const candidates: RootCandidate[] = [];
   let rows = 0;
-  let payloadRows = 0;
-  let textBytes = 0;
   let hasMore = false;
-  for (const row of db.iterate(
+  for (const raw of db.iterate(
     `SELECT checkout.id AS checkout_id, checkout.repo_id, entry.path,
-            typeof(entry.path) AS path_type,
-            length(CAST(entry.path AS BLOB)) AS path_bytes,
-            entry.stage, entry.mode, entry.oid, typeof(entry.oid) AS oid_type,
-            length(CAST(entry.oid AS BLOB)) AS oid_bytes
+            entry.stage, entry.mode, entry.oid
        FROM git_index entry
        JOIN git_checkouts checkout ON checkout.id = entry.checkout_id
       WHERE checkout.repo_id = ? AND (
@@ -799,57 +504,29 @@ function rootsFromIndex(
     stage,
     pageRows + 1,
   )) {
-    payloadRows++;
-    const storedPath = requirePageText(
-      row,
-      "path",
-      "path_type",
-      "path_bytes",
-      "stored index root path",
-    );
-    const storedOid = requirePageText(row, "oid", "oid_type", "oid_bytes", "stored index root OID");
-    textBytes += storedPath.bytes + storedOid.bytes;
+    const row = INDEX_ROOT_ROW.decode(raw);
     if (row.repo_id !== repoId) throw new CorruptError("index root crossed repositories");
+    if (
+      row.checkout_id < checkoutId ||
+      (row.checkout_id === checkoutId &&
+        (comparePaths(row.path, path) < 0 || (row.path === path && row.stage <= stage)))
+    ) {
+      throw new CorruptError("index roots are not in strict key order");
+    }
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
-    const nextCheckoutId = requireSafeInteger(row.checkout_id, "index root checkout id", 1);
-    if (!validIndexPath(storedPath.value)) {
-      throw new CorruptError("index root path is invalid");
-    }
-    const nextStage = requireSafeInteger(row.stage, "index root stage", 0, 3);
-    if (
-      nextCheckoutId < checkoutId ||
-      (nextCheckoutId === checkoutId &&
-        (comparePaths(storedPath.value, path) < 0 ||
-          (storedPath.value === path && nextStage <= stage)))
-    ) {
-      throw new CorruptError("index roots are not in strict key order");
-    }
-    if (
-      row.mode !== 0o100644 &&
-      row.mode !== 0o100755 &&
-      row.mode !== 0o120000 &&
-      row.mode !== 0o160000
-    ) {
-      throw new CorruptError("index root mode is invalid");
-    }
-    const oid = requireNullableOid(storedOid.value, "index root OID");
-    if (oid === null) throw new CorruptError("index root OID is absent");
     const gitlink = row.mode === 0o160000;
     candidates.push({
-      oid,
+      oid: row.oid,
       expectedType: gitlink ? "commit" : "blob",
       optionalMissing: gitlink,
     });
-    checkoutId = nextCheckoutId;
-    path = storedPath.value;
-    stage = nextStage;
+    checkoutId = row.checkout_id;
+    path = row.path;
+    stage = row.stage;
     rows++;
-  }
-  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
-    throw new CorruptError("maintenance index root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -867,75 +544,37 @@ function rootsFromIndexBaselines(
   pageRows: number,
 ): RootPage {
   const after = cursor ?? 0;
-  const metadata = requireRootPageMetadata(
-    db.one<Record<string, unknown>>(
-      `SELECT count(*) AS row_count,
-              coalesce(sum(CASE WHEN typeof(baseline_tree_oid) IN ('null', 'text')
-                THEN 0 ELSE 1 END), 0) AS invalid_types,
-              coalesce(sum(coalesce(length(CAST(baseline_tree_oid AS BLOB)), 0)), 0)
-                AS text_bytes
-         FROM (
-           SELECT state.baseline_tree_oid
-             FROM git_index_state state
-             JOIN git_checkouts checkout ON checkout.id = state.checkout_id
-            WHERE checkout.repo_id = ? AND checkout.id > ? AND state.complete = 1
-            ORDER BY checkout.id LIMIT ?
-         )`,
-      repoId,
-      after,
-      pageRows + 1,
-    ),
-    "maintenance index baseline root page",
-    pageRows + 1,
-  );
   const candidates: RootCandidate[] = [];
   let rows = 0;
-  let payloadRows = 0;
-  let textBytes = 0;
   let last = after;
   let hasMore = false;
-  for (const row of db.iterate(
+  for (const raw of db.iterate(
     `SELECT checkout.id AS checkout_id, checkout.repo_id, state.baseline_tree_oid,
-            typeof(state.baseline_tree_oid) AS baseline_tree_oid_type,
-            length(CAST(state.baseline_tree_oid AS BLOB)) AS baseline_tree_oid_bytes,
             state.format, state.complete
        FROM git_index_state state
        JOIN git_checkouts checkout ON checkout.id = state.checkout_id
       WHERE checkout.repo_id = ? AND checkout.id > ? AND state.complete = 1
       ORDER BY checkout.id LIMIT ?`,
     repoId,
-    last,
+    after,
     pageRows + 1,
   )) {
-    payloadRows++;
-    const baseline = requireNullablePageText(
-      row,
-      "baseline_tree_oid",
-      "baseline_tree_oid_type",
-      "baseline_tree_oid_bytes",
-      "stored index baseline tree OID",
-    );
-    textBytes += baseline.bytes;
+    const row = INDEX_BASELINE_ROOT_ROW.decode(raw);
+    if (row.repo_id !== repoId) throw new CorruptError("index baseline crossed repositories");
+    if (row.checkout_id <= last) throw new CorruptError("index baselines are unordered");
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
-    if (row.repo_id !== repoId) throw new CorruptError("index baseline crossed repositories");
-    const checkoutId = requireSafeInteger(row.checkout_id, "index baseline checkout id", 1);
-    if (checkoutId <= last) throw new CorruptError("index baselines are unordered");
-    if (row.format !== 1 || row.complete !== 1) {
-      throw new CorruptError("complete index baseline state is invalid");
+    if (row.baseline_tree_oid !== null) {
+      candidates.push({
+        oid: row.baseline_tree_oid,
+        expectedType: "tree",
+        optionalMissing: false,
+      });
     }
-    if (baseline.value !== null) {
-      const oid = requireNullableOid(baseline.value, "index baseline tree OID");
-      if (oid === null) throw new CorruptError("index baseline tree OID is absent");
-      candidates.push({ oid, expectedType: "tree", optionalMissing: false });
-    }
-    last = checkoutId;
+    last = row.checkout_id;
     rows++;
-  }
-  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
-    throw new CorruptError("maintenance index baseline root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -952,34 +591,12 @@ function rootsFromShallow(
   cursor: string | null,
   pageRows: number,
 ): RootPage {
-  const metadata = requireRootPageMetadata(
-    db.one<Record<string, unknown>>(
-      `SELECT count(*) AS row_count,
-              coalesce(sum(CASE WHEN typeof(oid) = 'text' THEN 0 ELSE 1 END), 0)
-                AS invalid_types,
-              coalesce(sum(length(CAST(oid AS BLOB))), 0) AS text_bytes
-         FROM (
-           SELECT oid FROM git_shallow
-            WHERE repo_id = ? AND (? IS NULL OR oid > ? COLLATE BINARY)
-            ORDER BY oid COLLATE BINARY LIMIT ?
-         )`,
-      repoId,
-      cursor,
-      cursor,
-      pageRows + 1,
-    ),
-    "maintenance shallow root page",
-    pageRows + 1,
-  );
   const candidates: RootCandidate[] = [];
   let rows = 0;
-  let payloadRows = 0;
-  let textBytes = 0;
   let last = cursor;
   let hasMore = false;
-  for (const row of db.iterate(
-    `SELECT repo_id, oid, typeof(oid) AS oid_type,
-            length(CAST(oid AS BLOB)) AS oid_bytes
+  for (const raw of db.iterate(
+    `SELECT repo_id, oid
        FROM git_shallow
       WHERE repo_id = ? AND (? IS NULL OR oid > ? COLLATE BINARY)
       ORDER BY oid COLLATE BINARY LIMIT ?`,
@@ -988,31 +605,18 @@ function rootsFromShallow(
     cursor,
     pageRows + 1,
   )) {
-    payloadRows++;
-    const storedOid = requirePageText(
-      row,
-      "oid",
-      "oid_type",
-      "oid_bytes",
-      "stored shallow root OID",
-    );
-    textBytes += storedOid.bytes;
+    const row = SHALLOW_ROOT_ROW.decode(raw);
+    if (row.repo_id !== repoId) throw new CorruptError("shallow root crossed repositories");
+    if (last !== null && comparePaths(last, row.oid) >= 0) {
+      throw new CorruptError("shallow roots are unordered");
+    }
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
-    if (row.repo_id !== repoId) throw new CorruptError("shallow root crossed repositories");
-    const oid = requireNullableOid(storedOid.value, "shallow root OID");
-    if (oid === null) throw new CorruptError("shallow root OID is absent");
-    if (last !== null && comparePaths(last, oid) >= 0) {
-      throw new CorruptError("shallow roots are unordered");
-    }
-    candidates.push({ oid, expectedType: "commit", optionalMissing: false });
-    last = oid;
+    candidates.push({ oid: row.oid, expectedType: "commit", optionalMissing: false });
+    last = row.oid;
     rows++;
-  }
-  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
-    throw new CorruptError("maintenance shallow root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -1029,28 +633,28 @@ function rootsFromOperations(
   cursorCheckoutId: number | null,
   cursorOrdinal: number | null,
   pageRows: number,
-  readOperationRoots: ValidatedOperationRootReader,
+  readOperationRootPage: OperationRootPageReader,
 ): RootPage {
   const candidates: RootCandidate[] = [];
   const after = cursorCheckoutId ?? 0;
-  let checkoutId: number | null = null;
+  const checkouts: number[] = [];
   const query =
     cursorOrdinal === null
       ? `SELECT id AS checkout_id, repo_id FROM git_checkouts
-          WHERE repo_id = ? AND id > ? ORDER BY id LIMIT 1`
+          WHERE repo_id = ? AND id > ? ORDER BY id LIMIT 2`
       : `SELECT id AS checkout_id, repo_id FROM git_checkouts
-          WHERE repo_id = ? AND id = ? LIMIT 1`;
-  for (const row of db.iterate(query, repoId, after)) {
+          WHERE repo_id = ? AND id >= ? ORDER BY id LIMIT 2`;
+  for (const raw of db.iterate(query, repoId, after)) {
+    const row = OPERATION_CHECKOUT_ROW.decode(raw);
     if (row.repo_id !== repoId) throw new CorruptError("operation root crossed repositories");
-    checkoutId = requireSafeInteger(row.checkout_id, "operation root checkout id", 1);
-    if (
-      (cursorOrdinal === null && checkoutId <= after) ||
-      (cursorOrdinal !== null && checkoutId !== cursorCheckoutId)
-    ) {
+    const previous = checkouts[checkouts.length - 1];
+    if (previous !== undefined && row.checkout_id <= previous) {
       throw new CorruptError("operation root checkouts are unordered");
     }
+    checkouts.push(row.checkout_id);
   }
-  if (checkoutId === null) {
+  const checkoutId = checkouts[0];
+  if (checkoutId === undefined) {
     if (cursorOrdinal !== null) {
       throw new CorruptError("operation root cursor checkout is missing");
     }
@@ -1062,53 +666,46 @@ function rootsFromOperations(
       hasMore: false,
     };
   }
-  const roots = readOperationRoots(checkoutId);
-  const offset = cursorOrdinal ?? 0;
-  if (offset > roots.length) {
-    throw new CorruptError("operation root cursor exceeds its validated journal");
+  if (
+    (cursorOrdinal === null && checkoutId <= after) ||
+    (cursorOrdinal !== null && checkoutId !== cursorCheckoutId)
+  ) {
+    throw new CorruptError("operation root checkouts are unordered");
   }
-  const end = Math.min(roots.length, offset + pageRows);
-  for (let ordinal = offset; ordinal < end; ordinal++) {
-    const root = roots[ordinal];
-    if (root === undefined || !isOid(root.oid)) {
-      throw new CorruptError("validated operation root is invalid");
-    }
-    if (!isObjectType(root.expectedType)) {
-      throw new CorruptError("validated operation root type is invalid");
-    }
+  const offset = cursorOrdinal ?? 0;
+  const page = readOperationRootPage(checkoutId, offset, pageRows);
+  if (page.roots.length > pageRows) {
+    throw new CorruptError("operation root page exceeded its row limit");
+  }
+  for (const root of page.roots) {
     candidates.push({
       oid: root.oid,
-      expectedType: root.expectedType,
+      expectedType: root.type,
       optionalMissing: false,
     });
   }
-  if (end < roots.length) {
+  if (page.nextCursor !== null) {
+    if (
+      page.roots.length !== pageRows ||
+      !Number.isSafeInteger(page.nextCursor) ||
+      page.nextCursor !== offset + page.roots.length
+    ) {
+      throw new CorruptError("operation root cursor did not progress strictly");
+    }
     return {
       candidates,
       cursorCheckoutId: checkoutId,
       cursorText: null,
-      cursorOrdinal: end,
+      cursorOrdinal: page.nextCursor,
       hasMore: true,
     };
-  }
-  let nextCheckout = false;
-  for (const row of db.iterate(
-    `SELECT id AS checkout_id, repo_id FROM git_checkouts
-      WHERE repo_id = ? AND id > ? ORDER BY id LIMIT 1`,
-    repoId,
-    checkoutId,
-  )) {
-    if (row.repo_id !== repoId) throw new CorruptError("operation root crossed repositories");
-    const nextId = requireSafeInteger(row.checkout_id, "next operation root checkout id", 1);
-    if (nextId <= checkoutId) throw new CorruptError("operation root checkouts are unordered");
-    nextCheckout = true;
   }
   return {
     candidates,
     cursorCheckoutId: checkoutId,
     cursorText: null,
     cursorOrdinal: null,
-    hasMore: nextCheckout,
+    hasMore: checkouts.length > 1,
   };
 }
 
@@ -1267,7 +864,7 @@ function pageForSource(
   repoId: number,
   run: RunState,
   pageRows: number,
-  readOperationRoots: ValidatedOperationRootReader,
+  readOperationRootPage: OperationRootPageReader,
 ): RootPage {
   if (run.rootSource === "refs") {
     return rootsFromRefs(db, repoId, run.cursorText, pageRows);
@@ -1301,7 +898,7 @@ function pageForSource(
       run.cursorCheckoutId,
       run.cursorOrdinal,
       pageRows,
-      readOperationRoots,
+      readOperationRootPage,
     );
   }
   return {
@@ -1402,7 +999,7 @@ export function advanceMaintenanceRootSnapshot(
         restarted: run.restarted,
       };
     }
-    const page = pageForSource(db, options.repoId, run, pageRows, options.readOperationRoots);
+    const page = pageForSource(db, options.repoId, run, pageRows, options.readOperationRootPage);
     const roots = validateObjectRoots(db, options.repoId, page.candidates);
     insertRoots(
       db,
@@ -1420,40 +1017,4 @@ export function advanceMaintenanceRootSnapshot(
       restarted: run.restarted,
     };
   });
-}
-
-/** Extract roots only from a journal already accepted by CheckoutStore validation. */
-export function validatedOperationJournalRoots(
-  journal: OperationJournal,
-): readonly MaintenanceRootInput[] {
-  const roots: MaintenanceRootInput[] = [
-    { oid: journal.state.originalHeadOid, expectedType: "commit" },
-  ];
-  if (journal.state.kind === "merge") {
-    roots.push({ oid: journal.state.currentParentOid, expectedType: "commit" });
-    roots.push({ oid: journal.state.incomingParentOid, expectedType: "commit" });
-  } else if (journal.state.kind === "rebase") {
-    roots.push({ oid: journal.state.upstreamOid, expectedType: "commit" });
-    roots.push({ oid: journal.state.baseOid, expectedType: "commit" });
-    roots.push({ oid: journal.state.currentParentOid, expectedType: "commit" });
-  }
-  for (const step of journal.steps) {
-    roots.push({ oid: step.sourceOid, expectedType: "commit" });
-    if (step.selectedParentOid !== null) {
-      roots.push({ oid: step.selectedParentOid, expectedType: "commit" });
-    }
-    if (step.resultOid !== null) roots.push({ oid: step.resultOid, expectedType: "commit" });
-  }
-  for (const entry of journal.touched) {
-    if (entry.index !== null) {
-      roots.push({
-        oid: entry.index.oid,
-        expectedType: entry.index.mode === 0o160000 ? "commit" : "blob",
-      });
-    }
-    if (entry.worktree.kind === "file" || entry.worktree.kind === "symlink") {
-      roots.push({ oid: entry.worktree.oid, expectedType: "blob" });
-    }
-  }
-  return roots;
 }
