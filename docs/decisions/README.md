@@ -36,3 +36,4 @@ a commit message suffices.
 - [0019 — Organize source by domain with bottom-up layers](0019-organize-source-by-domain-with-bottom-up-layers.md) — accepted (2026-08-30)
 - [0020 — Model partial-clone blobs as durable promises](0020-model-partial-clone-blobs-as-durable-promises.md) — accepted (2026-08-31)
 - [0021 — Admit a bounded POSIX shell surface](0021-admit-a-bounded-posix-shell-surface.md) — accepted (2026-09-01)
+- [0022 — Own local Git mutations with SQLite transactions](0022-own-local-git-mutations-with-sqlite-transactions.md) — accepted (2026-09-02)

@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Trusted reads and linear journal](sprint-2026-09-02-trusted-reads-and-linear-journal.md)
+  — transaction-owned local Git mutations, linear durable operation transitions,
+  and trusted plain projections over explicit write premises.
 - [Git correctness and scale](sprint-2026-09-02-git-correctness-and-scale.md)
   - ordered untracked selection, streamed staging and hashing, live cache
   correctness, bounded reflog headers, and removal of the total tree-object cap.

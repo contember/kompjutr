@@ -1,3 +1,22 @@
+> **OUTCOME - shipped 2026-09-03.** Durable operation plans are immutable and
+> transition in constant journal work under one SQLite-owned local mutation;
+> filesystem, config, index, sparse, loose-object, and maintenance-root reads now
+> rely on explicit write premises and plain trusted projections. Commit map:
+> plan -> `31c3803`; WU1 -> `8904d4f`, `8bfb87d`; WU2 -> `ddaf047`; WU3 ->
+> `0787053`; WU4 -> `3662b92`; WU5 -> `efcdd1f`; WU6 -> `9c4a70a`; WU7 ->
+> `730a921`; integration and closure -> `eda7a5d`, `dca55c6`, `a7187c1`,
+> `9fa664a`, `b4e82a3`, `34337fa`, `793fc84`, `d50532c`, `6028bf1`, `48752ba`.
+> Verification: every focused witness and independent review passed; N-step
+> replay used 534 SQL statements / 593 rows versus 950 / 1,081 at 2N; both
+> targeted memory scenarios passed; smoke passed 168/168 in 14.92 seconds;
+> typecheck, Biome check, build, and package smoke passed; the 3,399-case test
+> inventory passed through the complete 8-root-shard, protocol, 5-pack-shard,
+> filesystem, shell, and end-to-end exhaustive matrix in 791.22 seconds. Backlog
+> closed: ARCH-5/CORR-6, ARCH-6, ARCH-11, ARCH-15, ARCH-28, CORR-13, ARCH-32,
+> and ARCH-35 were removed from backlog 65. Deferred: remaining architecture and
+> structural-bound findings stay in backlog 65; packed traversal stays in
+> backlog 63; optional integrity audit and snapshots stay in backlog 17.
+
 # Sprint - Trusted reads and linear journal (2026-09-02)
 
 **Goal.** Complete the remaining coherent ADR-0018 tranche and make durable

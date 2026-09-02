@@ -16,14 +16,12 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-09-02-trusted-reads-and-linear-journal.md`](sprints/sprint-2026-09-02-trusted-reads-and-linear-journal.md)
-  - trusted ordinary reads, explicit write premises, and linear durable operation
-    transitions.
+None.
 
 ## Specs
 
 - [`specs/trusted-domain-architecture.md`](specs/trusted-domain-architecture.md)
-  — the authoritative target architecture for the active restructure sprint.
+  — the authoritative target architecture adopted by the completed restructure.
 - [`specs/budget-targets-evidence-ledger.md`](specs/budget-targets-evidence-ledger.md)
   — accepted statement-barrier and byte-limit evidence incorporated by the
   archived budget-targets sprint.
@@ -38,9 +36,10 @@ decisions → reference → archive.
   [`benchmark-current`](reference/benchmark-current.md#clone-statement-profile).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0020).
-- The first two tranches from the 2026-09-02 Git-in-SQLite architecture review
-  are fixed: storage/publication safety, then Git result and scale correctness.
-  Remaining verified work is in
+- Three tranches from the 2026-09-02 Git-in-SQLite architecture review are
+  complete: storage/publication safety, Git result and scale correctness, then
+  transaction-owned local mutations with trusted ordinary reads. Remaining
+  verified work is in
   [`backlog/65`](backlog/65-git-sqlite-architecture-review.md) and
   [`backlog/63`](backlog/63-bound-packed-dependency-graph-traversal.md); unverified
   claims remain in [`ideas`](ideas/git-sqlite-architecture-review-triage.md).
@@ -88,9 +87,13 @@ decisions → reference → archive.
 - [`decisions/0019-organize-source-by-domain-with-bottom-up-layers.md`](decisions/0019-organize-source-by-domain-with-bottom-up-layers.md)
 - [`decisions/0020-model-partial-clone-blobs-as-durable-promises.md`](decisions/0020-model-partial-clone-blobs-as-durable-promises.md)
 - [`decisions/0021-admit-a-bounded-posix-shell-surface.md`](decisions/0021-admit-a-bounded-posix-shell-surface.md)
+- [`decisions/0022-own-local-git-mutations-with-sqlite-transactions.md`](decisions/0022-own-local-git-mutations-with-sqlite-transactions.md)
 
 ## Historical records
 
+- [`archive/sprint-2026-09-02-trusted-reads-and-linear-journal.md`](archive/sprint-2026-09-02-trusted-reads-and-linear-journal.md)
+  — transaction-owned local Git mutations, linear durable operation
+  transitions, and trusted plain projections over explicit write premises.
 - [`archive/sprint-2026-09-02-git-correctness-and-scale.md`](archive/sprint-2026-09-02-git-correctness-and-scale.md)
   - ordered untracked selection, streamed staging and hashing, live cache
   correctness, bounded reflog headers, and removal of the total tree-object cap.

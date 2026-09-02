@@ -20,6 +20,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [`sprint-2026-09-02-trusted-reads-and-linear-journal.md`](sprint-2026-09-02-trusted-reads-and-linear-journal.md)
-  - complete the remaining coherent ADR-0018 tranche and make durable operation
-    transitions linear before the ADR-0017 structural-bounds sprint.
+None.
