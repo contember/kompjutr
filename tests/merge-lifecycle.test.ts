@@ -556,20 +556,31 @@ describe("merge lifecycle", () => {
     expect(textAt(workspace, "incoming.txt")).toBe("incoming\n");
   });
 
-  it("rolls back a clean merge when publication fails after the ref mutation", async () => {
+  it("rolls back a clean merge when a durable ref write fails after mutation", async () => {
     const history = cleanDivergence();
     const workspace = await clonedFrom(history.fixture);
     const before = snapshot(workspace);
-    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
-    workspace.repo.mutateRefs = (mutation, metadata) => {
-      originalUpdate(mutation, metadata);
-      throw new Error("late merge publication fault");
+    const originalRun = workspace.repo.store.db.run.bind(workspace.repo.store.db);
+    let faultInjected = false;
+    workspace.repo.store.db.run = (query, ...bindings) => {
+      originalRun(query, ...bindings);
+      if (!faultInjected && query.includes("INSERT INTO git_refs")) {
+        faultInjected = true;
+        expect(
+          workspace.repo.store.db.scalar<string>(
+            "SELECT target FROM git_refs WHERE repo_id = ? AND name = 'refs/heads/main'",
+            workspace.repo.store.repoId,
+          ),
+        ).not.toBe(history.current);
+        throw new Error("late merge publication fault");
+      }
     };
 
     expect(() =>
       merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
     ).toThrow("late merge publication fault");
 
+    expect(faultInjected).toBe(true);
     expect(snapshot(workspace)).toEqual(before);
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
     expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
@@ -1034,7 +1045,7 @@ describe("merge lifecycle", () => {
     ).toBe(1);
   });
 
-  it("rejects substituting another valid incoming parent after conflict resolution", async () => {
+  it("keeps the captured incoming parent exact across conflict continuation", async () => {
     const fixture = newFixture();
     fixture.write("conflict.txt", "base\n");
     const base = fixture.commit("base");
@@ -1048,28 +1059,29 @@ describe("merge lifecycle", () => {
     fixture.write("conflict.txt", "current\n");
     const current = fixture.commit("current");
     const workspace = await clonedFrom(fixture);
+    const git = nativeGit(workspace);
 
-    expect(
-      merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
-    ).toEqual({ conflicted: true, pendingCommit: true });
+    await expect(git.merge({ theirs: "topic" })).resolves.toEqual({
+      conflicted: true,
+      pendingCommit: true,
+    });
+    await expect(
+      git.updateRef({ ref: "refs/heads/topic", value: alternate, force: true }),
+    ).rejects.toMatchObject({ code: "EMERGEACTIVE" });
+    await expect(git.readRef({ ref: "refs/heads/topic" })).resolves.toEqual({
+      kind: "direct",
+      oid: incoming,
+    });
+    expect(workspace.repo.checkout.requireMergeState().state.incomingParentOid).toBe(incoming);
+
     writeWorkFile(workspace, "/conflict.txt", "resolved\n");
-    add(workspace.repo, workspace.worktree, { paths: ["conflict.txt"] });
-    workspace.database.db.run(
-      "UPDATE git_operation_state SET incoming_parent_oid = ? WHERE checkout_id = ?",
-      alternate,
-      workspace.repo.store.repoId,
-    );
+    await git.add({ paths: ["conflict.txt"] });
+    const result = await git.mergeContinue();
 
-    expect(() => mergeContinue(workspace.context, workspace.repo)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(workspace.repo.head().oid).toBe(current);
-    const persisted = workspace.database.db.scalar<string>(
-      "SELECT incoming_parent_oid FROM git_operation_state WHERE checkout_id = ?",
-      workspace.repo.store.repoId,
-    );
-    expect(persisted).toBe(alternate);
-    expect(persisted).not.toBe(incoming);
+    if (result.oid === undefined) throw new Error("merge continuation returned no oid");
+    expect(workspace.repo.readCommit(result.oid).parent).toEqual([current, incoming]);
+    expect(workspace.repo.readCommit(result.oid).parent).not.toContain(alternate);
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
   it("rolls a compatibility conflict back atomically", async () => {
