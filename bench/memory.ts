@@ -34,6 +34,7 @@ import {
   SqliteGitDatabase,
 } from "../src/git/store/index.js";
 import { advanceMaintenanceReachability } from "../src/git/store/maintenance/reachability.js";
+import { INFLATE_FEED } from "../src/git/store/objects.js";
 import { commitGraphBytes } from "./commit-graph-bytes.js";
 import type { Harness, Scenario } from "./harness.js";
 import {
@@ -46,9 +47,13 @@ import {
   LARGE_CONFIG_BYTES,
   LARGE_HEADER_BYTES,
   LARGE_OBJECT_BYTES,
+  LOOSE_STREAM_OBJECT_BYTES,
+  LOOSE_STREAM_OBJECT_COUNT,
+  LOOSE_STREAM_OUTPUT_BYTES,
   type MemoryPhaseEvidence,
   type MemoryScenarioSpec,
   memoryScenarioSpec,
+  PROCESS_TRANSIENT_TARGET_BYTES,
 } from "./memory-protocol.js";
 
 const INITIAL_SPEC = memoryScenarioSpec("fs.initial-write");
@@ -335,9 +340,9 @@ async function* singleBlobPackStream(
   yield hash.digest();
 }
 
-function deterministicBytes(size: number): Uint8Array {
+function deterministicBytes(size: number, seed = 0x9e3779b9): Uint8Array {
   const data = new Uint8Array(size);
-  let state = 0x9e3779b9;
+  let state = seed;
   for (let index = 0; index < data.length; index++) {
     state ^= state << 13;
     state ^= state >>> 17;
@@ -702,6 +707,104 @@ function stagingAddScenario(): Scenario {
             throw new Error("staging add wrote the wrong loose object bytes");
           }
           verificationDigest = stored.digest;
+        },
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
+      },
+    ],
+  };
+}
+
+function looseObjectStreamScenario(): Scenario {
+  const spec = memoryScenarioSpec("core.loose-object-stream");
+  let store: SharedRepoStore | null = null;
+  const oids: string[] = [];
+  let objects: Map<string, Uint8Array> | null = null;
+  let expectedDigest: string | null = null;
+  let storedBytes = 0;
+  let verificationDigest: string | null = null;
+  return {
+    name: spec.scenario,
+    kind: "memory",
+    fileBacked: true,
+    async setup({ harness }) {
+      const created = createRepository(harness, "/repo");
+      const expected = createHash("sha256");
+      for (let index = 0; index < LOOSE_STREAM_OBJECT_COUNT; index++) {
+        const data = deterministicBytes(LOOSE_STREAM_OBJECT_BYTES, 0x51a7_0000 + index);
+        expected.update(data);
+        oids.push(created.repo.store.write("blob", data));
+      }
+      expectedDigest = expected.digest("hex");
+      store = reopenRepository(harness, "/repo").repo.store;
+      const payload = store.db.one<{ chunks: number; bytes: number }>(
+        `SELECT count(*) AS chunks, sum(length(data)) AS bytes
+           FROM git_object_chunks
+          WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))`,
+        store.repoId,
+        JSON.stringify(oids),
+      );
+      if (
+        payload === undefined ||
+        !Number.isSafeInteger(payload.chunks) ||
+        !Number.isSafeInteger(payload.bytes) ||
+        payload.chunks !== spec.verifiedChunkCount ||
+        payload.bytes <= 0
+      ) {
+        throw new Error("loose stream fixture did not produce its many-chunk payload");
+      }
+      storedBytes = payload.bytes;
+      if (
+        LOOSE_STREAM_OUTPUT_BYTES + INFLATE_FEED >= PROCESS_TRANSIENT_TARGET_BYTES ||
+        LOOSE_STREAM_OUTPUT_BYTES + storedBytes <= PROCESS_TRANSIENT_TARGET_BYTES
+      ) {
+        throw new Error("loose stream fixture does not distinguish streamed and retained payloads");
+      }
+    },
+    phases: [
+      {
+        name: spec.operation,
+        async run() {
+          if (store === null || oids.length !== LOOSE_STREAM_OBJECT_COUNT) {
+            throw new Error("loose stream fixture is missing");
+          }
+          const read = store.readBlobs(oids, { budgetBytes: LOOSE_STREAM_OUTPUT_BYTES });
+          objects = read.blobs;
+          if (
+            objects.size !== LOOSE_STREAM_OBJECT_COUNT ||
+            read.remaining.length !== 0 ||
+            read.bytes !== LOOSE_STREAM_OUTPUT_BYTES
+          ) {
+            throw new Error("loose stream read did not return the complete bounded batch");
+          }
+        },
+        async verify() {
+          if (store === null || objects === null || expectedDigest === null || storedBytes === 0) {
+            throw new Error("loose stream fixture is missing");
+          }
+          const chunks = store.db.scalar<number>(
+            `SELECT count(*) FROM git_object_chunks
+              WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))`,
+            store.repoId,
+            JSON.stringify(oids),
+          );
+          const hash = createHash("sha256");
+          let contentBytes = 0;
+          for (const oid of oids) {
+            const object = objects.get(oid);
+            if (object === undefined || hashObject("blob", object) !== oid) {
+              throw new Error("loose stream read returned the wrong object identity");
+            }
+            contentBytes += object.length;
+            hash.update(object);
+          }
+          verificationDigest = hash.digest("hex");
+          if (
+            contentBytes !== spec.verifiedContentBytes ||
+            chunks !== spec.verifiedChunkCount ||
+            verificationDigest !== expectedDigest
+          ) {
+            throw new Error("loose stream read failed exact byte verification");
+          }
         },
         memoryEvidence: () => ownedEvidence(spec, verificationDigest),
       },
@@ -1162,6 +1265,7 @@ export const MEMORY: Scenario[] = [
   integrationGuardScenario(),
   rebaseBaselineScenario(),
   stagingAddScenario(),
+  looseObjectStreamScenario(),
   maintenanceReachabilityScenario(),
   packFallbackAuditScenario(),
   packAuthenticationScenario(),

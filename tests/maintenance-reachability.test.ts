@@ -45,6 +45,7 @@ class FailingReachabilityDatabase implements SqlDatabase {
   failure: ReachabilityFailure | null = null;
   activeHeaderIterators = 0;
   closedHeaderIterators = 0;
+  readonly objectInfoQueries: string[] = [];
 
   constructor(readonly inner: TestDatabase) {}
 
@@ -61,6 +62,7 @@ class FailingReachabilityDatabase implements SqlDatabase {
   }
 
   one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    if (query.includes("maintenance-object-info")) this.objectInfoQueries.push(query);
     return this.inner.one<Row>(query, ...bindings);
   }
 
@@ -624,6 +626,21 @@ describe("maintenance reachability", () => {
           malformedOid,
         ),
       ).toBe(0);
+    });
+
+    it("reads loose reachability metadata without preflighting payload rows", () => {
+      const inner = new TestDatabase();
+      const observed = new FailingReachabilityDatabase(inner);
+      const database = new SqliteGitDatabase(observed, { objectCacheBytes: 0, chunkBytes: 0 });
+      const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+      const store = database.openCheckout(checkout);
+      const tree = store.write("tree", serializeTree([]));
+      const root = store.write("commit", commit(tree));
+      seedMark(inner, checkout.repoId, [{ oid: root }]);
+
+      expect(advanceMaintenanceReachability(store.shared)).toMatchObject({ processedOid: root });
+      expect(observed.objectInfoQueries).toHaveLength(1);
+      expect(observed.objectInfoQueries[0]).not.toContain("git_object_chunks");
     });
 
     it("releases ownership and restarts after SQL, source, parser, and publication failures", () => {

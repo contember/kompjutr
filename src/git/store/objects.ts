@@ -10,7 +10,7 @@ import {
   objectHeader,
   type RawObject,
 } from "../common/objects.js";
-import { int, nullable, oneOf, RowShape } from "../common/rows.js";
+import { blob as blobRow, int, nullable, oneOf, RowShape, text } from "../common/rows.js";
 import { Sha1 } from "../common/sha1.js";
 import { deflate, InflateInto, InflateSizeError, InflateStream } from "../common/zlib.js";
 import {
@@ -62,20 +62,17 @@ export const MAX_BLOB_BATCH_OIDS = 4096;
 /** Parsed commits staged beside encoded object bytes before a batch flush. */
 export const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
 
-export interface ObjectReadMetadata {
-  ordinal: number;
+interface ObjectReadMetadata {
   oid: string;
   source: "loose" | "pack";
   type: ObjectType;
   size: number;
-  stored: "raw" | "zlib" | null;
 }
 
 const OBJECT_READ_ROW = new RowShape({
   source: nullable(oneOf(["loose", "pack"])),
   type: nullable(oneOf(["blob", "tree", "commit", "tag"])),
   size: nullable(int(0)),
-  stored: nullable(oneOf(["raw", "zlib"])),
 });
 const OBJECT_INFO_ROW = new RowShape({
   source: nullable(oneOf(["loose", "pack"])),
@@ -87,6 +84,16 @@ const OBJECT_INFO_ROW = new RowShape({
   last_chunk: nullable(int(0)),
   largest_chunk: int(0),
   stored_bytes: int(0),
+});
+
+const LOOSE_PAYLOAD_ROW = new RowShape({
+  ordinal: int(0),
+  oid: text(),
+  type: oneOf(["blob", "tree", "commit", "tag"]),
+  size: int(0, MAX_OBJECT_BYTES),
+  stored: oneOf(["raw", "zlib"]),
+  seq: nullable(int(0)),
+  data: nullable(blobRow()),
 });
 
 export type LooseEncoding = "raw" | "zlib";
@@ -270,21 +277,19 @@ export class ObjectTable {
 
   #readAuthenticatedObject(oid: string, expectedType: ObjectType): RawObject | null {
     if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
-    const loose = this.#looseRow(oid);
-    if (loose === null) {
+    const loose = this.#readLooseObjects([oid]).get(oid);
+    if (loose === undefined) {
       return this.#packs.readAuthenticatedObject(oid, expectedType);
     }
     const cacheKey = this.#objectCacheKey(oid);
     try {
-      const object = this.#readLooseObjectRows([{ oid, ...loose }]).get(oid);
-      if (object === undefined) throw new CorruptError(`loose ${expectedType} ${oid} disappeared`);
-      if (object.type !== expectedType) {
-        throw new CorruptError(`${oid} is a ${object.type}, not a ${expectedType}`);
+      if (loose.type !== expectedType) {
+        throw new CorruptError(`${oid} is a ${loose.type}, not a ${expectedType}`);
       }
-      if (hashObject(object.type, object.data) !== oid) {
+      if (hashObject(loose.type, loose.data) !== oid) {
         throw new CorruptError(`loose ${expectedType} ${oid} does not match its bytes`);
       }
-      return object;
+      return loose;
     } finally {
       this.#objects.delete(cacheKey);
     }
@@ -416,8 +421,7 @@ export class ObjectTable {
                CASE WHEN loose.oid IS NOT NULL THEN loose.type
                     WHEN pack.pack_id IS NOT NULL THEN packed.type END AS type,
                CASE WHEN loose.oid IS NOT NULL THEN loose.size
-                    WHEN pack.pack_id IS NOT NULL THEN packed.size END AS size,
-               CASE WHEN loose.oid IS NOT NULL THEN loose.stored END AS stored
+                    WHEN pack.pack_id IS NOT NULL THEN packed.size END AS size
           FROM wanted w
           LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = w.oid
           LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = w.oid
@@ -444,25 +448,11 @@ export class ObjectTable {
       if (row.type === null || row.size === null) {
         throw new CorruptError(`object ${oid} has invalid indexed metadata`);
       }
-      let stored: "raw" | "zlib" | null;
-      if (row.source === "loose") {
-        if (row.stored !== "raw" && row.stored !== "zlib") {
-          throw new CorruptError(`object ${oid} has invalid storage metadata`);
-        }
-        stored = row.stored;
-      } else {
-        if (row.stored !== null) {
-          throw new CorruptError(`object ${oid} has invalid storage metadata`);
-        }
-        stored = null;
-      }
       metadata.push({
-        ordinal: index,
         oid,
         source: row.source,
         type: row.type,
         size: row.size,
-        stored,
       });
     }
 
@@ -489,7 +479,7 @@ export class ObjectTable {
     }
 
     const remaining = wanted.slice(selected.length);
-    const looseObjects = this.#readLooseObjectRows(looseRows);
+    const looseObjects = this.#readLooseObjects(looseRows.map((row) => row.oid));
     const packed =
       packedOids.length === 0 ? new Map<string, RawObject>() : this.#packs.readObjects(packedOids);
     const objects = new Map<string, RawObject>();
@@ -1126,26 +1116,156 @@ export class ObjectTable {
 
   #readLoose(oid: string): RawObject | null {
     if (!this.#cacheKeys.hasLoose) return null;
-    const row = this.#looseRow(oid);
-    if (row === null) return null;
-    return this.#readLooseObjectRows([{ oid, ...row }]).get(oid) ?? null;
+    return this.#readLooseObjects([oid]).get(oid) ?? null;
   }
 
+  /** Decode the joined payload cursor without retaining compressed rows between iterations. */
   #readLooseObjects(oids: readonly string[]): Map<string, RawObject> {
     if (oids.length === 0) return new Map();
-    const rows = this.#db.all<{
+    const wanted = [...new Set(oids)];
+    const result = new Map<string, RawObject>();
+    let current: {
+      ordinal: number;
       oid: string;
-      type: string;
+      type: ObjectType;
       size: number;
-      stored: string;
-    }>(
-      `SELECT wanted.value AS oid, object.type, object.size, object.stored
-         FROM json_each(?) wanted
-         JOIN git_objects object ON object.repo_id = ? AND object.oid = wanted.value`,
-      JSON.stringify(oids),
+      stored: LooseEncoding;
+      nextSeq: number;
+      encodedBytes: number;
+      data: Uint8Array | null;
+      inflater: InflateInto | null;
+    } | null = null;
+
+    const finishCurrent = (): void => {
+      const state = current;
+      if (state === null) return;
+      let data: Uint8Array;
+      if (state.nextSeq === 0) {
+        throw new CorruptError(`loose blob ${state.oid} has no payload rows`);
+      }
+      if (state.stored === "raw") {
+        if (state.encodedBytes !== state.size || state.data === null) {
+          throw new CorruptError(`loose blob ${state.oid} size does not match its metadata`);
+        }
+        data = state.data;
+      } else {
+        if (state.encodedBytes === 0 || state.inflater?.ended !== true) {
+          throw new CorruptError(`loose object ${state.oid} size does not match its metadata`);
+        }
+        try {
+          data = state.inflater.finish();
+        } catch (error) {
+          throw new CorruptError(`loose object ${state.oid} size does not match its metadata`, {
+            cause: error,
+          });
+        }
+      }
+      if (data.length !== state.size) {
+        throw new CorruptError(`loose blob ${state.oid} size does not match its metadata`);
+      }
+      const object: RawObject = { type: state.type, data };
+      this.#objects.set(this.#objectCacheKey(state.oid), object);
+      result.set(state.oid, object);
+    };
+
+    for (const raw of this.#db.iterate(
+      `WITH /* loose-object-payload */ wanted(ordinal, oid) AS (
+         SELECT CAST(key AS INTEGER), value FROM json_each(?)
+       )
+       SELECT wanted.ordinal, object.oid, object.type, object.size, object.stored,
+              chunk.seq, chunk.data
+         FROM wanted
+         JOIN git_objects object ON object.repo_id = ? AND object.oid = wanted.oid
+         LEFT JOIN git_object_chunks chunk
+           ON chunk.repo_id = object.repo_id AND chunk.oid = object.oid
+        ORDER BY wanted.ordinal, chunk.seq`,
+      JSON.stringify(wanted),
       this.#repoId,
-    );
-    return this.#readLooseObjectRows(rows);
+    )) {
+      const row = LOOSE_PAYLOAD_ROW.decode(raw);
+      const expectedOid = wanted[row.ordinal];
+      if (expectedOid === undefined || row.oid !== expectedOid) {
+        throw new CorruptError("loose object payload crossed object boundaries");
+      }
+      if (current === null || row.ordinal !== current.ordinal) {
+        if (current !== null && row.ordinal <= current.ordinal) {
+          throw new CorruptError("loose object payload returned out-of-order objects");
+        }
+        finishCurrent();
+        current = {
+          ordinal: row.ordinal,
+          oid: row.oid,
+          type: row.type,
+          size: row.size,
+          stored: row.stored,
+          nextSeq: 0,
+          encodedBytes: 0,
+          data: row.stored === "raw" ? new Uint8Array(row.size) : null,
+          inflater: row.stored === "zlib" ? new InflateInto(row.size) : null,
+        };
+      } else if (
+        row.oid !== current.oid ||
+        row.type !== current.type ||
+        row.size !== current.size ||
+        row.stored !== current.stored
+      ) {
+        throw new CorruptError(`loose object ${current.oid} metadata changed between payload rows`);
+      }
+      if (row.seq === null || row.data === null) {
+        throw new CorruptError(`loose blob ${row.oid} has no payload rows`);
+      }
+      if (row.seq !== current.nextSeq) {
+        throw new CorruptError(`loose blob ${row.oid} has an invalid chunk sequence`);
+      }
+      if (
+        row.data.length === 0 &&
+        !(current.stored === "raw" && current.size === 0 && row.seq === 0)
+      ) {
+        throw new CorruptError(`loose blob ${row.oid} has an empty payload row`);
+      }
+      if (row.data.length > OBJECT_CHUNK) {
+        throw new CorruptError(`loose blob ${row.oid} has an oversized payload row`);
+      }
+      if (row.data.length > Number.MAX_SAFE_INTEGER - current.encodedBytes) {
+        throw new CorruptError(`loose blob ${row.oid} encoded size overflowed`);
+      }
+      const offset = current.encodedBytes;
+      current.encodedBytes += row.data.length;
+      current.nextSeq++;
+      if (current.stored === "raw") {
+        if (current.data === null || current.encodedBytes > current.size) {
+          throw new CorruptError(`loose blob ${row.oid} size does not match its metadata`);
+        }
+        current.data.set(row.data, offset);
+        continue;
+      }
+      const inflater = current.inflater;
+      if (inflater === null) throw new CorruptError(`loose object ${row.oid} lost its inflater`);
+      for (let feedOffset = 0; feedOffset < row.data.length; feedOffset += INFLATE_FEED) {
+        const input = row.data.subarray(feedOffset, feedOffset + INFLATE_FEED);
+        let used: number;
+        try {
+          used = inflater.push(input);
+        } catch (error) {
+          if (error instanceof InflateSizeError) {
+            throw new CorruptError(`loose object ${row.oid} exceeds its indexed size`, {
+              cause: error,
+            });
+          }
+          throw new CorruptError(`loose object ${row.oid} has invalid compressed bytes`, {
+            cause: error,
+          });
+        }
+        if (used <= 0 || (!inflater.ended && used !== input.length)) {
+          throw new CorruptError(`loose object ${row.oid} inflater made no progress`);
+        }
+        if (used !== input.length) {
+          throw new CorruptError(`loose object ${row.oid} has trailing compressed bytes`);
+        }
+      }
+    }
+    finishCurrent();
+    return result;
   }
 
   #looseObjectMetadata(oids: readonly string[]): Map<string, { type: ObjectType; size: number }> {
@@ -1168,141 +1288,6 @@ export class ObjectTable {
         throw new CorruptError("loose object metadata query returned an invalid row");
       }
       result.set(row.oid, { type: row.type, size: row.size });
-    }
-    return result;
-  }
-
-  #readLooseObjectRows(
-    rows: readonly {
-      oid: string;
-      type: string | null;
-      size: number | null;
-      stored: string | null;
-    }[],
-  ): Map<string, RawObject> {
-    if (rows.length === 0) return new Map();
-    const wanted = rows.map((row) => row.oid);
-    const encodedWanted = JSON.stringify(wanted);
-    const gate = this.#db.all<{
-      oid: string;
-      chunks: number;
-      first_seq: number | null;
-      last_seq: number | null;
-      largest_chunk: number;
-      stored_bytes: number;
-    }>(
-      `WITH wanted(ordinal, oid) AS (
-         SELECT CAST(key AS INTEGER), value FROM json_each(?)
-       )
-       SELECT w.oid, COUNT(c.seq) AS chunks, MIN(c.seq) AS first_seq,
-              MAX(c.seq) AS last_seq, COALESCE(MAX(length(c.data)), 0) AS largest_chunk,
-              COALESCE(SUM(length(c.data)), 0) AS stored_bytes
-         FROM wanted w
-         LEFT JOIN git_object_chunks c ON c.repo_id = ? AND c.oid = w.oid
-        GROUP BY w.ordinal, w.oid
-        ORDER BY w.ordinal`,
-      encodedWanted,
-      this.#repoId,
-    );
-    if (gate.length !== rows.length) throw new CorruptError("loose blob gate lost an object");
-    for (let index = 0; index < gate.length; index++) {
-      const checked = gate[index]!;
-      const source = rows[index]!;
-      const chunks = Number(checked.chunks);
-      const size = source.size;
-      const stored = parseLooseEncoding(source.stored ?? "");
-      if (
-        checked.oid !== source.oid ||
-        !isObjectType(source.type) ||
-        typeof size !== "number" ||
-        !Number.isSafeInteger(size) ||
-        size < 0 ||
-        !Number.isSafeInteger(chunks) ||
-        chunks <= 0 ||
-        checked.first_seq !== 0 ||
-        checked.last_seq !== chunks - 1 ||
-        !Number.isSafeInteger(checked.largest_chunk) ||
-        checked.largest_chunk < 0 ||
-        checked.largest_chunk > OBJECT_CHUNK ||
-        !Number.isSafeInteger(checked.stored_bytes) ||
-        checked.stored_bytes < 0 ||
-        (stored === "raw" && checked.stored_bytes !== size) ||
-        (stored === "zlib" && checked.stored_bytes === 0)
-      ) {
-        throw new CorruptError(`loose blob ${source.oid} has invalid chunk metadata`);
-      }
-    }
-
-    const parts = new Map<string, Uint8Array[]>();
-    for (const row of this.#db.iterate(
-      `WITH wanted(ordinal, oid) AS (
-         SELECT CAST(key AS INTEGER), value FROM json_each(?)
-       )
-       SELECT w.oid, c.seq, c.data
-         FROM wanted w
-         JOIN git_object_chunks c ON c.repo_id = ? AND c.oid = w.oid
-        ORDER BY w.ordinal, c.seq`,
-      encodedWanted,
-      this.#repoId,
-    )) {
-      if (typeof row.oid !== "string" || !Number.isSafeInteger(row.seq)) {
-        throw new CorruptError("loose blob query returned invalid chunk metadata");
-      }
-      const list = parts.get(row.oid);
-      if (list === undefined) parts.set(row.oid, [readBlob(row.data)]);
-      else list.push(readBlob(row.data));
-    }
-
-    const result = new Map<string, RawObject>();
-    for (const row of rows) {
-      if (!isObjectType(row.type)) throw new CorruptError(`${row.oid} has an invalid object type`);
-      const size = row.size;
-      if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
-        throw new CorruptError(`loose blob ${row.oid} has an invalid size`);
-      }
-      const stored = parseLooseEncoding(row.stored ?? "");
-      const encoded = concat(parts.get(row.oid) ?? []);
-      let data: Uint8Array;
-      if (stored === "raw") {
-        data = encoded;
-      } else {
-        const stream = new InflateInto(size);
-        let consumed = 0;
-        while (!stream.ended && consumed < encoded.length) {
-          const input = encoded.subarray(consumed, consumed + INFLATE_FEED);
-          let used: number;
-          try {
-            used = stream.push(input);
-          } catch (error) {
-            if (error instanceof InflateSizeError) {
-              throw new CorruptError(`loose object ${row.oid} exceeds its indexed size`, {
-                cause: error,
-              });
-            }
-            throw error;
-          }
-          consumed += used;
-          if (!stream.ended && used !== input.length) {
-            throw new CorruptError(`loose object ${row.oid} inflater made no progress`);
-          }
-        }
-        if (!stream.ended || consumed !== encoded.length) {
-          throw new CorruptError(`loose object ${row.oid} size does not match its metadata`);
-        }
-        try {
-          data = stream.finish();
-        } catch (error) {
-          throw new CorruptError(`loose object ${row.oid} size does not match its metadata`, {
-            cause: error,
-          });
-        }
-      }
-      if (data.length !== size) {
-        throw new CorruptError(`loose blob ${row.oid} size does not match its metadata`);
-      }
-      const object: RawObject = { type: row.type, data };
-      this.#objects.set(this.#objectCacheKey(row.oid), object);
-      result.set(row.oid, object);
     }
     return result;
   }

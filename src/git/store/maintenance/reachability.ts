@@ -1,9 +1,10 @@
 import type { SqlDatabase } from "../../../db/db.js";
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../../common/errors.js";
-import type { ObjectType } from "../../common/objects.js";
+import { MAX_OBJECT_BYTES, type ObjectType } from "../../common/objects.js";
 import { InflateStream } from "../../common/zlib.js";
-import type { ObjectReadInfo, SharedRepoStore } from "../index.js";
+import type { SharedRepoStore } from "../index.js";
+import { maximumDeflatedBytes, STREAM_CHUNK } from "../objects.js";
 import { MAX_DELTA_DEPTH } from "../packs.js";
 import {
   expectPhase,
@@ -17,6 +18,8 @@ const EDGE_PAGE = 256;
 // Bounds one synchronous mark transaction: each expansion reads one queue row and its edge page.
 export const MARK_EXPANSIONS_PER_CALL = 64;
 const HEADER_LINE_PREFIX_BYTES = 128;
+// Streamed writes use the smallest loose payload rows, so they set the legitimate row ceiling.
+const MAX_LOOSE_PAYLOAD_ROWS = Math.ceil(maximumDeflatedBytes(MAX_OBJECT_BYTES) / STREAM_CHUNK);
 
 export type MaintenanceReachabilityStatus = "progress" | "complete" | "root-changed";
 
@@ -78,7 +81,11 @@ interface PublicationResult {
   reachableObjects: number;
 }
 
-interface ReachabilityObjectInfo extends ObjectReadInfo {
+interface ReachabilityObjectInfo {
+  oid: string;
+  type: ObjectType;
+  size: number;
+  source: "loose" | "pack";
   stored: "raw" | "zlib" | null;
 }
 
@@ -333,18 +340,13 @@ function requireObjectInfo(store: SharedRepoStore, oid: string): ReachabilityObj
                  WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
             CASE WHEN loose.oid IS NOT NULL THEN loose.type ELSE packed.type END AS type,
             CASE WHEN loose.oid IS NOT NULL THEN loose.size ELSE packed.size END AS size,
-            loose.stored,
-            CASE WHEN loose.oid IS NULL THEN 0 ELSE (
-              SELECT count(*) FROM git_object_chunks chunk
-               WHERE chunk.repo_id = ? AND chunk.oid = input.oid
-            ) END AS chunk_rows
+            loose.stored
        FROM (SELECT ? AS oid) input
        LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = input.oid
        LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = input.oid
        LEFT JOIN git_pack_meta pack
          ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
         AND pack.state = 'complete'`,
-    store.repoId,
     oid,
     store.repoId,
     store.repoId,
@@ -367,7 +369,6 @@ function requireObjectInfo(store: SharedRepoStore, oid: string): ReachabilityObj
     type: objectType(row.type, "reachable object type"),
     size: safeInteger(row.size, "reachable object size", 0),
     source: row.source,
-    chunkRows: safeInteger(row.chunk_rows, "reachable object chunk count", 0),
     stored,
   };
 }
@@ -414,7 +415,7 @@ function streamLooseHeaders(
       ORDER BY chunk.seq LIMIT ?`,
       store.repoId,
       info.oid,
-      info.chunkRows + 1,
+      MAX_LOOSE_PAYLOAD_ROWS + 1,
     );
     iterator = source[Symbol.iterator]();
     for (;;) {
@@ -424,6 +425,9 @@ function streamLooseHeaders(
         break;
       }
       const row = next.value;
+      if (rows >= MAX_LOOSE_PAYLOAD_ROWS) {
+        throw new CorruptError("loose header stream exceeded its payload-row bound");
+      }
       if (row.repo_id !== store.repoId || row.oid !== info.oid || row.seq !== rows) {
         throw new CorruptError("loose header stream returned inconsistent rows");
       }
@@ -456,7 +460,7 @@ function streamLooseHeaders(
   } finally {
     if (!finished) iterator?.return?.();
   }
-  if (rows !== info.chunkRows || stored === null) {
+  if (rows === 0 || stored === null) {
     throw new CorruptError("loose header stream returned an incomplete chunk sequence");
   }
   if (stored === "zlib" && inflater?.ended !== true) {

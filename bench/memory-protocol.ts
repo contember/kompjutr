@@ -1,4 +1,6 @@
 import { CHUNK_SIZE } from "../src/fs/schema.js";
+import { MAX_OBJECT_BYTES } from "../src/git/common/objects.js";
+import { INFLATE_FEED, maximumDeflatedBytes, OBJECT_CHUNK } from "../src/git/store/objects.js";
 import { commitGraphBytes } from "./commit-graph-bytes.js";
 
 export const SQL_STATEMENT_TARGET = 1_000;
@@ -16,6 +18,12 @@ export const LARGE_OBJECT_BYTES = 4 * 1024 * 1024 + 1;
 export const LARGE_CONFIG_BYTES = 1024 * 1024 + 1;
 export const LARGE_HEADER_BYTES = 48 * 1024 * 1024 + 64 * 1024;
 export const CHECKOUT_COUNT = 1_024;
+export const LOOSE_STREAM_OBJECT_BYTES = MAX_OBJECT_BYTES - 2 * 1024 * 1024;
+export const LOOSE_STREAM_OBJECT_COUNT = 2;
+export const LOOSE_STREAM_OUTPUT_BYTES = LOOSE_STREAM_OBJECT_BYTES * LOOSE_STREAM_OBJECT_COUNT;
+const LOOSE_STREAM_PAYLOAD_BYTES =
+  maximumDeflatedBytes(LOOSE_STREAM_OBJECT_BYTES) * LOOSE_STREAM_OBJECT_COUNT;
+const LOOSE_STREAM_RETAINED_BYTES = LOOSE_STREAM_OUTPUT_BYTES + LOOSE_STREAM_PAYLOAD_BYTES;
 export const CHECKOUT_ROOT_BYTES = 4_096;
 export const CHECKOUT_HEAD_BYTES = 1_024;
 
@@ -63,6 +71,12 @@ if (GRAPH_RETAINED_BYTES <= 32 * 1024 * 1024) {
 if (CHECKOUT_RETAINED_BYTES <= 6 * 1024 * 1024) {
   throw new Error("checkout memory fixture does not cross its former retained limit");
 }
+if (LOOSE_STREAM_OUTPUT_BYTES + INFLATE_FEED >= PROCESS_TRANSIENT_TARGET_BYTES) {
+  throw new Error("loose stream final outputs and one inflater feed do not fit the process target");
+}
+if (LOOSE_STREAM_RETAINED_BYTES <= PROCESS_TRANSIENT_TARGET_BYTES) {
+  throw new Error("loose stream fixture does not cross the retired retained-payload shape");
+}
 
 export type MemoryScenarioName =
   | "fs.initial-write"
@@ -70,6 +84,7 @@ export type MemoryScenarioName =
   | "core.integration.guard-hash"
   | "core.rebase.baseline-hash"
   | "core.staging.add-hash"
+  | "core.loose-object-stream"
   | "sqlite.maintenance.reachability"
   | "sqlite.pack.fallback-audit"
   | "sqlite.pack.authenticate"
@@ -83,11 +98,11 @@ export type MemorySource =
   | "requireCleanIntegrationWorktree"
   | "rebase"
   | "add"
+  | "SharedRepoStore.readBlobs"
   | "advanceMaintenanceReachability"
   | "PackStore.deleteCompletePacks"
   | "PackStore.authenticateCompleteSources"
   | "Repository.walkIndexed"
-  | "SharedRepoStore.readBlobs"
   | "CheckoutStore.configMoveSection"
   | "SqliteGitDatabase.listCheckouts";
 
@@ -150,6 +165,17 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 32 * 1024 * 1024,
     verifiedContentBytes: HASH_WORKLOAD_BYTES,
     verifiedChunkCount: RANGE_HASH_CHUNKS * 2,
+  },
+  {
+    scenario: "core.loose-object-stream",
+    operation: "core.loose-object-stream",
+    source: "SharedRepoStore.readBlobs",
+    workloadBytes: LOOSE_STREAM_RETAINED_BYTES,
+    formerLimitBytes: PROCESS_TRANSIENT_TARGET_BYTES,
+    verifiedContentBytes: LOOSE_STREAM_OUTPUT_BYTES,
+    verifiedChunkCount:
+      Math.ceil(maximumDeflatedBytes(LOOSE_STREAM_OBJECT_BYTES) / OBJECT_CHUNK) *
+      LOOSE_STREAM_OBJECT_COUNT,
   },
   {
     scenario: "sqlite.maintenance.reachability",
