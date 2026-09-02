@@ -38,8 +38,9 @@ not effort: a wrong answer outranks a missing one.
   concrete workload behind it. Textual `apply` is not filed because local
   snapshot replay serves the current workload.
 - **Not a parity gap.** [63](63-bound-packed-dependency-graph-traversal.md)
-  retains non-regression scaling found while closing the budget sprint;
-  [64](64-speed-up-full-test-suite.md) tracks exhaustive-suite wall time.
+  retains packed-graph and read-memory scaling; [65](65-git-sqlite-architecture-review.md)
+  collects verified architecture-review remediation; [64](64-speed-up-full-test-suite.md)
+  tracks exhaustive-suite wall time.
 
 ## Consumer demand
 
@@ -124,3 +125,4 @@ units over the same files, and a long sprint does not make that safe.
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
 - [63 — Bound packed dependency graph traversal](63-bound-packed-dependency-graph-traversal.md)
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
+- [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)

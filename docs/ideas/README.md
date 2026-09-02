@@ -17,3 +17,6 @@ decided work or status.
 - [`offload-large-objects-to-r2.md`](offload-large-objects-to-r2.md) — keep
   objects above the materialisation ceiling in R2 keyed by OID instead of
   refusing them at `add` and ingest.
+- [`git-sqlite-architecture-review-triage.md`](git-sqlite-architecture-review-triage.md)
+  — verify or dismiss the unresolved hypotheses from the 2026-09-02 storage
+  architecture review before they enter the backlog.

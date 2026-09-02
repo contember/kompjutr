@@ -36,6 +36,11 @@ None.
   [`benchmark-current`](reference/benchmark-current.md#clone-statement-profile).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0020).
+- The first critical/high tranche from the 2026-09-02 Git-in-SQLite architecture
+  review is fixed. Remaining verified work is in
+  [`backlog/65`](backlog/65-git-sqlite-architecture-review.md) and
+  [`backlog/63`](backlog/63-bound-packed-dependency-graph-traversal.md); unverified
+  claims remain in [`ideas`](ideas/git-sqlite-architecture-review-triage.md).
 - The completed everyday Git shell sprint made command execution asynchronous,
   added staged diff and history reads, exposed exact local/network operations,
   and composed pull with the restart-safe rebase lifecycle.
