@@ -16,7 +16,9 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprints/sprint-2026-09-02-trusted-reads-and-linear-journal.md`](sprints/sprint-2026-09-02-trusted-reads-and-linear-journal.md)
+  - trusted ordinary reads, explicit write premises, and linear durable operation
+    transitions.
 
 ## Specs
 
