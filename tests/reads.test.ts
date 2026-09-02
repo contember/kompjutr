@@ -537,7 +537,11 @@ describe("bounded commit graph reads", () => {
     db.storage.resetCounters();
 
     expect(log(repo, { depth: 257 })).toHaveLength(257);
-    expect([...db.storage.histogram.keys()].join("\n")).toContain("SELECT w.oid, c.seq, c.data");
+    expect(
+      db.storage.histogram.get(
+        "WITH /* loose-object-payload */ wanted(ordinal, oid) AS ( SELECT CAST(key AS INTEGER), value FROM json_each(?) ) SELECT ",
+      ),
+    ).toBe(257);
   });
 
   it("rejects a coordinated cached cycle on point and indexed log paths", () => {
