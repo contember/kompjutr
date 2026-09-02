@@ -40,6 +40,7 @@ import { FullStatusTrackerSeed, sparseStatus } from "./status-sparse.js";
 import { treeStream } from "./tree-stream.js";
 import type { Worktree } from "./worktree.js";
 import {
+  createWorktreeHashCursor,
   hashWorktreePath,
   indexMatchesStat,
   type WorktreePath,
@@ -334,6 +335,7 @@ function* statusStreamInternal(
   const ignores = options.ignores ?? loadIgnoreMatcher(worktree, repo.root);
   const prunable = prunableExcludeRoots(excluded, snapshot.trackedPaths);
   const buffered: BufferedStatusRow[] = [];
+  const hashCursor = createWorktreeHashCursor();
   let sourceRows = 0;
   let collapsedIgnored: string | null = null;
   let collapsedUntracked: string | null = null;
@@ -394,11 +396,11 @@ function* statusStreamInternal(
     }
 
     if (sourceRows >= STATUS_WINDOW_ROWS) {
-      yield* flushStatusRows(repo, worktree, buffered, seed);
+      yield* flushStatusRows(repo, worktree, buffered, seed, false, undefined, hashCursor);
       sourceRows = 0;
     }
   }
-  yield* flushStatusRows(repo, worktree, buffered, seed);
+  yield* flushStatusRows(repo, worktree, buffered, seed, false, undefined, hashCursor);
   seed?.finish();
 }
 

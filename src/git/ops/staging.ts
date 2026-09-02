@@ -65,10 +65,12 @@ import { type TargetEntry, treeStream } from "./tree-stream.js";
 import { gitModeFor, type Worktree } from "./worktree.js";
 import {
   compilePathspecsOwned,
+  createWorktreeHashCursor,
   hashExactWorktreePathsOwned,
   hashWorktreePathsOwned,
   indexEntryFor,
   indexMatchesStat,
+  type WorktreeHashCursor,
   type WorktreePath,
   walkWorktreeEntriesStreamOwned,
 } from "./worktree-io.js";
@@ -79,8 +81,6 @@ const ADD_MAX_ROWS_PER_STREAM = 50_000;
 const ADD_SELECTED_RETAINED_BYTES = 8 * 1024 * 1024;
 const ADD_SELECTED_PATHS = 1_000;
 const ADD_SELECTED_ROWS = 32_768;
-const INDEX_ROW_FIXED_BYTES = 256;
-const PATH_ENTRY_FIXED_BYTES = 96;
 const SELECTED_RESULT_FIXED_BYTES = 64;
 const SELECTED_ARRAY_FIXED_BYTES = 64;
 const SELECTED_ARRAY_SLOT_BYTES = 8;
@@ -110,15 +110,14 @@ interface AvailableSelectedPaths extends Extract<SelectedPathResult, { available
 interface AddIndexPath {
   path: string;
   entry: IndexEntry | undefined;
+  conflicted: boolean;
 }
 
 interface AddIndexSnapshot {
-  paths: AddIndexPath[];
-  conflicted: Set<string>;
+  paths: Iterable<AddIndexPath>;
 }
 
 interface AddOperationLimits {
-  indexRows: number;
   worktreeRows: number;
   headRows: number;
 }
@@ -274,7 +273,6 @@ function runAdd(
   if (!all && specs.length === 0) return;
 
   const limits: AddOperationLimits = {
-    indexRows: 0,
     worktreeRows: 0,
     headRows: 0,
   };
@@ -291,7 +289,7 @@ function runAdd(
         repo,
         worktree,
         options,
-        snapshotAddIndexRows(selected.index, pathspec, selected.structuralBytes, limits),
+        addIndexSource(selected.index, pathspec),
         selectedWorktreeFiles(selected.worktree, pathspec),
         pathspec,
         force,
@@ -305,7 +303,7 @@ function runAdd(
     assertPathspecsMatch(repo, worktree, specs, index);
   }
 
-  const snapshot = snapshotAddIndex(index, pathspec, limits);
+  const snapshot = addIndexSource(indexScanOwned(index), pathspec);
   const walked = walkWorktreeEntriesStreamOwned(worktree, repo.root, {
     pathspec,
     excludeRoots: options.excludeRoots,
@@ -352,8 +350,9 @@ function applyAdd(
   const pending: StageCandidateBatch = {
     rows: [],
   };
+  const hashCursor = createWorktreeHashCursor();
   index.indexApply((sink) => {
-    const flush = (): void => stageCandidates(repo, worktree, pending, sink);
+    const flush = (): void => stageCandidates(repo, worktree, pending, sink, hashCursor);
     for (const row of joinSorted3(
       boundedAddWorktreeRows(walked, limits),
       snapshot.paths,
@@ -370,7 +369,7 @@ function applyAdd(
       if (row.a !== undefined) {
         if (row.b === undefined && isExcluded(row.path, excluded)) continue;
         if (row.b === undefined && isIgnored(row.path)) continue;
-        const conflicted = snapshot.conflicted.has(row.path);
+        const conflicted = row.b?.conflicted ?? false;
         if (!conflicted && existing !== undefined && indexMatchesStat(existing, row.a.stat)) {
           continue;
         }
@@ -387,6 +386,7 @@ function applyAdd(
       // A conflict-only path has no stage-zero row but still needs removal.
       if (row.b === undefined) continue;
       if (pathspec !== undefined && !pathspec.matches(row.path)) continue;
+      flush();
       sink.remove(row.path);
     }
     flush();
@@ -998,53 +998,32 @@ function lowerBoundSelectedPath<T extends { path: string }>(
   return low;
 }
 
-function snapshotAddIndex(
-  index: IndexStore,
-  pathspec: CompiledPathspecMatcher | undefined,
-  limits: AddOperationLimits,
-): AddIndexSnapshot {
-  return snapshotAddIndexRows(indexScanOwned(index), pathspec, 0, limits);
-}
-
-function snapshotAddIndexRows(
+function addIndexSource(
   entries: Iterable<IndexEntry>,
   pathspec: CompiledPathspecMatcher | undefined,
-  initialRetained: number,
-  limits: AddOperationLimits,
 ): AddIndexSnapshot {
-  const paths: AddIndexPath[] = [];
-  const conflicted = new Set<string>();
-  let retained = initialRetained;
+  return { paths: groupedAddIndexRows(entries, pathspec) };
+}
+
+function* groupedAddIndexRows(
+  entries: Iterable<IndexEntry>,
+  pathspec: CompiledPathspecMatcher | undefined,
+): Generator<AddIndexPath> {
   let current: AddIndexPath | null = null;
   for (const entry of entries) {
-    if (limits.indexRows >= ADD_MAX_ROWS_PER_STREAM) {
-      throw new GitError("E2BIG", `add index scan exceeds ${ADD_MAX_ROWS_PER_STREAM} rows`);
-    }
-    limits.indexRows++;
     if (pathspec !== undefined && !pathspec.matches(entry.path)) continue;
-    const rowRetained =
-      INDEX_ROW_FIXED_BYTES + structuralStringBytes(entry.path) + structuralStringBytes(entry.oid);
-    retained += rowRetained;
-    if (retained > ADD_RETAINED_BYTES) {
-      throw new GitError("E2BIG", `add retained state exceeds ${ADD_RETAINED_BYTES} bytes`);
-    }
     if (current === null || current.path !== entry.path) {
-      current = { path: entry.path, entry: entry.stage === 0 ? entry : undefined };
-      paths.push(current);
-      const pathRetained = PATH_ENTRY_FIXED_BYTES;
-      retained += pathRetained;
+      if (current !== null) yield current;
+      current = {
+        path: entry.path,
+        entry: entry.stage === 0 ? entry : undefined,
+        conflicted: entry.stage !== 0,
+      };
     } else if (entry.stage === 0) {
       current.entry = entry;
-    }
-    if (entry.stage !== 0 && !conflicted.has(entry.path)) {
-      retained += PATH_ENTRY_FIXED_BYTES;
-      conflicted.add(entry.path);
-    }
-    if (retained > ADD_RETAINED_BYTES) {
-      throw new GitError("E2BIG", `add retained state exceeds ${ADD_RETAINED_BYTES} bytes`);
-    }
+    } else current.conflicted = true;
   }
-  return { paths, conflicted };
+  if (current !== null) yield current;
 }
 
 function* boundedAddWorktreeRows(
@@ -1078,6 +1057,7 @@ function stageCandidates(
   worktree: Worktree,
   candidates: StageCandidateBatch,
   sink: IndexSink,
+  hashCursor: WorktreeHashCursor,
 ): void {
   if (candidates.rows.length === 0) return;
   try {
@@ -1102,7 +1082,7 @@ function stageCandidates(
         mapped.set(row.path, oid);
       }
     }
-    const hashes = hashWorktreePathsOwned(repo, worktree, unresolved);
+    const hashes = hashWorktreePathsOwned(repo, worktree, unresolved, {}, hashCursor);
     repo.store.upsertBlobIds(
       [...hashes.values()].flatMap((hashed) => {
         const contentId = hashed.stat.contentId;
@@ -1772,7 +1752,7 @@ export function lsFilesWithWorktree(
   const ignores = selection.excludeStandard
     ? loadIgnoreMatcher(worktree, repo.root, { excludeRoots })
     : undefined;
-  const index = uniqueIndexPaths(repo, pathspec.scanPrefixes);
+  const index = uniqueIndexPaths(repo, null);
   const walked = walkWorktreeEntriesStreamOwned(worktree, repo.root, {
     excludeRoots,
     ignores,

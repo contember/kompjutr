@@ -25,8 +25,10 @@ import { trySparseCleanCheckout } from "./sparse-checkout.js";
 import { treeStream } from "./tree-stream.js";
 import { gitModeFor, type Worktree } from "./worktree.js";
 import {
+  createWorktreeHashCursor,
   hashWorktreePathsOwned,
   indexMatchesStat,
+  type WorktreeHashCursor,
   type WorktreePath,
   walkWorktreeEntriesStreamOwned,
 } from "./worktree-io.js";
@@ -691,6 +693,7 @@ function checkoutBlockersAgainstMode(
   const pendingTargets: PendingTarget[] = [];
   const pendingTrackedPaths: PendingTarget[] = [];
   const untrackedAncestors: PendingTarget[] = [];
+  const hashCursor = createWorktreeHashCursor();
 
   for (const row of checkoutGuardRows(repo, worktree, baselineTree, tree, excludeRoots)) {
     if (limits !== undefined) {
@@ -776,10 +779,10 @@ function checkoutBlockersAgainstMode(
     if (indexMatchesStat(existing, row.worktree.stat)) continue;
     dirtyCandidates.push({ entry: existing, worktree: row.worktree });
     if (dirtyCandidates.length >= CHECKOUT_GUARD_BATCH) {
-      flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, limits);
+      flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, limits, hashCursor);
     }
   }
-  flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, limits);
+  flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, limits, hashCursor);
   tracked.sort(comparePaths);
   untracked.sort(comparePaths);
   return { tracked, untracked };
@@ -874,6 +877,7 @@ function flushGuardCandidates(
   candidates: GuardCandidate[],
   tracked: string[],
   limits: CheckoutBlockerLimits | undefined,
+  hashCursor: WorktreeHashCursor,
 ): void {
   if (candidates.length === 0) return;
   const identities = repo.store.lookupBlobIds(
@@ -909,6 +913,7 @@ function flushGuardCandidates(
     worktree,
     needsHash.map((candidate) => candidate.worktree),
     { write: false },
+    hashCursor,
   );
   const dirty = new Set<string>();
   for (const candidate of needsHash) {

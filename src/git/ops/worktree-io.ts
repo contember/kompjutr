@@ -413,6 +413,16 @@ interface WorktreeHashOptions {
   write?: boolean;
 }
 
+/** Cursor shared by strictly ordered hash windows within one operation. */
+export interface WorktreeHashCursor {
+  root: RealPath | null;
+  after: string | undefined;
+}
+
+export function createWorktreeHashCursor(): WorktreeHashCursor {
+  return { root: null, after: undefined };
+}
+
 function readWorktreeRealpath(worktree: Worktree, path: string): RealPath {
   return nativeRealpathOwned(worktree, path) ?? worktree.realpath(path);
 }
@@ -446,14 +456,15 @@ export function hashWorktreePathsOwned(
   worktree: Worktree,
   paths: readonly WorktreePath[],
   options: WorktreeHashOptions = {},
+  cursor?: WorktreeHashCursor,
 ): Map<string, HashedPath> {
   if (paths.length === 0) return new Map();
-  const root = readWorktreeRealpath(worktree, repo.root);
+  const root = cursor?.root ?? readWorktreeRealpath(worktree, repo.root);
   return hashWorktreePathsAtRoot(
     repo,
     worktree,
     root,
-    refreshPaths(worktree, root, paths),
+    refreshPaths(worktree, root, paths, cursor),
     options,
   );
 }
@@ -588,7 +599,15 @@ function refreshPaths(
   worktree: Worktree,
   root: RealPath,
   paths: readonly WorktreePath[],
+  cursor?: WorktreeHashCursor,
 ): WorktreePath[] {
+  if (cursor !== undefined) {
+    if (cursor.root !== null && cursor.root !== root) {
+      throw new Error("worktree hash cursor changed roots");
+    }
+    cursor.root = root;
+    return refreshOrderedPaths(worktree, root, paths, cursor);
+  }
   const wanted = new Map<string, string>();
   for (const candidate of paths) {
     const absolute = joinPath(root, candidate.path);
@@ -606,6 +625,39 @@ function refreshPaths(
     wanted.delete(scannedPath);
     if (wanted.size === 0) break;
   }
+  return refreshed;
+}
+
+function refreshOrderedPaths(
+  worktree: Worktree,
+  root: RealPath,
+  paths: readonly WorktreePath[],
+  cursor: WorktreeHashCursor,
+): WorktreePath[] {
+  const wanted = new Map<string, string>();
+  let previous = cursor.after;
+  for (const candidate of paths) {
+    if (previous !== undefined && comparePaths(previous, candidate.path) >= 0) {
+      throw new Error("worktree hash windows are not strictly ordered");
+    }
+    wanted.set(joinPath(root, candidate.path), candidate.path);
+    previous = candidate.path;
+  }
+  if (previous === undefined) return [];
+
+  const through = joinPath(root, previous);
+  const after = cursor.after === undefined ? undefined : joinPath(root, cursor.after);
+  const refreshed: WorktreePath[] = [];
+  for (const entry of scanWorktreeEntries(worktree, root, undefined, after)) {
+    if (comparePaths(entry.path, through) > 0) break;
+    const relative = wanted.get(entry.path);
+    if (relative === undefined) continue;
+    const { path: scannedPath, ...stat } = entry;
+    refreshed.push({ path: relative, stat });
+    wanted.delete(scannedPath);
+    if (wanted.size === 0) break;
+  }
+  cursor.after = previous;
   return refreshed;
 }
 
@@ -717,6 +769,7 @@ export function* dirtyPathStreamOwned(
   let scanned: Generator<WorktreePath> | null = null;
   let current: IteratorResult<WorktreePath, void> | null = null;
   const pending: { index: IndexEntry; path: WorktreePath }[] = [];
+  const hashCursor = createWorktreeHashCursor();
 
   const flush = function* (): Generator<string> {
     if (pending.length === 0) return;
@@ -727,6 +780,7 @@ export function* dirtyPathStreamOwned(
       worktree,
       root,
       batch.map((candidate) => candidate.path),
+      hashCursor,
     );
     const current = new Map(refreshed.map((candidate) => [candidate.path, candidate]));
     const expected = new Map(batch.map((candidate) => [candidate.index.path, candidate.index]));
@@ -860,8 +914,9 @@ function* scanWorktreeEntries(
   worktree: Worktree,
   root: RealPath,
   limits?: DirtyPathLimits,
+  initialAfter?: string,
 ): Generator<ScanEntry> {
-  let after: string | undefined;
+  let after = initialAfter;
   while (true) {
     const read = readWorktreeScanPage(worktree, root, {
       after,

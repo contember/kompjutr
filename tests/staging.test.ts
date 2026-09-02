@@ -4,6 +4,7 @@ import type { ScanEntry } from "../src/fs/types.js";
 import { utf8, utf8Decoder } from "../src/git/common/bytes.js";
 import { GitError, PathspecNotFoundError } from "../src/git/common/errors.js";
 import { hashObject } from "../src/git/common/objects.js";
+import { comparePaths } from "../src/git/common/streams.js";
 import { IGNORE_LIMITS } from "../src/git/ignore/index.js";
 import { checkoutTree } from "../src/git/ops/checkout.js";
 import type { GitContext } from "../src/git/ops/context.js";
@@ -1692,6 +1693,101 @@ describe("cost", () => {
       throw new Error(`scalar readlink is forbidden during add: ${path}`);
     }
   }
+
+  it("streams add all past the former whole-index threshold", () => {
+    const workspace = makeRepo("/");
+    const original = utf8.encode("original\n");
+    const modified = utf8.encode("modified\n");
+    const resolved = utf8.encode("resolved\n");
+    const fresh = utf8.encode("fresh\n");
+    const originalOid = workspace.repo.store.write("blob", original);
+    const paths = Array.from(
+      { length: 30_000 },
+      (_, index) => `tracked/f${index.toString().padStart(5, "0")}-${"x".repeat(24)}.txt`,
+    );
+    workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, bytes: original })));
+    const stats = new Map(
+      workspace.worktree
+        .scan("/", { filesOnly: true, limit: paths.length + 1 })
+        .map((entry) => [entry.path.slice(1), entry]),
+    );
+    const conflictOrdinal = 999;
+    const conflictPath = paths[conflictOrdinal];
+    if (conflictPath === undefined) throw new Error("add-all conflict path is missing");
+    workspace.repo.checkout.indexReplace(
+      paths.flatMap((path, ordinal) => {
+        const stat = stats.get(path);
+        if (stat === undefined) throw new Error(`missing add-all scale path: ${path}`);
+        const entry = {
+          path,
+          stage: 0,
+          mode: 0o100644,
+          oid: originalOid,
+          size: stat.size,
+          mtime: stat.mtime,
+          ino: stat.ino,
+          rev: stat.rev,
+        };
+        return ordinal === conflictOrdinal
+          ? [1, 2, 3].map((stage) => ({ ...entry, stage }))
+          : [entry];
+      }),
+    );
+    const formerlyModeledBytes = paths.reduce(
+      (bytes, path) => bytes + 256 + (48 + path.length * 2) + (48 + originalOid.length * 2) + 96,
+      0,
+    );
+    expect(formerlyModeledBytes).toBeGreaterThan(16 * 1024 * 1024);
+
+    workspace.tick(60_000);
+    const deletedPath = paths[1];
+    const newPath = "zzzz-new.txt";
+    if (deletedPath === undefined) throw new Error("add-all scale paths are missing");
+    const modifiedPaths = paths
+      .slice(0, 1_200)
+      .filter((path) => path !== deletedPath && path !== conflictPath);
+    const modifiedSet = new Set(modifiedPaths);
+    expect(modifiedPaths.length).toBeGreaterThan(1_000);
+    workspace.worktree.writeFiles([
+      ...modifiedPaths.map((path) => ({ path: `/${path}`, bytes: modified })),
+      { path: `/${conflictPath}`, bytes: resolved },
+      { path: `/${newPath}`, bytes: fresh },
+    ]);
+    workspace.worktree.removeFiles([`/${deletedPath}`]);
+    const worktree = new BulkOnlyWorktree(workspace.worktree);
+
+    add(workspace.repo, worktree, { paths: [], all: true });
+
+    const modifiedOid = hashObject("blob", modified);
+    const resolvedOid = hashObject("blob", resolved);
+    const freshOid = hashObject("blob", fresh);
+    const expected = [newPath, ...paths.filter((path) => path !== deletedPath)]
+      .sort(comparePaths)
+      .map((path) => ({
+        path,
+        oid:
+          path === conflictPath
+            ? resolvedOid
+            : modifiedSet.has(path)
+              ? modifiedOid
+              : path === newPath
+                ? freshOid
+                : originalOid,
+      }));
+    const actual = workspace.repo.checkout.indexEntries();
+    expect(actual.filter((entry) => entry.path === newPath)).toHaveLength(1);
+    expect(actual.filter((entry) => entry.path === conflictPath)).toEqual([
+      expect.objectContaining({ stage: 0, oid: resolvedOid }),
+    ]);
+    expect(actual.every((entry) => entry.stage === 0)).toBe(true);
+    expect(actual.map((entry) => entry.path)).toEqual(
+      actual.map((entry) => entry.path).sort(comparePaths),
+    );
+    expect(actual.map((entry) => ({ path: entry.path, oid: entry.oid }))).toEqual(expected);
+    expect(worktree.bulkReadPaths).toEqual(
+      [...modifiedPaths, conflictPath, newPath].sort(comparePaths).map((path) => `/${path}`),
+    );
+  });
 
   it("stages 9,329 files and exactly 1,000 changes through bounded bulk calls", () => {
     const workspace = makeRepo("/");

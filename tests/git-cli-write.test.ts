@@ -7,8 +7,11 @@ import { ComputerWorktree } from "../src/compat/computer/worktree.js";
 import { iterateSqlCursor, type SqlDatabase } from "../src/db/db.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
 import { createContextGitCliRunner } from "../src/git/cli/index.js";
+import { utf8 } from "../src/git/common/bytes.js";
+import { hashObject } from "../src/git/common/objects.js";
 import { joinPath as gitJoinPath } from "../src/git/common/paths.js";
 import { checkoutTree } from "../src/git/ops/checkout.js";
+import { commit } from "../src/git/ops/commit.js";
 import { type GitContext, openRepository } from "../src/git/ops/context.js";
 import { diffSummaryBounded, diffSummaryEntryRetainedBytes } from "../src/git/ops/diff.js";
 import { initRepository } from "../src/git/ops/init.js";
@@ -506,6 +509,90 @@ describe("mutating git CLI handlers", () => {
       }),
     ).toEqual(cliResult(expectedEmpty));
     expect(workspace.repo.head().oid).toBe(source.git("rev-parse", "HEAD"));
+  });
+  it("streams commit all past the former whole-index threshold", async () => {
+    const workspace = nativeRepository();
+    const original = utf8.encode("original\n");
+    const modified = utf8.encode("modified\n");
+    const fresh = utf8.encode("fresh\n");
+    const originalOid = workspace.repo.store.write("blob", original);
+    const paths = Array.from({ length: 30_000 }, (_, index) => {
+      const directory = Math.floor(index / 100);
+      const file = index % 100;
+      return `tracked/d${directory.toString().padStart(3, "0")}/f${file
+        .toString()
+        .padStart(3, "0")}-${"x".repeat(24)}.txt`;
+    });
+    workspace.worktree.writeFiles(
+      paths.map((path) => ({ path: `/repo/${path}`, bytes: original })),
+    );
+    const stats = new Map(
+      workspace.worktree
+        .scan("/repo", { filesOnly: true, limit: paths.length + 1 })
+        .map((entry) => [entry.path.slice("/repo/".length), entry]),
+    );
+    workspace.repo.checkout.indexReplace(
+      paths.map((path) => {
+        const stat = stats.get(path);
+        if (stat === undefined) throw new Error(`missing commit-all scale path: ${path}`);
+        return {
+          path,
+          stage: 0,
+          mode: 0o100644,
+          oid: originalOid,
+          size: stat.size,
+          mtime: stat.mtime,
+          ino: stat.ino,
+          rev: stat.rev,
+        };
+      }),
+    );
+    commit(workspace.context, workspace.repo, { message: "base" });
+    const formerlyModeledBytes = paths.reduce(
+      (bytes, path) => bytes + 256 + (48 + path.length * 2) + (48 + originalOid.length * 2) + 96,
+      0,
+    );
+    expect(formerlyModeledBytes).toBeGreaterThan(16 * 1024 * 1024);
+
+    workspace.tick(60_000);
+    const modifiedPath = paths[0];
+    const deletedPath = paths[1];
+    const unchangedPath = paths[paths.length - 1];
+    const newPath = "new.txt";
+    if (modifiedPath === undefined || deletedPath === undefined || unchangedPath === undefined) {
+      throw new Error("commit-all scale paths are missing");
+    }
+    workspace.worktree.writeFiles([
+      { path: `/repo/${modifiedPath}`, bytes: modified },
+      { path: `/repo/${newPath}`, bytes: fresh },
+    ]);
+    workspace.worktree.removeFiles([`/repo/${deletedPath}`]);
+
+    const result = await runner(workspace.context).runCli({
+      argv: ["commit", "-a", "-m", "scale"],
+      cwd: "/repo",
+      env: IDENTITY_ENV,
+    });
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: "", truncated: false });
+    const modifiedOid = hashObject("blob", modified);
+    expect(
+      [...workspace.repo.checkout.indexScan()].map((entry) => ({
+        path: entry.path,
+        oid: entry.oid,
+      })),
+    ).toEqual(
+      paths
+        .filter((path) => path !== deletedPath)
+        .map((path) => ({ path, oid: path === modifiedPath ? modifiedOid : originalOid })),
+    );
+    const tree = workspace.repo.headTree();
+    if (tree === null) throw new Error("commit-all scale commit has no tree");
+    expect(workspace.repo.resolveTreePath(tree, modifiedPath)?.oid).toBe(modifiedOid);
+    expect(workspace.repo.resolveTreePath(tree, deletedPath)).toBeNull();
+    expect(workspace.repo.resolveTreePath(tree, newPath)).toBeNull();
+    expect(workspace.repo.resolveTreePath(tree, unchangedPath)?.oid).toBe(originalOid);
+    expect(workspace.worktree.stat(`/repo/${newPath}`)).not.toBeNull();
   });
   it("matches an empty root commit and an unborn amend refusal", async () => {
     const source = fixture();

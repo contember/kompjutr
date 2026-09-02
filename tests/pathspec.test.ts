@@ -238,6 +238,26 @@ describe("ls-files pathspec", () => {
     expect(lsFiles(workspace.repo, { paths: ["dir"] })).toEqual(["dir/a", "dir/sub/b"]);
   });
 
+  it("matches real Git when literal prefix scans interleave", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("a-/tracked.txt", "tracked dash\n");
+    fixture.write("a/tracked.txt", "tracked slash\n");
+    fixture.commit("tracked prefixes");
+    const workspace = makeRepo("/");
+    await importFixture(fixture, workspace.repo.checkout);
+    checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+    fixture.write("a-/new.txt", "new dash\n");
+    fixture.write("a/new.txt", "new slash\n");
+    writeWorkFile(workspace, "/a-/new.txt", "new dash\n");
+    writeWorkFile(workspace, "/a/new.txt", "new slash\n");
+
+    const paths = ["a", "a-"];
+    expect(
+      lsFilesWithWorktree(workspace.repo, workspace.worktree, { others: true, paths }),
+    ).toEqual(gitLsFilesSelection(fixture, ["--others"], paths));
+  });
+
   it("coalesces redundant literal scans", () => {
     const workspace = makeRepo("/");
     const oid = workspace.repo.store.write("blob", new Uint8Array([1]));

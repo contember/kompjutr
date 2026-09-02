@@ -35,9 +35,11 @@ import { type StatusIndexGroup, statusIndexGroups } from "./status-rows.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import { gitModeFor, type Worktree } from "./worktree.js";
 import {
+  createWorktreeHashCursor,
   hashExactWorktreePaths,
-  hashWorktreePaths,
+  hashWorktreePathsOwned,
   indexMatchesStat,
+  type WorktreeHashCursor,
   type WorktreePath,
   walkWorktreeEntriesStream,
 } from "./worktree-io.js";
@@ -1052,6 +1054,7 @@ function* pendingChanges(
   // patch, as it does in real `git diff`.
   const from = treeStream(repo, fromTreeOid);
   const candidates: WorkingCandidate[] = [];
+  const hashCursor = createWorktreeHashCursor();
   for (const row of joinSorted3(
     from,
     stageZero(repo.checkout.indexScan()),
@@ -1085,10 +1088,18 @@ function* pendingChanges(
         candidates,
         false,
         renameCandidatesOnly,
+        hashCursor,
       );
     }
   }
-  yield* resolveWorkingCandidateIdentities(repo, worktree, candidates, false, renameCandidatesOnly);
+  yield* resolveWorkingCandidateIdentities(
+    repo,
+    worktree,
+    candidates,
+    false,
+    renameCandidatesOnly,
+    hashCursor,
+  );
 }
 
 type IndexPatchCandidate =
@@ -1396,6 +1407,7 @@ function* resolveWorkingCandidateIdentities(
   candidates: WorkingCandidate[],
   exact = false,
   renameCandidatesOnly = false,
+  hashCursor?: WorktreeHashCursor,
 ): Generator<PendingChange> {
   if (candidates.length === 0) return;
   const sourceRows = candidates.splice(0);
@@ -1406,7 +1418,7 @@ function* resolveWorkingCandidateIdentities(
       })
     : sourceRows;
   if (rows.length === 0) return;
-  const afters = resolveWorkingCandidateAfters(repo, worktree, rows, exact);
+  const afters = resolveWorkingCandidateAfters(repo, worktree, rows, exact, hashCursor);
   for (const row of rows) {
     const after = afters.get(row.path);
     if (after === undefined) throw new CorruptError("diff lost a working-tree identity");
@@ -1425,6 +1437,7 @@ function resolveWorkingCandidateAfters(
   worktree: Worktree,
   rows: readonly WorkingCandidate[],
   exact: boolean,
+  hashCursor?: WorktreeHashCursor,
 ): Map<string, EndpointIdentity | null> {
   const expected: BlobIdMapping[] = [];
   for (const row of rows) {
@@ -1453,7 +1466,7 @@ function resolveWorkingCandidateAfters(
   }
   const hashes = exact
     ? hashExactWorktreePaths(repo, worktree, unresolved, { write: false })
-    : hashWorktreePaths(repo, worktree, unresolved, { write: false });
+    : hashWorktreePathsOwned(repo, worktree, unresolved, { write: false }, hashCursor);
   repo.store.upsertBlobIds(
     [...hashes.values()].flatMap((hashed) => {
       const contentId = hashed.stat.contentId;

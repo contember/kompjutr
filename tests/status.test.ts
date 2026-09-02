@@ -153,11 +153,21 @@ class BulkOnlyWorktree extends CountingWorktree {
 }
 
 class ScanCountingWorktree extends BulkOnlyWorktree {
-  readonly scanPages: Array<{ afterSubtree: string | undefined; rows: ScanEntry[] }> = [];
+  readonly scanPages: Array<{
+    after: string | undefined;
+    afterSubtree: string | undefined;
+    filesOnly: boolean | undefined;
+    rows: ScanEntry[];
+  }> = [];
 
   override scan(root: string, options: ScanOptions): ScanEntry[] {
     const rows = super.scan(root, options);
-    this.scanPages.push({ afterSubtree: options.afterSubtree, rows });
+    this.scanPages.push({
+      after: options.after,
+      afterSubtree: options.afterSubtree,
+      filesOnly: options.filesOnly,
+      rows,
+    });
     return rows;
   }
 }
@@ -1016,6 +1026,34 @@ describe("status cost", () => {
     expect(new Set(worktree.bulkReadPaths)).toEqual(
       new Set(changed.map((entry) => `/${entry.path}`)),
     );
+  });
+
+  it("resumes hash refreshes across status windows", () => {
+    const workspace = makeRepo("/");
+    const bytes = utf8.encode("contents\n");
+    const oid = workspace.repo.store.write("blob", bytes);
+    const paths = Array.from(
+      { length: 2_001 },
+      (_, index) => `f${index.toString().padStart(4, "0")}.txt`,
+    );
+    workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, bytes })));
+    workspace.repo.checkout.indexReplace(
+      paths.map((path) => ({
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      })),
+    );
+    const worktree = new ScanCountingWorktree(workspace.worktree);
+
+    expect(status(workspace.repo, worktree, { renames: false })).toHaveLength(paths.length);
+
+    const refreshes = worktree.scanPages.filter((page) => page.filesOnly === true);
+    expect(refreshes.map((page) => page.after)).toEqual([undefined, "/f0999.txt", "/f1999.txt"]);
   });
 
   it("streams a 24,252-file index and reports all 100 modifications", () => {
