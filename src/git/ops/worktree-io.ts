@@ -10,7 +10,7 @@ import { nativeRealpathOwned, nativeScanOwned } from "../../fs/store/owned-read.
 import type { RealPath, ScanEntry, ScanOptions } from "../../fs/types.js";
 import { toHex, utf8 } from "../common/bytes.js";
 import { GitError } from "../common/errors.js";
-import { hashObject, objectHeader } from "../common/objects.js";
+import { hashObject, MAX_OBJECT_BYTES, objectHeader } from "../common/objects.js";
 import { joinPath, relativeTo } from "../common/paths.js";
 import { Sha1 } from "../common/sha1.js";
 import { comparePaths } from "../common/streams.js";
@@ -471,6 +471,14 @@ function hashWorktreePathsAtRoot(
 
   for (const candidate of paths) {
     if (candidate.stat.type === "dir") continue;
+    // Refuse from the stat, before any content is read: an oversized file
+    // never enters memory and never reaches the object store.
+    if (options.write !== false && candidate.stat.size > MAX_OBJECT_BYTES) {
+      throw new GitError(
+        "E2BIG",
+        `${candidate.path} is ${candidate.stat.size} bytes, above the ${MAX_OBJECT_BYTES}-byte object limit`,
+      );
+    }
     if (candidate.stat.type === "symlink") {
       symlinks.push(candidate);
     } else if (candidate.stat.size > STREAM_ABOVE) {

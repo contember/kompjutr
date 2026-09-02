@@ -26,20 +26,10 @@ export function flushCheckoutWrites(
   if (entries.length === 0) return;
   let pending = entries.splice(0, entries.length);
   while (pending.length > 0) {
-    let blobs: Map<string, Uint8Array>;
-    try {
-      blobs = repo.readBlobs(
-        pending.map((entry) => entry.oid),
-        {
-          budgetBytes: CHECKOUT_BLOB_BYTES,
-        },
-      ).blobs;
-    } catch (error) {
-      if (!(error instanceof GitError) || error.code !== "EFBIG") throw error;
-      const first = pending[0];
-      if (first === undefined) throw new CorruptError("checkout blob batch is empty");
-      blobs = new Map([[first.oid, repo.readBlob(first.oid)]]);
-    }
+    const blobs = repo.readBlobs(
+      pending.map((entry) => entry.oid),
+      { budgetBytes: CHECKOUT_BLOB_BYTES },
+    ).blobs;
     const writes = [];
     const indexEntries: IndexEntry[] = [];
     const mappings: BlobIdMapping[] = [];

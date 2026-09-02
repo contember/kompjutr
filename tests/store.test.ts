@@ -10,6 +10,7 @@ import {
 import { concat, utf8 } from "../src/git/common/bytes.js";
 import {
   hashObject,
+  MAX_OBJECT_BYTES,
   MODE_FILE,
   serializeCommit,
   serializeTree,
@@ -2921,5 +2922,60 @@ describe("refs, config and index", () => {
     expect(store.indexEntries()).toHaveLength(2);
     store.indexRemove("src/a.ts");
     expect(store.indexEntries()).toHaveLength(0);
+  });
+});
+
+describe("object materialisation ceiling", () => {
+  const zeroChunks = (size: number) =>
+    function* (): Generator<Uint8Array> {
+      const chunk = new Uint8Array(1024 * 1024);
+      for (let offset = 0; offset < size; offset += chunk.length) {
+        yield chunk.subarray(0, Math.min(chunk.length, size - offset));
+      }
+    };
+
+  it("stores and returns a loose object at the ceiling", () => {
+    const { store } = open();
+    const oid = store.writeStream("blob", MAX_OBJECT_BYTES, zeroChunks(MAX_OBJECT_BYTES));
+
+    expect(store.objectInfo([oid])).toEqual([
+      expect.objectContaining({ type: "blob", size: MAX_OBJECT_BYTES }),
+    ]);
+    expect(store.read(oid)?.data.length).toBe(MAX_OBJECT_BYTES);
+  });
+
+  it("refuses a loose write one byte above the ceiling before reading the stream", () => {
+    const { store, db } = open();
+    let pulled = 0;
+    const chunks = function* (): Generator<Uint8Array> {
+      pulled++;
+      yield new Uint8Array(MAX_OBJECT_BYTES + 1);
+    };
+
+    expect(() => store.writeStream("blob", MAX_OBJECT_BYTES + 1, chunks)).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(() => store.write("blob", new Uint8Array(MAX_OBJECT_BYTES + 1))).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+
+    expect(pulled).toBe(0);
+    expect(store.objectCount()).toBe(0);
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_objects WHERE size > ?", MAX_OBJECT_BYTES),
+    ).toBe(0);
+  });
+
+  it("rejects an oversized object row at the schema boundary", () => {
+    const { store, db } = open();
+
+    expect(() =>
+      db.run(
+        "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, 'blob', ?, 'zlib')",
+        store.sharedRepoId,
+        "c".repeat(40),
+        MAX_OBJECT_BYTES + 1,
+      ),
+    ).toThrow(/CHECK constraint failed/);
   });
 });

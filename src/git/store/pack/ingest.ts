@@ -7,6 +7,7 @@ import { CorruptError, GitError } from "../../common/errors.js";
 import type { ByteLru } from "../../common/lru.js";
 import {
   hashObject,
+  MAX_OBJECT_BYTES,
   NUMBER_TYPE,
   type ObjectType,
   objectHeader,
@@ -349,6 +350,12 @@ export class PackIngestEngine {
     for (let i = 0; i < count; i++) {
       throwIfIngestAborted(signal);
       const header = reader.entryHeader();
+      if (header.kind === null && header.entrySize > MAX_OBJECT_BYTES) {
+        throw new GitError(
+          "E2BIG",
+          `pack entry at ${header.offset} is ${header.entrySize} bytes, above the ${MAX_OBJECT_BYTES}-byte object limit`,
+        );
+      }
       membership.addOffset(i, header.offset);
       const entryType = header.kind === null ? NUMBER_TYPE[header.type]! : null;
       const entry = this.#inflateAt(reader, header.dataOff, header.entrySize, entryType);

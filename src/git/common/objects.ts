@@ -18,6 +18,13 @@ export interface RawObject {
   data: Uint8Array;
 }
 
+/**
+ * Largest object the store accepts. A read materialises one object as a single
+ * buffer inside a Workers isolate, so this is what keeps an object clear of the
+ * 128 MiB isolate ceiling and the sub-100 MiB per-operation target.
+ */
+export const MAX_OBJECT_BYTES = 48 * 1024 * 1024;
+
 export const TYPE_NUMBER: Record<ObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 export const NUMBER_TYPE: Record<number, ObjectType> = {
   1: "commit",

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ScanEntry } from "../src/fs/types.js";
 import { utf8, utf8Decoder } from "../src/git/common/bytes.js";
 import { GitError } from "../src/git/common/errors.js";
-import { MODE_FILE, serializeTree } from "../src/git/common/objects.js";
+import { MAX_OBJECT_BYTES, MODE_FILE, serializeTree } from "../src/git/common/objects.js";
 import { comparePaths } from "../src/git/common/streams.js";
 import { checkoutTree } from "../src/git/ops/checkout.js";
 import type { GitContext } from "../src/git/ops/context.js";
@@ -1381,5 +1381,22 @@ describe("tree and index write plumbing", () => {
         ).toThrow(expect.objectContaining({ code: "EINVAL" }));
       }
     });
+  });
+});
+
+describe("object materialisation ceiling", () => {
+  it("refuses to stage a working-tree file above the object ceiling", () => {
+    const workspace = makeRepo("/");
+    workspace.worktree.writeFiles([
+      { path: "/huge.bin", bytes: new Uint8Array(MAX_OBJECT_BYTES + 1), mode: 0o644 },
+    ]);
+    const beforeObjects = workspace.repo.store.objectCount();
+
+    expect(() => add(workspace.repo, workspace.worktree, { paths: ["huge.bin"] })).toThrow(
+      expect.objectContaining({ code: "E2BIG", message: expect.stringContaining("huge.bin") }),
+    );
+
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+    expect([...workspace.repo.checkout.indexScan()]).toEqual([]);
   });
 });

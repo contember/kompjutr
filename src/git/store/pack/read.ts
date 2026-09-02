@@ -243,7 +243,6 @@ export class PackReadEngine {
         !isObjectType(object.type) ||
         !Number.isSafeInteger(object.size) ||
         object.size < 0 ||
-        object.size > MAX_PACK_DELTA_WORKING_BYTES ||
         !Number.isSafeInteger(object.packId) ||
         object.packId < 0
       ) {
@@ -759,7 +758,6 @@ export class PackReadEngine {
         dataLen < 0 ||
         !Number.isSafeInteger(dataOff + dataLen) ||
         size < 0 ||
-        size > MAX_PACK_DELTA_WORKING_BYTES ||
         entrySize < 0 ||
         entrySize > MAX_PACK_DELTA_WORKING_BYTES ||
         (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid)))
@@ -920,12 +918,7 @@ export class PackReadEngine {
       for (const oid of externalOids) {
         const object = resolvedMetadata.get(oid);
         if (object === undefined) continue;
-        if (
-          !isObjectType(object.type) ||
-          !Number.isSafeInteger(object.size) ||
-          object.size < 0 ||
-          object.size > MAX_PACK_DELTA_WORKING_BYTES
-        ) {
+        if (!isObjectType(object.type) || !Number.isSafeInteger(object.size) || object.size < 0) {
           throw new CorruptError("loose base metadata is invalid");
         }
         externalMetadata.set(oid, object);

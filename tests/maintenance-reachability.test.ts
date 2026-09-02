@@ -4,6 +4,7 @@ import { createGit } from "../src/git/client.js";
 import { concat, utf8 } from "../src/git/common/bytes.js";
 import {
   hashObject,
+  MAX_OBJECT_BYTES,
   MODE_COMMIT,
   MODE_FILE,
   type ObjectType,
@@ -271,8 +272,7 @@ function fullObjectPack(type: ObjectType, value: Uint8Array): Uint8Array {
   return concat(chunks);
 }
 
-const FORMER_HEADER_OBJECT_BYTES = 48 * 1024 * 1024;
-const LARGE_HEADER_OBJECT_BYTES = FORMER_HEADER_OBJECT_BYTES + 64 * 1024;
+const LARGE_HEADER_OBJECT_BYTES = MAX_OBJECT_BYTES - 64 * 1024;
 
 function deterministicIncompressibleBytes(size: number, prefix: Uint8Array): Uint8Array {
   if (prefix.length > size) throw new Error("deterministic fixture prefix exceeds its size");
@@ -498,7 +498,7 @@ describe("maintenance reachability", () => {
   });
 
   describe("WU6g reachability ownership", () => {
-    it("streams valid loose commit and tag headers beyond 48 MiB with bounded live memory", () => {
+    it("streams valid loose commit and tag headers at the object ceiling with bounded live memory", () => {
       const { db, checkout, store } = open();
       const tree = store.write("tree", serializeTree([]));
       const target = store.write("blob", utf8.encode("large tag target\n"));

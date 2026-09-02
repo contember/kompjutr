@@ -39,15 +39,10 @@ function directErrorCode(error: unknown): string | undefined {
 }
 
 function readInitialBlobs(repo: Repository, entries: readonly TargetEntry[]) {
-  try {
-    return repo.readBlobs(
-      entries.map((entry) => entry.oid),
-      { budgetBytes: INITIAL_BLOB_BYTES },
-    );
-  } catch (error) {
-    if (directErrorCode(error) === "EFBIG") throw INITIAL_CHECKOUT_FALLBACK;
-    throw error;
-  }
+  return repo.readBlobs(
+    entries.map((entry) => entry.oid),
+    { budgetBytes: INITIAL_BLOB_BYTES },
+  );
 }
 
 function writeInitialEntry(

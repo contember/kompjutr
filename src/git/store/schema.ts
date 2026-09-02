@@ -3,6 +3,7 @@
 
 import type { SqlDatabase } from "../../db/db.js";
 import { CorruptError } from "../common/errors.js";
+import { MAX_OBJECT_BYTES } from "../common/objects.js";
 import { BLOB_ID_GENERATION_EXHAUSTED, MAX_BLOB_ID_CACHE_ROWS } from "./blob-id-cache.js";
 import { OPERATION_STATE_TABLE } from "./operation-schema.js";
 import { MAX_PROMISOR_REMOTE_NAME_BYTES, MAX_PROMISOR_URL_BYTES } from "./promisor.js";
@@ -522,7 +523,9 @@ const STATEMENTS = [
      repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
      oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
      type TEXT NOT NULL CHECK (typeof(type) = 'text' AND type IN ('blob','tree','commit','tag')),
-     size INTEGER NOT NULL CHECK (typeof(size) = 'integer' AND size >= 0),
+     size INTEGER NOT NULL CHECK (
+       typeof(size) = 'integer' AND size BETWEEN 0 AND ${MAX_OBJECT_BYTES}
+     ),
      stored TEXT NOT NULL DEFAULT 'zlib'
        CHECK (typeof(stored) = 'text' AND stored IN ('zlib','raw')),
      PRIMARY KEY (repo_id, oid),
@@ -613,7 +616,9 @@ const STATEMENTS = [
      data_off INTEGER NOT NULL CHECK (typeof(data_off) = 'integer' AND data_off >= 0),
      data_len INTEGER NOT NULL CHECK (typeof(data_len) = 'integer' AND data_len >= 0),
      type TEXT NOT NULL CHECK (typeof(type) = 'text' AND type IN ('blob','tree','commit','tag')),
-     size INTEGER NOT NULL CHECK (typeof(size) = 'integer' AND size >= 0),
+     size INTEGER NOT NULL CHECK (
+       typeof(size) = 'integer' AND size BETWEEN 0 AND ${MAX_OBJECT_BYTES}
+     ),
      entry_size INTEGER NOT NULL CHECK (typeof(entry_size) = 'integer' AND entry_size >= 0),
      base_oid TEXT CHECK (
        base_oid IS NULL OR (typeof(base_oid) = 'text' AND length(CAST(base_oid AS BLOB)) = 40)
@@ -635,7 +640,9 @@ const STATEMENTS = [
      data_off INTEGER NOT NULL CHECK (typeof(data_off) = 'integer' AND data_off >= 0),
      data_len INTEGER NOT NULL CHECK (typeof(data_len) = 'integer' AND data_len >= 0),
      type TEXT NOT NULL CHECK (typeof(type) = 'text' AND type IN ('blob','tree','commit','tag')),
-     size INTEGER NOT NULL CHECK (typeof(size) = 'integer' AND size >= 0),
+     size INTEGER NOT NULL CHECK (
+       typeof(size) = 'integer' AND size BETWEEN 0 AND ${MAX_OBJECT_BYTES}
+     ),
      entry_size INTEGER NOT NULL CHECK (typeof(entry_size) = 'integer' AND entry_size >= 0),
      base_oid TEXT CHECK (
        base_oid IS NULL OR (typeof(base_oid) = 'text' AND length(CAST(base_oid AS BLOB)) = 40)

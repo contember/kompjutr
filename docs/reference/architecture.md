@@ -144,7 +144,9 @@ Small loose objects are stored raw. Larger loose objects are compressed and
 split into 1 MiB `git_object_chunks` rows. Incoming packs stay compressed and
 are split into 1 MiB `git_pack_data` rows. The pack delta workspace uses a
 separate operation-local pool of 64 KiB chunks; that size is not the database
-row size.
+row size. No object above 48 MiB is ever stored: reads materialise one object as
+a single buffer, so the worktree stat, the loose write paths, pack ingest, and
+the `size` `CHECK`s all refuse it with `E2BIG` at the boundary.
 
 Pack ingest is provisional:
 

@@ -3,7 +3,13 @@ import { blob, readBlob, type SqlDatabase } from "../../db/db.js";
 import { concat, isOid, toHex } from "../common/bytes.js";
 import { CorruptError, GitError, ObjectNotFoundError } from "../common/errors.js";
 import type { ByteLru } from "../common/lru.js";
-import { hashObject, type ObjectType, objectHeader, type RawObject } from "../common/objects.js";
+import {
+  hashObject,
+  MAX_OBJECT_BYTES,
+  type ObjectType,
+  objectHeader,
+  type RawObject,
+} from "../common/objects.js";
 import { int, nullable, oneOf, RowShape } from "../common/rows.js";
 import { Sha1 } from "../common/sha1.js";
 import { deflate, InflateInto, InflateSizeError, InflateStream } from "../common/zlib.js";
@@ -23,11 +29,7 @@ import type {
   OwnedObjectBatch,
 } from "./contracts.js";
 import { isThenableResult } from "./json-pages.js";
-import {
-  MAX_PACK_DELTA_WORKING_BYTES,
-  PACK_BLOB_BATCH_TARGET_BYTES,
-  type PackStore,
-} from "./packs.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES, type PackStore } from "./packs.js";
 import type { Clock } from "./reflog.js";
 import { indexSeededTreeSource, indexSeededTreeSources } from "./tree-index.js";
 
@@ -150,6 +152,16 @@ export function readAuthenticatedObjectOwned(
   expectedType: ObjectType,
 ): RawObject | null {
   return store.readAuthenticatedObjectOwned(oid, expectedType);
+}
+
+/** The store never accepts an object it could not later return in one buffer. */
+function requireStorableObjectSize(type: ObjectType, size: number): void {
+  if (size > MAX_OBJECT_BYTES) {
+    throw new GitError(
+      "E2BIG",
+      `${type} object of ${size} bytes exceeds the ${MAX_OBJECT_BYTES}-byte object limit`,
+    );
+  }
 }
 
 export function requireCommitCacheWrites(result: CommitCacheWriteResult, expected: number): void {
@@ -532,6 +544,7 @@ export class ObjectTable {
   /** Stream every non-tree entry in raw Git DFS order with one SQL statement. */
 
   write(type: ObjectType, data: Uint8Array): string {
+    requireStorableObjectSize(type, data.length);
     const oid = hashObject(type, data);
     const commitEntry =
       type === "commit" ? prepareCommitCache({ repoId: this.#repoId, oid, data }) : undefined;
@@ -621,6 +634,7 @@ export class ObjectTable {
     if (!Number.isSafeInteger(size) || size < 0) {
       throw new GitError("EINVAL", "streamed object size must be a safe nonnegative integer");
     }
+    requireStorableObjectSize(type, size);
     const hash = new Sha1().update(objectHeader(type, size));
     const commitData = type === "commit" ? new Uint8Array(size) : undefined;
     let hashed = 0;
@@ -862,6 +876,7 @@ export class ObjectTable {
       write: (type: ObjectType, data: Uint8Array): string => {
         requireActive();
         try {
+          requireStorableObjectSize(type, data.length);
           const oid = hashObject(type, data);
           if (staged.has(oid)) return oid;
           const stored = looseEncoding(data.length);
@@ -1169,7 +1184,6 @@ export class ObjectTable {
         !isObjectType(row.type) ||
         !Number.isSafeInteger(row.size) ||
         row.size < 0 ||
-        row.size > MAX_PACK_DELTA_WORKING_BYTES ||
         result.has(row.oid)
       ) {
         throw new CorruptError("loose object metadata query returned an invalid row");
@@ -1224,7 +1238,6 @@ export class ObjectTable {
         typeof size !== "number" ||
         !Number.isSafeInteger(size) ||
         size < 0 ||
-        size > MAX_PACK_DELTA_WORKING_BYTES ||
         !Number.isSafeInteger(chunks) ||
         chunks <= 0 ||
         checked.first_seq !== 0 ||
@@ -1267,9 +1280,6 @@ export class ObjectTable {
       const size = row.size;
       if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
         throw new CorruptError(`loose blob ${row.oid} has an invalid size`);
-      }
-      if (size > MAX_PACK_DELTA_WORKING_BYTES) {
-        throw new GitError("E2BIG", `loose blob ${row.oid} exceeds the bounded inflate limit`);
       }
       const stored = parseLooseEncoding(row.stored ?? "");
       const encoded = concat(parts.get(row.oid) ?? []);

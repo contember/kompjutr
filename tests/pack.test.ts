@@ -6,6 +6,7 @@ import { concat, utf8, utf8Decoder } from "../src/git/common/bytes.js";
 import { GitError } from "../src/git/common/errors.js";
 import {
   hashObject,
+  MAX_OBJECT_BYTES,
   MODE_FILE,
   type ObjectType,
   parseCommit,
@@ -3964,5 +3965,24 @@ describe("real git packs", () => {
       const object = store.read(oid)!;
       expect(hashObject(object.type, object.data)).toBe(oid);
     }
+  });
+
+  it("rejects a real pack holding an object above the object ceiling", async () => {
+    const repo = fixture().init();
+    repo.write("small.txt", "small\n");
+    repo.write("huge.bin", new Uint8Array(MAX_OBJECT_BYTES + 1));
+    repo.commit("huge");
+    const pack = repo.packAll();
+
+    const store = open();
+    await expect(store.packs.ingest(slices(pack, 64 * 1024))).rejects.toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+
+    expect(
+      store.db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'complete'"),
+    ).toBe(0);
+    expect(store.db.scalar<number>("SELECT count(*) FROM git_pack_objects")).toBe(0);
+    expect(store.listRefs()).toEqual([]);
   });
 });
