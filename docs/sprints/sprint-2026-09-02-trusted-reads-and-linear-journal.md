@@ -385,3 +385,23 @@ successor rather than hiding unfinished work.
   opaque revision and eleven secondary gaps. The user selected blocking SQLite
   transactions wherever a local same-database state machine permits them; the
   plan now removes detached journal CAS instead of replacing its currency.
+- 2026-09-02 - WU7 enumerated only the ordinary reads changed by WU1-WU6:
+  operation state/steps/touched and operation-root pages; index tracker state
+  and dirty pages; native sparse selection, workspace, tree-resolution, and
+  snapshot projections; the joined loose-object payload cursor; and ref, HEAD,
+  reflog, index, baseline, shallow, and operation-checkout maintenance pages.
+  The policy witness deliberately excludes schema validation, write SQL, JSON
+  ordinal casts, network ingest, filesystem stale-handle revalidation, and true
+  algorithmic guards.
+- 2026-09-02 - Local state-machine ownership, rejected detached
+  revisions/hashes/leases/mutexes, and release/reacquisition around `await`
+  graduated to
+  [ADR-0022](../decisions/0022-own-local-git-mutations-with-sqlite-transactions.md).
+- 2026-09-02 - WU7 did not broaden the ARCH-17 sweep. Backlog 65 now records
+  the settled trusted-read tranche and narrows ARCH-17 to its remaining
+  unscheduled algorithms; backlog 17 remains the opt-in integrity-audit and
+  snapshot work rather than an ordinary-read requirement.
+- 2026-09-02 - WU7 review clarified that sparse bounds use different units:
+  selected-path projection counts 1,000 distinct paths (with up to four index
+  conflict stages each), workspace hydration bounds request and index rows, and
+  commit-tree snapshot shares one global 1,000-item materialization counter.

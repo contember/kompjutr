@@ -290,6 +290,16 @@ rows before untracked rows and ignored rows in eager `status()` and
 ordering inside each group. The staged deletion thus precedes the same path's
 untracked row; `statusStream()` remains path/window ordered.
 
+Native status, staging, and commit-tree snapshot fast paths accept only an
+internal sparse-source receipt bound to the exact SQLite `Database` instance.
+A spread, wrapper, custom source, or source from another database uses the
+generic streaming path. Selected-path projection retains at most 1,000 distinct
+paths, each with up to four conflict-stage index rows. Native workspace
+hydration bounds its 1,000-path request and retained index rows. Commit-tree
+snapshot instead shares one global 1,000-item counter across its materialized
+dirty, index, directory, and tree-entry results. Overflow makes the fast path
+unavailable and falls back without truncating caller-visible results.
+
 ### `git add` — `add()`
 
 | Git | kompjutr | |
@@ -482,6 +492,12 @@ reads, and promisor hydration. The Computer compatibility facade projects
 | `GIT_INDEX_FILE=<throwaway>` around those commands | `withScratchIndex({ name }, callback)` | ★ ~ the synchronous callback receives `readTree`, `add`, `writeTree`, `commitTree`, and `replaySnapshot`; all scratch rows are transaction-scoped and no index file or persistent alternate index exists |
 | `git diff --binary --full-index <snap>^ <snap>` then `git apply --3way --cached` | `scratch.replaySnapshot({ snapshot, onto })` | ★ ~ index-only replay while all objects share one store; clean results return a tree, conflicts return physical stage rows and write nothing. ✘ textual patch interchange |
 | general `git rev-list`, ref enumeration through `git for-each-ref` | — | ✘ the bounded reads above do not expose general enumeration |
+
+Loose-object reads join object metadata and ordered chunk payload in one cursor.
+They retain the final decoded object, one current feed, and fixed inflater
+state—not an aggregate metadata preflight or every compressed chunk. Chunk
+sequence, encoded size, inflater progress, and final size are checked while
+decoding.
 
 Omitted selection remains cached-only. `excludeStandard` requires `others`.
 Any presence of `cached`, `others`, or `excludeStandard`, including `false`, is
@@ -738,14 +754,23 @@ after lease comparison is still rejected by the server-side request CAS.
 
 ## Integration
 
-All four commands below use the same bounded three-way engine and the same
-durable operation journal, so each survives a Durable Object restart mid-way.
+All four commands below use the same bounded three-way engine and durable
+operation journal, so each survives a Durable Object restart mid-way. The
+validated operation plan and its anchors are immutable after creation. Ordinary
+reads use plain projections. A replay or one-shot operation transition may
+change only `phase`, `empty_reason`, the `current_step` cursor,
+`current_parent_oid`, `replayed_count` and `skipped_count`, `committer_name`
+and `committer_email`, the current step's `outcome` and `result_oid`, and the
+bounded conflict snapshot. Its outer synchronous SQLite transaction owns the
+authoritative reread, index/worktree changes, conditional journal transition,
+and maintenance-root epoch bump.
+Supported public mutation re-entry fails with `EREENTRANT`.
 
 When the two sides put a regular or executable file and a symlink at the same
 path, the symlink stays at the logical path and the regular side is materialised
 at a collision-checked `~<label>` relocation, matching Git. Index stages are
 split by mode class; when a merge base exists, its stage follows the primary or
-relocated path with the same mode class. Continue and abort authenticate both
+relocated path with the same mode class. Continue and abort revalidate both
 physical paths after a reopen. A distinct-type conflict involving a gitlink
 cannot be materialised and fails atomically with `EUNSUPPORTED`.
 
@@ -821,10 +846,12 @@ Restrictions, each a stable error rather than a fallback:
 
 `RebaseResult` is `up-to-date`, `completed` (with `replayed`, `skipped`,
 `fastForward`), or `conflicted`. During replay the branch stays at its original
-OID while the authenticated journal owns the unpublished results. Completion
-publishes the branch once; continue, skip, and abort work after a cold reopen.
-Source-empty commits are retained, while commits whose patch becomes empty on
-the new parent are skipped.
+OID while the immutable journal plan owns the unpublished results. Each
+transition updates only the mutable journal fields listed above; it does not
+replace or re-authenticate the complete plan. Completion publishes the branch
+once; continue, skip, and abort work after a cold reopen. Source-empty commits
+are retained, while commits whose patch becomes empty on the new parent are
+skipped.
 The strict argv runner exposes start, continue, skip, and abort. Its worktree
 materialization excludes registered nested repository roots, including after a
 cold reopen.
@@ -849,8 +876,12 @@ the eligibility boundary starts a fresh run without also consuming its first
 root page.
 
 Every call samples the runtime clock once and stays below the operation SQL and
-memory ceilings. Root changes restart discovery safely. Cold reopen and calls
-through any linked checkout resume the same shared run.
+memory ceilings. Root discovery decodes refs, checkout HEADs, retained reflogs,
+index entries, index baselines, shallow boundaries, and checkout selection from
+one bounded keyset projection per page. Operation journals expose their own
+bounded root page instead of being reread in full. Root-epoch drift restarts
+discovery before destructive work. Cold reopen and calls through any linked
+checkout resume the same shared run.
 
 ## Configuration
 

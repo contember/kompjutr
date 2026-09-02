@@ -86,7 +86,12 @@ view, and nested checkout roots are excluded from parent worktree scans.
 repository/checkout routing. `shared.ts` composes repository-owned families.
 `checkout.ts` composes a checkout-bound store. Cohesive table families own
 objects, refs, config, shallow state, fetch publication, indexes, reflogs,
-operation journals, packs, sparse projections, and maintenance.
+operation plans, packs, sparse projections, and maintenance. Operation plans
+are immutable after creation. A transition may change only `phase`,
+`empty_reason`, the `current_step` cursor, `current_parent_oid`,
+`replayed_count` and `skipped_count`, `committer_name` and `committer_email`,
+the current step's `outcome` and `result_oid`, and the bounded conflict
+snapshot.
 
 There is no `.git` directory and no external filesystem runtime.
 
@@ -106,22 +111,30 @@ driver values through `RowShape`, `expectText`, `expectSafeInteger`, and
 `expectBlob`. A failed stored-row decode is `CorruptError`; it is not an
 invitation to re-prove the row. Reads do not use SQL storage-class witnesses,
 two-phase metadata preflights, or projection-to-object re-authentication.
-Out-of-band mutation of `git_*` tables is undefined behavior.
+Same-database sparse sources carry an internal receipt bound to the exact
+`Database` instance; structural copies, wrappers, custom sources, and sources
+from another database take the generic path. Out-of-band mutation of `git_*` or
+`fs_*` tables is undefined behavior.
 
 Algorithm and concurrency checks remain. These include traversal cycle and
-termination guards, compare-and-swap checks, revisions, maintenance epochs,
-ingest leases, provisional visibility, and the pack-deletion delta-closure
-check.
+termination guards, arbitrary-iterable ordering checks, conditional transition
+predicates, compare-and-swap checks, maintenance epochs, ingest leases,
+provisional visibility, and the pack-deletion delta-closure check.
 
 ## Structural cost bounds
 
 There is no dynamic memory-accounting ledger and no projected statement
 admission rule. Work is bounded by construction:
 
-- traversals use lazy `db.iterate()` cursors;
+- traversals and loose-object payload decoding use lazy `db.iterate()` cursors;
 - merge joins retain only bounded lookahead;
-- object, index, filesystem, protocol, and journal work uses fixed pages and
-  batch flush points;
+- object, index, filesystem, protocol, journal, sparse, and maintenance-root
+  work uses fixed pages and batch flush points;
+- native selected-path projection retains at most 1,000 distinct paths, each
+  with up to four conflict-stage index rows; native workspace hydration bounds
+  its 1,000-path request and retained index rows; commit-tree snapshot uses one
+  global 1,000-item counter across its materialized results. An unavailable fast
+  path falls back to the generic streaming implementation without truncation;
 - caches and queues have fixed capacities;
 - a single-value or enumeration cap survives only when it names a real format,
   platform, memory, or structural failure;
@@ -141,12 +154,16 @@ capped transient is 54,423,552 bytes.
 ## Objects, packs, and projections
 
 Small loose objects are stored raw. Larger loose objects are compressed and
-split into 1 MiB `git_object_chunks` rows. Incoming packs stay compressed and
-are split into 1 MiB `git_pack_data` rows. The pack delta workspace uses a
-separate operation-local pool of 64 KiB chunks; that size is not the database
-row size. No object above 48 MiB is ever stored: reads materialise one object as
-a single buffer, so the worktree stat, the loose write paths, pack ingest, and
-the `size` `CHECK`s all refuse it with `E2BIG` at the boundary.
+split into 1 MiB `git_object_chunks` rows. A loose read joins metadata and
+ordered payload rows in one cursor, retains only the final output plus the
+current payload feed and fixed inflater state, and checks sequence, encoded
+size, inflate progress, and final size while decoding. Incoming packs stay
+compressed and are split into 1 MiB `git_pack_data` rows. The pack delta
+workspace uses a separate operation-local pool of 64 KiB chunks; that size is
+not the database row size. No object above 48 MiB is ever stored: reads
+materialise one object as a single buffer, so the worktree stat, loose write
+paths, pack ingest, and the `size` `CHECK`s all refuse it with `E2BIG` at the
+boundary.
 
 Pack ingest is provisional:
 
@@ -186,9 +203,21 @@ missing blobs only as terminal leaves.
 ## Concurrency seams
 
 Local mutations finish inside synchronous SQLite transactions. Code never emits
-SQL transaction statements. Clone, fetch, push, pull, maintenance repack, and
-promise-hydrating content operations cross asynchronous boundaries after
-repository state has opened.
+SQL transaction statements. A supported public Git mutation acquires an
+uncommitted `git_meta` guard row inside its outer transaction; same-stack public
+mutation re-entry fails with `EREENTRANT`, while internal owned seams compose
+without reacquiring it. The owner removes the row before commit, and rollback
+leaves none. This is local transaction serialization, not a lease or a
+cross-process lock
+([ADR-0022](../decisions/0022-own-local-git-mutations-with-sqlite-transactions.md)).
+
+Clone, fetch, push, pull, maintenance repack, and promise-hydrating content
+operations cross asynchronous boundaries after repository state has opened.
+No guarded repository, index, or worktree publication phase holds the local
+mutation guard across `await`; a later guarded publication phase reacquires it
+and repeats its authoritative durable checks. Fetch generations and namespaces,
+pack-stream checkpoints, and other async ownership use their own transactions,
+epochs, CAS, or leases rather than the local mutation guard.
 
 - Clone hides partial state behind a renewable provisional owner generation.
 - Ordinary pack ingest uses one renewable five-minute generation lease per
@@ -197,8 +226,10 @@ repository state has opened.
 - Fetch publication uses durable namespace generations, exact ref snapshots,
   shallow revisions, and atomic publication.
 - Ref updates and integration publication use expected-state CAS checks.
-- Maintenance records a repository root epoch. Root drift restarts discovery
-  before destructive work. Maintenance pack batches have their own exact owner.
+- Maintenance consumes each root source as a single decoded keyset page and
+  operation journals through bounded root pages. A repository root epoch
+  restarts discovery before destructive work. Maintenance pack batches have
+  their own exact owner.
 - Pending packs are durable but invisible; complete packs may survive a stale
   publication and be reused.
 
@@ -214,6 +245,12 @@ Architecture rules are executable checks:
   and Git-layer direction plus the compat-only optional dependency.
 - `tests/public-exports.test.ts` keeps the root and Git entrypoint surfaces
   aligned through the restructure.
+- `tests/trusted-read-policy.test.ts` exhaustively classifies the changed
+  ordinary-read scopes. It rejects storage-class, authentication-shaped BLOB
+  casts, `length`/`hex` witnesses, metadata preflights, detached journal
+  identity, and whole-journal topology/object authentication without banning
+  schema, write, ingest, stale-handle, JSON-ordinal, or exact algorithmic
+  boundaries.
 - The source-file ceiling witness rejects any `src/**/*.ts` file above 2,000
   lines.
 
