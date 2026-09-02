@@ -921,6 +921,22 @@ describe("synthetic pack ingest", () => {
     expect(store.read(oid)?.data).toEqual(current);
   });
 
+  it("keeps loose objects readable after a live cache clear", () => {
+    const store = open();
+    const data = utf8.encode("loose after cache clear\n");
+    const oid = store.write("blob", data);
+    expect(store.read(oid)?.data).toEqual(data);
+    const db = store.db;
+    if (!(db instanceof TestDatabase)) throw new Error("expected test database");
+
+    db.storage.resetCounters();
+    store.shared.clearCaches();
+    expect(store.shared.hasLoose).toBe(true);
+    expect(db.storage.statementCount).toBe(0);
+    expect(store.read(oid)?.data).toEqual(data);
+    expect(db.storage.statementCount).toBeGreaterThan(0);
+  });
+
   it("revalidates loose availability and invalidates both storage cache generations", async () => {
     const store = open();
     const removedData = utf8.encode("removed loose\n");

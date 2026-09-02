@@ -378,7 +378,7 @@ export class SharedRepoStore {
   clearCaches(): void {
     this.#cacheGeneration++;
     this.#packs.clearCaches();
-    this.#hasLoose = false;
+    this.#hasLoose = true;
     this.#shallow = null;
   }
 
