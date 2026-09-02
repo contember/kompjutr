@@ -1,3 +1,17 @@
+> **OUTCOME - shipped 2026-09-02.** `ls-files --others` now preserves Git path
+> order, add-all and commit-all stream the index beyond the former modeled-byte
+> refusal, repeated worktree hash windows resume instead of rescanning from the
+> root, live cache clears keep loose objects visible, ref and reflog headers no
+> longer scan all retained history, and tree construction has no repository-wide
+> tree-object admission cap. Commit map: plan -> `ec2464b`; WU1 -> `aa587d3`;
+> WU2 -> `e37e4e9`; WU3 -> `46ea08f`; WU4 -> `cb0c980`. Verification: all
+> issue-derived witnesses passed; smoke passed 165/165; typecheck, Biome check,
+> and build passed; the exhaustive runner passed 3,377 tests with 405 skipped
+> across 174 files. Backlog closed: ARCH-4/CORR-5, CORR-7/ARCH-7, CORR-8,
+> CORR-9, CORR-10, and ARCH-31 were removed from backlog 65. Deferred: the
+> remaining verified findings stay in backlog 65 and 63; unverified claims stay
+> in ideas.
+
 # Sprint - Git correctness and scale (2026-09-02)
 
 **Goal.** Remove the first verified wrong-result and artificial-scale failures
@@ -151,3 +165,10 @@ data-loss or repository-corruption blast radius.
   the review gate.
 
 ## Run log
+
+- WU1 fix round removed the residual streamed-index row refusal and extended the
+  acceptance fixture across an index page, buffered mutation flushes, conflict
+  resolution, and a later-sorting inserted path.
+- The combined reflog/store command exposed Vitest's worker RPC timeout after all
+  103 store assertions passed. Focused reflog/store witnesses passed cleanly, and
+  the batched exhaustive runner later passed the complete suite.

@@ -16,9 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-09-02-git-correctness-and-scale.md`](sprints/sprint-2026-09-02-git-correctness-and-scale.md)
-  - wrong-result fixes, live cache correctness, reflog scan removal, and the
-  repository-wide tree-object cap.
+None.
 
 ## Specs
 
@@ -38,8 +36,9 @@ decisions → reference → archive.
   [`benchmark-current`](reference/benchmark-current.md#clone-statement-profile).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0020).
-- The first critical/high tranche from the 2026-09-02 Git-in-SQLite architecture
-  review is fixed. Remaining verified work is in
+- The first two tranches from the 2026-09-02 Git-in-SQLite architecture review
+  are fixed: storage/publication safety, then Git result and scale correctness.
+  Remaining verified work is in
   [`backlog/65`](backlog/65-git-sqlite-architecture-review.md) and
   [`backlog/63`](backlog/63-bound-packed-dependency-graph-traversal.md); unverified
   claims remain in [`ideas`](ideas/git-sqlite-architecture-review-triage.md).
@@ -90,6 +89,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-09-02-git-correctness-and-scale.md`](archive/sprint-2026-09-02-git-correctness-and-scale.md)
+  - ordered untracked selection, streamed staging and hashing, live cache
+  correctness, bounded reflog headers, and removal of the total tree-object cap.
 - [`archive/sprint-2026-08-31-everyday-git-shell.md`](archive/sprint-2026-08-31-everyday-git-shell.md)
   — asynchronous bounded shell execution and exact everyday Git reads,
   mutations, history, network commands, and pull-rebase.

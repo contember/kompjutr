@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Git correctness and scale](sprint-2026-09-02-git-correctness-and-scale.md)
+  - ordered untracked selection, streamed staging and hashing, live cache
+  correctness, bounded reflog headers, and removal of the total tree-object cap.
 - [Everyday Git shell](sprint-2026-08-31-everyday-git-shell.md)
   — asynchronous bounded shell execution and exact everyday Git reads,
   mutations, history, network commands, and pull-rebase.

@@ -87,15 +87,18 @@ A blocked item must not move ahead of its blocker.
 **Phase 1** package work is complete. The real adapter now reruns its workflow as
 the integration gate. Everything below the gate is re-planned from that result.
 **Phase 2** is production scale; partial clone shipped directly outside a sprint.
-The everyday Git shell sprint is complete. The remaining parity work stays
-unscheduled until the external consumer integration gate provides new evidence.
+The first architecture-review correction sprint shipped independently because
+its defects were already reproduced. Remaining parity work stays unscheduled
+until the external consumer integration gate provides new evidence.
 
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
 | **Phase 1 — a consumer can run** | | | | |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Phase 2 — production scale** | | | | |
-| 1 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Audit the settled physical, shallow, and promisor storage shapes. |
+| 1 | Architecture review conformance | [65](65-git-sqlite-architecture-review.md) | long | Settle trusted-read, cost-model, and remaining verified scale drift before building an audit over those shapes. |
+| 2 | Packed dependency traversal | [63](63-bound-packed-dependency-graph-traversal.md) | normal | Bound packed-read memory and maintenance traversal before auditing extreme graphs. |
+| 3 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Audit the settled physical, shallow, promisor, and packed storage shapes. |
 | **Remaining parity without a caller (unscheduled)** | | | | |
 | — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
 | — | Plumbing reads | [39](39-plumbing-read-surface.md) | normal | Type/size probes, tree/blob filters, ref enumeration, and general commit enumeration have no current caller. |

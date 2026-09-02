@@ -20,5 +20,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [`sprint-2026-09-02-git-correctness-and-scale.md`](sprint-2026-09-02-git-correctness-and-scale.md)
-  - first verified correctness and scale follow-ups from backlog 65.
+None.

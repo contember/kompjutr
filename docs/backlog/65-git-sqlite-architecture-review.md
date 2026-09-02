@@ -17,9 +17,11 @@ row as a candidate work unit and re-check its premise at HEAD before scheduling
 it. Split a selected cluster into a sprint with focused witnesses; do not attempt
 this entire item as one undifferentiated change.
 
-The first response tranche is already complete and is not work in this item:
-CORR-1 (`dea7dc5`), ARCH-1/CORR-2 plus ARCH-12/CORR-30 (`3a835ef`), CORR-3
-(`7f74cc1`), ARCH-2 (`e85ec7e`), CORR-4 (`285368e`), and ARCH-3 (`26ffa5f`).
+Completed response tranches are not work in this item: CORR-1 (`dea7dc5`),
+ARCH-1/CORR-2 plus ARCH-12/CORR-30 (`3a835ef`), CORR-3 (`7f74cc1`), ARCH-2
+(`e85ec7e`), CORR-4 (`285368e`), ARCH-3 (`26ffa5f`), ARCH-4/CORR-5
+(`46ea08f`), CORR-7/ARCH-7 plus CORR-8/CORR-10 (`aa587d3`), CORR-9
+(`cb0c980`), and ARCH-31 (`e37e4e9`).
 
 ARCH-10 is tracked in
 [`63 - Bound packed dependency graph traversal`](63-bound-packed-dependency-graph-traversal.md),
@@ -33,14 +35,9 @@ Unverified and disputed claims remain in
 
 | IDs | Problem | Acceptance | Touch points |
 |---|---|---|---|
-| ARCH-4 / CORR-5 | Ref mutations and reflog reads scan all retained reflog rows to derive a compound maximum. | Cost is independent of unrelated reflog history; ordinal CAS and per-entry ordering checks remain. | `src/git/store/refs.ts`, `src/git/store/reflog.ts` |
 | ARCH-5 / CORR-6 | Journal reads re-authenticate every referenced object and replay topology, making rebase quadratic. | Full validation happens at the write boundary or only for the advancing step; N-step replay has linear statement and row growth. | `src/git/store/operation-journal.ts`, `src/git/ops/rebase-lifecycle.ts` |
 | ARCH-6 | Operation journal, index tracker, and sparse reads retain SQL `typeof`/`CAST` witnesses and metadata preflights forbidden by ADR-0018. | Git-owned reads use plain projections and shared row decoders. Add sufficient `fs_*` write constraints before removing cross-domain sparse checks. | `src/git/store/operation-journal.ts`, `src/git/store/index-tracker.ts`, `src/git/store/sparse/`, `src/fs/` |
-| CORR-7 / ARCH-7 | Every worktree hash batch refreshes from the repository root. | Hash scan work grows linearly while lazy streams still re-stat content and handle vanished paths correctly. | `src/git/ops/worktree-io.ts`, `src/git/ops/status-rows.ts`, `src/git/ops/diff.ts`, `src/git/ops/staging.ts`, `src/git/ops/refs.ts` |
 | ARCH-8 | Three-way integration refuses more than 1,000 changed paths even though deleting the cap alone would leave retained plan state unbounded. | A 1,001-path integration succeeds under a real retained-state bound or a restart-safe streaming plan. | `src/git/ops/integration.ts`, `src/git/ops/integration-structure.ts` |
-| CORR-8 | `ls-files --others` concatenates separately sorted prefix scans and can report a tracked path as untracked. | Prefix scans are globally merged with `comparePaths`, or replaced with one ordered scan; interleaving prefixes match real Git. | `src/git/ops/staging.ts`, `src/git/ops/pathspec.ts` |
-| CORR-9 | `write-tree` and integration reject repositories with 4,096 or more directories although tree construction is flush-bounded. | Repositories above the old directory count succeed; only limits tied to a real serialized-tree failure remain. | `src/git/ops/tree-build.ts`, `src/git/ops/integration-worktree.ts`, `src/git/ops/plumbing.ts` |
-| CORR-10 | `add -A` and `commit -a` materialize the whole index and fail near 27,600 tracked rows. | The index side is grouped and merged as a stream, with no whole-index retention or refusal at the old threshold. | `src/git/ops/staging.ts`, `src/git/ops/status-rows.ts` |
 
 ## Store and maintenance work
 
@@ -75,7 +72,6 @@ Unverified and disputed claims remain in
 
 | IDs | Problem | Acceptance | Touch points |
 |---|---|---|---|
-| ARCH-31 | `clearCaches()` marks loose objects absent instead of invalidating the availability cache. | Loose reads still work immediately after a live cache clear. | `src/git/store/shared.ts`, `src/git/store/database.ts` |
 | ARCH-32 | Scratch-index entries lack the checkout index's write-time field envelope. | Malformed scratch entries fail before storage; valid scratch workflows remain unchanged. | `src/git/store/schema.ts`, `src/git/store/index-table.ts` |
 | ARCH-33 / ARCH-39 | Checkout-backed `indexApply` lacks the scratch branch's thenable guard, sink revocation, and guaranteed disposal. | Both branches reject asynchronous callbacks, revoke escaped sinks, and dispose buffers in `finally`. | `src/git/store/index-table.ts` |
 | ARCH-34 | `store/operations.ts` duplicates existing ref and path validators. | The reviewed equivalent implementations collapse to shared validators with no behavior change. | `src/git/store/operations.ts`, `src/git/store/ref-validation.ts`, `src/git/common/` |
