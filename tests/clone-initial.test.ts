@@ -31,8 +31,9 @@ class RecordingStorage implements DurableObjectStorageLike {
     this.sql = {
       exec: <Row extends object>(query: string, ...bindings: unknown[]): SQLCursorLike<Row> => {
         if (query === WALK_TREE_SQL) this.walkStatements++;
+        // The batched content read; objectInfo shares the CTE name but materializes it.
         if (
-          query.includes("WITH wanted(ordinal, oid) AS") &&
+          query.includes("WITH wanted(ordinal, oid) AS (") &&
           query.includes("LEFT JOIN git_objects loose")
         ) {
           this.blobReadStatements++;
