@@ -802,25 +802,47 @@ describe("pull", () => {
       try {
         const git = gitFor(workspace);
         await git.clone({ url: server.url, dir: "/work", depth: 0 });
-        await workspace.workspace.fs.writeFile("/work/local.txt", "local\n");
-        await git.add({ dir: "/work", paths: ["local.txt"] });
+        await workspace.workspace.fs.writeFile("/work/base.txt", "local\n");
+        await git.add({ dir: "/work", paths: ["base.txt"] });
         const local = await git.commit({ dir: "/work", message: "local" });
-        fixture.write("remote.txt", "remote\n");
+        fixture.write("base.txt", "remote\n");
         const incoming = fixture.commit("remote");
         const repo = openRepository(workspace.context, "/work");
-        const originalMutateRefs = repo.mutateRefs.bind(repo);
-        repo.mutateRefs = () => {
-          throw new Error("stop before pull rebase publication");
-        };
-
         await expect(
           pullCore(workspace.context, repo, workspace.worktree, { rebase: true }),
-        ).rejects.toThrow("stop before pull rebase publication");
-        repo.mutateRefs = originalMutateRefs;
+        ).resolves.toEqual({
+          strategy: "rebase",
+          result: { outcome: "conflicted", replayed: 0, skipped: 0 },
+        });
+        await workspace.workspace.fs.writeFile("/work/base.txt", "resolved\n");
+        await git.add({ dir: "/work", paths: ["base.txt"] });
 
+        // Let the resolved step commit, then move the branch through its valid write boundary
+        // immediately before the completed journal enters its publication transaction.
+        const originalTransaction = repo.store.db.transactionSync.bind(repo.store.db);
+        let staleInjected = false;
+        repo.store.db.transactionSync = function transactionSync<T>(closure: () => T): T {
+          if (!staleInjected) {
+            const journal = repo.checkout.readOperationState();
+            if (journal?.kind === "rebase" && journal.state.currentStep === journal.steps.length) {
+              staleInjected = true;
+              repo.store.setRef("refs/heads/main", incoming);
+            }
+          }
+          return originalTransaction(closure);
+        };
+        try {
+          expect(() => rebaseContinue(workspace.context, repo, workspace.worktree)).toThrowError(
+            expect.objectContaining({ code: "ESTALEHEAD" }),
+          );
+        } finally {
+          repo.store.db.transactionSync = originalTransaction;
+        }
+
+        expect(staleInjected).toBe(true);
         const completed = repo.checkout.requireOperationState("rebase");
         expect(completed.state.currentStep).toBe(completed.steps.length);
-        repo.store.setRef("refs/heads/main", incoming);
+        expect(repo.head().oid).toBe(incoming);
 
         const cold = reopenTestRepository(workspace, "/work");
         expect(cold.repo.head().oid).toBe(incoming);

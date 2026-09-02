@@ -169,12 +169,8 @@ describe("rebase lifecycle", () => {
     const workspace = await imported(source);
     source.git("rebase", "upstream");
     const expected = source.git("rev-parse", "HEAD");
-    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
-    let publications = 0;
-    workspace.repo.mutateRefs = (mutation, metadata) => {
-      publications++;
-      return originalUpdate(mutation, metadata);
-    };
+    // The named reflog is the durable witness for branch publication.
+    const namedReflogBefore = workspace.repo.store.reflog("refs/heads/current").length;
     const recorded = recordingBaselineContext(workspace);
 
     const result = rebase(recorded.context, workspace.repo, workspace.worktree, {
@@ -198,12 +194,13 @@ describe("rebase lifecycle", () => {
       workspace.repo.readCommit(originalFirst).author,
     );
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
-    expect(publications).toBe(1);
+    const namedReflog = workspace.repo.store.reflog("refs/heads/current");
+    expect(namedReflog).toHaveLength(namedReflogBefore + 1);
     expect(recorded.advances).toEqual([
       { checkoutId: workspace.repo.checkout.checkoutId, tree: final.tree },
     ]);
     expect(original).not.toBe(expected);
-    const named = workspace.repo.store.reflog("refs/heads/current")[0];
+    const named = namedReflog[0];
     const head = workspace.repo.checkout.reflog("HEAD")[0];
     expect(named).toMatchObject({
       oldOid: original,

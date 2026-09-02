@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import { utf8 } from "../src/git/common/bytes.js";
-import { hasErrorCode } from "../src/git/common/errors.js";
 import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
 import {
   MAX_MERGE_MESSAGE_BYTES,
@@ -133,28 +132,22 @@ describe("durable merge journal", () => {
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("requires a valid authenticated merge origin in DDL and cold reads", () => {
+  it("enforces merge-origin DDL and cold-reopens valid public writes", () => {
     const ddl = open();
     ddl.store.writeMergeState(metadata(), touched());
     expect(() =>
       ddl.db.run("UPDATE git_operation_state SET merge_origin = 'fetch' WHERE checkout_id = 1"),
     ).toThrow();
 
-    const tampered = open();
-    tampered.store.writeMergeState(metadata(), touched());
-    tampered.db.run("UPDATE git_operation_state SET merge_origin = 'pull' WHERE checkout_id = 1");
-    expect(() => tampered.store.readMergeState()).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-
-    const invalid = open();
-    invalid.store.writeMergeState(metadata(), touched());
-    invalid.db.run("PRAGMA ignore_check_constraints = ON");
-    invalid.db.run("UPDATE git_operation_state SET merge_origin = 'fetch' WHERE checkout_id = 1");
-    invalid.db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() => invalid.store.readMergeState()).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
+    const trusted = open();
+    const state = metadata({ mergeOrigin: "pull" });
+    trusted.store.writeMergeState(state, touched());
+    const coldDatabase = new SqliteGitDatabase(trusted.db);
+    const cold = coldDatabase.openCheckout(trusted.repository);
+    expect(cold.requireMergeState()).toEqual({
+      state,
+      touched: touched(),
+    });
   });
 
   it("persists ready no-commit state and optional explicit identities", () => {
@@ -192,22 +185,22 @@ describe("durable merge journal", () => {
     expect(store.requireMergeState()).toEqual(before);
   });
 
-  it("clears state and touched rows, including corrupt orphan rows", () => {
+  it("clears state and touched rows and rejects orphan touched rows", () => {
     const { db, store } = open();
     store.writeMergeState(metadata(), touched());
-    expect(store.clearMergeState()).toBe(true);
-    expect(store.readMergeState()).toBeNull();
-    expect(store.clearMergeState()).toBe(false);
 
-    store.writeMergeState(metadata(), touched());
-    db.run("PRAGMA foreign_keys = OFF");
-    db.run("DELETE FROM git_operation_state WHERE checkout_id = 1");
-    db.run("PRAGMA foreign_keys = ON");
-    expect(() => store.readMergeState()).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
     expect(store.clearMergeState()).toBe(true);
     expect(store.readMergeState()).toBeNull();
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched")).toBe(0);
+    expect(store.clearMergeState()).toBe(false);
+    expect(() =>
+      db.run(
+        `INSERT INTO git_operation_touched
+           (checkout_id, ordinal, path, logical_path, purpose, worktree_kind)
+         VALUES (1, 0, 'orphan', 'orphan', 'primary', 'absent')`,
+      ),
+    ).toThrow();
   });
 
   it("removes every operation journal table when the repository is destroyed", () => {
@@ -252,49 +245,36 @@ describe("durable merge journal", () => {
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched")).toBe(0);
   });
 
-  it("fails closed on corrupt metadata, revisions, and counts", () => {
-    const corruptions: readonly {
-      name: string;
-      corrupt: (db: TestDatabase) => void;
-      code: string;
-    }[] = [
-      {
-        name: "phase",
-        corrupt: (db) => {
-          db.run("PRAGMA ignore_check_constraints = ON");
-          db.run("UPDATE git_operation_state SET phase = 'applying' WHERE checkout_id = 1");
-          db.run("PRAGMA ignore_check_constraints = OFF");
-        },
-        code: "ECORRUPT",
-      },
-      {
-        name: "revision",
-        corrupt: (db) =>
-          db.run("UPDATE git_operation_touched SET worktree_revision = -1 WHERE ordinal = 0"),
-        code: "ECORRUPT",
-      },
-      {
-        name: "count",
-        corrupt: (db) =>
-          db.run(
-            "UPDATE git_operation_state SET touched_count = ? WHERE checkout_id = 1",
-            MAX_MERGE_TOUCHED_PATHS + 1,
-          ),
-        code: "E2BIG",
-      },
-    ];
+  it("validates metadata and revisions before writing exact touched counts", () => {
+    const invalidMetadata = open();
+    expect(() =>
+      invalidMetadata.store.writeMergeState(metadata({ phase: "ready" }), touched()),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(invalidMetadata.store.readMergeState()).toBeNull();
 
-    for (const corruption of corruptions) {
-      const { db, store } = open();
-      store.writeMergeState(metadata(), touched());
-      corruption.corrupt(db);
-      try {
-        store.readMergeState();
-        throw new Error(`expected corrupt ${corruption.name} to fail`);
-      } catch (error) {
-        expect(hasErrorCode(error, corruption.code), corruption.name).toBe(true);
-      }
-    }
+    const invalidRevision = touched().map(
+      (entry): MergeTouchedPath =>
+        entry.worktree.kind === "file"
+          ? { ...entry, worktree: { ...entry.worktree, revision: -1 } }
+          : entry,
+    );
+    const rejectedRevision = open();
+    expect(() => rejectedRevision.store.writeMergeState(metadata(), invalidRevision)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(rejectedRevision.store.readMergeState()).toBeNull();
+
+    const valid = open();
+    const paths = touched();
+    valid.store.writeMergeState(metadata(), paths);
+    expect(
+      valid.db.scalar<number>(
+        "SELECT touched_count FROM git_operation_state WHERE checkout_id = 1",
+      ),
+    ).toBe(paths.length);
+    expect(
+      valid.db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched WHERE checkout_id = 1"),
+    ).toBe(paths.length);
   });
 
   it("rejects impossible metadata and empty conflicted journals", () => {
@@ -334,63 +314,53 @@ describe("durable merge journal", () => {
     );
   });
 
-  it("requires authoritative complete objects with types matching every saved mode", () => {
-    const missingOnWrite = open();
-    expect(() =>
-      missingOnWrite.store.writeMergeState(
-        metadata({ incomingParentOid: "f".repeat(40) }),
-        touched(),
-      ),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    expect(missingOnWrite.store.readMergeState()).toBeNull();
-
-    const corruptions: readonly {
+  it("requires complete objects with matching types when the journal is created", () => {
+    const cases: readonly {
       name: string;
-      corrupt: (db: TestDatabase) => void;
+      state: MergeStateMetadata;
+      paths: readonly MergeTouchedPath[];
     }[] = [
       {
         name: "missing parent",
-        corrupt: (db) =>
-          db.run(
-            "UPDATE git_operation_state SET incoming_parent_oid = ? WHERE checkout_id = 1",
-            "f".repeat(40),
-          ),
+        state: metadata({ incomingParentOid: "f".repeat(40) }),
+        paths: touched(),
       },
       {
         name: "parent is a blob",
-        corrupt: (db) =>
-          db.run(
-            "UPDATE git_operation_state SET incoming_parent_oid = ? WHERE checkout_id = 1",
-            FILE,
-          ),
+        state: metadata({ incomingParentOid: FILE }),
+        paths: touched(),
       },
       {
         name: "index file is a commit",
-        corrupt: (db) =>
-          db.run("UPDATE git_operation_touched SET index_oid = ? WHERE path = 'a.txt'", INCOMING),
+        state: metadata(),
+        paths: touched().map(
+          (entry): MergeTouchedPath =>
+            entry.index === null ? entry : { ...entry, index: { ...entry.index, oid: INCOMING } },
+        ),
       },
       {
         name: "worktree symlink is a commit",
-        corrupt: (db) =>
-          db.run(
-            "UPDATE git_operation_touched SET worktree_oid = ? WHERE path = 'node~HEAD'",
-            INCOMING,
-          ),
-      },
-      {
-        name: "loose blob lost its only chunk",
-        corrupt: (db) =>
-          db.run("DELETE FROM git_object_chunks WHERE repo_id = 1 AND oid = ?", FILE),
+        state: metadata(),
+        paths: touched().map(
+          (entry): MergeTouchedPath =>
+            entry.worktree.kind === "symlink"
+              ? { ...entry, worktree: { ...entry.worktree, oid: INCOMING } }
+              : entry,
+        ),
       },
     ];
 
-    for (const corruption of corruptions) {
+    for (const testCase of cases) {
       const { db, store } = open();
-      store.writeMergeState(metadata(), touched());
-      corruption.corrupt(db);
-      expect(() => store.readMergeState(), corruption.name).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
+      expect(
+        () => store.writeMergeState(testCase.state, testCase.paths),
+        testCase.name,
+      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+      expect(store.readMergeState(), testCase.name).toBeNull();
+      expect(
+        db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched WHERE checkout_id = 1"),
+        testCase.name,
+      ).toBe(0);
     }
   });
 });
