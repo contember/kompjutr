@@ -12,6 +12,7 @@ import {
   readCommitCache,
   readCommitGraph,
 } from "./commits.js";
+import { requireConfigPath, requireConfigSectionMove } from "./config.js";
 import type {
   BlobIdMapping,
   BlobReadBatch,
@@ -799,7 +800,8 @@ export class CheckoutStore implements IndexStore {
   }
 
   configSet(path: string, value: string): void {
-    this.#mutate(() => this.configSetOwned(path, value));
+    const checkedPath = requireConfigPath(path);
+    this.#mutate(() => this.configSetOwned(checkedPath, value));
   }
 
   private configSetOwned(path: string, value: string): void {
@@ -807,7 +809,8 @@ export class CheckoutStore implements IndexStore {
   }
 
   configAdd(path: string, value: string): void {
-    this.#mutate(() => this.configAddOwned(path, value));
+    const checkedPath = requireConfigPath(path);
+    this.#mutate(() => this.configAddOwned(checkedPath, value));
   }
 
   private configAddOwned(path: string, value: string): void {
@@ -815,7 +818,8 @@ export class CheckoutStore implements IndexStore {
   }
 
   configUnset(path: string): void {
-    this.#mutate(() => this.configUnsetOwned(path));
+    const checkedPath = requireConfigPath(path);
+    this.#mutate(() => this.configUnsetOwned(checkedPath));
   }
 
   private configUnsetOwned(path: string): void {
@@ -829,7 +833,8 @@ export class CheckoutStore implements IndexStore {
 
   /** Validate and move one exact dotted config section without changing value order. */
   configMoveSection(sourcePrefix: string, destinationPrefix: string): void {
-    this.#mutate(() => this.configMoveSectionOwned(sourcePrefix, destinationPrefix));
+    const [source, destination] = requireConfigSectionMove(sourcePrefix, destinationPrefix);
+    this.#mutate(() => this.configMoveSectionOwned(source, destination));
   }
 
   private configMoveSectionOwned(sourcePrefix: string, destinationPrefix: string): void {

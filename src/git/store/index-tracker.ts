@@ -1,6 +1,8 @@
 import type { SqlDatabase } from "../../db/db.js";
 import { isOid } from "../common/bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../common/errors.js";
+import { isCanonicalAbsolutePath, isCanonicalGitPath } from "../common/paths.js";
+import { int, nullable, oneOf, RowShape, text } from "../common/rows.js";
 import { comparePaths } from "../common/streams.js";
 import {
   bumpMaintenanceRootEpoch,
@@ -23,6 +25,16 @@ const TRACKER_FORMAT = 1;
 const DEFAULT_PAGE_ROWS = 1_000;
 const MAX_PAGE_ROWS = 1_000;
 const MAX_PAGE_BYTES = 1024 * 1024;
+
+const TRACKER_STATE_ROW = new RowShape({
+  baseline_tree_oid: nullable(text()),
+  format: int(1),
+  complete: oneOf([0, 1]),
+});
+const TRACKER_DIRTY_ROW = new RowShape({
+  path: text(),
+  flags: oneOf([INDEX_DIRTY, WORKTREE_DIRTY, INDEX_DIRTY | WORKTREE_DIRTY]),
+});
 
 function invalidPathSql(path: string): string {
   return `typeof(${path}) <> 'text'
@@ -269,77 +281,22 @@ function isMaintenanceEpochExhaustion(error: unknown): boolean {
 }
 
 function relativePathBytes(path: string): number | null {
-  if (path === "" || path.startsWith("/") || path.endsWith("/") || path.includes("\0")) {
-    return null;
-  }
+  if (!isCanonicalGitPath(path)) return null;
   let bytes = 0;
-  let segmentStart = 0;
   for (let at = 0; at < path.length; at++) {
     const unit = path.charCodeAt(at);
-    if (unit === 0x2f) {
-      const segmentLength = at - segmentStart;
-      if (
-        segmentLength === 0 ||
-        (segmentLength === 1 && path.charCodeAt(segmentStart) === 0x2e) ||
-        (segmentLength === 2 &&
-          path.charCodeAt(segmentStart) === 0x2e &&
-          path.charCodeAt(segmentStart + 1) === 0x2e)
-      ) {
-        return null;
-      }
-      segmentStart = at + 1;
-      bytes++;
-    } else if (unit >= 0xd800 && unit <= 0xdbff) {
-      const next = path.charCodeAt(++at);
-      if (next < 0xdc00 || next > 0xdfff) return null;
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      at++;
       bytes += 4;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      return null;
-    } else if (unit < 0x80) bytes++;
-    else if (unit < 0x800) bytes += 2;
-    else bytes += 3;
-  }
-  const segmentLength = path.length - segmentStart;
-  if (
-    (segmentLength === 1 && path.charCodeAt(segmentStart) === 0x2e) ||
-    (segmentLength === 2 &&
-      path.charCodeAt(segmentStart) === 0x2e &&
-      path.charCodeAt(segmentStart + 1) === 0x2e)
-  ) {
-    return null;
+    } else if (unit < 0x80) {
+      bytes++;
+    } else if (unit < 0x800) {
+      bytes += 2;
+    } else {
+      bytes += 3;
+    }
   }
   return bytes;
-}
-
-function validRoot(root: string): boolean {
-  if (!root.startsWith("/") || root.includes("\0")) return false;
-  if (root === "/") return true;
-  if (root.endsWith("/")) return false;
-  let segmentStart = 1;
-  for (let at = 1; at <= root.length; at++) {
-    if (at === root.length || root.charCodeAt(at) === 0x2f) {
-      const length = at - segmentStart;
-      if (
-        length === 0 ||
-        (length === 1 && root.charCodeAt(segmentStart) === 0x2e) ||
-        (length === 2 &&
-          root.charCodeAt(segmentStart) === 0x2e &&
-          root.charCodeAt(segmentStart + 1) === 0x2e)
-      ) {
-        return false;
-      }
-      segmentStart = at + 1;
-      continue;
-    }
-    const unit = root.charCodeAt(at);
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const next = root.charCodeAt(++at);
-      if (next < 0xdc00 || next > 0xdfff) return false;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      return false;
-    }
-  }
-  return true;
 }
 
 function validateDirty(entry: IndexTrackerDirty): void {
@@ -447,35 +404,17 @@ export function initializeIndexTracker(db: SqlDatabase): void {
 
 export function readIndexTrackerState(db: SqlDatabase, checkoutId: number): IndexTrackerState {
   validateCheckoutId(checkoutId);
-  const row = db.one<Record<string, unknown>>(
-    `SELECT CASE
-              WHEN baseline_tree_oid IS NULL THEN NULL
-              WHEN typeof(baseline_tree_oid) = 'text'
-                AND length(CAST(baseline_tree_oid AS BLOB)) = 40
-                THEN baseline_tree_oid
-            END AS baseline_tree_oid,
-            CASE WHEN baseline_tree_oid IS NULL
-                    OR (typeof(baseline_tree_oid) = 'text'
-                      AND length(CAST(baseline_tree_oid AS BLOB)) = 40)
-                 THEN 1 ELSE 0 END AS baseline_valid,
-            CASE WHEN typeof(format) = 'integer' THEN format END AS format,
-            CASE WHEN typeof(complete) = 'integer' THEN complete END AS complete
+  const stored = db.one(
+    `SELECT baseline_tree_oid, format, complete
        FROM git_index_state WHERE checkout_id = ?`,
     checkoutId,
   );
-  if (
-    row === undefined ||
-    row.complete !== 1 ||
-    row.format !== TRACKER_FORMAT ||
-    row.baseline_valid !== 1
-  ) {
+  if (stored === undefined) return { available: false };
+  const row = TRACKER_STATE_ROW.decode(stored);
+  if (row.complete !== 1 || row.format !== TRACKER_FORMAT) {
     return { available: false };
   }
-  const baseline = row.baseline_tree_oid;
-  if (baseline !== null && (typeof baseline !== "string" || !isOid(baseline))) {
-    return { available: false };
-  }
-  return { available: true, baselineTreeOid: baseline };
+  return { available: true, baselineTreeOid: row.baseline_tree_oid };
 }
 
 function* dirtyRows(
@@ -497,13 +436,7 @@ function* dirtyRows(
       after,
       pageRows + 1,
     )) {
-      const path = row.path;
-      const flags = row.flags;
-      if (typeof path !== "string" || typeof flags !== "number") {
-        throw new CorruptError("index tracker has a malformed dirty row");
-      }
-      const entry: IndexTrackerDirty = { path, flags };
-      validateDirty(entry);
+      const entry = TRACKER_DIRTY_ROW.decode(row);
       if (after !== null && comparePaths(entry.path, after) <= 0) {
         throw new CorruptError("index tracker dirty rows are unordered");
       }
@@ -622,7 +555,7 @@ export function resealIndexTracker(
       if (metadata === undefined) return false;
       if (
         typeof metadata.root !== "string" ||
-        !validRoot(metadata.root) ||
+        (metadata.root !== "/" && !isCanonicalAbsolutePath(metadata.root)) ||
         typeof metadata.repo_id !== "number" ||
         !Number.isSafeInteger(metadata.repo_id) ||
         metadata.repo_id < 1 ||

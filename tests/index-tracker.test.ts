@@ -176,32 +176,30 @@ describe("index tracker", () => {
     expect(dirty(db, 1)).toEqual([{ path: "kept", flags: INDEX_DIRTY }]);
   });
 
-  it("fails closed on malformed state and dirty rows", () => {
+  it("reads state and dirty pages through plain stored-row projections", () => {
     const db = setup();
     addRepository(db, 1, "/repo");
-    seal(db, 1);
-    db.run("UPDATE git_index_state SET baseline_tree_oid = 'bad' WHERE checkout_id = 1");
-    expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
-    db.run("INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, '/bad', 1)");
-    expect(() => dirty(db, 1)).toThrowError(/invalid path/);
+    expect(
+      resealIndexTracker(db, 1, TREE, [
+        { path: "a", flags: INDEX_DIRTY },
+        { path: "b", flags: WORKTREE_DIRTY },
+        { path: "c", flags: INDEX_DIRTY | WORKTREE_DIRTY },
+      ]),
+    ).toBe(true);
+    db.storage.histogram = new Map();
+
+    expect(readIndexTrackerState(db, 1)).toEqual({ available: true, baselineTreeOid: TREE });
+    expect(dirty(db, 1)).toHaveLength(3);
+    const reads = [...db.storage.histogram.keys()]
+      .filter(
+        (query) => query.includes("FROM git_index_state") || query.includes("FROM git_index_dirty"),
+      )
+      .join("\n");
+    expect(reads).not.toContain("typeof(");
+    expect(reads).not.toContain("CAST(");
+    expect(reads).toContain("SELECT baseline_tree_oid, format, complete");
+    expect(reads).toContain("SELECT path, flags");
     expect(() => iterateIndexTrackerDirty(db, 1, 1001)).toThrowError(/page size/);
-
-    db.run("DELETE FROM git_index_dirty WHERE checkout_id = 1");
-    db.run("INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, '', 1)");
-    expect(() => dirty(db, 1)).toThrowError(/invalid path/);
-
-    db.run("DELETE FROM git_index_dirty WHERE checkout_id = 1");
-    db.run("PRAGMA ignore_check_constraints = ON");
-    db.run(
-      "INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, 'bad-flags', zeroblob(4096))",
-    );
-    db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() => dirty(db, 1)).toThrowError(/malformed dirty row/);
-
-    db.run(
-      "UPDATE git_index_state SET baseline_tree_oid = zeroblob(1048576) WHERE checkout_id = 1",
-    );
-    expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
   });
 
   it("accepts paths beyond the former component and page targets", () => {
@@ -224,15 +222,6 @@ describe("index tracker", () => {
       { path: formerExact, flags: INDEX_DIRTY },
       { path: formerExcess, flags: WORKTREE_DIRTY },
     ]);
-
-    seal(db, 1);
-    db.run("PRAGMA ignore_check_constraints = ON");
-    db.run(
-      "INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, ?, 1)",
-      new Uint8Array([1]),
-    );
-    db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() => dirty(db, 1)).toThrowError(/malformed dirty row/);
   });
 
   it("streams and reseals past the former dirty-row and page ceilings", () => {

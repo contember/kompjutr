@@ -1,5 +1,6 @@
 import type { SqlDatabase } from "../../db/db.js";
 import { CorruptError, GitError, hasErrorCode } from "../common/errors.js";
+import { checkRefText } from "../common/ref-name.js";
 import { expectText, int, RowShape, text } from "../common/rows.js";
 import type { BoundedSingleConfigValue, ConfigValueCardinality } from "./contracts.js";
 import { jsonPages, utf8ByteLength } from "./json-pages.js";
@@ -54,10 +55,7 @@ export class ConfigTable {
   }
 
   getOwned(path: string): string | undefined {
-    if (typeof path !== "string" || path === "") {
-      throw new GitError("EINVAL", "config path must be a non-empty string");
-    }
-    return this.getBounded(path);
+    return this.getBounded(requireConfigPath(path));
   }
 
   /** Read one config value with an optional payload limit. */
@@ -81,10 +79,7 @@ export class ConfigTable {
 
   /** Read zero or one value without materialising an unbounded multi-valued key. */
   getSingleBounded(path: string, maxBytes?: number): BoundedSingleConfigValue {
-    if (typeof path !== "string" || path === "") {
-      throw new GitError("EINVAL", "bounded config path must be a non-empty string");
-    }
-    boundedCanonicalUtf8Bytes(path, MAX_INDEX_PATH_BYTES, "bounded config path");
+    const checkedPath = requireConfigPath(path, "bounded config path");
     if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
       throw new GitError("EINVAL", "config byte limit must be a non-negative safe integer");
     }
@@ -93,11 +88,11 @@ export class ConfigTable {
       `SELECT value FROM git_config
         WHERE repo_id = ? AND path = ? ORDER BY seq LIMIT 2`,
       this.repoId,
-      path,
+      checkedPath,
     );
     if (rows.length === 0) return { kind: "missing" };
     if (rows.length !== 1) return { kind: "multiple" };
-    const value = expectText(rows[0]?.value, `config ${path}`);
+    const value = expectText(rows[0]?.value, `config ${checkedPath}`);
     if (maxBytes !== undefined && utf8ByteLength(value) > maxBytes) {
       throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
     }
@@ -106,43 +101,46 @@ export class ConfigTable {
 
   /** Inspect zero, one, or multiple values without materialising their payloads. */
   cardinality(path: string): ConfigValueCardinality {
-    if (typeof path !== "string" || path === "") {
-      throw new GitError("EINVAL", "config path must be a non-empty string");
-    }
-    boundedCanonicalUtf8Bytes(path, MAX_INDEX_PATH_BYTES, "config path");
+    const checkedPath = requireConfigPath(path);
     const rows = this.db.all<{ value: unknown }>(
       `SELECT value FROM git_config
         WHERE repo_id = ? AND path = ? ORDER BY seq LIMIT 2`,
       this.repoId,
-      path,
+      checkedPath,
     ).length;
     return rows === 0 ? "missing" : rows === 1 ? "single" : "multiple";
   }
 
   set(path: string, value: string): void {
+    const checkedPath = requireConfigPath(path);
     this.db.transactionSync(() => {
-      this.db.run("DELETE FROM git_config WHERE repo_id = ? AND path = ?", this.repoId, path);
+      this.db.run(
+        "DELETE FROM git_config WHERE repo_id = ? AND path = ?",
+        this.repoId,
+        checkedPath,
+      );
       this.db.run(
         "INSERT INTO git_config (repo_id, path, seq, value) VALUES (?, ?, 0, ?)",
         this.repoId,
-        path,
+        checkedPath,
         value,
       );
     });
   }
 
   add(path: string, value: string): void {
+    const checkedPath = requireConfigPath(path);
     this.db.transactionSync(() => {
       const seq =
         (this.db.scalar<number | null>(
           "SELECT MAX(seq) FROM git_config WHERE repo_id = ? AND path = ?",
           this.repoId,
-          path,
+          checkedPath,
         ) ?? -1) + 1;
       this.db.run(
         "INSERT INTO git_config (repo_id, path, seq, value) VALUES (?, ?, ?, ?)",
         this.repoId,
-        path,
+        checkedPath,
         seq,
         value,
       );
@@ -150,7 +148,8 @@ export class ConfigTable {
   }
 
   unset(path: string): void {
-    this.db.run("DELETE FROM git_config WHERE repo_id = ? AND path = ?", this.repoId, path);
+    const checkedPath = requireConfigPath(path);
+    this.db.run("DELETE FROM git_config WHERE repo_id = ? AND path = ?", this.repoId, checkedPath);
   }
 
   /** Distinct config paths under a dotted prefix, e.g. "remote.". */
@@ -167,11 +166,7 @@ export class ConfigTable {
 
   /** Validate and move one exact dotted config section without changing value order. */
   moveSection(sourcePrefix: string, destinationPrefix: string): void {
-    const source = requireConfigSectionPrefix(sourcePrefix, "source");
-    const destination = requireConfigSectionPrefix(destinationPrefix, "destination");
-    if (source === destination) {
-      throw new GitError("EINVAL", "config section source and destination must differ");
-    }
+    const [source, destination] = requireConfigSectionMove(sourcePrefix, destinationPrefix);
 
     this.db.transactionSync(() => {
       let destinationCandidates = 0;
@@ -250,6 +245,14 @@ export function nextPrefix(prefix: string): string {
   return `${prefix.slice(0, -1)}${String.fromCharCode(last + 1)}`;
 }
 
+export function requireConfigPath(value: unknown, label = "config path"): string {
+  if (typeof value !== "string" || value === "") {
+    throw new GitError("EINVAL", `${label} must be a non-empty string`);
+  }
+  boundedCanonicalUtf8Bytes(value, MAX_INDEX_PATH_BYTES, label);
+  return value;
+}
+
 export function requireConfigSectionPrefix(value: string, label: string): string {
   if (typeof value !== "string" || value === "") {
     throw new GitError("EINVAL", `config section ${label} is required`);
@@ -261,31 +264,30 @@ export function requireConfigSectionPrefix(value: string, label: string): string
   return value;
 }
 
-export function boundedCanonicalUtf8Bytes(value: string, limit: number, label: string): number {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
-    if (unit === 0 || unit === 0x0a || unit === 0x0d) {
-      throw new GitError("EINVAL", `${label} contains an invalid character`);
-    }
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      if (index + 1 >= value.length) {
-        throw new GitError("EINVAL", `${label} is not canonical UTF-16`);
-      }
-      const low = value.charCodeAt(index + 1);
-      if (low < 0xdc00 || low > 0xdfff) {
-        throw new GitError("EINVAL", `${label} is not canonical UTF-16`);
-      }
-      index++;
-      bytes += 4;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      throw new GitError("EINVAL", `${label} is not canonical UTF-16`);
-    } else {
-      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
-    }
-    if (bytes > limit) throw new GitError("E2BIG", `${label} exceeds ${limit} UTF-8 bytes`);
+export function requireConfigSectionMove(
+  sourcePrefix: string,
+  destinationPrefix: string,
+): readonly [source: string, destination: string] {
+  const source = requireConfigSectionPrefix(sourcePrefix, "source");
+  const destination = requireConfigSectionPrefix(destinationPrefix, "destination");
+  if (source === destination) {
+    throw new GitError("EINVAL", "config section source and destination must differ");
   }
-  return bytes;
+  return [source, destination];
+}
+
+export function boundedCanonicalUtf8Bytes(value: string, limit: number, label: string): number {
+  const checked = checkRefText(value, limit);
+  if (checked.problem === "invalid-character") {
+    throw new GitError("EINVAL", `${label} contains an invalid character`);
+  }
+  if (checked.problem === "noncanonical-utf16") {
+    throw new GitError("EINVAL", `${label} is not canonical UTF-16`);
+  }
+  if (checked.problem === "too-long") {
+    throw new GitError("E2BIG", `${label} exceeds ${limit} UTF-8 bytes`);
+  }
+  return checked.bytes;
 }
 
 export function configSectionMetadataSql(): string {

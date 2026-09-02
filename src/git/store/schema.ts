@@ -240,6 +240,9 @@ const STATEMENTS = [
      path TEXT NOT NULL CHECK (
        typeof(path) = 'text'
        AND length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
+       AND instr(path, char(0)) = 0
+       AND instr(path, char(10)) = 0
+       AND instr(path, char(13)) = 0
      ),
      seq INTEGER NOT NULL CHECK (typeof(seq) = 'integer' AND seq >= 0),
      value TEXT NOT NULL CHECK (typeof(value) = 'text'),
@@ -320,14 +323,23 @@ const STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS git_scratch_index_entries (
      repo_id INTEGER NOT NULL,
      name TEXT NOT NULL,
-     path TEXT NOT NULL,
-     stage INTEGER NOT NULL,
-     mode INTEGER NOT NULL,
-     oid TEXT NOT NULL,
-     size INTEGER,
-     mtime INTEGER,
-     ino INTEGER,
-     rev INTEGER,
+     path TEXT NOT NULL CHECK (
+       typeof(path) = 'text'
+       AND length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
+     ),
+     stage INTEGER NOT NULL CHECK (typeof(stage) = 'integer' AND stage BETWEEN 0 AND 3),
+     mode INTEGER NOT NULL CHECK (
+       typeof(mode) = 'integer' AND mode IN (33188, 33261, 40960, 57344)
+     ),
+     oid TEXT NOT NULL CHECK (
+       typeof(oid) = 'text'
+       AND length(CAST(oid AS BLOB)) = 40
+       AND oid NOT GLOB '*[^0-9a-f]*'
+     ),
+     size INTEGER CHECK (size IS NULL OR (typeof(size) = 'integer' AND size >= 0)),
+     mtime INTEGER CHECK (mtime IS NULL OR (typeof(mtime) = 'integer' AND mtime >= 0)),
+     ino INTEGER CHECK (ino IS NULL OR (typeof(ino) = 'integer' AND ino >= 0)),
+     rev INTEGER CHECK (rev IS NULL OR (typeof(rev) = 'integer' AND rev >= 0)),
      PRIMARY KEY (repo_id, name, path, stage),
      FOREIGN KEY (repo_id, name) REFERENCES git_scratch_indexes (repo_id, name)
        ON DELETE CASCADE

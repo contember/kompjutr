@@ -22,11 +22,14 @@ import {
   ancestors,
   CONFIG_SECTION_MOVE_UPDATE_SQL,
   contentIdKey,
+  type IndexEntry,
+  indexScanOwned,
   MAX_CONFIG_SECTION_MOVE_ROWS,
   PACK_BLOB_BATCH_TARGET_BYTES,
   SqliteGitDatabase,
   type StoreOptions,
 } from "../src/git/store/index.js";
+import { scanGenericIndexOwned } from "../src/git/store/index-table.js";
 import { PackWriter } from "../src/git/store/pack/writer.js";
 import {
   MAX_BLOB_ID_CACHE_ROWS,
@@ -2691,6 +2694,27 @@ describe("refs, config and index", () => {
     expect(store.configGet("user.email")).toBeUndefined();
   });
 
+  it("rejects invalid config mutation paths before SQL without changing an existing value", () => {
+    const { db, store } = open();
+    store.configSet("user.email", "kept@example.com");
+    const mutations = [
+      () => Reflect.apply(store.configSet, store, [42, "replacement"]),
+      () => Reflect.apply(store.configAdd, store, ["remote.\0url", "replacement"]),
+      () => Reflect.apply(store.configUnset, store, ["branch.\ud800.remote"]),
+      () => Reflect.apply(store.shared.configAdd, store.shared, ["shared.\0url", "replacement"]),
+      () => Reflect.apply(store.configSet, store, ["x".repeat(MAX_INDEX_PATH_BYTES + 1), "value"]),
+    ];
+
+    for (const mutate of mutations) {
+      db.storage.resetCounters();
+      expect(mutate).toThrowError(
+        expect.objectContaining({ code: expect.stringMatching(/^(EINVAL|E2BIG)$/) }),
+      );
+      expect(db.storage.statementCount).toBe(0);
+      expect(store.configGet("user.email")).toBe("kept@example.com");
+    }
+  });
+
   it("reads one config value at the exact byte bound and rejects one byte more", () => {
     const path = "remote.origin.url";
     const exact = open();
@@ -2894,6 +2918,204 @@ describe("refs, config and index", () => {
     ).toThrow(/injected failure/);
     expect(store.configGet("branch.old.remote")).toBe("origin");
     expect(store.configGet("branch.new.remote")).toBeUndefined();
+  });
+
+  it("validates scratch entries before buffering and rolls malformed input back atomically", () => {
+    const { db, store } = open();
+    const valid: IndexEntry = {
+      path: "src/a.ts",
+      stage: 0,
+      mode: 0o100644,
+      oid: "a".repeat(40),
+      size: 12,
+      mtime: 5,
+      ino: 7,
+      rev: 1,
+    };
+    const invalid: readonly unknown[] = [
+      null,
+      { ...valid, path: "" },
+      { ...valid, path: `src/${"x".repeat(MAX_INDEX_PATH_BYTES)}` },
+      { ...valid, stage: 4 },
+      { ...valid, mode: 0 },
+      { ...valid, oid: "not-an-object-id" },
+      { ...valid, size: -1 },
+    ];
+
+    for (const entry of invalid) {
+      expect(() =>
+        store.shared.withScratchIndex("invalid-entry", (scratch) => {
+          db.storage.resetCounters();
+          try {
+            Reflect.apply(scratch.indexReplace, scratch, [[entry]]);
+          } finally {
+            expect(db.storage.statementCount).toBe(0);
+          }
+        }),
+      ).toThrowError(expect.objectContaining({ code: expect.stringMatching(/^(EINVAL|E2BIG)$/) }));
+      expect(db.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(0);
+      expect(db.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
+    }
+
+    expect(() =>
+      store.shared.withScratchIndex("invalid-sink-entry", (scratch) => {
+        scratch.indexApply((sink) => sink.put({ ...valid, oid: "bad" }));
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(db.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
+  });
+
+  it("enforces the checkout index field envelope on scratch rows", () => {
+    const { db, store } = open();
+    store.shared.withScratchIndex("schema-envelope", () => {
+      const invalidRows = [
+        ["bad-stage", 4, 0o100644, "a".repeat(40), 1],
+        ["bad-mode", 0, 0, "a".repeat(40), 1],
+        ["bad-oid", 0, 0o100644, "bad", 1],
+        ["bad-size", 0, 0o100644, "a".repeat(40), -1],
+      ];
+      for (const [path, stage, mode, oid, size] of invalidRows) {
+        expect(() =>
+          db.run(
+            `INSERT INTO git_scratch_index_entries
+               (repo_id, name, path, stage, mode, oid, size, mtime, ino, rev)
+             VALUES (1, 'schema-envelope', ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+            path,
+            stage,
+            mode,
+            oid,
+            size,
+          ),
+        ).toThrow();
+      }
+      expect(db.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
+    });
+  });
+
+  it("keeps valid scratch replacement and buffered mutation workflows unchanged", () => {
+    const { db, store } = open();
+    const entries = store.shared.withScratchIndex("valid-entries", (scratch) => {
+      scratch.indexReplace([
+        {
+          path: "a.txt",
+          stage: 0,
+          mode: 0o100644,
+          oid: "a".repeat(40),
+          size: null,
+          mtime: null,
+          ino: null,
+        },
+      ]);
+      scratch.indexApply((sink) => {
+        sink.put({
+          path: "b.txt",
+          stage: 2,
+          mode: 0o100755,
+          oid: "b".repeat(40),
+          size: 2,
+          mtime: 3,
+          ino: 4,
+          rev: 5,
+        });
+        sink.put({
+          path: "carriage\rreturn",
+          stage: 0,
+          mode: 0o100644,
+          oid: "c".repeat(40),
+          size: null,
+          mtime: null,
+          ino: null,
+        });
+        sink.put({
+          path: "line\nbreak",
+          stage: 0,
+          mode: 0o100644,
+          oid: "d".repeat(40),
+          size: null,
+          mtime: null,
+          ino: null,
+        });
+        sink.flush();
+      });
+      return [...scratch.indexScan()];
+    });
+
+    expect(entries.map((entry) => [entry.path, entry.stage])).toEqual([
+      ["a.txt", 0],
+      ["b.txt", 2],
+      ["carriage\rreturn", 0],
+      ["line\nbreak", 0],
+    ]);
+    expect(db.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
+  });
+
+  it("hands off immutable persisted rows once and validates arbitrary generic scans", () => {
+    const { store } = open();
+    for (const entry of [
+      { path: "a.txt", oid: "a".repeat(40) },
+      { path: "b.txt", oid: "b".repeat(40) },
+    ]) {
+      store.indexPut({
+        path: entry.path,
+        stage: 0,
+        mode: 0o100644,
+        oid: entry.oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+    }
+
+    const persisted: IndexEntry[] = [];
+    function* observedPersistedScan(): Generator<IndexEntry> {
+      for (const entry of store.indexScan()) {
+        expect(Object.isFrozen(entry)).toBe(true);
+        persisted.push(entry);
+        yield entry;
+      }
+    }
+    const trusted = [...scanGenericIndexOwned(observedPersistedScan())];
+    expect(trusted).toHaveLength(2);
+    expect(trusted[0]).toBe(persisted[0]);
+    expect(trusted[1]).toBe(persisted[1]);
+    expect([...indexScanOwned(store)]).toHaveLength(2);
+    const first = persisted[0];
+    if (first === undefined) throw new Error("persisted index scan returned no rows");
+    expect(Reflect.set(first, "path", "z.txt")).toBe(false);
+    expect(() => [...scanGenericIndexOwned([{ ...first, mode: 0 }].values())]).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+
+    const reordered = persisted.map((entry) => ({ ...entry })).reverse();
+    expect(() => [...scanGenericIndexOwned(reordered.values())]).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+
+    const generic = [
+      {
+        path: "z.txt",
+        stage: 0,
+        mode: 0o100644,
+        oid: "a".repeat(40),
+        size: null,
+        mtime: null,
+        ino: null,
+      },
+      {
+        path: "a.txt",
+        stage: 0,
+        mode: 0o100644,
+        oid: "b".repeat(40),
+        size: null,
+        mtime: null,
+        ino: null,
+      },
+    ];
+    expect(() => [...scanGenericIndexOwned(generic.values())]).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
   });
 
   it("keys the index by path and stage", () => {

@@ -16,7 +16,7 @@ import {
   readCommitCache,
   readCommitGraph,
 } from "./commits.js";
-import { ConfigTable } from "./config.js";
+import { ConfigTable, requireConfigPath, requireConfigSectionMove } from "./config.js";
 import type {
   BlobIdMapping,
   BlobReadBatch,
@@ -806,7 +806,8 @@ export class SharedRepoStore {
   }
 
   configSet(path: string, value: string): void {
-    withGitMutationGuard(this.db, () => this.configSetOwned(path, value));
+    const checkedPath = requireConfigPath(path);
+    withGitMutationGuard(this.db, () => this.configSetOwned(checkedPath, value));
   }
 
   private configSetOwned(path: string, value: string): void {
@@ -814,7 +815,8 @@ export class SharedRepoStore {
   }
 
   configAdd(path: string, value: string): void {
-    withGitMutationGuard(this.db, () => this.configAddOwned(path, value));
+    const checkedPath = requireConfigPath(path);
+    withGitMutationGuard(this.db, () => this.configAddOwned(checkedPath, value));
   }
 
   private configAddOwned(path: string, value: string): void {
@@ -822,7 +824,8 @@ export class SharedRepoStore {
   }
 
   configUnset(path: string): void {
-    withGitMutationGuard(this.db, () => this.configUnsetOwned(path));
+    const checkedPath = requireConfigPath(path);
+    withGitMutationGuard(this.db, () => this.configUnsetOwned(checkedPath));
   }
 
   private configUnsetOwned(path: string): void {
@@ -834,9 +837,8 @@ export class SharedRepoStore {
   }
 
   configMoveSection(sourcePrefix: string, destinationPrefix: string): void {
-    withGitMutationGuard(this.db, () =>
-      this.configMoveSectionOwned(sourcePrefix, destinationPrefix),
-    );
+    const [source, destination] = requireConfigSectionMove(sourcePrefix, destinationPrefix);
+    withGitMutationGuard(this.db, () => this.configMoveSectionOwned(source, destination));
   }
 
   private configMoveSectionOwned(sourcePrefix: string, destinationPrefix: string): void {

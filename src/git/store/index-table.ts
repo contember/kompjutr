@@ -1,7 +1,8 @@
 import type { SqlDatabase } from "../../db/db.js";
 import { isOid } from "../common/bytes.js";
 import { CorruptError, GitError } from "../common/errors.js";
-import { int, nullable, OptionsSchema, oneOf, RowShape, text } from "../common/rows.js";
+import { isCanonicalGitPath } from "../common/paths.js";
+import { int, nullable, OptionsSchema, oneOf, optional, RowShape, text } from "../common/rows.js";
 import { comparePaths } from "../common/streams.js";
 import { InitialBlobIdBuffer } from "./blob-ids.js";
 import { nextPrefix } from "./config.js";
@@ -16,6 +17,7 @@ import type {
 } from "./contracts.js";
 import { isThenableResult, JSON_ENCODER, requireBooleanProbe } from "./json-pages.js";
 import { bumpMaintenanceRootEpoch } from "./maintenance/control.js";
+import { MAX_INDEX_PATH_BYTES } from "./schema.js";
 import type { SharedRepoStore } from "./shared.js";
 
 /** Index rows per round trip. This is the memory bound of a scan. */
@@ -36,11 +38,17 @@ const INDEX_ENTRY_FIELDS = {
   size: nullable(int(0)),
   mtime: nullable(int(0)),
   ino: nullable(int(0)),
-  rev: nullable(int(0)),
 };
 
-const INDEX_ENTRY_ROW = new RowShape(INDEX_ENTRY_FIELDS);
-const INDEX_ENTRY_INPUT = new OptionsSchema(INDEX_ENTRY_FIELDS, "index scan row is invalid");
+const INDEX_ENTRY_ROW = new RowShape({ ...INDEX_ENTRY_FIELDS, rev: nullable(int(0)) });
+const INDEX_ENTRY_INPUT = new OptionsSchema(
+  { ...INDEX_ENTRY_FIELDS, rev: optional(nullable(int(0))) },
+  "index scan row is invalid",
+);
+// Checkout facades relay these exact objects, so ephemeral provenance survives
+// composition without exposing a forgeable capability on IndexStore.
+const PERSISTED_INDEX_SCAN = new WeakMap<object, object>();
+const PERSISTED_INDEX_ORDINAL = new WeakMap<object, number>();
 
 export interface BufferedIndexMutation {
   kind: "p" | "r";
@@ -206,7 +214,7 @@ export function validateInitialIndexEntry(entry: IndexEntry): void {
   }
 }
 
-/** Internal ordered scan over validated persisted rows. */
+/** Internal ordered scan that does not re-decode rows from the persisted index path. */
 export function indexScanOwned(
   index: IndexStore,
   options: IndexScanOptions = {},
@@ -219,17 +227,30 @@ export function* scanGenericIndexOwned(
 ): Generator<IndexEntry> {
   let previousPath: string | null = null;
   let previousStage = -1;
+  let persistedScan: object | undefined;
+  let persistedOrdinal = 0;
+  let generic = false;
   for (const raw of entries) {
-    const entry = INDEX_ENTRY_INPUT.decode({
-      path: raw.path,
-      stage: raw.stage,
-      mode: raw.mode,
-      oid: raw.oid,
-      size: raw.size,
-      mtime: raw.mtime,
-      ino: raw.ino,
-      rev: raw.rev ?? null,
-    });
+    if (!generic) {
+      const scan = PERSISTED_INDEX_SCAN.get(raw);
+      const ordinal = PERSISTED_INDEX_ORDINAL.get(raw);
+      if (
+        scan !== undefined &&
+        ordinal === persistedOrdinal &&
+        (persistedScan === undefined || scan === persistedScan)
+      ) {
+        persistedScan = scan;
+        persistedOrdinal++;
+        yield raw;
+        continue;
+      }
+      if (persistedScan !== undefined) {
+        throw new CorruptError("persisted index scan lost its row provenance");
+      }
+      generic = true;
+    }
+
+    const entry = INDEX_ENTRY_INPUT.decode(raw);
     if (
       previousPath !== null &&
       (comparePaths(previousPath, entry.path) > 0 ||
@@ -254,6 +275,38 @@ export function requireStoredIndexEntry(row: unknown): IndexEntry {
   return INDEX_ENTRY_ROW.decode(row);
 }
 
+function requireScratchIndexPath(path: string): void {
+  if (!isCanonicalGitPath(path)) {
+    throw new GitError("EINVAL", "scratch index entry has an invalid path");
+  }
+  let bytes = 0;
+  for (let index = 0; index < path.length; index++) {
+    const unit = path.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      index++;
+      bytes += 4;
+    } else if (unit < 0x80) {
+      bytes++;
+    } else if (unit < 0x800) {
+      bytes += 2;
+    } else {
+      bytes += 3;
+    }
+    if (bytes > MAX_INDEX_PATH_BYTES) {
+      throw new GitError("E2BIG", `scratch index path exceeds ${MAX_INDEX_PATH_BYTES} UTF-8 bytes`);
+    }
+  }
+}
+
+function requireScratchIndexEntry(row: unknown): IndexEntry {
+  const entry = INDEX_ENTRY_INPUT.decode(row);
+  requireScratchIndexPath(entry.path);
+  if (!isOid(entry.oid)) {
+    throw new GitError("EINVAL", "scratch index entry has an invalid object id");
+  }
+  return entry;
+}
+
 export type OwnedIndexSource =
   | { kind: "checkout"; repoId: number; checkoutId: number }
   | { kind: "scratch"; repoId: number; name: string };
@@ -269,6 +322,8 @@ export function* scanIndexOwned(
   const prefix = options.prefix;
   let path = options.after?.path ?? "";
   let stage = options.after?.stage ?? -1;
+  const scan = {};
+  let persistedOrdinal = 0;
   for (;;) {
     requireActive();
     const query =
@@ -330,6 +385,7 @@ export function* scanIndexOwned(
             ];
     let pageRows = 0;
     let last: IndexEntry | undefined;
+    let issued: IndexEntry | undefined;
     const rows = db.iterate(query, ...bindings)[Symbol.iterator]();
     try {
       for (;;) {
@@ -340,11 +396,22 @@ export function* scanIndexOwned(
           throw new CorruptError("index scan returned invalid page cardinality");
         }
         const entry = requireStoredIndexEntry(next.value);
+        Object.freeze(entry);
+        PERSISTED_INDEX_SCAN.set(entry, scan);
+        PERSISTED_INDEX_ORDINAL.set(entry, persistedOrdinal++);
+        issued = entry;
         last = entry;
         pageRows++;
         yield entry;
+        PERSISTED_INDEX_SCAN.delete(entry);
+        PERSISTED_INDEX_ORDINAL.delete(entry);
+        issued = undefined;
       }
     } finally {
+      if (issued !== undefined) {
+        PERSISTED_INDEX_SCAN.delete(issued);
+        PERSISTED_INDEX_ORDINAL.delete(issued);
+      }
       if (rows.return !== undefined) rows.return();
     }
     if (pageRows === 0) return;
@@ -650,7 +717,9 @@ export class IndexTable implements IndexStore {
       });
       first = false;
     });
-    for (const entry of entries) pending.add(entry);
+    for (const entry of entries) {
+      pending.add(this.source.kind === "scratch" ? requireScratchIndexEntry(entry) : entry);
+    }
     pending.flush();
     if (first) {
       if (this.source.kind === "checkout") this.indexClear();
@@ -691,7 +760,7 @@ export class IndexTable implements IndexStore {
     const sink: IndexSink = {
       put: (entry) => {
         requireSinkActive();
-        pending.add(entry);
+        pending.add(requireScratchIndexEntry(entry));
       },
       remove: (path) => {
         requireSinkActive();
