@@ -70,7 +70,8 @@ Ordinary ingest uses a renewable five-minute repository lease and monotonic pack
 IDs. Maintenance has exact batch ownership instead. One `maintenance()` call
 advances one bounded durable action. Root mutations bump the repository epoch;
 epoch drift restarts discovery before destructive work. Sweep eligibility is 14
-days after stable classification.
+days after stable classification. A loose object that a surviving pack still
+names as a delta base is never nominated and never swept.
 
 Pack code derives from dgit (MIT). Keep the attribution headers when splitting
 or moving it. `src/git/diff/` is a separate LGPL boundary.

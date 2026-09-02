@@ -14,6 +14,7 @@ import {
   GC_GRACE_MS,
   type MaintenanceSweepProgress,
 } from "../src/git/store/maintenance/sweep.js";
+import { encodeDeltaHeader } from "../src/git/store/pack/delta.js";
 import { PackWriter } from "../src/git/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
@@ -117,6 +118,15 @@ function advanceToPhase(
     if (result.phase === phase) return result;
   }
   throw new Error(`maintenance sweep did not reach ${phase}`);
+}
+
+function literalDelta(baseSize: number, target: Uint8Array): Uint8Array {
+  const chunks = [encodeDeltaHeader(baseSize, target.length)];
+  for (let offset = 0; offset < target.length; offset += 127) {
+    const part = target.subarray(offset, offset + 127);
+    chunks.push(new Uint8Array([part.length]), part);
+  }
+  return concat(chunks);
 }
 
 function fullPack(objects: readonly { type: ObjectType; data: Uint8Array }[]): Uint8Array {
@@ -802,6 +812,51 @@ describe("maintenance sweep", () => {
       /page size/,
     );
   });
+  it("keeps a loose delta base that a surviving pack still needs", async () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const baseData = utf8.encode("loose delta base\n");
+    const baseOid = store.write("blob", baseData);
+    const keeperData = utf8.encode("packed keeper\n");
+    const keeperOid = hashObject("blob", keeperData);
+    const targetData = utf8.encode("loose delta target\n");
+    const targetOid = hashObject("blob", targetData);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.object("blob", keeperData);
+    writer.refDelta(baseOid, literalDelta(baseData.length, targetData));
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    expect(
+      db.scalar<string>(
+        "SELECT base_oid FROM git_pack_entries WHERE repo_id = ? AND base_oid = ?",
+        checkout.repoId,
+        baseOid,
+      ),
+    ).toBe(baseOid);
+
+    seedRun(db, checkout.repoId, "classify-loose", [{ oid: keeperOid, physicalOnly: true }]);
+    advanceToPhase(db, store.shared, 100, "repack");
+    expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, baseOid)).toBeUndefined();
+
+    // A pack ingested after classification leaves an aged nomination behind.
+    db.run(
+      "UPDATE git_maintenance_runs SET phase = 'sweep-loose' WHERE repo_id = ? AND run_id = 1",
+      checkout.repoId,
+    );
+    db.run(
+      `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms) VALUES (?, ?, 100)`,
+      checkout.repoId,
+      baseOid,
+    );
+    advanceToPhase(db, store.shared, 100 + GC_GRACE_MS, "sweep-packs");
+
+    expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, baseOid)).toBeUndefined();
+    expect(store.read(baseOid)?.data).toEqual(baseData);
+    expect(store.read(targetOid)?.data).toEqual(targetData);
+  });
+
   it("keeps every stateless loose page within the statement target and memory envelope", () => {
     const db = new TestDatabase();
     const { checkout, store } = open(db);

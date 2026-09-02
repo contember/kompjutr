@@ -648,6 +648,11 @@ const STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS git_pack_entries_by_oid
      ON git_pack_entries (repo_id, oid, pack_id, offset)`,
 
+  // Maintenance asks the reverse question — which OIDs a surviving pack still
+  // needs as a delta base — once per swept loose object.
+  `CREATE INDEX IF NOT EXISTS git_pack_entries_by_base
+     ON git_pack_entries (repo_id, base_oid) WHERE base_oid IS NOT NULL`,
+
   // Delta entries whose base had not been seen yet when the pack was
   // scanned. Drained before the pack is marked complete.
   `CREATE TABLE IF NOT EXISTS git_pack_pending (
@@ -662,6 +667,9 @@ const STATEMENTS = [
      PRIMARY KEY (repo_id, pack_id, offset),
      FOREIGN KEY (repo_id, pack_id) REFERENCES git_pack_meta (repo_id, pack_id) ON DELETE CASCADE
    )`,
+
+  `CREATE INDEX IF NOT EXISTS git_pack_pending_by_base
+     ON git_pack_pending (repo_id, base_oid) WHERE base_oid IS NOT NULL`,
 
   `CREATE TABLE IF NOT EXISTS git_tree_sources (
      source_key INTEGER PRIMARY KEY,
