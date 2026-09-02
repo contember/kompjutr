@@ -632,4 +632,46 @@ describe("maintenance roots", () => {
       ),
     ).toBe(1);
   });
+
+  it("treats a promised missing blob in the index as a leaf, not a root", () => {
+    const { db, database, checkout, store } = open();
+    const promised = hashObject("blob", utf8.encode("omitted by blob:none\n"));
+    store.registerPromisorRemote("origin", "https://example.test/repo.git");
+    store.addPromisedBlobs("origin", [promised]);
+    store.indexPut({
+      path: "omitted.txt",
+      stage: 0,
+      mode: 0o100644,
+      oid: promised,
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    installRootRun(db, checkout.repoId, "index");
+
+    expect(
+      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 128 }),
+    ).toMatchObject({ rootSource: "index-baseline", complete: false });
+    expect(rootMask(db, checkout.repoId, promised)).toBeUndefined();
+  });
+
+  it("still rejects a missing index root that no promise covers", () => {
+    const { db, database, checkout, store } = open();
+    const missing = hashObject("blob", utf8.encode("never promised\n"));
+    store.indexPut({
+      path: "gone.txt",
+      stage: 0,
+      mode: 0o100644,
+      oid: missing,
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    installRootRun(db, checkout.repoId, "index");
+
+    expect(() =>
+      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 128 }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(rootMask(db, checkout.repoId, missing)).toBeUndefined();
+  });
 });

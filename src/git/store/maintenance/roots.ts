@@ -1142,7 +1142,8 @@ function validateObjectRoots(db: SqlDatabase, repoId: number, roots: RootCandida
     `SELECT json_extract(input.value, '$.oid') AS oid,
             json_extract(input.value, '$.expectedType') AS expected_type,
             json_extract(input.value, '$.optionalMissing') AS optional_missing,
-            loose.type AS loose_type, packed.type AS packed_type
+            loose.type AS loose_type, packed.type AS packed_type,
+            promised.oid AS promised_oid
        FROM json_each(?) input
        LEFT JOIN git_objects loose
          ON loose.repo_id = ? AND loose.oid = json_extract(input.value, '$.oid')
@@ -1153,8 +1154,11 @@ function validateObjectRoots(db: SqlDatabase, repoId: number, roots: RootCandida
            WHERE meta.repo_id = packed.repo_id AND meta.pack_id = packed.pack_id
              AND meta.state = 'complete'
         )
+       LEFT JOIN git_promised_blobs promised
+         ON promised.repo_id = ? AND promised.oid = json_extract(input.value, '$.oid')
       ORDER BY CAST(input.key AS INTEGER)`,
     payload,
+    repoId,
     repoId,
     repoId,
   )) {
@@ -1188,6 +1192,8 @@ function validateObjectRoots(db: SqlDatabase, repoId: number, roots: RootCandida
     const actual = looseType ?? packedType;
     if (actual === null) {
       if (wanted.optionalMissing) continue;
+      // A promised blob is a terminal leaf, not a root and not corruption (ADR-0020).
+      if (wanted.expectedType === "blob" && row.promised_oid === row.oid) continue;
       throw new CorruptError(`maintenance root ${row.oid} references a missing object`);
     }
     if (wanted.expectedType !== null && actual !== wanted.expectedType) {
