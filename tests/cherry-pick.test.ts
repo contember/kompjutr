@@ -152,11 +152,14 @@ describe("cherry-pick lifecycle", () => {
         };
       }
       if (fault === "index") {
-        const original = workspace.repo.checkout.indexApply.bind(workspace.repo.checkout);
-        workspace.repo.checkout.indexApply = (body, options) => {
-          original(body, options);
-          throw new Error("fault index");
-        };
+        workspace.repo.store.db.run(
+          `CREATE TRIGGER fault_replay_index
+           AFTER INSERT ON git_index
+           WHEN NEW.checkout_id = ${workspace.repo.checkout.checkoutId}
+           BEGIN
+             SELECT RAISE(ABORT, 'fault index');
+           END`,
+        );
       }
       if (fault === "journal") {
         workspace.repo.store.db.run(
