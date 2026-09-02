@@ -181,17 +181,11 @@ export function requireRefLogHeader(row: Record<string, unknown>, repoId: number
     repo_id: int(1),
     head: text(),
     next_ordinal: int(0, MAX_REFLOG_ORDINAL),
-    latest_ordinal: nullable(int(1, MAX_REFLOG_ORDINAL)),
   }).decode(row);
   if (stored.repo_id !== repoId) {
     throw new CorruptError("reflog header belongs to another repository");
   }
-  const nextOrdinal = stored.next_ordinal;
-  const latest = stored.latest_ordinal;
-  if ((nextOrdinal === 0 && latest !== null) || (latest ?? 0) > nextOrdinal) {
-    throw new CorruptError("reflog state precedes its newest entry");
-  }
-  return nextOrdinal;
+  return stored.next_ordinal;
 }
 
 export function validateRefLogMetadata(metadata: RefLogMetadata): RefLogMetadata {
@@ -266,16 +260,9 @@ export function readRefLog(
   let nextOrdinal = 0;
   let entryCount = 0;
   const headerSql = `SELECT 0 AS kind, repository.id AS repo_id, checkout.head,
-              state.next_ordinal,
-              (SELECT max(ordinal) FROM (
-                 SELECT direct.ordinal FROM git_reflog_entries direct
-                  WHERE direct.repo_id = repository.id
-                 UNION ALL
-                 SELECT local.ordinal FROM git_checkout_reflog_entries local
-                  WHERE local.repo_id = repository.id
-               )) AS latest_ordinal,
-              NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
-              NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
+               state.next_ordinal,
+               NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
+               NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
               NULL AS timestamp, NULL AS timezone, NULL AS reason
          FROM git_repositories repository
          JOIN git_reflog_state state ON state.repo_id = repository.id
@@ -285,10 +272,10 @@ export function readRefLog(
     name === "HEAD"
       ? db.iterate(
           `${headerSql}
-             UNION ALL
-             SELECT 1 AS kind, NULL AS repo_id, NULL AS head, NULL AS next_ordinal,
-                    NULL AS latest_ordinal, 'HEAD' AS ref_name, entry.ordinal,
-                    entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
+              UNION ALL
+              SELECT 1 AS kind, NULL AS repo_id, NULL AS head, NULL AS next_ordinal,
+                     'HEAD' AS ref_name, entry.ordinal,
+                     entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
                     entry.actor_name, entry.actor_email, entry.timestamp, entry.timezone,
                     entry.reason
                FROM git_checkout_reflog_entries entry
@@ -302,10 +289,10 @@ export function readRefLog(
         )
       : db.iterate(
           `${headerSql}
-             UNION ALL
-             SELECT 1 AS kind, NULL AS repo_id, NULL AS head, NULL AS next_ordinal,
-                    NULL AS latest_ordinal, entry.ref_name, entry.ordinal,
-                    entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
+              UNION ALL
+              SELECT 1 AS kind, NULL AS repo_id, NULL AS head, NULL AS next_ordinal,
+                     entry.ref_name, entry.ordinal,
+                     entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
                     entry.actor_name, entry.actor_email, entry.timestamp, entry.timezone,
                     entry.reason
                FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
@@ -357,14 +344,7 @@ export function* activeRefLogOids(
   const now = nowSeconds(clock);
   const cutoff = Math.max(0, now - REFLOG_RETENTION_SECONDS);
   const header = db.one<Record<string, unknown>>(
-    `SELECT repository.id AS repo_id, checkout.head, state.next_ordinal,
-              (SELECT max(ordinal) FROM (
-                 SELECT direct.ordinal FROM git_reflog_entries direct
-                  WHERE direct.repo_id = repository.id
-                 UNION ALL
-                 SELECT local.ordinal FROM git_checkout_reflog_entries local
-                  WHERE local.repo_id = repository.id
-               )) AS latest_ordinal
+    `SELECT repository.id AS repo_id, checkout.head, state.next_ordinal
          FROM git_repositories repository
          JOIN git_reflog_state state ON state.repo_id = repository.id
          JOIN git_checkouts checkout ON checkout.repo_id = repository.id

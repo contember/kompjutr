@@ -234,21 +234,13 @@ export class RefTable {
       const header = this.db.one<{
         repo_id: unknown;
         next_ordinal: unknown;
-        latest_ordinal: unknown;
         checkout_revision: unknown;
       }>(
         `SELECT repository.id AS repo_id, state.next_ordinal,
-                repository.checkout_revision,
-                (SELECT max(ordinal) FROM (
-                   SELECT entry.ordinal FROM git_reflog_entries entry
-                    WHERE entry.repo_id = repository.id
-                   UNION ALL
-                   SELECT entry.ordinal FROM git_checkout_reflog_entries entry
-                    WHERE entry.repo_id = repository.id
-                 )) AS latest_ordinal
-           FROM git_repositories repository
-           JOIN git_reflog_state state ON state.repo_id = repository.id
-          WHERE repository.id = ?`,
+                 repository.checkout_revision
+            FROM git_repositories repository
+            JOIN git_reflog_state state ON state.repo_id = repository.id
+           WHERE repository.id = ?`,
         this.repoId,
       );
       if (header === undefined) throw new CorruptError("repository is missing its reflog state");
@@ -261,18 +253,6 @@ export class RefTable {
         0,
         MAX_REFLOG_ORDINAL,
       );
-      const latestOrdinal =
-        header.latest_ordinal === null
-          ? null
-          : requireSafeRefLogInteger(
-              header.latest_ordinal,
-              "newest reflog ordinal",
-              1,
-              MAX_REFLOG_ORDINAL,
-            );
-      if ((nextOrdinal === 0 && latestOrdinal !== null) || (latestOrdinal ?? 0) > nextOrdinal) {
-        throw new CorruptError("reflog state precedes its newest entry");
-      }
       const checkoutRevision = requireRefGeneration(
         header.checkout_revision,
         "stored checkout revision",

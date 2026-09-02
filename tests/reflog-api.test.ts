@@ -335,6 +335,119 @@ class GuardedDatabase implements SqlDatabase {
   }
 }
 
+class ReflogWitnessDatabase implements SqlDatabase {
+  readonly queries: { query: string; bindings: unknown[] }[] = [];
+  allocatorRaceInjected = false;
+  #allocatorRaceArmed = false;
+
+  constructor(readonly inner = new TestDatabase()) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.queries.push({ query, bindings });
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    this.queries.push({ query, bindings });
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    this.queries.push({ query, bindings });
+    if (
+      this.#allocatorRaceArmed &&
+      query.includes("UPDATE git_reflog_state SET next_ordinal = ?")
+    ) {
+      this.#allocatorRaceArmed = false;
+      this.allocatorRaceInjected = true;
+      const repoId = bindings[1];
+      if (typeof repoId !== "number" || !Number.isSafeInteger(repoId)) {
+        throw new Error("allocator CAS repository binding is invalid");
+      }
+      this.inner.run(
+        "UPDATE git_reflog_state SET next_ordinal = next_ordinal + 1 WHERE repo_id = ?",
+        repoId,
+      );
+    }
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    this.queries.push({ query, bindings });
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    this.queries.push({ query, bindings });
+    return this.inner.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+
+  resetQueries(): void {
+    this.queries.length = 0;
+  }
+
+  armAllocatorRace(): void {
+    this.#allocatorRaceArmed = true;
+    this.allocatorRaceInjected = false;
+  }
+
+  planFor(fragment: string): string[] {
+    const issued = this.queries.find(({ query }) => query.includes(fragment));
+    if (issued === undefined)
+      throw new Error(`production query containing ${fragment} was not issued`);
+    return this.inner
+      .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
+      .map(({ detail }) => detail);
+  }
+}
+
+describe("reflog query plans", () => {
+  it("keeps mutation and active-root headers off both histories", () => {
+    const db = new ReflogWitnessDatabase();
+    const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(repository);
+    seedCombinedActiveRefLogs(db, store.repoId, [repository.id], 1_024, 1_024);
+
+    db.resetQueries();
+    store.setRef("refs/tags/query-plan", THIRD);
+    const mutationPlan = db.planFor("repository.checkout_revision").join("\n");
+    expect(mutationPlan).not.toContain("git_reflog_entries");
+    expect(mutationPlan).not.toContain("git_checkout_reflog_entries");
+
+    db.resetQueries();
+    const roots = store.activeRefLogOids();
+    expect(roots.next().done).toBe(false);
+    roots.return(undefined);
+    const activeRootHeaderPlan = db.planFor("checkout.head, state.next_ordinal").join("\n");
+    expect(activeRootHeaderPlan).not.toContain("git_reflog_entries");
+    expect(activeRootHeaderPlan).not.toContain("git_checkout_reflog_entries");
+  });
+
+  it("keeps exact reads off the unrelated history", () => {
+    const db = new ReflogWitnessDatabase();
+    const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(repository);
+    seedCombinedActiveRefLogs(db, store.repoId, [repository.id], 1_024, 1_024);
+
+    db.resetQueries();
+    expect(store.reflog("refs/tags/combined-0001")).toHaveLength(1);
+    const directPlan = db.planFor("ORDER BY kind, ordinal DESC").join("\n");
+    expect(directPlan).toContain("git_reflog_entries");
+    expect(directPlan).not.toContain("git_checkout_reflog_entries");
+
+    db.resetQueries();
+    expect(store.reflog("HEAD")).toHaveLength(1_024);
+    const headPlan = db.planFor("ORDER BY kind, ordinal DESC").join("\n");
+    expect(headPlan).not.toContain("git_reflog_entries");
+  });
+});
+
 describe("public reflog listing", () => {
   it("round-trips former ref, target, identity, and reason first excesses", () => {
     const workspace = makeRepo("/");
@@ -1044,5 +1157,26 @@ describe("mutation publication result", () => {
     expect(coldStore.head()).toBe("ref: refs/heads/main");
     expect(coldStore.getRef("refs/heads/main")).toBeNull();
     expect(coldStore.reflog("HEAD")).toEqual([]);
+  });
+
+  it("rolls refs, entries, and state back when the allocator changes before final CAS", () => {
+    const db = new ReflogWitnessDatabase();
+    const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
+    const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+    const repo = new Repository(database.openCheckout(checkout));
+    const before = durableRefMutationState(db.inner);
+    db.armAllocatorRace();
+
+    expect(() =>
+      repo.mutateRefs(
+        { puts: [{ name: "refs/heads/main", target: FIRST }] },
+        metadata("allocator race"),
+      ),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(db.allocatorRaceInjected).toBe(true);
+    expect(durableRefMutationState(db.inner)).toEqual(before);
+    expect(repo.store.getRef("refs/heads/main")).toBeNull();
+    expect(repo.reflog("refs/heads/main")).toEqual([]);
+    expect(repo.reflog("HEAD")).toEqual([]);
   });
 });
