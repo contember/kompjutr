@@ -1,3 +1,5 @@
+import { withGitMutationGuardOwned } from "../store/database.js";
+import { sharedRepoStoreMutations } from "../store/shared.js";
 // Bounded structured Smart HTTP push with one advertisement, one union pack,
 // and post-status atomic tracking reconciliation.
 
@@ -461,10 +463,12 @@ async function reconcileTracking(
     }
     throwIfAborted(signal);
     try {
-      const changedRefs = repo.store.publishFetchRefs(
-        publication,
-        { trackingPuts: puts, trackingKeep: keep },
-        operationRefLogMetadata(context, repo, "push"),
+      const changedRefs = withGitMutationGuardOwned(context.database, () =>
+        sharedRepoStoreMutations(repo.store).publishFetchRefsOwned(
+          publication,
+          { trackingPuts: puts, trackingKeep: keep },
+          operationRefLogMetadata(context, repo, "push"),
+        ),
       );
       return { outcome: changedRefs ? "updated" : "unchanged" };
     } catch (error) {

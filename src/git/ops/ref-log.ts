@@ -8,8 +8,9 @@ import type {
   RefLogMetadata,
   RefLogReadOptions as StoreRefLogReadOptions,
 } from "../store/index.js";
+import { withGitMutationGuard } from "../store/mutation-guard.js";
 import type { GitContext, GitIdentity } from "./context.js";
-import type { Repository } from "./repository.js";
+import { type Repository, repositoryMutations } from "./repository.js";
 
 export type RefLogReason =
   | "commit (initial)"
@@ -79,6 +80,15 @@ export function recoverRef(
   repo: Repository,
   options: RecoverRefOptions,
 ): void {
+  withGitMutationGuard(repo.checkout.db, () => recoverRefOwned(context, repo, options));
+}
+
+/** Internal recovery seam for composition under an existing mutation guard. */
+export function recoverRefOwned(
+  context: GitContext,
+  repo: Repository,
+  options: RecoverRefOptions,
+): void {
   if (!options.ref.startsWith("refs/") || options.ref.length === "refs/".length) {
     throw new GitError("EINVAL", "recovery destination must be a direct refs/* name");
   }
@@ -107,7 +117,7 @@ export function recoverRef(
       throw new RefNotFoundError(`${options.source.ref}@{${options.source.ordinal}}`);
     }
     if (!repo.has(oid)) throw new ObjectNotFoundError(oid);
-    const changed = repo.mutateRefs(
+    const changed = repositoryMutations(repo).mutateRefsOwned(
       {
         puts: [{ name: options.ref, target: oid }],
         expected: { name: options.ref, target: options.expectedCurrent },

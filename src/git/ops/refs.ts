@@ -1,3 +1,5 @@
+import { mutateRefsOwned } from "../store/refs.js";
+import { sharedRepoStoreMutations } from "../store/shared.js";
 // Branches, tags and HEAD movement, plus the working-tree reconciliation
 // that goes with moving HEAD. Refs are rows; HEAD is a column on the
 // repository row, so nothing here writes a file.
@@ -11,7 +13,6 @@ import {
   type IndexEntry,
   indexScanOwned,
   listCheckoutsOwned,
-  mutateRefsOwned,
 } from "../store/index.js";
 import { resolveBranchUpstream } from "./branch-upstream.js";
 import { checkoutTreeExcluding, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
@@ -151,7 +152,7 @@ function branchRenameOwned(
 
     const sourceConfig = branchConfigPrefix(source);
     const destinationConfig = branchConfigPrefix(destination);
-    repo.store.configMoveSection(sourceConfig, destinationConfig);
+    sharedRepoStoreMutations(repo.store).configMoveSectionOwned(sourceConfig, destinationConfig);
     mutateRefsOwned(
       repo.checkout,
       {

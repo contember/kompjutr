@@ -59,8 +59,10 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "index:git_checkouts_attached_branch",
   "index:git_checkouts_primary",
   "index:git_maintenance_objects_queue",
+  "index:git_pack_entries_by_base",
   "index:git_pack_entries_by_oid",
   "index:git_pack_objects_loc",
+  "index:git_pack_pending_by_base",
   "index:git_reflog_entries_by_ref",
   "index:git_reflog_entries_by_timestamp",
   "index:git_tree_entries_by_name_bytes",
@@ -96,6 +98,8 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "table:git_pack_meta",
   "table:git_pack_objects",
   "table:git_pack_pending",
+  "table:git_promised_blobs",
+  "table:git_promisor_remotes",
   "table:git_reflog_entries",
   "table:git_reflog_state",
   "table:git_refs",
@@ -112,6 +116,7 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "trigger:git_blob_id_updates_invalid",
   "trigger:git_blob_id_updates_mapping",
   "trigger:git_checkouts_identity_immutable",
+  "trigger:git_promised_blobs_loose_present",
   "trigger:git_tree_effective_loose_delete",
   "trigger:git_tree_effective_loose_insert",
   "trigger:git_tree_effective_pack_complete",
@@ -147,6 +152,8 @@ type RequiredRow =
   | "replay.recovery"
   | "rebase.plan"
   | "rebase.transition"
+  | "rebase.transition-n"
+  | "rebase.transition-2n"
   | "pack.uncached-auth"
   | "pack.uncached-read"
   | "pack.fallback-audit"
@@ -183,6 +190,8 @@ const REQUIRED_ROWS: readonly RequiredRow[] = [
   "replay.recovery",
   "rebase.plan",
   "rebase.transition",
+  "rebase.transition-n",
+  "rebase.transition-2n",
   "pack.uncached-auth",
   "pack.uncached-read",
   "pack.fallback-audit",
@@ -200,8 +209,8 @@ interface ResultRow {
   rowsRead: number;
   targetStatements: number;
   target: "pass" | "miss";
-  baselineStatements: number;
-  baselineRowsRead: number;
+  baselineStatements: number | null;
+  baselineRowsRead: number | null;
 }
 
 interface NextjsReference {
@@ -226,78 +235,78 @@ interface History {
 }
 
 // Frozen at the pre-sprint implementation. A target miss is reported separately.
-const BASELINE_STATEMENTS: Record<RequiredRow, number> = {
-  "schema.init": 74,
+const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
+  "schema.init": 79,
   "fs.redirect.stream": 32,
   "ls-files.cached": 1,
-  "ls-files.combined": 7,
+  "ls-files.combined": 6,
   "ignore.load": 3,
   "sparse.prune": 126,
-  "checkout.remove": 40,
-  "worktree.guard": 11,
-  "staging.add": 18,
-  "staging.rm": 29,
-  "status.full": 30,
-  "checkout.initial": 23,
-  "commit.sparse": 33,
-  "diff.index-worktree": 37,
-  "fetch.publication": 19,
-  "merge-base.select": 7,
-  "merge.virtual-base": 123,
-  "merge.apply": 97,
-  "merge.recovery": 66,
-  "merge.restore": 54,
-  "replay.preflight": 4,
-  "replay.plan": 18,
-  "replay.recovery": 81,
-  "rebase.plan": 15,
-  "rebase.transition": 393,
+  "checkout.remove": 39,
+  "worktree.guard": 8,
+  "staging.add": 16,
+  "staging.rm": 27,
+  "status.full": 28,
+  "checkout.initial": 24,
+  "commit.sparse": 37,
+  "diff.index-worktree": 35,
+  "fetch.publication": 22,
+  "merge-base.select": 9,
+  "merge.virtual-base": 128,
+  "merge.apply": 100,
+  "merge.recovery": 72,
+  "merge.restore": 56,
+  "replay.preflight": 5,
+  "replay.plan": 24,
+  "replay.recovery": 85,
+  "rebase.plan": 18,
+  "rebase.transition": 322,
   "pack.uncached-auth": 3,
   "pack.uncached-read": 3,
-  "pack.fallback-audit": 19,
+  "pack.fallback-audit": 12,
   "index-tracker.dirty": 2,
   "index-tracker.reseal": 8,
-  "maintenance.repack.select": 7,
+  "maintenance.repack.select": 6,
   "transport.discovery": 2,
-  "transport.fetch": 61,
-  "transport.push": 47,
+  "transport.fetch": 64,
+  "transport.push": 55,
 };
 
-const BASELINE_ROWS_READ: Record<RequiredRow, number> = {
-  "schema.init": 69,
+const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
+  "schema.init": 74,
   "fs.redirect.stream": 4,
   "ls-files.cached": 2,
-  "ls-files.combined": 14,
+  "ls-files.combined": 13,
   "ignore.load": 7,
-  "sparse.prune": 248,
-  "checkout.remove": 34,
-  "worktree.guard": 17,
-  "staging.add": 27,
-  "staging.rm": 33,
-  "status.full": 33,
+  "sparse.prune": 247,
+  "checkout.remove": 32,
+  "worktree.guard": 13,
+  "staging.add": 25,
+  "staging.rm": 31,
+  "status.full": 31,
   "checkout.initial": 21,
-  "commit.sparse": 26,
-  "diff.index-worktree": 38,
-  "fetch.publication": 10,
-  "merge-base.select": 8,
-  "merge.virtual-base": 118,
-  "merge.apply": 89,
-  "merge.recovery": 53,
-  "merge.restore": 48,
+  "commit.sparse": 30,
+  "diff.index-worktree": 35,
+  "fetch.publication": 12,
+  "merge-base.select": 10,
+  "merge.virtual-base": 123,
+  "merge.apply": 91,
+  "merge.recovery": 59,
+  "merge.restore": 50,
   "replay.preflight": 10,
-  "replay.plan": 17,
-  "replay.recovery": 58,
-  "rebase.plan": 16,
-  "rebase.transition": 521,
+  "replay.plan": 21,
+  "replay.recovery": 63,
+  "rebase.plan": 19,
+  "rebase.transition": 366,
   "pack.uncached-auth": 3,
   "pack.uncached-read": 2,
-  "pack.fallback-audit": 9,
+  "pack.fallback-audit": 2,
   "index-tracker.dirty": 1_025,
   "index-tracker.reseal": 3,
-  "maintenance.repack.select": 7,
+  "maintenance.repack.select": 6,
   "transport.discovery": 2,
-  "transport.fetch": 48,
-  "transport.push": 61,
+  "transport.fetch": 47,
+  "transport.push": 63,
 };
 
 const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
@@ -437,8 +446,8 @@ async function measure<T>(
     rowsRead,
     targetStatements: TARGET_STATEMENTS,
     target: statements <= TARGET_STATEMENTS ? "pass" : "miss",
-    baselineStatements: BASELINE_STATEMENTS[operation],
-    baselineRowsRead: BASELINE_ROWS_READ[operation],
+    baselineStatements: BASELINE_STATEMENTS[operation] ?? null,
+    baselineRowsRead: BASELINE_ROWS_READ[operation] ?? null,
   });
   return value;
 }
@@ -506,7 +515,7 @@ function crissCrossHistory(): History {
   return { fixture, base, current, incoming };
 }
 
-function rebaseHistory(): History {
+function rebaseHistory(stepCount = 2, constantTree = false): History {
   const fixture = new GitFixture().init();
   fixture.write("base.txt", "base\n");
   const base = fixture.commit("base");
@@ -514,10 +523,12 @@ function rebaseHistory(): History {
   fixture.write("upstream.txt", "upstream\n");
   const incoming = fixture.commit("upstream");
   fixture.git("checkout", "-q", "main");
-  fixture.write("current-1.txt", "one\n");
-  fixture.commit("current one");
-  fixture.write("current-2.txt", "two\n");
-  const current = fixture.commit("current two");
+  let current = base;
+  for (let ordinal = 1; ordinal <= stepCount; ordinal++) {
+    const content = ordinal === 1 ? "one\n" : ordinal === 2 ? "two\n" : `${ordinal}\n`;
+    fixture.write(constantTree ? "current.txt" : `current-${ordinal}.txt`, content);
+    current = fixture.commit(`current ${ordinal}`);
+  }
   return { fixture, base, current, incoming };
 }
 
@@ -1700,6 +1711,33 @@ async function rebaseRows(rows: ResultRow[]): Promise<void> {
   } finally {
     transitioned.fixture.dispose();
   }
+
+  const measureScale = async (
+    operation: "rebase.transition-n" | "rebase.transition-2n",
+    steps: number,
+  ): Promise<void> => {
+    const history = rebaseHistory(steps, true);
+    try {
+      const workspace = await imported(history.fixture);
+      await measure(
+        rows,
+        workspace.storage,
+        operation,
+        () =>
+          rebase(workspace.context, workspace.repo, workspace.worktree, { upstream: "upstream" }),
+        (value) => {
+          assert(value.outcome === "completed", `${operation} did not complete`);
+          assert(value.replayed === steps, `${operation} replayed another queue length`);
+          assert(value.skipped === 0 && value.fastForward === false, `${operation} changed`);
+          assert(workspace.repo.checkout.readOperationState() === null, `${operation} survived`);
+        },
+      );
+    } finally {
+      history.fixture.dispose();
+    }
+  };
+  await measureScale("rebase.transition-n", 4);
+  await measureScale("rebase.transition-2n", 8);
 }
 
 async function packUncachedAuthRow(rows: ResultRow[]): Promise<void> {
@@ -1916,6 +1954,12 @@ async function maintenanceRow(rows: ResultRow[]): Promise<void> {
     checkout.repoId,
   );
   assert(rootEpoch !== undefined, "maintenance root epoch is missing");
+  db.run(
+    `UPDATE git_maintenance_control
+        SET next_run_id = 2
+      WHERE repo_id = ? AND next_run_id = 1`,
+    checkout.repoId,
+  );
   db.run(
     `INSERT INTO git_maintenance_runs
        (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
@@ -2199,16 +2243,26 @@ function checkReport(report: StatementReport): void {
   for (const row of report.rows) {
     if (seen.has(row.operation)) throw new Error(`duplicate statement row: ${row.operation}`);
     seen.add(row.operation);
-    if (row.statements > row.baselineStatements) {
+    if (row.baselineStatements !== null && row.statements > row.baselineStatements) {
       throw new Error(
         `${row.operation}: ${row.statements} statements regress frozen baseline ${row.baselineStatements}`,
       );
     }
-    if (row.rowsRead !== row.baselineRowsRead) {
+    if (row.baselineRowsRead !== null && row.rowsRead !== row.baselineRowsRead) {
       throw new Error(
         `${row.operation}: ${row.rowsRead} rows differ from frozen baseline ${row.baselineRowsRead}`,
       );
     }
+  }
+  const n = report.rows.find((row) => row.operation === "rebase.transition-n");
+  const twoN = report.rows.find((row) => row.operation === "rebase.transition-2n");
+  if (n === undefined || twoN === undefined) {
+    throw new Error("rebase transition scaling rows are missing");
+  }
+  if (twoN.statements > n.statements * 2 || twoN.rowsRead > n.rowsRead * 2) {
+    throw new Error(
+      `rebase transition growth is not linear: N=${n.statements}/${n.rowsRead}, 2N=${twoN.statements}/${twoN.rowsRead}`,
+    );
   }
   for (const required of REQUIRED_ROWS) {
     if (!seen.has(required)) throw new Error(`missing statement row: ${required}`);

@@ -1,15 +1,13 @@
+import { checkoutStoreMutations } from "../store/checkout.js";
+import { sharedRepoStoreMutations, writeObjectsOwned } from "../store/shared.js";
 // Plumbing: hashing bytes, reading raw objects, writing refs, and finding
 // the repository a directory belongs to.
 
 import { isOid, utf8 } from "../common/bytes.js";
 import { CorruptError, GitError, ObjectNotFoundError } from "../common/errors.js";
 import { hashObject as hashRaw, type Person } from "../common/objects.js";
-import {
-  type IndexEntry,
-  type IndexStore,
-  indexScanOwned,
-  writeObjectsOwned,
-} from "../store/index.js";
+import { type IndexEntry, type IndexStore, indexScanOwned } from "../store/index.js";
+import { withGitMutationGuard } from "../store/mutation-guard.js";
 import { checkoutTree, indexFromTree } from "./checkout.js";
 import {
   type CommitIdentities,
@@ -22,6 +20,7 @@ import { operationRefLogMetadata } from "./ref-log.js";
 import {
   type Repository,
   readRawRefOwned,
+  repositoryMutations,
   resolveHeadOwned,
   symbolicTargetOwned,
 } from "./repository.js";
@@ -38,11 +37,19 @@ export interface HashObjectOptions {
   /** Write the blob into the object database. Defaults to false. */
   write?: boolean;
 }
-
 export function hashObject(repo: Repository, options: HashObjectOptions): string {
   const bytes =
     typeof options.content === "string" ? utf8.encode(options.content) : options.content;
   return options.write === true ? repo.store.write("blob", bytes) : hashRaw("blob", bytes);
+}
+
+/** @internal Hash or write an object while the caller owns the Git mutation guard. */
+export function hashObjectOwned(repo: Repository, options: HashObjectOptions): string {
+  const bytes =
+    typeof options.content === "string" ? utf8.encode(options.content) : options.content;
+  return options.write === true
+    ? sharedRepoStoreMutations(repo.store).writeOwned("blob", bytes)
+    : hashRaw("blob", bytes);
 }
 
 export interface CatFileOptions {
@@ -72,6 +79,16 @@ export type ReadTreeOptions =
 
 /** Replace the selected index from one tree-ish, optionally updating the worktree. */
 export function readTree(
+  repo: Repository,
+  worktree: Worktree,
+  options: ReadTreeOptions,
+  index: IndexStore = repo.checkout,
+): void {
+  withGitMutationGuard(repo.checkout.db, () => readTreeOwned(repo, worktree, options, index));
+}
+
+/** @internal Replace an index while the caller owns the Git mutation guard. */
+export function readTreeOwned(
   repo: Repository,
   worktree: Worktree,
   options: ReadTreeOptions,
@@ -107,7 +124,13 @@ export function readTree(
         );
         return;
       }
-      index.indexReplace(boundedReadTreeIndex(repo, treeOid));
+      if (index === repo.checkout) {
+        checkoutStoreMutations(repo.checkout).indexReplaceOwned(
+          boundedReadTreeIndex(repo, treeOid),
+        );
+      } else {
+        index.indexReplace(boundedReadTreeIndex(repo, treeOid));
+      }
     }),
   );
 }
@@ -125,6 +148,11 @@ function* boundedReadTreeIndex(repo: Repository, treeOid: string | null): Genera
 
 /** Materialize the selected index as trees without changing refs or worktree state. */
 export function writeTree(repo: Repository, index: IndexStore = repo.checkout): string {
+  return withGitMutationGuard(repo.checkout.db, () => writeTreeOwned(repo, index));
+}
+
+/** @internal Materialize an index while the caller owns the Git mutation guard. */
+export function writeTreeOwned(repo: Repository, index: IndexStore = repo.checkout): string {
   return repo.store.runScratchAwareOperation(() =>
     repo.store.db.transactionSync(() => {
       if (index.hasConflicts()) {
@@ -178,6 +206,15 @@ interface CheckedCommitTreeInput {
 
 /** Write one detached commit object without changing refs, indexes, or the worktree. */
 export function commitTree(
+  context: GitContext,
+  repo: Repository,
+  options: CommitTreeOptions,
+): string {
+  return withGitMutationGuard(repo.checkout.db, () => commitTreeOwned(context, repo, options));
+}
+
+/** @internal Write a detached commit while the caller owns the Git mutation guard. */
+export function commitTreeOwned(
   context: GitContext,
   repo: Repository,
   options: CommitTreeOptions,
@@ -449,7 +486,11 @@ export function readRef(repo: Repository, options: ReadRefOptions): RawRefTarget
  * see today — its doc comment describes a fast-forward check it never
  * performs.
  */
-export function updateRef(context: GitContext, repo: Repository, options: UpdateRefOptions): void {
+export function updateRefOwned(
+  context: GitContext,
+  repo: Repository,
+  options: UpdateRefOptions,
+): void {
   const deletion: unknown = Reflect.get(options, "delete");
   const expected: unknown = Reflect.get(options, "expected");
   const force: unknown = Reflect.get(options, "force");
@@ -467,7 +508,7 @@ export function updateRef(context: GitContext, repo: Repository, options: Update
       expected === undefined ? undefined : expected === null ? null : requireDirectOid(expected);
     if (deletion === true) {
       if (value !== undefined) throw new GitError("EINVAL", "delete ref update rejects value");
-      repo.mutateRefs(
+      repositoryMutations(repo).mutateRefsOwned(
         {
           deletes: [ref],
           expected:
@@ -480,7 +521,7 @@ export function updateRef(context: GitContext, repo: Repository, options: Update
     const target = requireDirectOid(value);
     const metadata = operationRefLogMetadata(context, repo, "update-ref");
     repo.typeOf(target);
-    repo.mutateRefs(
+    repositoryMutations(repo).mutateRefsOwned(
       { puts: [{ name: ref, target }], expected: { name: ref, target: checkedExpected ?? null } },
       metadata,
     );
@@ -500,7 +541,15 @@ export function updateRef(context: GitContext, repo: Repository, options: Update
   if (symbolic !== true) repo.typeOf(target);
   const mutation =
     options.ref === "HEAD" ? { head: target } : { puts: [{ name: options.ref, target }] };
-  repo.mutateRefs(mutation, operationRefLogMetadata(context, repo, "update-ref"));
+  repositoryMutations(repo).mutateRefsOwned(
+    mutation,
+    operationRefLogMetadata(context, repo, "update-ref"),
+  );
+}
+
+/** Apply one public low-level ref mutation under the database-local mutation guard. */
+export function updateRef(context: GitContext, repo: Repository, options: UpdateRefOptions): void {
+  withGitMutationGuard(repo.checkout.db, () => updateRefOwned(context, repo, options));
 }
 
 function requireDirectUpdateRef(value: unknown): string {

@@ -41,7 +41,6 @@ export type {
 } from "./contracts.js";
 export { FetchPublicationToken, TrackingRefPublicationToken } from "./contracts.js";
 export {
-  advanceMaintenanceRootSnapshotOwned,
   listCheckoutsOwned,
   SqliteGitDatabase,
 } from "./database.js";
@@ -52,20 +51,15 @@ export {
   PROVISIONAL_CLONE_LEASE_MS,
   PROVISIONAL_CLONE_RENEW_WINDOW_MS,
 } from "./lifecycle.js";
+export { readAuthenticatedObjectOwned } from "./objects.js";
 export {
-  readAuthenticatedObjectOwned,
-  writeBatchOwned,
-  writeObjectsOwned,
-} from "./objects.js";
-export {
+  type OperationRootPage,
+  type RebaseJournalCursor,
   readOperationStateOwned,
-  replaceOperationJournalOwned,
-  replaceOperationStateOwned,
-  writeOperationJournalOwned,
+  readRebaseCursorOwned,
 } from "./operation-journal.js";
 export { PACK_BLOB_BATCH_TARGET_BYTES } from "./packs.js";
 export { MAX_REFLOG_ROOT_SCAN_ENTRIES } from "./reflog.js";
-export { mutateRefsOwned } from "./refs.js";
 export { readShallowOwned } from "./shallow.js";
 export { SharedRepoStore } from "./shared.js";
 export type { WalkTreeDiffEntry, WalkTreeDiffObject, WalkTreeEntry } from "./tree-walk.js";

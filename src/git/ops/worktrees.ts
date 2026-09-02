@@ -7,12 +7,9 @@ import {
 } from "../common/errors.js";
 import { normalizePath } from "../common/paths.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../common/ref-name.js";
-import {
-  type CheckoutRow,
-  type CheckoutStore,
-  listCheckoutsOwned,
-  mutateRefsOwned,
-} from "../store/index.js";
+import { sqliteGitDatabaseMutations, withGitMutationGuardOwned } from "../store/database.js";
+import { type CheckoutRow, type CheckoutStore, listCheckoutsOwned } from "../store/index.js";
+import { mutateRefsOwned } from "../store/refs.js";
 import { checkoutTree } from "./checkout.js";
 import type { ExactRootState, GitContext } from "./context.js";
 import { operationRefLogMetadata } from "./ref-log.js";
@@ -202,13 +199,27 @@ export function worktreeAdd(
   repo: Repository,
   options: WorktreeAddOptions,
 ): WorktreeInfo {
+  return withGitMutationGuardOwned(context.database, () =>
+    worktreeAddOwned(context, repo, options),
+  );
+}
+
+/** @internal Add a worktree while the caller owns the Git mutation guard. */
+export function worktreeAddOwned(
+  context: GitContext,
+  repo: Repository,
+  options: WorktreeAddOptions,
+): WorktreeInfo {
   if (typeof options.root !== "string" || options.root === "") {
     throw worktreeError("EINVAL", "worktree root is required");
   }
   const root = normalizePath(options.root);
   const plan = addPlan(repo, options.target);
-  const row = context.database.createCheckout(repo.store.repoId, root, plan.commitOid, (checkout) =>
-    initializeCheckout(context, checkout, plan),
+  const row = sqliteGitDatabaseMutations(context.database).createCheckoutOwned(
+    repo.store.repoId,
+    root,
+    plan.commitOid,
+    (checkout) => initializeCheckout(context, checkout, plan),
   );
   return info(row, "present");
 }
@@ -232,6 +243,15 @@ export function worktreeRemove(
   repo: Repository,
   options: WorktreeRemoveOptions,
 ): void {
+  withGitMutationGuardOwned(context.database, () => worktreeRemoveOwned(context, repo, options));
+}
+
+/** @internal Remove a worktree while the caller owns the Git mutation guard. */
+export function worktreeRemoveOwned(
+  context: GitContext,
+  repo: Repository,
+  options: WorktreeRemoveOptions,
+): void {
   if (typeof options.root !== "string" || options.root === "") {
     throw worktreeError("EINVAL", "worktree root is required");
   }
@@ -244,7 +264,7 @@ export function worktreeRemove(
     throw worktreeError("EPRIMARYWORKTREE", "the primary checkout cannot be removed");
   }
   const target = new Repository(context.database.openCheckout(row));
-  context.database.removeCheckout(row.id, () => {
+  sqliteGitDatabaseMutations(context.database).removeCheckoutOwned(row.id, () => {
     if (options.force !== true) {
       const stream = statusStream(target, context.worktree, { untrackedFiles: "normal" });
       const first = stream.next();
@@ -259,6 +279,11 @@ export function worktreeRemove(
 }
 
 export function worktreePrune(context: GitContext, repo: Repository): readonly WorktreeInfo[] {
+  return withGitMutationGuardOwned(context.database, () => worktreePruneOwned(context, repo));
+}
+
+/** @internal Prune worktrees while the caller owns the Git mutation guard. */
+export function worktreePruneOwned(context: GitContext, repo: Repository): readonly WorktreeInfo[] {
   const current = snapshot(context, repo);
   const checkoutIds: number[] = [];
   const selected = new Map<number, WorktreeInfo>();
@@ -273,7 +298,10 @@ export function worktreePrune(context: GitContext, repo: Repository): readonly W
       selected.set(row.id, info(row, state));
     }
   }
-  const removed = context.database.removeCheckouts(repo.store.repoId, checkoutIds);
+  const removed = sqliteGitDatabaseMutations(context.database).removeCheckoutsOwned(
+    repo.store.repoId,
+    checkoutIds,
+  );
   const result: WorktreeInfo[] = [];
   for (const row of removed) {
     const item = selected.get(row.id);

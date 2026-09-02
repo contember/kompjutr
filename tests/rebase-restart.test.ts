@@ -1,6 +1,5 @@
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-
 import { afterEach, describe, expect, it } from "vitest";
 import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
 import { fromHex } from "../src/git/common/bytes.js";
@@ -18,11 +17,12 @@ import {
   rebaseSkip,
 } from "../src/git/ops/rebase.js";
 import { preflightReplayCommitObjects } from "../src/git/ops/replay.js";
-import { Repository } from "../src/git/ops/repository.js";
+import { Repository, repositoryMutations } from "../src/git/ops/repository.js";
 import { add } from "../src/git/ops/staging.js";
 import { status } from "../src/git/ops/status.js";
 import type { Worktree } from "../src/git/ops/worktree.js";
 import { worktreeAdd } from "../src/git/ops/worktrees.js";
+import { checkoutStoreMutations } from "../src/git/store/checkout.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -505,8 +505,9 @@ describe("rebase restart recovery", () => {
     const second = source.commit("two");
     source.git("checkout", "-q", "-b", "behind", first);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
-    workspace.repo.mutateRefs = (mutation, metadata) => {
+    const mutations = repositoryMutations(workspace.repo);
+    const originalUpdate = mutations.mutateRefsOwned;
+    mutations.mutateRefsOwned = (mutation, metadata) => {
       originalUpdate({ puts: [{ name: "refs/heads/behind", target: second }] }, metadata);
       return originalUpdate(mutation, metadata);
     };
@@ -530,7 +531,7 @@ describe("rebase restart recovery", () => {
     const workspace = await imported(source);
     workspace.repo.store.db.run(
       `CREATE TRIGGER fault_rebase_conflict_journal
-       BEFORE INSERT ON git_operation_state
+       BEFORE UPDATE OF phase ON git_operation_state
        WHEN NEW.kind = 'rebase' AND NEW.phase = 'conflicted'
        BEGIN
          SELECT RAISE(ABORT, 'conflict journal fault');
@@ -560,7 +561,7 @@ describe("rebase restart recovery", () => {
     const before = workspace.repo.checkout.requireOperationState("rebase");
     workspace.repo.store.db.run(
       `CREATE TRIGGER fault_skip_cursor
-       BEFORE INSERT ON git_operation_state
+       BEFORE UPDATE OF current_step ON git_operation_state
        WHEN NEW.kind = 'rebase' AND NEW.phase = 'running'
        BEGIN
          SELECT RAISE(ABORT, 'skip cursor fault');
@@ -572,11 +573,7 @@ describe("rebase restart recovery", () => {
     );
     const durable = reopen(workspace);
     const after = durable.repo.checkout.requireOperationState("rebase");
-    expect(after.integrityOid).toBe(before.integrityOid);
-    expect(after.state).toMatchObject({
-      phase: "conflicted",
-      currentStep: before.state.currentStep,
-    });
+    expect(after).toEqual(before);
     expect(workspace.worktree.readFile("/one.txt")).toEqual(
       new TextEncoder().encode("conflict-time staged edit\n"),
     );
@@ -591,17 +588,16 @@ describe("rebase restart recovery", () => {
     ).toBe("conflicted");
     writeWorkFile(workspace, "/one.txt", "abort-time edit\n");
     const before = workspace.repo.checkout.requireOperationState("rebase");
-    const originalClear = workspace.repo.checkout.clearOperationState.bind(workspace.repo.checkout);
-    workspace.repo.checkout.clearOperationState = () => {
+    const mutations = checkoutStoreMutations(workspace.repo.checkout);
+    const originalClear = mutations.clearOperationStateOwned;
+    mutations.clearOperationStateOwned = () => {
       originalClear();
       throw new Error("abort clear fault");
     };
 
     expect(() => rebaseAbort(workspace.repo, workspace.worktree)).toThrow("abort clear fault");
     const durable = reopen(workspace);
-    expect(durable.repo.checkout.requireOperationState("rebase").integrityOid).toBe(
-      before.integrityOid,
-    );
+    expect(durable.repo.checkout.requireOperationState("rebase")).toEqual(before);
     expect(workspace.worktree.readFile("/one.txt")).toEqual(
       new TextEncoder().encode("abort-time edit\n"),
     );
@@ -614,7 +610,7 @@ describe("rebase restart recovery", () => {
     const projectionsBefore = objectProjectionCounts(workspace);
     workspace.repo.store.db.run(
       `CREATE TRIGGER fault_clean_cursor
-       BEFORE INSERT ON git_operation_state
+       BEFORE UPDATE OF current_step ON git_operation_state
        WHEN NEW.kind = 'rebase' AND NEW.phase = 'running' AND NEW.current_step = 1
        BEGIN
          SELECT RAISE(ABORT, 'clean cursor fault');
@@ -734,8 +730,9 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
-    workspace.repo.mutateRefs = (mutation, metadata) => {
+    const mutations = repositoryMutations(workspace.repo);
+    const originalUpdate = mutations.mutateRefsOwned;
+    mutations.mutateRefsOwned = (mutation, metadata) => {
       originalUpdate(mutation, metadata);
       throw new Error("restart before publication");
     };
@@ -782,8 +779,9 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
-    workspace.repo.mutateRefs = (mutation, metadata) => {
+    const mutations = repositoryMutations(workspace.repo);
+    const originalUpdate = mutations.mutateRefsOwned;
+    mutations.mutateRefsOwned = (mutation, metadata) => {
       workspace.repo.store.db.run(
         "UPDATE git_refs SET target = ? WHERE repo_id = ? AND name = 'refs/heads/current'",
         upstream,
@@ -816,8 +814,9 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
-    workspace.repo.mutateRefs = (mutation, metadata) => {
+    const mutations = repositoryMutations(workspace.repo);
+    const originalUpdate = mutations.mutateRefsOwned;
+    mutations.mutateRefsOwned = (mutation, metadata) => {
       originalUpdate(mutation, metadata);
       throw new Error("restart before completed abort");
     };
@@ -851,9 +850,7 @@ describe("rebase restart recovery", () => {
     expect(() =>
       rebaseContinue(workspace.context, workspace.repo, workspace.worktree),
     ).toThrowError("HEAD changed during the rebase operation");
-    expect(workspace.repo.checkout.requireOperationState("rebase").integrityOid).toBe(
-      journal.integrityOid,
-    );
+    expect(workspace.repo.checkout.requireOperationState("rebase")).toEqual(journal);
   });
 });
 

@@ -11,7 +11,6 @@ export {
   type OperationStepMetadata,
   type OperationStepOutcome,
   operationAlreadyActive,
-  operationJournalIntegrityOid,
   operationKindMismatch,
   operationNotActive,
   operationStepsForState,

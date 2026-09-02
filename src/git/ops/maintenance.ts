@@ -1,5 +1,5 @@
 import { CorruptError, GitError } from "../common/errors.js";
-import { advanceMaintenanceRootSnapshotOwned } from "../store/index.js";
+import { advanceMaintenanceRootSnapshotOwned } from "../store/database.js";
 import { advanceMaintenanceMark } from "../store/maintenance/reachability.js";
 import {
   advanceMaintenanceRepack,

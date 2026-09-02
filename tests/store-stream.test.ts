@@ -21,6 +21,7 @@ import {
   MAX_SCRATCH_INDEX_NAME_BYTES,
   MAX_SCRATCH_INDEXES_PER_REPOSITORY,
 } from "../src/git/store/schema.js";
+import { sharedRepoStoreMutations } from "../src/git/store/shared.js";
 import { TestDatabase } from "./helpers/db.js";
 
 /** Records the widest result returned by any single query. */
@@ -52,7 +53,7 @@ class WidestDatabase implements SqlDatabase {
 
   run(query: string, ...bindings: unknown[]): void {
     this.#measure(bindings);
-    if (/^\s*DELETE\b/.test(query)) this.deleteStatements++;
+    if (/^\s*DELETE\s+FROM\s+git_index\b/.test(query)) this.deleteStatements++;
     if (/^\s*(?:WITH[\s\S]*?)?INSERT INTO git_(?:index|blob_ids|blob_id_updates)\b/.test(query)) {
       this.initialStateWrites++;
       if (this.initialStateWrites === this.failInitialStateWrite) {
@@ -432,24 +433,29 @@ describe("scratch indexes", () => {
 
     first.shared.withScratchIndex("same", (firstScratch) => {
       firstScratch.indexReplace([entry("first.txt")]);
-      second.shared.withScratchIndex("same", (secondScratch) => {
+      sharedRepoStoreMutations(second.shared).withScratchIndexOwned("same", (secondScratch) => {
         secondScratch.indexReplace([entry("second.txt")]);
         expect([...firstScratch.indexScan()].map((row) => row.path)).toEqual(["first.txt"]);
         expect([...secondScratch.indexScan()].map((row) => row.path)).toEqual(["second.txt"]);
       });
-      expect(() => first.shared.withScratchIndex("same", () => undefined)).toThrowError(
-        expect.objectContaining({ code: "EEXIST" }),
-      );
+      expect(() =>
+        sharedRepoStoreMutations(first.shared).withScratchIndexOwned("same", () => undefined),
+      ).toThrowError(expect.objectContaining({ code: "EEXIST" }));
     });
 
     const nest = (depth: number): void => {
       if (depth === MAX_SCRATCH_INDEXES_PER_REPOSITORY) {
-        expect(() => first.shared.withScratchIndex(`slot-${depth}`, () => undefined)).toThrowError(
-          expect.objectContaining({ code: "E2BIG" }),
-        );
+        expect(() =>
+          sharedRepoStoreMutations(first.shared).withScratchIndexOwned(
+            `slot-${depth}`,
+            () => undefined,
+          ),
+        ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
         return;
       }
-      first.shared.withScratchIndex(`slot-${depth}`, () => nest(depth + 1));
+      sharedRepoStoreMutations(first.shared).withScratchIndexOwned(`slot-${depth}`, () =>
+        nest(depth + 1),
+      );
     };
     nest(0);
 
@@ -472,9 +478,12 @@ describe("scratch indexes", () => {
       first.shared.withScratchIndex("outer-throw", (outer) => {
         outer.indexReplace([entry("outer.txt")]);
         try {
-          second.shared.withScratchIndex("inner-throw", (nested) => {
+          sharedRepoStoreMutations(second.shared).withScratchIndexOwned("inner-throw", (nested) => {
             nested.indexReplace([entry("inner.txt")]);
-            thrownOid = second.write("blob", utf8.encode("nested throw\n"));
+            thrownOid = sharedRepoStoreMutations(second.shared).writeOwned(
+              "blob",
+              utf8.encode("nested throw\n"),
+            );
             throw new Error("nested failure");
           });
         } catch (error) {
@@ -489,11 +498,17 @@ describe("scratch indexes", () => {
     expect(() =>
       first.shared.withScratchIndex("outer-thenable", () => {
         try {
-          first.shared.withScratchIndex("inner-thenable", (nested) => {
-            nested.indexReplace([entry("thenable.txt")]);
-            thenableOid = first.write("blob", utf8.encode("nested thenable\n"));
-            return Promise.resolve("late");
-          });
+          sharedRepoStoreMutations(first.shared).withScratchIndexOwned(
+            "inner-thenable",
+            (nested) => {
+              nested.indexReplace([entry("thenable.txt")]);
+              thenableOid = sharedRepoStoreMutations(first.shared).writeOwned(
+                "blob",
+                utf8.encode("nested thenable\n"),
+              );
+              return Promise.resolve("late");
+            },
+          );
         } catch (error) {
           expect(error).toEqual(expect.objectContaining({ code: "EINVAL" }));
         }
@@ -539,7 +554,10 @@ describe("scratch indexes", () => {
     expect(() =>
       store.shared.withScratchIndex("throw", (scratch) => {
         scratch.indexReplace([entry("throw.txt")]);
-        thrownOid = store.write("blob", utf8.encode("throw\n"));
+        thrownOid = sharedRepoStoreMutations(store.shared).writeOwned(
+          "blob",
+          utf8.encode("throw\n"),
+        );
         expect(store.read(thrownOid)?.data).toEqual(utf8.encode("throw\n"));
         throw new Error("stop");
       }),
@@ -550,7 +568,10 @@ describe("scratch indexes", () => {
     expect(() =>
       store.shared.withScratchIndex("thenable", (scratch) => {
         scratch.indexReplace([entry("thenable.txt")]);
-        thenableOid = store.write("blob", utf8.encode("thenable\n"));
+        thenableOid = sharedRepoStoreMutations(store.shared).writeOwned(
+          "blob",
+          utf8.encode("thenable\n"),
+        );
         return Promise.resolve("late");
       }),
     ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
@@ -1104,8 +1125,8 @@ describe("object batches", () => {
     store.writeObjects((batch) => {
       for (const data of objects) batch.write("tree", data);
     });
-    // The probe alone: nothing is fresh, so no delete and no insert.
-    expect(inner.storage.statementCount).toBe(1);
+    // Guard acquire, one object probe, guard release; no delete or insert.
+    expect(inner.storage.statementCount).toBe(3);
     expect(chunks()).toBe(before);
   });
 

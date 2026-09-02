@@ -550,9 +550,7 @@ describe("cherry-pick lifecycle", () => {
     expect(textAt(workspace, "conflict.txt")).toBe("current\n");
     expect(textAt(workspace, "sentinel.txt")).toBe("local sentinel\n");
     expect(textAt(workspace, "untracked.txt")).toBe("untracked\n");
-    expect(reopen(workspace).repo.checkout.requireOperationState("cherry-pick").integrityOid).toBe(
-      journal.integrityOid,
-    );
+    expect(reopen(workspace).repo.checkout.requireOperationState("cherry-pick")).toEqual(journal);
 
     cherryPickAbort(workspace.repo, workspace.worktree);
 

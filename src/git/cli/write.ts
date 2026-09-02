@@ -30,6 +30,7 @@ import {
   switchBranchExcluding,
 } from "../ops/refs.js";
 import type { Repository, ResolvedHead } from "../ops/repository.js";
+import { repositoryMutations } from "../ops/repository.js";
 import {
   type AddLiteralPathsResult,
   addLiteralPaths,
@@ -39,6 +40,8 @@ import {
 import { eagerStatus } from "../ops/status.js";
 import { formatCommitRefusalStatus, statusFormatOptions } from "../ops/status-format.js";
 import { treeStream } from "../ops/tree-stream.js";
+import { checkoutStoreMutations } from "../store/checkout.js";
+import { withGitMutationGuardOwned } from "../store/database.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES, type WalkTreeDiffEntry } from "../store/index.js";
 import {
   boundedGitCliResult,
@@ -257,7 +260,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
                 ...(command.ref === undefined ? {} : { ref: command.ref }),
                 excludeRoots: exclusions,
               });
-              repo.checkout.clearOperationState();
+              checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
             } else {
               repo.checkout.requireNoOperationState();
               if (paths.length > 0) requireResetPaths(repo, command.ref, paths);
@@ -544,7 +547,7 @@ function withRepository(
       options,
     );
   }
-  return body(repo);
+  return withGitMutationGuardOwned(context.database, () => body(repo));
 }
 
 function requireTransactionalWorktree(context: GitContext, repo: Repository): void {
@@ -627,7 +630,7 @@ function requirePathsInSources(
 function moveResetHead(context: GitContext, repo: Repository, ref: string): void {
   const commit = repo.peel(repo.revParse(ref));
   const head = repo.head();
-  repo.mutateRefs(
+  repositoryMutations(repo).mutateRefsOwned(
     head.ref === null ? { head: commit } : { puts: [{ name: head.ref, target: commit }] },
     operationRefLogMetadata(context, repo, "reset: hard"),
   );

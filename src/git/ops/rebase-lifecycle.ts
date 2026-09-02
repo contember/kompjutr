@@ -1,3 +1,6 @@
+import { checkoutStoreMutations } from "../store/checkout.js";
+import { advanceRebaseOwned, writeOperationJournalOwned } from "../store/operation-journal.js";
+import { repositoryMutations } from "./repository.js";
 // Restart-safe execution of one authenticated linear rebase sequence.
 
 import { CorruptError, GitError } from "../common/errors.js";
@@ -5,9 +8,8 @@ import { relativeTo } from "../common/paths.js";
 import { comparePaths, joinSorted } from "../common/streams.js";
 import {
   type IndexEntry,
-  readOperationStateOwned,
-  replaceOperationJournalOwned,
-  writeOperationJournalOwned,
+  type RebaseJournalCursor,
+  readRebaseCursorOwned,
 } from "../store/index.js";
 import { checkoutTreeExcluding } from "./checkout.js";
 import { resolveIdentity, writeUnpublishedCommit } from "./commit.js";
@@ -26,13 +28,8 @@ import {
 } from "./integration-worktree.js";
 import type { RebaseResult } from "./kinds.js";
 import { applyProjectedRebaseTransition } from "./merge-apply.js";
-import { selectMergeBases } from "./merge-base.js";
-import type {
-  OperationStepMetadata,
-  RebaseJournal,
-  RebaseStateMetadata,
-} from "./operation-state.js";
-import { operationKindMismatch, operationNotActive } from "./operation-state.js";
+import type { OperationStepMetadata, RebaseStateMetadata } from "./operation-state.js";
+import { operationNotActive } from "./operation-state.js";
 import { planRebase, type RebasePlan } from "./rebase-plan.js";
 import { operationRefLogMetadata, persistedRefLogMetadata } from "./ref-log.js";
 import {
@@ -78,10 +75,9 @@ interface RebaseExclusions {
 
 const NO_REBASE_EXCLUSIONS: RebaseExclusions = { absolute: [], relative: [] };
 
-function requireRebaseJournal(repo: Repository): RebaseJournal {
-  const journal = readOperationStateOwned(repo.checkout);
+function requireRebaseCursor(repo: Repository): RebaseJournalCursor {
+  const journal = readRebaseCursorOwned(repo.checkout);
   if (journal === null) throw operationNotActive("rebase");
-  if (journal.kind !== "rebase") throw operationKindMismatch("rebase", journal.kind);
   return journal;
 }
 
@@ -162,20 +158,6 @@ function sameQueueStep(left: OperationStepMetadata, right: OperationStepMetadata
     left.selectedParentOid === right.selectedParentOid &&
     left.mainline === right.mainline
   );
-}
-
-function requireResumedTopology(repo: Repository, journal: RebaseJournal): void {
-  const selection = selectMergeBases(repo, {
-    currentOid: journal.state.originalHeadOid,
-    incomingOid: journal.state.upstreamOid,
-  });
-  if (
-    selection.kind !== "divergent" ||
-    selection.bases.length !== 1 ||
-    selection.bases[0] !== journal.state.baseOid
-  ) {
-    throw new GitError("ECORRUPT", "rebase topology differs from its authenticated base");
-  }
 }
 
 function requireCurrentBaseline(
@@ -338,50 +320,27 @@ function initialState(
   };
 }
 
-function completedCounts(steps: readonly OperationStepMetadata[]): {
-  replayed: number;
-  skipped: number;
-} {
-  let replayed = 0;
-  let skipped = 0;
-  for (const step of steps) {
-    if (step.outcome === "applied") replayed++;
-    else if (step.outcome === "skipped") skipped++;
-  }
-  return { replayed, skipped };
-}
-
-function nextSteps(
-  journal: RebaseJournal,
-  outcome: "applied" | "skipped",
-  resultOid: string | null,
-): readonly OperationStepMetadata[] {
-  return journal.steps.map((step, ordinal) =>
-    ordinal === journal.state.currentStep ? { ...step, outcome, resultOid } : step,
-  );
-}
-
 function advance(
   repo: Repository,
-  journal: RebaseJournal,
+  journal: RebaseJournalCursor,
   outcome: "applied" | "skipped",
   resultOid: string | null,
   committer?: GitIdentity,
 ): void {
-  const steps = nextSteps(journal, outcome, resultOid);
-  const state: RebaseStateMetadata = {
-    ...journal.state,
-    phase: "running",
-    currentStep: journal.state.currentStep + 1,
-    currentParentOid: resultOid ?? journal.state.currentParentOid,
-    committer: committer ?? journal.state.committer,
-  };
-  replaceOperationJournalOwned(repo.checkout, journal.integrityOid, state, steps, []);
+  advanceRebaseOwned(
+    repo.checkout,
+    journal.state.phase,
+    journal.state.currentStep,
+    outcome,
+    resultOid,
+    resultOid ?? journal.state.currentParentOid,
+    committer ?? journal.state.committer,
+  );
 }
 
-function planCurrentStep(repo: Repository, journal: RebaseJournal): ReplayPlan {
-  const step = journal.steps[journal.state.currentStep];
-  if (step === undefined || step.outcome !== "pending") {
+function planCurrentStep(repo: Repository, journal: RebaseJournalCursor): ReplayPlan {
+  const step = journal.step;
+  if (step === null || step.outcome !== "pending") {
     throw new CorruptError("rebase current step is not pending");
   }
   const plan = planFixedReplayStep(repo, {
@@ -425,13 +384,13 @@ function applyOneStep(
   context: GitContext,
   repo: Repository,
   worktree: Worktree,
-  expectedIntegrityOid: string,
+  expectedStep: number,
   options: RebaseContinueOptions,
   exclusions: RebaseExclusions,
 ): "advanced" | "conflicted" {
   return repo.store.db.transactionSync(() => {
-    const journal = requireRebaseJournal(repo);
-    if (journal.integrityOid !== expectedIntegrityOid) {
+    const journal = requireRebaseCursor(repo);
+    if (journal.state.currentStep !== expectedStep) {
       throw new GitError("EOPMISMATCH", "rebase operation changed before replay");
     }
     requireOriginalHead(repo, journal.state);
@@ -478,9 +437,8 @@ function applyOneStep(
     requireRebaseTree(repo, () => prospectiveIntegrationIndexEntries(repo, projected));
     const conflicted = plan.integration.entries.some((entry) => entry.kind === "conflict");
     const transition = applyProjectedRebaseTransition<"advanced">(repo, worktree, projected, {
-      expectedIntegrityOid: journal.integrityOid,
+      currentStep: journal.state.currentStep,
       conflictState: conflicted ? { ...journal.state, phase: "conflicted" } : null,
-      steps: journal.steps,
       onClean: () => {
         if (integrationIndexMatchesTree(repo, currentTree)) {
           advance(repo, journal, "skipped", null);
@@ -503,7 +461,7 @@ function applyOneStep(
 function requireConflictOwnership(
   repo: Repository,
   worktree: Worktree,
-  journal: RebaseJournal,
+  journal: RebaseJournalCursor,
 ): void {
   requireConflictSnapshots(repo, journal);
   const plan = planCurrentStep(repo, journal);
@@ -538,7 +496,7 @@ function requireConflictOwnership(
   }
 }
 
-function requireConflictSnapshots(repo: Repository, journal: RebaseJournal): void {
+function requireConflictSnapshots(repo: Repository, journal: RebaseJournalCursor): void {
   const currentTree = repo.readCommit(journal.state.currentParentOid).tree;
   for (const row of joinSorted(treeStream(repo, currentTree), journal.touched, {
     left: (entry) => entry.path,
@@ -583,16 +541,16 @@ function publishCompleted(
   exclusions: RebaseExclusions,
 ): RebaseLifecycleResult {
   return repo.store.db.transactionSync(() => {
-    const journal = requireRebaseJournal(repo);
+    const journal = requireRebaseCursor(repo);
     requireOriginalHead(repo, journal.state);
-    if (journal.state.phase !== "running" || journal.state.currentStep !== journal.steps.length) {
+    if (journal.state.phase !== "running" || journal.state.currentStep !== journal.stepCount) {
       throw new CorruptError("rebase publication started before replay completion");
     }
     const tree = requireCurrentBaseline(repo, worktree, journal.state, exclusions);
     if (repo.readCommit(journal.state.currentParentOid).tree !== tree) {
       throw new CorruptError("completed rebase baseline changed before publication");
     }
-    repo.mutateRefs(
+    repositoryMutations(repo).mutateRefsOwned(
       {
         expected: {
           name: journal.state.originalHeadRef,
@@ -609,18 +567,18 @@ function publishCompleted(
     );
     // False leaves the old baseline mismatched, so later sparse reads fall back safely.
     context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, tree);
-    repo.checkout.clearOperationState();
+    checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
     return {
       outcome: "completed",
       oid: journal.state.currentParentOid,
-      ...completedCounts(journal.steps),
+      replayed: journal.replayed,
+      skipped: journal.skipped,
       fastForward: false,
     };
   });
 }
 
 interface RebaseDriveState {
-  integrityOid: string;
   phase: RebaseStateMetadata["phase"];
   currentStep: number;
   stepCount: number;
@@ -629,14 +587,14 @@ interface RebaseDriveState {
 }
 
 function readRebaseDriveState(repo: Repository): RebaseDriveState {
-  const journal = requireRebaseJournal(repo);
+  const journal = requireRebaseCursor(repo);
   requireOriginalHead(repo, journal.state);
   return {
-    integrityOid: journal.integrityOid,
     phase: journal.state.phase,
     currentStep: journal.state.currentStep,
-    stepCount: journal.steps.length,
-    ...completedCounts(journal.steps),
+    stepCount: journal.stepCount,
+    replayed: journal.replayed,
+    skipped: journal.skipped,
   };
 }
 
@@ -655,7 +613,7 @@ function driveRebase(
     if (state.currentStep === state.stepCount) {
       return publishCompleted(context, repo, worktree, exclusions);
     }
-    applyOneStep(context, repo, worktree, state.integrityOid, options, exclusions);
+    applyOneStep(context, repo, worktree, state.currentStep, options, exclusions);
   }
 }
 
@@ -714,7 +672,7 @@ function startRebaseInternal(
       throw new GitError("ESTALEHEAD", "HEAD changed while rebase was being prepared");
     }
     if (plan.relation === "fast-forward") {
-      repo.mutateRefs(
+      repositoryMutations(repo).mutateRefsOwned(
         {
           expected: { name: head.ref, target: head.oid },
           puts: [{ name: head.ref, target: plan.upstreamOid }],
@@ -749,22 +707,21 @@ function startRebaseInternal(
   return driveRebase(context, repo, worktree, options, exclusions);
 }
 
-type PreparedContinuation = { phase: "running" } | { phase: "conflicted"; integrityOid: string };
+type PreparedContinuation = { phase: "running" } | { phase: "conflicted"; currentStep: number };
 
 function prepareContinuation(
   repo: Repository,
   worktree: Worktree,
   exclusions: RebaseExclusions,
 ): PreparedContinuation {
-  const journal = requireRebaseJournal(repo);
+  const journal = requireRebaseCursor(repo);
   requireOriginalHead(repo, journal.state);
-  requireResumedTopology(repo, journal);
   if (journal.state.phase === "running") {
     requireCurrentBaseline(repo, worktree, journal.state, exclusions);
     return { phase: "running" };
   }
   requireConflictOwnership(repo, worktree, journal);
-  return { phase: "conflicted", integrityOid: journal.integrityOid };
+  return { phase: "conflicted", currentStep: journal.state.currentStep };
 }
 
 export function continueRebase(
@@ -804,8 +761,11 @@ function continueRebaseInternal(
     return driveRebase(context, repo, worktree, options, exclusions);
   }
   repo.store.db.transactionSync(() => {
-    const current = requireRebaseJournal(repo);
-    if (current.integrityOid !== prepared.integrityOid) {
+    const current = requireRebaseCursor(repo);
+    if (
+      current.state.phase !== "conflicted" ||
+      current.state.currentStep !== prepared.currentStep
+    ) {
       throw new GitError("EOPMISMATCH", "rebase conflict changed before continuation");
     }
     requireOriginalHead(repo, current.state);
@@ -836,22 +796,21 @@ function continueRebaseInternal(
 }
 
 interface PreparedSkip {
-  integrityOid: string;
+  currentStep: number;
   currentTree: string;
   baseline: BaselineTransition;
 }
 
 function prepareSkip(repo: Repository, worktree: Worktree): PreparedSkip {
-  const journal = requireRebaseJournal(repo);
+  const journal = requireRebaseCursor(repo);
   requireOriginalHead(repo, journal.state);
-  requireResumedTopology(repo, journal);
   if (journal.state.phase !== "conflicted") {
     throw new GitError("EOPMISMATCH", "rebase skip requires a conflicted step");
   }
   requireConflictOwnership(repo, worktree, journal);
   const currentTree = repo.readCommit(journal.state.currentParentOid).tree;
   return {
-    integrityOid: journal.integrityOid,
+    currentStep: journal.state.currentStep,
     currentTree,
     baseline: preflightBaselineTransition(repo, currentTree),
   };
@@ -885,8 +844,11 @@ function skipRebaseInternal(
 ): RebaseLifecycleResult {
   const prepared = prepareSkip(repo, worktree);
   repo.store.db.transactionSync(() => {
-    const current = requireRebaseJournal(repo);
-    if (current.integrityOid !== prepared.integrityOid) {
+    const current = requireRebaseCursor(repo);
+    if (
+      current.state.phase !== "conflicted" ||
+      current.state.currentStep !== prepared.currentStep
+    ) {
       throw new GitError("EOPMISMATCH", "rebase conflict changed before skip");
     }
     requireOriginalHead(repo, current.state);
@@ -897,22 +859,23 @@ function skipRebaseInternal(
 }
 
 interface PreparedAbort {
-  integrityOid: string;
+  phase: RebaseStateMetadata["phase"];
+  currentStep: number;
   baselineTree: string;
   baseline: BaselineTransition;
 }
 
 function prepareAbort(repo: Repository, worktree: Worktree): PreparedAbort {
-  const journal = requireRebaseJournal(repo);
+  const journal = requireRebaseCursor(repo);
   requireOriginalHead(repo, journal.state);
-  requireResumedTopology(repo, journal);
   if (journal.state.phase === "conflicted") {
     requireConflictOwnership(repo, worktree, journal);
   }
   const originalTree = repo.readCommit(journal.state.originalHeadOid).tree;
   const baselineTree = repo.readCommit(journal.state.currentParentOid).tree;
   return {
-    integrityOid: journal.integrityOid,
+    phase: journal.state.phase,
+    currentStep: journal.state.currentStep,
     baselineTree,
     baseline: preflightBaselineTransition(repo, originalTree),
   };
@@ -937,12 +900,15 @@ function abortRebaseInternal(
 ): void {
   const prepared = prepareAbort(repo, worktree);
   repo.store.db.transactionSync(() => {
-    const current = requireRebaseJournal(repo);
-    if (current.integrityOid !== prepared.integrityOid) {
+    const current = requireRebaseCursor(repo);
+    if (
+      current.state.phase !== prepared.phase ||
+      current.state.currentStep !== prepared.currentStep
+    ) {
       throw new GitError("EOPMISMATCH", "rebase operation changed before abort");
     }
     requireOriginalHead(repo, current.state);
     hardMaterializeTree(repo, worktree, prepared.baselineTree, prepared.baseline, exclusions);
-    repo.checkout.clearOperationState();
+    checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
   });
 }

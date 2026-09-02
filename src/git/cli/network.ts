@@ -9,6 +9,7 @@ import { pull, resolvePull } from "../ops/pull.js";
 import { push } from "../ops/push.js";
 import type { PushLeaseExpectation, PushResult } from "../ops/refspec.js";
 import type { Repository } from "../ops/repository.js";
+import { withGitMutationGuardOwned } from "../store/database.js";
 import {
   boundedGitCliResult,
   boundedPublishedGitCliResult,
@@ -39,17 +40,19 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
         : `${root === "/" ? "" : root}/.git/`;
       const result = gitCliResult(`Initialized empty Git repository in ${repositoryPath}\n`, "", 0);
       try {
-        return context.database.db.transactionSync(() => {
-          const bounded = boundedGitCliResult(result, options);
-          initRepository(context, {
-            dir: root,
-            ...(invocation.command.defaultBranch === undefined
-              ? {}
-              : { defaultBranch: invocation.command.defaultBranch }),
-            ...(invocation.command.bare ? { bare: true } : {}),
-          });
-          return bounded;
-        });
+        return withGitMutationGuardOwned(context.database, () =>
+          context.database.db.transactionSync(() => {
+            const bounded = boundedGitCliResult(result, options);
+            initRepository(context, {
+              dir: root,
+              ...(invocation.command.defaultBranch === undefined
+                ? {}
+                : { defaultBranch: invocation.command.defaultBranch }),
+              ...(invocation.command.bare ? { bare: true } : {}),
+            });
+            return bounded;
+          }),
+        );
       } catch (error) {
         if (hasErrorCode(error, "E2BIG")) throw error;
         return boundedGitCliResult(mapFailure(error), options);
@@ -113,23 +116,25 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
         return boundedGitCliResult(gitCliResult(`${url}\n`, "", 0), options);
       }
       try {
-        return repo.store.db.transactionSync(() => {
-          if (command.name === undefined) throw new Error("parsed remote mutation lost its name");
-          if (command.action === "add") {
-            if (command.url === undefined) throw new Error("parsed remote add lost its URL");
-            requireCliHttpUrl(command.url);
-            remoteAdd(repo, {
-              name: command.name,
-              url: command.url,
-            });
-          } else if (command.action === "remove") remoteRemove(repo, { name: command.name });
-          else {
-            if (command.url === undefined) throw new Error("parsed remote set-url lost its URL");
-            requireCliHttpUrl(command.url);
-            remoteSetUrl(repo, { name: command.name, url: command.url });
-          }
-          return boundedGitCliResult(gitCliResult("", "", 0), options);
-        });
+        return withGitMutationGuardOwned(context.database, () =>
+          repo.store.db.transactionSync(() => {
+            if (command.name === undefined) throw new Error("parsed remote mutation lost its name");
+            if (command.action === "add") {
+              if (command.url === undefined) throw new Error("parsed remote add lost its URL");
+              requireCliHttpUrl(command.url);
+              remoteAdd(repo, {
+                name: command.name,
+                url: command.url,
+              });
+            } else if (command.action === "remove") remoteRemove(repo, { name: command.name });
+            else {
+              if (command.url === undefined) throw new Error("parsed remote set-url lost its URL");
+              requireCliHttpUrl(command.url);
+              remoteSetUrl(repo, { name: command.name, url: command.url });
+            }
+            return boundedGitCliResult(gitCliResult("", "", 0), options);
+          }),
+        );
       } catch (error) {
         repo.store.revalidateStorageCaches();
         if (hasErrorCode(error, "E2BIG")) throw error;

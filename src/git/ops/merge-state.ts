@@ -16,7 +16,6 @@ export {
   type MergeTouchedPurpose,
   type MergeWorktreeSnapshot,
   mergeAlreadyActive,
-  mergeJournalIntegrityOid,
   mergeNotActive,
   requireMergeInteger,
   requireMergeMode,

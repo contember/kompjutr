@@ -116,34 +116,7 @@ export interface ObjectCacheKeys {
 }
 
 export interface ObjectTableOwner {
-  writeBatchOwned(options?: ObjectBatchOptions): OwnedObjectBatch;
   readAuthenticatedObjectOwned(oid: string, expectedType: ObjectType): RawObject | null;
-}
-
-export function writeBatchOwned(
-  store: ObjectTableOwner,
-  options: ObjectBatchOptions = {},
-): OwnedObjectBatch {
-  return store.writeBatchOwned(options);
-}
-
-export function writeObjectsOwned<T>(
-  store: ObjectTableOwner,
-  body: (batch: ObjectBatch) => T,
-  options: ObjectBatchOptions = {},
-): T {
-  const batch = writeBatchOwned(store, options);
-  try {
-    const result = body(batch);
-    if (isThenableResult(result)) {
-      void Promise.resolve(result).catch(() => {});
-      throw new GitError("EINVAL", "object batch callback must be synchronous");
-    }
-    batch.flush();
-    return result;
-  } finally {
-    batch.dispose();
-  }
 }
 
 export function readAuthenticatedObjectOwned(
@@ -841,12 +814,18 @@ export class ObjectTable {
   writeBatch(options: ObjectBatchOptions = {}): ObjectBatch {
     return this.#createWriteBatch(options);
   }
+  writeBatchGuarded(options: ObjectBatchOptions, mutate: (body: () => void) => void): ObjectBatch {
+    return this.#createWriteBatch(options, mutate);
+  }
 
   writeBatchOwned(options: ObjectBatchOptions): OwnedObjectBatch {
     return this.#createWriteBatch(options);
   }
 
-  #createWriteBatch(options: ObjectBatchOptions): OwnedObjectBatch {
+  #createWriteBatch(
+    options: ObjectBatchOptions,
+    mutate: (body: () => void) => void = (body) => body(),
+  ): OwnedObjectBatch {
     const payloadBytes = options.payloadBytes ?? OBJECT_PAYLOAD;
     const flushEvery = options.flushEvery ?? DEFAULT_OBJECT_FLUSH;
     // Keyed by oid: a tree build re-emits identical subtrees, and one
@@ -867,7 +846,7 @@ export class ObjectTable {
       requireActive();
       if (staged.size === 0) return;
       try {
-        this.#flushObjects([...staged.values()], payloadBytes);
+        mutate(() => this.#flushObjects([...staged.values()], payloadBytes));
       } finally {
         clear();
       }

@@ -21,22 +21,16 @@ describe("sqlite store module exports", () => {
       "SqliteGitDatabase",
       "TrackingRefPublicationToken",
       "WALK_TREE_SQL",
-      "advanceMaintenanceRootSnapshotOwned",
       "ancestors",
       "configGetOwned",
       "contentIdKey",
       "indexScanOwned",
       "listCheckoutsOwned",
-      "mutateRefsOwned",
       "normalizeRoot",
       "readAuthenticatedObjectOwned",
       "readOperationStateOwned",
+      "readRebaseCursorOwned",
       "readShallowOwned",
-      "replaceOperationJournalOwned",
-      "replaceOperationStateOwned",
-      "writeBatchOwned",
-      "writeObjectsOwned",
-      "writeOperationJournalOwned",
     ]);
     expect(store.CheckoutStore).toBe(CheckoutStore);
     expect(store.SharedRepoStore).toBe(SharedRepoStore);

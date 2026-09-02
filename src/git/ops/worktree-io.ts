@@ -1,3 +1,4 @@
+import { sharedRepoStoreMutations, writeObjectsOwned } from "../store/shared.js";
 // The bridge between the working tree and the object database: walking it,
 // hashing what is in it, and describing an index row for a path.
 //
@@ -15,12 +16,7 @@ import { joinPath, relativeTo } from "../common/paths.js";
 import { Sha1 } from "../common/sha1.js";
 import { comparePaths } from "../common/streams.js";
 import type { IgnoreMatcher } from "../ignore/index.js";
-import {
-  type IndexEntry,
-  indexScanOwned,
-  PACK_BLOB_BATCH_TARGET_BYTES,
-  writeObjectsOwned,
-} from "../store/index.js";
+import { type IndexEntry, indexScanOwned, PACK_BLOB_BATCH_TARGET_BYTES } from "../store/index.js";
 import type { Repository } from "./repository.js";
 import { gitModeFor, type Worktree, type WorktreeStat } from "./worktree.js";
 
@@ -712,7 +708,7 @@ function hashLargeFile(
     return { oid: toHex(hash.digest()), mode: gitModeFor(stat), stat };
   }
   return {
-    oid: repo.store.writeStream("blob", stat.size, chunks),
+    oid: sharedRepoStoreMutations(repo.store).writeStreamOwned("blob", stat.size, chunks),
     mode: gitModeFor(stat),
     stat,
   };

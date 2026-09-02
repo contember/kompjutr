@@ -1,3 +1,5 @@
+import { checkoutStoreMutations } from "../store/checkout.js";
+import { sharedRepoStoreMutations } from "../store/shared.js";
 // The repository: everything reachable from the object store and the refs,
 // with no knowledge of Computer, DOFS or HTTP.
 
@@ -45,6 +47,7 @@ import type {
   WalkTreeDiffObject,
 } from "../store/index.js";
 import { readShallowOwned } from "../store/index.js";
+import { withGitMutationGuard } from "../store/mutation-guard.js";
 import { requireRefName } from "../store/ref-validation.js";
 
 /** Where a short ref name is looked up, in git's own order. */
@@ -249,8 +252,7 @@ class CommitFillBuffer {
   }
 
   flush(): void {
-    if (this.#pending.length === 0) return;
-    this.store.cacheCommits(this.#pending);
+    sharedRepoStoreMutations(this.store).cacheCommitsOwned(this.#pending);
     this.#pending.length = 0;
     this.#bytes = 0;
   }
@@ -276,6 +278,25 @@ type OwnedPrunedWalk = (
 const OWNED_INDEXED_WALKS = new WeakMap<Repository, OwnedIndexedWalk>();
 const OWNED_PRUNED_WALKS = new WeakMap<Repository, OwnedPrunedWalk>();
 const OWNED_WALKS = new WeakMap<Repository, OwnedWalk>();
+interface RepositoryMutations {
+  invalidateShallowOwned(): void;
+  mutateRefsOwned(mutation: RefMutation, metadata: RefLogMetadata): boolean;
+  publishFetchRefsOwned(
+    token: FetchPublicationToken,
+    plan: FetchPublicationPlan,
+    metadata: RefLogMetadata,
+  ): boolean;
+}
+
+const REPOSITORY_MUTATIONS = new WeakMap<object, RepositoryMutations>();
+
+/** Internal mutation capability; intentionally absent from the package facade. */
+export function repositoryMutations(repo: Repository): RepositoryMutations {
+  const mutations = REPOSITORY_MUTATIONS.get(repo);
+  if (mutations === undefined)
+    throw new GitError("EINVAL", "repository mutation capability is unavailable");
+  return mutations;
+}
 
 /** Internal point walk retained under an existing repository operation. */
 export function walkOwned(
@@ -317,6 +338,12 @@ export class Repository {
     OWNED_INDEXED_WALKS.set(this, (oid, limits) => this.#walkIndexedOwned(oid, limits));
     OWNED_PRUNED_WALKS.set(this, (oid, select) => this.#walkPrunedOwned(oid, select));
     OWNED_WALKS.set(this, (oid) => this.#walkOwned(oid));
+    REPOSITORY_MUTATIONS.set(this, {
+      invalidateShallowOwned: () => this.invalidateShallowOwned(),
+      mutateRefsOwned: (mutation, metadata) => this.mutateRefsOwned(mutation, metadata),
+      publishFetchRefsOwned: (token, plan, metadata) =>
+        this.publishFetchRefsOwned(token, plan, metadata),
+    });
   }
 
   get root(): string {
@@ -329,6 +356,10 @@ export class Repository {
   }
 
   invalidateShallow(): void {
+    withGitMutationGuard(this.checkout.db, () => this.invalidateShallowOwned());
+  }
+
+  private invalidateShallowOwned(): void {
     this.store.invalidateShallow();
   }
 
@@ -429,7 +460,7 @@ export class Repository {
     const prepared = this.#readAuthenticatedCommitEntryOwned(oid);
     if (fill === undefined) {
       if (prepared.cacheBytes <= COMMIT_CACHE_FLUSH_BYTES) {
-        this.store.cacheCommits([prepared]);
+        sharedRepoStoreMutations(this.store).cacheCommitsOwned([prepared]);
       }
     } else {
       fill.add(prepared);
@@ -518,7 +549,11 @@ export class Repository {
   }
 
   mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
-    return this.checkout.mutateRefs(mutation, metadata);
+    return withGitMutationGuard(this.checkout.db, () => this.mutateRefsOwned(mutation, metadata));
+  }
+
+  private mutateRefsOwned(mutation: RefMutation, metadata: RefLogMetadata): boolean {
+    return checkoutStoreMutations(this.checkout).mutateRefsOwned(mutation, metadata);
   }
 
   beginFetchPublication(
@@ -533,7 +568,17 @@ export class Repository {
     plan: FetchPublicationPlan,
     metadata: RefLogMetadata,
   ): boolean {
-    return this.store.publishFetchRefs(token, plan, metadata);
+    return withGitMutationGuard(this.checkout.db, () =>
+      this.publishFetchRefsOwned(token, plan, metadata),
+    );
+  }
+
+  private publishFetchRefsOwned(
+    token: FetchPublicationToken,
+    plan: FetchPublicationPlan,
+    metadata: RefLogMetadata,
+  ): boolean {
+    return sharedRepoStoreMutations(this.store).publishFetchRefsOwned(token, plan, metadata);
   }
 
   activeRefLogOids(): Generator<string> {

@@ -1,3 +1,6 @@
+import { checkoutStoreMutations } from "../store/checkout.js";
+import { sharedRepoStoreMutations } from "../store/shared.js";
+import { repositoryMutations } from "./repository.js";
 // Staging: moving working-tree facts into the SQL index.
 //
 // The index is rows, so staging writes one row per *changed* path instead
@@ -1083,7 +1086,7 @@ function stageCandidates(
       }
     }
     const hashes = hashWorktreePathsOwned(repo, worktree, unresolved, {}, hashCursor);
-    repo.store.upsertBlobIds(
+    sharedRepoStoreMutations(repo.store).upsertBlobIdsOwned(
       [...hashes.values()].flatMap((hashed) => {
         const contentId = hashed.stat.contentId;
         return contentId === null ? [] : [{ contentId, oid: hashed.oid }];
@@ -1648,7 +1651,7 @@ export function reset(
   const tree = targetTree(repo, options.ref);
   if (specs.length === 0) {
     // This one genuinely replaces the whole index, so the big hammer fits.
-    repo.checkout.indexReplace(indexFromTree(repo, tree));
+    checkoutStoreMutations(repo.checkout).indexReplaceOwned(indexFromTree(repo, tree));
     return;
   }
 
@@ -1848,7 +1851,7 @@ function hardReset(
       const metadata = operationRefLogMetadata(context, repo, "reset: hard");
       const mutation =
         head.ref === null ? { head: commit } : { puts: [{ name: head.ref, target: commit }] };
-      repo.mutateRefs(mutation, metadata);
+      repositoryMutations(repo).mutateRefsOwned(mutation, metadata);
     }
     checkoutTreeExcluding(repo, worktree, tree, options.excludeRoots ?? [], {
       discardUnmerged: true,

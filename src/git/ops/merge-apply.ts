@@ -1,3 +1,6 @@
+import { checkoutStoreMutations } from "../store/checkout.js";
+import { suspendRebaseOwned, writeOperationJournalOwned } from "../store/operation-journal.js";
+import { writeObjectsOwned } from "../store/shared.js";
 // Atomic low-level application and restoration of one projected merge plan.
 
 import { nativeRealpathOwned, nativeScanOwned } from "../../fs/store/owned-read.js";
@@ -19,10 +22,6 @@ import {
   type IndexStore,
   indexScanOwned,
   PACK_BLOB_BATCH_TARGET_BYTES,
-  readOperationStateOwned,
-  replaceOperationJournalOwned,
-  writeObjectsOwned,
-  writeOperationJournalOwned,
 } from "../store/index.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
 import {
@@ -39,10 +38,6 @@ import {
   mergeOperationState,
   type OperationJournal,
   type OperationStateMetadata,
-  type OperationStepMetadata,
-  operationJournalIntegrityOid,
-  operationKindMismatch,
-  operationNotActive,
   operationStepsForState,
   type RebaseStateMetadata,
 } from "./operation-state.js";
@@ -66,9 +61,8 @@ export interface OperationApplyOptions {
 }
 
 interface ActiveRebaseApply {
-  expectedIntegrityOid: string;
+  currentStep: number;
   conflictState: RebaseStateMetadata | null;
-  steps: readonly OperationStepMetadata[];
 }
 
 export interface OperationApplyResult {
@@ -769,34 +763,9 @@ function applyProjectedOperationInternal(
   activeRebase: ActiveRebaseApply | null,
 ): OperationApplyResult {
   validateProjectedIndexEntries(entries);
-  if (activeRebase === null) {
-    repo.checkout.requireNoOperationState();
-  } else {
-    if (options.suspendedState !== null) {
-      throw new CorruptError("rebase apply supplied two journal transitions");
-    }
-    const current = readOperationStateOwned(repo.checkout);
-    if (current === null) throw operationNotActive("rebase");
-    if (current.kind !== "rebase") throw operationKindMismatch("rebase", current.kind);
-    if (current.integrityOid !== activeRebase.expectedIntegrityOid) {
-      throw new GitError("EOPMISMATCH", "rebase operation changed before apply");
-    }
-    if (
-      current.steps.length !== activeRebase.steps.length ||
-      current.steps.some((step, ordinal) => {
-        const supplied = activeRebase.steps[ordinal];
-        return (
-          supplied === undefined ||
-          step.sourceOid !== supplied.sourceOid ||
-          step.selectedParentOid !== supplied.selectedParentOid ||
-          step.mainline !== supplied.mainline ||
-          step.outcome !== supplied.outcome ||
-          step.resultOid !== supplied.resultOid
-        );
-      })
-    ) {
-      throw new GitError("EOPMISMATCH", "rebase apply queue differs from its active journal");
-    }
+  if (activeRebase === null) repo.checkout.requireNoOperationState();
+  else if (options.suspendedState !== null) {
+    throw new CorruptError("rebase apply supplied two journal transitions");
   }
   const suspendedState = activeRebase?.conflictState ?? options.suspendedState;
 
@@ -844,13 +813,7 @@ function applyProjectedOperationInternal(
         touched,
       );
     } else {
-      replaceOperationJournalOwned(
-        repo.checkout,
-        activeRebase.expectedIntegrityOid,
-        suspendedState,
-        activeRebase.steps,
-        touched,
-      );
+      suspendRebaseOwned(repo.checkout, activeRebase.currentStep, touched);
     }
   }
   return { touched };
@@ -1116,7 +1079,7 @@ export function abortProjectedMerge(
   const restoreBlobs = validateRestoreBlobs(repo, journal.touched);
   restoreWorktree(repo, worktree, journal.touched, current.entries, restoreBlobs);
   restoreIndex(repo, journal.touched);
-  repo.checkout.clearMergeState();
+  checkoutStoreMutations(repo.checkout).clearMergeStateOwned();
 }
 
 /** Restore one authenticated operation snapshot; the caller owns state clearing. */
@@ -1125,12 +1088,6 @@ export function restoreProjectedOperation(
   worktree: Worktree,
   journal: OperationJournal,
 ): void {
-  if (
-    operationJournalIntegrityOid(journal.state, journal.touched, journal.steps) !==
-    journal.integrityOid
-  ) {
-    throw new CorruptError("operation journal integrity identity is stale");
-  }
   let previous: string | null = null;
   for (const entry of journal.touched) {
     if (previous !== null && comparePaths(previous, entry.path) >= 0) {

@@ -1,13 +1,11 @@
+import { checkoutStoreMutations } from "../store/checkout.js";
+import { markReplayEmptyOwned, writeOperationJournalOwned } from "../store/operation-journal.js";
 // Shared orchestration for one bounded cherry-pick or revert operation.
 
 import { GitError } from "../common/errors.js";
 import { hashObject, type Person } from "../common/objects.js";
 import { joinSorted } from "../common/streams.js";
-import {
-  readOperationStateOwned,
-  replaceOperationStateOwned,
-  writeOperationJournalOwned,
-} from "../store/index.js";
+import { readOperationStateOwned } from "../store/index.js";
 import { type CommitIdentities, commitIndex } from "./commit.js";
 import type { GitContext, GitIdentity } from "./context.js";
 import {
@@ -358,14 +356,9 @@ export function continueReplay(
     if (integrationIndexMatchesTree(repo, plan.currentTreeOid)) {
       const reason: ReplayEmptyReason = "result";
       if (policy.suspendEmpty) {
-        const nextState: ReplayStateMetadata = {
-          ...journal.state,
-          phase: "empty",
-          emptyReason: reason,
-        };
-        replaceOperationStateOwned(repo.checkout, journal.integrityOid, nextState);
+        markReplayEmptyOwned(repo.checkout, policy.kind, reason);
       } else {
-        repo.checkout.clearOperationState();
+        checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
       }
       return { outcome: "empty", reason };
     }
@@ -386,7 +379,7 @@ export function continueReplay(
       },
       context,
     );
-    repo.checkout.clearOperationState();
+    checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
     return { outcome: "committed", oid: result.oid };
   });
 }
@@ -395,12 +388,14 @@ export function cancelReplay(repo: Repository, worktree: Worktree, kind: ReplayK
   repo.store.db.transactionSync(() => {
     const journal = requireReplayJournal(repo, kind);
     requireOriginalHead(repo, journal.state);
-    const incomingLabelStyle: ReplayIncomingLabelStyle =
-      kind === "cherry-pick" ? "source-subject" : "parent-of-source-subject";
-    requireOwnership(repo, worktree, journal, incomingLabelStyle);
-    if (journal.touched.length > 0) {
-      restoreProjectedOperation(repo, worktree, journal);
+    if (journal.state.phase !== "empty") {
+      const incomingLabelStyle: ReplayIncomingLabelStyle =
+        kind === "cherry-pick" ? "source-subject" : "parent-of-source-subject";
+      requireOwnership(repo, worktree, journal, incomingLabelStyle);
+      if (journal.touched.length > 0) {
+        restoreProjectedOperation(repo, worktree, journal);
+      }
     }
-    repo.checkout.clearOperationState();
+    checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
   });
 }

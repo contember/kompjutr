@@ -49,11 +49,17 @@ import {
   requireSafeId,
   requireStoredCheckoutRow,
 } from "./lifecycle.js";
-import { OperationJournalTable } from "./operation-journal.js";
+import { withGitMutationGuard } from "./mutation-guard.js";
+import {
+  OperationJournalTable,
+  type OperationRootPage,
+  type RebaseJournalCursor,
+} from "./operation-journal.js";
 import type {
   CherryPickJournal,
   MergeJournal,
   MergeOperationJournal,
+  MergeSavedIdentity,
   MergeStateMetadata,
   MergeTouchedPath,
   OperationJournal,
@@ -73,7 +79,7 @@ import {
 } from "./reflog.js";
 import type { HeadOwner } from "./refs.js";
 import { MAX_CHECKOUTS_PER_REPOSITORY } from "./schema.js";
-import type { SharedRepoStore } from "./shared.js";
+import { type SharedRepoStore, sharedRepoStoreMutations, writeObjectsOwned } from "./shared.js";
 import {
   iterateTree,
   iterateTreeDiff,
@@ -84,6 +90,75 @@ import {
 } from "./tree-walk.js";
 
 export const DEFAULT_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
+interface CheckoutStoreMutations {
+  upsertBlobIdsOwned(mappings: Iterable<BlobIdMapping>): void;
+  registerPromisorRemoteOwned(remoteName: string, url: string): PromisorRemote;
+  addPromisedBlobsOwned(remoteName: string, oids: Iterable<string>): void;
+  addPromisedBlobsFromPackTreesOwned(remoteName: string, packId: number): void;
+  writeOwned(type: ObjectType, data: Uint8Array): string;
+  writeStreamOwned(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string;
+  setRefOwned(name: string, target: string): void;
+  updateRefExpectedOwned(name: string, expectedOid: string, targetOid: string): void;
+  deleteRefOwned(name: string): void;
+  updateRefsOwned(puts: Iterable<RefRow>, deletes?: Iterable<string>): void;
+  publishTrackingRefOwned(
+    token: TrackingRefPublicationToken,
+    target: string | null,
+    metadata: RefLogMetadata,
+  ): boolean;
+  publishFetchRefsOwned(
+    token: FetchPublicationToken,
+    plan: FetchPublicationPlan,
+    metadata: RefLogMetadata,
+  ): boolean;
+  mutateRefsOwned(mutation: RefMutation, metadata: RefLogMetadata): boolean;
+  setHeadOwned(value: string): void;
+  configSetOwned(path: string, value: string): void;
+  configAddOwned(path: string, value: string): void;
+  configUnsetOwned(path: string): void;
+  configMoveSectionOwned(sourcePrefix: string, destinationPrefix: string): void;
+  writeOperationStateOwned(
+    state: OperationStateMetadata,
+    touched: readonly MergeTouchedPath[],
+  ): void;
+  writeOperationJournalOwned(
+    state: OperationStateMetadata,
+    steps: readonly OperationStepMetadata[],
+    touched: readonly MergeTouchedPath[],
+  ): void;
+  markReplayEmptyOwned(kind: "cherry-pick" | "revert", reason: "source" | "result"): void;
+  suspendRebaseOwned(currentStep: number, touched: readonly MergeTouchedPath[]): void;
+  advanceRebaseOwned(
+    phase: "running" | "conflicted",
+    currentStep: number,
+    outcome: "applied" | "skipped",
+    resultOid: string | null,
+    currentParentOid: string,
+    committer: MergeSavedIdentity | null,
+  ): void;
+  clearOperationStateOwned(): boolean;
+  writeMergeStateOwned(state: MergeStateMetadata, touched: readonly MergeTouchedPath[]): void;
+  clearMergeStateOwned(): boolean;
+  indexPutOwned(entry: IndexEntry): void;
+  indexRemoveOwned(path: string): void;
+  indexClearOwned(): void;
+  indexReplaceOwned(entries: Iterable<IndexEntry>, options?: IndexApplyOptions): void;
+  cacheCommitOwned(oid: string, data: Uint8Array): CommitCacheEntry | null;
+  cacheCommitsOwned(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult;
+  setShallowOwned(add: Iterable<string>, remove?: Iterable<string>): void;
+  destroyOwned(): void;
+}
+
+const CHECKOUT_STORE_MUTATIONS = new WeakMap<object, CheckoutStoreMutations>();
+const NEVER_AUTHORIZE_LIFECYCLE_MUTATION = (): boolean => false;
+
+/** Internal mutation capability; intentionally absent from the package facade. */
+export function checkoutStoreMutations(store: CheckoutStore): CheckoutStoreMutations {
+  const mutations = CHECKOUT_STORE_MUTATIONS.get(store);
+  if (mutations === undefined)
+    throw new CorruptError("checkout store mutation capability is missing");
+  return mutations;
+}
 
 /** Checkout-bound storage view. */
 export class CheckoutStore implements IndexStore {
@@ -99,6 +174,7 @@ export class CheckoutStore implements IndexStore {
   readonly #onDestroy: (() => void) | undefined;
   readonly #now: () => number;
   readonly #lifetime: CheckoutStoreLifetime;
+  readonly #isLifecycleMutationAuthorized: (store: CheckoutStore) => boolean;
 
   constructor(
     shared: SharedRepoStore,
@@ -106,6 +182,9 @@ export class CheckoutStore implements IndexStore {
     options: StoreOptions = {},
     onDestroy?: () => void,
     lifetime = new CheckoutStoreLifetime(),
+    isLifecycleMutationAuthorized: (
+      store: CheckoutStore,
+    ) => boolean = NEVER_AUTHORIZE_LIFECYCLE_MUTATION,
   ) {
     if (
       requireSafeId(checkout.id, "checkout id") < 1 ||
@@ -117,6 +196,7 @@ export class CheckoutStore implements IndexStore {
     this.#onDestroy = onDestroy;
     this.#now = options.now ?? Date.now;
     this.#lifetime = lifetime;
+    this.#isLifecycleMutationAuthorized = isLifecycleMutationAuthorized;
     this.#database = shared.db;
     this.#repoId = shared.repoId;
     this.#checkoutId = checkout.id;
@@ -131,7 +211,7 @@ export class CheckoutStore implements IndexStore {
       this.#database,
       this.#repoId,
       this.#checkoutId,
-      shared.objectTable,
+      sharedRepoStoreMutations(shared).objectTableOwned(),
     );
     this.#headOwner = {
       checkoutId: this.#checkoutId,
@@ -143,11 +223,76 @@ export class CheckoutStore implements IndexStore {
       pruneExpiredCheckoutRefLogs: (cutoff) => this.#pruneExpiredCheckoutRefLogs(cutoff),
       pruneRetainedCheckoutRefLogs: (events) => this.#pruneRetainedCheckoutRefLogs(events),
     };
-    shared.bindCheckoutOperations(this, this.#headOwner);
+    shared.bindCheckoutOperations(
+      {
+        sharedRepoId: this.#repoId,
+        checkoutId: this.#checkoutId,
+        isPrimary: this.#isPrimary,
+        destroyOwned: () => this.destroyOwned(),
+      },
+      this.#headOwner,
+    );
+    CHECKOUT_STORE_MUTATIONS.set(this, {
+      upsertBlobIdsOwned: (mappings) => this.upsertBlobIdsOwned(mappings),
+      registerPromisorRemoteOwned: (remoteName, url) =>
+        this.registerPromisorRemoteOwned(remoteName, url),
+      addPromisedBlobsOwned: (remoteName, oids) => this.addPromisedBlobsOwned(remoteName, oids),
+      addPromisedBlobsFromPackTreesOwned: (remoteName, packId) =>
+        this.addPromisedBlobsFromPackTreesOwned(remoteName, packId),
+      writeOwned: (type, data) => this.writeOwned(type, data),
+      writeStreamOwned: (type, size, chunks) => this.writeStreamOwned(type, size, chunks),
+      setRefOwned: (name, target) => this.setRefOwned(name, target),
+      updateRefExpectedOwned: (name, expectedOid, targetOid) =>
+        this.updateRefExpectedOwned(name, expectedOid, targetOid),
+      deleteRefOwned: (name) => this.deleteRefOwned(name),
+      updateRefsOwned: (puts, deletes) => this.updateRefsOwned(puts, deletes),
+      publishTrackingRefOwned: (token, target, metadata) =>
+        this.publishTrackingRefOwned(token, target, metadata),
+      publishFetchRefsOwned: (token, plan, metadata) =>
+        this.publishFetchRefsOwned(token, plan, metadata),
+      mutateRefsOwned: (mutation, metadata) => this.mutateRefsOwned(mutation, metadata),
+      setHeadOwned: (value) => this.setHeadOwned(value),
+      configSetOwned: (path, value) => this.configSetOwned(path, value),
+      configAddOwned: (path, value) => this.configAddOwned(path, value),
+      configUnsetOwned: (path) => this.configUnsetOwned(path),
+      configMoveSectionOwned: (sourcePrefix, destinationPrefix) =>
+        this.configMoveSectionOwned(sourcePrefix, destinationPrefix),
+      writeOperationStateOwned: (state, touched) => this.writeOperationStateOwned(state, touched),
+      writeOperationJournalOwned: (state, steps, touched) =>
+        this.writeOperationJournalOwned(state, steps, touched),
+      markReplayEmptyOwned: (kind, reason) => this.markReplayEmptyOwned(kind, reason),
+      suspendRebaseOwned: (currentStep, touched) => this.suspendRebaseOwned(currentStep, touched),
+      advanceRebaseOwned: (phase, currentStep, outcome, resultOid, currentParentOid, committer) =>
+        this.advanceRebaseOwned(
+          phase,
+          currentStep,
+          outcome,
+          resultOid,
+          currentParentOid,
+          committer,
+        ),
+      clearOperationStateOwned: () => this.clearOperationStateOwned(),
+      writeMergeStateOwned: (state, touched) => this.writeMergeStateOwned(state, touched),
+      clearMergeStateOwned: () => this.clearMergeStateOwned(),
+      indexPutOwned: (entry) => this.indexPutOwned(entry),
+      indexRemoveOwned: (path) => this.indexRemoveOwned(path),
+      indexClearOwned: () => this.indexClearOwned(),
+      indexReplaceOwned: (entries, applyOptions) => this.indexReplaceOwned(entries, applyOptions),
+      cacheCommitOwned: (oid, data) => this.cacheCommitOwned(oid, data),
+      cacheCommitsOwned: (entries) => this.cacheCommitsOwned(entries),
+      setShallowOwned: (add, remove) => this.setShallowOwned(add, remove),
+      destroyOwned: () => this.destroyOwned(),
+    });
   }
 
   #requireActive(): void {
     this.#lifetime.requireActive();
+  }
+
+  #mutate<T>(body: () => T): T {
+    this.#requireActive();
+    if (this.#isLifecycleMutationAuthorized(this)) return body();
+    return withGitMutationGuard(this.#db, body);
   }
 
   get shared(): SharedRepoStore {
@@ -213,7 +358,11 @@ export class CheckoutStore implements IndexStore {
 
   /** Upsert opaque content-id mappings in bounded BLOB payloads. */
   upsertBlobIds(mappings: Iterable<BlobIdMapping>): void {
-    this.shared.upsertBlobIds(mappings);
+    this.#mutate(() => this.upsertBlobIdsOwned(mappings));
+  }
+
+  private upsertBlobIdsOwned(mappings: Iterable<BlobIdMapping>): void {
+    sharedRepoStoreMutations(this.shared).upsertBlobIdsOwned(mappings);
   }
 
   has(oid: string): boolean {
@@ -229,7 +378,11 @@ export class CheckoutStore implements IndexStore {
   }
 
   registerPromisorRemote(remoteName: string, url: string): PromisorRemote {
-    return this.shared.registerPromisorRemote(remoteName, url);
+    return this.#mutate(() => this.registerPromisorRemoteOwned(remoteName, url));
+  }
+
+  private registerPromisorRemoteOwned(remoteName: string, url: string): PromisorRemote {
+    return sharedRepoStoreMutations(this.shared).registerPromisorRemoteOwned(remoteName, url);
   }
 
   readPromisorRemote(remoteName: string): PromisorRemote | null {
@@ -237,11 +390,19 @@ export class CheckoutStore implements IndexStore {
   }
 
   addPromisedBlobs(remoteName: string, oids: Iterable<string>): void {
-    this.shared.addPromisedBlobs(remoteName, oids);
+    this.#mutate(() => this.addPromisedBlobsOwned(remoteName, oids));
+  }
+
+  private addPromisedBlobsOwned(remoteName: string, oids: Iterable<string>): void {
+    sharedRepoStoreMutations(this.shared).addPromisedBlobsOwned(remoteName, oids);
   }
 
   addPromisedBlobsFromPackTrees(remoteName: string, packId: number): void {
-    this.shared.addPromisedBlobsFromPackTrees(remoteName, packId);
+    this.#mutate(() => this.addPromisedBlobsFromPackTreesOwned(remoteName, packId));
+  }
+
+  private addPromisedBlobsFromPackTreesOwned(remoteName: string, packId: number): void {
+    sharedRepoStoreMutations(this.shared).addPromisedBlobsFromPackTreesOwned(remoteName, packId);
   }
 
   promisedMissing(oids: readonly string[]): string[] {
@@ -303,19 +464,32 @@ export class CheckoutStore implements IndexStore {
   }
 
   write(type: ObjectType, data: Uint8Array): string {
-    return this.shared.write(type, data);
+    return this.#mutate(() => this.writeOwned(type, data));
+  }
+
+  private writeOwned(type: ObjectType, data: Uint8Array): string {
+    return sharedRepoStoreMutations(this.shared).writeOwned(type, data);
   }
 
   writeStream(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string {
-    return this.shared.writeStream(type, size, chunks);
+    return this.#mutate(() => this.writeStreamOwned(type, size, chunks));
   }
 
+  private writeStreamOwned(
+    type: ObjectType,
+    size: number,
+    chunks: () => Iterable<Uint8Array>,
+  ): string {
+    return sharedRepoStoreMutations(this.shared).writeStreamOwned(type, size, chunks);
+  }
   writeBatch(options: ObjectBatchOptions = {}): ObjectBatch {
-    return this.shared.writeBatch(options);
+    return sharedRepoStoreMutations(this.shared)
+      .objectTableOwned()
+      .writeBatchGuarded(options, (body) => this.#mutate(body));
   }
 
   writeObjects<T>(body: (batch: ObjectBatch) => T, options: ObjectBatchOptions = {}): T {
-    return this.shared.writeObjects(body, options);
+    return this.#mutate(() => writeObjectsOwned(this.shared, body, options));
   }
 
   readChunks(oid: string): Iterable<Uint8Array> | null {
@@ -339,29 +513,45 @@ export class CheckoutStore implements IndexStore {
   }
 
   setRef(name: string, target: string): void {
+    this.#mutate(() => this.setRefOwned(name, target));
+  }
+
+  private setRefOwned(name: string, target: string): void {
     if (name === "HEAD") {
-      this.setHead(target);
+      this.setHeadOwned(target);
       return;
     }
-    this.shared.setRef(name, target);
+    sharedRepoStoreMutations(this.shared).setRefOwned(name, target);
   }
 
   /** Move one direct ref only if it still contains the caller's observed OID. */
   updateRefExpected(name: string, expectedOid: string, targetOid: string): void {
-    this.shared.updateRefExpected(name, expectedOid, targetOid);
+    this.#mutate(() => this.updateRefExpectedOwned(name, expectedOid, targetOid));
+  }
+
+  private updateRefExpectedOwned(name: string, expectedOid: string, targetOid: string): void {
+    sharedRepoStoreMutations(this.shared).updateRefExpectedOwned(name, expectedOid, targetOid);
   }
 
   deleteRef(name: string): void {
+    this.#mutate(() => this.deleteRefOwned(name));
+  }
+
+  private deleteRefOwned(name: string): void {
     if (name === "HEAD") {
-      this.mutateRefs({ deletes: [name] }, this.#genericRefLogMetadata("ref delete"));
+      this.mutateRefsOwned({ deletes: [name] }, this.#genericRefLogMetadata("ref delete"));
       return;
     }
-    this.shared.deleteRef(name);
+    sharedRepoStoreMutations(this.shared).deleteRefOwned(name);
   }
 
   /** Apply bounded ref deletions and updates atomically. */
   updateRefs(puts: Iterable<RefRow>, deletes: Iterable<string> = []): void {
-    this.shared.updateRefs(puts, deletes);
+    this.#mutate(() => this.updateRefsOwned(puts, deletes));
+  }
+
+  private updateRefsOwned(puts: Iterable<RefRow>, deletes: Iterable<string> = []): void {
+    sharedRepoStoreMutations(this.shared).updateRefsOwned(puts, deletes);
   }
 
   beginTrackingRefPublication(
@@ -376,7 +566,15 @@ export class CheckoutStore implements IndexStore {
     target: string | null,
     metadata: RefLogMetadata,
   ): boolean {
-    return this.shared.publishTrackingRef(token, target, metadata);
+    return this.#mutate(() => this.publishTrackingRefOwned(token, target, metadata));
+  }
+
+  private publishTrackingRefOwned(
+    token: TrackingRefPublicationToken,
+    target: string | null,
+    metadata: RefLogMetadata,
+  ): boolean {
+    return sharedRepoStoreMutations(this.shared).publishTrackingRefOwned(token, target, metadata);
   }
 
   beginFetchPublication(
@@ -391,13 +589,29 @@ export class CheckoutStore implements IndexStore {
     plan: FetchPublicationPlan,
     metadata: RefLogMetadata,
   ): boolean {
-    return this.shared.publishFetchRefs(token, plan, metadata);
+    return this.#mutate(() => this.publishFetchRefsOwned(token, plan, metadata));
+  }
+
+  private publishFetchRefsOwned(
+    token: FetchPublicationToken,
+    plan: FetchPublicationPlan,
+    metadata: RefLogMetadata,
+  ): boolean {
+    return sharedRepoStoreMutations(this.shared).publishFetchRefsOwned(token, plan, metadata);
   }
 
   /** Apply current ref state and its bounded history through one atomic seam. */
   mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
+    return this.#mutate(() => this.mutateRefsOwned(mutation, metadata));
+  }
+
+  private mutateRefsOwned(mutation: RefMutation, metadata: RefLogMetadata): boolean {
     this.#requireActive();
-    return this.#sharedStore.mutateRefsOwned(this.#headOwner, mutation, metadata);
+    return sharedRepoStoreMutations(this.#sharedStore).mutateRefsOwned(
+      this.#headOwner,
+      mutation,
+      metadata,
+    );
   }
 
   listRefs(prefix = ""): RefRow[] {
@@ -421,6 +635,10 @@ export class CheckoutStore implements IndexStore {
 
   setHead(value: string): void {
     this.mutateRefs({ head: value }, this.#genericRefLogMetadata("HEAD update"));
+  }
+
+  private setHeadOwned(value: string): void {
+    this.mutateRefsOwned({ head: value }, this.#genericRefLogMetadata("HEAD update"));
   }
 
   #readRefMutationHeads(): CheckoutRow[] {
@@ -581,15 +799,27 @@ export class CheckoutStore implements IndexStore {
   }
 
   configSet(path: string, value: string): void {
-    this.shared.configSet(path, value);
+    this.#mutate(() => this.configSetOwned(path, value));
+  }
+
+  private configSetOwned(path: string, value: string): void {
+    sharedRepoStoreMutations(this.shared).configSetOwned(path, value);
   }
 
   configAdd(path: string, value: string): void {
-    this.shared.configAdd(path, value);
+    this.#mutate(() => this.configAddOwned(path, value));
+  }
+
+  private configAddOwned(path: string, value: string): void {
+    sharedRepoStoreMutations(this.shared).configAddOwned(path, value);
   }
 
   configUnset(path: string): void {
-    this.shared.configUnset(path);
+    this.#mutate(() => this.configUnsetOwned(path));
+  }
+
+  private configUnsetOwned(path: string): void {
+    sharedRepoStoreMutations(this.shared).configUnsetOwned(path);
   }
 
   /** Distinct config paths under a dotted prefix, e.g. "remote.". */
@@ -599,7 +829,11 @@ export class CheckoutStore implements IndexStore {
 
   /** Validate and move one exact dotted config section without changing value order. */
   configMoveSection(sourcePrefix: string, destinationPrefix: string): void {
-    this.shared.configMoveSection(sourcePrefix, destinationPrefix);
+    this.#mutate(() => this.configMoveSectionOwned(sourcePrefix, destinationPrefix));
+  }
+
+  private configMoveSectionOwned(sourcePrefix: string, destinationPrefix: string): void {
+    sharedRepoStoreMutations(this.shared).configMoveSectionOwned(sourcePrefix, destinationPrefix);
   }
 
   // -- integration operation journal --------------------------------
@@ -614,7 +848,19 @@ export class CheckoutStore implements IndexStore {
     return this.readOperationState();
   }
 
+  readRebaseCursorOwned(): RebaseJournalCursor | null {
+    this.#requireActive();
+    return this.#operationJournals.readRebaseCursorOwned();
+  }
+
   writeOperationState(state: OperationStateMetadata, touched: readonly MergeTouchedPath[]): void {
+    this.#mutate(() => this.writeOperationStateOwned(state, touched));
+  }
+
+  private writeOperationStateOwned(
+    state: OperationStateMetadata,
+    touched: readonly MergeTouchedPath[],
+  ): void {
     this.#requireActive();
     this.#operationJournals.writeOperationState(state, touched);
   }
@@ -624,47 +870,57 @@ export class CheckoutStore implements IndexStore {
     steps: readonly OperationStepMetadata[],
     touched: readonly MergeTouchedPath[],
   ): void {
+    this.#mutate(() => this.writeOperationJournalOwned(state, steps, touched));
+  }
+
+  private writeOperationJournalOwned(
+    state: OperationStateMetadata,
+    steps: readonly OperationStepMetadata[],
+    touched: readonly MergeTouchedPath[],
+  ): void {
     this.#requireActive();
     this.#operationJournals.writeOperationJournal(state, steps, touched);
   }
 
-  writeOperationJournalOwned(
-    state: OperationStateMetadata,
-    steps: readonly OperationStepMetadata[],
-    touched: readonly MergeTouchedPath[],
-  ): void {
-    this.writeOperationJournal(state, steps, touched);
-  }
-
-  replaceOperationState(expectedIntegrityOid: string, state: OperationStateMetadata): void {
+  private markReplayEmptyOwned(kind: "cherry-pick" | "revert", reason: "source" | "result"): void {
     this.#requireActive();
-    this.#operationJournals.replaceOperationState(expectedIntegrityOid, state);
+    this.#operationJournals.markReplayEmpty(kind, reason);
   }
 
-  replaceOperationStateOwned(expectedIntegrityOid: string, state: OperationStateMetadata): void {
-    this.replaceOperationState(expectedIntegrityOid, state);
+  private suspendRebaseOwned(currentStep: number, touched: readonly MergeTouchedPath[]): void {
+    this.#requireActive();
+    this.#operationJournals.suspendRebase(currentStep, touched);
   }
 
-  replaceOperationJournal(
-    expectedIntegrityOid: string,
-    state: OperationStateMetadata,
-    steps: readonly OperationStepMetadata[],
-    touched: readonly MergeTouchedPath[],
+  private advanceRebaseOwned(
+    phase: "running" | "conflicted",
+    currentStep: number,
+    outcome: "applied" | "skipped",
+    resultOid: string | null,
+    currentParentOid: string,
+    committer: MergeSavedIdentity | null,
   ): void {
     this.#requireActive();
-    this.#operationJournals.replaceOperationJournal(expectedIntegrityOid, state, steps, touched);
+    this.#operationJournals.advanceRebase(
+      phase,
+      currentStep,
+      outcome,
+      resultOid,
+      currentParentOid,
+      committer,
+    );
   }
 
-  replaceOperationJournalOwned(
-    expectedIntegrityOid: string,
-    state: OperationStateMetadata,
-    steps: readonly OperationStepMetadata[],
-    touched: readonly MergeTouchedPath[],
-  ): void {
-    this.replaceOperationJournal(expectedIntegrityOid, state, steps, touched);
+  operationRootPage(cursor = 0, limit = 128): OperationRootPage {
+    this.#requireActive();
+    return this.#operationJournals.operationRootPage(cursor, limit);
   }
 
   clearOperationState(): boolean {
+    return this.#mutate(() => this.clearOperationStateOwned());
+  }
+
+  private clearOperationStateOwned(): boolean {
     this.#requireActive();
     return this.#operationJournals.clearOperationState();
   }
@@ -690,11 +946,22 @@ export class CheckoutStore implements IndexStore {
   }
 
   writeMergeState(state: MergeStateMetadata, touched: readonly MergeTouchedPath[]): void {
+    this.#mutate(() => this.writeMergeStateOwned(state, touched));
+  }
+
+  private writeMergeStateOwned(
+    state: MergeStateMetadata,
+    touched: readonly MergeTouchedPath[],
+  ): void {
     this.#requireActive();
     this.#operationJournals.writeMergeState(state, touched);
   }
 
   clearMergeState(): boolean {
+    return this.#mutate(() => this.clearMergeStateOwned());
+  }
+
+  private clearMergeStateOwned(): boolean {
     this.#requireActive();
     return this.#operationJournals.clearMergeState();
   }
@@ -725,18 +992,34 @@ export class CheckoutStore implements IndexStore {
   }
 
   indexPut(entry: IndexEntry): void {
+    this.#mutate(() => this.indexPutOwned(entry));
+  }
+
+  private indexPutOwned(entry: IndexEntry): void {
     this.#indexTable.indexPut(entry);
   }
 
   indexRemove(path: string): void {
+    this.#mutate(() => this.indexRemoveOwned(path));
+  }
+
+  private indexRemoveOwned(path: string): void {
     this.#indexTable.indexRemove(path);
   }
 
   indexClear(): void {
+    this.#mutate(() => this.indexClearOwned());
+  }
+
+  private indexClearOwned(): void {
     this.#indexTable.indexClear();
   }
 
   indexReplace(entries: Iterable<IndexEntry>, options: IndexApplyOptions = {}): void {
+    this.#mutate(() => this.indexReplaceOwned(entries, options));
+  }
+
+  private indexReplaceOwned(entries: Iterable<IndexEntry>, options: IndexApplyOptions = {}): void {
     this.#indexTable.indexReplace(entries, options);
   }
 
@@ -768,11 +1051,18 @@ export class CheckoutStore implements IndexStore {
 
   /** Lazily add one derived commit row from bytes the caller already read. */
   cacheCommit(oid: string, data: Uint8Array): CommitCacheEntry | null {
+    return this.#mutate(() => this.cacheCommitOwned(oid, data));
+  }
+
+  private cacheCommitOwned(oid: string, data: Uint8Array): CommitCacheEntry | null {
     return indexCommitSource(this.#db, { repoId: this.#repoId, oid, data });
   }
 
-  /** Insert prepared point misses with the shared row and JSON byte bounds. */
   cacheCommits(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
+    return this.#mutate(() => this.cacheCommitsOwned(entries));
+  }
+
+  private cacheCommitsOwned(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
     return insertCommitCaches(this.#db, entries);
   }
 
@@ -788,7 +1078,11 @@ export class CheckoutStore implements IndexStore {
   }
 
   setShallow(add: Iterable<string>, remove: Iterable<string> = []): void {
-    this.shared.setShallow(add, remove);
+    this.#mutate(() => this.setShallowOwned(add, remove));
+  }
+
+  private setShallowOwned(add: Iterable<string>, remove: Iterable<string> = []): void {
+    sharedRepoStoreMutations(this.shared).setShallowOwned(add, remove);
   }
 
   #genericRefLogMetadata(reason: string): RefLogMetadata {
@@ -808,6 +1102,10 @@ export class CheckoutStore implements IndexStore {
 
   /** Drop the shared store and every checkout through foreign-key cascades. */
   destroy(): void {
+    this.#mutate(() => this.destroyOwned());
+  }
+
+  private destroyOwned(): void {
     this.#requireActive();
     if (this.#onDestroy !== undefined) {
       this.#db.transactionSync(this.#onDestroy);

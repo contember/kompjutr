@@ -16,7 +16,8 @@ import {
   type TreeEntry,
 } from "../common/objects.js";
 import { comparePaths } from "../common/streams.js";
-import { type IndexEntry, type ObjectBatch, writeObjectsOwned } from "../store/index.js";
+import type { IndexEntry, ObjectBatch } from "../store/index.js";
+import { writeObjectsOwned } from "../store/shared.js";
 import type { Repository } from "./repository.js";
 import type { CommitTreeSnapshotResult } from "./sparse-workspace.js";
 

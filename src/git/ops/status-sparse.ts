@@ -2,6 +2,7 @@ import { CorruptError, GitError, hasErrorCode } from "../common/errors.js";
 import { comparePaths } from "../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { contentIdKey, type IndexEntry } from "../store/index.js";
+import { sharedRepoStoreMutations } from "../store/shared.js";
 import {
   hydrateSparseWorkspaceOwned,
   sparseDirtyPathsOwned,
@@ -379,7 +380,7 @@ function compareSparseWorktree(
   const hashed = hashExactWorktreePathsOwned(repo, worktree, unresolved, {
     write: false,
   });
-  repo.store.upsertBlobIds(
+  sharedRepoStoreMutations(repo.store).upsertBlobIdsOwned(
     [...hashed.values()].flatMap((value) => {
       const contentId = value.stat.contentId;
       return contentId === null ? [] : [{ contentId, oid: value.oid }];

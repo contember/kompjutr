@@ -1,3 +1,4 @@
+import { sharedRepoStoreMutations } from "../store/shared.js";
 // Shared bounded blob writes for full and sparse checkout paths.
 
 import { fromHex } from "../common/bytes.js";
@@ -65,7 +66,7 @@ export function flushCheckoutWrites(
       mappings.push({ contentId, oid: entry.oid });
     }
     worktree.writeFiles(writes);
-    repo.store.upsertBlobIds(mappings);
+    sharedRepoStoreMutations(repo.store).upsertBlobIdsOwned(mappings);
     for (const entry of indexEntries) {
       sink.remove(entry.path);
       sink.put(entry);

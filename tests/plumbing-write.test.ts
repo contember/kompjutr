@@ -14,6 +14,7 @@ import {
   MAX_COMMIT_TREE_PARENTS,
   MAX_COMMIT_TREE_REVISION_TRAVERSALS,
   readTree,
+  readTreeOwned,
   updateRef,
   writeTree,
 } from "../src/git/ops/plumbing.js";
@@ -29,6 +30,7 @@ import {
   WORKTREE_DIRTY,
 } from "../src/git/store/index-tracker.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/git/store/packs.js";
+import { sharedRepoStoreMutations } from "../src/git/store/shared.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
@@ -296,15 +298,18 @@ describe("tree and index write plumbing", () => {
     const beforeWorktree = worktreeState(workspace);
 
     expect(writeTree(workspace.repo)).toBe(baseTree);
-    workspace.repo.store.withScratchIndex("write-tree", (scratch) => {
-      readTree(workspace.repo, workspace.worktree, { tree: base }, scratch);
-      scratch.indexApply((sink) => {
-        sink.put(indexed("vendor/module", base, 0o160000));
-      });
-      expect(writeTree(workspace.repo, scratch)).toBe(expectedScratch);
-      readTree(workspace.repo, workspace.worktree, { empty: true }, scratch);
-      expect(writeTree(workspace.repo, scratch)).toBe(expectedEmpty);
-    });
+    sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned(
+      "write-tree",
+      (scratch) => {
+        readTree(workspace.repo, workspace.worktree, { tree: base }, scratch);
+        scratch.indexApply((sink) => {
+          sink.put(indexed("vendor/module", base, 0o160000));
+        });
+        expect(writeTree(workspace.repo, scratch)).toBe(expectedScratch);
+        readTree(workspace.repo, workspace.worktree, { empty: true }, scratch);
+        expect(writeTree(workspace.repo, scratch)).toBe(expectedEmpty);
+      },
+    );
 
     expect(controlState(workspace)).toEqual(beforeControl);
     expect(worktreeState(workspace)).toEqual(beforeWorktree);
@@ -318,14 +323,17 @@ describe("tree and index write plumbing", () => {
     const beforeObjects = workspace.repo.store.objectCount();
 
     expect(() =>
-      workspace.repo.store.withScratchIndex("unmerged-tree", (scratch) => {
-        scratch.indexReplace([
-          indexed("conflict.txt", ancestor, 0o100644, 1),
-          indexed("conflict.txt", ours, 0o100644, 2),
-          indexed("conflict.txt", theirs, 0o100644, 3),
-        ]);
-        writeTree(workspace.repo, scratch);
-      }),
+      sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned(
+        "unmerged-tree",
+        (scratch) => {
+          scratch.indexReplace([
+            indexed("conflict.txt", ancestor, 0o100644, 1),
+            indexed("conflict.txt", ours, 0o100644, 2),
+            indexed("conflict.txt", theirs, 0o100644, 3),
+          ]);
+          writeTree(workspace.repo, scratch);
+        },
+      ),
     ).toThrowError(expect.objectContaining({ code: "EUNMERGED" }));
 
     expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
@@ -798,20 +806,23 @@ describe("tree and index write plumbing", () => {
     let caughtCode = "";
 
     expect(() =>
-      workspace.repo.store.withScratchIndex("commit-preflight", (scratch) => {
-        scratch.indexReplace([indexed("tracked.txt", blob)]);
-        try {
-          commitTree(workspace.context, workspace.repo, {
-            tree,
-            message: "too many parents",
-            parent: Array.from({ length: MAX_COMMIT_TREE_PARENTS + 1 }, () => "missing"),
-          });
-        } catch (error) {
-          if (!(error instanceof GitError)) throw error;
-          caughtCode = error.code;
-        }
-        workspace.repo.store.write("blob", utf8.encode("must roll back\n"));
-      }),
+      sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned(
+        "commit-preflight",
+        (scratch) => {
+          scratch.indexReplace([indexed("tracked.txt", blob)]);
+          try {
+            commitTree(workspace.context, workspace.repo, {
+              tree,
+              message: "too many parents",
+              parent: Array.from({ length: MAX_COMMIT_TREE_PARENTS + 1 }, () => "missing"),
+            });
+          } catch (error) {
+            if (!(error instanceof GitError)) throw error;
+            caughtCode = error.code;
+          }
+          workspace.repo.store.write("blob", utf8.encode("must roll back\n"));
+        },
+      ),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
 
     expect(caughtCode).toBe("E2BIG");
@@ -867,7 +878,7 @@ describe("tree and index write plumbing", () => {
       },
     };
 
-    workspace.repo.store.withScratchIndex("snapshot", (scratch) => {
+    sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned("snapshot", (scratch) => {
       readTree(workspace.repo, workspace.worktree, { tree: "base-treeish" }, scratch);
       add(workspace.repo, workspace.worktree, { paths: ["changed.txt"] }, context, scratch);
       add(workspace.repo, workspace.worktree, { paths: [], all: true }, context, scratch);
@@ -920,7 +931,7 @@ describe("tree and index write plumbing", () => {
     writeWorkFile(workspace, "/blocked-file/untracked.txt", "blocking directory\n");
     const beforeControl = controlState(workspace);
 
-    workspace.repo.store.withScratchIndex("update", (scratch) => {
+    sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned("update", (scratch) => {
       readTree(workspace.repo, workspace.worktree, { tree: base }, scratch);
       readTree(workspace.repo, workspace.worktree, { tree: target, updateWorktree: true }, scratch);
       expect(indexLines(scratch)).toEqual(expected);
@@ -985,20 +996,23 @@ describe("tree and index write plumbing", () => {
     let caughtCode = "";
 
     expect(() =>
-      workspace.repo.store.withScratchIndex("late-failure", (scratch) => {
-        try {
-          readTree(
-            workspace.repo,
-            workspace.worktree,
-            { tree: target, updateWorktree: true },
-            scratch,
-          );
-        } catch (error) {
-          if (!(error instanceof GitError)) throw error;
-          caughtCode = error.code;
-        }
-        expect(workspace.worktree.scan("/", { filesOnly: true, limit: 1 })).toHaveLength(1);
-      }),
+      sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned(
+        "late-failure",
+        (scratch) => {
+          try {
+            readTree(
+              workspace.repo,
+              workspace.worktree,
+              { tree: target, updateWorktree: true },
+              scratch,
+            );
+          } catch (error) {
+            if (!(error instanceof GitError)) throw error;
+            caughtCode = error.code;
+          }
+          expect(workspace.worktree.scan("/", { filesOnly: true, limit: 1 })).toHaveLength(1);
+        },
+      ),
     ).toThrowError(expect.objectContaining({ code: "ENOTFOUND" }));
 
     expect(caughtCode).toBe("ENOTFOUND");
@@ -1030,15 +1044,18 @@ describe("tree and index write plumbing", () => {
     const beforeRowStatements = workspace.storage.statementCount;
 
     expect(() =>
-      workspace.repo.store.withScratchIndex("wide-tree", (scratch) => {
-        try {
-          readTree(workspace.repo, workspace.worktree, { tree: wideTree }, scratch);
-        } catch (error) {
-          if (!(error instanceof GitError)) throw error;
-          rowError = error.message;
-        }
-        expect(scratch.indexScan({ pageSize: 1 }).next().done).toBe(false);
-      }),
+      sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned(
+        "wide-tree",
+        (scratch) => {
+          try {
+            readTree(workspace.repo, workspace.worktree, { tree: wideTree }, scratch);
+          } catch (error) {
+            if (!(error instanceof GitError)) throw error;
+            rowError = error.message;
+          }
+          expect(scratch.indexScan({ pageSize: 1 }).next().done).toBe(false);
+        },
+      ),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     expect(rowError).toContain("50000 rows");
     expect(workspace.storage.statementCount - beforeRowStatements).toBeLessThan(1_000);
@@ -1080,21 +1097,24 @@ describe("tree and index write plumbing", () => {
     let rowError = "";
     const beforeRowStatements = workspace.storage.statementCount;
     expect(() =>
-      workspace.repo.store.withScratchIndex("row-limit", (scratch) => {
-        try {
-          add(
-            workspace.repo,
-            syntheticWorktree(workspace.worktree, 50_001, contentId),
-            { paths: [], all: true, force: true },
-            undefined,
-            scratch,
-          );
-        } catch (error) {
-          if (!(error instanceof GitError)) throw error;
-          rowError = error.message;
-        }
-        expect(scratch.indexScan({ pageSize: 1 }).next().done).toBe(false);
-      }),
+      sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned(
+        "row-limit",
+        (scratch) => {
+          try {
+            add(
+              workspace.repo,
+              syntheticWorktree(workspace.worktree, 50_001, contentId),
+              { paths: [], all: true, force: true },
+              undefined,
+              scratch,
+            );
+          } catch (error) {
+            if (!(error instanceof GitError)) throw error;
+            rowError = error.message;
+          }
+          expect(scratch.indexScan({ pageSize: 1 }).next().done).toBe(false);
+        },
+      ),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     expect(rowError).toContain("50000 rows");
     expect(workspace.storage.statementCount - beforeRowStatements).toBeLessThan(1_000);
@@ -1102,20 +1122,23 @@ describe("tree and index write plumbing", () => {
     let directoryError = "";
     const beforeDirectoryStatements = workspace.storage.statementCount;
     expect(() =>
-      workspace.repo.store.withScratchIndex("directory-row-limit", (scratch) => {
-        try {
-          add(
-            workspace.repo,
-            syntheticDirectoryWorktree(workspace.worktree, 50_001),
-            { paths: [], all: true, force: true },
-            undefined,
-            scratch,
-          );
-        } catch (error) {
-          if (!(error instanceof GitError)) throw error;
-          directoryError = error.message;
-        }
-      }),
+      sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned(
+        "directory-row-limit",
+        (scratch) => {
+          try {
+            add(
+              workspace.repo,
+              syntheticDirectoryWorktree(workspace.worktree, 50_001),
+              { paths: [], all: true, force: true },
+              undefined,
+              scratch,
+            );
+          } catch (error) {
+            if (!(error instanceof GitError)) throw error;
+            directoryError = error.message;
+          }
+        },
+      ),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     expect(directoryError).toContain("50000 rows");
     expect(workspace.storage.statementCount - beforeDirectoryStatements).toBeLessThan(1_000);
@@ -1133,17 +1156,26 @@ describe("tree and index write plumbing", () => {
         return new Uint8Array(length);
       },
     };
-    workspace.repo.store.withScratchIndex("former-range-limit", (scratch) => {
-      add(workspace.repo, rangeWorktree, { paths: [], all: true, force: true }, undefined, scratch);
-      const staged = [...scratch.indexScan()];
-      expect(staged).toHaveLength(1);
-      expect(staged[0]).toMatchObject({
-        path: "f00000.txt",
-        mode: 0o100644,
-        oid: rangeOid,
-        size: rangeSize,
-      });
-    });
+    sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned(
+      "former-range-limit",
+      (scratch) => {
+        add(
+          workspace.repo,
+          rangeWorktree,
+          { paths: [], all: true, force: true },
+          undefined,
+          scratch,
+        );
+        const staged = [...scratch.indexScan()];
+        expect(staged).toHaveLength(1);
+        expect(staged[0]).toMatchObject({
+          path: "f00000.txt",
+          mode: 0o100644,
+          oid: rangeOid,
+          size: rangeSize,
+        });
+      },
+    );
     expect(rangeReads).toBe(65);
     expect(workspace.repo.store.typeAndSize(rangeOid)).toEqual({ type: "blob", size: rangeSize });
 
@@ -1181,33 +1213,36 @@ describe("tree and index write plumbing", () => {
       },
     };
 
-    workspace.repo.store.withScratchIndex("directory-prune", (scratch) => {
-      scratch.indexReplace(
-        paths.map((path) => ({
-          path,
-          stage: 0,
-          mode: 0o100644,
-          oid,
-          size: bytes.length,
-          mtime: null,
-          ino: null,
-        })),
-      );
-      const beforeStatements = workspace.storage.statementCount;
-      checkoutTree(
-        workspace.repo,
-        counted,
-        null,
-        {
-          maxSourceRowsPerPass: 50_000,
-          maxWorktreeRowsPerPass: 50_000,
-          maxWriteBytes: 64 * 1024 * 1024,
-        },
-        scratch,
-      );
-      expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1_000);
-      expect([...scratch.indexScan()]).toEqual([]);
-    });
+    sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned(
+      "directory-prune",
+      (scratch) => {
+        scratch.indexReplace(
+          paths.map((path) => ({
+            path,
+            stage: 0,
+            mode: 0o100644,
+            oid,
+            size: bytes.length,
+            mtime: null,
+            ino: null,
+          })),
+        );
+        const beforeStatements = workspace.storage.statementCount;
+        checkoutTree(
+          workspace.repo,
+          counted,
+          null,
+          {
+            maxSourceRowsPerPass: 50_000,
+            maxWorktreeRowsPerPass: 50_000,
+            maxWriteBytes: 64 * 1024 * 1024,
+          },
+          scratch,
+        );
+        expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1_000);
+        expect([...scratch.indexScan()]).toEqual([]);
+      },
+    );
 
     expect(recursiveRemovals).toBe(1);
     expect(rmdirCalls).toBe(0);
@@ -1259,32 +1294,35 @@ describe("tree and index write plumbing", () => {
       },
     };
 
-    workspace.repo.store.withScratchIndex("binding-batches", (scratch) => {
-      scratch.indexReplace(
-        directories.map((directory) => ({
-          path: `${directory}/tracked.txt`,
-          stage: 0,
-          mode: 0o100644,
-          oid,
-          size: 0,
-          mtime: null,
-          ino: null,
-        })),
-      );
-      const beforeStatements = workspace.storage.statementCount;
-      checkoutTree(
-        workspace.repo,
-        synthetic,
-        null,
-        {
-          maxSourceRowsPerPass: 50_000,
-          maxWorktreeRowsPerPass: 50_000,
-          maxWriteBytes: 64 * 1024 * 1024,
-        },
-        scratch,
-      );
-      expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1_000);
-    });
+    sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned(
+      "binding-batches",
+      (scratch) => {
+        scratch.indexReplace(
+          directories.map((directory) => ({
+            path: `${directory}/tracked.txt`,
+            stage: 0,
+            mode: 0o100644,
+            oid,
+            size: 0,
+            mtime: null,
+            ino: null,
+          })),
+        );
+        const beforeStatements = workspace.storage.statementCount;
+        checkoutTree(
+          workspace.repo,
+          synthetic,
+          null,
+          {
+            maxSourceRowsPerPass: 50_000,
+            maxWorktreeRowsPerPass: 50_000,
+            maxWriteBytes: 64 * 1024 * 1024,
+          },
+          scratch,
+        );
+        expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1_000);
+      },
+    );
 
     expect(recursiveBatches.length).toBeGreaterThan(1);
     expect(recursiveBatches.length).toBeLessThanOrEqual(16);
@@ -1325,7 +1363,7 @@ describe("tree and index write plumbing", () => {
       },
     };
 
-    workspace.repo.store.withScratchIndex("scale", (scratch) => {
+    sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned("scale", (scratch) => {
       scratch.indexReplace(rows());
       const paged = pageIndex(scratch, 513);
       const beforeStatements = workspace.storage.statementCount;
@@ -1346,7 +1384,7 @@ describe("tree and index write plumbing", () => {
     const workspace = makeRepo("/");
     const oid = workspace.repo.store.write("blob", utf8.encode("entry\n"));
 
-    workspace.repo.store.withScratchIndex("empty", (scratch) => {
+    sharedRepoStoreMutations(workspace.repo.store).withScratchIndexOwned("empty", (scratch) => {
       scratch.indexReplace([
         {
           path: "entry.txt",
@@ -1367,7 +1405,7 @@ describe("tree and index write plumbing", () => {
         { empty: true, updateWorktree: true },
       ]) {
         expect(() =>
-          Reflect.apply(readTree, undefined, [
+          Reflect.apply(readTreeOwned, undefined, [
             workspace.repo,
             workspace.worktree,
             options,

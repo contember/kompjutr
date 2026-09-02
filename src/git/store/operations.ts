@@ -1,8 +1,7 @@
 // Durable, bounded state for one incomplete two-head merge.
 
-import { isOid, utf8 } from "../common/bytes.js";
+import { isOid } from "../common/bytes.js";
 import { CorruptError, GitError } from "../common/errors.js";
-import { hashObject } from "../common/objects.js";
 
 export const MAX_MERGE_TOUCHED_PATHS = 1_000;
 export const MAX_MERGE_PATH_BYTES = 2_200;
@@ -374,63 +373,6 @@ function validateMergeJournal(
   }
 }
 
-function savedIdentityVector(identity: MergeSavedIdentity | null): readonly unknown[] | null {
-  return identity === null ? null : [identity.name, identity.email];
-}
-
-function indexSnapshotVector(snapshot: MergeIndexSnapshot | null): readonly unknown[] | null {
-  return snapshot === null
-    ? null
-    : [
-        snapshot.stage,
-        snapshot.mode,
-        snapshot.oid,
-        snapshot.size,
-        snapshot.mtime,
-        snapshot.ino,
-        snapshot.rev,
-      ];
-}
-
-function worktreeSnapshotVector(snapshot: MergeWorktreeSnapshot): readonly unknown[] {
-  if (snapshot.kind === "absent") return [snapshot.kind];
-  if (snapshot.kind === "directory") return [snapshot.kind, snapshot.mode, snapshot.revision];
-  return [snapshot.kind, snapshot.mode, snapshot.oid, snapshot.revision];
-}
-
-/** Bind every persisted operation field to one deterministic content identity. */
-export function mergeJournalIntegrityOid(
-  state: MergeStateMetadata,
-  touched: readonly MergeTouchedPath[],
-): string {
-  validateMergeJournal(state, touched);
-  const payload: readonly unknown[] = [
-    2,
-    [
-      state.originalHeadRef,
-      state.originalHeadOid,
-      state.currentParentOid,
-      state.incomingParentOid,
-      state.phase,
-      state.mode,
-      state.mergeOrigin,
-      state.currentLabel,
-      state.incomingLabel,
-      state.message,
-      savedIdentityVector(state.author),
-      savedIdentityVector(state.committer),
-    ],
-    touched.map((entry) => [
-      entry.path,
-      entry.logicalPath,
-      entry.purpose,
-      indexSnapshotVector(entry.index),
-      worktreeSnapshotVector(entry.worktree),
-    ]),
-  ];
-  return hashObject("blob", utf8.encode(JSON.stringify(payload)));
-}
-
 export function mergeAlreadyActive(): GitError {
   return new GitError("EMERGEACTIVE", "a merge operation is already active");
 }
@@ -500,7 +442,8 @@ interface OperationJournalFields<S extends OperationStateMetadata> {
   state: S;
   steps: readonly OperationStepMetadata[];
   touched: readonly MergeTouchedPath[];
-  integrityOid: string;
+  replayed: number;
+  skipped: number;
 }
 
 export type MergeOperationJournal = OperationJournalFields<MergeOperationStateMetadata> & {
@@ -759,12 +702,17 @@ function validateSequencedState(
   }
 }
 
-function validateOperationJournal(
+export function validateOperationJournal(
   state: OperationStateMetadata,
   touched: readonly MergeTouchedPath[],
   steps: readonly OperationStepMetadata[],
 ): void {
-  if (state.kind === "merge") throw new CorruptError("merge journal entered replay validation");
+  if (state.kind === "merge") {
+    if (steps.length !== 0) throw new CorruptError("merge journal retained replay steps");
+    const { kind: _kind, ...mergeState } = state;
+    validateMergeJournal(mergeState, touched);
+    return;
+  }
   if (touched.length > MAX_MERGE_TOUCHED_PATHS) {
     throw new GitError(
       "E2BIG",
@@ -784,79 +732,6 @@ function validateOperationJournal(
   for (const entry of touched) {
     validateMergeTouchedPath(entry);
   }
-}
-
-function replaySavedIdentityVector(identity: MergeSavedIdentity | null): readonly unknown[] | null {
-  return identity === null ? null : [identity.name, identity.email];
-}
-
-function touchedVector(entry: MergeTouchedPath): readonly unknown[] {
-  const index =
-    entry.index === null
-      ? null
-      : [
-          entry.index.stage,
-          entry.index.mode,
-          entry.index.oid,
-          entry.index.size,
-          entry.index.mtime,
-          entry.index.ino,
-          entry.index.rev,
-        ];
-  const worktree =
-    entry.worktree.kind === "absent"
-      ? [entry.worktree.kind]
-      : entry.worktree.kind === "directory"
-        ? [entry.worktree.kind, entry.worktree.mode, entry.worktree.revision]
-        : [entry.worktree.kind, entry.worktree.mode, entry.worktree.oid, entry.worktree.revision];
-  return [entry.path, entry.logicalPath, entry.purpose, index, worktree];
-}
-
-function stepVector(step: OperationStepMetadata): readonly unknown[] {
-  return [step.sourceOid, step.selectedParentOid, step.mainline, step.outcome, step.resultOid];
-}
-
-function operationHeaderVector(
-  state: ReplayStateMetadata | RebaseStateMetadata,
-): readonly unknown[] {
-  const common: readonly unknown[] = [
-    state.originalHeadRef,
-    state.originalHeadOid,
-    state.phase,
-    state.currentLabel,
-    state.incomingLabel,
-    state.message,
-    replaySavedIdentityVector(state.author),
-    replaySavedIdentityVector(state.committer),
-  ];
-  return state.kind === "rebase"
-    ? [...common, state.upstreamOid, state.baseOid, state.currentParentOid, state.currentStep]
-    : [...common, state.emptyReason];
-}
-
-export function operationJournalIntegrityOid(
-  state: OperationStateMetadata,
-  touched: readonly MergeTouchedPath[],
-  steps?: readonly OperationStepMetadata[],
-): string {
-  if (state.kind === "merge") {
-    if (steps !== undefined && steps.length !== 0) {
-      throw new CorruptError("merge journal retained replay steps");
-    }
-    const { kind: _kind, ...mergeState } = state;
-    return mergeJournalIntegrityOid(mergeState, touched);
-  }
-  const sequence = steps ?? (state.kind === "rebase" ? undefined : operationStepsForState(state));
-  if (sequence === undefined) throw new CorruptError("rebase journal is missing its replay steps");
-  validateOperationJournal(state, touched, sequence);
-  const payload: readonly unknown[] = [
-    3,
-    state.kind,
-    operationHeaderVector(state),
-    sequence.map(stepVector),
-    touched.map(touchedVector),
-  ];
-  return hashObject("blob", utf8.encode(JSON.stringify(payload)));
 }
 
 export function mergeOperationState(state: MergeStateMetadata): MergeOperationStateMetadata {

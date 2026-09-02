@@ -1,3 +1,5 @@
+import { sqliteGitDatabaseMutations } from "../store/database.js";
+import { sharedRepoStoreMutations } from "../store/shared.js";
 // Creating a repository. There is no directory to make and no template to
 // copy: a repository is one row in `git_repositories` plus whatever refs
 // and config follow.
@@ -23,8 +25,12 @@ export function initRepository(context: GitContext, options: InitOptions = {}): 
   const root = normalizePath(options.dir ?? "/");
   if (context.database.checkoutAt(root) !== null) throw new AlreadyInitializedError(root);
   const branch = options.defaultBranch ?? "main";
-  const row = context.database.createRepository(root, `ref: refs/heads/${branch}`);
+  const row = sqliteGitDatabaseMutations(context.database).createRepositoryOwned(
+    root,
+    `ref: refs/heads/${branch}`,
+  );
   const repo = new Repository(context.database.openCheckout(row));
-  if (options.bare === true) repo.store.configSet("core.bare", "true");
+  if (options.bare === true)
+    sharedRepoStoreMutations(repo.store).configSetOwned("core.bare", "true");
   return repo;
 }

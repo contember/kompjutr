@@ -1,3 +1,4 @@
+import { sharedRepoStoreMutations } from "../store/shared.js";
 // Repository config and the remotes described by it. Config is
 // relational — one row per value, keyed by the dotted path — so there is
 // no config file to parse and no section header to preserve.
@@ -35,12 +36,13 @@ export interface ConfigSetOptions {
 
 export function configSet(repo: Repository, options: ConfigSetOptions): void {
   if (options.value === undefined) {
-    repo.store.configUnset(options.path);
+    sharedRepoStoreMutations(repo.store).configUnsetOwned(options.path);
     return;
   }
   const value = String(options.value);
-  if (options.append === true) repo.store.configAdd(options.path, value);
-  else repo.store.configSet(options.path, value);
+  if (options.append === true)
+    sharedRepoStoreMutations(repo.store).configAddOwned(options.path, value);
+  else sharedRepoStoreMutations(repo.store).configSetOwned(options.path, value);
 }
 
 export interface RemoteAddOptions {
@@ -60,8 +62,8 @@ export function remoteAdd(repo: Repository, options: RemoteAddOptions): void {
     throw new GitError("EREMOTEFAIL", `remote ${name} already exists`);
   }
   repo.store.db.transactionSync(() => {
-    repo.store.configSet(urlPath, url);
-    repo.store.configSet(fetchPath, fetch);
+    sharedRepoStoreMutations(repo.store).configSetOwned(urlPath, url);
+    sharedRepoStoreMutations(repo.store).configSetOwned(fetchPath, fetch);
   });
 }
 
@@ -88,7 +90,7 @@ export function remoteSetUrl(repo: Repository, options: RemoteSetUrlOptions): vo
   const path = `${REMOTE}${input.name}.url`;
   repo.store.db.transactionSync(() => {
     requireSingleRemoteUrl(repo, input.name, path);
-    repo.store.configSet(path, input.url);
+    sharedRepoStoreMutations(repo.store).configSetOwned(path, input.url);
   });
 }
 
@@ -161,7 +163,7 @@ export function remoteRemove(repo: Repository, options: RemoteRemoveOptions): vo
   const paths = repo.store.configPaths(`${REMOTE}${name}.`);
   if (paths.length === 0) throw new GitError("EREMOTEFAIL", `no such remote: ${name}`);
   repo.store.db.transactionSync(() => {
-    for (const path of paths) repo.store.configUnset(path);
+    for (const path of paths) sharedRepoStoreMutations(repo.store).configUnsetOwned(path);
   });
 }
 

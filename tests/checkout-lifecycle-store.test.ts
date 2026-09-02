@@ -92,16 +92,15 @@ function insertBusyOperation(db: TestDatabase, checkoutId: number): void {
         current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode, merge_origin,
         current_step, step_count, current_label, incoming_label, message,
         author_name, author_email, committer_name, committer_email,
-        touched_count, integrity_oid)
+        touched_count, replayed_count, skipped_count)
      VALUES (?, 'merge', 'refs/heads/topic', ?, 'conflicted', NULL,
              ?, ?, NULL, NULL, 'commit', 'merge',
              0, 0, 'HEAD', 'topic', 'merge topic',
-             NULL, NULL, NULL, NULL, 0, ?)`,
+             NULL, NULL, NULL, NULL, 0, 0, 0)`,
     checkoutId,
     OID,
     OID,
     OTHER_OID,
-    OID,
   );
 }
 

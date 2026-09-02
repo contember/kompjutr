@@ -460,6 +460,12 @@ describe("provisional clone publication", () => {
       workspace.database.publishProvisionalClone(owner, workspace.context.now(), (store) => {
         expect(store.write("blob", bytes)).toBe(oid);
         expect(store.read(oid)?.data).toEqual(bytes);
+        expect(() => store.shared.configSet("prepare.reentry", "blocked")).toThrowError(
+          expect.objectContaining({ code: "EREENTRANT" }),
+        );
+        expect(() =>
+          workspace.database.createRepository("/prepare-reentry", "ref: refs/heads/main"),
+        ).toThrowError(expect.objectContaining({ code: "EREENTRANT" }));
         throw retry;
       }),
     ).toThrow(retry);

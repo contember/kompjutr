@@ -5,7 +5,7 @@ import type { SqlDatabase } from "../../db/db.js";
 import { CorruptError } from "../common/errors.js";
 import { MAX_OBJECT_BYTES } from "../common/objects.js";
 import { BLOB_ID_GENERATION_EXHAUSTED, MAX_BLOB_ID_CACHE_ROWS } from "./blob-id-cache.js";
-import { OPERATION_STATE_TABLE } from "./operation-schema.js";
+import { OPERATION_SCHEMA_STATEMENTS } from "./operation-schema.js";
 import { MAX_PROMISOR_REMOTE_NAME_BYTES, MAX_PROMISOR_URL_BYTES } from "./promisor.js";
 import { REFLOG_SCHEMA_STATEMENTS } from "./reflog-schema.js";
 
@@ -49,23 +49,6 @@ const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
   cache_bytes INTEGER NOT NULL CHECK (typeof(cache_bytes) = 'integer' AND cache_bytes >= 0),
   PRIMARY KEY (repo_id, oid),
   FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
-) WITHOUT ROWID`;
-
-const OPERATION_STEPS_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_steps (
-  checkout_id INTEGER NOT NULL CHECK (
-    typeof(checkout_id) = 'integer' AND checkout_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
-  ),
-  ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
-  source_oid TEXT NOT NULL,
-  selected_parent_oid TEXT,
-  mainline INTEGER CHECK (mainline IS NULL OR (typeof(mainline) = 'integer' AND mainline >= 1)),
-  outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'applied', 'skipped')),
-  result_oid TEXT,
-  PRIMARY KEY (checkout_id, ordinal),
-  CHECK ((outcome = 'applied' AND result_oid IS NOT NULL)
-      OR (outcome IN ('pending', 'skipped') AND result_oid IS NULL)),
-  CHECK (mainline IS NULL OR selected_parent_oid IS NOT NULL),
-  FOREIGN KEY (checkout_id) REFERENCES git_operation_state (checkout_id) ON DELETE CASCADE
 ) WITHOUT ROWID`;
 
 const STATEMENTS = [
@@ -368,51 +351,7 @@ const STATEMENTS = [
 
   // One durable incomplete operation header; ordered replay state lives in
   // `git_operation_steps` and touched rows belong only to a suspended step.
-  OPERATION_STATE_TABLE,
-
-  OPERATION_STEPS_TABLE,
-
-  // Original identities for only paths owned by the operation. Physical paths
-  // include conflict relocations; logical_path ties them back to the index path.
-  `CREATE TABLE IF NOT EXISTS git_operation_touched (
-     checkout_id INTEGER NOT NULL,
-     ordinal INTEGER NOT NULL,
-     path TEXT NOT NULL,
-     logical_path TEXT NOT NULL,
-     purpose TEXT NOT NULL CHECK (
-       purpose IN ('primary', 'current-relocation', 'incoming-relocation')
-     ),
-     index_stage INTEGER,
-     index_mode INTEGER,
-     index_oid TEXT,
-     index_size INTEGER,
-     index_mtime INTEGER,
-     index_ino INTEGER,
-     index_rev INTEGER,
-     worktree_kind TEXT NOT NULL CHECK (
-       worktree_kind IN ('absent', 'file', 'symlink', 'directory')
-     ),
-     worktree_mode INTEGER,
-     worktree_oid TEXT,
-     worktree_revision INTEGER,
-     PRIMARY KEY (checkout_id, ordinal),
-     UNIQUE (checkout_id, path),
-     CHECK (
-       (index_stage IS NULL AND index_mode IS NULL AND index_oid IS NULL
-          AND index_size IS NULL AND index_mtime IS NULL AND index_ino IS NULL
-          AND index_rev IS NULL)
-       OR (index_stage = 0 AND index_mode IS NOT NULL AND index_oid IS NOT NULL)
-     ),
-     CHECK (
-       (worktree_kind = 'absent' AND worktree_mode IS NULL
-          AND worktree_oid IS NULL AND worktree_revision IS NULL)
-       OR (worktree_kind IN ('file', 'symlink') AND worktree_mode IS NOT NULL
-          AND worktree_oid IS NOT NULL AND worktree_revision IS NOT NULL)
-       OR (worktree_kind = 'directory' AND worktree_mode IS NOT NULL
-          AND worktree_oid IS NULL AND worktree_revision IS NOT NULL)
-     ),
-     FOREIGN KEY (checkout_id) REFERENCES git_operation_state (checkout_id) ON DELETE CASCADE
-   ) WITHOUT ROWID`,
+  ...OPERATION_SCHEMA_STATEMENTS,
 
   // The working tree's opaque content ids mapped to blob oids. A file whose
   // `fs_nodes.content_id` is in here is unchanged: `status` and `add` answer

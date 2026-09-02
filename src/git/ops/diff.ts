@@ -1,3 +1,4 @@
+import { sharedRepoStoreMutations } from "../store/shared.js";
 // `diff` and `diffSummary`.
 //
 // Four modes: working tree vs HEAD, working tree vs a ref, a commit pair,
@@ -1467,7 +1468,7 @@ function resolveWorkingCandidateAfters(
   const hashes = exact
     ? hashExactWorktreePaths(repo, worktree, unresolved, { write: false })
     : hashWorktreePathsOwned(repo, worktree, unresolved, { write: false }, hashCursor);
-  repo.store.upsertBlobIds(
+  sharedRepoStoreMutations(repo.store).upsertBlobIdsOwned(
     [...hashes.values()].flatMap((hashed) => {
       const contentId = hashed.stat.contentId;
       return contentId === null ? [] : [{ contentId, oid: hashed.oid }];

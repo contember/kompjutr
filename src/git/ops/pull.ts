@@ -5,6 +5,7 @@ import { isOid } from "../common/bytes.js";
 import { CorruptError, GitError, UnsupportedOperationError } from "../common/errors.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../common/ref-name.js";
 import { normalizeRemoteUrl } from "../protocol/remote.js";
+import { withGitMutationGuardOwned } from "../store/database.js";
 import { type GitContext, type GitIdentity, nestedRoots } from "./context.js";
 import type { PullResult } from "./kinds.js";
 import { type MergeBehavior, mergeOwned } from "./merge.js";
@@ -355,50 +356,52 @@ export async function pull(
       },
     },
   );
-  if (fetched.fetchHead === null) {
+  const upstream = fetched.fetchHead;
+  if (upstream === null) {
     throw new GitError("EFETCHFAIL", `remote ${plan.remote} advertised no usable upstream ref`);
   }
-  validatePullAfterFetch(repo, options, plan);
+  return withGitMutationGuardOwned(context.database, () => {
+    validatePullAfterFetch(repo, options, plan);
+    if (plan.strategy === "rebase") {
+      const rebaseOptions = {
+        upstream,
+        ...(options.committer === undefined ? {} : { committer: options.committer }),
+        ...(options.env === undefined ? {} : { env: options.env }),
+      };
+      return {
+        strategy: "rebase",
+        result: startRebaseExcluding(
+          context,
+          repo,
+          worktree,
+          nestedRoots(context, repo.root),
+          rebaseOptions,
+        ),
+      };
+    }
 
-  if (plan.strategy === "rebase") {
-    const rebaseOptions = {
-      upstream: fetched.fetchHead,
-      ...(options.committer === undefined ? {} : { committer: options.committer }),
-      ...(options.env === undefined ? {} : { env: options.env }),
-    };
-    return {
-      strategy: "rebase",
-      result: startRebaseExcluding(
-        context,
-        repo,
-        worktree,
-        nestedRoots(context, repo.root),
-        rebaseOptions,
-      ),
-    };
-  }
-
-  const message = options.message === undefined ? defaultPullMessage(plan) : options.message;
-  const result = await mergeOwned(
-    context,
-    repo,
-    worktree,
-    {
-      theirs: fetched.fetchHead,
-      ours: plan.headRef,
-      ...(plan.fastForward === undefined ? {} : { fastForward: plan.fastForward }),
-      ...(plan.fastForwardOnly === undefined ? {} : { fastForwardOnly: plan.fastForwardOnly }),
-      message,
-      ...(options.author === undefined ? {} : { author: options.author }),
-      ...(options.committer === undefined ? {} : { committer: options.committer }),
-      ...(options.env === undefined ? {} : { env: options.env }),
-      ...(options.commit === undefined ? {} : { commit: options.commit }),
-    },
-    {
-      ...behavior,
-      incomingLabel: fetched.fetchHead,
-      origin: "pull",
-    },
-  );
-  return { strategy: "merge", result };
+    const message = options.message === undefined ? defaultPullMessage(plan) : options.message;
+    const result = mergeOwned(
+      context,
+      repo,
+      worktree,
+      {
+        theirs: upstream,
+        ours: plan.headRef,
+        ...(plan.fastForward === undefined ? {} : { fastForward: plan.fastForward }),
+        ...(plan.fastForwardOnly === undefined ? {} : { fastForwardOnly: plan.fastForwardOnly }),
+        message,
+        ...(options.author === undefined ? {} : { author: options.author }),
+        ...(options.committer === undefined ? {} : { committer: options.committer }),
+        ...(options.env === undefined ? {} : { env: options.env }),
+        ...(options.commit === undefined ? {} : { commit: options.commit }),
+      },
+      {
+        ...behavior,
+        incomingLabel: upstream,
+        origin: "pull",
+      },
+    );
+    return { strategy: "merge", result };
+  });
 }

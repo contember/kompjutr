@@ -45,6 +45,7 @@ import { ScratchIndexStore } from "./index-table.js";
 import { isThenableResult, requireBooleanProbe } from "./json-pages.js";
 import { advanceCheckoutRevision, requireScratchIndexName } from "./lifecycle.js";
 import { bumpMaintenanceRootEpoch } from "./maintenance/control.js";
+import { withGitMutationGuard } from "./mutation-guard.js";
 import { ObjectTable } from "./objects.js";
 import { PackStore } from "./packs.js";
 import { PromisorTable } from "./promisor.js";
@@ -69,7 +70,52 @@ interface CheckoutOperations {
   readonly sharedRepoId: number;
   readonly checkoutId: number;
   readonly isPrimary: boolean;
-  destroy(): void;
+  destroyOwned(): void;
+}
+interface SharedRepoStoreMutations {
+  upsertBlobIdsOwned(mappings: Iterable<BlobIdMapping>): void;
+  registerPromisorRemoteOwned(remoteName: string, url: string): PromisorRemote;
+  addPromisedBlobsOwned(remoteName: string, oids: Iterable<string>): void;
+  addPromisedBlobsFromPackTreesOwned(remoteName: string, packId: number): void;
+  writeOwned(type: ObjectType, data: Uint8Array): string;
+  writeStreamOwned(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string;
+  writeBatchOwned(options?: ObjectBatchOptions): OwnedObjectBatch;
+  objectTableOwned(): ObjectTable;
+  withScratchIndexOwned<T>(name: string, body: (index: IndexStore) => T): T;
+  setRefOwned(name: string, target: string): void;
+  updateRefExpectedOwned(name: string, expectedOid: string, targetOid: string): void;
+  deleteRefOwned(name: string): void;
+  updateRefsOwned(puts: Iterable<RefRow>, deletes?: Iterable<string>): void;
+  mutateSharedRefsOwned(mutation: RefMutation, metadata: RefLogMetadata): boolean;
+  mutateRefsOwned(headOwner: HeadOwner, mutation: RefMutation, metadata: RefLogMetadata): boolean;
+  publishTrackingRefOwned(
+    token: TrackingRefPublicationToken,
+    target: string | null,
+    metadata: RefLogMetadata,
+  ): boolean;
+  publishFetchRefsOwned(
+    token: FetchPublicationToken,
+    plan: FetchPublicationPlan,
+    metadata: RefLogMetadata,
+  ): boolean;
+  configSetOwned(path: string, value: string): void;
+  configAddOwned(path: string, value: string): void;
+  configUnsetOwned(path: string): void;
+  configMoveSectionOwned(sourcePrefix: string, destinationPrefix: string): void;
+  cacheCommitOwned(oid: string, data: Uint8Array): CommitCacheEntry | null;
+  cacheCommitsOwned(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult;
+  setShallowOwned(add: Iterable<string>, remove?: Iterable<string>): void;
+  destroyOwned(): void;
+}
+
+const SHARED_REPO_STORE_MUTATIONS = new WeakMap<object, SharedRepoStoreMutations>();
+
+/** Internal mutation capability; intentionally absent from the package facade. */
+export function sharedRepoStoreMutations(store: SharedRepoStore): SharedRepoStoreMutations {
+  const mutations = SHARED_REPO_STORE_MUTATIONS.get(store);
+  if (mutations === undefined)
+    throw new CorruptError("shared store mutation capability is missing");
+  return mutations;
 }
 
 class ScratchTransactionCoordinator {
@@ -220,6 +266,40 @@ export class SharedRepoStore {
       throw new CorruptError("shared store availability probe returned an invalid value");
     }
     this.#hasLoose = availability.has_loose === 1;
+    SHARED_REPO_STORE_MUTATIONS.set(this, {
+      upsertBlobIdsOwned: (mappings) => this.upsertBlobIdsOwned(mappings),
+      registerPromisorRemoteOwned: (remoteName, url) =>
+        this.registerPromisorRemoteOwned(remoteName, url),
+      addPromisedBlobsOwned: (remoteName, oids) => this.addPromisedBlobsOwned(remoteName, oids),
+      addPromisedBlobsFromPackTreesOwned: (remoteName, packId) =>
+        this.addPromisedBlobsFromPackTreesOwned(remoteName, packId),
+      writeOwned: (type, data) => this.writeOwned(type, data),
+      writeStreamOwned: (type, size, chunks) => this.writeStreamOwned(type, size, chunks),
+      writeBatchOwned: (batchOptions) => this.writeBatchOwned(batchOptions),
+      objectTableOwned: () => this.#objectOps(),
+      withScratchIndexOwned: (name, body) => this.withScratchIndexOwned(name, body),
+      setRefOwned: (name, target) => this.setRefOwned(name, target),
+      updateRefExpectedOwned: (name, expectedOid, targetOid) =>
+        this.updateRefExpectedOwned(name, expectedOid, targetOid),
+      deleteRefOwned: (name) => this.deleteRefOwned(name),
+      updateRefsOwned: (puts, deletes) => this.updateRefsOwned(puts, deletes),
+      mutateSharedRefsOwned: (mutation, metadata) => this.mutateSharedRefsOwned(mutation, metadata),
+      mutateRefsOwned: (headOwner, mutation, metadata) =>
+        this.mutateRefsOwned(headOwner, mutation, metadata),
+      publishTrackingRefOwned: (token, target, metadata) =>
+        this.publishTrackingRefOwned(token, target, metadata),
+      publishFetchRefsOwned: (token, plan, metadata) =>
+        this.publishFetchRefsOwned(token, plan, metadata),
+      configSetOwned: (path, value) => this.configSetOwned(path, value),
+      configAddOwned: (path, value) => this.configAddOwned(path, value),
+      configUnsetOwned: (path) => this.configUnsetOwned(path),
+      configMoveSectionOwned: (sourcePrefix, destinationPrefix) =>
+        this.configMoveSectionOwned(sourcePrefix, destinationPrefix),
+      cacheCommitOwned: (oid, data) => this.cacheCommitOwned(oid, data),
+      cacheCommitsOwned: (entries) => this.cacheCommitsOwned(entries),
+      setShallowOwned: (add, remove) => this.setShallowOwned(add, remove),
+      destroyOwned: () => this.destroyOwned(),
+    });
   }
 
   bindCheckoutOperations(operations: CheckoutOperations, headOwner: HeadOwner): void {
@@ -249,8 +329,13 @@ export class SharedRepoStore {
     }
   }
 
-  /** Run one named scratch index inside the caller's synchronous transaction. */
+  /** Run one named scratch index as an isolated public Git mutation. */
   withScratchIndex<T>(name: string, body: (index: IndexStore) => T): T {
+    return withGitMutationGuard(this.db, () => this.withScratchIndexOwned(name, body));
+  }
+
+  /** Run one named scratch index while the caller owns the mutation guard. */
+  private withScratchIndexOwned<T>(name: string, body: (index: IndexStore) => T): T {
     const checkedName = requireScratchIndexName(name);
     const outermost = this.#scratchTransactions.enter();
     let opened = false;
@@ -354,10 +439,6 @@ export class SharedRepoStore {
     return this.#objectTable;
   }
 
-  get objectTable(): ObjectTable {
-    return this.#objectOps();
-  }
-
   get packs(): PackStore {
     return this.#packs;
   }
@@ -421,6 +502,10 @@ export class SharedRepoStore {
   }
 
   upsertBlobIds(mappings: Iterable<BlobIdMapping>): void {
+    withGitMutationGuard(this.db, () => this.upsertBlobIdsOwned(mappings));
+  }
+
+  private upsertBlobIdsOwned(mappings: Iterable<BlobIdMapping>): void {
     this.#blobIds.upsert(mappings);
   }
 
@@ -437,6 +522,10 @@ export class SharedRepoStore {
   }
 
   registerPromisorRemote(remoteName: string, url: string): PromisorRemote {
+    return withGitMutationGuard(this.db, () => this.registerPromisorRemoteOwned(remoteName, url));
+  }
+
+  private registerPromisorRemoteOwned(remoteName: string, url: string): PromisorRemote {
     return this.#promisor.register(remoteName, url);
   }
 
@@ -445,10 +534,20 @@ export class SharedRepoStore {
   }
 
   addPromisedBlobs(remoteName: string, oids: Iterable<string>): void {
+    withGitMutationGuard(this.db, () => this.addPromisedBlobsOwned(remoteName, oids));
+  }
+
+  private addPromisedBlobsOwned(remoteName: string, oids: Iterable<string>): void {
     this.#promisor.addBlobs(remoteName, oids);
   }
 
   addPromisedBlobsFromPackTrees(remoteName: string, packId: number): void {
+    withGitMutationGuard(this.db, () =>
+      this.addPromisedBlobsFromPackTreesOwned(remoteName, packId),
+    );
+  }
+
+  private addPromisedBlobsFromPackTreesOwned(remoteName: string, packId: number): void {
     this.#promisor.addBlobsFromPackTrees(remoteName, packId);
   }
 
@@ -515,23 +614,37 @@ export class SharedRepoStore {
   }
 
   write(type: ObjectType, data: Uint8Array): string {
+    return withGitMutationGuard(this.db, () => this.writeOwned(type, data));
+  }
+
+  private writeOwned(type: ObjectType, data: Uint8Array): string {
     return this.#objectOps().write(type, data);
   }
 
   writeStream(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string {
+    return withGitMutationGuard(this.db, () => this.writeStreamOwned(type, size, chunks));
+  }
+
+  private writeStreamOwned(
+    type: ObjectType,
+    size: number,
+    chunks: () => Iterable<Uint8Array>,
+  ): string {
     return this.#objectOps().writeStream(type, size, chunks);
   }
 
   writeBatch(options: ObjectBatchOptions = {}): ObjectBatch {
-    return this.#objectOps().writeBatch(options);
+    return this.#objectOps().writeBatchGuarded(options, (body) =>
+      withGitMutationGuard(this.db, body),
+    );
   }
 
-  writeBatchOwned(options: ObjectBatchOptions = {}): OwnedObjectBatch {
+  private writeBatchOwned(options: ObjectBatchOptions = {}): OwnedObjectBatch {
     return this.#objectOps().writeBatchOwned(options);
   }
 
   writeObjects<T>(body: (batch: ObjectBatch) => T, options: ObjectBatchOptions = {}): T {
-    return this.#objectOps().writeObjects(body, options);
+    return withGitMutationGuard(this.db, () => this.#objectOps().writeObjects(body, options));
   }
 
   readChunks(oid: string): Iterable<Uint8Array> | null {
@@ -552,29 +665,53 @@ export class SharedRepoStore {
   }
 
   setRef(name: string, target: string): void {
+    withGitMutationGuard(this.db, () => this.setRefOwned(name, target));
+  }
+
+  private setRefOwned(name: string, target: string): void {
     if (name === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
     this.#refs.setRef(this.#heads(), name, target);
   }
 
   updateRefExpected(name: string, expectedOid: string, targetOid: string): void {
+    withGitMutationGuard(this.db, () => this.updateRefExpectedOwned(name, expectedOid, targetOid));
+  }
+
+  private updateRefExpectedOwned(name: string, expectedOid: string, targetOid: string): void {
     this.#refs.updateRefExpected(this.#heads(), name, expectedOid, targetOid);
   }
 
   deleteRef(name: string): void {
+    withGitMutationGuard(this.db, () => this.deleteRefOwned(name));
+  }
+
+  private deleteRefOwned(name: string): void {
     if (name === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
     this.#refs.deleteRef(this.#heads(), name);
   }
 
   updateRefs(puts: Iterable<RefRow>, deletes: Iterable<string> = []): void {
+    withGitMutationGuard(this.db, () => this.updateRefsOwned(puts, deletes));
+  }
+
+  private updateRefsOwned(puts: Iterable<RefRow>, deletes: Iterable<string> = []): void {
     this.#refs.updateRefs(this.#heads(), puts, deletes);
   }
 
   mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
+    return withGitMutationGuard(this.db, () => this.mutateSharedRefsOwned(mutation, metadata));
+  }
+
+  private mutateSharedRefsOwned(mutation: RefMutation, metadata: RefLogMetadata): boolean {
     if (mutation.head !== undefined) throw new GitError("EINVAL", "HEAD belongs to a checkout");
     return this.#refs.mutateRefs(this.#heads(), mutation, metadata);
   }
 
-  mutateRefsOwned(headOwner: HeadOwner, mutation: RefMutation, metadata: RefLogMetadata): boolean {
+  private mutateRefsOwned(
+    headOwner: HeadOwner,
+    mutation: RefMutation,
+    metadata: RefLogMetadata,
+  ): boolean {
     return this.#refs.mutateRefs(headOwner, mutation, metadata);
   }
 
@@ -590,6 +727,16 @@ export class SharedRepoStore {
     target: string | null,
     metadata: RefLogMetadata,
   ): boolean {
+    return withGitMutationGuard(this.db, () =>
+      this.publishTrackingRefOwned(token, target, metadata),
+    );
+  }
+
+  private publishTrackingRefOwned(
+    token: TrackingRefPublicationToken,
+    target: string | null,
+    metadata: RefLogMetadata,
+  ): boolean {
     return this.#fetchPublication.publishTrackingRef(token, target, metadata);
   }
 
@@ -601,6 +748,14 @@ export class SharedRepoStore {
   }
 
   publishFetchRefs(
+    token: FetchPublicationToken,
+    plan: FetchPublicationPlan,
+    metadata: RefLogMetadata,
+  ): boolean {
+    return withGitMutationGuard(this.db, () => this.publishFetchRefsOwned(token, plan, metadata));
+  }
+
+  private publishFetchRefsOwned(
     token: FetchPublicationToken,
     plan: FetchPublicationPlan,
     metadata: RefLogMetadata,
@@ -651,14 +806,26 @@ export class SharedRepoStore {
   }
 
   configSet(path: string, value: string): void {
+    withGitMutationGuard(this.db, () => this.configSetOwned(path, value));
+  }
+
+  private configSetOwned(path: string, value: string): void {
     this.#config.set(path, value);
   }
 
   configAdd(path: string, value: string): void {
+    withGitMutationGuard(this.db, () => this.configAddOwned(path, value));
+  }
+
+  private configAddOwned(path: string, value: string): void {
     this.#config.add(path, value);
   }
 
   configUnset(path: string): void {
+    withGitMutationGuard(this.db, () => this.configUnsetOwned(path));
+  }
+
+  private configUnsetOwned(path: string): void {
     this.#config.unset(path);
   }
 
@@ -667,6 +834,12 @@ export class SharedRepoStore {
   }
 
   configMoveSection(sourcePrefix: string, destinationPrefix: string): void {
+    withGitMutationGuard(this.db, () =>
+      this.configMoveSectionOwned(sourcePrefix, destinationPrefix),
+    );
+  }
+
+  private configMoveSectionOwned(sourcePrefix: string, destinationPrefix: string): void {
     this.#config.moveSection(sourcePrefix, destinationPrefix);
   }
 
@@ -679,10 +852,18 @@ export class SharedRepoStore {
   }
 
   cacheCommit(oid: string, data: Uint8Array): CommitCacheEntry | null {
+    return withGitMutationGuard(this.db, () => this.cacheCommitOwned(oid, data));
+  }
+
+  private cacheCommitOwned(oid: string, data: Uint8Array): CommitCacheEntry | null {
     return indexCommitSource(this.db, { repoId: this.repoId, oid, data });
   }
 
   cacheCommits(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
+    return withGitMutationGuard(this.db, () => this.cacheCommitsOwned(entries));
+  }
+
+  private cacheCommitsOwned(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
     return insertCommitCaches(this.db, entries);
   }
 
@@ -704,11 +885,47 @@ export class SharedRepoStore {
   }
 
   setShallow(add: Iterable<string>, remove: Iterable<string> = []): void {
+    withGitMutationGuard(this.db, () => this.setShallowOwned(add, remove));
+  }
+
+  private setShallowOwned(add: Iterable<string>, remove: Iterable<string> = []): void {
     this.#shallowTable.set(add, remove);
     this.#shallow = null;
   }
 
   destroy(): void {
-    this.#ops().destroy();
+    withGitMutationGuard(this.db, () => this.destroyOwned());
+  }
+
+  private destroyOwned(): void {
+    this.#ops().destroyOwned();
+  }
+}
+
+/** Internal object-batch capability for composition under an existing mutation guard. */
+export function writeBatchOwned(
+  store: SharedRepoStore,
+  options: ObjectBatchOptions = {},
+): OwnedObjectBatch {
+  return sharedRepoStoreMutations(store).writeBatchOwned(options);
+}
+
+/** Internal scoped object writer for composition under an existing mutation guard. */
+export function writeObjectsOwned<T>(
+  store: SharedRepoStore,
+  body: (batch: ObjectBatch) => T,
+  options: ObjectBatchOptions = {},
+): T {
+  const batch = writeBatchOwned(store, options);
+  try {
+    const result = body(batch);
+    if (isThenableResult(result)) {
+      void Promise.resolve(result).catch(() => {});
+      throw new GitError("EINVAL", "object batch callback must be synchronous");
+    }
+    batch.flush();
+    return result;
+  } finally {
+    batch.dispose();
   }
 }

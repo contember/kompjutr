@@ -3,6 +3,7 @@ import { CorruptError } from "../common/errors.js";
 import { comparePaths } from "../common/streams.js";
 import type { IgnoreMatcher } from "../ignore/index.js";
 import { contentIdKey, type IndexEntry } from "../store/index.js";
+import { sharedRepoStoreMutations } from "../store/shared.js";
 import type { TargetEntry } from "./checkout.js";
 import type {
   IgnoredStatusCode,
@@ -323,7 +324,7 @@ export function* flushStatusRows(
   const freshHashes = exact
     ? hashExactWorktreePaths(repo, worktree, unresolved, { write: false })
     : hashWorktreePathsOwned(repo, worktree, unresolved, { write: false }, hashCursor);
-  repo.store.upsertBlobIds(
+  sharedRepoStoreMutations(repo.store).upsertBlobIdsOwned(
     [...freshHashes.values()].flatMap((hashed) => {
       const contentId = hashed.stat.contentId;
       return contentId === null ? [] : [{ contentId, oid: hashed.oid }];

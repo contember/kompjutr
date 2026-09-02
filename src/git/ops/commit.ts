@@ -3,12 +3,18 @@
 
 import { GitError, hasErrorCode, MissingIdentityError } from "../common/errors.js";
 import { type Commit, hashObject, type Person, serializeCommit } from "../common/objects.js";
-import { indexScanOwned, writeObjectsOwned } from "../store/index.js";
+import { indexScanOwned } from "../store/index.js";
+import { writeObjectsOwned } from "../store/shared.js";
 import { snapshotCommitTreeOwned } from "../store/sparse-workspace.js";
 import type { GitContext, GitIdentity } from "./context.js";
 import type { CommitResult } from "./kinds.js";
 import { committerRefLogMetadata, type RefLogReason } from "./ref-log.js";
-import { type Repository, type ResolvedHead, resolveHeadOwned } from "./repository.js";
+import {
+  type Repository,
+  type ResolvedHead,
+  repositoryMutations,
+  resolveHeadOwned,
+} from "./repository.js";
 import {
   buildTreeInBatch,
   planSparseTreeBuild,
@@ -241,9 +247,12 @@ function publishCommitResult(
 ): CommitResult {
   // A symbolic HEAD on an unborn branch creates the branch here.
   if (expectedHead.ref === null) {
-    repo.mutateRefs({ head: result.oid }, metadata);
+    repositoryMutations(repo).mutateRefsOwned({ head: result.oid }, metadata);
   } else {
-    repo.mutateRefs({ puts: [{ name: expectedHead.ref, target: result.oid }] }, metadata);
+    repositoryMutations(repo).mutateRefsOwned(
+      { puts: [{ name: expectedHead.ref, target: result.oid }] },
+      metadata,
+    );
   }
   // A false result leaves the prior baseline mismatched, so sparse readers safely use full scans.
   context?.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, result.tree);

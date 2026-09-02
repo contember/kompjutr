@@ -43,12 +43,29 @@ import {
   type MaintenanceRootSnapshotProgress,
   validatedOperationJournalRoots,
 } from "./maintenance/roots.js";
+import { withGitMutationGuard } from "./mutation-guard.js";
 import { readOperationStateOwned } from "./operation-journal.js";
 import { MAX_PACK_ROW_CACHE_BYTES } from "./packs.js";
 import { rawSymbolicTarget, requireRawRefTarget } from "./ref-validation.js";
 import { requireSafeRefLogInteger } from "./reflog.js";
 import { initializeGitSchema, MAX_CHECKOUTS_PER_REPOSITORY } from "./schema.js";
 import { SharedRepoStore } from "./shared.js";
+
+const LIFECYCLE_MUTATION_CHECKOUTS = new WeakSet<object>();
+
+function isLifecycleMutationCheckout(store: CheckoutStore): boolean {
+  return LIFECYCLE_MUTATION_CHECKOUTS.has(store);
+}
+
+function withLifecycleCheckoutMutations<T>(store: CheckoutStore, body: () => T): T {
+  const alreadyAuthorized = LIFECYCLE_MUTATION_CHECKOUTS.has(store);
+  if (!alreadyAuthorized) LIFECYCLE_MUTATION_CHECKOUTS.add(store);
+  try {
+    return body();
+  } finally {
+    if (!alreadyAuthorized) LIFECYCLE_MUTATION_CHECKOUTS.delete(store);
+  }
+}
 
 interface ProvisionalStoreRecord {
   generation: number;
@@ -80,6 +97,52 @@ const OWNED_MAINTENANCE_ROOT_ADVANCERS = new WeakMap<object, OwnedMaintenanceRoo
 type OwnedCheckoutLister = (repoId: number) => readonly CheckoutRow[];
 
 const OWNED_CHECKOUT_LISTERS = new WeakMap<object, OwnedCheckoutLister>();
+type OwnedMutationGuard = <T>(body: () => T) => T;
+const OWNED_MUTATION_GUARDS = new WeakMap<object, OwnedMutationGuard>();
+interface SqliteGitDatabaseMutations {
+  beginProvisionalCloneOwned(
+    root: string,
+    head: string,
+    now: number,
+    cleanup: (store: CheckoutStore) => undefined,
+  ): ProvisionalCloneOwner;
+  renewProvisionalCloneOwned(owner: ProvisionalCloneOwner, now: number): number;
+  publishProvisionalCloneOwned(
+    owner: ProvisionalCloneOwner,
+    now: number,
+    prepare?: (store: CheckoutStore) => undefined,
+  ): CheckoutRow;
+  discardProvisionalCloneOwned(
+    owner: ProvisionalCloneOwner,
+    now: number,
+    cleanup: (store: CheckoutStore) => undefined,
+  ): void;
+  createRepositoryOwned(root: string, head: string): CheckoutRow;
+  createCheckoutOwned(
+    repoId: number,
+    root: string,
+    head: string,
+    initialize?: (store: CheckoutStore) => undefined,
+  ): CheckoutRow;
+  removeCheckoutOwned(
+    checkoutId: number,
+    removeRoot: (checkout: CheckoutRow) => undefined,
+  ): CheckoutRow;
+  removeCheckoutsOwned(repoId: number, checkoutIds: readonly number[]): readonly CheckoutRow[];
+  destroyRepositoryOwned(repoId: number): void;
+}
+
+const SQLITE_GIT_DATABASE_MUTATIONS = new WeakMap<object, SqliteGitDatabaseMutations>();
+
+/** Internal mutation capability; intentionally absent from the package facade. */
+export function sqliteGitDatabaseMutations(
+  database: SqliteGitDatabase,
+): SqliteGitDatabaseMutations {
+  const mutations = SQLITE_GIT_DATABASE_MUTATIONS.get(database);
+  if (mutations === undefined)
+    throw new CorruptError("Git database mutation capability is missing");
+  return mutations;
+}
 
 /** Owns the schema plus shared-store and checkout facade registries. */
 export class SqliteGitDatabase {
@@ -115,6 +178,23 @@ export class SqliteGitDatabase {
       this.#advanceMaintenanceRootSnapshot(repoId, rootOptions),
     );
     OWNED_CHECKOUT_LISTERS.set(this, (repoId) => this.#listCheckoutsOwned(repoId));
+    OWNED_MUTATION_GUARDS.set(this, (body) => withGitMutationGuard(this.#db, body));
+    SQLITE_GIT_DATABASE_MUTATIONS.set(this, {
+      beginProvisionalCloneOwned: (root, head, now, cleanup) =>
+        this.beginProvisionalCloneOwned(root, head, now, cleanup),
+      renewProvisionalCloneOwned: (owner, now) => this.renewProvisionalCloneOwned(owner, now),
+      publishProvisionalCloneOwned: (owner, now, prepare) =>
+        this.publishProvisionalCloneOwned(owner, now, prepare),
+      discardProvisionalCloneOwned: (owner, now, cleanup) =>
+        this.discardProvisionalCloneOwned(owner, now, cleanup),
+      createRepositoryOwned: (root, head) => this.createRepositoryOwned(root, head),
+      createCheckoutOwned: (repoId, root, head, initialize) =>
+        this.createCheckoutOwned(repoId, root, head, initialize),
+      removeCheckoutOwned: (checkoutId, removeRoot) =>
+        this.removeCheckoutOwned(checkoutId, removeRoot),
+      removeCheckoutsOwned: (repoId, checkoutIds) => this.removeCheckoutsOwned(repoId, checkoutIds),
+      destroyRepositoryOwned: (repoId) => this.destroyRepositoryOwned(repoId),
+    });
   }
 
   get db(): SqlDatabase {
@@ -322,6 +402,7 @@ export class SqliteGitDatabase {
         throw new GitError("EINVAL", "provisional clone requires exact-owner discard");
       },
       lifetime,
+      isLifecycleMutationCheckout,
     );
     const record: ProvisionalStoreRecord = {
       generation,
@@ -538,6 +619,18 @@ export class SqliteGitDatabase {
     now: number,
     cleanup: (store: CheckoutStore) => undefined,
   ): ProvisionalCloneOwner {
+    return withGitMutationGuard(this.#db, () =>
+      this.beginProvisionalCloneOwned(root, head, now, cleanup),
+    );
+  }
+
+  /** @internal Begin a provisional clone while the caller owns the mutation guard. */
+  private beginProvisionalCloneOwned(
+    root: string,
+    head: string,
+    now: number,
+    cleanup: (store: CheckoutStore) => undefined,
+  ): ProvisionalCloneOwner {
     const normalized = this.#checkoutRootInput(root);
     const checkedHead = requireRawRefTarget(head, "initial HEAD target", "input");
     const nowMs = requireMilliseconds(now, "clone lease clock", "input");
@@ -566,7 +659,7 @@ export class SqliteGitDatabase {
           }
           cleanupGeneration = oldGeneration;
           const oldStore = this.#provisionalStore(existing.checkout, oldGeneration).store;
-          const result = cleanup(oldStore);
+          const result = withLifecycleCheckoutMutations(oldStore, () => cleanup(oldStore));
           if (isThenableResult(result)) {
             void Promise.resolve(result).catch(() => {});
             throw new GitError("EINVAL", "provisional clone cleanup must be synchronous");
@@ -654,6 +747,11 @@ export class SqliteGitDatabase {
   }
 
   renewProvisionalClone(owner: ProvisionalCloneOwner, now: number): number {
+    return withGitMutationGuard(this.#db, () => this.renewProvisionalCloneOwned(owner, now));
+  }
+
+  /** @internal Renew a provisional clone while the caller owns the mutation guard. */
+  private renewProvisionalCloneOwned(owner: ProvisionalCloneOwner, now: number): number {
     const nowMs = requireMilliseconds(now, "clone lease clock", "input");
     try {
       return this.#db.transactionSync(() => {
@@ -697,6 +795,17 @@ export class SqliteGitDatabase {
     now: number,
     prepare?: (store: CheckoutStore) => undefined,
   ): CheckoutRow {
+    return withGitMutationGuard(this.#db, () =>
+      this.publishProvisionalCloneOwned(owner, now, prepare),
+    );
+  }
+
+  /** @internal Publish a provisional clone while the caller owns the mutation guard. */
+  private publishProvisionalCloneOwned(
+    owner: ProvisionalCloneOwner,
+    now: number,
+    prepare?: (store: CheckoutStore) => undefined,
+  ): CheckoutRow {
     const nowMs = requireMilliseconds(now, "clone lease clock", "input");
     let prepareStarted = false;
     let synchronousPrepareFailure = false;
@@ -709,7 +818,7 @@ export class SqliteGitDatabase {
           prepareStarted = true;
           let result: undefined;
           try {
-            result = prepare(owner.store);
+            result = withLifecycleCheckoutMutations(owner.store, () => prepare(owner.store));
           } catch (error) {
             synchronousPrepareFailure = true;
             throw error;
@@ -759,6 +868,15 @@ export class SqliteGitDatabase {
     now: number,
     cleanup: (store: CheckoutStore) => undefined,
   ): void {
+    withGitMutationGuard(this.#db, () => this.discardProvisionalCloneOwned(owner, now, cleanup));
+  }
+
+  /** @internal Discard a provisional clone while the caller owns the mutation guard. */
+  private discardProvisionalCloneOwned(
+    owner: ProvisionalCloneOwner,
+    now: number,
+    cleanup: (store: CheckoutStore) => undefined,
+  ): void {
     requireMilliseconds(now, "clone lease clock", "input");
     let cleanupRecord: ProvisionalStoreRecord | null = null;
     try {
@@ -770,7 +888,8 @@ export class SqliteGitDatabase {
           throw new GitError("ESTALE", "provisional clone facade belongs to another owner");
         }
         cleanupRecord = existing ?? this.#provisionalStore(stored.checkout, generation);
-        const result = cleanup(cleanupRecord.store);
+        const cleanupStore = cleanupRecord.store;
+        const result = withLifecycleCheckoutMutations(cleanupStore, () => cleanup(cleanupStore));
         if (isThenableResult(result)) {
           void Promise.resolve(result).catch(() => {});
           throw new GitError("EINVAL", "provisional clone cleanup must be synchronous");
@@ -803,6 +922,11 @@ export class SqliteGitDatabase {
   }
 
   createRepository(root: string, head: string): CheckoutRow {
+    return withGitMutationGuard(this.#db, () => this.createRepositoryOwned(root, head));
+  }
+
+  /** @internal Create a repository while the caller owns the mutation guard. */
+  private createRepositoryOwned(root: string, head: string): CheckoutRow {
     const normalized = this.#checkoutRootInput(root);
     const checkedHead = requireRawRefTarget(head, "initial HEAD target", "input");
     return this.#db.transactionSync(() => {
@@ -857,8 +981,20 @@ export class SqliteGitDatabase {
     });
   }
 
-  /** Create one non-primary checkout and initialize its private state atomically. */
   createCheckout(
+    repoId: number,
+    root: string,
+    head: string,
+    initialize?: (store: CheckoutStore) => undefined,
+  ): CheckoutRow {
+    return withGitMutationGuard(this.#db, () =>
+      this.createCheckoutOwned(repoId, root, head, initialize),
+    );
+  }
+
+  /** @internal Create a checkout while the caller owns the mutation guard. */
+  /** Create one non-primary checkout and initialize its private state atomically. */
+  private createCheckoutOwned(
     repoId: number,
     root: string,
     head: string,
@@ -975,11 +1111,12 @@ export class SqliteGitDatabase {
           shared,
           initial,
           this.#options,
-          () => this.destroyRepository(repoId),
+          () => this.destroyRepositoryOwned(repoId),
           lifetime,
+          isLifecycleMutationCheckout,
         );
         if (initialize !== undefined) {
-          const result = initialize(store);
+          const result = withLifecycleCheckoutMutations(store, () => initialize(store));
           if (isThenableResult(result)) {
             void Promise.resolve(result).catch(() => {});
             throw new GitError("EINVAL", "checkout initialization must be synchronous");
@@ -1000,8 +1137,16 @@ export class SqliteGitDatabase {
     return remembered;
   }
 
-  /** Remove one non-primary checkout after the caller deletes its root. */
   removeCheckout(
+    checkoutId: number,
+    removeRoot: (checkout: CheckoutRow) => undefined,
+  ): CheckoutRow {
+    return withGitMutationGuard(this.#db, () => this.removeCheckoutOwned(checkoutId, removeRoot));
+  }
+
+  /** @internal Remove a checkout while the caller owns the mutation guard. */
+  /** Remove one non-primary checkout after the caller deletes its root. */
+  private removeCheckoutOwned(
     checkoutId: number,
     removeRoot: (checkout: CheckoutRow) => undefined,
   ): CheckoutRow {
@@ -1022,7 +1167,10 @@ export class SqliteGitDatabase {
       }
       this.#requireCheckoutsIdle(row.repoId, [row.id]);
       advanceCheckoutRevision(this.#db, row.repoId);
-      const result = removeRoot(Object.freeze(row));
+      const callbackStore = this.openCheckout(row);
+      const result = withLifecycleCheckoutMutations(callbackStore, () =>
+        removeRoot(Object.freeze(row)),
+      );
       if (isThenableResult(result)) {
         void Promise.resolve(result).catch(() => {});
         throw new GitError("EINVAL", "checkout removal must be synchronous");
@@ -1047,8 +1195,16 @@ export class SqliteGitDatabase {
     return removed;
   }
 
-  /** Remove a bounded set of non-primary checkouts in one atomic delete. */
   removeCheckouts(repoId: number, checkoutIds: readonly number[]): readonly CheckoutRow[] {
+    return withGitMutationGuard(this.#db, () => this.removeCheckoutsOwned(repoId, checkoutIds));
+  }
+
+  /** @internal Remove checkouts while the caller owns the mutation guard. */
+  /** Remove a bounded set of non-primary checkouts in one atomic delete. */
+  private removeCheckoutsOwned(
+    repoId: number,
+    checkoutIds: readonly number[],
+  ): readonly CheckoutRow[] {
     if (!Number.isSafeInteger(repoId) || repoId < 1) {
       throw new GitError("EINVAL", "repository id must be a safe positive integer");
     }
@@ -1193,8 +1349,9 @@ export class SqliteGitDatabase {
       store,
       primary,
       this.#options,
-      () => this.destroyRepository(repoId),
+      () => this.destroyRepositoryOwned(repoId),
       lifetime,
+      isLifecycleMutationCheckout,
     );
     this.#checkoutStores.set(primary.id, primaryStore);
     this.#checkoutLifetimes.set(primary.id, lifetime);
@@ -1235,8 +1392,9 @@ export class SqliteGitDatabase {
       shared,
       stored,
       this.#options,
-      () => this.destroyRepository(stored.repoId),
+      () => this.destroyRepositoryOwned(stored.repoId),
       lifetime,
+      isLifecycleMutationCheckout,
     );
     this.#checkoutStores.set(checkoutId, store);
     this.#checkoutLifetimes.set(checkoutId, lifetime);
@@ -1320,7 +1478,9 @@ export class SqliteGitDatabase {
     repoId: number,
     options: MaintenanceRootAdvanceOptions,
   ): MaintenanceRootSnapshotProgress {
-    return this.#advanceMaintenanceRootSnapshot(repoId, options);
+    return withGitMutationGuard(this.#db, () =>
+      this.#advanceMaintenanceRootSnapshot(repoId, options),
+    );
   }
 
   #advanceMaintenanceRootSnapshot(
@@ -1345,6 +1505,11 @@ export class SqliteGitDatabase {
   }
 
   destroyRepository(repoId: number): void {
+    withGitMutationGuard(this.#db, () => this.destroyRepositoryOwned(repoId));
+  }
+
+  /** @internal Destroy a repository while the caller owns the mutation guard. */
+  private destroyRepositoryOwned(repoId: number): void {
     if (!Number.isSafeInteger(repoId) || repoId < 1) {
       throw new GitError("EINVAL", "repository id must be a safe positive integer");
     }
@@ -1382,4 +1547,13 @@ export function listCheckoutsOwned(
     throw new GitError("EINVAL", "checkout database owner is unavailable");
   }
   return list(repoId);
+}
+
+/** @internal Run one synchronous public Git mutation under the database-local guard. */
+export function withGitMutationGuardOwned<T>(database: SqliteGitDatabase, body: () => T): T {
+  const guard = OWNED_MUTATION_GUARDS.get(database);
+  if (guard === undefined) {
+    throw new GitError("EINVAL", "Git mutation database owner is unavailable");
+  }
+  return guard(body);
 }

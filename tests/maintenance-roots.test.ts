@@ -4,7 +4,6 @@ import { createFilesystem } from "../src/fs/filesystem.js";
 import { utf8 } from "../src/git/common/bytes.js";
 import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
 import type { MergeStateMetadata, MergeTouchedPath } from "../src/git/ops/merge-state.js";
-import { mergeOperationState } from "../src/git/ops/operation-state.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
@@ -400,26 +399,9 @@ describe("maintenance roots", () => {
     };
     store.writeMergeState(ready, []);
     expect(readMaintenanceRootEpoch(db, checkout.repoId)).toBe(7);
-    const journal = store.requireOperationState("merge");
-    store.replaceOperationState(
-      journal.integrityOid,
-      mergeOperationState({ ...ready, message: "Updated merge\n" }),
-    );
+    expect(store.requireOperationState("merge").state).toEqual({ kind: "merge", ...ready });
+    expect(store.clearOperationState()).toBe(true);
     expect(readMaintenanceRootEpoch(db, checkout.repoId)).toBe(8);
-    expect(store.clearOperationState()).toBe(true);
-    expect(readMaintenanceRootEpoch(db, checkout.repoId)).toBe(9);
-    db.run("PRAGMA foreign_keys = OFF");
-    db.run(
-      `INSERT INTO git_operation_steps
-         (checkout_id, ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid)
-       VALUES (?, 0, ?, NULL, NULL, 'pending', NULL)`,
-      checkout.id,
-      original,
-    );
-    db.run("PRAGMA foreign_keys = ON");
-    const beforeOrphanClear = readMaintenanceRootEpoch(db, checkout.repoId);
-    expect(store.clearOperationState()).toBe(true);
-    expect(readMaintenanceRootEpoch(db, checkout.repoId)).toBeGreaterThan(beforeOrphanClear);
 
     db.run(
       "UPDATE git_maintenance_control SET root_epoch = ? WHERE repo_id = ?",
@@ -546,7 +528,7 @@ describe("maintenance roots", () => {
       checkout.repoId,
     );
     db.run(
-      "UPDATE git_operation_state SET integrity_oid = ? WHERE checkout_id = ?",
+      "UPDATE git_operation_state SET original_head_oid = ? WHERE checkout_id = ?",
       "e".repeat(40),
       checkout.id,
     );

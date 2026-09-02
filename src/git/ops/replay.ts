@@ -1,3 +1,4 @@
+import { checkoutStoreMutations } from "../store/checkout.js";
 // Pure one-commit replay planning shared by cherry-pick and revert.
 
 import { isAbbreviatedOid, isOid } from "../common/bytes.js";
@@ -12,6 +13,7 @@ import {
 import { comparePaths, joinSorted } from "../common/streams.js";
 import type { TextMergeOptions } from "../diff/xmerge.js";
 import { type IndexEntry, type IndexStore, PACK_BLOB_BATCH_TARGET_BYTES } from "../store/index.js";
+import { withGitMutationGuard } from "../store/mutation-guard.js";
 import { indexFromTree } from "./checkout.js";
 import {
   type IntegrationConflictKind,
@@ -25,7 +27,7 @@ import { projectedTouchedShape, requireBoundedIntegrationTree } from "./integrat
 import { applyProjectedIndex, validateProjectedIndexEntries } from "./merge-apply.js";
 import { type ProjectedMergeEntry, projectMergePlan } from "./merge-projection.js";
 import { MAX_OPERATION_STEPS } from "./operation-state.js";
-import { writeTree } from "./plumbing.js";
+import { writeTreeOwned } from "./plumbing.js";
 import type { Repository } from "./repository.js";
 
 export const MAX_REPLAY_REVISION_CODE_UNITS = 1_024;
@@ -541,6 +543,15 @@ export function replaySnapshot(
   index: IndexStore,
   options: ReplaySnapshotOptions,
 ): ReplaySnapshotResult {
+  return withGitMutationGuard(repo.checkout.db, () => replaySnapshotOwned(repo, index, options));
+}
+
+/** @internal Replay a snapshot while the caller owns the Git mutation guard. */
+export function replaySnapshotOwned(
+  repo: Repository,
+  index: IndexStore,
+  options: ReplaySnapshotOptions,
+): ReplaySnapshotResult {
   const snapshot = requireBoundedRevision(Reflect.get(options, "snapshot"), {
     input: "snapshot",
     operation: "snapshot replay",
@@ -581,9 +592,15 @@ export function replaySnapshot(
   validateSnapshotResultObjects(repo, plan.currentTreeOid, projected);
   return repo.store.runScratchAwareOperation(() =>
     repo.store.db.transactionSync(() => {
-      index.indexReplace(indexFromTree(repo, plan.currentTreeOid));
+      if (index === repo.checkout) {
+        checkoutStoreMutations(repo.checkout).indexReplaceOwned(
+          indexFromTree(repo, plan.currentTreeOid),
+        );
+      } else {
+        index.indexReplace(indexFromTree(repo, plan.currentTreeOid));
+      }
       applyProjectedIndex(repo, index, projected);
-      return { outcome: "clean", tree: writeTree(repo, index) };
+      return { outcome: "clean", tree: writeTreeOwned(repo, index) };
     }),
   );
 }

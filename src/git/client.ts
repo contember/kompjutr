@@ -77,6 +77,8 @@ import type {
   LsRemoteResult as StructuredLsRemoteResult,
   PushResult as StructuredPushResult,
 } from "./ops/refspec.js";
+import { checkoutStoreMutations } from "./store/checkout.js";
+import { sharedRepoStoreMutations } from "./store/shared.js";
 
 export type {
   FetchRefspec,
@@ -98,18 +100,18 @@ import {
   type CatFileOptions,
   type CommitTreeOptions,
   catFile as catFileOp,
-  commitTree as commitTreeOp,
+  commitTreeOwned as commitTreeOp,
   type HashObjectOptions,
-  hashObject as hashObjectOp,
+  hashObjectOwned as hashObjectOp,
   type RawRefTarget,
   type ReadRefOptions,
   type ReadTreeOptions,
   readRef as readRefOp,
-  readTree as readTreeOp,
+  readTreeOwned as readTreeOp,
   repoRoot as repoRootOp,
   type UpdateRefOptions,
-  updateRef as updateRefOp,
-  writeTree as writeTreeOp,
+  updateRefOwned as updateRefOp,
+  writeTreeOwned as writeTreeOp,
 } from "./ops/plumbing.js";
 import { type PullOptions, pull as pullOp } from "./ops/pull.js";
 import { type PushOptions, push as pushOp } from "./ops/push.js";
@@ -138,7 +140,7 @@ import {
   type RecoverRefOptions,
   type RefLogEntry,
   type RefLogReadOptions,
-  recoverRef as recoverRefOp,
+  recoverRefOwned as recoverRefOp,
   reflog as reflogOp,
 } from "./ops/ref-log.js";
 import {
@@ -162,7 +164,7 @@ import {
 import {
   type ReplaySnapshotOptions,
   type ReplaySnapshotResult,
-  replaySnapshot as replaySnapshotOp,
+  replaySnapshotOwned as replaySnapshotOp,
 } from "./ops/replay.js";
 import type { Repository } from "./ops/repository.js";
 import {
@@ -203,13 +205,13 @@ import {
   type WorktreeAddOptions,
   type WorktreeInfo,
   type WorktreeRemoveOptions,
-  worktreeAdd as worktreeAddOp,
+  worktreeAddOwned as worktreeAddOp,
   worktreeList as worktreeListOp,
-  worktreePrune as worktreePruneOp,
-  worktreeRemove as worktreeRemoveOp,
+  worktreePruneOwned as worktreePruneOp,
+  worktreeRemoveOwned as worktreeRemoveOp,
 } from "./ops/worktrees.js";
 import type { AuthCallback, GitHttpClient } from "./protocol/transport.js";
-import type { SqliteGitDatabase } from "./store/index.js";
+import { type SqliteGitDatabase, withGitMutationGuardOwned } from "./store/database.js";
 
 export type { PullResult } from "./ops/kinds.js";
 export type { AbortableNetworkOptions, CloneOptions, FetchOptions } from "./ops/network.js";
@@ -453,6 +455,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
 
   const at = (dir?: string): Repository => openRepository(context, dir ?? "/");
   const excludeRoots = (repo: Repository): string[] => nestedRoots(context, repo.root);
+  const mutate = <T>(body: () => T): T => withGitMutationGuardOwned(binding.database, body);
 
   return {
     async clone(input) {
@@ -468,7 +471,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return lsRemoteOp(context, at(input.dir), input);
     },
     async init(input = {}) {
-      initRepository(context, input);
+      mutate(() => initRepository(context, input));
     },
     async status(input = {}) {
       const { dir, ...statusOptions } = input;
@@ -504,45 +507,55 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       );
     },
     async clean(input = {}) {
-      const repo = at(input.dir);
-      repo.checkout.requireNoOperationState();
-      return cleanOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
+      return mutate(() => {
+        const repo = at(input.dir);
+        repo.checkout.requireNoOperationState();
+        return cleanOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
+      });
     },
     async add(input) {
-      const repo = at(input.dir);
-      addOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) }, context);
+      mutate(() => {
+        const repo = at(input.dir);
+        addOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) }, context);
+      });
     },
     async rm(input) {
-      const repo = at(input.dir);
-      rmOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
+      mutate(() => {
+        const repo = at(input.dir);
+        rmOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
+      });
     },
     async reset(input = {}) {
-      const repo = at(input.dir);
-      if (input.hard === true) {
-        repo.store.db.transactionSync(() => {
-          resetOp(context, repo, context.worktree, input);
-          repo.checkout.clearOperationState();
-        });
-        return;
-      }
-      repo.checkout.requireNoOperationState();
-      resetOp(context, repo, context.worktree, input);
+      mutate(() => {
+        const repo = at(input.dir);
+        if (input.hard === true) {
+          repo.store.db.transactionSync(() => {
+            resetOp(context, repo, context.worktree, input);
+            checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
+          });
+          return;
+        }
+        repo.checkout.requireNoOperationState();
+        resetOp(context, repo, context.worktree, input);
+      });
     },
     async commit(input) {
-      const repo = at(input.dir);
-      const operation = repo.checkout.readOperationState();
-      if (operation?.kind === "merge") {
-        if (input.amend === true) {
-          throw new GitError("EINVAL", "cannot amend while continuing a merge");
+      return mutate(() => {
+        const repo = at(input.dir);
+        const operation = repo.checkout.readOperationState();
+        if (operation?.kind === "merge") {
+          if (input.amend === true) {
+            throw new GitError("EINVAL", "cannot amend while continuing a merge");
+          }
+          const result = mergeContinueOp(context, repo, input);
+          if (result.oid === undefined) {
+            throw new GitError("ECORRUPT", "merge continuation did not create a commit");
+          }
+          return { oid: result.oid };
         }
-        const result = mergeContinueOp(context, repo, input);
-        if (result.oid === undefined) {
-          throw new GitError("ECORRUPT", "merge continuation did not create a commit");
-        }
-        return { oid: result.oid };
-      }
-      if (operation !== null) repo.checkout.requireNoOperationState();
-      return commitOp(context, repo, input);
+        if (operation !== null) repo.checkout.requireNoOperationState();
+        return commitOp(context, repo, input);
+      });
     },
     async log(input = {}) {
       return logOp(at(input.dir), input);
@@ -567,30 +580,32 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return readRefOp(at(input.dir), input);
     },
     async worktreeAdd(input) {
-      return worktreeAddOp(context, at(input.dir), input);
+      return mutate(() => worktreeAddOp(context, at(input.dir), input));
     },
     async worktreeList(input = {}) {
       return worktreeListOp(context, at(input.dir));
     },
     async worktreeRemove(input) {
-      worktreeRemoveOp(context, at(input.dir), input);
+      mutate(() => worktreeRemoveOp(context, at(input.dir), input));
     },
     async worktreePrune(input = {}) {
-      return worktreePruneOp(context, at(input.dir));
+      return mutate(() => worktreePruneOp(context, at(input.dir)));
     },
     async reflog(input = {}) {
       return reflogOp(at(input.dir), input);
     },
     async recoverRef(input) {
-      const repo = at(input.dir);
-      repo.checkout.requireNoOperationState();
-      recoverRefOp(context, repo, input);
+      mutate(() => {
+        const repo = at(input.dir);
+        repo.checkout.requireNoOperationState();
+        recoverRefOp(context, repo, input);
+      });
     },
     async repoRoot(input = {}) {
       return repoRootOp(context, input);
     },
     async maintenance(input = {}) {
-      return maintenanceOp(context, at(input.dir));
+      return mutate(() => maintenanceOp(context, at(input.dir)));
     },
     async currentBranch(input = {}) {
       return currentBranchOp(at(input.dir), input);
@@ -611,30 +626,38 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return lsTreeOp(at(input.dir), input.ref, input.path, { recursive: input.recursive });
     },
     async branch(input) {
-      const repo = at(input.dir);
-      repo.checkout.requireNoOperationState();
-      branchOp(context, repo, input);
+      mutate(() => {
+        const repo = at(input.dir);
+        repo.checkout.requireNoOperationState();
+        branchOp(context, repo, input);
+      });
     },
     async branchDelete(input) {
-      const repo = at(input.dir);
-      repo.checkout.requireNoOperationState();
-      branchDeleteOp(context, repo, input);
+      mutate(() => {
+        const repo = at(input.dir);
+        repo.checkout.requireNoOperationState();
+        branchDeleteOp(context, repo, input);
+      });
     },
     async branchRename(input) {
-      branchRenameOp(context, at(input.dir), input);
+      mutate(() => branchRenameOp(context, at(input.dir), input));
     },
     async branchList(input = {}) {
       return branchListOp(at(input.dir));
     },
     async tag(input) {
-      const repo = at(input.dir);
-      repo.checkout.requireNoOperationState();
-      tagOp(context, repo, input);
+      mutate(() => {
+        const repo = at(input.dir);
+        repo.checkout.requireNoOperationState();
+        tagOp(context, repo, input);
+      });
     },
     async tagDelete(input) {
-      const repo = at(input.dir);
-      repo.checkout.requireNoOperationState();
-      tagDeleteOp(context, repo, input);
+      mutate(() => {
+        const repo = at(input.dir);
+        repo.checkout.requireNoOperationState();
+        tagDeleteOp(context, repo, input);
+      });
     },
     async tagList(input = {}) {
       return tagListOp(at(input.dir));
@@ -645,24 +668,29 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       const commit = repo.peel(repo.revParse(input.ref));
       const tree = repo.readCommit(commit).tree;
       await hydrateTreeBlobs(context, repo, tree, input.paths);
-      repo.checkout.requireNoOperationState();
-      const currentCommit = repo.peel(repo.revParse(input.ref));
-      if (currentCommit !== commit || repo.readCommit(currentCommit).tree !== tree) {
-        throw new GitError("ESTALE", `checkout target ${input.ref} changed during blob hydration`);
-      }
-      checkoutOp(context, repo, context.worktree, input);
+      mutate(() => {
+        repo.checkout.requireNoOperationState();
+        const currentCommit = repo.peel(repo.revParse(input.ref));
+        if (currentCommit !== commit || repo.readCommit(currentCommit).tree !== tree) {
+          throw new GitError(
+            "ESTALE",
+            `checkout target ${input.ref} changed during blob hydration`,
+          );
+        }
+        checkoutOp(context, repo, context.worktree, input);
+      });
     },
     async remoteAdd(input) {
-      remoteAdd(at(input.dir), input);
+      mutate(() => remoteAdd(at(input.dir), input));
     },
     async remoteGetUrl(input) {
       return remoteGetUrl(at(remoteOptionsDir(input, "remote get-url")), input);
     },
     async remoteRemove(input) {
-      remoteRemove(at(input.dir), input);
+      mutate(() => remoteRemove(at(input.dir), input));
     },
     async remoteSetUrl(input) {
-      remoteSetUrl(at(remoteOptionsDir(input, "remote set-url")), input);
+      mutate(() => remoteSetUrl(at(remoteOptionsDir(input, "remote set-url")), input));
     },
     async remoteList(input = {}) {
       return remoteList(at(input.dir));
@@ -671,10 +699,10 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return configGet(at(input.dir), input);
     },
     async configSet(input) {
-      configSet(at(input.dir), input);
+      mutate(() => configSet(at(input.dir), input));
     },
     async hashObject(input) {
-      return hashObjectOp(at(input.dir), input);
+      return mutate(() => hashObjectOp(at(input.dir), input));
     },
     async catFile(input) {
       const repo = at(input.dir);
@@ -686,62 +714,70 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return { oid: result.oid, bytes: result.bytes };
     },
     async readTree(input) {
-      const { dir, ...readOptions } = input;
-      readTreeOp(at(dir), context.worktree, readOptions);
+      mutate(() => {
+        const { dir, ...readOptions } = input;
+        readTreeOp(at(dir), context.worktree, readOptions);
+      });
     },
     async writeTree(input = {}) {
-      return writeTreeOp(at(input.dir));
+      return mutate(() => writeTreeOp(at(input.dir)));
     },
     async commitTree(input) {
-      const { dir, ...commitOptions } = input;
-      return commitTreeOp(context, at(dir), commitOptions);
+      return mutate(() => {
+        const { dir, ...commitOptions } = input;
+        return commitTreeOp(context, at(dir), commitOptions);
+      });
     },
     async withScratchIndex(input, body) {
-      const repo = at(input.dir);
-      return repo.store.withScratchIndex(input.name, (index) => {
-        let active = true;
-        const requireActive = (): void => {
-          if (!active) throw new GitError("EINVAL", "scratch index session is no longer active");
-        };
-        const scratch: GitScratchIndex = {
-          readTree(readOptions) {
-            requireActive();
-            readTreeOp(repo, context.worktree, readOptions, index);
-          },
-          add(addOptions) {
-            requireActive();
-            addOp(
-              repo,
-              context.worktree,
-              { ...addOptions, excludeRoots: excludeRoots(repo) },
-              context,
-              index,
-            );
-          },
-          writeTree() {
-            requireActive();
-            return writeTreeOp(repo, index);
-          },
-          commitTree(commitOptions) {
-            requireActive();
-            return commitTreeOp(context, repo, commitOptions);
-          },
-          replaySnapshot(replayOptions) {
-            requireActive();
-            return replaySnapshotOp(repo, index, replayOptions);
-          },
-        };
-        try {
-          return body(scratch);
-        } finally {
-          active = false;
-        }
+      return mutate(() => {
+        const repo = at(input.dir);
+        return sharedRepoStoreMutations(repo.store).withScratchIndexOwned(input.name, (index) => {
+          let active = true;
+          const requireActive = (): void => {
+            if (!active) throw new GitError("EINVAL", "scratch index session is no longer active");
+          };
+          const scratch: GitScratchIndex = {
+            readTree(readOptions) {
+              requireActive();
+              readTreeOp(repo, context.worktree, readOptions, index);
+            },
+            add(addOptions) {
+              requireActive();
+              addOp(
+                repo,
+                context.worktree,
+                { ...addOptions, excludeRoots: excludeRoots(repo) },
+                context,
+                index,
+              );
+            },
+            writeTree() {
+              requireActive();
+              return writeTreeOp(repo, index);
+            },
+            commitTree(commitOptions) {
+              requireActive();
+              return commitTreeOp(context, repo, commitOptions);
+            },
+            replaySnapshot(replayOptions) {
+              requireActive();
+              return replaySnapshotOp(repo, index, replayOptions);
+            },
+          };
+          try {
+            return body(scratch);
+          } finally {
+            active = false;
+          }
+        });
       });
     },
     async updateRef(input) {
-      const repo = at(input.dir);
-      repo.checkout.requireNoOperationState();
-      updateRefOp(context, repo, input);
+      mutate(() => {
+        const repo = at(input.dir);
+        repo.checkout.requireNoOperationState();
+        updateRefOp(context, repo, input);
+      });
     },
     async push(input = {}) {
       const repo = at(input.dir);
@@ -754,54 +790,64 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return pullOp(context, repo, context.worktree, input);
     },
     async merge(input) {
-      const repo = at(input.dir);
-      return mergeOp(context, repo, context.worktree, input);
+      return mutate(() => {
+        const repo = at(input.dir);
+        return mergeOp(context, repo, context.worktree, input);
+      });
     },
     async mergeContinue(input = {}) {
-      return mergeContinueOp(context, at(input.dir), input);
+      return mutate(() => mergeContinueOp(context, at(input.dir), input));
     },
     async mergeAbort(input = {}) {
-      mergeAbortOp(at(input.dir), context.worktree);
+      mutate(() => mergeAbortOp(at(input.dir), context.worktree));
     },
     async cherryPick(input) {
-      return cherryPickOp(context, at(input.dir), context.worktree, input);
+      return mutate(() => cherryPickOp(context, at(input.dir), context.worktree, input));
     },
     async cherryPickContinue(input = {}) {
-      return cherryPickContinueOp(context, at(input.dir), input);
+      return mutate(() => cherryPickContinueOp(context, at(input.dir), input));
     },
     async cherryPickSkip(input = {}) {
-      cherryPickSkipOp(at(input.dir), context.worktree);
+      mutate(() => cherryPickSkipOp(at(input.dir), context.worktree));
     },
     async cherryPickAbort(input = {}) {
-      cherryPickAbortOp(at(input.dir), context.worktree);
+      mutate(() => cherryPickAbortOp(at(input.dir), context.worktree));
     },
     async revert(input) {
-      return revertOp(context, at(input.dir), context.worktree, input);
+      return mutate(() => revertOp(context, at(input.dir), context.worktree, input));
     },
     async revertContinue(input = {}) {
-      return revertContinueOp(context, at(input.dir), input);
+      return mutate(() => revertContinueOp(context, at(input.dir), input));
     },
     async revertSkip(input = {}) {
-      revertSkipOp(at(input.dir), context.worktree);
+      mutate(() => revertSkipOp(at(input.dir), context.worktree));
     },
     async revertAbort(input = {}) {
-      revertAbortOp(at(input.dir), context.worktree);
+      mutate(() => revertAbortOp(at(input.dir), context.worktree));
     },
     async rebase(input) {
-      const repo = at(input.dir);
-      return rebaseOp(context, repo, context.worktree, excludeRoots(repo), input);
+      return mutate(() => {
+        const repo = at(input.dir);
+        return rebaseOp(context, repo, context.worktree, excludeRoots(repo), input);
+      });
     },
     async rebaseContinue(input = {}) {
-      const repo = at(input.dir);
-      return rebaseContinueOp(context, repo, context.worktree, excludeRoots(repo), input);
+      return mutate(() => {
+        const repo = at(input.dir);
+        return rebaseContinueOp(context, repo, context.worktree, excludeRoots(repo), input);
+      });
     },
     async rebaseSkip(input = {}) {
-      const repo = at(input.dir);
-      return rebaseSkipOp(context, repo, context.worktree, excludeRoots(repo), input);
+      return mutate(() => {
+        const repo = at(input.dir);
+        return rebaseSkipOp(context, repo, context.worktree, excludeRoots(repo), input);
+      });
     },
     async rebaseAbort(input = {}) {
-      const repo = at(input.dir);
-      rebaseAbortOp(repo, context.worktree, excludeRoots(repo));
+      mutate(() => {
+        const repo = at(input.dir);
+        rebaseAbortOp(repo, context.worktree, excludeRoots(repo));
+      });
     },
     async stashPush() {
       throw new UnsupportedOperationError("stash push");

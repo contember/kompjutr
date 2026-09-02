@@ -3,6 +3,7 @@ import { isOid } from "../common/bytes.js";
 import { CorruptError, GitError } from "../common/errors.js";
 import { expectText, RowShape, text } from "../common/rows.js";
 import { comparePaths } from "../common/streams.js";
+import { type CheckoutStore, checkoutStoreMutations } from "./checkout.js";
 import { nextPrefix } from "./config.js";
 import type {
   CheckoutRow,
@@ -63,16 +64,12 @@ export interface RefTableOptions {
   readonly clock: Clock;
 }
 
-export interface RefMutationOwner {
-  mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean;
-}
-
 export function mutateRefsOwned(
-  store: RefMutationOwner,
+  store: CheckoutStore,
   mutation: RefMutation,
   metadata: RefLogMetadata,
 ): boolean {
-  return store.mutateRefs(mutation, metadata);
+  return checkoutStoreMutations(store).mutateRefsOwned(mutation, metadata);
 }
 
 const REF_ROW = new RowShape({ name: text(), target: text() });

@@ -1,14 +1,12 @@
+import { checkoutStoreMutations } from "../store/checkout.js";
+import { writeObjectsOwned } from "../store/shared.js";
+import { repositoryMutations } from "./repository.js";
 // Two-head merge orchestration over bounded graph, integration, and apply seams.
 
 import { GitError } from "../common/errors.js";
 import { hashObject, serializeCommit } from "../common/objects.js";
 import { joinSorted } from "../common/streams.js";
-import {
-  type IndexEntry,
-  type ObjectBatch,
-  readOperationStateOwned,
-  writeObjectsOwned,
-} from "../store/index.js";
+import { type IndexEntry, type ObjectBatch, readOperationStateOwned } from "../store/index.js";
 import { type CommitIdentities, commitIndex, resolveIdentity } from "./commit.js";
 import type { GitContext, GitIdentity } from "./context.js";
 import {
@@ -582,7 +580,7 @@ function mergeInTransaction(
   );
   const applied = applyProjectedMerge(repo, worktree, projected, mergeMetadata);
   if (isFastForward) {
-    repo.mutateRefs(
+    repositoryMutations(repo).mutateRefsOwned(
       {
         expected: { name: head.ref, target: head.oid },
         puts: [{ name: head.ref, target: incomingOid }],
@@ -666,7 +664,7 @@ export function mergeContinue(
       },
       context,
     );
-    repo.checkout.clearMergeState();
+    checkoutStoreMutations(repo.checkout).clearMergeStateOwned();
     return result;
   });
 }

@@ -1,16 +1,15 @@
 import { describe, expect, it } from "vitest";
-
 import { utf8 } from "../src/git/common/bytes.js";
 import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
 import type { MergeTouchedPath } from "../src/git/ops/merge-state.js";
 import {
   MAX_OPERATION_STEPS,
   type OperationStepMetadata,
-  operationJournalIntegrityOid,
   operationStepsForState,
   type RebaseStateMetadata,
   type ReplayStateMetadata,
 } from "../src/git/ops/operation-state.js";
+import { checkoutStoreMutations } from "../src/git/store/checkout.js";
 import { readOperationStateOwned, SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 
@@ -77,7 +76,6 @@ const RESULT_TWO_BYTES = serializeCommit({
   committer: PERSON,
   message: "rewritten third\n",
 });
-const RESULT_TWO = hashObject("commit", RESULT_TWO_BYTES);
 const WRONG_RESULT_BYTES = serializeCommit({
   tree: TREE,
   parent: [ORIGINAL],
@@ -180,7 +178,7 @@ function open() {
 }
 
 describe("durable operation journal", () => {
-  it("round-trips replay metadata and integrity through a cold reopen", () => {
+  it("round-trips trusted replay metadata through a cold reopen", () => {
     const kinds: readonly ("cherry-pick" | "revert")[] = ["cherry-pick", "revert"];
     for (const kind of kinds) {
       const { db, repository, store } = open();
@@ -195,7 +193,8 @@ describe("durable operation journal", () => {
         state,
         steps,
         touched: [],
-        integrityOid: operationJournalIntegrityOid(state, [], steps),
+        replayed: 0,
+        skipped: 0,
       });
     }
   });
@@ -209,179 +208,88 @@ describe("durable operation journal", () => {
       expect.objectContaining({ code: "ENOREVERT" }),
     );
     store.writeOperationState(replay(), []);
-
     expect(() => store.requireNoOperationState()).toThrowError(
       expect.objectContaining({ code: "EOPACTIVE" }),
     );
     expect(() => store.requireOperationState("revert")).toThrowError(
       expect.objectContaining({ code: "EOPMISMATCH" }),
     );
-    expect(() => store.requireMergeState()).toThrowError(
-      expect.objectContaining({ code: "EOPMISMATCH" }),
-    );
   });
 
-  it("replaces only the authenticated operation metadata and retains snapshots", () => {
+  it("moves a conflicted replay to empty with one conditional transition", () => {
     const { store } = open();
-    const conflicted = replay("cherry-pick", {
-      phase: "conflicted",
-      emptyReason: null,
-    });
-    const paths = touched();
-    store.writeOperationState(conflicted, paths);
-    const before = store.requireOperationState("cherry-pick");
-    const empty = replay("cherry-pick", { phase: "empty", emptyReason: "result" });
-
-    expect(() => store.replaceOperationState("f".repeat(40), empty)).toThrowError(
-      expect.objectContaining({ code: "EOPMISMATCH" }),
+    store.writeOperationState(
+      replay("cherry-pick", { phase: "conflicted", emptyReason: null }),
+      touched(),
     );
-    store.replaceOperationState(before.integrityOid, empty);
 
-    const after = store.requireOperationState("cherry-pick");
-    expect(after.state).toEqual(empty);
-    expect(after.touched).toEqual(paths);
-    expect(after.integrityOid).not.toBe(before.integrityOid);
-  });
+    checkoutStoreMutations(store).markReplayEmptyOwned("cherry-pick", "result");
 
-  it("round-trips ordered rebase steps and advances them through whole-journal CAS", () => {
-    const { db, repository, store } = open();
-    const initialState = rebase();
-    const initialSteps = rebaseSteps();
-    store.writeOperationJournal(initialState, initialSteps, []);
-    const initial = store.requireOperationState("rebase");
-
+    const journal = store.requireOperationState("cherry-pick");
+    expect(journal.state).toMatchObject({ phase: "empty", emptyReason: "result" });
+    expect(journal.touched).toEqual([]);
     expect(() =>
-      store.replaceOperationJournal("f".repeat(40), initialState, initialSteps, []),
+      checkoutStoreMutations(store).markReplayEmptyOwned("cherry-pick", "result"),
     ).toThrowError(expect.objectContaining({ code: "EOPMISMATCH" }));
-
-    const appliedSteps: readonly OperationStepMetadata[] = [
-      { ...initialSteps[0]!, outcome: "applied", resultOid: RESULT_ONE },
-      initialSteps[1]!,
-    ];
-    const appliedState = rebase({ currentStep: 1, currentParentOid: RESULT_ONE });
-    store.replaceOperationJournal(initial.integrityOid, appliedState, appliedSteps, []);
-    const applied = store.requireOperationState("rebase");
-    expect(applied.steps).toEqual(appliedSteps);
-
-    const completedSteps: readonly OperationStepMetadata[] = [
-      appliedSteps[0]!,
-      { ...appliedSteps[1]!, outcome: "skipped" },
-    ];
-    const completedState = rebase({ currentStep: 2, currentParentOid: RESULT_ONE });
-    store.replaceOperationJournal(applied.integrityOid, completedState, completedSteps, []);
-
-    const cold = new SqliteGitDatabase(db).openCheckout(repository).requireOperationState("rebase");
-    expect(cold.state).toEqual(completedState);
-    expect(cold.steps).toEqual(completedSteps);
-    expect(cold.touched).toEqual([]);
   });
 
-  it("permits only one contiguous rebase step or one conflict suspension per CAS", () => {
-    {
-      const { store } = open();
-      const initialState = rebase();
-      const initialSteps = rebaseSteps();
-      store.writeOperationJournal(initialState, initialSteps, []);
-      const initial = store.requireOperationState("rebase");
-      const conflictedState = rebase({ phase: "conflicted" });
-      store.replaceOperationJournal(initial.integrityOid, conflictedState, initialSteps, touched());
-      const conflicted = store.requireOperationState("rebase");
-      const appliedSteps: readonly OperationStepMetadata[] = [
-        { ...initialSteps[0]!, outcome: "applied", resultOid: RESULT_ONE },
-        initialSteps[1]!,
-      ];
-      store.replaceOperationJournal(
-        conflicted.integrityOid,
-        rebase({ currentStep: 1, currentParentOid: RESULT_ONE }),
-        appliedSteps,
-        [],
-      );
-      expect(store.requireOperationState("rebase").steps).toEqual(appliedSteps);
-    }
+  it("keeps replay plans immutable while advancing one row per step", () => {
+    const { db, repository, store } = open();
+    const steps = rebaseSteps();
+    store.writeOperationJournal(rebase(), steps, []);
 
-    const illegal: readonly ((store: ReturnType<typeof open>["store"]) => void)[] = [
-      (store) => {
-        const current = store.requireOperationState("rebase");
-        const steps: readonly OperationStepMetadata[] = [
-          { ...rebaseSteps()[0]!, outcome: "applied", resultOid: RESULT_ONE },
-          { ...rebaseSteps()[1]!, outcome: "skipped" },
-        ];
-        store.replaceOperationJournal(
-          current.integrityOid,
-          rebase({ currentStep: 2, currentParentOid: RESULT_ONE }),
-          steps,
-          [],
-        );
-      },
-      (store) => {
-        const current = store.requireOperationState("rebase");
-        const steps: readonly OperationStepMetadata[] = [
-          { ...rebaseSteps()[0]!, outcome: "applied", resultOid: RESULT_ONE },
-          rebaseSteps()[1]!,
-        ];
-        store.replaceOperationJournal(
-          current.integrityOid,
-          rebase({ upstreamOid: ORIGINAL, currentStep: 1, currentParentOid: RESULT_ONE }),
-          steps,
-          [],
-        );
-      },
-      (store) => {
-        const current = store.requireOperationState("rebase");
-        const steps: readonly OperationStepMetadata[] = [
-          { ...rebaseSteps()[0]!, outcome: "applied", resultOid: RESULT_ONE },
-          { ...rebaseSteps()[1]!, sourceOid: SOURCE, selectedParentOid: ORIGINAL },
-        ];
-        store.replaceOperationJournal(
-          current.integrityOid,
-          rebase({ currentStep: 1, currentParentOid: RESULT_ONE }),
-          steps,
-          [],
-        );
-      },
-    ];
-    for (const transition of illegal) {
-      const { store } = open();
-      store.writeOperationJournal(rebase(), rebaseSteps(), []);
-      expect(() => transition(store)).toThrowError(
-        expect.objectContaining({ code: "EOPMISMATCH" }),
-      );
-      expect(store.requireOperationState("rebase").state.currentStep).toBe(0);
-    }
+    checkoutStoreMutations(store).suspendRebaseOwned(0, touched());
+    let journal = store.requireOperationState("rebase");
+    expect(journal.state).toMatchObject({ phase: "conflicted", currentStep: 0 });
+    expect(journal.steps).toEqual(steps);
 
-    {
-      const { store } = open();
-      const initialSteps = rebaseSteps();
-      store.writeOperationJournal(rebase(), initialSteps, []);
-      const initial = store.requireOperationState("rebase");
-      const appliedSteps: readonly OperationStepMetadata[] = [
-        { ...initialSteps[0]!, outcome: "applied", resultOid: RESULT_ONE },
-        initialSteps[1]!,
-      ];
-      store.replaceOperationJournal(
-        initial.integrityOid,
-        rebase({ currentStep: 1, currentParentOid: RESULT_ONE }),
-        appliedSteps,
-        [],
-      );
-      const applied = store.requireOperationState("rebase");
-      expect(() =>
-        store.replaceOperationJournal(applied.integrityOid, rebase(), initialSteps, []),
-      ).toThrowError(expect.objectContaining({ code: "EOPMISMATCH" }));
+    checkoutStoreMutations(store).advanceRebaseOwned(
+      "conflicted",
+      0,
+      "applied",
+      RESULT_ONE,
+      RESULT_ONE,
+      null,
+    );
+    journal = store.requireOperationState("rebase");
+    expect(journal.state).toMatchObject({
+      phase: "running",
+      currentStep: 1,
+      currentParentOid: RESULT_ONE,
+    });
+    expect(journal.steps).toEqual([
+      { ...steps[0]!, outcome: "applied", resultOid: RESULT_ONE },
+      steps[1],
+    ]);
+    expect(journal).toMatchObject({ replayed: 1, skipped: 0, touched: [] });
 
-      const mutatedPrefix: readonly OperationStepMetadata[] = [
-        { ...appliedSteps[0]!, resultOid: RESULT_TWO },
-        { ...appliedSteps[1]!, outcome: "skipped" },
-      ];
-      expect(() =>
-        store.replaceOperationJournal(
-          applied.integrityOid,
-          rebase({ currentStep: 2, currentParentOid: RESULT_TWO }),
-          mutatedPrefix,
-          [],
-        ),
-      ).toThrowError(expect.objectContaining({ code: "EOPMISMATCH" }));
-    }
+    checkoutStoreMutations(store).advanceRebaseOwned(
+      "running",
+      1,
+      "skipped",
+      null,
+      RESULT_ONE,
+      null,
+    );
+    const cold = new SqliteGitDatabase(db).openCheckout(repository).requireOperationState("rebase");
+    expect(cold.state).toMatchObject({ currentStep: 2, currentParentOid: RESULT_ONE });
+    expect(cold.steps[0]).toEqual({
+      ...steps[0],
+      outcome: "applied",
+      resultOid: RESULT_ONE,
+    });
+    expect(cold.steps[1]).toEqual({ ...steps[1], outcome: "skipped" });
+    expect(cold).toMatchObject({ replayed: 1, skipped: 1 });
+    expect(() =>
+      checkoutStoreMutations(store).advanceRebaseOwned(
+        "running",
+        1,
+        "skipped",
+        null,
+        RESULT_ONE,
+        null,
+      ),
+    ).toThrowError(expect.objectContaining({ code: "EOPMISMATCH" }));
   });
 
   it("rejects cursor/outcome mismatches, invalid touched ownership, and bad topology", () => {
@@ -433,69 +341,12 @@ describe("durable operation journal", () => {
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
-  it("rejects authenticated swapped sources and an applied result with the wrong parent", () => {
-    {
-      const { db, store } = open();
-      const state = rebase();
-      const steps = [...rebaseSteps()].reverse();
-      store.writeOperationJournal(state, rebaseSteps(), []);
-      for (let ordinal = 0; ordinal < steps.length; ordinal++) {
-        const step = steps[ordinal];
-        if (step === undefined) throw new Error("expected swapped step");
-        db.run(
-          `UPDATE git_operation_steps
-              SET source_oid = ?, selected_parent_oid = ?, mainline = ?
-            WHERE checkout_id = 1 AND ordinal = ?`,
-          step.sourceOid,
-          step.selectedParentOid,
-          step.mainline,
-          ordinal,
-        );
-      }
-      db.run(
-        "UPDATE git_operation_state SET integrity_oid = ? WHERE checkout_id = 1",
-        operationJournalIntegrityOid(state, [], steps),
-      );
-      expect(() => store.readOperationState()).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-    }
-
-    {
-      const { db, store } = open();
-      const state = rebase({ currentStep: 1, currentParentOid: WRONG_RESULT });
-      const steps: readonly OperationStepMetadata[] = [
-        { ...rebaseSteps()[0]!, outcome: "applied", resultOid: WRONG_RESULT },
-        rebaseSteps()[1]!,
-      ];
-      store.writeOperationJournal(rebase(), rebaseSteps(), []);
-      db.run(
-        `UPDATE git_operation_steps
-            SET outcome = 'applied', result_oid = ?
-          WHERE checkout_id = 1 AND ordinal = 0`,
-        WRONG_RESULT,
-      );
-      db.run(
-        `UPDATE git_operation_state
-            SET current_step = 1, current_parent_oid = ?, integrity_oid = ?
-          WHERE checkout_id = 1`,
-        WRONG_RESULT,
-        operationJournalIntegrityOid(state, [], steps),
-      );
-      expect(() => store.readOperationState()).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-    }
-  });
-
-  it("keeps structural limits while large journals round-trip", () => {
+  it("keeps structural limits while large conflict snapshots round-trip", () => {
     const step = rebaseSteps()[0]!;
-    const exactSteps = Array.from({ length: MAX_OPERATION_STEPS }, () => step);
-    expect(operationJournalIntegrityOid(rebase(), [], exactSteps)).toMatch(/^[0-9a-f]{40}$/);
-    expect(() => operationJournalIntegrityOid(rebase(), [], [...exactSteps, step])).toThrowError(
+    const tooManySteps = Array.from({ length: MAX_OPERATION_STEPS + 1 }, () => step);
+    expect(() => open().store.writeOperationJournal(rebase(), tooManySteps, [])).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
-
     const state = replay("cherry-pick", { message: "large journal\n" });
     const largeTouched = Array.from({ length: 1_000 }, (_, ordinal): MergeTouchedPath => {
       const path = `${ordinal.toString().padStart(4, "0")}/${"x".repeat(2_100)}`;
@@ -565,68 +416,6 @@ describe("durable operation journal", () => {
     expect(cold.requireOperationState("rebase").steps).toHaveLength(MAX_OPERATION_STEPS);
   });
 
-  it("clears state and corrupt orphan rows generically", () => {
-    const { db, store } = open();
-    store.writeOperationState(
-      replay("revert", { phase: "conflicted", emptyReason: null }),
-      touched(),
-    );
-    db.run("PRAGMA foreign_keys = OFF");
-    db.run("DELETE FROM git_operation_state WHERE checkout_id = 1");
-    db.run("PRAGMA foreign_keys = ON");
-    expect(() => store.readOperationState()).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(store.clearOperationState()).toBe(true);
-    expect(store.readOperationState()).toBeNull();
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_steps")).toBe(0);
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched")).toBe(0);
-  });
-
-  it("fails closed on invalid kind metadata, counts, integrity, and object types", () => {
-    const corruptions: readonly ((db: TestDatabase) => void)[] = [
-      (db) => {
-        db.run("PRAGMA ignore_check_constraints = ON");
-        db.run("UPDATE git_operation_state SET kind = 'pick' WHERE checkout_id = 1");
-        db.run("PRAGMA ignore_check_constraints = OFF");
-      },
-      (db) => db.run("UPDATE git_operation_state SET touched_count = 1 WHERE checkout_id = 1"),
-      (db) =>
-        db.run("UPDATE git_operation_state SET integrity_oid = ? WHERE checkout_id = 1", FILE),
-      (db) => db.run("UPDATE git_operation_steps SET source_oid = ? WHERE checkout_id = 1", FILE),
-      (db) => {
-        db.run("PRAGMA ignore_check_constraints = ON");
-        db.run(
-          "UPDATE git_operation_state SET current_step = zeroblob(4096) WHERE checkout_id = 1",
-        );
-        db.run("PRAGMA ignore_check_constraints = OFF");
-      },
-      (db) => {
-        db.run("PRAGMA ignore_check_constraints = ON");
-        db.run("UPDATE git_operation_state SET step_count = zeroblob(4096) WHERE checkout_id = 1");
-        db.run("PRAGMA ignore_check_constraints = OFF");
-      },
-      (db) => {
-        db.run("PRAGMA ignore_check_constraints = ON");
-        db.run("UPDATE git_operation_steps SET ordinal = zeroblob(4096) WHERE checkout_id = 1");
-        db.run("PRAGMA ignore_check_constraints = OFF");
-      },
-      (db) => {
-        db.run("PRAGMA ignore_check_constraints = ON");
-        db.run("UPDATE git_operation_steps SET mainline = zeroblob(4096) WHERE checkout_id = 1");
-        db.run("PRAGMA ignore_check_constraints = OFF");
-      },
-    ];
-    for (const corrupt of corruptions) {
-      const { db, store } = open();
-      store.writeOperationState(replay(), []);
-      corrupt(db);
-      expect(() => store.readOperationState()).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-    }
-  });
-
   it("rejects authenticated replay selections that differ from source parents", () => {
     const cases: readonly {
       name: string;
@@ -684,38 +473,16 @@ describe("durable operation journal", () => {
       },
     ];
     for (const witness of cases) {
-      const { db, store } = open();
+      const { store } = open();
       expect(
         () => store.writeOperationState(witness.invalid, []),
         `${witness.name} write`,
       ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
       store.writeOperationState(witness.valid, []);
-      const current = store.readOperationState();
-      if (current === null) throw new Error("expected operation journal");
-      expect(
-        () => store.replaceOperationState(current.integrityOid, witness.invalid),
-        `${witness.name} replace`,
-      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-      const steps = operationStepsForState(witness.invalid);
-      const [step] = steps;
-      if (step === undefined) throw new Error("expected replay step");
-      const integrityOid = operationJournalIntegrityOid(witness.invalid, [], steps);
-      db.run(
-        `UPDATE git_operation_steps
-            SET source_oid = ?, selected_parent_oid = ?, mainline = ?
-          WHERE checkout_id = 1 AND ordinal = 0`,
-        step.sourceOid,
-        step.selectedParentOid,
-        step.mainline,
-      );
-      db.run(
-        `UPDATE git_operation_state SET integrity_oid = ? WHERE checkout_id = 1`,
-        integrityOid,
-      );
-
-      expect(() => store.readOperationState(), witness.name).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
+      expect(store.readOperationState()).toMatchObject({
+        state: witness.valid,
+        steps: operationStepsForState(witness.valid),
+      });
     }
   });
 

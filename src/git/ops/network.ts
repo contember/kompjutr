@@ -1,3 +1,6 @@
+import { sqliteGitDatabaseMutations, withGitMutationGuardOwned } from "../store/database.js";
+import { sharedRepoStoreMutations } from "../store/shared.js";
+import { repositoryMutations } from "./repository.js";
 // clone and fetch: ref discovery, bounded negotiation, streaming pack
 // ingest, then a transactional ref update.
 //
@@ -821,8 +824,8 @@ function fetchRemoteUrl(repo: Repository, options: FetchOperationOptions): Fetch
 }
 
 function recordPartialFetch(repo: Repository, remote: string, url: string, packId: number): void {
-  repo.store.registerPromisorRemote(remote, url);
-  repo.store.addPromisedBlobsFromPackTrees(remote, packId);
+  sharedRepoStoreMutations(repo.store).registerPromisorRemoteOwned(remote, url);
+  sharedRepoStoreMutations(repo.store).addPromisedBlobsFromPackTreesOwned(remote, packId);
 }
 
 function requirePartialFetchTarget(repo: Repository, remote: string, url: string): void {
@@ -1341,14 +1344,16 @@ async function fetchMappedInto(
 
     await runFetchCheckpoint(behavior.checkpoint, "before-ref-publication", options.signal);
     throwIfAborted(options.signal);
-    repo.publishFetchRefs(
-      publication,
-      {
-        exactPuts: refs.map((ref) => ({ name: ref.destination, target: ref.oid })),
-      },
-      operationRefLogMetadata(context, repo, refLogReason),
-    );
-    publication.dispose();
+    withGitMutationGuardOwned(context.database, () => {
+      repositoryMutations(repo).publishFetchRefsOwned(
+        publication,
+        {
+          exactPuts: refs.map((ref) => ({ name: ref.destination, target: ref.oid })),
+        },
+        operationRefLogMetadata(context, repo, refLogReason),
+      );
+      publication.dispose();
+    });
     const afterRefs = behavior.checkpoint?.("after-ref-publication");
     if (afterRefs !== undefined) await afterRefs;
     return {
@@ -1593,14 +1598,17 @@ async function fetchLegacyInto(
   try {
     if (plan === null) throw new Error("legacy fetch lost its publication plan");
     throwIfAborted(options.signal);
-    repo.store.publishFetchRefs(
-      prepared.publication,
-      plan,
-      operationRefLogMetadata(context, repo, refLogReason),
-    );
-    prepared.publication.dispose();
-    plan = null;
-    prepared.plan = null;
+    const publicationPlan = plan;
+    withGitMutationGuardOwned(context.database, () => {
+      sharedRepoStoreMutations(repo.store).publishFetchRefsOwned(
+        prepared.publication,
+        publicationPlan,
+        operationRefLogMetadata(context, repo, refLogReason),
+      );
+      prepared.publication.dispose();
+      plan = null;
+      prepared.plan = null;
+    });
     const afterRefs = behavior.checkpoint?.("after-ref-publication");
     if (afterRefs !== undefined) await afterRefs;
     return prepared.result;
@@ -1677,18 +1685,26 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     return undefined;
   };
   const cloneStartedAt = context.now();
-  const owner = context.database.beginProvisionalClone(
-    root,
-    "ref: refs/heads/main",
-    cloneStartedAt,
-    cleanup,
+  const owner = withGitMutationGuardOwned(context.database, () =>
+    sqliteGitDatabaseMutations(context.database).beginProvisionalCloneOwned(
+      root,
+      "ref: refs/heads/main",
+      cloneStartedAt,
+      cleanup,
+    ),
   );
   const repo = new Repository(owner.store);
   let leaseExpiresAt = cloneStartedAt + PROVISIONAL_CLONE_LEASE_MS;
-  const heartbeat = (): void => {
+  const heartbeatOwned = (): void => {
     const now = context.now();
     if (leaseExpiresAt - now > PROVISIONAL_CLONE_RENEW_WINDOW_MS) return;
-    leaseExpiresAt = context.database.renewProvisionalClone(owner, now);
+    leaseExpiresAt = sqliteGitDatabaseMutations(context.database).renewProvisionalCloneOwned(
+      owner,
+      now,
+    );
+  };
+  const heartbeat = (): void => {
+    withGitMutationGuardOwned(context.database, heartbeatOwned);
   };
   const checkpoint = (): Promise<void> | undefined => {
     throwIfAborted(options.signal);
@@ -1702,10 +1718,15 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     })();
   };
   try {
-    heartbeat();
-    repo.store.configSet(`remote.${remote}.url`, url);
-    repo.store.configSet(`remote.${remote}.fetch`, `+refs/heads/*:refs/remotes/${remote}/*`);
-    heartbeat();
+    withGitMutationGuardOwned(context.database, () => {
+      heartbeatOwned();
+      sharedRepoStoreMutations(repo.store).configSetOwned(`remote.${remote}.url`, url);
+      sharedRepoStoreMutations(repo.store).configSetOwned(
+        `remote.${remote}.fetch`,
+        `+refs/heads/*:refs/remotes/${remote}/*`,
+      );
+      heartbeatOwned();
+    });
 
     const depth =
       options.depth !== undefined && options.depth > 0 && Number.isFinite(options.depth)
@@ -1737,18 +1758,23 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     const tip = result.fetchHead;
     if (tip === null) throw new GitError("EFETCHFAIL", "remote advertised no usable ref");
 
-    throwIfAborted(options.signal);
-    heartbeat();
-    repo.store.db.transactionSync(() => {
-      repo.mutateRefs(
-        {
-          puts: [{ name: `refs/heads/${branch}`, target: tip }],
-          head: `ref: refs/heads/${branch}`,
-        },
-        operationRefLogMetadata(context, repo, "clone: checkout"),
-      );
-      repo.store.configSet(`branch.${branch}.remote`, remote);
-      repo.store.configSet(`branch.${branch}.merge`, `refs/heads/${branch}`);
+    withGitMutationGuardOwned(context.database, () => {
+      throwIfAborted(options.signal);
+      heartbeatOwned();
+      repo.store.db.transactionSync(() => {
+        repositoryMutations(repo).mutateRefsOwned(
+          {
+            puts: [{ name: `refs/heads/${branch}`, target: tip }],
+            head: `ref: refs/heads/${branch}`,
+          },
+          operationRefLogMetadata(context, repo, "clone: checkout"),
+        );
+        sharedRepoStoreMutations(repo.store).configSetOwned(`branch.${branch}.remote`, remote);
+        sharedRepoStoreMutations(repo.store).configSetOwned(
+          `branch.${branch}.merge`,
+          `refs/heads/${branch}`,
+        );
+      });
     });
     const afterLocalRefs = checkpoint();
     if (afterLocalRefs !== undefined) await afterLocalRefs;
@@ -1768,19 +1794,37 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     };
     try {
       throwIfAborted(options.signal);
-      context.database.publishProvisionalClone(owner, context.now(), () => {
-        const initial = options.paths === undefined && tryInitialClone(context, repo, tree);
-        if (!initial) return fallback();
-        return undefined;
-      });
+      withGitMutationGuardOwned(context.database, () =>
+        sqliteGitDatabaseMutations(context.database).publishProvisionalCloneOwned(
+          owner,
+          context.now(),
+          () => {
+            const initial = options.paths === undefined && tryInitialClone(context, repo, tree);
+            if (!initial) return fallback();
+            return undefined;
+          },
+        ),
+      );
     } catch (error) {
       if (!isInitialCheckoutFallback(error)) throw error;
       throwIfAborted(options.signal);
-      context.database.publishProvisionalClone(owner, context.now(), fallback);
+      withGitMutationGuardOwned(context.database, () =>
+        sqliteGitDatabaseMutations(context.database).publishProvisionalCloneOwned(
+          owner,
+          context.now(),
+          fallback,
+        ),
+      );
     }
   } catch (error) {
     try {
-      context.database.discardProvisionalClone(owner, context.now(), cleanup);
+      withGitMutationGuardOwned(context.database, () =>
+        sqliteGitDatabaseMutations(context.database).discardProvisionalCloneOwned(
+          owner,
+          context.now(),
+          cleanup,
+        ),
+      );
     } catch (discardError) {
       if (!hasErrorCode(discardError, "ESTALE")) throw discardError;
     }
