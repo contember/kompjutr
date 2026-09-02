@@ -983,7 +983,7 @@ headroom total at most 100 MiB minus one byte.
 One repository admits at most 16 simultaneous scratch-index names, each at most
 255 UTF-8 bytes. A scratch callback is synchronous and cannot escape its owning
 transaction. `writeTree()` admits at most 10,000 entries in one materialized
-tree object and 4,096 tree objects. Cumulative path and serialized-tree bytes
+tree object. Cumulative path bytes, serialized-tree bytes, and tree-object count
 are diagnostics; the live directory stack is bounded by the per-tree entry cap,
 and objects flush through fixed batches. `commitTree()` accepts at most two
 ordered parents and eight cumulative revision traversals. Recursive `lsTree()`

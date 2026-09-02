@@ -9,9 +9,9 @@ import {
 import type { IndexEntry } from "../src/git/store/index.js";
 
 const OID = "1".repeat(40);
+const FORMER_TREE_OBJECT_LIMIT = 4_096;
 const LIMITS: TreeBuildPreflightLimits = {
   maxEntriesPerTree: 10,
-  maxTreeObjects: 10,
 };
 
 function preflight(entries: Iterable<IndexEntry>, limits: TreeBuildPreflightLimits = LIMITS) {
@@ -52,24 +52,18 @@ describe("tree-build preflight", () => {
     });
   });
 
-  it("accepts exact structural limits and rejects each next unit", () => {
+  it("accepts the exact per-tree entry limit and rejects the next entry", () => {
     const entries = [entry("a.txt"), entry("dir/b", 0o100755)];
     const exact: TreeBuildPreflightLimits = {
       maxEntriesPerTree: 2,
-      maxTreeObjects: 2,
     };
     expect(preflight(entries, exact)).toMatchObject({
       leafEntries: 2,
       treeObjects: 2,
     });
-    for (const limits of [
-      { ...exact, maxEntriesPerTree: 1 },
-      { ...exact, maxTreeObjects: 1 },
-    ]) {
-      expect(() => preflight(entries, limits)).toThrowError(
-        expect.objectContaining({ code: "E2BIG" }),
-      );
-    }
+    expect(() => preflight(entries, { maxEntriesPerTree: 1 })).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
   });
 
   it("bounds entries per tree object rather than cumulative leaves", () => {
@@ -82,7 +76,6 @@ describe("tree-build preflight", () => {
     };
     const limits: TreeBuildPreflightLimits = {
       maxEntriesPerTree: 10_000,
-      maxTreeObjects: 3,
     };
 
     expect(preflight(distributed(), limits)).toMatchObject({
@@ -98,6 +91,20 @@ describe("tree-build preflight", () => {
     expect(() => preflight(flat(), limits)).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
+  });
+
+  it("preflights beyond the former 4,096-tree-object boundary", () => {
+    const entries = function* (): Generator<IndexEntry> {
+      for (let index = 0; index < FORMER_TREE_OBJECT_LIMIT; index++) {
+        const ordinal = index.toString().padStart(4, "0");
+        yield entry(`d${ordinal}/f${ordinal}`);
+      }
+    };
+
+    expect(preflight(entries(), { maxEntriesPerTree: FORMER_TREE_OBJECT_LIMIT })).toMatchObject({
+      leafEntries: FORMER_TREE_OBJECT_LIMIT,
+      treeObjects: FORMER_TREE_OBJECT_LIMIT + 1,
+    });
   });
 
   it("counts an empty root tree while ignoring non-zero stages", () => {
@@ -126,7 +133,7 @@ describe("tree-build preflight", () => {
       }
     };
 
-    const stats = preflight(entries(), { maxEntriesPerTree: 8_000, maxTreeObjects: 4_001 });
+    const stats = preflight(entries(), { maxEntriesPerTree: 8_000 });
     expect(stats.totalPathBytes).toBeGreaterThan(4 * 1024 * 1024);
     expect(stats.serializedTreeBytes).toBeGreaterThan(16 * 1024 * 1024);
     expect(stats.maxSingleTreeBytes).toBeLessThan(1024 * 1024);

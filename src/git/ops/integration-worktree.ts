@@ -11,7 +11,6 @@ import { checkoutBlockersAgainstOwned, checkoutBlockersOwned } from "./refs.js";
 import type { Repository } from "./repository.js";
 import {
   MAX_TREE_BUILD_LEAF_ENTRIES,
-  MAX_TREE_BUILD_OBJECTS,
   preflightTreeBuild,
   type TreeBuildPreflightStats,
 } from "./tree-build.js";
@@ -24,7 +23,6 @@ import {
 } from "./worktree-io.js";
 
 export const MAX_INTEGRATION_INDEX_ENTRIES = MAX_TREE_BUILD_LEAF_ENTRIES;
-export const MAX_INTEGRATION_TREE_OBJECTS = MAX_TREE_BUILD_OBJECTS;
 const MAX_REPOSITORY_ROWS = 50_000;
 const MAX_RELOCATION_COLLISIONS = 1_000;
 const NO_OMITTED_PATHS: ReadonlySet<string> = new Set();
@@ -62,7 +60,6 @@ export function requireBoundedIntegrationTree(
   const entries = typeof source === "function" ? source() : source;
   return preflightTreeBuild(entries, {
     maxEntriesPerTree: MAX_INTEGRATION_INDEX_ENTRIES,
-    maxTreeObjects: MAX_INTEGRATION_TREE_OBJECTS,
   });
 }
 

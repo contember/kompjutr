@@ -19,6 +19,7 @@ import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspac
 import { CountingWorktree } from "./helpers/worktree.js";
 
 const IDENTITY = { name: "Fixture", email: "fixture@example.com" };
+const FORMER_TREE_OBJECT_LIMIT = 4_096;
 const fixtures: GitFixture[] = [];
 
 interface History {
@@ -455,6 +456,104 @@ describe("merge lifecycle", () => {
     });
     if (named === undefined || head === undefined) throw new Error("merge reflog is missing");
     expect(head.ordinal).toBe(named.ordinal + 1);
+  });
+
+  it("publicly merges beyond the former 4,096-tree-object boundary", async () => {
+    const workspace = makeRepo("/");
+    const stableBlob = workspace.repo.store.write("blob", utf8.encode("stable\n"));
+    const currentBlob = workspace.repo.store.write("blob", utf8.encode("current\n"));
+    const incomingBlob = workspace.repo.store.write("blob", utf8.encode("incoming\n"));
+    const leafTree = workspace.repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "file.txt", oid: stableBlob }]),
+    );
+    const wideTree = workspace.repo.store.write(
+      "tree",
+      serializeTree(
+        Array.from({ length: FORMER_TREE_OBJECT_LIMIT }, (_, index) => ({
+          mode: "40000",
+          name: `d${index.toString().padStart(4, "0")}`,
+          oid: leafTree,
+        })),
+      ),
+    );
+    const stableEntry = { mode: "40000", name: "stable", oid: wideTree };
+    const baseTree = workspace.repo.store.write("tree", serializeTree([stableEntry]));
+    const currentTree = workspace.repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "current.txt", oid: currentBlob }, stableEntry]),
+    );
+    const incomingTree = workspace.repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "incoming.txt", oid: incomingBlob }, stableEntry]),
+    );
+    const person = {
+      ...IDENTITY,
+      timestamp: 1_577_836_800,
+      timezoneOffset: 0,
+    };
+    const base = workspace.repo.store.write(
+      "commit",
+      serializeCommit({
+        tree: baseTree,
+        parent: [],
+        author: person,
+        committer: person,
+        message: "base\n",
+      }),
+    );
+    const current = workspace.repo.store.write(
+      "commit",
+      serializeCommit({
+        tree: currentTree,
+        parent: [base],
+        author: person,
+        committer: person,
+        message: "current\n",
+      }),
+    );
+    const incoming = workspace.repo.store.write(
+      "commit",
+      serializeCommit({
+        tree: incomingTree,
+        parent: [base],
+        author: person,
+        committer: person,
+        message: "incoming\n",
+      }),
+    );
+    workspace.repo.store.setRef("refs/heads/main", current);
+    workspace.repo.store.setRef("refs/heads/topic", incoming);
+    workspace.repo.checkout.indexReplace([
+      {
+        path: "current.txt",
+        stage: 0,
+        mode: 0o100644,
+        oid: currentBlob,
+        size: null,
+        mtime: null,
+        ino: null,
+        rev: null,
+      },
+      ...Array.from({ length: FORMER_TREE_OBJECT_LIMIT }, (_, index) => ({
+        path: `stable/d${index.toString().padStart(4, "0")}/file.txt`,
+        stage: 0,
+        mode: 0o100644,
+        oid: stableBlob,
+        size: null,
+        mtime: null,
+        ino: null,
+        rev: null,
+      })),
+    ]);
+    writeWorkFile(workspace, "/current.txt", "current\n");
+
+    const result = await nativeGit(workspace).merge({ theirs: "topic", fastForward: false });
+
+    if (result.oid === undefined) throw new Error("wide merge returned no commit");
+    expect(workspace.repo.readCommit(result.oid).parent).toEqual([current, incoming]);
+    expect(workspace.repo.head().oid).toBe(result.oid);
+    expect(textAt(workspace, "incoming.txt")).toBe("incoming\n");
   });
 
   it("rolls back a clean merge when publication fails after the ref mutation", async () => {

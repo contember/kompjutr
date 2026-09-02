@@ -25,12 +25,7 @@ import {
   resolveHeadOwned,
   symbolicTargetOwned,
 } from "./repository.js";
-import {
-  buildTreeInBatch,
-  MAX_TREE_BUILD_LEAF_ENTRIES,
-  MAX_TREE_BUILD_OBJECTS,
-  preflightTreeBuild,
-} from "./tree-build.js";
+import { buildTreeInBatch, MAX_TREE_BUILD_LEAF_ENTRIES, preflightTreeBuild } from "./tree-build.js";
 import type { Worktree } from "./worktree.js";
 
 const READ_TREE_MAX_ROWS_PER_STREAM = 50_000;
@@ -151,7 +146,6 @@ export function writeTree(repo: Repository, index: IndexStore = repo.checkout): 
       };
       preflightTreeBuild(entries(), {
         maxEntriesPerTree: MAX_TREE_BUILD_LEAF_ENTRIES,
-        maxTreeObjects: MAX_TREE_BUILD_OBJECTS,
       });
       const missing = repo.store.missing(requiredObjects);
       if (missing[0] !== undefined) throw new ObjectNotFoundError(missing[0]);

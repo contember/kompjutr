@@ -22,7 +22,6 @@ import type { CommitTreeSnapshotResult } from "./sparse-workspace.js";
 
 /** Maximum entries retained in one materialized tree object. */
 export const MAX_TREE_BUILD_LEAF_ENTRIES = 10_000;
-export const MAX_TREE_BUILD_OBJECTS = 4_096;
 
 const INDEX_DIRTY = 1;
 const MAX_SPARSE_TREE_PATHS = 1_000;
@@ -30,7 +29,6 @@ const MAX_SPARSE_TREE_INDEX_ROWS = MAX_SPARSE_TREE_PATHS * 4;
 
 export interface TreeBuildPreflightLimits {
   maxEntriesPerTree: number;
-  maxTreeObjects: number;
 }
 
 export interface TreeBuildPreflightStats {
@@ -551,8 +549,6 @@ export function preflightTreeBuild(
   limits: TreeBuildPreflightLimits,
 ): TreeBuildPreflightStats {
   const maxEntriesPerTree = requireLimit(limits.maxEntriesPerTree, "tree-entry");
-  const maxTreeObjects = requireLimit(limits.maxTreeObjects, "tree-object");
-  if (maxTreeObjects < 1) throw new GitError("E2BIG", "tree build requires its root tree");
 
   const stack: PreflightDirectory[] = [{ serializedBytes: 0, entries: 0 }];
   const open: string[] = [];
@@ -619,9 +615,6 @@ export function preflightTreeBuild(
     while (shared < depth && shared < open.length && open[shared] === segments[shared]) shared++;
     closeTo(shared);
     for (let level = shared; level < depth; level++) {
-      if (treeObjects >= maxTreeObjects) {
-        throw new GitError("E2BIG", `tree build exceeds ${maxTreeObjects} tree objects`);
-      }
       const name = segments[level];
       if (name === undefined) throw new CorruptError("tree-build directory segment is missing");
       const bytes = serializedEntryBytes(5, utf8Length(name, "tree-build directory name"));
@@ -631,7 +624,7 @@ export function preflightTreeBuild(
       retainEntry(parent, bytes);
       stack.push({ serializedBytes: 0, entries: 0 });
       open.push(name);
-      treeObjects++;
+      treeObjects = checkedBytes(treeObjects, 1, "tree-object diagnostic");
     }
 
     const name = segments[depth];

@@ -18,7 +18,7 @@ import {
   writeTree,
 } from "../src/git/ops/plumbing.js";
 import { add } from "../src/git/ops/staging.js";
-import { MAX_TREE_BUILD_LEAF_ENTRIES, MAX_TREE_BUILD_OBJECTS } from "../src/git/ops/tree-build.js";
+import { MAX_TREE_BUILD_LEAF_ENTRIES } from "../src/git/ops/tree-build.js";
 import type { Worktree } from "../src/git/ops/worktree.js";
 import type { IndexEntry, IndexStore } from "../src/git/store/index.js";
 import {
@@ -34,6 +34,7 @@ import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
 
 const FORMER_COMMIT_TREE_MESSAGE_BYTES = 1024 * 1024;
+const FORMER_TREE_OBJECT_LIMIT = 4_096;
 const fixtures: GitFixture[] = [];
 
 function newFixture(): GitFixture {
@@ -390,12 +391,6 @@ describe("tree and index write plumbing", () => {
           yield indexed(`f${index.toString().padStart(5, "0")}`, blob);
         }
       },
-      function* () {
-        for (let index = 0; index < MAX_TREE_BUILD_OBJECTS; index++) {
-          const ordinal = index.toString().padStart(4, "0");
-          yield indexed(`d${ordinal}/f${ordinal}`, blob);
-        }
-      },
     ];
 
     for (const open of cases) {
@@ -407,12 +402,12 @@ describe("tree and index write plumbing", () => {
     }
   });
 
-  it("materializes the maximal admitted tree-object shape below the SQL gate", () => {
+  it("writes beyond the former 4,096-tree-object boundary", () => {
     const workspace = makeRepo("/");
     const blob = workspace.repo.store.write("blob", new Uint8Array(0));
     const suffix = "x".repeat(900);
     const rows = function* (): Generator<IndexEntry> {
-      for (let index = 0; index < MAX_TREE_BUILD_OBJECTS - 1; index++) {
+      for (let index = 0; index < FORMER_TREE_OBJECT_LIMIT; index++) {
         const ordinal = index.toString().padStart(4, "0");
         yield indexed(`d${ordinal}/f${ordinal}-${suffix}`, blob);
       }
@@ -425,7 +420,7 @@ describe("tree and index write plumbing", () => {
     const statements = workspace.storage.statementCount - beforeStatements;
 
     expect(workspace.repo.store.read(oid)?.type).toBe("tree");
-    expect(workspace.repo.store.objectCount() - beforeObjects).toBe(MAX_TREE_BUILD_OBJECTS);
+    expect(workspace.repo.store.objectCount() - beforeObjects).toBe(FORMER_TREE_OBJECT_LIMIT + 1);
     expect(statements).toBeLessThan(1_000);
     expect(controlState(workspace)).toEqual(beforeControl);
     expect(worktreeState(workspace)).toEqual([]);
