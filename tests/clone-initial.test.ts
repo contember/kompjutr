@@ -6,13 +6,13 @@ import { readBlob } from "../src/db/db.js";
 import { createGit, type GitFactory } from "../src/git/client.js";
 import { equalBytes, fromHex } from "../src/git/common/bytes.js";
 import { GitError } from "../src/git/common/errors.js";
-import type { InitialWorktreeWriter } from "../src/git/ops/context.js";
+import type { InitialWorktreeWriter } from "../src/git/ops/core/context.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES, WALK_TREE_SQL } from "../src/git/store/index.js";
 import {
   INDEX_DIRTY,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
-} from "../src/git/store/index-tracker.js";
+} from "../src/git/store/indexes/index-tracker.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

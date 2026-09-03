@@ -3,18 +3,18 @@ import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
 import { isOid } from "../../src/git/common/bytes.js";
 import { CorruptError, GitError } from "../../src/git/common/errors.js";
-import type { GitContext } from "../../src/git/ops/context.js";
-import { openRepository } from "../../src/git/ops/context.js";
-import type { Repository } from "../../src/git/ops/repository.js";
+import type { GitContext } from "../../src/git/ops/core/context.js";
+import { openRepository } from "../../src/git/ops/core/context.js";
+import type { Repository } from "../../src/git/ops/repository/repository.js";
 import { SqliteGitDatabase, type StoreOptions } from "../../src/git/store/index.js";
 import {
   initializeIndexTracker,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
-} from "../../src/git/store/index-tracker.js";
+} from "../../src/git/store/indexes/index-tracker.js";
 import { readMaintenanceRunView } from "../../src/git/store/maintenance/state.js";
-import { requireRawRefTarget, requireRefName } from "../../src/git/store/ref-validation.js";
-import { createSqliteSparseWorkspaceSource } from "../../src/git/store/sparse-workspace.js";
+import { requireRawRefTarget, requireRefName } from "../../src/git/store/refs/ref-validation.js";
+import { createSqliteSparseWorkspaceSource } from "../../src/git/store/sparse/sparse-workspace.js";
 import { TestDatabase } from "./db.js";
 import type { TestWorkspace } from "./workspace.js";
 

@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createGit, type Git } from "../src/git/client.js";
-import { checkoutTree, indexFromTree } from "../src/git/ops/checkout.js";
-import type { GitContext } from "../src/git/ops/context.js";
-import type { Repository } from "../src/git/ops/repository.js";
-import type { Worktree } from "../src/git/ops/worktree.js";
+import { checkoutTree, indexFromTree } from "../src/git/ops/checkout/checkout.js";
+import type { GitContext } from "../src/git/ops/core/context.js";
+import type { Repository } from "../src/git/ops/repository/repository.js";
+import type { Worktree } from "../src/git/ops/worktree/worktree.js";
 import type { IndexEntry, SqliteGitDatabase } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

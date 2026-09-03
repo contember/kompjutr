@@ -5,7 +5,7 @@ import type {
   SparseIndexAncestorRequest,
   SparseTreeLeaf,
   SparseWorkspaceRequest,
-} from "../contracts.js";
+} from "../core/contracts.js";
 
 export const MAX_PATHS = 1_000;
 export const MAX_SPARSE_BINDING_BYTES = 8 * 1024 * 1024;

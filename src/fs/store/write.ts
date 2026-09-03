@@ -37,7 +37,7 @@ import {
   writeChunks,
   writeNodes,
   writePaths,
-} from "./write-batches.js";
+} from "./write/write-batches.js";
 
 const DEFAULT_FILE_MODE = 0o644;
 const DEFAULT_DIR_MODE = 0o755;

@@ -13,8 +13,8 @@ import {
   MAX_REPLAY_REVISION_HOPS,
   planReplay,
   preflightReplayCommitObjects,
-} from "../src/git/ops/replay.js";
-import { Repository } from "../src/git/ops/repository.js";
+} from "../src/git/ops/replay/replay.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 

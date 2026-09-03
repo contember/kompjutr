@@ -1,21 +1,21 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import { openRepository } from "../src/git/ops/context.js";
-import type { StatusEntry } from "../src/git/ops/kinds.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import { openRepository } from "../src/git/ops/core/context.js";
+import type { StatusEntry } from "../src/git/ops/core/kinds.js";
 import {
   formatPorcelainV1,
   formatPorcelainV2,
   formatShort,
   status,
   statusReport,
-} from "../src/git/ops/status.js";
+} from "../src/git/ops/status/status.js";
 import {
   STATUS_FORMAT_MAX_RECORDS,
   STATUS_FORMAT_MAX_RETAINED_BYTES,
   statusFormatOptions,
-} from "../src/git/ops/status-format.js";
-import type { StatusDetail } from "../src/git/ops/status-rows.js";
-import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
+} from "../src/git/ops/status/status-format.js";
+import type { StatusDetail } from "../src/git/ops/status/status-rows.js";
+import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree/worktree-io.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";

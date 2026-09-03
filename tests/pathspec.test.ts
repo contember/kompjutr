@@ -10,20 +10,20 @@ import type {
   ScanOptions,
 } from "../src/fs/types.js";
 import { comparePaths } from "../src/git/common/streams.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import {
-  type CompiledReadPathspec,
-  compileReadPathspec,
-  type LsFilesOptions,
-} from "../src/git/ops/pathspec.js";
-import { lsFilesAtRef } from "../src/git/ops/reads.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import { lsFilesAtRef } from "../src/git/ops/repository/reads.js";
 import {
   lsFiles,
   lsFilesWithWorktree,
   MAX_LS_FILES_EXCLUDE_ROOTS,
-} from "../src/git/ops/staging.js";
-import type { Worktree } from "../src/git/ops/worktree.js";
-import { WORKTREE_SCAN_PAGE } from "../src/git/ops/worktree-io.js";
+} from "../src/git/ops/staging/staging.js";
+import {
+  type CompiledReadPathspec,
+  compileReadPathspec,
+  type LsFilesOptions,
+} from "../src/git/ops/worktree/pathspec.js";
+import type { Worktree } from "../src/git/ops/worktree/worktree.js";
+import { WORKTREE_SCAN_PAGE } from "../src/git/ops/worktree/worktree-io.js";
 import type { IndexEntry } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

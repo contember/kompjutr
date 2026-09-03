@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { worktreeAdd } from "../src/git/ops/worktrees.js";
+import { worktreeAdd } from "../src/git/ops/worktree/worktrees.js";
 import {
   fetchHttpClient,
   type GitHttpClient,

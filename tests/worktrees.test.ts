@@ -4,16 +4,16 @@ import { describe, expect, it } from "vitest";
 import { createGit, type Git } from "../src/git/client.js";
 import { utf8 } from "../src/git/common/bytes.js";
 import { MODE_FILE, serializeCommit, serializeTree } from "../src/git/common/objects.js";
-import type { ReplayStateMetadata } from "../src/git/ops/operation-state.js";
-import { operationRefLogMetadata } from "../src/git/ops/ref-log.js";
-import { branchDelete } from "../src/git/ops/refs.js";
-import { Repository } from "../src/git/ops/repository.js";
+import type { ReplayStateMetadata } from "../src/git/ops/core/operation-state.js";
+import { operationRefLogMetadata } from "../src/git/ops/core/ref-log.js";
+import { branchDelete } from "../src/git/ops/refs/refs.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
 import {
   worktreeAdd,
   worktreeList,
   worktreePrune,
   worktreeRemove,
-} from "../src/git/ops/worktrees.js";
+} from "../src/git/ops/worktree/worktrees.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import { GitFixture } from "./helpers/git.js";

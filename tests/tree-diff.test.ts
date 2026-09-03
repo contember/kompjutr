@@ -11,7 +11,7 @@ import {
   serializeTree,
 } from "../src/git/common/objects.js";
 import { joinSorted } from "../src/git/common/streams.js";
-import { Repository } from "../src/git/ops/repository.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { PackWriter } from "../src/git/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";

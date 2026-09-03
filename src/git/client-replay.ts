@@ -2,28 +2,28 @@ import type { GitClientServices } from "./client-services.js";
 import type { Git } from "./client-types.js";
 import { UnsupportedOperationError } from "./common/errors.js";
 import {
-  cherryPickAbort as cherryPickAbortOp,
-  cherryPickContinue as cherryPickContinueOp,
-  cherryPick as cherryPickOp,
-  cherryPickSkip as cherryPickSkipOp,
-} from "./ops/cherry-pick.js";
-import {
   mergeAbort as mergeAbortOp,
   mergeContinue as mergeContinueOp,
   merge as mergeOp,
-} from "./ops/merge.js";
+} from "./ops/merge/merge.js";
 import {
   rebaseAbortExcluding as rebaseAbortOp,
   rebaseContinueExcluding as rebaseContinueOp,
   rebaseExcluding as rebaseOp,
   rebaseSkipExcluding as rebaseSkipOp,
-} from "./ops/rebase.js";
+} from "./ops/rebase/rebase.js";
+import {
+  cherryPickAbort as cherryPickAbortOp,
+  cherryPickContinue as cherryPickContinueOp,
+  cherryPick as cherryPickOp,
+  cherryPickSkip as cherryPickSkipOp,
+} from "./ops/replay/cherry-pick.js";
 import {
   revertAbort as revertAbortOp,
   revertContinue as revertContinueOp,
   revert as revertOp,
   revertSkip as revertSkipOp,
-} from "./ops/revert.js";
+} from "./ops/replay/revert.js";
 
 type ReplayMethods = Pick<
   Git,

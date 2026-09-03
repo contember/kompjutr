@@ -97,8 +97,8 @@ export {
   RefNotFoundError,
   UnsupportedOperationError,
 } from "./common/errors.js";
-export type { GitCliNetworkBinding, GitContext, GitIdentity } from "./ops/context.js";
-export { findRepository, nestedRoots, openRepository } from "./ops/context.js";
+export type { GitCliNetworkBinding, GitContext, GitIdentity } from "./ops/core/context.js";
+export { findRepository, nestedRoots, openRepository } from "./ops/core/context.js";
 export type {
   CommitResult,
   DiffSummaryEntry,
@@ -110,11 +110,16 @@ export type {
   ReplayResult,
   StatusEntry,
   StatusRow,
-} from "./ops/kinds.js";
+} from "./ops/core/kinds.js";
 export {
-  MAX_LS_REMOTE_PATTERNS,
-  MAX_LS_REMOTE_REFS,
-} from "./ops/ls-remote.js";
+  type RecoverRefOptions,
+  type RefLogEndpoint,
+  type RefLogEntry,
+  type RefLogReadOptions,
+  type RefLogRecoverySource,
+  recoverRef,
+  reflog,
+} from "./ops/core/ref-log.js";
 export {
   type DivergenceOptions,
   type DivergenceRelationship,
@@ -124,7 +129,32 @@ export {
   type MergeBaseOptions,
   type MergeBaseResult,
   mergeBase,
-} from "./ops/merge-base.js";
+} from "./ops/merge/merge-base.js";
+export {
+  MAX_LS_REMOTE_PATTERNS,
+  MAX_LS_REMOTE_REFS,
+} from "./ops/network/ls-remote.js";
+export {
+  type FetchRefspec,
+  type FetchRefUpdate,
+  type FetchResult,
+  type LsRemoteResult,
+  MAX_REFSPEC_EXPANDED_DESTINATIONS,
+  MAX_REFSPEC_MAPPINGS,
+  type PushRefStatus,
+  type PushRefspec,
+  type PushResult,
+  type PushTrackingResult,
+  type RemoteRefView,
+  type RemoteTarget,
+} from "./ops/refs/refspec.js";
+export {
+  type ReplaySnapshotConflict,
+  type ReplaySnapshotConflictStage,
+  type ReplaySnapshotOptions,
+  type ReplaySnapshotResult,
+  replaySnapshot,
+} from "./ops/replay/replay.js";
 export {
   type CommitTreeOptions,
   commitTree,
@@ -139,7 +169,7 @@ export {
   type UpdateRefWriteOptions,
   updateRef,
   writeTree,
-} from "./ops/plumbing.js";
+} from "./ops/repository/plumbing.js";
 export type {
   CommitView,
   LogOptions,
@@ -147,38 +177,8 @@ export type {
   ShowOptions,
   ShowResult,
   TreeEntryView,
-} from "./ops/reads.js";
-export {
-  type RecoverRefOptions,
-  type RefLogEndpoint,
-  type RefLogEntry,
-  type RefLogReadOptions,
-  type RefLogRecoverySource,
-  recoverRef,
-  reflog,
-} from "./ops/ref-log.js";
-export {
-  type FetchRefspec,
-  type FetchRefUpdate,
-  type FetchResult,
-  type LsRemoteResult,
-  MAX_REFSPEC_EXPANDED_DESTINATIONS,
-  MAX_REFSPEC_MAPPINGS,
-  type PushRefStatus,
-  type PushRefspec,
-  type PushResult,
-  type PushTrackingResult,
-  type RemoteRefView,
-  type RemoteTarget,
-} from "./ops/refspec.js";
-export {
-  type ReplaySnapshotConflict,
-  type ReplaySnapshotConflictStage,
-  type ReplaySnapshotOptions,
-  type ReplaySnapshotResult,
-  replaySnapshot,
-} from "./ops/replay.js";
-export { Repository, type RevisionResolution } from "./ops/repository.js";
+} from "./ops/repository/reads.js";
+export { Repository, type RevisionResolution } from "./ops/repository/repository.js";
 export {
   formatPorcelainV1,
   formatPorcelainV2,
@@ -191,12 +191,12 @@ export {
   status,
   statusReport,
   statusStream,
-} from "./ops/status.js";
+} from "./ops/status/status.js";
 export {
   type StatusFormatOptions,
   statusFormatOptions,
-} from "./ops/status-format.js";
-export type { Worktree, WorktreeDirent, WorktreeStat } from "./ops/worktree.js";
+} from "./ops/status/status-format.js";
+export type { Worktree, WorktreeDirent, WorktreeStat } from "./ops/worktree/worktree.js";
 export {
   type WorktreeAddOptions,
   type WorktreeAddTarget,
@@ -206,7 +206,7 @@ export {
   worktreeList,
   worktreePrune,
   worktreeRemove,
-} from "./ops/worktrees.js";
+} from "./ops/worktree/worktrees.js";
 export {
   type CheckoutRow,
   CheckoutStore,
@@ -216,4 +216,4 @@ export {
   SqliteGitDatabase,
   type StoreOptions,
 } from "./store/index.js";
-export { initializeGitSchema, SCHEMA_VERSION } from "./store/schema.js";
+export { initializeGitSchema, SCHEMA_VERSION } from "./store/schema/schema.js";

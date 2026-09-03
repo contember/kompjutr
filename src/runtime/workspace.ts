@@ -5,19 +5,23 @@ import { createFilesystem } from "../fs/filesystem.js";
 import { createInitialWorktreeWriter } from "../fs/store/initial-write.js";
 import type { Filesystem } from "../fs/types.js";
 import type { Git, GitFactory, GitPromisorAuth } from "../git/client.js";
-import type { GitCliNetworkBinding, GitIdentity, IndexTrackerWriter } from "../git/ops/context.js";
+import type {
+  GitCliNetworkBinding,
+  GitIdentity,
+  IndexTrackerWriter,
+} from "../git/ops/core/context.js";
 import type { GitHttpClient } from "../git/protocol/transport.js";
 import { SqliteGitDatabase, type StoreOptions } from "../git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
   initializeIndexTracker,
   resealIndexTracker,
-} from "../git/store/index-tracker.js";
+} from "../git/store/indexes/index-tracker.js";
 import {
   createSqliteCommitTreeSnapshotSource,
   createSqliteSelectedPathSource,
   createSqliteSparseWorkspaceSource,
-} from "../git/store/sparse-workspace.js";
+} from "../git/store/sparse/sparse-workspace.js";
 import type { ProcessExecOptions, ProcessHandle, ProcessHost } from "./types.js";
 
 export interface WorkspaceOptions extends StoreOptions {

@@ -8,7 +8,8 @@ import {
   parseCommit,
   serializeCommit,
 } from "../src/git/common/objects.js";
-import { Repository } from "../src/git/ops/repository.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   COMMIT_CACHE_FLUSH_BYTES,
   commitCacheBytes,
@@ -16,8 +17,7 @@ import {
   MAX_LOG_COMMITS,
   prepareCommitCache,
   WALK_COMMIT_GRAPH_SQL,
-} from "../src/git/store/commits.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../src/git/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const FORMER_INDEXED_COMMIT_BYTES = 1024 * 1024;

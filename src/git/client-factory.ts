@@ -7,9 +7,9 @@ import { createGitClientRefMethods } from "./client-refs.js";
 import { createGitClientReplayMethods } from "./client-replay.js";
 import type { GitClientServices } from "./client-services.js";
 import type { CreateGitOptions, Git, GitFactory, GitWorkspaceBinding } from "./client-types.js";
-import { type GitContext, nestedRoots, openRepository } from "./ops/context.js";
-import type { Repository } from "./ops/repository.js";
-import { withGitMutationGuardOwned } from "./store/database.js";
+import { type GitContext, nestedRoots, openRepository } from "./ops/core/context.js";
+import type { Repository } from "./ops/repository/repository.js";
+import { withGitMutationGuardOwned } from "./store/database/database.js";
 
 /** Create a Git factory that binds lazily to one Workspace database. */
 export function createGit(options: CreateGitOptions = {}): GitFactory {

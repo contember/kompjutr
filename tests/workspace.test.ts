@@ -2,16 +2,16 @@ import { describe, expect, it } from "vitest";
 import { createInitialWorktreeWriter } from "../src/fs/store/initial-write.js";
 import { createGit, type GitWorkspaceBinding } from "../src/git/client.js";
 import { utf8Decoder } from "../src/git/common/bytes.js";
-import { nestedRoots, openRepository } from "../src/git/ops/context.js";
-import { initRepository } from "../src/git/ops/init.js";
-import { walkWorktree } from "../src/git/ops/worktree-io.js";
+import { nestedRoots, openRepository } from "../src/git/ops/core/context.js";
+import { initRepository } from "../src/git/ops/repository/init.js";
+import { walkWorktree } from "../src/git/ops/worktree/worktree-io.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   INDEX_DIRTY,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
   resealIndexTracker,
-} from "../src/git/store/index-tracker.js";
+} from "../src/git/store/indexes/index-tracker.js";
 import { Workspace as RuntimeWorkspace } from "../src/runtime/workspace.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 import { makeRepo, makeWorkspace, writeWorkFile } from "./helpers/workspace.js";

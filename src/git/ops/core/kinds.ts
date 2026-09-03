@@ -1,0 +1,98 @@
+// View types shared by the commands. These mirror the shapes Computer's
+// `GitClient` interface returns, so the facade in `src/compat/computer/` is a
+// direct hand-off with no translation layer.
+//
+// FROZEN SEAM: every command depends on these. Changing one invalidates
+// work in flight elsewhere.
+
+export type { CatFileResult, CommitView, TreeEntryView } from "../repository/reads.js";
+
+import type { ReplayEmptyReason } from "../../store/operations/operations.js";
+
+export type { ReplayEmptyReason } from "../../store/operations/operations.js";
+
+/**
+ * `Person.timezoneOffset` is minutes **west** of UTC — `+0100` is `-60`,
+ * the `Date.prototype.getTimezoneOffset` convention. That is what
+ * isomorphic-git returns at runtime and therefore what Computer's
+ * `CommitView` actually carries, whatever its doc comment says. Anything
+ * formatting a commit date has to negate.
+ */
+
+export type OrdinaryStatusIndexCode = " " | "A" | "M" | "D";
+export type OrdinaryStatusWorktreeCode = " " | "A" | "M" | "D" | "?";
+export type UnmergedStatusCode = "A" | "D" | "U";
+export type IgnoredStatusCode = "!";
+export type RenameStatusCode = "R";
+
+export interface OrdinaryStatusEntry {
+  path: string;
+  index: OrdinaryStatusIndexCode;
+  worktree: OrdinaryStatusWorktreeCode;
+}
+
+export interface StatusEntry {
+  path: string;
+  index: OrdinaryStatusIndexCode | UnmergedStatusCode | IgnoredStatusCode | RenameStatusCode;
+  worktree: OrdinaryStatusWorktreeCode | UnmergedStatusCode | IgnoredStatusCode;
+  /** Source path for a staged exact rename. */
+  originalPath?: string;
+  /** Exact renames currently report only 100. */
+  similarity?: 100;
+}
+
+/**
+ * isomorphic-git's `statusMatrix` row shape, kept for callers that already
+ * speak it: `[filepath, head, workdir, stage]` where 0 = absent,
+ * 1 = present and equal to HEAD, 2 = present and different, 3 = present
+ * and different from both.
+ */
+export type StatusRow = [filepath: string, head: number, workdir: number, stage: number];
+
+export interface DiffSummaryEntry {
+  path: string;
+  status: "A" | "M" | "D" | "R";
+  insertions: number;
+  deletions: number;
+  originalPath?: string;
+  similarity?: 100;
+}
+
+export interface CommitResult {
+  oid: string;
+}
+
+export interface RemoteView {
+  name: string;
+  url: string;
+}
+
+export interface MergeResult {
+  oid?: string;
+  alreadyMerged?: boolean;
+  fastForward?: boolean;
+  /** The index contains unresolved stages and the merge can be continued or aborted. */
+  conflicted?: boolean;
+  /** The merge has durable state but has not created its merge commit yet. */
+  pendingCommit?: boolean;
+}
+
+export type ReplayResult =
+  | { outcome: "committed"; oid: string }
+  | { outcome: "conflicted" }
+  | { outcome: "empty"; reason: ReplayEmptyReason };
+
+export type RebaseResult =
+  | { outcome: "up-to-date"; oid: string }
+  | {
+      outcome: "completed";
+      oid: string;
+      replayed: number;
+      skipped: number;
+      fastForward: boolean;
+    }
+  | { outcome: "conflicted"; replayed: number; skipped: number };
+
+export type PullResult =
+  | { strategy: "merge"; result: MergeResult }
+  | { strategy: "rebase"; result: RebaseResult };

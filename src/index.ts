@@ -101,8 +101,8 @@ export {
   RefNotFoundError,
   UnsupportedOperationError,
 } from "./git/common/errors.js";
-export type { GitCliNetworkBinding, GitContext, GitIdentity } from "./git/ops/context.js";
-export { findRepository, nestedRoots, openRepository } from "./git/ops/context.js";
+export type { GitCliNetworkBinding, GitContext, GitIdentity } from "./git/ops/core/context.js";
+export { findRepository, nestedRoots, openRepository } from "./git/ops/core/context.js";
 export type {
   CommitResult,
   DiffSummaryEntry,
@@ -114,11 +114,16 @@ export type {
   ReplayResult,
   StatusEntry,
   StatusRow,
-} from "./git/ops/kinds.js";
+} from "./git/ops/core/kinds.js";
 export {
-  MAX_LS_REMOTE_PATTERNS,
-  MAX_LS_REMOTE_REFS,
-} from "./git/ops/ls-remote.js";
+  type RecoverRefOptions,
+  type RefLogEndpoint,
+  type RefLogEntry,
+  type RefLogReadOptions,
+  type RefLogRecoverySource,
+  recoverRef,
+  reflog,
+} from "./git/ops/core/ref-log.js";
 export {
   type DivergenceOptions,
   type DivergenceRelationship,
@@ -128,7 +133,32 @@ export {
   type MergeBaseOptions,
   type MergeBaseResult,
   mergeBase,
-} from "./git/ops/merge-base.js";
+} from "./git/ops/merge/merge-base.js";
+export {
+  MAX_LS_REMOTE_PATTERNS,
+  MAX_LS_REMOTE_REFS,
+} from "./git/ops/network/ls-remote.js";
+export {
+  type FetchRefspec,
+  type FetchRefUpdate,
+  type FetchResult,
+  type LsRemoteResult,
+  MAX_REFSPEC_EXPANDED_DESTINATIONS,
+  MAX_REFSPEC_MAPPINGS,
+  type PushRefStatus,
+  type PushRefspec,
+  type PushResult,
+  type PushTrackingResult,
+  type RemoteRefView,
+  type RemoteTarget,
+} from "./git/ops/refs/refspec.js";
+export {
+  type ReplaySnapshotConflict,
+  type ReplaySnapshotConflictStage,
+  type ReplaySnapshotOptions,
+  type ReplaySnapshotResult,
+  replaySnapshot,
+} from "./git/ops/replay/replay.js";
 export {
   type CommitTreeOptions,
   commitTree,
@@ -143,7 +173,7 @@ export {
   type UpdateRefWriteOptions,
   updateRef,
   writeTree,
-} from "./git/ops/plumbing.js";
+} from "./git/ops/repository/plumbing.js";
 export type {
   CommitView,
   LogOptions,
@@ -151,38 +181,8 @@ export type {
   ShowOptions,
   ShowResult,
   TreeEntryView,
-} from "./git/ops/reads.js";
-export {
-  type RecoverRefOptions,
-  type RefLogEndpoint,
-  type RefLogEntry,
-  type RefLogReadOptions,
-  type RefLogRecoverySource,
-  recoverRef,
-  reflog,
-} from "./git/ops/ref-log.js";
-export {
-  type FetchRefspec,
-  type FetchRefUpdate,
-  type FetchResult,
-  type LsRemoteResult,
-  MAX_REFSPEC_EXPANDED_DESTINATIONS,
-  MAX_REFSPEC_MAPPINGS,
-  type PushRefStatus,
-  type PushRefspec,
-  type PushResult,
-  type PushTrackingResult,
-  type RemoteRefView,
-  type RemoteTarget,
-} from "./git/ops/refspec.js";
-export {
-  type ReplaySnapshotConflict,
-  type ReplaySnapshotConflictStage,
-  type ReplaySnapshotOptions,
-  type ReplaySnapshotResult,
-  replaySnapshot,
-} from "./git/ops/replay.js";
-export { Repository, type RevisionResolution } from "./git/ops/repository.js";
+} from "./git/ops/repository/reads.js";
+export { Repository, type RevisionResolution } from "./git/ops/repository/repository.js";
 export {
   formatPorcelainV1,
   formatPorcelainV2,
@@ -195,12 +195,12 @@ export {
   status,
   statusReport,
   statusStream,
-} from "./git/ops/status.js";
+} from "./git/ops/status/status.js";
 export {
   type StatusFormatOptions,
   statusFormatOptions,
-} from "./git/ops/status-format.js";
-export type { Worktree, WorktreeDirent, WorktreeStat } from "./git/ops/worktree.js";
+} from "./git/ops/status/status-format.js";
+export type { Worktree, WorktreeDirent, WorktreeStat } from "./git/ops/worktree/worktree.js";
 export {
   type WorktreeAddOptions,
   type WorktreeAddTarget,
@@ -210,7 +210,7 @@ export {
   worktreeList,
   worktreePrune,
   worktreeRemove,
-} from "./git/ops/worktrees.js";
+} from "./git/ops/worktree/worktrees.js";
 export {
   type CheckoutRow,
   CheckoutStore,
@@ -220,7 +220,7 @@ export {
   SqliteGitDatabase,
   type StoreOptions,
 } from "./git/store/index.js";
-export { initializeGitSchema, SCHEMA_VERSION } from "./git/store/schema.js";
+export { initializeGitSchema, SCHEMA_VERSION } from "./git/store/schema/schema.js";
 export {
   type Async,
   type AsyncFilesystem,

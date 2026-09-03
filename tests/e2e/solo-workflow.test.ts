@@ -24,7 +24,7 @@ describe("solo workflow", () => {
   it("grows an unborn repository into its first commit", async () => {
     world = await createWorld({ start: "init" });
 
-    // KNOWN DIVERGENCE: `init()` makes no directory (src/git/ops/init.ts), so
+    // KNOWN DIVERGENCE: `init()` makes no directory (src/git/ops/repository/init.ts), so
     // the repository root does not exist until something writes into it, while
     // git's worktree root always does. Pinned rather than worked around.
     await expect(world.compare("fresh init")).rejects.toThrow(/ENOENT/);
@@ -495,7 +495,7 @@ describe("solo workflow", () => {
 
     // KNOWN DIVERGENCE: naming an ignored path outright is an error in git
     // ("paths are ignored by one of your .gitignore files", exit 1), while
-    // kompjutr skips it and reports success (src/git/ops/staging.ts, above
+    // kompjutr skips it and reports success (src/git/ops/staging/staging.ts, above
     // `assertPathspecsMatch`). Both leave the index alone, so only the outcome
     // differs. Pinned rather than worked around.
     await expect(world.run({ op: "add", paths: ["debug.log"] })).rejects.toThrow(

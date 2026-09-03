@@ -7,13 +7,13 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { createGit } from "../src/git/client.js";
 import { GitError } from "../src/git/common/errors.js";
-import { openRepository } from "../src/git/ops/context.js";
-import { divergence, mergeBase } from "../src/git/ops/merge-base.js";
-import { clone, fetchInto, remoteUrlFor } from "../src/git/ops/network.js";
-import { push } from "../src/git/ops/push.js";
-import { log, lsTree } from "../src/git/ops/reads.js";
-import type { Repository } from "../src/git/ops/repository.js";
-import { gitModeFor, type Worktree } from "../src/git/ops/worktree.js";
+import { openRepository } from "../src/git/ops/core/context.js";
+import { divergence, mergeBase } from "../src/git/ops/merge/merge-base.js";
+import { clone, fetchInto, remoteUrlFor } from "../src/git/ops/network/network.js";
+import { push } from "../src/git/ops/push/push.js";
+import { log, lsTree } from "../src/git/ops/repository/reads.js";
+import type { Repository } from "../src/git/ops/repository/repository.js";
+import { gitModeFor, type Worktree } from "../src/git/ops/worktree/worktree.js";
 import {
   fetchHttpClient,
   type GitHttpClient,

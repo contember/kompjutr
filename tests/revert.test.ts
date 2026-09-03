@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { utf8Decoder } from "../src/git/common/bytes.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import { cherryPick } from "../src/git/ops/cherry-pick.js";
-import type { GitContext } from "../src/git/ops/context.js";
-import { Repository } from "../src/git/ops/repository.js";
-import { revert, revertAbort, revertContinue, revertSkip } from "../src/git/ops/revert.js";
-import { add, rm } from "../src/git/ops/staging.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import type { GitContext } from "../src/git/ops/core/context.js";
+import { cherryPick } from "../src/git/ops/replay/cherry-pick.js";
+import { revert, revertAbort, revertContinue, revertSkip } from "../src/git/ops/replay/revert.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import { add, rm } from "../src/git/ops/staging/staging.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";

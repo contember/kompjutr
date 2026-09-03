@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest";
 import { utf8 } from "../src/git/common/bytes.js";
 import { CorruptError } from "../src/git/common/errors.js";
 import { MODE_COMMIT, serializeTree } from "../src/git/common/objects.js";
-import { commit } from "../src/git/ops/commit.js";
-import { diff, diffSummary } from "../src/git/ops/diff.js";
-import type { SparseWorkspaceSource } from "../src/git/ops/sparse-workspace.js";
+import { diff, diffSummary } from "../src/git/ops/diff/diff.js";
+import { commit } from "../src/git/ops/repository/commit.js";
+import type { SparseWorkspaceSource } from "../src/git/ops/worktree/sparse-workspace.js";
 import type { IndexEntry } from "../src/git/store/index.js";
 import {
   configureFixtureIdentity,

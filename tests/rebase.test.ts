@@ -2,19 +2,19 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { utf8, utf8Decoder } from "../src/git/common/bytes.js";
 import { hasErrorCode } from "../src/git/common/errors.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import { openRepository } from "../src/git/ops/context.js";
-import { integrationIndexMatchesTree } from "../src/git/ops/integration-worktree.js";
-import { clone, fetchInto } from "../src/git/ops/network.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import { openRepository } from "../src/git/ops/core/context.js";
+import { integrationIndexMatchesTree } from "../src/git/ops/integration/integration-worktree.js";
+import { clone, fetchInto } from "../src/git/ops/network/network.js";
 import {
   rebase,
   rebaseAbort,
   rebaseContinue,
   rebaseContinueExcluding,
   rebaseSkip,
-} from "../src/git/ops/rebase.js";
-import { Repository } from "../src/git/ops/repository.js";
-import { add, rm } from "../src/git/ops/staging.js";
+} from "../src/git/ops/rebase/rebase.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import { add, rm } from "../src/git/ops/staging/staging.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";

@@ -1,32 +1,47 @@
 import type { GitClientServices } from "./client-services.js";
 import type { Git, GitLsFilesOptions } from "./client-types.js";
 import { GitError } from "./common/errors.js";
-import { commit as commitOp } from "./ops/commit.js";
-import { diff as diffOp, diffSummary as diffSummaryOp } from "./ops/diff.js";
-import { initRepository } from "./ops/init.js";
-import { lsRemote as lsRemoteOp } from "./ops/ls-remote.js";
-import { maintenance as maintenanceOp } from "./ops/maintenance.js";
-import { mergeContinue as mergeContinueOp } from "./ops/merge.js";
-import { divergence as divergenceOp, mergeBase as mergeBaseOp } from "./ops/merge-base.js";
+import { recoverRefOwned as recoverRefOp, reflog as reflogOp } from "./ops/core/ref-log.js";
+import { diff as diffOp, diffSummary as diffSummaryOp } from "./ops/diff/diff.js";
+import { mergeContinue as mergeContinueOp } from "./ops/merge/merge.js";
+import { divergence as divergenceOp, mergeBase as mergeBaseOp } from "./ops/merge/merge-base.js";
+import { lsRemote as lsRemoteOp } from "./ops/network/ls-remote.js";
 import {
   clone as cloneOp,
   fetchInto,
   validateFetchOptions,
   withPromisorHydration,
-} from "./ops/network.js";
-import { readRef as readRefOp, repoRoot as repoRootOp } from "./ops/plumbing.js";
-import { log as logOp, lsFilesAtRef, lsTree as lsTreeOp, show as showOp } from "./ops/reads.js";
-import { recoverRefOwned as recoverRefOp, reflog as reflogOp } from "./ops/ref-log.js";
-import { currentBranch as currentBranchOp } from "./ops/refs.js";
-import { add as addOp, lsFilesWithWorktree, reset as resetOp, rm as rmOp } from "./ops/staging.js";
-import { clean as cleanOp, eagerStatus, type StatusDetail, statusBranch } from "./ops/status.js";
+} from "./ops/network/network.js";
+import { currentBranch as currentBranchOp } from "./ops/refs/refs.js";
+import { commit as commitOp } from "./ops/repository/commit.js";
+import { initRepository } from "./ops/repository/init.js";
+import { maintenance as maintenanceOp } from "./ops/repository/maintenance.js";
+import { readRef as readRefOp, repoRoot as repoRootOp } from "./ops/repository/plumbing.js";
+import {
+  log as logOp,
+  lsFilesAtRef,
+  lsTree as lsTreeOp,
+  show as showOp,
+} from "./ops/repository/reads.js";
+import {
+  add as addOp,
+  lsFilesWithWorktree,
+  reset as resetOp,
+  rm as rmOp,
+} from "./ops/staging/staging.js";
+import {
+  clean as cleanOp,
+  eagerStatus,
+  type StatusDetail,
+  statusBranch,
+} from "./ops/status/status.js";
 import {
   worktreeAddOwned as worktreeAddOp,
   worktreeList as worktreeListOp,
   worktreePruneOwned as worktreePruneOp,
   worktreeRemoveOwned as worktreeRemoveOp,
-} from "./ops/worktrees.js";
-import { checkoutStoreMutations } from "./store/checkout.js";
+} from "./ops/worktree/worktrees.js";
+import { checkoutStoreMutations } from "./store/checkout/checkout.js";
 
 type CoreMethods = Pick<
   Git,
@@ -244,7 +259,7 @@ function rejectRefWorktreeSelection(input: GitLsFilesOptions): void {
   }
 }
 
-function publicStatusEntry(row: StatusDetail): import("./ops/kinds.js").StatusEntry {
+function publicStatusEntry(row: StatusDetail): import("./ops/core/kinds.js").StatusEntry {
   if (row.renamed === true) {
     return {
       path: row.path,

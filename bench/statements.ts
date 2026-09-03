@@ -13,21 +13,21 @@ import {
   serializeTree,
 } from "../src/git/common/objects.js";
 import { loadIgnoreMatcher } from "../src/git/ignore/index.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import { cherryPick, cherryPickContinue } from "../src/git/ops/cherry-pick.js";
-import { commit } from "../src/git/ops/commit.js";
-import { diff as diffIndexWorktree } from "../src/git/ops/diff.js";
-import { tryInitialCheckout } from "../src/git/ops/initial-checkout.js";
-import { merge, mergeAbort, mergeContinue } from "../src/git/ops/merge.js";
-import { selectMergeBases } from "../src/git/ops/merge-base.js";
-import { rebase } from "../src/git/ops/rebase.js";
-import { planRebase } from "../src/git/ops/rebase-plan.js";
-import { checkout } from "../src/git/ops/refs.js";
-import { planReplay, preflightReplayCommitObjects } from "../src/git/ops/replay.js";
-import { Repository } from "../src/git/ops/repository.js";
-import { add, lsFiles, lsFilesWithWorktree, rm } from "../src/git/ops/staging.js";
-import { eagerStatus } from "../src/git/ops/status.js";
-import { dirtyPaths } from "../src/git/ops/worktree-io.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import { tryInitialCheckout } from "../src/git/ops/checkout/initial-checkout.js";
+import { diff as diffIndexWorktree } from "../src/git/ops/diff/diff.js";
+import { merge, mergeAbort, mergeContinue } from "../src/git/ops/merge/merge.js";
+import { selectMergeBases } from "../src/git/ops/merge/merge-base.js";
+import { rebase } from "../src/git/ops/rebase/rebase.js";
+import { planRebase } from "../src/git/ops/rebase/rebase-plan.js";
+import { checkout } from "../src/git/ops/refs/refs.js";
+import { cherryPick, cherryPickContinue } from "../src/git/ops/replay/cherry-pick.js";
+import { planReplay, preflightReplayCommitObjects } from "../src/git/ops/replay/replay.js";
+import { commit } from "../src/git/ops/repository/commit.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import { add, lsFiles, lsFilesWithWorktree, rm } from "../src/git/ops/staging/staging.js";
+import { eagerStatus } from "../src/git/ops/status/status.js";
+import { dirtyPaths } from "../src/git/ops/worktree/worktree-io.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
@@ -36,10 +36,10 @@ import {
   readIndexTrackerState,
   resealIndexTracker,
   WORKTREE_DIRTY,
-} from "../src/git/store/index-tracker.js";
+} from "../src/git/store/indexes/index-tracker.js";
 import { advanceMaintenanceRepack } from "../src/git/store/maintenance/repack.js";
 import { PackWriter } from "../src/git/store/pack/writer.js";
-import { createSqliteCommitTreeSnapshotSource } from "../src/git/store/sparse-workspace.js";
+import { createSqliteCommitTreeSnapshotSource } from "../src/git/store/sparse/sparse-workspace.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import { TestDatabase } from "../tests/helpers/db.js";
 import { GitFixture, slices } from "../tests/helpers/git.js";

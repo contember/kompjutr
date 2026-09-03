@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../src/db/db.js";
 import { initializeFsSchema, ROOT_INODE } from "../src/fs/schema.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { initializeGitSchema, SCHEMA_VERSION } from "../src/git/store/schema.js";
+import { initializeGitSchema, SCHEMA_VERSION } from "../src/git/store/schema/schema.js";
 import { TestDatabase } from "./helpers/db.js";
 
 interface SchemaObject {

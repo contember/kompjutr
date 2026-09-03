@@ -1,6 +1,7 @@
 import type { GitClientServices } from "./client-services.js";
 import type { Git } from "./client-types.js";
 import { GitError } from "./common/errors.js";
+import { hydrateTreeBlobs } from "./ops/network/network.js";
 import {
   configGet,
   configSet,
@@ -9,8 +10,7 @@ import {
   remoteList,
   remoteRemove,
   remoteSetUrl,
-} from "./ops/config.js";
-import { hydrateTreeBlobs } from "./ops/network.js";
+} from "./ops/refs/config.js";
 import {
   branchDelete as branchDeleteOp,
   branchList as branchListOp,
@@ -20,7 +20,7 @@ import {
   tagDelete as tagDeleteOp,
   tagList as tagListOp,
   tag as tagOp,
-} from "./ops/refs.js";
+} from "./ops/refs/refs.js";
 
 type RefMethods = Pick<
   Git,

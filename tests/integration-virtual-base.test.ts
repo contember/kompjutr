@@ -14,9 +14,9 @@ import {
   type IntegrationEntry,
   planIntegration,
   planVirtualAncestorIntegration,
-} from "../src/git/ops/integration.js";
-import { Repository } from "../src/git/ops/repository.js";
-import { buildTree } from "../src/git/ops/tree-build.js";
+} from "../src/git/ops/integration/integration.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import { buildTree } from "../src/git/ops/tree/tree-build.js";
 import { type CheckoutStore, type IndexEntry, SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";

@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { CorruptError, GitError } from "../src/git/common/errors.js";
-import { commit } from "../src/git/ops/commit.js";
-import type { GitContext, IndexTrackerSeedEntry } from "../src/git/ops/context.js";
-import { openRepository } from "../src/git/ops/context.js";
-import type { SparseWorkspaceSource } from "../src/git/ops/sparse-workspace.js";
-import { add } from "../src/git/ops/staging.js";
-import { eagerStatus, type StatusOptions, status, statusStream } from "../src/git/ops/status.js";
-import { sparseStatus } from "../src/git/ops/status-sparse.js";
-import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
+import type { GitContext, IndexTrackerSeedEntry } from "../src/git/ops/core/context.js";
+import { openRepository } from "../src/git/ops/core/context.js";
+import { commit } from "../src/git/ops/repository/commit.js";
+import { add } from "../src/git/ops/staging/staging.js";
+import {
+  eagerStatus,
+  type StatusOptions,
+  status,
+  statusStream,
+} from "../src/git/ops/status/status.js";
+import { sparseStatus } from "../src/git/ops/status/status-sparse.js";
+import type { SparseWorkspaceSource } from "../src/git/ops/worktree/sparse-workspace.js";
+import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree/worktree-io.js";
 import type { IndexEntry } from "../src/git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
@@ -15,9 +20,9 @@ import {
   readIndexTrackerState,
   resealIndexTracker,
   WORKTREE_DIRTY,
-} from "../src/git/store/index-tracker.js";
+} from "../src/git/store/indexes/index-tracker.js";
 import { MAINTENANCE_ROOT_EPOCH_EXHAUSTED } from "../src/git/store/maintenance/control.js";
-import { createSqliteCommitTreeSnapshotSource } from "../src/git/store/sparse-workspace.js";
+import { createSqliteCommitTreeSnapshotSource } from "../src/git/store/sparse/sparse-workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import {
   configureFixtureIdentity,

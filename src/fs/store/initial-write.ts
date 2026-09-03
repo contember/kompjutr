@@ -4,16 +4,23 @@
 
 import type { SqlDatabase } from "../../db/db.js";
 import { filesystemError } from "../errors.js";
-import { InitialWorktreeSessionImpl } from "./initial-write-session.js";
-import type { InitialWorktreeSession, InitialWriteResult } from "./initial-write-types.js";
-import { isThenable, rootAncestors, validateCanonicalRoot } from "./initial-write-validation.js";
+import { InitialWorktreeSessionImpl } from "./initial-write/initial-write-session.js";
+import type {
+  InitialWorktreeSession,
+  InitialWriteResult,
+} from "./initial-write/initial-write-types.js";
+import {
+  isThenable,
+  rootAncestors,
+  validateCanonicalRoot,
+} from "./initial-write/initial-write-validation.js";
 
 export type {
   InitialSymlinkOptions,
   InitialWorktreeSession,
   InitialWriteOptions,
   InitialWriteResult,
-} from "./initial-write-types.js";
+} from "./initial-write/initial-write-types.js";
 
 interface PreflightRow {
   ordinal: number;

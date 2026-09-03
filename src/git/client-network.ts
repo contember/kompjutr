@@ -1,7 +1,7 @@
 import type { GitClientServices } from "./client-services.js";
 import type { Git } from "./client-types.js";
-import { pull as pullOp } from "./ops/pull.js";
-import { push as pushOp } from "./ops/push.js";
+import { pull as pullOp } from "./ops/network/pull.js";
+import { push as pushOp } from "./ops/push/push.js";
 
 type NetworkMethods = Pick<Git, "push" | "pull">;
 

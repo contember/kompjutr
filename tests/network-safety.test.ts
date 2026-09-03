@@ -6,7 +6,7 @@ import {
   type GitPushOptions,
   type PushLeaseExpectation,
 } from "../src/git/index.js";
-import { openRepository } from "../src/git/ops/context.js";
+import { openRepository } from "../src/git/ops/core/context.js";
 import {
   fetchHttpClient,
   type GitHttpClient,

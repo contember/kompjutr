@@ -24,9 +24,9 @@ direction.
 | Server responsibility | What already covers it |
 | --- | --- |
 | Emit a packfile without assembling it | [`PackWriter`](../../src/git/store/pack/writer.ts) streams bytes through `emit`, hashing the trailer as it goes |
-| Decide which objects a peer is missing | [`planPushObjects`](../../src/git/ops/push-plan.ts) computes the closure of `newOid` minus a set of remote oids — the same computation as `want` minus `have` |
-| Stream those objects out of SQLite | [`openPushPack`](../../src/git/ops/push-plan.ts) pages large blobs through the writer in bounded chunks |
-| Accept and index an incoming pack | `PackStore.ingest` in [`packs.ts`](../../src/git/store/packs.ts), already the fetch path via [`ingestPack`](../../src/git/ops/network.ts) |
+| Decide which objects a peer is missing | [`planPushObjects`](../../src/git/ops/push/push-plan.ts) computes the closure of `newOid` minus a set of remote oids — the same computation as `want` minus `have` |
+| Stream those objects out of SQLite | [`openPushPack`](../../src/git/ops/push/push-plan.ts) pages large blobs through the writer in bounded chunks |
+| Accept and index an incoming pack | `PackStore.ingest` in [`packs.ts`](../../src/git/store/pack/packs.ts), already the fetch path via [`ingestPack`](../../src/git/ops/network/network.ts) |
 | Frame the conversation | [`pktline.ts`](../../src/git/protocol/pktline.ts) encodes, [`stream.ts`](../../src/git/protocol/stream.ts) parses strictly and bounded |
 | Move a ref safely under a concurrent writer | `updateRefExpected` in the [`store/`](../../src/git/store/) ref family is a compare-and-swap |
 | Enumerate what to advertise | `Repository.branches()`, `tags()`, `resolveRef()`, `head()` |

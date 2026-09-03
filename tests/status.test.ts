@@ -3,8 +3,8 @@ import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
 import { fromHex, utf8 } from "../src/git/common/bytes.js";
 import { comparePaths } from "../src/git/common/streams.js";
 import type { IgnoreMatcher } from "../src/git/ignore/index.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import { commit } from "../src/git/ops/commit.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import { commit } from "../src/git/ops/repository/commit.js";
 import {
   clean,
   formatPorcelainV1,
@@ -17,8 +17,8 @@ import {
   statusMatrix,
   statusReport,
   statusStream,
-} from "../src/git/ops/status.js";
-import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
+} from "../src/git/ops/status/status.js";
+import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree/worktree-io.js";
 import type { IndexEntry } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

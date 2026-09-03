@@ -5,13 +5,13 @@ import { hasErrorCode } from "../src/git/common/errors.js";
 import { hashObject, MODE_FILE, serializeTree } from "../src/git/common/objects.js";
 import { comparePaths } from "../src/git/common/streams.js";
 import { DEFAULT_TEXT_MERGE_LIMITS } from "../src/git/diff/xmerge.js";
-import { type IntegrationEntry, planIntegration } from "../src/git/ops/integration.js";
+import { type IntegrationEntry, planIntegration } from "../src/git/ops/integration/integration.js";
 import {
   projectedTouchedShape,
   requireCleanIntegrationWorktree,
-} from "../src/git/ops/integration-worktree.js";
-import type { ProjectedMergeEntry } from "../src/git/ops/merge-projection.js";
-import { Repository } from "../src/git/ops/repository.js";
+} from "../src/git/ops/integration/integration-worktree.js";
+import type { ProjectedMergeEntry } from "../src/git/ops/merge/merge-projection.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
 import {
   type CheckoutStore,
   PACK_BLOB_BATCH_TARGET_BYTES,

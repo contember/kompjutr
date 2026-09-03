@@ -2,12 +2,12 @@ import { NodeFsCompat } from "../../src/fs/compat/node.js";
 import { createExactPathStateSource } from "../../src/fs/exact-path-states.js";
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
-import type { GitContext } from "../../src/git/ops/context.js";
-import { initRepository } from "../../src/git/ops/init.js";
-import type { Repository } from "../../src/git/ops/repository.js";
+import type { GitContext } from "../../src/git/ops/core/context.js";
+import { initRepository } from "../../src/git/ops/repository/init.js";
+import type { Repository } from "../../src/git/ops/repository/repository.js";
 import { SqliteGitDatabase, type StoreOptions } from "../../src/git/store/index.js";
-import { initializeIndexTracker } from "../../src/git/store/index-tracker.js";
-import { createSqliteSparseWorkspaceSource } from "../../src/git/store/sparse-workspace.js";
+import { initializeIndexTracker } from "../../src/git/store/indexes/index-tracker.js";
+import { createSqliteSparseWorkspaceSource } from "../../src/git/store/sparse/sparse-workspace.js";
 import { TestDatabase } from "./db.js";
 import { SqliteTestStorage } from "./storage.js";
 

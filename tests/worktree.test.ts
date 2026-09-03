@@ -3,9 +3,9 @@ import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
 import { fromHex } from "../src/git/common/bytes.js";
 import { hashObject } from "../src/git/common/objects.js";
 import { comparePaths } from "../src/git/common/streams.js";
-import { matchesPaths } from "../src/git/ops/checkout.js";
-import { initRepository } from "../src/git/ops/init.js";
-import type { Worktree } from "../src/git/ops/worktree.js";
+import { matchesPaths } from "../src/git/ops/checkout/checkout.js";
+import { initRepository } from "../src/git/ops/repository/init.js";
+import type { Worktree } from "../src/git/ops/worktree/worktree.js";
 import {
   compilePathspecs,
   dirtyPaths,
@@ -18,7 +18,7 @@ import {
   walkWorktreeEntriesStream,
   walkWorktreeEntriesStreamOwned,
   walkWorktreeStream,
-} from "../src/git/ops/worktree-io.js";
+} from "../src/git/ops/worktree/worktree-io.js";
 import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
 import { CountingWorktree } from "./helpers/worktree.js";
 

@@ -9,8 +9,8 @@ import {
   readIndexTrackerState,
   resealIndexTracker,
   WORKTREE_DIRTY,
-} from "../src/git/store/index-tracker.js";
-import { initializeGitSchema } from "../src/git/store/schema.js";
+} from "../src/git/store/indexes/index-tracker.js";
+import { initializeGitSchema } from "../src/git/store/schema/schema.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const TREE = "1".repeat(40);

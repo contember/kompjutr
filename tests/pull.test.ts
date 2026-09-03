@@ -3,12 +3,16 @@ import type { GitPullOptions as ComputerPullOptions } from "@cloudflare/computer
 import { describe, expect, it } from "vitest";
 import { createFilesystem } from "../src/fs/filesystem.js";
 import { createGit, type Git, type GitPullOptions } from "../src/git/client.js";
-import { commit } from "../src/git/ops/commit.js";
-import { openRepository } from "../src/git/ops/context.js";
-import type { MergeStateMetadata } from "../src/git/ops/merge-state.js";
-import { pull as pullCore, resolvePull, validatePullAfterFetch } from "../src/git/ops/pull.js";
-import { rebaseContinue } from "../src/git/ops/rebase.js";
-import type { Repository } from "../src/git/ops/repository.js";
+import { openRepository } from "../src/git/ops/core/context.js";
+import type { MergeStateMetadata } from "../src/git/ops/merge/merge-state.js";
+import {
+  pull as pullCore,
+  resolvePull,
+  validatePullAfterFetch,
+} from "../src/git/ops/network/pull.js";
+import { rebaseContinue } from "../src/git/ops/rebase/rebase.js";
+import { commit } from "../src/git/ops/repository/commit.js";
+import type { Repository } from "../src/git/ops/repository/repository.js";
 import { fetchHttpClient, type GitHttpClient } from "../src/git/protocol/transport.js";
 import { createGitCommand } from "../src/git/shell.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";

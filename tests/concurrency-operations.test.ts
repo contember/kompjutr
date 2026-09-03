@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createGit, type Git } from "../src/git/client.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import type { GitContext } from "../src/git/ops/context.js";
-import { updateRef } from "../src/git/ops/plumbing.js";
-import { recoverRef } from "../src/git/ops/ref-log.js";
-import type { Repository } from "../src/git/ops/repository.js";
-import type { Worktree } from "../src/git/ops/worktree.js";
-import { SqliteGitDatabase, withGitMutationGuardOwned } from "../src/git/store/database.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import type { GitContext } from "../src/git/ops/core/context.js";
+import { recoverRef } from "../src/git/ops/core/ref-log.js";
+import { updateRef } from "../src/git/ops/repository/plumbing.js";
+import type { Repository } from "../src/git/ops/repository/repository.js";
+import type { Worktree } from "../src/git/ops/worktree/worktree.js";
+import {
+  SqliteGitDatabase,
+  withGitMutationGuardOwned,
+} from "../src/git/store/database/database.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { assertRepositoryReadable, reopenTestRepository } from "./helpers/repository-invariants.js";

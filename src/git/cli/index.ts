@@ -1,7 +1,7 @@
-import type { GitContext } from "../ops/context.js";
-import { createGitCliNetworkHandlers } from "./network.js";
-import { parseGitCliInput } from "./parse.js";
-import { createGitCliReadHandlers } from "./read.js";
+import type { GitContext } from "../ops/core/context.js";
+import { createGitCliNetworkHandlers } from "./network/network.js";
+import { parseGitCliInput } from "./parse/parse.js";
+import { createGitCliReadHandlers } from "./read/read.js";
 import { boundedGitCliResult, resolveGitCliRunOptions } from "./result.js";
 import type {
   GitCliHandlers,
@@ -13,9 +13,9 @@ import type {
   ParsedGitCliCommand,
   ResolvedGitCliRunOptions,
 } from "./types.js";
-import { createGitCliWriteHandlers } from "./write.js";
+import { createGitCliWriteHandlers } from "./write/write.js";
 
-export * from "./parse.js";
+export * from "./parse/parse.js";
 export * from "./result.js";
 export * from "./types.js";
 

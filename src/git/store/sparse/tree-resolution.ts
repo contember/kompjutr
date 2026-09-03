@@ -2,7 +2,7 @@ import type { SqlDatabase } from "../../../db/db.js";
 import { isOid } from "../../common/bytes.js";
 import { CorruptError } from "../../common/errors.js";
 import { int, nullable, oneOf, RowShape, text } from "../../common/rows.js";
-import type { SparseTreeLeaf, SparseWorkspaceRequest } from "../contracts.js";
+import type { SparseTreeLeaf, SparseWorkspaceRequest } from "../core/contracts.js";
 import {
   encoder,
   MAX_DEPTH,

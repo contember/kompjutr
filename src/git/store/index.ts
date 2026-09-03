@@ -1,13 +1,6 @@
 // Compatibility facade for the SQLite repository store.
 
-export { contentIdKey } from "./blob-ids.js";
-export { CheckoutStore } from "./checkout.js";
-export { MAX_LOG_COMMITS } from "./commits.js";
-export {
-  CONFIG_SECTION_MOVE_UPDATE_SQL,
-  configGetOwned,
-  MAX_CONFIG_SECTION_MOVE_ROWS,
-} from "./config.js";
+export { CheckoutStore } from "./checkout/checkout.js";
 export type {
   BlobIdMapping,
   BlobReadBatch,
@@ -38,29 +31,36 @@ export type {
   RefRow,
   RepositoryLifecycle,
   StoreOptions,
-} from "./contracts.js";
-export { FetchPublicationToken, TrackingRefPublicationToken } from "./contracts.js";
+} from "./core/contracts.js";
+export { FetchPublicationToken, TrackingRefPublicationToken } from "./core/contracts.js";
 export {
   listCheckoutsOwned,
   SqliteGitDatabase,
-} from "./database.js";
-export { indexScanOwned } from "./index-table.js";
+} from "./database/database.js";
 export {
   ancestors,
   normalizeRoot,
   PROVISIONAL_CLONE_LEASE_MS,
   PROVISIONAL_CLONE_RENEW_WINDOW_MS,
-} from "./lifecycle.js";
-export { readAuthenticatedObjectOwned } from "./objects.js";
+} from "./database/lifecycle.js";
+export { indexScanOwned } from "./indexes/index-table.js";
+export { contentIdKey } from "./objects/blob-ids.js";
+export { readAuthenticatedObjectOwned } from "./objects/objects.js";
 export {
   type OperationRootPage,
   type RebaseJournalCursor,
   readOperationStateOwned,
   readRebaseCursorOwned,
-} from "./operation-journal.js";
-export { PACK_BLOB_BATCH_TARGET_BYTES } from "./packs.js";
-export { MAX_REFLOG_ROOT_SCAN_ENTRIES } from "./reflog.js";
-export { readShallowOwned } from "./shallow.js";
-export { SharedRepoStore } from "./shared.js";
-export type { WalkTreeDiffEntry, WalkTreeDiffObject, WalkTreeEntry } from "./tree-walk.js";
-export { WALK_TREE_SQL } from "./tree-walk.js";
+} from "./operations/operation-journal.js";
+export { PACK_BLOB_BATCH_TARGET_BYTES } from "./pack/packs.js";
+export {
+  CONFIG_SECTION_MOVE_UPDATE_SQL,
+  configGetOwned,
+  MAX_CONFIG_SECTION_MOVE_ROWS,
+} from "./refs/config.js";
+export { MAX_REFLOG_ROOT_SCAN_ENTRIES } from "./refs/reflog.js";
+export { readShallowOwned } from "./refs/shallow.js";
+export { SharedRepoStore } from "./repository/shared.js";
+export { MAX_LOG_COMMITS } from "./trees/commits.js";
+export type { WalkTreeDiffEntry, WalkTreeDiffObject, WalkTreeEntry } from "./trees/tree-walk.js";
+export { WALK_TREE_SQL } from "./trees/tree-walk.js";

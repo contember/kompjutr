@@ -3,19 +3,19 @@ import { createFilesystem } from "../src/fs/filesystem.js";
 import { createGit } from "../src/git/client.js";
 import { concat, utf8 } from "../src/git/common/bytes.js";
 import { hashObject, serializeTree } from "../src/git/common/objects.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import type { GitContext } from "../src/git/ops/context.js";
-import { nestedRoots, openRepository } from "../src/git/ops/context.js";
-import { initRepository } from "../src/git/ops/init.js";
-import { clone } from "../src/git/ops/network.js";
-import { Repository } from "../src/git/ops/repository.js";
-import type { Worktree } from "../src/git/ops/worktree.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import type { GitContext } from "../src/git/ops/core/context.js";
+import { nestedRoots, openRepository } from "../src/git/ops/core/context.js";
+import { clone } from "../src/git/ops/network/network.js";
+import { initRepository } from "../src/git/ops/repository/init.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import type { Worktree } from "../src/git/ops/worktree/worktree.js";
 import {
   type CheckoutStore,
   PROVISIONAL_CLONE_LEASE_MS,
   SqliteGitDatabase,
 } from "../src/git/store/index.js";
-import { initializeIndexTracker } from "../src/git/store/index-tracker.js";
+import { initializeIndexTracker } from "../src/git/store/indexes/index-tracker.js";
 import { PackWriter } from "../src/git/store/pack/writer.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import { TestDatabase } from "./helpers/db.js";

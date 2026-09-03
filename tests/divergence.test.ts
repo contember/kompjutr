@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../src/db/db.js";
 import { utf8 } from "../src/git/common/bytes.js";
 import { serializeCommit, serializeTree } from "../src/git/common/objects.js";
-import { divergence, MAX_MERGE_BASE_COMMITS } from "../src/git/ops/merge-base.js";
-import { Repository } from "../src/git/ops/repository.js";
-import { MAX_LOG_COMMITS } from "../src/git/store/commits.js";
+import { divergence, MAX_MERGE_BASE_COMMITS } from "../src/git/ops/merge/merge-base.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
 import { type CheckoutRow, type CheckoutStore, SqliteGitDatabase } from "../src/git/store/index.js";
+import { MAX_LOG_COMMITS } from "../src/git/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 

@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { openRepository } from "../src/git/ops/context.js";
-import type { MergeStateMetadata } from "../src/git/ops/merge-state.js";
-import { clone, fetchInto } from "../src/git/ops/network.js";
-import type { Repository } from "../src/git/ops/repository.js";
-import { worktreeAdd } from "../src/git/ops/worktrees.js";
+import { openRepository } from "../src/git/ops/core/context.js";
+import type { MergeStateMetadata } from "../src/git/ops/merge/merge-state.js";
+import { clone, fetchInto } from "../src/git/ops/network/network.js";
+import type { Repository } from "../src/git/ops/repository/repository.js";
+import { worktreeAdd } from "../src/git/ops/worktree/worktrees.js";
 import { fetchHttpClient } from "../src/git/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

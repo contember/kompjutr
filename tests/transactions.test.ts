@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../src/db/db.js";
 import { utf8 } from "../src/git/common/bytes.js";
-import { commitIndex } from "../src/git/ops/commit.js";
-import { Repository } from "../src/git/ops/repository.js";
+import { commitIndex } from "../src/git/ops/repository/commit.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 

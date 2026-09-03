@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { createSqliteGitClient } from "../src/compat/computer.js";
 import { Database, type SqlDatabase } from "../src/db/db.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { SCHEMA_VERSION } from "../src/git/store/schema.js";
+import { SCHEMA_VERSION } from "../src/git/store/schema/schema.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 

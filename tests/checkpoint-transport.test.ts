@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { openRepository } from "../src/git/ops/context.js";
+import { openRepository } from "../src/git/ops/core/context.js";
 import { fetchHttpClient, type GitHttpClient } from "../src/git/protocol/transport.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { createGit, type Git } from "../src/index.js";

@@ -11,8 +11,8 @@ import { CorruptError, GitError } from "../../common/errors.js";
 import { type ObjectType, objectHeader } from "../../common/objects.js";
 import { Sha1 } from "../../common/sha1.js";
 import { type InflateInto, InflateSizeError } from "../../common/zlib.js";
-import type { PackObjectInput } from "../pack-ingest-index.js";
 import type { ByteSource, ChunkedBytes } from "./chunks.js";
+import type { PackObjectInput } from "./pack-ingest-index.js";
 import type { PackRangeRequest } from "./shared-delta.js";
 
 export {

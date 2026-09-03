@@ -6,26 +6,15 @@ import type { RemoveOptions, WriteEntry, WriteOptions } from "../src/fs/types.js
 import { fromHex, utf8, utf8Decoder } from "../src/git/common/bytes.js";
 import { serializeCommit } from "../src/git/common/objects.js";
 import { joinPath } from "../src/git/common/paths.js";
-import { commit } from "../src/git/ops/commit.js";
+import type { RemoteView } from "../src/git/ops/core/kinds.js";
+import type { MergeStateMetadata } from "../src/git/ops/merge/merge-state.js";
 import {
   configGet,
   configSet,
   remoteAdd,
   remoteList,
   remoteRemove,
-} from "../src/git/ops/config.js";
-import { initRepository } from "../src/git/ops/init.js";
-import type { RemoteView } from "../src/git/ops/kinds.js";
-import type { MergeStateMetadata } from "../src/git/ops/merge-state.js";
-import {
-  catFile,
-  hashObject,
-  type RawRefTarget,
-  readRef,
-  repoRoot,
-  symbolicRef,
-  updateRef,
-} from "../src/git/ops/plumbing.js";
+} from "../src/git/ops/refs/config.js";
 import {
   branch,
   branchDelete,
@@ -38,9 +27,20 @@ import {
   tag,
   tagDelete,
   tagList,
-} from "../src/git/ops/refs.js";
-import { Repository } from "../src/git/ops/repository.js";
-import { walkWorktree } from "../src/git/ops/worktree-io.js";
+} from "../src/git/ops/refs/refs.js";
+import { commit } from "../src/git/ops/repository/commit.js";
+import { initRepository } from "../src/git/ops/repository/init.js";
+import {
+  catFile,
+  hashObject,
+  type RawRefTarget,
+  readRef,
+  repoRoot,
+  symbolicRef,
+  updateRef,
+} from "../src/git/ops/repository/plumbing.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import { walkWorktree } from "../src/git/ops/worktree/worktree-io.js";
 import { type IndexEntry, SqliteGitDatabase } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

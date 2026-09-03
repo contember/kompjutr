@@ -9,6 +9,7 @@ filesystem.ts   assembles the Filesystem from the store layer
 types.ts        the public interface — read it before adding a method
 path.ts         comparePaths, dirname, subtreeSuccessor, codePointLength
 store/          resolve, scan, search, read, write, remove, ops, meta
+store/{initial-write,read,scan,write}/  cohesive helpers behind store facades
 compat/node.ts  NodeFsCompat — the synchronous Node-style facade
 import.ts       bulk import of an external tree
 ```

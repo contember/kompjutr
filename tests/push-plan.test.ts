@@ -1,16 +1,16 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { isTreeMode, serializeCommit, serializeTree } from "../src/git/common/objects.js";
-import { commit } from "../src/git/ops/commit.js";
-import { openRepository } from "../src/git/ops/context.js";
-import { clone } from "../src/git/ops/network.js";
+import { openRepository } from "../src/git/ops/core/context.js";
+import { clone } from "../src/git/ops/network/network.js";
 import {
   type PushPlan,
   planPushObjects,
   pushPlanObjectCount,
   pushPlanObjectOidAt,
-} from "../src/git/ops/push-plan.js";
-import type { Repository } from "../src/git/ops/repository.js";
-import { add } from "../src/git/ops/staging.js";
+} from "../src/git/ops/push/push-plan.js";
+import { commit } from "../src/git/ops/repository/commit.js";
+import type { Repository } from "../src/git/ops/repository/repository.js";
+import { add } from "../src/git/ops/staging/staging.js";
 import { ZERO_OID } from "../src/git/protocol/receive-pack.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

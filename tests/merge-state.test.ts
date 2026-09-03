@@ -7,7 +7,7 @@ import {
   MAX_MERGE_TOUCHED_PATHS,
   type MergeStateMetadata,
   type MergeTouchedPath,
-} from "../src/git/ops/merge-state.js";
+} from "../src/git/ops/merge/merge-state.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 

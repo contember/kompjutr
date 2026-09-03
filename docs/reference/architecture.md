@@ -53,6 +53,10 @@ store. Cross-domain dependencies also point down: `db` imports no domain, `fs`
 uses only `fs` and `db`, and `shell` uses only `shell`, `fs`, and `db`.
 `@cloudflare/computer` is confined to `compat`.
 
+Within a layer, cohesive command and table families live in semantic
+subdirectories. These folders do not add dependency ranks. No source directory
+contains more than 20 direct TypeScript files.
+
 ## Filesystem storage
 
 The working tree is relational:
@@ -82,12 +86,12 @@ view, and nested checkout roots are excluded from parent worktree scans.
 | Source surrogate | `git_tree_entries` for one exact loose or packed tree source |
 | Synchronous scratch transaction | named scratch indexes; rows never survive the callback and are not maintenance roots |
 
-`git/store/index.ts` is the facade. `database.ts` owns schema initialization and
-repository/checkout routing. `shared.ts` composes repository-owned families.
-`checkout.ts` composes a checkout-bound store. Cohesive table families own
-objects, refs, config, shallow state, fetch publication, indexes, reflogs,
-operation plans, packs, sparse projections, and maintenance. Operation plans
-are immutable after creation. A transition may change only `phase`,
+`git/store/index.ts` is the facade. `store/database/` owns schema initialization
+and repository/checkout routing. `store/repository/` composes repository-owned
+families. `store/checkout/` composes a checkout-bound store. Other table-family
+directories own objects, refs, config, shallow state, fetch publication,
+indexes, reflogs, operation plans, packs, sparse projections, and maintenance.
+Operation plans are immutable after creation. A transition may change only `phase`,
 `empty_reason`, the `current_step` cursor, `current_parent_oid`,
 `replayed_count` and `skipped_count`, `committer_name` and `committer_email`,
 the current step's `outcome` and `result_oid`, and the bounded conflict
@@ -253,6 +257,8 @@ Architecture rules are executable checks:
   boundaries.
 - The source-file ceiling witness rejects any `src/**/*.ts` file at or above 500
   lines.
+- The same source-structure witness rejects any directory under `src/` with more
+  than 20 direct TypeScript files.
 
 Behavior remains covered by Git parity, filesystem conformance, end-to-end
 journeys, and the focused store, pack, maintenance, and concurrency suites.

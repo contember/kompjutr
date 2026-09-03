@@ -5,9 +5,9 @@ import type { SqlDatabase } from "../../../db/db.js";
 import { CorruptError } from "../../common/errors.js";
 import type { ByteLru } from "../../common/lru.js";
 import { hashObject, type ObjectType, type RawObject } from "../../common/objects.js";
-import { PackSourceAuthenticator } from "./read-authenticate.js";
-import { PackDataReader } from "./read-data.js";
-import { PackObjectResolver } from "./read-resolver.js";
+import { PackSourceAuthenticator } from "./read/read-authenticate.js";
+import { PackDataReader } from "./read/read-data.js";
+import { PackObjectResolver } from "./read/read-resolver.js";
 import {
   type ExternalBatchResolver,
   type ExternalMetadataResolver,

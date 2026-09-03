@@ -11,7 +11,7 @@ import type {
   CommitTreeSnapshotSource,
   SelectedPathRequest,
   SparseWorkspaceDirty,
-} from "../contracts.js";
+} from "../core/contracts.js";
 import { bindSparseSource } from "./receipt.js";
 import { readSelectedIndex, validateSelectedPathRequest } from "./selection.js";
 import {

@@ -8,7 +8,7 @@ import type {
   SelectedPathSource,
   SelectedPathSpec,
   SelectedWorktreeFact,
-} from "../contracts.js";
+} from "../core/contracts.js";
 import type { IndexEntry } from "../index.js";
 import { decodeSparseWorktreeRow, validatedSparseIndexEntry } from "./index-rows.js";
 import { bindSparseSource } from "./receipt.js";

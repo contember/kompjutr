@@ -2,9 +2,9 @@
 // https://github.com/littledivy/dgit — the three-phase ingest, the rotating offset window, the deferred-delta table and the iterative delta-chain walk all follow dgit's src/git/packstore.ts.
 
 import type { SqlDatabase } from "../../../db/db.js";
-import { PackDeletion } from "./lifecycle-delete.js";
-import { PackIngestLifecycleControl } from "./lifecycle-ingest.js";
-import { PackMembershipReader } from "./lifecycle-membership.js";
+import { PackDeletion } from "./lifecycle/lifecycle-delete.js";
+import { PackIngestLifecycleControl } from "./lifecycle/lifecycle-ingest.js";
+import { PackMembershipReader } from "./lifecycle/lifecycle-membership.js";
 import type {
   CompletePackedEntry,
   CompletePackObject,

@@ -2,13 +2,13 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 import { createGit, type Git } from "../src/git/client.js";
-import { Repository } from "../src/git/ops/repository.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   iterateIndexTrackerDirty,
   readIndexTrackerState,
   resealIndexTracker,
-} from "../src/git/store/index-tracker.js";
+} from "../src/git/store/indexes/index-tracker.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";

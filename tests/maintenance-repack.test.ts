@@ -14,8 +14,11 @@ import {
   settleMaintenanceRepackForRestart,
 } from "../src/git/store/maintenance/repack.js";
 import { encodeDeltaHeader } from "../src/git/store/pack/delta.js";
+import {
+  type CompletePackObject,
+  PACK_BLOB_BATCH_TARGET_BYTES,
+} from "../src/git/store/pack/packs.js";
 import { PackWriter } from "../src/git/store/pack/writer.js";
-import { type CompletePackObject, PACK_BLOB_BATCH_TARGET_BYTES } from "../src/git/store/packs.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 import { awaitBarrierEntry, checkpointBarrier } from "./helpers/interleaving.js";

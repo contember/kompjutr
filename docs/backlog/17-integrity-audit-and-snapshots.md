@@ -39,7 +39,8 @@ rebuildable data, or captures portable incident and migration state.
 
 ## Touch points
 
-`src/fs/schema.ts`, `src/git/store/schema.ts`,
-`src/git/store/operation-schema.ts`, `src/git/store/database.ts`,
-`src/git/store/{objects,packs,refs,index-table}.ts`,
+`src/fs/schema.ts`, `src/git/store/schema/schema.ts`,
+`src/git/store/schema/operation-schema.ts`, `src/git/store/database/database.ts`,
+`src/git/store/objects/`, `src/git/store/pack/`, `src/git/store/refs/`,
+`src/git/store/indexes/index-table.ts`,
 `src/git/store/maintenance/`, the new audit/snapshot API, and focused `tests/`

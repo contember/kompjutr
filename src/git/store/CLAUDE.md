@@ -7,31 +7,22 @@ routing limits live below the domains in `src/db/`; the filesystem owns its own
 ## Module map
 
 ```text
-index.ts             internal compatibility facade; consumers use this seam
-contracts.ts         shared store contracts, tokens, and row value types
-database.ts          schema ownership and repository/checkout registry
-shared.ts            repository-scoped facade and scratch transactions
-checkout.ts          composition root for one checkout-bound store
-objects.ts           loose objects and object batching
-config.ts            repository configuration
-promisor.ts          partial-clone remotes and promised missing blobs
-shallow.ts           shallow boundaries
-blob-ids.ts          disposable filesystem-content to Git-OID cache
-reflog.ts            shared ref and checkout HEAD histories
-refs.ts              ref mutation, validation, and CAS publication
-fetch-publication.ts discovery snapshots and atomic fetch publication
-index-table.ts       checkout and scratch indexes
-operation-journal.ts restartable merge/replay/rebase state
-lifecycle.ts         identities, checkout lifecycle, provisional clones
-json-pages.ts        shared bounded JSON-page helpers
-pack/                pack read, ingest, publication, deletion, delta workspace
-sparse/              sparse snapshots, selection, index rows, tree resolution
-maintenance/         roots, reachability, repack, sweep, durable run control
-tree-index.ts        parsed tree projections
-tree-walk.ts         streaming tree and tree-diff traversals
-commits.ts           commit projections and bounded graph reads
-schema.ts            editable schema version 1; no migrations
-../../db/            Database adapter, GitError base, routing limits
+index.ts       internal compatibility facade; consumers use this seam
+core/          shared contracts, JSON paging, and mutation guard
+database/      schema ownership, identities, lifecycle, and checkout registry
+repository/    repository-scoped facade and scratch transactions
+checkout/      composition root for one checkout-bound store
+objects/       loose objects, object batching, and filesystem-content OID cache
+refs/          refs, reflogs, configuration, and shallow boundaries
+fetch/         promisor metadata and atomic fetch publication
+indexes/       checkout/scratch indexes and filesystem change tracker
+operations/    restartable merge, replay, and rebase state
+schema/        editable schema version 1; no migrations
+trees/         tree/commit projections and streaming walks
+pack/          pack read, ingest, publication, deletion, and delta workspace
+sparse/        sparse snapshots, selection, index rows, and tree resolution
+maintenance/   roots, reachability, repack, sweep, and durable run control
+../../db/      database adapter, GitError base, and routing limits
 ```
 
 ## Row ownership

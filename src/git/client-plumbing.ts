@@ -1,7 +1,8 @@
 import type { GitClientServices } from "./client-services.js";
 import type { Git, GitScratchIndex } from "./client-types.js";
 import { GitError } from "./common/errors.js";
-import { withPromisorHydration } from "./ops/network.js";
+import { withPromisorHydration } from "./ops/network/network.js";
+import { replaySnapshotOwned as replaySnapshotOp } from "./ops/replay/replay.js";
 import {
   catFile as catFileOp,
   commitTreeOwned as commitTreeOp,
@@ -9,11 +10,10 @@ import {
   readTreeOwned as readTreeOp,
   updateRefOwned as updateRefOp,
   writeTreeOwned as writeTreeOp,
-} from "./ops/plumbing.js";
-import { catFile as catFileRead } from "./ops/reads.js";
-import { replaySnapshotOwned as replaySnapshotOp } from "./ops/replay.js";
-import { add as addOp } from "./ops/staging.js";
-import { sharedRepoStoreMutations } from "./store/shared.js";
+} from "./ops/repository/plumbing.js";
+import { catFile as catFileRead } from "./ops/repository/reads.js";
+import { add as addOp } from "./ops/staging/staging.js";
+import { sharedRepoStoreMutations } from "./store/repository/shared.js";
 
 type PlumbingMethods = Pick<
   Git,

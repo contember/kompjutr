@@ -7,10 +7,10 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { utf8 } from "../src/git/common/bytes.js";
 import { diffText } from "../src/git/diff/index.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import { commit } from "../src/git/ops/commit.js";
-import { diff, diffSummary, diffTrees } from "../src/git/ops/diff.js";
-import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import { diff, diffSummary, diffTrees } from "../src/git/ops/diff/diff.js";
+import { commit } from "../src/git/ops/repository/commit.js";
+import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree/worktree-io.js";
 import type { IndexEntry } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

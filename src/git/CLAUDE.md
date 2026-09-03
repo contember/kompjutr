@@ -7,17 +7,20 @@ behind `GitHttpClient`.
 ## Layers
 
 ```text
-common/                      bytes, objects, errors, rows, paths, streams, hashes
-diff/ | ignore/ | protocol/  independent algorithm and wire slices
-store/                       SQLite tables, packs, projections, maintenance
-ops/                         command families, Repository, Worktree, context
-client.ts | cli/             public client and asynchronous argv surface
+common/                           bytes, objects, errors, rows, paths, streams, hashes
+diff/ | ignore/ | protocol/       independent algorithm and wire slices
+store/<table-family>/             SQLite tables, packs, projections, maintenance
+ops/<command-family>/             commands, Repository, Worktree, context
+client.ts | cli/<command-shape>/  public client and asynchronous argv surface
 ```
 
 Dependencies point down this list. `diff`, `ignore`, and `protocol` may use
 `common` but not one another. `store` never imports `ops`. `client.ts` assembles
 ops into the public API; ops throw `UnsupportedOperationError` instead of
 falling back.
+
+Subdirectories within `store`, `ops`, and `cli` group cohesive families. They
+do not introduce additional dependency ranks.
 
 `common/rows.ts` is the shared decoder kit. Stored-row shape failures become
 `CorruptError`; caller-option failures become `GitError`. Reads decode only to
@@ -51,7 +54,7 @@ caches, queues, and caps tied to real failures; there is no runtime byte ledger.
 
 ## Rules
 
-- Tree traversal reads no object BLOBs. `ops/tree-stream.ts` walks parsed
+- Tree traversal reads no object BLOBs. `ops/tree/tree-stream.ts` walks parsed
   `git_tree_*` edges through the store cursor.
 - Loose sources shadow packed sources, and projection rows stay
   source-qualified.

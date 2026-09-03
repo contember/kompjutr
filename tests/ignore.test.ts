@@ -20,7 +20,7 @@ import {
   WorktreeIgnoreMatcher,
 } from "../src/git/ignore/index.js";
 import { compilePattern } from "../src/git/ignore/pattern.js";
-import type { Worktree } from "../src/git/ops/worktree.js";
+import type { Worktree } from "../src/git/ops/worktree/worktree.js";
 import { GitFixture } from "./helpers/git.js";
 import type { SqliteTestStorage } from "./helpers/storage.js";
 import { makeRepo, type TestWorkspace, writeWorkFile } from "./helpers/workspace.js";

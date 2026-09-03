@@ -22,10 +22,13 @@ import {
   type GitScratchIndex,
   type PushLeaseExpectation,
 } from "../src/git/client.js";
-import { Repository } from "../src/git/ops/repository.js";
-import type { Worktree } from "../src/git/ops/worktree.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import type { Worktree } from "../src/git/ops/worktree/worktree.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { iterateIndexTrackerDirty, readIndexTrackerState } from "../src/git/store/index-tracker.js";
+import {
+  iterateIndexTrackerDirty,
+  readIndexTrackerState,
+} from "../src/git/store/indexes/index-tracker.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

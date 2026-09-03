@@ -1,5 +1,5 @@
-import type { GitContext } from "./ops/context.js";
-import type { Repository } from "./ops/repository.js";
+import type { GitContext } from "./ops/core/context.js";
+import type { Repository } from "./ops/repository/repository.js";
 
 export interface GitClientServices {
   readonly context: GitContext;

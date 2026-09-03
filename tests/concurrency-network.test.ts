@@ -1,12 +1,12 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { createGit, type Git } from "../src/git/client.js";
 import { GitError } from "../src/git/common/errors.js";
-import { openRepository } from "../src/git/ops/context.js";
-import { maintenance } from "../src/git/ops/maintenance.js";
-import type { MergeStateMetadata } from "../src/git/ops/merge-state.js";
-import { clone, fetchInto } from "../src/git/ops/network.js";
-import { push } from "../src/git/ops/push.js";
-import type { Repository } from "../src/git/ops/repository.js";
+import { openRepository } from "../src/git/ops/core/context.js";
+import type { MergeStateMetadata } from "../src/git/ops/merge/merge-state.js";
+import { clone, fetchInto } from "../src/git/ops/network/network.js";
+import { push } from "../src/git/ops/push/push.js";
+import { maintenance } from "../src/git/ops/repository/maintenance.js";
+import type { Repository } from "../src/git/ops/repository/repository.js";
 import {
   fetchHttpClient,
   type GitHttpClient,

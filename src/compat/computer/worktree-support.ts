@@ -1,6 +1,6 @@
 import { comparePaths, normalize } from "../../fs/path.js";
 import type { RealPath } from "../../fs/types.js";
-import type { WorktreeEntryType } from "../../git/ops/worktree.js";
+import type { WorktreeEntryType } from "../../git/ops/worktree/worktree.js";
 
 export interface DirentLike {
   name: string;

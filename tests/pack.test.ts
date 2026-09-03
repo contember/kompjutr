@@ -15,14 +15,12 @@ import {
   serializeCommit,
   serializeTree,
 } from "../src/git/common/objects.js";
-import { COMMIT_CACHE_FLUSH_BYTES } from "../src/git/store/commits.js";
 import { SqliteGitDatabase, type StoreOptions } from "../src/git/store/index.js";
 import { applyDelta, encodeDeltaHeader } from "../src/git/store/pack/delta.js";
 import {
   type FullObjectPackInput,
   streamFullObjectPack,
 } from "../src/git/store/pack/full-object-stream.js";
-import { PackWriter } from "../src/git/store/pack/writer.js";
 import {
   type CompletePackObject,
   MAX_DELTA_DEPTH,
@@ -30,7 +28,9 @@ import {
   MAX_PACK_DELTA_WORKING_BYTES,
   PACK_BLOB_BATCH_TARGET_BYTES,
   PACK_CHUNK,
-} from "../src/git/store/packs.js";
+} from "../src/git/store/pack/packs.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
+import { COMMIT_CACHE_FLUSH_BYTES } from "../src/git/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 

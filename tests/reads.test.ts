@@ -23,10 +23,9 @@ import {
   lsTree,
   MAX_LS_TREE_ENTRIES,
   show,
-} from "../src/git/ops/reads.js";
-import { Repository } from "../src/git/ops/repository.js";
-import { treeStream } from "../src/git/ops/tree-stream.js";
-import { commitCacheBytes } from "../src/git/store/commits.js";
+} from "../src/git/ops/repository/reads.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import { treeStream } from "../src/git/ops/tree/tree-stream.js";
 import {
   readAuthenticatedObjectOwned,
   SqliteGitDatabase,
@@ -34,7 +33,8 @@ import {
 } from "../src/git/store/index.js";
 import { encodeDeltaHeader } from "../src/git/store/pack/delta.js";
 import { PackWriter } from "../src/git/store/pack/writer.js";
-import { TREE_WALK_PATH_BYTES, TREE_WALK_STATE_BYTES } from "../src/git/store/tree-walk.js";
+import { commitCacheBytes } from "../src/git/store/trees/commits.js";
+import { TREE_WALK_PATH_BYTES, TREE_WALK_STATE_BYTES } from "../src/git/store/trees/tree-walk.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

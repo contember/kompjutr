@@ -10,21 +10,21 @@ import type {
 import { fromHex, toHex, utf8, utf8Decoder } from "../src/git/common/bytes.js";
 import { CorruptError } from "../src/git/common/errors.js";
 import { comparePaths } from "../src/git/common/streams.js";
-import { commit } from "../src/git/ops/commit.js";
-import type { GitContext, IndexTrackerSeedEntry } from "../src/git/ops/context.js";
-import { checkout } from "../src/git/ops/refs.js";
+import type { GitContext, IndexTrackerSeedEntry } from "../src/git/ops/core/context.js";
+import { checkout } from "../src/git/ops/refs/refs.js";
+import { commit } from "../src/git/ops/repository/commit.js";
 import type {
   SelectedPathRequest,
   SelectedPathResult,
   SparseWorkspaceSource,
-} from "../src/git/ops/sparse-workspace.js";
-import type { Worktree } from "../src/git/ops/worktree.js";
-import { hashWorktreePath } from "../src/git/ops/worktree-io.js";
+} from "../src/git/ops/worktree/sparse-workspace.js";
+import type { Worktree } from "../src/git/ops/worktree/worktree.js";
+import { hashWorktreePath } from "../src/git/ops/worktree/worktree-io.js";
 import type { IndexEntry } from "../src/git/store/index.js";
 import {
   createSqliteSelectedPathSource,
   createSqliteSparseWorkspaceSource,
-} from "../src/git/store/sparse-workspace.js";
+} from "../src/git/store/sparse/sparse-workspace.js";
 import {
   configureFixtureIdentity,
   requireSparseWorkspace,

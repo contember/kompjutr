@@ -3,16 +3,16 @@ import { Database } from "../src/db/db.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
 import { utf8 } from "../src/git/common/bytes.js";
 import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
-import type { MergeStateMetadata, MergeTouchedPath } from "../src/git/ops/merge-state.js";
-import type { CheckoutStore } from "../src/git/store/checkout.js";
-import type { CheckoutRow } from "../src/git/store/contracts.js";
+import type { MergeStateMetadata, MergeTouchedPath } from "../src/git/ops/merge/merge-state.js";
+import type { CheckoutStore } from "../src/git/store/checkout/checkout.js";
+import type { CheckoutRow } from "../src/git/store/core/contracts.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
   initializeIndexTracker,
   invalidateIndexTracker,
   resealIndexTracker,
-} from "../src/git/store/index-tracker.js";
+} from "../src/git/store/indexes/index-tracker.js";
 import {
   MAINTENANCE_ROOT_EPOCH_EXHAUSTED,
   readMaintenanceRootEpoch,

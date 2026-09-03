@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { hasErrorCode } from "../src/git/common/errors.js";
 import { serializeCommit, serializeTree } from "../src/git/common/objects.js";
-import { MAX_MERGE_BASE_COMMITS } from "../src/git/ops/merge-base.js";
-import { MAX_OPERATION_STEPS } from "../src/git/ops/operation-state.js";
-import { planRebase } from "../src/git/ops/rebase-plan.js";
-import { MAX_REPLAY_REVISION_CODE_UNITS } from "../src/git/ops/replay.js";
-import { Repository } from "../src/git/ops/repository.js";
-import { commitCacheBytes } from "../src/git/store/commits.js";
+import { MAX_OPERATION_STEPS } from "../src/git/ops/core/operation-state.js";
+import { MAX_MERGE_BASE_COMMITS } from "../src/git/ops/merge/merge-base.js";
+import { planRebase } from "../src/git/ops/rebase/rebase-plan.js";
+import { MAX_REPLAY_REVISION_CODE_UNITS } from "../src/git/ops/replay/replay.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../src/git/store/index.js";
+import { commitCacheBytes } from "../src/git/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 

@@ -4,25 +4,25 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
 import { fromHex } from "../src/git/common/bytes.js";
 import { serializeCommit, serializeTree } from "../src/git/common/objects.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import { commit } from "../src/git/ops/commit.js";
-import type { GitContext } from "../src/git/ops/context.js";
-import { integrationIndexMatchesTree } from "../src/git/ops/integration-worktree.js";
-import { MAX_OPERATION_STEPS } from "../src/git/ops/operation-state.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import type { GitContext } from "../src/git/ops/core/context.js";
+import { MAX_OPERATION_STEPS } from "../src/git/ops/core/operation-state.js";
+import { integrationIndexMatchesTree } from "../src/git/ops/integration/integration-worktree.js";
 import {
   type RebaseLifecycleResult,
   rebase,
   rebaseAbort,
   rebaseContinue,
   rebaseSkip,
-} from "../src/git/ops/rebase.js";
-import { preflightReplayCommitObjects } from "../src/git/ops/replay.js";
-import { Repository, repositoryMutations } from "../src/git/ops/repository.js";
-import { add } from "../src/git/ops/staging.js";
-import { status } from "../src/git/ops/status.js";
-import type { Worktree } from "../src/git/ops/worktree.js";
-import { worktreeAdd } from "../src/git/ops/worktrees.js";
-import { checkoutStoreMutations } from "../src/git/store/checkout.js";
+} from "../src/git/ops/rebase/rebase.js";
+import { preflightReplayCommitObjects } from "../src/git/ops/replay/replay.js";
+import { commit } from "../src/git/ops/repository/commit.js";
+import { Repository, repositoryMutations } from "../src/git/ops/repository/repository.js";
+import { add } from "../src/git/ops/staging/staging.js";
+import { status } from "../src/git/ops/status/status.js";
+import type { Worktree } from "../src/git/ops/worktree/worktree.js";
+import { worktreeAdd } from "../src/git/ops/worktree/worktrees.js";
+import { checkoutStoreMutations } from "../src/git/store/checkout/checkout.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";

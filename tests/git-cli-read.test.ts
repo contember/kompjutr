@@ -2,22 +2,22 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runGitCli } from "../src/git/cli/index.js";
-import { createGitCliReadHandlers } from "../src/git/cli/read.js";
+import { createGitCliReadHandlers } from "../src/git/cli/read/read.js";
 import type { GitCliResult } from "../src/git/cli/types.js";
 import { createGit } from "../src/git/client.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import { commit } from "../src/git/ops/commit.js";
-import { openRepository } from "../src/git/ops/context.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import { openRepository } from "../src/git/ops/core/context.js";
 import {
   diff as coreDiff,
   DIFF_COMBINED_MAX_LINES,
   DIFF_COMBINED_MAX_MEMORY_BYTES,
   DIFF_MAX_OUTPUT_BYTES,
   diffHeaderPath,
-} from "../src/git/ops/diff.js";
-import { rebase } from "../src/git/ops/rebase.js";
-import { add } from "../src/git/ops/staging.js";
-import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
+} from "../src/git/ops/diff/diff.js";
+import { rebase } from "../src/git/ops/rebase/rebase.js";
+import { commit } from "../src/git/ops/repository/commit.js";
+import { add } from "../src/git/ops/staging/staging.js";
+import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree/worktree-io.js";
 import { fetchHttpClient } from "../src/git/protocol/transport.js";
 import type { IndexEntry } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";

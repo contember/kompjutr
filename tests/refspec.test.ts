@@ -7,8 +7,8 @@ import {
   MAX_REFSPEC_MAPPINGS,
   type PushRefspec,
   type RefspecSourceRef,
-} from "../src/git/ops/refspec.js";
-import { requireRefName } from "../src/git/store/ref-validation.js";
+} from "../src/git/ops/refs/refspec.js";
+import { requireRefName } from "../src/git/store/refs/ref-validation.js";
 
 const OID = "1".repeat(40);
 

@@ -28,7 +28,7 @@ import type {
   WriteOptions,
 } from "../../fs/types.js";
 import { dirnameOf } from "../../git/common/paths.js";
-import type { Worktree, WorktreeDirent, WorktreeStat } from "../../git/ops/worktree.js";
+import type { Worktree, WorktreeDirent, WorktreeStat } from "../../git/ops/worktree/worktree.js";
 import { globMatcher } from "./worktree-glob.js";
 import { readFileHandleBatch, readPathBatch } from "./worktree-reads.js";
 import {

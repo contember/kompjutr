@@ -1,8 +1,8 @@
 import { CorruptError } from "../../common/errors.js";
 import { blob, int, nullable, oneOf, RowShape, text } from "../../common/rows.js";
-import type { SparseWorktreeLeaf } from "../contracts.js";
+import type { SparseWorktreeLeaf } from "../core/contracts.js";
 import type { IndexEntry } from "../index.js";
-import { requireStoredIndexEntry } from "../index-table.js";
+import { requireStoredIndexEntry } from "../indexes/index-table.js";
 
 const encoder = new TextEncoder();
 

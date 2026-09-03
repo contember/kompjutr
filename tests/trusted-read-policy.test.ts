@@ -69,7 +69,7 @@ function readSqlLiterals(contents: string): string[] {
 }
 
 function ordinaryReadInventory(): ReadQuery[] {
-  const journalReads = "src/git/store/operation-journal-read.ts";
+  const journalReads = "src/git/store/operations/operation-journal-read.ts";
   const scopes: readonly QueryScope[] = [
     {
       category: "operation journal",
@@ -94,20 +94,20 @@ function ordinaryReadInventory(): ReadQuery[] {
     {
       category: "operation journal",
       name: "operation-root page",
-      path: "src/git/store/operation-journal-roots.ts",
+      path: "src/git/store/operations/operation-journal-roots.ts",
       start: "export function operationRootPage(",
     },
     {
       category: "index tracker",
       name: "tracker state",
-      path: "src/git/store/index-tracker.ts",
+      path: "src/git/store/indexes/index-tracker.ts",
       start: "export function readIndexTrackerState(",
       end: "function* dirtyRows(",
     },
     {
       category: "index tracker",
       name: "dirty-path page",
-      path: "src/git/store/index-tracker.ts",
+      path: "src/git/store/indexes/index-tracker.ts",
       start: "function* dirtyRows(",
       end: "export function iterateIndexTrackerDirty(",
     },
@@ -146,20 +146,20 @@ function ordinaryReadInventory(): ReadQuery[] {
     {
       category: "loose-object payload",
       name: "joined payload stream",
-      path: "src/git/store/objects.ts",
+      path: "src/git/store/objects/objects.ts",
       start: "  #readLooseObjects(oids: readonly string[]): Map<string, RawObject> {",
       end: "  #looseObjectMetadata(",
     },
     {
       category: "maintenance roots",
       name: "ref root source pages",
-      path: "src/git/store/maintenance/root-ref-pages.ts",
+      path: "src/git/store/maintenance/roots/root-ref-pages.ts",
       start: "export function rootsFromRefs(",
     },
     {
       category: "maintenance roots",
       name: "worktree root source pages",
-      path: "src/git/store/maintenance/root-worktree-pages.ts",
+      path: "src/git/store/maintenance/roots/root-worktree-pages.ts",
       start: "export function rootsFromIndex(",
     },
   ];
@@ -254,7 +254,7 @@ describe("trusted ordinary read policy", () => {
   });
 
   it("keeps complete journal readers free of detached and whole-plan authentication", () => {
-    const path = "src/git/store/operation-journal-read.ts";
+    const path = "src/git/store/operations/operation-journal-read.ts";
     const readers = [scopedSource(path, "export function readOperationState(")];
     for (const reader of readers) expect(journalReaderViolations(reader)).toEqual([]);
 

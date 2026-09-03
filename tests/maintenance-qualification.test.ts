@@ -3,7 +3,7 @@ import type { SqlDatabase } from "../src/db/db.js";
 import { createGit, type GitMaintenanceResult } from "../src/git/client.js";
 import { utf8 } from "../src/git/common/bytes.js";
 import { type ObjectType, serializeCommit } from "../src/git/common/objects.js";
-import type { MergeStateMetadata, MergeTouchedPath } from "../src/git/ops/merge-state.js";
+import type { MergeStateMetadata, MergeTouchedPath } from "../src/git/ops/merge/merge-state.js";
 import { fetchHttpClient } from "../src/git/protocol/transport.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { advanceMaintenanceRepack } from "../src/git/store/maintenance/repack.js";

@@ -13,26 +13,30 @@ import {
   serializeCommit,
   serializeTree,
 } from "../src/git/common/objects.js";
+import type { GitContext } from "../src/git/ops/core/context.js";
 import {
   commit,
   commitIndex,
   resolveIdentity,
   writeUnpublishedCommit,
-} from "../src/git/ops/commit.js";
-import type { GitContext } from "../src/git/ops/context.js";
-import { log } from "../src/git/ops/reads.js";
-import type { CommitTreeSnapshotSource } from "../src/git/ops/sparse-workspace.js";
-import { eagerStatus } from "../src/git/ops/status.js";
-import { buildTree } from "../src/git/ops/tree-build.js";
-import { hashWorktreePath, indexEntryFor, walkWorktree } from "../src/git/ops/worktree-io.js";
+} from "../src/git/ops/repository/commit.js";
+import { log } from "../src/git/ops/repository/reads.js";
+import { eagerStatus } from "../src/git/ops/status/status.js";
+import { buildTree } from "../src/git/ops/tree/tree-build.js";
+import type { CommitTreeSnapshotSource } from "../src/git/ops/worktree/sparse-workspace.js";
+import {
+  hashWorktreePath,
+  indexEntryFor,
+  walkWorktree,
+} from "../src/git/ops/worktree/worktree-io.js";
 import type { IndexEntry } from "../src/git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
   invalidateIndexTracker,
   readIndexTrackerState,
   resealIndexTracker,
-} from "../src/git/store/index-tracker.js";
-import { createSqliteCommitTreeSnapshotSource } from "../src/git/store/sparse-workspace.js";
+} from "../src/git/store/indexes/index-tracker.js";
+import { createSqliteCommitTreeSnapshotSource } from "../src/git/store/sparse/sparse-workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
 

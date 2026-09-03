@@ -23,7 +23,7 @@ import {
   type ScanEntry,
   type ScanOptions,
 } from "../types.js";
-import { DISCOVERY_PAGE_MAX, subtreeBounds, validatePattern } from "./scan-shared.js";
+import { DISCOVERY_PAGE_MAX, subtreeBounds, validatePattern } from "./scan/scan-shared.js";
 
 const PERMISSION_BITS = 0o7777;
 const TYPE_BITS: Record<EntryType, number> = {
@@ -43,8 +43,8 @@ export {
   discoverFiles,
   discoveryExcludeRootsJsonSegments,
   validateDiscoveryExcludeRoots,
-} from "./discovery.js";
-export { DISCOVERY_PAGE_MAX, GLOB_PATTERN_MAX_BYTES } from "./scan-shared.js";
+} from "./scan/discovery.js";
+export { DISCOVERY_PAGE_MAX, GLOB_PATTERN_MAX_BYTES } from "./scan/scan-shared.js";
 
 // Written without table aliases on purpose: the query plan then names the
 // tables, so the gate can assert on the plan the design specifies.

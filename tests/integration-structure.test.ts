@@ -14,9 +14,9 @@ import {
   classifyStructuralStreams,
   type IntegrationIdentity,
   type StructuralIntegrationEntry,
-} from "../src/git/ops/integration-structure.js";
-import { Repository } from "../src/git/ops/repository.js";
-import type { TargetEntry } from "../src/git/ops/tree-stream.js";
+} from "../src/git/ops/integration/integration-structure.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import type { TargetEntry } from "../src/git/ops/tree/tree-stream.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";

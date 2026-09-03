@@ -1,23 +1,11 @@
 import type { GitCliInput, GitCliResult, GitCliRunner } from "./cli/types.js";
-import type { CherryPickContinueOptions, CherryPickOptions } from "./ops/cherry-pick.js";
-import type { CommitOptions } from "./ops/commit.js";
-import type {
-  ConfigGetOptions,
-  ConfigSetOptions,
-  RemoteAddOptions,
-  RemoteGetUrlOptions,
-  RemoteRemoveOptions,
-  RemoteSetUrlOptions,
-} from "./ops/config.js";
 import type {
   ExactRootStateSource,
   GitCliNetworkBinding,
   GitIdentity,
   IndexTrackerWriter,
   InitialWorktreeWriter,
-} from "./ops/context.js";
-import type { DiffOptions } from "./ops/diff.js";
-import type { InitOptions } from "./ops/init.js";
+} from "./ops/core/context.js";
 import type {
   CommitResult,
   DiffSummaryEntry,
@@ -27,38 +15,29 @@ import type {
   RemoteView,
   ReplayResult,
   StatusEntry,
-} from "./ops/kinds.js";
-import type { LsRemoteOptions } from "./ops/ls-remote.js";
-import type { MaintenanceResult } from "./ops/maintenance.js";
-import type { MergeContinueOptions, MergeOptions } from "./ops/merge.js";
+} from "./ops/core/kinds.js";
+import type { RecoverRefOptions, RefLogEntry, RefLogReadOptions } from "./ops/core/ref-log.js";
+import type { DiffOptions } from "./ops/diff/diff.js";
+import type { MergeContinueOptions, MergeOptions } from "./ops/merge/merge.js";
 import type {
   DivergenceOptions,
   DivergenceResult,
   MergeBaseOptions,
   MergeBaseResult,
-} from "./ops/merge-base.js";
-import type { AbortableNetworkOptions, CloneOptions, FetchOptions } from "./ops/network.js";
+} from "./ops/merge/merge-base.js";
+import type { LsRemoteOptions } from "./ops/network/ls-remote.js";
+import type { AbortableNetworkOptions, CloneOptions, FetchOptions } from "./ops/network/network.js";
+import type { PullOptions } from "./ops/network/pull.js";
+import type { PushOptions } from "./ops/push/push.js";
+import type { RebaseContinueOptions, RebaseStartOptions } from "./ops/rebase/rebase.js";
 import type {
-  CatFileOptions,
-  CommitTreeOptions,
-  HashObjectOptions,
-  RawRefTarget,
-  ReadRefOptions,
-  ReadTreeOptions,
-  UpdateRefOptions,
-} from "./ops/plumbing.js";
-import type { PullOptions } from "./ops/pull.js";
-import type { PushOptions } from "./ops/push.js";
-import type {
-  CommitView,
-  LogOptions,
-  LsTreeOptions,
-  ShowOptions,
-  ShowResult,
-  TreeEntryView,
-} from "./ops/reads.js";
-import type { RebaseContinueOptions, RebaseStartOptions } from "./ops/rebase.js";
-import type { RecoverRefOptions, RefLogEntry, RefLogReadOptions } from "./ops/ref-log.js";
+  ConfigGetOptions,
+  ConfigSetOptions,
+  RemoteAddOptions,
+  RemoteGetUrlOptions,
+  RemoteRemoveOptions,
+  RemoteSetUrlOptions,
+} from "./ops/refs/config.js";
 import type {
   BranchDeleteOptions,
   BranchOptions,
@@ -67,34 +46,64 @@ import type {
   CurrentBranchOptions,
   TagDeleteOptions,
   TagOptions,
-} from "./ops/refs.js";
+} from "./ops/refs/refs.js";
 import type {
   FetchResult as StructuredFetchResult,
   LsRemoteResult as StructuredLsRemoteResult,
   PushResult as StructuredPushResult,
-} from "./ops/refspec.js";
-import type { ReplaySnapshotOptions, ReplaySnapshotResult } from "./ops/replay.js";
-import type { RevertContinueOptions, RevertOptions } from "./ops/revert.js";
+} from "./ops/refs/refspec.js";
+import type { CherryPickContinueOptions, CherryPickOptions } from "./ops/replay/cherry-pick.js";
+import type { ReplaySnapshotOptions, ReplaySnapshotResult } from "./ops/replay/replay.js";
+import type { RevertContinueOptions, RevertOptions } from "./ops/replay/revert.js";
+import type { CommitOptions } from "./ops/repository/commit.js";
+import type { InitOptions } from "./ops/repository/init.js";
+import type { MaintenanceResult } from "./ops/repository/maintenance.js";
 import type {
-  CommitTreeSnapshotSource,
-  SelectedPathSource,
-  SparseWorkspaceSource,
-} from "./ops/sparse-workspace.js";
-import type { AddOptions, LsFilesWorktreeOptions, ResetOptions, RmOptions } from "./ops/staging.js";
+  CatFileOptions,
+  CommitTreeOptions,
+  HashObjectOptions,
+  RawRefTarget,
+  ReadRefOptions,
+  ReadTreeOptions,
+  UpdateRefOptions,
+} from "./ops/repository/plumbing.js";
+import type {
+  CommitView,
+  LogOptions,
+  LsTreeOptions,
+  ShowOptions,
+  ShowResult,
+  TreeEntryView,
+} from "./ops/repository/reads.js";
+import type {
+  AddOptions,
+  LsFilesWorktreeOptions,
+  ResetOptions,
+  RmOptions,
+} from "./ops/staging/staging.js";
 import type {
   CleanOptions,
   StatusBranch,
   StatusOptions,
   StatusReportOptions,
-} from "./ops/status.js";
-import type { Worktree } from "./ops/worktree.js";
-import type { WorktreeAddOptions, WorktreeInfo, WorktreeRemoveOptions } from "./ops/worktrees.js";
+} from "./ops/status/status.js";
+import type {
+  CommitTreeSnapshotSource,
+  SelectedPathSource,
+  SparseWorkspaceSource,
+} from "./ops/worktree/sparse-workspace.js";
+import type { Worktree } from "./ops/worktree/worktree.js";
+import type {
+  WorktreeAddOptions,
+  WorktreeInfo,
+  WorktreeRemoveOptions,
+} from "./ops/worktree/worktrees.js";
 import type { AuthCallback, GitHttpClient } from "./protocol/transport.js";
-import type { SqliteGitDatabase } from "./store/database.js";
+import type { SqliteGitDatabase } from "./store/database/database.js";
 
-export type { PullResult } from "./ops/kinds.js";
-export type { AbortableNetworkOptions, CloneOptions, FetchOptions } from "./ops/network.js";
-export type { PushOptions } from "./ops/push.js";
+export type { PullResult } from "./ops/core/kinds.js";
+export type { AbortableNetworkOptions, CloneOptions, FetchOptions } from "./ops/network/network.js";
+export type { PushOptions } from "./ops/push/push.js";
 export type {
   FetchRefspec,
   FetchRefUpdate,
@@ -107,7 +116,7 @@ export type {
   PushTrackingResult,
   RemoteRefView,
   RemoteTarget,
-} from "./ops/refspec.js";
+} from "./ops/refs/refspec.js";
 
 export interface GitDirOptions {
   dir?: string;

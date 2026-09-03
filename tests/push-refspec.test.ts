@@ -4,8 +4,8 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { concat } from "../src/git/common/bytes.js";
 import { serializeCommit, serializeTag, serializeTree } from "../src/git/common/objects.js";
-import { openRepository } from "../src/git/ops/context.js";
-import { clone } from "../src/git/ops/network.js";
+import { openRepository } from "../src/git/ops/core/context.js";
+import { clone } from "../src/git/ops/network/network.js";
 import {
   authenticatePushBranchTargets,
   disposePushPlan,
@@ -17,8 +17,8 @@ import {
   pushPlanHasObject,
   pushPlanObjectCount,
   pushPlanObjectOidAt,
-} from "../src/git/ops/push-plan.js";
-import type { PushPlanningUpdate } from "../src/git/ops/refspec.js";
+} from "../src/git/ops/push/push-plan.js";
+import type { PushPlanningUpdate } from "../src/git/ops/refs/refspec.js";
 import { FLUSH, pkt } from "../src/git/protocol/pktline.js";
 import { receivePack, ZERO_OID } from "../src/git/protocol/receive-pack.js";
 import { discover } from "../src/git/protocol/remote.js";

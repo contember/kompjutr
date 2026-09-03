@@ -2,7 +2,7 @@ import { normalize } from "../../fs/path.js";
 import { CHUNK_SIZE } from "../../fs/schema.js";
 import { MAX_HANDLE_MATERIALIZE_BYTES } from "../../fs/store/read.js";
 import type { HandleReadBatch, ReadBatch, RealPath, RegularFileHandle } from "../../fs/types.js";
-import type { Worktree, WorktreeStat } from "../../git/ops/worktree.js";
+import type { Worktree, WorktreeStat } from "../../git/ops/worktree/worktree.js";
 
 const MAX_HANDLE_COUNT = 5_000;
 

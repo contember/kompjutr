@@ -37,6 +37,8 @@ We organize `src/` into behavior domains over one shared storage kernel.
 - `diff/` remains an LGPL-2.1-or-later boundary with its own license and SPDX
   headers.
 - Every TypeScript source file stays below 500 lines.
+- Every source directory contains at most 20 direct TypeScript files. Cohesive
+  subfolders inside a Git slice retain that slice's dependency rank.
 
 `tests/import-graph.test.ts` enforces these rules exactly:
 
@@ -51,7 +53,8 @@ We organize `src/` into behavior domains over one shared storage kernel.
 6. Only `src/compat` may import `@cloudflare/computer`.
 
 The import witness covers relative TypeScript imports, exports, dynamic imports,
-and import types. A separate source-file witness enforces the line ceiling.
+and import types. A separate source-structure witness enforces the line and
+directory ceilings.
 `tests/public-exports.test.ts` protects the published entrypoint surface.
 
 ## Consequences
@@ -65,8 +68,8 @@ and import types. A separate source-file witness enforces the line ceiling.
 - Internal table-family APIs are explicit without becoming package exports.
 - The package keeps one release unit while tests provide package-like dependency
   boundaries.
-- New source files that violate dependency direction or the 500-line ceiling
-  fail the suite.
+- New source files that violate dependency direction, the 500-line ceiling, or
+  the 20-file directory ceiling fail the suite.
 
 ## Alternatives considered
 

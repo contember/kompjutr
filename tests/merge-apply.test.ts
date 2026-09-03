@@ -6,11 +6,11 @@ import {
   abortProjectedMerge,
   applyProjectedMerge,
   type MergeApplyMetadata,
-} from "../src/git/ops/merge-apply.js";
-import type { ProjectedMergeEntry } from "../src/git/ops/merge-projection.js";
-import type { MergeJournal, MergeTouchedPath } from "../src/git/ops/merge-state.js";
-import type { Repository } from "../src/git/ops/repository.js";
-import type { Worktree } from "../src/git/ops/worktree.js";
+} from "../src/git/ops/merge/merge-apply.js";
+import type { ProjectedMergeEntry } from "../src/git/ops/merge/merge-projection.js";
+import type { MergeJournal, MergeTouchedPath } from "../src/git/ops/merge/merge-state.js";
+import type { Repository } from "../src/git/ops/repository/repository.js";
+import type { Worktree } from "../src/git/ops/worktree/worktree.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/git/store/index.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";
 

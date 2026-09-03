@@ -22,21 +22,21 @@ import {
   serializeCommit,
   serializeTree,
 } from "../src/git/common/objects.js";
-import type { GitContext } from "../src/git/ops/context.js";
-import { requireCleanIntegrationWorktree } from "../src/git/ops/integration-worktree.js";
-import { type RebaseLifecycleResult, rebase } from "../src/git/ops/rebase.js";
-import { Repository } from "../src/git/ops/repository.js";
-import { add } from "../src/git/ops/staging.js";
-import type { Worktree, WorktreeDirent, WorktreeStat } from "../src/git/ops/worktree.js";
+import type { GitContext } from "../src/git/ops/core/context.js";
+import { requireCleanIntegrationWorktree } from "../src/git/ops/integration/integration-worktree.js";
+import { type RebaseLifecycleResult, rebase } from "../src/git/ops/rebase/rebase.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
+import { add } from "../src/git/ops/staging/staging.js";
+import type { Worktree, WorktreeDirent, WorktreeStat } from "../src/git/ops/worktree/worktree.js";
 import {
   type CheckoutRow,
   type SharedRepoStore,
   SqliteGitDatabase,
 } from "../src/git/store/index.js";
 import { advanceMaintenanceReachability } from "../src/git/store/maintenance/reachability.js";
-import { INFLATE_FEED } from "../src/git/store/objects.js";
+import { INFLATE_FEED } from "../src/git/store/objects/objects.js";
 import { MAX_SPARSE_BINDING_BYTES } from "../src/git/store/sparse/shared.js";
-import { createSqliteSelectedPathSource } from "../src/git/store/sparse-workspace.js";
+import { createSqliteSelectedPathSource } from "../src/git/store/sparse/sparse-workspace.js";
 import { commitGraphBytes } from "./commit-graph-bytes.js";
 import type { Harness, Scenario } from "./harness.js";
 import {

@@ -16,8 +16,7 @@ import {
   serializeTree,
 } from "../src/git/common/objects.js";
 import { deflate } from "../src/git/common/zlib.js";
-import type { ReplayStateMetadata } from "../src/git/ops/operation-state.js";
-import { BLOB_ID_CACHE_ELIGIBILITY_BYTES } from "../src/git/store/blob-id-cache.js";
+import type { ReplayStateMetadata } from "../src/git/ops/core/operation-state.js";
 import {
   ancestors,
   CONFIG_SECTION_MOVE_UPDATE_SQL,
@@ -29,13 +28,14 @@ import {
   SqliteGitDatabase,
   type StoreOptions,
 } from "../src/git/store/index.js";
-import { scanGenericIndexOwned } from "../src/git/store/index-table.js";
+import { scanGenericIndexOwned } from "../src/git/store/indexes/index-table.js";
+import { BLOB_ID_CACHE_ELIGIBILITY_BYTES } from "../src/git/store/objects/blob-id-cache.js";
 import { PackWriter } from "../src/git/store/pack/writer.js";
 import {
   MAX_BLOB_ID_CACHE_ROWS,
   MAX_INDEX_PATH_BYTES,
   MAX_TRACKING_REF_REVISIONS,
-} from "../src/git/store/schema.js";
+} from "../src/git/store/schema/schema.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 

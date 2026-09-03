@@ -12,11 +12,11 @@ import { readBlob, type SqlDatabase } from "../../db/db.js";
 import { normalize } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type { ReadBatch, ReadOptions } from "../types.js";
-import { DEFAULT_READ_BUDGET } from "./read-limits.js";
+import { DEFAULT_READ_BUDGET } from "./read/read-limits.js";
 import { realpath } from "./resolve.js";
 
-export { readFileHandles } from "./read-handles.js";
-export { DEFAULT_READ_BUDGET, MAX_HANDLE_MATERIALIZE_BYTES } from "./read-limits.js";
+export { readFileHandles } from "./read/read-handles.js";
+export { DEFAULT_READ_BUDGET, MAX_HANDLE_MATERIALIZE_BYTES } from "./read/read-limits.js";
 
 /** Bounds both the JSON binding and each path-lookup result set. */
 const LOOKUP_BATCH_BYTES = 1_500_000;

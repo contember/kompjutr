@@ -17,38 +17,29 @@ import { iterateSqlCursor, type SqlDatabase } from "../../db/db.js";
 import { createContextGitCliRunner } from "../../git/cli/index.js";
 import type { GitCliRunner } from "../../git/cli/types.js";
 import { GitError, UnsupportedOperationError } from "../../git/common/errors.js";
-import { commit as commitOp } from "../../git/ops/commit.js";
-import { configGet, configSet, remoteAdd, remoteList, remoteRemove } from "../../git/ops/config.js";
 import {
   type GitContext,
   type GitIdentity,
   nestedRoots,
   openRepository,
-} from "../../git/ops/context.js";
-import { diff as diffOp, diffSummary as diffSummaryOp } from "../../git/ops/diff.js";
-import { initRepository } from "../../git/ops/init.js";
-import { merge as mergeOp } from "../../git/ops/merge.js";
+} from "../../git/ops/core/context.js";
+import { diff as diffOp, diffSummary as diffSummaryOp } from "../../git/ops/diff/diff.js";
+import { merge as mergeOp } from "../../git/ops/merge/merge.js";
 import {
   clone as cloneOp,
   fetchInto,
   validateFetchOptions,
   withPromisorHydration,
-} from "../../git/ops/network.js";
+} from "../../git/ops/network/network.js";
+import { pull as pullOp } from "../../git/ops/network/pull.js";
+import { type PushOptions, push as pushOp } from "../../git/ops/push/push.js";
 import {
-  catFile as catFileOp,
-  hashObject as hashObjectOp,
-  repoRoot as repoRootOp,
-  updateRef as updateRefOp,
-} from "../../git/ops/plumbing.js";
-import { pull as pullOp } from "../../git/ops/pull.js";
-import { type PushOptions, push as pushOp } from "../../git/ops/push.js";
-import {
-  catFile as catFileRead,
-  log as logOp,
-  lsFilesAtRef,
-  lsTree as lsTreeOp,
-  show as showOp,
-} from "../../git/ops/reads.js";
+  configGet,
+  configSet,
+  remoteAdd,
+  remoteList,
+  remoteRemove,
+} from "../../git/ops/refs/config.js";
 import {
   branchDelete as branchDeleteOp,
   branchList as branchListOp,
@@ -58,16 +49,31 @@ import {
   tagDelete as tagDeleteOp,
   tagList as tagListOp,
   tag as tagOp,
-} from "../../git/ops/refs.js";
-import type { PushResult } from "../../git/ops/refspec.js";
-import type { Repository } from "../../git/ops/repository.js";
+} from "../../git/ops/refs/refs.js";
+import type { PushResult } from "../../git/ops/refs/refspec.js";
+import { commit as commitOp } from "../../git/ops/repository/commit.js";
+import { initRepository } from "../../git/ops/repository/init.js";
+import {
+  catFile as catFileOp,
+  hashObject as hashObjectOp,
+  repoRoot as repoRootOp,
+  updateRef as updateRefOp,
+} from "../../git/ops/repository/plumbing.js";
+import {
+  catFile as catFileRead,
+  log as logOp,
+  lsFilesAtRef,
+  lsTree as lsTreeOp,
+  show as showOp,
+} from "../../git/ops/repository/reads.js";
+import type { Repository } from "../../git/ops/repository/repository.js";
 import {
   add as addOp,
   lsFiles as lsFilesOp,
   reset as resetOp,
   rm as rmOp,
-} from "../../git/ops/staging.js";
-import { clean as cleanOp, status as statusOp } from "../../git/ops/status.js";
+} from "../../git/ops/staging/staging.js";
+import { clean as cleanOp, status as statusOp } from "../../git/ops/status/status.js";
 import { SqliteGitDatabase, type StoreOptions } from "../../git/store/index.js";
 import { ComputerWorktree } from "./worktree.js";
 

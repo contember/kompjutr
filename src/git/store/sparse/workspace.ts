@@ -10,9 +10,9 @@ import type {
   SparseWorkspaceRow,
   SparseWorkspaceSource,
   SparseWorktreeLeaf,
-} from "../contracts.js";
+} from "../core/contracts.js";
 import type { IndexEntry } from "../index.js";
-import { iterateIndexTrackerDirty, readIndexTrackerState } from "../index-tracker.js";
+import { iterateIndexTrackerDirty, readIndexTrackerState } from "../indexes/index-tracker.js";
 import { decodeSparseWorktreeRow, validatedSparseIndexEntry } from "./index-rows.js";
 import { bindSparseSource } from "./receipt.js";
 import { inputError, MAX_PATHS, validateIndexAncestorRequest, validateRequest } from "./shared.js";

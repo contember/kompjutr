@@ -10,7 +10,7 @@ import {
   TreeParser,
 } from "../src/git/common/objects.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { PackTreeIndex } from "../src/git/store/pack-ingest-index.js";
+import { PackTreeIndex } from "../src/git/store/pack/pack-ingest-index.js";
 import {
   createTreeIndexSink,
   indexTreeSource,
@@ -18,12 +18,12 @@ import {
   initializeGitSchema,
   TREE_QUEUE_ROW_FIXED_BYTES,
   type TreeSource,
-} from "../src/git/store/schema.js";
+} from "../src/git/store/schema/schema.js";
 import {
   indexSeededTreeSource,
   indexSeededTreeSources,
   type TreeSourceInput,
-} from "../src/git/store/tree-index.js";
+} from "../src/git/store/trees/tree-index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const OID = "11".repeat(20);

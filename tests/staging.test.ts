@@ -6,18 +6,18 @@ import { GitError, PathspecNotFoundError } from "../src/git/common/errors.js";
 import { hashObject } from "../src/git/common/objects.js";
 import { comparePaths } from "../src/git/common/streams.js";
 import { IGNORE_LIMITS } from "../src/git/ignore/index.js";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import type { GitContext } from "../src/git/ops/context.js";
-import type { Repository } from "../src/git/ops/repository.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import type { GitContext } from "../src/git/ops/core/context.js";
+import type { Repository } from "../src/git/ops/repository/repository.js";
+import { add, lsFiles, reset, rm } from "../src/git/ops/staging/staging.js";
 import type {
   SelectedPathResult,
   SparseIndexAncestorResult,
-} from "../src/git/ops/sparse-workspace.js";
-import { add, lsFiles, reset, rm } from "../src/git/ops/staging.js";
+} from "../src/git/ops/worktree/sparse-workspace.js";
 import {
   createSqliteSelectedPathSource,
   createSqliteSparseWorkspaceSource,
-} from "../src/git/store/sparse-workspace.js";
+} from "../src/git/store/sparse/sparse-workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

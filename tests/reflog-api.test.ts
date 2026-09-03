@@ -7,8 +7,8 @@ import {
   type SqlDatabase,
 } from "../src/db/db.js";
 import { createGit, type Git, type GitRecoverRefOptions } from "../src/git/client.js";
-import { recoverRef } from "../src/git/ops/ref-log.js";
-import { Repository } from "../src/git/ops/repository.js";
+import { recoverRef } from "../src/git/ops/core/ref-log.js";
+import { Repository } from "../src/git/ops/repository/repository.js";
 import {
   MAX_REFLOG_ROOT_SCAN_ENTRIES,
   type RefLogMetadata,

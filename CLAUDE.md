@@ -66,6 +66,8 @@ suite enforces the exact rules.
 - No `any`, no `as` casts, no `@ts-expect-error`. `noUncheckedIndexedAccess` is on.
 - Source files stay under 500 lines; split along a seam before you get there. A
   suite witness enforces this.
+- Source directories contain at most 20 direct TypeScript files. Group a growing
+  family in a semantic subdirectory without changing its architectural layer.
 - Recurring checks and comparisons go through the shared guard/decoder and path
   kits; do not hand-roll multi-operand `typeof` chains or local path helpers.
 

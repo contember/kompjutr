@@ -1,15 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { utf8 } from "../src/git/common/bytes.js";
 import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
-import type { MergeTouchedPath } from "../src/git/ops/merge-state.js";
 import {
   MAX_OPERATION_STEPS,
   type OperationStepMetadata,
   operationStepsForState,
   type RebaseStateMetadata,
   type ReplayStateMetadata,
-} from "../src/git/ops/operation-state.js";
-import { checkoutStoreMutations } from "../src/git/store/checkout.js";
+} from "../src/git/ops/core/operation-state.js";
+import type { MergeTouchedPath } from "../src/git/ops/merge/merge-state.js";
+import { checkoutStoreMutations } from "../src/git/store/checkout/checkout.js";
 import { readOperationStateOwned, SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 

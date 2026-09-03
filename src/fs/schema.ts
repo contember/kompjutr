@@ -1,5 +1,5 @@
 // The filesystem's tables. Everything under `fs_`; nothing here is shared
-// with the git schema, which lives in `src/git/store/schema.ts`.
+// with the git schema, which lives in `src/git/store/schema/schema.ts`.
 //
 // The shape that matters: `fs_paths` is keyed on the whole path under
 // BINARY collation, so the physical storage order IS git's tree order and

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { checkoutTree } from "../src/git/ops/checkout.js";
-import type { GitContext } from "../src/git/ops/context.js";
-import { merge } from "../src/git/ops/merge.js";
+import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
+import type { GitContext } from "../src/git/ops/core/context.js";
+import { merge } from "../src/git/ops/merge/merge.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";

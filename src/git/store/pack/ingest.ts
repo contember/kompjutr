@@ -6,9 +6,9 @@ import { GitError } from "../../common/errors.js";
 import type { ByteLru } from "../../common/lru.js";
 import type { RawObject } from "../../common/objects.js";
 import { ChunkPool } from "./chunks.js";
-import { PackIndexer } from "./ingest-index.js";
-import { type AbortablePackIngestOptions, throwIfIngestAborted } from "./ingest-options.js";
-import { PackChunkWriter } from "./ingest-write.js";
+import { PackIndexer } from "./ingest/ingest-index.js";
+import { type AbortablePackIngestOptions, throwIfIngestAborted } from "./ingest/ingest-options.js";
+import { PackChunkWriter } from "./ingest/ingest-write.js";
 import type { PackLifecycle } from "./lifecycle.js";
 import type { PackReadEngine } from "./read.js";
 import {

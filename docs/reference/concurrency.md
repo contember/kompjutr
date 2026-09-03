@@ -194,11 +194,11 @@ reason to invalidate an otherwise correct durable outcome.
 | Concurrent maintenance | [`concurrency-maintenance.test.ts`](../../tests/concurrency-maintenance.test.ts): selected owner to pending barrier, same-runtime `EBUSY`, once-only finalization, and cold selected/pending/published settlement. | Owner prefix/tail and rival calls are measured separately; every settled state is read through a fresh `Workspace`. |
 
 The implementation seams are
-[`network.ts`](../../src/git/ops/network.ts),
-[`push.ts`](../../src/git/ops/push.ts),
-[`pull.ts`](../../src/git/ops/pull.ts),
-[`maintenance.ts`](../../src/git/ops/maintenance.ts), and
-[`packs.ts`](../../src/git/store/packs.ts), with durable ownership in the
+[`network.ts`](../../src/git/ops/network/network.ts),
+[`push.ts`](../../src/git/ops/push/push.ts),
+[`pull.ts`](../../src/git/ops/network/pull.ts),
+[`maintenance.ts`](../../src/git/ops/repository/maintenance.ts), and
+[`packs.ts`](../../src/git/store/pack/packs.ts), with durable ownership in the
 [`store/`](../../src/git/store/) families.
 
 ## Deterministic test model

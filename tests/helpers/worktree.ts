@@ -13,7 +13,11 @@ import type {
   WriteEntry,
   WriteOptions,
 } from "../../src/fs/types.js";
-import type { Worktree, WorktreeDirent, WorktreeStat } from "../../src/git/ops/worktree.js";
+import type {
+  Worktree,
+  WorktreeDirent,
+  WorktreeStat,
+} from "../../src/git/ops/worktree/worktree.js";
 
 /** Counts the calls that would mean a file was read to be hashed. */
 export class CountingWorktree implements Worktree {
