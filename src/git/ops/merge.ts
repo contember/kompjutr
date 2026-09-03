@@ -1,60 +1,36 @@
 import { checkoutStoreMutations } from "../store/checkout.js";
-import { writeObjectsOwned } from "../store/shared.js";
 import { repositoryMutations } from "./repository.js";
 // Two-head merge orchestration over bounded graph, integration, and apply seams.
 
 import { GitError } from "../common/errors.js";
-import { hashObject, serializeCommit } from "../common/objects.js";
-import { joinSorted } from "../common/streams.js";
-import { type IndexEntry, type ObjectBatch, readOperationStateOwned } from "../store/index.js";
 import { type CommitIdentities, commitIndex, resolveIdentity } from "./commit.js";
 import type { GitContext, GitIdentity } from "./context.js";
+import { planIntegration } from "./integration.js";
 import {
-  type IntegrationPlan,
-  planIntegration,
-  planVirtualAncestorIntegration,
-} from "./integration.js";
-import {
-  projectedTouchedShape,
   projectIntegrationWithCollisions,
   prospectiveIntegrationIndexEntries,
   requireBoundedIntegrationIndex,
   requireBoundedIntegrationTree,
   requireCleanIntegrationIndex,
   requireSafeIntegrationWorktree,
-  touchedPathSet,
 } from "./integration-worktree.js";
 import type { MergeResult } from "./kinds.js";
 import { abortProjectedMerge, applyProjectedMerge } from "./merge-apply.js";
 import { selectMergeBases } from "./merge-base.js";
+import { requireJournalOwnership, requireMergeJournalOwned } from "./merge-journal.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
 import {
-  type MergeJournal,
   type MergeOrigin,
   type MergeStateMetadata,
-  type MergeTouchedPath,
   validateMergeStateMetadata,
 } from "./merge-state.js";
-import {
-  mergeJournalFromOperation,
-  operationKindMismatch,
-  operationNotActive,
-} from "./operation-state.js";
+import { commitTree, selectedBaseTree, type VirtualState } from "./merge-virtual-base.js";
 import { operationRefLogMetadata, type RefLogReason } from "./ref-log.js";
 import type { Repository, ResolvedHead } from "./repository.js";
-import { buildTreeInBatch } from "./tree-build.js";
-import { treeStream } from "./tree-stream.js";
 import type { Worktree } from "./worktree.js";
 
 const HEADS = "refs/heads/";
 const MAX_MERGE_REVISION_CODE_UNITS = 1_024;
-const MAX_VIRTUAL_COMMITS = 1;
-const VIRTUAL_IDENTITY = {
-  name: "git merge-recursive",
-  email: "merge-recursive@localhost",
-  timestamp: 0,
-  timezoneOffset: 0,
-};
 
 export interface MergeOptions {
   theirs: string;
@@ -132,270 +108,6 @@ function incomingLabel(repo: Repository, theirs: string, oid: string): string {
 
 function defaultMessage(label: string): string {
   return `Merge branch '${label}'`;
-}
-
-function commitTree(repo: Repository, oid: string): string {
-  return repo.readCommit(oid).tree;
-}
-
-interface VirtualState {
-  commits: number;
-}
-
-function indexEntry(path: string, mode: string, oid: string): IndexEntry {
-  return {
-    path,
-    stage: 0,
-    mode: Number.parseInt(mode, 8),
-    oid,
-    size: null,
-    mtime: null,
-    ino: null,
-    rev: null,
-  };
-}
-
-function* virtualTreeEntries(
-  repo: Repository,
-  batch: ObjectBatch,
-  currentTree: string,
-  plan: IntegrationPlan,
-): Generator<IndexEntry> {
-  for (const row of joinSorted(treeStream(repo, currentTree), plan.entries, {
-    left: (entry) => entry.path,
-    right: (entry) => entry.path,
-  })) {
-    const planned = row.right;
-    if (planned === undefined) {
-      const current = row.left;
-      if (current === undefined) throw new GitError("ECORRUPT", "virtual tree row is empty");
-      yield indexEntry(current.path, current.mode, current.oid);
-      continue;
-    }
-    if (planned.kind !== "clean") {
-      throw new GitError("ECORRUPT", "virtual integration retained a conflict");
-    }
-    const result = planned.result;
-    if (result === null) continue;
-    if (planned.content !== null) {
-      const oid = batch.write("blob", planned.content);
-      if (oid !== result.oid || hashObject("blob", planned.content) !== result.oid) {
-        throw new GitError("ECORRUPT", `virtual content identity differs at ${planned.path}`);
-      }
-    }
-    yield indexEntry(planned.path, result.mode, result.oid);
-  }
-}
-
-function materializeVirtualCommit(
-  repo: Repository,
-  currentOid: string,
-  incomingOid: string,
-  plan: IntegrationPlan,
-): string {
-  const currentTree = commitTree(repo, currentOid);
-  return writeObjectsOwned(repo.store, (batch) => {
-    const tree = buildTreeInBatch(batch, virtualTreeEntries(repo, batch, currentTree, plan));
-    return batch.write(
-      "commit",
-      serializeCommit({
-        tree,
-        parent: [currentOid, incomingOid],
-        author: VIRTUAL_IDENTITY,
-        committer: VIRTUAL_IDENTITY,
-        message: "virtual merge base\n",
-      }),
-    );
-  });
-}
-
-function requireBoundedVirtualTree(
-  repo: Repository,
-  currentOid: string,
-  plan: IntegrationPlan,
-): void {
-  const currentTree = commitTree(repo, currentOid);
-  requireBoundedIntegrationTree(
-    repo,
-    virtualTreeEntries(repo, batchForIdentity(), currentTree, plan),
-  );
-}
-
-function batchForIdentity(): ObjectBatch {
-  return {
-    write: (type, data) => hashObject(type, data),
-    flush() {},
-  };
-}
-
-function synthesizeVirtualPair(
-  repo: Repository,
-  currentOid: string,
-  incomingOid: string,
-  state: VirtualState,
-  depth: number,
-): string {
-  const selection = selectMergeBases(repo, { currentOid, incomingOid });
-  if (selection.kind === "already-merged") return currentOid;
-  if (selection.kind === "fast-forward") return incomingOid;
-  if (selection.kind === "shallow") {
-    throw new GitError("ESHALLOW", "cannot synthesize a merge base across a shallow boundary");
-  }
-  if (selection.kind === "unrelated") {
-    throw new GitError("EUNRELATED", "cannot synthesize unrelated merge bases");
-  }
-  state.commits++;
-  if (state.commits > MAX_VIRTUAL_COMMITS) {
-    throw new GitError(
-      "E2BIG",
-      `recursive merge-base synthesis exceeds ${MAX_VIRTUAL_COMMITS} temporary commits`,
-    );
-  }
-  const baseCommit = synthesizeVirtualBases(repo, selection.bases, state, depth + 1);
-  const plan = planVirtualAncestorIntegration(repo, {
-    baseTreeOid: commitTree(repo, baseCommit),
-    currentTreeOid: commitTree(repo, currentOid),
-    incomingTreeOid: commitTree(repo, incomingOid),
-    labels: { current: "Temporary merge branch 1", incoming: "Temporary merge branch 2" },
-    depth,
-  });
-  requireBoundedVirtualTree(repo, currentOid, plan);
-  return materializeVirtualCommit(repo, currentOid, incomingOid, plan);
-}
-
-function synthesizeVirtualBases(
-  repo: Repository,
-  bases: readonly string[],
-  state: VirtualState,
-  depth: number,
-): string {
-  const first = bases[0];
-  if (first === undefined) throw new GitError("EUNRELATED", "merge base list is empty");
-  let current = first;
-  for (let index = 1; index < bases.length; index++) {
-    const incoming = bases[index];
-    if (incoming === undefined) throw new GitError("ECORRUPT", "merge base list has a hole");
-    current = synthesizeVirtualPair(repo, current, incoming, state, depth);
-  }
-  return current;
-}
-
-function selectedBaseTree(repo: Repository, bases: readonly string[], state: VirtualState): string {
-  return commitTree(repo, synthesizeVirtualBases(repo, bases, state, 1));
-}
-
-function snapshotMode(entry: MergeTouchedPath): string | null {
-  const snapshot = entry.worktree;
-  if (snapshot.kind === "symlink") return "120000";
-  if (snapshot.kind === "file") return (snapshot.mode & 0o111) === 0 ? "100644" : "100755";
-  return null;
-}
-
-function requireOriginalSnapshots(repo: Repository, journal: MergeJournal): void {
-  const currentTree = commitTree(repo, journal.state.currentParentOid);
-  for (const row of joinSorted(treeStream(repo, currentTree), journal.touched, {
-    left: (entry) => entry.path,
-    right: (entry) => entry.path,
-  })) {
-    const saved = row.right;
-    if (saved === undefined) continue;
-    const expected = row.left;
-    const index = saved.index;
-    if (expected === undefined) {
-      if (index !== null) {
-        throw new GitError("ECORRUPT", `merge journal index snapshot differs at ${saved.path}`);
-      }
-      if (saved.worktree.kind !== "absent" && saved.worktree.kind !== "directory") {
-        throw new GitError("ECORRUPT", `merge journal worktree snapshot differs at ${saved.path}`);
-      }
-      continue;
-    }
-    if (
-      index === null ||
-      index.oid !== expected.oid ||
-      index.mode !== Number.parseInt(expected.mode, 8)
-    ) {
-      throw new GitError("ECORRUPT", `merge journal index snapshot differs at ${saved.path}`);
-    }
-    if (saved.worktree.kind === "absent") continue;
-    if (saved.worktree.kind !== "file" && saved.worktree.kind !== "symlink") {
-      throw new GitError("ECORRUPT", `merge journal worktree snapshot differs at ${saved.path}`);
-    }
-    if (saved.worktree.oid !== expected.oid || snapshotMode(saved) !== expected.mode) {
-      throw new GitError("ECORRUPT", `merge journal worktree snapshot differs at ${saved.path}`);
-    }
-  }
-}
-
-function requireJournalOwnership(
-  repo: Repository,
-  worktree: Worktree,
-  journal: MergeJournal,
-): void {
-  const state = journal.state;
-  requireOriginalSnapshots(repo, journal);
-  const selection = selectMergeBases(repo, {
-    currentOid: state.currentParentOid,
-    incomingOid: state.incomingParentOid,
-  });
-  if (selection.kind === "shallow") {
-    throw new GitError("ESHALLOW", "cannot verify merge journal across a shallow boundary");
-  }
-  if (selection.kind === "unrelated" || selection.kind === "already-merged") {
-    throw new GitError("ECORRUPT", "merge journal parents do not describe an incomplete merge");
-  }
-  const currentTree = commitTree(repo, state.currentParentOid);
-  const incomingTree = commitTree(repo, state.incomingParentOid);
-  const virtualState: VirtualState = { commits: 0 };
-  const baseTree = selectedBaseTree(repo, selection.bases, virtualState);
-  const plan = planIntegration(repo, {
-    baseTreeOid: baseTree,
-    currentTreeOid: currentTree,
-    incomingTreeOid: incomingTree,
-    text: {
-      labels: {
-        current: state.currentLabel,
-        base: "base",
-        incoming: state.incomingLabel,
-      },
-    },
-  });
-  const omitted = touchedPathSet(journal.touched);
-  const projected = projectIntegrationWithCollisions(
-    repo,
-    worktree,
-    baseTree,
-    incomingTree,
-    plan,
-    state.currentLabel,
-    state.incomingLabel,
-    omitted,
-    "merge",
-  );
-  const expected = projectedTouchedShape(projected);
-  if (expected.length !== journal.touched.length) {
-    throw new GitError("ECORRUPT", "merge journal path ownership is incomplete");
-  }
-  for (let index = 0; index < expected.length; index++) {
-    const wanted = expected[index];
-    const saved = journal.touched[index];
-    if (
-      wanted === undefined ||
-      saved === undefined ||
-      wanted.path !== saved.path ||
-      wanted.logicalPath !== saved.logicalPath ||
-      wanted.purpose !== saved.purpose
-    ) {
-      throw new GitError("ECORRUPT", "merge journal path ownership differs from its parents");
-    }
-  }
-}
-
-function requireMergeJournalOwned(repo: Repository): MergeJournal {
-  const journal = readOperationStateOwned(repo.checkout);
-  if (journal === null) throw operationNotActive("merge");
-  if (journal.kind !== "merge") throw operationKindMismatch("merge", journal.kind);
-  return mergeJournalFromOperation(journal);
 }
 
 function savedIdentity(identity: GitIdentity | undefined): GitIdentity | null {

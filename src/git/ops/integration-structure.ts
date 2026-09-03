@@ -15,90 +15,32 @@ const PLAN_ENTRY_BYTES = 192;
 const IDENTITY_BYTES = 128;
 const PREFIX_STATE_BYTES = 128;
 
-export interface IntegrationIdentity {
-  mode: string;
-  oid: string;
-}
+import type {
+  ClassifiedRow,
+  ConflictStructuralEntry,
+  IntegrationIdentity,
+  IntegrationStages,
+  IntegrationStructureInput,
+  IntegrationStructureLimits,
+  PrefixCandidate,
+  ResolvedLimits,
+  StructuralConflictKind,
+  StructuralIntegrationEntry,
+  StructuralIntegrationPlan,
+} from "./integration-structure-types.js";
 
-export interface IntegrationStages {
-  base: IntegrationIdentity | null;
-  current: IntegrationIdentity | null;
-  incoming: IntegrationIdentity | null;
-}
-
-export interface CleanStructuralEntry {
-  kind: "clean";
-  path: string;
-  before: IntegrationIdentity | null;
-  result: IntegrationIdentity | null;
-}
-
-/** A regular-file candidate whose bytes must be resolved by the content phase. */
-export interface ContentStructuralEntry {
-  kind: "content";
-  path: string;
-  base: IntegrationIdentity;
-  current: IntegrationIdentity;
-  incoming: IntegrationIdentity;
-  resultMode: string;
-}
-
-export type StructuralConflictKind =
-  | "add/add"
-  | "modify/delete"
-  | "mode"
-  | "symlink"
-  | "gitlink"
-  | "file/directory";
-
-export interface ConflictStructuralEntry {
-  kind: "conflict";
-  path: string;
-  conflict: StructuralConflictKind;
-  stages: IntegrationStages;
-}
-
-export type StructuralIntegrationEntry =
-  | CleanStructuralEntry
-  | ContentStructuralEntry
-  | ConflictStructuralEntry;
-
-export interface StructuralIntegrationPlan {
-  /** A Git-path-ordered delta relative to the current tree. */
-  entries: readonly StructuralIntegrationEntry[];
-  sourceRows: number;
-}
-
-export interface IntegrationStructureLimits {
-  maxRows?: number;
-  maxEntries?: number;
-  maxRetainedBytes?: number;
-}
-
-export interface IntegrationStructureInput {
-  baseTreeOid: string | null;
-  currentTreeOid: string | null;
-  incomingTreeOid: string | null;
-  limits?: IntegrationStructureLimits;
-}
-
-interface ResolvedLimits {
-  maxRows: number;
-  maxEntries: number;
-  maxRetainedBytes: number | undefined;
-}
-
-interface ClassifiedRow {
-  entry: StructuralIntegrationEntry | null;
-  occupiesPath: boolean;
-}
-
-interface PrefixCandidate {
-  path: string;
-  stages: IntegrationStages;
-  entryIndex: number | null;
-  retainedBytes: number;
-}
+export type {
+  CleanStructuralEntry,
+  ConflictStructuralEntry,
+  ContentStructuralEntry,
+  IntegrationIdentity,
+  IntegrationStages,
+  IntegrationStructureInput,
+  IntegrationStructureLimits,
+  StructuralConflictKind,
+  StructuralIntegrationEntry,
+  StructuralIntegrationPlan,
+} from "./integration-structure-types.js";
 
 class PlanBudget {
   #entries = 0;
