@@ -19,33 +19,31 @@
 // `WHERE true` before `ON CONFLICT` is mandatory, not decorative: SQLite
 // cannot parse an upsert on a SELECT-fed INSERT without it.
 
-import { blob, type SqlDatabase } from "../../db/db.js";
+import type { SqlDatabase } from "../../db/db.js";
 import { filesystemError as fsError } from "../errors.js";
 import { comparePaths } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type { EntryType, WriteEntry, WriteOptions } from "../types.js";
 import { allocateInodes, bumpRev } from "./meta.js";
 import { realpathsNoFollow } from "./resolve.js";
+import {
+  deleteChunks,
+  payloadBudgetOf,
+  selectExistingRows,
+  utf8Length,
+  type WriteChunkRow,
+  type WriteNodeRow,
+  type WritePathRow,
+  writeChunks,
+  writeNodes,
+  writePaths,
+} from "./write-batches.js";
 
 const DEFAULT_FILE_MODE = 0o644;
 const DEFAULT_DIR_MODE = 0o755;
 /** POSIX reports 0777 for every symlink, and so does dofs (`fs/symlink.ts:61`). */
 const DEFAULT_SYMLINK_MODE = 0o777;
 const MODE_BITS = 0o7777;
-
-/** Bytes per content statement. The platform caps a bound value at 2 MB. */
-const DEFAULT_PAYLOAD_BYTES = 1024 * 1024;
-const MAX_PAYLOAD_BYTES = 2_000_000;
-
-/**
- * A JSON argument is a bound value too, so it lives under the same 2 MB
- * ceiling as a BLOB. 1.5 MB leaves room for the framing and still keeps the
- * 9,329-file node batch (~840 KB) in a single statement.
- */
-const MAX_JSON_BYTES = 1_500_000;
-
-/** Upper bound on one serialised offset item, so grouping never re-measures. */
-const OFFSET_ITEM_BYTES = 80;
 
 interface Planned {
   path: string;
@@ -57,119 +55,10 @@ interface Planned {
   contentId: Uint8Array | null;
 }
 
-interface NodeRow {
-  inode: number;
-  type: EntryType;
-  mode: number;
-  mtime: number;
-  size: number;
-  target: string | null;
-  contentId: Uint8Array | null;
-}
-
-interface PathRow {
-  path: string;
-  parent: string;
-  inode: number;
-}
-
-interface ChunkRow {
-  inode: number;
-  idx: number;
-  bytes: Uint8Array;
-}
-
 interface ExistingRow {
   path: string;
   inode: number;
   type: EntryType;
-}
-
-// -- SQL -------------------------------------------------------------
-
-/**
- * Metadata upsert. Bindings, in the order the `?`s appear: the node JSON,
- * the revision, the concatenated `content_id` payload. The `WITH` clause is
- * there so the JSON binds first and the order reads the way a caller
- * thinks about it.
- *
- * `nlink` is deliberately absent from the DO UPDATE list: it counts
- * `fs_paths` rows, and overwriting a path adds none.
- */
-const UPSERT_NODES = `
-WITH j(value) AS (SELECT value FROM json_each(?))
-INSERT INTO fs_nodes (inode, type, mode, mtime, size, rev, nlink, link_target, content_id)
-SELECT json_extract(value, '$.i'),
-       json_extract(value, '$.t'),
-       json_extract(value, '$.m'),
-       json_extract(value, '$.mt'),
-       json_extract(value, '$.s'),
-       ?,
-       1,
-       json_extract(value, '$.l'),
-       CASE WHEN json_extract(value, '$.ca') > 0
-            THEN substr(?, json_extract(value, '$.ca'), json_extract(value, '$.cn'))
-            ELSE NULL END
-  FROM j
- WHERE true
-ON CONFLICT(inode) DO UPDATE SET
-  type = excluded.type,
-  mode = excluded.mode,
-  mtime = excluded.mtime,
-  size = excluded.size,
-  rev = excluded.rev,
-  link_target = excluded.link_target,
-  content_id = excluded.content_id`;
-
-/**
- * New path keys only — an overwritten path keeps its row, so no conflict is
- * reachable and a plain INSERT is right: a duplicate here would be a bug
- * and should raise rather than be absorbed.
- *
- * `ORDER BY j.key` makes "a parent lands before its children" a property of
- * the statement rather than of `json_each`'s undocumented iteration order.
- */
-const INSERT_PATHS = `
-INSERT INTO fs_paths (path, parent, inode)
-SELECT json_extract(j.value, '$.p'),
-       json_extract(j.value, '$.pa'),
-       json_extract(j.value, '$.i')
-  FROM json_each(?) j
- ORDER BY j.key`;
-
-/** P3 verbatim: one payload BLOB, one JSON offset array, byte offsets. */
-const UPSERT_CHUNKS = `
-INSERT INTO fs_chunks (inode, idx, bytes)
-SELECT json_extract(j.value, '$.i'),
-       json_extract(j.value, '$.x'),
-       substr(?, json_extract(j.value, '$.at'), json_extract(j.value, '$.n'))
-  FROM json_each(?) j
- WHERE true
-ON CONFLICT(inode, idx) DO UPDATE SET bytes = excluded.bytes`;
-
-const DELETE_CHUNKS = "DELETE FROM fs_chunks WHERE inode IN (SELECT value FROM json_each(?))";
-
-const SELECT_EXISTING = `
-SELECT p.path AS path, p.inode AS inode, n.type AS type
-  FROM fs_paths p
-  JOIN fs_nodes n ON n.inode = p.inode
- WHERE p.path IN (SELECT value FROM json_each(?))`;
-
-// -- helpers ---------------------------------------------------------
-
-/** UTF-8 length, which is what a bound TEXT value actually costs. */
-function utf8Length(value: string): number {
-  let total = 0;
-  for (let i = 0; i < value.length; i++) {
-    const unit = value.charCodeAt(i);
-    if (unit < 0x80) total += 1;
-    else if (unit < 0x800) total += 2;
-    else if (unit >= 0xd800 && unit < 0xdc00) {
-      total += 4;
-      i++;
-    } else total += 3;
-  }
-  return total;
 }
 
 function parentOf(path: string): string {
@@ -186,52 +75,6 @@ function strictAncestors(path: string): string[] {
     out.push(path.slice(0, slash));
     slash = path.indexOf("/", slash + 1);
   }
-  return out;
-}
-
-function payloadBudgetOf(requested: number | undefined): number {
-  if (requested === undefined || !Number.isFinite(requested) || requested <= 0) {
-    return DEFAULT_PAYLOAD_BYTES;
-  }
-  return Math.min(Math.floor(requested), MAX_PAYLOAD_BYTES);
-}
-
-/**
- * Group pre-serialised JSON items into as few statements as the 2 MB bound
- * value ceiling allows. `sizes` are UTF-8 byte counts, measured when the
- * items were built.
- */
-function jsonBatches(items: readonly string[], sizes: readonly number[]): string[] {
-  const out: string[] = [];
-  let group: string[] = [];
-  let bytes = 2;
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const size = sizes[i];
-    if (item === undefined || size === undefined) continue;
-    if (group.length > 0 && bytes + size + 1 > MAX_JSON_BYTES) {
-      out.push(`[${group.join(",")}]`);
-      group = [];
-      bytes = 2;
-    }
-    group.push(item);
-    bytes += size + 1;
-  }
-  if (group.length > 0) out.push(`[${group.join(",")}]`);
-  return out;
-}
-
-/** One JSON-fed query per batch, results concatenated. */
-function selectByPaths<Row extends object>(
-  db: SqlDatabase,
-  sql: string,
-  paths: readonly string[],
-): Row[] {
-  if (paths.length === 0) return [];
-  const items = paths.map((path) => JSON.stringify(path));
-  const sizes = items.map(utf8Length);
-  const out: Row[] = [];
-  for (const batch of jsonBatches(items, sizes)) out.push(...db.all<Row>(sql, batch));
   return out;
 }
 
@@ -274,7 +117,7 @@ function toPlanned(path: string, entry: WriteEntry, now: number): Planned {
   };
 }
 
-function implicitDirectory(inode: number, now: number): NodeRow {
+function implicitDirectory(inode: number, now: number): WriteNodeRow {
   return {
     inode,
     type: "dir",
@@ -286,7 +129,7 @@ function implicitDirectory(inode: number, now: number): NodeRow {
   };
 }
 
-function nodeRowOf(entry: Planned, inode: number): NodeRow {
+function nodeRowOf(entry: Planned, inode: number): WriteNodeRow {
   let size = 0;
   if (entry.type === "file") size = entry.bytes?.length ?? 0;
   // POSIX: a symlink's size is the byte length of its target.
@@ -301,109 +144,6 @@ function nodeRowOf(entry: Planned, inode: number): NodeRow {
     contentId: entry.contentId,
   };
 }
-
-// -- writers ---------------------------------------------------------
-
-/**
- * One statement per 1.5 MB of JSON, with the `content_id`s riding along as
- * one concatenated BLOB — JSON cannot carry bytes, and hex plus `unhex()`
- * would assume a SQLite version we have not verified on the Durable Object.
- */
-function writeNodes(db: SqlDatabase, rows: readonly NodeRow[], rev: number): void {
-  let group: NodeRow[] = [];
-  let jsonBytes = 2;
-  let idBytes = 0;
-
-  const flush = (): void => {
-    if (group.length === 0) return;
-    const ids = new Uint8Array(idBytes);
-    const items: string[] = [];
-    let at = 0;
-    for (const row of group) {
-      const id = row.contentId;
-      let start = 0;
-      if (id !== null) {
-        ids.set(id, at);
-        start = at + 1; // substr() is 1-based
-        at += id.length;
-      }
-      items.push(
-        `{"i":${row.inode},"t":${JSON.stringify(row.type)},"m":${row.mode},` +
-          `"mt":${row.mtime},"s":${row.size},"l":${JSON.stringify(row.target)},` +
-          `"ca":${start},"cn":${id?.length ?? 0}}`,
-      );
-    }
-    db.run(UPSERT_NODES, `[${items.join(",")}]`, rev, blob(ids));
-    group = [];
-    jsonBytes = 2;
-    idBytes = 0;
-  };
-
-  for (const row of rows) {
-    // Upper bound: the fixed keys plus generous room for the numbers.
-    const estimate = 96 + utf8Length(JSON.stringify(row.target));
-    const idSize = row.contentId?.length ?? 0;
-    if (
-      group.length > 0 &&
-      (jsonBytes + estimate > MAX_JSON_BYTES || idBytes + idSize > MAX_PAYLOAD_BYTES)
-    ) {
-      flush();
-    }
-    group.push(row);
-    jsonBytes += estimate;
-    idBytes += idSize;
-  }
-  flush();
-}
-
-function writePaths(db: SqlDatabase, rows: readonly PathRow[]): void {
-  if (rows.length === 0) return;
-  const items = rows.map(
-    (row) =>
-      `{"p":${JSON.stringify(row.path)},"pa":${JSON.stringify(row.parent)},"i":${row.inode}}`,
-  );
-  const sizes = items.map(utf8Length);
-  for (const batch of jsonBatches(items, sizes)) db.run(INSERT_PATHS, batch);
-}
-
-/** P3. One statement per payload budget, whatever the file count. */
-function writeChunks(db: SqlDatabase, rows: readonly ChunkRow[], budget: number): void {
-  let group: ChunkRow[] = [];
-  let items: string[] = [];
-  let payloadBytes = 0;
-  let jsonBytes = 2;
-
-  const flush = (): void => {
-    if (group.length === 0) return;
-    const payload = new Uint8Array(payloadBytes);
-    let at = 0;
-    for (const row of group) {
-      payload.set(row.bytes, at);
-      at += row.bytes.length;
-    }
-    db.run(UPSERT_CHUNKS, blob(payload), `[${items.join(",")}]`);
-    group = [];
-    items = [];
-    payloadBytes = 0;
-    jsonBytes = 2;
-  };
-
-  for (const row of rows) {
-    const overBudget = payloadBytes + row.bytes.length > budget;
-    const overJson = jsonBytes + OFFSET_ITEM_BYTES > MAX_JSON_BYTES;
-    if (group.length > 0 && (overBudget || overJson)) flush();
-    // Offsets are into the payload this row is about to join, so the item
-    // is built after any flush has reset the cursor to zero.
-    const item = `{"i":${row.inode},"x":${row.idx},"at":${payloadBytes + 1},"n":${row.bytes.length}}`;
-    group.push(row);
-    items.push(item);
-    payloadBytes += row.bytes.length;
-    jsonBytes += OFFSET_ITEM_BYTES;
-  }
-  flush();
-}
-
-// -- the contract ----------------------------------------------------
 
 /**
  * Create or overwrite many entries in a constant number of metadata
@@ -464,7 +204,7 @@ export function writeFiles(
 
     const existing = new Map<string, ExistingRow>();
     const probe = [...required, ...targets.map((target) => target.path)];
-    for (const row of selectByPaths<ExistingRow>(db, SELECT_EXISTING, probe)) {
+    for (const row of selectExistingRows<ExistingRow>(db, probe)) {
       existing.set(row.path, row);
     }
 
@@ -508,8 +248,8 @@ export function writeFiles(
     const firstInode = creating.length > 0 ? allocateInodes(db, creating.length) : 0;
 
     const inodes = new Map<string, number>();
-    const nodes: NodeRow[] = [];
-    const paths: PathRow[] = [];
+    const nodes: WriteNodeRow[] = [];
+    const paths: WritePathRow[] = [];
     for (let i = 0; i < creating.length; i++) {
       const path = creating[i];
       if (path === undefined) continue;
@@ -532,19 +272,13 @@ export function writeFiles(
     // Stale content dies before the new content lands, so a shorter
     // overwrite cannot leave the old tail behind.
     if (replaced.length > 0) {
-      const items = replaced.map(String);
-      for (const batch of jsonBatches(
-        items,
-        items.map((item) => item.length),
-      )) {
-        db.run(DELETE_CHUNKS, batch);
-      }
+      deleteChunks(db, replaced);
     }
 
     writeNodes(db, nodes, rev);
     writePaths(db, paths);
 
-    const chunks: ChunkRow[] = [];
+    const chunks: WriteChunkRow[] = [];
     for (const entry of targets) {
       if (entry.type !== "file" || entry.bytes === null) continue;
       const inode = inodes.get(entry.path);
