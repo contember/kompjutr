@@ -8,9 +8,7 @@ import { Buffer } from "node:buffer";
 
 import type { SQLiteWorkspaceProvider } from "@cloudflare/computer";
 import type { SqlDatabase } from "../../db/db.js";
-import { comparePaths, normalize, subtreeSuccessor } from "../../fs/path.js";
-import { CHUNK_SIZE } from "../../fs/schema.js";
-import { MAX_HANDLE_MATERIALIZE_BYTES } from "../../fs/store/read.js";
+import { comparePaths, subtreeSuccessor } from "../../fs/path.js";
 import {
   DISCOVERY_PAGE_MAX,
   GLOB_PATTERN_MAX_BYTES,
@@ -30,143 +28,23 @@ import type {
   WriteOptions,
 } from "../../fs/types.js";
 import { dirnameOf } from "../../git/common/paths.js";
-import type {
-  Worktree,
-  WorktreeDirent,
-  WorktreeEntryType,
-  WorktreeStat,
-} from "../../git/ops/worktree.js";
-
-const MAX_HANDLE_COUNT = 5_000;
+import type { Worktree, WorktreeDirent, WorktreeStat } from "../../git/ops/worktree.js";
+import { globMatcher } from "./worktree-glob.js";
+import { readFileHandleBatch, readPathBatch } from "./worktree-reads.js";
+import {
+  assertRealPath,
+  codeOf,
+  type DirentLike,
+  entryType,
+  isExcluded,
+  isMissing,
+  popCandidate,
+  pushCandidate,
+  type ScanCandidate,
+  statType,
+} from "./worktree-support.js";
 
 const EMPTY = Buffer.alloc(0);
-
-function statType(stats: { isSymbolicLink(): boolean; isDirectory(): boolean }): WorktreeEntryType {
-  if (stats.isSymbolicLink()) return "symlink";
-  return stats.isDirectory() ? "dir" : "file";
-}
-
-function codeOf(error: unknown): unknown {
-  if (typeof error !== "object" || error === null) return undefined;
-  return "code" in error ? error.code : undefined;
-}
-
-function isMissing(error: unknown): boolean {
-  const code = codeOf(error);
-  return code === "ENOENT" || code === "ENOTDIR";
-}
-
-function assertRealPath(path: string): asserts path is RealPath {
-  if (!path.startsWith("/") || normalize(path) !== path) {
-    throw new Error(`Computer returned an invalid canonical path: '${path}'`);
-  }
-}
-
-function validateHandleInputs(handles: readonly RegularFileHandle[]): void {
-  if (handles.length > MAX_HANDLE_COUNT) {
-    throw new Error(`readFileHandles: at most ${MAX_HANDLE_COUNT} handles may be read at once`);
-  }
-  for (let index = 0; index < handles.length; index++) {
-    const handle = handles[index];
-    if (handle === undefined) continue;
-    if (
-      typeof handle.path !== "string" ||
-      !handle.path.startsWith("/") ||
-      normalize(handle.path) !== handle.path
-    ) {
-      throw new Error(`readFileHandles: handle ${index} has an invalid canonical path`);
-    }
-    if (
-      !Number.isSafeInteger(handle.ino) ||
-      !Number.isSafeInteger(handle.size) ||
-      handle.size < 0 ||
-      !Number.isSafeInteger(handle.rev)
-    ) {
-      throw new Error(`readFileHandles: handle ${index} has invalid metadata`);
-    }
-  }
-}
-
-function isExcluded(path: string, roots: readonly string[]): boolean {
-  return roots.some((root) => root === "/" || path === root || path.startsWith(`${root}/`));
-}
-
-function appendRemaining(
-  out: RegularFileHandle[],
-  handles: readonly RegularFileHandle[],
-  from: number,
-): void {
-  for (let index = from; index < handles.length; index++) {
-    const handle = handles[index];
-    if (handle !== undefined) out.push(handle);
-  }
-}
-
-interface DirentLike {
-  name: string;
-  isSymbolicLink(): boolean;
-  isDirectory(): boolean;
-  isFile(): boolean;
-}
-
-interface ScanCandidate {
-  path: string;
-}
-
-function pushCandidate(heap: ScanCandidate[], candidate: ScanCandidate): void {
-  heap.push(candidate);
-  let index = heap.length - 1;
-  while (index > 0) {
-    const parent = Math.floor((index - 1) / 2);
-    const parentEntry = heap[parent];
-    if (parentEntry === undefined || comparePaths(parentEntry.path, candidate.path) <= 0) break;
-    heap[index] = parentEntry;
-    index = parent;
-  }
-  heap[index] = candidate;
-}
-
-function popCandidate(heap: ScanCandidate[]): ScanCandidate | undefined {
-  const first = heap[0];
-  const last = heap.pop();
-  if (first === undefined || last === undefined || heap.length === 0) return first;
-
-  let index = 0;
-  while (true) {
-    const left = index * 2 + 1;
-    const right = left + 1;
-    if (left >= heap.length) break;
-    let child = left;
-    const leftEntry = heap[left];
-    const rightEntry = heap[right];
-    if (
-      rightEntry !== undefined &&
-      leftEntry !== undefined &&
-      comparePaths(rightEntry.path, leftEntry.path) < 0
-    ) {
-      child = right;
-    }
-    const childEntry = heap[child];
-    if (childEntry === undefined || comparePaths(last.path, childEntry.path) <= 0) break;
-    heap[index] = childEntry;
-    index = child;
-  }
-  heap[index] = last;
-  return first;
-}
-
-/**
- * dofs's `wrapDirent` hardcodes `isSymbolicLink: () => false` and derives
- * `isFile` from `type === "file"`, so a symlink answers false to all three
- * predicates. An inconclusive dirent therefore gets one `lstat` to settle
- * it — which only happens for symlinks, leaving the walk's hot path alone.
- */
-function entryType(entry: DirentLike): WorktreeEntryType | null {
-  if (entry.isSymbolicLink()) return "symlink";
-  if (entry.isDirectory()) return "dir";
-  if (entry.isFile()) return "file";
-  return null;
-}
 
 export class ComputerWorktree implements Worktree {
   constructor(
@@ -376,102 +254,11 @@ export class ComputerWorktree implements Worktree {
     handles: readonly RegularFileHandle[],
     options: { budget?: number } = {},
   ): HandleReadBatch {
-    const budget = options.budget ?? 1_500_000;
-    if (!(budget > 0)) throw new Error("readFileHandles: budget must be positive");
-    if (budget > 1_500_000) {
-      throw new Error("readFileHandles: budget must not exceed 1500000 bytes");
-    }
-    validateHandleInputs(handles);
-    const files = new Map<RealPath, Uint8Array>();
-    const remaining: RegularFileHandle[] = [];
-    const pending: RegularFileHandle[] = [];
-    let plannedBytes = 0;
-    for (let index = 0; index < handles.length; index++) {
-      const handle = handles[index];
-      if (handle === undefined) continue;
-      if (pending.length > 0 && plannedBytes + handle.size > budget) {
-        appendRemaining(remaining, handles, index);
-        break;
-      }
-      pending.push(handle);
-      plannedBytes += handle.size;
-      if (handle.size > budget) {
-        appendRemaining(remaining, handles, index + 1);
-        break;
-      }
-    }
-
-    const stats = new Map<RealPath, WorktreeStat>();
-    for (const handle of pending) {
-      const stat = this.stat(handle.path);
-      if (
-        stat?.type !== "file" ||
-        stat.ino !== handle.ino ||
-        stat.size !== handle.size ||
-        stat.mtime !== handle.rev
-      ) {
-        throw Object.assign(new Error(`ESTALE: file handle is stale, '${handle.path}'`), {
-          code: "ESTALE",
-        });
-      }
-      if (stat.size > MAX_HANDLE_MATERIALIZE_BYTES) {
-        throw Object.assign(
-          new Error(
-            `EFBIG: '${handle.path}' is ${stat.size} bytes; handle reads are capped at ${MAX_HANDLE_MATERIALIZE_BYTES}`,
-          ),
-          { code: "EFBIG" },
-        );
-      }
-      stats.set(handle.path, stat);
-    }
-
-    for (const handle of pending) {
-      const stat = stats.get(handle.path);
-      if (stat === undefined) throw new Error(`validated stat missing for '${handle.path}'`);
-      const contents = new Uint8Array(stat.size);
-      for (let offset = 0; offset < stat.size; offset += CHUNK_SIZE) {
-        const length = Math.min(CHUNK_SIZE, stat.size - offset);
-        const chunk = this.readRange(handle.path, offset, length);
-        if (chunk.length !== length) {
-          throw Object.assign(new Error(`EIO: short read for '${handle.path}' at ${offset}`), {
-            code: "EIO",
-          });
-        }
-        contents.set(chunk, offset);
-      }
-      const after = this.stat(handle.path);
-      if (
-        after?.type !== "file" ||
-        after.ino !== handle.ino ||
-        after.size !== stat.size ||
-        after.mtime !== handle.rev
-      ) {
-        throw Object.assign(new Error(`ESTALE: file handle is stale, '${handle.path}'`), {
-          code: "ESTALE",
-        });
-      }
-      files.set(handle.path, contents);
-    }
-    return { files, remaining };
+    return readFileHandleBatch(this, handles, options);
   }
 
   readFiles(paths: readonly string[], options: { budget?: number } = {}): ReadBatch {
-    const budget = options.budget ?? 1_500_000;
-    const files = new Map<string, Uint8Array>();
-    const remaining: string[] = [];
-    let bytes = 0;
-    for (const path of paths) {
-      const stat = this.stat(path);
-      if (stat?.type !== "file") continue;
-      if (files.size > 0 && bytes + stat.size > budget) {
-        remaining.push(path);
-        continue;
-      }
-      const contents = this.readFile(path);
-      files.set(path, contents);
-      bytes += contents.byteLength;
-    }
-    return { files, remaining };
+    return readPathBatch(this, paths, options);
   }
 
   glob(root: string, pattern: string, options: { limit?: number } = {}): string[] {
@@ -606,74 +393,4 @@ export class ComputerWorktree implements Worktree {
     }
     return this.#canonicalResult(resolved.length === 0 ? "/" : `/${resolved.join("/")}`);
   }
-}
-
-function regexLiteral(character: string): string {
-  return character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
-}
-
-function classLiteral(character: string): string {
-  return character.replace(/[\\\]\-^]/g, "\\$&");
-}
-
-function classMatcher(pattern: string, start: number): { source: string; end: number } | null {
-  let index = start;
-  let inverted = false;
-  if (pattern[index] === "^") {
-    inverted = true;
-    index++;
-  }
-
-  const singles: string[] = [];
-  const ranges: string[] = [];
-  let prior: string | undefined;
-  if (pattern[index] === "]") {
-    singles.push(classLiteral("]"));
-    index++;
-  }
-
-  while (index < pattern.length && pattern[index] !== "]") {
-    const character = pattern[index];
-    if (character === undefined) break;
-    const upper = pattern[index + 1];
-    if (character === "-" && prior !== undefined && upper !== undefined && upper !== "]") {
-      const lowerCodePoint = prior.codePointAt(0);
-      const upperCodePoint = upper.codePointAt(0);
-      if (
-        lowerCodePoint !== undefined &&
-        upperCodePoint !== undefined &&
-        lowerCodePoint <= upperCodePoint
-      ) {
-        ranges.push(`${classLiteral(prior)}-${classLiteral(upper)}`);
-      }
-      prior = undefined;
-      index += 2;
-      continue;
-    }
-    singles.push(classLiteral(character));
-    prior = character;
-    index++;
-  }
-
-  if (pattern[index] !== "]") return null;
-  return {
-    source: `[${inverted ? "^" : ""}${singles.join("")}${ranges.join("")}]`,
-    end: index,
-  };
-}
-
-function globMatcher(pattern: string): RegExp {
-  let source = "^";
-  for (let index = 0; index < pattern.length; index++) {
-    const character = pattern[index];
-    if (character === "*") source += "[^]*";
-    else if (character === "?") source += "[^]";
-    else if (character === "[") {
-      const matcher = classMatcher(pattern, index + 1);
-      if (matcher === null) return /(?!)/u;
-      source += matcher.source;
-      index = matcher.end;
-    } else if (character !== undefined) source += regexLiteral(character);
-  }
-  return new RegExp(`${source}$`, "u");
 }
