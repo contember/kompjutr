@@ -69,28 +69,33 @@ function readSqlLiterals(contents: string): string[] {
 }
 
 function ordinaryReadInventory(): ReadQuery[] {
-  const journal = "src/git/store/operation-journal.ts";
+  const journalReads = "src/git/store/operation-journal-read.ts";
   const scopes: readonly QueryScope[] = [
     {
       category: "operation journal",
       name: "complete operation read",
-      path: journal,
-      start: "  readOperationState(): OperationJournal | null {",
-      end: "  readRebaseCursorOwned(): RebaseJournalCursor | null {",
+      path: journalReads,
+      start: "export function readOperationState(",
+      end: "export function readRebaseCursor(",
     },
     {
       category: "operation journal",
       name: "rebase cursor read",
-      path: journal,
-      start: "  readRebaseCursorOwned(): RebaseJournalCursor | null {",
-      end: "  writeOperationState(",
+      path: journalReads,
+      start: "export function readRebaseCursor(",
+      end: "function readTouched(",
+    },
+    {
+      category: "operation journal",
+      name: "touched-path read",
+      path: journalReads,
+      start: "function readTouched(",
     },
     {
       category: "operation journal",
       name: "operation-root page",
-      path: journal,
-      start: "  operationRootPage(cursor = 0, limit = 128): OperationRootPage {",
-      end: "  readMergeState(): MergeJournal | null {",
+      path: "src/git/store/operation-journal-roots.ts",
+      start: "export function operationRootPage(",
     },
     {
       category: "index tracker",
@@ -147,10 +152,15 @@ function ordinaryReadInventory(): ReadQuery[] {
     },
     {
       category: "maintenance roots",
-      name: "root source pages",
-      path: "src/git/store/maintenance/roots.ts",
-      start: "function rootsFromRefs(",
-      end: "function validateObjectRoots(",
+      name: "ref root source pages",
+      path: "src/git/store/maintenance/root-ref-pages.ts",
+      start: "export function rootsFromRefs(",
+    },
+    {
+      category: "maintenance roots",
+      name: "worktree root source pages",
+      path: "src/git/store/maintenance/root-worktree-pages.ts",
+      start: "export function rootsFromIndex(",
     },
   ];
 
@@ -212,7 +222,7 @@ describe("trusted ordinary read policy", () => {
       expect(policyViolations(query.sql, "ordinary-read"), query.name).toEqual([]);
     }
     expect(categories).toEqual({
-      "operation journal": 7,
+      "operation journal": 6,
       "index tracker": 2,
       "sparse selection": 7,
       "sparse tree resolution": 1,
@@ -244,19 +254,8 @@ describe("trusted ordinary read policy", () => {
   });
 
   it("keeps complete journal readers free of detached and whole-plan authentication", () => {
-    const path = "src/git/store/operation-journal.ts";
-    const readers = [
-      scopedSource(
-        path,
-        "  readOperationState(): OperationJournal | null {",
-        "  readRebaseCursorOwned(): RebaseJournalCursor | null {",
-      ),
-      scopedSource(
-        path,
-        "  readRebaseCursorOwned(): RebaseJournalCursor | null {",
-        "  writeOperationState(",
-      ),
-    ];
+    const path = "src/git/store/operation-journal-read.ts";
+    const readers = [scopedSource(path, "export function readOperationState(")];
     for (const reader of readers) expect(journalReaderViolations(reader)).toEqual([]);
 
     const regressions = [
