@@ -64,8 +64,8 @@ suite enforces the exact rules.
 - Comments explain *why*, in a header block or above the subtle line. Match the
   existing density; do not exceed it.
 - No `any`, no `as` casts, no `@ts-expect-error`. `noUncheckedIndexedAccess` is on.
-- Source files stay at or under 2,000 lines; split along a seam before you get
-  there. A suite witness enforces this.
+- Source files stay under 500 lines; split along a seam before you get there. A
+  suite witness enforces this.
 - Recurring checks and comparisons go through the shared guard/decoder and path
   kits; do not hand-roll multi-operand `typeof` chains or local path helpers.
 

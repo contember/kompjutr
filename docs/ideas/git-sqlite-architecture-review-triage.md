@@ -99,7 +99,6 @@ acceptance witness of the listed verified finding.
 | TEST-3 | Add a platform-shaped witness that production code delegates transactions and never sends transaction SQL through `sql.exec`. |
 | TEST-4 | Enforce the documented production `node:` import allowlist without flagging allowed compatibility facades. |
 | TEST-5 | Publish shallow-only fetch state and witness the exact maintenance root-epoch transition and restart. |
-| TEST-6 | Decide whether the 2,000-line ceiling counts logical lines or newline separators, then align the witness and message. |
 | TEST-7 | Inventory promised-blob hydration races and add a deterministic lease-contention/cold-reopen witness if existing owner tests do not cover them. |
 | Nested rollback | Verify caught inner-failure semantics with Miniflare/workerd or the real Durable Object adapter; hand-written test storage currently flattens nesting. |
 

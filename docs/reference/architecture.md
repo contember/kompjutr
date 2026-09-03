@@ -251,7 +251,7 @@ Architecture rules are executable checks:
   identity, and whole-journal topology/object authentication without banning
   schema, write, ingest, stale-handle, JSON-ordinal, or exact algorithmic
   boundaries.
-- The source-file ceiling witness rejects any `src/**/*.ts` file above 2,000
+- The source-file ceiling witness rejects any `src/**/*.ts` file at or above 500
   lines.
 
 Behavior remains covered by Git parity, filesystem conformance, end-to-end

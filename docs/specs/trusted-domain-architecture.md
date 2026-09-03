@@ -137,9 +137,7 @@ The rules are tests, not conventions:
 
 - **Import-graph witness** — static check that every `src/` import respects the
   domain and layer order above.
-- **File-ceiling witness** — no source file over 2,000 lines. Known offenders
-  to split: `packs.ts` (read engine / ingest / publication / deletion / lease),
-  `sparse-workspace.ts`, `staging.ts`, and the drafted `store/checkout.ts`.
+- **File-ceiling witness** — every source file stays under 500 lines.
 - **Public-exports witness** — unchanged package surface.
 - **Leased cgroup memory scenarios** in `bench/` — the evidence that the
   composed peak stays under the 100 MiB target without a runtime ledger.

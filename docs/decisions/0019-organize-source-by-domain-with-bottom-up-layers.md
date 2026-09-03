@@ -36,7 +36,7 @@ We organize `src/` into behavior domains over one shared storage kernel.
   checkout-scoped operations stay on the checkout composition root.
 - `diff/` remains an LGPL-2.1-or-later boundary with its own license and SPDX
   headers.
-- Every TypeScript source file stays at or below 2,000 lines.
+- Every TypeScript source file stays below 500 lines.
 
 `tests/import-graph.test.ts` enforces these rules exactly:
 
@@ -65,7 +65,7 @@ and import types. A separate source-file witness enforces the line ceiling.
 - Internal table-family APIs are explicit without becoming package exports.
 - The package keeps one release unit while tests provide package-like dependency
   boundaries.
-- New source files that violate dependency direction or the 2,000-line ceiling
+- New source files that violate dependency direction or the 500-line ceiling
   fail the suite.
 
 ## Alternatives considered
