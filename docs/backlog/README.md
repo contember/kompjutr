@@ -40,7 +40,8 @@ not effort: a wrong answer outranks a missing one.
 - **Not a parity gap.** [63](63-bound-packed-dependency-graph-traversal.md)
   retains packed-graph and read-memory scaling; [65](65-git-sqlite-architecture-review.md)
   collects verified architecture-review remediation; [64](64-speed-up-full-test-suite.md)
-  tracks exhaustive-suite wall time.
+  tracks exhaustive-suite wall time; [66](66-retire-modeled-retained-byte-charges.md)
+  finishes the ledger removal ADR-0005 only partly completed.
 
 ## Consumer demand
 
@@ -68,7 +69,7 @@ Coverage of the calls that decide whether Phase 1 is usable:
 | a full-history clone that later runs `merge-base`, `rebase`, `rev-list --count` | both | Served: optionless clone is complete, while explicit shallow clones can deepen and unshallow later |
 | `branch -m`, `remote set-url` | both | Served by typed native operations; [18](18-branch-and-remote-management.md) now retains only no-caller management |
 | `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'` | builder | Served by native cached/untracked selection and repository `.gitignore` filtering; [36](36-glob-pathspecs.md) now retains mutating globs only |
-| `clone --filter=blob:none` | both | Served by native filtered clone/fetch, durable promises, and bounded lazy backfill (ADR-0020) |
+| `clone --filter=blob:none` | both | Served by native filtered clone/fetch, durable promises, and bounded lazy backfill (ADR-0015) |
 | `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | Served by the strict awaitable runner, bounded per-run stdin/env, and the explicit `kompjutr/git/shell` adapter |
 
 Everything else both consumers issue is served, or routes through another
@@ -129,3 +130,4 @@ units over the same files, and a long sprint does not make that safe.
 - [63 — Bound packed dependency graph traversal](63-bound-packed-dependency-graph-traversal.md)
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
 - [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
+- [66 — Retire modeled retained-byte charges](66-retire-modeled-retained-byte-charges.md)

@@ -1,4 +1,4 @@
-// ADR-0019: source files stay small and cohesive families stay grouped.
+// ADR-0002: source files stay small and cohesive families stay grouped.
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import * as ts from "typescript";

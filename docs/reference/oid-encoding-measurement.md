@@ -6,7 +6,7 @@ traversal 60.0–75.6% slower and point lookup 14.5–16.7% slower. The current
 JavaScript API uses hex strings, so the BLOB result pays conversion on every
 boundary.
 
-[ADR 0005](../decisions/0005-keep-oid-columns-as-text.md) records the separate
+[ADR-0009](../decisions/0009-persisted-git-storage-formats.md) records the separate
 storage decision that used this evidence. The reproducible harness is
 [`bench/oid-encoding.ts`](../../bench/oid-encoding.ts).
 

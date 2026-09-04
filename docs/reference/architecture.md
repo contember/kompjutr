@@ -125,8 +125,8 @@ provisional visibility, and the pack-deletion delta-closure check.
 
 ## Structural cost bounds
 
-There is no dynamic memory-accounting ledger and no projected statement
-admission rule. Work is bounded by construction:
+There is no projected statement admission rule and no accounting ledger threaded
+through signatures. Work is bounded by construction:
 
 - traversals and loose-object payload decoding use lazy `db.iterate()` cursors;
 - merge joins retain only bounded lookahead;
@@ -141,6 +141,17 @@ admission rule. Work is bounded by construction:
 - a single-value or enumeration cap survives only when it names a real format,
   platform, memory, or structural failure;
 - caller-unbounded materialized results fail instead of truncating.
+
+A byte budget is legitimate only when it charges bytes an operation actually
+retains: the shell's intermediate pipeline buffers, and the caller-declared
+integration plan ceiling. Five Git operations — push planning, full status,
+rename detection, rebase planning, and selected-path staging — still charge a
+hand-computed estimate of a JavaScript object's footprint on top of a structural
+count cap that already bounds the same structure — except full status and
+`clean`, where the byte charge is currently the only bound on the tracked-path
+set. They are known exceptions tracked in [backlog 66](../backlog/66-retire-modeled-retained-byte-charges.md),
+and no new one may be added
+([ADR-0005](../decisions/0005-bound-real-failures-and-measure-cost.md)).
 
 At most 1,000 SQL statements and less than 100 MiB of process-transient memory
 per representative operation are benchmark targets. A target miss is
@@ -211,7 +222,7 @@ mutation re-entry fails with `EREENTRANT`, while internal owned seams compose
 without reacquiring it. The owner removes the row before commit, and rollback
 leaves none. This is local transaction serialization, not a lease or a
 cross-process lock
-([ADR-0022](../decisions/0022-own-local-git-mutations-with-sqlite-transactions.md)).
+([ADR-0006](../decisions/0006-own-local-git-mutations-with-sqlite-transactions.md)).
 
 Clone, fetch, push, pull, maintenance repack, and promise-hydrating content
 operations cross asynchronous boundaries after repository state has opened.

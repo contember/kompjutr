@@ -26,7 +26,7 @@ acceptance witness of the listed verified finding.
 | CORR-14 | Backlog 65, ARCH-32 | Reproduce malformed OID or path data through a supported scratch-index writer; do not revive the dismissed stronger trust-premise claim. |
 | CORR-18 | Backlog 65, ARCH-18 | Establish a correctness consequence distinct from the verified whole-ref-table materialization cost. |
 | CORR-19 / TEST-2 | Backlog 65, ARCH-6 | Define a narrow source witness for forbidden read-time authentication that does not flag schema checks or boundary validation. |
-| CORR-20 | Backlog 65, ARCH-17 | Classify sparse accounting as mutable ledger, structural cap, or result cap under ADR-0017. |
+| CORR-20 | Backlog 65, ARCH-17 | Classify sparse accounting as mutable ledger, structural cap, or result cap under ADR-0005. |
 | DOCS-2 / part of DOCS-3 / compact reflog-root cap claim | Backlog 65, ARCH-19 | Confirm which constants disappear with the duplicate root stream and which still bound public materialization. |
 | DOCS-6 and compact `*Owned` claims | Backlog 65, ARCH-24/ARCH-25 | Inventory remaining wrappers, WeakMaps, and callerless exports before mechanical removal. |
 | DOCS-7 and compact local-helper claims | Backlog 65, ARCH-27 | Attach exact helper call sites and divergent inputs to the shared-kit cleanup. |
@@ -38,7 +38,7 @@ acceptance witness of the listed verified finding.
 |---|---|---|
 | CORR-15 | The ordinary index accepts paths that initial-state insertion rejects and later reports as corruption. | Drive a non-canonical path through a supported writer and reproduce the later failure; otherwise dismiss under existing boundary validation. |
 | CORR-16 | Restart-state tables persist combinations not protected by write checks. | Audit every relevant column against schema checks and all writers, then reproduce a supported write that stores unreadable state. |
-| CORR-17 | A journal that fails object validation has no usable continue, skip, or abort path. | Prove supported execution can create the state and test every recovery method; out-of-band mutation is insufficient under ADR-0018. |
+| CORR-17 | A journal that fails object validation has no usable continue, skip, or abort path. | Prove supported execution can create the state and test every recovery method; out-of-band mutation is insufficient under ADR-0004. |
 | CORR-21 / CORR-22 | Expired provisional repositories can leak permanently and block `createRepository`. | Simulate cold expiry without owner takeover, enumerate reclaim paths, and decide whether creation or maintenance owns reclamation. |
 | CORR-23 | Mapped fetch refuses 1,025 destinations while legacy fetch admits 16,384. | Reproduce the boundary, identify the real retained-state owner, and decide whether the limits should match. |
 | CORR-24 | Clone and fetch do not validate `depth` consistently. | Exercise zero, negative, fractional, infinite, and unsafe values through both public APIs and require stable errors. |
@@ -83,8 +83,8 @@ acceptance witness of the listed verified finding.
 | DOCS-3 | Identify the real owner of each structural cap; do not delete `MAX_REFLOG_STATE_ROWS` if it still bounds a public materialized result. |
 | DOCS-4 | Compare every README implementation-status claim with current reference and archived sprint outcomes. |
 | DOCS-5 | Compare the `src/git/store/CLAUDE.md` map with current ownership-bearing modules, without turning it into a file inventory. |
-| DOCS-8 | Decide whether root invariant 4 and ADR-0018 govern all domains or only the Git store before changing filesystem checks. |
-| DOCS-9 | Reconcile ADR-0014's old statement that fetch cannot deepen a clone with shipped deepen and unshallow support. |
+| DOCS-8 | Decide whether root invariant 4 and ADR-0004 govern all domains or only the Git store before changing filesystem checks. |
+| DOCS-9 | ~~Reconcile ADR-0014's statement that fetch cannot deepen a clone with shipped deepen and unshallow support.~~ Resolved in the 2026-09-04 ADR rewrite: ADR-0014 now records that the premise lapsed and why the decision survives it. |
 | DOCS-10 | Establish which synchronous APIs return `EPROMISED` and which asynchronous operations hydrate before documenting it. |
 | DOCS-11 / DOCS-12 | Re-check the headers of `shared.ts`, `database.ts`, and `operations.ts` against current ownership. |
 | DOCS-13 | Inventory obsolete `src/core/` and `src/sqlite/` paths in living docs; do not rewrite historical archive records merely for age. |

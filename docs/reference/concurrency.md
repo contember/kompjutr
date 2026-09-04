@@ -20,7 +20,7 @@ transactions, epochs, CAS, or leases.
 All other public Git methods finish their core mutation synchronously before
 their async wrapper returns. They can run while an asynchronous owner is paused,
 but they cannot interleave inside another local transaction. See
-[ADR-0022](../decisions/0022-own-local-git-mutations-with-sqlite-transactions.md).
+[ADR-0006](../decisions/0006-own-local-git-mutations-with-sqlite-transactions.md).
 
 ## Outcomes
 

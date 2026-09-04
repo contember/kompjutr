@@ -193,7 +193,7 @@ function validateObjectRoots(db: SqlDatabase, repoId: number, roots: RootCandida
     const actual = looseType ?? packedType;
     if (actual === null) {
       if (wanted.optionalMissing) continue;
-      // A promised blob is a terminal leaf, not a root and not corruption (ADR-0020).
+      // A promised blob is a terminal leaf, not a root and not corruption (ADR-0015).
       if (wanted.expectedType === "blob" && row.promised_oid === row.oid) continue;
       throw new CorruptError(`maintenance root ${row.oid} references a missing object`);
     }

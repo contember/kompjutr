@@ -34,7 +34,7 @@ readable it looks.
 - **A path must be well-formed UTF-8, and `store/resolve.ts` is where that is
   enforced.** A lone surrogate stores as WTF-8 through a JSON binding and as
   U+FFFD through a direct bind, so the name read back is not the name written.
-  Callers get `EINVAL`; `src/git` rejects the same input (ADR-0010).
+  Callers get `EINVAL`; `src/git` rejects the same input (ADR-0007).
 - **`fs_paths.path` is always a real path.** If `/a` symlinks to `/b`, then
   `/a/c` is stored as `/b/c`. `store/resolve.ts` is the sole producer of a
   `RealPath`; a lexical path reaching the store shadows its own target. Never

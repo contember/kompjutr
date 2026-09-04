@@ -1,4 +1,4 @@
-// Representative schema prototype for ADR 0005. It deliberately stays separate
+// Representative schema prototype for ADR-0009. It deliberately stays separate
 // from the production schema so the decision can precede a coordinated migration.
 
 import { execFileSync } from "node:child_process";

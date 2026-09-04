@@ -72,9 +72,9 @@ Unverified and disputed claims remain in
 
 ## Cross-cutting acceptance
 
-- Preserve ADR-0017's rule that cost is bounded structurally rather than through
+- Preserve ADR-0005's rule that cost is bounded structurally rather than through
   projected-work currencies.
-- Preserve ADR-0018's boundary-validation and trusted-read model. The optional
+- Preserve ADR-0004's boundary-validation and trusted-read model. The optional
   integrity audit remains
   [`17 - Add repository integrity audit and snapshots`](17-integrity-audit-and-snapshots.md),
   not a reason to re-authenticate ordinary reads.

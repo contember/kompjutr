@@ -215,7 +215,7 @@ in which to run it. The [printf parity suite](../../tests/shell/parity-bash-prin
 and [exit parity suite](../../tests/shell/parity-bash-exit.test.ts) compare the
 admitted forms with Bash and pin these intentional refusals locally. Bash parity
 is the standing admission gate for future shell syntax and commands; see
-[ADR-0021](../decisions/0021-admit-a-bounded-posix-shell-surface.md).
+[ADR-0019](../decisions/0019-admit-a-bounded-posix-shell-surface.md).
 
 The completed design and historical measurements remain in the
 [archived shell plan](../archive/plans/shell.md). Agent-facing implementation

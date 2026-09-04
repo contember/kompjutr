@@ -1,7 +1,7 @@
 // A lone surrogate has no UTF-8 encoding. `JSON.stringify` escapes it to
 // `\ud800`, which SQLite un-escapes into WTF-8, while a direct bind stores
 // U+FFFD — so the name read back is not the name written. `src/fs` rejects it
-// at the resolve chokepoint, exactly as `src/git` does (ADR-0010).
+// at the resolve chokepoint, exactly as `src/git` does (ADR-0007).
 
 import { describe, expect, it } from "vitest";
 

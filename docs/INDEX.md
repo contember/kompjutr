@@ -35,7 +35,7 @@ None.
   current median-of-three snapshot are in
   [`benchmark-current`](reference/benchmark-current.md#clone-statement-profile).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
-  promise-aware maintenance, and pre-push hydration are complete (ADR-0020).
+  promise-aware maintenance, and pre-push hydration are complete (ADR-0015).
 - Three tranches from the 2026-09-02 Git-in-SQLite architecture review are
   complete: storage/publication safety, Git result and scale correctness, then
   transaction-owned local mutations with trusted ordinary reads. Remaining
@@ -48,7 +48,7 @@ None.
   and composed pull with the restart-safe rebase lifecycle.
 - The completed POSIX shell sprint admitted bounded `printf`, `exit`, `1>&2`,
   and named parameter expansion with Bash parity as the standing gate
-  (ADR-0021).
+  (ADR-0019).
 - Next is the external consumer integration gate outside this public repository;
   its provider still lacks the bulk worktree scan needed for an efficient
   implementation without crossing private storage boundaries. Phase 2 is
@@ -67,27 +67,28 @@ None.
 
 ## Decisions
 
-- [`decisions/0001-own-the-standalone-sqlite-runtime.md`](decisions/0001-own-the-standalone-sqlite-runtime.md)
-- [`decisions/0002-compile-shell-commands-to-bounded-queries.md`](decisions/0002-compile-shell-commands-to-bounded-queries.md)
-- [`decisions/0003-port-xdiff-text-merge.md`](decisions/0003-port-xdiff-text-merge.md)
-- [`decisions/0004-foreign-key-enforcement.md`](decisions/0004-foreign-key-enforcement.md)
-- [`decisions/0005-keep-oid-columns-as-text.md`](decisions/0005-keep-oid-columns-as-text.md)
-- [`decisions/0006-keep-content-identities-opaque-and-bound-the-cache.md`](decisions/0006-keep-content-identities-opaque-and-bound-the-cache.md)
-- [`decisions/0007-key-parsed-trees-by-source-surrogate.md`](decisions/0007-key-parsed-trees-by-source-surrogate.md)
-- [`decisions/0008-retain-deleted-ref-history.md`](decisions/0008-retain-deleted-ref-history.md)
-- [`decisions/0009-split-shared-store-from-checkouts.md`](decisions/0009-split-shared-store-from-checkouts.md)
-- [`decisions/0010-require-valid-utf8-git-paths.md`](decisions/0010-require-valid-utf8-git-paths.md)
-- [`decisions/0012-run-maintenance-as-resumable-generations.md`](decisions/0012-run-maintenance-as-resumable-generations.md)
-- [`decisions/0013-publish-clones-through-provisional-ownership.md`](decisions/0013-publish-clones-through-provisional-ownership.md)
-- [`decisions/0014-default-clone-is-complete.md`](decisions/0014-default-clone-is-complete.md)
-- [`decisions/0015-route-git-argv-through-one-synchronous-runner.md`](decisions/0015-route-git-argv-through-one-synchronous-runner.md)
-- [`decisions/0016-preflight-mutating-cli-output-inside-the-transaction.md`](decisions/0016-preflight-mutating-cli-output-inside-the-transaction.md)
-- [`decisions/0017-measure-query-cost-and-bound-real-failures.md`](decisions/0017-measure-query-cost-and-bound-real-failures.md)
-- [`decisions/0018-trust-stored-rows-validate-at-the-boundary.md`](decisions/0018-trust-stored-rows-validate-at-the-boundary.md)
-- [`decisions/0019-organize-source-by-domain-with-bottom-up-layers.md`](decisions/0019-organize-source-by-domain-with-bottom-up-layers.md)
-- [`decisions/0020-model-partial-clone-blobs-as-durable-promises.md`](decisions/0020-model-partial-clone-blobs-as-durable-promises.md)
-- [`decisions/0021-admit-a-bounded-posix-shell-surface.md`](decisions/0021-admit-a-bounded-posix-shell-surface.md)
-- [`decisions/0022-own-local-git-mutations-with-sqlite-transactions.md`](decisions/0022-own-local-git-mutations-with-sqlite-transactions.md)
+- [0001 — Own the standalone SQLite runtime](decisions/0001-own-the-standalone-sqlite-runtime.md)
+- [0002 — Organize source by domain with bottom-up layers](decisions/0002-organize-source-by-domain-with-bottom-up-layers.md)
+- [0003 — Split the shared Git store from checkouts](decisions/0003-split-the-shared-git-store-from-checkouts.md)
+- [0004 — Trust stored rows and validate at the boundary](decisions/0004-trust-stored-rows-validate-at-the-boundary.md)
+- [0005 — Bound real failures and measure cost](decisions/0005-bound-real-failures-and-measure-cost.md)
+- [0006 — Own local Git mutations with SQLite transactions](decisions/0006-own-local-git-mutations-with-sqlite-transactions.md)
+- [0007 — Require well-formed UTF-8 paths](decisions/0007-require-well-formed-utf8-paths.md)
+- [0008 — Enforce SQLite foreign keys at the store boundary](decisions/0008-enforce-sqlite-foreign-keys-at-the-store-boundary.md)
+- [0009 — Choose the persisted Git storage formats](decisions/0009-persisted-git-storage-formats.md)
+- [0010 — Port xdiff for text merge](decisions/0010-port-xdiff-for-text-merge.md)
+- [0011 — Retain bounded deleted-ref history](decisions/0011-retain-bounded-deleted-ref-history.md)
+- [0012 — Run maintenance as resumable generations](decisions/0012-run-maintenance-as-resumable-generations.md)
+- [0013 — Publish clones through provisional ownership](decisions/0013-publish-clones-through-provisional-ownership.md)
+- [0014 — Make an optionless clone complete](decisions/0014-make-an-optionless-clone-complete.md)
+- [0015 — Model partial-clone blobs as durable promises](decisions/0015-model-partial-clone-blobs-as-durable-promises.md)
+- [0016 — Route Git argv through one asynchronous runner](decisions/0016-route-git-argv-through-one-asynchronous-runner.md)
+- [0017 — Preflight mutating CLI output inside the transaction](decisions/0017-preflight-mutating-cli-output-inside-the-transaction.md)
+- [0018 — Compile shell commands to bounded queries](decisions/0018-compile-shell-commands-to-bounded-queries.md)
+- [0019 — Admit a bounded POSIX shell surface](decisions/0019-admit-a-bounded-posix-shell-surface.md)
+
+The set was renumbered on 2026-09-04; [`decisions/README.md`](decisions/README.md#renumbered-on-2026-09-04)
+decodes an old number found in `archive/` or `specs/`.
 
 ## Historical records
 

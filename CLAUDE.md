@@ -92,13 +92,13 @@ rules.
    shared guards only because the type system requires it; a failed guard is
    `CorruptError` and that is the whole read-time check. Out-of-band database
    mutation is undefined behavior
-   ([ADR-0018](docs/decisions/0018-trust-stored-rows-validate-at-the-boundary.md)).
+   ([ADR-0004](docs/decisions/0004-trust-stored-rows-validate-at-the-boundary.md)).
 5. **Bound the cost structurally; do not manufacture the failure.** Stream
    traversals, fix batch and cache sizes, cap caller-unbounded enumerations —
    and never refuse work from an invented currency (projected statements or a
    byte ledger). ≤1,000 SQL statements and <100 MiB per operation is a
    *target*, measured in `bench/`
-   ([ADR-0017](docs/decisions/0017-measure-query-cost-and-bound-real-failures.md)).
+   ([ADR-0005](docs/decisions/0005-bound-real-failures-and-measure-cost.md)).
    A cap survives only if it names the real failure it prevents; never
    truncate silently.
 

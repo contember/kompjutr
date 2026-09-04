@@ -8,7 +8,7 @@ import { filesystemError } from "./errors.js";
 
 /**
  * Reject a path that is not well-formed UTF-16, exactly as `src/git` does
- * (ADR-0010). A lone surrogate stores as WTF-8 through a JSON binding and as
+ * (ADR-0007). A lone surrogate stores as WTF-8 through a JSON binding and as
  * U+FFFD through a direct bind, so the name read back is not the name written.
  */
 export function assertWellFormedPath(path: string, what = "path"): void {

@@ -55,4 +55,4 @@ plan and performed by the executor.
 - **Bash parity gates additions to the shell surface.** Compare admitted syntax
   and built-ins byte-for-byte against Bash. Pin an intentional divergence as an
   explicit local refusal; never weaken the comparison. See
-  [ADR-0021](../../docs/decisions/0021-admit-a-bounded-posix-shell-surface.md).
+  [ADR-0019](../../docs/decisions/0019-admit-a-bounded-posix-shell-surface.md).

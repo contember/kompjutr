@@ -13,7 +13,7 @@ state without burdening ordinary reads.
 ## Problem
 
 Ordinary reads trust rows admitted by validated schemas and supported writers
-([ADR-0018](../decisions/0018-trust-stored-rows-validate-at-the-boundary.md)).
+([ADR-0004](../decisions/0004-trust-stored-rows-validate-at-the-boundary.md)).
 Out-of-band mutation is undefined behavior, and callers have no public,
 opt-in command that surveys the damage, distinguishes authoritative from
 rebuildable data, or captures portable incident and migration state.
@@ -26,7 +26,7 @@ rebuildable data, or captures portable incident and migration state.
 - Stream the audit through fixed keyset pages and bounded work queues. Apply
   explicit finding and output caps that name retained-result limits; do not
   invent projected-statement or modeled-byte admission currencies
-  ([ADR-0017](../decisions/0017-measure-query-cost-and-bound-real-failures.md)).
+  ([ADR-0005](../decisions/0005-bound-real-failures-and-measure-cost.md)).
   Report stable structured findings instead of stopping at the first unrelated
   defect.
 - Classify repairs as safe derived-data rebuilds or destructive authoritative

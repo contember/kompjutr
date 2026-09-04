@@ -33,7 +33,7 @@ fetch state, direct-ref reflogs, projections, blob IDs, and maintenance.
 `checkout_id` owns the root, raw `HEAD`, index and tracker state, operation
 journals, and `HEAD` reflog. `git_tree_entries` is owned through its source
 surrogate. `git_scratch_index*` rows are transaction-local and never become
-maintenance roots. This boundary is ADR-0009.
+maintenance roots. This boundary is ADR-0003.
 
 ## Trust and cost rules
 
@@ -42,7 +42,7 @@ maintenance roots. This boundary is ADR-0009.
 - Reads trust rows. Decode driver values through `common/rows.ts`; a shape
   mismatch is `CorruptError`. Do not add SQL `typeof` witnesses, two-phase
   metadata preflights, or read-time re-authentication. Out-of-band mutation is
-  undefined behavior (ADR-0018).
+  undefined behavior (ADR-0004).
 - Caller mistakes are `GitError`, never corruption. Keep that distinction when
   moving validation between a family and its facade.
 - Promised blobs are metadata, not physical objects or maintenance roots. Only

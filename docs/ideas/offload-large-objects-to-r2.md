@@ -23,7 +23,7 @@ git_objects(oid, type, size, source = 'external')   -> r2://<bucket>/<oid>
   `git_object_chunks` and `git_pack_data` rows, `readChunks()` on the store,
   512 KiB `fs_chunks` in the filesystem. A large object can stream R2 →
   `fs_chunks` page by page.
-- Promised blobs ([ADR-0020](../decisions/0020-model-partial-clone-blobs-as-durable-promises.md))
+- Promised blobs ([ADR-0015](../decisions/0015-model-partial-clone-blobs-as-durable-promises.md))
   are the precedent for "the object is in the graph but its bytes are
   elsewhere": a promise row, `EPROMISED` on synchronous reads, asynchronous
   hydration. An offloaded object is a promise whose remote is R2.

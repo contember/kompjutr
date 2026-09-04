@@ -25,7 +25,7 @@ do not introduce additional dependency ranks.
 `CorruptError`; caller-option failures become `GitError`. Reads decode only to
 refine driver values: they do not re-authenticate stored data or add SQL
 `typeof` witnesses. Write validation and schema `CHECK`s establish the trusted
-store premise. Out-of-band database mutation is undefined behavior (ADR-0018).
+store premise. Out-of-band database mutation is undefined behavior (ADR-0004).
 
 `common/paths.ts` is the single home for Git-side path construction,
 normalization, ancestry, prefix checks, and `comparePaths`. Do not add local
