@@ -203,6 +203,6 @@ their source headers and license notices. Files ported from
 
 ## License
 
-MIT, except `src/core/diff/`, which is a port of Git's xdiff implementation and
-is LGPL-2.1-or-later. See `LICENSE`, `src/core/diff/LICENSE`, and
+MIT, except `src/git/diff/`, which is a port of Git's xdiff implementation and
+is LGPL-2.1-or-later. See `LICENSE`, `src/git/diff/LICENSE`, and
 `LICENSES/LGPL-2.1.txt`.

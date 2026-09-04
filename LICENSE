@@ -55,7 +55,7 @@ The files carrying adapted code name it in their header.
 
 --------------------------------------------------------------------------
 
-EXCEPTION: src/core/diff/ (and its compiled output under dist/core/diff/) is
+EXCEPTION: src/git/diff/ (and its compiled output under dist/git/diff/) is
 NOT MIT. It is a port of the xdiff library as it appears in git, and is
 licensed under the GNU Lesser General Public License, version 2.1 or (at your
-option) any later version. See src/core/diff/LICENSE and LICENSES/LGPL-2.1.txt.
+option) any later version. See src/git/diff/LICENSE and LICENSES/LGPL-2.1.txt.
