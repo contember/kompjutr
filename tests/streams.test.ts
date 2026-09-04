@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
+import { comparePaths as compareFilesystemPaths } from "../src/fs/path.js";
 import { comparePaths, joinSorted, joinSorted3, peekable } from "../src/git/common/streams.js";
 
 /**
@@ -121,6 +122,45 @@ describe("comparePaths", () => {
     // A real pair is four bytes from F0, an unpaired lead three from EF.
     expect(comparePaths("\u{1f600}", "\ud83d")).toBeGreaterThan(0);
     expect(comparePaths("\ud83d", "\u{1f600}")).toBeLessThan(0);
+  });
+});
+
+/**
+ * Invariant 1 has two implementations because `src/fs` may not import `src/git`
+ * (see the header of `src/fs/path.ts`). Nothing else compares them, so a change
+ * to one could silently order the working tree differently from the index.
+ *
+ * Well-formed strings only. The two genuinely disagree on an unpaired
+ * surrogate — `streams.ts` folds it to U+FFFD, `fs/path.ts` compares the raw
+ * unit — and that is out of scope because the filesystem boundary rejects a
+ * path that is not well-formed before it can reach either.
+ */
+describe("the filesystem and git path comparators", () => {
+  const CORPUS = [...AWKWARD_PATHS, "\ufffd", "\ufffd/x"];
+
+  it("share a corpus of well-formed paths only", () => {
+    expect(CORPUS.filter((path) => !path.isWellFormed())).toEqual([]);
+  });
+
+  it("sort a shared corpus identically, and as SQLite does", () => {
+    const input = shuffled(CORPUS);
+    const expected = sqliteOrder(input);
+    expect([...input].sort(comparePaths)).toEqual(expected);
+    expect([...input].sort(compareFilesystemPaths)).toEqual(expected);
+  });
+
+  it("agree on the sign of every pair", () => {
+    const disagreements: string[] = [];
+    for (const left of CORPUS) {
+      for (const right of CORPUS) {
+        if (
+          Math.sign(comparePaths(left, right)) !== Math.sign(compareFilesystemPaths(left, right))
+        ) {
+          disagreements.push(`${JSON.stringify(left)} vs ${JSON.stringify(right)}`);
+        }
+      }
+    }
+    expect(disagreements).toEqual([]);
   });
 });
 
