@@ -18,6 +18,14 @@ import { TestDatabase } from "../helpers/db.js";
 
 const REAL_TOUCH = spawnSync("touch", ["--version"]).status === 0;
 const ENCODER = new TextEncoder();
+
+/** Present so a missing `touch` is a visible skip, not a silent pass. */
+describe("the touch parity suite has something to compare against", () => {
+  it("found touch", () => {
+    expect(REAL_TOUCH).toBe(true);
+  });
+});
+
 describe.skipIf(!REAL_TOUCH)("touch parity", () => {
   it("matches files, directories, final symlinks, dangling symlinks, and missing files", async () => {
     const directory = mkdtempSync(join(tmpdir(), "kompjutr-touch-"));
