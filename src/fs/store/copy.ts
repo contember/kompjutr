@@ -7,6 +7,7 @@ import { comparePaths, dirname, normalize } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type { CopyOptions, EntryType, RealPath } from "../types.js";
 import { allocateInodes, bumpRev } from "./meta.js";
+import { utf8Length } from "./write/write-batches.js";
 
 const DEFAULT_COPY_BUDGET = 1_500_000;
 export const COPY_ENTRY_LIMIT = 1_000;
@@ -217,12 +218,6 @@ function validateExisting(row: ExistingRow): Existing {
   }
   return { path: row.path, inode: row.inode, type: entryType(row.type) };
 }
-
-function utf8Length(value: string): number {
-  return ENCODER.encode(value).byteLength;
-}
-
-const ENCODER = new TextEncoder();
 
 function jsonBatches(items: readonly string[]): string[] {
   const out: string[] = [];

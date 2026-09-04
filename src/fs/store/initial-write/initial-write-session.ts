@@ -2,6 +2,7 @@ import type { SqlDatabase } from "../../../db/db.js";
 import { filesystemError } from "../../errors.js";
 import { comparePaths, dirname } from "../../path.js";
 import { CHUNK_SIZE } from "../../schema.js";
+import { utf8Length } from "../write/write-batches.js";
 import {
   type InitialChunkRow as ChunkRow,
   flushInitialChunks,
@@ -20,7 +21,6 @@ import {
   checkedSize,
   jsonStringCodeUnits,
   MAX_PATH_SEGMENTS,
-  utf8Length,
   validateRelative,
 } from "./initial-write-validation.js";
 

@@ -2,20 +2,6 @@ import { filesystemError } from "../../errors.js";
 
 export const MAX_PATH_SEGMENTS = 128;
 
-export function utf8Length(value: string): number {
-  let total = 0;
-  for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
-    if (unit < 0x80) total++;
-    else if (unit < 0x800) total += 2;
-    else if (unit >= 0xd800 && unit < 0xdc00) {
-      total += 4;
-      index++;
-    } else total += 3;
-  }
-  return total;
-}
-
 export function jsonStringCodeUnits(value: string | null, end = value?.length ?? 0): number {
   if (value === null) return 4;
   let total = 2;

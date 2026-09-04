@@ -2,6 +2,7 @@ import { readBlob, type SqlDatabase } from "../../../db/db.js";
 import { normalize } from "../../path.js";
 import { CHUNK_SIZE } from "../../schema.js";
 import type { HandleReadBatch, RealPath, RegularFileHandle } from "../../types.js";
+import { utf8Length } from "../write/write-batches.js";
 import { DEFAULT_READ_BUDGET, MAX_HANDLE_MATERIALIZE_BYTES } from "./read-limits.js";
 
 const LOOKUP_BATCH_BYTES = 1_500_000;
@@ -122,10 +123,6 @@ const HANDLE_CHUNKS_SQL = `WITH requested AS (
         AND fs_chunks.idx > ?
       ORDER BY validated.ord, fs_chunks.idx
       LIMIT ?`;
-
-function utf8Length(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
 
 function validateHandleInputs(handles: readonly RegularFileHandle[]): void {
   if (handles.length > HANDLE_BATCH_MAX) {

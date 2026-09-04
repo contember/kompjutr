@@ -14,6 +14,7 @@ import { CHUNK_SIZE } from "../schema.js";
 import type { ReadBatch, ReadOptions } from "../types.js";
 import { DEFAULT_READ_BUDGET } from "./read/read-limits.js";
 import { realpath } from "./resolve.js";
+import { utf8Length } from "./write/write-batches.js";
 
 export { readFileHandles } from "./read/read-handles.js";
 export { DEFAULT_READ_BUDGET, MAX_HANDLE_MATERIALIZE_BYTES } from "./read/read-limits.js";
@@ -73,10 +74,6 @@ const LOOKUP_ONE_SQL = `SELECT p.path AS path, p.inode AS inode, n.type AS type,
      LEFT JOIN fs_chunks c ON c.inode = p.inode
     WHERE p.path = ?
     GROUP BY p.path, p.inode, n.type, n.size`;
-
-function utf8Length(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
 
 function lookupMany(db: SqlDatabase, paths: readonly string[]): NodeRow[] {
   const out: NodeRow[] = [];

@@ -78,16 +78,23 @@ SELECT p.path AS path, p.inode AS inode, n.type AS type
   JOIN fs_nodes n ON n.inode = p.inode
  WHERE p.path IN (SELECT value FROM json_each(?))`;
 
-/** UTF-8 length, which is what a bound TEXT value actually costs. */
+/**
+ * UTF-8 length, which is what a bound TEXT value actually costs. Matches
+ * `TextEncoder` without allocating: an unpaired surrogate encodes as the
+ * three-byte U+FFFD, so a size written here equals the stored byte length.
+ */
 export function utf8Length(value: string): number {
   let total = 0;
   for (let i = 0; i < value.length; i++) {
     const unit = value.charCodeAt(i);
     if (unit < 0x80) total += 1;
     else if (unit < 0x800) total += 2;
-    else if (unit >= 0xd800 && unit < 0xdc00) {
-      total += 4;
-      i++;
+    else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        total += 4;
+        i++;
+      } else total += 3;
     } else total += 3;
   }
   return total;
