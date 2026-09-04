@@ -98,11 +98,15 @@ export function checkedPackBytes(left: number, right: number, label: string): nu
   return left + right;
 }
 
+/** Paged recovery recognises the graph limit by text; thrower and matcher share this literal. */
+export const PACK_GRAPH_LIMIT_MESSAGE =
+  "packed blob dependency graph exceeds the bounded entry limit";
+
 export function isPackGraphLimit(error: unknown): error is GitError {
   return (
     error instanceof GitError &&
     error.code === "E2BIG" &&
-    error.message === "packed blob dependency graph exceeds the bounded entry limit"
+    error.message === PACK_GRAPH_LIMIT_MESSAGE
   );
 }
 
