@@ -30,5 +30,4 @@ available for bounded sequencing and recovery.
 
 ## Touch points
 
-`src/core/ops/`, `src/git/client.ts`, `src/compat/computer/client.ts`,
-`src/sqlite/store.ts`, `tests/`
+`src/core/ops/`, `src/git/client.ts`, `src/sqlite/store.ts`, `tests/`

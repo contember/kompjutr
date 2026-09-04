@@ -2,9 +2,8 @@
 
 kompjutr uses Node.js 24 and npm 11 for maintainer checks and packaging. The
 published JavaScript targets Cloudflare Workers with SQLite-backed Durable
-Objects. The optional `kompjutr/compat/computer` entry requires
-`@cloudflare/computer` 0.2.1 or newer; every other package entry must load without
-that peer.
+Objects. The package has no runtime peer dependency; every entry must load on
+its own.
 
 ## Continuous integration
 
@@ -18,15 +17,15 @@ Pull requests and pushes to `main` run these gates on `ubuntu-latest`:
 6. `npm run package:smoke`
 
 The package smoke command rebuilds the package, runs `npm pack` once, and installs
-that exact tarball into two temporary consumers. The standalone consumer imports
-`kompjutr`, `kompjutr/fs`, `kompjutr/git`, `kompjutr/shell`, and
-`kompjutr/testing` without Computer installed. The compatibility consumer
-installs Computer and imports `kompjutr/compat/computer`. The command removes its
-temporary consumers even when a check fails.
+that exact tarball into a temporary consumer, which imports `kompjutr`,
+`kompjutr/fs`, `kompjutr/git`, `kompjutr/shell`, and `kompjutr/testing`. The
+command removes the consumer even when a check fails.
 
 `npm run test:full` covers every Vitest file in bounded root shards plus separate
 filesystem, shell, and end-to-end slices. This keeps each worker pool short-lived
-without weakening the exhaustive CI and release gate.
+without weakening the exhaustive CI and release gate. The slices run
+concurrently in a core-budgeted lane pool; `TEST_FULL_LANES` overrides the cap
+on a busy or a larger machine.
 
 Benchmarks are not CI gates. Run and report them only under the CPU lease defined
 in `bench/CLAUDE.md`.

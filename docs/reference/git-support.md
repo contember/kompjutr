@@ -6,9 +6,8 @@ matter.
 ## How to read this
 
 kompjutr has no external process or general Git command line. Its primary API is
-the typed `Git` interface from `kompjutr/git` (and the narrower `GitClient` from
-`kompjutr/compat/computer`). A strict argv runner covers the agent command
-subset described below. It never falls back to a binary or admits an unlisted
+the typed `Git` interface from `kompjutr/git`. A strict argv runner covers the
+agent command subset described below. It never falls back to a binary or admits an unlisted
 command.
 
 The tables therefore map the familiar command-line spelling to the option that
@@ -22,10 +21,6 @@ command-specific refusal. Nothing silently degrades.
 | ~ | supported with a stated difference from Git |
 | ✘ | not supported — fails, or has no equivalent |
 | ★ | issued by the [reference workload](#the-reference-workload); it combines with the support mark, so `★ ✘` is a gap that workload runs into |
-
-Two surfaces exist. The native `Git` interface is the full one. The Computer
-compatibility client exposes a subset — see [Surface
-differences](#surface-differences).
 
 ## The reference workload
 
@@ -64,7 +59,6 @@ Local snapshot replay is available without textual patch interchange.
 Native `Git` implements
 `runCli(input, options?): Promise<GitCliResult>`; `cli(input)` uses the same
 asynchronous dispatcher.
-The Computer compatibility client's `cli(input)` invokes the same dispatcher.
 `GitCliRunner`, `GitCliInput`, `GitCliResult`, and `GitCliRunOptions` are public
 types from `kompjutr` and `kompjutr/git`.
 
@@ -153,8 +147,8 @@ Reads and pre-publication commands fail the first excess with `E2BIG`. Once
 clone, fetch, or pull has published local state, or push has invoked
 receive-pack, the durable outcome remains authoritative: returned bytes fit the
 destination and `truncated` is true.
-The installed Computer interface still exposes scalar worktree metadata reads:
-a 1,001-file plain-diff probe uses 10,019 statements. That is a measured target
+Scalar worktree metadata reads stay scalar: a 1,001-file plain-diff probe uses
+10,019 statements. That is a measured target
 miss, not a runtime rejection, and the runner adds no projected-count refusal.
 
 Local mutating commands execute their mutation, format their success output,
@@ -188,8 +182,8 @@ truncation never replaces them. A thrown `EPUSHUNCERTAIN` carries its bounded
 | `--template`, `--separate-git-dir`, `--shared` | — | ✘ |
 
 If `dir` did not exist before `init()`, walking the fresh checkout root returns
-`ENOENT` until a write or explicit directory creation materialises it. Both the
-native and Computer surfaces use this database-only creation path.
+`ENOENT` until a write or explicit directory creation materialises it. This
+database-only creation path is the only one.
 
 ### `git clone` — `clone()`
 
@@ -258,9 +252,7 @@ destination as `path`, carries the source as `originalPath`, and reports
 `similarity: 100`. `StatusDetail` adds the modes and OIDs required by ordinary,
 unmerged, and rename porcelain v2 rows. Exact detection pairs equal authoritative
 blob OIDs within compatible regular-file or symlink mode classes. It honours an
-explicit `renames` value before `status.renames`, then defaults on. The Computer
-compatibility facade keeps its pinned `dir`-only input, disables rename detection,
-and rejects unmerged rows that its installed interface cannot express.
+explicit `renames` value before `status.renames`, then defaults on.
 
 In newline mode the formatters use Git's C quoting for control bytes, double
 quotes, and backslashes. With `quotePath: true`, they also octal-escape each
@@ -269,8 +261,8 @@ quoting unsafe ASCII. Porcelain v1 and short also quote leading or trailing
 spaces, and quote either side of a rename when it contains the literal ` -> `;
 porcelain v2 does not quote a path solely for those conditions. Rename paths
 are always processed independently. The formatters and `statusFormatOptions()`
-are standalone exports from `kompjutr` and `kompjutr/git`, not methods on `Git`
-or the Computer compatibility client. Formatting fails with `E2BIG` rather
+are standalone exports from `kompjutr` and `kompjutr/git`, not methods on `Git`.
+Formatting fails with `E2BIG` rather
 than exceeding its bounded record or output budget.
 
 Git tree names may contain arbitrary non-NUL bytes; kompjutr's path model is
@@ -451,8 +443,7 @@ Returns `{ commit: CommitView, patch?: string }`. `patch: true` compares a root
 with the empty tree, a one-parent commit with its parent, and a merge with the
 explicit one-indexed `mainline`; a merge patch without `mainline` fails loudly.
 Patch reads use bounded tree traversal, exact rename detection, batched blob
-reads, and promisor hydration. The Computer compatibility facade projects
-`commit` to preserve its metadata-only contract. Tree/blob display remains ✘.
+reads, and promisor hydration. Tree/blob display remains ✘.
 
 ### `git rev-parse` — `revParse()`
 
@@ -535,8 +526,6 @@ Every checkout in the shared repository is checked before deletion. A branch
 attached to any checkout fails with `EBRANCHFAIL`, even with `force`. Force also
 does not bypass authoritative commit validation, structural bounds, or the
 transactional expected-tip guard that prevents deleting a concurrently moved
-ref. The Computer interface has no `force` field, so its `branchDelete()`
-exposes only the safe default.
 
 Rename has no force mode. It rejects an occupied destination, a detached
 selected checkout, a source attached to another checkout, destination branch
@@ -943,38 +932,6 @@ on the surface.
 - **Mechanisms:** hooks, GPG/SSH signing, credential helpers ★, `.gitattributes`
   (no filters, no eol conversion, no merge drivers), `.mailmap`, Git LFS,
   `git://` and `ssh://` transports
-
-## Surface differences
-
-`kompjutr/compat/computer` implements Computer's `GitClient` interface. It
-covers clone, fetch, init, status, diff, diffSummary, clean, add, rm, reset,
-commit, log, show, revParse, repoRoot, currentBranch, lsFiles, lsTree, branch,
-tag, checkout, remote, config, hashObject, catFile, updateRef, push, pull and
-merge. Its `cli()` uses the strict runner above. The typed methods retain these
-differences:
-
-- ✘ no `cherryPick`, `revert` or `rebase`;
-- ✘ no `reflog` or `recoverRef` surface;
-- ✘ no linked-checkout lifecycle, `divergence`, or `readRef` surface;
-- ✘ no `readTree`, `writeTree`, `commitTree`, or scoped scratch-index surface;
-- ✘ no `lsRemote` surface;
-- ✘ no native `branchRename()`, `remoteGetUrl()` / `remoteSetUrl()`, or
-  `lsFiles({ paths })` extensions;
-- ✘ no `mergeContinue` / `mergeAbort`: merge is single-shot, so a conflict rolls
-  the local integration back and reports `EMERGEFAIL`. A conflicting pull still
-  keeps the fetched objects and the remote-tracking ref;
-- `branchDelete()` has no `force` option on the installed Computer interface,
-  so it always uses the native operation's safe merged check;
-- `status()` accepts only `dir` on the installed Computer interface; native
-  callers own `untrackedFiles`, ignored-row, rename, and formatted-output
-  choices;
-- `rm()` remains cached-only, recursive, and unconditional: it removes matching
-  index entries without changing working-tree bytes or applying native content
-  safety checks;
-- `fetch()` and `push()` retain Computer's legacy single-selection inputs and
-  result shapes. The adapter projects the native structured push status to its
-  ref-keyed record and does not expose unpack or tracking reconciliation;
-- `pull` returns `void` rather than the native `PullResult`.
 
 ## Limits
 

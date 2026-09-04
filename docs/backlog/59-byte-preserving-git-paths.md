@@ -12,9 +12,10 @@ model for repositories that contain non-UTF-8 tree names. Effort XL.
 ## Problem
 
 Git permits arbitrary non-NUL bytes in tree entry names. Kompjutr currently uses
-JavaScript strings across its filesystem, index, tree walk, status, clients, and
-compatibility adapters. ADR-0010 makes this boundary safe by rejecting invalid
-UTF-8, but it cannot represent every valid Git repository.
+JavaScript strings across its filesystem, index, tree walk, status, and clients.
+Both domains reject a path that is not well-formed UTF-8 — ADR-0010 on the Git
+side, the store boundary on the filesystem side — which makes the boundary safe
+but still cannot represent every valid Git repository.
 
 ## Approach / acceptance
 

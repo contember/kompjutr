@@ -31,7 +31,6 @@ In `src/core/ops/reads.ts` and `src/core/ops/plumbing.ts`:
 ## Touch points
 
 `src/core/ops/reads.ts`, `src/core/ops/plumbing.ts`, `src/git/client.ts`,
-`src/compat/computer/client.ts`, `tests/reads.test.ts`,
-`docs/reference/git-support.md`
+`tests/reads.test.ts`, `docs/reference/git-support.md`
 
 <!-- Origin: docs/reference/git-support.md#reference-workload-coverage; split 2026-08-28 by consumer demand -->

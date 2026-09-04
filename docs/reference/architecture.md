@@ -16,7 +16,6 @@ DurableObjectStorageLike
 
 shell/                             separate query surface over Filesystem
 runtime/Workspace                  composition and optional ProcessHost
-compat/                            optional @cloudflare/computer adapter
 ```
 
 `src/db/` is the shared storage kernel. It defines the structural SQLite
@@ -26,8 +25,8 @@ filesystem and Git. `GitError` originates there because SQLite error
 normalization is below the Git domain; `git/common/errors.ts` re-exports it and
 adds Git-specific subclasses.
 
-The package exports `kompjutr`, `/fs`, `/git`, `/git/shell`, `/shell`,
-`/compat/computer`, and `/testing`. The shell is not a `Workspace` property. A
+The package exports `kompjutr`, `/fs`, `/git`, `/git/shell`, `/shell`, and
+`/testing`. The shell is not a `Workspace` property. A
 consumer injects Git into the shell through the explicit `kompjutr/git/shell`
 adapter.
 
@@ -51,7 +50,6 @@ common → diff | ignore | protocol → store → ops → client / cli / exports
 ops. Persisted journal codecs and capability contracts therefore live in the
 store. Cross-domain dependencies also point down: `db` imports no domain, `fs`
 uses only `fs` and `db`, and `shell` uses only `shell`, `fs`, and `db`.
-`@cloudflare/computer` is confined to `compat`.
 
 Within a layer, cohesive command and table families live in semantic
 subdirectories. These folders do not add dependency ranks. No source directory
@@ -246,7 +244,7 @@ The complete outcome matrix is in [concurrency.md](concurrency.md).
 Architecture rules are executable checks:
 
 - `tests/import-graph.test.ts` parses every source import and enforces domain
-  and Git-layer direction plus the compat-only optional dependency.
+  and Git-layer direction, and keeps the value-import graph acyclic.
 - `tests/public-exports.test.ts` keeps the root and Git entrypoint surfaces
   aligned through the restructure.
 - `tests/trusted-read-policy.test.ts` exhaustively classifies the changed
