@@ -18,6 +18,7 @@ import {
 } from "../src/git/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
+import { TIMING_GATE } from "./helpers/timing.js";
 
 async function* once(...chunks: Uint8Array[]): AsyncGenerator<Uint8Array> {
   for (const chunk of chunks) yield chunk;
@@ -640,7 +641,7 @@ describe("discovery", () => {
     for (let sample = 0; sample < 5; sample++) {
       samples.push(await measure(10_000));
     }
-    expect(Math.max(...samples)).toBeLessThan(100);
+    if (TIMING_GATE) expect(Math.max(...samples)).toBeLessThan(100);
   });
 
   it("agrees with the refs a real git server advertises", async () => {

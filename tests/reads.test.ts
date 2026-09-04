@@ -39,8 +39,7 @@ import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
-
-const timingGate = process.env.KOMPJUTR_TIMING_GATE === "1";
+import { TIMING_GATE } from "./helpers/timing.js";
 
 class TraversalPayloadProbeDatabase extends TestDatabase {
   traversalPayloadRows = 0;
@@ -607,7 +606,7 @@ describe("bounded commit graph reads", () => {
     const elapsed = performance.now() - started;
 
     expect(db.storage.statementCount).toBeLessThan(1_000);
-    if (timingGate) expect(elapsed).toBeLessThan(100);
+    if (TIMING_GATE) expect(elapsed).toBeLessThan(100);
   });
 });
 
@@ -1250,7 +1249,7 @@ describe("batched tree reads", () => {
         { path: `${"d/".repeat(1_098)}leaf`, mode: MODE_FILE, oid: leafOid },
       ]);
       expect(db.storage.statementCount).toBeLessThan(1_000);
-      if (timingGate) expect(elapsed).toBeLessThan(100);
+      if (TIMING_GATE) expect(elapsed).toBeLessThan(100);
     }
   }, 30_000);
 
@@ -1266,7 +1265,7 @@ describe("batched tree reads", () => {
         { path: `${"d/".repeat(1_098)}leaf`, mode: MODE_FILE, oid: leafOid },
       ]);
       expect(db.storage.statementCount).toBeLessThan(1_000);
-      if (timingGate) expect(elapsed).toBeLessThan(100);
+      if (TIMING_GATE) expect(elapsed).toBeLessThan(100);
     }
   }, 30_000);
 
@@ -1279,7 +1278,7 @@ describe("batched tree reads", () => {
 
     expect(entries).toEqual([{ path: `${"d/".repeat(1_099)}lea`, mode: MODE_FILE, oid: leafOid }]);
     expect(db.storage.statementCount).toBeLessThan(1_000);
-    if (timingGate) expect(elapsed).toBeLessThan(100);
+    if (TIMING_GATE) expect(elapsed).toBeLessThan(100);
   }, 30_000);
 
   it("projects a shallow ASCII path within the fixed traversal cap", () => {
@@ -1490,6 +1489,6 @@ describe("batched tree reads", () => {
     const elapsed = performance.now() - started;
 
     expect(db.storage.statementCount).toBeLessThan(1_000);
-    if (timingGate) expect(elapsed).toBeLessThan(100);
+    if (TIMING_GATE) expect(elapsed).toBeLessThan(100);
   });
 });

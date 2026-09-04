@@ -74,6 +74,8 @@ v2 text, worktree bytes and modes, the log, and which integration is pending.
   shape. Vitest may use a coarse `<1,000` operation-cost alarm, but representative
   SQL and returned-row cost belongs in `bench/`. A target miss is optimization
   evidence; it never authorizes a runtime refusal.
+- Wall-clock assertions are opt-in through `KOMPJUTR_TIMING_GATE=1` and
+  `helpers/timing.ts`; no script sets it. Gate the assertion, never the work.
 - Agent PTYs must set `GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true` for the full
   suite. Real-Git rebase continuations otherwise wait for an editor.
 - Timeouts are 60 s for tests and hooks. A test needing more is measuring the

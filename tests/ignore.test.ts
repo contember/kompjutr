@@ -23,6 +23,7 @@ import { compilePattern } from "../src/git/ignore/pattern.js";
 import type { Worktree } from "../src/git/ops/worktree/worktree.js";
 import { GitFixture } from "./helpers/git.js";
 import type { SqliteTestStorage } from "./helpers/storage.js";
+import { TIMING_GATE } from "./helpers/timing.js";
 import { makeRepo, type TestWorkspace, writeWorkFile } from "./helpers/workspace.js";
 import { CountingWorktree } from "./helpers/worktree.js";
 
@@ -400,7 +401,7 @@ const CASES: { name: string; files: Record<string, string>; paths: string[] }[] 
 ];
 
 const fixtures: GitFixture[] = [];
-const timingIt = process.env.KOMPJUTR_TIMING_GATE === "1" ? it : it.skip;
+const timingIt = TIMING_GATE ? it : it.skip;
 afterAll(() => {
   for (const fixture of fixtures) fixture.dispose();
 });

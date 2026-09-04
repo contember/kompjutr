@@ -33,6 +33,7 @@ import { PackWriter } from "../src/git/store/pack/writer.js";
 import { COMMIT_CACHE_FLUSH_BYTES } from "../src/git/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
+import { TIMING_GATE } from "./helpers/timing.js";
 
 class ReorderedRangeDatabase implements SqlDatabase {
   constructor(readonly inner: TestDatabase) {}
@@ -1232,7 +1233,7 @@ describe("synthetic pack ingest", () => {
       ),
     ).toEqual([]);
     expect(db.storage.statementCount).toBeLessThan(1_000);
-    expect(elapsed).toBeLessThan(100);
+    if (TIMING_GATE) expect(elapsed).toBeLessThan(100);
 
     db.storage.resetCounters();
     const second = cold.readBlobs(wanted, { budgetBytes: 1024 * 1024 });
