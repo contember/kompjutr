@@ -10,5 +10,5 @@ export {
   patternLiteral,
   patternMatchesNever,
 } from "./pattern-compile.js";
-export { compareLiteralBytes, type MatchDepth, matchPatternDepths } from "./pattern-match.js";
+export { compareLiteralBytes, matchPatternDepths } from "./pattern-match.js";
 export type { EncodedPath, IgnorePattern } from "./pattern-types.js";

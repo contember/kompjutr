@@ -1,6 +1,5 @@
 export type {
   CommitTreeSnapshotDirectory,
-  CommitTreeSnapshotEntry,
   CommitTreeSnapshotRequest,
   CommitTreeSnapshotResult,
   CommitTreeSnapshotSource,
@@ -18,6 +17,5 @@ export type {
   SparseWorkspaceResult,
   SparseWorkspaceRow,
   SparseWorkspaceSource,
-  SparseWorkspaceState,
   SparseWorktreeLeaf,
 } from "../../store/core/contracts.js";

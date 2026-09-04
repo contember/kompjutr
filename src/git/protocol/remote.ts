@@ -18,7 +18,5 @@ export {
 } from "./remote-base.js";
 export {
   type UploadPackFilter,
-  type UploadPackRequest,
-  type UploadPackResult,
   uploadPack,
 } from "./upload-pack.js";

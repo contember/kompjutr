@@ -1,7 +1,6 @@
 export { advanceMaintenanceRootSnapshot } from "./roots/root-advance.js";
 export type {
   AdvanceMaintenanceRootSnapshotOptions,
-  MaintenanceRootCursorState,
   MaintenanceRootSnapshotProgress,
   MaintenanceRootSource,
   OperationRootPageReader,

@@ -12,13 +12,11 @@ export {
   hashExactWorktreePaths,
   hashExactWorktreePathsOwned,
   hashWorktreePath,
-  hashWorktreePathOwned,
   hashWorktreePaths,
   hashWorktreePathsOwned,
   indexEntryFor,
   indexMatchesStat,
   type WorktreeHashCursor,
-  worktreeBytes,
 } from "./worktree-io-hash.js";
 export {
   type CompiledPathspecMatcher,
@@ -27,7 +25,6 @@ export {
   MAX_COMPILED_PATHS,
 } from "./worktree-io-pathspec.js";
 export {
-  type WalkOptions,
   WORKTREE_SCAN_PAGE,
   type WorktreePath,
   walkWorktree,

@@ -16,7 +16,6 @@ export {
   validateRemoteAuthOptions,
 } from "./network-options.js";
 export {
-  hydratePromisedBlobs,
   hydrateTreeBlobs,
   withPromisorHydration,
 } from "./network-promisor.js";

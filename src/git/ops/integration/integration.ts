@@ -1,7 +1,6 @@
 export { planIntegration, planVirtualAncestorIntegration } from "./integration-plan.js";
 export type {
   CleanIntegrationEntry,
-  ConflictIntegrationEntry,
   IntegrationConflictKind,
   IntegrationEntry,
   IntegrationInput,
