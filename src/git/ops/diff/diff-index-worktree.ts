@@ -1,8 +1,8 @@
 import { utf8 } from "../../common/bytes.js";
-import { CorruptError, GitError } from "../../common/errors.js";
+import { CorruptError } from "../../common/errors.js";
 import { joinPath } from "../../common/paths.js";
 import { joinSorted } from "../../common/streams.js";
-import type { BlobReadBatch, IndexEntry } from "../../store/index.js";
+import type { IndexEntry } from "../../store/index.js";
 import { matchesPaths } from "../checkout/checkout.js";
 import type { Repository } from "../repository/repository.js";
 import { type StatusIndexGroup, statusIndexGroups } from "../status/status-rows.js";
@@ -10,6 +10,7 @@ import type { Worktree } from "../worktree/worktree.js";
 import { type WorktreePath, walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import {
   contentDiffers,
+  hydrationWindows,
   readWorktreeFileContents,
   repositoryOids,
   requiredWorktreeBytes,
@@ -23,9 +24,7 @@ import {
   type WorkingCandidate,
 } from "./diff-internal.js";
 import {
-  DIFF_REPOSITORY_BYTES,
   DIFF_WINDOW_ROWS,
-  DIFF_WORKTREE_BYTES,
   hydrateEndpoint,
   type PatchChange,
   type UnmergedPathChange,
@@ -177,55 +176,12 @@ function* hydrateIndexPatchChanges(
 ): Generator<PatchChange> {
   if (changes.length === 0) return;
   const root = worktree.realpath(repo.root);
-  let offset = 0;
-  while (offset < changes.length) {
-    let end = offset;
-    let worktreeBytes = 0;
-    while (end < changes.length && end - offset < DIFF_WINDOW_ROWS) {
-      const change = changes[end]!;
-      const size = indexPatchWorktreeBytes(change);
-      if (size > DIFF_WORKTREE_BYTES) {
-        throw new GitError("EFBIG", `diff path ${change.path} exceeds the working-tree byte limit`);
-      }
-      if (end > offset && worktreeBytes + size > DIFF_WORKTREE_BYTES) break;
-      worktreeBytes += size;
-      end++;
-    }
-
-    const proposed = changes.slice(offset, end);
-    const wanted = indexPatchRepositoryOids(proposed);
-    const stored = new Map<string, Uint8Array>();
-    let remaining = wanted;
-    let storedBytes = 0;
-    while (remaining.length > 0 && storedBytes < DIFF_REPOSITORY_BYTES) {
-      const budget = Math.min(4 * 1024 * 1024, DIFF_REPOSITORY_BYTES - storedBytes);
-      let batch: BlobReadBatch;
-      try {
-        batch = repo.readBlobs(remaining, { budgetBytes: budget });
-      } catch (error) {
-        if (error instanceof GitError && error.code === "EFBIG") break;
-        throw error;
-      }
-      for (const [oid, bytes] of batch.blobs) stored.set(oid, bytes);
-      storedBytes += batch.bytes;
-      if (batch.remaining.length >= remaining.length) {
-        throw new CorruptError("bulk blob reader did not make progress");
-      }
-      remaining = batch.remaining;
-    }
-
-    let ready = 0;
-    for (const change of proposed) {
-      if (!indexPatchRepositoryOids([change]).every((oid) => stored.has(oid))) break;
-      ready++;
-    }
-    if (ready === 0) {
-      throw new GitError(
-        "EFBIG",
-        `diff path ${changes[offset]?.path ?? ""} exceeds the blob limit`,
-      );
-    }
-    const group = proposed.slice(0, ready);
+  for (const { group, stored } of hydrationWindows(
+    repo,
+    changes,
+    indexPatchWorktreeBytes,
+    indexPatchRepositoryOids,
+  )) {
     const worktreeContents = readIndexPatchWorktreeContents(worktree, root, group);
     for (const change of group) {
       if (isPendingUnmergedChange(change)) {
@@ -250,7 +206,6 @@ function* hydrateIndexPatchChanges(
         };
       }
     }
-    offset += ready;
   }
 }
 

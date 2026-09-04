@@ -13,22 +13,29 @@ import {
   hydrateEndpoint,
 } from "./diff-types.js";
 
-export function* hydrateChanges(
-  repo: Repository,
-  worktree: Worktree | undefined,
-  changes: PendingChange[],
-): Generator<FileChange> {
-  if (changes.length === 0) return;
-  const pending = changes.splice(0);
-  const root = worktree?.realpath(repo.root);
-  let offset = 0;
+/** One window of changes whose repository blobs are all resident. */
+export interface HydrationWindow<Change> {
+  group: readonly Change[];
+  stored: ReadonlyMap<string, Uint8Array>;
+}
 
-  while (offset < pending.length) {
+/**
+ * Cut changes into windows bounded by row count and working-tree bytes, then read the repository
+ * blobs each window needs. A window shrinks to the prefix whose blobs actually fit.
+ */
+export function* hydrationWindows<Change extends { path: string }>(
+  repo: Repository,
+  changes: readonly Change[],
+  worktreeBytesOf: (change: Change) => number,
+  repositoryOidsOf: (changes: readonly Change[]) => string[],
+): Generator<HydrationWindow<Change>> {
+  let offset = 0;
+  while (offset < changes.length) {
     let end = offset;
     let worktreeBytes = 0;
-    while (end < pending.length && end - offset < DIFF_WINDOW_ROWS) {
-      const change = pending[end]!;
-      const size = requiredWorktreeBytes(change);
+    while (end < changes.length && end - offset < DIFF_WINDOW_ROWS) {
+      const change = changes[end]!;
+      const size = worktreeBytesOf(change);
       if (size > DIFF_WORKTREE_BYTES) {
         throw new GitError("EFBIG", `diff path ${change.path} exceeds the working-tree byte limit`);
       }
@@ -37,10 +44,9 @@ export function* hydrateChanges(
       end++;
     }
 
-    const proposed = pending.slice(offset, end);
-    const wanted = repositoryOids(proposed);
+    const proposed = changes.slice(offset, end);
     const stored = new Map<string, Uint8Array>();
-    let remaining = wanted;
+    let remaining = repositoryOidsOf(proposed);
     let storedBytes = 0;
     while (remaining.length > 0 && storedBytes < DIFF_REPOSITORY_BYTES) {
       const budget = Math.min(4 * 1024 * 1024, DIFF_REPOSITORY_BYTES - storedBytes);
@@ -61,16 +67,35 @@ export function* hydrateChanges(
 
     let ready = 0;
     for (const change of proposed) {
-      if (!repositoryOids([change]).every((oid) => stored.has(oid))) break;
+      if (!repositoryOidsOf([change]).every((oid) => stored.has(oid))) break;
       ready++;
     }
     if (ready === 0) {
       throw new GitError(
         "EFBIG",
-        `diff path ${pending[offset]?.path ?? ""} exceeds the blob limit`,
+        `diff path ${changes[offset]?.path ?? ""} exceeds the blob limit`,
       );
     }
-    const group = proposed.slice(0, ready);
+    yield { group: proposed.slice(0, ready), stored };
+    offset += ready;
+  }
+}
+
+export function* hydrateChanges(
+  repo: Repository,
+  worktree: Worktree | undefined,
+  changes: PendingChange[],
+): Generator<FileChange> {
+  if (changes.length === 0) return;
+  const pending = changes.splice(0);
+  const root = worktree?.realpath(repo.root);
+
+  for (const { group, stored } of hydrationWindows(
+    repo,
+    pending,
+    requiredWorktreeBytes,
+    repositoryOids,
+  )) {
     const worktreeContents =
       worktree === undefined || root === undefined
         ? new Map<string, Uint8Array>()
@@ -82,7 +107,6 @@ export function* hydrateChanges(
         after: hydrateEndpoint(change.after, stored, worktreeContents),
       };
     }
-    offset += ready;
   }
 }
 
