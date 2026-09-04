@@ -1,10 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { Workspace as ComputerWorkspace } from "@cloudflare/computer";
 import { afterEach, describe, expect, it } from "vitest";
-import { ComputerWorktree } from "../src/compat/computer/worktree.js";
-import { iterateSqlCursor, type SqlDatabase } from "../src/db/db.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
 import { createContextGitCliRunner } from "../src/git/cli/index.js";
 import { utf8 } from "../src/git/common/bytes.js";
@@ -22,7 +19,6 @@ import { PACK_BLOB_BATCH_TARGET_BYTES, SqliteGitDatabase } from "../src/git/stor
 import { TestDatabase } from "./helpers/db.js";
 import { type GitCommandResult, GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
-import { SqliteTestStorage } from "./helpers/storage.js";
 import {
   makeRepo,
   type TestRepository,
@@ -153,38 +149,6 @@ function reopenNative(
   };
   return { context, repo: openRepository(context, root) };
 }
-function computerContext(workspace: ComputerWorkspace): GitContext {
-  const provider = workspace.provider();
-  const computerDb = provider.db;
-  const db: SqlDatabase = {
-    run(query, ...bindings) {
-      computerDb.run(query, ...bindings);
-    },
-    all(query, ...bindings) {
-      return computerDb.all(query, ...bindings);
-    },
-    one(query, ...bindings) {
-      return computerDb.one(query, ...bindings);
-    },
-    scalar(query, ...bindings) {
-      return computerDb.scalar(query, ...bindings);
-    },
-    iterate(query, ...bindings) {
-      return iterateSqlCursor(computerDb.sql.exec(query, ...bindings));
-    },
-    transactionSync(closure) {
-      return computerDb.transactionSync(closure);
-    },
-  };
-  return {
-    database: new SqliteGitDatabase(db, { now: () => FIXED_TIME }),
-    worktree: new ComputerWorktree(provider, db),
-    now: () => FIXED_TIME,
-    timezoneOffset: () => 0,
-    defaultIdentity: IDENTITY,
-  };
-}
-type BackendKind = "native" | "computer";
 interface ReopenableBackend {
   context: GitContext;
   repo: Repository;
@@ -194,39 +158,21 @@ interface ReopenableBackend {
     repo: Repository;
   };
 }
-async function backend(kind: BackendKind): Promise<ReopenableBackend> {
-  if (kind === "native") {
-    const workspace = nativeRepository("/");
-    return {
-      context: workspace.context,
-      repo: workspace.repo,
-      async write(path, content) {
-        writeWorkFile(workspace, path, content);
-      },
-      reopen() {
-        return reopenNative(workspace);
-      },
-    };
-  }
-  const storage = new SqliteTestStorage();
-  const computer = new ComputerWorkspace({ storage });
-  const context = computerContext(computer);
-  context.defaultIdentity = IDENTITY;
-  const repo = initRepository(context);
+async function backend(): Promise<ReopenableBackend> {
+  const workspace = nativeRepository("/");
   return {
-    context,
-    repo,
+    context: workspace.context,
+    repo: workspace.repo,
     async write(path, content) {
-      await computer.fs.writeFile(path, content);
+      writeWorkFile(workspace, path, content);
     },
     reopen() {
-      const reopenedContext = computerContext(new ComputerWorkspace({ storage }));
-      return { context: reopenedContext, repo: openRepository(reopenedContext) };
+      return reopenNative(workspace);
     },
   };
 }
-async function dirtyCommitAllBackend(kind: BackendKind): Promise<ReopenableBackend> {
-  const target = await backend(kind);
+async function dirtyCommitAllBackend(): Promise<ReopenableBackend> {
+  const target = await backend();
   await target.write("/file.txt", "one\n");
   await runner(target.context).runCli({ argv: ["add", "file.txt"], env: IDENTITY_ENV });
   await runner(target.context).runCli({
@@ -236,10 +182,10 @@ async function dirtyCommitAllBackend(kind: BackendKind): Promise<ReopenableBacke
   await target.write("/file.txt", "two\n");
   return target;
 }
-async function conflictedBackend(kind: BackendKind): Promise<ReopenableBackend> {
+async function conflictedBackend(): Promise<ReopenableBackend> {
   const source = fixture();
   divergent(source);
-  const target = await backend(kind);
+  const target = await backend();
   await importFixture(source, target.repo.checkout);
   checkoutTree(target.repo, target.context.worktree, target.repo.headTree());
   expect(
@@ -254,8 +200,8 @@ async function conflictedBackend(kind: BackendKind): Promise<ReopenableBackend> 
   ).toEqual({ stdout: "", stderr: "", exitCode: 0, truncated: false });
   return target;
 }
-async function mixedIgnoredAddBackend(kind: BackendKind): Promise<ReopenableBackend> {
-  const target = await backend(kind);
+async function mixedIgnoredAddBackend(): Promise<ReopenableBackend> {
+  const target = await backend();
   await target.write("/.gitignore", "*.log\n");
   await target.write("/good.txt", "good\n");
   await target.write("/ignored.log", "ignored\n");
@@ -1347,7 +1293,7 @@ describe("mutating git CLI handlers", () => {
     );
   });
   it("bounds mixed ignored add output and rolls back its staged paths across reopen", async () => {
-    const control = await mixedIgnoredAddBackend("native");
+    const control = await mixedIgnoredAddBackend();
     const controlLooseBefore = looseOids(control.repo);
     const controlResult = await runner(control.context).runCli({
       argv: ["add", "good.txt", "ignored.log"],
@@ -1365,34 +1311,32 @@ describe("mutating git CLI handlers", () => {
         firstExcess: { maxCombinedOutputBytes: stderrBytes - 1 },
       },
     ];
-    for (const kind of ["native", "computer"] satisfies BackendKind[]) {
-      for (const ceiling of ceilings) {
-        const exact = await mixedIgnoredAddBackend(kind);
-        expect(
-          await runner(exact.context).runCli(
+    for (const ceiling of ceilings) {
+      const exact = await mixedIgnoredAddBackend();
+      expect(
+        await runner(exact.context).runCli(
+          { argv: ["add", "good.txt", "ignored.log"] },
+          ceiling.exact,
+        ),
+      ).toEqual(controlResult);
+      expect(exact.repo.checkout.indexGet("good.txt", 0)).not.toBeNull();
+      const overflow = await mixedIgnoredAddBackend();
+      const before = repositoryState(overflow.context, overflow.repo);
+      await expectE2Big(
+        async () =>
+          await runner(overflow.context).runCli(
             { argv: ["add", "good.txt", "ignored.log"] },
-            ceiling.exact,
+            ceiling.firstExcess,
           ),
-        ).toEqual(controlResult);
-        expect(exact.repo.checkout.indexGet("good.txt", 0)).not.toBeNull();
-        const overflow = await mixedIgnoredAddBackend(kind);
-        const before = repositoryState(overflow.context, overflow.repo);
-        await expectE2Big(
-          async () =>
-            await runner(overflow.context).runCli(
-              { argv: ["add", "good.txt", "ignored.log"] },
-              ceiling.firstExcess,
-            ),
-        );
-        expectObjectsAbsent(overflow.repo, orphanOids);
-        const reopened = overflow.reopen();
-        expect(repositoryState(reopened.context, reopened.repo)).toEqual(before);
-        expectObjectsAbsent(reopened.repo, orphanOids);
-      }
+      );
+      expectObjectsAbsent(overflow.repo, orphanOids);
+      const reopened = overflow.reopen();
+      expect(repositoryState(reopened.context, reopened.repo)).toEqual(before);
+      expectObjectsAbsent(reopened.repo, orphanOids);
     }
   });
   it("rolls back commit-all staging and publication on output overflow across reopen", async () => {
-    const control = await dirtyCommitAllBackend("native");
+    const control = await dirtyCommitAllBackend();
     const controlLooseBefore = looseOids(control.repo);
     const controlResult = await runner(control.context).runCli({
       argv: ["commit", "-a", "-m", "commit"],
@@ -1413,34 +1357,32 @@ describe("mutating git CLI handlers", () => {
         firstExcess: { maxCombinedOutputBytes: stdoutBytes - 1 },
       },
     ];
-    for (const kind of ["native", "computer"] satisfies BackendKind[]) {
-      for (const ceiling of ceilings) {
-        const exact = await dirtyCommitAllBackend(kind);
-        expect(
-          await runner(exact.context).runCli(
+    for (const ceiling of ceilings) {
+      const exact = await dirtyCommitAllBackend();
+      expect(
+        await runner(exact.context).runCli(
+          { argv: ["commit", "-a", "-m", "commit"], env: IDENTITY_ENV },
+          ceiling.exact,
+        ),
+      ).toEqual(controlResult);
+      const prepared = await dirtyCommitAllBackend();
+      const overflow = prepared.reopen();
+      const before = repositoryState(overflow.context, overflow.repo);
+      await expectE2Big(
+        async () =>
+          await runner(overflow.context).runCli(
             { argv: ["commit", "-a", "-m", "commit"], env: IDENTITY_ENV },
-            ceiling.exact,
+            ceiling.firstExcess,
           ),
-        ).toEqual(controlResult);
-        const prepared = await dirtyCommitAllBackend(kind);
-        const overflow = prepared.reopen();
-        const before = repositoryState(overflow.context, overflow.repo);
-        await expectE2Big(
-          async () =>
-            await runner(overflow.context).runCli(
-              { argv: ["commit", "-a", "-m", "commit"], env: IDENTITY_ENV },
-              ceiling.firstExcess,
-            ),
-        );
-        expectObjectsAbsent(overflow.repo, orphanOids);
-        const reopened = prepared.reopen();
-        expect(repositoryState(reopened.context, reopened.repo)).toEqual(before);
-        expectObjectsAbsent(reopened.repo, orphanOids);
-      }
+      );
+      expectObjectsAbsent(overflow.repo, orphanOids);
+      const reopened = prepared.reopen();
+      expect(repositoryState(reopened.context, reopened.repo)).toEqual(before);
+      expectObjectsAbsent(reopened.repo, orphanOids);
     }
   });
   it("rolls back every retained rebase output overflow and can discard stderr", async () => {
-    const control = await conflictedBackend("native");
+    const control = await conflictedBackend();
     const controlLooseBefore = looseOids(control.repo);
     const controlResult = await runner(control.context).runCli({
       argv: ["rebase", "--continue"],
@@ -1467,62 +1409,60 @@ describe("mutating git CLI handlers", () => {
         firstExcess: { maxCombinedOutputBytes: combinedBytes - 1 },
       },
     ];
-    for (const kind of ["native", "computer"] satisfies BackendKind[]) {
-      for (const ceiling of ceilings) {
-        const exact = await conflictedBackend(kind);
-        expect(
-          await runner(exact.context).runCli(
+    for (const ceiling of ceilings) {
+      const exact = await conflictedBackend();
+      expect(
+        await runner(exact.context).runCli(
+          { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
+          ceiling.exact,
+        ),
+      ).toEqual(controlResult);
+      const overflow = await conflictedBackend();
+      const before = repositoryState(overflow.context, overflow.repo);
+      await expectE2Big(
+        async () =>
+          await runner(overflow.context).runCli(
             { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
-            ceiling.exact,
+            ceiling.firstExcess,
           ),
-        ).toEqual(controlResult);
-        const overflow = await conflictedBackend(kind);
-        const before = repositoryState(overflow.context, overflow.repo);
-        await expectE2Big(
-          async () =>
-            await runner(overflow.context).runCli(
-              { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
-              ceiling.firstExcess,
-            ),
-        );
-        expectObjectsAbsent(overflow.repo, orphanOids);
-        const reopened = overflow.reopen();
-        expect(repositoryState(reopened.context, reopened.repo)).toEqual(before);
-        expectObjectsAbsent(reopened.repo, orphanOids);
-      }
-      const discarded = await conflictedBackend(kind);
-      const discardedResult = await runner(discarded.context).runCli(
-        { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
-        {
-          maxStderrBytes: 0,
-          maxCombinedOutputBytes: stdoutBytes,
-          discardStderr: true,
-        },
       );
-      expect(discardedResult).toEqual({
-        stdout: controlResult.stdout,
-        stderr: "",
-        exitCode: 0,
-        truncated: false,
-      });
-      for (const options of [
-        { maxStdoutBytes: stdoutBytes - 1, discardStderr: true },
-        { maxCombinedOutputBytes: stdoutBytes - 1, discardStderr: true },
-      ]) {
-        const overflow = await conflictedBackend(kind);
-        const before = repositoryState(overflow.context, overflow.repo);
-        await expectE2Big(
-          async () =>
-            await runner(overflow.context).runCli(
-              { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
-              options,
-            ),
-        );
-        expectObjectsAbsent(overflow.repo, orphanOids);
-        const reopened = overflow.reopen();
-        expect(repositoryState(reopened.context, reopened.repo)).toEqual(before);
-        expectObjectsAbsent(reopened.repo, orphanOids);
-      }
+      expectObjectsAbsent(overflow.repo, orphanOids);
+      const reopened = overflow.reopen();
+      expect(repositoryState(reopened.context, reopened.repo)).toEqual(before);
+      expectObjectsAbsent(reopened.repo, orphanOids);
+    }
+    const discarded = await conflictedBackend();
+    const discardedResult = await runner(discarded.context).runCli(
+      { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
+      {
+        maxStderrBytes: 0,
+        maxCombinedOutputBytes: stdoutBytes,
+        discardStderr: true,
+      },
+    );
+    expect(discardedResult).toEqual({
+      stdout: controlResult.stdout,
+      stderr: "",
+      exitCode: 0,
+      truncated: false,
+    });
+    for (const options of [
+      { maxStdoutBytes: stdoutBytes - 1, discardStderr: true },
+      { maxCombinedOutputBytes: stdoutBytes - 1, discardStderr: true },
+    ]) {
+      const overflow = await conflictedBackend();
+      const before = repositoryState(overflow.context, overflow.repo);
+      await expectE2Big(
+        async () =>
+          await runner(overflow.context).runCli(
+            { argv: ["rebase", "--continue"], env: IDENTITY_ENV },
+            options,
+          ),
+      );
+      expectObjectsAbsent(overflow.repo, orphanOids);
+      const reopened = overflow.reopen();
+      expect(repositoryState(reopened.context, reopened.repo)).toEqual(before);
+      expectObjectsAbsent(reopened.repo, orphanOids);
     }
   });
   it("keeps rejected mutating argv non-mutating", async () => {

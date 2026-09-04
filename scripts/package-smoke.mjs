@@ -1,13 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { constants } from "node:fs";
-import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-const compatPeer = "@cloudflare/computer@0.2.1";
 const typescriptCompiler = join(root, "node_modules", "typescript", "bin", "tsc");
 
 function run(command, args, cwd) {
@@ -31,7 +29,7 @@ function requestedPackDestination(args) {
   return resolve(args[1]);
 }
 
-async function writeConsumer(directory, source, skipLibCheck = false) {
+async function writeConsumer(directory, source) {
   await mkdir(directory, { recursive: true });
   await writeFile(
     join(directory, "package.json"),
@@ -46,7 +44,6 @@ async function writeConsumer(directory, source, skipLibCheck = false) {
           module: "NodeNext",
           moduleResolution: "NodeNext",
           noEmit: true,
-          skipLibCheck,
           strict: true,
           target: "ES2022",
           typeRoots: [join(root, "node_modules", "@types")],
@@ -68,26 +65,6 @@ function typecheckConsumer(directory) {
   );
 }
 
-async function assertComputerIsAbsent(directory) {
-  const manifest = join(directory, "node_modules", "@cloudflare", "computer", "package.json");
-  await assertPathIsAbsent(
-    manifest,
-    "The standalone consumer unexpectedly installed @cloudflare/computer",
-  );
-}
-
-async function assertPathIsAbsent(path, message) {
-  try {
-    await access(path, constants.F_OK);
-  } catch (error) {
-    if (error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      return;
-    }
-    throw error;
-  }
-  throw new Error(message);
-}
-
 async function main() {
   const externalDestination = requestedPackDestination(process.argv.slice(2));
   const temporaryRoot = await mkdtemp(join(tmpdir(), "kompjutr-package-smoke-"));
@@ -103,10 +80,6 @@ async function main() {
     }
 
     run(npm, ["run", "build"], root);
-    await assertPathIsAbsent(
-      join(root, "dist", "computer"),
-      "Build retained stale dist/computer output",
-    );
     run(npm, ["pack", "--pack-destination", packDestination], root);
 
     const tarballs = (await readdir(packDestination)).filter((name) => name.endsWith(".tgz"));
@@ -236,7 +209,6 @@ async function main() {
       ].join("\n"),
     );
     run(npm, ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarball], standalone);
-    await assertComputerIsAbsent(standalone);
     typecheckConsumer(standalone);
     run(
       process.execPath,
@@ -265,30 +237,6 @@ async function main() {
         ].join("\n"),
       ],
       standalone,
-    );
-
-    const compatibility = join(temporaryRoot, "compat-consumer");
-    await writeConsumer(
-      compatibility,
-      [
-        'import { ComputerWorktree, createSqliteGitClient } from "kompjutr/compat/computer";',
-        "",
-        "void ComputerWorktree;",
-        "void createSqliteGitClient;",
-        "",
-      ].join("\n"),
-      true,
-    );
-    run(
-      npm,
-      ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarball, compatPeer],
-      compatibility,
-    );
-    typecheckConsumer(compatibility);
-    run(
-      process.execPath,
-      ["--input-type=module", "--eval", 'await import("kompjutr/compat/computer");'],
-      compatibility,
     );
 
     console.log(`Package smoke passed for ${tarballs[0]}`);

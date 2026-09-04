@@ -1,7 +1,7 @@
-import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
+import { NodeFsCompat } from "../src/fs/compat/node.js";
+import { createFilesystem } from "../src/fs/filesystem.js";
 import { createGit, type Git, type PushRefspec } from "../src/git/client.js";
 import { fetchHttpClient, type GitHttpClient } from "../src/git/protocol/transport.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
@@ -12,6 +12,7 @@ import { SqliteTestStorage } from "./helpers/storage.js";
 import { makeWorkspace } from "./helpers/workspace.js";
 
 const IDENTITY = { name: "Agent", email: "agent@example.com" };
+const NOW = 1_600_000_000_000;
 const fixtures: GitFixture[] = [];
 
 afterAll(() => {
@@ -27,23 +28,29 @@ function remoteFixture(): GitFixture {
   return fixture;
 }
 
-function workspace(storage = new SqliteTestStorage()): Workspace {
-  return new Workspace({
-    storage,
-    git: createSqliteGitClient({ now: () => 1_600_000_000_000 }),
-    defaultGitIdentity: IDENTITY,
-  });
+/** A client and a node:fs facade over one storage, reopened on every call. */
+function openGit(storage: SqliteTestStorage, http?: GitHttpClient): { git: Git; fs: NodeFsCompat } {
+  const db = new TestDatabase(storage);
+  const worktree = createFilesystem(db, { now: () => NOW });
+  return {
+    fs: new NodeFsCompat(worktree),
+    git: createGit()({
+      database: new SqliteGitDatabase(db),
+      worktree,
+      now: () => NOW,
+      timezoneOffset: () => 0,
+      defaultIdentity: IDENTITY,
+      ...(http === undefined ? {} : { http }),
+    }),
+  };
 }
 
-function nativeGit(ws: Workspace, storage: SqliteTestStorage, http?: GitHttpClient): Git {
-  return createGit()({
-    database: new SqliteGitDatabase(new TestDatabase(storage)),
-    worktree: new ComputerWorktree(ws.provider()),
-    now: () => 1_600_000_000_000,
-    timezoneOffset: () => 0,
-    defaultIdentity: IDENTITY,
-    ...(http === undefined ? {} : { http }),
-  });
+function workspace(storage = new SqliteTestStorage()): { git: Git; fs: NodeFsCompat } {
+  return openGit(storage);
+}
+
+function nativeGit(storage: SqliteTestStorage, http?: GitHttpClient): Git {
+  return openGit(storage, http).git;
 }
 
 interface RefLogRow {
@@ -68,7 +75,11 @@ function reflog(storage: SqliteTestStorage, ref: string): RefLogRow[] {
     .toArray();
 }
 
-async function localCommit(ws: Workspace, content: string, message: string): Promise<string> {
+async function localCommit(
+  ws: { git: Git; fs: NodeFsCompat },
+  content: string,
+  message: string,
+): Promise<string> {
   await ws.fs.writeFile("/README.md", content);
   await ws.git.add({ paths: ["README.md"] });
   return (await ws.git.commit({ message })).oid;
@@ -82,7 +93,7 @@ describe("push", () => {
       const storage = new SqliteTestStorage();
       const ws = workspace(storage);
       await ws.git.clone({ url: server.url, dir: "/" });
-      const git = nativeGit(ws, storage);
+      const git = nativeGit(storage);
       const requests = server.requests.length;
       const malformed = { signal: new AbortController().signal };
       Object.defineProperty(malformed, "signal", { value: {} });
@@ -133,7 +144,7 @@ describe("push", () => {
       };
 
       await expect(
-        nativeGit(ws, storage, http).push({ signal: controller.signal }),
+        nativeGit(storage, http).push({ signal: controller.signal }),
       ).resolves.toMatchObject({
         ok: true,
         refs: [{ ref: "refs/heads/main", ok: true, error: null }],
@@ -208,7 +219,7 @@ describe("push", () => {
       );
       expect(reflog(storage, "refs/remotes/origin/main")).toHaveLength(trackingEntries);
 
-      const git = nativeGit(ws, storage);
+      const git = nativeGit(storage);
       await expect(
         git.push({ force: true, leases: { main: { tracking: true } } }),
       ).rejects.toMatchObject({ code: "ESTALELEASE" });
@@ -241,7 +252,7 @@ describe("push", () => {
       const ws = workspace(storage);
       await ws.git.clone({ url: server.url, dir: "/" });
       await ws.git.branch({ name: "topic" });
-      const git = nativeGit(ws, storage);
+      const git = nativeGit(storage);
       const posts = server.requests.filter((request) => request.method === "POST").length;
 
       await expect(
@@ -288,7 +299,7 @@ describe("push", () => {
       const storage = new SqliteTestStorage();
       const ws = workspace(storage);
       await ws.git.clone({ url: server.url, dir: "/" });
-      const git = nativeGit(ws, storage);
+      const git = nativeGit(storage);
       const requests = server.requests.length;
       const invalid = [
         { leases: null },
@@ -354,9 +365,15 @@ describe("push", () => {
       await expect(ws.git.push({})).resolves.toEqual({
         ok: false,
         error: "branch is currently checked out",
-        refs: {
-          "refs/heads/main": { ok: false, error: "branch is currently checked out" },
-        },
+        unpack: { ok: true },
+        refs: [
+          {
+            ref: "refs/heads/main",
+            ok: false,
+            error: "branch is currently checked out",
+          },
+        ],
+        tracking: { outcome: "not-applicable" },
       });
 
       expect(await ws.git.revParse({ ref: "refs/remotes/origin/main" })).toBe(tracked);
@@ -498,7 +515,7 @@ describe("push", () => {
       const storage = new SqliteTestStorage();
       const ws = workspace(storage);
       await ws.git.clone({ url: server.url, dir: "/" });
-      const git = nativeGit(ws, storage);
+      const git = nativeGit(storage);
       const requests = server.requests.length;
 
       await expect(
@@ -531,7 +548,7 @@ describe("push", () => {
       const storage = new SqliteTestStorage();
       const ws = workspace(storage);
       await ws.git.clone({ url: server.url, dir: "/" });
-      const git = nativeGit(ws, storage);
+      const git = nativeGit(storage);
       const oid = await localCommit(ws, "options\n", "push options");
       const beforeInvalid = server.requests.length;
 
@@ -629,7 +646,7 @@ describe("push", () => {
       const storage = new SqliteTestStorage();
       const ws = workspace(storage);
       await ws.git.clone({ url: server.url, dir: "/" });
-      const git = nativeGit(ws, storage);
+      const git = nativeGit(storage);
       const oid = await localCommit(ws, "mixed\n", "mixed mapping");
 
       await expect(
@@ -659,7 +676,7 @@ describe("push", () => {
       const storage = new SqliteTestStorage();
       const ws = workspace(storage);
       await ws.git.clone({ url: server.url, dir: "/" });
-      const git = nativeGit(ws, storage);
+      const git = nativeGit(storage);
       await localCommit(ws, "local\n", "local only");
       const requests = server.requests.length;
 

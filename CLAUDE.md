@@ -40,7 +40,6 @@ src/git/       Git domain
   cli/         Synchronous Git argv surface
   client.ts    Public Git facade
 src/runtime/   Workspace composition over db + filesystem + Git
-src/compat/    Migration adapter; the only entry allowed to import @cloudflare/computer
 tests/         Vitest suite, parity and conformance harnesses
 bench/         Standalone benchmark harness
 docs/          Architecture, current benchmarks, plans, and historical records
@@ -48,8 +47,9 @@ docs/          Architecture, current benchmarks, plans, and historical records
 
 Layering is bottom-up: `db` sits below the domains; `fs` may import only `fs`
 or `db`; `shell` may import only `shell`, `fs`, or `db`; and Git follows
-`common → diff|ignore|protocol → store → ops → client/cli`. The import-graph
-suite enforces the exact rules.
+`common → diff|ignore|protocol → store → ops → client/cli`. No file under `src/`
+may import `@cloudflare/computer`. The import-graph suite enforces the exact
+rules.
 
 ## Conventions
 
@@ -57,10 +57,10 @@ suite enforces the exact rules.
   type-only imports (`verbatimModuleSyntax`, `isolatedModules`).
 - Target is the Workers runtime. `node:` imports only where the platform
   provides them — `node:zlib` in `src/git/common/zlib.ts`, `node:buffer` in the
-  compat facades. Do not add others.
+  `node:fs` facades under `src/fs/compat/`. Do not add others.
 - Errors carry a stable `code`. Git errors subclass `GitError`; filesystem
   errors come from `filesystemError()`. Callers branch on `error.code`, never
-  `instanceof` — the compat classes are re-declared, so identity does not hold.
+  `instanceof`.
 - Comments explain *why*, in a header block or above the subtle line. Match the
   existing density; do not exceed it.
 - No `any`, no `as` casts, no `@ts-expect-error`. `noUncheckedIndexedAccess` is on.

@@ -78,5 +78,6 @@ v2 text, worktree bytes and modes, the log, and which integration is pending.
   suite. Real-Git rebase continuations otherwise wait for an editor.
 - Timeouts are 60 s for tests and hooks. A test needing more is measuring the
   wrong thing.
-- `@cloudflare/computer` is inlined by the vitest config and its
-  `cloudflare:workers` import is aliased to a stub. Only compat tests need it.
+- `@cloudflare/computer` is a test-only fixture and independent oracle; no
+  source file may import it. Vitest inlines it and aliases its
+  `cloudflare:workers` import to a stub.

@@ -5,7 +5,7 @@ import * as ts from "typescript";
 import { expect, it } from "vitest";
 
 const SOURCE_ROOT = path.resolve(process.cwd(), "src");
-const DOMAIN_DIRECTORIES = new Set(["db", "fs", "shell", "git", "runtime", "compat"]);
+const DOMAIN_DIRECTORIES = new Set(["db", "fs", "shell", "git", "runtime"]);
 
 type GitSlice = "common" | "diff" | "ignore" | "protocol" | "store" | "ops" | "surface";
 
@@ -107,12 +107,9 @@ it("keeps source imports inside the domain dependency graph", () => {
     const file = sourcePath(absoluteFile);
     const sourceDomain = domain(file);
     for (const specifier of importSpecifiers(absoluteFile)) {
-      if (
-        (specifier === "@cloudflare/computer" || specifier.startsWith("@cloudflare/computer/")) &&
-        sourceDomain !== "compat"
-      ) {
+      if (specifier === "@cloudflare/computer" || specifier.startsWith("@cloudflare/computer/")) {
         violations.push(
-          violation(file, specifier, "only src/compat may import @cloudflare/computer"),
+          violation(file, specifier, "no file under src/ may import @cloudflare/computer"),
         );
       }
 

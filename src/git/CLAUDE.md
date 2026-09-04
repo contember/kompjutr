@@ -1,8 +1,7 @@
 # src/git — the Git domain
 
 Git operations and Smart HTTP over a `Repository` and a `Worktree`. Nothing in
-this domain knows about Durable Objects or `@cloudflare/computer`; HTTP stays
-behind `GitHttpClient`.
+this domain knows about Durable Objects; HTTP stays behind `GitHttpClient`.
 
 ## Layers
 

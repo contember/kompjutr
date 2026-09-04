@@ -1,16 +1,15 @@
-// The acceptance test for the whole experiment: a real Computer Workspace
-// configured with `createSqliteGitClient()`, driven only through
-// `workspace.git`, with no Computer fork anywhere.
+// The acceptance test for the whole client surface, driven only through
+// `createGit()` over Durable Object SQLite.
 import { join } from "node:path";
-import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
-import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
 import {
   Database,
   type DurableObjectStorageLike,
   type SQLCursorLike,
   type SQLStorageLike,
 } from "../src/db/db.js";
+import type { NodeFsCompat } from "../src/fs/compat/node.js";
+import { createFilesystem } from "../src/fs/filesystem.js";
 import type { ScanEntry } from "../src/fs/types.js";
 import {
   createGit,
@@ -32,7 +31,7 @@ import {
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
-import { SqliteTestStorage } from "./helpers/storage.js";
+import type { SqliteTestStorage } from "./helpers/storage.js";
 import {
   makeWorkspace as makeTestWorkspace,
   type TestWorkspace,
@@ -75,17 +74,30 @@ class CodedTooBigStorage implements DurableObjectStorageLike {
     return this.inner.transactionSync(closure);
   }
 }
+interface ClientWorkspace extends TestWorkspace {
+  git: Git;
+  fs: NodeFsCompat;
+}
 function makeWorkspace(now = 1600000000000): {
-  workspace: Workspace;
+  workspace: ClientWorkspace;
   storage: SqliteTestStorage;
 } {
-  const storage = new SqliteTestStorage();
-  const workspace = new Workspace({
-    storage,
-    git: createSqliteGitClient({ now: () => now }),
-    defaultGitIdentity: IDENTITY,
+  const base = makeTestWorkspace({ startTime: now });
+  return {
+    workspace: { ...base, git: bindNativeGit(base), fs: base.workspace.fs },
+    storage: base.storage,
+  };
+}
+/** A second client over the same storage, with its own database and worktree. */
+function reopenGit(storage: SqliteTestStorage, now = 1600000000000): Git {
+  const db = new TestDatabase(storage);
+  return createGit()({
+    database: new SqliteGitDatabase(db),
+    worktree: createFilesystem(db, { now: () => now }),
+    now: () => now,
+    timezoneOffset: () => 0,
+    defaultIdentity: IDENTITY,
   });
-  return { workspace, storage };
 }
 function makeNativeGit(): {
   git: Git;
@@ -276,7 +288,7 @@ const fixtures: GitFixture[] = [];
 afterAll(() => {
   for (const fixture of fixtures) fixture.dispose();
 });
-describe("createSqliteGitClient", () => {
+describe("git client", () => {
   it("exposes native cancellation, deepening, unshallow, and lease options", () => {
     const signal = new AbortController().signal;
     const abortable: GitAbortableNetworkOptions = { signal };
@@ -469,23 +481,17 @@ describe("createSqliteGitClient", () => {
       oid,
     });
   });
-  it("reports exact renames natively without widening the Computer facade", async () => {
+  it("reports exact renames across a reopened client", async () => {
     const { workspace, storage } = makeWorkspace();
-    const compat = workspace.git;
-    await compat.init({});
+    const git = workspace.git;
+    await git.init({});
     await workspace.fs.writeFile("/old.txt", "same\n");
-    await compat.add({ paths: ["old.txt"] });
-    await compat.commit({ message: "base" });
+    await git.add({ paths: ["old.txt"] });
+    await git.commit({ message: "base" });
     await workspace.fs.rm("/old.txt");
     await workspace.fs.writeFile("/new.txt", "same\n");
-    await compat.add({ paths: ["."], all: true });
-    const native = createGit()({
-      database: new SqliteGitDatabase(new TestDatabase(storage)),
-      worktree: new ComputerWorktree(workspace.provider()),
-      now: () => 1600000000000,
-      timezoneOffset: () => 0,
-      defaultIdentity: IDENTITY,
-    });
+    await git.add({ paths: ["."], all: true });
+    const native = reopenGit(storage);
     await expect(native.status()).resolves.toEqual([
       {
         path: "new.txt",
@@ -508,17 +514,8 @@ describe("createSqliteGitClient", () => {
     await expect(native.diff()).resolves.toContain(
       "similarity index 100%\nrename from old.txt\nrename to new.txt\n",
     );
-    await expect(compat.status()).resolves.toEqual([
-      { path: "new.txt", index: "A", worktree: " " },
-      { path: "old.txt", index: "D", worktree: " " },
-    ]);
-    await expect(compat.diffSummary()).resolves.toEqual([
-      { path: "new.txt", status: "A", insertions: 1, deletions: 0 },
-      { path: "old.txt", status: "D", insertions: 0, deletions: 1 },
-    ]);
-    await expect(compat.diff()).resolves.not.toContain("similarity index");
   });
-  it("drives a full local cycle through workspace.git", async () => {
+  it("drives a full local cycle through the client", async () => {
     const { workspace, storage } = makeWorkspace();
     const git = workspace.git;
     await git.init({ dir: "/" });
@@ -544,14 +541,14 @@ describe("createSqliteGitClient", () => {
     await git.add({ paths: ["src/a.ts"] });
     const second = await git.commit({ message: "second" });
     expect((await git.log()).map((entry) => entry.message.trim())).toEqual(["second", "first"]);
-    expect((await git.show({ ref: "HEAD" })).oid).toBe(second.oid);
+    expect((await git.show({ ref: "HEAD" })).commit.oid).toBe(second.oid);
     expect(await git.lsFiles()).toEqual(["README.md", "src/a.ts"]);
     await git.branch({ name: "topic" });
     expect(await git.branchList()).toEqual(["main", "topic"]);
     await git.checkout({ ref: "topic" });
     expect(await git.currentBranch()).toBe("topic");
     // Nothing about this repository lives on disk.
-    const paths = await workspace.fs.ls("/");
+    const paths = await workspace.fs.readdir("/");
     expect(paths.some((path) => path.includes(".git"))).toBe(false);
     const tables = storage.sql
       .exec<{
@@ -657,7 +654,7 @@ describe("createSqliteGitClient", () => {
     await workspace.git.add({ paths: ["a.txt"] });
     const { oid } = await workspace.git.commit({ message: "identity" });
     const view = await workspace.git.show({ ref: oid });
-    expect(view.author).toMatchObject(IDENTITY);
+    expect(view.commit.author).toMatchObject(IDENTITY);
   });
   it("keeps native rm inside its repository and nested-root boundaries", async () => {
     const { git, workspace } = makeNativeGit();
@@ -860,7 +857,7 @@ describe("createSqliteGitClient", () => {
     });
     await expect(git.remoteList({ dir })).resolves.toEqual([]);
   });
-  it("keeps Computer push legacy while native push returns structured status", async () => {
+  it("returns structured push status confirmed by the remote", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
     fixture.write("README.md", "before\n");
@@ -873,23 +870,10 @@ describe("createSqliteGitClient", () => {
       await workspace.fs.writeFile("/README.md", "after\n");
       await workspace.git.add({ paths: ["README.md"] });
       const local = await workspace.git.commit({ message: "local change" });
-      const result = await workspace.git.push({});
-      expect(result).toEqual({
-        ok: true,
-        error: null,
-        refs: { "refs/heads/main": { ok: true } },
-      });
-      expect(result).not.toHaveProperty("unpack");
-      expect(result).not.toHaveProperty("tracking");
+      expect(await workspace.git.push({})).toMatchObject({ ok: true });
       expect(fixture.git("rev-parse", "refs/heads/main")).toBe(local.oid);
       expect(fixture.git("show", "HEAD:README.md")).toBe("after");
-      const native = createGit()({
-        database: new SqliteGitDatabase(new TestDatabase(storage)),
-        worktree: new ComputerWorktree(workspace.provider()),
-        now: () => 1600000000000,
-        timezoneOffset: () => 0,
-        defaultIdentity: IDENTITY,
-      });
+      const native = reopenGit(storage);
       await expect(native.push({})).resolves.toEqual({
         ok: true,
         error: null,
@@ -904,62 +888,33 @@ describe("createSqliteGitClient", () => {
       await server.close();
     }
   });
-  it("projects a confirmed Computer push rejection without native fields", async () => {
-    const fixture = new GitFixture().init();
-    fixtures.push(fixture);
-    fixture.write("README.md", "before\n");
-    fixture.commit("initial");
-    const server = await startGitServer(fixture.dir);
-    try {
-      const { workspace } = makeWorkspace();
-      await workspace.git.clone({ url: server.url, dir: "/" });
-      await workspace.fs.writeFile("/README.md", "after\n");
-      await workspace.git.add({ paths: ["README.md"] });
-      await workspace.git.commit({ message: "local change" });
-      const result = await workspace.git.push({});
-      expect(result.ok).toBe(false);
-      if (result.error === null) throw new Error("rejected push did not report an error");
-      expect(result.error).toContain("checked out");
-      expect(result.refs).toEqual({
-        "refs/heads/main": { ok: false, error: result.error },
-      });
-      expect(result).not.toHaveProperty("unpack");
-      expect(result).not.toHaveProperty("tracking");
-    } finally {
-      await server.close();
-    }
+  it("keeps a pending merge open and refuses to restart it", async () => {
+    const { workspace, storage } = makeWorkspace();
+    const git = workspace.git;
+    await git.init({});
+    await workspace.fs.writeFile("/base.txt", "base\n");
+    await git.add({ paths: ["base.txt"] });
+    await git.commit({ message: "base" });
+    await git.branch({ name: "topic" });
+    await git.checkout({ ref: "topic" });
+    await workspace.fs.writeFile("/topic.txt", "topic\n");
+    await git.add({ paths: ["topic.txt"] });
+    await git.commit({ message: "topic" });
+    await git.checkout({ ref: "main" });
+    await workspace.fs.writeFile("/main.txt", "main\n");
+    await git.add({ paths: ["main.txt"] });
+    const current = await git.commit({ message: "main" });
+    const native = reopenGit(storage);
+    await expect(native.merge({ theirs: "topic", commit: false })).resolves.toEqual({
+      pendingCommit: true,
+    });
+    expect(await git.revParse({ ref: "HEAD" })).toBe(current.oid);
+    await expect(native.merge({ theirs: "topic" })).rejects.toMatchObject({
+      code: "EMERGEACTIVE",
+    });
   });
-  it("pulls through the compatibility surface and rolls conflicts back locally", async () => {
-    const fixture = new GitFixture().init();
-    fixtures.push(fixture);
-    fixture.write("conflict.txt", "base\n");
-    fixture.commit("base");
-    const server = await startGitServer(fixture.dir);
-    try {
-      const { workspace } = makeWorkspace();
-      const git = workspace.git;
-      await git.clone({ url: server.url, dir: "/", depth: 0 });
-      await git.configSet({ path: "pull.rebase", value: "true" });
-      fixture.write("remote.txt", "remote\n");
-      const fastForward = fixture.commit("remote fast-forward");
-      await expect(git.pull({})).resolves.toBeUndefined();
-      expect(await git.revParse({ ref: "HEAD" })).toBe(fastForward);
-      await workspace.fs.writeFile("/conflict.txt", "local\n");
-      await git.add({ paths: ["conflict.txt"] });
-      const local = await git.commit({ message: "local" });
-      fixture.write("conflict.txt", "incoming\n");
-      const incoming = fixture.commit("incoming");
-      await expect(git.pull({})).rejects.toMatchObject({ code: "EMERGEFAIL" });
-      expect(await git.revParse({ ref: "HEAD" })).toBe(local.oid);
-      expect(await git.revParse({ ref: "refs/remotes/origin/main" })).toBe(incoming);
-      expect(await workspace.fs.readFile("/conflict.txt", "utf8")).toBe("local\n");
-      expect(await git.status()).toEqual([]);
-    } finally {
-      await server.close();
-    }
-  });
-  it("rolls a compatibility merge conflict back without pending state", async () => {
-    const { workspace } = makeWorkspace();
+  it("reports conflicts after reopen", async () => {
+    const { workspace, storage } = makeWorkspace();
     const git = workspace.git;
     await git.init({});
     await workspace.fs.writeFile("/conflict.txt", "base\n");
@@ -973,68 +928,11 @@ describe("createSqliteGitClient", () => {
     await git.checkout({ ref: "main" });
     await workspace.fs.writeFile("/conflict.txt", "current\n");
     await git.add({ paths: ["conflict.txt"] });
-    const current = await git.commit({ message: "main" });
-    await expect(git.merge({ theirs: "topic" })).rejects.toMatchObject({ code: "EMERGEFAIL" });
-    expect(await git.revParse({ ref: "HEAD" })).toBe(current.oid);
-    expect(await workspace.fs.readFile("/conflict.txt", "utf8")).toBe("current\n");
-    expect(await git.status()).toEqual([]);
-    await expect(git.merge({ theirs: "topic" })).rejects.toMatchObject({ code: "EMERGEFAIL" });
-  });
-  it("blocks compatibility commit while a native merge is pending", async () => {
-    const { workspace, storage } = makeWorkspace();
-    const compat = workspace.git;
-    await compat.init({});
-    await workspace.fs.writeFile("/base.txt", "base\n");
-    await compat.add({ paths: ["base.txt"] });
-    await compat.commit({ message: "base" });
-    await compat.branch({ name: "topic" });
-    await compat.checkout({ ref: "topic" });
-    await workspace.fs.writeFile("/topic.txt", "topic\n");
-    await compat.add({ paths: ["topic.txt"] });
-    await compat.commit({ message: "topic" });
-    await compat.checkout({ ref: "main" });
-    await workspace.fs.writeFile("/main.txt", "main\n");
-    await compat.add({ paths: ["main.txt"] });
-    const current = await compat.commit({ message: "main" });
-    const native = createGit()({
-      database: new SqliteGitDatabase(new TestDatabase(storage)),
-      worktree: new ComputerWorktree(workspace.provider()),
-      now: () => 1600000000000,
-      timezoneOffset: () => 0,
-      defaultIdentity: IDENTITY,
-    });
-    await expect(native.merge({ theirs: "topic", commit: false })).resolves.toEqual({
-      pendingCommit: true,
-    });
-    await expect(
-      compat.commit({ message: "must not bypass merge continuation" }),
-    ).rejects.toMatchObject({
-      code: "EMERGEACTIVE",
-    });
-    expect(await compat.revParse({ ref: "HEAD" })).toBe(current.oid);
-    await expect(native.merge({ theirs: "topic" })).rejects.toMatchObject({
-      code: "EMERGEACTIVE",
-    });
-  });
-  it("reports native conflicts after reopen and rejects them on the Computer facade", async () => {
-    const { workspace, storage } = makeWorkspace();
-    const compat = workspace.git;
-    await compat.init({});
-    await workspace.fs.writeFile("/conflict.txt", "base\n");
-    await compat.add({ paths: ["conflict.txt"] });
-    await compat.commit({ message: "base" });
-    await compat.branch({ name: "topic" });
-    await compat.checkout({ ref: "topic" });
-    await workspace.fs.writeFile("/conflict.txt", "incoming\n");
-    await compat.add({ paths: ["conflict.txt"] });
-    await compat.commit({ message: "topic" });
-    await compat.checkout({ ref: "main" });
-    await workspace.fs.writeFile("/conflict.txt", "current\n");
-    await compat.add({ paths: ["conflict.txt"] });
-    await compat.commit({ message: "main" });
+    await git.commit({ message: "main" });
+    const db = new TestDatabase(storage);
     const binding = {
-      database: new SqliteGitDatabase(new TestDatabase(storage)),
-      worktree: new ComputerWorktree(workspace.provider()),
+      database: new SqliteGitDatabase(db),
+      worktree: createFilesystem(db, { now: () => 1600000000000 }),
       now: () => 1600000000000,
       timezoneOffset: () => 0,
       defaultIdentity: IDENTITY,
@@ -1048,7 +946,6 @@ describe("createSqliteGitClient", () => {
     await expect(reopened.status()).resolves.toEqual([
       { path: "conflict.txt", index: "U", worktree: "U" },
     ]);
-    await expect(compat.status()).rejects.toMatchObject({ code: "EUNMERGED" });
   });
   it("blocks ordinary native commit during replay and lets hard reset clear it", async () => {
     const { workspace, storage } = makeWorkspace();
@@ -1056,7 +953,8 @@ describe("createSqliteGitClient", () => {
     await workspace.fs.writeFile("/file.txt", "base\n");
     await workspace.git.add({ paths: ["file.txt"] });
     const original = await workspace.git.commit({ message: "base" });
-    const database = new SqliteGitDatabase(new TestDatabase(storage));
+    const replayDb = new TestDatabase(storage);
+    const database = new SqliteGitDatabase(replayDb);
     const repository = database.findCheckout("/");
     if (repository === null) throw new Error("repository is missing");
     const store = database.openCheckout(repository);
@@ -1080,7 +978,7 @@ describe("createSqliteGitClient", () => {
     );
     const native = createGit()({
       database,
-      worktree: new ComputerWorktree(workspace.provider()),
+      worktree: createFilesystem(replayDb, { now: () => 1600000000000 }),
       now: () => 1600000000000,
       timezoneOffset: () => 0,
       defaultIdentity: IDENTITY,
@@ -1474,22 +1372,22 @@ describe("createSqliteGitClient", () => {
     expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1000);
     expect(clientControlState(workspace, "/")).toEqual(beforeControl);
   });
-  it("routes native and Computer argv CLI through the same dispatcher", async () => {
+  it("routes argv CLI through the same dispatcher in two independent workspaces", async () => {
     const clock = 1577836800000;
     const native = makeNativeGit();
-    const { workspace: computer } = makeWorkspace(clock);
+    const { workspace: mirror } = makeWorkspace(clock);
     const nativeGit = native.git;
-    const computerGit = computer.git;
+    const mirrorGit = mirror.git;
     const dir = "/argv-repo";
     await nativeGit.init({ dir });
-    await computerGit.init({ dir });
+    await mirrorGit.init({ dir });
     writeWorkFile(native.workspace, `${dir}/sub/file.txt`, "one\n");
-    await computer.fs.mkdir(`${dir}/sub`, { recursive: true });
-    await computer.fs.writeFile(`${dir}/sub/file.txt`, "one\n");
+    await mirror.fs.mkdir(`${dir}/sub`, { recursive: true });
+    await mirror.fs.writeFile(`${dir}/sub/file.txt`, "one\n");
     const statusInput = { argv: ["status", "--porcelain"], cwd: `${dir}/sub` };
     const nativeStatus = await nativeGit.runCli(statusInput);
     expect(await nativeGit.cli(statusInput)).toEqual(nativeStatus);
-    expect(await computerGit.cli(statusInput)).toEqual(nativeStatus);
+    expect(await mirrorGit.cli(statusInput)).toEqual(nativeStatus);
     expect(nativeStatus).toEqual({
       stdout: "?? ./\n",
       stderr: "",
@@ -1497,7 +1395,7 @@ describe("createSqliteGitClient", () => {
       truncated: false,
     });
     const addInput = { argv: ["add", "file.txt"], cwd: `${dir}/sub` };
-    expect(await computerGit.cli(addInput)).toEqual(await nativeGit.cli(addInput));
+    expect(await mirrorGit.cli(addInput)).toEqual(await nativeGit.cli(addInput));
     const env = {
       GIT_AUTHOR_NAME: "CLI Author",
       GIT_AUTHOR_EMAIL: "author@example.com",
@@ -1505,7 +1403,7 @@ describe("createSqliteGitClient", () => {
       GIT_COMMITTER_EMAIL: "committer@example.com",
     };
     const commitInput = { argv: ["commit", "-m", "from argv"], cwd: dir, env };
-    expect(await computerGit.cli(commitInput)).toEqual(await nativeGit.cli(commitInput));
+    expect(await mirrorGit.cli(commitInput)).toEqual(await nativeGit.cli(commitInput));
     for (const input of [
       { argv: ["symbolic-ref", "--short", "HEAD"], cwd: `${dir}/sub` },
       { argv: ["log", "-1", "--format=%an <%ae>%n%cn <%ce>"], cwd: dir },
@@ -1514,13 +1412,13 @@ describe("createSqliteGitClient", () => {
       { argv: ["unknown"], cwd: dir },
       { argv: ["status", "--porcelain"], cwd: "/outside" },
     ]) {
-      expect(await computerGit.cli(input)).toEqual(await nativeGit.runCli(input));
+      expect(await mirrorGit.cli(input)).toEqual(await nativeGit.runCli(input));
     }
     const legacyInput = { argv: ["status", "--porcelain"], cwd: dir, dir };
     await expect(nativeGit.runCli(legacyInput)).rejects.toThrowError(
       expect.objectContaining({ code: "EINVAL" }),
     );
-    await expect(computerGit.cli(legacyInput)).rejects.toMatchObject({ code: "EINVAL" });
+    await expect(mirrorGit.cli(legacyInput)).rejects.toMatchObject({ code: "EINVAL" });
     const unexpected = new Error("unexpected argv getter failure");
     const throwingInput = {
       get argv(): string[] {
@@ -1529,7 +1427,7 @@ describe("createSqliteGitClient", () => {
     };
     await expect(nativeGit.runCli(throwingInput)).rejects.toThrow(unexpected);
     await expect(nativeGit.cli(throwingInput)).rejects.toBe(unexpected);
-    await expect(computerGit.cli(throwingInput)).rejects.toBe(unexpected);
+    await expect(mirrorGit.cli(throwingInput)).rejects.toBe(unexpected);
   });
   it("fails explicitly for methods that remain unsupported", async () => {
     const { workspace } = makeWorkspace();

@@ -4,7 +4,6 @@
 import { Workspace } from "@cloudflare/computer";
 import { convertV4MiniflareOptions, Miniflare } from "miniflare";
 import { describe, expect, it } from "vitest";
-import { createSqliteGitClient } from "../src/compat/computer.js";
 import { Database, type SqlDatabase } from "../src/db/db.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { SCHEMA_VERSION } from "../src/git/store/schema/schema.js";
@@ -194,12 +193,12 @@ describe("foreign-key contract", () => {
     expectEnforcedBehavior(db);
   });
 
-  it("enforces foreign keys through the Computer provider adapter", async () => {
+  it("enforces foreign keys through the Computer provider adapter", () => {
     const storage = new SqliteTestStorage();
     storage.db.exec("PRAGMA foreign_keys = OFF");
-    const workspace = new Workspace({ storage, git: createSqliteGitClient() });
+    const workspace = new Workspace({ storage });
 
-    await workspace.git.init({});
+    new SqliteGitDatabase(new TestDatabase(storage));
 
     expectEnforcedBehavior(workspace.provider().db);
   });
