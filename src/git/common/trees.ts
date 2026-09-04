@@ -61,8 +61,6 @@ export function typeForMode(mode: string): "blob" | "tree" | "commit" {
   return "blob";
 }
 
-// -- tree -------------------------------------------------------------
-
 export function parseTree(data: Uint8Array): TreeEntry[] {
   const entries: TreeEntry[] = [];
   let pos = 0;

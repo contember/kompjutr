@@ -70,8 +70,6 @@ export interface Tag {
   message: string;
 }
 
-// -- identity lines ---------------------------------------------------
-
 function formatTimezone(offsetMinutes: number): string {
   // Stored west-positive, written east-positive.
   const east = -offsetMinutes;
@@ -113,8 +111,6 @@ export function parsePerson(line: string): Person {
   };
 }
 
-// -- header block -----------------------------------------------------
-
 interface HeaderBlock {
   headers: [string, string][];
   message: string;
@@ -143,8 +139,6 @@ function splitHeaders(text: string): HeaderBlock {
   }
   return { headers, message };
 }
-
-// -- commit -----------------------------------------------------------
 
 export function parseCommit(data: Uint8Array): Commit {
   return parseCommitText(utf8Decoder.decode(data));
@@ -216,8 +210,6 @@ export function serializeCommit(commit: Commit): Uint8Array {
   }
   return utf8.encode(`${lines.join("\n")}\n\n${commit.message}`);
 }
-
-// -- tag --------------------------------------------------------------
 
 export function parseTag(data: Uint8Array): Tag {
   const { headers, message } = splitHeaders(utf8Decoder.decode(data));

@@ -23,8 +23,6 @@ export function stagedIndex(repo: Repository): Map<string, IndexEntry> {
   return index;
 }
 
-// -- the isomorphic-git shape ------------------------------------------
-
 /**
  * isomorphic-git's `statusMatrix`, for callers that already speak it. It
  * lists every file individually — no directory collapsing — and compares

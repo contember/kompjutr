@@ -18,8 +18,6 @@ import {
   statusStringBytes,
 } from "./status-types.js";
 
-// -- clean -------------------------------------------------------------
-
 /**
  * Remove untracked paths, returning them as git's `clean -n` names them:
  * a directory removed whole keeps its trailing slash.
