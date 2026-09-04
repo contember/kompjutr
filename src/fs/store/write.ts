@@ -21,7 +21,7 @@
 
 import type { SqlDatabase } from "../../db/db.js";
 import { filesystemError as fsError } from "../errors.js";
-import { comparePaths } from "../path.js";
+import { assertWellFormedPath, comparePaths } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type { EntryType, WriteEntry, WriteOptions } from "../types.js";
 import { allocateInodes, bumpRev } from "./meta.js";
@@ -85,6 +85,7 @@ function toPlanned(path: string, entry: WriteEntry, now: number): Planned {
   const mtime = entry.mtime ?? now;
   const contentId = entry.contentId ?? null;
   if (entry.target !== undefined) {
+    assertWellFormedPath(entry.target, "symlink target");
     return {
       path,
       type: "symlink",

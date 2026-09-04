@@ -4,6 +4,19 @@
 // two are not merged here because the filesystem must not depend on the git
 // layer and wave B is additive only; they collapse in the integration wave.
 
+import { filesystemError } from "./errors.js";
+
+/**
+ * Reject a path that is not well-formed UTF-16, exactly as `src/git` does
+ * (ADR-0010). A lone surrogate stores as WTF-8 through a JSON binding and as
+ * U+FFFD through a direct bind, so the name read back is not the name written.
+ */
+export function assertWellFormedPath(path: string, what = "path"): void {
+  if (!path.isWellFormed()) {
+    throw filesystemError("EINVAL", `${what} is not well-formed UTF-8`, path);
+  }
+}
+
 /** Lexical normalisation. Does NOT resolve symlinks — see `realpath`. */
 export function normalize(path: string): string {
   const absolute = path.startsWith("/") ? path : `/${path}`;

@@ -4,9 +4,11 @@
 // `fs_paths.path` is always a real path: if `/a` is a symlink to `/b`, then
 // `/a/c` is stored as `/b/c`. A lexical path reaching the store would
 // shadow its own target and diverge from every POSIX filesystem. Every path
-// entering the store passes through here first.
+// entering the store passes through here first, so this is also where a
+// caller path is rejected for not being well-formed UTF-8.
 
 import type { SqlDatabase } from "../../db/db.js";
+import { assertWellFormedPath } from "../path.js";
 import type { RealPath } from "../types.js";
 
 /** POSIX's own guidance; dofs counts follows the same way. */
@@ -138,6 +140,7 @@ function resolve(
   followFinal: boolean,
   initialNodes?: ReadonlyMap<string, NodeRow>,
 ): RealPath {
+  assertWellFormedPath(path);
   let resolved: string[] = [];
   let pending = componentsOf(path);
   let follows = 0;
@@ -203,6 +206,8 @@ function resolveMany(db: SqlDatabase, paths: readonly string[], followFinal: boo
   };
 
   for (const path of paths) {
+    // Ahead of the planning binding, so a malformed path never reaches SQL.
+    assertWellFormedPath(path);
     const candidates = plannedPaths([], componentsOf(path));
     let addedBytes = 0;
     for (const candidate of candidates) {
