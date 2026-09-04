@@ -1,4 +1,4 @@
-import { checkoutStoreMutations } from "../../store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { repositoryMutations } from "../repository/repository.js";
 // Two-head merge orchestration over bounded graph, integration, and apply seams.
 

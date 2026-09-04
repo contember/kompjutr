@@ -9,7 +9,7 @@ import {
   type ReplayStateMetadata,
 } from "../src/git/ops/core/operation-state.js";
 import type { MergeTouchedPath } from "../src/git/ops/merge/merge-state.js";
-import { checkoutStoreMutations } from "../src/git/store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../src/git/store/core/checkout-mutations-registry.js";
 import { readOperationStateOwned, SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 

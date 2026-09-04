@@ -3,7 +3,7 @@
 
 import { fromHex } from "../../common/bytes.js";
 import { CorruptError } from "../../common/errors.js";
-import { checkoutStoreMutations } from "../../store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { type InitialStateSession, PACK_BLOB_BATCH_TARGET_BYTES } from "../../store/index.js";
 import type { GitContext, IndexTrackerSeedEntry, InitialWorktreeSession } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";

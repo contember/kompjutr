@@ -1,5 +1,5 @@
 import { CorruptError, GitError } from "../../common/errors.js";
-import { checkoutStoreMutations } from "../../store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { writeOperationJournalOwned } from "../../store/operations/operation-journal.js";
 import type { GitContext } from "../core/context.js";
 import type { RebaseStateMetadata } from "../core/operation-state.js";

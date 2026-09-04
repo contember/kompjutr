@@ -12,7 +12,7 @@ import {
   switchBranchExcluding,
 } from "../../ops/refs/refs.js";
 import { reset } from "../../ops/staging/staging.js";
-import { checkoutStoreMutations } from "../../store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { gitCliResult } from "../result.js";
 import type { GitCliHandlers } from "../types.js";
 import { mapLocalMutationFailure, mapPathMutationFailure } from "./write-errors.js";

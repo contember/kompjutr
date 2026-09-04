@@ -1,7 +1,7 @@
 import { CorruptError, GitError, ObjectNotFoundError } from "../../common/errors.js";
 import { MODE_COMMIT } from "../../common/objects.js";
 import { comparePaths, joinSorted } from "../../common/streams.js";
-import { checkoutStoreMutations } from "../../store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { withGitMutationGuard } from "../../store/core/mutation-guard.js";
 import type { IndexEntry, IndexStore } from "../../store/index.js";
 import { indexFromTree } from "../checkout/checkout.js";

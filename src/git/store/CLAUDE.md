@@ -8,7 +8,8 @@ routing limits live below the domains in `src/db/`; the filesystem owns its own
 
 ```text
 index.ts       internal compatibility facade; consumers use this seam
-core/          shared contracts, JSON paging, and mutation guard
+core/          shared contracts, JSON paging, mutation guard, and the
+               checkout mutation registry
 database/      schema ownership, identities, lifecycle, and checkout registry
 repository/    repository-scoped facade and scratch transactions
 checkout/      composition root for one checkout-bound store

@@ -41,7 +41,7 @@ import {
   worktreePruneOwned as worktreePruneOp,
   worktreeRemoveOwned as worktreeRemoveOp,
 } from "./ops/worktree/worktrees.js";
-import { checkoutStoreMutations } from "./store/checkout/checkout.js";
+import { checkoutStoreMutations } from "./store/core/checkout-mutations-registry.js";
 
 type CoreMethods = Pick<
   Git,

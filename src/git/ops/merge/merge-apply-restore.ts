@@ -1,6 +1,6 @@
 import { CorruptError, hasErrorCode } from "../../common/errors.js";
 import { comparePaths } from "../../common/streams.js";
-import { checkoutStoreMutations } from "../../store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import type { OperationJournal } from "../core/operation-state.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";

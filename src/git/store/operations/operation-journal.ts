@@ -1,5 +1,6 @@
 import type { SqlDatabase } from "../../../db/db.js";
-import { type CheckoutStore, checkoutStoreMutations } from "../checkout/checkout.js";
+import type { CheckoutStore } from "../checkout/checkout.js";
+import { checkoutStoreMutations } from "../core/checkout-mutations-registry.js";
 import type { ObjectTable } from "../objects/objects.js";
 import { readOperationState, readRebaseCursor } from "./operation-journal-read.js";
 import { operationRootPage as readOperationRootPage } from "./operation-journal-roots.js";

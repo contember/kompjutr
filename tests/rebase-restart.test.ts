@@ -22,7 +22,7 @@ import { add } from "../src/git/ops/staging/staging.js";
 import { status } from "../src/git/ops/status/status.js";
 import type { Worktree } from "../src/git/ops/worktree/worktree.js";
 import { worktreeAdd } from "../src/git/ops/worktree/worktrees.js";
-import { checkoutStoreMutations } from "../src/git/store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../src/git/store/core/checkout-mutations-registry.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";

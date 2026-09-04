@@ -1,4 +1,3 @@
-import { CorruptError } from "../../common/errors.js";
 import type { ObjectType } from "../../common/objects.js";
 import type {
   BlobIdMapping,
@@ -160,18 +159,4 @@ export function createCheckoutStoreMutations(
     setShallowOwned: (add, remove) => sharedMutations().setShallowOwned(add, remove),
     destroyOwned: () => dependencies.destroyOwned(),
   };
-}
-
-const CHECKOUT_STORE_MUTATIONS = new WeakMap<object, CheckoutStoreMutations>();
-
-export function bindCheckoutStoreMutations(store: object, mutations: CheckoutStoreMutations): void {
-  CHECKOUT_STORE_MUTATIONS.set(store, mutations);
-}
-
-export function requireCheckoutStoreMutations(store: object): CheckoutStoreMutations {
-  const mutations = CHECKOUT_STORE_MUTATIONS.get(store);
-  if (mutations === undefined) {
-    throw new CorruptError("checkout store mutation capability is missing");
-  }
-  return mutations;
 }

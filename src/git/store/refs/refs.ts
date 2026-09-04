@@ -3,7 +3,8 @@ import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { expectText, RowShape, text } from "../../common/rows.js";
 import { comparePaths } from "../../common/streams.js";
-import { type CheckoutStore, checkoutStoreMutations } from "../checkout/checkout.js";
+import type { CheckoutStore } from "../checkout/checkout.js";
+import { checkoutStoreMutations } from "../core/checkout-mutations-registry.js";
 import type {
   CheckoutRow,
   RefLogMetadata,

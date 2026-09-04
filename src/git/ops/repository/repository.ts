@@ -14,7 +14,7 @@ import {
   type Tag,
   type TreeEntry,
 } from "../../common/objects.js";
-import { checkoutStoreMutations } from "../../store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { withGitMutationGuard } from "../../store/core/mutation-guard.js";
 import type {
   BlobReadBatch,

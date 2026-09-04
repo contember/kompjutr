@@ -1,4 +1,4 @@
-import { checkoutStoreMutations } from "../../store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import {
   markReplayEmptyOwned,
   writeOperationJournalOwned,

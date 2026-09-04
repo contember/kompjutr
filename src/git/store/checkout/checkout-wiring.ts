@@ -1,16 +1,13 @@
 import type { SqlDatabase } from "../../../db/db.js";
 import { CorruptError } from "../../common/errors.js";
+import { bindCheckoutStoreMutations } from "../core/checkout-mutations-registry.js";
 import type { CheckoutRow, StoreOptions } from "../core/contracts.js";
 import { withGitMutationGuard } from "../core/mutation-guard.js";
 import { type CheckoutStoreLifetime, requireSafeId } from "../database/lifecycle.js";
 import type { SharedRepoStore } from "../repository/shared.js";
 import type { CheckoutStore } from "./checkout.js";
 import { CheckoutIndexStore } from "./checkout-index.js";
-import {
-  bindCheckoutStoreMutations,
-  type CheckoutStoreMutations,
-  createCheckoutStoreMutations,
-} from "./checkout-mutations.js";
+import { type CheckoutStoreMutations, createCheckoutStoreMutations } from "./checkout-mutations.js";
 import { CheckoutOperationStore } from "./checkout-operation.js";
 import { CheckoutRefStore } from "./checkout-refs.js";
 

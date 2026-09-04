@@ -1,17 +1,12 @@
+import { checkoutStoreMutations } from "../core/checkout-mutations-registry.js";
 import { CheckoutStoreLifetime } from "../database/lifecycle.js";
 import { requireConfigPath, requireConfigSectionMove } from "../refs/config.js";
 import { sharedRepoStoreMutations, writeObjectsOwned } from "../repository/shared.js";
 import { iterateTree, iterateTreeDiff, iterateTreeDiffObjects } from "../trees/tree-walk.js";
 import type * as Api from "./checkout-api.js";
-import { requireCheckoutStoreMutations } from "./checkout-mutations.js";
 import { createCheckoutStoreState, NEVER_AUTHORIZE_LIFECYCLE_MUTATION } from "./checkout-wiring.js";
 
 export const DEFAULT_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
-
-/** Internal mutation capability; intentionally absent from the package facade. */
-export function checkoutStoreMutations(store: CheckoutStore): Api.CheckoutStoreMutations {
-  return requireCheckoutStoreMutations(store);
-}
 
 export class CheckoutStore implements Api.IndexStore {
   readonly #state: Api.CheckoutStoreState;

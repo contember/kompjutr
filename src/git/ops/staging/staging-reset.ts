@@ -1,5 +1,6 @@
 import { joinSorted } from "../../common/streams.js";
-import { applyIndexOwned, checkoutStoreMutations } from "../../store/checkout/checkout.js";
+import { applyIndexOwned } from "../../store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { checkoutTreeExcluding, indexFromTree, matchesPaths } from "../checkout/checkout.js";
 import type { GitContext } from "../core/context.js";
 import { operationRefLogMetadata } from "../core/ref-log.js";

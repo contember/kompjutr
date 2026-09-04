@@ -1,4 +1,4 @@
-import { checkoutStoreMutations } from "../../store/checkout/checkout.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { sharedRepoStoreMutations, writeObjectsOwned } from "../../store/repository/shared.js";
 // Plumbing: hashing bytes, reading raw objects, writing refs, and finding
 // the repository a directory belongs to.
