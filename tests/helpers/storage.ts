@@ -59,6 +59,19 @@ class Cursor<Row extends object> implements SQLCursorLike<Row>, IterableIterator
   }
 }
 
+/**
+ * The platform rejects SQL transaction statements outright, so the double must
+ * too — otherwise a `BEGIN` emitted by `src/` passes here and fails only in a
+ * Durable Object. Its own `transactionSync` goes straight to `db`, below this.
+ */
+const TRANSACTION_SQL = /^\s*(?:BEGIN|COMMIT|ROLLBACK)\b/i;
+
+function rejectTransactionSQL(query: string): void {
+  if (TRANSACTION_SQL.test(query)) {
+    throw new Error("transaction SQL is reserved for the storage runtime");
+  }
+}
+
 function toSQLiteValue(value: unknown): SQLInputValue {
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   if (ArrayBuffer.isView(value) && !(value instanceof Uint8Array)) {
@@ -115,6 +128,7 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
       ): SQLCursorLike<Row> & IterableIterator<Row> => {
         // Multi-statement scripts go through exec(); node:sqlite's prepare()
         // only accepts a single statement.
+        rejectTransactionSQL(query);
         this.#record(query);
         if (bindings.length === 0 && /;\s*\S/.test(query)) {
           this.db.exec(query);
@@ -164,6 +178,7 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
   }
 
   *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
+    rejectTransactionSQL(query);
     this.#record(query);
     const stmt = this.#acquire(query);
     this.statementCount++;
