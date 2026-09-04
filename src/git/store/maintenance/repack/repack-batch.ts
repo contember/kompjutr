@@ -1,5 +1,6 @@
 import type { SqlDatabase } from "../../../../db/db.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
+import { expectSafeInteger } from "../../../common/rows.js";
 import {
   type LooseCandidate,
   MAX_REPACK_INFLATED_BYTES,
@@ -9,13 +10,7 @@ import {
   type RepackLimits,
   type RepackRun,
 } from "./repack-contracts.js";
-import {
-  objectType,
-  oidField,
-  packIdField,
-  requireRepackedCapacity,
-  safeInteger,
-} from "./repack-helpers.js";
+import { objectType, oidField, packIdField, requireRepackedCapacity } from "./repack-helpers.js";
 
 export function readBatch(
   db: SqlDatabase,
@@ -39,18 +34,23 @@ export function readBatch(
       throw new CorruptError("maintenance repack batch state is invalid");
     }
     const packId = row.pack_id === null ? null : packIdField(row.pack_id, "repack pack id");
-    const objectCount = safeInteger(
+    const objectCount = expectSafeInteger(
       row.object_count,
-      "repack batch object count",
       1,
       MAX_REPACK_OBJECTS,
+      "repack batch object count",
     );
-    const inflatedBytes = safeInteger(row.inflated_bytes, "repack batch inflated bytes", 0);
-    const storedBytes = safeInteger(
+    const inflatedBytes = expectSafeInteger(
+      row.inflated_bytes,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      "repack batch inflated bytes",
+    );
+    const storedBytes = expectSafeInteger(
       row.stored_bytes,
-      "repack batch stored bytes",
       0,
       MAX_REPACK_STORED_BYTES,
+      "repack batch stored bytes",
     );
     if (
       (row.state === "selected" && (packId !== null || storedBytes !== 0)) ||
@@ -61,7 +61,7 @@ export function readBatch(
       throw new CorruptError("maintenance repack batch header is inconsistent");
     }
     header = {
-      batchId: safeInteger(row.batch_id, "repack batch id", 1),
+      batchId: expectSafeInteger(row.batch_id, 1, Number.MAX_SAFE_INTEGER, "repack batch id"),
       state: row.state,
       packId,
       objectCount,
@@ -95,7 +95,7 @@ export function readBatch(
       throw new CorruptError("maintenance repack object order is invalid");
     }
     const type = objectType(row.type, "repack batch type");
-    const size = safeInteger(row.size, "repack batch size", 0);
+    const size = expectSafeInteger(row.size, 0, Number.MAX_SAFE_INTEGER, "repack batch size");
     if (size > Number.MAX_SAFE_INTEGER - inflatedBytes) {
       throw new CorruptError("maintenance repack inflated size is not representable");
     }
@@ -123,10 +123,30 @@ function validateLooseCandidate(row: Record<string, unknown>, repoId: number): L
   }
   const oid = oidField(row.oid, "maintenance repack candidate OID");
   const type = objectType(row.type, "maintenance repack candidate type");
-  const size = safeInteger(row.size, "maintenance repack candidate size", 0);
-  const chunkRows = safeInteger(row.chunk_rows, "maintenance repack loose chunk count", 1);
-  const largestChunk = safeInteger(row.largest_chunk, "maintenance repack loose chunk size", 0);
-  const storedBytes = safeInteger(row.stored_bytes, "maintenance repack loose stored size", 0);
+  const size = expectSafeInteger(
+    row.size,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "maintenance repack candidate size",
+  );
+  const chunkRows = expectSafeInteger(
+    row.chunk_rows,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "maintenance repack loose chunk count",
+  );
+  const largestChunk = expectSafeInteger(
+    row.largest_chunk,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "maintenance repack loose chunk size",
+  );
+  const storedBytes = expectSafeInteger(
+    row.stored_bytes,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "maintenance repack loose stored size",
+  );
   if (
     (row.stored !== "raw" && row.stored !== "zlib") ||
     row.first_chunk !== 0 ||
@@ -144,7 +164,14 @@ function validateLooseCandidate(row: Record<string, unknown>, repoId: number): L
     if (objectType(row.complete_type, "maintenance shadow type") !== type) {
       throw new CorruptError("maintenance packed shadow has the wrong type");
     }
-    if (safeInteger(row.complete_size, "maintenance shadow size", 0) !== size) {
+    if (
+      expectSafeInteger(
+        row.complete_size,
+        0,
+        Number.MAX_SAFE_INTEGER,
+        "maintenance shadow size",
+      ) !== size
+    ) {
       throw new CorruptError("maintenance packed shadow has the wrong size");
     }
     baseOid =

@@ -1,7 +1,8 @@
 import type { SqlDatabase } from "../../../../db/db.js";
 import { CorruptError } from "../../../common/errors.js";
+import { expectSafeInteger } from "../../../common/rows.js";
 import type { SharedRepoStore } from "../../index.js";
-import { booleanInteger, oidField, safeInteger } from "./reachability-codecs.js";
+import { booleanInteger, oidField } from "./reachability-codecs.js";
 import {
   EDGE_PAGE,
   type ObjectExpansion,
@@ -141,8 +142,18 @@ export function treeExpansion(
   if (!booleanInteger(source.complete, "tree source completion marker")) {
     throw new CorruptError("tree source is incomplete");
   }
-  const sourceKey = safeInteger(source.source_key, "tree source key", 1);
-  const entryCount = safeInteger(source.entry_count, "tree source entry count", 0);
+  const sourceKey = expectSafeInteger(
+    source.source_key,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "tree source key",
+  );
+  const entryCount = expectSafeInteger(
+    source.entry_count,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "tree source entry count",
+  );
   if (object.edgeCursor > entryCount) throw new CorruptError("tree edge cursor exceeds its marker");
 
   const edges: ReachabilityEdge[] = [];

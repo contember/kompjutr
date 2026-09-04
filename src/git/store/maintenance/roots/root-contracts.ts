@@ -84,23 +84,6 @@ export function isObjectType(value: unknown): value is ObjectType {
   return value === "blob" || value === "tree" || value === "commit" || value === "tag";
 }
 
-export function requireSafeInteger(
-  value: unknown,
-  label: string,
-  minimum: number,
-  maximum = Number.MAX_SAFE_INTEGER,
-): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < minimum ||
-    value > maximum
-  ) {
-    throw new CorruptError(`${label} is not a bounded safe integer`);
-  }
-  return value;
-}
-
 /** Validate the phase-specific durable root cursor shape. */
 export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): void {
   const none =

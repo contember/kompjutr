@@ -1,9 +1,10 @@
 import type { SqlDatabase } from "../../../../db/db.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
+import { expectSafeInteger } from "../../../common/rows.js";
 import type { SharedRepoStore } from "../../index.js";
 import { reconcileMaintenanceMark } from "../state/state-transitions.js";
 import { expectPhase, expectRootsSettled, readMaintenanceRunView } from "../state/state-view.js";
-import { booleanInteger, oidField, safeInteger } from "./reachability-codecs.js";
+import { booleanInteger, oidField } from "./reachability-codecs.js";
 import {
   MARK_EXPANSIONS_PER_CALL,
   type MaintenanceReachabilityProgress,
@@ -78,7 +79,12 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
     if (expanded || shallowBoundary !== storedShallow || (physicalOnly && shallowBoundary)) {
       throw new CorruptError("maintenance queued object has inconsistent state");
     }
-    const edgeCursor = safeInteger(row.edge_cursor, "maintenance edge cursor", 0);
+    const edgeCursor = expectSafeInteger(
+      row.edge_cursor,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      "maintenance edge cursor",
+    );
     if (physicalOnly && edgeCursor !== 0) {
       throw new CorruptError("physical-only maintenance object retained a semantic cursor");
     }
@@ -93,7 +99,12 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
     if (result === null) {
       result = {
         oid,
-        sourceMask: safeInteger(row.source_mask, "maintenance source mask", 0),
+        sourceMask: expectSafeInteger(
+          row.source_mask,
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance source mask",
+        ),
         shallowBoundary,
         physicalOnly,
         edgeCursor,

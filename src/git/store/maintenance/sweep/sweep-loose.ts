@@ -1,12 +1,11 @@
 import type { SqlDatabase } from "../../../../db/db.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
-import { decodeRow, int, nullable, text } from "../../../common/rows.js";
+import { decodeRow, expectSafeInteger, int, nullable, text } from "../../../common/rows.js";
 import type { LooseRow, RunState, SliceResult } from "./sweep-contracts.js";
 import {
   eligibilityTime,
   progress,
   requireStableEpoch,
-  safeInteger,
   sweepCutoff,
   transitionPhase,
   updateReclamationCounters,
@@ -229,7 +228,9 @@ function nextLooseEligibility(db: SqlDatabase, repoId: number, run: RunState): n
   }
   return row.since === null
     ? null
-    : eligibilityTime(safeInteger(row.since, "loose candidate age", 0));
+    : eligibilityTime(
+        expectSafeInteger(row.since, 0, Number.MAX_SAFE_INTEGER, "loose candidate age"),
+      );
 }
 
 export function sweepLoose(

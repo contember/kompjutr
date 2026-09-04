@@ -1,9 +1,10 @@
 import type { SqlDatabase } from "../../../../db/db.js";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError } from "../../../common/errors.js";
+import { expectSafeInteger } from "../../../common/rows.js";
 import type { FullObjectPackInput } from "../../pack/full-object-stream.js";
 import { type FinalizedObject, MAX_REPACK_OBJECTS, type RepackBatch } from "./repack-contracts.js";
-import { objectType, oidField, safeInteger } from "./repack-helpers.js";
+import { objectType, oidField } from "./repack-helpers.js";
 
 export function verifyCompletePack(
   db: SqlDatabase,
@@ -246,7 +247,12 @@ export function deleteExactLooseObjects(
     ) {
       throw new CorruptError("maintenance loose deletion set is incomplete");
     }
-    safeInteger(row.created_ms, "maintenance loose lifecycle timestamp", 0);
+    expectSafeInteger(
+      row.created_ms,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      "maintenance loose lifecycle timestamp",
+    );
     ordinal++;
   }
   if (ordinal !== objects.length) {
@@ -274,7 +280,8 @@ export function deleteExactLooseObjects(
     if (
       expected === undefined ||
       objectType(row.type, "deleted maintenance loose type") !== expected.type ||
-      safeInteger(row.size, "deleted maintenance loose size", 0) !== expected.size
+      expectSafeInteger(row.size, 0, Number.MAX_SAFE_INTEGER, "deleted maintenance loose size") !==
+        expected.size
     ) {
       throw new CorruptError("maintenance loose deletion returned an unexpected object");
     }

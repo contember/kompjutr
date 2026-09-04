@@ -2,23 +2,6 @@ import { isOid } from "../../../common/bytes.js";
 import { CorruptError } from "../../../common/errors.js";
 import type { ObjectType } from "../../../common/objects.js";
 
-export function safeInteger(
-  value: unknown,
-  label: string,
-  minimum: number,
-  maximum = Number.MAX_SAFE_INTEGER,
-): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < minimum ||
-    value > maximum
-  ) {
-    throw new CorruptError(`${label} is not a bounded safe integer`);
-  }
-  return value;
-}
-
 export function booleanInteger(value: unknown, label: string): boolean {
   if (value !== 0 && value !== 1) throw new CorruptError(`${label} is not boolean`);
   return value === 1;

@@ -2,6 +2,7 @@ import type { SqlDatabase } from "../../../../db/db.js";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import type { ObjectType } from "../../../common/objects.js";
+import { expectSafeInteger } from "../../../common/rows.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../../pack/packs.js";
 import { expectPhase, expectRootsSettled, readMaintenanceRunView } from "../state/state-view.js";
 import {
@@ -13,23 +14,6 @@ import {
   type RepackLimits,
   type RepackRun,
 } from "./repack-contracts.js";
-
-export function safeInteger(
-  value: unknown,
-  label: string,
-  minimum: number,
-  maximum = Number.MAX_SAFE_INTEGER,
-): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < minimum ||
-    value > maximum
-  ) {
-    throw new CorruptError(`${label} is not a bounded safe integer`);
-  }
-  return value;
-}
 
 export function objectType(value: unknown, label: string): ObjectType {
   if (value !== "blob" && value !== "tree" && value !== "commit" && value !== "tag") {
@@ -44,7 +28,7 @@ export function oidField(value: unknown, label: string): string {
 }
 
 export function packIdField(value: unknown, label: string): number {
-  return safeInteger(value, label, 0);
+  return expectSafeInteger(value, 0, Number.MAX_SAFE_INTEGER, label);
 }
 
 function optionLimit(value: number | undefined, fallback: number, label: string): number {
@@ -94,7 +78,7 @@ export function currentRootEpoch(db: SqlDatabase, repoId: number): number {
   if (row === undefined || row.repo_id !== repoId) {
     throw new CorruptError("maintenance root epoch is missing");
   }
-  return safeInteger(row.root_epoch, "maintenance root epoch", 0);
+  return expectSafeInteger(row.root_epoch, 0, Number.MAX_SAFE_INTEGER, "maintenance root epoch");
 }
 
 export function rootChanged(runId: number): MaintenanceRepackProgress {

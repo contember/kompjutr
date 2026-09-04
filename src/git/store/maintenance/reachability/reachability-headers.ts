@@ -1,10 +1,11 @@
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError, hasErrorCode } from "../../../common/errors.js";
 import { MAX_OBJECT_BYTES, type ObjectType } from "../../../common/objects.js";
+import { expectSafeInteger } from "../../../common/rows.js";
 import { InflateStream } from "../../../common/zlib.js";
 import type { SharedRepoStore } from "../../index.js";
 import { maximumDeflatedBytes, STREAM_CHUNK } from "../../objects/objects.js";
-import { bytesField, objectType, safeInteger } from "./reachability-codecs.js";
+import { bytesField, objectType } from "./reachability-codecs.js";
 import type { HeaderScanResult, ReachabilityObjectInfo } from "./reachability-contracts.js";
 
 const HEADER_LINE_PREFIX_BYTES = 128;
@@ -164,7 +165,7 @@ export function requireObjectInfo(store: SharedRepoStore, oid: string): Reachabi
   return {
     oid,
     type: objectType(row.type, "reachable object type"),
-    size: safeInteger(row.size, "reachable object size", 0),
+    size: expectSafeInteger(row.size, 0, Number.MAX_SAFE_INTEGER, "reachable object size"),
     source: row.source,
     stored,
   };

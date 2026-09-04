@@ -1,13 +1,12 @@
 import type { SqlDatabase } from "../../../../db/db.js";
 import { CorruptError } from "../../../common/errors.js";
-import { decodeRow, int, nullable, oneOf } from "../../../common/rows.js";
+import { decodeRow, expectSafeInteger, int, nullable, oneOf } from "../../../common/rows.js";
 import type { SharedRepoStore } from "../../index.js";
 import type { PackAudit, RunState, SliceResult } from "./sweep-contracts.js";
 import {
   eligibilityTime,
   progress,
   requireStableEpoch,
-  safeInteger,
   sweepCutoff,
   transitionPhase,
   updateReclamationCounters,
@@ -198,7 +197,9 @@ function nextPackEligibility(db: SqlDatabase, repoId: number, run: RunState): nu
   }
   return row.since === null
     ? null
-    : eligibilityTime(safeInteger(row.since, "pack candidate age", 0));
+    : eligibilityTime(
+        expectSafeInteger(row.since, 0, Number.MAX_SAFE_INTEGER, "pack candidate age"),
+      );
 }
 
 export function sweepPacks(store: SharedRepoStore, run: RunState, nowMs: number): SliceResult {

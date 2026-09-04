@@ -2,6 +2,7 @@ import type { SqlDatabase } from "../../../../db/db.js";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import type { ObjectType } from "../../../common/objects.js";
+import { expectSafeInteger } from "../../../common/rows.js";
 import { ensureMaintenanceControl } from "../control.js";
 import type { MaintenanceRunView } from "../state/state-contracts.js";
 import { readMaintenanceRunView } from "../state/state-view.js";
@@ -24,7 +25,6 @@ import {
   ROOT_SOURCES,
   type RootCandidate,
   type RootPage,
-  requireSafeInteger,
 } from "./root-contracts.js";
 import { rootsFromHeads, rootsFromReflogs, rootsFromRefs } from "./root-ref-pages.js";
 import {
@@ -60,7 +60,12 @@ function createRun(
   if (allocated.repo_id !== repoId || allocated.root_epoch !== rootEpoch) {
     throw new CorruptError("maintenance run allocation changed its root epoch");
   }
-  const nextRunId = requireSafeInteger(allocated.next_run_id, "maintenance next run id", 2);
+  const nextRunId = expectSafeInteger(
+    allocated.next_run_id,
+    2,
+    Number.MAX_SAFE_INTEGER,
+    "maintenance next run id",
+  );
   const runId = nextRunId - 1;
   db.run(
     `INSERT INTO git_maintenance_runs
@@ -323,7 +328,12 @@ function publishPage(
       repoId,
       run.runId,
     );
-    const queuedObjects = requireSafeInteger(queued, "maintenance queued root count", 0);
+    const queuedObjects = expectSafeInteger(
+      queued,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      "maintenance queued root count",
+    );
     const row = db.one<Record<string, unknown>>(
       `UPDATE git_maintenance_runs
           SET phase = 'mark', root_source = 'done', cursor_checkout_id = NULL,

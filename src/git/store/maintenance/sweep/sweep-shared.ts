@@ -1,5 +1,6 @@
 import type { SqlDatabase } from "../../../../db/db.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
+import { expectSafeInteger } from "../../../common/rows.js";
 import { expectPhase, expectRootsSettled, readMaintenanceRunView } from "../state/state-view.js";
 import {
   GC_GRACE_MS,
@@ -8,23 +9,6 @@ import {
   type RunState,
   type SweepPhase,
 } from "./sweep-contracts.js";
-
-export function safeInteger(
-  value: unknown,
-  label: string,
-  minimum: number,
-  maximum = Number.MAX_SAFE_INTEGER,
-): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < minimum ||
-    value > maximum
-  ) {
-    throw new CorruptError(`${label} is not a bounded safe integer`);
-  }
-  return value;
-}
 
 export function readRun(db: SqlDatabase, repoId: number): RunState {
   const run = readMaintenanceRunView(db, repoId);
@@ -59,7 +43,10 @@ export function requireStableEpoch(db: SqlDatabase, repoId: number, run: RunStat
     "SELECT root_epoch FROM git_maintenance_control WHERE repo_id = ?",
     repoId,
   );
-  if (safeInteger(epoch, "destructive maintenance root epoch", 0) !== run.observedRootEpoch) {
+  if (
+    expectSafeInteger(epoch, 0, Number.MAX_SAFE_INTEGER, "destructive maintenance root epoch") !==
+    run.observedRootEpoch
+  ) {
     throw new GitError("ESTALE", "maintenance roots changed before storage reclamation");
   }
 }

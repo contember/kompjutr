@@ -1,8 +1,9 @@
 import type { SqlDatabase } from "../../../../db/db.js";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
+import { expectSafeInteger } from "../../../common/rows.js";
 import type { SharedRepoStore } from "../../index.js";
-import { booleanInteger, objectType, oidField, safeInteger } from "./reachability-codecs.js";
+import { booleanInteger, objectType, oidField } from "./reachability-codecs.js";
 import {
   EDGE_PAGE,
   type ExistingMark,
@@ -143,7 +144,12 @@ function existingMarks(
         exists: true,
         physicalOnly: booleanInteger(row.physical_only, "existing physical marker"),
         expanded: booleanInteger(row.expanded, "existing expanded marker"),
-        edgeCursor: safeInteger(row.edge_cursor, "existing edge cursor", 0),
+        edgeCursor: expectSafeInteger(
+          row.edge_cursor,
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "existing edge cursor",
+        ),
       });
       const stored = result.get(expected.oid);
       if (stored?.physicalOnly === true && stored.edgeCursor !== 0) {
