@@ -268,3 +268,30 @@ gate is proportionate to its unit's blast radius.
 
 - 2026-09-08 — Planning reproduced WU1–WU4 against the built `dist` and refuted
   backlog 70's scan-ordering mechanism. → Decision 3.
+- 2026-09-08 — **Decision 1 refined during WU1.** Blanket abort-only on any
+  nested throw is wrong: `withGitMutationGuard` rejects reentry *before*
+  changing anything, and real workerd `transactionSync` rolls a failed nested
+  scope back with `SAVEPOINT`/`ROLLBACK TO`
+  (`api/actor-state.c++:713`), so the outer transaction survives there. The
+  blanket rule would have killed the deliberate caught-reentry pattern on local
+  only — a new divergence inside the sprint that exists to remove them. The
+  shipped rule is abort-only *when the nested scope produced effects*: rows
+  changed on the connection, or disk effects recorded by the coordinator. That
+  needed `RecoveryCoordinator.changed` to become a monotonic `effects` counter.
+  Cost is one `SELECT total_changes()` per nested entry; measured nesting is 1–3
+  per public operation (`init`, `add` and `commit` over 1,000 files).
+- 2026-09-08 — Both Durable Object test doubles were flattening nested
+  `transactionSync` (`tests/helpers/storage.ts`, `tests/helpers/db.ts`), so the
+  harness modelled neither workerd nor the DO adapter. They now use savepoints
+  and delegate every call, which is what makes the new shared-contract clause
+  testable in both compositions.
+- 2026-09-08 — Real Git (2.54.0) opens an exclude file with `O_NOFOLLOW`, warns,
+  and proceeds as if it were absent — identical `status` output for regular,
+  in-root symlinked, dangling and escaping `.gitignore`. That fixed WU4's target
+  behavior.
+- 2026-09-08 — Witness placement deviates from the plan where the defect is
+  local-only: the WU3 rebase and WU4 ignore parity witnesses live in
+  `tests/local/git-parity.test.ts` (the harness that runs the real binary
+  against `LocalWorkspace`) rather than `tests/rebase.test.ts` and
+  `tests/ignore.test.ts`, and WU2's public-boundary witness lives in
+  `tests/client.test.ts` beside the rest of the public client surface.
