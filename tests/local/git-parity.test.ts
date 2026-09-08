@@ -4,6 +4,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -361,6 +362,61 @@ describe("LocalWorkspace Git parity", () => {
         mirror.dispose();
         fixture.dispose();
       }
+    }
+  });
+
+  it("rebases a symlink change the way Git does", async () => {
+    const fixture = localFixture();
+    const mirror = new GitFixture().init();
+    const workspace = fixture.workspace({
+      now: () => FIXED_TIME,
+      timezoneOffset: () => 0,
+      defaultGitIdentity: IDENTITY,
+    });
+    const linkBoth = (target: string): void => {
+      for (const dir of [workspace.root, mirror.dir]) {
+        rmSync(join(dir, "link"), { force: true });
+        symlinkSync(target, join(dir, "link"));
+      }
+    };
+    try {
+      await workspace.git.init();
+      writeBoth(workspace, mirror, "base.txt", "base\n");
+      linkBoth("base.txt");
+      await workspace.git.add({ paths: ["."] });
+      await workspace.git.commit({ message: "base" });
+      mirror.git("add", "--", ".");
+      mirror.git("commit", "-q", "-m", "base");
+
+      await workspace.git.branch({ name: "feature", checkout: true });
+      mirror.git("checkout", "-q", "-b", "feature");
+      writeBoth(workspace, mirror, "feature.txt", "feature\n");
+      linkBoth("feature.txt");
+      await workspace.git.add({ paths: ["."] });
+      await workspace.git.commit({ message: "relink" });
+      mirror.git("add", "--", ".");
+      mirror.git("commit", "-q", "-m", "relink");
+
+      await workspace.git.checkout({ ref: "main" });
+      mirror.git("checkout", "-q", "main");
+      writeBoth(workspace, mirror, "main.txt", "main\n");
+      await workspace.git.add({ paths: ["main.txt"] });
+      await workspace.git.commit({ message: "main" });
+      mirror.git("add", "--", "main.txt");
+      mirror.git("commit", "-q", "-m", "main");
+
+      await workspace.git.checkout({ ref: "feature" });
+      mirror.git("checkout", "-q", "feature");
+      await workspace.git.rebase({ upstream: "main" });
+      mirror.git("rebase", "-q", "main");
+      expect(readlinkSync(join(workspace.root, "link"))).toBe(
+        readlinkSync(join(mirror.dir, "link")),
+      );
+      await compare(workspace, mirror);
+    } finally {
+      workspace.close();
+      mirror.dispose();
+      fixture.dispose();
     }
   });
 });

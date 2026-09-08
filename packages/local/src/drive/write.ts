@@ -9,6 +9,7 @@ import {
   opendirSync,
   openSync,
   renameSync,
+  rmdirSync,
   rmSync,
   symlinkSync,
   writeSync,
@@ -110,6 +111,25 @@ function replaceFile(
   recovery.checkpoint("replacement-renamed");
 }
 
+function replaceSymlink(
+  mapper: PathMapper,
+  recovery: RecoveryCoordinator,
+  path: string,
+  target: string,
+  parents: boolean,
+): void {
+  requireParent(mapper, recovery, path, parents);
+  const parent = virtualParent(path);
+  // Rename over the destination: after the first touch the backup no longer clears it.
+  const temporary = recovery.temporary(parent);
+  symlinkSync(target, temporary);
+  recovery.checkpoint("replacement-synced");
+  renameSync(temporary, mapper.lexicalHost(path));
+  syncDirectory(mapper.lexicalHost(parent));
+  recovery.markChanged();
+  recovery.checkpoint("replacement-renamed");
+}
+
 function replaceFromSource(
   mapper: PathMapper,
   recovery: RecoveryCoordinator,
@@ -199,10 +219,7 @@ export class DiskWriter {
           options.parents !== false,
         );
       } else if (entry.target !== undefined) {
-        requireParent(this.#mapper, this.#recovery, path, options.parents !== false);
-        symlinkSync(entry.target, this.#mapper.lexicalHost(path));
-        syncDirectory(this.#mapper.lexicalHost(virtualParent(path)));
-        this.#recovery.markChanged();
+        replaceSymlink(this.#mapper, this.#recovery, path, entry.target, options.parents !== false);
       } else {
         requireParent(this.#mapper, this.#recovery, path, options.parents !== false);
         mkdirSync(this.#mapper.lexicalHost(path), validateMode(entry.mode ?? 0o755));
@@ -261,7 +278,13 @@ export class DiskWriter {
     const prepared = this.#recovery.prepare(existing);
     for (const item of prepared) {
       if (item.moved || !pathExists(item.host)) continue;
-      rmSync(item.host, { force, recursive });
+      try {
+        // `rm` refuses a directory without `recursive`; an empty one is `rmdir`'s job.
+        if (!recursive && lstatSync(item.host).isDirectory()) rmdirSync(item.host);
+        else rmSync(item.host, { force, recursive });
+      } catch (error) {
+        normalizeHostError(error, "remove path", item.path);
+      }
       syncDirectory(dirname(item.host));
       this.#recovery.markChanged();
     }

@@ -261,4 +261,56 @@ describe("DiskDrive", () => {
       fixture.dispose();
     }
   });
+
+  it("repeats symlink and directory mutations within one transaction", () => {
+    const fixture = localFixture();
+    writeFileSync(join(fixture.root, "existing.txt"), "old");
+    symlinkSync("existing.txt", join(fixture.root, "link"));
+    const workspace = fixture.workspace();
+    try {
+      workspace.database.transactionSync(() => {
+        workspace.drive.writeFiles([{ path: "/link", target: "first" }]);
+        workspace.drive.writeFiles([{ path: "/link", target: "second" }]);
+        workspace.drive.makeDirectories(["/tree/leaf"]);
+        workspace.drive.writeFiles([{ path: "/tree/leaf/file.txt", bytes: encoder.encode("x") }]);
+        workspace.drive.removeFiles(["/tree/leaf/file.txt"], { recursive: false });
+        workspace.drive.removeFiles(["/tree/leaf"], { recursive: false });
+      });
+      expect(readlinkSync(join(fixture.root, "link"))).toBe("second");
+      expect(workspace.drive.stat("/tree/leaf")).toBeNull();
+      expect(workspace.drive.stat("/tree")?.type).toBe("dir");
+    } finally {
+      workspace.close();
+      fixture.dispose();
+    }
+  });
+
+  it("reports a stable code for a non-empty directory and rolls repeats back", () => {
+    const fixture = localFixture();
+    symlinkSync("first", join(fixture.root, "link"));
+    const workspace = fixture.workspace();
+    try {
+      expect(() =>
+        workspace.database.transactionSync(() => workspace.drive.makeDirectories(["/tree/leaf"])),
+      ).not.toThrow();
+      expect(() =>
+        workspace.database.transactionSync(() => {
+          workspace.drive.writeFiles([{ path: "/tree/leaf/file.txt", bytes: encoder.encode("x") }]);
+          workspace.drive.removeFiles(["/tree"], { recursive: false });
+        }),
+      ).toThrowError(expect.objectContaining({ code: "ENOTEMPTY" }));
+      expect(() =>
+        workspace.database.transactionSync(() => {
+          workspace.drive.writeFiles([{ path: "/link", target: "second" }]);
+          workspace.drive.writeFiles([{ path: "/link", target: "third" }]);
+          throw new Error("late failure");
+        }),
+      ).toThrow("late failure");
+      expect(readlinkSync(join(fixture.root, "link"))).toBe("first");
+      expect(workspace.drive.stat("/tree/leaf/file.txt")).toBeNull();
+    } finally {
+      workspace.close();
+      fixture.dispose();
+    }
+  });
 });
