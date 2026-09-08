@@ -22,8 +22,9 @@ is everything over 2 MiB. Two sites copy before that decision is known:
 - `packages/git/src/client-plumbing.ts` copies every `catFile()` result. For an
   object the cache refused, the store's buffer was already unaliased, so the copy
   is provably unnecessary — and `MAX_OBJECT_BYTES` is 48 MiB, so `catFile` of a
-  large blob now peaks near 96 MiB against ADR-0005's <100 MiB per-operation
-  target.
+  large blob can hold 96 MiB in its source and result buffers alone. This is a
+  static two-buffer estimate, not a measured process peak or an upper bound;
+  comparison with ADR-0005's <100 MiB per-operation target requires measurement.
 
 The boundary cannot tell a retained buffer from a fresh one, because a cold read
 also caches the instance it returns (`objects.ts:293`, `pack/read/read-resolver.ts:385,441`).

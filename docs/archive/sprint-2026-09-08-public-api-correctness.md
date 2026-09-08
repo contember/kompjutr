@@ -24,7 +24,7 @@
 >
 > Backlog closed: 67, 68, 69 deleted; 70 deleted whole — WU4 consumed its
 > discovery contract and planning refuted its scan-ordering claim (Decision 3),
-> with the refutation preserved in the record below. Filed: 81, the measured cost
+> with the refutation preserved in the record below. Filed: 81, the estimated cost
 > of unconditional ownership copies.
 >
 > Deferred / honest notes: the `## Plan review` below stayed **pending** — no
@@ -53,10 +53,8 @@ succeeds when every reproduction below is a committed regression witness, the
 local and Durable Object compositions agree where the review found them
 disagreeing, and no operation loses current parity.
 
-Consumes backlog [67](../backlog/67-own-public-object-buffers.md),
-[68](../backlog/68-abort-caught-nested-local-failures.md),
-[69](../backlog/69-fix-repeated-local-path-mutations.md), and the discovery half
-of [70](../backlog/70-enforce-local-scan-and-discovery-contracts.md).
+Consumes backlog 67, 68, 69, and the discovery half of backlog 70 (historical
+identifiers; the consumed items were deleted at closure).
 
 ## Refs re-verified at HEAD (2026-09-08)
 
@@ -242,7 +240,7 @@ temporary and are not a committed suite.
 - [71](../backlog/71-invalidate-maintenance-on-promise-fulfillment.md),
   [72](../backlog/72-preserve-pack-dependencies-during-lifecycle.md), and
   [73](../backlog/73-validate-fetch-connectivity-and-publication.md) — they run as
-  [sprint-2026-09-08-lifecycle-and-network-integrity](sprint-2026-09-08-lifecycle-and-network-integrity.md).
+  [sprint-2026-09-08-lifecycle-and-network-integrity](../sprints/sprint-2026-09-08-lifecycle-and-network-integrity.md).
 - [74](../backlog/74-align-pack-ingest-with-physical-membership.md) and everything
   in [75](../backlog/75-bound-network-authentication-payloads.md)–[79](../backlog/79-bound-materialized-status-and-config-reads.md):
   the scaling items start with measurement, not with a fix.
@@ -350,11 +348,11 @@ gate is proportionate to its unit's blast radius.
   rows stay readable inside the transaction until the commit is refused, where
   the Durable Object has already removed them. Reworded, and
   `reference/concurrency.md` now records both runtimes.
-- 2026-09-08 — Review of WU2 measured the cost of unconditional ownership
-  copies: `catFile` of a 48 MiB blob now peaks near 96 MiB, and a scalar write
+- 2026-09-08 — Review of WU2 estimated the cost of unconditional ownership
+  copies: `catFile` of a 48 MiB blob can hold two 48 MiB buffers, and a scalar write
   above the cache's entry limit copies bytes the cache then drops. The rule is
-  right (a cold read is cached too, so the boundary cannot tell), the number is
-  not. → backlog 81.
+  right (a cold read is cached too, so the boundary cannot tell); process peak
+  memory was not established by this static estimate. → backlog 81.
 - 2026-09-08 — **Re-review after the fixes found one more live site of the same
   class**, which is why `ownedBytes()` now lives in `@kompjutr/sqlite` rather
   than the Git bytes kit: pack ingest kept its rolling 20-byte trailer
