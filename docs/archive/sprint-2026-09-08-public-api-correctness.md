@@ -1,10 +1,43 @@
-<!--
-On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
-
-> **OUTCOME — shipped YYYY-MM-DD.** <one-paragraph result.> Commit map: WU1 → <sha>,
-> WU2 → <sha>, … Verification: <the gate command + numbers>. Backlog closed:
-> <ids deleted/rescoped>. Deferred: <honest notes>.
--->
+> **OUTCOME — shipped 2026-09-08.** All four public-API failures are closed and
+> each has a committed regression witness. WU1 makes a nested failure abort-only
+> *when that scope produced effects* — rows, schema, or disk — which keeps the
+> deliberate caught-reentry pattern working instead of killing it, and both
+> Durable Object test doubles now model workerd's savepoint nesting rather than
+> flattening it. WU2 turned out to be the hard one: the first fix was a no-op,
+> because `Buffer.prototype.slice()` is Node's alias for `subarray()` and every
+> witness had built its input with `utf8.encode()`. The rule now lives in one
+> shared `ownedBytes()` below every composition, and it closed two sites the
+> sprint never planned for — the batch writer, which *persisted* corrupted bytes
+> under a clean OID, and pack ingest's trailer lookbehind at the network trust
+> boundary. WU3 and WU4 landed as planned; WU4's target behavior came from asking
+> git 2.54.0 rather than from reading a spec.
+>
+> Commit map: WU1 → `057606a`, WU2 → `9350c8b` + `674a5a9`, WU4 → `a4ad6a2`,
+> WU3 → `3a77f48`; review fixes → `d6ad7fc`, `2a90d99`, `e98f224`; docs →
+> `a94f5f6`, `602cc8c`.
+>
+> Verification: `npm run test:full` clean on the final tree — 449.9 s wall over
+> 3 lanes, no failing slice. Along the way: `npm test` 158, `npm run test:fs`
+> 467, `tests/local` + `tests/rebase.test.ts` 104, the WU witnesses 258. Every
+> fix was also verified in reverse, by temporarily restoring the defect and
+> watching its witness fail.
+>
+> Backlog closed: 67, 68, 69 deleted; 70 deleted whole — WU4 consumed its
+> discovery contract and planning refuted its scan-ordering claim (Decision 3),
+> with the refutation preserved in the record below. Filed: 81, the measured cost
+> of unconditional ownership copies.
+>
+> Deferred / honest notes: the `## Plan review` below stayed **pending** — no
+> independent reviewer checked the plan against HEAD before implementation, which
+> `docs/CLAUDE.md` requires. Independent review of WU1 and WU2 did happen, twice
+> each, and found the WU2 no-op; that is the only reason this sprint did not ship
+> a fix that fixed nothing. Two latent WU1 residuals are recorded in the run log
+> (`temp`-schema DDL is invisible to the effect mark; a hand-set negative schema
+> cookie fails closed as `ECORRUPT`), neither reachable from source. One earlier
+> run of `tests/reads` + `tests/pack` + `tests/local` reported 2 failures whose
+> detail was lost to a truncated pipe; the same set and then the full suite ran
+> clean afterwards, and that run also carried two vitest worker RPC timeouts
+> under a saturated CPU pool — likely but not proven to be the cause.
 
 # Sprint — public API correctness (2026-09-08)
 

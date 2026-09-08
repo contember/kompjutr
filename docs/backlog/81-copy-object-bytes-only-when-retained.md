@@ -49,4 +49,4 @@ is cache-aliased. Then the public boundary copies only what it must.
   `objects-write.ts`, `packages/git/src/client-plumbing.ts`.
 - `bench/` peak-memory scenario; `tests/client.test.ts` ownership witnesses.
 
-<!-- Origin: independent review of WU2 in sprints/sprint-2026-09-08-public-api-correctness.md. -->
+<!-- Origin: independent review of WU2 in ../archive/sprint-2026-09-08-public-api-correctness.md. -->

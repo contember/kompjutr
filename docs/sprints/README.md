@@ -20,9 +20,6 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [`sprint-2026-09-08-public-api-correctness.md`](sprint-2026-09-08-public-api-correctness.md)
-  — backlog 67, 68, 69, and the discovery contract of 70. All four reproduced at
-  planning time; plan review pending.
 - [`sprint-2026-09-08-lifecycle-and-network-integrity.md`](sprint-2026-09-08-lifecycle-and-network-integrity.md)
   — backlog 71, 72, 73. Statically verified only; each unit reproduces before it
   fixes. Plan review pending.

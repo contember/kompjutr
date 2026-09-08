@@ -194,8 +194,8 @@ task of each unit.
 
 ## Out of scope (explicit)
 
-- [67](../backlog/67-own-public-object-buffers.md)–[70](../backlog/70-enforce-local-scan-and-discovery-contracts.md)
-  — they run as [sprint-2026-09-08-public-api-correctness](sprint-2026-09-08-public-api-correctness.md).
+- Backlog 67–70 — shipped as
+  [sprint-2026-09-08-public-api-correctness](../archive/sprint-2026-09-08-public-api-correctness.md).
 - [74](../backlog/74-align-pack-ingest-with-physical-membership.md) — pack ingest
   versus physical membership is interoperability with real Git packs, a different
   contract from deletion safety, and it would double this sprint's size.

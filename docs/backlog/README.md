@@ -123,7 +123,7 @@ an accepted correctness witness under ADR-0004.
 
 | Work | Items | Evidence boundary |
 |---|---|---|
-| Public API correctness | [67](67-own-public-object-buffers.md), [68](68-abort-caught-nested-local-failures.md), [69](69-fix-repeated-local-path-mutations.md), [70](70-enforce-local-scan-and-discovery-contracts.md) | Buffer aliasing, nested rollback, and repeated mutations reproduced; scan/discovery contracts statically verified. |
+| Public API correctness | shipped — [`archive/sprint-2026-09-08-public-api-correctness.md`](../archive/sprint-2026-09-08-public-api-correctness.md) | Buffer aliasing, nested rollback, repeated mutations, and regular-file discovery. Item 70's scan-ordering claim was refuted, not fixed. |
 | Lifecycle and valid pack handling | [71](71-invalidate-maintenance-on-promise-fulfillment.md), [72](72-preserve-pack-dependencies-during-lifecycle.md), [74](74-align-pack-ingest-with-physical-membership.md) | Reproduced publication/store mechanisms with explicit limits on end-to-end public coverage; retain verification-first acceptance for concurrency schedules. |
 | Network boundary | [73](73-validate-fetch-connectivity-and-publication.md) | Incomplete-graph clone reproduced with a faulty remote response; publication-race and framing witnesses are qualified separately. |
 | Valid-input resource scaling | [75](75-bound-network-authentication-payloads.md), [76](76-bound-full-tree-construction.md), [77](77-remove-repeated-local-traversal-work.md), [78](78-make-sql-cursors-seek-and-deliver-incrementally.md), [79](79-bound-materialized-status-and-config-reads.md) | Static live-state/work analysis and specified query-plan observations; target-runtime measurements remain acceptance work. |
@@ -153,10 +153,6 @@ does not schedule these issues into a sprint.
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
 - [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
 - [66 — Retire modeled retained-byte charges](66-retire-modeled-retained-byte-charges.md)
-- [67 — Own buffers across public Git object boundaries](67-own-public-object-buffers.md)
-- [68 — Abort local transactions after caught nested failures](68-abort-caught-nested-local-failures.md)
-- [69 — Preserve local mutation semantics after first touch](69-fix-repeated-local-path-mutations.md)
-- [70 — Enforce local scan ordering and regular-file discovery](70-enforce-local-scan-and-discovery-contracts.md)
 - [71 — Invalidate maintenance marks when promised blobs become physical](71-invalidate-maintenance-on-promise-fulfillment.md)
 - [72 — Preserve pack dependencies across ingest, promotion, and sweep](72-preserve-pack-dependencies-during-lifecycle.md)
 - [73 — Validate fetched object connectivity and final publication](73-validate-fetch-connectivity-and-publication.md)

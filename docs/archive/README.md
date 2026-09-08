@@ -9,6 +9,10 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Public API correctness](sprint-2026-09-08-public-api-correctness.md)
+  — buffer ownership across the object boundaries, nested transaction failure,
+  repeated local path mutations, and regular-file discovery. Records why
+  `Buffer.prototype.slice()` cannot be used to take ownership.
 - [Scoped packages and local runtime](sprint-2026-09-07-scoped-packages-and-local-runtime.md)
   — five lockstep packages, the preserved Durable Object path, and a
   crash-recoverable Unix local composition.
