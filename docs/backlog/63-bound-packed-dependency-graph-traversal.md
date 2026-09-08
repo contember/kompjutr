@@ -13,12 +13,12 @@ projected-work refusal.
 ## Problem
 
 Packed dependency traversal retains root and checkpoint state proportional to
-graph width and depth. In addition, `src/git/store/pack/read.ts` keeps every
+graph width and depth. In addition, `packages/git/src/store/pack/read.ts` keeps every
 resolved intermediate object in an unbounded per-call memo, including objects
 too large for the bounded shared cache. A deep or shared-base delta batch can
 therefore exceed the operation's intended live-memory bound.
 
-`src/git/store/maintenance/reachability.ts` also revalidates progressively
+`packages/git/src/store/maintenance/reachability.ts` also revalidates progressively
 shorter packed-delta suffixes, making a deep chain O(n²). None of these shapes is
 a regression for a current supported workload, but all violate the structural
 cost model at adversarial format-valid scale.
@@ -35,8 +35,8 @@ structural limits or introduce a projected-work refusal.
 
 ## Touch points
 
-`src/git/store/pack/read.ts`, `src/git/store/pack/lifecycle.ts`,
-`src/git/store/maintenance/reachability.ts`, `tests/pack.test.ts`,
+`packages/git/src/store/pack/read.ts`, `packages/git/src/store/pack/lifecycle.ts`,
+`packages/git/src/store/maintenance/reachability.ts`, `tests/pack.test.ts`,
 `tests/maintenance-reachability.test.ts`.
 
 <!-- Origin: ../archive/sprint-2026-08-29-budget-targets-and-store-split.md WU6g -->

@@ -1,3 +1,21 @@
+> **OUTCOME - shipped 2026-09-08.** Five lockstep `@kompjutr/*` packages now
+> separate shared SQLite and drive contracts, generic Git, the optimized Durable
+> Object composition, and a Unix-only local composition. Local mutations use a
+> root-keyed lifetime lock and generation-backed, checksum-framed undo recovery;
+> neither runtime creates `.git`. Commit map: plan, specification, and decisions
+> -> `70fe5fa`; packages, runtime, recovery, release workflow, and witnesses ->
+> `b2cabed`; living-reference refresh and sprint archive -> this commit.
+> Verification: all focused and routine gates passed; package, recovery, and
+> SQLite hot-path reviews reached review-to-clean; package smoke installed all
+> five packed artifacts; deterministic SQL/row checks passed; and the exhaustive
+> matrix passed 3,476 tests with 5 environment skips in 342.0 seconds wall time.
+> The final seven-run comparison preserved every operation's SQL/row profile and
+> reduced the sum of operation wall medians by 5.416%. Deferred: npm scope and
+> trusted-publisher setup remain external release prerequisites. The real
+> bind-mount witness could not run because the host forbids user mount namespaces;
+> injected and real cross-device witnesses passed, and nested bind aliases remain
+> explicitly unsupported.
+
 # Sprint — scoped packages and local runtime (2026-09-07)
 
 **Goal.** Publish five `@kompjutr/*` packages and deliver a crash-recoverable

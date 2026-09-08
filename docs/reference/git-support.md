@@ -6,7 +6,7 @@ matter.
 ## How to read this
 
 kompjutr has no external process or general Git command line. Its primary API is
-the typed `Git` interface from `kompjutr/git`. A strict argv runner covers the
+the typed `Git` interface from `@kompjutr/git`. A strict argv runner covers the
 agent command subset described below. It never falls back to a binary or admits an unlisted
 command.
 
@@ -60,7 +60,7 @@ Native `Git` implements
 `runCli(input, options?): Promise<GitCliResult>`; `cli(input)` uses the same
 asynchronous dispatcher.
 `GitCliRunner`, `GitCliInput`, `GitCliResult`, and `GitCliRunOptions` are public
-types from `kompjutr` and `kompjutr/git`.
+types from `@kompjutr/git`.
 
 The accepted argv grammar is exact:
 
@@ -261,7 +261,7 @@ quoting unsafe ASCII. Porcelain v1 and short also quote leading or trailing
 spaces, and quote either side of a rename when it contains the literal ` -> `;
 porcelain v2 does not quote a path solely for those conditions. Rename paths
 are always processed independently. The formatters and `statusFormatOptions()`
-are standalone exports from `kompjutr` and `kompjutr/git`, not methods on `Git`.
+are standalone exports from `@kompjutr/git`, not methods on `Git`.
 Formatting fails with `E2BIG` rather
 than exceeding its bounded record or output budget.
 

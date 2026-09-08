@@ -12,7 +12,7 @@ prefixes, and no current caller needs glob-shaped mutations.
 
 ## Problem
 
-`matchesPaths()` in `src/core/ops/checkout.ts` remains the exact/prefix matcher
+`matchesPaths()` in `packages/git/src/ops/checkout/checkout.ts` remains the exact/prefix matcher
 for add, rm, reset, checkout, clean, diff, and status. Glob-shaped mutations
 therefore still fail loudly with `PathspecNotFoundError`.
 
@@ -26,8 +26,8 @@ therefore still fail loudly with `PathspecNotFoundError`.
 
 ## Touch points
 
-`src/core/ops/checkout.ts`, `src/core/ops/staging.ts`, `src/core/ops/status.ts`,
-`src/core/ops/diff.ts`, `tests/pathspec.test.ts`, `tests/staging.test.ts`,
+`packages/git/src/ops/checkout/checkout.ts`, `packages/git/src/ops/staging/staging.ts`, `packages/git/src/ops/status/status.ts`,
+`packages/git/src/ops/diff/diff.ts`, `tests/pathspec.test.ts`, `tests/staging.test.ts`,
 `tests/status.test.ts`, `docs/reference/git-support.md`
 
 <!-- Read-only tracked/ref globs shipped 2026-08-28; cached/others/exclude-standard selection shipped 2026-08-29. -->

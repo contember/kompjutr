@@ -35,10 +35,10 @@ interface GitCliRunner {
 Native `Git` implements it, and `Git.cli()` uses the same dispatcher rather than
 a second parser or handler set.
 
-The dedicated `kompjutr/git/shell` entry may depend on shell command types and
-exports `createGitCommand(runner: GitCliRunner): Command`. The shell package
-never imports Git, and the root entry does not register Git implicitly. A
-consumer opts in:
+The dedicated `@kompjutr/do/git-shell` entry may depend on shell command types
+and exports `createGitCommand(runner: GitCliRunner): Command`. The
+`@kompjutr/do/shell` entry never imports Git, and the root entry does not
+register Git implicitly. A consumer opts in:
 
 ```ts
 new Map([["git", createGitCommand(workspace.git)]])

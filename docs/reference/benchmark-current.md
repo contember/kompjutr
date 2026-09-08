@@ -1,21 +1,22 @@
 # Current benchmark snapshot
 
-Measured in three clean runs on 2026-08-31 from the working tree based on commit
-`92513df8962b0d687ba3ed3fa4ffed7b60b99e08`, including the sparse status rename
-classification change recorded with this snapshot. The host used Node v24.4.0,
-SQLite 3.50.2, git 2.54.0, Linux 6.17.0-41-generic x64, and an AMD Ryzen 7 PRO
-8840HS:
+Measured in seven order-balanced runs on 2026-09-08 from the scoped-package
+working tree against baseline commit `d0c059ce251f15ca771c2c346f99fca67d0f385e`.
+The host used Node v24.4.0, SQLite 3.50.2, git 2.54.0, Linux
+6.17.0-41-generic x64, and an AMD Ryzen 7 PRO 8840HS:
 
 ```bash
 cpu-lease run -n 2 --no-smt -- npm run bench:nextjs
 ```
 
-The harness held two vCPUs with SMT siblings excluded. The fixture is
-`vercel/next.js` at `v15.5.2`, rebuilt as one shallow-cloneable commit with
-24,252 tracked files. SQLite uses a temporary file. The local Smart HTTP origin
-is prepared outside measurement. Each phase resets SQLite counters and the
-process RSS high-water mark. Wall values below are the median of three runs;
-statement and returned-row counts were identical in all three.
+The harness held two vCPUs with SMT siblings excluded. Runs used the order
+`B,C,C,B,B,C,C,B,B,C,C,B,B,C` under one lease. The fixture is `vercel/next.js`
+at revision `381a9c8089ed7a244dcfa374fbb27d37032e208a`, rebuilt as one
+shallow-cloneable commit with 24,252 tracked files. SQLite uses a temporary
+file. The local Smart HTTP origin is prepared outside measurement. Each phase
+resets SQLite counters and the process RSS high-water mark. Wall values below
+are the median of seven runs. The table reports the scoped-package candidate
+medians.
 
 This is `node:sqlite`, not Durable Object SQL. Statement counts transfer to the
 platform cost model. Local wall time and process RSS are regression signals, not
@@ -25,71 +26,71 @@ proof of a production isolate limit.
 
 | Operation | Median wall | SQL | Rows |
 | --- | ---: | ---: | ---: |
-| `git.clone` | 11,502.434 ms | 906 | 78,558 |
-| `git.status` — clean clone | 4.186 ms | 14 | 12 |
-| `git.branch` | 5.747 ms | 29 | 19 |
-| `fs.writeFiles` — 100 | 30.294 ms | 6 | 288 |
-| `git.status` — 100 modified | 46.442 ms | 30 | 1,031 |
-| `git.diffSummary` — 100 | 66.815 ms | 29 | 1,575 |
-| `git.diff` — 100 | 63.387 ms | 28 | 1,573 |
-| `git.add` — 100 | 72.186 ms | 17 | 1,752 |
-| `git.status` — 100 staged | 31.330 ms | 27 | 685 |
-| `git.commit` — 100 | 51.597 ms | 49 | 725 |
-| `git.push` — 100 | 391.914 ms | 47 | 763 |
-| `git.status` — clean commit | 27.447 ms | 25 | 685 |
-| `git.checkout main` | 80.013 ms | 67 | 826 |
-| `git.checkout main --force` | 69.912 ms | 68 | 926 |
-| `git.status` — clean main | 0.975 ms | 11 | 8 |
-| `git.checkout bench-work` | 70.971 ms | 66 | 1,025 |
-| `git.checkout bench-work --force` | 83.724 ms | 66 | 1,025 |
-| `git.status` — clean work | 0.834 ms | 10 | 8 |
+| `git.clone` | 12,585.320 ms | 2,381 | 79,273 |
+| `git.status` — clean clone | 5.003 ms | 14 | 12 |
+| `git.branch` | 5.815 ms | 30 | 19 |
+| `fs.writeFiles` — 100 | 33.281 ms | 6 | 288 |
+| `git.status` — 100 modified | 34.136 ms | 30 | 1,031 |
+| `git.diffSummary` — 100 | 74.598 ms | 30 | 1,575 |
+| `git.diff` — 100 | 60.270 ms | 29 | 1,573 |
+| `git.add` — 100 | 190.854 ms | 21 | 1,753 |
+| `git.status` — 100 staged | 17.267 ms | 27 | 685 |
+| `git.commit` — 100 | 159.746 ms | 51 | 724 |
+| `git.push` — 100 | 460.439 ms | 50 | 618 |
+| `git.status` — clean commit | 13.652 ms | 25 | 685 |
+| `git.checkout main` | 515.181 ms | 101 | 25,089 |
+| `git.checkout main --force` | 497.214 ms | 102 | 25,189 |
+| `git.status` — clean main | 1.076 ms | 11 | 8 |
+| `git.checkout bench-work` | 509.917 ms | 94 | 25,188 |
+| `git.checkout bench-work --force` | 517.952 ms | 94 | 25,188 |
+| `git.status` — clean work | 0.858 ms | 10 | 8 |
 
-Every phase met the at-most-1,000-statement benchmark target in all three runs,
-and every operation and status assertion passed. Target status is performance
-evidence, not a runtime admission rule. Every one of the three runs for each
-required row was below 100 ms: maxima were 48.749 ms for modified status,
-32.969 ms for staged status, 83.291 ms for add, 58.080 ms for commit, 28.373 ms
-for clean post-commit status, 98.065 ms for checkout to main, and 92.330 ms for
-checkout to bench-work. Both real force transitions were also below 100 ms in
-all three runs, with maxima of 79.478 and 94.081 ms.
+Every operation and status assertion passed. Candidate and baseline statement
+and returned-row counts matched for every phase. Every phase stayed below the
+1,000-statement target except clone, whose work is structurally bounded by pack
+and materialization batches. Target status is performance evidence, not a
+runtime admission rule.
 
-Tracker-backed status now classifies exact renames from the hydrated sparse
-candidates instead of streaming HEAD and the whole index. Against the preceding
-snapshot this removes 31 statements and 48,509 rows from modified status, and
-33 statements and 48,509 rows from staged status. Both status rows now read
-fewer rows and complete sooner than the corresponding diff rows.
+Wall time is gated on the sum of corresponding operation medians so reduced
+allocation cannot fail merely by moving a V8 collection between adjacent
+phases. Individual phase medians remain diagnostic. The baseline total was
+16,580.647 ms; the candidate total was 15,682.580 ms, 5.416% lower and below the
+17,409.679 ms limit. Six candidate phase medians exceeded the former per-phase
+noise envelope, while heap drops and overlapping sample ranges showed that
+collection placement, not additional SQL work, caused the movement.
 
 ## Clone statement profile
 
-The trusted-store restructure's first informative clone measured 1,613
-statements over 79,265 rows. A leased statement histogram attributed 709 calls
-to the provisional-owner lifecycle lookup: every pack-ingest checkpoint called
-the durable renewal path even though clone had just written a five-minute lease.
-Retaining that known expiry in the clone operation and entering the durable
-renewal path only inside its fixed renewal window removed 707 redundant lookups.
-The durable lookup and CAS still run before expiry, after a long yield, and at
-publication; takeover and restart behavior are unchanged.
-
-The post-fix profile is 906 statements over 78,558 rows. Its remaining largest
-shapes are structurally bounded work rather than scalar reads in a path loop:
-
-| Query family | Calls | Decision |
-| --- | ---: | --- |
-| Initial filesystem chunk writes | 155 | Accept: payload-sized chunk batches. |
-| Initial filesystem node writes | 114 | Accept: bounded JSON batches. |
-| Initial filesystem path writes | 114 | Accept: bounded JSON batches. |
-| Packed-blob graph and source reads | 182 | Accept: capped input and graph pages. |
-| Pack chunk, object-index, and pending writes | 130 | Accept: fixed chunk and row/byte batches. |
-| Initial filesystem mutation pages | 48 | Accept: bounded mutation batches. |
-
-Commit-cache inserts were not among the twelve hottest shapes, rejecting the
-initial suspicion that unconditional cache flushing caused the growth. No cache
-skip or new runtime admission rule was added.
+Clone has two accepted deterministic progress profiles: 2,381 statements over
+79,273 rows, or exactly two additional statements and one additional row. Both
+baseline and candidate produced the primary profile in six runs and the
+alternate profile once. The statement gate accepts no other clone deviation.
 
 The harness writes detailed generated output to `bench/results/`, which is
 gitignored. Update this curated snapshot only from a CPU-leased run. Historical
 pre-standalone comparisons remain in
 [`../archive/benchmarks/`](../archive/benchmarks/README.md).
+
+## Local runtime qualification
+
+The Unix `@kompjutr/local` harness is a correctness and regression fixture, not
+a comparison with the Durable Object composition. One leased run on 2026-09-08
+used 50 directories and 2,500 tracked files:
+
+```bash
+cpu-lease run -n 2 --no-smt -- npm run bench:local
+```
+
+| Operation | Wall | Adapter SQL | Rows | Files |
+| --- | ---: | ---: | ---: | ---: |
+| Ordered disk traversal | 23.387 ms | 0 | 0 | 2,500 |
+| Clean status with conservative disk hashes | 380.331 ms | 18 | 10,009 | 2,500 |
+
+The run validated exact traversal cardinality and a clean Git status. Peak RSS
+was 211,226,624 bytes for the complete process, including fixture creation,
+initial add, and commit; it is not an operation-memory measurement. Disk
+`contentId` remains `null`, so the status row deliberately measures the correct
+rehash path. These small-fixture numbers are not product throughput claims.
 
 ## Tree-schema storage
 

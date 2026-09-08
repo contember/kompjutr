@@ -23,25 +23,25 @@ direction.
 
 | Server responsibility | What already covers it |
 | --- | --- |
-| Emit a packfile without assembling it | [`PackWriter`](../../src/git/store/pack/writer.ts) streams bytes through `emit`, hashing the trailer as it goes |
-| Decide which objects a peer is missing | [`planPushObjects`](../../src/git/ops/push/push-plan.ts) computes the closure of `newOid` minus a set of remote oids — the same computation as `want` minus `have` |
-| Stream those objects out of SQLite | [`openPushPack`](../../src/git/ops/push/push-plan.ts) pages large blobs through the writer in bounded chunks |
-| Accept and index an incoming pack | `PackStore.ingest` in [`packs.ts`](../../src/git/store/pack/packs.ts), already the fetch path via [`ingestPack`](../../src/git/ops/network/network.ts) |
-| Frame the conversation | [`pktline.ts`](../../src/git/protocol/pktline.ts) encodes, [`stream.ts`](../../src/git/protocol/stream.ts) parses strictly and bounded |
-| Move a ref safely under a concurrent writer | `updateRefExpected` in the [`store/`](../../src/git/store/) ref family is a compare-and-swap |
+| Emit a packfile without assembling it | [`PackWriter`](../../packages/git/src/store/pack/writer.ts) streams bytes through `emit`, hashing the trailer as it goes |
+| Decide which objects a peer is missing | [`planPushObjects`](../../packages/git/src/ops/push/push-plan.ts) computes the closure of `newOid` minus a set of remote oids — the same computation as `want` minus `have` |
+| Stream those objects out of SQLite | [`openPushPack`](../../packages/git/src/ops/push/push-plan.ts) pages large blobs through the writer in bounded chunks |
+| Accept and index an incoming pack | `PackStore.ingest` in [`packs.ts`](../../packages/git/src/store/pack/packs.ts), already the fetch path via [`ingestPack`](../../packages/git/src/ops/network/network.ts) |
+| Frame the conversation | [`pktline.ts`](../../packages/git/src/protocol/pktline.ts) encodes, [`stream.ts`](../../packages/git/src/protocol/stream.ts) parses strictly and bounded |
+| Move a ref safely under a concurrent writer | `updateRefExpected` in the [`store/`](../../packages/git/src/store/) ref family is a compare-and-swap |
 | Enumerate what to advertise | `Repository.branches()`, `tags()`, `resolveRef()`, `head()` |
 
 The client also already *consumes* every capability the server would want to
 advertise: `side-band-64k`, `report-status`, `thin-pack`, `shallow`
-([`remote.ts`](../../src/git/protocol/remote.ts),
-[`receive-pack.ts`](../../src/git/protocol/receive-pack.ts)). The decoders
+([`remote.ts`](../../packages/git/src/protocol/remote.ts),
+[`receive-pack.ts`](../../packages/git/src/protocol/receive-pack.ts)). The decoders
 exist; the encoders do not.
 
 ## What is genuinely new
 
 1. **Ref advertisement.** `GET /info/refs?service=…` returns the service line, a
    pkt-line ref list, capabilities, and a `symref=HEAD:…`. This is
-   [`discover()`](../../src/git/protocol/remote.ts) inverted.
+   [`discover()`](../../packages/git/src/protocol/remote.ts) inverted.
 2. **`upload-pack`, server side.** Read `want`/`have`/`done`, answer
    `NAK`/`ACK`, then stream the pack. Protocol v0 with a single round ending in
    `done` is sufficient — the client computes nothing the server needs.
@@ -98,7 +98,7 @@ movement — objects are immutable, so a pinned set stays servable.
 
 Every byte a client sends is untrusted network input. Ref names, oids,
 capability lines, and pack contents all arrive from outside. `requireBranchRef`
-in [`receive-pack.ts`](../../src/git/protocol/receive-pack.ts) already
+in [`receive-pack.ts`](../../packages/git/src/protocol/receive-pack.ts) already
 encodes the accepted ref subset for pushes we send; the server side needs the
 same validation applied to what it receives, plus a size ceiling on the request
 body before anything is indexed.

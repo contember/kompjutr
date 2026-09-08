@@ -17,7 +17,7 @@ mutations: `commit` or `rebase --continue` could publish durable state and then
 fail with `E2BIG` while the caller observed no successful command result.
 
 Git operations and filesystem writes join nested `transactionSync()` calls when
-the repository and worktree use the same database capability, so a thrown outer
+the repository and worktree share one opaque mutation scope, so a thrown outer
 transaction rolls back the whole mutation. Repository storage caches must still
 be revalidated after that rollback, because an operation may have observed newly
 written objects.
@@ -38,9 +38,9 @@ every local mutating handler uses one shared synchronous wrapper in this order:
    unchanged. The same output bounds apply to any mapped failure result.
 
 Before a command that can mutate the worktree enters the wrapper, it must prove
-transaction affinity by identity — `context.worktree.db === repo.store.db`
-(`src/git/cli/write/write-runtime.ts`). A missing or different database
-capability fails closed before any mutation.
+transaction affinity through opaque scope identity
+(`packages/git/src/cli/write/write-runtime.ts`). A missing or different scope
+fails closed before any mutation.
 
 The dispatcher awaits the handler only after the local transaction callback has
 returned, and keeps its own final bounding call as defense in depth.
@@ -70,8 +70,8 @@ HTTP side effect or an already-published fetch. Four boundaries are explicit:
   stdout, retained stderr, and combined-output overflow. With `discardStderr`,
   stderr is neither validated nor charged, so the mutation commits when stdout
   and the resulting combined output fit.
-- Worktree-mutating commands are unavailable to a custom worktree adapter that
-  does not expose the selected repository database by identity.
+- Worktree-mutating commands are unavailable when the repository and worktree do
+  not expose the same opaque mutation scope.
 - Handlers receive resolved ceilings even when they only read. The narrow public
   runner capability is unchanged.
 - A promise-returning runner does not make local transaction ownership

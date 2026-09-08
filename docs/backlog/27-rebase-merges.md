@@ -31,9 +31,9 @@ steps, and their recovery state must all be authenticated.
 
 ## Touch points
 
-`src/core/ops/rebase-plan.ts`, `src/core/ops/rebase-lifecycle.ts`,
-`src/core/ops/operation-state.ts`, `src/core/ops/merge-apply.ts`,
-`src/sqlite/schema.ts`, `src/sqlite/store.ts`, `tests/rebase*.test.ts`, reference
+`packages/git/src/ops/rebase/rebase-plan.ts`, `packages/git/src/ops/rebase/rebase-lifecycle.ts`,
+`packages/git/src/ops/core/operation-state.ts`, `packages/git/src/ops/merge/merge-apply.ts`,
+`packages/git/src/store/schema/schema.ts`, `packages/git/src/store/`, `tests/rebase*.test.ts`, reference
 docs
 
 <!-- Origin: ../archive/sprint-2026-08-25-bounded-rebase-sequencer.md -->

@@ -11,7 +11,7 @@ read shapes remain absent, but no current consumer issues them.
 
 ## Problem
 
-In `src/core/ops/reads.ts` and `src/core/ops/plumbing.ts`:
+In `packages/git/src/ops/repository/reads.ts` and `packages/git/src/ops/repository/plumbing.ts`:
 
 - `catFile()` returns `{ oid, bytes }`; there is no `-t` or `-s`, so a caller must
   materialise a blob to learn its type or size.
@@ -30,7 +30,7 @@ In `src/core/ops/reads.ts` and `src/core/ops/plumbing.ts`:
 
 ## Touch points
 
-`src/core/ops/reads.ts`, `src/core/ops/plumbing.ts`, `src/git/client.ts`,
+`packages/git/src/ops/repository/reads.ts`, `packages/git/src/ops/repository/plumbing.ts`, `packages/git/src/client.ts`,
 `tests/reads.test.ts`, `docs/reference/git-support.md`
 
 <!-- Origin: docs/reference/git-support.md#reference-workload-coverage; split 2026-08-28 by consumer demand -->

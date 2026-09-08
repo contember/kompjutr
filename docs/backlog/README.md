@@ -70,7 +70,7 @@ Coverage of the calls that decide whether Phase 1 is usable:
 | `branch -m`, `remote set-url` | both | Served by typed native operations; [18](18-branch-and-remote-management.md) now retains only no-caller management |
 | `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'` | builder | Served by native cached/untracked selection and repository `.gitignore` filtering; [36](36-glob-pathspecs.md) now retains mutating globs only |
 | `clone --filter=blob:none` | both | Served by native filtered clone/fetch, durable promises, and bounded lazy backfill (ADR-0015) |
-| `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | Served by the strict awaitable runner, bounded per-run stdin/env, and the explicit `kompjutr/git/shell` adapter |
+| `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | Served by the strict awaitable runner, bounded per-run stdin/env, and the explicit `@kompjutr/do/git-shell` adapter |
 
 Everything else both consumers issue is served, or routes through another
 spelling listed under

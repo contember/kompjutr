@@ -29,5 +29,5 @@ compressing repeated content independently.
 
 ## Touch points
 
-`src/core/pack/writer.ts`, `src/core/ops/push.ts`, pack selection helpers,
+`packages/git/src/store/pack/writer.ts`, `packages/git/src/ops/push/push.ts`, pack selection helpers,
 `tests/pack.test.ts`, `tests/push*.test.ts`, `bench/`

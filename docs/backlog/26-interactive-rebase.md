@@ -32,8 +32,8 @@ source of truth because it would not survive a Durable Object restart.
 
 ## Touch points
 
-`src/core/ops/rebase-plan.ts`, `src/core/ops/rebase-lifecycle.ts`,
-`src/core/ops/operation-state.ts`, `src/sqlite/store.ts`, `src/git/client.ts`,
+`packages/git/src/ops/rebase/rebase-plan.ts`, `packages/git/src/ops/rebase/rebase-lifecycle.ts`,
+`packages/git/src/ops/core/operation-state.ts`, `packages/git/src/store/`, `packages/git/src/client.ts`,
 `tests/rebase*.test.ts`, public declarations and reference docs
 
 <!-- Origin: ../archive/sprint-2026-08-25-bounded-rebase-sequencer.md -->

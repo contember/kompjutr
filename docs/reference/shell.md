@@ -1,6 +1,6 @@
 # Shell reference
 
-`kompjutr/shell` is a bounded command surface over `Filesystem`. It resembles
+`@kompjutr/do/shell` is a bounded command surface over `Filesystem`. It resembles
 Bash for the supported agent workload, but it is not a general shell or process
 runtime. Unsupported syntax and options fail explicitly.
 
@@ -114,11 +114,12 @@ repeated `-e`/`--regexp`, `-g`/`--glob`, and `-t`/`--type`. Known types are
 `ts`, `js`, `md`, `json`, `css`, `html`, `py`, `go`, `rust`, `sh`, `yaml`,
 `toml`, and `sql`. Ignore files are deliberately not read.
 
-`git` is not built in. Register the explicit adapter from `kompjutr/git/shell`:
+`git` is not built in. Register the explicit adapter from
+`@kompjutr/do/git-shell`:
 
 ```ts
-import { createGitCommand } from "kompjutr/git/shell";
-import { createShell } from "kompjutr/shell";
+import { createGitCommand } from "@kompjutr/do/git-shell";
+import { createShell } from "@kompjutr/do/shell";
 
 const shell = createShell({
   fs: workspace.filesystem,
@@ -219,4 +220,4 @@ is the standing admission gate for future shell syntax and commands; see
 
 The completed design and historical measurements remain in the
 [archived shell plan](../archive/plans/shell.md). Agent-facing implementation
-rules are in [`src/shell/CLAUDE.md`](../../src/shell/CLAUDE.md).
+rules are in [`packages/do/src/shell/CLAUDE.md`](../../packages/do/src/shell/CLAUDE.md).

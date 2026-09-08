@@ -28,7 +28,7 @@ remote rename, separate push-URL management, or tracking-ref cleanup on remove.
 
 ## Touch points
 
-`src/core/ops/config.ts`, `src/core/ops/refs.ts`, `src/git/client.ts`,
+`packages/git/src/ops/refs/config.ts`, `packages/git/src/ops/refs/refs.ts`, `packages/git/src/client.ts`,
 `tests/refs.test.ts`, `tests/client.test.ts`
 
 <!-- Required first-contact subset shipped 2026-08-28; this file retains only the no-caller remainder. -->

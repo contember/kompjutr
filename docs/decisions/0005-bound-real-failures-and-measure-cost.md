@@ -56,21 +56,22 @@ structure.
 
 Two budgets satisfy the rule and are part of the contract:
 
-- `src/shell/exec/context.ts` — `RetainedBudget` charges the real byte length of
+- `packages/do/src/shell/exec/context.ts` — `RetainedBudget` charges the real byte length of
   intermediate pipeline buffers and releases each reservation when the buffer
   leaves scope. It is a documented shell limit
   ([ADR-0018](0018-compile-shell-commands-to-bounded-queries.md),
   [ADR-0019](0019-admit-a-bounded-posix-shell-surface.md)).
-- `src/git/ops/integration/integration-limits.ts` — `maxPlanBytes` is supplied by
+- `packages/git/src/ops/integration/integration-limits.ts` — `maxPlanBytes` is supplied by
   the caller and converted into remaining text-merge output capacity. Absent a
   caller value, the text-merge output ceiling still bounds the result.
 
 Five charge modeled object sizes and are debt, not contract:
-`src/git/ops/push/push-plan-types.ts` (`COMMIT_ENTRY_BYTES`, `MAP_ENTRY_BYTES`,
+`packages/git/src/ops/push/push-plan-types.ts` (`COMMIT_ENTRY_BYTES`, `MAP_ENTRY_BYTES`,
 and a `PushRetainedTracker` with reservation transfer and ownership),
-`src/git/ops/status/status-full.ts`, `src/git/ops/status/rename-detection.ts`,
-`src/git/ops/rebase/rebase-plan.ts`, and
-`src/git/ops/staging/staging-selected-validation.ts`.
+`packages/git/src/ops/status/status-full.ts`,
+`packages/git/src/ops/status/rename-detection.ts`,
+`packages/git/src/ops/rebase/rebase-plan.ts`, and
+`packages/git/src/ops/staging/staging-selected-validation.ts`.
 
 Four of the five sit on top of a structural count cap that already bounds the
 same structure — 512 commits and 100,000 objects for push, 10,000 candidates for

@@ -16,9 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprint-2026-09-07-scoped-packages-and-local-runtime.md`](sprints/sprint-2026-09-07-scoped-packages-and-local-runtime.md)
-  — five scoped packages and a crash-recoverable Unix local runtime, with the
-  current DOFS performance path as a hard regression gate.
+- None.
 
 ## Specs
 
@@ -36,10 +34,11 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- The trusted-store restructure and its clone follow-up are complete. Clone is
-  back under the statement target at 906 SQL / 78,558 rows; the attribution and
-  current median-of-three snapshot are in
-  [`benchmark-current`](reference/benchmark-current.md#clone-statement-profile).
+- Five lockstep `@kompjutr/*` packages now separate shared contracts, generic
+  Git, the Durable Object runtime, and a crash-recoverable Unix local runtime.
+  The final package-split comparison preserved every operation's SQL/row profile
+  and reduced total workflow median time by 5.416%; see
+  [`benchmark-current`](reference/benchmark-current.md).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0015).
 - Three tranches from the 2026-09-02 Git-in-SQLite architecture review are
@@ -100,6 +99,9 @@ decodes an old number found in `archive/` or `specs/`.
 
 ## Historical records
 
+- [`archive/sprint-2026-09-07-scoped-packages-and-local-runtime.md`](archive/sprint-2026-09-07-scoped-packages-and-local-runtime.md)
+  — five scoped packages, the preserved Durable Object path, and a
+  crash-recoverable Unix local composition.
 - [`archive/sprint-2026-09-02-trusted-reads-and-linear-journal.md`](archive/sprint-2026-09-02-trusted-reads-and-linear-journal.md)
   — transaction-owned local Git mutations, linear durable operation
   transitions, and trusted plain projections over explicit write premises.

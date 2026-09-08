@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Scoped packages and local runtime](sprint-2026-09-07-scoped-packages-and-local-runtime.md)
+  — five lockstep packages, the preserved Durable Object path, and a
+  crash-recoverable Unix local composition.
 - [Trusted reads and linear journal](sprint-2026-09-02-trusted-reads-and-linear-journal.md)
   — transaction-owned local Git mutations, linear durable operation transitions,
   and trusted plain projections over explicit write premises.

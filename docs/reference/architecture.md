@@ -1,44 +1,64 @@
 # Architecture
 
-## Runtime composition
+## Package and runtime composition
 
-One `Workspace` creates one `Database` over Durable Object storage. The
-filesystem is available immediately; the Git database and client are created on
-first access. Both domains use the same SQLite database.
+Five lockstep packages separate shared contracts, the generic Git engine, and
+the two runtime compositions:
+
+```text
+@kompjutr/sqlite    synchronous SQLite contracts, errors, limits, codecs
+@kompjutr/drive     synchronous working-tree contracts and capability receipts
+        │
+        └──── @kompjutr/git       generic Git engine
+                    │
+                    ├── @kompjutr/do      Worker composition
+                    └── @kompjutr/local   Unix Node.js composition
+```
+
+`@kompjutr/git/do-fs` is an isolated integration subpath used only by
+`@kompjutr/do`. It owns mixed Git/filesystem SQL and receipt consumers that must
+not enter the generic Git graph.
+
+One Durable Object `Workspace` creates one `Database` over Durable Object
+storage. The filesystem is available immediately; the Git database and client
+are created on first access. Both domains use the same SQLite database.
 
 ```text
 DurableObjectStorageLike
-└── db/Database                    SQL adapter and transaction boundary
-    ├── fs/Filesystem              fs_* schema and bulk filesystem operations
+└── @kompjutr/do Database          SQL adapter and transaction boundary
+    ├── Filesystem                 fs_* schema and bulk filesystem operations
     │   └── NodeFsCompat           synchronous Node-shaped facade
-    └── git/SqliteGitDatabase      git_* schema and repository registry
+    └── SqliteGitDatabase          git_* schema and repository registry
         └── Git client             operations, CLI adapter, Smart HTTP
 
-shell/                             separate query surface over Filesystem
-runtime/Workspace                  composition and optional ProcessHost
+@kompjutr/do/shell                 separate query surface over Filesystem
+@kompjutr/do Workspace             composition and optional ProcessHost
 ```
 
-`src/db/` is the shared storage kernel. It defines the structural SQLite
-interfaces, normalizes rows and SQLite size failures, delegates synchronous
-transactions to Durable Object storage, and owns routing limits shared by the
-filesystem and Git. `GitError` originates there because SQLite error
-normalization is below the Git domain; `git/common/errors.ts` re-exports it and
-adds Git-specific subclasses.
+`@kompjutr/sqlite` is the shared storage contract. It defines structural SQLite
+interfaces, normalizes rows and SQLite size failures, and owns routing limits
+shared by both runtime graphs. `GitError` originates there because SQLite error
+normalization sits below the Git domain; Git re-exports it and adds specific
+subclasses.
 
-The package exports `kompjutr`, `/fs`, `/git`, `/git/shell`, `/shell`, and
-`/testing`. The shell is not a `Workspace` property. A
-consumer injects Git into the shell through the explicit `kompjutr/git/shell`
-adapter.
+There is no unscoped compatibility facade. The DO package exports `.`, `/fs`,
+`/shell`, `/git-shell`, and `/testing`. The shell is not a `Workspace` property.
+A consumer injects Git through the explicit `@kompjutr/do/git-shell` adapter.
+
+`LocalWorkspace` uses `NodeSqliteDatabase` for Git state and `DiskDrive` for the
+working tree. Both share one `RecoveryCoordinator` as their opaque mutation
+scope. Virtual `/` maps to the configured host root. The SQLite database, lock,
+recovery generations, and traversal spill runs remain outside that root.
 
 ## Domains and dependency direction
 
-The source tree has three behavior domains over the database kernel:
+The DO package has two behavior domains over the shared database contract:
 
 - `fs/` owns POSIX-shaped paths, nodes, content chunks, handles, and bulk file
   operations.
 - `shell/` parses, plans, and executes bounded commands over `Filesystem`.
-- `git/` owns Git objects, packs, refs, checkouts, protocol, operations, and
-  public Git surfaces.
+- `@kompjutr/git` owns Git objects, packs, refs, checkouts, protocol, operations,
+  and public Git surfaces.
 
 Git is layered bottom-up:
 
@@ -48,8 +68,9 @@ common → diff | ignore | protocol → store → ops → client / cli / exports
 
 `diff`, `ignore`, and `protocol` are independent peers. The store never imports
 ops. Persisted journal codecs and capability contracts therefore live in the
-store. Cross-domain dependencies also point down: `db` imports no domain, `fs`
-uses only `fs` and `db`, and `shell` uses only `shell`, `fs`, and `db`.
+store. Cross-package dependencies also point down: SQLite and drive contracts
+import no runtime, generic Git imports only those contracts, and the DO and
+local packages depend on generic Git rather than on each other.
 
 Within a layer, cohesive command and table families live in semantic
 subdirectories. These folders do not add dependency ranks. No source directory
@@ -71,6 +92,44 @@ filesystem revision per public mutation. Scans use indexed path ranges and
 keyset cursors. Discovery returns revision-bearing regular-file handles; batched
 reads revalidate every handle before exposing content.
 
+## Local disk and recovery
+
+`DiskDrive` resolves virtual paths component by component and rejects ancestor
+symlinks that leave the host root when observed. Pure Node cannot make the
+subsequent path-based call atomic with that check, so processes that ignore the
+lifetime lock must not replace directory topology concurrently. DiskDrive
+streams trees in Git UTF-8 order. Wide directories are sorted in fixed-size runs
+under the state directory and merged with bounded fan-in; a fixed aggregate
+frontier budget also spills deep traversals. The worktree is never materialized
+as one path array.
+
+Exact directory aliases are rejected by device and inode identity. Portable Node
+APIs do not identify bind-mounted ancestry, so pre-existing aliases of nested
+worktree, state, or recovery directories are unsupported.
+
+Local metadata observations use revisions leased from an independently committed
+SQLite database, so outer Git rollback cannot reissue a live lease. Disk
+`contentId` is always `null`, so Git rehashes content rather than trusting inode,
+size, or timestamp equality.
+
+Each coupled mutation starts `BEGIN IMMEDIATE` in the Node adapter and prepares
+an undo transaction in the recovery directory. The journal records synced,
+checksum-framed intents before a first-touch backup rename or temporary
+replacement. A device check and durably journaled live rename probe qualify each
+distinct worktree-parent/recovery pair. The SQLite recovery generation is
+published in the same commit as Git state. Reopen compares that generation with
+pending journals, then idempotently rolls disk state backward or forward before
+exposing the workspace.
+
+The state database persists the canonical root and recovery-directory identity.
+Reopen rejects a mismatch before settlement. A root-keyed SQLite database beside
+the worktree holds an exclusive transaction for the workspace lifetime, so
+different state configurations contend; process exit releases the lock without
+stale-owner takeover.
+
+Transaction SQL exists only in `@kompjutr/local`. Shared and Worker-facing code
+calls `transactionSync()` and never emits `BEGIN`, `COMMIT`, or `ROLLBACK`.
+
 ## Git storage and ownership
 
 Several repositories can share one database. Each repository can have several
@@ -84,7 +143,7 @@ view, and nested checkout roots are excluded from parent worktree scans.
 | Source surrogate | `git_tree_entries` for one exact loose or packed tree source |
 | Synchronous scratch transaction | named scratch indexes; rows never survive the callback and are not maintenance roots |
 
-`git/store/index.ts` is the facade. `store/database/` owns schema initialization
+`packages/git/src/store/index.ts` is the facade. `store/database/` owns schema initialization
 and repository/checkout routing. `store/repository/` composes repository-owned
 families. `store/checkout/` composes a checkout-bound store. Other table-family
 directories own objects, refs, config, shallow state, fetch publication,
@@ -95,7 +154,9 @@ Operation plans are immutable after creation. A transition may change only `phas
 the current step's `outcome` and `result_oid`, and the bounded conflict
 snapshot.
 
-There is no `.git` directory and no external filesystem runtime.
+Neither runtime creates a `.git` directory. The Durable Object composition has
+no external filesystem runtime; the local composition intentionally uses its
+configured host working tree.
 
 ## Trusted-store contract
 
@@ -264,9 +325,9 @@ Architecture rules are executable checks:
   identity, and whole-journal topology/object authentication without banning
   schema, write, ingest, stale-handle, JSON-ordinal, or exact algorithmic
   boundaries.
-- The source-file ceiling witness rejects any `src/**/*.ts` file at or above 500
+- The source-file ceiling witness rejects any `packages/*/src/**/*.ts` file at or above 500
   lines.
-- The same source-structure witness rejects any directory under `src/` with more
+- The same source-structure witness rejects any directory under `packages/*/src/` with more
   than 20 direct TypeScript files.
 
 Behavior remains covered by Git parity, filesystem conformance, end-to-end

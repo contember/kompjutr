@@ -82,14 +82,12 @@ acceptance witness of the listed verified finding.
 |---|---|
 | DOCS-3 | Identify the real owner of each structural cap; do not delete `MAX_REFLOG_STATE_ROWS` if it still bounds a public materialized result. |
 | DOCS-4 | Compare every README implementation-status claim with current reference and archived sprint outcomes. |
-| DOCS-5 | Compare the `src/git/store/CLAUDE.md` map with current ownership-bearing modules, without turning it into a file inventory. |
+| DOCS-5 | Compare the `packages/git/src/store/CLAUDE.md` map with current ownership-bearing modules, without turning it into a file inventory. |
 | DOCS-8 | Decide whether root invariant 4 and ADR-0004 govern all domains or only the Git store before changing filesystem checks. |
 | DOCS-9 | ~~Reconcile ADR-0014's statement that fetch cannot deepen a clone with shipped deepen and unshallow support.~~ Resolved in the 2026-09-04 ADR rewrite: ADR-0014 now records that the premise lapsed and why the decision survives it. |
 | DOCS-10 | Establish which synchronous APIs return `EPROMISED` and which asynchronous operations hydrate before documenting it. |
 | DOCS-11 / DOCS-12 | Re-check the headers of `shared.ts`, `database.ts`, and `operations.ts` against current ownership. |
-| DOCS-13 | Inventory obsolete `src/core/` and `src/sqlite/` paths in living docs; do not rewrite historical archive records merely for age. |
 | DOCS-14 | Find a reproducible artifact for the exact 54,423,552-byte memory claim or replace the unsupported precision. |
-| DOCS-15 | Reconcile `docs/INDEX.md` calling the trusted-domain spec an active target while no sprint is active. |
 | Stale schema-version wording | Determine whether any persisted compatibility requirement remains before removing the `schema v5` contract text. |
 
 ## Test candidates

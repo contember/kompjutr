@@ -1,9 +1,16 @@
 # Release process
 
-kompjutr uses Node.js 24 and npm 11 for maintainer checks and packaging. The
-published JavaScript targets Cloudflare Workers with SQLite-backed Durable
-Objects. The package has no runtime peer dependency; every entry must load on
-its own.
+kompjutr uses Node.js 24 and npm 11 for maintainer checks and packaging. Five
+public packages share one version:
+
+1. `@kompjutr/sqlite`
+2. `@kompjutr/drive`
+3. `@kompjutr/git`
+4. `@kompjutr/do`
+5. `@kompjutr/local`
+
+The first four have Worker-safe entry graphs. `@kompjutr/local` is Unix-only and
+requires Node.js 24. There is no unscoped `kompjutr` package.
 
 ## Continuous integration
 
@@ -16,10 +23,15 @@ Pull requests and pushes to `main` run these gates on `ubuntu-latest`:
 5. `npm run build`
 6. `npm run package:smoke`
 
-The package smoke command rebuilds the package, runs `npm pack` once, and installs
-that exact tarball into a temporary consumer, which imports `kompjutr`,
-`kompjutr/fs`, `kompjutr/git`, `kompjutr/shell`, and `kompjutr/testing`. The
-command removes the consumer even when a check fails.
+The package smoke command rebuilds all package projects and runs `npm pack --json`
+for each package. It rejects version drift, mismatched internal
+dependency versions, unexpected artifacts, TypeScript source, and build state.
+It installs the five exact tarballs together in a Node consumer and the four
+Worker-facing tarballs in a separate consumer with no ambient Node types. It
+verifies that every scoped package resolved from those tarballs, type-checks all
+public entries, checks runtime imports, and proves the retired unscoped facade is
+not available. The command removes its temporary consumers even when a check
+fails.
 
 `npm run test:full` covers every Vitest file in bounded root shards plus separate
 filesystem, shell, and end-to-end slices. This keeps each worker pool short-lived
@@ -34,15 +46,21 @@ in `bench/CLAUDE.md`.
 
 Package publication is CI-only:
 
-1. Set a real package version. The placeholder `0.0.0` cannot be released.
+1. Set the same real version in all five package manifests. The placeholder
+   `0.0.0` cannot be released.
 2. Merge the version change after the normal CI gates pass.
 3. Create and push the matching tag `v<package-version>`.
-4. The release workflow checks that the tag and package version match, repeats
-   every CI gate, creates one tarball, and tests that exact artifact.
+4. The release workflow checks that the tag and all five package versions
+   match, repeats every CI gate, creates five tarballs, and tests those exact
+   artifacts together. A retry skips an already published package only when the
+   registry integrity matches the verified tarball, so a partial publication can
+   resume without accepting different bytes under the same version.
 5. GitHub holds the publish job at the protected `npm` environment. After its
-   configured approval and protection rules pass, the job publishes the verified
-   tarball to npm with provenance.
+   configured approval and protection rules pass, the job publishes the
+   verified tarballs with provenance, in dependency order: SQLite, drive, Git,
+   DO, local.
 
-The `npm` GitHub environment and npm trusted-publisher configuration are release
-prerequisites. The publish job uses OIDC and npm 11; it does not use a long-lived
-npm token. Never run `npm publish` from a maintainer workstation.
+The `npm` GitHub environment, npm scope ownership, and trusted-publisher
+configuration for each package are release prerequisites. The publish job uses
+OIDC and npm 11; it does not use a long-lived npm token. Never run `npm publish`
+from a maintainer workstation.

@@ -26,15 +26,18 @@ losslessly.
 
 ## Decision
 
-Paths must be well-formed UTF-8 in both domains, and each domain enforces it at
-one chokepoint.
+Paths must be well-formed UTF-8 in both runtime compositions, and each drive
+enforces it at one chokepoint.
 
 - Git: every tree ingestion and authoritative tree-row read decodes names
   fatally and fails with a stable `EUNSUPPORTED` before publishing an invalid
   loose or packed tree.
-- Filesystem: `src/fs/store/resolve.ts` is the sole producer of a `RealPath` and
-  therefore the single place a caller path is checked. A path that is not
-  well-formed fails with `EINVAL`.
+- DO filesystem: `packages/do/src/fs/store/resolve.ts` is the sole producer of a
+  `RealPath` and therefore the single place a caller path is checked.
+- Local disk: `packages/local/src/paths.ts` resolves every virtual path before
+  host access and rejects malformed names and escaping symlinks.
+
+A caller path that is not well-formed fails with `EINVAL`.
 
 Public paths remain JavaScript strings.
 

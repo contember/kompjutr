@@ -1,13 +1,16 @@
 # Trusted-store domain architecture
 
-Accepted 2026-08-30. The authoritative target for the restructure sprint
+Accepted 2026-08-30. This remains the trust-model and Git-layering record for the restructure sprint
 ([`../archive/sprint-2026-08-30-trusted-store-and-domain-restructure.md`](../archive/sprint-2026-08-30-trusted-store-and-domain-restructure.md), shipped).
-Decisions behind it: [ADR-0018](../decisions/0018-trust-stored-rows-validate-at-the-boundary.md)
-(trust model) and [ADR-0019](../decisions/0019-organize-source-by-domain-with-bottom-up-layers.md)
+Decisions behind it: [ADR-0004](../decisions/0004-trust-stored-rows-validate-at-the-boundary.md)
+(trust model) and [ADR-0002](../decisions/0002-organize-source-by-domain-with-bottom-up-layers.md)
 (layout). By user direction this design is not subject to architecture review;
 the test suite is the only gate.
 
-## Target tree
+Its package layout and public-surface sections are superseded by
+[`scoped-packages-and-local-runtime.md`](scoped-packages-and-local-runtime.md).
+
+## Historical target tree (superseded)
 
 ```text
 src/
@@ -55,9 +58,9 @@ structural caps live beside the seams they bound.
 | Journal codecs in the legacy merge and operation state modules | persisted-format half moves to `src/git/store/operations.ts`; op logic stays in `ops/` |
 | `IndexEntry` and legacy sparse-workspace capability contracts | `src/git/store/contracts.ts` |
 
-Public package exports (`kompjutr`, `kompjutr/fs`, `kompjutr/git`,
-`kompjutr/shell`, `kompjutr/compat/computer`) are byte-stable across the whole
-restructure; `tests/public-exports.test.ts` is the witness.
+This historical restructure kept the then-current unscoped exports stable. The
+later scoped-package specification deliberately removed them and defines the
+current `@kompjutr/*` surface.
 
 ## Trust model (ADR-0018 applied)
 
@@ -158,5 +161,5 @@ The rules are tests, not conventions:
 The final layout adds `src/db/` below the domains for the shared SQLite adapter,
 error normalization, and routing limits. `GitError` is defined in `db/db.ts`
 because SQLite error normalization lives in that kernel, then re-exported by
-`git/common/errors.ts`. [ADR-0019](../decisions/0019-organize-source-by-domain-with-bottom-up-layers.md)
+`git/common/errors.ts`. [ADR-0002](../decisions/0002-organize-source-by-domain-with-bottom-up-layers.md)
 is the living record for the final tree and enforced dependency rules.

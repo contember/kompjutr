@@ -8,6 +8,33 @@ with `EREENTRANT`; internal owned seams compose without reacquiring the guard.
 The successful owner deletes the row before commit, and rollback leaves no
 committed guard.
 
+## Runtime transaction owners
+
+In `@kompjutr/do`, `Database.transactionSync()` delegates every nesting level to
+Durable Object storage. Git and the relational filesystem use that same database
+and the storage object is their opaque mutation scope.
+
+In `@kompjutr/local`, one lifetime process lock excludes a second local writer.
+The lock is an exclusive transaction in a root-keyed SQLite database beside the
+worktree and is released by the kernel when its process exits. Alternate state
+configurations therefore contend. `NodeSqliteDatabase.transactionSync()` owns
+`BEGIN IMMEDIATE`, `COMMIT`, and `ROLLBACK`; nested calls join the outer transaction. The database and
+`DiskDrive` share one `RecoveryCoordinator` as their mutation scope. Disk
+changes are backed up before application, and the committed SQLite recovery
+generation decides rollback or roll-forward after a crash or uncertain commit.
+The lock, SQLite files, undo generations, and traversal spills stay outside the
+worktree.
+
+`transactionSync()` rejects a returned thenable at runtime, rolls back, and
+poisons the adapter before the continuation can publish in autocommit mode.
+Observation revisions are leased through an independent SQLite transaction so
+an outer Git rollback cannot make a lease reusable.
+
+Coupled Git operations compare opaque mutation-scope identity before their first
+database, drive, or network publication and recheck at central drive-writing
+seams. Git-only forms remain valid without a writable drive scope: cached
+removal, non-hard reset, and dry-run clean do not require the check.
+
 A returned `Promise` does not by itself make an operation concurrent. `clone`,
 `fetch`, `push`, `pull`, the repack phase of `maintenance`, and content
 operations that hydrate promised blobs await after they have opened repository
@@ -194,12 +221,12 @@ reason to invalidate an otherwise correct durable outcome.
 | Concurrent maintenance | [`concurrency-maintenance.test.ts`](../../tests/concurrency-maintenance.test.ts): selected owner to pending barrier, same-runtime `EBUSY`, once-only finalization, and cold selected/pending/published settlement. | Owner prefix/tail and rival calls are measured separately; every settled state is read through a fresh `Workspace`. |
 
 The implementation seams are
-[`network.ts`](../../src/git/ops/network/network.ts),
-[`push.ts`](../../src/git/ops/push/push.ts),
-[`pull.ts`](../../src/git/ops/network/pull.ts),
-[`maintenance.ts`](../../src/git/ops/repository/maintenance.ts), and
-[`packs.ts`](../../src/git/store/pack/packs.ts), with durable ownership in the
-[`store/`](../../src/git/store/) families.
+[`network.ts`](../../packages/git/src/ops/network/network.ts),
+[`push.ts`](../../packages/git/src/ops/push/push.ts),
+[`pull.ts`](../../packages/git/src/ops/network/pull.ts),
+[`maintenance.ts`](../../packages/git/src/ops/repository/maintenance.ts), and
+[`packs.ts`](../../packages/git/src/store/pack/packs.ts), with durable ownership in the
+[`store/`](../../packages/git/src/store/) families.
 
 ## Deterministic test model
 

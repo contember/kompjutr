@@ -21,16 +21,17 @@ its own, because either could change rows the other believed it owned.
 
 ## Decision
 
-We own the filesystem, Git store, and workspace runtime over one Durable Object
+`@kompjutr/do` owns the filesystem and workspace runtime over one Durable Object
 SQLite database. Paths, file content, Git objects, refs, the index, and packs
 are rows in that database. Bulk, paged, and streaming operations are the
-first-class API.
+first-class API. `@kompjutr/local` is a separate composition over the generic Git
+engine and does not change DO storage ownership.
 
-No file under `src/` imports `@cloudflare/computer`, and
+No source file imports `@cloudflare/computer`, and
 `tests/import-graph.test.ts` enforces that. Exactly two deliberate contact
 points remain:
 
-- `src/fs/import.ts` — a one-time, in-database migration that reads Computer's
+- `packages/do/src/fs/import.ts` — a one-time, in-database migration that reads Computer's
   v5 `vfs_*` tables and moves a working tree into `fs_*`. It is the only
   production module that reads `vfs_*`, and it requires an explicit caller
   acknowledgement that the provider is quiescent, because pending file
@@ -42,8 +43,9 @@ points remain:
 - Every operation is built on bulk, paged primitives whose cost is measured in
   `bench/` ([ADR-0005](0005-bound-real-failures-and-measure-cost.md)) instead of
   degrading per path.
-- The runtime needs no `.git` directory and no external filesystem
-  implementation.
+- The DO runtime needs no `.git` directory and no external filesystem
+  implementation. The local runtime also creates no `.git`, but intentionally
+  maps its working tree to host disk.
 - The project owns POSIX semantics, schema shape, pack storage, and the
   corresponding conformance burden.
 - An existing Computer working tree gets a one-way migration, not a
