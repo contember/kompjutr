@@ -16,7 +16,14 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- None.
+- [`sprints/sprint-2026-09-08-public-api-correctness.md`](sprints/sprint-2026-09-08-public-api-correctness.md)
+  — four reproduced public-API failures of the local composition: object buffer
+  ownership, nested transaction failure, repeated path mutations, and regular-file
+  discovery. Consumes backlog 67–69 and the discovery half of 70.
+- [`sprints/sprint-2026-09-08-lifecycle-and-network-integrity.md`](sprints/sprint-2026-09-08-lifecycle-and-network-integrity.md)
+  — nothing is deleted or published before its physical bytes are proven present:
+  promise fulfillment versus maintenance marks, pack dependencies across the pack
+  lifecycle, and fetched-graph connectivity. Consumes backlog 71–73.
 
 ## Specs
 
@@ -41,6 +48,12 @@ decisions → reference → archive.
   [`benchmark-current`](reference/benchmark-current.md).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0015).
+- The 2026-09-08 architecture-review follow-up is filed in
+  [`backlog/67–80`](backlog/README.md#2026-09-08-review-intake), with explicit
+  separation of valid public API failures, malformed-input validation, store-only
+  reproductions, and unmeasured scaling findings. Existing findings were refined
+  in [`65`](backlog/65-git-sqlite-architecture-review.md) and
+  [`63`](backlog/63-bound-packed-dependency-graph-traversal.md).
 - Three tranches from the 2026-09-02 Git-in-SQLite architecture review are
   complete: storage/publication safety, Git result and scale correctness, then
   transaction-owned local mutations with trusted ordinary reads. Remaining
