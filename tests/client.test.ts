@@ -1354,12 +1354,38 @@ describe("git client", () => {
     expect(utf8Decoder.decode(warm.bytes)).toBe("abc");
     warm.bytes[1] = 0x79;
     expect(utf8Decoder.decode((await git.catFile({ oid })).bytes)).toBe("abc");
-    await git.maintenance({ dir: "/" });
     const cold = reopenGit(workspace.storage);
-    const packed = await cold.catFile({ oid });
-    expect(utf8Decoder.decode(packed.bytes)).toBe("abc");
-    packed.bytes[1] = 0x7a;
+    const reread = await cold.catFile({ oid });
+    expect(utf8Decoder.decode(reread.bytes)).toBe("abc");
+    reread.bytes[1] = 0x7a;
     expect(utf8Decoder.decode((await cold.catFile({ oid })).bytes)).toBe("abc");
+  });
+
+  it("owns object bytes read out of a pack", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("README.md", "# remote\n");
+    fixture.commit("remote work");
+    const server = await startGitServer(fixture.dir);
+    try {
+      const { workspace, storage } = makeWorkspace();
+      await workspace.git.clone({ url: server.url, dir: "/" });
+      expect(storage.db.prepare("SELECT COUNT(*) AS n FROM git_pack_objects").get()).toEqual({
+        n: 3,
+      });
+      const oid = fixture.git("rev-parse", "HEAD:README.md");
+      const packed = await workspace.git.catFile({ oid });
+      expect(utf8Decoder.decode(packed.bytes)).toBe("# remote\n");
+      packed.bytes[2] = 0x78;
+      expect(utf8Decoder.decode((await workspace.git.catFile({ oid })).bytes)).toBe("# remote\n");
+      const cold = reopenGit(storage);
+      const again = await cold.catFile({ oid });
+      expect(utf8Decoder.decode(again.bytes)).toBe("# remote\n");
+      again.bytes[2] = 0x79;
+      expect(utf8Decoder.decode((await cold.catFile({ oid })).bytes)).toBe("# remote\n");
+    } finally {
+      await server.close();
+    }
   });
 
   it("keeps the maximal public scratch snapshot below the SQL budget", async () => {
