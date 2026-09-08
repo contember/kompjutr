@@ -295,3 +295,30 @@ gate is proportionate to its unit's blast radius.
   against `LocalWorkspace`) rather than `tests/rebase.test.ts` and
   `tests/ignore.test.ts`, and WU2's public-boundary witness lives in
   `tests/client.test.ts` beside the rest of the public client surface.
+- 2026-09-08 — **Independent review of WU1 and WU2 found the first WU2 fix was a
+  no-op.** `Buffer.prototype.slice()` is Node's alias for `subarray()`, so it
+  returns a view; `node:fs` hands callers a `Buffer`, and every witness had built
+  its input with `utf8.encode()`. The batch writer carried the same hole and was
+  worse — its flush is deferred, so a mutation between `batch.write()` and the
+  flush is *persisted* under a clean OID. Closed with a shared `ownedBytes()` in
+  the bytes kit, applied at every ownership snapshot (`objects-write.ts`,
+  `objects-batch.ts`, `client-plumbing.ts`, `blob-ids.ts`,
+  `pack-ingest-index.ts`), and witnessed with a `Buffer` through
+  `LocalWorkspace`. The sprint's premise that "the batch writer already copies"
+  was false for the composition the sprint is about.
+- 2026-09-08 — Review of WU1: `total_changes()` is blind to DDL, so a nested
+  scope that created a table and then threw stayed committed. Effect detection
+  now reads `schema_version` in the same statement, so the cost is unchanged.
+  `diskEffects` had no dedicated witness — every disk test also changed rows —
+  and `diskChanged` was redundant with `diskEffects > 0` while letting a stub
+  express a state the coordinator cannot reach; both fixed.
+- 2026-09-08 — Review of WU1: the first contract wording ("leave no effect
+  behind") hid what the local escape clause actually does — the failed scope's
+  rows stay readable inside the transaction until the commit is refused, where
+  the Durable Object has already removed them. Reworded, and
+  `reference/concurrency.md` now records both runtimes.
+- 2026-09-08 — Review of WU2 measured the cost of unconditional ownership
+  copies: `catFile` of a 48 MiB blob now peaks near 96 MiB, and a scalar write
+  above the cache's entry limit copies bytes the cache then drops. The rule is
+  right (a cold read is cached too, so the boundary cannot tell), the number is
+  not. → backlog 81.
