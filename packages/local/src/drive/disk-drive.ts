@@ -262,6 +262,8 @@ export class DiskDrive implements GitDrive {
       filesOnly: true,
       pruneDirectory: isExcluded,
     })) {
+      // A discovery page hands out regular-file handles; `filesOnly` still yields symlinks.
+      if (entry.type !== "file") continue;
       if (options.after !== undefined && comparePaths(entry.path, options.after) <= 0) continue;
       if (isExcluded(entry.path)) continue;
       if (!matches.test(entry.path)) continue;

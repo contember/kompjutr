@@ -1,11 +1,46 @@
-import { closeSync, mkdirSync, openSync, readdirSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
 import { classifyDirectoryEntry } from "../../packages/local/src/drive/external-sort.js";
+import { TestDatabase } from "../helpers/db.js";
 import { localFixture } from "./helpers.js";
 
 describe("DiskDrive ordered traversal", () => {
+  it("discovers regular files only, exactly as the Durable Object twin does", () => {
+    const fixture = localFixture();
+    mkdirSync(join(fixture.root, "dir"));
+    writeFileSync(join(fixture.root, "dir", "nested.txt"), "nested");
+    writeFileSync(join(fixture.root, "file.txt"), "content");
+    symlinkSync("file.txt", join(fixture.root, "link.txt"));
+    symlinkSync("nowhere.txt", join(fixture.root, "dangling.txt"));
+    const workspace = fixture.workspace();
+    const durable = createFilesystem(new TestDatabase(), { now: () => 1_700_000_000_000 });
+    durable.writeFiles(
+      [
+        { path: "/dir/nested.txt", bytes: new TextEncoder().encode("nested") },
+        { path: "/file.txt", bytes: new TextEncoder().encode("content") },
+      ],
+      { parents: true },
+    );
+    durable.symlink("file.txt", "/link.txt");
+    durable.symlink("nowhere.txt", "/dangling.txt");
+    try {
+      const local = workspace.drive.discoverFiles(workspace.drive.realpath("/"), "*.txt");
+      expect(local.handles.map((handle) => handle.path)).toEqual(["/dir/nested.txt", "/file.txt"]);
+      expect(
+        durable.discoverFiles(durable.realpath("/"), "*.txt").handles.map((handle) => handle.path),
+      ).toEqual(local.handles.map((handle) => handle.path));
+      expect(
+        workspace.drive.scan("/", { limit: 10, filesOnly: true }).map((entry) => entry.path),
+      ).toContain("/link.txt");
+    } finally {
+      workspace.close();
+      fixture.dispose();
+    }
+  });
+
   it("orders direct file and directory names without traversal markers", () => {
     const fixture = localFixture();
     mkdirSync(join(fixture.root, "a"));

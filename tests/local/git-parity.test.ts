@@ -319,4 +319,48 @@ describe("LocalWorkspace Git parity", () => {
       fixture.dispose();
     }
   });
+  it("treats every symlinked .gitignore as absent, exactly as Git does", async () => {
+    const topologies = {
+      "in-root": "sub/rules",
+      dangling: "nowhere/rules",
+      escaping: "../outside/rules",
+    };
+    for (const [name, target] of Object.entries(topologies)) {
+      const fixture = localFixture();
+      const mirrorRoot = join(fixture.base, "mirror");
+      mkdirSync(mirrorRoot);
+      mkdirSync(join(fixture.base, "outside"));
+      writeFileSync(join(fixture.base, "outside", "rules"), "ignored.txt\n");
+      const mirror = new GitFixture(mirrorRoot).init();
+      const workspace = fixture.workspace({
+        now: () => FIXED_TIME,
+        timezoneOffset: () => 0,
+        defaultGitIdentity: IDENTITY,
+      });
+      try {
+        await workspace.git.init();
+        for (const dir of [workspace.root, mirror.dir]) {
+          mkdirSync(join(dir, "sub"));
+          writeFileSync(join(dir, "sub", "rules"), "ignored.txt\n");
+          writeFileSync(join(dir, "ignored.txt"), "ignored\n");
+          writeFileSync(join(dir, "visible.txt"), "visible\n");
+          symlinkSync(target, join(dir, ".gitignore"));
+        }
+        const status = await workspace.git.runCli({ argv: ["status", "--porcelain=v2"], cwd: "/" });
+        expect(status.exitCode, `${name} status`).toBe(0);
+        expect(status.stdout.trimEnd()).toBe(mirror.git("status", "--porcelain=v2"));
+        await workspace.git.add({ paths: ["."] });
+        mirror.git("add", "--", ".");
+        const staged = await workspace.git.runCli({
+          argv: ["status", "--porcelain=v2"],
+          cwd: "/",
+        });
+        expect(staged.stdout.trimEnd()).toBe(mirror.git("status", "--porcelain=v2"));
+      } finally {
+        workspace.close();
+        mirror.dispose();
+        fixture.dispose();
+      }
+    }
+  });
 });
