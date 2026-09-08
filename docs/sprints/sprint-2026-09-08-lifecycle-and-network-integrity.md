@@ -24,18 +24,19 @@ Consumes backlog [71](../backlog/71-invalidate-maintenance-on-promise-fulfillmen
 
 ## Refs re-verified at HEAD (2026-09-08)
 
-`✔` = confirmed live · `⚠` = drift/nuance caught. Everything below is static
-verification; unlike the public-API sprint, none of these three has a planning-
-time runtime reproduction through public operations. Producing one is the first
-task of each unit.
+`✔` = confirmed live · `⚠` = drift/nuance caught. This planning pass verified code
+statically; it did not rerun the prior runtime observations recorded in the
+backlog. Each unit first establishes permanent deterministic witnesses under its
+declared verify-first gate.
 
 - ✔ Marking skips an edge whose target is a missing promised blob —
   `packages/git/src/store/maintenance/reachability/reachability-publish.ts:87`.
 - ✔ Loose publication removes the promise through a trigger —
   `packages/git/src/store/schema/schema-object-statements.ts:45-52`; complete pack
   publication deletes it directly — `packages/git/src/store/pack/packs.ts:233`.
-- ✔ Neither advances the maintenance root epoch. The bump has one implementation
-  (`packages/git/src/store/maintenance/control.ts:60-75`) and its callers are
+- ✔ Neither promise-fulfillment path advances the maintenance root epoch. The bump
+  has one implementation (`packages/git/src/store/maintenance/control.ts:60-75`);
+  examples of callers include
   checkout mutations (`database-checkout-mutations.ts:219,277,356`), shallow
   (`refs/shallow.ts:103`), fetch publication (`fetch/fetch-publication.ts:421`),
   and the index tracker (`do-fs/indexes/index-tracker.ts:269,306,359,395,406`).
@@ -64,7 +65,9 @@ task of each unit.
   function). Treat them as store-level observations, not as proof that ordinary
   maintenance destroys reachable history.
 - ⚠ Backlog 71's end-to-end journey (HTTP partial clone → `catFile()` hydration →
-  sweep) was never run; only the publication path is traced.
+  sweep) was never run; that connection is traced statically. Backlog 71 does
+  record loose and packed reproductions using supported writers and cold public
+  maintenance. Re-establish those observations as permanent witnesses.
 - ⚠ Backlog 73's legacy fetch/maintenance interleaving is a static schedule. A
   normal mapped transfer with a fresh fallback pack is a different witness and
   does not establish it.
@@ -81,8 +84,11 @@ task of each unit.
   (`sweep-contracts.ts:3`) the sweep deletes it — local bytes and the automatic
   promise-based recovery are both gone.
 - **Verify first.** Build the deterministic schedule with an injected clock:
-  reference the tree, mark while the blob is absent, publish loose, then publish
-  packed, leave the generation unfinished, resume past the grace. Record whether
+  in two isolated repositories, reference the tree and mark while the blob is
+  absent; fulfill the promise through loose publication in one and packed
+  publication in the other. Leave the generation unfinished, classify the newly
+  physical object, and resume after its classification age exceeds the grace.
+  Record the maintenance phase and clock at each step. Record whether
   the blob is actually deleted for each storage variant *before* changing code. If
   a variant does not reproduce, narrow the claim in the run log.
 - **Scope.** 1) Atomically invalidate the stale reachability generation when
@@ -129,7 +135,10 @@ task of each unit.
   — the thin-delta schedule, the three-pack cycle, a self-referential alternative,
   and the blocked-lowest-id sweep all keep every reachable object readable after
   cache eviction and cold reopen; repeated maintenance makes progress past a
-  blocked candidate.
+  blocked candidate. In the sweep witness, assert that later eligible dead packs
+  are actually removed, the required base survives, and the generation finishes
+  within a fixture-derived bound on calls. Also cover an entirely dead base/child
+  pair so skipping blocked packs cannot silently turn into permanent retention.
 - **Touch points.** `packages/git/src/store/pack/ingest/ingest-pending.ts`,
   `packages/git/src/store/pack/lifecycle/lifecycle-delete.ts`,
   `lifecycle-ingest.ts`, `packages/git/src/store/maintenance/sweep/sweep-packs.ts`,
@@ -147,9 +156,11 @@ task of each unit.
   (`network-fetch-legacy.ts:208`). The sideband reader also accepts frames real Git
   rejects (`protocol/upload-pack.ts:251-266`).
 - **Verify first.** Reproduce the incomplete-graph clone against a faulty test
-  remote. Then attempt the legacy fetch/maintenance interleaving; if it does not
-  reproduce, the lifetime half of this unit ships as an ownership guarantee with
-  the schedule recorded as unproven rather than as a claimed fix.
+  remote. Then attempt the legacy fetch/maintenance interleaving. If it does not
+  reproduce, identify the existing invariant that prevents it and witness that
+  protection without adding another mechanism. An unresolved schedule is a blocker
+  to investigate, not a mandate to introduce ownership. Before changing
+  connectivity code, capture the cost baseline described below.
 - **Scope.** 1) Reject an incomplete graph before ref publication, for clone,
   fetch, and unmaterialized fetched branches. 2) Explicitly allow declared shallow
   boundaries, absent gitlinks, and durable `blob:none` promises
@@ -157,20 +168,69 @@ task of each unit.
   3) Use bounded metadata walks and batches; do not re-hash trusted local objects
   (ADR-0004) and do not invent a projected-work refusal
   ([ADR-0005](../decisions/0005-bound-real-failures-and-measure-cost.md)).
-  4) Establish object lifetime across the validation/publication seam by ownership
-  or an effective final check. 5) Make sideband framing differential: empty
+  4) Prove object lifetime across the validation/publication seam; retain existing
+  protection when sufficient, otherwise prefer the smallest effective final check.
+  New ownership requires demonstrated necessity and approval.
+  5) Make sideband framing differential: empty
   packets, unknown bands, and EOF without termination. Trailing bytes after flush
   are out of scope.
 - **Acceptance / witness.** `npx vitest run tests/clone.test.ts tests/fetch-refspec.test.ts tests/concurrency-fetch.test.ts tests/protocol.test.ts`
   — a response missing a parent, a tree, or a non-promised blob is rejected before
   any ref moves; previous refs and checkout state survive every rejection; shallow,
   gitlink, and promise cases still succeed; large valid transfers still stream.
+  The witness matrix must include:
+  - Legacy and mapped fetch, clone, and a fetched branch that is not checked out.
+    Include tag roots and verify the declared shallow boundary exempts parent
+    edges only, not the boundary commit's tree or blobs.
+  - For legacy and mapped publication separately: validate, pause at
+    `before-ref-publication`, advance eligible public maintenance, then resume.
+    Either publication succeeds with the complete graph readable after cold
+    reopen, or it rejects with refs, shallow state, and checkout state unchanged.
+    The legacy fixture reuses an aged unreferenced pack without a new transfer;
+    a fresh mapped fallback pack does not stand in for that reproduction.
+  - If the original lifetime schedule cannot reproduce, a deterministic witness
+    must exercise the existing protection at that seam. A demonstrated existing
+    guarantee needs no runtime change; record an unresolved result as a blocker.
+  - Differential native-Git fixtures for empty sideband packets, unknown bands,
+    and EOF without required termination, plus valid flush and progress frames.
+    Compare acceptance/rejection, not exact error text; rejected responses leave
+    publication state unchanged.
 - **Touch points.** `packages/git/src/ops/network/network-fetch-mapped.ts`,
   `network-fetch-legacy.ts`, `network-tags.ts`, `network-checkpoint.ts`,
   `packages/git/src/store/fetch/fetch-publication-preflight.ts`,
   `packages/git/src/protocol/upload-pack.ts`, `tests/clone.test.ts`,
   `tests/fetch-refspec.test.ts`, `tests/concurrency-fetch.test.ts`,
   `tests/protocol.test.ts`.
+
+### WU3 cost witness — required before/after evidence
+
+- Extend an existing benchmark harness first, reusing its fixture, HTTP backend,
+  and measurement helpers. Record the selected files and exact command before
+  the runtime fix, prefixed with `cpu-lease run -n 2 --`. A separate runner is
+  justified only if it is the smallest solution, not a required deliverable.
+  WU3 owns benchmark-only changes; preserve existing runner behavior.
+- Before the validation fix, run that harness against the unchanged runtime;
+  rerun the identical harness after the fix. Record the runtime commits, fixture
+  revision, commands, and results in the run log. Use the existing Next.js fixture
+  for a large clone, then an unchanged fetch and a fetch of one new commit with
+  one changed file. Exercise legacy and mapped fetch separately with equivalent
+  repository state; do not compare their different transfer strategies as a
+  before/after result.
+- Report SQL statements, returned-row counts, and process peak-memory evidence
+  using the existing local instrumentation. `tests/helpers/storage.ts` counts
+  cursor yields, not SQLite rows scanned: label this metric **rows returned** and
+  do not claim it measures scan work. Review query shape and plans for scan cost.
+  Report baseline RSS, peak-reset success, peak RSS, and peak minus baseline;
+  preserve the distinction between process RSS and isolate memory evidence.
+  Local elapsed time is supplementary. Keep
+  setup outside operation measurements and verify the resulting refs and graph.
+  If the helpers cannot measure a required metric, resolve that gap before the
+  runtime fix rather than substituting an unlabelled proxy.
+- The reviewer must account for the added traversal cost, including unchanged
+  fetch. Unbounded retained queues/sets, per-object SQL in place of batches, or
+  unexplained baseline regressions block acceptance. The 1,000-statement and
+  100-MiB targets are reported, not converted into runtime refusal limits. Record
+  and resolve target misses explicitly before accepting WU3.
 
 ## Review strategy
 
@@ -179,18 +239,25 @@ task of each unit.
 | Sprint integration | WU1 and WU2 both change what maintenance may delete; WU3 changes what fetch may publish. A wrong combination deletes reachable data silently | `npm test` plus `npx vitest run tests/maintenance-sweep.test.ts tests/concurrency-pack.test.ts tests/concurrency-maintenance.test.ts tests/clone.test.ts`; independent integration review after the last WU, repeated after any fix that touches deletion order | Any unit widens what may be deleted, or two units edit the same sweep file |
 | WU1 | Fundamental. Failure mode is silent local data loss with no automatic recovery | Independent review to clean; the reviewer re-runs the injected-clock schedule for both storage variants | The fix needs a schema change, or the verify-first step cannot reproduce either variant |
 | WU2 | Fundamental and extra-large. Three mechanisms over ingest, promotion, and sweep, with concurrency schedules | Independent review to clean, per mechanism; a mechanism without a public reproduction ships with a store-level witness and an explicit narrower claim | A single mechanism grows past its own witness — split it out into its own unit rather than widening this one |
-| WU3 | Fundamental. Adds a new validation pass to every fetch, so both correctness and cost are in play | Independent review to clean; reviewer checks that no stored object is re-hashed and that the walk is bounded and streaming | Connectivity validation measurably changes clone cost — then measure under `bench/CLAUDE.md` before merging |
+| WU3 | Fundamental. Adds a new validation pass to every fetch, so both correctness and cost are in play | Independent review to clean; reviewer checks no stored object is re-hashed, bounded streaming traversal, both publication-seam witnesses, and the mandatory before/after cost report | Ownership needs changes in pack lifecycle or maintenance, or cost cannot be accounted for within the declared scope: stop and resolve the shared seam before proceeding |
 
 ## Test cadence
 
 - **Per WU.** Run the exact acceptance witness above, plus `npm run test:e2e`
-  for WU3 because it crosses the network transport.
+  for WU3 because it crosses the network transport. Run `npm run typecheck` and
+  `npm run check` before accepting each WU. Any review fix reruns its affected
+  witness; semantic fixes return to the independent reviewer until clean.
 - **Routine integration.** `npm test` after each WU lands; keep it under 30 s.
 - **Sprint closure.** `npm run test:full` once, after the last review and its
-  focused fixes have settled.
+  focused fixes have settled, plus `npm run typecheck` and `npm run check` on the
+  integrated tree.
 - **Failure loop.** Reproduce a full-suite failure with its exact file or slice,
   stabilize it, then rerun the full suite. Concurrency witnesses that fail
   intermittently are treated as findings, not as flakes, until proven otherwise.
+- **Resources.** Prefix CPU-bound test/check commands with
+  `cpu-lease run -n 4 --`; use the two-core command above for the cost witness.
+  If leases or required benchmark instrumentation are unavailable, stop and report
+  the blocker. Do not claim an unleased measurement as evidence.
 
 ## Out of scope (explicit)
 
@@ -229,21 +296,44 @@ task of each unit.
 |---|---|---|---|
 | 1 | WU1 | WU3 | Establishes what a generation means before WU2 changes selection inside the same sweep files |
 | 2 | WU2 | WU3 | Shares `store/maintenance/sweep/` with WU1; serialize to keep the witnesses attributable |
-| — | WU3 | WU1 and WU2 | Disjoint territory: `ops/network/`, `store/fetch/`, `protocol/` |
+| — | WU3 | WU1 and WU2 after seam review | Starts in `ops/network/`, `store/fetch/`, `protocol/`, and its focused benchmark; ownership changes may cross into lifecycle |
 
 Two agents at most: one on the WU1 → WU2 chain, one on WU3. Do not run WU1 and
 WU2 concurrently even though their fixes look separable — both change deletion
 eligibility, and a combined failure is hard to attribute.
 
+Before parallel implementation, WU3 records its selected lifetime mechanism and
+write territory. If it needs pack lifecycle or maintenance edits, land that shared
+seam with its witness and independent review first, or serialize the affected
+work with WU1/WU2. File separation alone does not establish semantic independence.
+
+Each unit records the pre-fix result, implementation, exact witness results, and
+independent review verdict before its atomic commit. A failed verify-first step
+must distinguish an unreproduced defect from a broken fixture. WU1 cannot proceed
+without at least one reproduced storage variant; WU2 may retain a valid store-API
+witness with a narrower claim. WU3 must reproduce incomplete-graph acceptance and
+prove its final lifetime guarantee even if the historical interleaving remains
+unproven. Escalations and architectural changes require approval before coding.
+
 ## Plan review
 
-An independent reviewer checks this proposal against HEAD, including whether the
-verify-first gates are strong enough to keep an unreproduced schedule from being
-written up as a fixed defect.
+An independent reviewer checked this proposal against runtime HEAD
+`920ac0b346b44918b4a2905202e6e0bb1be87918`, including grounding, dependencies,
+acceptance witnesses, benchmark feasibility, and review/test gates.
 
-- **Reviewer:** pending
-- **Verdict:** pending
-- **Material findings:** —
+- **Reviewer:** independent general agent, session
+  `ses_f7e8cc706ffeWLy1lDhXygi24S`, 2026-09-08.
+- **Verdict:** ready after corrections and independent re-review. Implementation
+  may begin under the per-unit verify-first gates.
+- **Material findings resolved:** distinguish local returned-row counts from
+  SQLite scan work; assign memory-helper territory and specify memory evidence;
+  correct the incomplete epoch-caller list and WU1's prior reproduction status;
+  align the run log with permitted narrower verify-first results.
+- **Evidence boundary:** static plan/code review only. Runtime reproductions,
+  cost baselines, tests, and implementation reviews remain execution gates.
+- **Approved execution refinement:** user approved removing mandatory new
+  ownership and a mandatory new benchmark runner; prefer demonstrated existing
+  protection and existing measurement infrastructure.
 
 ## Run log
 
@@ -253,5 +343,9 @@ written up as a fixed defect.
      trim to a one-line pointer ("→ ADR-0007"). -->
 
 - 2026-09-08 — Planning verified every mechanism statically at HEAD; no unit has a
-  public runtime reproduction yet. Each WU's verify-first step must record one
-  before its fix lands.
+  new runtime reproduction from this planning pass. Prior observations remain in
+  backlog 71–73. Each WU records its verify-first result under its declared gate
+  before its fix lands, including permitted store-level or unproven claims.
+- 2026-09-08 — User approved full execution, independent reviews, and atomic
+  per-unit commits on the current branch. No push. WU1 precedes WU2; WU3's
+  lifetime seam is qualified before concurrent runtime edits.
