@@ -20,4 +20,6 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None.
+- [`sprint-2026-09-07-scoped-packages-and-local-runtime.md`](sprint-2026-09-07-scoped-packages-and-local-runtime.md)
+  — split the runtime into scoped packages and add the crash-recoverable Unix
+  local composition without regressing DOFS.

@@ -16,12 +16,18 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprint-2026-09-07-scoped-packages-and-local-runtime.md`](sprints/sprint-2026-09-07-scoped-packages-and-local-runtime.md)
+  — five scoped packages and a crash-recoverable Unix local runtime, with the
+  current DOFS performance path as a hard regression gate.
 
 ## Specs
 
+- [`specs/scoped-packages-and-local-runtime.md`](specs/scoped-packages-and-local-runtime.md)
+  — accepted package graph, DOFS integration, disk drive, and local recovery
+  contract.
 - [`specs/trusted-domain-architecture.md`](specs/trusted-domain-architecture.md)
-  — the authoritative target architecture adopted by the completed restructure.
+  — trust-model and Git-layering record; its old package layout is superseded by
+  the scoped-package specification above.
 - [`specs/budget-targets-evidence-ledger.md`](specs/budget-targets-evidence-ledger.md)
   — accepted statement-barrier and byte-limit evidence incorporated by the
   archived budget-targets sprint.
@@ -86,6 +92,8 @@ None.
 - [0017 — Preflight mutating CLI output inside the transaction](decisions/0017-preflight-mutating-cli-output-inside-the-transaction.md)
 - [0018 — Compile shell commands to bounded queries](decisions/0018-compile-shell-commands-to-bounded-queries.md)
 - [0019 — Admit a bounded POSIX shell surface](decisions/0019-admit-a-bounded-posix-shell-surface.md)
+- [0020 — Publish runtime boundaries as scoped packages](decisions/0020-publish-runtime-boundaries-as-scoped-packages.md)
+- [0021 — Recover local worktree mutations with an undo journal](decisions/0021-recover-local-worktree-mutations-with-an-undo-journal.md)
 
 The set was renumbered on 2026-09-04; [`decisions/README.md`](decisions/README.md#renumbered-on-2026-09-04)
 decodes an old number found in `archive/` or `specs/`.

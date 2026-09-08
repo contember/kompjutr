@@ -25,6 +25,7 @@ so the two cannot drift.
 - [0001 — Own the standalone SQLite runtime](0001-own-the-standalone-sqlite-runtime.md) — accepted (2026-08-20)
 - [0002 — Organize source by domain with bottom-up layers](0002-organize-source-by-domain-with-bottom-up-layers.md) — accepted (2026-08-30)
 - [0003 — Split the shared Git store from checkouts](0003-split-the-shared-git-store-from-checkouts.md) — accepted (2026-08-26)
+- [0020 — Publish runtime boundaries as scoped packages](0020-publish-runtime-boundaries-as-scoped-packages.md) — accepted (2026-09-07)
 
 **Cross-cutting invariants**
 
@@ -32,6 +33,7 @@ so the two cannot drift.
 - [0005 — Bound real failures and measure cost](0005-bound-real-failures-and-measure-cost.md) — accepted (2026-08-29)
 - [0006 — Own local Git mutations with SQLite transactions](0006-own-local-git-mutations-with-sqlite-transactions.md) — accepted (2026-09-02)
 - [0007 — Require well-formed UTF-8 paths](0007-require-well-formed-utf8-paths.md) — accepted (2026-08-26)
+- [0021 — Recover local worktree mutations with an undo journal](0021-recover-local-worktree-mutations-with-an-undo-journal.md) — accepted (2026-09-07)
 
 **Storage**
 
