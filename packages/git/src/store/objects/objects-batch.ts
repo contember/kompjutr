@@ -1,5 +1,5 @@
 import { blob } from "@kompjutr/sqlite";
-import { concat } from "../../common/bytes.js";
+import { concat, ownedBytes } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { hashObject, type ObjectType } from "../../common/objects.js";
 import type { ObjectBatch, ObjectBatchOptions, OwnedObjectBatch } from "../core/contracts.js";
@@ -59,9 +59,9 @@ export function createObjectWriteBatch(
         const oid = hashObject(type, data);
         if (staged.has(oid)) return oid;
         const stored = looseEncoding(data.length);
-        const storedData = stored === "raw" ? data.slice() : encodeLoose(data, stored);
+        const storedData = stored === "raw" ? ownedBytes(data) : encodeLoose(data, stored);
         const object: StagedObject = { oid, type, size: data.length, stored, storedData };
-        if (type === "tree") object.treeData = stored === "raw" ? storedData : data.slice();
+        if (type === "tree") object.treeData = stored === "raw" ? storedData : ownedBytes(data);
         if (type === "commit") {
           const commitEntry = prepareCommitCache({ repoId: context.repoId, oid, data });
           object.commitEntry = commitEntry;

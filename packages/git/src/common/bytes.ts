@@ -17,6 +17,15 @@ export function concat(parts: Uint8Array[]): Uint8Array {
 const HEX: string[] = [];
 for (let i = 0; i < 256; i++) HEX.push(i.toString(16).padStart(2, "0"));
 
+/**
+ * A copy the caller cannot reach. Never `.slice()`: on a `Buffer` — what
+ * `node:fs` hands back — that is Node's alias for `subarray()` and returns a
+ * view over the caller's memory.
+ */
+export function ownedBytes(bytes: Uint8Array): Uint8Array {
+  return new Uint8Array(bytes);
+}
+
 export function toHex(bytes: Uint8Array): string {
   let out = "";
   for (let i = 0; i < bytes.length; i++) out += HEX[bytes[i]!];

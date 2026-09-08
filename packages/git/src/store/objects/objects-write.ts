@@ -1,6 +1,6 @@
 import { blob } from "@kompjutr/sqlite";
 import pako from "pako";
-import { toHex } from "../../common/bytes.js";
+import { ownedBytes, toHex } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { hashObject, type ObjectType, objectHeader } from "../../common/objects.js";
 import { Sha1 } from "../../common/sha1.js";
@@ -99,7 +99,7 @@ export function writeObject(
   });
   context.cacheKeys.markLoose();
   // The cache outlives this call, so it owns its bytes; the caller may reuse `data`.
-  context.objects.set(context.cacheKeys.objectCacheKey(oid), { type, data: data.slice() });
+  context.objects.set(context.cacheKeys.objectCacheKey(oid), { type, data: ownedBytes(data) });
   return oid;
 }
 

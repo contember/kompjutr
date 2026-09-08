@@ -1,5 +1,5 @@
 import { blob, type SqlDatabase } from "@kompjutr/sqlite";
-import { concat, isOid, toHex } from "../../common/bytes.js";
+import { concat, isOid, ownedBytes, toHex } from "../../common/bytes.js";
 import { GitError } from "../../common/errors.js";
 import { expectSafeInteger, expectText } from "../../common/rows.js";
 import type { BlobIdMapping } from "../core/contracts.js";
@@ -38,7 +38,7 @@ export function* contentIdPages(contentIds: Iterable<Uint8Array>): Generator<Con
   const unique = new Map<string, Uint8Array>();
   for (const contentId of contentIds) {
     if (contentId.length > BLOB_ID_CACHE_ELIGIBILITY_BYTES) continue;
-    const snapshot = contentId.slice();
+    const snapshot = ownedBytes(contentId);
     const key = contentIdKey(snapshot);
     unique.set(key, snapshot);
   }
@@ -241,7 +241,7 @@ export class BlobIdTable {
       if (cacheable) {
         retained.push({
           ordinal: capturedCount,
-          contentId: mapping.contentId.slice(),
+          contentId: ownedBytes(mapping.contentId),
           oid: mapping.oid,
         });
       } else {
@@ -284,7 +284,7 @@ export class BlobIdTable {
       if (!isOid(mapping.oid)) throw new GitError("EINVAL", `invalid blob oid ${mapping.oid}`);
       if (mapping.contentId.length > BLOB_ID_CACHE_ELIGIBILITY_BYTES) continue;
       const snapshot: BlobIdMapping = {
-        contentId: mapping.contentId.slice(),
+        contentId: ownedBytes(mapping.contentId),
         oid: mapping.oid,
       };
       const key = contentIdKey(snapshot.contentId);

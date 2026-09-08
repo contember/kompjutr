@@ -1,5 +1,5 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
-import { isOid } from "../../common/bytes.js";
+import { isOid, ownedBytes } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { hashObject, type ObjectType, parseCommit } from "../../common/objects.js";
 import {
@@ -290,7 +290,7 @@ export class PackTreeIndex {
       this.flush();
     }
     const chunks: Uint8Array[] = [];
-    for (const chunk of target.chunks()) chunks.push(chunk.slice());
+    for (const chunk of target.chunks()) chunks.push(ownedBytes(chunk));
     this.#sources.push(this.#source(repoId, treeOid, sourceId, objectSize, chunks));
     this.#payloadBytes += target.length;
     this.#retainedBytes += retained;

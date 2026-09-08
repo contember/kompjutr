@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 import type { ScanEntry } from "../packages/do/src/fs/types.js";
-import { utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { ownedBytes, utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
 import { GitError } from "../packages/git/src/common/errors.js";
 import { MAX_OBJECT_BYTES, MODE_FILE, serializeTree } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
@@ -246,6 +246,14 @@ function corruptLooseObject(workspace: TestRepository, oid: string): void {
 }
 
 describe("tree and index write plumbing", () => {
+  it("copies bytes a caller can still reach, including a Buffer", () => {
+    const source = Buffer.from("abc");
+    const owned = ownedBytes(source);
+    source[0] = 0x58;
+    expect(utf8Decoder.decode(owned)).toBe("abc");
+    expect(ownedBytes(new Uint8Array([1, 2])).buffer).not.toBe(new Uint8Array([1, 2]).buffer);
+  });
+
   it("owns the bytes handed to scalar and batch object writes", () => {
     const test = makeRepo();
     const scalar = utf8.encode("scalar\n");

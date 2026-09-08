@@ -1,5 +1,6 @@
 import type { GitClientServices } from "./client-services.js";
 import type { Git, GitScratchIndex } from "./client-types.js";
+import { ownedBytes } from "./common/bytes.js";
 import { GitError } from "./common/errors.js";
 import { withPromisorHydration } from "./ops/network/network.js";
 import { replaySnapshotOwned as replaySnapshotOp } from "./ops/replay/replay.js";
@@ -40,7 +41,7 @@ export function createGitClientPlumbingMethods(services: GitClientServices): Plu
           : catFileRead(repo, input.oid, input.filepath),
       );
       // Public bytes leave the store's ownership; a cached object must not alias them.
-      return { oid: result.oid, bytes: result.bytes.slice() };
+      return { oid: result.oid, bytes: ownedBytes(result.bytes) };
     },
     async readTree(input) {
       mutate(() => {

@@ -3,9 +3,44 @@ import { join } from "node:path";
 
 import { LocalWorkspace } from "@kompjutr/local";
 import { describe, expect, it } from "vitest";
+import { utf8Decoder } from "../../packages/git/src/common/bytes.js";
+import { Repository } from "../../packages/git/src/ops/repository/repository.js";
 import { localFixture } from "./helpers.js";
 
 describe("LocalWorkspace", () => {
+  it("owns a Buffer handed across the public object boundaries", async () => {
+    const fixture = localFixture();
+    const workspace = fixture.workspace({
+      defaultGitIdentity: { name: "Fixture", email: "fixture@example.com" },
+    });
+    try {
+      await workspace.git.init();
+      // `node:fs` hands callers a Buffer, and `Buffer.prototype.slice()` is a view.
+      const content = Buffer.from("abc");
+      const oid = await workspace.git.hashObject({ content, write: true });
+      content[1] = 0x78;
+      const warm = await workspace.git.catFile({ oid });
+      expect(utf8Decoder.decode(warm.bytes)).toBe("abc");
+      warm.bytes[1] = 0x79;
+      expect(utf8Decoder.decode((await workspace.git.catFile({ oid })).bytes)).toBe("abc");
+      const staged = Buffer.from("batched\n");
+      const checkout = workspace.gitDatabase.findCheckout("/");
+      if (checkout === null) throw new Error("repository is missing");
+      const repository = new Repository(workspace.gitDatabase.openCheckout(checkout));
+      let batchedOid = "";
+      repository.store.writeObjects((batch) => {
+        batchedOid = batch.write("blob", staged);
+        staged[0] = 0x58;
+      });
+      expect(utf8Decoder.decode((await workspace.git.catFile({ oid: batchedOid })).bytes)).toBe(
+        "batched\n",
+      );
+    } finally {
+      workspace.close();
+      fixture.dispose();
+    }
+  });
+
   it("locks one root across different state and recovery configurations", () => {
     const fixture = localFixture();
     const first = fixture.workspace();
