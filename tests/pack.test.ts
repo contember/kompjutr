@@ -3162,6 +3162,29 @@ describe("pack publication and deletion", () => {
     expect(store.read(targetOid)?.data).toEqual(target);
   });
 
+  it.each([7, 20, 64])("owns reused Buffer chunks of %i bytes during ingest", async (size) => {
+    const store = open();
+    const data = utf8.encode("retained transport bytes\n".repeat(20));
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("blob", data);
+    writer.finish();
+    const pack = concat(chunks);
+    async function* reusedChunks(): AsyncGenerator<Uint8Array> {
+      const buffer = Buffer.alloc(size);
+      for (let offset = 0; offset < pack.length; offset += size) {
+        const source = pack.subarray(offset, offset + size);
+        buffer.set(source);
+        yield buffer.subarray(0, source.length);
+        buffer.fill(0xff);
+      }
+    }
+    const result = await store.packs.ingest(reusedChunks());
+    expect(result.count).toBe(1);
+    expect(store.read(hashObject("blob", data))?.data).toEqual(data);
+  });
+
   it("rejects a pack whose trailer does not match", async () => {
     const store = open();
     const chunks: Uint8Array[] = [];
