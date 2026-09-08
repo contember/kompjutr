@@ -1,5 +1,5 @@
-import { blob, type SqlDatabase } from "@kompjutr/sqlite";
-import { concat, isOid, ownedBytes, toHex } from "../../common/bytes.js";
+import { blob, ownedBytes, type SqlDatabase } from "@kompjutr/sqlite";
+import { concat, isOid, toHex } from "../../common/bytes.js";
 import { GitError } from "../../common/errors.js";
 import { expectSafeInteger, expectText } from "../../common/rows.js";
 import type { BlobIdMapping } from "../core/contracts.js";

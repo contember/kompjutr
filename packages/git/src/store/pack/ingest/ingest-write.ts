@@ -1,7 +1,7 @@
 // Derived from dgit (MIT, Copyright (c) 2026 Divy Srivastava),
 // https://github.com/littledivy/dgit — the three-phase ingest, the rotating offset window, the deferred-delta table and the iterative delta-chain walk all follow dgit's src/git/packstore.ts.
 
-import { blob, type SqlDatabase } from "@kompjutr/sqlite";
+import { blob, ownedBytes, type SqlDatabase } from "@kompjutr/sqlite";
 import { concat, toHex } from "../../../common/bytes.js";
 import { CorruptError } from "../../../common/errors.js";
 import { Sha1 } from "../../../common/sha1.js";
@@ -44,9 +44,10 @@ export class PackChunkWriter {
       const joined = tail.length > 0 ? concat([tail, data]) : data;
       if (joined.length > 20) {
         sha.update(joined.subarray(0, joined.length - 20));
-        tail = joined.slice(joined.length - 20);
+        // The lookbehind outlives this chunk; the producer may refill its own buffer.
+        tail = ownedBytes(joined.subarray(joined.length - 20));
       } else {
-        tail = joined.slice();
+        tail = ownedBytes(joined);
       }
       let offset = 0;
       while (offset < data.length) {
@@ -55,7 +56,7 @@ export class PackChunkWriter {
         filled += take;
         offset += take;
         if (filled === PACK_CHUNK) {
-          this.#writeChunk(packId, seq++, buffer.slice());
+          this.#writeChunk(packId, seq++, ownedBytes(buffer));
           filled = 0;
         }
       }

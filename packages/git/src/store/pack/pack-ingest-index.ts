@@ -1,5 +1,5 @@
-import type { SqlDatabase } from "@kompjutr/sqlite";
-import { isOid, ownedBytes } from "../../common/bytes.js";
+import { ownedBytes, type SqlDatabase } from "@kompjutr/sqlite";
+import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { hashObject, type ObjectType, parseCommit } from "../../common/objects.js";
 import {

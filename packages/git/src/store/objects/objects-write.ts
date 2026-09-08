@@ -1,6 +1,6 @@
-import { blob } from "@kompjutr/sqlite";
+import { blob, ownedBytes } from "@kompjutr/sqlite";
 import pako from "pako";
-import { ownedBytes, toHex } from "../../common/bytes.js";
+import { toHex } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { hashObject, type ObjectType, objectHeader } from "../../common/objects.js";
 import { Sha1 } from "../../common/sha1.js";

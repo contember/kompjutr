@@ -1,5 +1,5 @@
-import { blob } from "@kompjutr/sqlite";
-import { concat, ownedBytes } from "../../common/bytes.js";
+import { blob, ownedBytes } from "@kompjutr/sqlite";
+import { concat } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { hashObject, type ObjectType } from "../../common/objects.js";
 import type { ObjectBatch, ObjectBatchOptions, OwnedObjectBatch } from "../core/contracts.js";

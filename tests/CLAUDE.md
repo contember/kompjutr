@@ -2,7 +2,9 @@
 
 Vitest under plain Node. `tests/helpers/storage.ts` backs
 `DurableObjectStorageLike` with `node:sqlite`, so the whole stack runs without
-a Worker — Workers' DO SQL surface is a subset of it.
+a Worker — Workers' DO SQL surface is a subset of it. Nested `transactionSync`
+uses savepoints, as workerd does; the double is more permissive in one respect,
+because it has no notion of workerd's critical-error abort.
 
 ```
 helpers/db.ts        TestDatabase — use for store tests, no Workspace needed

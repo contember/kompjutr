@@ -1,9 +1,10 @@
 import { lstatSync, readdirSync, readFileSync, readlinkSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
+import { ownedBytes } from "@kompjutr/sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ScanEntry } from "../packages/do/src/fs/types.js";
-import { ownedBytes, utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
 import { GitError } from "../packages/git/src/common/errors.js";
 import { MAX_OBJECT_BYTES, MODE_FILE, serializeTree } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
@@ -246,12 +247,18 @@ function corruptLooseObject(workspace: TestRepository, oid: string): void {
 }
 
 describe("tree and index write plumbing", () => {
-  it("copies bytes a caller can still reach, including a Buffer", () => {
-    const source = Buffer.from("abc");
-    const owned = ownedBytes(source);
-    source[0] = 0x58;
+  it("copies bytes a caller can still reach, including a Buffer and a view", () => {
+    const pooled = Buffer.from("abc");
+    const owned = ownedBytes(pooled);
+    pooled[0] = 0x58;
     expect(utf8Decoder.decode(owned)).toBe("abc");
-    expect(ownedBytes(new Uint8Array([1, 2])).buffer).not.toBe(new Uint8Array([1, 2]).buffer);
+
+    const parent = utf8.encode("hello");
+    const view = ownedBytes(parent.subarray(1, 4));
+    parent[1] = 0x58;
+    expect(utf8Decoder.decode(view)).toBe("ell");
+    expect(view.buffer).not.toBe(parent.buffer);
+    expect(view.byteOffset).toBe(0);
   });
 
   it("owns the bytes handed to scalar and batch object writes", () => {

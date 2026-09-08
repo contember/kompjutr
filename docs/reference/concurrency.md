@@ -27,7 +27,9 @@ disk work cannot be undone alone, so the whole transaction is refused with
 `ERECOVERY`. A nested failure that changed nothing, such as the `EREENTRANT`
 rejection above, leaves the outer transaction committable. Until the refusal the
 failed scope's rows stay readable inside the transaction, which is where the two
-runtimes differ. The database and
+runtimes differ. An observation lease is the documented exception: it commits on
+its own connection, so a nested failure neither undoes nor detects it. The
+database and
 `DiskDrive` share one `RecoveryCoordinator` as their mutation scope. Disk
 changes are backed up before application, and the committed SQLite recovery
 generation decides rollback or roll-forward after a crash or uncertain commit.

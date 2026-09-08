@@ -27,9 +27,9 @@ export interface SqlDatabase {
   /** Implementations must return a lazy cursor and close it on early return. */
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>>;
   /**
-   * Nested calls join the outer transaction. A nested closure that throws must
-   * leave nothing committed: undo that scope alone, or refuse the outer commit
-   * — and then its rows stay readable until the refusal.
+   * Nested calls join the outer transaction. Nothing a nested closure changed in
+   * this database before throwing may be committed: undo that scope alone, or
+   * refuse the outer commit — and then it stays visible until the refusal.
    */
   transactionSync<T>(closure: () => T): T;
 }
@@ -119,10 +119,20 @@ export function* iterateSqlCursor<Row extends object = Record<string, unknown>>(
   }
 }
 
+/**
+ * A copy the caller cannot reach. Never `.slice()`: on a `Buffer` — what
+ * `node:fs` and `node:http` hand back — that is Node's alias for `subarray()`
+ * and returns a view over the caller's memory.
+ */
+export function ownedBytes(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  return new Uint8Array(bytes);
+}
+
+/** A driver-ready array whose view covers its whole backing buffer. */
 export function blob(bytes: Uint8Array): Uint8Array {
   return bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
     ? bytes
-    : bytes.slice();
+    : ownedBytes(bytes);
 }
 
 export function readBlob(value: unknown): Uint8Array {

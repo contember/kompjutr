@@ -322,3 +322,26 @@ gate is proportionate to its unit's blast radius.
   above the cache's entry limit copies bytes the cache then drops. The rule is
   right (a cold read is cached too, so the boundary cannot tell), the number is
   not. → backlog 81.
+- 2026-09-08 — **Re-review after the fixes found one more live site of the same
+  class**, which is why `ownedBytes()` now lives in `@kompjutr/sqlite` rather
+  than the Git bytes kit: pack ingest kept its rolling 20-byte trailer
+  lookbehind as `joined.slice(...)` across `for await` iterations
+  (`store/pack/ingest/ingest-write.ts`). The pack body comes from a caller's
+  `GitHttpClient`, and `node:http` yields `Buffer`s, so the trailer validated
+  need not be the trailer that arrived — at the ingest trust boundary. `blob()`
+  in the shared package had the same fallback and its own postcondition was
+  false for a pooled `Buffer`. Both fixed; a grep for an ownership `.slice()` is
+  now the check.
+- 2026-09-08 — Re-review of WU1 confirmed `schema_version` cannot move without
+  the nested closure doing it: the outer `BEGIN IMMEDIATE` owns the write lock,
+  and the cookie reverts on rollback. Two latent residuals, neither reachable in
+  source: `temp`-schema DDL is invisible (`pragma_schema_version()` reads `main`),
+  and a hand-set negative cookie fails closed as `ECORRUPT` at nested entry.
+- 2026-09-08 — Contract wording corrected again: "leave nothing committed" was
+  absolute, and the local composition deliberately breaks it — an observation
+  lease commits on its own connection so an outer rollback cannot make it
+  reusable. The clause is now scoped to the transaction's own database.
+- 2026-09-08 — The disk-only witness added after review is coverage, not a fix:
+  the `diskEffects` comparison shipped working in WU1 and nothing exercised the
+  branch where a nested scope's disk writes succeed and it then fails for another
+  reason.
