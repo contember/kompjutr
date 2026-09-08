@@ -196,7 +196,7 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
   }
 
   transactionSync<T>(closure: () => T): T {
-    if (this.#depth > 0) return closure();
+    if (this.#depth > 0) return this.#savepoint(closure);
     this.#depth++;
     this.db.exec("BEGIN");
     try {
@@ -205,6 +205,23 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
       return result;
     } catch (error) {
       this.db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.#depth--;
+    }
+  }
+
+  /** Nested scopes roll back alone, exactly as workerd's `transactionSync` does. */
+  #savepoint<T>(closure: () => T): T {
+    const name = `_nested_${this.#depth++}`;
+    this.db.exec(`SAVEPOINT ${name}`);
+    try {
+      const result = closure();
+      this.db.exec(`RELEASE ${name}`);
+      return result;
+    } catch (error) {
+      this.db.exec(`ROLLBACK TO ${name}`);
+      this.db.exec(`RELEASE ${name}`);
       throw error;
     } finally {
       this.#depth--;

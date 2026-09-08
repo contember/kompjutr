@@ -47,7 +47,7 @@ function isThenable(value: unknown): boolean {
   return typeof Reflect.get(value, "then") === "function";
 }
 
-function requireGeneration(value: unknown, label: string): number {
+function requireCounter(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || Number(value) < 0) {
     throw localError("ECORRUPT", `${label} is not a safe nonnegative integer`);
   }
@@ -91,6 +91,7 @@ export class NodeSqliteDatabase implements SqlDatabase {
   #depth = 0;
   #closed = false;
   #asyncResultDetected = false;
+  #nestedFailureLeftEffects = false;
   #statements = 0;
   #rows = 0;
 
@@ -240,7 +241,7 @@ export class NodeSqliteDatabase implements SqlDatabase {
   }
 
   recoveryGeneration(): number {
-    return requireGeneration(
+    return requireCounter(
       this.scalar("SELECT recovery_generation FROM local_runtime_state WHERE singleton = 1"),
       "recovery generation",
     );
@@ -265,7 +266,7 @@ export class NodeSqliteDatabase implements SqlDatabase {
       const row: unknown = connection
         .prepare("SELECT next_revision FROM observation_state WHERE singleton = 1")
         .get();
-      const start = requireGeneration(
+      const start = requireCounter(
         typeof row === "object" && row !== null ? Reflect.get(row, "next_revision") : undefined,
         "next observation revision",
       );
@@ -286,7 +287,15 @@ export class NodeSqliteDatabase implements SqlDatabase {
 
   transactionSync<T>(closure: () => T): T {
     if (this.#depth > 0) {
-      const nested = closure();
+      const rows = this.#changeCount();
+      const disk = this.#recovery?.diskEffects ?? 0;
+      let nested: T;
+      try {
+        nested = closure();
+      } catch (error) {
+        if (this.#nestedScopeChanged(rows, disk)) this.#nestedFailureLeftEffects = true;
+        throw error;
+      }
       if (isThenable(nested)) {
         this.#asyncResultDetected = true;
         void Promise.resolve(nested).catch(() => {});
@@ -296,6 +305,7 @@ export class NodeSqliteDatabase implements SqlDatabase {
     }
     const connection = this.#requireOpen();
     this.#asyncResultDetected = false;
+    this.#nestedFailureLeftEffects = false;
     connection.exec("BEGIN IMMEDIATE");
     this.#depth++;
     let baseGeneration: number;
@@ -318,6 +328,12 @@ export class NodeSqliteDatabase implements SqlDatabase {
         throw localError(
           "EINVAL",
           "nested transactionSync closure returned an asynchronous result",
+        );
+      }
+      if (this.#nestedFailureLeftEffects) {
+        throw localError(
+          "ERECOVERY",
+          "a failed nested transaction made the transaction abort-only",
         );
       }
       if (this.#recovery?.abortOnly === true) {
@@ -354,6 +370,21 @@ export class NodeSqliteDatabase implements SqlDatabase {
       throw error;
     }
     return result;
+  }
+
+  /** Rows this connection has changed, including changes a later rollback undoes. */
+  #changeCount(): number {
+    return requireCounter(this.scalar("SELECT total_changes()"), "total change count");
+  }
+
+  #nestedScopeChanged(rows: number, disk: number): boolean {
+    if ((this.#recovery?.diskEffects ?? 0) !== disk) return true;
+    try {
+      return this.#changeCount() !== rows;
+    } catch {
+      // An unreadable connection cannot prove the nested closure changed nothing.
+      return true;
+    }
   }
 
   #rollbackAfterFailure(error: unknown, poisonAfterSettlement = false): never {

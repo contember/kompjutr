@@ -6,7 +6,6 @@ import { SqliteTestStorage } from "./storage.js";
  * can run without constructing a Workspace.
  */
 export class TestDatabase implements SqlDatabase {
-  #depth = 0;
   readonly mutationScope: object;
 
   constructor(readonly storage: SqliteTestStorage = new SqliteTestStorage()) {
@@ -36,12 +35,6 @@ export class TestDatabase implements SqlDatabase {
   }
 
   transactionSync<T>(closure: () => T): T {
-    if (this.#depth > 0) return closure();
-    this.#depth++;
-    try {
-      return this.storage.transactionSync(closure);
-    } finally {
-      this.#depth--;
-    }
+    return this.storage.transactionSync(closure);
   }
 }

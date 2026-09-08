@@ -55,7 +55,7 @@ interface ActiveRecovery {
   readonly touches: TouchRecord[];
   readonly touchPaths: Set<string>;
   readonly temporaries: TemporaryRecord[];
-  changed: boolean;
+  effects: number;
   backupSequence: number;
   temporarySequence: number;
 }
@@ -125,14 +125,18 @@ export class RecoveryCoordinator implements RecoveryTransactionOwner {
       touches: [],
       touchPaths: new Set(),
       temporaries: [],
-      changed: false,
+      effects: 0,
       backupSequence: 0,
       temporarySequence: 0,
     };
   }
 
   get diskChanged(): boolean {
-    return this.#active?.changed === true;
+    return this.diskEffects > 0;
+  }
+
+  get diskEffects(): number {
+    return this.#active?.effects ?? 0;
   }
 
   get abortOnly(): boolean {
@@ -322,7 +326,7 @@ export class RecoveryCoordinator implements RecoveryTransactionOwner {
         } catch (error) {
           normalizeHostError(error, "move recovery backup", touch.path);
         }
-        active.changed = true;
+        active.effects++;
         this.checkpoint("backup-moved");
       }
     }
@@ -331,7 +335,7 @@ export class RecoveryCoordinator implements RecoveryTransactionOwner {
   }
 
   markChanged(): void {
-    this.#requireActive().changed = true;
+    this.#requireActive().effects++;
   }
 
   temporary(parent: string): string {
