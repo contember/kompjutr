@@ -12,6 +12,9 @@ decided work or status.
 - [`git-server-inside-the-durable-object.md`](git-server-inside-the-durable-object.md)
   — answer Smart HTTP from the Durable Object so a `git` client can clone,
   fetch, and push against it.
+- [`local-git-compatible-binary.md`](local-git-compatible-binary.md)
+  — wrap the local argv runner as a Git-compatible command, discover SQLite
+  through `.git`, support linked-worktree pointers, and import existing repos.
 - [`offload-large-objects-to-r2.md`](offload-large-objects-to-r2.md) — keep
   objects above the materialisation ceiling in R2 keyed by OID instead of
   refusing them at `add` and ingest.
