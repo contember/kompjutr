@@ -29,6 +29,11 @@ Maintenance records the observed epoch, restarts root discovery when it drifts,
 and rechecks the epoch before every destructive transaction. Normal Git
 mutations stay available; sustained churn may delay collection safely.
 
+Fulfilling a promised blob also advances that epoch atomically with physical
+publication and promise removal. A previous mark may have omitted the absent
+leaf even though its tree remains reachable. Promise rows themselves are not
+roots, so fulfilled blobs with no surviving references remain collectible.
+
 An object, or a wholly unreachable complete pack, becomes a candidate only after
 a complete stable mark. Collection starts 14 days after its first unreachable
 observation, and retained reflog expiry happens before that clock starts. There

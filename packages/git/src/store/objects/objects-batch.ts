@@ -6,6 +6,7 @@ import type { ObjectBatch, ObjectBatchOptions, OwnedObjectBatch } from "../core/
 import { isThenableResult } from "../core/json-pages.js";
 import { insertCommitCaches, prepareCommitCache } from "../trees/commits.js";
 import { indexSeededTreeSources } from "../trees/tree-index.js";
+import { fulfillLoosePromises } from "./objects-promises.js";
 import {
   type ChunkPayload,
   COMMIT_STAGE_CACHE_BYTES,
@@ -133,6 +134,11 @@ function flushObjects(
   );
   let wroteLoose = false;
   context.db.transactionSync(() => {
+    fulfillLoosePromises(
+      context.db,
+      context.repoId,
+      staged.filter((object) => object.type === "blob").map((object) => object.oid),
+    );
     const fresh: StagedObject[] = [];
     for (const row of context.db.iterate(
       `INSERT INTO git_objects (repo_id, oid, type, size, stored)

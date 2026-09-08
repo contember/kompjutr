@@ -6,6 +6,7 @@ import { hashObject, type ObjectType, objectHeader } from "../../common/objects.
 import { Sha1 } from "../../common/sha1.js";
 import { insertCommitCaches, prepareCommitCache } from "../trees/commits.js";
 import { indexSeededTreeSource } from "../trees/tree-index.js";
+import { fulfillLoosePromises } from "./objects-promises.js";
 import { hasObject } from "./objects-query.js";
 import {
   encodeLoose,
@@ -37,6 +38,7 @@ export function writeObject(
   const storedData = encodeLoose(data, stored);
   const createdMs = nowMilliseconds(context);
   context.db.transactionSync(() => {
+    if (type === "blob") fulfillLoosePromises(context.db, context.repoId, [oid]);
     context.db.run(
       "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, ?)",
       context.repoId,
@@ -155,6 +157,7 @@ export function writeObjectStream(
     }
     const createdMs = nowMilliseconds(context);
     context.db.transactionSync(() => {
+      if (type === "blob") fulfillLoosePromises(context.db, context.repoId, [oid]);
       context.db.run(
         "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'raw')",
         context.repoId,
@@ -219,6 +222,7 @@ export function writeObjectStream(
 
   const createdMs = nowMilliseconds(context);
   context.db.transactionSync(() => {
+    if (type === "blob") fulfillLoosePromises(context.db, context.repoId, [oid]);
     context.db.run(
       "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'zlib')",
       context.repoId,

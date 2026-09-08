@@ -349,3 +349,25 @@ acceptance witnesses, benchmark feasibility, and review/test gates.
 - 2026-09-08 — User approved full execution, independent reviews, and atomic
   per-unit commits on the current branch. No push. WU1 precedes WU2; WU3's
   lifetime seam is qualified before concurrent runtime edits.
+- 2026-09-08 — Initial smoke gate: `cpu-lease run -n 4 -- npm test`, 159 tests
+  across 14 files passed in 16.92 s. An early typecheck encountered unfinished
+  witness helpers; it is not an acceptance result and will be rerun on frozen WUs.
+- 2026-09-08 — WU3 verify-first reproduced incomplete-graph clone (native Git
+  rejects the missing parent) and legacy publication after public maintenance
+  deletes the sole reused aged pack, with zero transfer POSTs. Leader approved
+  final synchronous connectivity validation inside the existing mutation guard;
+  no new ownership or maintenance seam. Benchmark extension uses the existing
+  Next.js runner with isolated legacy/mapped modes, before runtime edits.
+- 2026-09-08 — Leader-authored WU2 cycle witnesses in `tests/pack.test.ts` fail
+  before lifecycle changes for both three-pack and self-referential promotion:
+  deletion succeeds and cold reads report `cyclic delta chain`. Command:
+  `cpu-lease run -n 2 -- npx vitest run tests/pack.test.ts -t 'canonical promotion cycle' --reporter=dot`.
+  Evidence remains store-API level; no arbitrary SQL mutation was used.
+- 2026-09-08 — WU1 reproduced both storage variants and the real HTTP partial
+  clone → historical `catFile()` → cold maintenance journey before changing
+  runtime code. Atomic promise consumption now advances the epoch only on actual
+  fulfillment, for all loose writers and complete pack publication; no schema or
+  sweep change. Independent reviewer `ses_f7e6133f7ffeqBjbsmNjODZnta`: clean,
+  reran 29 tests. Leader reran the same 29 tests (3.92 s), typecheck, and smoke
+  (159 tests, 16.40 s); formatting gate was temporarily held by WU3's active
+  benchmark edits. → ADR-0012 and `reference/concurrency.md` for the invariant.

@@ -18,6 +18,7 @@ import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
+import { promiseMaintenance } from "./helpers/promise-maintenance.js";
 
 const PERSON = {
   name: "Sweep Fixture",
@@ -216,6 +217,60 @@ class CorruptAvailabilityDatabase implements SqlDatabase {
 }
 
 describe("maintenance sweep", () => {
+  it.each(["loose", "packed"])(
+    "keeps a fulfilled %s promise across stale marking and cold sweep",
+    async (variant) => {
+      const fixture = promiseMaintenance();
+      await fixture.runtime().git.init({ dir: "/repo" });
+      const store = fixture.store();
+      const data = utf8.encode("reachable promised leaf\n");
+      const oid = hashObject("blob", data);
+      store.registerPromisorRemote("origin", "https://example.test/repo.git");
+      store.addPromisedBlobs("origin", [oid]);
+      const tree = store.write("tree", serializeTree([{ mode: MODE_FILE, name: "file", oid }]));
+      const head = store.write(
+        "commit",
+        serializeCommit({
+          tree,
+          parent: [],
+          author: PERSON,
+          committer: PERSON,
+          message: "promise\n",
+        }),
+      );
+      store.setRef("refs/heads/main", head);
+      const deadData = utf8.encode("genuinely unreachable\n");
+      const dead = hashObject("blob", deadData);
+      store.addPromisedBlobs("origin", [dead]);
+      await fixture.until("classify-loose");
+      expect(fixture.marked(oid)).toBe(0);
+      if (variant === "loose") {
+        store.write("blob", data);
+        store.write("blob", deadData);
+      } else {
+        await store.packs.ingest(slices(fullPack([{ type: "blob", data }]), 17));
+        await store.packs.ingest(slices(fullPack([{ type: "blob", data: deadData }]), 17));
+      }
+      expect(store.promisedBlobCount()).toBe(0);
+      expect(await fixture.call()).toMatchObject({ phase: "roots", restarted: true });
+      await fixture.until("sweep-loose");
+      expect(fixture.marked(oid)).toBe(1);
+      const deadPack = fixture.store().packs.lookup(dead)?.packId;
+      expect(
+        candidateAge(
+          fixture.db,
+          variant === "loose" ? "git_loose_gc_candidates" : "git_pack_gc_candidates",
+          store.repoId,
+          deadPack ?? dead,
+        ),
+      ).toBe(fixture.clock.value);
+      fixture.clock.value += GC_GRACE_MS + 1;
+      await fixture.until("finish");
+      expect(fixture.store().read(dead)).toBeNull();
+      await fixture.expectReadable(head, oid, data);
+    },
+  );
+
   it("converges loose candidates without cursors, preserves first age, and resumes cold", () => {
     const db = new TestDatabase();
     const { checkout, store } = open(db);

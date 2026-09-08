@@ -9,6 +9,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import type { ByteLru } from "../../common/lru.js";
 import type { ObjectType, RawObject } from "../../common/objects.js";
+import { bumpMaintenanceRootEpoch } from "../maintenance/control.js";
 import { PackIngestEngine } from "./ingest.js";
 import { PackLifecycle } from "./lifecycle.js";
 import { PackReadEngine } from "./read.js";
@@ -238,6 +239,9 @@ export class PackStore {
             this.#repoId,
             result.packId,
           );
+          if (this.#db.scalar<number>("SELECT changes()") !== 0) {
+            bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+          }
           return lifecycle?.published(result);
         },
       },

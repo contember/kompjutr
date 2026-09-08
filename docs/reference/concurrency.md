@@ -165,8 +165,11 @@ delta, corruption, or structural bound is exhausted.
 
 Promise rows do not become maintenance roots. A missing blob reached through a
 tree is a valid terminal leaf only while the same repository owns its promise.
-Hydration publishes a complete pack and removes matching promises in one
-transaction; an interrupted pack leaves every promise intact. A mutable
+Loose or complete-pack publication removes fulfilled promises and advances the
+maintenance root epoch in the same transaction. The next maintenance action
+restarts discovery so newly physical leaves cannot inherit an absent mark.
+Publication without fulfillment leaves the epoch unchanged; an interrupted pack
+leaves every promise intact. A mutable
 `remote.<name>.url` must still match the pinned promisor URL before discovery.
 
 ## Current compatibility matrix
