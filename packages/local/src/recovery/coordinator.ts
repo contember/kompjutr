@@ -131,10 +131,6 @@ export class RecoveryCoordinator implements RecoveryTransactionOwner {
     };
   }
 
-  get diskChanged(): boolean {
-    return this.diskEffects > 0;
-  }
-
   get diskEffects(): number {
     return this.#active?.effects ?? 0;
   }

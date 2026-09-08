@@ -75,6 +75,11 @@ export interface NodeSqliteDatabaseOptions {
   readonly recoveryDirectory?: string;
 }
 
+interface SqlEffects {
+  readonly changes: number;
+  readonly schema: number;
+}
+
 export interface NodeSqliteMetrics {
   readonly statements: number;
   readonly rows: number;
@@ -287,13 +292,13 @@ export class NodeSqliteDatabase implements SqlDatabase {
 
   transactionSync<T>(closure: () => T): T {
     if (this.#depth > 0) {
-      const rows = this.#changeCount();
+      const sql = this.#sqlEffects();
       const disk = this.#recovery?.diskEffects ?? 0;
       let nested: T;
       try {
         nested = closure();
       } catch (error) {
-        if (this.#nestedScopeChanged(rows, disk)) this.#nestedFailureLeftEffects = true;
+        if (this.#nestedScopeChanged(sql, disk)) this.#nestedFailureLeftEffects = true;
         throw error;
       }
       if (isThenable(nested)) {
@@ -339,7 +344,7 @@ export class NodeSqliteDatabase implements SqlDatabase {
       if (this.#recovery?.abortOnly === true) {
         throw localError("ERECOVERY", "a failed disk operation made the transaction abort-only");
       }
-      diskChanged = this.#recovery?.diskChanged === true;
+      diskChanged = (this.#recovery?.diskEffects ?? 0) > 0;
       if (diskChanged) {
         if (baseGeneration === Number.MAX_SAFE_INTEGER) {
           throw localError("E2BIG", "recovery generation is exhausted");
@@ -372,15 +377,23 @@ export class NodeSqliteDatabase implements SqlDatabase {
     return result;
   }
 
-  /** Rows this connection has changed, including changes a later rollback undoes. */
-  #changeCount(): number {
-    return requireCounter(this.scalar("SELECT total_changes()"), "total change count");
+  /** Rows and schema this connection changed, counting what a rollback later undoes. */
+  #sqlEffects(): SqlEffects {
+    const row = this.one<Record<string, unknown>>(
+      `SELECT total_changes() AS changes,
+              (SELECT schema_version FROM pragma_schema_version()) AS schema`,
+    );
+    return {
+      changes: requireCounter(row?.changes, "total change count"),
+      schema: requireCounter(row?.schema, "schema version"),
+    };
   }
 
-  #nestedScopeChanged(rows: number, disk: number): boolean {
+  #nestedScopeChanged(sql: SqlEffects, disk: number): boolean {
     if ((this.#recovery?.diskEffects ?? 0) !== disk) return true;
     try {
-      return this.#changeCount() !== rows;
+      const current = this.#sqlEffects();
+      return current.changes !== sql.changes || current.schema !== sql.schema;
     } catch {
       // An unreadable connection cannot prove the nested closure changed nothing.
       return true;

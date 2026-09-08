@@ -11,14 +11,23 @@ committed guard.
 ## Runtime transaction owners
 
 In `@kompjutr/do`, `Database.transactionSync()` delegates every nesting level to
-Durable Object storage. Git and the relational filesystem use that same database
-and the storage object is their opaque mutation scope.
+Durable Object storage, which nests with SQLite savepoints: a nested closure that
+throws is rolled back alone and the outer transaction may still commit. Git and
+the relational filesystem use that same database and the storage object is their
+opaque mutation scope.
 
 In `@kompjutr/local`, one lifetime process lock excludes a second local writer.
 The lock is an exclusive transaction in a root-keyed SQLite database beside the
 worktree and is released by the kernel when its process exits. Alternate state
 configurations therefore contend. `NodeSqliteDatabase.transactionSync()` owns
-`BEGIN IMMEDIATE`, `COMMIT`, and `ROLLBACK`; nested calls join the outer transaction. The database and
+`BEGIN IMMEDIATE`, `COMMIT`, and `ROLLBACK`; nested calls join the outer
+transaction. A nested closure that throws makes the outer transaction
+abort-only when that scope changed rows or schema, or recorded a disk effect —
+disk work cannot be undone alone, so the whole transaction is refused with
+`ERECOVERY`. A nested failure that changed nothing, such as the `EREENTRANT`
+rejection above, leaves the outer transaction committable. Until the refusal the
+failed scope's rows stay readable inside the transaction, which is where the two
+runtimes differ. The database and
 `DiskDrive` share one `RecoveryCoordinator` as their mutation scope. Disk
 changes are backed up before application, and the committed SQLite recovery
 generation decides rollback or roll-forward after a crash or uncertain commit.

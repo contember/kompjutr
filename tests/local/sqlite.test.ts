@@ -102,6 +102,25 @@ describe("NodeSqliteDatabase", () => {
     }
   });
 
+  it("refuses the outer commit when a caught nested failure left schema behind", () => {
+    const db = database();
+    try {
+      expect(() =>
+        db.transactionSync(() => {
+          expect(() =>
+            db.transactionSync(() => {
+              db.run("CREATE TABLE half_built (a INTEGER)");
+              throw new Error("nested failure");
+            }),
+          ).toThrow("nested failure");
+        }),
+      ).toThrowError(expect.objectContaining({ code: "ERECOVERY" }));
+      expect(db.all("SELECT name FROM sqlite_master WHERE name = 'half_built'")).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
   it("commits the outer transaction when a caught nested failure changed nothing", () => {
     const db = database();
     try {
@@ -140,6 +159,32 @@ describe("NodeSqliteDatabase", () => {
       ).toThrowError(expect.objectContaining({ code: "ERECOVERY" }));
       expect(existsSync(join(workspace.root, "nested.txt"))).toBe(false);
       expect(database.all("SELECT key FROM git_meta WHERE key = 'nested'")).toEqual([]);
+      database.transactionSync(() =>
+        drive.writeFiles([{ path: "/after.txt", bytes: new Uint8Array([2]) }]),
+      );
+      expect(existsSync(join(workspace.root, "after.txt"))).toBe(true);
+    } finally {
+      workspace.close();
+      fixture.dispose();
+    }
+  });
+
+  it("refuses the outer commit when a caught nested failure left only disk effects", async () => {
+    const fixture = localFixture();
+    const workspace = fixture.workspace();
+    const { database, drive } = workspace;
+    try {
+      expect(() =>
+        database.transactionSync(() => {
+          expect(() =>
+            database.transactionSync(() => {
+              drive.writeFiles([{ path: "/disk-only.txt", bytes: new Uint8Array([1]) }]);
+              throw new Error("nested failure");
+            }),
+          ).toThrow("nested failure");
+        }),
+      ).toThrowError(expect.objectContaining({ code: "ERECOVERY" }));
+      expect(existsSync(join(workspace.root, "disk-only.txt"))).toBe(false);
       database.transactionSync(() =>
         drive.writeFiles([{ path: "/after.txt", bytes: new Uint8Array([2]) }]),
       );
@@ -250,7 +295,6 @@ describe("NodeSqliteDatabase", () => {
       let abandoned = false;
       const recovery: RecoveryTransactionOwner = {
         begin() {},
-        diskChanged: failure === "classification",
         diskEffects: failure === "classification" ? 1 : 0,
         abortOnly: false,
         checkpoint(checkpoint) {
@@ -289,7 +333,6 @@ describe("NodeSqliteDatabase", () => {
     let abandoned = false;
     const recovery: RecoveryTransactionOwner = {
       begin() {},
-      diskChanged: false,
       diskEffects: 0,
       abortOnly: false,
       checkpoint() {},

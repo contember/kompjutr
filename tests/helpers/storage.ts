@@ -64,7 +64,7 @@ class Cursor<Row extends object> implements SQLCursorLike<Row>, IterableIterator
  * too — otherwise a `BEGIN` emitted by `src/` passes here and fails only in a
  * Durable Object. Its own `transactionSync` goes straight to `db`, below this.
  */
-const TRANSACTION_SQL = /^\s*(?:BEGIN|COMMIT|ROLLBACK)\b/i;
+const TRANSACTION_SQL = /^\s*(?:BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
 
 function rejectTransactionSQL(query: string): void {
   if (TRANSACTION_SQL.test(query)) {
@@ -211,7 +211,7 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
     }
   }
 
-  /** Nested scopes roll back alone, exactly as workerd's `transactionSync` does. */
+  /** Nested scopes roll back alone, as workerd's `transactionSync` does with savepoints. */
   #savepoint<T>(closure: () => T): T {
     const name = `_nested_${this.#depth++}`;
     this.db.exec(`SAVEPOINT ${name}`);

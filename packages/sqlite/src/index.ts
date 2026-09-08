@@ -27,9 +27,9 @@ export interface SqlDatabase {
   /** Implementations must return a lazy cursor and close it on early return. */
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>>;
   /**
-   * Nested calls join the outer transaction; a nested closure that throws must
-   * leave no effect behind, so an implementation that cannot undo the nested
-   * scope alone must refuse the outer commit.
+   * Nested calls join the outer transaction. A nested closure that throws must
+   * leave nothing committed: undo that scope alone, or refuse the outer commit
+   * — and then its rows stay readable until the refusal.
    */
   transactionSync<T>(closure: () => T): T;
 }

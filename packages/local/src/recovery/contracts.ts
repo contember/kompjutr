@@ -26,7 +26,6 @@ export type RecoveryCheckpointHandler = (checkpoint: RecoveryCheckpoint) => void
 
 export interface RecoveryTransactionOwner {
   begin(baseGeneration: number): void;
-  readonly diskChanged: boolean;
   /** Monotonic count of disk effects recorded by the active transaction. */
   readonly diskEffects: number;
   readonly abortOnly: boolean;
