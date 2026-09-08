@@ -113,6 +113,28 @@ until the external consumer integration gate provides new evidence.
 Do not merge 26 and 27 into one sprint. They are two independent extra-large
 units over the same files, and a long sprint does not make that safe.
 
+## 2026-09-08 review intake
+
+These issues preserve the review's distinction between ordinary valid API use,
+invalid external input, and store-level reproduction. Each item states its
+trigger, actual evidence, and missing public witness. Static allocation/work
+proofs are not measured OOM or latency results. Arbitrary `git_*` mutation is not
+an accepted correctness witness under ADR-0004.
+
+| Work | Items | Evidence boundary |
+|---|---|---|
+| Public API correctness | [67](67-own-public-object-buffers.md), [68](68-abort-caught-nested-local-failures.md), [69](69-fix-repeated-local-path-mutations.md), [70](70-enforce-local-scan-and-discovery-contracts.md) | Buffer aliasing, nested rollback, and repeated mutations reproduced; scan/discovery contracts statically verified. |
+| Lifecycle and valid pack handling | [71](71-invalidate-maintenance-on-promise-fulfillment.md), [72](72-preserve-pack-dependencies-during-lifecycle.md), [74](74-align-pack-ingest-with-physical-membership.md) | Reproduced publication/store mechanisms with explicit limits on end-to-end public coverage; retain verification-first acceptance for concurrency schedules. |
+| Network boundary | [73](73-validate-fetch-connectivity-and-publication.md) | Incomplete-graph clone reproduced with a faulty remote response; publication-race and framing witnesses are qualified separately. |
+| Valid-input resource scaling | [75](75-bound-network-authentication-payloads.md), [76](76-bound-full-tree-construction.md), [77](77-remove-repeated-local-traversal-work.md), [78](78-make-sql-cursors-seek-and-deliver-incrementally.md), [79](79-bound-materialized-status-and-config-reads.md) | Static live-state/work analysis and specified query-plan observations; target-runtime measurements remain acceptance work. |
+| Architectural test guarantee | [80](80-restore-import-graph-domain-guarantees.md) | Lost enforcement verified; current inspected source edges are clean. |
+
+Existing pending-projection, aggregate integration, ref-limit, sweep, and related
+findings remain in [65](65-git-sqlite-architecture-review.md); packed-read memory
+and chain traversal remain in [63](63-bound-packed-dependency-graph-traversal.md).
+Callback misuse and design experiments are explicitly labeled there. The intake
+does not schedule these issues into a sprint.
+
 ## Items
 
 - [06 — Implement stash operations](06-stash-operations.md)
@@ -131,3 +153,17 @@ units over the same files, and a long sprint does not make that safe.
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
 - [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
 - [66 — Retire modeled retained-byte charges](66-retire-modeled-retained-byte-charges.md)
+- [67 — Own buffers across public Git object boundaries](67-own-public-object-buffers.md)
+- [68 — Abort local transactions after caught nested failures](68-abort-caught-nested-local-failures.md)
+- [69 — Preserve local mutation semantics after first touch](69-fix-repeated-local-path-mutations.md)
+- [70 — Enforce local scan ordering and regular-file discovery](70-enforce-local-scan-and-discovery-contracts.md)
+- [71 — Invalidate maintenance marks when promised blobs become physical](71-invalidate-maintenance-on-promise-fulfillment.md)
+- [72 — Preserve pack dependencies across ingest, promotion, and sweep](72-preserve-pack-dependencies-during-lifecycle.md)
+- [73 — Validate fetched object connectivity and final publication](73-validate-fetch-connectivity-and-publication.md)
+- [74 — Align pack ingest with physical membership and cold reads](74-align-pack-ingest-with-physical-membership.md)
+- [75 — Bound payload lifetime during network object validation](75-bound-network-authentication-payloads.md)
+- [76 — Bound full-tree construction before serialization allocation](76-bound-full-tree-construction.md)
+- [77 — Remove repeated local traversal and recovery work](77-remove-repeated-local-traversal-work.md)
+- [78 — Make SQL cursors seek and deliver incrementally](78-make-sql-cursors-seek-and-deliver-incrementally.md)
+- [79 — Bound materialized status and avoid scalar config overreads](79-bound-materialized-status-and-config-reads.md)
+- [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)

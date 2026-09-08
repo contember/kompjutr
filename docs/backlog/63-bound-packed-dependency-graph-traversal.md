@@ -19,9 +19,23 @@ too large for the bounded shared cache. A deep or shared-base delta batch can
 therefore exceed the operation's intended live-memory bound.
 
 `packages/git/src/store/maintenance/reachability.ts` also revalidates progressively
-shorter packed-delta suffixes, making a deep chain O(n²). None of these shapes is
-a regression for a current supported workload, but all violate the structural
-cost model at adversarial format-valid scale.
+shorter packed-delta suffixes, making a deep chain O(n²). These are valid-input
+scale problems reachable through ordinary reads and maintenance, not failures
+requiring out-of-band database mutation. A production workload regression has
+not been measured.
+
+## 2026-09-08 evidence qualification
+
+Independent static verification traced the retaining `resolved` map to
+`packages/git/src/store/pack/read/read-resolver.ts`. An 8 MiB base and 16 distinct
+8 MiB targets retain 136 MiB of decoded payload while immediate delta working-set
+checks can still pass. This is an analytical payload total, not measured RSS or
+a reproduced Workers OOM.
+
+The paged reader replaces decoded checkpoint results between pages; it does not
+retain every prior decoded checkpoint. Page descriptors and checkpoint metadata
+still accumulate during discovery, and each page uses the retaining resolver.
+Maintenance's suffix revalidation remains a separate verified quadratic path.
 
 ## Approach / acceptance
 
@@ -32,6 +46,12 @@ Process or persist maintenance progress so each dependency edge is validated a
 constant number of times. Wide and deep graph reads must have bounded measured
 high-water, and deep-chain maintenance work must grow linearly. Do not lower
 structural limits or introduce a projected-work refusal.
+
+Exercise public cold reads with format-valid multi-megabyte delta chains and
+public maintenance with N/2N depth fixtures. Measure under the benchmark rules;
+cache size, returned batch size, and statement count alone are not sufficient.
+Coordinate dependency lifetime with
+[72](72-preserve-pack-dependencies-during-lifecycle.md).
 
 ## Touch points
 

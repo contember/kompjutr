@@ -1,0 +1,49 @@
+---
+id: 74
+title: Align pack ingest with physical membership and cold reads
+blocked-by: []
+---
+
+# 74 — Align pack ingest with physical membership and cold reads
+
+**Summary.** Accept valid repeated physical objects and establish cold-read
+admissibility before publication. These inputs need not be malformed Git data.
+
+## Problem and evidence
+
+- Deferred OFS lookup joins canonical `git_pack_objects` instead of physical
+  `git_pack_entries`. A full base already canonically owned by an older pack,
+  followed by enough entries to evict its offset window, cannot be located at its
+  new physical offset. The initial window is certainly evicted after 8,192
+  resolved offset insertions. This mechanism is statically verified.
+- Every physical occurrence of a nonempty tree starts projection ordinals again,
+  but its source key identifies the OID and pack, not offset. Duplicate tree
+  entries collide on `(source_key, ordinal)`. The review reproduced rejection of
+  a duplicate-tree pack that native `git index-pack` accepted; the mechanism was
+  independently checked.
+- Ingest and cold reads disagree on delta admissibility: reads add a modeled
+  256-byte charge absent from ingest, and immediate resolution does not establish
+  the reader's depth limit. The size mismatch is statically proven. An existing
+  reduced-depth test demonstrates successful ingest followed by cold-read
+  refusal; production-depth publication was not runtime-tested.
+
+## Approach / acceptance
+
+- Use physical membership for OFS offset resolution; preserve canonical lookup
+  by OID after resolving the physical reference.
+- Deduplicate tree projection work by exact source while preserving every physical
+  membership entry. Cover full/delta occurrences within and across flushes.
+- Add real-Git pack parity for duplicated OIDs and distant OFS bases, including
+  bases canonically owned by another pack.
+- Establish one real delta-size/depth contract at ingest and read. Remove the
+  modeled wrapper discrepancy rather than introducing another byte ledger.
+- Every accepted fixture remains readable after cache eviction and cold reopen;
+  rejected input must not publish refs or visible incomplete projections.
+
+## Touch points
+
+- `packages/git/src/store/pack/ingest/ingest-pending.ts`, `ingest-index.ts`,
+  `ingest-inflate.ts`, `ingest-projection.ts`, `ingest-reader.ts`.
+- `packages/git/src/store/pack/pack-ingest-index.ts`, `shared-delta.ts`.
+- `packages/git/src/store/trees/tree-index-batch.ts`.
+- `tests/pack.test.ts`, `tests/tree-index-stream.test.ts`.

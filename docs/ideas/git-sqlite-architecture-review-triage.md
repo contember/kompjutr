@@ -16,6 +16,16 @@ Verified open work is canonical in
 [`../backlog/65-git-sqlite-architecture-review.md`](../backlog/65-git-sqlite-architecture-review.md).
 The report's explicitly dismissed claims are not retained here.
 
+The 2026-09-08 follow-up graduated the ref-limit correctness consequence and
+unused membership digests into [65](../backlog/65-git-sqlite-architecture-review.md),
+journal-root paging into
+[78](../backlog/78-make-sql-cursors-seek-and-deliver-incrementally.md), and the
+qualified malformed-sideband finding into
+[73](../backlog/73-validate-fetch-connectivity-and-publication.md).
+Their evidence and acceptance now live in those items. The
+[review intake](../backlog/README.md#2026-09-08-review-intake) distinguishes valid
+API failures from malformed-input checks and store-level reproductions.
+
 ## Subsumed claims
 
 These claims need no separate backlog item. Verification can strengthen the
@@ -24,13 +34,11 @@ acceptance witness of the listed verified finding.
 | Claims | Candidate owner | Verification needed |
 |---|---|---|
 | CORR-14 | Backlog 65, ARCH-32 | Reproduce malformed OID or path data through a supported scratch-index writer; do not revive the dismissed stronger trust-premise claim. |
-| CORR-18 | Backlog 65, ARCH-18 | Establish a correctness consequence distinct from the verified whole-ref-table materialization cost. |
 | CORR-19 / TEST-2 | Backlog 65, ARCH-6 | Define a narrow source witness for forbidden read-time authentication that does not flag schema checks or boundary validation. |
 | CORR-20 | Backlog 65, ARCH-17 | Classify sparse accounting as mutable ledger, structural cap, or result cap under ADR-0005. |
 | DOCS-2 / part of DOCS-3 / compact reflog-root cap claim | Backlog 65, ARCH-19 | Confirm which constants disappear with the duplicate root stream and which still bound public materialization. |
 | DOCS-6 and compact `*Owned` claims | Backlog 65, ARCH-24/ARCH-25 | Inventory remaining wrappers, WeakMaps, and callerless exports before mechanical removal. |
 | DOCS-7 and compact local-helper claims | Backlog 65, ARCH-27 | Attach exact helper call sites and divergent inputs to the shared-kit cleanup. |
-| Compact repeated journal-root reads | Backlog 65, ARCH-5/CORR-6 | Measure whether root paging adds a distinct cost after journal read-time authentication is removed. |
 
 ## Correctness candidates
 
@@ -47,8 +55,7 @@ acceptance witness of the listed verified finding.
 | CORR-27 | Tree ingest does not establish sortedness before projection. | Ingest a validly hashed unsorted tree and determine whether Git accepts it and whether traversal invariants fail. |
 | CORR-28 | Sparse checkout issues two scalar probes per candidate directory. | Measure statement growth and identify a set-based emptiness or removal primitive. |
 | CORR-29 | Literal add can reject a directory when a sibling sorts between it and its subtree. | Reproduce files, directories, and sibling-prefix boundaries against real Git. |
-| Pack membership digests | Per-entry membership digests are computed but never compared. | Trace altered indexed rows through publication; either consume the digests or remove the unused hashing and its claims. |
-| Short or missing chunks | Cached packed reads can zero-fill a short range and loose chunk reads can return truncated content. | Inject short and missing rows and require every read surface to fail consistently with `ECORRUPT`. |
+| Short or missing chunks | A supported writer might publish incomplete physical content. | First establish a supported writer or lifecycle sequence that creates the short/missing content. Injecting damaged rows alone is out-of-band mutation and is insufficient under ADR-0004. |
 | Legacy tree modes | Modes such as `100664` abort ingest although Git may warn and canonicalize. | Build the object with real Git and compare clone, checkout, and `fsck` before choosing rejection or normalization. |
 | Branch-rename reflog | Branch rename may leave history under the old reflog name. | Compare old and new reflog visibility after rename with real Git. |
 | Put/delete overlap | A ref named in both puts and deletes may silently resolve as a put. | Exercise all overlap forms and define rejection or precedence in the public batch contract. |
@@ -57,7 +64,6 @@ acceptance witness of the listed verified finding.
 | Missing operation gitlinks | Journal gitlink OIDs may be mandatory roots while index gitlinks are optional. | Create an operation over an absent gitlink and establish maintenance and recovery semantics. |
 | Clean sibling ordering | Ignored-subtree state may reset at an interleaving sibling prefix. | Build the ordering fixture and compare clean selection with Git before any deletion. |
 | Join equality | `joinSorted` and `joinSorted3` use different equality definitions. | Find reachable distinct strings that compare equal, or prove boundary validation makes the difference unreachable. |
-| Upload-pack sideband | Fetch may accept malformed sideband frames rejected by the push-side parser. | Differentially test empty frames, invalid bands, malformed UTF-8, missing flushes, and trailing packets. |
 | Tracking reconciliation | Similar target-authentication failures may map to `deferred` and `failed` inconsistently. | Exercise each error code and define retryable versus terminal outcomes. |
 
 ## Architecture and cost candidates
