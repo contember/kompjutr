@@ -246,6 +246,21 @@ function corruptLooseObject(workspace: TestRepository, oid: string): void {
 }
 
 describe("tree and index write plumbing", () => {
+  it("owns the bytes handed to scalar and batch object writes", () => {
+    const test = makeRepo();
+    const scalar = utf8.encode("scalar\n");
+    const scalarOid = test.repo.store.write("blob", scalar);
+    scalar[0] = 0x58;
+    expect(test.repo.store.read(scalarOid)?.data).toEqual(utf8.encode("scalar\n"));
+    const batched = utf8.encode("batched\n");
+    let batchedOid = "";
+    test.repo.store.writeObjects((batch) => {
+      batchedOid = batch.write("blob", batched);
+    });
+    batched[0] = 0x58;
+    expect(test.repo.store.read(batchedOid)?.data).toEqual(utf8.encode("batched\n"));
+  });
+
   it("updates a guarded ref with long configured metadata", () => {
     const name = "N".repeat(128 * 1024);
     const email = `${"e".repeat(128 * 1024)}@example.test`;

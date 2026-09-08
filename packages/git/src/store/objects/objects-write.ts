@@ -98,7 +98,8 @@ export function writeObject(
     }
   });
   context.cacheKeys.markLoose();
-  context.objects.set(context.cacheKeys.objectCacheKey(oid), { type, data });
+  // The cache outlives this call, so it owns its bytes; the caller may reuse `data`.
+  context.objects.set(context.cacheKeys.objectCacheKey(oid), { type, data: data.slice() });
   return oid;
 }
 

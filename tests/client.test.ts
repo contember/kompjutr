@@ -21,6 +21,7 @@ import {
   type GitScratchIndex,
   type PushLeaseExpectation,
 } from "../packages/git/src/client.js";
+import { utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
 import {
   iterateIndexTrackerDirty,
   readIndexTrackerState,
@@ -1343,6 +1344,24 @@ describe("git client", () => {
       new Uint8Array(fixture.gitBinary("cat-file", "commit", expectedSnapshot)),
     );
   });
+  it("owns object bytes across the public write and read boundaries", async () => {
+    const { git, workspace } = makeNativeGit();
+    await git.init({ dir: "/" });
+    const content = utf8.encode("abc");
+    const oid = await git.hashObject({ content, write: true });
+    content[1] = 0x78;
+    const warm = await git.catFile({ oid });
+    expect(utf8Decoder.decode(warm.bytes)).toBe("abc");
+    warm.bytes[1] = 0x79;
+    expect(utf8Decoder.decode((await git.catFile({ oid })).bytes)).toBe("abc");
+    await git.maintenance({ dir: "/" });
+    const cold = reopenGit(workspace.storage);
+    const packed = await cold.catFile({ oid });
+    expect(utf8Decoder.decode(packed.bytes)).toBe("abc");
+    packed.bytes[1] = 0x7a;
+    expect(utf8Decoder.decode((await cold.catFile({ oid })).bytes)).toBe("abc");
+  });
+
   it("keeps the maximal public scratch snapshot below the SQL budget", async () => {
     const workspace = makeTestWorkspace();
     const setupGit = bindNativeGit(workspace);

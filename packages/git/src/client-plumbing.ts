@@ -39,7 +39,8 @@ export function createGitClientPlumbingMethods(services: GitClientServices): Plu
           ? catFileOp(repo, input)
           : catFileRead(repo, input.oid, input.filepath),
       );
-      return { oid: result.oid, bytes: result.bytes };
+      // Public bytes leave the store's ownership; a cached object must not alias them.
+      return { oid: result.oid, bytes: result.bytes.slice() };
     },
     async readTree(input) {
       mutate(() => {
