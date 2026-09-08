@@ -3,7 +3,11 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { DivergenceRelationship, DivergenceResult, RawRefTarget } from "../../src/index.js";
+import type {
+  DivergenceRelationship,
+  DivergenceResult,
+  RawRefTarget,
+} from "../../packages/do/src/index.js";
 import { createWorld, type E2ESnapshot, type E2EWorld, WORK } from "../helpers/e2e.js";
 import type { GitFixture } from "../helpers/git.js";
 

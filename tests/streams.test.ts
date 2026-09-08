@@ -2,8 +2,13 @@ import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
-import { comparePaths as compareFilesystemPaths } from "../src/fs/path.js";
-import { comparePaths, joinSorted, joinSorted3, peekable } from "../src/git/common/streams.js";
+import { comparePaths as compareFilesystemPaths } from "../packages/do/src/fs/path.js";
+import {
+  comparePaths,
+  joinSorted,
+  joinSorted3,
+  peekable,
+} from "../packages/git/src/common/streams.js";
 
 /**
  * `comparePaths` claims to be SQLite's BINARY collation. That claim is not
@@ -126,8 +131,8 @@ describe("comparePaths", () => {
 });
 
 /**
- * Invariant 1 has two implementations because `src/fs` may not import `src/git`
- * (see the header of `src/fs/path.ts`). Nothing else compares them, so a change
+ * Invariant 1 has two implementations because `packages/do/src/fs` may not import `packages/git/src`
+ * (see the header of `packages/do/src/fs/path.ts`). Nothing else compares them, so a change
  * to one could silently order the working tree differently from the index.
  *
  * Well-formed strings only. The two genuinely disagree on an unpaired

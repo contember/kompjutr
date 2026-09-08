@@ -1,4 +1,4 @@
-import type { Commit } from "../src/git/common/objects.js";
+import type { Commit } from "../packages/git/src/common/objects.js";
 
 const COMMIT_FIXED_CACHE_BYTES = 512;
 const COMMIT_PARENT_CACHE_BYTES = 64;

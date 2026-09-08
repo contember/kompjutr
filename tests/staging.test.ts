@@ -1,23 +1,23 @@
 import { afterEach, describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../src/db/db.js";
-import type { ScanEntry } from "../src/fs/types.js";
-import { utf8, utf8Decoder } from "../src/git/common/bytes.js";
-import { GitError, PathspecNotFoundError } from "../src/git/common/errors.js";
-import { hashObject } from "../src/git/common/objects.js";
-import { comparePaths } from "../src/git/common/streams.js";
-import { IGNORE_LIMITS } from "../src/git/ignore/index.js";
-import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
-import type { GitContext } from "../src/git/ops/core/context.js";
-import type { Repository } from "../src/git/ops/repository/repository.js";
-import { add, lsFiles, reset, rm } from "../src/git/ops/staging/staging.js";
-import type {
-  SelectedPathResult,
-  SparseIndexAncestorResult,
-} from "../src/git/ops/worktree/sparse-workspace.js";
+import type { SqlDatabase } from "../packages/do/src/db/db.js";
+import type { ScanEntry } from "../packages/do/src/fs/types.js";
+import { utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { GitError, PathspecNotFoundError } from "../packages/git/src/common/errors.js";
+import { hashObject } from "../packages/git/src/common/objects.js";
+import { comparePaths } from "../packages/git/src/common/streams.js";
 import {
   createSqliteSelectedPathSource,
   createSqliteSparseWorkspaceSource,
-} from "../src/git/store/sparse/sparse-workspace.js";
+} from "../packages/git/src/do-fs/index.js";
+import { IGNORE_LIMITS } from "../packages/git/src/ignore/index.js";
+import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
+import type { GitContext } from "../packages/git/src/ops/core/context.js";
+import type { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { add, lsFiles, reset, rm } from "../packages/git/src/ops/staging/staging.js";
+import type {
+  SelectedPathResult,
+  SparseIndexAncestorResult,
+} from "../packages/git/src/ops/worktree/sparse-workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

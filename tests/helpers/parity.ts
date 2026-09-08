@@ -24,9 +24,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { expect } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { Filesystem } from "../../src/fs/types.js";
-import { createShell, type Shell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { Filesystem } from "../../packages/do/src/fs/types.js";
+import { createShell, type Shell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "./db.js";
 /** Where the corpus lives inside kompjutr. The on-disk root maps onto it. */
 export const ROOT = "/repo";

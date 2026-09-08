@@ -21,9 +21,9 @@ import { dirname, join, posix } from "node:path";
 
 import { expect } from "vitest";
 
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { WriteEntry } from "../../src/fs/types.js";
-import { createShell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { WriteEntry } from "../../packages/do/src/fs/types.js";
+import { createShell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "./db.js";
 
 const ROOT = "/repo";

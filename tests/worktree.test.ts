@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
-import { fromHex } from "../src/git/common/bytes.js";
-import { hashObject } from "../src/git/common/objects.js";
-import { comparePaths } from "../src/git/common/streams.js";
-import { matchesPaths } from "../src/git/ops/checkout/checkout.js";
-import { initRepository } from "../src/git/ops/repository/init.js";
-import type { Worktree } from "../src/git/ops/worktree/worktree.js";
+import type { ScanEntry, ScanOptions } from "../packages/do/src/fs/types.js";
+import { fromHex } from "../packages/git/src/common/bytes.js";
+import { hashObject } from "../packages/git/src/common/objects.js";
+import { comparePaths } from "../packages/git/src/common/streams.js";
+import { matchesPaths } from "../packages/git/src/ops/checkout/checkout.js";
+import { initRepository } from "../packages/git/src/ops/repository/init.js";
+import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
 import {
   compilePathspecs,
+  createWorktreeHashCursor,
   dirtyPaths,
   hashWorktreePaths,
   hashWorktreePathsOwned,
@@ -18,7 +19,7 @@ import {
   walkWorktreeEntriesStream,
   walkWorktreeEntriesStreamOwned,
   walkWorktreeStream,
-} from "../src/git/ops/worktree/worktree-io.js";
+} from "../packages/git/src/ops/worktree/worktree-io.js";
 import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
 import { CountingWorktree } from "./helpers/worktree.js";
 
@@ -925,6 +926,29 @@ describe("dirtyPaths content identity", () => {
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
   });
 
+  it("canonicalizes hash exclusions once across ordered windows", () => {
+    const workspace = makeRepo("/");
+    workspace.worktree.makeDirectories(["/nested-a", "/nested-b"]);
+    workspace.worktree.writeFile("/a.txt", new TextEncoder().encode("a"));
+    workspace.worktree.writeFile("/z.txt", new TextEncoder().encode("z"));
+    const worktree = new CountingWorktree(workspace.worktree);
+    const cursor = createWorktreeHashCursor(["/nested-a", "/nested-b"]);
+    for (const path of ["a.txt", "z.txt"]) {
+      const stat = worktree.stat(`/${path}`);
+      if (stat === null) throw new Error(`missing test path: ${path}`);
+      expect(
+        hashWorktreePathsOwned(
+          workspace.repo,
+          worktree,
+          [{ path, stat }],
+          { write: false },
+          cursor,
+        ).has(path),
+      ).toBe(true);
+    }
+    expect(worktree.realpaths).toBe(1);
+  });
+
   it("keeps 9,329 identity and unresolved comparisons below 1,000 statements", () => {
     const workspace = makeRepo("/");
     const bytes = new Uint8Array([120]);
@@ -947,9 +971,33 @@ describe("dirtyPaths content identity", () => {
         ino: null,
       })),
     );
+    const streamedEntries = workspace.worktree.scan("/", {
+      filesOnly: true,
+      limit: paths.length + 1,
+    });
+    let streamStarts = 0;
+    let fallbackScans = 0;
+    const streaming = new Proxy(workspace.worktree, {
+      get(target, property, receiver) {
+        if (property === "scanStream") {
+          return function* (): Generator<(typeof streamedEntries)[number]> {
+            streamStarts++;
+            yield* streamedEntries;
+          };
+        }
+        if (property === "scan") {
+          return (...args: Parameters<typeof target.scan>) => {
+            fallbackScans++;
+            return target.scan(...args);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
 
     workspace.storage.resetCounters();
-    expect(dirtyPaths(workspace.repo, workspace.worktree)).toEqual([]);
+    expect(dirtyPaths(workspace.repo, streaming)).toEqual([]);
     const identities = workspace.storage.statementCount;
 
     workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, bytes })));
@@ -959,6 +1007,8 @@ describe("dirtyPaths content identity", () => {
 
     expect(identities).toBeLessThan(1_000);
     expect(unresolved).toBeLessThan(1_000);
+    expect(streamStarts).toBe(2);
+    expect(fallbackScans).toBe(0);
   });
 
   it("reads no content when checkout supplied the indexed blob identity", () => {

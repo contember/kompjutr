@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { Database, readBlob, type SqlDatabase } from "../src/db/db.js";
-import { concat, utf8, utf8Decoder } from "../src/git/common/bytes.js";
+import { Database, readBlob, type SqlDatabase } from "../packages/do/src/db/db.js";
+import { concat, utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
 import {
   hashObject,
   parseTree,
@@ -8,9 +8,9 @@ import {
   serializeTree,
   type TreeEntry,
   TreeParser,
-} from "../src/git/common/objects.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { PackTreeIndex } from "../src/git/store/pack/pack-ingest-index.js";
+} from "../packages/git/src/common/objects.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { PackTreeIndex } from "../packages/git/src/store/pack/pack-ingest-index.js";
 import {
   createTreeIndexSink,
   indexTreeSource,
@@ -18,12 +18,12 @@ import {
   initializeGitSchema,
   TREE_QUEUE_ROW_FIXED_BYTES,
   type TreeSource,
-} from "../src/git/store/schema/schema.js";
+} from "../packages/git/src/store/schema/schema.js";
 import {
   indexSeededTreeSource,
   indexSeededTreeSources,
   type TreeSourceInput,
-} from "../src/git/store/trees/tree-index.js";
+} from "../packages/git/src/store/trees/tree-index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const OID = "11".repeat(20);

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { createFilesystemOps } from "../../../src/fs/ops.js";
-import { initializeFsSchema } from "../../../src/fs/schema.js";
+import { createFilesystemOps } from "../../../packages/do/src/fs/ops.js";
+import { initializeFsSchema } from "../../../packages/do/src/fs/schema.js";
 import { TestDatabase } from "../../helpers/db.js";
 
 const bytes = (value: string): Uint8Array => new TextEncoder().encode(value);

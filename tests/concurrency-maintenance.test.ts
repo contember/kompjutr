@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { createGit, type GitMaintenanceResult } from "../src/git/client.js";
-import { utf8 } from "../src/git/common/bytes.js";
-import { fetchHttpClient } from "../src/git/protocol/transport.js";
-import { Workspace } from "../src/runtime/workspace.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createGit, type GitMaintenanceResult } from "../packages/git/src/client.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import { fetchHttpClient } from "../packages/git/src/protocol/transport.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

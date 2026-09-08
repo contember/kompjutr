@@ -14,7 +14,7 @@ import {
   optional,
   RowShape,
   text,
-} from "../src/git/common/rows.js";
+} from "../packages/git/src/common/rows.js";
 
 function expectCorrupt(action: () => unknown, message: string): void {
   expect(action).toThrowError(expect.objectContaining({ code: "ECORRUPT", message }));

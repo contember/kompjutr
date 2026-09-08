@@ -1,30 +1,30 @@
 import { describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../src/db/db.js";
+import type { SqlDatabase } from "../packages/do/src/db/db.js";
 import type {
   RemoveOptions,
   ScanEntry,
   ScanOptions,
   WriteEntry,
   WriteOptions,
-} from "../src/fs/types.js";
-import { fromHex, toHex, utf8, utf8Decoder } from "../src/git/common/bytes.js";
-import { CorruptError } from "../src/git/common/errors.js";
-import { comparePaths } from "../src/git/common/streams.js";
-import type { GitContext, IndexTrackerSeedEntry } from "../src/git/ops/core/context.js";
-import { checkout } from "../src/git/ops/refs/refs.js";
-import { commit } from "../src/git/ops/repository/commit.js";
+} from "../packages/do/src/fs/types.js";
+import { fromHex, toHex, utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { CorruptError } from "../packages/git/src/common/errors.js";
+import { comparePaths } from "../packages/git/src/common/streams.js";
+import {
+  createSqliteSelectedPathSource,
+  createSqliteSparseWorkspaceSource,
+} from "../packages/git/src/do-fs/index.js";
+import type { GitContext, IndexTrackerSeedEntry } from "../packages/git/src/ops/core/context.js";
+import { checkout } from "../packages/git/src/ops/refs/refs.js";
+import { commit } from "../packages/git/src/ops/repository/commit.js";
 import type {
   SelectedPathRequest,
   SelectedPathResult,
   SparseWorkspaceSource,
-} from "../src/git/ops/worktree/sparse-workspace.js";
-import type { Worktree } from "../src/git/ops/worktree/worktree.js";
-import { hashWorktreePath } from "../src/git/ops/worktree/worktree-io.js";
-import type { IndexEntry } from "../src/git/store/index.js";
-import {
-  createSqliteSelectedPathSource,
-  createSqliteSparseWorkspaceSource,
-} from "../src/git/store/sparse/sparse-workspace.js";
+} from "../packages/git/src/ops/worktree/sparse-workspace.js";
+import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
+import { hashWorktreePath } from "../packages/git/src/ops/worktree/worktree-io.js";
+import type { IndexEntry } from "../packages/git/src/store/index.js";
 import {
   configureFixtureIdentity,
   requireSparseWorkspace,

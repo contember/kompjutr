@@ -2,8 +2,8 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { concat, utf8, ZERO_OID } from "../src/git/common/bytes.js";
-import { FLUSH, MAX_PKT_PAYLOAD_BYTES, pkt } from "../src/git/protocol/pktline.js";
+import { concat, utf8, ZERO_OID } from "../packages/git/src/common/bytes.js";
+import { FLUSH, MAX_PKT_PAYLOAD_BYTES, pkt } from "../packages/git/src/protocol/pktline.js";
 import {
   MAX_PUSH_OPTIONS,
   MAX_RECEIVE_PACK_COMMANDS,
@@ -11,13 +11,13 @@ import {
   type ReceivePackRequest,
   receivePack,
   validatePushOptions,
-} from "../src/git/protocol/receive-pack.js";
-import { discover } from "../src/git/protocol/remote.js";
+} from "../packages/git/src/protocol/receive-pack.js";
+import { discover } from "../packages/git/src/protocol/remote.js";
 import {
   fetchHttpClient,
   type GitHttpClient,
   type GitHttpResponse,
-} from "../src/git/protocol/transport.js";
+} from "../packages/git/src/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServer, startGitServer } from "./helpers/http-backend.js";
 

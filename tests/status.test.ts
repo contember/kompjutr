@@ -1,10 +1,10 @@
 import { afterAll, describe, expect, it } from "vitest";
-import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
-import { fromHex, utf8 } from "../src/git/common/bytes.js";
-import { comparePaths } from "../src/git/common/streams.js";
-import type { IgnoreMatcher } from "../src/git/ignore/index.js";
-import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
-import { commit } from "../src/git/ops/repository/commit.js";
+import type { ScanEntry, ScanOptions } from "../packages/do/src/fs/types.js";
+import { fromHex, utf8 } from "../packages/git/src/common/bytes.js";
+import { comparePaths } from "../packages/git/src/common/streams.js";
+import type { IgnoreMatcher } from "../packages/git/src/ignore/index.js";
+import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
+import { commit } from "../packages/git/src/ops/repository/commit.js";
 import {
   clean,
   formatPorcelainV1,
@@ -17,9 +17,9 @@ import {
   statusMatrix,
   statusReport,
   statusStream,
-} from "../src/git/ops/status/status.js";
-import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree/worktree-io.js";
-import type { IndexEntry } from "../src/git/store/index.js";
+} from "../packages/git/src/ops/status/status.js";
+import { hashWorktreePath, indexEntryFor } from "../packages/git/src/ops/worktree/worktree-io.js";
+import type { IndexEntry } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

@@ -6,17 +6,23 @@ import { join } from "node:path";
 
 import { Workspace } from "@cloudflare/computer";
 import { describe, expect, it } from "vitest";
-import { readBlob, type SqlDatabase } from "../../src/db/db.js";
+import { readBlob, type SqlDatabase } from "../../packages/do/src/db/db.js";
 import {
   assertComputerImportCurrent,
   COMPUTER_IMPORT_ACKNOWLEDGEMENT,
   type ImportFromComputerOptions,
   importFromComputer,
-} from "../../src/fs/import.js";
-import { initializeFsSchema } from "../../src/fs/schema.js";
-import { realpath as resolveRealpath } from "../../src/fs/store/resolve.js";
-import { type ShadowReadSource, shadowReads } from "../../src/fs/testing.js";
-import { type RealPath, S_IFDIR, S_IFREG, type ScanEntry, type Stat } from "../../src/fs/types.js";
+} from "../../packages/do/src/fs/import.js";
+import { initializeFsSchema } from "../../packages/do/src/fs/schema.js";
+import { realpath as resolveRealpath } from "../../packages/do/src/fs/store/resolve.js";
+import { type ShadowReadSource, shadowReads } from "../../packages/do/src/fs/testing.js";
+import {
+  type RealPath,
+  S_IFDIR,
+  S_IFREG,
+  type ScanEntry,
+  type Stat,
+} from "../../packages/do/src/fs/types.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 

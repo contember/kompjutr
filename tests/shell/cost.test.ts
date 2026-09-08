@@ -6,9 +6,9 @@
 // done-check rule — a statement target alarm alone is beaten by an implementation
 // that does nothing.
 import { describe, expect, it } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { WriteEntry } from "../../src/fs/types.js";
-import { createShell, type Shell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { WriteEntry } from "../../packages/do/src/fs/types.js";
+import { createShell, type Shell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 

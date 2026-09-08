@@ -6,10 +6,10 @@
 // `-F` forces the fast path on a pattern that has metacharacters; wrapping
 // the same pattern so it looks like an expression forces the slow one.
 import { beforeEach, describe, expect, it } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import { CHUNK_SIZE } from "../../src/fs/schema.js";
-import type { Filesystem } from "../../src/fs/types.js";
-import { createShell, type Shell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import { CHUNK_SIZE } from "../../packages/do/src/fs/schema.js";
+import type { Filesystem } from "../../packages/do/src/fs/types.js";
+import { createShell, type Shell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const ENCODER = new TextEncoder();

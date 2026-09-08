@@ -1,20 +1,23 @@
-import { createExactPathStateSource } from "../../src/fs/exact-path-states.js";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { Filesystem } from "../../src/fs/types.js";
-import { isOid } from "../../src/git/common/bytes.js";
-import { CorruptError, GitError } from "../../src/git/common/errors.js";
-import type { GitContext } from "../../src/git/ops/core/context.js";
-import { openRepository } from "../../src/git/ops/core/context.js";
-import type { Repository } from "../../src/git/ops/repository/repository.js";
-import { SqliteGitDatabase, type StoreOptions } from "../../src/git/store/index.js";
+import { createExactPathStateSource } from "../../packages/do/src/fs/exact-path-states.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { Filesystem } from "../../packages/do/src/fs/types.js";
+import { isOid } from "../../packages/git/src/common/bytes.js";
+import { CorruptError, GitError } from "../../packages/git/src/common/errors.js";
+import { createSqliteSparseWorkspaceSource } from "../../packages/git/src/do-fs/index.js";
 import {
   initializeIndexTracker,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
-} from "../../src/git/store/indexes/index-tracker.js";
-import { readMaintenanceRunView } from "../../src/git/store/maintenance/state.js";
-import { requireRawRefTarget, requireRefName } from "../../src/git/store/refs/ref-validation.js";
-import { createSqliteSparseWorkspaceSource } from "../../src/git/store/sparse/sparse-workspace.js";
+} from "../../packages/git/src/do-fs/indexes/index-tracker.js";
+import type { GitContext } from "../../packages/git/src/ops/core/context.js";
+import { openRepository } from "../../packages/git/src/ops/core/context.js";
+import type { Repository } from "../../packages/git/src/ops/repository/repository.js";
+import { SqliteGitDatabase, type StoreOptions } from "../../packages/git/src/store/index.js";
+import { readMaintenanceRunView } from "../../packages/git/src/store/maintenance/state.js";
+import {
+  requireRawRefTarget,
+  requireRefName,
+} from "../../packages/git/src/store/refs/ref-validation.js";
 import { TestDatabase } from "./db.js";
 import type { TestWorkspace } from "./workspace.js";
 

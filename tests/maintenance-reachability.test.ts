@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../src/db/db.js";
-import { createGit } from "../src/git/client.js";
-import { concat, utf8 } from "../src/git/common/bytes.js";
+import type { SqlDatabase } from "../packages/do/src/db/db.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createGit } from "../packages/git/src/client.js";
+import { concat, utf8 } from "../packages/git/src/common/bytes.js";
 import {
   hashObject,
   MAX_OBJECT_BYTES,
@@ -11,16 +12,15 @@ import {
   serializeCommit,
   serializeTag,
   serializeTree,
-} from "../src/git/common/objects.js";
-import { deflate } from "../src/git/common/zlib.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/git/src/common/objects.js";
+import { deflate } from "../packages/git/src/common/zlib.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import {
   advanceMaintenanceReachability,
   MARK_EXPANSIONS_PER_CALL,
-} from "../src/git/store/maintenance/reachability.js";
-import { encodeDeltaHeader } from "../src/git/store/pack/delta.js";
-import { PackWriter } from "../src/git/store/pack/writer.js";
-import { Workspace } from "../src/runtime/workspace.js";
+} from "../packages/git/src/store/maintenance/reachability.js";
+import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
+import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 import { SqliteTestStorage } from "./helpers/storage.js";

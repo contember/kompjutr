@@ -10,17 +10,31 @@ import {
   normalizePath,
   relativePath,
   splitPath,
-} from "../src/git/common/paths.js";
+} from "../packages/git/src/common/paths.js";
 
 describe("git path kit", () => {
   it("normalizes, joins, splits, and walks ancestors", () => {
     expect(normalizePath("repo/./src/../test.ts")).toBe("/repo/test.ts");
-    expect(joinPath("/repo/", "src/index.ts")).toBe("/repo/src/index.ts");
-    expect(splitPath("/repo/src/index.ts")).toEqual(["repo", "src", "index.ts"]);
-    expect(relativePath("/repo/src", "/repo/src/index.ts")).toBe("index.ts");
-    expect(relativePath("/repo/src", "/repo/README.md")).toBe("../README.md");
-    expect(relativePath("/repo/src", "/repo/src")).toBe(".");
-    expect(ancestorsOf("/repo/src/index.ts")).toEqual(["/repo/src", "/repo", "/"]);
+    expect(joinPath("/repo/", "packages/do/src/index.ts")).toBe("/repo/packages/do/src/index.ts");
+    expect(splitPath("/repo/packages/do/src/index.ts")).toEqual([
+      "repo",
+      "packages",
+      "do",
+      "src",
+      "index.ts",
+    ]);
+    expect(relativePath("/repo/packages/do/src", "/repo/packages/do/src/index.ts")).toBe(
+      "index.ts",
+    );
+    expect(relativePath("/repo/packages/do/src", "/repo/README.md")).toBe("../../../README.md");
+    expect(relativePath("/repo/packages/do/src", "/repo/packages/do/src")).toBe(".");
+    expect(ancestorsOf("/repo/packages/do/src/index.ts")).toEqual([
+      "/repo/packages/do/src",
+      "/repo/packages/do",
+      "/repo/packages",
+      "/repo",
+      "/",
+    ]);
   });
 
   it("checks canonical paths and component boundaries", () => {

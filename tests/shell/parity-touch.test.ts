@@ -12,8 +12,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import { createShell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import { createShell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const REAL_TOUCH = spawnSync("touch", ["--version"]).status === 0;

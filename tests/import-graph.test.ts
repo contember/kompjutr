@@ -4,21 +4,54 @@ import path from "node:path";
 import * as ts from "typescript";
 import { expect, it } from "vitest";
 
-const SOURCE_ROOT = path.resolve(process.cwd(), "src");
-const DOMAIN_DIRECTORIES = new Set(["db", "fs", "shell", "git", "runtime"]);
-const RUNTIME_IMPORTABLE = new Set(["runtime", "db", "fs", "git", "shell"]);
+const PACKAGES_ROOT = path.resolve(process.cwd(), "packages");
+const SOURCE_ROOTS = new Map(
+  ["sqlite", "drive", "git", "do", "local"].map((name) => [
+    name,
+    path.join(PACKAGES_ROOT, name, "src"),
+  ]),
+);
+const PACKAGE_IMPORTS: Readonly<Record<string, ReadonlySet<string>>> = {
+  sqlite: new Set(),
+  drive: new Set(),
+  git: new Set(["sqlite", "drive"]),
+  do: new Set(["sqlite", "drive", "git"]),
+  local: new Set(["sqlite", "drive", "git"]),
+};
+const ENTRY_FILES = new Map([
+  ["@kompjutr/sqlite", "sqlite/src/index.ts"],
+  ["@kompjutr/drive", "drive/src/index.ts"],
+  ["@kompjutr/git", "git/src/index.ts"],
+  ["@kompjutr/git/do-fs", "git/src/do-fs/index.ts"],
+  ["@kompjutr/do", "do/src/index.ts"],
+  ["@kompjutr/do/fs", "do/src/fs/index.ts"],
+  ["@kompjutr/do/shell", "do/src/shell/index.ts"],
+  ["@kompjutr/do/git-shell", "do/src/git-shell.ts"],
+  ["@kompjutr/do/testing", "do/src/testing.ts"],
+  ["@kompjutr/local", "local/src/index.ts"],
+]);
 
-type GitSlice = "common" | "diff" | "ignore" | "protocol" | "store" | "ops" | "surface";
+type GitSlice = "common" | "algorithm" | "store" | "do-fs" | "ops" | "surface";
 
-const GIT_SLICE_RANK: Readonly<Record<GitSlice, number>> = {
+const GIT_SLICE_RANK: Readonly<Record<Exclude<GitSlice, "do-fs">, number>> = {
   common: 0,
-  diff: 1,
-  ignore: 1,
-  protocol: 1,
+  algorithm: 1,
   store: 2,
   ops: 3,
   surface: 4,
 };
+
+interface SourceFile {
+  readonly absolute: string;
+  readonly id: string;
+  readonly packageName: string;
+  readonly packagePath: string;
+}
+
+interface Edge {
+  readonly specifier: string;
+  readonly typeOnly: boolean;
+}
 
 function sourceFiles(directory: string): string[] {
   const files: string[] = [];
@@ -30,16 +63,17 @@ function sourceFiles(directory: string): string[] {
   return files;
 }
 
-/** An edge is type-only when nothing it names survives to runtime. */
-interface Edge {
-  readonly specifier: string;
-  readonly typeOnly: boolean;
+function allSourceFiles(): SourceFile[] {
+  return [...SOURCE_ROOTS].flatMap(([packageName, root]) =>
+    sourceFiles(root).map((absolute) => {
+      const packagePath = path.relative(root, absolute).split(path.sep).join("/");
+      return { absolute, id: `${packageName}/src/${packagePath}`, packageName, packagePath };
+    }),
+  );
 }
 
 function importClauseIsTypeOnly(clause: ts.ImportClause): boolean {
   if (clause.isTypeOnly) return true;
-  // A default or namespace binding is a value; only a fully `type`-marked
-  // named clause elides.
   if (clause.name !== undefined) return false;
   const bindings = clause.namedBindings;
   if (bindings === undefined || !ts.isNamedImports(bindings)) return false;
@@ -49,7 +83,6 @@ function importClauseIsTypeOnly(clause: ts.ImportClause): boolean {
 function exportDeclarationIsTypeOnly(node: ts.ExportDeclaration): boolean {
   if (node.isTypeOnly) return true;
   const clause = node.exportClause;
-  // `export * from` re-exports values.
   if (clause === undefined || !ts.isNamedExports(clause)) return false;
   return clause.elements.every((element) => element.isTypeOnly);
 }
@@ -97,101 +130,106 @@ function importEdges(file: string): Edge[] {
   return edges;
 }
 
-function sourcePath(file: string): string {
-  return path.relative(SOURCE_ROOT, file).split(path.sep).join("/");
+function packageSpecifier(specifier: string): string | null {
+  const match = /^@kompjutr\/([^/]+)/.exec(specifier);
+  return match?.[1] ?? null;
 }
 
-function relativeTarget(file: string, specifier: string): string | null {
+function relativeTarget(file: SourceFile, specifier: string): string | null {
   if (!specifier.startsWith(".")) return null;
-  const unresolved = path.resolve(path.dirname(file), specifier);
+  const unresolved = path.resolve(path.dirname(file.absolute), specifier);
   const resolved = unresolved.endsWith(".js") ? `${unresolved.slice(0, -3)}.ts` : unresolved;
-  const relative = path.relative(SOURCE_ROOT, resolved);
-  if (relative === ".." || relative.startsWith(`..${path.sep}`)) return null;
-  return relative.split(path.sep).join("/");
+  const relative = path.relative(PACKAGES_ROOT, resolved);
+  return relative === ".." || relative.startsWith(`..${path.sep}`)
+    ? null
+    : relative.split(path.sep).join("/");
 }
 
-function domain(file: string): string {
-  return file.split("/", 1)[0] ?? "";
-}
-
-function gitSlice(file: string): GitSlice | null {
-  if (domain(file) !== "git") return null;
-  const segment = file.split("/")[1];
-  if (
-    segment === "common" ||
-    segment === "diff" ||
-    segment === "ignore" ||
-    segment === "protocol" ||
-    segment === "store" ||
-    segment === "ops"
-  ) {
-    return segment;
-  }
+function gitSlice(file: SourceFile): GitSlice | null {
+  if (file.packageName !== "git") return null;
+  const segment = file.packagePath.split("/", 1)[0];
+  if (segment === "common") return "common";
+  if (segment === "diff" || segment === "ignore" || segment === "protocol") return "algorithm";
+  if (segment === "store") return "store";
+  if (segment === "do-fs") return "do-fs";
+  if (segment === "ops") return "ops";
   return "surface";
 }
 
-function violation(file: string, specifier: string, reason: string): string {
-  return `${file} imports "${specifier}": ${reason}`;
+function violation(file: SourceFile, specifier: string, reason: string): string {
+  return `${file.id} imports "${specifier}": ${reason}`;
 }
 
-it("keeps source imports inside the domain dependency graph", () => {
+it("keeps source imports inside the package and Git layer graph", () => {
   const violations: string[] = [];
+  const files = allSourceFiles();
+  const byId = new Map(files.map((file) => [file.id, file]));
 
-  for (const absoluteFile of sourceFiles(SOURCE_ROOT)) {
-    const file = sourcePath(absoluteFile);
-    const sourceDomain = domain(file);
-    for (const { specifier } of importEdges(absoluteFile)) {
+  for (const file of files) {
+    for (const { specifier } of importEdges(file.absolute)) {
       if (specifier === "@cloudflare/computer" || specifier.startsWith("@cloudflare/computer/")) {
         violations.push(
-          violation(file, specifier, "no file under src/ may import @cloudflare/computer"),
+          violation(file, specifier, "source packages may not import the test oracle"),
         );
       }
 
-      const target = relativeTarget(absoluteFile, specifier);
-      if (target === null) continue;
-      const targetDomain = domain(target);
-
-      if (sourceDomain === "db" && DOMAIN_DIRECTORIES.has(targetDomain) && targetDomain !== "db") {
-        violations.push(violation(file, specifier, "src/db may not import a domain"));
-      }
-      if (sourceDomain === "fs" && targetDomain !== "fs" && targetDomain !== "db") {
-        violations.push(violation(file, specifier, "src/fs may import only src/fs or src/db"));
-      }
+      const importedPackage = packageSpecifier(specifier);
       if (
-        sourceDomain === "shell" &&
-        targetDomain !== "shell" &&
-        targetDomain !== "fs" &&
-        targetDomain !== "db"
+        importedPackage !== null &&
+        importedPackage !== file.packageName &&
+        !PACKAGE_IMPORTS[file.packageName]?.has(importedPackage)
       ) {
+        violations.push(violation(file, specifier, "package dependency points outside its layer"));
+      }
+      if (specifier === "@kompjutr/git/do-fs" && file.packageName !== "do") {
         violations.push(
-          violation(file, specifier, "src/shell may import only src/shell, src/fs, or src/db"),
+          violation(file, specifier, "only @kompjutr/do may compose the DO integration"),
         );
       }
-      if (sourceDomain === "runtime" && !RUNTIME_IMPORTABLE.has(targetDomain)) {
+
+      if (specifier.startsWith("node:")) {
+        const allowed =
+          file.packageName === "local" ||
+          (file.id === "git/src/common/zlib.ts" && specifier === "node:zlib") ||
+          (file.id === "do/src/fs/compat/node-path.ts" && specifier === "node:buffer");
+        if (!allowed)
+          violations.push(violation(file, specifier, "Node builtin is not Worker-safe"));
+      }
+
+      const targetId = relativeTarget(file, specifier);
+      if (targetId === null) continue;
+      const target = byId.get(targetId);
+      if (target === undefined) {
         violations.push(
-          violation(
-            file,
-            specifier,
-            "src/runtime may import only src/runtime, src/db, src/fs, src/git, or src/shell",
-          ),
+          violation(file, specifier, "relative import does not resolve to package source"),
         );
+        continue;
+      }
+      if (target.packageName !== file.packageName) {
+        violations.push(
+          violation(file, specifier, "cross-package source imports must use public exports"),
+        );
+        continue;
       }
 
       const sourceSlice = gitSlice(file);
       const targetSlice = gitSlice(target);
-      if (sourceSlice !== null && targetSlice !== null && sourceSlice !== targetSlice) {
-        if (GIT_SLICE_RANK[targetSlice] >= GIT_SLICE_RANK[sourceSlice]) {
+      if (sourceSlice === null || targetSlice === null || sourceSlice === targetSlice) continue;
+      if (targetSlice === "do-fs" && sourceSlice !== "do-fs") {
+        violations.push(violation(file, specifier, "ordinary Git code may not reach do-fs"));
+      } else if (sourceSlice === "do-fs") {
+        if (targetSlice === "ops" || targetSlice === "surface") {
           violations.push(
-            violation(
-              file,
-              specifier,
-              `git/${sourceSlice} may import only lower git slices, not git/${targetSlice}`,
-            ),
+            violation(file, specifier, "do-fs may import only common and store layers"),
           );
         }
-      }
-      if (file.startsWith("git/store/") && target.startsWith("git/ops/")) {
-        violations.push(violation(file, specifier, "src/git/store may not import src/git/ops"));
+      } else if (
+        targetSlice !== "do-fs" &&
+        GIT_SLICE_RANK[targetSlice] >= GIT_SLICE_RANK[sourceSlice]
+      ) {
+        violations.push(
+          violation(file, specifier, `Git ${sourceSlice} may not import Git ${targetSlice}`),
+        );
       }
     }
   }
@@ -199,10 +237,6 @@ it("keeps source imports inside the domain dependency graph", () => {
   expect(violations).toEqual([]);
 });
 
-/**
- * Strongly connected components of the value-import graph. Tarjan's algorithm;
- * a component of more than one file is a cycle.
- */
 function valueCycles(edges: ReadonlyMap<string, readonly string[]>): string[][] {
   const index = new Map<string, number>();
   const lowlink = new Map<string, number>();
@@ -242,24 +276,20 @@ function valueCycles(edges: ReadonlyMap<string, readonly string[]>): string[][] 
   return cycles;
 }
 
-/**
- * Type-only cycles are harmless — they vanish at compile time, and five of them
- * exist here. Only edges that survive to runtime are counted, because only
- * those can produce a partially initialised module at import time.
- */
 it("keeps the value-import graph acyclic", () => {
+  const files = allSourceFiles();
+  const byId = new Map(files.map((file) => [file.id, file]));
   const edges = new Map<string, readonly string[]>();
 
-  for (const absoluteFile of sourceFiles(SOURCE_ROOT)) {
-    const file = sourcePath(absoluteFile);
+  for (const file of files) {
     const targets = new Set<string>();
-    for (const { specifier, typeOnly } of importEdges(absoluteFile)) {
+    for (const { specifier, typeOnly } of importEdges(file.absolute)) {
       if (typeOnly) continue;
-      const target = relativeTarget(absoluteFile, specifier);
-      if (target === null || target === file) continue;
-      targets.add(target);
+      const relative = relativeTarget(file, specifier);
+      const target = relative ?? ENTRY_FILES.get(specifier) ?? null;
+      if (target !== null && target !== file.id && byId.has(target)) targets.add(target);
     }
-    edges.set(file, [...targets]);
+    edges.set(file.id, [...targets]);
   }
 
   expect(valueCycles(edges)).toEqual([]);

@@ -1,11 +1,11 @@
-import { CHUNK_SIZE } from "../src/fs/schema.js";
-import { MAX_OBJECT_BYTES } from "../src/git/common/objects.js";
+import { CHUNK_SIZE } from "../packages/do/src/fs/schema.js";
+import { MAX_OBJECT_BYTES } from "../packages/git/src/common/objects.js";
 import {
   INFLATE_FEED,
   maximumDeflatedBytes,
   OBJECT_CHUNK,
-} from "../src/git/store/objects/objects.js";
-import { MAX_INDEX_PATH_BYTES } from "../src/git/store/schema/schema.js";
+} from "../packages/git/src/store/objects/objects.js";
+import { MAX_INDEX_PATH_BYTES } from "../packages/git/src/store/schema/schema.js";
 import { commitGraphBytes } from "./commit-graph-bytes.js";
 
 export const SQL_STATEMENT_TARGET = 1_000;

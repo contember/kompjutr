@@ -1,9 +1,9 @@
 // End to end over a real SQLite-backed filesystem.
 import { beforeEach, describe, expect, it } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { Filesystem } from "../../src/fs/types.js";
-import { encode } from "../../src/shell/exec/bytes.js";
-import { type Command, createShell, type Shell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { Filesystem } from "../../packages/do/src/fs/types.js";
+import { encode } from "../../packages/do/src/shell/exec/bytes.js";
+import { type Command, createShell, type Shell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 

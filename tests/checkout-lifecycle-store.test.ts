@@ -1,7 +1,11 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
-import type { SqlDatabase } from "../src/db/db.js";
-import { utf8 } from "../src/git/common/bytes.js";
-import { type CheckoutRow, type CheckoutStore, SqliteGitDatabase } from "../src/git/store/index.js";
+import type { SqlDatabase } from "../packages/do/src/db/db.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import {
+  type CheckoutRow,
+  type CheckoutStore,
+  SqliteGitDatabase,
+} from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { makeRepo } from "./helpers/workspace.js";
 

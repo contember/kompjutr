@@ -3,10 +3,10 @@
 
 import { describe, expect, it } from "vitest";
 
-import { ShellSyntaxError } from "../../src/shell/parse/ast.js";
-import { parse } from "../../src/shell/parse/parser.js";
-import { planScript } from "../../src/shell/plan/plan.js";
-import type { Argument, PlannedPipeline } from "../../src/shell/plan/types.js";
+import { ShellSyntaxError } from "../../packages/do/src/shell/parse/ast.js";
+import { parse } from "../../packages/do/src/shell/parse/parser.js";
+import { planScript } from "../../packages/do/src/shell/plan/plan.js";
+import type { Argument, PlannedPipeline } from "../../packages/do/src/shell/plan/types.js";
 
 function planOne(source: string): PlannedPipeline {
   const plan = planScript(parse(source));

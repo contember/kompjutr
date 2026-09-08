@@ -1,9 +1,11 @@
 import { expect } from "vitest";
-
-import type { GitContext, IndexTrackerSeedEntry } from "../../src/git/ops/core/context.js";
-import type { SparseWorkspaceSource } from "../../src/git/ops/worktree/sparse-workspace.js";
-import { hashWorktreePath, indexEntryFor } from "../../src/git/ops/worktree/worktree-io.js";
-import { resealIndexTracker } from "../../src/git/store/indexes/index-tracker.js";
+import { resealIndexTracker } from "../../packages/git/src/do-fs/indexes/index-tracker.js";
+import type { GitContext, IndexTrackerSeedEntry } from "../../packages/git/src/ops/core/context.js";
+import type { SparseWorkspaceSource } from "../../packages/git/src/ops/worktree/sparse-workspace.js";
+import {
+  hashWorktreePath,
+  indexEntryFor,
+} from "../../packages/git/src/ops/worktree/worktree-io.js";
 import type { TestRepository } from "./workspace.js";
 
 export function configureFixtureIdentity(workspace: TestRepository): void {

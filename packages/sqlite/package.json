@@ -1,0 +1,24 @@
+{
+  "name": "@kompjutr/sqlite",
+  "version": "0.0.0",
+  "description": "Shared SQLite contracts and codecs for kompjutr runtimes.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/contember/kompjutr.git",
+    "directory": "packages/sqlite"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ]
+}

@@ -1,22 +1,22 @@
 import { randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
-import { blob, readBlob } from "../src/db/db.js";
+import { blob, readBlob } from "../packages/do/src/db/db.js";
 import {
   MAX_ROUTING_CHECKOUTS,
   MAX_ROUTING_CHECKOUTS_RETAINED_BYTES,
   MAX_ROUTING_ROOTS_UTF8_BYTES,
-} from "../src/db/routing.js";
-import { concat, utf8 } from "../src/git/common/bytes.js";
+} from "../packages/do/src/db/routing.js";
+import { concat, utf8 } from "../packages/git/src/common/bytes.js";
 import {
   hashObject,
   MAX_OBJECT_BYTES,
   MODE_FILE,
   serializeCommit,
   serializeTree,
-} from "../src/git/common/objects.js";
-import { deflate } from "../src/git/common/zlib.js";
-import type { ReplayStateMetadata } from "../src/git/ops/core/operation-state.js";
+} from "../packages/git/src/common/objects.js";
+import { deflate } from "../packages/git/src/common/zlib.js";
+import type { ReplayStateMetadata } from "../packages/git/src/ops/core/operation-state.js";
 import {
   ancestors,
   CONFIG_SECTION_MOVE_UPDATE_SQL,
@@ -27,15 +27,15 @@ import {
   PACK_BLOB_BATCH_TARGET_BYTES,
   SqliteGitDatabase,
   type StoreOptions,
-} from "../src/git/store/index.js";
-import { scanGenericIndexOwned } from "../src/git/store/indexes/index-table.js";
-import { BLOB_ID_CACHE_ELIGIBILITY_BYTES } from "../src/git/store/objects/blob-id-cache.js";
-import { PackWriter } from "../src/git/store/pack/writer.js";
+} from "../packages/git/src/store/index.js";
+import { scanGenericIndexOwned } from "../packages/git/src/store/indexes/index-table.js";
+import { BLOB_ID_CACHE_ELIGIBILITY_BYTES } from "../packages/git/src/store/objects/blob-id-cache.js";
+import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import {
   MAX_BLOB_ID_CACHE_ROWS,
   MAX_INDEX_PATH_BYTES,
   MAX_TRACKING_REF_REVISIONS,
-} from "../src/git/store/schema/schema.js";
+} from "../packages/git/src/store/schema/schema.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 
@@ -75,7 +75,9 @@ describe("repository registry", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
     database.createRepository("/", "ref: refs/heads/main");
     database.createRepository("/projects/app", "ref: refs/heads/main");
-    expect(database.findCheckout("/projects/app/src/index.ts")?.root).toBe("/projects/app");
+    expect(database.findCheckout("/projects/app/packages/do/src/index.ts")?.root).toBe(
+      "/projects/app",
+    );
     expect(database.findCheckout("/projects/other")?.root).toBe("/");
     expect(database.findCheckout("/projects/appliance")?.root).toBe("/");
   });

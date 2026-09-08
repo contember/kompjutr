@@ -2,20 +2,26 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createFilesystem } from "../src/fs/filesystem.js";
-import { createContextGitCliRunner } from "../src/git/cli/index.js";
-import { utf8 } from "../src/git/common/bytes.js";
-import { hashObject } from "../src/git/common/objects.js";
-import { joinPath as gitJoinPath } from "../src/git/common/paths.js";
-import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
-import { type GitContext, openRepository } from "../src/git/ops/core/context.js";
-import { diffSummaryBounded, diffSummaryEntryRetainedBytes } from "../src/git/ops/diff/diff.js";
-import { rebase } from "../src/git/ops/rebase/rebase.js";
-import { commit } from "../src/git/ops/repository/commit.js";
-import { initRepository } from "../src/git/ops/repository/init.js";
-import type { Repository } from "../src/git/ops/repository/repository.js";
-import { dirtyPathStream } from "../src/git/ops/worktree/worktree-io.js";
-import { PACK_BLOB_BATCH_TARGET_BYTES, SqliteGitDatabase } from "../src/git/store/index.js";
+import { createFilesystem } from "../packages/do/src/fs/filesystem.js";
+import { createContextGitCliRunner } from "../packages/git/src/cli/index.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import { hashObject } from "../packages/git/src/common/objects.js";
+import { joinPath as gitJoinPath } from "../packages/git/src/common/paths.js";
+import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
+import { type GitContext, openRepository } from "../packages/git/src/ops/core/context.js";
+import {
+  diffSummaryBounded,
+  diffSummaryEntryRetainedBytes,
+} from "../packages/git/src/ops/diff/diff.js";
+import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
+import { commit } from "../packages/git/src/ops/repository/commit.js";
+import { initRepository } from "../packages/git/src/ops/repository/init.js";
+import type { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { dirtyPathStream } from "../packages/git/src/ops/worktree/worktree-io.js";
+import {
+  PACK_BLOB_BATCH_TARGET_BYTES,
+  SqliteGitDatabase,
+} from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { type GitCommandResult, GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -1482,11 +1488,11 @@ describe("mutating git CLI handlers", () => {
     const target = await conflictedNative();
     const context: GitContext = {
       ...target.workspace.context,
-      worktree: { ...target.workspace.worktree, db: undefined },
+      worktree: { ...target.workspace.worktree, mutationScope: undefined },
     };
     const before = repositoryState(target.workspace.context, target.repo);
     await expect(runner(context).runCli({ argv: ["rebase", "--abort"] })).rejects.toThrowError(
-      /share one database/,
+      /share one atomic mutation scope/,
     );
     expect(repositoryState(target.workspace.context, target.repo)).toEqual(before);
   });

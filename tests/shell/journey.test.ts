@@ -1,9 +1,9 @@
 // One mixed workflow proving that control flow, streaming, set mutations, and
 // shared limits compose rather than only passing in isolation.
 import { expect, it } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import { encode } from "../../src/shell/exec/bytes.js";
-import { type Command, createShell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import { encode } from "../../packages/do/src/shell/exec/bytes.js";
+import { type Command, createShell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const ENCODER = new TextEncoder();

@@ -1,4 +1,4 @@
-import type { SqlDatabase } from "../../src/db/db.js";
+import type { SqlDatabase } from "../../packages/do/src/db/db.js";
 import { SqliteTestStorage } from "./storage.js";
 
 /**
@@ -7,8 +7,11 @@ import { SqliteTestStorage } from "./storage.js";
  */
 export class TestDatabase implements SqlDatabase {
   #depth = 0;
+  readonly mutationScope: object;
 
-  constructor(readonly storage: SqliteTestStorage = new SqliteTestStorage()) {}
+  constructor(readonly storage: SqliteTestStorage = new SqliteTestStorage()) {
+    this.mutationScope = storage;
+  }
 
   run(query: string, ...bindings: unknown[]): void {
     this.storage.sql.exec(query, ...bindings);

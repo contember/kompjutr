@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { Filesystem } from "../../src/fs/types.js";
-import type { ByteStream } from "../../src/shell/exec/bytes.js";
-import { type Command, type RetainedBudget, result } from "../../src/shell/exec/context.js";
-import { createShell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { Filesystem } from "../../packages/do/src/fs/types.js";
+import type { ByteStream } from "../../packages/do/src/shell/exec/bytes.js";
+import {
+  type Command,
+  type RetainedBudget,
+  result,
+} from "../../packages/do/src/shell/exec/context.js";
+import { createShell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const MIB = 1024 * 1024;

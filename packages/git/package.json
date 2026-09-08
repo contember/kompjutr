@@ -1,0 +1,35 @@
+{
+  "name": "@kompjutr/git",
+  "version": "0.0.0",
+  "description": "SQLite-native Git engine over a synchronous drive.",
+  "license": "MIT AND LGPL-2.1-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/contember/kompjutr.git",
+    "directory": "packages/git"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./do-fs": {
+      "types": "./dist/do-fs/index.d.ts",
+      "import": "./dist/do-fs/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src/diff/LICENSE",
+    "LICENSE",
+    "LICENSES",
+    "README.md"
+  ],
+  "dependencies": {
+    "@kompjutr/drive": "0.0.0",
+    "@kompjutr/sqlite": "0.0.0",
+    "pako": "2.2.0"
+  }
+}

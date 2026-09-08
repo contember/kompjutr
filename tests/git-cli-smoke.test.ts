@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { createGit } from "../src/git/client.js";
-import { createGitCommand } from "../src/git/shell.js";
-import { Workspace } from "../src/runtime/workspace.js";
-import { createShell } from "../src/shell/index.js";
+import { createGitCommand } from "../packages/do/src/git-shell.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createShell } from "../packages/do/src/shell/index.js";
+import { createGit } from "../packages/git/src/client.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 const ENCODER = new TextEncoder();

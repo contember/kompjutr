@@ -1,11 +1,15 @@
 import { runInNewContext } from "node:vm";
 import { beforeEach, describe, expect, it } from "vitest";
-import type { GitCliInput, GitCliRunner, GitCliRunOptions } from "../../src/git/cli/types.js";
-import { createGit } from "../../src/git/client.js";
-import { createGitCommand } from "../../src/git/shell.js";
-import { Workspace } from "../../src/runtime/workspace.js";
-import { type Command, result } from "../../src/shell/exec/context.js";
-import { createShell, type Shell } from "../../src/shell/index.js";
+import { createGitCommand } from "../../packages/do/src/git-shell.js";
+import { Workspace } from "../../packages/do/src/runtime/workspace.js";
+import { type Command, result } from "../../packages/do/src/shell/exec/context.js";
+import { createShell, type Shell } from "../../packages/do/src/shell/index.js";
+import type {
+  GitCliInput,
+  GitCliRunner,
+  GitCliRunOptions,
+} from "../../packages/git/src/cli/types.js";
+import { createGit } from "../../packages/git/src/client.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 
 const IDENTITY = { name: "Agent", email: "agent@example.com" };

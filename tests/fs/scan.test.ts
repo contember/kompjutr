@@ -8,12 +8,12 @@
 // being written in parallel with this file and cannot be imported.
 
 import { describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../../src/db/db.js";
-import { MAX_ROUTING_ROOTS_UTF8_BYTES } from "../../src/db/routing.js";
-import { comparePaths, subtreeSuccessor } from "../../src/fs/path.js";
-import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
-import { allocateInodes } from "../../src/fs/store/meta.js";
-import { realpath } from "../../src/fs/store/resolve.js";
+import type { SqlDatabase } from "../../packages/do/src/db/db.js";
+import { MAX_ROUTING_ROOTS_UTF8_BYTES } from "../../packages/do/src/db/routing.js";
+import { comparePaths, subtreeSuccessor } from "../../packages/do/src/fs/path.js";
+import { CHUNK_SIZE, initializeFsSchema } from "../../packages/do/src/fs/schema.js";
+import { allocateInodes } from "../../packages/do/src/fs/store/meta.js";
+import { realpath } from "../../packages/do/src/fs/store/resolve.js";
 import {
   DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX,
   DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES,
@@ -29,8 +29,8 @@ import {
   listEntries,
   scan,
   validateDiscoveryExcludeRoots,
-} from "../../src/fs/store/scan.js";
-import { writeFiles } from "../../src/fs/store/write.js";
+} from "../../packages/do/src/fs/store/scan.js";
+import { writeFiles } from "../../packages/do/src/fs/store/write.js";
 import {
   type EntryType,
   type ListCursor,
@@ -40,7 +40,7 @@ import {
   S_IFLNK,
   S_IFREG,
   type ScanEntry,
-} from "../../src/fs/types.js";
+} from "../../packages/do/src/fs/types.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const MTIME_BASE = 1_700_000_000_000;

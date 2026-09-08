@@ -4,9 +4,8 @@
 // The filesystem now refuses the write, so the drop cannot happen.
 
 import { describe, expect, it } from "vitest";
-
-import { createGit } from "../src/git/client.js";
-import { Workspace } from "../src/runtime/workspace.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createGit } from "../packages/git/src/client.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 const ENCODER = new TextEncoder();

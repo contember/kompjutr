@@ -5,38 +5,38 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { utf8, utf8Decoder } from "../src/git/common/bytes.js";
-import { GitError } from "../src/git/common/errors.js";
+import { utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { GitError } from "../packages/git/src/common/errors.js";
 import {
   hashObject,
   type Person,
   serializeCommit,
   serializeTree,
-} from "../src/git/common/objects.js";
-import type { GitContext } from "../src/git/ops/core/context.js";
-import {
-  commit,
-  commitIndex,
-  resolveIdentity,
-  writeUnpublishedCommit,
-} from "../src/git/ops/repository/commit.js";
-import { log } from "../src/git/ops/repository/reads.js";
-import { eagerStatus } from "../src/git/ops/status/status.js";
-import { buildTree } from "../src/git/ops/tree/tree-build.js";
-import type { CommitTreeSnapshotSource } from "../src/git/ops/worktree/sparse-workspace.js";
-import {
-  hashWorktreePath,
-  indexEntryFor,
-  walkWorktree,
-} from "../src/git/ops/worktree/worktree-io.js";
-import type { IndexEntry } from "../src/git/store/index.js";
+} from "../packages/git/src/common/objects.js";
+import { createSqliteCommitTreeSnapshotSource } from "../packages/git/src/do-fs/index.js";
 import {
   advanceIndexTrackerBaseline,
   invalidateIndexTracker,
   readIndexTrackerState,
   resealIndexTracker,
-} from "../src/git/store/indexes/index-tracker.js";
-import { createSqliteCommitTreeSnapshotSource } from "../src/git/store/sparse/sparse-workspace.js";
+} from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import type { GitContext } from "../packages/git/src/ops/core/context.js";
+import {
+  commit,
+  commitIndex,
+  resolveIdentity,
+  writeUnpublishedCommit,
+} from "../packages/git/src/ops/repository/commit.js";
+import { log } from "../packages/git/src/ops/repository/reads.js";
+import { eagerStatus } from "../packages/git/src/ops/status/status.js";
+import { buildTree } from "../packages/git/src/ops/tree/tree-build.js";
+import type { CommitTreeSnapshotSource } from "../packages/git/src/ops/worktree/sparse-workspace.js";
+import {
+  hashWorktreePath,
+  indexEntryFor,
+  walkWorktree,
+} from "../packages/git/src/ops/worktree/worktree-io.js";
+import type { IndexEntry } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
 
@@ -215,7 +215,7 @@ describe("commit oids match git", () => {
     const repo = mirror();
     repo
       .write("README.md", "# demo\n")
-      .write("src/index.ts", "export const a = 1;\n")
+      .write("packages/do/src/index.ts", "export const a = 1;\n")
       .write("src/deep/inner/value.ts", "export const b = 2;\n");
     repo.expectSameCommit("nested");
   });

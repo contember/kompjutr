@@ -5,8 +5,8 @@
 
 import { describe, expect, it } from "vitest";
 
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { Filesystem, RealPath, WriteEntry } from "../../src/fs/types.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { Filesystem, RealPath, WriteEntry } from "../../packages/do/src/fs/types.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 

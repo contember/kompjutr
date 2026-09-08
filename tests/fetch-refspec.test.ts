@@ -1,12 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { worktreeAdd } from "../src/git/ops/worktree/worktrees.js";
+import { createGit, type FetchRefspec, type Git } from "../packages/do/src/index.js";
+import { worktreeAdd } from "../packages/git/src/ops/worktree/worktrees.js";
 import {
   fetchHttpClient,
   type GitHttpClient,
   type GitHttpRequest,
-} from "../src/git/protocol/transport.js";
-import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/git/store/index.js";
-import { createGit, type FetchRefspec, type Git } from "../src/index.js";
+} from "../packages/git/src/protocol/transport.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServer, startGitServer } from "./helpers/http-backend.js";
 import { reopenTestRepository } from "./helpers/repository-invariants.js";

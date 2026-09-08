@@ -4,24 +4,24 @@
 import { randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../src/db/db.js";
-import { concat, toHex, utf8 } from "../src/git/common/bytes.js";
-import { hashObject, MODE_FILE, serializeTree } from "../src/git/common/objects.js";
-import { Sha1 } from "../src/git/common/sha1.js";
+import type { SqlDatabase } from "../packages/do/src/db/db.js";
+import { concat, toHex, utf8 } from "../packages/git/src/common/bytes.js";
+import { hashObject, MODE_FILE, serializeTree } from "../packages/git/src/common/objects.js";
+import { Sha1 } from "../packages/git/src/common/sha1.js";
 import {
   type IndexEntry,
   type IndexSink,
   type IndexStore,
   type InitialStateSession,
   SqliteGitDatabase,
-} from "../src/git/store/index.js";
-import { readMaintenanceRootEpoch } from "../src/git/store/maintenance/control.js";
-import { MAX_BLOB_ID_CACHE_ROWS } from "../src/git/store/objects/blob-id-cache.js";
-import { sharedRepoStoreMutations } from "../src/git/store/repository/shared.js";
+} from "../packages/git/src/store/index.js";
+import { readMaintenanceRootEpoch } from "../packages/git/src/store/maintenance/control.js";
+import { MAX_BLOB_ID_CACHE_ROWS } from "../packages/git/src/store/objects/blob-id-cache.js";
+import { sharedRepoStoreMutations } from "../packages/git/src/store/repository/shared.js";
 import {
   MAX_SCRATCH_INDEX_NAME_BYTES,
   MAX_SCRATCH_INDEXES_PER_REPOSITORY,
-} from "../src/git/store/schema/schema.js";
+} from "../packages/git/src/store/schema/schema.js";
 import { TestDatabase } from "./helpers/db.js";
 
 /** Records the widest result returned by any single query. */

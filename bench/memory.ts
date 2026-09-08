@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { CHUNK_SIZE } from "../src/fs/schema.js";
-import { createInitialWorktreeWriter } from "../src/fs/store/initial-write.js";
+import { CHUNK_SIZE } from "../packages/do/src/fs/schema.js";
+import { createInitialWorktreeWriter } from "../packages/do/src/fs/store/initial-write.js";
 import type {
   DiscoverFilesOptions,
   DiscoverFilesPage,
@@ -14,29 +14,33 @@ import type {
   ScanOptions,
   WriteEntry,
   WriteOptions,
-} from "../src/fs/types.js";
-import { fromHex, utf8 } from "../src/git/common/bytes.js";
+} from "../packages/do/src/fs/types.js";
+import { fromHex, utf8 } from "../packages/git/src/common/bytes.js";
 import {
   type Commit,
   hashObject,
   serializeCommit,
   serializeTree,
-} from "../src/git/common/objects.js";
-import type { GitContext } from "../src/git/ops/core/context.js";
-import { requireCleanIntegrationWorktree } from "../src/git/ops/integration/integration-worktree.js";
-import { type RebaseLifecycleResult, rebase } from "../src/git/ops/rebase/rebase.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import { add } from "../src/git/ops/staging/staging.js";
-import type { Worktree, WorktreeDirent, WorktreeStat } from "../src/git/ops/worktree/worktree.js";
+} from "../packages/git/src/common/objects.js";
+import { createSqliteSelectedPathSource } from "../packages/git/src/do-fs/index.js";
+import { MAX_SPARSE_BINDING_BYTES } from "../packages/git/src/do-fs/sparse/shared.js";
+import type { GitContext } from "../packages/git/src/ops/core/context.js";
+import { requireCleanIntegrationWorktree } from "../packages/git/src/ops/integration/integration-worktree.js";
+import { type RebaseLifecycleResult, rebase } from "../packages/git/src/ops/rebase/rebase.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { add } from "../packages/git/src/ops/staging/staging.js";
+import type {
+  Worktree,
+  WorktreeDirent,
+  WorktreeStat,
+} from "../packages/git/src/ops/worktree/worktree.js";
 import {
   type CheckoutRow,
   type SharedRepoStore,
   SqliteGitDatabase,
-} from "../src/git/store/index.js";
-import { advanceMaintenanceReachability } from "../src/git/store/maintenance/reachability.js";
-import { INFLATE_FEED } from "../src/git/store/objects/objects.js";
-import { MAX_SPARSE_BINDING_BYTES } from "../src/git/store/sparse/shared.js";
-import { createSqliteSelectedPathSource } from "../src/git/store/sparse/sparse-workspace.js";
+} from "../packages/git/src/store/index.js";
+import { advanceMaintenanceReachability } from "../packages/git/src/store/maintenance/reachability.js";
+import { INFLATE_FEED } from "../packages/git/src/store/objects/objects.js";
 import { commitGraphBytes } from "./commit-graph-bytes.js";
 import type { Harness, Scenario } from "./harness.js";
 import {

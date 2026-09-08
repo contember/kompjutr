@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "tsBuildInfoFile": "../../git.tsbuildinfo"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../sqlite/tsconfig.build.json" },
+    { "path": "../drive/tsconfig.build.json" }
+  ]
+}

@@ -1,14 +1,18 @@
-import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from "../../src/db/db.js";
-import { createGit } from "../../src/git/client.js";
-import { concat, utf8, utf8Decoder } from "../../src/git/common/bytes.js";
-import { FLUSH, pkt } from "../../src/git/protocol/pktline.js";
+import type {
+  DurableObjectStorageLike,
+  SQLCursorLike,
+  SQLStorageLike,
+} from "../../packages/do/src/db/db.js";
+import { Workspace } from "../../packages/do/src/runtime/workspace.js";
+import { createGit } from "../../packages/git/src/client.js";
+import { concat, utf8, utf8Decoder } from "../../packages/git/src/common/bytes.js";
+import { FLUSH, pkt } from "../../packages/git/src/protocol/pktline.js";
 import {
   fetchHttpClient,
   type GitHttpClient,
   type GitHttpRequest,
   type GitHttpResponse,
-} from "../../src/git/protocol/transport.js";
-import { Workspace } from "../../src/runtime/workspace.js";
+} from "../../packages/git/src/protocol/transport.js";
 import {
   PROBE_FIXTURE_BRANCH,
   PROBE_FIXTURE_FETCH_BRANCH,

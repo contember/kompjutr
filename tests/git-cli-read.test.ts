@@ -1,25 +1,25 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { runGitCli } from "../src/git/cli/index.js";
-import { createGitCliReadHandlers } from "../src/git/cli/read/read.js";
-import type { GitCliResult } from "../src/git/cli/types.js";
-import { createGit } from "../src/git/client.js";
-import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
-import { openRepository } from "../src/git/ops/core/context.js";
+import { runGitCli } from "../packages/git/src/cli/index.js";
+import { createGitCliReadHandlers } from "../packages/git/src/cli/read/read.js";
+import type { GitCliResult } from "../packages/git/src/cli/types.js";
+import { createGit } from "../packages/git/src/client.js";
+import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
+import { openRepository } from "../packages/git/src/ops/core/context.js";
 import {
   diff as coreDiff,
   DIFF_COMBINED_MAX_LINES,
   DIFF_COMBINED_MAX_MEMORY_BYTES,
   DIFF_MAX_OUTPUT_BYTES,
   diffHeaderPath,
-} from "../src/git/ops/diff/diff.js";
-import { rebase } from "../src/git/ops/rebase/rebase.js";
-import { commit } from "../src/git/ops/repository/commit.js";
-import { add } from "../src/git/ops/staging/staging.js";
-import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree/worktree-io.js";
-import { fetchHttpClient } from "../src/git/protocol/transport.js";
-import type { IndexEntry } from "../src/git/store/index.js";
+} from "../packages/git/src/ops/diff/diff.js";
+import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
+import { commit } from "../packages/git/src/ops/repository/commit.js";
+import { add } from "../packages/git/src/ops/staging/staging.js";
+import { hashWorktreePath, indexEntryFor } from "../packages/git/src/ops/worktree/worktree-io.js";
+import { fetchHttpClient } from "../packages/git/src/protocol/transport.js";
+import type { IndexEntry } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { importFixture } from "./helpers/import.js";

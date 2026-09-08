@@ -1,19 +1,23 @@
 import { randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
-import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from "../src/db/db.js";
-import { readBlob } from "../src/db/db.js";
-import { createGit, type GitFactory } from "../src/git/client.js";
-import { equalBytes, fromHex } from "../src/git/common/bytes.js";
-import { GitError } from "../src/git/common/errors.js";
-import type { InitialWorktreeWriter } from "../src/git/ops/core/context.js";
-import { PACK_BLOB_BATCH_TARGET_BYTES, WALK_TREE_SQL } from "../src/git/store/index.js";
+import type {
+  DurableObjectStorageLike,
+  SQLCursorLike,
+  SQLStorageLike,
+} from "../packages/do/src/db/db.js";
+import { readBlob } from "../packages/do/src/db/db.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createGit, type GitFactory } from "../packages/git/src/client.js";
+import { equalBytes, fromHex } from "../packages/git/src/common/bytes.js";
+import { GitError } from "../packages/git/src/common/errors.js";
 import {
   INDEX_DIRTY,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
-} from "../src/git/store/indexes/index-tracker.js";
-import { Workspace } from "../src/runtime/workspace.js";
+} from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import type { InitialWorktreeWriter } from "../packages/git/src/ops/core/context.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES, WALK_TREE_SQL } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { SqliteTestStorage } from "./helpers/storage.js";

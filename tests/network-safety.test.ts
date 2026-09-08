@@ -5,13 +5,13 @@ import {
   type GitFetchOptions,
   type GitPushOptions,
   type PushLeaseExpectation,
-} from "../src/git/index.js";
-import { openRepository } from "../src/git/ops/core/context.js";
+} from "../packages/git/src/index.js";
+import { openRepository } from "../packages/git/src/ops/core/context.js";
 import {
   fetchHttpClient,
   type GitHttpClient,
   type GitHttpRequest,
-} from "../src/git/protocol/transport.js";
+} from "../packages/git/src/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";

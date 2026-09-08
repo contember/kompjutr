@@ -1,23 +1,26 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
-import { Database } from "../src/db/db.js";
-import { createFilesystem } from "../src/fs/filesystem.js";
-import { utf8 } from "../src/git/common/bytes.js";
-import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
-import type { MergeStateMetadata, MergeTouchedPath } from "../src/git/ops/merge/merge-state.js";
-import type { CheckoutStore } from "../src/git/store/checkout/checkout.js";
-import type { CheckoutRow } from "../src/git/store/core/contracts.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { Database } from "../packages/do/src/db/db.js";
+import { createFilesystem } from "../packages/do/src/fs/filesystem.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import { hashObject, serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
 import {
   advanceIndexTrackerBaseline,
   initializeIndexTracker,
   invalidateIndexTracker,
   resealIndexTracker,
-} from "../src/git/store/indexes/index-tracker.js";
+} from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import type {
+  MergeStateMetadata,
+  MergeTouchedPath,
+} from "../packages/git/src/ops/merge/merge-state.js";
+import type { CheckoutStore } from "../packages/git/src/store/checkout/checkout.js";
+import type { CheckoutRow } from "../packages/git/src/store/core/contracts.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import {
   MAINTENANCE_ROOT_EPOCH_EXHAUSTED,
   readMaintenanceRootEpoch,
-} from "../src/git/store/maintenance/control.js";
-import type { MaintenanceRootSource } from "../src/git/store/maintenance/roots.js";
+} from "../packages/git/src/store/maintenance/control.js";
+import type { MaintenanceRootSource } from "../packages/git/src/store/maintenance/roots.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const NOW = 1_800_000_000_123;

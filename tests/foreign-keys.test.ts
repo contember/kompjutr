@@ -4,9 +4,9 @@
 import { Workspace } from "@cloudflare/computer";
 import { convertV4MiniflareOptions, Miniflare } from "miniflare";
 import { describe, expect, it } from "vitest";
-import { Database, type SqlDatabase } from "../src/db/db.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { SCHEMA_VERSION } from "../src/git/store/schema/schema.js";
+import { Database, type SqlDatabase } from "../packages/do/src/db/db.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { SCHEMA_VERSION } from "../packages/git/src/store/schema/schema.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 

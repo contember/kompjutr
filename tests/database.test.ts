@@ -5,9 +5,10 @@ import {
   iterateSqlCursor,
   type SQLCursorLike,
   type SQLStorageLike,
-} from "../src/db/db.js";
-import { initializeFsSchema } from "../src/fs/schema.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/do/src/db/db.js";
+import { initializeFsSchema } from "../packages/do/src/fs/schema.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { firstSqlRowValue, normalizeSqlRow } from "../packages/sqlite/src/index.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 function objectRow<Row extends object>(value: unknown): value is Row {
@@ -165,6 +166,17 @@ function openDatabase(): Database {
 }
 
 describe("Database", () => {
+  it("preserves row identity when no ArrayBuffer field needs conversion", () => {
+    const row = { id: 1, value: "plain" };
+    expect(normalizeSqlRow(row)).toBe(row);
+    const binary = { id: 2, value: arrayBuffer(new Uint8Array([1, 2])) };
+    const normalized = normalizeSqlRow(binary);
+    expect(normalized).not.toBe(binary);
+    expect(normalized).toEqual({ id: 2, value: new Uint8Array([1, 2]) });
+    expect(firstSqlRowValue({ first: 1, second: 2 })).toBe(1);
+    expect(firstSqlRowValue({})).toBeUndefined();
+  });
+
   it("normalizes engine-reported SQLite value limits without a projected ceiling", () => {
     const db = new Database(new TooBigStorage());
     for (const operation of [

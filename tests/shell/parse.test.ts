@@ -6,8 +6,8 @@
 
 import { describe, expect, it } from "vitest";
 
-import { hasGlob, ShellSyntaxError, wordText } from "../../src/shell/parse/ast.js";
-import { parse } from "../../src/shell/parse/parser.js";
+import { hasGlob, ShellSyntaxError, wordText } from "../../packages/do/src/shell/parse/ast.js";
+import { parse } from "../../packages/do/src/shell/parse/parser.js";
 
 function commands(source: string): string[][] {
   const script = parse(source);

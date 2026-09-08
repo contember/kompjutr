@@ -1,9 +1,7 @@
 # kompjutr
 
-SQLite-native filesystem and Git runtime for Cloudflare Durable Objects. The
-working tree, Git objects, refs, index, and received packs are all rows in the
-Durable Object's SQLite database. There is no `.git` directory and no external
-filesystem runtime.
+SQLite-native Git runtime with Cloudflare Durable Object and Unix local
+compositions. Neither creates a `.git` directory.
 
 The project is still in development and has no production users, so backward compatibility, including schema migrations, is not required unless explicitly requested.
 
@@ -16,10 +14,10 @@ npm run test:shell                   # shell slice
 npm run test:e2e                     # end-to-end slice
 npm run test:full                    # exhaustive batched suite; sprint closure and CI only
 npx vitest run tests/status.test.ts  # exact focused witness
-npm run typecheck                    # tsc --noEmit over src + tests + bench
+npm run typecheck                    # tsc --noEmit over packages + tests + bench
 npm run check                        # biome lint + format check
 npm run format                       # biome format --write
-npm run build                        # tsc -p tsconfig.build.json -> dist/
+npm run build                        # project-reference build -> packages/*/dist
 ```
 
 Benchmarks have their own rules. Read `bench/CLAUDE.md` before running one.
@@ -27,37 +25,28 @@ Benchmarks have their own rules. Read `bench/CLAUDE.md` before running one.
 ## Project structure
 
 ```
-src/db/        Shared SQLite adapter, error normalization, and routing limits
-src/fs/        Filesystem domain over Durable Object SQLite
-src/shell/     kompjutr/shell — bash-shaped commands compiled to queries
-src/git/       Git domain
-  common/      Bytes, objects, errors, rows, paths, streams, hashes, compression
-  diff/        LGPL xdiff port
-  ignore/      Gitignore discovery and matching
-  protocol/    Smart HTTP wire and transport
-  store/       SQLite schema, table families, packs, projections, maintenance
-  ops/         Git command families, repository, and worktree abstractions
-  cli/         Synchronous Git argv surface
-  client.ts    Public Git facade
-src/runtime/   Workspace composition over db + filesystem + Git
-tests/         Vitest suite, parity and conformance harnesses
-bench/         Standalone benchmark harness
-docs/          Architecture, current benchmarks, plans, and historical records
+packages/sqlite/  Shared SQLite contracts, errors, limits, and codecs
+packages/drive/   Synchronous Git drive contracts and capability receipts
+packages/git/     Generic Git engine; `do-fs` is the isolated DO integration
+packages/do/      Worker adapter, SQLite filesystem, shell, and Workspace
+packages/local/   Unix node:sqlite adapter, disk drive, recovery, LocalWorkspace
+tests/            Vitest suite, parity and conformance harnesses
+bench/            Standalone benchmark harness
+docs/             Architecture, current benchmarks, plans, and history
 ```
 
-Layering is bottom-up: `db` sits below the domains; `fs` may import only `fs`
-or `db`; `shell` may import only `shell`, `fs`, or `db`; and Git follows
-`common → diff|ignore|protocol → store → ops → client/cli`. No file under `src/`
-may import `@cloudflare/computer`. The import-graph suite enforces the exact
-rules.
+Layering is bottom-up: `sqlite|drive → git → do|local`. Inside Git:
+`common → diff|ignore|protocol → store → ops → client|cli`. Ordinary Git cannot
+reach `git/do-fs`; Worker-facing packages cannot reach `local` or Node-only
+builtins. Source cannot import `@cloudflare/computer`. The import-graph suite
+enforces the exact rules.
 
 ## Conventions
 
 - ESM with explicit `.js` extensions on relative imports. `import type` for
   type-only imports (`verbatimModuleSyntax`, `isolatedModules`).
-- Target is the Workers runtime. `node:` imports only where the platform
-  provides them — `node:zlib` in `src/git/common/zlib.ts`, `node:buffer` in the
-  `node:fs` facades under `src/fs/compat/`. Do not add others.
+- Worker-facing packages use only platform-supported `node:` imports. Node-only
+  imports belong in `@kompjutr/local`.
 - Errors carry a stable `code`. Git errors subclass `GitError`; filesystem
   errors come from `filesystemError()`. Callers branch on `error.code`, never
   `instanceof`.
@@ -76,11 +65,12 @@ rules.
 1. **Never order paths with `<`, `>`, or a bare `.sort()`.** JavaScript compares
    UTF-16 code units; Git trees and SQLite `BINARY` compare UTF-8 bytes, and the
    two disagree above the BMP. Use `comparePaths`
-   (`src/git/common/{streams,paths}.ts` for the git side, `src/fs/path.ts` for
-   the filesystem side).
-2. **Never emit `BEGIN`, `COMMIT`, or `ROLLBACK`.** The platform rejects SQL
-   transaction statements. Use `db.transactionSync()`, which delegates every
-   nesting level to Durable Object storage.
+   (`packages/git/src/common/{streams,paths}.ts` for Git,
+   `packages/do/src/fs/path.ts` for DOFS, and `packages/local/src/paths.ts` for
+   disk).
+2. **Shared and Worker code never emits `BEGIN`, `COMMIT`, or `ROLLBACK`.** Use
+   `db.transactionSync()`. Transaction SQL is allowed only inside the local
+   Node adapter.
 3. **Traversals use `db.iterate()`, never `db.all()`.** `all()` materialises the
    cursor and is for bounded result sets only. A traversal that materialises
    defeats the entire cost model.
@@ -106,10 +96,11 @@ rules.
 
 Read the file for a directory before changing code in it:
 
-- `src/git/CLAUDE.md` — Git layers, merge-join cost model, shared kits, trust rules
-- `src/git/store/CLAUDE.md` — row ownership, table families, packs, maintenance
-- `src/fs/CLAUDE.md` — POSIX semantics, handles and revalidation, the bulk API
-- `src/shell/CLAUDE.md` — a command is a query; parse → plan → execute
+- `packages/git/src/CLAUDE.md` — Git layers, cost model, shared kits, trust rules
+- `packages/git/src/store/CLAUDE.md` — row ownership, packs, and maintenance
+- `packages/do/src/fs/CLAUDE.md` — POSIX semantics, handles, and bulk operations
+- `packages/do/src/shell/CLAUDE.md` — parse → plan → execute
+- `packages/local/src/CLAUDE.md` — Unix paths, locking, recovery, and traversal
 - `tests/CLAUDE.md` — parity against real binaries, conformance against `node:fs`
 - `bench/CLAUDE.md` — measurement rules; a number measured wrong is worse than none
 

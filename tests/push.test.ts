@@ -1,10 +1,10 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { NodeFsCompat } from "../src/fs/compat/node.js";
-import { createFilesystem } from "../src/fs/filesystem.js";
-import { createGit, type Git, type PushRefspec } from "../src/git/client.js";
-import { fetchHttpClient, type GitHttpClient } from "../src/git/protocol/transport.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { NodeFsCompat } from "../packages/do/src/fs/compat/node.js";
+import { createFilesystem } from "../packages/do/src/fs/filesystem.js";
+import { createGit, type Git, type PushRefspec } from "../packages/git/src/client.js";
+import { fetchHttpClient, type GitHttpClient } from "../packages/git/src/protocol/transport.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServerOptions, startGitServer } from "./helpers/http-backend.js";

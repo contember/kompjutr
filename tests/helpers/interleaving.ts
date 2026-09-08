@@ -2,7 +2,7 @@ import type {
   GitHttpClient,
   GitHttpRequest,
   GitHttpResponse,
-} from "../../src/git/protocol/transport.js";
+} from "../../packages/git/src/protocol/transport.js";
 
 export interface BarrierEntry {
   readonly name: string;

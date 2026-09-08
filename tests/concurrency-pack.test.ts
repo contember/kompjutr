@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { concat, utf8 } from "../src/git/common/bytes.js";
-import { hashObject } from "../src/git/common/objects.js";
-import { type CheckoutStore, SqliteGitDatabase } from "../src/git/store/index.js";
+import { concat, utf8 } from "../packages/git/src/common/bytes.js";
+import { hashObject } from "../packages/git/src/common/objects.js";
+import { type CheckoutStore, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import {
   type CompletePackObject,
   PACK_INGEST_LEASE_MS,
   type PackIngestResult,
-} from "../src/git/store/pack/packs.js";
-import { PackWriter } from "../src/git/store/pack/writer.js";
+} from "../packages/git/src/store/pack/packs.js";
+import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 import { awaitBarrierEntry, checkpointBarrier } from "./helpers/interleaving.js";

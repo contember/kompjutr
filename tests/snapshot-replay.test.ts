@@ -1,14 +1,14 @@
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
-import { createGit, type Git } from "../src/git/client.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { createGit, type Git } from "../packages/git/src/client.js";
 import {
   iterateIndexTrackerDirty,
   readIndexTrackerState,
   resealIndexTracker,
-} from "../src/git/store/indexes/index-tracker.js";
+} from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";

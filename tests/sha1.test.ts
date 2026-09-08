@@ -2,8 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
-import { toHex } from "../src/git/common/bytes.js";
-import { Sha1, sha1 } from "../src/git/common/sha1.js";
+import { toHex } from "../packages/git/src/common/bytes.js";
+import { Sha1, sha1 } from "../packages/git/src/common/sha1.js";
 
 function reference(data: Uint8Array): string {
   return createHash("sha1").update(data).digest("hex");

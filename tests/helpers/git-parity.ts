@@ -5,9 +5,9 @@ import { Buffer } from "node:buffer";
 import { lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { join } from "node:path";
 
-import { comparePaths } from "../../src/fs/path.js";
-import { createGit, type Git } from "../../src/git/client.js";
-import { Workspace } from "../../src/runtime/workspace.js";
+import { comparePaths } from "../../packages/do/src/fs/path.js";
+import { Workspace } from "../../packages/do/src/runtime/workspace.js";
+import { createGit, type Git } from "../../packages/git/src/client.js";
 import { GitFixture } from "./git.js";
 import { SqliteTestStorage } from "./storage.js";
 

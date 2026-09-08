@@ -1,0 +1,40 @@
+{
+  "name": "@kompjutr/local",
+  "version": "0.0.0",
+  "description": "Unix local SQLite Git workspace runtime.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/contember/kompjutr.git",
+    "directory": "packages/local"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "dependencies": {
+    "@kompjutr/drive": "0.0.0",
+    "@kompjutr/git": "0.0.0",
+    "@kompjutr/sqlite": "0.0.0"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "os": [
+    "aix",
+    "darwin",
+    "freebsd",
+    "linux",
+    "openbsd",
+    "sunos"
+  ]
+}

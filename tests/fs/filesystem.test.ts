@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createFilesystem } from "../../src/fs/filesystem.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
 import { TestDatabase } from "../helpers/db.js";
 
 function open(now = 1_700_000_000_000) {

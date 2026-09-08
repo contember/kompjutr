@@ -1,0 +1,46 @@
+{
+  "name": "@kompjutr/do",
+  "version": "0.0.0",
+  "description": "Durable Object filesystem and Git workspace runtime.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/contember/kompjutr.git",
+    "directory": "packages/do"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./fs": {
+      "types": "./dist/fs/index.d.ts",
+      "import": "./dist/fs/index.js"
+    },
+    "./shell": {
+      "types": "./dist/shell/index.d.ts",
+      "import": "./dist/shell/index.js"
+    },
+    "./git-shell": {
+      "types": "./dist/git-shell.d.ts",
+      "import": "./dist/git-shell.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "LICENSES",
+    "README.md"
+  ],
+  "dependencies": {
+    "@kompjutr/drive": "0.0.0",
+    "@kompjutr/git": "0.0.0",
+    "@kompjutr/sqlite": "0.0.0"
+  }
+}

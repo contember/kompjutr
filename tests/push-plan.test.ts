@@ -1,17 +1,17 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { isTreeMode, serializeCommit, serializeTree } from "../src/git/common/objects.js";
-import { openRepository } from "../src/git/ops/core/context.js";
-import { clone } from "../src/git/ops/network/network.js";
+import { isTreeMode, serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
+import { openRepository } from "../packages/git/src/ops/core/context.js";
+import { clone } from "../packages/git/src/ops/network/network.js";
 import {
   type PushPlan,
   planPushObjects,
   pushPlanObjectCount,
   pushPlanObjectOidAt,
-} from "../src/git/ops/push/push-plan.js";
-import { commit } from "../src/git/ops/repository/commit.js";
-import type { Repository } from "../src/git/ops/repository/repository.js";
-import { add } from "../src/git/ops/staging/staging.js";
-import { ZERO_OID } from "../src/git/protocol/receive-pack.js";
+} from "../packages/git/src/ops/push/push-plan.js";
+import { commit } from "../packages/git/src/ops/repository/commit.js";
+import type { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { add } from "../packages/git/src/ops/staging/staging.js";
+import { ZERO_OID } from "../packages/git/src/protocol/receive-pack.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { makeWorkspace, writeWorkFile } from "./helpers/workspace.js";

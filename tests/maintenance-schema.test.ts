@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { hashObject } from "../src/git/common/objects.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { hashObject } from "../packages/git/src/common/objects.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const NOW = 1_800_000_000_123;

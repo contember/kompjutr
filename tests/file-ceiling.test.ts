@@ -13,7 +13,10 @@ const DIRECTORY_FILE_CEILING = 20;
  * rather than covered by a higher bar for everyone.
  */
 const SYMBOL_CEILING = 173;
-const ROOT = join(import.meta.dirname, "..", "src");
+const PACKAGES_ROOT = join(import.meta.dirname, "..", "packages");
+const ROOTS = ["sqlite", "drive", "git", "do", "local"].map((name) =>
+  join(PACKAGES_ROOT, name, "src"),
+);
 
 /**
  * Long procedures that stay long, each deliberately. A symbol leaving this list
@@ -25,7 +28,7 @@ const GRANDFATHERED_SYMBOLS: ReadonlySet<string> = new Set([
   "git/cli/network/network-handlers.ts::createGitCliNetworkHandlers",
   "git/cli/read/read-handlers.ts::createGitCliReadHandlers",
   "git/cli/write/write-refs.ts::createGitCliRefWriteHandlers",
-  "fs/filesystem.ts::createFilesystem",
+  "do/fs/filesystem.ts::createFilesystem",
   // A declarative decode schema: one `decodeRow` field per stored column.
   "git/store/maintenance/state/state-view.ts::requireRunView",
   // Linear state machines and single-pass streaming procedures, split further
@@ -43,8 +46,8 @@ const GRANDFATHERED_SYMBOLS: ReadonlySet<string> = new Set([
   "git/diff/myers-search.ts::findSplit",
   // One flag-by-flag option surface each, compared byte-for-byte against the
   // real binaries in tests/shell/parity-{grep,rg}.test.ts.
-  "shell/commands/rg.ts::rg",
-  "shell/commands/grep.ts::grep",
+  "do/shell/commands/rg.ts::rg",
+  "do/shell/commands/grep.ts::grep",
 ]);
 
 type FunctionLike =
@@ -112,7 +115,8 @@ function measureSymbols(file: string): MeasuredSymbol[] {
     true,
     ts.ScriptKind.TS,
   );
-  const path = relative(ROOT, file).split(sep).join("/");
+  const relativePath = relative(PACKAGES_ROOT, file).split(sep).join("/");
+  const path = relativePath.replace("/src/", "/");
   const symbols: MeasuredSymbol[] = [];
   const visit = (node: ts.Node): void => {
     if (isFunctionLike(node) && node.body !== undefined) {
@@ -147,9 +151,11 @@ function* sourceDirectories(dir: string): Generator<string> {
 describe("source structure ceilings", () => {
   it("keeps every src/ file under 500 lines", () => {
     const over: string[] = [];
-    for (const file of sourceFiles(ROOT)) {
-      const lines = readFileSync(file, "utf8").split("\n").length;
-      if (lines >= CEILING) over.push(`${file}: ${lines}`);
+    for (const root of ROOTS) {
+      for (const file of sourceFiles(root)) {
+        const lines = readFileSync(file, "utf8").split("\n").length;
+        if (lines >= CEILING) over.push(`${file}: ${lines}`);
+      }
     }
     expect(over).toEqual([]);
   });
@@ -162,11 +168,13 @@ describe("source structure ceilings", () => {
   it("keeps every function and method under the measured symbol ceiling", () => {
     const over: string[] = [];
     const stale = new Set(GRANDFATHERED_SYMBOLS);
-    for (const file of sourceFiles(ROOT)) {
-      for (const symbol of measureSymbols(file)) {
-        if (symbol.lines < SYMBOL_CEILING) continue;
-        stale.delete(symbol.key);
-        if (!GRANDFATHERED_SYMBOLS.has(symbol.key)) over.push(`${symbol.key}: ${symbol.lines}`);
+    for (const root of ROOTS) {
+      for (const file of sourceFiles(root)) {
+        for (const symbol of measureSymbols(file)) {
+          if (symbol.lines < SYMBOL_CEILING) continue;
+          stale.delete(symbol.key);
+          if (!GRANDFATHERED_SYMBOLS.has(symbol.key)) over.push(`${symbol.key}: ${symbol.lines}`);
+        }
       }
     }
     expect(over).toEqual([]);
@@ -175,11 +183,13 @@ describe("source structure ceilings", () => {
 
   it("keeps at most 20 direct TypeScript files in every src/ directory", () => {
     const over: string[] = [];
-    for (const directory of sourceDirectories(ROOT)) {
-      const files = readdirSync(directory, { withFileTypes: true }).filter(
-        (entry) => entry.isFile() && entry.name.endsWith(".ts"),
-      ).length;
-      if (files > DIRECTORY_FILE_CEILING) over.push(`${directory}: ${files}`);
+    for (const root of ROOTS) {
+      for (const directory of sourceDirectories(root)) {
+        const files = readdirSync(directory, { withFileTypes: true }).filter(
+          (entry) => entry.isFile() && entry.name.endsWith(".ts"),
+        ).length;
+        if (files > DIRECTORY_FILE_CEILING) over.push(`${directory}: ${files}`);
+      }
     }
     expect(over).toEqual([]);
   });

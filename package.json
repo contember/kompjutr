@@ -1,57 +1,25 @@
 {
-  "name": "kompjutr",
+  "name": "kompjutr-workspace",
   "version": "0.0.0",
-  "description": "SQLite-native filesystem and git backend for Cloudflare Workers.",
-  "license": "MIT AND LGPL-2.1-or-later",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "description": "Workspace for the scoped kompjutr runtime packages.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/contember/kompjutr.git"
   },
   "type": "module",
-  "sideEffects": false,
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./fs": {
-      "types": "./dist/fs/index.d.ts",
-      "import": "./dist/fs/index.js"
-    },
-    "./git": {
-      "types": "./dist/git/index.d.ts",
-      "import": "./dist/git/index.js"
-    },
-    "./git/shell": {
-      "types": "./dist/git/shell.d.ts",
-      "import": "./dist/git/shell.js"
-    },
-    "./shell": {
-      "types": "./dist/shell/index.d.ts",
-      "import": "./dist/shell/index.js"
-    },
-    "./testing": {
-      "types": "./dist/testing.d.ts",
-      "import": "./dist/testing.js"
-    }
-  },
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "files": [
-    "dist",
-    "src/git/diff/LICENSE",
-    "LICENSE",
-    "LICENSES",
-    "README.md"
-  ],
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json",
+    "build": "node scripts/clean-dist.mjs && tsc -b tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run test:smoke",
     "test:smoke": "vitest run --maxWorkers=4 tests/schema.test.ts tests/database.test.ts tests/transactions.test.ts tests/fs/filesystem.test.ts tests/shell/journey.test.ts tests/plumbing-git-contract.test.ts tests/integration.test.ts tests/runtime.test.ts tests/workspace.test.ts tests/client.test.ts tests/operation-state.test.ts tests/public-exports.test.ts tests/git-cli-smoke.test.ts tests/production-probe-protocol.test.ts",
     "test:fs": "vitest run --maxWorkers=4 tests/fs",
     "test:shell": "vitest run --maxWorkers=4 tests/shell",
     "test:e2e": "vitest run --maxWorkers=4 tests/e2e",
+    "test:local-mounts": "node scripts/test-local-mounts.mjs",
     "test:full": "node scripts/test-full.mjs",
     "test:watch": "vitest",
     "package:smoke": "node scripts/package-smoke.mjs",
@@ -61,6 +29,7 @@
     "bench:memory": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts --memory",
     "bench:macro": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts --scenarios=macro-packed,macro-loose",
     "bench:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/nextjs-run.ts",
+    "bench:local": "node --experimental-transform-types --import ./bench/register.mjs bench/local.ts",
     "bench:statements": "node --experimental-transform-types --import ./bench/register.mjs bench/statements.ts",
     "bench:clone-storage": "node --experimental-transform-types --import ./bench/register.mjs bench/clone-storage.ts",
     "bench:tree-schema": "node --experimental-transform-types --import ./bench/register.mjs bench/tree-schema.ts",
@@ -70,16 +39,14 @@
     "probe:run": "node --experimental-transform-types --import ./bench/register.mjs bench/production/run.ts",
     "probe:analytics": "node --experimental-transform-types --import ./bench/register.mjs bench/production/analytics.ts"
   },
-  "dependencies": {
-    "pako": "2.2.0"
-  },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.16",
+    "@biomejs/biome": "2.5.9",
     "@cloudflare/computer": "^0.2.1",
     "@types/node": "^24.0.0",
     "@types/pako": "^2.0.3",
     "esbuild": "0.28.2",
     "miniflare": "5.20260820.0-alpha",
+    "pako": "2.2.0",
     "typescript": "^5.9.0",
     "vitest": "^3.2.4",
     "wrangler": "4.127.0"

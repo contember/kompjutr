@@ -8,23 +8,23 @@ import type {
   RegularFileHandle,
   ScanEntry,
   ScanOptions,
-} from "../src/fs/types.js";
-import { comparePaths } from "../src/git/common/streams.js";
-import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
-import { lsFilesAtRef } from "../src/git/ops/repository/reads.js";
+} from "../packages/do/src/fs/types.js";
+import { comparePaths } from "../packages/git/src/common/streams.js";
+import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
+import { lsFilesAtRef } from "../packages/git/src/ops/repository/reads.js";
 import {
   lsFiles,
   lsFilesWithWorktree,
   MAX_LS_FILES_EXCLUDE_ROOTS,
-} from "../src/git/ops/staging/staging.js";
+} from "../packages/git/src/ops/staging/staging.js";
 import {
   type CompiledReadPathspec,
   compileReadPathspec,
   type LsFilesOptions,
-} from "../src/git/ops/worktree/pathspec.js";
-import type { Worktree } from "../src/git/ops/worktree/worktree.js";
-import { WORKTREE_SCAN_PAGE } from "../src/git/ops/worktree/worktree-io.js";
-import type { IndexEntry } from "../src/git/store/index.js";
+} from "../packages/git/src/ops/worktree/pathspec.js";
+import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
+import { WORKTREE_SCAN_PAGE } from "../packages/git/src/ops/worktree/worktree-io.js";
+import type { IndexEntry } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import type { SqliteTestStorage } from "./helpers/storage.js";

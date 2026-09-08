@@ -4,15 +4,15 @@
 // can be crossed, and that therefore never runs in a small fixture. A
 // fallback nothing exercises is a fallback nobody knows is broken.
 import { beforeEach, describe, expect, it } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { Filesystem, ScanEntry } from "../../src/fs/types.js";
-import { createGit } from "../../src/git/client.js";
-import { createGitCommand } from "../../src/git/shell.js";
-import { Workspace } from "../../src/runtime/workspace.js";
-import { encode } from "../../src/shell/exec/bytes.js";
-import { type Command, result } from "../../src/shell/exec/context.js";
-import { sqlGlobFor } from "../../src/shell/exec/glob.js";
-import { createShell, type Shell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { Filesystem, ScanEntry } from "../../packages/do/src/fs/types.js";
+import { createGitCommand } from "../../packages/do/src/git-shell.js";
+import { Workspace } from "../../packages/do/src/runtime/workspace.js";
+import { encode } from "../../packages/do/src/shell/exec/bytes.js";
+import { type Command, result } from "../../packages/do/src/shell/exec/context.js";
+import { sqlGlobFor } from "../../packages/do/src/shell/exec/glob.js";
+import { createShell, type Shell } from "../../packages/do/src/shell/index.js";
+import { createGit } from "../../packages/git/src/client.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 

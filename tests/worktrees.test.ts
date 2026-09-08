@@ -1,21 +1,21 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createGit, type Git } from "../src/git/client.js";
-import { utf8 } from "../src/git/common/bytes.js";
-import { MODE_FILE, serializeCommit, serializeTree } from "../src/git/common/objects.js";
-import type { ReplayStateMetadata } from "../src/git/ops/core/operation-state.js";
-import { operationRefLogMetadata } from "../src/git/ops/core/ref-log.js";
-import { branchDelete } from "../src/git/ops/refs/refs.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createGit, type Git } from "../packages/git/src/client.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import { MODE_FILE, serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
+import type { ReplayStateMetadata } from "../packages/git/src/ops/core/operation-state.js";
+import { operationRefLogMetadata } from "../packages/git/src/ops/core/ref-log.js";
+import { branchDelete } from "../packages/git/src/ops/refs/refs.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import {
   worktreeAdd,
   worktreeList,
   worktreePrune,
   worktreeRemove,
-} from "../src/git/ops/worktree/worktrees.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { Workspace } from "../src/runtime/workspace.js";
+} from "../packages/git/src/ops/worktree/worktrees.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 import {
@@ -133,6 +133,30 @@ function realGitWorktreeRoots(fixture: GitFixture): string[] {
 }
 
 describe("worktree add", () => {
+  it("rejects repositories from another context before lifecycle publication", () => {
+    const left = makeRepo("/");
+    const right = makeRepo("/");
+    seedMain(left);
+    seedMain(right);
+
+    expect(() =>
+      worktreeAdd(left.context, right.repo, {
+        root: "/foreign",
+        target: { kind: "new-branch", name: "foreign" },
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EUNSUPPORTED" }));
+    expect(left.database.checkoutAt("/foreign")).toBeNull();
+
+    worktreeAdd(left.context, left.repo, {
+      root: "/linked",
+      target: { kind: "new-branch", name: "linked" },
+    });
+    expect(() =>
+      worktreeRemove(left.context, right.repo, { root: "/linked", force: true }),
+    ).toThrowError(expect.objectContaining({ code: "EUNSUPPORTED" }));
+    expect(left.database.checkoutAt("/linked")).not.toBeNull();
+  });
+
   it("prevents deleting a branch attached to another checkout even with force", () => {
     const workspace = makeRepo("/");
     const base = seedMain(workspace);

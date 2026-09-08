@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveBranchUpstream } from "../src/git/ops/refs/branch-upstream.js";
+import { resolveBranchUpstream } from "../packages/git/src/ops/refs/branch-upstream.js";
 import { makeRepo } from "./helpers/workspace.js";
 
 const OID = "0123456789abcdef0123456789abcdef01234567";

@@ -1,13 +1,12 @@
 import { rm } from "node:fs/promises";
-import { basename, dirname, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
-const target = resolve(dirname(fileURLToPath(import.meta.url)), "..", "dist");
-const expected = resolve(root, "dist");
-
-if (target !== expected || dirname(target) !== root || basename(target) !== "dist") {
-  throw new Error(`Refusing to clean unexpected build output: ${target}`);
+for (const name of ["sqlite", "drive", "git", "do", "local"]) {
+  const target = resolve(root, "packages", name, "dist");
+  const expectedParent = resolve(root, "packages", name);
+  if (dirname(target) !== expectedParent) throw new Error(`Refusing to clean ${target}`);
+  await rm(target, { force: true, recursive: true });
+  await rm(resolve(root, `${name}.tsbuildinfo`), { force: true });
 }
-
-await rm(target, { force: true, recursive: true });

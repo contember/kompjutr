@@ -1,22 +1,22 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
-import { openRepository } from "../src/git/ops/core/context.js";
-import type { StatusEntry } from "../src/git/ops/core/kinds.js";
+import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
+import { openRepository } from "../packages/git/src/ops/core/context.js";
+import type { StatusEntry } from "../packages/git/src/ops/core/kinds.js";
 import {
   formatPorcelainV1,
   formatPorcelainV2,
   formatShort,
   status,
   statusReport,
-} from "../src/git/ops/status/status.js";
+} from "../packages/git/src/ops/status/status.js";
 import {
   STATUS_FORMAT_MAX_RECORDS,
   STATUS_FORMAT_MAX_RETAINED_BYTES,
   statusFormatOptions,
-} from "../src/git/ops/status/status-format.js";
-import type { StatusDetail } from "../src/git/ops/status/status-rows.js";
-import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree/worktree-io.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/git/src/ops/status/status-format.js";
+import type { StatusDetail } from "../packages/git/src/ops/status/status-rows.js";
+import { hashWorktreePath, indexEntryFor } from "../packages/git/src/ops/worktree/worktree-io.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

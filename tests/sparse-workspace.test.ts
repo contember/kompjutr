@@ -1,14 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../src/db/db.js";
-import { MODE_FILE, MODE_TREE, serializeTree } from "../src/git/common/objects.js";
-import { comparePaths } from "../src/git/common/streams.js";
-import { commit } from "../src/git/ops/repository/commit.js";
-import { add } from "../src/git/ops/staging/staging.js";
-import {
-  INDEX_DIRTY,
-  invalidateIndexTracker,
-  resealIndexTracker,
-} from "../src/git/store/indexes/index-tracker.js";
+import type { SqlDatabase } from "../packages/do/src/db/db.js";
+import { MODE_FILE, MODE_TREE, serializeTree } from "../packages/git/src/common/objects.js";
+import { comparePaths } from "../packages/git/src/common/streams.js";
 import {
   createSqliteCommitTreeSnapshotSource,
   createSqliteSelectedPathSource,
@@ -19,7 +12,14 @@ import {
   selectSparsePathsOwned,
   snapshotCommitTreeOwned,
   sparseIndexAncestorFactsOwned,
-} from "../src/git/store/sparse/sparse-workspace.js";
+} from "../packages/git/src/do-fs/index.js";
+import {
+  INDEX_DIRTY,
+  invalidateIndexTracker,
+  resealIndexTracker,
+} from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import { commit } from "../packages/git/src/ops/repository/commit.js";
+import { add } from "../packages/git/src/ops/staging/staging.js";
 import { makeRepo, writeWorkFile } from "./helpers/workspace.js";
 
 class ExplainSelectedDatabase implements SqlDatabase {

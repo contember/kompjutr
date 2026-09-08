@@ -1,23 +1,26 @@
 import { randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
-import { createFilesystem } from "../src/fs/filesystem.js";
-import { createInitialWorktreeWriter } from "../src/fs/store/initial-write.js";
-import type { Filesystem } from "../src/fs/types.js";
-import { equalBytes, fromHex, utf8Decoder } from "../src/git/common/bytes.js";
-import { GitError } from "../src/git/common/errors.js";
-import type { GitContext, InitialWorktreeWriter } from "../src/git/ops/core/context.js";
-import { checkout } from "../src/git/ops/refs/refs.js";
-import { initRepository } from "../src/git/ops/repository/init.js";
-import type { Repository } from "../src/git/ops/repository/repository.js";
-import { PACK_BLOB_BATCH_TARGET_BYTES, SqliteGitDatabase } from "../src/git/store/index.js";
+import { createFilesystem } from "../packages/do/src/fs/filesystem.js";
+import { createInitialWorktreeWriter } from "../packages/do/src/fs/store/initial-write.js";
+import type { Filesystem } from "../packages/do/src/fs/types.js";
+import { equalBytes, fromHex, utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { GitError } from "../packages/git/src/common/errors.js";
 import {
   INDEX_DIRTY,
   initializeIndexTracker,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
   resealIndexTracker,
-} from "../src/git/store/indexes/index-tracker.js";
+} from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import type { GitContext, InitialWorktreeWriter } from "../packages/git/src/ops/core/context.js";
+import { checkout } from "../packages/git/src/ops/refs/refs.js";
+import { initRepository } from "../packages/git/src/ops/repository/init.js";
+import type { Repository } from "../packages/git/src/ops/repository/repository.js";
+import {
+  PACK_BLOB_BATCH_TARGET_BYTES,
+  SqliteGitDatabase,
+} from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

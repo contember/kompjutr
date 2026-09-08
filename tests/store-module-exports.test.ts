@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { CheckoutStore } from "../src/git/store/checkout/checkout.js";
+import { CheckoutStore } from "../packages/git/src/store/checkout/checkout.js";
 import {
   FetchPublicationToken,
   TrackingRefPublicationToken,
-} from "../src/git/store/core/contracts.js";
-import { SqliteGitDatabase } from "../src/git/store/database/database.js";
-import * as store from "../src/git/store/index.js";
-import { SharedRepoStore } from "../src/git/store/repository/shared.js";
+} from "../packages/git/src/store/core/contracts.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/database/database.js";
+import * as store from "../packages/git/src/store/index.js";
+import { SharedRepoStore } from "../packages/git/src/store/repository/shared.js";
 
 describe("sqlite store module exports", () => {
   it("preserves the compatibility facade runtime surface and class identities", () => {

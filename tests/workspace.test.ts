@@ -1,18 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { createInitialWorktreeWriter } from "../src/fs/store/initial-write.js";
-import { createGit, type GitWorkspaceBinding } from "../src/git/client.js";
-import { utf8Decoder } from "../src/git/common/bytes.js";
-import { nestedRoots, openRepository } from "../src/git/ops/core/context.js";
-import { initRepository } from "../src/git/ops/repository/init.js";
-import { walkWorktree } from "../src/git/ops/worktree/worktree-io.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { createInitialWorktreeWriter } from "../packages/do/src/fs/store/initial-write.js";
+import { Workspace as RuntimeWorkspace } from "../packages/do/src/runtime/workspace.js";
+import { createGit, type GitWorkspaceBinding } from "../packages/git/src/client.js";
+import { utf8Decoder } from "../packages/git/src/common/bytes.js";
 import {
   INDEX_DIRTY,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
   resealIndexTracker,
-} from "../src/git/store/indexes/index-tracker.js";
-import { Workspace as RuntimeWorkspace } from "../src/runtime/workspace.js";
+} from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import { nestedRoots, openRepository } from "../packages/git/src/ops/core/context.js";
+import { initRepository } from "../packages/git/src/ops/repository/init.js";
+import { walkWorktree } from "../packages/git/src/ops/worktree/worktree-io.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 import { makeRepo, makeWorkspace, writeWorkFile } from "./helpers/workspace.js";
 

@@ -1,23 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { createFilesystem } from "../src/fs/filesystem.js";
-import { createGit } from "../src/git/client.js";
-import { concat, utf8 } from "../src/git/common/bytes.js";
-import { hashObject, serializeTree } from "../src/git/common/objects.js";
-import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
-import type { GitContext } from "../src/git/ops/core/context.js";
-import { nestedRoots, openRepository } from "../src/git/ops/core/context.js";
-import { clone } from "../src/git/ops/network/network.js";
-import { initRepository } from "../src/git/ops/repository/init.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import type { Worktree } from "../src/git/ops/worktree/worktree.js";
+import { createFilesystem } from "../packages/do/src/fs/filesystem.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createGit } from "../packages/git/src/client.js";
+import { concat, utf8 } from "../packages/git/src/common/bytes.js";
+import { hashObject, serializeTree } from "../packages/git/src/common/objects.js";
+import { initializeIndexTracker } from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
+import type { GitContext } from "../packages/git/src/ops/core/context.js";
+import { nestedRoots, openRepository } from "../packages/git/src/ops/core/context.js";
+import { clone } from "../packages/git/src/ops/network/network.js";
+import { initRepository } from "../packages/git/src/ops/repository/init.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
 import {
   type CheckoutStore,
   PROVISIONAL_CLONE_LEASE_MS,
   SqliteGitDatabase,
-} from "../src/git/store/index.js";
-import { initializeIndexTracker } from "../src/git/store/indexes/index-tracker.js";
-import { PackWriter } from "../src/git/store/pack/writer.js";
-import { Workspace } from "../src/runtime/workspace.js";
+} from "../packages/git/src/store/index.js";
+import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
@@ -684,7 +684,7 @@ describe("provisional clone publication", () => {
     fixture.commit("unproven worktree database");
     const server = await startGitServer(fixture.dir);
     const workspace = makeWorkspace({ startTime: 43_000 });
-    const { db: _ignoredDatabase, ...unprovenWorktree } = workspace.worktree;
+    const { mutationScope: _ignoredMutationScope, ...unprovenWorktree } = workspace.worktree;
     const context: GitContext = { ...workspace.context, worktree: unprovenWorktree };
 
     try {

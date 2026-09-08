@@ -12,12 +12,12 @@ import type {
   ScanOptions,
   WriteEntry,
   WriteOptions,
-} from "../../src/fs/types.js";
+} from "../../packages/do/src/fs/types.js";
 import type {
   Worktree,
   WorktreeDirent,
   WorktreeStat,
-} from "../../src/git/ops/worktree/worktree.js";
+} from "../../packages/git/src/ops/worktree/worktree.js";
 
 /** Counts the calls that would mean a file was read to be hashed. */
 export class CountingWorktree implements Worktree {
@@ -29,13 +29,19 @@ export class CountingWorktree implements Worktree {
   creates = 0;
   /** Directory listings, which is how a lazy walk shows it is lazy. */
   readdirs = 0;
+  realpaths = 0;
 
   constructor(private readonly inner: Worktree) {}
+
+  get mutationScope(): object | undefined {
+    return this.inner.mutationScope;
+  }
 
   stat(path: string): WorktreeStat | null {
     return this.inner.stat(path);
   }
   realpath(path: string): RealPath {
+    this.realpaths++;
     return this.inner.realpath(path);
   }
   readFile(path: string): Uint8Array {

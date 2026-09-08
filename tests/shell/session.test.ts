@@ -1,9 +1,9 @@
 // The persistent working directory, and the one thing that makes it worth a
 // row rather than a field: it has to survive a Durable Object eviction.
 import { describe, expect, it } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { Filesystem } from "../../src/fs/types.js";
-import { createShell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { Filesystem } from "../../packages/do/src/fs/types.js";
+import { createShell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const ENCODER = new TextEncoder();

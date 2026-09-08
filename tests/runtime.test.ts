@@ -9,7 +9,7 @@ import {
   type ProcessHost,
   type ProcessResult,
   Workspace,
-} from "../src/index.js";
+} from "../packages/do/src/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
@@ -141,7 +141,7 @@ describe("Workspace", () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
     fixture.write("README.md", "# remote\n");
-    fixture.write("src/index.ts", "export const value = 1;\n");
+    fixture.write("packages/do/src/index.ts", "export const value = 1;\n");
     fixture.commit("remote work");
 
     const server = await startGitServer(fixture.dir);
@@ -160,7 +160,7 @@ describe("Workspace", () => {
 
       expect(await workspace.fs.readFile("/README.md", "utf8")).toBe("# remote\n");
       expect(await workspace.git.revParse({ ref: "HEAD" })).toBe(fixture.git("rev-parse", "HEAD"));
-      expect(await workspace.git.lsFiles()).toEqual(["README.md", "src/index.ts"]);
+      expect(await workspace.git.lsFiles()).toEqual(["README.md", "packages/do/src/index.ts"]);
       expect(phases.length).toBeGreaterThan(0);
     } finally {
       await server.close();

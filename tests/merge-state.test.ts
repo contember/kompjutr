@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { utf8 } from "../src/git/common/bytes.js";
-import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import { hashObject, serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
 import {
   MAX_MERGE_MESSAGE_BYTES,
   MAX_MERGE_TOUCHED_PATHS,
   type MergeStateMetadata,
   type MergeTouchedPath,
-} from "../src/git/ops/merge/merge-state.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/git/src/ops/merge/merge-state.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const TREE_BYTES = serializeTree([]);

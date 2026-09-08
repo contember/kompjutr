@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createGit, type GitFactory, Workspace } from "../src/index.js";
+import { createGit, type GitFactory, Workspace } from "../packages/do/src/index.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 describe("Workspace Git factory", () => {

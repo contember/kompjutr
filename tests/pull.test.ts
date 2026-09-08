@@ -1,22 +1,22 @@
 import { join } from "node:path";
 import type { GitPullOptions as ComputerPullOptions } from "@cloudflare/computer/git";
 import { describe, expect, it } from "vitest";
-import { createFilesystem } from "../src/fs/filesystem.js";
-import { createGit, type Git, type GitPullOptions } from "../src/git/client.js";
-import { openRepository } from "../src/git/ops/core/context.js";
-import type { MergeStateMetadata } from "../src/git/ops/merge/merge-state.js";
+import { createFilesystem } from "../packages/do/src/fs/filesystem.js";
+import { createGitCommand } from "../packages/do/src/git-shell.js";
+import { createShell } from "../packages/do/src/shell/index.js";
+import { createGit, type Git, type GitPullOptions } from "../packages/git/src/client.js";
+import { openRepository } from "../packages/git/src/ops/core/context.js";
+import type { MergeStateMetadata } from "../packages/git/src/ops/merge/merge-state.js";
 import {
   pull as pullCore,
   resolvePull,
   validatePullAfterFetch,
-} from "../src/git/ops/network/pull.js";
-import { rebaseContinue } from "../src/git/ops/rebase/rebase.js";
-import { commit } from "../src/git/ops/repository/commit.js";
-import type { Repository } from "../src/git/ops/repository/repository.js";
-import { fetchHttpClient, type GitHttpClient } from "../src/git/protocol/transport.js";
-import { createGitCommand } from "../src/git/shell.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { createShell } from "../src/shell/index.js";
+} from "../packages/git/src/ops/network/pull.js";
+import { rebaseContinue } from "../packages/git/src/ops/rebase/rebase.js";
+import { commit } from "../packages/git/src/ops/repository/commit.js";
+import type { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { fetchHttpClient, type GitHttpClient } from "../packages/git/src/protocol/transport.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

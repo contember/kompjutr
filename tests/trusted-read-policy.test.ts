@@ -69,7 +69,7 @@ function readSqlLiterals(contents: string): string[] {
 }
 
 function ordinaryReadInventory(): ReadQuery[] {
-  const journalReads = "src/git/store/operations/operation-journal-read.ts";
+  const journalReads = "packages/git/src/store/operations/operation-journal-read.ts";
   const scopes: readonly QueryScope[] = [
     {
       category: "operation journal",
@@ -94,46 +94,46 @@ function ordinaryReadInventory(): ReadQuery[] {
     {
       category: "operation journal",
       name: "operation-root page",
-      path: "src/git/store/operations/operation-journal-roots.ts",
+      path: "packages/git/src/store/operations/operation-journal-roots.ts",
       start: "export function operationRootPage(",
     },
     {
       category: "index tracker",
       name: "tracker state",
-      path: "src/git/store/indexes/index-tracker.ts",
+      path: "packages/git/src/do-fs/indexes/index-tracker.ts",
       start: "export function readIndexTrackerState(",
       end: "function* dirtyRows(",
     },
     {
       category: "index tracker",
       name: "dirty-path page",
-      path: "src/git/store/indexes/index-tracker.ts",
+      path: "packages/git/src/do-fs/indexes/index-tracker.ts",
       start: "function* dirtyRows(",
       end: "export function iterateIndexTrackerDirty(",
     },
     {
       category: "sparse selection",
       name: "native selection",
-      path: "src/git/store/sparse/selection.ts",
+      path: "packages/git/src/do-fs/sparse/selection.ts",
       start: "const CHECKOUT_ROW",
     },
     {
       category: "sparse tree resolution",
       name: "tree-depth projection",
-      path: "src/git/store/sparse/tree-resolution.ts",
+      path: "packages/git/src/do-fs/sparse/tree-resolution.ts",
       start: "export const SPARSE_TREE_DEPTH_SQL",
       end: "const TREE_DEPTH_ROW",
     },
     {
       category: "sparse workspace",
       name: "native workspace",
-      path: "src/git/store/sparse/workspace.ts",
+      path: "packages/git/src/do-fs/sparse/workspace.ts",
       start: "const INDEX_SQL",
     },
     {
       category: "sparse snapshot",
       name: "native snapshot",
-      path: "src/git/store/sparse/snapshot.ts",
+      path: "packages/git/src/do-fs/sparse/snapshot.ts",
       start: "const SNAPSHOT_DIRTY_SQL",
       classify: (sql) => {
         if (!sql.includes("sqlite_master")) return "ordinary-read";
@@ -146,20 +146,20 @@ function ordinaryReadInventory(): ReadQuery[] {
     {
       category: "loose-object payload",
       name: "joined payload stream",
-      path: "src/git/store/objects/objects.ts",
+      path: "packages/git/src/store/objects/objects.ts",
       start: "  #readLooseObjects(oids: readonly string[]): Map<string, RawObject> {",
       end: "  #looseObjectMetadata(",
     },
     {
       category: "maintenance roots",
       name: "ref root source pages",
-      path: "src/git/store/maintenance/roots/root-ref-pages.ts",
+      path: "packages/git/src/store/maintenance/roots/root-ref-pages.ts",
       start: "export function rootsFromRefs(",
     },
     {
       category: "maintenance roots",
       name: "worktree root source pages",
-      path: "src/git/store/maintenance/roots/root-worktree-pages.ts",
+      path: "packages/git/src/store/maintenance/roots/root-worktree-pages.ts",
       start: "export function rootsFromIndex(",
     },
   ];
@@ -254,7 +254,7 @@ describe("trusted ordinary read policy", () => {
   });
 
   it("keeps complete journal readers free of detached and whole-plan authentication", () => {
-    const path = "src/git/store/operations/operation-journal-read.ts";
+    const path = "packages/git/src/store/operations/operation-journal-read.ts";
     const readers = [scopedSource(path, "export function readOperationState(")];
     for (const reader of readers) expect(journalReaderViolations(reader)).toEqual([]);
 

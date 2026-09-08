@@ -11,6 +11,9 @@ import { describe, expect, it } from "vitest";
 const ROOT = join(import.meta.dirname, "..");
 const RUNNER = join(ROOT, "scripts", "test-full.mjs");
 const PACK_SUITE = join(ROOT, "tests", "pack.test.ts");
+const RELEASE_WORKFLOW = join(ROOT, ".github", "workflows", "release.yml");
+const PACKAGE_SMOKE = join(ROOT, "scripts", "package-smoke.mjs");
+const PACKAGE_NAMES = ["sqlite", "drive", "git", "do", "local"];
 
 function parse(file: string, kind: ts.ScriptKind): ts.SourceFile {
   return ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true, kind);
@@ -79,5 +82,27 @@ describe("the full-suite pack slices", () => {
       slices.filter((slice) => !covered.has(slice)),
       "slice matches no describe",
     ).toEqual([]);
+  });
+});
+
+describe("the scoped-package release gate", () => {
+  it("publishes all lockstep artifacts in dependency order", () => {
+    const versions = PACKAGE_NAMES.map((name) =>
+      JSON.parse(readFileSync(join(ROOT, "packages", name, "package.json"), "utf8")),
+    ).map((manifest) => manifest.version);
+    expect(new Set(versions).size).toBe(1);
+
+    const workflow = readFileSync(RELEASE_WORKFLOW, "utf8");
+    expect(workflow).toContain("for package in sqlite drive git do local");
+    expect(workflow).toContain('npm publish "$tarball"');
+    expect(workflow).toContain("--access public --provenance");
+    expect(workflow).toContain('npm view "$specifier" dist.integrity');
+    expect(workflow).toContain('published_integrity" != "$local_integrity');
+
+    const smoke = readFileSync(PACKAGE_SMOKE, "utf8");
+    expect(smoke).toContain('const packages = ["sqlite", "drive", "git", "do", "local"]');
+    expect(smoke).toContain('"pack", "--json"');
+    expect(smoke).toContain('const workerConsumer = join(temporaryRoot, "worker-consumer")');
+    expect(smoke).toContain("consumer did not resolve @kompjutr/");
   });
 });

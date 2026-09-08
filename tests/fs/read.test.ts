@@ -6,9 +6,9 @@
 // any single statement carried rather than trusting `remaining` to appear.
 
 import { describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../../src/db/db.js";
-import { normalize } from "../../src/fs/path.js";
-import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
+import type { SqlDatabase } from "../../packages/do/src/db/db.js";
+import { normalize } from "../../packages/do/src/fs/path.js";
+import { CHUNK_SIZE, initializeFsSchema } from "../../packages/do/src/fs/schema.js";
 import {
   DEFAULT_READ_BUDGET,
   MAX_HANDLE_MATERIALIZE_BYTES,
@@ -16,10 +16,10 @@ import {
   readFileHandles,
   readFiles,
   readRange,
-} from "../../src/fs/store/read.js";
-import { realpath } from "../../src/fs/store/resolve.js";
-import { discoverFiles } from "../../src/fs/store/scan.js";
-import { writeFiles } from "../../src/fs/store/write.js";
+} from "../../packages/do/src/fs/store/read.js";
+import { realpath } from "../../packages/do/src/fs/store/resolve.js";
+import { discoverFiles } from "../../packages/do/src/fs/store/scan.js";
+import { writeFiles } from "../../packages/do/src/fs/store/write.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 

@@ -2,19 +2,19 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { RemoveOptions, WriteEntry, WriteOptions } from "../src/fs/types.js";
-import { fromHex, utf8, utf8Decoder } from "../src/git/common/bytes.js";
-import { serializeCommit } from "../src/git/common/objects.js";
-import { joinPath } from "../src/git/common/paths.js";
-import type { RemoteView } from "../src/git/ops/core/kinds.js";
-import type { MergeStateMetadata } from "../src/git/ops/merge/merge-state.js";
+import type { RemoveOptions, WriteEntry, WriteOptions } from "../packages/do/src/fs/types.js";
+import { fromHex, utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { serializeCommit } from "../packages/git/src/common/objects.js";
+import { joinPath } from "../packages/git/src/common/paths.js";
+import type { RemoteView } from "../packages/git/src/ops/core/kinds.js";
+import type { MergeStateMetadata } from "../packages/git/src/ops/merge/merge-state.js";
 import {
   configGet,
   configSet,
   remoteAdd,
   remoteList,
   remoteRemove,
-} from "../src/git/ops/refs/config.js";
+} from "../packages/git/src/ops/refs/config.js";
 import {
   branch,
   branchDelete,
@@ -27,9 +27,9 @@ import {
   tag,
   tagDelete,
   tagList,
-} from "../src/git/ops/refs/refs.js";
-import { commit } from "../src/git/ops/repository/commit.js";
-import { initRepository } from "../src/git/ops/repository/init.js";
+} from "../packages/git/src/ops/refs/refs.js";
+import { commit } from "../packages/git/src/ops/repository/commit.js";
+import { initRepository } from "../packages/git/src/ops/repository/init.js";
 import {
   catFile,
   hashObject,
@@ -38,10 +38,10 @@ import {
   repoRoot,
   symbolicRef,
   updateRef,
-} from "../src/git/ops/repository/plumbing.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import { walkWorktree } from "../src/git/ops/worktree/worktree-io.js";
-import { type IndexEntry, SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/git/src/ops/repository/plumbing.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { walkWorktree } from "../packages/git/src/ops/worktree/worktree-io.js";
+import { type IndexEntry, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import {

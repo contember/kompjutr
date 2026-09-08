@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest";
 import type {
   IntegrationConflictKind,
   IntegrationPlan,
-} from "../src/git/ops/integration/integration.js";
-import type { IntegrationIdentity } from "../src/git/ops/integration/integration-structure.js";
-import { projectMergePlan } from "../src/git/ops/merge/merge-projection.js";
+} from "../packages/git/src/ops/integration/integration.js";
+import type { IntegrationIdentity } from "../packages/git/src/ops/integration/integration-structure.js";
+import { projectMergePlan } from "../packages/git/src/ops/merge/merge-projection.js";
 
 function identity(digit: string, mode = "100644"): IntegrationIdentity {
   return { mode, oid: digit.repeat(40) };

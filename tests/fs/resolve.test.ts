@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { Database, type DurableObjectStorageLike, type SqlDatabase } from "../../src/db/db.js";
-import { initializeFsSchema } from "../../src/fs/schema.js";
-import { allocateInodes } from "../../src/fs/store/meta.js";
-import { realpath, realpathNoFollow, realpaths } from "../../src/fs/store/resolve.js";
-import type { EntryType } from "../../src/fs/types.js";
+import {
+  Database,
+  type DurableObjectStorageLike,
+  type SqlDatabase,
+} from "../../packages/do/src/db/db.js";
+import { initializeFsSchema } from "../../packages/do/src/fs/schema.js";
+import { allocateInodes } from "../../packages/do/src/fs/store/meta.js";
+import { realpath, realpathNoFollow, realpaths } from "../../packages/do/src/fs/store/resolve.js";
+import type { EntryType } from "../../packages/do/src/fs/types.js";
 import { TestDatabase } from "../helpers/db.js";
 
 interface Spec {

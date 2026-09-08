@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { concat, utf8 } from "../src/git/common/bytes.js";
-import { hashObject } from "../src/git/common/objects.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import { JSON_BATCH_ROWS } from "../src/git/store/core/json-pages.js";
-import { MAX_PROMISED_BLOB_LOOKUP_OIDS } from "../src/git/store/fetch/promisor.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { PackWriter } from "../src/git/store/pack/writer.js";
+import { concat, utf8 } from "../packages/git/src/common/bytes.js";
+import { hashObject } from "../packages/git/src/common/objects.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { JSON_BATCH_ROWS } from "../packages/git/src/store/core/json-pages.js";
+import { MAX_PROMISED_BLOB_LOOKUP_OIDS } from "../packages/git/src/store/fetch/promisor.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 

@@ -2,10 +2,14 @@
 // existed those lines died with "command not found"; these cases are the
 // ones R2 leaves behind on purpose.
 import { beforeEach, describe, expect, it } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import { type ByteStream, encode } from "../../src/shell/exec/bytes.js";
-import { type Command, type RetainedBudget, result } from "../../src/shell/exec/context.js";
-import { createShell, type Shell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import { type ByteStream, encode } from "../../packages/do/src/shell/exec/bytes.js";
+import {
+  type Command,
+  type RetainedBudget,
+  result,
+} from "../../packages/do/src/shell/exec/context.js";
+import { createShell, type Shell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const ENCODER = new TextEncoder();

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { GitError } from "../src/git/common/errors.js";
+import { GitError } from "../packages/git/src/common/errors.js";
 import { harness, type ScenarioContext } from "./harness.js";
 import { NEXTJS_WORKFLOW } from "./nextjs-workflow.js";
 

@@ -1,23 +1,23 @@
 import { describe, expect, it } from "vitest";
 
-import { hasErrorCode } from "../src/git/common/errors.js";
+import { hasErrorCode } from "../packages/git/src/common/errors.js";
 import {
   MODE_COMMIT,
   MODE_EXECUTABLE,
   MODE_FILE,
   MODE_SYMLINK,
   serializeTree,
-} from "../src/git/common/objects.js";
-import { comparePaths } from "../src/git/common/streams.js";
+} from "../packages/git/src/common/objects.js";
+import { comparePaths } from "../packages/git/src/common/streams.js";
 import {
   classifyIntegrationStructure,
   classifyStructuralStreams,
   type IntegrationIdentity,
   type StructuralIntegrationEntry,
-} from "../src/git/ops/integration/integration-structure.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import type { TargetEntry } from "../src/git/ops/tree/tree-stream.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/git/src/ops/integration/integration-structure.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import type { TargetEntry } from "../packages/git/src/ops/tree/tree-stream.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 

@@ -3,15 +3,15 @@ import { deflateSync } from "node:zlib";
 
 import { describe, expect, it } from "vitest";
 
-import { concat, toHex } from "../src/git/common/bytes.js";
-import { sha1 } from "../src/git/common/sha1.js";
+import { concat, toHex } from "../packages/git/src/common/bytes.js";
+import { sha1 } from "../packages/git/src/common/sha1.js";
 import {
   deflate,
   InflateInto,
   InflateStream,
   inflate,
   inflatePrefix,
-} from "../src/git/common/zlib.js";
+} from "../packages/git/src/common/zlib.js";
 
 describe("zlib", () => {
   it("round-trips", () => {

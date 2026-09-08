@@ -4,9 +4,9 @@
 
 import { describe, expect, it } from "vitest";
 
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import { CHUNK_SIZE } from "../../src/fs/schema.js";
-import type { Filesystem, RealPath } from "../../src/fs/types.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import { CHUNK_SIZE } from "../../packages/do/src/fs/schema.js";
+import type { Filesystem, RealPath } from "../../packages/do/src/fs/types.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 

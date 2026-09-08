@@ -4,7 +4,7 @@ import {
   type SQLCursorLike,
   type SQLStorageLike,
   Workspace,
-} from "../../src/index.js";
+} from "../../packages/do/src/index.js";
 
 interface DurableObjectContextLike {
   storage: DurableObjectStorageLike;

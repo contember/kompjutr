@@ -5,7 +5,7 @@
 // scenario's allocations; phases inside a scenario share the fixture, which
 // is what makes a six-operation macro suite affordable.
 
-import { createGit, type Git, Workspace } from "../src/index.js";
+import { createGit, type Git, Workspace } from "../packages/do/src/index.js";
 import { SqliteTestStorage } from "../tests/helpers/storage.js";
 import { type FixtureName, isFixtureName } from "./fixtures.js";
 import type { MemoryPhaseEvidence } from "./memory-protocol.js";

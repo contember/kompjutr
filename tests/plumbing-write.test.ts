@@ -2,13 +2,20 @@ import { lstatSync, readdirSync, readFileSync, readlinkSync, unlinkSync } from "
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
-import type { ScanEntry } from "../src/fs/types.js";
-import { utf8, utf8Decoder } from "../src/git/common/bytes.js";
-import { GitError } from "../src/git/common/errors.js";
-import { MAX_OBJECT_BYTES, MODE_FILE, serializeTree } from "../src/git/common/objects.js";
-import { comparePaths } from "../src/git/common/streams.js";
-import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
-import type { GitContext } from "../src/git/ops/core/context.js";
+import type { ScanEntry } from "../packages/do/src/fs/types.js";
+import { utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { GitError } from "../packages/git/src/common/errors.js";
+import { MAX_OBJECT_BYTES, MODE_FILE, serializeTree } from "../packages/git/src/common/objects.js";
+import { comparePaths } from "../packages/git/src/common/streams.js";
+import {
+  INDEX_DIRTY,
+  iterateIndexTrackerDirty,
+  readIndexTrackerState,
+  resealIndexTracker,
+  WORKTREE_DIRTY,
+} from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
+import type { GitContext } from "../packages/git/src/ops/core/context.js";
 import {
   commitTree,
   MAX_COMMIT_TREE_PARENTS,
@@ -17,20 +24,13 @@ import {
   readTreeOwned,
   updateRef,
   writeTree,
-} from "../src/git/ops/repository/plumbing.js";
-import { add } from "../src/git/ops/staging/staging.js";
-import { MAX_TREE_BUILD_LEAF_ENTRIES } from "../src/git/ops/tree/tree-build.js";
-import type { Worktree } from "../src/git/ops/worktree/worktree.js";
-import type { IndexEntry, IndexStore } from "../src/git/store/index.js";
-import {
-  INDEX_DIRTY,
-  iterateIndexTrackerDirty,
-  readIndexTrackerState,
-  resealIndexTracker,
-  WORKTREE_DIRTY,
-} from "../src/git/store/indexes/index-tracker.js";
-import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/git/store/pack/packs.js";
-import { sharedRepoStoreMutations } from "../src/git/store/repository/shared.js";
+} from "../packages/git/src/ops/repository/plumbing.js";
+import { add } from "../packages/git/src/ops/staging/staging.js";
+import { MAX_TREE_BUILD_LEAF_ENTRIES } from "../packages/git/src/ops/tree/tree-build.js";
+import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
+import type { IndexEntry, IndexStore } from "../packages/git/src/store/index.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES } from "../packages/git/src/store/pack/packs.js";
+import { sharedRepoStoreMutations } from "../packages/git/src/store/repository/shared.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

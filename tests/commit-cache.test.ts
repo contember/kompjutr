@@ -1,15 +1,15 @@
 import { describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../src/db/db.js";
-import { utf8 } from "../src/git/common/bytes.js";
-import { hasErrorCode } from "../src/git/common/errors.js";
+import type { SqlDatabase } from "../packages/do/src/db/db.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import { hasErrorCode } from "../packages/git/src/common/errors.js";
 import {
   type Commit,
   hashObject,
   parseCommit,
   serializeCommit,
-} from "../src/git/common/objects.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/git/src/common/objects.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import {
   COMMIT_CACHE_FLUSH_BYTES,
   commitCacheBytes,
@@ -17,7 +17,7 @@ import {
   MAX_LOG_COMMITS,
   prepareCommitCache,
   WALK_COMMIT_GRAPH_SQL,
-} from "../src/git/store/trees/commits.js";
+} from "../packages/git/src/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const FORMER_INDEXED_COMMIT_BYTES = 1024 * 1024;

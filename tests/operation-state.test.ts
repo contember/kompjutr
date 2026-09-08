@@ -1,16 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { utf8 } from "../src/git/common/bytes.js";
-import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import { hashObject, serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
 import {
   MAX_OPERATION_STEPS,
   type OperationStepMetadata,
   operationStepsForState,
   type RebaseStateMetadata,
   type ReplayStateMetadata,
-} from "../src/git/ops/core/operation-state.js";
-import type { MergeTouchedPath } from "../src/git/ops/merge/merge-state.js";
-import { checkoutStoreMutations } from "../src/git/store/core/checkout-mutations-registry.js";
-import { readOperationStateOwned, SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/git/src/ops/core/operation-state.js";
+import type { MergeTouchedPath } from "../packages/git/src/ops/merge/merge-state.js";
+import { checkoutStoreMutations } from "../packages/git/src/store/core/checkout-mutations-registry.js";
+import { readOperationStateOwned, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const TREE_BYTES = serializeTree([]);

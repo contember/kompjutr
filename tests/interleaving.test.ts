@@ -3,7 +3,7 @@ import type {
   GitHttpClient,
   GitHttpRequest,
   GitHttpResponse,
-} from "../src/git/protocol/transport.js";
+} from "../packages/git/src/protocol/transport.js";
 import {
   awaitBarrierEntry,
   BUFFERED_HTTP_RESPONSE_HEADROOM_BYTES,

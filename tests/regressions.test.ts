@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { branch, checkout } from "../src/git/ops/refs/refs.js";
-import { commit as commitOp } from "../src/git/ops/repository/commit.js";
-import { add } from "../src/git/ops/staging/staging.js";
-import { dirtyPaths } from "../src/git/ops/worktree/worktree-io.js";
+import { branch, checkout } from "../packages/git/src/ops/refs/refs.js";
+import { commit as commitOp } from "../packages/git/src/ops/repository/commit.js";
+import { add } from "../packages/git/src/ops/staging/staging.js";
+import { dirtyPaths } from "../packages/git/src/ops/worktree/worktree-io.js";
 import {
   makeRepo,
   makeWorkspace,

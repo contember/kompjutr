@@ -7,10 +7,10 @@ import {
   type DurableObjectStorageLike,
   type SQLCursorLike,
   type SQLStorageLike,
-} from "../src/db/db.js";
-import type { NodeFsCompat } from "../src/fs/compat/node.js";
-import { createFilesystem } from "../src/fs/filesystem.js";
-import type { ScanEntry } from "../src/fs/types.js";
+} from "../packages/do/src/db/db.js";
+import type { NodeFsCompat } from "../packages/do/src/fs/compat/node.js";
+import { createFilesystem } from "../packages/do/src/fs/filesystem.js";
+import type { ScanEntry } from "../packages/do/src/fs/types.js";
 import {
   createGit,
   type Git,
@@ -20,14 +20,14 @@ import {
   type GitPushOptions,
   type GitScratchIndex,
   type PushLeaseExpectation,
-} from "../src/git/client.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import type { Worktree } from "../src/git/ops/worktree/worktree.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/git/src/client.js";
 import {
   iterateIndexTrackerDirty,
   readIndexTrackerState,
-} from "../src/git/store/indexes/index-tracker.js";
+} from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

@@ -5,17 +5,21 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { concat, utf8 } from "../src/git/common/bytes.js";
-import { hashObject } from "../src/git/common/objects.js";
-import { ChunkedBytes, ChunkPool, PACK_CHUNK_BYTES } from "../src/git/store/pack/chunks.js";
+import { concat, utf8 } from "../packages/git/src/common/bytes.js";
+import { hashObject } from "../packages/git/src/common/objects.js";
+import {
+  ChunkedBytes,
+  ChunkPool,
+  PACK_CHUNK_BYTES,
+} from "../packages/git/src/store/pack/chunks.js";
 import {
   applyDelta,
   DeltaApplier,
   type DeltaLimits,
   encodeDeltaHeader,
   MAX_DELTA_WORKING_BYTES,
-} from "../src/git/store/pack/delta.js";
-import { PackWriter } from "../src/git/store/pack/writer.js";
+} from "../packages/git/src/store/pack/delta.js";
+import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 
 function literalDelta(baseSize: number, target: Uint8Array): Uint8Array {
   const parts: Uint8Array[] = [encodeDeltaHeader(baseSize, target.length)];

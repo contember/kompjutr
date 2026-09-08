@@ -1,12 +1,12 @@
 // A lone surrogate has no UTF-8 encoding. `JSON.stringify` escapes it to
 // `\ud800`, which SQLite un-escapes into WTF-8, while a direct bind stores
-// U+FFFD — so the name read back is not the name written. `src/fs` rejects it
-// at the resolve chokepoint, exactly as `src/git` does (ADR-0007).
+// U+FFFD — so the name read back is not the name written. `packages/do/src/fs` rejects it
+// at the resolve chokepoint, exactly as `packages/git/src` does (ADR-0007).
 
 import { describe, expect, it } from "vitest";
 
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { Filesystem } from "../../src/fs/types.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { Filesystem } from "../../packages/do/src/fs/types.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const ENCODER = new TextEncoder();

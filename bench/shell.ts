@@ -7,7 +7,7 @@
 // to push down to and every candidate file is read. The gap between the two
 // rows is the content predicate, and it should widen with the file count.
 
-import { createShell, type Shell } from "../src/shell/index.js";
+import { createShell, type Shell } from "../packages/do/src/shell/index.js";
 import type { Harness, Scenario, ScenarioContext, Shape } from "./harness.js";
 import { shapeOf } from "./harness.js";
 import { FILE_BYTES, pathFor } from "./synthetic.js";

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { initializeFsSchema } from "../src/fs/schema.js";
+import { initializeFsSchema } from "../packages/do/src/fs/schema.js";
 import {
   advanceIndexTrackerBaseline,
   INDEX_DIRTY,
@@ -9,8 +9,8 @@ import {
   readIndexTrackerState,
   resealIndexTracker,
   WORKTREE_DIRTY,
-} from "../src/git/store/indexes/index-tracker.js";
-import { initializeGitSchema } from "../src/git/store/schema/schema.js";
+} from "../packages/git/src/do-fs/indexes/index-tracker.js";
+import { initializeGitSchema } from "../packages/git/src/store/schema/schema.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const TREE = "1".repeat(40);

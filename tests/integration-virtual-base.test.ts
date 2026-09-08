@@ -8,16 +8,20 @@ import {
   MODE_EXECUTABLE,
   MODE_FILE,
   MODE_SYMLINK,
-} from "../src/git/common/objects.js";
-import { comparePaths } from "../src/git/common/streams.js";
+} from "../packages/git/src/common/objects.js";
+import { comparePaths } from "../packages/git/src/common/streams.js";
 import {
   type IntegrationEntry,
   planIntegration,
   planVirtualAncestorIntegration,
-} from "../src/git/ops/integration/integration.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import { buildTree } from "../src/git/ops/tree/tree-build.js";
-import { type CheckoutStore, type IndexEntry, SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/git/src/ops/integration/integration.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { buildTree } from "../packages/git/src/ops/tree/tree-build.js";
+import {
+  type CheckoutStore,
+  type IndexEntry,
+  SqliteGitDatabase,
+} from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 

@@ -2,8 +2,8 @@ import { randomBytes } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { iterateSqlCursor, readBlob, type SqlDatabase } from "../src/db/db.js";
-import { concat, utf8, utf8Decoder } from "../src/git/common/bytes.js";
+import { iterateSqlCursor, readBlob, type SqlDatabase } from "../packages/do/src/db/db.js";
+import { concat, utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
 import {
   type Commit,
   hashObject,
@@ -13,7 +13,7 @@ import {
   serializeCommit,
   serializeTag,
   serializeTree,
-} from "../src/git/common/objects.js";
+} from "../packages/git/src/common/objects.js";
 import {
   catFile,
   collectDirectTreeEntries,
@@ -23,18 +23,21 @@ import {
   lsTree,
   MAX_LS_TREE_ENTRIES,
   show,
-} from "../src/git/ops/repository/reads.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import { treeStream } from "../src/git/ops/tree/tree-stream.js";
+} from "../packages/git/src/ops/repository/reads.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { treeStream } from "../packages/git/src/ops/tree/tree-stream.js";
 import {
   readAuthenticatedObjectOwned,
   SqliteGitDatabase,
   WALK_TREE_SQL,
-} from "../src/git/store/index.js";
-import { encodeDeltaHeader } from "../src/git/store/pack/delta.js";
-import { PackWriter } from "../src/git/store/pack/writer.js";
-import { commitCacheBytes } from "../src/git/store/trees/commits.js";
-import { TREE_WALK_PATH_BYTES, TREE_WALK_STATE_BYTES } from "../src/git/store/trees/tree-walk.js";
+} from "../packages/git/src/store/index.js";
+import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
+import { PackWriter } from "../packages/git/src/store/pack/writer.js";
+import { commitCacheBytes } from "../packages/git/src/store/trees/commits.js";
+import {
+  TREE_WALK_PATH_BYTES,
+  TREE_WALK_STATE_BYTES,
+} from "../packages/git/src/store/trees/tree-walk.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

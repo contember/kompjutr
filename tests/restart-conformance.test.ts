@@ -1,10 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createGit, type Git } from "../src/git/client.js";
-import { checkoutTree, indexFromTree } from "../src/git/ops/checkout/checkout.js";
-import type { GitContext } from "../src/git/ops/core/context.js";
-import type { Repository } from "../src/git/ops/repository/repository.js";
-import type { Worktree } from "../src/git/ops/worktree/worktree.js";
-import type { IndexEntry, SqliteGitDatabase } from "../src/git/store/index.js";
+import { createGit, type Git } from "../packages/git/src/client.js";
+import { checkoutTree, indexFromTree } from "../packages/git/src/ops/checkout/checkout.js";
+import type { GitContext } from "../packages/git/src/ops/core/context.js";
+import type { Repository } from "../packages/git/src/ops/repository/repository.js";
+import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
+import type { IndexEntry, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { assertRepositoryReadable, reopenTestRepository } from "./helpers/repository-invariants.js";

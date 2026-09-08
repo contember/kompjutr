@@ -5,13 +5,13 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import { utf8 } from "../src/git/common/bytes.js";
-import { diffText } from "../src/git/diff/index.js";
-import { checkoutTree } from "../src/git/ops/checkout/checkout.js";
-import { diff, diffSummary, diffTrees } from "../src/git/ops/diff/diff.js";
-import { commit } from "../src/git/ops/repository/commit.js";
-import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree/worktree-io.js";
-import type { IndexEntry } from "../src/git/store/index.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import { diffText } from "../packages/git/src/diff/index.js";
+import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
+import { diff, diffSummary, diffTrees } from "../packages/git/src/ops/diff/diff.js";
+import { commit } from "../packages/git/src/ops/repository/commit.js";
+import { hashWorktreePath, indexEntryFor } from "../packages/git/src/ops/worktree/worktree-io.js";
+import type { IndexEntry } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";

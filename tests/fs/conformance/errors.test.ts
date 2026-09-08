@@ -6,20 +6,30 @@ import { Buffer } from "node:buffer";
 
 import { describe, expect, it } from "vitest";
 
-import { NodeFsCompat } from "../../../src/fs/compat/node.js";
-import { createFilesystemOps } from "../../../src/fs/ops.js";
-import { initializeFsSchema } from "../../../src/fs/schema.js";
-import { copyFiles } from "../../../src/fs/store/copy.js";
-import { currentRev } from "../../../src/fs/store/meta.js";
-import { readFileHandles, readFiles } from "../../../src/fs/store/read.js";
-import { removeFiles } from "../../../src/fs/store/remove.js";
-import { realpath, realpaths, realpathsNoFollow } from "../../../src/fs/store/resolve.js";
-import { discoverFiles, glob, globPage, listEntries, scan } from "../../../src/fs/store/scan.js";
-import { discoverFilesContaining } from "../../../src/fs/store/search.js";
-import { writeFileStream } from "../../../src/fs/store/stream-write.js";
-import { touchFiles } from "../../../src/fs/store/touch.js";
-import { makeDirectories, writeFiles } from "../../../src/fs/store/write.js";
-import type { Filesystem } from "../../../src/fs/types.js";
+import { NodeFsCompat } from "../../../packages/do/src/fs/compat/node.js";
+import { createFilesystemOps } from "../../../packages/do/src/fs/ops.js";
+import { initializeFsSchema } from "../../../packages/do/src/fs/schema.js";
+import { copyFiles } from "../../../packages/do/src/fs/store/copy.js";
+import { currentRev } from "../../../packages/do/src/fs/store/meta.js";
+import { readFileHandles, readFiles } from "../../../packages/do/src/fs/store/read.js";
+import { removeFiles } from "../../../packages/do/src/fs/store/remove.js";
+import {
+  realpath,
+  realpaths,
+  realpathsNoFollow,
+} from "../../../packages/do/src/fs/store/resolve.js";
+import {
+  discoverFiles,
+  glob,
+  globPage,
+  listEntries,
+  scan,
+} from "../../../packages/do/src/fs/store/scan.js";
+import { discoverFilesContaining } from "../../../packages/do/src/fs/store/search.js";
+import { writeFileStream } from "../../../packages/do/src/fs/store/stream-write.js";
+import { touchFiles } from "../../../packages/do/src/fs/store/touch.js";
+import { makeDirectories, writeFiles } from "../../../packages/do/src/fs/store/write.js";
+import type { Filesystem } from "../../../packages/do/src/fs/types.js";
 import { TestDatabase } from "../../helpers/db.js";
 
 function createTestProvider(): NodeFsCompat {

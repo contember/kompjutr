@@ -1,15 +1,21 @@
 import { describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../src/db/db.js";
-import { createGit, type GitMaintenanceResult } from "../src/git/client.js";
-import { utf8 } from "../src/git/common/bytes.js";
-import { type ObjectType, serializeCommit } from "../src/git/common/objects.js";
-import type { MergeStateMetadata, MergeTouchedPath } from "../src/git/ops/merge/merge-state.js";
-import { fetchHttpClient } from "../src/git/protocol/transport.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { advanceMaintenanceRepack } from "../src/git/store/maintenance/repack.js";
-import { advanceMaintenanceSweep, GC_GRACE_MS } from "../src/git/store/maintenance/sweep.js";
-import { PackWriter } from "../src/git/store/pack/writer.js";
-import { Workspace } from "../src/runtime/workspace.js";
+import type { SqlDatabase } from "../packages/do/src/db/db.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createGit, type GitMaintenanceResult } from "../packages/git/src/client.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import { type ObjectType, serializeCommit } from "../packages/git/src/common/objects.js";
+import type {
+  MergeStateMetadata,
+  MergeTouchedPath,
+} from "../packages/git/src/ops/merge/merge-state.js";
+import { fetchHttpClient } from "../packages/git/src/protocol/transport.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { advanceMaintenanceRepack } from "../packages/git/src/store/maintenance/repack.js";
+import {
+  advanceMaintenanceSweep,
+  GC_GRACE_MS,
+} from "../packages/git/src/store/maintenance/sweep.js";
+import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

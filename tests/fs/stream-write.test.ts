@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { readBlob, type SqlDatabase } from "../../src/db/db.js";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import { CHUNK_SIZE } from "../../src/fs/schema.js";
+import { readBlob, type SqlDatabase } from "../../packages/do/src/db/db.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import { CHUNK_SIZE } from "../../packages/do/src/fs/schema.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const ENCODER = new TextEncoder();

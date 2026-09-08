@@ -7,20 +7,20 @@ import type {
   HandleReadBatch,
   RealPath,
   RegularFileHandle,
-} from "../src/fs/types.js";
+} from "../packages/do/src/fs/types.js";
 import type {
   IgnoreLimitResource,
   IgnorePattern,
   IgnoreSourceHashStep,
-} from "../src/git/ignore/index.js";
+} from "../packages/git/src/ignore/index.js";
 import {
   IGNORE_LIMITS,
   IgnoreLimitError,
   loadIgnoreMatcher,
   WorktreeIgnoreMatcher,
-} from "../src/git/ignore/index.js";
-import { compilePattern } from "../src/git/ignore/pattern.js";
-import type { Worktree } from "../src/git/ops/worktree/worktree.js";
+} from "../packages/git/src/ignore/index.js";
+import { compilePattern } from "../packages/git/src/ignore/pattern.js";
+import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
 import { GitFixture } from "./helpers/git.js";
 import type { SqliteTestStorage } from "./helpers/storage.js";
 import { TIMING_GATE } from "./helpers/timing.js";

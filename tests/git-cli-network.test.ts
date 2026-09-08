@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { createGit } from "../src/git/client.js";
-import { createGitCommand } from "../src/git/shell.js";
-import { Workspace } from "../src/runtime/workspace.js";
-import { createShell } from "../src/shell/index.js";
+import { createGitCommand } from "../packages/do/src/git-shell.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createShell } from "../packages/do/src/shell/index.js";
+import { createGit } from "../packages/git/src/client.js";
 import { GitFixture } from "./helpers/git.js";
 import type { GitServer } from "./helpers/http-backend.js";
 import { type GitServerOptions, startGitServer } from "./helpers/http-backend.js";

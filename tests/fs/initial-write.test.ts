@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { readBlob, type SqlDatabase } from "../../src/db/db.js";
-import { hasErrorCode } from "../../src/fs/errors.js";
-import { initializeFsSchema } from "../../src/fs/schema.js";
+import { readBlob, type SqlDatabase } from "../../packages/do/src/db/db.js";
+import { hasErrorCode } from "../../packages/do/src/fs/errors.js";
+import { initializeFsSchema } from "../../packages/do/src/fs/schema.js";
 import {
   createInitialWorktreeWriter,
   type InitialWorktreeSession,
-} from "../../src/fs/store/initial-write.js";
-import { writeFiles } from "../../src/fs/store/write.js";
+} from "../../packages/do/src/fs/store/initial-write.js";
+import { writeFiles } from "../../packages/do/src/fs/store/write.js";
 import { TestDatabase } from "../helpers/db.js";
 
 interface EntryRow {

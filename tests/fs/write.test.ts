@@ -10,14 +10,14 @@
 // non-ASCII path shows the mis-sliced boundaries.
 
 import { describe, expect, it } from "vitest";
-import { readBlob, type SqlDatabase } from "../../src/db/db.js";
-import { comparePaths } from "../../src/fs/path.js";
-import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
-import { currentRev } from "../../src/fs/store/meta.js";
-import { realpath } from "../../src/fs/store/resolve.js";
-import { writeFileStream } from "../../src/fs/store/stream-write.js";
-import { makeDirectories, writeFiles } from "../../src/fs/store/write.js";
-import type { WriteEntry } from "../../src/fs/types.js";
+import { readBlob, type SqlDatabase } from "../../packages/do/src/db/db.js";
+import { comparePaths } from "../../packages/do/src/fs/path.js";
+import { CHUNK_SIZE, initializeFsSchema } from "../../packages/do/src/fs/schema.js";
+import { currentRev } from "../../packages/do/src/fs/store/meta.js";
+import { realpath } from "../../packages/do/src/fs/store/resolve.js";
+import { writeFileStream } from "../../packages/do/src/fs/store/stream-write.js";
+import { makeDirectories, writeFiles } from "../../packages/do/src/fs/store/write.js";
+import type { WriteEntry } from "../../packages/do/src/fs/types.js";
 import { TestDatabase } from "../helpers/db.js";
 
 // -- harness ---------------------------------------------------------

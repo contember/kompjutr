@@ -7,7 +7,7 @@ import {
   exactRenameCandidateRetainedBytes,
   MAX_EXACT_RENAME_CANDIDATES,
   renameDetectionEnabled,
-} from "../src/git/ops/status/rename-detection.js";
+} from "../packages/git/src/ops/status/rename-detection.js";
 import { GitFixture } from "./helpers/git.js";
 import { makeRepo } from "./helpers/workspace.js";
 

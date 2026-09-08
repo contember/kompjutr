@@ -16,7 +16,7 @@ import {
   type ResolvedGitCliRunOptions,
   resolveGitCliRunOptions,
   validateGitCliInput,
-} from "../src/git/cli/index.js";
+} from "../packages/git/src/cli/index.js";
 
 const ENCODER = new TextEncoder();
 describe("git argv grammar", () => {

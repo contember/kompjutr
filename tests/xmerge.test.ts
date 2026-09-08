@@ -11,7 +11,7 @@ import {
   mergeText,
   type TextMergeOptions,
   type TextMergeStyle,
-} from "../src/git/diff/index.js";
+} from "../packages/git/src/diff/index.js";
 
 const utf8 = new TextEncoder();
 const scratch = mkdtempSync(join(tmpdir(), "kompjutr-xmerge-"));

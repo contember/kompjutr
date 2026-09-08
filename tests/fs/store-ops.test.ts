@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { SqlDatabase } from "../../src/db/db.js";
-import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
-import { currentRev } from "../../src/fs/store/meta.js";
+import type { SqlDatabase } from "../../packages/do/src/db/db.js";
+import { CHUNK_SIZE, initializeFsSchema } from "../../packages/do/src/fs/schema.js";
+import { currentRev } from "../../packages/do/src/fs/store/meta.js";
 import {
   chmodRaw,
   linkRaw,
@@ -10,11 +10,11 @@ import {
   statRaw,
   truncateRaw,
   writeRangeRaw,
-} from "../../src/fs/store/ops.js";
-import { readFile } from "../../src/fs/store/read.js";
-import { realpath, realpathNoFollow } from "../../src/fs/store/resolve.js";
-import { writeFiles } from "../../src/fs/store/write.js";
-import { S_IFDIR, S_IFREG } from "../../src/fs/types.js";
+} from "../../packages/do/src/fs/store/ops.js";
+import { readFile } from "../../packages/do/src/fs/store/read.js";
+import { realpath, realpathNoFollow } from "../../packages/do/src/fs/store/resolve.js";
+import { writeFiles } from "../../packages/do/src/fs/store/write.js";
+import { S_IFDIR, S_IFREG } from "../../packages/do/src/fs/types.js";
 import { TestDatabase } from "../helpers/db.js";
 
 class MeasuringDatabase implements SqlDatabase {

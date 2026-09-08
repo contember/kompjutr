@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { readBlob, type SqlDatabase } from "../src/db/db.js";
-import { hashObject } from "../src/git/common/objects.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { readBlob, type SqlDatabase } from "../packages/do/src/db/db.js";
+import { hashObject } from "../packages/git/src/common/objects.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 class RecordingDatabase implements SqlDatabase {

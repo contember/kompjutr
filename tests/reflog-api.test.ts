@@ -5,15 +5,15 @@ import {
   type SQLCursorLike,
   type SQLStorageLike,
   type SqlDatabase,
-} from "../src/db/db.js";
-import { createGit, type Git, type GitRecoverRefOptions } from "../src/git/client.js";
-import { recoverRef } from "../src/git/ops/core/ref-log.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
+} from "../packages/do/src/db/db.js";
+import { createGit, type Git, type GitRecoverRefOptions } from "../packages/git/src/client.js";
+import { recoverRef } from "../packages/git/src/ops/core/ref-log.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import {
   MAX_REFLOG_ROOT_SCAN_ENTRIES,
   type RefLogMetadata,
   SqliteGitDatabase,
-} from "../src/git/store/index.js";
+} from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

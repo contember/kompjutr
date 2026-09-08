@@ -1,21 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import { hasErrorCode } from "../src/git/common/errors.js";
+import { hasErrorCode } from "../packages/git/src/common/errors.js";
 import {
   MODE_FILE,
   type Person,
   serializeCommit,
   serializeTag,
   serializeTree,
-} from "../src/git/common/objects.js";
+} from "../packages/git/src/common/objects.js";
 import {
   MAX_REPLAY_REVISION_CODE_UNITS,
   MAX_REPLAY_REVISION_HOPS,
   planReplay,
   preflightReplayCommitObjects,
-} from "../src/git/ops/replay/replay.js";
-import { Repository } from "../src/git/ops/repository/repository.js";
-import { type CheckoutStore, SqliteGitDatabase } from "../src/git/store/index.js";
+} from "../packages/git/src/ops/replay/replay.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { type CheckoutStore, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const PERSON: Person = {

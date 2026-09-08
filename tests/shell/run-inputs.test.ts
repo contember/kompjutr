@@ -1,12 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
-import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { Filesystem } from "../../src/fs/types.js";
-import type { GitCliRunner } from "../../src/git/cli/types.js";
-import { createGitCommand } from "../../src/git/shell.js";
-import { type ByteStream, close as closeStream, encode } from "../../src/shell/exec/bytes.js";
-import { type Command, RetainedBudget, result } from "../../src/shell/exec/context.js";
-import { RunInputOwner } from "../../src/shell/exec/execute.js";
-import { createShell, type Shell } from "../../src/shell/index.js";
+import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
+import type { Filesystem } from "../../packages/do/src/fs/types.js";
+import { createGitCommand } from "../../packages/do/src/git-shell.js";
+import {
+  type ByteStream,
+  close as closeStream,
+  encode,
+} from "../../packages/do/src/shell/exec/bytes.js";
+import { type Command, RetainedBudget, result } from "../../packages/do/src/shell/exec/context.js";
+import { RunInputOwner } from "../../packages/do/src/shell/exec/execute.js";
+import { createShell, type Shell } from "../../packages/do/src/shell/index.js";
+import type { GitCliRunner } from "../../packages/git/src/cli/types.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 

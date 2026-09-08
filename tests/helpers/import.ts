@@ -1,4 +1,4 @@
-import type { CheckoutStore, RefRow } from "../../src/git/store/index.js";
+import type { CheckoutStore, RefRow } from "../../packages/git/src/store/index.js";
 import { type GitFixture, slices } from "./git.js";
 
 /** Load a fixture repository's pack and refs into a store, with no checkout. */

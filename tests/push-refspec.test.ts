@@ -2,10 +2,14 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import { concat } from "../src/git/common/bytes.js";
-import { serializeCommit, serializeTag, serializeTree } from "../src/git/common/objects.js";
-import { openRepository } from "../src/git/ops/core/context.js";
-import { clone } from "../src/git/ops/network/network.js";
+import { concat } from "../packages/git/src/common/bytes.js";
+import {
+  serializeCommit,
+  serializeTag,
+  serializeTree,
+} from "../packages/git/src/common/objects.js";
+import { openRepository } from "../packages/git/src/ops/core/context.js";
+import { clone } from "../packages/git/src/ops/network/network.js";
 import {
   authenticatePushBranchTargets,
   disposePushPlan,
@@ -17,12 +21,12 @@ import {
   pushPlanHasObject,
   pushPlanObjectCount,
   pushPlanObjectOidAt,
-} from "../src/git/ops/push/push-plan.js";
-import type { PushPlanningUpdate } from "../src/git/ops/refs/refspec.js";
-import { FLUSH, pkt } from "../src/git/protocol/pktline.js";
-import { receivePack, ZERO_OID } from "../src/git/protocol/receive-pack.js";
-import { discover } from "../src/git/protocol/remote.js";
-import { fetchHttpClient, type GitHttpClient } from "../src/git/protocol/transport.js";
+} from "../packages/git/src/ops/push/push-plan.js";
+import type { PushPlanningUpdate } from "../packages/git/src/ops/refs/refspec.js";
+import { FLUSH, pkt } from "../packages/git/src/protocol/pktline.js";
+import { receivePack, ZERO_OID } from "../packages/git/src/protocol/receive-pack.js";
+import { discover } from "../packages/git/src/protocol/remote.js";
+import { fetchHttpClient, type GitHttpClient } from "../packages/git/src/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { makeRepo, makeWorkspace } from "./helpers/workspace.js";

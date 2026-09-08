@@ -10,7 +10,7 @@
 // The inherited tests are MIT, from cloudflare/computer's `packages/dofs`.
 // See LICENSES/ and the file headers on the ported files.
 
-import type { Dirent, Filesystem, Stat } from "../../../src/fs/types.js";
+import type { Dirent, Filesystem, Stat } from "../../../packages/do/src/fs/types.js";
 
 /** dofs' stat shape: `fs/stat.ts:8-23`. Permission bits only, no S_IF*. */
 export interface WorkspaceStatResult {

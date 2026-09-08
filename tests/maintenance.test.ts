@@ -1,10 +1,10 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
-import { createGit, type GitMaintenanceResult } from "../src/git/client.js";
-import { utf8 } from "../src/git/common/bytes.js";
-import { SqliteGitDatabase } from "../src/git/store/index.js";
-import { readMaintenanceRunView } from "../src/git/store/maintenance/state.js";
-import { GC_GRACE_MS } from "../src/git/store/maintenance/sweep.js";
-import { Workspace } from "../src/runtime/workspace.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createGit, type GitMaintenanceResult } from "../packages/git/src/client.js";
+import { utf8 } from "../packages/git/src/common/bytes.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { readMaintenanceRunView } from "../packages/git/src/store/maintenance/state.js";
+import { GC_GRACE_MS } from "../packages/git/src/store/maintenance/sweep.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
