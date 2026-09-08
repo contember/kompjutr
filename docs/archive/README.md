@@ -13,6 +13,8 @@ that ships — only what genuinely helps a future reader. The git log holds the 
   — buffer ownership across the object boundaries, nested transaction failure,
   repeated local path mutations, and regular-file discovery. Records why
   `Buffer.prototype.slice()` cannot be used to take ownership.
+  [Final follow-up validation](public-api-correctness-validation-2026-09-08.md)
+  records the SQL-savepoint correction and the full-suite result on `d624d19`.
 - [Scoped packages and local runtime](sprint-2026-09-07-scoped-packages-and-local-runtime.md)
   — five lockstep packages, the preserved Durable Object path, and a
   crash-recoverable Unix local composition.

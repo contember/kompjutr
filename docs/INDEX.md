@@ -108,6 +108,10 @@ decodes an old number found in `archive/` or `specs/`.
 
 ## Historical records
 
+- [Public API correctness](archive/sprint-2026-09-08-public-api-correctness.md)
+  — object-byte ownership, local path mutations, and regular-file discovery;
+  [final follow-up validation](archive/public-api-correctness-validation-2026-09-08.md)
+  records the SQL-savepoint correction and full-suite closure.
 - [`archive/sprint-2026-09-07-scoped-packages-and-local-runtime.md`](archive/sprint-2026-09-07-scoped-packages-and-local-runtime.md)
   — five scoped packages, the preserved Durable Object path, and a
   crash-recoverable Unix local composition.
