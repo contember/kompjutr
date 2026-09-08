@@ -9,6 +9,7 @@ import {
 import { localError } from "../errors.js";
 import { requireCanonicalAbsolutePath } from "../paths.js";
 import type { RecoveryTransactionOwner } from "../recovery/contracts.js";
+import { SqliteCursorScope, scopedSqliteRows } from "./cursors.js";
 import { requireSqlitePaths } from "./files.js";
 
 const LOCAL_SCHEMA = `
@@ -54,30 +55,11 @@ function requireCounter(value: unknown, label: string): number {
   return Number(value);
 }
 
-function* normalizedRows(
-  cursor: unknown,
-  observed: () => void,
-): Generator<Record<string, unknown>> {
-  try {
-    for (const row of iterateSqlCursor(cursor)) {
-      observed();
-      yield row;
-    }
-  } catch (error) {
-    rethrowSqliteError(error);
-  }
-}
-
 export interface NodeSqliteDatabaseOptions {
   readonly mutationScope?: object;
   readonly recovery?: RecoveryTransactionOwner;
   readonly root?: string;
   readonly recoveryDirectory?: string;
-}
-
-interface SqlEffects {
-  readonly changes: number;
-  readonly schema: number;
 }
 
 export interface NodeSqliteMetrics {
@@ -97,6 +79,7 @@ export class NodeSqliteDatabase implements SqlDatabase {
   #closed = false;
   #asyncResultDetected = false;
   #nestedFailureLeftEffects = false;
+  #cursorScope: SqliteCursorScope | undefined;
   #statements = 0;
   #rows = 0;
 
@@ -239,7 +222,11 @@ export class NodeSqliteDatabase implements SqlDatabase {
       const iterator = this.#requireOpen()
         .prepare(query)
         .iterate(...bindings.map(sqliteBinding));
-      return normalizedRows(iterator, () => this.#rows++);
+      return scopedSqliteRows(
+        iterator,
+        () => this.#cursorScope,
+        () => this.#rows++,
+      );
     } catch (error) {
       rethrowSqliteError(error);
     }
@@ -291,28 +278,13 @@ export class NodeSqliteDatabase implements SqlDatabase {
   }
 
   transactionSync<T>(closure: () => T): T {
-    if (this.#depth > 0) {
-      const sql = this.#sqlEffects();
-      const disk = this.#recovery?.diskEffects ?? 0;
-      let nested: T;
-      try {
-        nested = closure();
-      } catch (error) {
-        if (this.#nestedScopeChanged(sql, disk)) this.#nestedFailureLeftEffects = true;
-        throw error;
-      }
-      if (isThenable(nested)) {
-        this.#asyncResultDetected = true;
-        void Promise.resolve(nested).catch(() => {});
-        throw localError("EINVAL", "transactionSync closure returned an asynchronous result");
-      }
-      return nested;
-    }
+    if (this.#depth > 0) return this.#nestedTransaction(closure);
     const connection = this.#requireOpen();
     this.#asyncResultDetected = false;
     this.#nestedFailureLeftEffects = false;
     connection.exec("BEGIN IMMEDIATE");
     this.#depth++;
+    this.#cursorScope = new SqliteCursorScope(undefined);
     let baseGeneration: number;
     try {
       baseGeneration = this.recoveryGeneration();
@@ -368,6 +340,8 @@ export class NodeSqliteDatabase implements SqlDatabase {
     }
 
     this.#depth--;
+    this.#cursorScope.release();
+    this.#cursorScope = undefined;
     try {
       this.#recovery?.commitSucceeded();
     } catch (error) {
@@ -377,32 +351,46 @@ export class NodeSqliteDatabase implements SqlDatabase {
     return result;
   }
 
-  /** Rows and schema this connection changed, counting what a rollback later undoes. */
-  #sqlEffects(): SqlEffects {
-    const row = this.one<Record<string, unknown>>(
-      `SELECT total_changes() AS changes,
-              (SELECT schema_version FROM pragma_schema_version()) AS schema`,
-    );
-    return {
-      changes: requireCounter(row?.changes, "total change count"),
-      schema: requireCounter(row?.schema, "schema version"),
-    };
-  }
-
-  #nestedScopeChanged(sql: SqlEffects, disk: number): boolean {
-    if ((this.#recovery?.diskEffects ?? 0) !== disk) return true;
+  #nestedTransaction<T>(closure: () => T): T {
+    const connection = this.#requireOpen();
+    const name = `local_nested_${this.#depth}`;
+    connection.exec(`SAVEPOINT ${name}`);
+    const scope = new SqliteCursorScope(this.#cursorScope);
+    this.#cursorScope = scope;
+    this.#depth++;
+    const disk = this.#recovery?.diskEffects ?? 0;
     try {
-      const current = this.#sqlEffects();
-      return current.changes !== sql.changes || current.schema !== sql.schema;
-    } catch {
-      // An unreadable connection cannot prove the nested closure changed nothing.
-      return true;
+      const result = closure();
+      if (isThenable(result)) {
+        this.#asyncResultDetected = true;
+        void Promise.resolve(result).catch(() => {});
+        throw localError("EINVAL", "transactionSync closure returned an asynchronous result");
+      }
+      connection.exec(`RELEASE ${name}`);
+      scope.release();
+      return result;
+    } catch (error) {
+      if ((this.#recovery?.diskEffects ?? 0) !== disk) this.#nestedFailureLeftEffects = true;
+      try {
+        scope.rollback();
+        connection.exec(`ROLLBACK TO ${name}`);
+        connection.exec(`RELEASE ${name}`);
+      } catch (rollbackError) {
+        this.#nestedFailureLeftEffects = true;
+        throw rollbackError;
+      }
+      throw error;
+    } finally {
+      this.#cursorScope = scope.parent;
+      this.#depth--;
     }
   }
 
   #rollbackAfterFailure(error: unknown, poisonAfterSettlement = false): never {
     let rollbackFailure: unknown;
     try {
+      this.#cursorScope?.rollback();
+      this.#cursorScope = undefined;
       if (this.#connection.isTransaction) this.#connection.exec("ROLLBACK");
     } catch (caught) {
       rollbackFailure = caught;
@@ -430,6 +418,8 @@ export class NodeSqliteDatabase implements SqlDatabase {
 
   #recoverAfterUncertainConnection(error: unknown, poisonAfterSettlement = false): never {
     try {
+      this.#cursorScope?.rollback();
+      this.#cursorScope = undefined;
       this.#connection.close();
       this.#primaryClosed = true;
     } catch (closeFailure) {

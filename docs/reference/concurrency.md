@@ -20,17 +20,26 @@ In `@kompjutr/local`, one lifetime process lock excludes a second local writer.
 The lock is an exclusive transaction in a root-keyed SQLite database beside the
 worktree and is released by the kernel when its process exits. Alternate state
 configurations therefore contend. `NodeSqliteDatabase.transactionSync()` owns
-`BEGIN IMMEDIATE`, `COMMIT`, and `ROLLBACK`; nested calls join the outer
-transaction. A nested closure that throws makes the outer transaction
-abort-only when that scope changed rows or schema, or recorded a disk effect —
-disk work cannot be undone alone, so the whole transaction is refused with
-`ERECOVERY`. A nested failure that changed nothing, such as the `EREENTRANT`
-rejection above, leaves the outer transaction committable. Until the refusal the
-failed scope's rows stay readable inside the transaction, which is where the two
-runtimes differ. An observation lease is the documented exception: it commits on
-its own connection, so a nested failure neither undoes nor detects it. The
-database and
-`DiskDrive` share one `RecoveryCoordinator` as their mutation scope. Disk
+`BEGIN IMMEDIATE`, `COMMIT`, and `ROLLBACK`; each nested call uses a SQLite
+savepoint. A failed nested scope immediately rolls back its SQL changes,
+including transactional metadata and TEMP schema changes. Its SQL changes are
+no longer readable by the outer closure. If the failed scope recorded disk
+effects, the outer transaction also becomes abort-only and refuses commit with
+`ERECOVERY`: disk work cannot be undone independently. A caught SQL-only failure,
+including the `EREENTRANT` rejection above, leaves the outer transaction
+committable. A failed drive operation can also mark the transaction abort-only
+before recording an effect.
+
+Local cursors created or advanced in a rolled-back scope are closed before SQL
+rollback; advancing them again fails with `ESTALE`. This includes unstarted
+cursors, so a failed scope cannot defer a write until after rollback. Successful
+scopes preserve their read cursors. SQLite requires pending write statements to
+finish before a savepoint can be released or the outer transaction committed.
+See [ADR-0021](../decisions/0021-recover-local-worktree-mutations-with-an-undo-journal.md).
+
+An observation lease is the documented exception: it commits on its own
+connection, so a nested failure does not undo it. The database and `DiskDrive`
+share one `RecoveryCoordinator` as their mutation scope. Disk
 changes are backed up before application, and the committed SQLite recovery
 generation decides rollback or roll-forward after a crash or uncertain commit.
 The lock, SQLite files, undo generations, and traversal spills stay outside the

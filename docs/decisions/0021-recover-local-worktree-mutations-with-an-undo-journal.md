@@ -55,6 +55,25 @@ side effect. Unsupported database/drive combinations fail with `EUNSUPPORTED`.
 Shared and Worker code continue to call only `transactionSync()`; transaction SQL
 and filesystem durability operations live in `@kompjutr/local`.
 
+Each nested SQL transaction owns a SQLite savepoint. On failure, close and
+invalidate cursors created or advanced in that scope, then roll back and release
+the savepoint. A successful child scope transfers cursor ownership to its parent;
+an outer rollback must also invalidate cursors from successful children. Resuming
+an invalidated cursor fails with `ESTALE`, including a cursor that had not started.
+
+SQL rollback is immediate even when the outer closure catches the failure. If the
+failed scope recorded disk effects, refuse the outer commit with `ERECOVERY` and
+let the existing undo journal restore the whole disk transaction. A failed drive
+operation may independently mark the transaction abort-only. Observation leases
+remain outside this scope because they commit on their own connection.
+
+A caught SQL-only failure leaves the outer transaction usable, matching Durable
+Object savepoint behavior. In particular, a rejected Git mutation reentry must not
+abort its successful owner. Use SQLite rollback rather than inferring SQL effects:
+`total_changes()` misses unfinished `RETURNING` statements, and a main schema
+cookie misses TEMP DDL and transactional header PRAGMAs. Manually assigned signed
+schema cookies are not recovery counters and are not inspected at nested entry.
+
 The exact protocol is specified in
 [`scoped-packages-and-local-runtime.md`](../specs/scoped-packages-and-local-runtime.md#local-undo-protocol).
 
@@ -64,6 +83,10 @@ The exact protocol is specified in
   the new database and worktree after reopen.
 - Existing synchronous Git algorithms retain read-your-writes behavior and do
   not gain a per-operation recovery implementation.
+- Failed nested SQL writes disappear before control returns to the outer closure;
+  disk effects remain visible until the refused outer transaction is rolled back.
+- Pending write cursors must finish before SQLite can release their savepoint or
+  commit the transaction. Successful read cursors may outlive their scope.
 - Local mutation pays backup, journal, rename, and fsync cost. Correct recovery
   is prioritized over matching the DO filesystem's write latency.
 - Every target must share a filesystem with recovery storage. Nested mounts and
@@ -84,6 +107,11 @@ The exact protocol is specified in
 
 ## Alternatives considered
 
+- Blanket abort-only for every nested exception breaks deliberate caught reentry.
+  Detecting effects through counters is incomplete for public SQL callers.
+- Independent disk savepoints require a separate nested undo protocol. SQL
+  savepoints plus whole-transaction disk rollback retain one recovery generation
+  and the existing first-touch journal ownership.
 - Materializing a complete shadow worktree and swapping the root is attractive
   for disposable directories, but it mishandles untracked files, open paths,
   nested mounts, and roots that cannot be replaced.

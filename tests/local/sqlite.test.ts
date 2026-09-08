@@ -79,42 +79,39 @@ describe("NodeSqliteDatabase", () => {
     }
   });
 
-  it("refuses the outer commit when a caught nested failure left effects behind", () => {
+  it("rolls back a failed SQL scope while preserving the outer transaction", () => {
     const db = database();
     try {
       db.run("CREATE TABLE sample (value TEXT NOT NULL)");
-      expect(() =>
-        db.transactionSync(() => {
-          db.run("INSERT INTO sample VALUES ('outer')");
-          expect(() =>
-            db.transactionSync(() => {
-              db.run("INSERT INTO sample VALUES ('nested')");
-              throw new Error("nested failure");
-            }),
-          ).toThrow("nested failure");
-        }),
-      ).toThrowError(expect.objectContaining({ code: "ERECOVERY" }));
-      expect(db.all("SELECT value FROM sample")).toEqual([]);
+      db.transactionSync(() => {
+        db.run("INSERT INTO sample VALUES ('outer')");
+        expect(() =>
+          db.transactionSync(() => {
+            db.run("INSERT INTO sample VALUES ('nested')");
+            throw new Error("nested failure");
+          }),
+        ).toThrow("nested failure");
+        expect(db.all("SELECT value FROM sample")).toEqual([{ value: "outer" }]);
+      });
       db.transactionSync(() => db.run("INSERT INTO sample VALUES ('after')"));
-      expect(db.all("SELECT value FROM sample")).toEqual([{ value: "after" }]);
+      expect(db.all("SELECT value FROM sample")).toEqual([{ value: "outer" }, { value: "after" }]);
     } finally {
       db.close();
     }
   });
 
-  it("refuses the outer commit when a caught nested failure left schema behind", () => {
+  it("rolls back schema from a caught nested failure", () => {
     const db = database();
     try {
-      expect(() =>
-        db.transactionSync(() => {
-          expect(() =>
-            db.transactionSync(() => {
-              db.run("CREATE TABLE half_built (a INTEGER)");
-              throw new Error("nested failure");
-            }),
-          ).toThrow("nested failure");
-        }),
-      ).toThrowError(expect.objectContaining({ code: "ERECOVERY" }));
+      db.transactionSync(() => {
+        expect(() =>
+          db.transactionSync(() => {
+            db.run("CREATE TABLE half_built (a INTEGER)");
+            throw new Error("nested failure");
+          }),
+        ).toThrow("nested failure");
+        expect(db.all("SELECT name FROM sqlite_master WHERE name = 'half_built'")).toEqual([]);
+      });
       expect(db.all("SELECT name FROM sqlite_master WHERE name = 'half_built'")).toEqual([]);
     } finally {
       db.close();
@@ -155,6 +152,8 @@ describe("NodeSqliteDatabase", () => {
               throw new Error("nested failure");
             }),
           ).toThrow("nested failure");
+          expect(database.all("SELECT key FROM git_meta WHERE key = 'nested'")).toEqual([]);
+          expect(existsSync(join(workspace.root, "nested.txt"))).toBe(true);
         }),
       ).toThrowError(expect.objectContaining({ code: "ERECOVERY" }));
       expect(existsSync(join(workspace.root, "nested.txt"))).toBe(false);
@@ -203,15 +202,14 @@ describe("NodeSqliteDatabase", () => {
       database.all("SELECT key FROM git_meta WHERE key = 'mutation_guard'").length;
     try {
       await workspace.git.init();
-      expect(() =>
-        database.transactionSync(() => {
-          expect(() =>
-            withGitMutationGuard(database, () => {
-              throw new Error("mutation failure");
-            }),
-          ).toThrow("mutation failure");
-        }),
-      ).toThrowError(expect.objectContaining({ code: "ERECOVERY" }));
+      database.transactionSync(() => {
+        expect(() =>
+          withGitMutationGuard(database, () => {
+            throw new Error("mutation failure");
+          }),
+        ).toThrow("mutation failure");
+        expect(guards()).toBe(0);
+      });
       expect(guards()).toBe(0);
       expect(withGitMutationGuard(database, () => "ok")).toBe("ok");
     } finally {
@@ -220,21 +218,22 @@ describe("NodeSqliteDatabase", () => {
     }
   });
 
-  it("refuses the outer commit after the CLI maps a failed mutation to an exit code", async () => {
+  it("keeps public mutations usable after a caught CLI failure and reopen", async () => {
     const fixture = localFixture();
-    const workspace = fixture.workspace();
+    let workspace = fixture.workspace();
     const { database } = workspace;
     try {
       await workspace.git.init();
       let cliRun: Promise<{ exitCode: number }> | undefined;
-      expect(() =>
-        database.transactionSync(() => {
-          cliRun = workspace.git.runCli({ argv: ["branch", "topic", "missing"], cwd: "/" });
-        }),
-      ).toThrowError(expect.objectContaining({ code: "ERECOVERY" }));
+      database.transactionSync(() => {
+        cliRun = workspace.git.runCli({ argv: ["branch", "topic", "missing"], cwd: "/" });
+      });
       expect((await cliRun)?.exitCode).not.toBe(0);
       expect(database.all("SELECT key FROM git_meta WHERE key = 'mutation_guard'")).toEqual([]);
-      expect(withGitMutationGuard(database, () => "ok")).toBe("ok");
+      workspace.close();
+      workspace = fixture.workspace();
+      await workspace.git.configSet({ path: "user.name", value: "After Reopen" });
+      expect(await workspace.git.configGet({ path: "user.name" })).toBe("After Reopen");
     } finally {
       workspace.close();
       fixture.dispose();
