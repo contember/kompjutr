@@ -125,7 +125,7 @@ export class InflateInto {
     }
     this.#target = new Uint8Array(expectedSize);
     const output = expectedSize === 0 ? new Uint8Array(1) : this.#target;
-    this.#inflate = new pako.Inflate({ chunkSize: INFLATE_CHUNK });
+    this.#inflate = new pako.Inflate({ chunkSize: INFLATE_CHUNK, windowBits: 15 });
     this.#inflate.strm.output = output;
     this.#inflate.strm.next_out = 0;
     this.#inflate.strm.avail_out = output.length;
@@ -183,7 +183,7 @@ export class InflateStream {
     // dgit measured a 53 MB pack peaking near 250 MB of buffers this way.
     // Only oversized entries stream here, so our exposure is far smaller —
     // but a tighter chunk costs nothing and keeps the bound honest.
-    this.#inflate = new pako.Inflate({ chunkSize: INFLATE_CHUNK });
+    this.#inflate = new pako.Inflate({ chunkSize: INFLATE_CHUNK, windowBits: 15 });
     this.#inflate.onData = (chunk) => {
       if (!(chunk instanceof Uint8Array)) throw new Error("inflate produced a non-binary chunk");
       this.#inflated += chunk.length;

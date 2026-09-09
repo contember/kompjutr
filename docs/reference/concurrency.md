@@ -152,6 +152,10 @@ owner moves neither refs nor shallow rows. A successful retry negotiates from
 the last published boundary even when an earlier attempt left a complete,
 unreachable pack.
 
+Pack entries use RFC 1950 zlib streams. Both native and incremental inflation
+reject gzip and raw DEFLATE wrappers; incremental readers retain exact output
+size and consumed-length checks.
+
 `git_pack_entries` authenticates every physical entry of each pack, including
 duplicate OIDs. `git_pack_objects` remains the single canonical read location
 for each OID. Deferred OFS deltas resolve their pack-relative base offset through
