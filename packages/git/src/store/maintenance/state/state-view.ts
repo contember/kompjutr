@@ -283,6 +283,10 @@ export function expectPhase<const Phases extends readonly MaintenancePhase[]>(
 
 /** Require root discovery to be settled before a downstream maintenance phase. */
 export function expectRootsSettled(view: MaintenanceRunView): void {
+  if (view.phase === "sweep-packs") {
+    validateMaintenanceRootCursor(view);
+    return;
+  }
   if (
     view.rootSource !== "done" ||
     view.cursorCheckoutId !== null ||

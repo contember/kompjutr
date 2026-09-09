@@ -1559,6 +1559,123 @@ describe("synthetic pack ingest", () => {
 });
 
 describe("pack fallback preservation", () => {
+  it.each([false, true])(
+    "promotes the whole safe deletion batch before checking dependencies (reverse: %s)",
+    async (reverse) => {
+      const store = open();
+      const a = utf8.encode("batch promotion A\n");
+      const b = utf8.encode("batch promotion B\n");
+      const aOid = hashObject("blob", a);
+      const bOid = hashObject("blob", b);
+      const p1 = await store.packs.ingest(slices(singleBlobPack(a), 64));
+      const p2 = await store.packs.ingest(slices(singleBlobPack(b), 64));
+      const chunks: Uint8Array[] = [];
+      const writer = new PackWriter((chunk) => chunks.push(chunk));
+      writer.header(1);
+      writer.refDelta(bOid, literalDelta(b.length, a));
+      writer.finish();
+      const p3 = await store.packs.ingest(slices(concat(chunks), 64));
+      const p4 = await store.packs.ingest(slices(singleBlobPack(b), 64));
+      const ids = [p1.packId, p2.packId];
+      expect(store.packs.deleteCompletePacks(reverse ? ids.reverse() : ids)).toBe(2);
+      const database = new SqliteGitDatabase(store.db, { objectCacheBytes: 0 });
+      const checkout = database.findCheckout("/repo");
+      if (checkout === null) throw new Error("batch promotion fixture disappeared");
+      const cold = database.openCheckout(checkout);
+      expect(cold.read(aOid)?.data).toEqual(a);
+      expect(cold.read(bOid)?.data).toEqual(b);
+      expect(cold.packs.completePackedEntry(aOid)?.packId).toBe(p3.packId);
+      expect(cold.packs.completePackedEntry(bOid)?.packId).toBe(p4.packId);
+    },
+  );
+
+  it("checks a promoted dependency closure through indexed metadata lookups", async () => {
+    const inner = new TestDatabase();
+    const recording = new RecordingDatabase(inner);
+    const database = new SqliteGitDatabase(recording, { objectCacheBytes: 0 });
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const members = Array.from({ length: 65 }, (_, index) =>
+      utf8.encode(`promotion chain ${index}\n`),
+    );
+    const last = members[64]!;
+    const primary = await store.packs.ingest(slices(singleBlobPack(last), 64));
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(members.length);
+    writer.object("blob", members[0]!);
+    for (let index = 1; index < members.length; index++) {
+      const base = members[index - 1]!;
+      writer.refDelta(hashObject("blob", base), literalDelta(base.length, members[index]!));
+    }
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64));
+    recording.queries.length = 0;
+    expect(store.packs.deleteCompletePacks([primary.packId])).toBe(1);
+    const issued = recording.queries.find(({ query }) => query.includes("WITH RECURSIVE closure"));
+    if (issued === undefined) throw new Error("promotion closure was not checked");
+    const plan = inner
+      .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
+      .map((row) => row.detail);
+    expect(
+      plan
+        .filter((detail) => /^SEARCH (object|base) /.test(detail))
+        .every((detail) => detail.includes("(repo_id=? AND oid=?)")),
+    ).toBe(true);
+    expect(plan.join("\n")).toMatch(/SEARCH base USING INDEX sqlite_autoindex_git_pack_objects_1/);
+    expect(plan.join("\n")).toMatch(/SEARCH child USING AUTOMATIC COVERING INDEX \(base_oid=\?\)/);
+    expect(plan.filter((detail) => /^SCAN (object|base|pack|loose)$/.test(detail))).toEqual([]);
+    const protection = recording.queries.find(({ query }) =>
+      query.includes("SELECT DISTINCT base.oid"),
+    );
+    if (protection === undefined) throw new Error("surviving dependencies were not checked");
+    const protectionPlan = inner
+      .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${protection.query}`, ...protection.bindings)
+      .map((row) => row.detail)
+      .join("\n");
+    expect(protectionPlan).toContain("git_pack_entries_by_base (repo_id=? AND base_oid=?)");
+    expect(protectionPlan).toContain("git_pack_pending_by_base (repo_id=? AND base_oid=?)");
+    const cold = new SqliteGitDatabase(inner, { objectCacheBytes: 0 });
+    const checkout = cold.findCheckout("/repo");
+    if (checkout === null) throw new Error("promotion fixture disappeared");
+    expect(cold.openCheckout(checkout).read(hashObject("blob", last))?.data).toEqual(last);
+  });
+
+  it.each(["three-pack", "self-referential"])(
+    "rejects a %s canonical promotion cycle without losing cold readability",
+    async (variant) => {
+      const store = open();
+      const a = utf8.encode("canonical cycle A\n");
+      const b = utf8.encode("canonical cycle B\n");
+      const aOid = hashObject("blob", a);
+      const bOid = hashObject("blob", b);
+      const first = await store.packs.ingest(slices(singleBlobPack(a), 64));
+      const deltaPack = (baseOid: string, base: Uint8Array, target: Uint8Array) => {
+        const chunks: Uint8Array[] = [];
+        const writer = new PackWriter((chunk) => chunks.push(chunk));
+        writer.header(1);
+        writer.refDelta(baseOid, literalDelta(base.length, target));
+        writer.finish();
+        return concat(chunks);
+      };
+      if (variant === "three-pack") {
+        await store.packs.ingest(slices(deltaPack(aOid, a, b), 64));
+        await store.packs.ingest(slices(deltaPack(bOid, b, a), 64));
+      } else {
+        await store.packs.ingest(slices(deltaPack(aOid, a, a), 64));
+      }
+      expect
+        .soft(() => store.packs.deleteCompletePacks([first.packId]))
+        .toThrowError(expect.objectContaining({ code: "EBUSY" }));
+      const database = new SqliteGitDatabase(store.db, { objectCacheBytes: 0 });
+      const checkout = database.findCheckout("/repo");
+      if (checkout === null) throw new Error("cycle witness repository disappeared");
+      const cold = database.openCheckout(checkout);
+      expect(cold.read(aOid)?.data).toEqual(a);
+      if (variant === "three-pack") expect(cold.read(bOid)?.data).toEqual(b);
+      expect(cold.packs.completePackedEntry(aOid)?.packId).toBe(first.packId);
+    },
+  );
+
   it("promotes a complete duplicate when its canonical pack is reclaimed", async () => {
     const store = open();
     const data = syntheticCommit(1);

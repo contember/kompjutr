@@ -480,6 +480,10 @@ describe("maintenance sweep", () => {
       ),
     ).toBe(0);
     expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({
+      phase: "sweep-packs",
+      status: "progress",
+    });
+    expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({
       phase: "finish",
       status: "complete",
     });
@@ -621,12 +625,21 @@ describe("maintenance sweep", () => {
       owned.packId,
     );
 
-    expect(advance(db, store.shared, 100)).toMatchObject({
+    expect(advance(db, store.shared, 100, 1)).toMatchObject({
       phase: "sweep-packs",
       reclaimedObjects: 0,
       reclaimedPacks: 0,
     });
-    expect(advance(db, store.shared, 100)).toMatchObject({
+    expect(
+      db.scalar(
+        "SELECT cursor_ordinal FROM git_maintenance_runs WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(owned.packId);
+    expect(
+      db.scalar("SELECT count(*) FROM git_pack_gc_candidates WHERE repo_id = ?", checkout.repoId),
+    ).toBe(1);
+    expect(advance(db, store.shared, 100, 1)).toMatchObject({
       phase: "sweep-packs",
       reclaimedObjects: 0,
       reclaimedPacks: 0,
@@ -637,6 +650,15 @@ describe("maintenance sweep", () => {
         checkout.repoId,
       ),
     ).toBe(0);
+    expect(
+      db.scalar(
+        "SELECT cursor_ordinal FROM git_maintenance_runs WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(99);
+    expect(
+      db.scalar("SELECT cursor_text FROM git_maintenance_runs WHERE repo_id = ?", checkout.repoId),
+    ).toBeNull();
     expect(
       db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE repo_id = ?", checkout.repoId),
     ).toBe(2);
@@ -822,6 +844,13 @@ describe("maintenance sweep", () => {
     db.corruptAvailability = false;
     const coldDatabase = new SqliteGitDatabase(inner, { objectCacheBytes: 8 * 1024 * 1024 });
     const cold = coldDatabase.openCheckout(checkout.id);
+    expect(advanceMaintenanceSweep(cold.shared, { nowMs: GC_GRACE_MS })).toMatchObject({
+      phase: "sweep-packs",
+      status: "progress",
+      reclaimedObjects: 1,
+      reclaimedPacks: 1,
+      reclaimedBytes: packed.bytes,
+    });
     expect(advanceMaintenanceSweep(cold.shared, { nowMs: GC_GRACE_MS })).toMatchObject({
       phase: "finish",
       status: "complete",

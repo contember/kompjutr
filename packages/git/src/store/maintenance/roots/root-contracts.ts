@@ -8,6 +8,7 @@ import { requireRefName } from "../../refs/ref-validation.js";
 export const DEFAULT_PAGE_ROWS = 128;
 export const MAX_PAGE_ROWS = 128;
 export const MAINTENANCE_ROOT_EPOCH_DRIFTED = "maintenance roots changed after root discovery";
+export const PACK_SWEEP_RETRY = "retry";
 
 export const ROOT_REFS = 1;
 export const ROOT_HEADS = 2;
@@ -86,6 +87,19 @@ export function isObjectType(value: unknown): value is ObjectType {
 
 /** Validate the phase-specific durable root cursor shape. */
 export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): void {
+  if (run.phase === "sweep-packs") {
+    if (
+      run.rootSource !== "done" ||
+      run.cursorCheckoutId !== null ||
+      (run.cursorText !== null && run.cursorText !== PACK_SWEEP_RETRY) ||
+      (run.cursorOrdinal !== null &&
+        (!Number.isSafeInteger(run.cursorOrdinal) || run.cursorOrdinal < 0)) ||
+      (run.cursorText !== null && run.cursorOrdinal === null)
+    ) {
+      throw new CorruptError("maintenance pack sweep cursor is invalid");
+    }
+    return;
+  }
   const none =
     run.cursorCheckoutId === null && run.cursorText === null && run.cursorOrdinal === null;
   if (run.phase !== "roots") {

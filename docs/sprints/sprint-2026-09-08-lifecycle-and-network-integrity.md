@@ -359,6 +359,31 @@ longer an acceptable completion path. WU3 waits for the necessary ingest repair.
 
 ## Sequencing
 
+### WU4 frozen clone-heartbeat cost step
+
+The safe query histogram on the in-progress WU3 runtime records 2,520 SQL
+statements, including 708 mutation-guard acquisitions and 708 releases. Clone
+checkpoints enter that guard even when their lease is not due for renewal.
+
+- Add the existing renewal-window comparison before guard acquisition in
+  `network-clone.ts`'s `heartbeat`. Keep `heartbeatOwned` and its guarded due
+  check unchanged. Actual renewal and readiness publication retain exact-owner
+  validation and their existing guards. No new ownership seam is introduced.
+- Preserve the strict `>` comparison, so renewal is due at equality. The added
+  clock sample is observable; clock callbacks already run outside the guard at
+  reservation. Do not claim identical callback counts or guard context.
+- First capture non-due guard counts with a streamed real-Git clone and a fixed
+  clock. After the change, prove that those heartbeat guard pairs disappear,
+  while HEAD, files, status, and cold reopen match. Exercise just-before and
+  exact renewal-window boundaries and retain the real expiry/takeover witness.
+- Territory: `ops/network/network-clone.ts` and a dedicated focused clone
+  heartbeat test. Gate: that test, `concurrency-clone.test.ts`, `clone.test.ts`,
+  independent implementation review, typecheck, lint, and smoke.
+- Step review `ses_f7a6c41f5ffektyzGL6Luqw3yP`: ready. This is only an evidenced
+  reduction; even subtracting all observed guard pairs leaves 1,104 statements
+  in that runtime state. Final integrated SQL and memory measurements remain
+  mandatory. Memory allocation ownership is not yet established.
+
 ### WU2 approved bounded-sweep continuation
 
 The user approved extending the existing cursor fields for `sweep-packs` after
@@ -510,3 +535,24 @@ acceptance witnesses, benchmark feasibility, and review/test gates.
   by `ses_f7e271569ffewnPw0zEEiSXg1F`. Leader verified all three native-Git
   controls (3.36 s), typecheck, lint (789 files), and smoke (159 tests, 16.12 s).
   Runtime change is one physical-table join; no benchmark transport workaround.
+- 2026-09-09 — WU2 continuation step and implementation reviewed clean by
+  `ses_f7e2f32b6ffe4PB9CgnsIpPjrD`; independent witnesses: 12 tests / two files.
+  Leader gate: 156 tests / five files (84.52 s), typecheck passed, all 13 WU2
+  files passed Biome, roots 15 tests (2.09 s), smoke 159 tests / 14 files
+  (25.89 s). Heavy gates used a
+  verified 4 GiB/no-swap cgroup. WU3 helper formatting was settled and global
+  lint passed (795 files) before commit. → ADR-0012 and
+  `reference/concurrency.md` for durable continuation and dependency behavior.
+- 2026-09-09 — After `cf2e6fb`, both unchanged default-transport Next.js workflows
+  passed under a verified 1 GiB/no-swap cap. Clone: 2,374 SQL, 79,268 returned
+  rows; process peak above baseline 146.88 MiB (mapped), 141.61 MiB (legacy).
+  Unchanged/one-file fetch: mapped 275/283 SQL, legacy 25/71 SQL. WU3 resumed;
+  clone SQL and memory misses remain blocking acceptance criteria.
+- 2026-09-09 — Temporary pass-through memory instrumentation sampled the initial
+  writer and bounded SQL high-water records under the verified 1 GiB cap.
+  On the in-progress heartbeat/WU3 runtime it observed 990 SQL statements,
+  including five guard pairs. RSS was 184,307,712 bytes at baseline,
+  320,864,256 before materialization, and peaked at 338,841,600 during writes.
+  Most growth preceded checkout, across pack parsing and deferred resolution;
+  this localizes the phase but does not establish a retained allocation owner.
+  These instrumented results are diagnostic, not the final acceptance benchmark.

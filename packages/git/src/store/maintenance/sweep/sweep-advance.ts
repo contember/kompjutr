@@ -44,7 +44,7 @@ export function advanceMaintenanceSweep(
     if (run.phase === "sweep-loose") {
       return sweepLoose(store.db, store.repoId, run, nowMs, pageRows);
     }
-    return sweepPacks(store, run, nowMs);
+    return sweepPacks(store, run, nowMs, pageRows);
   });
   if (result.storageChanged) store.revalidateStorageCaches();
   return result.progress;

@@ -11,6 +11,7 @@ import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 import { awaitBarrierEntry, checkpointBarrier } from "./helpers/interleaving.js";
+import { lifecycleDelta, lifecyclePack } from "./helpers/pack-maintenance.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 const INDEX_CHECKPOINT_OBJECTS = 1_024;
@@ -193,6 +194,48 @@ function expectCheckpointReadable(store: CheckoutStore, fixture: CheckpointPack)
 }
 
 describe("concurrent pack ownership", () => {
+  it.each(["unresolved", "flushed"])(
+    "protects a %s pending thin delta base across cold deletion",
+    async (stage) => {
+      const opened = createStore();
+      const base = utf8.encode("thin external base\n");
+      const target = utf8.encode("thin resolved target\n");
+      const baseOid = hashObject("blob", base);
+      const first = await opened.store.packs.ingest(singleChunk(fullObjectPack([base])));
+      const cold = reopenStore(opened.storage);
+      const bytes = lifecyclePack((writer) => {
+        writer.refDelta(baseOid, lifecycleDelta(base.length, target));
+        for (let i = 0; i < 1023; i++) writer.object("blob", utf8.encode(`thin filler ${i}\n`));
+      }, 1024);
+      const barrier = checkpointBarrier<boolean>(`thin delta ${stage}`, Boolean);
+      const owner = cold.store.packs.ingest(singleChunk(bytes), {
+        async yieldNow() {
+          const table = stage === "unresolved" ? "git_pack_pending" : "git_pack_entries";
+          const found = cold.db.scalar<number>(
+            `SELECT count(*) FROM ${table} WHERE base_oid = ?`,
+            baseOid,
+          );
+          await barrier.checkpoint((found ?? 0) > 0);
+        },
+      });
+      await awaitBarrierEntry(barrier, owner);
+      try {
+        const deleting = reopenStore(opened.storage);
+        expect(() => deleting.store.packs.deleteCompletePacks([first.packId])).toThrowError(
+          expect.objectContaining({ code: "EBUSY" }),
+        );
+        expect(deleting.store.read(baseOid)?.data).toEqual(base);
+      } finally {
+        barrier.release();
+        await owner;
+      }
+      expect(reopenStore(opened.storage).store.read(hashObject("blob", target))?.data).toEqual(
+        target,
+      );
+      expect(reopenStore(opened.storage).store.packs.reclaimPending()).toBe(0);
+    },
+  );
+
   it("fences a same-store overlap and preserves its duplicate fallback after retry", async () => {
     const opened = createStore();
     const targetData = utf8.encode("shared same-store target\n");

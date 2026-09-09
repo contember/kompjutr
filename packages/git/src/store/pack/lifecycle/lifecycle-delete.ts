@@ -16,6 +16,7 @@ import {
   requirePackId,
   uniquePackIds,
 } from "../shared.js";
+import { assertTerminatingPromotions } from "./lifecycle-dependencies.js";
 
 export class PackDeletion {
   constructor(
@@ -183,8 +184,12 @@ export class PackDeletion {
     if (states.size === 0) return 0;
     this.db.transactionSync(() => {
       const deletingPackIds = [...states.keys()];
-      for (const packId of deletingPackIds) {
-        this.deletePack(packId, deletingPackIds);
+      const promotions = deletingPackIds.map((packId) => ({
+        packId,
+        oids: this.#promoteFallbacks(packId, deletingPackIds),
+      }));
+      for (const { packId, oids } of promotions) {
+        this.#deletePackStorage(packId, deletingPackIds, oids);
       }
     });
     this.#clearCaches();
@@ -196,20 +201,20 @@ export class PackDeletion {
     for (const row of this.db.iterate(
       `SELECT DISTINCT base.oid, base.type, base.size,
               loose.oid AS loose_oid, loose.type AS loose_type, loose.size AS loose_size
-         FROM git_pack_entries child
-         JOIN git_pack_meta child_pack
-           ON child_pack.repo_id = child.repo_id AND child_pack.pack_id = child.pack_id
-          AND child_pack.state = 'complete'
-         JOIN git_pack_objects base
-           ON base.repo_id = child.repo_id AND base.oid = child.base_oid
-          AND base.pack_id = ?
+         FROM git_pack_objects base
          LEFT JOIN git_objects loose
            ON loose.repo_id = base.repo_id AND loose.oid = base.oid
-        WHERE child.repo_id = ?
-          AND child.pack_id NOT IN (SELECT value FROM json_each(?))
+        WHERE base.pack_id = ? AND base.repo_id = ?
+          AND (EXISTS (SELECT 1 FROM git_pack_entries child
+            WHERE child.repo_id = base.repo_id AND child.base_oid = base.oid
+              AND child.pack_id NOT IN (SELECT value FROM json_each(?)))
+            OR EXISTS (SELECT 1 FROM git_pack_pending child
+              WHERE child.repo_id = base.repo_id AND child.base_oid = base.oid
+                AND child.pack_id NOT IN (SELECT value FROM json_each(?))))
         ORDER BY base.oid COLLATE BINARY LIMIT ?`,
       deletingPackId,
       this.repoId,
+      JSON.stringify(deletingPackIds),
       JSON.stringify(deletingPackIds),
       MAX_PACK_MEMBERSHIP_OBJECTS + 1,
     )) {
@@ -276,6 +281,11 @@ export class PackDeletion {
   }
 
   deletePack(packId: number, deletingPackIds: readonly number[]): void {
+    const promotedOids = this.#promoteFallbacks(packId, deletingPackIds);
+    this.#deletePackStorage(packId, deletingPackIds, promotedOids);
+  }
+
+  #promoteFallbacks(packId: number, deletingPackIds: readonly number[]): Set<unknown> {
     const encodedDeletingPackIds = JSON.stringify(deletingPackIds);
     const promotedOids = new Set<unknown>();
     for (const row of this.db.iterate(
@@ -327,7 +337,16 @@ export class PackDeletion {
       }
       promotedOids.add(row.oid);
     }
+    return promotedOids;
+  }
+
+  #deletePackStorage(
+    packId: number,
+    deletingPackIds: readonly number[],
+    promotedOids: ReadonlySet<unknown>,
+  ): void {
     this.#authenticateLooseDeltaBases(packId, deletingPackIds);
+    assertTerminatingPromotions(this.db, this.repoId, promotedOids, deletingPackIds);
     this.db.run(
       `DELETE FROM git_commits
         WHERE repo_id = ?

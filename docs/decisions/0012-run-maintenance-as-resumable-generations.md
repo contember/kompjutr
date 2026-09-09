@@ -44,10 +44,19 @@ containing full objects, and publishes a pack before deleting its loose sources.
 Garbage collection deletes only wholly unreachable packs; it does not evacuate
 live objects from mixed packs.
 
+Pack sweeping persists its last examined pack ID and a sticky deletion marker
+in the existing phase-specific cursor fields. Each call examines one bounded
+candidate page and deletes at most one pack. A pass that deleted a pack must
+restart, because that deletion may unblock an earlier candidate. Only an
+exhausted deletion-free pass completes. Epoch restart and phase exit clear the
+cursor. Prospective dependency checks use metadata and the actual canonical
+fallback order, including dependencies held by pending packs.
+
 ## Consequences
 
-- Each invocation has a fixed cost envelope, and every durable boundary is
-  restartable.
+- Each invocation has bounded pages and candidate checks, and every durable
+  boundary is restartable. A candidate's dependency analysis remains proportional
+  to its SQLite metadata graph; the page bound does not make that graph fixed-size.
 - Foreground writes never wait for a repository-wide maintenance lock.
 - Root churn can repeat bounded marking work but cannot make a stale mark safe
   for deletion.

@@ -2,7 +2,9 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../../common/errors.js";
 import { decodeRow, expectSafeInteger, int, nullable, oneOf } from "../../../common/rows.js";
 import type { SharedRepoStore } from "../../index.js";
+import { PACK_SWEEP_RETRY } from "../roots/root-contracts.js";
 import type { PackAudit, RunState, SliceResult } from "./sweep-contracts.js";
+import { hasRequiredPackDependency } from "./sweep-pack-dependencies.js";
 import {
   eligibilityTime,
   progress,
@@ -118,36 +120,35 @@ export function classifyPacks(
   return { progress: progress(run, run.phase, "progress"), storageChanged: false };
 }
 
-function readPackSweepAction(
+function* readPackSweepPage(
   db: SqlDatabase,
   repoId: number,
   run: RunState,
   nowMs: number,
-): PackAudit | null {
-  let result: PackAudit | null = null;
-  let rows = 0;
+  pageRows: number,
+): Generator<PackAudit> {
   for (const row of db.iterate(
     `WITH audits AS (
-       SELECT ${PACK_COLUMNS}
-         FROM git_pack_gc_candidates candidate
+        SELECT ${PACK_COLUMNS}
+          FROM git_pack_gc_candidates candidate
          JOIN git_pack_meta pack
            ON pack.repo_id = candidate.repo_id AND pack.pack_id = candidate.pack_id
-        WHERE candidate.repo_id = ?
+        WHERE candidate.repo_id = ? AND candidate.pack_id > ?
      )
-     SELECT * FROM audits
-      WHERE state != 'complete' OR owned != 0 OR marked != 0 OR unreachable_since_ms <= ?
-      ORDER BY pack_id LIMIT 2`,
+      SELECT /* pack-sweep-page */ * FROM audits
+        WHERE state != 'complete' OR owned != 0 OR marked != 0
+          OR unreachable_since_ms <= ?
+        ORDER BY pack_id LIMIT ?`,
     run.runId,
     repoId,
+    run.cursorOrdinal ?? -1,
     sweepCutoff(nowMs),
+    pageRows,
   )) {
     const checked = readPackRow(row, repoId);
     if (checked.candidateSince === null) throw new CorruptError("pack sweep lost candidate age");
-    result ??= checked;
-    rows++;
+    yield checked;
   }
-  if (rows > 2) throw new CorruptError("pack sweep action exceeded sentinel");
-  return result;
 }
 
 function deletePackStorage(store: SharedRepoStore, run: RunState, pack: PackAudit): void {
@@ -202,28 +203,80 @@ function nextPackEligibility(db: SqlDatabase, repoId: number, run: RunState): nu
       );
 }
 
-export function sweepPacks(store: SharedRepoStore, run: RunState, nowMs: number): SliceResult {
-  const pack = readPackSweepAction(store.db, store.repoId, run, nowMs);
-  if (pack === null) {
-    const packEligible = nextPackEligibility(store.db, store.repoId, run);
-    const nextEligibleMs =
-      run.nextEligibleMs === null
-        ? packEligible
-        : packEligible === null
-          ? run.nextEligibleMs
-          : Math.min(run.nextEligibleMs, packEligible);
-    const updated = transitionPhase(store.db, store.repoId, run, "finish", nextEligibleMs);
-    return { progress: progress(updated, updated.phase, "complete"), storageChanged: false };
+function saveSweepCursor(
+  store: SharedRepoStore,
+  run: RunState,
+  ordinal: number | null,
+  marker: string | null,
+): RunState {
+  const row = store.db.one<Record<string, unknown>>(
+    `UPDATE git_maintenance_runs SET cursor_ordinal = ?, cursor_text = ?
+      WHERE repo_id = ? AND run_id = ? AND phase = 'sweep-packs'
+        AND observed_root_epoch = ? AND cursor_checkout_id IS NULL
+        AND cursor_ordinal IS ? AND cursor_text IS ?
+      RETURNING cursor_ordinal, cursor_text`,
+    ordinal,
+    marker,
+    store.repoId,
+    run.runId,
+    run.observedRootEpoch,
+    run.cursorOrdinal,
+    run.cursorText,
+  );
+  if (row === undefined || row.cursor_ordinal !== ordinal || row.cursor_text !== marker) {
+    throw new CorruptError("maintenance pack sweep cursor was not published atomically");
   }
-  if (pack.state !== "complete" || pack.owned || pack.marked) {
-    deletePackCandidate(store.db, store.repoId, pack.packId);
-    return { progress: progress(run, run.phase, "progress"), storageChanged: false };
+  return { ...run, cursorOrdinal: ordinal, cursorText: marker };
+}
+
+export function sweepPacks(
+  store: SharedRepoStore,
+  run: RunState,
+  nowMs: number,
+  pageRows: number,
+): SliceResult {
+  let examined = 0;
+  let last = run.cursorOrdinal;
+  for (const pack of readPackSweepPage(store.db, store.repoId, run, nowMs, pageRows)) {
+    examined++;
+    last = pack.packId;
+    if (pack.state !== "complete" || pack.owned || pack.marked) {
+      deletePackCandidate(store.db, store.repoId, pack.packId);
+      const updated = saveSweepCursor(store, run, last, run.cursorText);
+      return { progress: progress(updated, updated.phase, "progress"), storageChanged: false };
+    }
+    const since = pack.candidateSince;
+    if (since === null || nowMs < eligibilityTime(since)) {
+      throw new CorruptError("pack sweep selected an ineligible candidate");
+    }
+    if (hasRequiredPackDependency(store.db, store.repoId, pack.packId)) continue;
+    deletePackStorage(store, run, pack);
+    const counted = updateReclamationCounters(
+      store.db,
+      store.repoId,
+      run,
+      pack.count,
+      1,
+      pack.size,
+    );
+    const updated = saveSweepCursor(store, counted, last, PACK_SWEEP_RETRY);
+    return { progress: progress(updated, updated.phase, "progress"), storageChanged: true };
   }
-  const since = pack.candidateSince;
-  if (since === null || nowMs < eligibilityTime(since)) {
-    throw new CorruptError("pack sweep selected an ineligible candidate");
+  if (examined === pageRows) {
+    const updated = saveSweepCursor(store, run, last, run.cursorText);
+    return { progress: progress(updated, updated.phase, "progress"), storageChanged: false };
   }
-  deletePackStorage(store, run, pack);
-  const updated = updateReclamationCounters(store.db, store.repoId, run, pack.count, 1, pack.size);
-  return { progress: progress(updated, updated.phase, "progress"), storageChanged: true };
+  const cleared = saveSweepCursor(store, run, null, null);
+  if (run.cursorText === PACK_SWEEP_RETRY) {
+    return { progress: progress(cleared, cleared.phase, "progress"), storageChanged: false };
+  }
+  const packEligible = nextPackEligibility(store.db, store.repoId, run);
+  const nextEligibleMs =
+    run.nextEligibleMs === null
+      ? packEligible
+      : packEligible === null
+        ? run.nextEligibleMs
+        : Math.min(run.nextEligibleMs, packEligible);
+  const updated = transitionPhase(store.db, store.repoId, cleared, "finish", nextEligibleMs);
+  return { progress: progress(updated, updated.phase, "complete"), storageChanged: false };
 }
