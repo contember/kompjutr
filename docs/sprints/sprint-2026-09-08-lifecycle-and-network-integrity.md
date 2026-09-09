@@ -556,3 +556,9 @@ acceptance witnesses, benchmark feasibility, and review/test gates.
   Most growth preceded checkout, across pack parsing and deferred resolution;
   this localizes the phase but does not establish a retained allocation owner.
   These instrumented results are diagnostic, not the final acceptance benchmark.
+- 2026-09-09 — WU2 committed as `284c092` after independent review and leader
+  verification. WU4 heartbeat implementation reviewed clean by
+  `ses_f7a6c41f5ffektyzGL6Luqw3yP`; verify-first real-clone guard counts fell
+  from 27 to five pairs with 11 checkpoint yields unchanged. Leader exact gate:
+  76 tests / three files (53.57 s), smoke 159 tests / 14 files (25.86 s),
+  typecheck and global lint (795 files) passed under the verified memory cap.

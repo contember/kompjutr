@@ -106,6 +106,7 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     );
   };
   const heartbeat = (): void => {
+    if (leaseExpiresAt - context.now() > PROVISIONAL_CLONE_RENEW_WINDOW_MS) return;
     withGitMutationGuardOwned(context.database, heartbeatOwned);
   };
   const checkpoint = (): Promise<void> | undefined => {

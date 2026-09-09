@@ -111,8 +111,10 @@ Clone reserves its destination as a provisional repository with a renewable
 five-minute owner generation. The root blocks traversal into a parent repository
 but is absent from ordinary lookup and public store opens. A live same-root clone
 gets `EBUSY`; exact expiry lets a cold retry remove only the abandoned tracked
-state and allocate new monotonic identities. Each network and pack resumption
-renews or validates the lease. A fenced owner gets `ESTALE` and cannot publish or
+state and allocate new monotonic identities. Network and pack checkpoints compare
+the local expiry; only a due renewal enters the mutation guard and validates the
+durable owner. Readiness publication independently checks ownership and expiry.
+A fenced owner gets `ESTALE` and cannot publish or
 discard its replacement. Readiness publishes only after refs, configuration,
 index, and initial worktree materialization are complete. The fallback
 materializer rejects existing target-path collisions, then changes its index and
