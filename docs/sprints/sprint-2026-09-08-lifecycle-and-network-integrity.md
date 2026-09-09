@@ -234,6 +234,75 @@ declared verify-first gate.
 
 ## Review strategy
 
+### Approved expansion — default ingest and measured memory (WU4)
+
+The user expanded execution after the default mapped benchmark failed and the
+REF_DELTA experiment ran away (approximately 30 GiB reported by the user; the
+captured process log only establishes exit 137). Transport substitutions are no
+longer an acceptable completion path. WU3 waits for the necessary ingest repair.
+
+- **Verify first.** Reduce the default repeated-pack failure to a native-Git-valid
+  physical-offset witness, and independently identify the allocation/retention
+  mechanism behind the REF_DELTA runaway. Do not infer an OOM cause solely from
+  exit 137. Use fixed-size fixtures and enforced cgroup limits before increasing
+  input size; record the actual limit and measured high-water.
+- **Scope.** Repair the demonstrated physical-membership and memory mechanisms
+  needed for default clone and repeated legacy/mapped fetch. Backlog 74 and any
+  necessary packed-read retention seam from backlog 63 are now eligible only for
+  evidence-backed changes; unrelated findings are not pulled in automatically.
+  The exact write territory and design require independent step review before
+  WU4 runtime edits. WU2's lifecycle territory remains serialized if it overlaps.
+- **Acceptance.** Native-Git-valid OFS_DELTA and REF_DELTA inputs ingest and remain
+  readable after cache eviction and cold reopen, including repeated physical
+  bases owned canonically by an older pack. Default Next.js clone, unchanged
+  fetch, and one-file fetch complete for both modes. Restore the original cost
+  criteria for these measured workflows: at most 1,000 SQL statements and below
+  100 MiB process peak above the same-run baseline. Do not close with unexplained
+  growth, a transport workaround, or a recorded target miss instead of a fix.
+  These are measurement gates, never runtime projected-work refusals.
+- **Review/gates.** Independent review to clean of the reduced witness, runtime
+  repair, query plans, and memory evidence; leader reruns focused witnesses and
+  capped before/after measurements. The exact commands and files are frozen after
+  qualification. Integration and full-suite closure remain mandatory.
+- **Diagnostic containment.** Every potentially large reproduction runs in a
+  verified cgroup with swap disabled. The execution wrapper
+  `/tmp/opencode/kompjutr-capped-run.sh` sets and reads back the current CPU lease's
+  `memory.max` (default 1 GiB) and `memory.swap.max` (zero); test suites with large
+  fixture overhead may use an explicit 4 GiB cap. A diagnostic cap is distinct
+  from the 100 MiB operation target and cannot substitute for memory measurement.
+
+#### WU4 frozen physical-offset step
+
+- **Grounding:** `ingest/ingest-pending.ts` resolves an OFS base using a
+  `(repo_id, pack_id, offset)` join against canonical `git_pack_objects`.
+  `PackObjectBatch.flush()` stores all resolved physical occurrences in
+  `git_pack_entries`, whose primary key already matches that coordinate. An
+  older canonical owner plus 8,192 resolved offset insertions evicts the incoming
+  base from the two-window cache; the canonical join then misses it.
+- **Write territory:** the single deferred-base join in
+  `packages/git/src/store/pack/ingest/ingest-pending.ts`, and
+  `tests/pack-physical-membership.test.ts`. No schema, index, ownership, or
+  canonical-by-OID reader change.
+- **Implementation contract:** resolve the physical coordinate through
+  `git_pack_entries`; retain the existing canonical-by-OID resolution after the
+  OID has been found.
+- **Witness:** `cpu-lease run -n 2 -- bash /tmp/opencode/kompjutr-capped-run.sh npx vitest run tests/pack-physical-membership.test.ts`.
+  Native Git accepts all three fixtures. The pre-fix runtime passes with 8,190
+  intervening blobs and an older owner, and with 8,191 blobs without an older
+  owner; it fails only with 8,191 blobs plus an older owner. The incoming pack
+  is 171,000 bytes. All three must pass with matching cold target bytes.
+- **Next gate:** retry the unchanged default mapped benchmark under the cap,
+  then resume WU3. Duplicate-tree projection and depth/admissibility findings
+  remain separate unless demonstrated as another blocker.
+- **Memory finding disposition:** the reported approximately 30 GiB came from a
+  benchmark-only header-grouping diagnostic introduced during qualification.
+  SQLite sorter records included the entire chunk BLOB per entry: 30,613 entries
+  amplified 43,497,257 pack bytes into 31,779,725,438 sorter bytes. A capped
+  128-entry sample confirmed the amplification. The diagnostic was removed;
+  both abandoned databases show completed ingest, clone refs, and 24,252 index
+  entries. This is not evidence of a runtime ingest leak. Default-operation cost
+  and memory criteria still require measurement and resolution before closure.
+
 | Scope | Risk / rationale | Required gate and review | Escalate when |
 |---|---|---|---|
 | Sprint integration | WU1 and WU2 both change what maintenance may delete; WU3 changes what fetch may publish. A wrong combination deletes reachable data silently | `npm test` plus `npx vitest run tests/maintenance-sweep.test.ts tests/concurrency-pack.test.ts tests/concurrency-maintenance.test.ts tests/clone.test.ts`; independent integration review after the last WU, repeated after any fix that touches deletion order | Any unit widens what may be deleted, or two units edit the same sweep file |
@@ -263,12 +332,10 @@ declared verify-first gate.
 
 - Backlog 67–70 — shipped as
   [sprint-2026-09-08-public-api-correctness](../archive/sprint-2026-09-08-public-api-correctness.md).
-- [74](../backlog/74-align-pack-ingest-with-physical-membership.md) — pack ingest
-  versus physical membership is interoperability with real Git packs, a different
-  contract from deletion safety, and it would double this sprint's size.
-- [63](../backlog/63-bound-packed-dependency-graph-traversal.md) — bounded
-  dependency traversal is coordinated with WU2 but not delivered here. WU2 must
-  not leave a traversal that grows worse than the current one.
+- Unrelated portions of [74](../backlog/74-align-pack-ingest-with-physical-membership.md)
+  and [63](../backlog/63-bound-packed-dependency-graph-traversal.md) remain out of
+  scope; WU4 consumes only the demonstrated default-ingest and memory blockers.
+  WU2 must not leave a traversal that grows worse than the current one.
 - [65](../backlog/65-git-sqlite-architecture-review.md), ARCH-16 cursors and
   ARCH-9 pending projections: adjacent to WU1 and WU2 but separately owned.
 - Trailing bytes after a sideband flush, and any general storage normalization
@@ -291,6 +358,37 @@ declared verify-first gate.
    undefined behavior, so it can never be the sole justification for a fix.
 
 ## Sequencing
+
+### WU2 approved bounded-sweep continuation
+
+The user approved extending the existing cursor fields for `sweep-packs` after
+independent review found unbounded candidate analysis in one call. No new table
+or ownership mechanism is needed.
+
+- `cursor_ordinal` records the last examined pack ID in the current pass;
+  `cursor_text` is null or a fixed retry marker indicating that a deletion in
+  this pass may have unblocked earlier candidates. `cursor_checkout_id` stays
+  null and `root_source` stays `done`.
+- Examine at most the existing sweep `pageRows` candidates per call, in pack-ID
+  order using a keyset predicate and bounded SQL page. Keep the existing
+  prospective dependency check and at most one destructive pack action per call.
+  Persist skipped-candidate progress atomically with any deletion and counters.
+- At end of a pass with deletions, clear the cursor/marker and start another
+  bounded pass. Finish only after a pass makes no deletion. This reconsiders
+  newly unblocked earlier packs without rechecking every low-ID blocker before
+  each later deletion.
+- Update the shared phase-specific cursor validation and settled-roots check
+  explicitly for `sweep-packs`; keep every other phase's shape unchanged. Root
+  epoch drift and phase exit clear the continuation fields. Validate cold resume
+  and phase transitions under the existing transaction contract.
+- The additional witness uses more than two pages of independent blocked bases
+  retained by mixed live packs, followed by collectible packs. Assert bounded
+  candidate checks in every public call, progress across cold reopen, eventual
+  collection and completion, retry of newly unblocked earlier packs, and restart
+  after root-epoch drift. Preserve all full/delta fallback and unsafe-cycle tests.
+- Territory expands to maintenance `roots/`, `state/`, and `sweep/` only as needed
+  for this phase contract, plus focused maintenance tests. Independent step
+  review precedes implementation; the revised WU2 still requires review-to-clean.
 
 | Order | Unit | Parallel with | Why |
 |---|---|---|---|
@@ -334,6 +432,11 @@ acceptance witnesses, benchmark feasibility, and review/test gates.
 - **Approved execution refinement:** user approved removing mandatory new
   ownership and a mandatory new benchmark runner; prefer demonstrated existing
   protection and existing measurement infrastructure.
+- **Expansion gate:** the user subsequently approved fixing ingest and its memory
+  failure rather than changing benchmark inputs. WU4's frozen physical-offset
+  step was independently reviewed by `ses_f7e271569ffewnPw0zEEiSXg1F`: ready,
+  no findings. Runtime edits may proceed inside that exact territory. Additional
+  performance repairs require evidence and their own frozen step/review.
 
 ## Run log
 
@@ -371,3 +474,39 @@ acceptance witnesses, benchmark feasibility, and review/test gates.
   reran 29 tests. Leader reran the same 29 tests (3.92 s), typecheck, and smoke
   (159 tests, 16.40 s); formatting gate was temporarily held by WU3's active
   benchmark edits. → ADR-0012 and `reference/concurrency.md` for the invariant.
+- 2026-09-08 — WU1 committed as `008169e` after the global formatting gate passed.
+- 2026-09-08 — WU3's pre-fix Next.js mapped baseline failed during repeated pack
+  ingest (`cannot resolve 367 delta object(s): missing base`), before publication.
+  User approved reducing the failure and, only if causal, a benchmark-only
+  REF_DELTA configuration applied identically before/after; backlog 74 stays out
+  of runtime scope. Both comparable baselines must use the frozen WU1 code.
+- 2026-09-08 — WU2's stronger sweep witness exposed an optimistic alternative-pack
+  exemption in candidate selection: presence alone does not prove a terminating
+  promotion. Leader retained dependency-safe ordering and rejected root-cursor
+  reuse or new durable ownership. The unchanged witness gates this correction.
+- 2026-09-08 — REF_DELTA qualification failed before clone completion (one timeout,
+  then exit 137). The user reported approximately 30 GiB memory growth, rejected
+  the proposed no-delta benchmark, and required fixing ingest and meeting the
+  original criteria. WU4 added; WU3 paused. The leader verified a 1 GiB/no-swap
+  diagnostic cgroup wrapper before further reproductions. No 30 GiB process
+  remained in the subsequent process snapshot; the source of growth is unproven.
+- 2026-09-08 — WU2 leader gate passed: 148 tests / four files in 79.46 s under
+  a verified 4 GiB/no-swap cgroup, with two Vitest threads. Independent review
+  `ses_f7e2f32b6ffe4PB9CgnsIpPjrD` requested a correction: mutually dependent packs
+  can have an acyclic object graph and a safe fallback yet both be skipped.
+  The fix round must reproduce that graph and preserve safe full and delta
+  fallback collection without weakening the existing blocked-pack witnesses.
+- 2026-09-08 — WU4 qualification `ses_f7e69d15effejFJStEUr3Bv2hJ`: the physical
+  lookup witness gives two passes and one expected pre-fix failure under 1 GiB.
+  The 30 GiB amplification was traced to the added diagnostic sorter, not to
+  ingest; removed that query and all REF_DELTA request rewriting. Retained
+  databases establish that clone completed before the diagnostic ran. The
+  original exit 137 alone did not establish an OOM kill. Frozen WU4 step above.
+- 2026-09-09 — User approved WU2 bounded continuation using the existing cursor
+  fields. The prior full/delta retention finding is fixed, but re-review found
+  repeated unbounded per-candidate analyses; the approved step above replaces
+  that loop with cold-resumable bounded passes.
+- 2026-09-09 — WU4 physical-offset implementation independently reviewed clean
+  by `ses_f7e271569ffewnPw0zEEiSXg1F`. Leader verified all three native-Git
+  controls (3.36 s), typecheck, lint (789 files), and smoke (159 tests, 16.12 s).
+  Runtime change is one physical-table join; no benchmark transport workaround.

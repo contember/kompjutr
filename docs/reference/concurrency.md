@@ -152,7 +152,10 @@ unreachable pack.
 
 `git_pack_entries` authenticates every physical entry of each pack, including
 duplicate OIDs. `git_pack_objects` remains the single canonical read location
-for each OID. Publication compares the exact ordered rows with the digest made
+for each OID. Deferred OFS deltas resolve their pack-relative base offset through
+physical entries before using canonical OID reads; an older canonical owner does
+not hide an incoming occurrence. Publication compares the exact ordered rows with
+the digest made
 while parsing and requires every entry's canonical owner to be complete.
 Deleting that owner promotes one complete fallback entry atomically before the
 old rows disappear. The structural closure check covers canonical and

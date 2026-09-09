@@ -21,5 +21,5 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 ## Active
 
 - [`sprint-2026-09-08-lifecycle-and-network-integrity.md`](sprint-2026-09-08-lifecycle-and-network-integrity.md)
-  — backlog 71, 72, 73. Statically verified only; each unit reproduces before it
-  fixes. Plan review pending.
+  — backlog 71, 72, 73. Promise fulfillment, pack dependency lifetime, and fetched
+  connectivity under an independently approved verify-first plan.

@@ -75,7 +75,7 @@ export class PackPendingResolver {
                    pending.base_oid, pending.base_offset,
                    COALESCE(pending.base_oid, base.oid) AS resolved_oid
              FROM git_pack_pending pending
-             LEFT JOIN git_pack_objects base
+             LEFT JOIN git_pack_entries base
                 ON base.repo_id = pending.repo_id AND base.pack_id = pending.pack_id
                AND base.offset = pending.base_offset
              WHERE pending.repo_id = ? AND pending.pack_id = ? AND pending.offset > ?
