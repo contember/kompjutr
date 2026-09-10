@@ -132,7 +132,13 @@ describe("complete-input pack inflation", () => {
       const result = decode(read, encoded, size);
       expect(native).toHaveBeenCalledTimes(1);
       expect(exact).not.toHaveBeenCalled();
-      expect(result.buffer).not.toBe(encoded.buffer);
+      // Native buffers may share a pool, but their byte ranges must not overlap.
+      if (result.buffer === encoded.buffer) {
+        expect(
+          result.byteOffset + result.byteLength <= encoded.byteOffset ||
+            encoded.byteOffset + encoded.byteLength <= result.byteOffset,
+        ).toBe(true);
+      }
       encoded.fill(0xff);
       for (let i = 0; i < 32; i++) {
         const other = new Uint8Array(size).fill(i);

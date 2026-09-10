@@ -163,8 +163,17 @@ describe("local SQL savepoints", () => {
   });
 
   it("does not interpret a signed SQLite schema cookie as a recovery counter", () => {
-    using db = database();
-    db.run("PRAGMA schema_version = -1");
+    const fixture = localFixture();
+    fixtures.push(fixture);
+    const path = join(fixture.base, "scopes.sqlite");
+    using db = new NodeSqliteDatabase(path);
+    // Prepare the signed cookie through a connection that permits schema-version writes.
+    const setup = new DatabaseSync(path, { defensive: false });
+    try {
+      setup.exec("PRAGMA schema_version = -1");
+    } finally {
+      setup.close();
+    }
     expect(db.scalar("PRAGMA schema_version")).toBe(-1);
     expect(db.transactionSync(() => db.transactionSync(() => db.scalar("SELECT 123")))).toBe(123);
   });
