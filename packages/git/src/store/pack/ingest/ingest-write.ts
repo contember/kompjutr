@@ -41,13 +41,19 @@ export class PackChunkWriter {
       if (total > maxBytes) throw new CorruptError("pack exceeds the maximum accepted size");
       // Everything except the final 20 bytes is covered by the checksum,
       // and which bytes those are is only known at the end.
-      const joined = tail.length > 0 ? concat([tail, data]) : data;
-      if (joined.length > 20) {
-        sha.update(joined.subarray(0, joined.length - 20));
-        // The lookbehind outlives this chunk; the producer may refill its own buffer.
-        tail = ownedBytes(joined.subarray(joined.length - 20));
+      if (data.length >= 20) {
+        sha.update(tail);
+        sha.update(data.subarray(0, data.length - 20));
+        tail = ownedBytes(data.subarray(data.length - 20));
       } else {
-        tail = ownedBytes(joined);
+        const joined = tail.length > 0 ? concat([tail, data]) : data;
+        if (joined.length > 20) {
+          sha.update(joined.subarray(0, joined.length - 20));
+          // The lookbehind outlives this chunk; the producer may refill its own buffer.
+          tail = ownedBytes(joined.subarray(joined.length - 20));
+        } else {
+          tail = ownedBytes(joined);
+        }
       }
       let offset = 0;
       while (offset < data.length) {
