@@ -5,7 +5,7 @@ import { readBlob, type SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../../common/errors.js";
 import type { ByteLru } from "../../../common/lru.js";
 import type { RawObject } from "../../../common/objects.js";
-import { InflateInto } from "../../../common/zlib.js";
+import { InflateInto, inflatePrefix } from "../../../common/zlib.js";
 import { PACK_PENDING_PAGE_ROWS } from "../pack-ingest-index.js";
 import {
   MAX_PACK_DELTA_WORKING_BYTES,
@@ -64,28 +64,20 @@ export class PackDataReader {
     ) {
       throw new CorruptError(`${label} exceeds the bounded inflate limit`);
     }
-    const stream = new InflateInto(expectedSize);
-    let consumed = 0;
+    let result: ReturnType<typeof inflatePrefix>;
     try {
-      while (!stream.ended && consumed < input.length) {
-        const used = pushExactInflate(stream, input.subarray(consumed), label);
-        consumed += used;
-        if (!stream.ended && used === 0) {
-          throw new CorruptError(`${label} inflater made no progress`);
-        }
-      }
+      result = inflatePrefix(input, expectedSize);
     } catch (error) {
-      if (error instanceof CorruptError) throw error;
       throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });
     }
-    if (!stream.ended || consumed !== input.length) {
+    if (
+      result === null ||
+      result.data.length !== expectedSize ||
+      result.consumed !== input.length
+    ) {
       throw new CorruptError(`${label} size does not match its index metadata`);
     }
-    try {
-      return stream.finish();
-    } catch (error) {
-      throw new CorruptError(`${label} size does not match its index metadata`, { cause: error });
-    }
+    return result.data;
   }
 
   cacheObject(packId: number, oid: string, object: RawObject): void {
