@@ -176,13 +176,7 @@ export async function uploadPack(
         return {
           shallow,
           unshallow,
-          pack: sideband(
-            reader,
-            line.payload,
-            request.onProgress,
-            request.onMessage,
-            options.signal,
-          ),
+          pack: sideband(reader, line.payload, request.onProgress, options.signal),
         };
       }
       const text = ownedPktText(line);
@@ -241,7 +235,6 @@ async function* sideband(
   reader: ByteReader,
   first: Uint8Array,
   onProgress?: (message: string) => void,
-  onMessage?: (message: string) => void,
   signal?: AbortSignal,
 ): AsyncGenerator<Uint8Array> {
   try {
@@ -250,7 +243,8 @@ async function* sideband(
       throwIfAborted(signal);
       if (frame === null) {
         const line = await reader.readPkt();
-        if (line === null || line.kind === "flush") return;
+        if (line === null) throw new CorruptError("sideband response ended before its flush");
+        if (line.kind === "flush") return;
         if (line.kind !== "line") continue;
         frame = line.payload;
       }
@@ -262,8 +256,8 @@ async function* sideband(
         onProgress(utf8Decoder.decode(payload));
       } else if (band === 3) {
         throw new GitError("EFETCHFAIL", utf8Decoder.decode(payload).trim());
-      } else if (band !== 2 && onMessage !== undefined) {
-        onMessage(utf8Decoder.decode(frame));
+      } else if (band !== 2) {
+        throw new CorruptError("sideband response contains an invalid band");
       }
       frame = null;
     }

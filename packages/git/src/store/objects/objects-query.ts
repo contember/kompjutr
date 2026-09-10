@@ -101,17 +101,21 @@ export function objectInfo(
   for (const oid of wanted) {
     if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
   }
+  // Materialized lengths keep payload BLOBs out of the grouping sorter.
   const rows = context.db.all<Record<string, unknown>>(
     `WITH wanted(ordinal, oid) AS MATERIALIZED (
        SELECT CAST(key AS INTEGER), value FROM json_each(?)
+     ), chunk_lengths AS MATERIALIZED (
+        SELECT chunk.oid, chunk.seq, length(chunk.data) AS byte_length
+          FROM wanted
+          CROSS JOIN git_object_chunks chunk
+         WHERE chunk.repo_id = ? AND chunk.oid = wanted.oid
      ), chunks AS MATERIALIZED (
-       SELECT chunk.oid, COUNT(*) AS chunk_rows, MIN(chunk.seq) AS first_chunk,
-              MAX(chunk.seq) AS last_chunk, MAX(length(chunk.data)) AS largest_chunk,
-              SUM(length(chunk.data)) AS stored_bytes
-         FROM git_object_chunks chunk
-         JOIN wanted ON wanted.oid = chunk.oid
-        WHERE chunk.repo_id = ?
-        GROUP BY chunk.oid
+        SELECT oid, COUNT(*) AS chunk_rows, MIN(seq) AS first_chunk,
+               MAX(seq) AS last_chunk, MAX(byte_length) AS largest_chunk,
+               SUM(byte_length) AS stored_bytes
+          FROM chunk_lengths
+         GROUP BY oid
      )
      SELECT CASE WHEN loose.oid IS NOT NULL THEN 'loose'
                  WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,

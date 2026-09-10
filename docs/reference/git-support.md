@@ -645,10 +645,19 @@ Legacy fetch returns `{ mode: "legacy", defaultBranch, fetchHead, updates: [] }`
 Mapped fetch returns `{ mode: "mapped", defaultBranch, fetchHead: null,
 updates }`, with updates ordered by destination UTF-8 bytes. Exact missing
 sources fail; an unmatched wildcard is a successful discovery-only no-op. One
-complete validated pack and every selected destination publish atomically.
+complete validated pack precedes atomic publication of selected destinations.
 Interrupted ingest, a stale candidate, or one invalid destination moves no ref.
 Every selected ref is authenticated against the received objects before
 publication; a transfer that omits one fails with `EFETCHFAIL` and moves no ref.
+Immediately before ref publication, a synchronous metadata walk checks the
+complete selected graph under the publication guard, including branches outside
+the checkout and tag targets. Missing parents, trees, or blobs reject publication.
+Only declared shallow parent boundaries, gitlinks, and durable promised blob
+leaves are exceptions. The check also covers fetches that reuse existing objects
+without a transfer. Rejection leaves refs and shallow state unchanged; a complete
+unreachable pack may remain for maintenance.
+Sideband responses require a terminating flush and reject empty packets or
+unknown channel numbers.
 A selected tag is still fetched when it is itself the explicit selector. Tag
 publication authenticates annotated chains and never clobbers a different
 existing local tag. Auto-follow silently preserves an existing local tag, while

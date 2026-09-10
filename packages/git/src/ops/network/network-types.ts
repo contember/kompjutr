@@ -126,6 +126,7 @@ export interface LegacyFetchResult {
 }
 
 export interface PreparedLegacyFetchPublication {
+  readonly roots: readonly string[];
   readonly publication: FetchPublicationToken;
   plan: FetchPublicationPlan | null;
   readonly result: LegacyFetchResult;

@@ -21,6 +21,7 @@ import type { ExpandedFetchRefspec } from "../refs/refspec.js";
 import type { Repository } from "../repository/repository.js";
 import { repositoryMutations } from "../repository/repository.js";
 import { runFetchCheckpoint } from "./network-checkpoint.js";
+import { validateFetchedConnectivity } from "./network-connectivity.js";
 import { advertisedTags, authenticateTags, parseAuthenticatedTag } from "./network-tags.js";
 import { fetchProgressSink, transferPack } from "./network-transfer.js";
 import type {
@@ -252,6 +253,11 @@ export async function fetchMappedInto(
     await runFetchCheckpoint(behavior.checkpoint, "before-ref-publication", options.signal);
     throwIfAborted(options.signal);
     withGitMutationGuardOwned(context.database, () => {
+      validateFetchedConnectivity(
+        repo,
+        refs.map((ref) => ref.oid),
+        repo.shallow(),
+      );
       repositoryMutations(repo).publishFetchRefsOwned(
         publication,
         {

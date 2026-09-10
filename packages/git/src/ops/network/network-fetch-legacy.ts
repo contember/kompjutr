@@ -7,6 +7,7 @@ import type { GitContext } from "../core/context.js";
 import { operationRefLogMetadata } from "../core/ref-log.js";
 import type { Repository } from "../repository/repository.js";
 import { runFetchCheckpoint } from "./network-checkpoint.js";
+import { validateFetchedConnectivity } from "./network-connectivity.js";
 import { selectRefs } from "./network-selection.js";
 import {
   applyShallowResponse,
@@ -224,7 +225,15 @@ async function prepareLegacyFetchPublication(
       shallowAdd: shallow.add,
       shallowRemove: shallow.remove,
     };
-    return { publication, plan, result };
+    return {
+      publication,
+      plan,
+      result,
+      roots: [
+        ...selection.coverage.map((ref) => ref.oid),
+        ...selectedTags.map((tag) => tag.ref.oid),
+      ],
+    };
   } catch (error) {
     publication.dispose();
     throw error;
@@ -256,6 +265,10 @@ export async function fetchLegacyInto(
     throwIfAborted(options.signal);
     const publicationPlan = plan;
     withGitMutationGuardOwned(context.database, () => {
+      const boundary = repo.shallow();
+      for (const oid of publicationPlan.shallowRemove ?? []) boundary.delete(oid);
+      for (const oid of publicationPlan.shallowAdd ?? []) boundary.add(oid);
+      validateFetchedConnectivity(repo, prepared.roots, boundary);
       sharedRepoStoreMutations(repo.store).publishFetchRefsOwned(
         prepared.publication,
         publicationPlan,

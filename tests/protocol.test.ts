@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { concat, utf8 } from "../packages/git/src/common/bytes.js";
+import { fetchInto } from "../packages/git/src/ops/network/network.js";
 import {
   FLUSH,
   MAX_PKT_FRAME_BYTES,
@@ -23,7 +24,52 @@ import {
 } from "../packages/git/src/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
+import {
+  type FrameEnding,
+  faultyRemote,
+  nativeClone,
+  publicationState,
+} from "./helpers/network-integrity.js";
 import { TIMING_GATE } from "./helpers/timing.js";
+import { makeRepo } from "./helpers/workspace.js";
+
+describe("sideband termination parity", () => {
+  const endings: FrameEnding[] = ["empty", "unknown", "eof", "flush", "progress"];
+  for (const ending of endings) {
+    it(`matches native Git for ${ending} after pack data`, async () => {
+      const fixture = new GitFixture().init();
+      fixture.write("file.txt", "sideband parity\n");
+      const tip = fixture.commit("sideband");
+      const server = await faultyRemote(fixture, { ending });
+      const workspace = makeRepo("/work");
+      try {
+        const native = await nativeClone(server.url, ["--no-tags"]);
+        expect(native).toBe(ending === "flush" || ending === "progress");
+        const before = publicationState(workspace.repo);
+        const messages: string[] = [];
+        const result = fetchInto(workspace.context, workspace.repo, {
+          remote: "origin",
+          url: server.url,
+          singleBranch: false,
+          tags: false,
+          onMessage: (text) => messages.push(text),
+        });
+        if (native) {
+          await result;
+          expect(workspace.repo.store.getRef("refs/remotes/origin/main")).toBe(tip);
+          if (ending === "progress")
+            expect(messages.some((text) => text.includes("progress"))).toBe(true);
+        } else {
+          await expect(result).rejects.toBeDefined();
+          expect(publicationState(workspace.repo)).toEqual(before);
+        }
+      } finally {
+        await server.close();
+        fixture.dispose();
+      }
+    });
+  }
+});
 
 async function* once(...chunks: Uint8Array[]): AsyncGenerator<Uint8Array> {
   for (const chunk of chunks) yield chunk;

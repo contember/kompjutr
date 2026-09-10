@@ -152,6 +152,15 @@ owner moves neither refs nor shallow rows. A successful retry negotiates from
 the last published boundary even when an earlier attempt left a complete,
 unreachable pack.
 
+Both fetch modes validate the selected graph synchronously after the final
+await, inside the existing publication guard. Commit and tree metadata walks
+cover every selected root and annotated-tag target, including unmaterialized
+branches. Required-object and promise checks use fixed metadata batches.
+Declared shallow boundaries stop parent traversal only; gitlinks and durable
+missing-blob promises are terminal exceptions. No asynchronous gap separates
+this check from ref publication, so maintenance cannot delete a reused object
+between validation and publication.
+
 Pack entries use RFC 1950 zlib streams. Both native and incremental inflation
 reject gzip and raw DEFLATE wrappers; incremental readers retain exact output
 size and consumed-length checks.

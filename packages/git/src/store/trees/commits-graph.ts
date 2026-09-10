@@ -35,8 +35,14 @@ const COMMIT_GRAPH_COLUMNS = `NULL AS parents, NULL AS tree,
 
 /** One recursive graph cursor. Payload columns are projected only after every bound passes. */
 export const WALK_COMMIT_GRAPH_SQL = `WITH RECURSIVE
-  params(repo_id, root_oid, count_cap, byte_cap, fixed_bytes, parent_bytes)
-    AS (VALUES (?, ?, ?, ?, ?, ?)),
+  params(repo_id, root_oid, count_cap, byte_cap, fixed_bytes, parent_bytes, shallow_json)
+    AS (VALUES (?, ?, ?, ?, ?, ?, ?)),
+  boundaries(oid) AS MATERIALIZED (
+    SELECT value FROM params p, json_each(p.shallow_json)
+    UNION ALL
+    SELECT s.oid FROM git_shallow s, params p
+     WHERE p.shallow_json IS NULL AND s.repo_id = p.repo_id
+  ),
   reachable(oid) AS (
     SELECT root_oid FROM params
     UNION
@@ -46,7 +52,7 @@ export const WALK_COMMIT_GRAPH_SQL = `WITH RECURSIVE
       JOIN git_commits c ON c.repo_id = p.repo_id AND c.oid = r.oid
       JOIN json_each(c.parents) parent
      WHERE NOT EXISTS (
-       SELECT 1 FROM git_shallow s WHERE s.repo_id = p.repo_id AND s.oid = r.oid
+        SELECT 1 FROM boundaries s WHERE s.oid = r.oid
      )
      LIMIT (SELECT count_cap + 1 FROM params)
   ),
@@ -159,8 +165,9 @@ export function* readCommitGraph(
   repoId: number,
   rootOid: string,
   limits: CommitGraphLimits = {},
+  shallow?: readonly string[],
 ): Generator<CommitCacheEntry> {
-  yield* readCommitGraphOwned(db, repoId, rootOid, limits);
+  yield* readCommitGraphOwned(db, repoId, rootOid, limits, shallow);
 }
 
 /** Internal graph path with a fixed bound on recursive state. */
@@ -169,6 +176,7 @@ export function* readCommitGraphOwned(
   repoId: number,
   rootOid: string,
   limits: CommitGraphLimits = {},
+  shallow?: readonly string[],
 ): Generator<CommitCacheEntry> {
   if (!Number.isSafeInteger(repoId) || repoId < 1) {
     throw new CorruptError("commit graph has an invalid repository id");
@@ -195,6 +203,7 @@ export function* readCommitGraphOwned(
     maxBytes,
     COMMIT_FIXED_CACHE_BYTES,
     COMMIT_PARENT_CACHE_BYTES,
+    shallow === undefined ? null : JSON.stringify(shallow),
   )) {
     const row: CommitGraphRow = {
       kind: value.kind,

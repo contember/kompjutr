@@ -6,7 +6,7 @@ import type { Repository } from "../repository/repository.js";
 import type { AdvertisedTag } from "./network-types.js";
 
 const TAG_OBJECT_PAGE = 4_096;
-const TAG_PEEL_HOPS = 16;
+export const TAG_PEEL_HOPS = 16;
 const tagHeaderDecoder = new TextDecoder("utf-8", { fatal: true });
 
 export function advertisedTags(advertisement: Advertisement): AdvertisedTag[] {
