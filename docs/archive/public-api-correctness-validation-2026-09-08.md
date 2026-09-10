@@ -103,5 +103,5 @@ was made in this follow-up.
   This follow-up review does not retroactively satisfy that historical gate.
 - The original 449.9-second run and reverse-verification claims remain historical
   assertions in the original record; this follow-up has its own final-tree run.
-- The [lifecycle/network sprint](../sprints/sprint-2026-09-08-lifecycle-and-network-integrity.md)
+- The [lifecycle/network sprint](sprint-2026-09-08-lifecycle-and-network-integrity.md)
   remains active and its work units are not consumed here.

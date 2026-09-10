@@ -124,8 +124,7 @@ an accepted correctness witness under ADR-0004.
 | Work | Items | Evidence boundary |
 |---|---|---|
 | Public API correctness | shipped — [`archive/sprint-2026-09-08-public-api-correctness.md`](../archive/sprint-2026-09-08-public-api-correctness.md) | Buffer aliasing, nested rollback, repeated mutations, and regular-file discovery. Item 70's scan-ordering claim was refuted, not fixed. |
-| Lifecycle and valid pack handling | [71](71-invalidate-maintenance-on-promise-fulfillment.md), [72](72-preserve-pack-dependencies-during-lifecycle.md), [74](74-align-pack-ingest-with-physical-membership.md) | Reproduced publication/store mechanisms with explicit limits on end-to-end public coverage; retain verification-first acceptance for concurrency schedules. |
-| Network boundary | [73](73-validate-fetch-connectivity-and-publication.md) | Incomplete-graph clone reproduced with a faulty remote response; publication-race and framing witnesses are qualified separately. |
+| Valid pack handling | [74](74-align-pack-ingest-with-physical-membership.md) | Repeated-tree projection and cold-read admissibility remain. Lifecycle and network items 71–73 shipped in the [lifecycle/network sprint](../archive/sprint-2026-09-08-lifecycle-and-network-integrity.md). |
 | Valid-input resource scaling | [75](75-bound-network-authentication-payloads.md), [76](76-bound-full-tree-construction.md), [77](77-remove-repeated-local-traversal-work.md), [78](78-make-sql-cursors-seek-and-deliver-incrementally.md), [79](79-bound-materialized-status-and-config-reads.md) | Static live-state/work analysis and specified query-plan observations; target-runtime measurements remain acceptance work. |
 | Architectural test guarantee | [80](80-restore-import-graph-domain-guarantees.md) | Lost enforcement verified; current inspected source edges are clean. |
 
@@ -153,9 +152,6 @@ does not schedule these issues into a sprint.
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
 - [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
 - [66 — Retire modeled retained-byte charges](66-retire-modeled-retained-byte-charges.md)
-- [71 — Invalidate maintenance marks when promised blobs become physical](71-invalidate-maintenance-on-promise-fulfillment.md)
-- [72 — Preserve pack dependencies across ingest, promotion, and sweep](72-preserve-pack-dependencies-during-lifecycle.md)
-- [73 — Validate fetched object connectivity and final publication](73-validate-fetch-connectivity-and-publication.md)
 - [74 — Align pack ingest with physical membership and cold reads](74-align-pack-ingest-with-physical-membership.md)
 - [75 — Bound payload lifetime during network object validation](75-bound-network-authentication-payloads.md)
 - [76 — Bound full-tree construction before serialization allocation](76-bound-full-tree-construction.md)

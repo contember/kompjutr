@@ -165,6 +165,18 @@ Pack entries use RFC 1950 zlib streams. Both native and incremental inflation
 reject gzip and raw DEFLATE wrappers; incremental readers retain exact output
 size and consumed-length checks.
 
+Ingest hashes slices of at least 20 bytes without concatenating the checksum
+tail; shorter slices use a join of at most 39 bytes. Retained tail and row bytes
+remain owned. Full blobs above the explicit cache-entry limit stream through
+hashing without a full output target. Other buffered entries attempt native
+prefix inflation when the available compressed window is at least their declared
+output size. Incomplete native results and smaller windows use exact incremental
+inflation. That selection is a heuristic, not proof of a compressed boundary.
+Complete-input packed reads use native inflation with exact output and
+input-consumption checks; stored-entry reads remain incremental. The ingest
+push boundary and complete-input decoder wrap failures as `ECORRUPT`, with reader
+access outside those catches. Incremental stored-entry error handling is separate.
+
 `git_pack_entries` authenticates every physical entry of each pack, including
 duplicate OIDs. `git_pack_objects` remains the single canonical read location
 for each OID. Deferred OFS deltas resolve their pack-relative base offset through

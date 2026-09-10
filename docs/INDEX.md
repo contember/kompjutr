@@ -16,10 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-09-08-lifecycle-and-network-integrity.md`](sprints/sprint-2026-09-08-lifecycle-and-network-integrity.md)
-  — nothing is deleted or published before its physical bytes are proven present:
-  promise fulfillment versus maintenance marks, pack dependencies across the pack
-  lifecycle, and fetched-graph connectivity. Consumes backlog 71–73.
+None.
 
 ## Specs
 
@@ -37,6 +34,10 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
+- [Lifecycle and network integrity](archive/sprint-2026-09-08-lifecycle-and-network-integrity.md)
+  is complete: promise-aware maintenance, pack dependency preservation, and final
+  fetch connectivity checks. Default clone meets 990 SQL and the approved
+  <160 MiB added-peak RSS gate; the original <100 MiB gate was not met.
 - Five lockstep `@kompjutr/*` packages now separate shared contracts, generic
   Git, the Durable Object runtime, and a crash-recoverable Unix local runtime.
   The final package-split comparison preserved every operation's SQL/row profile
@@ -45,7 +46,7 @@ decisions → reference → archive.
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0015).
 - The 2026-09-08 architecture-review follow-up is filed in
-  [`backlog/71–81`](backlog/README.md#2026-09-08-review-intake), with explicit
+  [`backlog/74–81`](backlog/README.md#2026-09-08-review-intake), with explicit
   separation of valid public API failures, malformed-input validation, store-only
   reproductions, and unmeasured scaling findings. Existing findings were refined
   in [`65`](backlog/65-git-sqlite-architecture-review.md) and

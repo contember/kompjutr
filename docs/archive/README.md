@@ -9,6 +9,10 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Lifecycle and network integrity](sprint-2026-09-08-lifecycle-and-network-integrity.md)
+  — promise fulfillment invalidation, resumable dependency-safe sweep, final fetch
+  connectivity, physical OFS membership, and bounded decoder allocation. Records
+  the approved 160 MiB network RSS criterion and 3,649-test full-suite closure.
 - [Public API correctness](sprint-2026-09-08-public-api-correctness.md)
   — buffer ownership across the object boundaries, nested transaction failure,
   repeated local path mutations, and regular-file discovery. Records why

@@ -237,10 +237,8 @@ temporary and are not a committed suite.
 
 ## Out of scope (explicit)
 
-- [71](../backlog/71-invalidate-maintenance-on-promise-fulfillment.md),
-  [72](../backlog/72-preserve-pack-dependencies-during-lifecycle.md), and
-  [73](../backlog/73-validate-fetch-connectivity-and-publication.md) — they run as
-  [sprint-2026-09-08-lifecycle-and-network-integrity](../sprints/sprint-2026-09-08-lifecycle-and-network-integrity.md).
+- 71, 72, and 73 — tracked in
+  [sprint-2026-09-08-lifecycle-and-network-integrity](sprint-2026-09-08-lifecycle-and-network-integrity.md).
 - [74](../backlog/74-align-pack-ingest-with-physical-membership.md) and everything
   in [75](../backlog/75-bound-network-authentication-payloads.md)–[79](../backlog/79-bound-materialized-status-and-config-reads.md):
   the scaling items start with measurement, not with a fix.

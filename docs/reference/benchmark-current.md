@@ -1,5 +1,35 @@
 # Current benchmark snapshot
 
+## Default network clone and fetch — 2026-09-10
+
+The lifecycle/network closure witness uses `BENCH_NETWORK_MODE=legacy` and
+`BENCH_NETWORK_MODE=mapped` with `npm run bench:nextjs`. Each run held two
+leased vCPUs with a verified 1 GiB cgroup limit and zero swap. Node v24.4.0
+used default GC and heap settings. The fixture is Next.js v15.5.2, rebuilt at
+`381a9c8089ed7a244dcfa374fbb27d37032e208a` (24,252 files), with one-file child
+`7bb95e82c56785e1024728697c811557087b5f9c`. Default OFS_DELTA transport and
+cache settings are preserved. Both modes call the same clone operation;
+the mode selects subsequent fetch behavior, not a different clone path.
+
+| Operation | Wall, ms | SQL | Returned rows | Added peak RSS, MiB |
+| --- | ---: | ---: | ---: | ---: |
+| Clone, first run | 11,221.77 | 990 | 145,773 | 126.06 |
+| Legacy fetch, unchanged | 767.80 | 47 | 67,232 | 1.68 |
+| Legacy fetch, one changed file | 1,531.25 | 112 | 134,396 | 0.74 |
+| Clone, second run | 11,874.82 | 990 | 145,773 | 140.23 |
+| Mapped fetch, unchanged | 6,559.87 | 297 | 68,434 | 2.45 |
+| Mapped fetch, one changed file | 7,498.87 | 324 | 135,580 | 12.34 |
+
+All phases passed semantic verification. Clone baseline/reset-peak bytes were
+177,078,272 / 309,260,288 and 170,094,592 / 317,136,896. These are single runs,
+not medians or fixed savings estimates. Returned rows are not rows scanned.
+The approved regression gates for this witness are at most 1,000 SQL statements
+and less than 160 MiB reset process peak above the same-run baseline. The
+original 100 MiB criterion was not met. This local RSS gate does not prove a
+production isolate limit; forced-GC and heap-tuned diagnostics are excluded.
+
+## Scoped-package workflow comparison — 2026-09-08
+
 Measured in seven order-balanced runs on 2026-09-08 from the scoped-package
 working tree against baseline commit `d0c059ce251f15ca771c2c346f99fca67d0f385e`.
 The host used Node v24.4.0, SQLite 3.50.2, git 2.54.0, Linux
@@ -22,7 +52,7 @@ This is `node:sqlite`, not Durable Object SQL. Statement counts transfer to the
 platform cost model. Local wall time and process RSS are regression signals, not
 proof of a production isolate limit.
 
-## Results
+### Workflow results
 
 | Operation | Median wall | SQL | Rows |
 | --- | ---: | ---: | ---: |
@@ -59,9 +89,9 @@ phases. Individual phase medians remain diagnostic. The baseline total was
 noise envelope, while heap drops and overlapping sample ranges showed that
 collection placement, not additional SQL work, caused the movement.
 
-## Clone statement profile
+### Historical workflow clone statement profile
 
-Clone has two accepted deterministic progress profiles: 2,381 statements over
+That workflow comparison had two accepted deterministic progress profiles: 2,381 statements over
 79,273 rows, or exactly two additional statements and one additional row. Both
 baseline and candidate produced the primary profile in six runs and the
 alternate profile once. The statement gate accepts no other clone deviation.

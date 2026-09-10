@@ -21,8 +21,8 @@ unused membership digests into [65](../backlog/65-git-sqlite-architecture-review
 journal-root paging into
 [78](../backlog/78-make-sql-cursors-seek-and-deliver-incrementally.md), and the
 qualified malformed-sideband finding into
-[73](../backlog/73-validate-fetch-connectivity-and-publication.md).
-Their evidence and acceptance now live in those items. The
+[the completed lifecycle/network sprint](../archive/sprint-2026-09-08-lifecycle-and-network-integrity.md).
+Their evidence and acceptance live in those records. The
 [review intake](../backlog/README.md#2026-09-08-review-intake) distinguishes valid
 API failures from malformed-input checks and store-level reproductions.
 

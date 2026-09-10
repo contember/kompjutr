@@ -50,8 +50,8 @@ structural limits or introduce a projected-work refusal.
 Exercise public cold reads with format-valid multi-megabyte delta chains and
 public maintenance with N/2N depth fixtures. Measure under the benchmark rules;
 cache size, returned batch size, and statement count alone are not sufficient.
-Coordinate dependency lifetime with
-[72](72-preserve-pack-dependencies-during-lifecycle.md).
+Preserve the dependency-lifetime contract established by the
+[lifecycle/network sprint](../archive/sprint-2026-09-08-lifecycle-and-network-integrity.md).
 
 ## Touch points
 

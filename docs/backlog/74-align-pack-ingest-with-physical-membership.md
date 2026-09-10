@@ -10,7 +10,7 @@ blocked-by: []
 admissibility before publication. These inputs need not be malformed Git data.
 
 Physical OFS base lookup is resolved by the
-[lifecycle/network sprint](../sprints/sprint-2026-09-08-lifecycle-and-network-integrity.md#wu4-frozen-physical-offset-step).
+[lifecycle/network sprint](../archive/sprint-2026-09-08-lifecycle-and-network-integrity.md#wu4-frozen-physical-offset-step).
 
 ## Problem and evidence
 
