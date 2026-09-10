@@ -79,25 +79,47 @@ const cases = [
 ];
 
 describe("complete-input pack inflation", () => {
-  it.each(cases)("rejects native-invalid $name with a valid outer checksum", ({ bytes, size }) => {
-    const repo = new GitFixture().init();
-    const db = new TestDatabase();
-    try {
-      expect(() =>
-        execFileSync("git", ["index-pack", "--strict", "--stdin"], {
-          cwd: repo.dir,
-          input: pack(size, bytes),
-          stdio: ["pipe", "pipe", "pipe"],
-        }),
-      ).toThrow();
-      expect(() => decode(reader(db), bytes, size)).toThrow(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-    } finally {
-      db.storage.db.close();
-      repo.dispose();
-    }
-  });
+  it.each(cases)(
+    "rejects native-invalid $name with a valid outer checksum",
+    ({ name, bytes, size }) => {
+      const repo = new GitFixture().init();
+      const db = new TestDatabase();
+      try {
+        expect(() =>
+          execFileSync("git", ["index-pack", "--strict", "--stdin"], {
+            cwd: repo.dir,
+            input: pack(size, bytes),
+            stdio: ["pipe", "pipe", "pipe"],
+          }),
+        ).toThrow();
+        expect(() => decode(reader(db), bytes, size)).toThrow(
+          expect.objectContaining({ code: "ECORRUPT" }),
+        );
+        if (name === "output exceeds declaration") {
+          expect(() => decode(reader(db), bytes, size)).toThrow(
+            expect.objectContaining({
+              code: "ECORRUPT",
+              message: "pack entry at 12 exceeds its indexed size",
+              cause: expect.objectContaining({ code: "ERR_BUFFER_TOO_LARGE" }),
+            }),
+          );
+        } else if (name === "one byte declared zero") {
+          expect(() => decode(reader(db), bytes, size)).toThrow(/exceeds its indexed size/);
+        } else if (name === "Adler") {
+          expect(() => decode(reader(db), bytes, size)).toThrow(
+            expect.objectContaining({
+              code: "ECORRUPT",
+              message: "pack entry at 12 is not a valid zlib stream",
+              cause: expect.objectContaining({ code: "Z_DATA_ERROR" }),
+            }),
+          );
+        }
+      } finally {
+        db.storage.db.close();
+        repo.dispose();
+      }
+    },
+  );
 
   it.each([0, 1, 1024, 32769])("returns independent native output for %i bytes", (size) => {
     const db = new TestDatabase();

@@ -2,7 +2,7 @@
 // https://github.com/littledivy/dgit — the three-phase ingest, the rotating offset window, the deferred-delta table and the iterative delta-chain walk all follow dgit's src/git/packstore.ts.
 
 import { readBlob, type SqlDatabase } from "@kompjutr/sqlite";
-import { CorruptError } from "../../../common/errors.js";
+import { CorruptError, hasErrorCode } from "../../../common/errors.js";
 import type { ByteLru } from "../../../common/lru.js";
 import type { RawObject } from "../../../common/objects.js";
 import { InflateInto, inflatePrefix } from "../../../common/zlib.js";
@@ -68,7 +68,13 @@ export class PackDataReader {
     try {
       result = inflatePrefix(input, expectedSize);
     } catch (error) {
+      if (hasErrorCode(error, "ERR_BUFFER_TOO_LARGE")) {
+        throw new CorruptError(`${label} exceeds its indexed size`, { cause: error });
+      }
       throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });
+    }
+    if (result !== null && result.data.length > expectedSize) {
+      throw new CorruptError(`${label} exceeds its indexed size`);
     }
     if (
       result === null ||
