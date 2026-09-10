@@ -31,6 +31,7 @@ export class PackIngestInflater {
   constructor(
     private readonly read: PackReadEngine,
     private readonly maxBufferedEntry: number,
+    private readonly cacheEntryLimit: number,
   ) {}
   applyDeltaBytes(base: Uint8Array, delta: Uint8Array, pool: ChunkPool): ChunkedBytes {
     const probe = new DeltaHeaderProbe();
@@ -186,7 +187,8 @@ export class PackIngestInflater {
     deltaTargetSize: number | null;
     compressedDigest: string;
   } {
-    const buffered = entrySize <= this.maxBufferedEntry;
+    const buffered =
+      entrySize <= this.maxBufferedEntry && (type !== "blob" || entrySize <= this.cacheEntryLimit);
     const deltaHeader = type === null ? new DeltaHeaderProbe() : null;
     const compressedSha = new Sha1();
     reader.seek(dataOff);
@@ -195,7 +197,7 @@ export class PackIngestInflater {
       if (window.length === 0) throw new CorruptError(`truncated pack entry at ${dataOff}`);
       let exact: { data: Uint8Array; consumed: number } | null;
       try {
-        exact = inflatePrefix(window, entrySize);
+        exact = window.length >= entrySize ? inflatePrefix(window, entrySize) : null;
       } catch (error) {
         throw new CorruptError(`invalid pack entry at ${dataOff}`, { cause: error });
       }
@@ -238,10 +240,15 @@ export class PackIngestInflater {
     while (!stream.ended) {
       const window = reader.window();
       if (window.length === 0) throw new CorruptError(`truncated pack entry at ${dataOff}`);
-      const used =
-        exactInflater === null
-          ? stream.push(window)
-          : pushExactInflate(exactInflater, window, `pack entry at ${dataOff}`);
+      let used: number;
+      try {
+        used =
+          exactInflater === null
+            ? stream.push(window)
+            : pushExactInflate(exactInflater, window, `pack entry at ${dataOff}`);
+      } catch (error) {
+        throw new CorruptError(`invalid pack entry at ${dataOff}`, { cause: error });
+      }
       consumed += used;
       if (!stream.ended && used !== window.length) {
         throw new CorruptError(`pack entry inflater stopped before the stream ended at ${dataOff}`);

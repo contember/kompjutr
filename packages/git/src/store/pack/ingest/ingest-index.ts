@@ -47,7 +47,7 @@ export class PackIndexer {
     maxBufferedEntry: number,
     private readonly cacheEntryLimit: number,
   ) {
-    this.#inflater = new PackIngestInflater(read, maxBufferedEntry);
+    this.#inflater = new PackIngestInflater(read, maxBufferedEntry, cacheEntryLimit);
     this.#projection = new PackResolvedProjection(repoId, read);
     this.#pending = new PackPendingResolver(
       db,
