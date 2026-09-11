@@ -188,7 +188,12 @@ access outside those catches. Incremental stored-entry error handling is separat
 
 `git_pack_entries` authenticates every physical entry of each pack, including
 duplicate OIDs. `git_pack_objects` remains the single canonical read location
-for each OID. Deferred OFS deltas resolve their pack-relative base offset through
+for each OID. Pack tree projection batches deduplicate exact repository/pack/OID
+identities and query completed sources in one batch. Only completed projections
+are reused; unavailable sources remain eligible for another indexing attempt.
+Every physical occurrence still passes object authentication, and generic tree
+indexing continues to validate its input rather than trusting a duplicate key.
+Deferred OFS deltas resolve their pack-relative base offset through
 physical entries before using canonical OID reads; an older canonical owner does
 not hide an incoming occurrence. Publication compares the exact ordered rows with
 the digest made while parsing and requires every entry's canonical owner to be complete.

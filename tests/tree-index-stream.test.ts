@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Database, readBlob, type SqlDatabase } from "../packages/do/src/db/db.js";
 import { concat, utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { GitError } from "../packages/git/src/common/errors.js";
 import {
   hashObject,
   parseTree,
@@ -73,6 +74,8 @@ class ObservedDatabase implements SqlDatabase {
   entryInserts = 0;
   markerInserts = 0;
   failEntryInsert = 0;
+  rejectOversizedEntries = false;
+  exactSourceLookups = 0;
   entryRowCounts: number[] = [];
   markerRowCounts: number[] = [];
   sharedEntryPayload = true;
@@ -83,6 +86,9 @@ class ObservedDatabase implements SqlDatabase {
   run(query: string, ...bindings: unknown[]): void {
     if (query.startsWith("INSERT INTO git_tree_entries")) {
       this.entryInserts++;
+      if (this.rejectOversizedEntries && typeof bindings[0] === "number") {
+        throw new GitError("E2BIG", "injected SQLite row-size limit");
+      }
       if (this.entryInserts === this.failEntryInsert) throw new Error("injected tree INSERT");
       const encoded = bindings[2];
       const offset = bindings[3];
@@ -139,6 +145,7 @@ class ObservedDatabase implements SqlDatabase {
   }
 
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    if (query.startsWith("SELECT CAST(j.key AS INTEGER) AS ordinal")) this.exactSourceLookups++;
     return this.inner.iterate(query, ...bindings);
   }
 
@@ -215,6 +222,87 @@ describe("incremental tree parser", () => {
 });
 
 describe("incremental tree index sink", () => {
+  it("batches exact-source lookups for repeated small packed trees", () => {
+    const inner = new TestDatabase();
+    initializeTreeSchema(inner);
+    const db = new ObservedDatabase(inner);
+    const index = new PackTreeIndex(db);
+    inner.storage.resetCounters();
+    for (let at = 0; at < 3000; at++) {
+      const data = rawEntry("100644", `file-${at}`);
+      const oid = hashObject("tree", data);
+      index.addBuffered(1, oid, 1, data.length, data);
+      index.addBuffered(1, oid, 1, data.length, data);
+    }
+    index.flush();
+    expect(db.exactSourceLookups).toBe(3);
+    expect(inner.storage.statementCount).toBeLessThan(100);
+    expect(inner.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(3000);
+    expect(inner.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(
+      3000,
+    );
+    inner.storage.db.close();
+  });
+
+  it("does not confuse repositories or pack IDs in a projection batch", () => {
+    const db = new TestDatabase();
+    initializeTreeSchema(db);
+    db.run("INSERT INTO git_repositories (id) VALUES (2)");
+    const data = rawEntry("100644", "file");
+    const oid = hashObject("tree", data);
+    const index = new PackTreeIndex(db);
+    for (const [repoId, packId] of [
+      [1, 1],
+      [1, 2],
+      [2, 1],
+    ]) {
+      if (repoId === undefined || packId === undefined) throw new Error("missing fixture identity");
+      index.addBuffered(repoId, oid, packId, data.length, data);
+      index.addBuffered(repoId, oid, packId, data.length, data);
+    }
+    index.flush();
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(3);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(3);
+    db.storage.db.close();
+  });
+
+  it("keeps an unavailable oversized projection empty through repeated occurrences", () => {
+    const inner = new TestDatabase();
+    initializeTreeSchema(inner);
+    const db = new ObservedDatabase(inner);
+    db.rejectOversizedEntries = true;
+    const data = concat([rawEntry("100644", "a"), rawEntry("100644", `z${"x".repeat(ONE_MIB)}`)]);
+    const oid = hashObject("tree", data);
+    const index = new PackTreeIndex(db);
+    for (let at = 0; at < 2; at++) index.addBuffered(1, oid, 1, data.length, data);
+    index.flush();
+    expect(inner.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
+    expect(inner.one("SELECT complete, entry_count, base_cost FROM git_tree_sources")).toEqual({
+      complete: 0,
+      entry_count: null,
+      base_cost: null,
+    });
+    inner.storage.db.close();
+  });
+
+  it("still validates generic sources even when their identity is already projected", () => {
+    const db = new TestDatabase();
+    initializeTreeSchema(db);
+    const valid = rawEntry("100644", "file");
+    const invalid = rawEntry("100600", "file");
+    db.transactionSync(() => indexTreeSource(db, source(valid.length, 1), [valid]));
+    expect(() =>
+      db.transactionSync(() => indexTreeSource(db, source(invalid.length, 1), [invalid])),
+    ).toThrow("invalid tree mode");
+    expect(() =>
+      db.transactionSync(() =>
+        indexTreeSources(db, [{ ...source(invalid.length, 1), chunks: [invalid] }]),
+      ),
+    ).toThrow("invalid tree mode");
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(1);
+    db.storage.db.close();
+  });
+
   it("indexes a >16 MiB tree from tiny chunks with exact state within the statement target", () => {
     const inner = new TestDatabase();
     initializeTreeSchema(inner);

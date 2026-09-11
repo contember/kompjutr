@@ -467,6 +467,29 @@ only follow-ups need direct inspection unless they change a contract or claim.
 
 ## Run log
 
+- 2026-09-11: WU2 passed independent review by `ses_f6f05a905ffeafzone0HZHOnKA`
+  with no findings. Leader ran the repeated-tree witness on detached `187b9dd`:
+  all eight selected full/full, full/delta, delta/delta, cross-flush, streamed,
+  and chunked cases failed with the original source/ordinal UNIQUE collision
+  after native `git index-pack --stdin` accepted their bytes. `--strict`
+  deliberately rejects duplicate objects and is not the oracle for this input.
+- 2026-09-11: WU2 leader gate passed 141 tests in 53.04 s, exit 0:
+  `cpu-lease run -n 4 -- npx vitest run --maxWorkers=2 tests/pack-physical-membership.test.ts
+  tests/tree-index-stream.test.ts tests/pack-projection-publication.test.ts tests/pack.test.ts`.
+  The batching witness covers 6,000 physical occurrences in three source lookups.
+  Routine smoke passed 159 tests in 15.95 s; typecheck and check passed. WU2 is
+  verified for commit; backlog 74 now retains only cold-read admission work.
+
+- 2026-09-11: WU1 committed as `187b9dd`. Starting WU2 with one implementation
+  agent; territory is `store/pack/pack-ingest-index.ts`,
+  `store/pack/ingest/ingest-projection.ts`, `store/trees/tree-index*.ts`,
+  `tests/pack-physical-membership.test.ts`, and `tests/tree-index-stream.test.ts`.
+  Preserve WU1 staging. Deduplication belongs at the pack projection write seam;
+  bounded within-batch identity tracking and batched exact-source lookup may
+  reuse current schema. No schema/read-policy changes, per-small-tree scalar
+  preflights, unbounded pack-wide seen set, or entry-level conflict suppression.
+  Any needed change beyond that contract is reported before implementation.
+
 - 2026-09-11: WU1 passed independent implementation review by
   `ses_f6f1e234cffeCtG0AGL7h7MagN` with no findings. Leader independently ran the
   new Smart HTTP witness against detached baseline `7b958e0`: it failed at

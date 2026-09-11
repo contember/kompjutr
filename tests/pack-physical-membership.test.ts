@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { concat, utf8 } from "../packages/git/src/common/bytes.js";
-import { hashObject } from "../packages/git/src/common/objects.js";
+import { hashObject, serializeTree } from "../packages/git/src/common/objects.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import { OFFSET_WINDOW } from "../packages/git/src/store/pack/shared.js";
@@ -72,7 +72,206 @@ function pack(fillers: number | null): { bytes: Uint8Array; targetOffset: number
   };
 }
 
+function repeatedTreePack(tree: Uint8Array, deltas = 0, fillers = 0, malformed = false) {
+  const header = new Uint8Array(12);
+  header.set(utf8.encode("PACK"));
+  new DataView(header.buffer).setUint32(4, 2);
+  new DataView(header.buffer).setUint32(
+    8,
+    3 + fillers + (deltas === 2 ? 1 : 0) + Number(malformed),
+  );
+  const chunks = [header, entryHeader(3, BASE.length), deflateSync(BASE)];
+  let offset = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const rootOffset = offset;
+  const offsets = [rootOffset];
+  const append = (entry: Uint8Array) => {
+    chunks.push(entry);
+    offset += entry.length;
+  };
+  append(concat([entryHeader(2, tree.length), deflateSync(tree)]));
+  const appendFillers = () => {
+    for (let at = 0; at < fillers; at++) {
+      const data = serializeTree([{ mode: "100644", name: `filler-${at}`, oid: BASE_OID }]);
+      append(concat([entryHeader(2, data.length), deflateSync(data)]));
+    }
+  };
+  if (deltas !== 2) appendFillers();
+  for (let at = 0; at < Math.max(1, deltas); at++) {
+    if (deltas === 2 && at === 1) appendFillers();
+    offsets.push(offset);
+    if (deltas === 0) append(concat([entryHeader(2, tree.length), deflateSync(tree)]));
+    else {
+      const delta = concat([
+        encodeDeltaHeader(tree.length, tree.length),
+        new Uint8Array([
+          0xf0,
+          tree.length & 255,
+          (tree.length >>> 8) & 255,
+          (tree.length >>> 16) & 255,
+        ]),
+      ]);
+      append(
+        concat([
+          entryHeader(6, delta.length),
+          offsetDistance(offset - rootOffset),
+          deflateSync(delta),
+        ]),
+      );
+    }
+  }
+  if (malformed) {
+    const invalid = tree.subarray(0, tree.length - 1);
+    append(concat([entryHeader(2, invalid.length), deflateSync(invalid)]));
+  }
+  const body = concat(chunks);
+  return { bytes: concat([body, createHash("sha1").update(body).digest()]), offsets };
+}
+
 describe("pack physical offset membership", () => {
+  it.each([false, true])(
+    "keeps exact pack projections through selection and deletion (loose shadow: %s)",
+    async (loose) => {
+      const tree = serializeTree([{ mode: "100644", name: "file", oid: BASE_OID }]);
+      const oid = hashObject("tree", tree);
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+      const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+      const store = database.openCheckout(checkout).shared;
+      try {
+        if (loose) store.write("tree", tree);
+        const first = await store.packs.ingest(slices(repeatedTreePack(tree).bytes, 4096));
+        const second = await store.packs.ingest(slices(repeatedTreePack(tree, 2).bytes, 4096));
+        expect(
+          db.all<{ source_id: number }>(
+            "SELECT source_id FROM git_tree_sources WHERE tree_oid = ? AND storage = 'pack' AND complete = 1 ORDER BY source_id",
+            oid,
+          ),
+        ).toEqual([{ source_id: first.packId }, { source_id: second.packId }]);
+        expect(store.packs.completePackedEntry(oid)?.packId).toBe(first.packId);
+        expect(store.packs.deleteCompletePacks([first.packId])).toBe(1);
+        const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(
+          checkout,
+        ).shared;
+        expect(Buffer.from(cold.read(oid)?.data ?? []).equals(tree)).toBe(true);
+        expect([...cold.walkTree(oid)]).toEqual([{ path: "file", mode: "100644", oid: BASE_OID }]);
+        expect(cold.packs.completePackedEntry(oid)?.packId).toBe(second.packId);
+        expect(cold.packs.deleteCompletePacks([second.packId])).toBe(1);
+        expect(
+          db.scalar<number>(
+            "SELECT COUNT(*) FROM git_tree_sources WHERE tree_oid = ? AND storage = 'pack'",
+            oid,
+          ),
+        ).toBe(0);
+        expect(cold.has(oid)).toBe(loose);
+        if (loose) expect([...cold.walkTree(oid)]).toHaveLength(1);
+      } finally {
+        db.storage.db.close();
+      }
+    },
+  );
+
+  it("rejects a malformed later tree without publishing earlier repeated projections", async () => {
+    const tree = serializeTree([{ mode: "100644", name: "file", oid: BASE_OID }]);
+    const oid = hashObject("tree", tree);
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(checkout).shared;
+    try {
+      await expect(
+        store.packs.ingest(slices(repeatedTreePack(tree, 2, 2048, true).bytes, 4096)),
+      ).rejects.toThrow(/malformed tree/);
+      const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(checkout).shared;
+      expect(cold.has(oid)).toBe(false);
+      expect(cold.read(oid)).toBeNull();
+      expect(() => [...cold.walkTree(oid)]).toThrow();
+      expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'")).toBe(
+        0,
+      );
+    } finally {
+      db.storage.db.close();
+    }
+  });
+  it.each([
+    { label: "buffered full/full", deltas: 0, fillers: 0, count: 1, maxBufferedEntry: undefined },
+    { label: "buffered full/delta", deltas: 1, fillers: 0, count: 1, maxBufferedEntry: undefined },
+    { label: "buffered delta/delta", deltas: 2, fillers: 0, count: 1, maxBufferedEntry: undefined },
+    {
+      label: "full/full across flushes",
+      deltas: 0,
+      fillers: 2048,
+      count: 1,
+      maxBufferedEntry: undefined,
+    },
+    {
+      label: "full/delta across flushes",
+      deltas: 1,
+      fillers: 2048,
+      count: 1,
+      maxBufferedEntry: undefined,
+    },
+    {
+      label: "delta/delta across flushes",
+      deltas: 2,
+      fillers: 2048,
+      count: 1,
+      maxBufferedEntry: undefined,
+    },
+    { label: "streamed full/full", deltas: 0, fillers: 0, count: 30000, maxBufferedEntry: 65536 },
+    { label: "chunked delta/delta", deltas: 2, fillers: 0, count: 30000, maxBufferedEntry: 65536 },
+  ])(
+    "accepts native-valid repeated nonempty trees: $label",
+    async ({ deltas, fillers, count, maxBufferedEntry }) => {
+      const tree = serializeTree(
+        Array.from({ length: count }, (_, at) => ({
+          mode: "100644",
+          name: `file-${String(at).padStart(6, "0")}`,
+          oid: BASE_OID,
+        })),
+      );
+      const oid = hashObject("tree", tree);
+      const { bytes, offsets } = repeatedTreePack(tree, deltas, fillers);
+      const native = new GitFixture().init();
+      const db = new TestDatabase();
+      try {
+        execFileSync("git", ["index-pack", "--stdin"], {
+          cwd: native.dir,
+          input: bytes,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        const database = new SqliteGitDatabase(db, { objectCacheBytes: 0, maxBufferedEntry });
+        const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+        await database.openCheckout(checkout).shared.packs.ingest(slices(bytes, 4096));
+        const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(
+          checkout,
+        ).shared;
+        const nativeTree = execFileSync("git", ["cat-file", "tree", oid], {
+          cwd: native.dir,
+          maxBuffer: tree.length + 1024,
+        });
+        expect(Buffer.from(tree).equals(nativeTree)).toBe(true);
+        expect(Buffer.from(cold.read(oid)?.data ?? []).equals(nativeTree)).toBe(true);
+        expect(
+          db.all<{ offset: number }>(
+            "SELECT offset FROM git_pack_entries WHERE oid = ? ORDER BY offset",
+            oid,
+          ),
+        ).toEqual(offsets.map((offset) => ({ offset })));
+        expect(
+          db.scalar<number>(
+            "SELECT COUNT(*) FROM git_tree_sources WHERE tree_oid = ? AND complete = 1",
+            oid,
+          ),
+        ).toBe(1);
+        expect(
+          db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries_wide WHERE tree_oid = ?", oid),
+        ).toBe(count);
+      } finally {
+        native.dispose();
+        db.storage.db.close();
+      }
+    },
+  );
   it.each([
     { prior: true, fillers: OFFSET_WINDOW * 2 - 2, label: "retained offset window" },
     {

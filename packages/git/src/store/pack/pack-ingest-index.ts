@@ -9,13 +9,7 @@ import {
   prepareCommitCacheOwned,
 } from "../trees/commits.js";
 import { promoteCommitCaches, stageCommitCaches } from "../trees/commits-staging.js";
-import {
-  createTreeIndexSink,
-  indexTreeSource,
-  indexTreeSources,
-  type TreeSource,
-  type TreeSourceInput,
-} from "../trees/tree-index.js";
+import { indexPackTreeSources, type PackTreeSourceInput } from "../trees/tree-index.js";
 import { type ChunkedBytes, PACK_CHUNK_BYTES } from "./chunks.js";
 
 export const PACK_TREE_BATCH_BYTES = 1024 * 1024;
@@ -211,7 +205,7 @@ export class PackPendingBatch {
 
 /** Parsed pack trees pending a bounded, transactional index flush. */
 export class PackTreeIndex {
-  readonly #sources: TreeSourceInput[] = [];
+  readonly #sources: PackTreeSourceInput[] = [];
   #payloadBytes = 0;
   #retainedBytes = 0;
 
@@ -235,7 +229,9 @@ export class PackTreeIndex {
     }
     if (retained > PACK_TREE_BATCH_BYTES) {
       this.#direct(() =>
-        indexTreeSource(this.db, this.#directSource(repoId, treeOid, sourceId, objectSize), [data]),
+        indexPackTreeSources(this.db, [
+          this.#source(repoId, treeOid, sourceId, objectSize, [data]),
+        ]),
       );
       return;
     }
@@ -253,8 +249,9 @@ export class PackTreeIndex {
   ): void {
     this.flush();
     this.#direct(() => {
-      const source = this.#directSource(repoId, treeOid, sourceId, objectSize);
-      indexTreeSource(this.db, source, chunks());
+      indexPackTreeSources(this.db, [
+        this.#source(repoId, treeOid, sourceId, objectSize, chunks()),
+      ]);
     });
   }
 
@@ -270,14 +267,9 @@ export class PackTreeIndex {
     if (retained > PACK_TREE_BATCH_BYTES) {
       this.flush();
       this.#direct(() => {
-        const source = this.#directSource(repoId, treeOid, sourceId, objectSize);
-        const sink = createTreeIndexSink(this.db, source);
-        try {
-          for (const chunk of target.chunks()) sink.push(chunk);
-          sink.finish();
-        } finally {
-          sink.dispose();
-        }
+        indexPackTreeSources(this.db, [
+          this.#source(repoId, treeOid, sourceId, objectSize, target.chunks()),
+        ]);
       });
       return;
     }
@@ -299,7 +291,7 @@ export class PackTreeIndex {
   flush(): void {
     if (this.#sources.length === 0) return;
     try {
-      this.db.transactionSync(() => indexTreeSources(this.db, this.#sources));
+      this.db.transactionSync(() => indexPackTreeSources(this.db, this.#sources));
     } finally {
       this.#sources.length = 0;
       this.#payloadBytes = 0;
@@ -325,12 +317,8 @@ export class PackTreeIndex {
     sourceId: number,
     objectSize: number,
     chunks: Iterable<Uint8Array>,
-  ): TreeSourceInput {
+  ): PackTreeSourceInput {
     return { repoId, treeOid, storage: "pack", sourceId, objectSize, chunks };
-  }
-
-  #directSource(repoId: number, treeOid: string, sourceId: number, objectSize: number): TreeSource {
-    return { repoId, treeOid, storage: "pack", sourceId, objectSize };
   }
 
   #direct(write: () => void): void {

@@ -1,5 +1,6 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { TreeParser } from "../../common/objects.js";
+import { expectSafeInteger } from "../../common/rows.js";
 import { seedTreeSources, TreeIndexBatch, TreeSourceIndexer } from "./tree-index-batch.js";
 
 export { TREE_QUEUE_ROW_FIXED_BYTES } from "./tree-index-batch.js";
@@ -16,6 +17,40 @@ export interface TreeSource {
 
 export interface TreeSourceInput extends TreeSource {
   chunks: Iterable<Uint8Array>;
+}
+
+export interface PackTreeSourceInput extends TreeSourceInput {
+  storage: "pack";
+}
+
+/** The caller supplies a bounded batch of already authenticated pack occurrences. */
+export function indexPackTreeSources(
+  db: SqlDatabase,
+  sources: readonly PackTreeSourceInput[],
+): void {
+  const seen = new Set<string>();
+  const unique = sources.filter((source) => {
+    const key = JSON.stringify([source.repoId, source.treeOid, source.storage, source.sourceId]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const completed = new Set<number>();
+  for (const row of db.iterate(
+    `SELECT CAST(j.key AS INTEGER) AS ordinal FROM json_each(?) j
+       JOIN git_tree_sources s
+         ON s.repo_id = json_extract(j.value, '$.repoId')
+        AND s.tree_oid = json_extract(j.value, '$.treeOid')
+        AND s.storage = 'pack' AND s.source_id = json_extract(j.value, '$.sourceId')
+      WHERE s.complete = 1`,
+    JSON.stringify(unique.map(({ repoId, treeOid, sourceId }) => ({ repoId, treeOid, sourceId }))),
+  )) {
+    completed.add(expectSafeInteger(row.ordinal, 0, unique.length - 1, "tree source ordinal"));
+  }
+  indexTreeSources(
+    db,
+    unique.filter((_, ordinal) => !completed.has(ordinal)),
+  );
 }
 
 /** Incrementally parse and index one tree. The caller owns the transaction. */
