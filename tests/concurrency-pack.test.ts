@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { concat, utf8 } from "../packages/git/src/common/bytes.js";
 import { hashObject } from "../packages/git/src/common/objects.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../packages/git/src/store/index.js";
@@ -9,7 +9,7 @@ import {
 } from "../packages/git/src/store/pack/packs.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
-import { slices } from "./helpers/git.js";
+import { GitFixture, slices } from "./helpers/git.js";
 import { awaitBarrierEntry, checkpointBarrier } from "./helpers/interleaving.js";
 import { lifecycleDelta, lifecyclePack } from "./helpers/pack-maintenance.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
@@ -194,6 +194,177 @@ function expectCheckpointReadable(store: CheckoutStore, fixture: CheckpointPack)
 }
 
 describe("concurrent pack ownership", () => {
+  it.each(["publication", "lease release"])(
+    "rolls back commit promotion after %s failure",
+    async (seam) => {
+      const opened = createStore();
+      const data = utf8.encode(
+        `tree ${"0".repeat(40)}\nauthor Fixture <fixture@example.com> 1577836800 +0000\ncommitter Fixture <fixture@example.com> 1577836800 +0000\n\nrollback\n`,
+      );
+      const oid = hashObject("commit", data);
+      const bytes = lifecyclePack((writer) => writer.object("commit", data), 1);
+      const failure = new Error(`injected ${seam}`);
+      let published = false;
+      const originalOne = opened.db.one.bind(opened.db);
+      const fault = vi
+        .spyOn(opened.db, "one")
+        .mockImplementation(
+          <Row extends object>(query: string, ...bindings: unknown[]): Row | undefined => {
+            const row = originalOne<Row>(query, ...bindings);
+            if (
+              seam === "lease release" &&
+              published &&
+              query.includes("SET active_pack_id = NULL")
+            ) {
+              published = false;
+              throw failure;
+            }
+            return row;
+          },
+        );
+      try {
+        await expect(
+          opened.store.packs.ingest(singleChunk(bytes), {
+            lifecycle: {
+              reserved() {},
+              published() {
+                expect(opened.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(1);
+                expect(
+                  opened.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging"),
+                ).toBe(0);
+                published = true;
+                if (seam === "publication") throw failure;
+              },
+            },
+          }),
+        ).rejects.toBe(failure);
+      } finally {
+        fault.mockRestore();
+      }
+      const cold = reopenStore(opened.storage);
+      expect(cold.db.scalar<string>("SELECT state FROM git_pack_meta")).toBe("pending");
+      expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(1);
+      expect(cold.store.cachedCommit(oid)).toBeNull();
+      expect(cold.store.read(oid)).toBeNull();
+      expect(
+        cold.db.scalar<number | null>("SELECT active_pack_id FROM git_pack_ingest_control"),
+      ).toBeNull();
+      expect(() =>
+        cold.store.packs.discardPending(1, () => {
+          expect(cold.store.packs.discardPending(1)).toBe(true);
+          expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(0);
+          throw failure;
+        }),
+      ).toThrow(failure);
+      expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(1);
+      expect(cold.store.packs.discardPending(1)).toBe(true);
+      expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(0);
+      await cold.store.packs.ingest(singleChunk(bytes));
+      expect(reopenStore(opened.storage).store.cachedCommit(oid)?.commit.message).toBe(
+        "rollback\n",
+      );
+    },
+  );
+
+  it("counts repeated eligible and skipped physical commits while preserving published duplicates", async () => {
+    const opened = createStore();
+    const fixture = new GitFixture().init();
+    const header = `tree ${"0".repeat(40)}\nauthor Fixture <fixture@example.com> 1577836800 +0000\ncommitter Fixture <fixture@example.com> 1577836800 +0000\n\n`;
+    const eligible = utf8.encode(`${header}eligible\n`);
+    const loose = utf8.encode(`${header}loose\n`);
+    const skipped = utf8.encode(`${header}${"x".repeat(4 * 1024 * 1024)}\n`);
+    const eligibleOid = hashObject("commit", eligible);
+    const looseOid = opened.store.write("commit", loose);
+    await opened.store.packs.ingest(
+      singleChunk(lifecyclePack((writer) => writer.object("commit", eligible), 1)),
+    );
+    const before = opened.db.all<Record<string, unknown>>("SELECT * FROM git_commits ORDER BY oid");
+    const bytes = lifecyclePack((writer) => {
+      for (let i = 0; i < 3073; i++) writer.object("commit", eligible);
+      writer.object("commit", loose);
+      writer.object("commit", loose);
+      writer.object("commit", skipped);
+      writer.object("commit", skipped);
+    }, 3077);
+    try {
+      fixture.write("duplicates.pack", bytes);
+      expect(fixture.git("index-pack", "duplicates.pack")).toMatch(/^[0-9a-f]{40}$/);
+      let observed = false;
+      const result = await opened.store.packs.ingest(singleChunk(bytes), {
+        async yieldNow() {
+          if (opened.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging") === 0)
+            return;
+          observed = true;
+          const reader = reopenStore(opened.storage);
+          expect(reader.store.cachedCommit(eligibleOid)?.commit.message).toBe("eligible\n");
+          expect(reader.store.cachedCommit(looseOid)?.commit.message).toBe("loose\n");
+          expect(
+            reader.db.all<Record<string, unknown>>("SELECT * FROM git_commits ORDER BY oid"),
+          ).toEqual(before);
+        },
+      });
+      expect(observed).toBe(true);
+      expect(result.count).toBe(3077);
+      expect(
+        opened.db.scalar<number>(
+          "SELECT count(*) FROM git_pack_entries WHERE pack_id = ?",
+          result.packId,
+        ),
+      ).toBe(3077);
+      expect(opened.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(0);
+      const cold = reopenStore(opened.storage);
+      expect(
+        cold.db.all<Record<string, unknown>>("SELECT * FROM git_commits ORDER BY oid"),
+      ).toEqual(before);
+      const object = cold.store.read(hashObject("commit", skipped));
+      expect(object?.type).toBe("commit");
+      if (object === null) throw new Error("published oversized commit is missing");
+      expect(Buffer.from(object.data).equals(skipped)).toBe(true);
+      expect(cold.store.cachedCommit(hashObject("commit", skipped))).toBeNull();
+    } finally {
+      fixture.dispose();
+    }
+  });
+
+  it("reclaims expired commit staging through pack ownership from another handle", async () => {
+    const clock = { value: 10_000 };
+    const now = () => clock.value;
+    const opened = createStore(now);
+    const data = utf8.encode(
+      `tree ${"0".repeat(40)}\nauthor Fixture <fixture@example.com> 1577836800 +0000\ncommitter Fixture <fixture@example.com> 1577836800 +0000\n\nexpired\n`,
+    );
+    const bytes = lifecyclePack((writer) => {
+      for (let i = 0; i < 3073; i++) writer.object("commit", data);
+    }, 3073);
+    const barrier = checkpointBarrier<boolean>("staged lease expiry", Boolean);
+    const owner = opened.store.packs.ingest(singleChunk(bytes), {
+      async yieldNow() {
+        await barrier.checkpoint(
+          opened.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging") === 1,
+        );
+      },
+    });
+    try {
+      await awaitBarrierEntry(barrier, owner);
+      const cold = reopenStore(opened.storage, now);
+      expect(cold.store.packs.reclaimPending()).toBe(0);
+      clock.value += PACK_INGEST_LEASE_MS;
+      expect(cold.store.packs.reclaimPending()).toBe(1);
+      expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(0);
+      expect(cold.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
+      barrier.release();
+      await expect(owner).rejects.toMatchObject({ code: "ESTALE" });
+      await cold.store.packs.ingest(singleChunk(bytes));
+      expect(
+        reopenStore(opened.storage, now).store.cachedCommit(hashObject("commit", data))?.commit
+          .message,
+      ).toBe("expired\n");
+    } finally {
+      barrier.release();
+      await Promise.allSettled([owner]);
+    }
+  });
+
   it.each(["unresolved", "flushed"])(
     "protects a %s pending thin delta base across cold deletion",
     async (stage) => {

@@ -132,6 +132,7 @@ export class PackIngestEngine {
       const publishingLease = lease;
 
       throwIfIngestAborted(signal);
+      commits.checkpoint();
       this.#db.transactionSync(() => {
         if (publishingLease !== null) this.#lifecycle.renewIngestLease(publishingLease, now);
         const published = this.#db.one<Record<string, unknown>>(
@@ -152,8 +153,8 @@ export class PackIngestEngine {
         ) {
           throw new GitError("ESTALE", "pack ingest ownership changed before publication");
         }
-        commits.finish();
         this.#lifecycle.auditPublishedMembership(reservation.packId, membership);
+        commits.finish();
         if (options.lifecycle !== undefined) {
           requireLifecycleResult(options.lifecycle.published(result), "published");
         }

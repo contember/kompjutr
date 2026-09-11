@@ -46,6 +46,7 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_pack_gc_candidates", "shared"],
   ["git_pack_ingest_control", "shared"],
   ["git_commits", "shared"],
+  ["git_pack_commit_staging", "shared"],
   ["git_object_chunks", "shared"],
   ["git_pack_meta", "shared"],
   ["git_pack_data", "shared"],
@@ -103,6 +104,7 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_operation_state" },
   { type: "table", name: "git_operation_steps" },
   { type: "table", name: "git_operation_touched" },
+  { type: "table", name: "git_pack_commit_staging" },
   { type: "table", name: "git_pack_data" },
   { type: "table", name: "git_pack_entries" },
   { type: "index", name: "git_pack_entries_by_base" },
@@ -370,6 +372,28 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
     ],
   ],
   ["git_object_chunks", ["repo_id", "oid", "seq", "data"]],
+  [
+    "git_pack_commit_staging",
+    [
+      "repo_id",
+      "oid",
+      "parents",
+      "tree",
+      "author_name",
+      "author_email",
+      "author_time",
+      "author_timezone",
+      "committer_name",
+      "committer_email",
+      "committer_time",
+      "committer_timezone",
+      "message",
+      "gpgsig",
+      "object_size",
+      "cache_bytes",
+      "pack_id",
+    ],
+  ],
   ["git_pack_meta", ["repo_id", "pack_id", "size", "count", "state", "created"]],
   ["git_pack_gc_candidates", ["repo_id", "pack_id", "unreachable_since_ms"]],
   ["git_pack_data", ["repo_id", "pack_id", "seq", "data"]],
@@ -558,6 +582,11 @@ describe("git schema", () => {
     expect(primaryKeyOf(db, "git_checkout_reflog_entries")).toEqual(["checkout_id", "ordinal"]);
     expect(primaryKeyOf(db, "git_pack_ingest_control")).toEqual(["repo_id"]);
     expect(primaryKeyOf(db, "git_pack_entries")).toEqual(["repo_id", "pack_id", "offset"]);
+    expect(primaryKeyOf(db, "git_pack_commit_staging")).toEqual(["repo_id", "pack_id", "oid"]);
+    expect(cascadeForeignKeysOf(db, "git_pack_commit_staging")).toEqual([
+      { table: "git_pack_meta", from: "repo_id", to: "repo_id" },
+      { table: "git_pack_meta", from: "pack_id", to: "pack_id" },
+    ]);
 
     expect(cascadeForeignKeysOf(db, "git_checkouts")).toEqual([
       { table: "git_repositories", from: "repo_id", to: "id" },

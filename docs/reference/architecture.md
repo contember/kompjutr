@@ -141,6 +141,7 @@ view, and nested checkout roots are excluded from parent worktree scans.
 | Repository (`repo_id`) | objects, packs, refs, ordinary config, shallow, fetch and promisor state, direct-ref reflogs, tree/commit projections, blob-ID cache, maintenance |
 | Checkout (`checkout_id`) | canonical root, raw `HEAD`, index, tracker state, operation journal, checkout `HEAD` reflog |
 | Source surrogate | `git_tree_entries` for one exact loose or packed tree source |
+| Pack (`repo_id`, `pack_id`) | pending `git_pack_commit_staging` projections; promoted at complete publication or removed with the pack |
 | Synchronous scratch transaction | named scratch indexes; rows never survive the callback and are not maintenance roots |
 
 `packages/git/src/store/index.ts` is the facade. `store/database/` owns schema initialization

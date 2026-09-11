@@ -375,6 +375,13 @@ export function insertCommitCaches(
   db: SqlDatabase,
   entries: Iterable<CommitCacheEntry>,
 ): CommitCacheWriteResult {
+  return writeCommitCachePages(entries, (json) => insertCommitCacheJson(db, json));
+}
+
+export function writeCommitCachePages(
+  entries: Iterable<CommitCacheEntry>,
+  insert: (json: string) => number,
+): CommitCacheWriteResult {
   let pending: string[] = [];
   let pendingBytes = 2;
   let eligible = 0;
@@ -383,7 +390,7 @@ export function insertCommitCaches(
   let statements = 0;
   const flush = (): void => {
     if (pending.length === 0) return;
-    written += insertCommitCacheJson(db, `[${pending.join(",")}]`);
+    written += insert(`[${pending.join(",")}]`);
     pending = [];
     pendingBytes = 2;
     statements++;
@@ -401,7 +408,7 @@ export function insertCommitCaches(
     const { json, bytes } = serializeCommitCache(entry);
     if (shape.bytes + 2 > COMMIT_BATCH_JSON_BYTES) {
       flush();
-      written += insertCommitCacheJson(db, `[${json}]`);
+      written += insert(`[${json}]`);
       eligible++;
       statements++;
       continue;

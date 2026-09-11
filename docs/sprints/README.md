@@ -20,5 +20,7 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None. The [lifecycle/network sprint](../archive/sprint-2026-09-08-lifecycle-and-network-integrity.md)
-is complete.
+- [Production correctness and memory](sprint-2026-09-10-production-correctness-and-memory.md)
+  — pack publication/cold reads, packed dependency lifetime, and bounded
+  integration output; eight work units, plan review approved, implementation
+  design gates remain.

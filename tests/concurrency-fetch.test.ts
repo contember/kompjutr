@@ -399,6 +399,8 @@ describe("fetch publication concurrency", () => {
       ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
       expect(workspace.repo.store.getRef("refs/remotes/origin/main")).toBeNull();
       expect(workspace.repo.shallow()).toEqual(new Set());
+      expect(() => workspace.repo.readCommit(head)).toThrow();
+      expect(() => reopenTestRepository(workspace, "/work").repo.readCommit(head)).toThrow();
       expect(
         workspace.repo.store.db.all<{ state: string }>(
           "SELECT state FROM git_pack_meta ORDER BY pack_id",
@@ -412,6 +414,9 @@ describe("fetch publication concurrency", () => {
         tags: false,
       });
       expect(workspace.repo.store.getRef("refs/remotes/origin/main")).toBe(head);
+      expect(
+        workspace.repo.store.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging"),
+      ).toBe(0);
       expect(
         workspace.repo.store.db.all<{ state: string }>(
           "SELECT state FROM git_pack_meta ORDER BY pack_id",

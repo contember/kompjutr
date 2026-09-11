@@ -16,7 +16,8 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [Production correctness and memory](sprints/sprint-2026-09-10-production-correctness-and-memory.md)
+  — first production-hardening tranche: backlog 74, 63, and ARCH-9/ARCH-8 from 65.
 
 ## Specs
 
@@ -33,7 +34,10 @@ None.
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
-     If everything is "hot", nothing is. -->
+      If everything is "hot", nothing is. -->
+- [Production correctness and memory](sprints/sprint-2026-09-10-production-correctness-and-memory.md)
+  passed independent plan review: cold-readable pack admission, hidden provisional
+  projections, bounded packed reads, and integration output lifetime.
 - [Lifecycle and network integrity](archive/sprint-2026-09-08-lifecycle-and-network-integrity.md)
   is complete: promise-aware maintenance, pack dependency preservation, and final
   fetch connectivity checks. Default clone meets 990 SQL and the approved
@@ -64,10 +68,11 @@ None.
 - The completed POSIX shell sprint admitted bounded `printf`, `exit`, `1>&2`,
   and named parameter expansion with Bash parity as the standing gate
   (ADR-0019).
-- Next is the external consumer integration gate outside this public repository;
+- The external consumer integration gate remains outside this public repository;
   its provider still lacks the bulk worktree scan needed for an efficient
-  implementation without crossing private storage boundaries. Phase 2 is
-  re-planned from that real workflow rather than package-local assumptions.
+  implementation without crossing private storage boundaries. The hardening
+  sprint addresses known defects; broader production scope is re-planned from
+  that real workflow rather than package-local assumptions.
 
 ## Key reference
 
@@ -103,6 +108,7 @@ None.
 - [0019 — Admit a bounded POSIX shell surface](decisions/0019-admit-a-bounded-posix-shell-surface.md)
 - [0020 — Publish runtime boundaries as scoped packages](decisions/0020-publish-runtime-boundaries-as-scoped-packages.md)
 - [0021 — Recover local worktree mutations with an undo journal](decisions/0021-recover-local-worktree-mutations-with-an-undo-journal.md)
+- [0022 — Stage pack commit projections until publication](decisions/0022-stage-pack-commit-projections-until-publication.md)
 
 The set was renumbered on 2026-09-04; [`decisions/README.md`](decisions/README.md#renumbered-on-2026-09-04)
 decodes an old number found in `archive/` or `specs/`.

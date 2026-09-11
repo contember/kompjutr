@@ -39,6 +39,7 @@ so the two cannot drift.
 
 - [0008 — Enforce SQLite foreign keys at the store boundary](0008-enforce-sqlite-foreign-keys-at-the-store-boundary.md) — accepted (2026-08-25)
 - [0009 — Choose the persisted Git storage formats](0009-persisted-git-storage-formats.md) — accepted (2026-08-26)
+- [0022 — Stage pack commit projections until publication](0022-stage-pack-commit-projections-until-publication.md) — accepted (2026-09-11)
 
 **Git domain**
 

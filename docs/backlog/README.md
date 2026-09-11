@@ -89,7 +89,11 @@ A blocked item must not move ahead of its blocker.
 the integration gate. Everything below the gate is re-planned from that result.
 **Phase 2** is production scale; partial clone shipped directly outside a sprint.
 The first architecture-review correction sprint shipped independently because
-its defects were already reproduced. Remaining parity work stays unscheduled
+its defects were already reproduced. The
+[production correctness and memory sprint](../sprints/sprint-2026-09-10-production-correctness-and-memory.md)
+now owns all of 74 and 63 plus ARCH-9/ARCH-8 from 65. Other findings in 65 remain
+unscheduled. This bounded tranche precedes the broader scale/audit sequence below;
+it does not replace the external integration gate. Remaining parity work stays unscheduled
 until the external consumer integration gate provides new evidence.
 
 | # | Sprint | Items | Length | Why here |
@@ -97,8 +101,8 @@ until the external consumer integration gate provides new evidence.
 | **Phase 1 — a consumer can run** | | | | |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Phase 2 — production scale** | | | | |
-| 1 | Architecture review conformance | [65](65-git-sqlite-architecture-review.md) | long | Settle trusted-read, cost-model, and remaining verified scale drift before building an audit over those shapes. |
-| 2 | Packed dependency traversal | [63](63-bound-packed-dependency-graph-traversal.md) | normal | Bound packed-read memory and maintenance traversal before auditing extreme graphs. |
+| active | [Production correctness and memory](../sprints/sprint-2026-09-10-production-correctness-and-memory.md) | [74](74-align-pack-ingest-with-physical-membership.md), [63](63-bound-packed-dependency-graph-traversal.md), [65](65-git-sqlite-architecture-review.md) ARCH-9/ARCH-8 only | long | Prepare cold-readable publication and bounded packed/integration payload lifetime. |
+| 1 | Architecture review conformance, remainder | [65](65-git-sqlite-architecture-review.md), excluding ARCH-9/ARCH-8 | long | Re-plan remaining findings after the active tranche and consumer gate. |
 | 3 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Audit the settled physical, shallow, promisor, and packed storage shapes. |
 | **Remaining parity without a caller (unscheduled)** | | | | |
 | — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |

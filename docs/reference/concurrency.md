@@ -100,7 +100,16 @@ The conformance suite uses these outcomes:
 | promised blob hydration | Pinned promisor discovery; exact non-thin pack ingest; atomic physical publication and promise removal; synchronous operation retry. |
 
 Pack data and index checkpoints are durable but invisible to object reads until
-the pack becomes complete. Ref, HEAD, reflog, checkout, operation-journal, and
+the pack becomes complete. Eligible commit projections use pack-owned
+`git_pack_commit_staging` rows during ingest. The final publication transaction
+audits complete membership, promotes those rows into `git_commits` while
+preserving existing projections, and clears staging before the lifecycle
+callback and lease release. A failure rolls these steps back together. Pending
+discard and reclaim remove staging through the pack's cascading ownership;
+ordinary commit and graph reads never consult staging. See
+[ADR-0022](../decisions/0022-stage-pack-commit-projections-until-publication.md).
+
+Ref, HEAD, reflog, checkout, operation-journal, and
 individual maintenance transitions publish through synchronous database
 transactions. An operation plan and its anchors are immutable after creation;
 replay changes only bounded mutable transition state. Its legal transition
@@ -278,6 +287,7 @@ reason to invalidate an otherwise correct durable outcome.
 |---|---|---|
 | Repository route and readiness | [`concurrency-clone.test.ts`](../../tests/concurrency-clone.test.ts): “fences the real clone flow at every durable publication checkpoint”, “keeps reservation, complete pack, refs, and worktree private until the ready CAS”, and exact-expiry/collision/identity witnesses. | The real-flow witness replaces the evicted owner with a fresh `Workspace`; clone statement and composed-memory cost are measured separately. |
 | Ordinary pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): same-store overlap, separate-store active rejection, failed-owner retry, exact-expiry takeover, and duplicate/canonical ownership witnesses. | Reopened stores prove readable winner and fallback objects; pack statement and composed-memory cost are measured separately. |
+| Provisional commit projections | [`pack-projection-publication.test.ts`](../../tests/pack-projection-publication.test.ts): real Smart HTTP fetch pauses after staging; same/second handles cannot read pending-only commit or graph results, and live leases prevent reclaim. [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts) covers duplicate eligibility, expiry, and publication/release/discard rollback. | Abort, cold reopen, reclaim, and retry preserve refs/HEAD and publish readable complete history; staging is empty after publication or cleanup. |
 | Maintenance pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): pending dependency rejection; [`maintenance-repack.test.ts`](../../tests/maintenance-repack.test.ts): ordinary-winner finalization, selected/pending/published settlement, and local guard release/reacquisition around the asynchronous pack phase; [`maintenance-qualification.test.ts`](../../tests/maintenance-qualification.test.ts): pending fetch preservation. | Cold finalization tests authenticate every retained object and counter transition; the maintenance benchmark reports statement-target status and process-memory evidence. |
 | Tracking refs, tags, prune, and shallow boundaries | [`concurrency-fetch.test.ts`](../../tests/concurrency-fetch.test.ts): both same-remote orders, prune, local tracking ABA, response loss, disjoint namespaces, selected tags, and both shallow orders. | Every terminal schedule reopens and runs the shared repository oracle. [`store.test.ts`](../../tests/store.test.ts) exercises 9,329 tracking refs and the real memory/input bounds; `fetch.publication` owns representative query cost. |
 | Remote push leases, CAS, and local tracking | [`concurrency-network.test.ts`](../../tests/concurrency-network.test.ts): both push/fetch orders, same-OID fetch ABA, a buffered refresh losing to a post-snapshot fetch, a no-op push fencing an older fetch, both same-ref push orders, lease snapshots and remote races, authoritative refreshed/no-op commit reads, refresh failure, and preservation of HEAD/index/journal/maintenance state; [`push.test.ts`](../../tests/push.test.ts): rejection, response loss, abort certainty, leases, delete, no-op, and explicit URL; [`network-safety.test.ts`](../../tests/network-safety.test.ts): integrated real-backend abort/retry deepening and stale/fresh multi-ref leases. | Every concurrency schedule cold-reopens through the shared oracle; [`store.test.ts`](../../tests/store.test.ts) directly proves exact revision creation, prefix-scoped fetch observations, idempotent fencing, historical narrow/broad disjointness, maximal namespaces, and token ownership. `transport.push` measures configured and no-op push query cost without reserving a statement currency. |

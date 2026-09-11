@@ -1,6 +1,6 @@
 import { MAX_OBJECT_BYTES } from "../../common/objects.js";
 
-const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
+const COMMIT_COLUMNS = `
   repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
   oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
   parents TEXT NOT NULL CHECK (
@@ -18,7 +18,10 @@ const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
   message BLOB NOT NULL CHECK (typeof(message) = 'blob'),
   gpgsig BLOB CHECK (gpgsig IS NULL OR typeof(gpgsig) = 'blob'),
   object_size INTEGER NOT NULL CHECK (typeof(object_size) = 'integer' AND object_size >= 0),
-  cache_bytes INTEGER NOT NULL CHECK (typeof(cache_bytes) = 'integer' AND cache_bytes >= 0),
+  cache_bytes INTEGER NOT NULL CHECK (typeof(cache_bytes) = 'integer' AND cache_bytes >= 0)`;
+
+const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
+  ${COMMIT_COLUMNS},
   PRIMARY KEY (repo_id, oid),
   FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
 ) WITHOUT ROWID`;
@@ -52,6 +55,14 @@ export const OBJECT_SCHEMA_STATEMENTS = [
   // Full parsed commits for graph walks and reads. This remains a derived
   // cache: source metadata is validated before a row can be returned.
   COMMIT_TABLE,
+
+  `CREATE TABLE IF NOT EXISTS git_pack_commit_staging (
+     ${COMMIT_COLUMNS},
+     pack_id INTEGER NOT NULL CHECK (typeof(pack_id) = 'integer' AND pack_id >= 0),
+     PRIMARY KEY (repo_id, pack_id, oid),
+     FOREIGN KEY (repo_id, pack_id)
+       REFERENCES git_pack_meta (repo_id, pack_id) ON DELETE CASCADE
+   ) WITHOUT ROWID`,
 
   `CREATE TABLE IF NOT EXISTS git_object_chunks (
      repo_id INTEGER NOT NULL,

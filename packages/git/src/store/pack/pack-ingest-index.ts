@@ -6,9 +6,9 @@ import {
   COMMIT_CACHE_FLUSH_BYTES,
   type CommitCacheEntry,
   type CommitCacheSource,
-  insertCommitCaches,
   prepareCommitCacheOwned,
 } from "../trees/commits.js";
+import { promoteCommitCaches, stageCommitCaches } from "../trees/commits-staging.js";
 import {
   createTreeIndexSink,
   indexTreeSource,
@@ -382,16 +382,15 @@ export class PackCommitIndex {
     this.#bytes += entry.cacheBytes;
   }
 
-  /** Flush the final batch after the caller marks the pack complete. */
+  /** Promote only after the caller audits complete pack membership. */
   finish(): void {
-    this.objects.flush();
-    this.#insert();
-    this.#clear();
+    if (this.#entries.length !== 0) throw new CorruptError("packed commits were not checkpointed");
     if (this.#written !== this.#eligible || this.#eligible + this.#skipped !== this.#expected) {
       throw new CorruptError(
         `packed commit cache wrote ${this.#written} of ${this.#eligible} eligible rows and skipped ${this.#skipped} of ${this.#expected}`,
       );
     }
+    promoteCommitCaches(this.db, this.repoId, this.packId);
   }
 
   checkpoint(): void {
@@ -403,25 +402,14 @@ export class PackCommitIndex {
   #stage(): void {
     this.db.transactionSync(() => {
       this.objects.flush();
-      this.#setState("complete");
       this.#insert();
-      this.#setState("pending");
     });
     this.#clear();
   }
 
-  #setState(state: "complete" | "pending"): void {
-    this.db.run(
-      "UPDATE git_pack_meta SET state = ? WHERE repo_id = ? AND pack_id = ?",
-      state,
-      this.repoId,
-      this.packId,
-    );
-  }
-
   #insert(): void {
     if (this.#entries.length === 0) return;
-    const result = insertCommitCaches(this.db, this.#entries);
+    const result = stageCommitCaches(this.db, this.repoId, this.packId, this.#entries);
     if (
       result.written !== result.eligible ||
       result.eligible + result.skipped !== this.#entries.length
