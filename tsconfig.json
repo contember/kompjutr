@@ -16,5 +16,6 @@
       "@kompjutr/local": ["packages/local/src/index.ts"]
     }
   },
-  "include": ["packages", "tests", "bench", "*.ts"]
+  "include": ["packages", "tests", "bench", "*.ts"],
+  "exclude": ["node_modules", "bench/results"]
 }
