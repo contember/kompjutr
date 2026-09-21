@@ -49,7 +49,6 @@ export {
   MAX_PACK_ROW_CACHE_BYTES,
   PACK_BLOB_BATCH_TARGET_BYTES,
   PACK_CHUNK,
-  PACK_DELTA_OBJECT_WRAPPER_BYTES,
   PACK_INGEST_LEASE_MS,
 } from "./shared.js";
 
@@ -113,7 +112,7 @@ export class PackStore {
       boundedMaxDeltaDepth,
       boundedGraphPageEntries,
     );
-    this.#lifecycle = new PackLifecycle(db, repoId, sharedState, this.#now);
+    this.#lifecycle = new PackLifecycle(db, repoId, sharedState, this.#now, boundedMaxDeltaDepth);
     this.#ingest = new PackIngestEngine(
       db,
       repoId,
@@ -126,6 +125,7 @@ export class PackStore {
       this.#now,
       maxBufferedEntry,
       cacheEntryLimit,
+      boundedMaxDeltaDepth,
     );
   }
 

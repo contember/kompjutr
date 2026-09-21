@@ -7,6 +7,7 @@ import { SCHEMA_VERSION } from "./schema-constants.js";
 import { CORE_SCHEMA_STATEMENTS } from "./schema-core-statements.js";
 import { MAINTENANCE_SCHEMA_STATEMENTS } from "./schema-maintenance-statements.js";
 import { OBJECT_SCHEMA_STATEMENTS } from "./schema-object-statements.js";
+import { PACK_GRAPH_SCHEMA_STATEMENTS } from "./schema-pack-graph-statements.js";
 import { TREE_SCHEMA_STATEMENTS } from "./schema-tree-statements.js";
 import { WORKTREE_SCHEMA_STATEMENTS } from "./schema-worktree-statements.js";
 
@@ -34,6 +35,7 @@ const STATEMENTS = [
   ...CORE_SCHEMA_STATEMENTS,
   ...WORKTREE_SCHEMA_STATEMENTS,
   ...OBJECT_SCHEMA_STATEMENTS,
+  ...PACK_GRAPH_SCHEMA_STATEMENTS,
   ...TREE_SCHEMA_STATEMENTS,
   ...MAINTENANCE_SCHEMA_STATEMENTS,
 ] as const;

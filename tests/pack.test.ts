@@ -1611,19 +1611,29 @@ describe("pack fallback preservation", () => {
     await store.packs.ingest(slices(concat(chunks), 64));
     recording.queries.length = 0;
     expect(store.packs.deleteCompletePacks([primary.packId])).toBe(1);
-    const issued = recording.queries.find(({ query }) => query.includes("WITH RECURSIVE closure"));
+    const issued = recording.queries.find(({ query }) =>
+      query.includes("WITH RECURSIVE w(oid, root)"),
+    );
     if (issued === undefined) throw new Error("promotion closure was not checked");
     const plan = inner
       .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
       .map((row) => row.detail);
     expect(
       plan
-        .filter((detail) => /^SEARCH (object|base) /.test(detail))
+        .filter((detail) => /^SEARCH (p|l) /.test(detail))
         .every((detail) => detail.includes("(repo_id=? AND oid=?)")),
     ).toBe(true);
-    expect(plan.join("\n")).toMatch(/SEARCH base USING INDEX sqlite_autoindex_git_pack_objects_1/);
-    expect(plan.join("\n")).toMatch(/SEARCH child USING AUTOMATIC COVERING INDEX \(base_oid=\?\)/);
-    expect(plan.filter((detail) => /^SCAN (object|base|pack|loose)$/.test(detail))).toEqual([]);
+    expect(plan.join("\n")).toMatch(/SEARCH p USING INDEX sqlite_autoindex_git_pack_objects_1/);
+    expect(plan.filter((detail) => /^SCAN (p|l|v|m|h)$/.test(detail))).toEqual([]);
+    const reverse = recording.queries.find(({ query }) =>
+      query.includes("lane(root, parent, child)"),
+    );
+    if (reverse === undefined) throw new Error("reverse dependencies were not checked");
+    const reversePlan = inner
+      .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${reverse.query}`, ...reverse.bindings)
+      .map((row) => row.detail)
+      .join("\n");
+    expect(reversePlan).toContain("git_pack_objects_reverse (repo_id=? AND base_oid=? AND oid>?)");
     const protection = recording.queries.find(({ query }) =>
       query.includes("SELECT DISTINCT base.oid"),
     );
@@ -2753,8 +2763,9 @@ describe("pack deferred resolution", () => {
     );
     expect(() => cyclic.store.packs.read(cyclic.targets[0]!.oid)).toThrow(/cyclic delta chain/);
 
-    const deep = await pagedUnionFixture(new TestDatabase(), { maxDeltaDepth: 12 });
-    expect(() => deep.store.packs.read(deep.targets[0]!.oid)).toThrow(/delta chain deeper than 12/);
+    await expect(pagedUnionFixture(new TestDatabase(), { maxDeltaDepth: 12 })).rejects.toThrow(
+      /delta chain deeper than 12/,
+    );
   });
 
   it("closes the graph-page cursor when row validation fails", async () => {
@@ -3174,7 +3185,7 @@ describe("pack deferred resolution", () => {
 
   it("keeps the production delta limit and enforces its exact boundary", async () => {
     expect(MAX_DELTA_DEPTH).toBe(50_000);
-    const readAt = async (depth: number, limit: number) => {
+    const ingestAt = async (depth: number, limit: number) => {
       const db = new TestDatabase();
       const database = new SqliteGitDatabase(db, { maxDeltaDepth: limit });
       const store = database.openCheckout(
@@ -3182,15 +3193,17 @@ describe("pack deferred resolution", () => {
       );
       const fixture = deltaPack(depth);
       await store.packs.ingest(slices(fixture.bytes, 64));
-      const coldDatabase = new SqliteGitDatabase(db, { maxDeltaDepth: limit });
-      const row = coldDatabase.findCheckout("/repo");
-      if (row === null) throw new Error("repository missing after pack ingest");
-      return { actual: coldDatabase.openCheckout(row).read(fixture.targetOid), fixture };
+      return { db, fixture };
     };
 
-    const accepted = await readAt(3, 3);
-    expect(accepted.actual?.data).toEqual(accepted.fixture.target);
-    await expect(readAt(4, 3)).rejects.toThrow(/deeper than 3/);
+    const accepted = await ingestAt(3, 3);
+    const coldDatabase = new SqliteGitDatabase(accepted.db, { maxDeltaDepth: 3 });
+    const row = coldDatabase.findCheckout("/repo");
+    if (row === null) throw new Error("repository missing after pack ingest");
+    expect(coldDatabase.openCheckout(row).read(accepted.fixture.targetOid)?.data).toEqual(
+      accepted.fixture.target,
+    );
+    await expect(ingestAt(4, 3)).rejects.toThrow(/deeper than 3/);
 
     const openWithLimit = (maxDeltaDepth: number) => {
       const db = new TestDatabase();

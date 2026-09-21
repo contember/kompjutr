@@ -53,6 +53,10 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_pack_entries", "shared"],
   ["git_pack_objects", "shared"],
   ["git_pack_pending", "shared"],
+  ["git_pack_graph_operations", "shared"],
+  ["git_pack_graph_affected", "shared"],
+  ["git_pack_graph_memo", "shared"],
+  ["git_pack_graph_path", "shared"],
   ["git_tree_sources", "shared"],
   ["git_tree_entries", "shared"],
   ["git_tree_effective", "shared"],
@@ -110,10 +114,16 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "index", name: "git_pack_entries_by_base" },
   { type: "index", name: "git_pack_entries_by_oid" },
   { type: "table", name: "git_pack_gc_candidates" },
+  { type: "table", name: "git_pack_graph_affected" },
+  { type: "table", name: "git_pack_graph_memo" },
+  { type: "table", name: "git_pack_graph_operations" },
+  { type: "table", name: "git_pack_graph_path" },
+  { type: "index", name: "git_pack_graph_pending" },
   { type: "table", name: "git_pack_ingest_control" },
   { type: "table", name: "git_pack_meta" },
   { type: "table", name: "git_pack_objects" },
   { type: "index", name: "git_pack_objects_loc" },
+  { type: "index", name: "git_pack_objects_reverse" },
   { type: "table", name: "git_pack_pending" },
   { type: "index", name: "git_pack_pending_by_base" },
   { type: "table", name: "git_promised_blobs" },
@@ -397,6 +407,10 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   ["git_pack_meta", ["repo_id", "pack_id", "size", "count", "state", "created"]],
   ["git_pack_gc_candidates", ["repo_id", "pack_id", "unreachable_since_ms"]],
   ["git_pack_data", ["repo_id", "pack_id", "seq", "data"]],
+  ["git_pack_graph_operations", ["repo_id", "op_id"]],
+  ["git_pack_graph_affected", ["repo_id", "op_id", "oid", "pending", "cursor"]],
+  ["git_pack_graph_memo", ["repo_id", "op_id", "oid", "depth", "type"]],
+  ["git_pack_graph_path", ["repo_id", "op_id", "oid", "position"]],
   [
     "git_pack_objects",
     [
@@ -583,6 +597,17 @@ describe("git schema", () => {
     expect(primaryKeyOf(db, "git_pack_ingest_control")).toEqual(["repo_id"]);
     expect(primaryKeyOf(db, "git_pack_entries")).toEqual(["repo_id", "pack_id", "offset"]);
     expect(primaryKeyOf(db, "git_pack_commit_staging")).toEqual(["repo_id", "pack_id", "oid"]);
+    expect(primaryKeyOf(db, "git_pack_graph_operations")).toEqual(["repo_id", "op_id"]);
+    expect(cascadeForeignKeysOf(db, "git_pack_graph_operations")).toEqual([
+      { table: "git_repositories", from: "repo_id", to: "id" },
+    ]);
+    for (const table of ["git_pack_graph_affected", "git_pack_graph_memo", "git_pack_graph_path"]) {
+      expect(primaryKeyOf(db, table)).toEqual(["repo_id", "op_id", "oid"]);
+      expect(cascadeForeignKeysOf(db, table)).toEqual([
+        { table: "git_pack_graph_operations", from: "repo_id", to: "repo_id" },
+        { table: "git_pack_graph_operations", from: "op_id", to: "op_id" },
+      ]);
+    }
     expect(cascadeForeignKeysOf(db, "git_pack_commit_staging")).toEqual([
       { table: "git_pack_meta", from: "repo_id", to: "repo_id" },
       { table: "git_pack_meta", from: "pack_id", to: "pack_id" },

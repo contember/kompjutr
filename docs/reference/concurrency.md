@@ -218,6 +218,16 @@ resolved physical entries in pending packs. All canonical fallback promotions in
 a deletion batch precede metadata validation of terminating surviving chains;
 an unsafe promotion fails atomically with `EBUSY`.
 
+Publication and final-batch deletion validate the affected canonical dependency
+graph through indexed reverse closure and forward traversal. Complete canonical
+packed sources take precedence over loose terminals for this check; promises
+and pending sources cannot satisfy dependencies. Chains must preserve object
+type, terminate and stay within 50,000 delta edges. Repository/operation-owned
+SQL scratch holds affected nodes, depth memo and active paths; JavaScript pages
+contain at most 256 records. Scratch is removed before publication callbacks.
+Ingest and cold reads share the 48 MiB logical base/instructions/target limit;
+the separate rounded chunk-allocation guard also applies.
+
 Pack sweeping examines at most one bounded candidate page per call and deletes
 at most one pack. Its durable cursor records the last examined pack and a sticky
 retry marker after deletion. An exhausted dirty pass resets and returns; an

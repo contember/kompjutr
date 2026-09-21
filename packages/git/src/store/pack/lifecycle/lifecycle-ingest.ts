@@ -147,7 +147,7 @@ export class PackIngestLifecycleControl {
     if (ids.size > MAX_PACK_DELETE_BATCH) {
       throw new GitError("E2BIG", `pending pack cleanup exceeds ${MAX_PACK_DELETE_BATCH} packs`);
     }
-    for (const packId of ids) this.deletion.deletePack(packId, [packId]);
+    this.deletion.deletePacks([...ids]);
     return { control: current, removed: ids.size };
   }
 

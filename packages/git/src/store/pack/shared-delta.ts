@@ -6,7 +6,6 @@ import type { ObjectType, RawObject } from "../../common/objects.js";
 import type { ByteSource, ChunkedBytes, ChunkPool } from "./chunks.js";
 
 export const MAX_PACK_DELTA_WORKING_BYTES = 48 * 1024 * 1024;
-export const PACK_DELTA_OBJECT_WRAPPER_BYTES = 256;
 
 export type ExternalBatchResolver = (oids: readonly string[]) => Map<string, RawObject>;
 export interface ExternalObjectMetadata {
@@ -55,10 +54,6 @@ export interface IngestBase {
   owned: ChunkedBytes | null;
 }
 
-/**
- * Validate the delta header and the live base, instructions, target, and
- * object wrapper before allocating the result.
- */
 export function validateDeltaWorkingSet(
   base: Uint8Array,
   delta: Uint8Array,
@@ -82,7 +77,7 @@ export function validateDeltaWorkingSet(
   const targetSize = varint();
   if (sourceSize !== base.length) throw new CorruptError("delta base size mismatch");
   if (targetSize !== expectedTargetSize) throw new CorruptError("delta target size mismatch");
-  const workingBytes = base.length + delta.length + targetSize + PACK_DELTA_OBJECT_WRAPPER_BYTES;
+  const workingBytes = base.length + delta.length + targetSize;
   if (!Number.isSafeInteger(workingBytes) || workingBytes > MAX_PACK_DELTA_WORKING_BYTES) {
     throw new CorruptError("delta working set exceeds 48 MiB");
   }

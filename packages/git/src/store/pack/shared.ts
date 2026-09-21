@@ -24,7 +24,6 @@ export {
   type ExternalObjectMetadata,
   type IngestBase,
   MAX_PACK_DELTA_WORKING_BYTES,
-  PACK_DELTA_OBJECT_WRAPPER_BYTES,
   type PackGraphExit,
   type PackGraphOrigin,
   type PackGraphPage,

@@ -4,6 +4,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
+import { PackGraphAdmission } from "../graph/graph-admission.js";
 import {
   type CompletePackObject,
   isObjectType,
@@ -16,13 +17,13 @@ import {
   requirePackId,
   uniquePackIds,
 } from "../shared.js";
-import { assertTerminatingPromotions } from "./lifecycle-dependencies.js";
 
 export class PackDeletion {
   constructor(
     private readonly db: SqlDatabase,
     private readonly repoId: number,
     private readonly sharedState: PackSharedState,
+    private readonly maxDeltaDepth: number,
   ) {}
 
   #clearCaches(): void {
@@ -72,7 +73,7 @@ export class PackDeletion {
       if (current?.state !== "pending") {
         throw new CorruptError(`pack ${packId}: ownership release changed pending pack state`);
       }
-      this.deletePack(packId, [packId]);
+      this.deletePacks([packId]);
       return true;
     });
     if (removed) this.#clearCaches();
@@ -111,7 +112,7 @@ export class PackDeletion {
       if (current?.state !== "complete") {
         throw new CorruptError(`pack ${packId}: ownership release changed complete pack state`);
       }
-      this.deletePack(packId, [packId]);
+      this.deletePacks([packId]);
       let rows = 0;
       for (const validation of this.db.iterate(
         `SELECT /* owned-complete-discard-validation */ EXISTS(
@@ -183,14 +184,7 @@ export class PackDeletion {
     }
     if (states.size === 0) return 0;
     this.db.transactionSync(() => {
-      const deletingPackIds = [...states.keys()];
-      const promotions = deletingPackIds.map((packId) => ({
-        packId,
-        oids: this.#promoteFallbacks(packId, deletingPackIds),
-      }));
-      for (const { packId, oids } of promotions) {
-        this.#deletePackStorage(packId, deletingPackIds, oids);
-      }
+      this.deletePacks([...states.keys()]);
     });
     this.#clearCaches();
     return states.size;
@@ -280,15 +274,19 @@ export class PackDeletion {
     }
   }
 
-  deletePack(packId: number, deletingPackIds: readonly number[]): void {
-    const promotedOids = this.#promoteFallbacks(packId, deletingPackIds);
-    this.#deletePackStorage(packId, deletingPackIds, promotedOids);
+  deletePacks(deletingPackIds: readonly number[]): void {
+    if (deletingPackIds.length === 0) return;
+    const graph = new PackGraphAdmission(this.db, this.repoId, this.maxDeltaDepth, "deletion");
+    graph.seedPacks(deletingPackIds);
+    for (const packId of deletingPackIds) this.#promoteFallbacks(packId, deletingPackIds);
+    for (const packId of deletingPackIds) this.#deletePackStorage(packId, deletingPackIds);
+    graph.validate();
+    graph.cleanup();
   }
 
-  #promoteFallbacks(packId: number, deletingPackIds: readonly number[]): Set<unknown> {
+  #promoteFallbacks(packId: number, deletingPackIds: readonly number[]): void {
     const encodedDeletingPackIds = JSON.stringify(deletingPackIds);
-    const promotedOids = new Set<unknown>();
-    for (const row of this.db.iterate(
+    this.db.run(
       `INSERT OR REPLACE INTO git_pack_objects
          (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
        SELECT candidate.repo_id, candidate.oid, candidate.pack_id, candidate.offset,
@@ -322,31 +320,16 @@ export class PackDeletion {
                AND same_pack.pack_id = candidate.pack_id
                AND same_pack.oid = candidate.oid
                AND same_pack.offset < candidate.offset
-          )
-       RETURNING oid, pack_id`,
+           )`,
       this.repoId,
       encodedDeletingPackIds,
       packId,
       encodedDeletingPackIds,
-    )) {
-      if (
-        promotedOids.has(row.oid) ||
-        deletingPackIds.some((deletingPackId) => deletingPackId === row.pack_id)
-      ) {
-        throw new CorruptError(`pack ${packId}: promoted fallback row is invalid`);
-      }
-      promotedOids.add(row.oid);
-    }
-    return promotedOids;
+    );
   }
 
-  #deletePackStorage(
-    packId: number,
-    deletingPackIds: readonly number[],
-    promotedOids: ReadonlySet<unknown>,
-  ): void {
+  #deletePackStorage(packId: number, deletingPackIds: readonly number[]): void {
     this.#authenticateLooseDeltaBases(packId, deletingPackIds);
-    assertTerminatingPromotions(this.db, this.repoId, promotedOids, deletingPackIds);
     this.db.run(
       `DELETE FROM git_commits
         WHERE repo_id = ?

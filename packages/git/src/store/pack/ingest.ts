@@ -6,6 +6,7 @@ import { GitError } from "../../common/errors.js";
 import type { ByteLru } from "../../common/lru.js";
 import type { RawObject } from "../../common/objects.js";
 import { ChunkPool } from "./chunks.js";
+import { PackGraphAdmission } from "./graph/graph-admission.js";
 import { PackIndexer } from "./ingest/ingest-index.js";
 import { type AbortablePackIngestOptions, throwIfIngestAborted } from "./ingest/ingest-options.js";
 import { PackChunkWriter } from "./ingest/ingest-write.js";
@@ -44,6 +45,7 @@ export class PackIngestEngine {
     now: () => number,
     maxBufferedEntry: number,
     cacheEntryLimit: number,
+    private readonly maxDeltaDepth: number,
   ) {
     this.#db = db;
     this.#repoId = repoId;
@@ -154,7 +156,16 @@ export class PackIngestEngine {
           throw new GitError("ESTALE", "pack ingest ownership changed before publication");
         }
         this.#lifecycle.auditPublishedMembership(reservation.packId, membership);
+        const graph = new PackGraphAdmission(
+          this.#db,
+          this.#repoId,
+          this.maxDeltaDepth,
+          "publication",
+        );
+        graph.seedPacks([reservation.packId]);
+        graph.validate();
         commits.finish();
+        graph.cleanup();
         if (options.lifecycle !== undefined) {
           requireLifecycleResult(options.lifecycle.published(result), "published");
         }
