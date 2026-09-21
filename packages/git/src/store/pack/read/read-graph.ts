@@ -61,6 +61,7 @@ export class PackGraphPager {
         const rootJson = JSON.stringify(pageRoots);
         const links = new Map<string, string | null>();
         let rowCount = 0;
+        // CROSS JOIN keeps frontier-driven OID seeks ahead of repository-wide scans.
         for (const row of this.db.iterate(
           `WITH RECURSIVE /* pack-graph-page */
                frontier(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
@@ -68,23 +69,23 @@ export class PackGraphPager {
                reachable(oid) AS (
                  SELECT object.oid
                    FROM frontier
-                   JOIN git_pack_objects object
+                   CROSS JOIN git_pack_objects object
                      ON object.repo_id = ? AND object.oid = frontier.oid
-                   JOIN git_pack_meta pack
+                   CROSS JOIN git_pack_meta pack
                      ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
                     AND (pack.state = 'complete' OR object.pack_id = ?)
                  UNION
                  SELECT base.oid
                    FROM reachable
-                   JOIN git_pack_objects child
+                   CROSS JOIN git_pack_objects child
                      ON child.repo_id = ? AND child.oid = reachable.oid
-                   JOIN git_pack_meta child_pack
+                   CROSS JOIN git_pack_meta child_pack
                      ON child_pack.repo_id = child.repo_id
                     AND child_pack.pack_id = child.pack_id
                     AND (child_pack.state = 'complete' OR child.pack_id = ?)
-                   JOIN git_pack_objects base
+                   CROSS JOIN git_pack_objects base
                      ON base.repo_id = child.repo_id AND base.oid = child.base_oid
-                   JOIN git_pack_meta base_pack
+                   CROSS JOIN git_pack_meta base_pack
                      ON base_pack.repo_id = base.repo_id AND base_pack.pack_id = base.pack_id
                     AND (base_pack.state = 'complete' OR base.pack_id = ?)
                   WHERE NOT EXISTS (SELECT 1 FROM seeds WHERE seeds.oid = base.oid)
@@ -92,7 +93,7 @@ export class PackGraphPager {
                )
              SELECT object.oid, object.base_oid
                FROM reachable
-               JOIN git_pack_objects object
+               CROSS JOIN git_pack_objects object
                  ON object.repo_id = ? AND object.oid = reachable.oid`,
           rootJson,
           seedJson,

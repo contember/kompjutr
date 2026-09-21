@@ -373,11 +373,10 @@ The accepted ownership decision is [ADR-0022](../decisions/0022-stage-pack-commi
   baseline test hook from review notes. **User approval:** granted 2026-09-11,
   including sequential implementation/review agents and per-unit verified commits.
 
-### WU3 integration contract — draft 2026-09-11
+### WU3 integration contract — approved 2026-09-21
 
-The user approved the batched affected-graph approach as the design basis.
-This exact schema and lifecycle proposal awaits independent step review and
-user approval. Prototype evidence is recorded in the run log; it does not
+The user approved this reviewed schema and lifecycle contract on 2026-09-21.
+Prototype evidence is recorded in the run log; it does not
 establish production cost or maintenance restart semantics.
 
 **Source invariant.** Traverse canonical `git_pack_objects` directly, with a new
@@ -506,7 +505,8 @@ and admission must explicitly share the reduced depth test seam. This revision
 addresses all three and removes unnecessary loose-write/sweep hooks. Re-review
 approved the contract for the user gate after adding the three existing
 maintenance-caller suites above. No algorithm, schema, lifecycle, or territory
-blockers remain. User approval of this exact integration contract is pending.
+blockers remain. User approval of this exact integration contract was granted
+on 2026-09-21 with the instruction to continue and complete the sprint.
 
 **WU5 remains a separate design gate.** Transaction-local validation does not
 establish resumable maintenance. A later read-progress owner may share narrow
@@ -611,6 +611,53 @@ only follow-ups need direct inspection unless they change a contract or claim.
   that selection against the adopted WU6 design before implementation.
 
 ## Run log
+
+- 2026-09-21: Pager join-order prerequisite is verified. Seven inner joins now
+  explicitly preserve frontier/reachable → canonical OID → visible-pack order;
+  predicates, seeds, recursive limit, depth and cache semantics are unchanged.
+  The new EXPLAIN witness fails on baseline repo-only scans and passes with OID
+  seeks. Reviewer `ses_f3bb3993bffegh5v5QhCblqUFj` approved. Leader ran nine
+  targeted pager/cache tests, including the unchanged actual 50,000-edge cold
+  reopen witness (10.88 s), then 159 smoke tests, typecheck and lint. WU3's new
+  admission test file remains uncommitted with intentional baseline publication
+  failures while its separate implementation is pending. This prerequisite does
+  not close WU5's metadata lifetime or maintenance-work acceptance.
+
+- 2026-09-21: Actual-depth witness diagnosis localizes the long acceptance run
+  to the cold pager's recursive query plan: child lookup uses a repo-only range
+  ahead of the recursive frontier, repeating scans. Fixture generation/native
+  verification/ingest are short; actual 50,001-edge publication rejection now
+  fails against baseline in 6.93 s as intended. Pull forward only WU5's local
+  join-order correction, preserving source selection and all limits, to unblock
+  the unchanged 50,000-edge cold-acceptance witness. No fixture reduction or
+  timeout increase is authorized. Reconstruction of WU3's separate admission
+  algorithm continues independently. Evidence lives in ignored
+  `bench/results/pack-depth-witness-2026-09-21/`.
+
+- 2026-09-21: WU3 verify-first witnesses reproduce premature publication of a
+  reduced-limit over-depth pack and an old canonical cycle; native Git accepts
+  those physical inputs. Production code is not yet changed. The implementer
+  reported the lost graph prototype as blocking faithful integration. User
+  explicitly approved reconstruction with independent algorithm verification;
+  reconstructed source/evidence will live under ignored
+  `bench/results/pack-graph-reconstruction-2026-09-21/` rather than temporary-only
+  storage. Separate diagnosis is investigating the slow actual 50,000/50,001
+  depth fixtures without increasing test timeouts or lowering the requirement.
+- 2026-09-21: Frozen WU4 baseline at `49f68c9` confirms avoidable retention:
+  scalar 8 MiB output through sixteen 8 MiB delta targets adds 136.41 MiB process
+  HWM, versus 72.35 MiB for eight targets and 8.00 MiB output-only control.
+  All seven baseline processes passed output oracles and the independent 512 MiB
+  cgroup cap under enforced leases. Bounded-prefix shared-base cases add 16.11
+  MiB. Graph fixtures cross 4,096 and 8,192 edges. Internal inflation/descriptor/
+  maintenance dependency counters remain unobserved, not inferred from statement
+  counts. Source archives, fixtures and raw results are preserved under ignored
+  `bench/results/packed-read-baseline-2026-09-21/`.
+
+- 2026-09-21: User approved WU3 implementation and instructed completion of the
+  remaining sprint. WU3 implementation starts from `49f68c9` under the reviewed
+  contract. Independent preparation of frozen WU4/WU5 memory baselines writes
+  only isolated benchmark artifacts. WU5/WU6 unresolved architectural contracts
+  retain their explicit design gates; do not silently choose those boundaries.
 
 - 2026-09-21: Replaced the byte iterator in `TreeParser.push` with bounded
   indexed traversal, preserving parser state and yields. Independent reviewer

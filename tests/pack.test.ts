@@ -2651,6 +2651,40 @@ describe("pack deferred resolution", () => {
     expect(store.read(objects[999]!.oid)?.data).toEqual(objects[999]!.data);
   });
 
+  it("drives graph pages from the frontier with canonical oid seeks", async () => {
+    const inner = new TestDatabase();
+    try {
+      const recorder = new RecordingDatabase(inner);
+      const { store, targets } = await pagedUnionFixture(recorder);
+      recorder.queries.length = 0;
+      expect(store.packs.read(targets[0]!.oid)?.data).toEqual(targets[0]!.data);
+      const issued = recorder.queries.find((entry) =>
+        entry.query.includes("/* pack-graph-page */"),
+      );
+      if (issued === undefined) throw new Error("the graph pager was never issued");
+      const plan = inner
+        .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
+        .map((row) => row.detail);
+      for (const alias of ["object", "child", "base"]) {
+        const lookups = plan.filter((detail) =>
+          new RegExp(`^(SEARCH|SCAN) ${alias} `).test(detail),
+        );
+        expect(lookups.length).toBeGreaterThan(0);
+        for (const lookup of lookups) {
+          expect(lookup).toMatch(/SEARCH .* USING .*INDEX .* \(repo_id=\? AND oid=\?\)/);
+        }
+      }
+      const recursiveStep = plan.indexOf("RECURSIVE STEP");
+      const reachableScan = plan.indexOf("SCAN reachable", recursiveStep);
+      const childSeek = plan.findIndex((detail) => detail.startsWith("SEARCH child "));
+      expect(recursiveStep).toBeGreaterThanOrEqual(0);
+      expect(reachableScan).toBeGreaterThan(recursiveStep);
+      expect(childSeek).toBeGreaterThan(reachableScan);
+    } finally {
+      inner.storage.db.close();
+    }
+  });
+
   it("pages one shared union graph across every public packed read path", async () => {
     const { db, targets, packId, store } = await pagedUnionFixture();
     if (!(db instanceof TestDatabase)) throw new Error("expected pager test database");
