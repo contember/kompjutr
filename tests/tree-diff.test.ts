@@ -14,6 +14,7 @@ import { joinSorted } from "../packages/git/src/common/streams.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
+import { iterateTreeDiffObjects } from "../packages/git/src/store/trees/tree-walk.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 
@@ -59,6 +60,52 @@ class CapturingDatabase implements SqlDatabase {
 }
 
 describe("tree diff", () => {
+  it("emits checked subtrees but prunes their descendants in a stable validation transaction", () => {
+    const { db, store } = open();
+    const blob = store.write("blob", new TextEncoder().encode("shared"));
+    const child = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "file", oid: blob }]),
+    );
+    const empty = store.write("tree", serializeTree([]));
+    const first = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_TREE, name: "shared", oid: child }]),
+    );
+    const sibling = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "new", oid: blob }]),
+    );
+    const second = store.write(
+      "tree",
+      serializeTree([
+        { mode: MODE_TREE, name: "empty", oid: empty },
+        { mode: MODE_TREE, name: "shared", oid: child },
+        { mode: MODE_TREE, name: "sibling", oid: sibling },
+      ]),
+    );
+    db.transactionSync(() => {
+      expect([...iterateTreeDiffObjects(db, 1, null, first)]).toContainEqual({
+        oid: blob,
+        type: "blob",
+      });
+      const checked = new Set([child, empty]);
+      expect([...iterateTreeDiffObjects(db, 1, null, second, checked)]).toEqual([
+        { oid: second, type: "tree" },
+        { oid: empty, type: "tree" },
+        { oid: child, type: "tree" },
+        { oid: sibling, type: "tree" },
+        { oid: blob, type: "blob" },
+      ]);
+      expect([...iterateTreeDiffObjects(db, 1, null, empty, checked)]).toEqual([
+        { oid: empty, type: "tree" },
+      ]);
+      expect([...iterateTreeDiffObjects(db, 1, first, second, checked)]).toEqual([
+        ...iterateTreeDiffObjects(db, 1, first, second),
+      ]);
+    });
+  });
+
   it("is lazy and skips equal roots without SQL", () => {
     const { db, store } = open();
     const tree = store.write("tree", serializeTree([{ mode: MODE_FILE, name: "a", oid: oid(1) }]));
@@ -77,6 +124,39 @@ describe("tree diff", () => {
     expect([...store.walkTreeDiff(tree, tree)]).toEqual([]);
     expect([...store.walkTreeDiff(null, null)]).toEqual([]);
     expect(db.storage.statementCount).toBe(0);
+  });
+
+  it("treats checked input beyond 128 trees as cache misses", () => {
+    const { db, store } = open();
+    const blob = store.write("blob", new TextEncoder().encode("shared"));
+    const trees = Array.from({ length: 129 }, (_, index) =>
+      store.write("tree", serializeTree([{ mode: MODE_FILE, name: `file-${index}`, oid: blob }])),
+    );
+    const last = trees[128];
+    if (last === undefined) throw new Error("missing last tree");
+    db.transactionSync(() => {
+      for (const tree of trees)
+        expect([...iterateTreeDiffObjects(db, 1, null, tree)]).toHaveLength(2);
+      expect([...iterateTreeDiffObjects(db, 1, null, last, new Set(trees))]).toEqual([
+        { oid: last, type: "tree" },
+        { oid: blob, type: "blob" },
+      ]);
+    });
+  });
+
+  it("counts invalid cache entries toward the examined input bound", () => {
+    const { db, store } = open();
+    const blob = store.write("blob", new TextEncoder().encode("shared"));
+    const tree = store.write("tree", serializeTree([{ mode: MODE_FILE, name: "file", oid: blob }]));
+    const checked = new Set(Array.from({ length: 128 }, (_, index) => `invalid-${index}`));
+    checked.add(tree);
+    db.transactionSync(() => {
+      expect([...iterateTreeDiffObjects(db, 1, null, tree)]).toHaveLength(2);
+      expect([...iterateTreeDiffObjects(db, 1, null, tree, checked)]).toEqual([
+        { oid: tree, type: "tree" },
+        { oid: blob, type: "blob" },
+      ]);
+    });
   });
 
   it("reports additions, deletions, content and mode changes", () => {
@@ -277,7 +357,8 @@ describe("tree diff", () => {
     if (captured === null) throw new Error("tree diff statement was not captured");
     const plan = db.inner.all<{ detail: unknown }>(
       `EXPLAIN QUERY PLAN ${captured.query}`,
-      ...captured.bindings,
+      ...captured.bindings.slice(0, -1),
+      JSON.stringify([after]),
     );
     const details = plan.map((step) => {
       if (typeof step.detail !== "string") throw new Error("query plan detail is not text");
@@ -289,9 +370,13 @@ describe("tree diff", () => {
     expect(
       details.filter(
         (detail) =>
-          detail.startsWith("SCAN ") && !/SCAN (CONSTANT ROW|p\b|w\b|walk\b)/.test(detail),
+          detail.startsWith("SCAN ") &&
+          !/SCAN (CONSTANT ROW|p\b|w\b|walk\b|json_each\b|checked_trees\b)/.test(detail),
       ),
     ).toEqual([]);
+    expect(details.some((detail) => detail.includes("MATERIALIZE checked_trees"))).toBe(true);
+    expect(details.filter((detail) => detail.startsWith("SCAN json_each "))).toHaveLength(1);
+    expect(details.some((detail) => detail.includes("CORRELATED LIST SUBQUERY"))).toBe(false);
     expect(
       details.some(
         (detail) =>
@@ -611,6 +696,14 @@ describe("tree diff", () => {
     };
     expectRejected(null, tree);
     expectRejected(tree, null);
+    expect(() => [...iterateTreeDiffObjects(db, 1, null, tree)]).toThrow(/queue exceeds 16 MiB/);
+    db.transactionSync(() => {
+      expect([...iterateTreeDiffObjects(db, 1, null, child)]).toHaveLength(leafCount + 1);
+      expect([...iterateTreeDiffObjects(db, 1, null, tree, new Set([child]))]).toEqual([
+        { oid: tree, type: "tree" },
+        { oid: child, type: "tree" },
+      ]);
+    });
   });
 
   it("charges unilateral leaf names in both path and sort key", () => {

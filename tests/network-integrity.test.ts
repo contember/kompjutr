@@ -1,9 +1,16 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { concat } from "../packages/git/src/common/bytes.js";
+import {
+  MODE_FILE,
+  MODE_TREE,
+  serializeCommit,
+  serializeTree,
+} from "../packages/git/src/common/objects.js";
 import { openRepository } from "../packages/git/src/ops/core/context.js";
 import { clone, fetchInto } from "../packages/git/src/ops/network/network.js";
+import { validateFetchedConnectivity } from "../packages/git/src/ops/network/network-connectivity.js";
 import { maintenance } from "../packages/git/src/ops/repository/maintenance.js";
 import { GC_GRACE_MS } from "../packages/git/src/store/maintenance/sweep.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
@@ -155,6 +162,165 @@ describe("network integrity", () => {
 });
 
 describe("fetched graph connectivity", () => {
+  it("checks shared nested blobs once per invocation and starts the next invocation cold", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("shared/file", "shared\n");
+    fixture.write("changing", "first\n");
+    fixture.commit("first");
+    const first = fixture.git("rev-parse", "HEAD^{tree}");
+    fixture.write("changing", "second\n");
+    fixture.commit("second");
+    const second = fixture.git("rev-parse", "HEAD^{tree}");
+    const shared = fixture.git("rev-parse", "HEAD:shared/file");
+    const { repo } = makeRepo("/work");
+    try {
+      await repo.store.packs.ingest(slices(fixture.packAll(), 4096));
+      const info = vi.spyOn(repo.store, "objectInfo");
+      const run = () =>
+        repo.store.db.transactionSync(() =>
+          validateFetchedConnectivity(repo, [first, second], new Set()),
+        );
+      run();
+      expect(
+        info.mock.calls.flatMap(([oids]) => oids).filter((oid) => oid === shared),
+      ).toHaveLength(1);
+      info.mockClear();
+      run();
+      expect(
+        info.mock.calls.flatMap(([oids]) => oids).filter((oid) => oid === shared),
+      ).toHaveLength(1);
+      for (const entry of repo.store.walkTree(second)) {
+        expect(repo.store.read(entry.oid)?.data).toEqual(fixture.catFile(entry.oid));
+      }
+    } finally {
+      fixture.dispose();
+    }
+  });
+
+  it("flushes a missing blob in the final metadata batch before starting the next root", () => {
+    const { repo } = makeRepo("/work");
+    const missing = "1".repeat(40);
+    const child = repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "missing", oid: missing }]),
+    );
+    const root = repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_TREE, name: "shared", oid: child }]),
+    );
+    const walk = vi.spyOn(repo.store, "walkTreeDiffObjects");
+    expect(() =>
+      repo.store.db.transactionSync(() =>
+        validateFetchedConnectivity(repo, [child, root], new Set()),
+      ),
+    ).toThrow();
+    expect(walk).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a new missing subtree after successfully caching a shared subtree", () => {
+    const { repo } = makeRepo("/work");
+    const blob = repo.store.write("blob", utf8("good"));
+    const child = repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "file", oid: blob }]),
+    );
+    const bad = repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "missing", oid: "1".repeat(40) }]),
+    );
+    const root = repo.store.write(
+      "tree",
+      serializeTree([
+        { mode: MODE_TREE, name: "shared", oid: child },
+        { mode: MODE_TREE, name: "unchecked", oid: bad },
+      ]),
+    );
+    expect(() =>
+      repo.store.db.transactionSync(() =>
+        validateFetchedConnectivity(repo, [child, root], new Set()),
+      ),
+    ).toThrow();
+  });
+
+  it("retraverses evicted trees after the bounded cache fills", () => {
+    const { repo } = makeRepo("/work");
+    const blob = repo.store.write("blob", utf8("shared"));
+    const roots = Array.from({ length: 129 }, (_, index) =>
+      repo.store.write(
+        "tree",
+        serializeTree([{ mode: MODE_FILE, name: `file-${index}`, oid: blob }]),
+      ),
+    );
+    const first = roots[0];
+    if (first === undefined) throw new Error("missing first root");
+    const revisit = repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_TREE, name: "revisit", oid: first }]),
+    );
+    const info = vi.spyOn(repo.store, "objectInfo");
+    repo.store.db.transactionSync(() =>
+      validateFetchedConnectivity(repo, [...roots, revisit], new Set()),
+    );
+    expect(info.mock.calls.flatMap(([oids]) => oids).filter((oid) => oid === blob)).toHaveLength(
+      130,
+    );
+  });
+
+  it("allows promised missing blobs but never promised missing trees or commits", () => {
+    const { repo } = makeRepo("/work");
+    const missing = "1".repeat(40);
+    repo.store.registerPromisorRemote("origin", "https://example.com/repo.git");
+    repo.store.addPromisedBlobs("origin", [missing]);
+    const blobTree = repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "promised", oid: missing }]),
+    );
+    const treeTree = repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_TREE, name: "promised", oid: missing }]),
+    );
+    const person = { name: "Test", email: "test@example.com", timestamp: 1, timezoneOffset: 0 };
+    const commit = repo.store.write(
+      "commit",
+      serializeCommit({
+        tree: blobTree,
+        parent: [missing],
+        author: person,
+        committer: person,
+        message: "missing parent\n",
+      }),
+    );
+    const validate = (roots: string[]) =>
+      repo.store.db.transactionSync(() => validateFetchedConnectivity(repo, roots, new Set()));
+    expect(() => validate([blobTree])).not.toThrow();
+    expect(() => validate([blobTree, treeTree])).toThrow();
+    expect(() => validate([blobTree, commit])).toThrow();
+  });
+
+  it("retraverses trees beyond one walk's bounded candidate set", () => {
+    const { repo } = makeRepo("/work");
+    const blob = repo.store.write("blob", utf8("shared"));
+    const children = Array.from({ length: 129 }, (_, index) => ({
+      mode: MODE_TREE,
+      name: `tree-${String(index).padStart(3, "0")}`,
+      oid: repo.store.write(
+        "tree",
+        serializeTree([{ mode: MODE_FILE, name: `file-${index}`, oid: blob }]),
+      ),
+    }));
+    const last = children[128];
+    if (last === undefined) throw new Error("missing last child");
+    const first = repo.store.write("tree", serializeTree(children));
+    const second = repo.store.write("tree", serializeTree([last]));
+    const info = vi.spyOn(repo.store, "objectInfo");
+    repo.store.db.transactionSync(() =>
+      validateFetchedConnectivity(repo, [first, second], new Set()),
+    );
+    expect(info.mock.calls.flatMap(([oids]) => oids).filter((oid) => oid === blob)).toHaveLength(
+      130,
+    );
+  });
+
   it("preserves durable blob promises on legacy and mapped fetch of an unmaterialized branch", async () => {
     const fixture = new GitFixture().init();
     fixture.write("main.txt", "main\n");

@@ -169,6 +169,7 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
   params(repo_id, before_root, after_root, path_cap, state_cap, queue_cap, queue_fixed,
          emit_objects)
     AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?)),
+  checked_trees(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
   walk(path, path_bytes, sort_key, before_mode, before_oid, after_mode, after_oid,
        before_ancestry, after_ancestry, state_bytes, reserved_bytes, error, error_code) AS (
     SELECT '', 0, CAST('' AS BLOB),
@@ -252,6 +253,7 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
      WHERE w.error IS NULL
        AND w.error_code = 'ECORRUPT'
        AND (w.before_mode IN ('40000', '040000') OR w.after_mode IN ('40000', '040000'))
+       AND (w.after_oid IS NULL OR w.after_oid NOT IN (SELECT oid FROM checked_trees))
        AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
                 AND COALESCE(w.after_mode IN ('40000', '040000'), 0)
                 AND w.before_oid = w.after_oid)
@@ -416,6 +418,7 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
        AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
                 AND w.before_oid = w.after_oid)
        AND ax.repo_id = p.repo_id AND ax.tree_oid = w.after_oid
+       AND w.after_oid NOT IN (SELECT oid FROM checked_trees)
        AND aps.source_key = ax.source_key
        AND ae.source_key = aps.source_key
        AND be.ordinal IS NULL

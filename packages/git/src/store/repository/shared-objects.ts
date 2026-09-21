@@ -140,8 +140,9 @@ export abstract class SharedRepoObjectStore extends SharedRepoCore {
   *walkTreeDiffObjects(
     beforeTreeOid: string | null,
     afterTreeOid: string,
+    checkedTrees?: ReadonlySet<string>,
   ): Generator<WalkTreeDiffObject> {
-    yield* iterateTreeDiffObjects(this.db, this.repoId, beforeTreeOid, afterTreeOid);
+    yield* iterateTreeDiffObjects(this.db, this.repoId, beforeTreeOid, afterTreeOid, checkedTrees);
   }
 
   write(type: ObjectType, data: Uint8Array): string {

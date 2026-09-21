@@ -10,6 +10,7 @@ const TREE_WALK_QUEUE_BYTES = 16 * 1024 * 1024;
 // Caller-unbounded traversal state must fail before the recursive CTE expands it.
 export const TREE_WALK_PATH_BYTES = 7_456_512;
 export const TREE_WALK_STATE_BYTES = 64 * 1024 * 1024;
+export const CHECKED_TREE_CACHE_SIZE = 128;
 
 export interface WalkTreeEntry {
   path: string;
@@ -72,8 +73,19 @@ export function* iterateTreeDiffObjects(
   repoId: number,
   beforeTreeOid: string | null,
   afterTreeOid: string,
+  checkedTrees: ReadonlySet<string> = new Set(),
 ): Generator<WalkTreeDiffObject> {
   if (beforeTreeOid === afterTreeOid) return;
+  // Only connectivity's stable publication transaction may reuse checked subtrees.
+  const snapshot: string[] = [];
+  if (beforeTreeOid === null) {
+    let examined = 0;
+    for (const oid of checkedTrees) {
+      if (examined === CHECKED_TREE_CACHE_SIZE) break;
+      examined++;
+      if (oid.length === 40) snapshot.push(oid);
+    }
+  }
   for (const row of db.iterate(
     WALK_TREE_DIFF_SQL,
     repoId,
@@ -84,6 +96,7 @@ export function* iterateTreeDiffObjects(
     TREE_WALK_QUEUE_BYTES,
     TREE_QUEUE_ROW_FIXED_BYTES,
     1,
+    JSON.stringify(snapshot),
   )) {
     throwTraversalError(row, "tree diff object traversal");
     if (row.object_mode === null && row.object_oid === null) continue;
@@ -112,6 +125,7 @@ export function* iterateTreeDiff(
     TREE_WALK_QUEUE_BYTES,
     TREE_QUEUE_ROW_FIXED_BYTES,
     0,
+    "[]",
   )) {
     throwTraversalError(row, "tree diff traversal");
     const path = expectText(row.path, "tree diff path");

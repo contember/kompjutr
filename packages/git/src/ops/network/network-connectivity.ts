@@ -3,12 +3,12 @@ import type { ObjectType } from "../../common/objects.js";
 import { MAX_PROMISED_BLOB_LOOKUP_OIDS } from "../../store/fetch/promisor.js";
 import { MAX_BLOB_BATCH_OIDS } from "../../store/objects/objects.js";
 import { readCommitGraph } from "../../store/trees/commits.js";
+import { CHECKED_TREE_CACHE_SIZE } from "../../store/trees/tree-walk.js";
 import type { Repository } from "../repository/repository.js";
 import { parseAuthenticatedTag, TAG_PEEL_HOPS } from "./network-tags.js";
 
 const OBJECT_PAGE = 512;
 const METADATA_PAGE = Math.min(MAX_BLOB_BATCH_OIDS, MAX_PROMISED_BLOB_LOOKUP_OIDS);
-const TREE_CACHE = 128;
 const TAG_BATCH_BYTES = 4 * 1024 * 1024;
 
 interface RequiredObject {
@@ -50,12 +50,23 @@ export function validateFetchedConnectivity(
   };
   const tree = (oid: string): void => {
     if (checkedTrees.has(oid)) return;
-    for (const entry of repo.store.walkTreeDiffObjects(null, oid)) require(entry);
-    if (checkedTrees.size === TREE_CACHE) {
-      const oldest = checkedTrees.values().next();
-      if (!oldest.done) checkedTrees.delete(oldest.value);
+    const candidates = new Set<string>();
+    for (const entry of repo.store.walkTreeDiffObjects(null, oid, checkedTrees)) {
+      require(entry);
+      if (entry.type === "tree" && candidates.size < CHECKED_TREE_CACHE_SIZE) {
+        candidates.add(entry.oid);
+      }
     }
-    checkedTrees.add(oid);
+    // Admission requires both the complete walk and its final partial metadata batch.
+    if (required.length > 0) flush();
+    for (const candidate of candidates) {
+      if (checkedTrees.has(candidate)) continue;
+      if (checkedTrees.size === CHECKED_TREE_CACHE_SIZE) {
+        const oldest = checkedTrees.values().next();
+        if (!oldest.done) checkedTrees.delete(oldest.value);
+      }
+      checkedTrees.add(candidate);
+    }
   };
   try {
     for (let start = 0; start < roots.length; start += OBJECT_PAGE) {
