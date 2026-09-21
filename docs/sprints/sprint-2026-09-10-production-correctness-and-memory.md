@@ -373,6 +373,151 @@ The accepted ownership decision is [ADR-0022](../decisions/0022-stage-pack-commi
   baseline test hook from review notes. **User approval:** granted 2026-09-11,
   including sequential implementation/review agents and per-unit verified commits.
 
+### WU3 integration contract — draft 2026-09-11
+
+The user approved the batched affected-graph approach as the design basis.
+This exact schema and lifecycle proposal awaits independent step review and
+user approval. Prototype evidence is recorded in the run log; it does not
+establish production cost or maintenance restart semantics.
+
+**Source invariant.** Traverse canonical `git_pack_objects` directly, with a new
+partial reverse index `(repo_id, base_oid, oid) WHERE base_oid IS NOT NULL`.
+Do not add a second canonical graph projection. A visible complete packed source
+wins during dependency traversal; a loose object is a terminal only without that
+packed source. Pending packs and promises cannot supply published dependencies.
+Every visible chain must terminate, preserve object type, and have at most
+50,000 delta edges. A full object has depth zero. Existing ordinary loose-shadowing
+and physical OFS offset resolution retain their separate meanings.
+Both forward and reverse traversal must join canonical owners to complete pack
+metadata. Never choose arbitrary physical fallback entries during validation;
+the existing deterministic surviving pack/offset policy owns fallback selection.
+
+**Proposed transaction-local storage.** Add an operation owner
+`git_pack_graph_operations(repo_id, op_id)` with a composite primary key and
+repository cascade. An internally allocated unique token identifies each nested
+operation. Three child tables reference that owner with cascading deletion:
+
+| Table | Payload beyond owner | Keys / indexes |
+|---|---|---|
+| `git_pack_graph_affected` | `oid`, `pending`, `cursor` | owner + OID PK; owner + pending + OID index |
+| `git_pack_graph_memo` | `oid`, `depth`, `type` | owner + OID PK |
+| `git_pack_graph_path` | `oid`, `position` | owner + OID PK; unique owner + position |
+
+Use existing OID/type constraints, 0/1 pending state, empty-or-OID cursors, and
+nonnegative safe integer depths/positions. Create and remove owner-scoped state
+inside the existing `transactionSync()`; successful admission leaves no rows,
+and rollback restores the previous candidate and scratch state. Never clear
+another operation's rows. This bounds live JavaScript metadata, not total SQL
+scratch storage: storage grows with affected nodes and visited suffixes.
+
+**Execution.** Adapt the reviewed prototype's internally bounded 256-row reverse
+lanes, forward pages, batched writes, exact depth memo, and indexed disjoint path
+unwind. Scope every seek by repository and operation. Within-page cycle state
+stays page-sized; cross-page path membership lives in SQLite. Measure production
+visibility joins and query plans rather than assuming identical prototype cost.
+The statement target remains report-only.
+
+**Candidate boundaries.** Seed canonical OIDs becoming visible at pack
+publication. The deletion seam must cover ordinary complete deletion,
+`discardOwnedComplete`, `discardPending`, and automatic reclamation/reservation
+cleanup. Pending canonical rows can suppress complete physical fallbacks;
+deleting such rows can expose a new dependency even though pending sources are
+excluded from reads. Within the deletion transaction:
+
+1. Capture all old canonical OIDs owned by the entire deletion batch, including
+   pending-owned rows and removed sources without fallback.
+2. Promote all fallbacks, excluding the entire deletion batch.
+3. Preserve `authenticateLooseDeltaBases` before each storage removal, while
+   doomed canonical metadata still exists. Its surviving physical/pending
+   consumers are not covered by canonical graph validation.
+4. Validate the final graph once, after all requested storage removals. Surviving
+   reverse dependents must reject a missing terminal. Delete scratch and commit.
+
+Replace only the promotion-only termination check. Do not validate intermediate
+deletion states or move physical authentication after its evidence is deleted.
+No new graph hooks are needed for loose insertion (adds terminals, not edges),
+repack loose removal (existing checks require complete canonical replacements),
+or loose sweep (physical/pending dependencies already pin needed terminals).
+Redundant-pack removal during repack reaches the same validated deletion seam.
+Repository deletion removes the entire graph through ownership.
+
+**Publication order.** Final commit-staging flush remains outside publication.
+Inside its existing transaction: verify lease, mark complete, audit membership,
+validate the candidate graph, promote commit projections, clear admission scratch,
+invoke publication callback, release lease. Failure must roll back visibility,
+projections, and source changes together. Preserve existing error conventions,
+reentry behavior, and cache invalidation. The valid-prior-graph premise starts
+with the empty fresh schema and must be maintained by every relevant writer;
+there is no migration or ordinary read-time validation pass.
+Clear the operation owner before invoking the callback; never reuse an outer
+memo after callback mutation. Supported nested source mutations validate through
+their own owner against a valid graph. Preserve synchronous callback checks and
+existing lease/pool cleanup. Publication uses existing invalid-pack errors;
+deletion that would break surviving dependencies returns `EBUSY`.
+
+**Depth test seam.** Pass the existing bounded `maxDeltaDepth` option to admission
+as well as reads; production remains 50,000 edges. Reduced-limit fixtures start
+with fresh repositories and keep the same limit across handles. Reopening an
+existing database with a smaller test limit does not establish the valid-prior
+premise at that limit. Split ingest rejection from later cold-read assertions;
+the current combined rejecting promise is not a pre-publication witness.
+Keep actual 50,000/50,001-edge tests in addition to reduced-limit tests.
+
+**Size contract.** Remove the modeled 256-byte wrapper charge. Retain the shared
+48 MiB logical base + inflated instructions + target bound because cold decoding
+materializes instructions. Separately retain the real chunk-allocation guard;
+do not replace allocation constraints with a new aggregate accounting currency.
+Require immediate/deferred, OFS/REF, streamed, and external-base witnesses around
+exact logical and chunk-rounding boundaries.
+
+**WU3 implementation territory and witnesses.** One implementer owns new
+`packages/git/src/store/pack/graph/` helpers and
+`schema/schema-pack-graph-statements.ts`, schema assembly/inventory updates,
+`pack/packs.ts`, `pack/ingest.ts`, `pack/shared-delta.ts`, and
+`pack/lifecycle/` wiring. Any additional production file requires a reported
+reason before editing. Preserve generic read behavior and WU1/WU2 fixes.
+Add `tests/pack-cold-admission.test.ts`; adapt existing pack, concurrency, schema,
+and physical-membership witnesses only where this contract requires it.
+Tests must cover the pending-shadow reclaim cycle, publication substitutions,
+final-batch repair and deletion ordering, physical/pending base protection,
+nested callbacks, failure rollback, exact depth, logical-size and chunk bounds,
+and cold reopen. Produce baseline failures through real pack ingestion, not
+fabricated stored rows. Native Git remains the byte/format oracle; the local
+depth ceiling has separate explicit assertions.
+
+Focused command: `cpu-lease run -n 4 -- npx vitest run --maxWorkers=2
+tests/pack-cold-admission.test.ts tests/pack.test.ts
+tests/pack-physical-membership.test.ts tests/pack-projection-publication.test.ts
+tests/concurrency-pack.test.ts tests/concurrency-fetch.test.ts tests/schema.test.ts`.
+Also require the existing maintenance-caller regression gate before the WU3
+commit: `cpu-lease run -n 4 -- npx vitest run --maxWorkers=2
+tests/maintenance-repack.test.ts tests/maintenance-sweep.test.ts
+tests/concurrency-maintenance.test.ts`. This checks WU3 deletion/reclaim callers,
+not WU5's future progress implementation.
+Run routine smoke/typecheck/check and independent implementation review before
+the WU commit. Production statement/internal-work qualification remains required
+by the sprint; the prototype is not a substitute. Preserve WU4/WU5 before-memory
+fixtures before changing their lifetime paths.
+
+**Step review.** `ses_f6eb754c6ffevaAs2qUj5AoOlB` found three contract gaps:
+pending reclaim can change the effective graph; physical authentication must
+precede storage removal even when graph validation follows the whole batch;
+and admission must explicitly share the reduced depth test seam. This revision
+addresses all three and removes unnecessary loose-write/sweep hooks. Re-review
+approved the contract for the user gate after adding the three existing
+maintenance-caller suites above. No algorithm, schema, lifecycle, or territory
+blockers remain. User approval of this exact integration contract is pending.
+
+**WU5 remains a separate design gate.** Transaction-local validation does not
+establish resumable maintenance. A later read-progress owner may share narrow
+canonical decoding and bounded traversal helpers, but requires explicit snapshot,
+nested-read, and cleanup semantics after WU4 settles payload lifetime. Durable
+maintenance memo/path/progress must be run-owned and reset when its source
+assumptions change. Source changes without ref changes and maintenance-owned
+repack/fallback transitions need an explicit invalidation/settlement rule before
+that schema is approved. Do not infer it from the prototype or reuse admission
+rows across transactions.
+
 | Order | Work | Dependency / ownership |
 |---|---|---|
 | 0 | Approve plan; establish WU8 baseline fixtures | Clean independent plan review before implementation; memory baselines precede fixes |
@@ -466,6 +611,160 @@ only follow-ups need direct inspection unless they change a contract or claim.
   that selection against the adopted WU6 design before implementation.
 
 ## Run log
+
+- 2026-09-21: Committed checked-subtree optimization as `3be3828`. Production
+  correctness review and required focused/routine checks passed as recorded
+  below. Performance evidence supports the shared-history improvement; broad
+  clone remains storage-confounded. WU3–WU8 and staging-index/promotion proposals
+  remain open; this optimization does not close those units.
+
+- 2026-09-21: Checked-subtree optimization is ready to commit after the approved
+  implementation, corrected input-bound review, leader tests, and performance
+  qualification. The later broad-clone investigation changes the interpretation
+  of the earlier observed regressions: storage I/O confounds throughput, and a
+  cache-code-caused regression is not established. Four same-path ABBA runs
+  include unchanged-baseline variation of almost three seconds; 42 of 45 COMMITs
+  precede connectivity traversal. Write bytes, SQL/row counts, PRAGMAs, and
+  file-size sequences agree. Two traced runs attribute essentially the whole
+  final-COMMIT difference to database fsync latency. All six diagnostic operations
+  pass full native oracles. This does not exclude a smaller code effect and is
+  not a regression-free or Worker-memory claim. No speculative SQL specialization
+  or durability change was made. See ignored artifacts
+  `bench/results/subtree-cache-transaction-2026-09-21/` and the preceding
+  `subtree-cache-no-hit-2026-09-21/` investigation.
+- 2026-09-21: Independent measurement review
+  `ses_f3c9c9451ffe3WTFRipTgTvM1n` approved reconstructed sample identities,
+  boundaries, raw arithmetic, and native verification. Its report-regeneration
+  finding is resolved by preserving interpretation separately in
+  `bench/results/subtree-cache-2026-09-21/REVIEW.md`. Shared-history gains are
+  supported by the new experiment; broad-clone throughput remains inconclusive
+  under shared-storage noise. The cache does not address staging free pages,
+  WU3 admission, or WU4–WU6 lifetime work.
+
+- 2026-09-21: User approved fresh paired benchmark reconstruction after temporary
+  artifact loss. New inputs/harness/raw results are preserved under ignored
+  `bench/results/subtree-cache-2026-09-21/`; these are not the previous frozen
+  workload. Three alternating pairs per workflow (24 measured operations) passed
+  native-Git-derived oracles. The frozen cache patch includes the examined-input
+  fix. Reported history clone/fetch medians fell 109.53→5.39 s and 101.15→1.18 s;
+  corresponding transient process RSS medians fell 309.36→155.26 MiB and
+  234.39→24.85 MiB. Broad clone instead rose 11.18→12.60 s with identical
+  statement/returned-row counts, slower in all three pairs. Broad fetch ranges
+  overlap. These are local Node results, not Worker memory compliance.
+- 2026-09-21: Independent audit of the reconstructed measurement is running.
+  Do not commit the cache optimization as regression-free: investigate and
+  remove unnecessary empty/no-hit cache overhead first, preserving the approved
+  connectivity and queue contracts. Separate tuning artifacts must retain the
+  original benchmark and frozen identities for comparison.
+
+- 2026-09-21: Checked-subtree implementation passed independent review after
+  fixing examined-input accounting (128 invalid-length entries must not permit
+  a later valid certificate). Reviewer `ses_f3cbcdf0bffelci4tbItMu0kD8` approved
+  the correction. Leader observed the new witness fail before the fix, then
+  46 tree/network tests pass afterward. Before that boundary-only fix the
+  six-file fetch gate passed 111 tests and smoke passed 159. Final typecheck,
+  formatter, and repository check passed. Changes remain uncommitted pending
+  performance qualification.
+- 2026-09-21: Performance qualification is blocked: the previous
+  `/tmp/opencode/kompjutr-sprint-perf/` now contains no regular files. Frozen
+  inputs, harness, oracle and raw measurements cannot be recovered there.
+  Earlier recorded measurements remain historical reports, not currently
+  reproducible artifacts. New qualification performed zero measured runs.
+  A snapshot and missing-artifact inventory were saved in
+  `/tmp/opencode/kompjutr-subtree-cache-perf/`; that snapshot precedes the small
+  examined-input review fix. Restore the old artifacts or obtain user approval
+  to reconstruct fresh paired workloads; never present reconstructed bytes as
+  the original frozen inputs or compare new timing directly with old samples.
+
+- 2026-09-21: User explicitly approved a 128-entry, invocation-local checked
+  subtree cache for fetch connectivity. Independent design review
+  `ses_f6dd78fbdffe69wR8XIdXU6g4N` established the stable-transaction OID contract.
+  Admit bounded candidate trees only after the whole walk and final metadata
+  flush succeed; prune recursive descendants, not just emitted rows. Preserve
+  checked-directory validation and unchanged one-sided limits for actual
+  expansion. Eviction retraverses rather than refuses work. Generic two-sided
+  diff stays unchanged. One implementation agent owns the four existing
+  connectivity/store-walk files plus tree-diff/network-integrity witnesses;
+  independent review and same-workload performance measurement follow.
+- 2026-09-21: Staging diagnostics narrow the earlier RSS interpretation: paired
+  traced fetches have approximately equal total V8 allocation and post-GC live
+  heap (~46.3 MiB). High/low modes track nursery growth timing; both revisions
+  exhibit both modes. Allocation profiles attribute ~98.7% to existing
+  connectivity traversal. This argues against 42 MiB additional live WU1 data,
+  but does not explain earlier uninstrumented mode frequencies or clear the
+  product-memory gate. Existing-index staging SQL and paged promotion remain
+  separate unimplemented proposals; user selected the subtree-cache work first.
+
+- 2026-09-11: User redirected the next work toward performance and memory
+  optimization. Diagnose WU1 staging allocation/physical-membership query costs
+  and, independently, the 3,001 repeated tree walks in the measured small history
+  fetch. Use isolated diagnostics and the frozen product workloads. Preserve
+  publication/connectivity invariants; prefer verified local optimizations and
+  obtain approval before schema or data-flow changes. WU3 implementation waits
+  while this user-requested performance work proceeds.
+
+- 2026-09-11: Product performance comparison completed: 50 primary samples
+  (`7b958e0` versus `ea75af3`) plus 15 WU1 attribution samples (`187b9dd`).
+  All 60 successful public clone/fetch operations passed native-Git-derived
+  object/ref/checkout verification; five baseline duplicate-tree rejections were
+  expected. Fixed native HTTP responses, cold-open file-backed WAL databases,
+  alternating/rotating sample order and enforced CPU leases were used. Local
+  latency ranges overlap; no stable end-to-end direction is established.
+- 2026-09-11: The performance check is not neutral: the 3,000-commit/2,000-file
+  clone retains 12.5 MiB more checkpointed database space (85.09375 versus
+  97.59375 MiB), including 3,204 reusable free pages after staging deletion.
+  Next.js small-fetch transient RSS medians were 68.855 versus 111.570 MiB;
+  separate baseline/WU1/shipped attribution medians were 70.156/114.141/111.840
+  MiB. Overlapping five-sample distributions associate the shift with WU1 but
+  do not establish significance, retained allocations, or GC causality. RSS
+  includes the local process/server/instrumentation, not a Worker isolate.
+- 2026-09-11: Independent measurement review
+  `ses_f6df1469cffeklA6Do0UnGg25S` cross-checked all 65 raw records, manifest hashes,
+  arithmetic, sample boundaries, and lease consistency. No material methodology
+  defect requires rerunning. SQL evidence counts returned rows, not native rows
+  read; staging EXISTS searches physical membership by repo/pack without OID as
+  an index search term. Internal scan cost is unquantified. The existing history
+  fetch performs 3,001 recursive tree walks in both versions. Artifacts and
+  reproduction are in `/tmp/opencode/kompjutr-sprint-perf/`. No production fix
+  or WU3 implementation was made during this measurement.
+
+- 2026-09-11: User requested a whole-product performance check before continuing
+  WU3. Compare shipped `ea75af3` with baseline `7b958e0` on identical actual
+  clone/fetch inputs, including ordinary history, small incremental fetch into
+  an existing large repository, and duplicate-tree correctness. Measure repeated
+  leased runs, SQL work, reset process HWM, and database growth. Prototype-to-
+  prototype statement reductions do not demonstrate improvement over baseline
+  kompjutr. Isolated measurement is delegated; WU3 implementation remains gated.
+
+- 2026-09-11: User approved isolated affected-graph admission experiments, then
+  the batched approach as the basis for the WU3/WU5 integration design. Exact
+  production schema, lifecycle, and restart contracts still require independent
+  review and user approval before implementation.
+- 2026-09-11: Two metadata-only prototypes established affected reverse closure
+  plus transaction-local forward memoization with fixed 256-row JavaScript
+  pages. Both passed 1,210 independent oracle candidates; the batched version
+  also passed 11 adversarial batching/rollback witnesses. Leader reran both
+  oracle suites. Reviewers `ses_f6ee8a4a1ffe2qDMIZdDHgiYK2` and
+  `ses_f6ec7d15dffet1mjAYWkqZD9L2` approved the isolated evidence. The latter's
+  hard-coded SQLite-version finding was fixed with `sqlite_version()` and
+  verified against the runtime; existing recorded versions were correct.
+- 2026-09-11: Fourteen leased, fresh-process/file-backed cases compared original
+  and batched admission. Accepted depth-50,000 extension fell from 600,404 to
+  1,583 statements; cold forward depth-50,000 fell from 250,216 to 608. Maximum
+  reset-VmHWM increment was 29,892 versus 27,568 KiB. Native SQLite 3.46.1 replay
+  of 28 traces matched query results and final digests but showed 1.25–1.54x more
+  VM steps for the eight N/2N cases. Explicit work remained approximately linear;
+  100k/200k unrelated objects changed neither statements nor replay VM steps.
+  These are single local metadata samples, without a cgroup memory cap, not
+  Worker memory, Node SQLite 3.50.2 native counters, or production rows-read
+  evidence. Two accepted batched cases exceed the 1,000-statement target.
+- 2026-09-11: Reproduction artifacts remain outside the repository at
+  `/tmp/opencode/kompjutr-graph-spike` and
+  `/tmp/opencode/kompjutr-graph-spike-batched` (README, runners, raw results and
+  SQLite fixtures). The approach assumes a valid prior graph, complete changed
+  source enumeration, and stable source choice. Production physical selection,
+  payload admission, maintenance epochs/resumption, and destruction safety were
+  not implemented or qualified. WU3/WU5 remain open.
 
 - 2026-09-11: WU2 passed independent review by `ses_f6f05a905ffeafzone0HZHOnKA`
   with no findings. Leader ran the repeated-tree witness on detached `187b9dd`:
