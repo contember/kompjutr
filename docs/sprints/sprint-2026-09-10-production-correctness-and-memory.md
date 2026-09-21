@@ -419,9 +419,10 @@ The statement target remains report-only.
 **Candidate boundaries.** Seed canonical OIDs becoming visible at pack
 publication. The deletion seam must cover ordinary complete deletion,
 `discardOwnedComplete`, `discardPending`, and automatic reclamation/reservation
-cleanup. Pending canonical rows can suppress complete physical fallbacks;
-deleting such rows can expose a new dependency even though pending sources are
-excluded from reads. Within the deletion transaction:
+cleanup. Supported writers ensure that any complete physical occurrence has a
+complete canonical owner: pending insertion cannot replace an existing owner,
+and membership audit rejects competing publication behind a pending owner.
+Keep pending cleanup in the common validated deletion seam. Within its transaction:
 
 1. Capture all old canonical OIDs owned by the entire deletion batch, including
    pending-owned rows and removed sources without fallback.
@@ -477,8 +478,11 @@ exact logical and chunk-rounding boundaries.
 reason before editing. Preserve generic read behavior and WU1/WU2 fixes.
 Add `tests/pack-cold-admission.test.ts`; adapt existing pack, concurrency, schema,
 and physical-membership witnesses only where this contract requires it.
-Tests must cover the pending-shadow reclaim cycle, publication substitutions,
-final-batch repair and deletion ordering, physical/pending base protection,
+Tests must cover pending ownership blocking competing publication with ESTALE,
+later pending ingestion preserving existing complete ownership, and discard,
+reclaim and reservation cleanup after rejected publication. Cover reachable
+complete-owner fallback cycles, publication substitutions, final-batch repair
+and deletion ordering, physical/pending base protection,
 nested callbacks, failure rollback, exact depth, logical-size and chunk bounds,
 and cold reopen. Produce baseline failures through real pack ingestion, not
 fabricated stored rows. Native Git remains the byte/format oracle; the local
@@ -610,7 +614,359 @@ only follow-ups need direct inspection unless they change a contract or claim.
   replay/virtual-base/local test selection is recorded in Test cadence; re-check
   that selection against the adopted WU6 design before implementation.
 
+## WU5 integration contract — draft 2026-09-21
+
+The user selected SQL read scratch plus immediate-edge maintenance discovery.
+Exact snapshot, generation and repack settlement semantics below require review
+and approval before implementation.
+
+### Cold-read scope
+
+- One internal synchronous read scope covers source selection, bounded blob
+  prefix selection, graph discovery and payload consumption. Public packed reads,
+  pending resolution and source authentication all enter it. Do not scope only
+  `PackGraphPager`, because loose/packed metadata selection happens earlier.
+- Owner-qualified SQL rows replace cumulative page descriptors, origin checkpoint
+  sets and reverse replay metadata. Keys include repository and unique read ID;
+  nested reads have distinct owners. Keep existing bounded graph pages and WU4's
+  bounded payload lifetime. No scratch cursor or reference escapes the call.
+- Use `transactionSync()` without reacquiring the public mutation guard, so reads
+  within guarded operations continue to work. On local SQLite this reserves the
+  writer lock even for a cold read. Cleanup deletes only this owner before return.
+  Respect abort-only nested adapters; do not catch a failed transaction and claim
+  the enclosing operation can safely proceed.
+- A durable repository source generation identifies the selected sources. Check
+  generation around external resolver callbacks and before returning. A callback
+  that changes sources causes `ESTALE` and rollback of the read scope, including
+  its nested writes; do not silently retry user callbacks. Revalidate caches on
+  rollback through the existing coordinator. Pure nested reads remain supported.
+  Review must verify this error fits current resolver contracts and enumerate
+  every callback seam; transaction isolation alone is not a reentry guarantee.
+- Keep canonical/pending visibility, supplied seeds, authentication cache bypass,
+  expected types, allowed missing roots and request-prefix ordering per invocation.
+  WU3's complete-graph invariant does not justify dropping checks for pending or
+  authenticated physical reads.
+
+### Maintenance discovery and source drift
+
+- Trust WU3 admission for canonical complete-graph acyclicity, type and depth.
+  Expand only the immediate physical dependency through existing run-owned queue
+  state, rather than checking a complete suffix for each queued OID. Existing
+  physical-only and pending-source protection remains independently enforced.
+- Persist the source generation observed by each run alongside its root epoch.
+  Source changes must invalidate already-expanded dependency assumptions even
+  when roots and promises are unchanged. Generation covers canonical publication,
+  fallback selection/deletion and loose-source availability changes relevant to
+  reads/discovery. Define pending source coverage explicitly at review.
+- Central state decoding, reset, owned-batch settlement and destructive gates
+  compare both identities. On external drift, settle the existing owned repack
+  batch, clear run-owned discovery and restart before further destruction.
+- Maintenance-owned source changes need explicit progress reconciliation, not an
+  unconditional restart after every repack. The proposed rule is to adopt the new
+  generation atomically only for a batch whose replacement introduces no new
+  dependency outside the existing marked closure; otherwise settle and restart.
+  Review must identify the exact existing full-object repack invariant or replace
+  this rule with a concrete bounded reconciliation. No generic exemption for
+  maintenance writes is permitted.
+
+### Remaining review gates
+
+Specify source-generation mutation owners, read-scope entry points, exact scratch
+schema, rollback/cursor behavior on both adapters and the repack reconciliation
+proof before calling this contract implementation-ready. Current root epoch and
+in-memory pack cache counters are insufficient substitutes.
+
+Acceptance includes nested reads, rejected source-changing callbacks, pending
+authentication, local rollback cursor semantics, cold resume after every durable
+maintenance boundary, source-only drift and owned-repack drift without infinite
+restart. Measure descriptor/checkpoint maxima and N/2N dependency work with native
+SQL instrumentation; emitted rows and statement counts alone do not establish
+bounded internal work. Keep WU3 lifecycle and WU4 payload regressions in the gate.
+
+## WU6 integration contract — approved 2026-09-21
+
+The user approved this exact scoped SQL storage contract on 2026-09-21 after
+independent review by `ses_f3ba1e6d7ffeACQblIaRyWZc0c` found no remaining blockers.
+Implementation and behavioral verification remain required.
+
+### Ownership and visibility
+
+- Internal `withIntegrationWorkspaceOwned` owns one repository-qualified,
+  uniquely identified integration workspace. Its creation, use and deletion
+  run inside `transactionSync()` and the existing mutation/scratch coordinator.
+  It never reacquires the public mutation guard. Planners take the capability
+  explicitly and return scoped handles. The callback encloses every consumer,
+  adoption, index/worktree/journal change and final commit/ref publication.
+  Replay reconstruction cannot return a live plan after closing this callback;
+  keep continuation inside it or return detached typed metadata only.
+  A caught nested failure poisons the enclosing scratch transaction; asynchronous
+  callback results fail using the existing synchronous-callback convention.
+- Owner-qualified child tables hold output object metadata/chunks, parsed
+  virtual tree edges, ordered plan/projection records, and path reservations.
+  Foreign keys cascade from the owner and repository. No ordinary object,
+  projection, promise, or maintenance query can see these provisional rows.
+- Store contracts expose typed storage capabilities, not ops classification
+  rules. Store owns descriptor contracts; ops owns their classification. Store
+  reads refine driver values using shared decoders; writes establish invariants.
+- The callback capability is revoked on all exits. No scoped reference can be
+  put into a durable journal, returned public result, cache, or another owner.
+  Nested scopes have distinct owner IDs. Successful cleanup precedes transaction
+  completion; exceptions roll back scratch and application together.
+  Preserve the outer local recovery boundary: nested rollback does not itself
+  undo disk writes, and a nested failure with disk effects makes it abort-only.
+
+### Storage and API seams
+
+All workspace child keys begin with `(repo_id, workspace_id)` and cascade from
+`git_integration_workspaces`. IDs for plans are allocated within one live owner.
+The workspace never survives successful callback completion.
+
+| Table suffix (prefix `git_integration_`) | Remaining key / stored fields | Traversal/index |
+|---|---|---|
+| `workspaces` | Owner primary key | Repository FK; owner-qualified deletion |
+| `objects` | `oid`; `type`, `size` | Owner/OID point metadata lookup |
+| `object_chunks` | `oid, seq`; `data` | Object FK; ordered chunk traversal |
+| `tree_entries` | `tree_oid, ordinal`; `name`, `mode`, `child_oid` | Object FK; unique owner/tree/name; tree-order traversal |
+| `plans` | `plan_id`; `kind`, `source_rows`, `entry_count` | Owner/plan header |
+| `plan_entries` | `plan_id, path`; typed descriptor JSON | Plan FK; BINARY path keyset; no embedded payload bytes |
+| `reservations` | `plan_id, family, path`; typed ownership/collision metadata | Plan FK; exact/prefix membership and BINARY traversal |
+| `touched` | `plan_id, ordinal`; `path`, `logical_path`, `purpose`, typed snapshot fields | Plan FK; unique plan/path; ordinal keyset |
+
+The concrete descriptor discriminated unions and codecs belong to the store's
+integration-workspace contract and are imported by ops; they must not be an
+unstructured JSON container. Ops retains classification and projection behavior.
+Descriptor writes parse once at this boundary. Stored rows use shared shape
+decoders, without read-time reauthentication. `kind` distinguishes structural,
+resolved and projected plans so the handle returns the corresponding concrete
+record type, not unchecked casts. Scratch objects permit only blob/tree types.
+
+`withIntegrationWorkspaceOwned(store, body)` passes a revocable capability with
+typed plan writers, repeatable plan traversal, reservation/touched storage, scoped
+object writes and the narrow integration source reader. Entry points
+`planIntegration`, `planVirtualAncestorIntegration` and `planReplay` receive that
+capability explicitly. A plan handle contains its scoped identity and scalar
+counts and exposes repeatable ordered traversal; it has no retained entry array.
+All handles and cursors check that their owner is active. Drain/close cursors
+before cleanup; no lazy reader escapes the callback.
+
+Source reads expose `objectInfo`, bounded-prefix `readBlobs` and ordered tree
+traversal for ordinary or explicitly scoped tree identities. A workspace object
+can resolve only within its owner; ordinary sources remain the fallback for OIDs
+not produced there. Adoption walks published references while the workspace is
+live and uses existing ordinary object writers, including normal projections.
+It does not adopt every temporary object indiscriminately.
+
+Operations-store internal consumers use `readOperationHeader`,
+`iterateOperationTouched` and streamed touched-write/replace capabilities. Existing
+public APIs that explicitly return complete operation state may materialize that
+mandatory result, but internal application, validation, continuation and abort
+must not call those materializing readers. Remove the implicit 1,000-row refusal
+from public journal decoding too; an operation accepted with 1,001 paths must
+remain readable after reopen.
+
+### Bounded planning and repeat traversal
+
+- Classify three ordered tree streams into SQL-backed descriptors. Replace
+  whole-plan arrays, global payload-use maps, path reservation sets and sorted
+  output arrays with replayable keyset pages and indexed path membership. Use
+  fixed 256-record metadata batches and SQLite `BINARY` path order, preserving
+  `comparePaths` at JavaScript merge boundaries.
+- Load candidate inputs in bounded-prefix blob batches. A fixed reusable cache
+  may reread evicted shared identities; last-use counts must not pin all inputs.
+  Retain only the active candidate inputs, the fixed read window/cache, and its
+  output. Write generated bytes to scratch immediately and release them before
+  advancing. Reuse existing object chunk sizes and object/hash codecs.
+- Plans carry object identities and scoped content references rather than
+  `Uint8Array`s. Repeated descriptor traversal does not repeat text merging.
+  Projection uses streaming lookahead for file/directory groups and SQL-backed
+  reservations/collision membership. Materialize sorted projected descriptors
+  into the same workspace for repeat application and journal validation.
+- Preserve existing text/object limits and caller validation. Do not introduce
+  an aggregate payload admission cap. Replace the 1,000-entry materialization
+  ceiling throughout planning, touched-path expansion, journal writing/reading,
+  reconstruction and application with paged ownership. Do not merely raise it.
+  Audit every remaining count/byte cap against its actual protected resource;
+  changing an unrelated API limit requires a separate decision.
+
+### Journal and caller-limit contracts
+
+- Add metadata-only operation header/cursor reads and repeatable keyset touched
+  traversal by `(checkout_id, ordinal)`. Keep `touched_count` in the header;
+  neither `readRebaseCursor` nor ownership reconstruction materializes all rows.
+- Write, validate, replace and restore touched records through iterables/pages.
+  Snapshot drafts and touched membership belong to workspace SQL, including
+  ancestors and relocations. Preserve current first-insertion ownership in
+  canonical projected path order; explicit and ancestor collisions must not
+  silently replace their original logical path/purpose.
+- Bound transport pages by both 256 records and the existing `jsonPages` byte
+  policy. A long valid path must not cause an arbitrary component limit or a
+  whole-operation allocation. Apply the same paging to abort and restoration.
+- `ReplaySnapshotResult.conflicts` and required conflict-message strings are
+  detached mandatory output. The separate whole-plan conflict-kind lookup map
+  is not: replace it with ordered traversal or a workspace join.
+
+| Limit | Proposed default | Explicit caller contract |
+|---|---|---|
+| `maxSourceRows` | Existing 200,000 | Preserve safe integers 0–200,000 and existing failure behavior |
+| `maxEntries` | No implicit 1,000-entry materialization refusal | Preserve currently accepted explicit safe integers 0–1,000, counting logical plan entries rather than SQL pages |
+| `maxStructureBytes` | Absent | Preserve explicit nonnegative safe-integer limit and existing accounting semantics |
+| `maxPlanBytes` | Absent | Preserve explicit nonnegative safe-integer limit, including content length and current logical entry/path accounting; do not count only descriptor storage |
+| Text/object limits | Unchanged | Preserve current validation, output limits and error semantics |
+
+The retained explicit byte options are caller-requested ceilings, not evidence
+of actual RSS. They do not become default admission ledgers. Removing their
+existing modeled accounting would be a separate contract change.
+
+### Virtual sources and application
+
+- Introduce an explicit integration source capability for object metadata,
+  bounded blob reads and parsed tree traversal. It composes the ordinary repository with this workspace's
+  virtual sources. Ordinary repository reads remain unchanged; no ambient
+  current-owner lookup or temporary ordinary-object publication is permitted.
+- Virtual tree construction writes scratch objects and parsed edges. Selection
+  and integration consume those scoped sources, including validation followed
+  by materialization. Preserve the existing virtual-base recursion bound and
+  Git identities, labels and conflict rules. Return a tree identity/source;
+  do not add a virtual commit reader. Reject unsupported additional synthesis
+  before a synthetic commit can reach ordinary graph lookup. Preserve the
+  single-synthesis acceptance boundary; review the error precedence explicitly.
+- Applying consumers explicitly adopt generated objects into the ordinary store
+  only within their existing publication transaction. Stream adoption and
+  `writeFiles` batches; do not rebuild a whole-operation inline payload array.
+  Adopt every scratch-backed OID published into index stages 0–3 and every
+  scratch-backed dependency reachable from a published tree/commit, before
+  publishing those consumers. This includes a virtual-base blob becoming the
+  final conflict's stage-1 identity. Promise fulfillment happens only at ordinary
+  publication.
+- Adopted output has normal index/tree/commit roots. Do not add a generated
+  worktree-only conflict root family: continuation reconstructs ownership and
+  commits the resolved index; abort uses saved pre-operation roots. Worktree-only
+  generated bytes can be copied directly from scratch without ordinary adoption.
+- No provisional virtual object needs to survive callback exit unless explicitly
+  adopted into a published result. Cold journal reconstruction builds a new
+  workspace and must leave no ordinary virtual object behind.
+
+### Consumer ownership matrix
+
+| Consumer | Scope / traversal | Publication and disposal |
+|---|---|---|
+| Merge | Base synthesis, plan, both collision projections, validation and apply share one scope | Adopt in existing object/index/worktree/journal/ref transaction; discard on compatibility rejection or failure |
+| Cherry-pick / revert | Replay planning through final application | Adopt on application; empty and error paths discard |
+| Rebase applying step | One workspace per existing step transaction | Adopt index/tree dependencies before step publication; existing roots retain them; skipped/empty steps discard |
+| Replay/rebase ownership reconstruction | Scope includes every consumer of the reconstructed plan | Validation only; no adoption; dispose after comparison, including failure |
+| Merge-journal reconstruction | Includes recursive base synthesis and repeated projection | Validation only; neither outputs nor virtual objects become ordinary objects |
+| Snapshot replay | Plan through conflict enumeration or clean tree publication | Conflict-only return discards; clean result adopts inside the transient-index/tree transaction |
+| Recursive virtual base | Identity validation, tree construction and enclosing integration remain in the parent scope | Provisional source survives both traversals; only published dependencies are adopted |
+
+### Review and measurement gates
+
+Review must settle exact workspace table/API ownership, journal paging and public
+result boundaries, virtual source breadth, and operation-root invalidation before
+this contract is approved. Fixed pages must cover ancestors/relocations and long
+valid paths, not just changed leaves. Public result arrays, if required by an
+existing API, must be identified as mandatory output rather than hidden scratch.
+
+Freeze public 75/150 binary-conflict fixtures and generated-text fixtures before
+implementation. Acceptance retains all WU6 parity and fault gates, including
+1,001-path merge/rebase, distant shared-input reuse, validation-only object counts,
+snapshot conflict returns, repeated virtual traversals, revoke/nested-failure
+checks, maintenance during suspended conflicts, cold continue and abort. Measure
+active input/output, copies and caches separately; unchanged per-object limits
+do not imply that every legal single candidate fits the 100 MiB target.
+
 ## Run log
+
+- 2026-09-21: WU3 landed as `491189b`; design rationale →
+  [ADR-0023](../decisions/0023-validate-canonical-pack-dependencies-at-source-changes.md).
+  The independently approved source-less starting-root filter reduces the actual
+  reclaim witness from 1,185 to 673 statements, preserving all 65,536 reverse
+  seeds and the unchanged <1,000 alarm. Leader passed the seven-file 108-test
+  focused gate, typecheck and scoped Biome; smoke passed 160 tests in the working
+  tree (including one concurrent WU6 journal witness). Implementer passed 53
+  relevant pack and 51 maintenance-caller tests. Global Biome currently reports
+  formatting only in active WU6 edits. Native internal-work qualification remains
+  with WU8; emitted counters do not establish it. WU1–WU4 implementation is now
+  complete. Leader then assembled the eight approved WU6 workspace tables and
+  schema inventories; all 25 schema tests pass, unblocking runtime integration.
+
+- 2026-09-21: WU3 implementation reviewer `ses_f3b7f4ee6ffeyZNT5U9Ud8e6o6`
+  found no production correctness defects and passed three independent
+  concurrency witnesses. User approved correcting the unreachable pending-shadow
+  cycle acceptance: supported insertion, membership audit and complete-only
+  fallback promotion preserve a complete canonical owner for every complete
+  physical occurrence. The contract now requires direct witnesses of these
+  invariants, all pending cleanup routes, and reachable complete fallback cycles.
+  Common pending graph validation is retained. The 1,185-statement cost alarm
+  still blocks closure pending production cost diagnosis/disposition.
+
+- 2026-09-21: Independent WU6 re-review approved the exact workspace, adoption,
+  virtual-source, journal and limit contracts with no remaining blockers. User
+  explicitly approved implementation. Preserve E2BIG for unsupported additional
+  virtual synthesis, and keep every replay-plan consumer inside its owning scope.
+  Implementation must coordinate shared schema assembly with the active WU3
+  owner rather than editing the same seam concurrently.
+
+- 2026-09-21: WU6 frozen public-merge baseline at `dd0005c` completed under
+  enforcing two-vCPU leases and zero-swap 512 MiB cgroups. Binary 75/150 distinct
+  1 MiB conflicts add 153.77/287.29 MiB process HWM; both miss the target. The
+  150-file case records 1,657 cgroup memory-max events but no OOM/kill, so its
+  11.76 s includes reclaim pressure. Native byte/mode/stage/HEAD oracles pass.
+  Clean text 32/64 cases add 34.82/38.62 MiB; marker cases add 32.95/40.53 MiB.
+  A 1,001-path public merge fails with expected E2BIG and preserves initial state.
+  All packs use full objects, isolating these fixtures from WU4 delta retention.
+  Published-object counts remain 102→102 in separate planning witnesses and
+  134→134 in journal validation; these do not qualify every virtual consumer.
+  Source audit covers all 927 archived files. Scripts, fixtures, raw results and
+  limitations live in ignored `bench/results/integration-baseline-2026-09-21/`.
+  These are single-sample public-operation measurements, not planner-only
+  attribution, stable timing estimates or completion of WU6.
+
+- 2026-09-21: WU4 landed as `2af7f69`. Reviewer
+  `ses_f3b9c2ae4ffe7EMpZrTEglvngP` approved payload lifetime and external windows,
+  and verified frozen source/harness identities. Leader passed 55 lifetime/prefix/
+  client tests, 159 smoke tests, typecheck and scoped Biome. Repository-wide
+  Biome currently reports only formatting in concurrently edited WU3 files;
+  those remain with their implementer. Four behavioral negative controls fail
+  against the old resolver. Scalar sixteen-edge added peak changes from 136.41
+  to 88.20 MiB in single-sample Node observations, with 17 inflations and unchanged
+  SQL counts. This is not a robust RSS ceiling or Worker-isolate qualification.
+  Reproducible evidence is in ignored `bench/results/packed-read-after-2026-09-21/`.
+- 2026-09-21: WU5 design reviewer `ses_f3b9e4d73ffeICHWBEUjLSPyn1` withheld
+  approval pending exact generation owners, maintenance self-drift reconciliation
+  for every finalization/sweep path, read callback/error scope, coordinator/cache
+  settlement and scratch keys/indexes. Packed-first physical dependency selection
+  must remain distinct from loose-first logical reads. Implementation stays gated.
+
+- 2026-09-21: WU6 design reviewer `ses_f3ba1e6d7ffeACQblIaRyWZc0c` withheld
+  approval pending exact APIs, journal paging, limit semantics and virtual-source
+  ownership. Draft corrections now name the owned callback extent, local outer
+  recovery boundary, metadata-aware virtual source and adoption of all published
+  index stages. Removed the proposed extra conflict-output root family: no
+  consumer requires worktree-only generated blobs after scratch disposal.
+  Journal schema/API and explicit limit policy remain unresolved; implementation
+  stays gated and the revised contract needs another independent review.
+
+- 2026-09-21: User selected WU5's direction for detailed design/review: scoped
+  SQL cold-read metadata and immediate-edge maintenance expansion trusting WU3's
+  admitted canonical graph. This does not yet approve read snapshot/reentry or
+  durable source-generation semantics. Local read scratch would acquire the
+  adapter's writer reservation; root epoch alone misses source replacements.
+  Physical/pending-base protection remains independent of canonical admission.
+
+- 2026-09-21: Reconstructed WU3 traversal passed 1,500 oracle mutation batches,
+  actual depth boundaries, and unrelated-source isolation. Independent reviewer
+  `ses_f3ba87822ffeUNR4fd9C900wbL` approved after 176 additional admissions,
+  including forward concatenation and cross-root active-path reuse. Integration
+  is now proceeding against the approved lifecycle contract. The 256-record
+  recursive limit bounds admitted records/live queue, not all speculative record
+  construction or native VM work. Production must retain synchronous callback
+  checks absent from the prototype adapter. Lifecycle wiring and native internal
+  work remain separate qualification gates.
+- 2026-09-21: User selected operation-scoped SQL output storage as the WU6 design
+  direction over deterministic recomputation. This approves preparation of the
+  exact contract and independent review, not implementation of unresolved
+  virtual-source or durable-root seams. Frozen public-integration memory
+  baselines are being prepared before production changes.
 
 - 2026-09-21: Pager join-order prerequisite is verified. Seven inner joins now
   explicitly preserve frontier/reachable → canonical OID → visible-pack order;
