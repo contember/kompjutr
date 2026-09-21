@@ -186,6 +186,13 @@ input-consumption checks; stored-entry reads remain incremental. The ingest
 push boundary and complete-input decoder wrap failures as `ECORRUPT`, with reader
 access outside those catches. Incremental stored-entry error handling is separate.
 
+Packed resolution retains the active decoded chain value, requested outputs and
+the bounded object cache. It releases other decoded intermediates as the chain
+advances. Shared intermediates outside the cache can be inflated again. External
+base payloads load in 4 MiB windows, allowing one larger base for progress; each
+new window releases the previous one. Discovery-time cache entries evicted before
+consumption are loaded again from their stored source.
+
 `git_pack_entries` authenticates every physical entry of each pack, including
 duplicate OIDs. `git_pack_objects` remains the single canonical read location
 for each OID. Pack tree projection batches deduplicate exact repository/pack/OID

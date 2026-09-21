@@ -14,8 +14,6 @@ import {
   checkedPackBytes,
   type ExternalBatchResolver,
   type ExternalMetadataResolver,
-  type ExternalObjectMetadata,
-  isObjectType,
   isPackGraphLimit,
   MAX_PACK_BLOB_GRAPH_ENTRIES,
   MAX_PACK_BLOB_INPUTS,
@@ -27,6 +25,7 @@ import {
   validateDeltaWorkingSet,
 } from "../shared.js";
 import type { PackDataReader } from "./read-data.js";
+import { PackExternalWindow } from "./read-external.js";
 import { PackGraphPager } from "./read-graph.js";
 
 const INVALID_ENTRY = "packed blob index contains invalid metadata";
@@ -340,40 +339,18 @@ export class PackObjectResolver {
       }
     }
 
-    const externalMetadata = new Map<string, ExternalObjectMetadata>();
-    if (externalOids.size > 0) {
-      const resolvedMetadata = this.externalMetadata([...externalOids]);
-      for (const oid of externalOids) {
-        const object = resolvedMetadata.get(oid);
-        if (object === undefined) continue;
-        if (!isObjectType(object.type) || !Number.isSafeInteger(object.size) || object.size < 0) {
-          throw new CorruptError("loose base metadata is invalid");
-        }
-        externalMetadata.set(oid, object);
-      }
-    }
-    let external = new Map<string, RawObject>();
-    if (externalMetadata.size > 0) {
-      external = this.externalBatch([...externalMetadata.keys()]);
-    }
-    for (const [oid, object] of external) {
-      const metadata = externalMetadata.get(oid);
-      if (
-        metadata === undefined ||
-        metadata.type !== object.type ||
-        metadata.size !== object.data.length
-      ) {
-        throw new CorruptError("materialized loose base disagrees with its admitted metadata");
-      }
-    }
+    const external = new PackExternalWindow(
+      [...externalOids],
+      this.externalBatch,
+      this.externalMetadata,
+    );
 
     const result = new Map<string, RawObject>();
-    const resolved = new Map<string, RawObject>();
     const inflate = (entry: PackedEntry): Uint8Array =>
       this.data.inflateCompressed(
         entry,
         compressed.get(entry.oid)?.bytes,
-        streamedCompressed.has(entry.oid),
+        !compressed.has(entry.oid),
         bypassCache,
       );
     const materializeBase = (entry: PackedEntry): RawObject => {
@@ -381,13 +358,12 @@ export class PackObjectResolver {
         throw new CorruptError(`pack entry at ${entry.offset} has inconsistent size metadata`);
       }
       const object: RawObject = { type: entry.type, data: inflate(entry) };
-      resolved.set(entry.oid, object);
       if (!bypassCache) this.data.cacheObject(entry.packId, entry.oid, object);
       return object;
     };
     for (const oid of available) {
       const first = entries.get(oid)!;
-      const hit = resolved.get(oid) ?? cachedObject(first);
+      const hit = result.get(oid) ?? cachedObject(first);
       if (hit !== undefined) {
         result.set(oid, hit);
         continue;
@@ -399,7 +375,7 @@ export class PackObjectResolver {
       for (;;) {
         if (seen.has(current.oid)) throw new CorruptError(`cyclic delta chain at ${current.oid}`);
         seen.add(current.oid);
-        object = resolved.get(current.oid);
+        object = result.get(current.oid) ?? cachedObject(current);
         if (object !== undefined) break;
         if (current.baseOid === null) {
           object = materializeBase(current);
@@ -420,31 +396,28 @@ export class PackObjectResolver {
       if (object === undefined) {
         throw new CorruptError(`packed object ${oid} did not resolve a base`);
       }
-      let resolvedObject = object;
       for (let index = chain.length - 1; index >= 0; index--) {
         const entry = chain[index]!;
-        checkDeltaInflateBudget(resolvedObject.data, entry.entrySize);
+        checkDeltaInflateBudget(object.data, entry.entrySize);
         const delta = inflate(entry);
-        const targetSize = validateDeltaWorkingSet(resolvedObject.data, delta, entry.size);
+        const targetSize = validateDeltaWorkingSet(object.data, delta, entry.size);
         const target: RawObject = {
-          type: resolvedObject.type,
-          data: applyDelta(resolvedObject.data, delta),
+          type: object.type,
+          data: applyDelta(object.data, delta),
         };
         if (targetSize !== target.data.length) {
           throw new CorruptError(`pack entry at ${entry.offset} has inconsistent size metadata`);
         }
-        resolvedObject = target;
-        resolved.set(entry.oid, resolvedObject);
-        if (resolvedObject.data.length !== entry.size || resolvedObject.type !== entry.type) {
+        object = target;
+        if (object.data.length !== entry.size || object.type !== entry.type) {
           throw new CorruptError(`pack entry at ${entry.offset} has inconsistent type or size`);
         }
-        if (!bypassCache) this.data.cacheObject(entry.packId, entry.oid, resolvedObject);
+        if (!bypassCache) this.data.cacheObject(entry.packId, entry.oid, object);
       }
-      if (resolvedObject.type !== first.type || resolvedObject.data.length !== first.size) {
+      if (object.type !== first.type || object.data.length !== first.size) {
         throw new CorruptError(`packed object ${oid} has inconsistent type or size`);
       }
-      result.set(oid, resolvedObject);
-      resolved.set(oid, resolvedObject);
+      result.set(oid, object);
     }
     return result;
   }
