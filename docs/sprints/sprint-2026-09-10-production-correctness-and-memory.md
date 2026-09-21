@@ -612,6 +612,29 @@ only follow-ups need direct inspection unless they change a contract or claim.
 
 ## Run log
 
+- 2026-09-21: Applied the one-line staging lookup hint for the existing
+  `git_pack_entries_by_oid` index. All admission predicates, duplicate upsert
+  accounting, and publication ownership remain unchanged. Reviewer
+  `ses_f3c35e262ffeV9IbhqvZ4rhHZD` approved the code. Leader verified 178 focused
+  tests: 52+56 complementary pack groups and 70 publication/concurrency/schema/
+  membership tests; splitting was necessary after full-file Vitest RPC reporting
+  timeouts despite passing assertions. No timeout or assertion changed. Smoke
+  passed 159 tests. Typecheck and lint passed after user-approved exclusion of
+  generated `bench/results` fixture copies from TypeScript and Biome scanning.
+- 2026-09-21: Staging index qualification compared `f25965b` with only that hint,
+  preserving the subtree cache in both versions. Five alternating history-clone
+  pairs gave 6.074→2.658 s medians, all five faster; three broad-clone pairs gave
+  12.027→12.756 s with mixed pair direction and overlapping ranges. Do not claim
+  broad neutrality or memory reduction. Statement/returned-row counts and storage
+  are unchanged. EXPLAIN changes from repo/pack primary-key search to
+  `(repo_id, oid, pack_id)` index search. All 16 native-oracle samples and 18
+  harness selftests passed under one enforcing two-vCPU lease on CPUs 12–13.
+  Measurement reviewer `ses_f3c0d7bd6ffeGRQ2Jrp0tCvWdN` independently approved the
+  identities, raw medians, and input audit. The wrapper's final exit 1 came from
+  adding three analysis-only files after its strict input-list snapshot; all
+  measured scripts/inputs were verified unchanged, and all child commands passed.
+  Evidence: ignored `bench/results/staging-index-2026-09-21/README.md`.
+
 - 2026-09-21: Committed checked-subtree optimization as `3be3828`. Production
   correctness review and required focused/routine checks passed as recorded
   below. Performance evidence supports the shared-history improvement; broad

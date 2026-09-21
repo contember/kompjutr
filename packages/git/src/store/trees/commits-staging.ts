@@ -32,7 +32,7 @@ export function stageCommitCaches(
               json_extract(j.value, '$.s'), json_extract(j.value, '$.b'), ?
          FROM json_each(?) j
         WHERE json_extract(j.value, '$.r') = ? AND EXISTS (
-          SELECT 1 FROM git_pack_entries e
+           SELECT 1 FROM git_pack_entries e INDEXED BY git_pack_entries_by_oid
           JOIN git_pack_meta m ON m.repo_id = e.repo_id AND m.pack_id = e.pack_id
            WHERE e.repo_id = json_extract(j.value, '$.r') AND e.pack_id = ?
              AND e.oid = json_extract(j.value, '$.o') AND e.type = 'commit'
