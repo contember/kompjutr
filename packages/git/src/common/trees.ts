@@ -154,7 +154,8 @@ export class TreeParser {
   *push(chunk: Uint8Array): Generator<ParsedTreeEntry> {
     if (this.#finished) throw new Error("tree parser is already finished");
     try {
-      for (const byte of chunk) {
+      for (let offset = 0; offset < chunk.length; offset++) {
+        const byte = chunk[offset]!;
         this.#observedSize++;
         if (!Number.isSafeInteger(this.#observedSize)) {
           throw new CorruptError("tree object size exceeds the safe integer range");

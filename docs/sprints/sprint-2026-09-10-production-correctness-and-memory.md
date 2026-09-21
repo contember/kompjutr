@@ -612,6 +612,23 @@ only follow-ups need direct inspection unless they change a contract or claim.
 
 ## Run log
 
+- 2026-09-21: Replaced the byte iterator in `TreeParser.push` with bounded
+  indexed traversal, preserving parser state and yields. Independent reviewer
+  `ses_f3bec0bc2ffeZiJnjiCx38T6T9` approved. Leader checks passed: 52 focused
+  tree/parser/physical-pack tests, 159 smoke tests, typecheck, and repository lint.
+  No API, schema, lifetime, or data-flow changes were needed.
+- 2026-09-21: Five alternating live-Smart-HTTP Next.js clone pairs plus a separate
+  sampled-allocation pair qualify the parser change against `e0c34d9`. All 12
+  runs pass native HEAD, clean-status and all 24,252 checkout-blob hash checks;
+  this inherited oracle does not independently cover all reachable objects or
+  all modes/tracking refs. Sampled byte-iterator allocation falls from 54.78 MiB
+  to no samples; total sampled cumulative allocation estimate falls 4.09%.
+  Whole-clone added RSS medians are 235.67 versus 237.15 MiB with nearly identical
+  ranges; no reliable RSS reduction is established. Latency medians are 13.006
+  versus 12.294 s with overlapping ranges. This is an allocation improvement,
+  not closure of the clone memory objective. Artifacts and source/input audits:
+  ignored `bench/results/tree-parser-memory-2026-09-21/REPORT.md`.
+
 - 2026-09-21: Applied the one-line staging lookup hint for the existing
   `git_pack_entries_by_oid` index. All admission predicates, duplicate upsert
   accounting, and publication ownership remain unchanged. Reviewer
