@@ -85,11 +85,19 @@ export class PackGraphAdmission {
     );
   }
 
+  // Occurrences decide, not canonical rows, because deletion promotes an
+  // occurrence into the canonical row: seed what some occurrence gives a base
+  // and what some occurrence names as a base. The canonical test is a fast path.
   seedPacks(packIds: readonly number[]): void {
     this.db.run(
       `INSERT OR IGNORE INTO git_pack_graph_affected (repo_id, op_id, oid, pending, cursor)
-       SELECT repo_id, ?, oid, 1, '' FROM git_pack_objects
-       WHERE repo_id = ? AND pack_id IN (SELECT value FROM json_each(?))`,
+       SELECT o.repo_id, ?, o.oid, 1, '' FROM git_pack_objects o
+       WHERE o.repo_id = ? AND o.pack_id IN (SELECT value FROM json_each(?))
+         AND (o.base_oid IS NOT NULL
+           OR EXISTS (SELECT 1 FROM git_pack_entries e INDEXED BY git_pack_entries_by_oid
+             WHERE e.repo_id = o.repo_id AND e.oid = o.oid AND e.base_oid IS NOT NULL)
+           OR EXISTS (SELECT 1 FROM git_pack_entries c INDEXED BY git_pack_entries_by_base
+             WHERE c.repo_id = o.repo_id AND c.base_oid = o.oid))`,
       this.#opId,
       this.repoId,
       JSON.stringify(packIds),
