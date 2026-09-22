@@ -164,4 +164,5 @@ does not schedule these issues into a sprint.
 - [79 — Bound materialized status and avoid scalar config overreads](79-bound-materialized-status-and-config-reads.md)
 - [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
 - [81 — Copy object bytes only when a cache actually retains them](81-copy-object-bytes-only-when-retained.md)
+- [84 — Read integration worktree inputs once](84-read-integration-worktree-inputs-once.md)
 - [83 — Order unmerged status rows after changed rows](83-order-unmerged-status-rows-after-changed-rows.md)

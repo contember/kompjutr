@@ -1827,6 +1827,51 @@ do not imply that every legal single candidate fits the 100 MiB target.
 
 ## Run log
 
+- 2026-09-22: WU6's open measurement gate is closed. Measured at `fe4e4e2`,
+  extracted with `git archive` so the concurrently dirty tree never entered a
+  run, under a self-leased runner and per-measurement transient scopes with
+  `MemoryMax=512 MiB` and zero swap. **Every case now meets the <100 MiB
+  added-peak target, including both binary cases that missed it at the
+  baseline**: 75 distinct 1 MiB conflicts fall from 153.77 to 82.76 MiB and 150
+  from 287.29 to 91.25 MiB, medians of three timed passes with byte-identical
+  statement and row counts across passes. The 1,001-path merge and rebase are
+  new results rather than deltas -- the baseline refused the merge with `E2BIG`
+  before doing any work -- and both succeed at 20.73 and 7.90 MiB, with the
+  rebase reproducing native Git's commit, tree and all 1,001 stage-0 entries.
+  Two text cases rise slightly (clean-64 +4.20, marker-64 +6.11 MiB), far inside
+  the target; three samples is not a variance measurement. All 32 runs pass
+  their native byte/mode/stage/HEAD oracles.
+  One input could not be reused byte-for-byte: WU6's eight `git_integration_*`
+  tables make the frozen `baseline.sqlite` files fail schema validation at open,
+  so each database was rebuilt at the measured source from the same frozen pack
+  bytes with hashes re-verified. The workload is unchanged; only the store it
+  lands in is at the new schema. The baseline's pure-planner witness has no
+  like-for-like version, because ADR-0024 deliberately changed that contract.
+  Separate attribution shows where the bound comes from: binary conflicts stage
+  existing object identities, so at most 0.36 MiB of generated output reaches the
+  workspace even at 150 x 1 MiB, while clean-32 writes its 32 merged outputs once
+  and reads them back exactly three times, once per consumer, with no re-merging
+  -- the repeat-traversal claim, measured. The ledger measures transfer volume
+  per table family, not simultaneous residency; the process peak cannot be
+  decomposed into V8 heap, SQLite page cache and fragmentation with this harness.
+  binary-150 still reaches the 512 MiB cgroup cap and reclaims (483/735/842
+  `memory.max` events against the baseline's 1,657) with no OOM in any run; its
+  process peak is 236 MiB, so the cgroup total is dominated by page cache of a
+  159 MB database and is not presented as process memory.
+  Two costs are recorded for disposition rather than acted on. The <=1,000
+  statement target is missed by binary-75 (4,296), binary-150 (8,426), clean-64
+  (1,088, against 117 at the baseline) and both 1,001-path cases (14,434 and
+  14,540); per `bench/CLAUDE.md` that target is report-only and no code, fixture
+  or gate was changed. And 150 MiB of conflicted worktree bytes move through the
+  operation eight times, 1,200 MiB read as 2,400 512 KiB chunk rows with one row
+  live at a time -- bounded residency, but the dominant term in binary-150's
+  ~10 s. Filed as [backlog 84](../backlog/84-read-integration-worktree-inputs-once.md).
+  These are local Node measurements under Linux cgroups, not Worker-isolate
+  compliance, and they qualify none of virtual bases, snapshot replay,
+  continue/abort, cold recovery or fault injection. Artifacts:
+  ignored `bench/results/integration-after-2026-09-22/`.
+
+
 - 2026-09-22: WU5's round-two contract passed its confirmation review by
   `ses_ae3ce2e2f5aa33d4a` as **approved with conditions**, and the user approved
   implementation. All three blockers are closed against the code, not merely in
