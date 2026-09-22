@@ -241,10 +241,8 @@ interface NextjsReference {
   operation: "git.clone" | "git.commit (100)" | "git.checkout main (force)";
   statements: number;
   rowsRead: number;
-  source:
-    | "bench/results/nextjs-workflow.json"
-    | "frozen three-run baseline"
-    | "2026-09-07 pre-split HEAD baseline";
+  /** Provenance, reported for a measured row and documentation on a frozen one. */
+  source: string;
 }
 
 interface StatementReport {
@@ -292,14 +290,14 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "rebase.transition-2n": 1279,
   "pack.uncached-auth": 3,
   "pack.uncached-read": 3,
-  "pack.fallback-audit": 25,
+  "pack.fallback-audit": 20,
   "index-tracker.dirty": 2,
   "index-tracker.reseal": 8,
   "maintenance.repack.select": 8,
   "maintenance.mark-depth-n": 398,
   "maintenance.mark-depth-2n": 783,
   "transport.discovery": 2,
-  "transport.fetch": 89,
+  "transport.fetch": 84,
   "transport.push": 53,
 };
 
@@ -333,29 +331,37 @@ const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
   "rebase.transition-2n": 1273,
   "pack.uncached-auth": 3,
   "pack.uncached-read": 2,
-  "pack.fallback-audit": 7,
+  "pack.fallback-audit": 4,
   "index-tracker.dirty": 1_025,
   "index-tracker.reseal": 3,
   "maintenance.repack.select": 7,
   "maintenance.mark-depth-n": 332,
   "maintenance.mark-depth-2n": 653,
   "transport.discovery": 2,
-  "transport.fetch": 73,
+  "transport.fetch": 66,
   "transport.push": 59,
 };
 
 const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
   {
     operation: "git.clone",
-    statements: 2_381,
-    rowsRead: 79_273,
-    source: "2026-09-07 pre-split HEAD baseline",
+    statements: 1_031,
+    rowsRead: 164_287,
+    source:
+      "2026-09-22 HEAD, rebaselined with per-commit attribution. Statements fell from the " +
+      "2026-09-07 pre-split 2,381 at bc9bd3f (lease-guard pairs) and e7d31b0 (admission page " +
+      "256 -> 4,096). Rows rose from 79,273 through two correctness validations: 3fc7965 " +
+      "fetched-connectivity (+67,208) and 491189b pack graph admission (+68,595), the latter " +
+      "then reduced by 50,198 by seeding only delta participants.",
   },
   {
     operation: "git.commit (100)",
-    statements: 51,
-    rowsRead: 724,
-    source: "2026-09-07 pre-split HEAD baseline",
+    statements: 52,
+    rowsRead: 725,
+    source:
+      "2026-09-22 HEAD. 51/724 held from the 2026-09-07 pre-split baseline until 924fb06, " +
+      "whose source-generation bump adds one UPDATE and its RETURNING row per batch flush " +
+      "(ADR-0025, accepted consequence). Measured against its direct parent 2e1d48e.",
   },
   {
     operation: "git.checkout main (force)",
@@ -2350,11 +2356,7 @@ function checkNextjsReference(reference: NextjsReference): void {
     (candidate) => candidate.operation === reference.operation,
   );
   if (baseline === undefined) throw new Error(`unexpected Next.js row: ${reference.operation}`);
-  const knownCloneProgressProfile =
-    reference.operation === "git.clone" &&
-    reference.statements === baseline.statements + 2 &&
-    reference.rowsRead === baseline.rowsRead + 1;
-  if (reference.statements > baseline.statements && !knownCloneProgressProfile) {
+  if (reference.statements > baseline.statements) {
     throw new Error(
       `${reference.operation}: ${reference.statements} statements regress frozen Next.js baseline ${baseline.statements}`,
     );
