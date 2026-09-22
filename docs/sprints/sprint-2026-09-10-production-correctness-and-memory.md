@@ -424,7 +424,12 @@ transient and died with the run; git holds the full log.
 
 - 2026-09-22 — **WU5 landed as `924fb06`** → ADR-0025. Paged-read statement cost
   falls from 5,146/9,254 to 28/42, eliminating the origin dimension; maintenance
-  dependency rows fall from 153 to 17 at N=16 and 33 at 2N. Every load-bearing
+  dependency rows fall from 153 to 17 at N=16 and 33 at 2N. The relocated
+  `origins x depth` product was measured rather than asserted, as the approval
+  required: at 1,024 origins and depth 16 the scratch high-water is 5,120
+  `git_pack_read_frontier` rows costing 516,096 bytes plus 520,192 for its
+  unique index, about 1.0 MiB of B-tree for what used to be heap, and the
+  residual row count in all three scratch tables is zero after the scope closes. Every load-bearing
   behavior was proven by mutating the implementation and watching the witness
   fail first. Two things the contract did not anticipate are recorded because
   they changed behavior: `maintenance/roots/root-advance.ts` had to seed the

@@ -171,3 +171,4 @@ does not schedule these issues into a sprint.
 - [88 — Elide the operation journal keyset probe](88-elide-the-operation-journal-keyset-probe.md)
 - [89 — Trust staged commit promotion instead of counting it](89-trust-staged-commit-promotion.md)
 - [83 — Order unmerged status rows after changed rows](83-order-unmerged-status-rows-after-changed-rows.md)
+- [90 — Bring the Next.js clone under the statement target](90-bring-the-nextjs-clone-under-the-statement-target.md)

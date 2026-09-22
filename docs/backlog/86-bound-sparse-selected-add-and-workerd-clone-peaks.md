@@ -23,14 +23,10 @@ workerd has no isolate memory limiter, so this RSS is a regression signal and
 not evidence about the production 128 MB isolate limit; it also includes the
 SQLite page cache of a 233 MB database.
 
-The same workerd clone crossed the statement target during the sprint, 996 to
-1,068, with rows read 145,795 to 214,486. Per-commit attribution has since
-placed both deltas exactly, and neither is spread across work units: the whole
-row growth is `491189b` (WU3 pack-graph admission, +68,595), and `e7d31b0`
-returned statements from 1,833 to 1,067 for +110 rows. Every batching and
-page-size change in the sprint together costs +110 rows for -766 statements.
-See the sprint run log for the full table; the memory peaks below are the part
-that remains open here.
+The same clone also crossed the statement target during the sprint. That is
+now attributed per commit and tracked separately as
+[backlog 90](90-bring-the-nextjs-clone-under-the-statement-target.md); the
+memory peaks above are the part that remains open here.
 
 Measurements and attribution logs: ignored
 `bench/results/wu8-memory-2026-09-22-notes/` and
