@@ -167,4 +167,7 @@ does not schedule these issues into a sprint.
 - [84 — Read integration worktree inputs once](84-read-integration-worktree-inputs-once.md)
 - [85 — Restore the remaining broken benchmark harnesses](85-restore-broken-benchmark-harnesses.md)
 - [86 — Bound the sparse-selected-add and workerd clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
+- [87 — Bring an eight-step rebase under the statement target](87-bring-rebase-transition-under-the-statement-target.md)
+- [88 — Elide the operation journal keyset probe](88-elide-the-operation-journal-keyset-probe.md)
+- [89 — Trust staged commit promotion instead of counting it](89-trust-staged-commit-promotion.md)
 - [83 — Order unmerged status rows after changed rows](83-order-unmerged-status-rows-after-changed-rows.md)
