@@ -25,6 +25,7 @@ import { openRepository } from "../../packages/git/src/ops/core/context.js";
 import type { StatusBranch } from "../../packages/git/src/ops/status/status.js";
 import { formatPorcelainV2, statusReport } from "../../packages/git/src/ops/status/status.js";
 import type { WorktreeAddTarget } from "../../packages/git/src/ops/worktree/worktrees.js";
+import type { UploadPackFilter } from "../../packages/git/src/protocol/upload-pack.js";
 import { SqliteGitDatabase } from "../../packages/git/src/store/index.js";
 import { GitFixture } from "./git.js";
 import type { GitServer } from "./http-backend.js";
@@ -219,6 +220,14 @@ export interface E2EWorldOptions {
   seedHistory?: (fixture: GitFixture) => void;
   /** Start both sides from `init` instead of a clone. */
   start?: "clone" | "init";
+  /** Clone both sides partially, the way an orchestrator clones a project. */
+  filter?: UploadPackFilter;
+  /**
+   * Run at every pack-ingest and repack yield point, so a journey can cut a
+   * transfer off where a Durable Object would really lose it. Both the first
+   * `Workspace` and every one a `reopen` builds receive it.
+   */
+  yieldNow?: () => Promise<void>;
 }
 
 export interface E2EWorld {
@@ -273,13 +282,17 @@ export async function createWorld(options: E2EWorldOptions = {}): Promise<E2EWor
 
   const originK = track(bareCloneOf(seedWc));
   const originG = track(bareCloneOf(seedWc));
+  if (options.filter !== undefined) {
+    // `upload-pack` refuses a filter the served repository has not allowed.
+    for (const origin of [originK, originG]) origin.git("config", "uploadpack.allowFilter", "true");
+  }
   const peerK = track(workingCloneOf(originK));
   const peerG = track(workingCloneOf(originG));
 
   const server = await startGitServer(originK.dir);
 
   const storage = new SqliteTestStorage();
-  let workspace = newWorkspace(storage);
+  let workspace = newWorkspace(storage, options.yieldNow);
   const mirror = track(new GitFixture());
   const checkoutRoots = new Map<string, CheckoutRoots>();
   const linkedGitRoots = new Set<string>();
@@ -293,8 +306,18 @@ export async function createWorld(options: E2EWorldOptions = {}): Promise<E2EWor
       depth: 0,
       singleBranch: false,
       noTags: false,
+      ...(options.filter === undefined ? {} : { filter: options.filter }),
     });
-    mirror.git("clone", "-q", originG.dir, ".");
+    // git drops `--filter` on a plain local path, so a filtered mirror clone
+    // has to reach its own origin through the `file://` transport instead.
+    mirror.git(
+      "clone",
+      "-q",
+      ...(options.filter === undefined
+        ? [originG.dir]
+        : [`--filter=${options.filter}`, `file://${originG.dir}`]),
+      ".",
+    );
     mirror.git("config", "core.autocrlf", "false");
   } else {
     await workspace.git.init({ dir: WORK });
@@ -386,7 +409,7 @@ export async function createWorld(options: E2EWorldOptions = {}): Promise<E2EWor
       return new GitFixture(roots(worktree).git);
     },
     reopen() {
-      workspace = newWorkspace(storage);
+      workspace = newWorkspace(storage, options.yieldNow);
     },
     async read(path, worktree) {
       const bytes: unknown = await workspace.fs.readFile(
@@ -458,13 +481,17 @@ function headRelativeRowsRemoved(status: string): string {
     .join("\n");
 }
 
-function newWorkspace(storage: SqliteTestStorage): Workspace {
+function newWorkspace(
+  storage: SqliteTestStorage,
+  yieldNow: (() => Promise<void>) | undefined,
+): Workspace {
   return new Workspace({
     storage,
     git: createGit(),
     now: () => FIXED_TIME,
     timezoneOffset: () => 0,
     defaultGitIdentity: IDENTITY,
+    ...(yieldNow === undefined ? {} : { yieldNow }),
   });
 }
 
