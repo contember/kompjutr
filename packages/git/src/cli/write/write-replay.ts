@@ -7,6 +7,7 @@ import {
   rebaseExcluding,
   rebaseSkipExcluding,
 } from "../../ops/rebase/rebase.js";
+import { requireRebaseCursor } from "../../ops/rebase/rebase-lifecycle-baseline.js";
 import { gitCliResult } from "../result.js";
 import type { GitCliHandlers } from "../types.js";
 import {
@@ -137,5 +138,3 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
     },
   };
 }
-
-import { requireRebaseCursor } from "../../ops/rebase/rebase-lifecycle-baseline.js";

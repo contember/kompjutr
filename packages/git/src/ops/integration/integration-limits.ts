@@ -19,9 +19,11 @@ function boundedLimit(value: number | undefined, ceiling: number, label: string)
 }
 
 export function resolveLimits(limits: IntegrationLimits | undefined): ResolvedIntegrationLimits {
+  // The planner counts against the caller's own entry request, not a default
+  // ceiling, so this call only holds that request inside its documented range.
+  boundedLimit(limits?.maxEntries, MAX_INTEGRATION_PLAN_ENTRIES, "entry");
   return {
     maxSourceRows: boundedLimit(limits?.maxSourceRows, MAX_INTEGRATION_SOURCE_ROWS, "source row"),
-    maxEntries: boundedLimit(limits?.maxEntries, MAX_INTEGRATION_PLAN_ENTRIES, "entry"),
     maxStructureBytes: optionalLimit(limits?.maxStructureBytes, "structure byte"),
     maxPlanBytes: optionalLimit(limits?.maxPlanBytes, "plan byte"),
   };

@@ -35,7 +35,6 @@ import {
   resolveBoundedCommitRevision,
 } from "./replay-revision.js";
 import type {
-  OwnedReplayPlan as ReplayPlan,
   ReplaySnapshotConflict,
   ReplaySnapshotConflictStage,
   ReplaySnapshotOptions,
@@ -43,12 +42,16 @@ import type {
 } from "./replay-types.js";
 
 export const MAX_SNAPSHOT_REPLAY_SOURCE_ROWS = MAX_INTEGRATION_SOURCE_ROWS;
-function requireSnapshotTreesWithoutGitlinks(repo: Repository, plan: ReplayPlan): void {
-  const trees = new Set([plan.selectedParentTreeOid, plan.sourceTreeOid, plan.currentTreeOid]);
-  trees.delete(null);
+
+/** The snapshot and target commits a validated caller request resolved to. */
+interface SnapshotReplayTargets {
+  readonly sourceOid: string;
+  readonly currentOid: string;
+}
+
+function requireSnapshotTreesWithoutGitlinks(repo: Repository, treeOids: readonly string[]): void {
   let rows = 0;
-  for (const tree of trees) {
-    if (tree === null) continue;
+  for (const tree of new Set(treeOids)) {
     for (const { path, entry } of repo.walkTree(tree)) {
       if (rows >= MAX_SNAPSHOT_REPLAY_SOURCE_ROWS) {
         throw new GitError(
@@ -182,17 +185,21 @@ export function replaySnapshotOwned(
   index: IndexStore,
   options: ReplaySnapshotOptions,
 ): ReplaySnapshotResult {
+  const targets = requireSnapshotReplayTargets(repo, options);
   return withIntegrationWorkspaceOwned(repo.store, (workspace) =>
-    replayInWorkspace(workspace, repo, index, options),
+    replayInWorkspace(workspace, repo, index, targets),
   );
 }
 
-function replayInWorkspace(
-  workspace: IntegrationWorkspace,
+/**
+ * A rejected caller input must leave an enclosing scratch index usable, and any
+ * throw out of the integration workspace poisons that scope. So resolve and
+ * reject the caller's revisions, parent count and gitlinks before opening one.
+ */
+function requireSnapshotReplayTargets(
   repo: Repository,
-  index: IndexStore,
   options: ReplaySnapshotOptions,
-): ReplaySnapshotResult {
+): SnapshotReplayTargets {
   const snapshot = requireBoundedRevision(Reflect.get(options, "snapshot"), {
     input: "snapshot",
     operation: "snapshot replay",
@@ -205,20 +212,35 @@ function replayInWorkspace(
     input: "snapshot",
     operation: "snapshot replay",
   });
-  if (readReplayCommit(repo, sourceOid).parent.length !== 1) {
+  const sourceCommit = readReplayCommit(repo, sourceOid);
+  const selectedParentOid = sourceCommit.parent[0];
+  if (sourceCommit.parent.length !== 1 || selectedParentOid === undefined) {
     throw new GitError("EINVAL", "snapshot replay requires exactly one parent");
   }
   const currentOid = repo.peel(repo.revParse(onto));
+  requireSnapshotTreesWithoutGitlinks(repo, [
+    readReplayCommit(repo, selectedParentOid).tree,
+    sourceCommit.tree,
+    readReplayCommit(repo, currentOid).tree,
+  ]);
+  return { sourceOid, currentOid };
+}
+
+function replayInWorkspace(
+  workspace: IntegrationWorkspace,
+  repo: Repository,
+  index: IndexStore,
+  targets: SnapshotReplayTargets,
+): ReplaySnapshotResult {
   const plan = planReplayOwned(workspace, repo, {
     kind: "cherry-pick",
-    source: sourceOid,
-    currentOid,
+    source: targets.sourceOid,
+    currentOid: targets.currentOid,
     incomingLabelStyle: "source-subject",
   });
   if (plan.sourceCommit.parent.length !== 1 || plan.selectedParentOid === null) {
     throw new CorruptError("validated snapshot replay source lost its selected parent");
   }
-  requireSnapshotTreesWithoutGitlinks(repo, plan);
   const projected = projectMergePlanOwned(workspace, plan.integration, {
     currentLabel: plan.labels.current,
     incomingLabel: plan.labels.incoming,

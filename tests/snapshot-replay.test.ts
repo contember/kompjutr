@@ -314,17 +314,20 @@ describe("scratch snapshot replay", () => {
     const before = controlState(workspace);
     const beforeObjects = objectCount(workspace);
 
-    for (const snapshot of [root, merge, gitlink]) {
-      const code = snapshot === gitlink ? "EUNSUPPORTED" : "EINVAL";
-      await expect(
-        git.withScratchIndex({ name: "invalid" }, (scratch) => {
-          scratch.readTree({ tree: onto });
-          expect(() => scratch.replaySnapshot({ snapshot, onto })).toThrowError(
-            expect.objectContaining({ code }),
-          );
-        }),
-      ).rejects.toMatchObject({ code });
-    }
+    await git.withScratchIndex({ name: "invalid" }, (scratch) => {
+      scratch.readTree({ tree: onto });
+      const tree = scratch.writeTree();
+      for (const snapshot of [root, merge]) {
+        expect(() => scratch.replaySnapshot({ snapshot, onto })).toThrowError(
+          expect.objectContaining({ code: "EINVAL" }),
+        );
+        expect(scratch.writeTree()).toBe(tree);
+      }
+      expect(() => scratch.replaySnapshot({ snapshot: gitlink, onto })).toThrowError(
+        expect.objectContaining({ code: "EUNSUPPORTED" }),
+      );
+      expect(scratch.writeTree()).toBe(tree);
+    });
 
     expect(objectCount(workspace)).toBe(beforeObjects);
     expect(controlState(workspace)).toEqual(before);

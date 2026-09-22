@@ -66,7 +66,6 @@ export interface RelocationRequest {
 
 export interface ResolvedIntegrationLimits {
   maxSourceRows: number;
-  maxEntries: number;
   maxStructureBytes: number | undefined;
   maxPlanBytes: number | undefined;
 }

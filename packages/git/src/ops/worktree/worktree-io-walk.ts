@@ -116,6 +116,8 @@ function* walkWorktreeEntriesStreamCore(
   const excluded = new Set<string>();
   let after: string | undefined;
   let afterSubtree: string | undefined;
+  // `after` is cleared on the subtree branch, so progress needs its own record.
+  let lastScanned: string | undefined;
   let scannedRows = 0;
   const pruned: Array<{ directory: string; lower: string; upper: string }> = [];
   let pathspec = options.pathspec;
@@ -167,7 +169,6 @@ function* walkWorktreeEntriesStreamCore(
     return;
   }
   while (true) {
-    const requestedAfter = afterSubtree === undefined ? after : undefined;
     const read =
       afterSubtree === undefined
         ? readWorktreeScanPage(worktree, base, {
@@ -183,15 +184,15 @@ function* walkWorktreeEntriesStreamCore(
     const entries = read.page;
     afterSubtree = undefined;
     if (entries.length === 0) return;
-    // A drive that ignores the cursor would page the same rows forever, so the
-    // walk would never terminate and every consumer would accumulate its rows.
+    // A drive that ignores either cursor would page the same rows forever, so
+    // the walk would never terminate and every consumer would accumulate its
+    // rows. Both cursors resume strictly past the previous page's last row.
     const tail = entries[entries.length - 1];
-    if (
-      requestedAfter !== undefined &&
-      tail !== undefined &&
-      comparePaths(tail.path, requestedAfter) <= 0
-    ) {
-      throw new CorruptError("worktree scan cursor made no progress");
+    if (tail !== undefined) {
+      if (lastScanned !== undefined && comparePaths(tail.path, lastScanned) <= 0) {
+        throw new CorruptError("worktree scan cursor made no progress");
+      }
+      lastScanned = tail.path;
     }
 
     for (let index = 0; index < entries.length; index++) {

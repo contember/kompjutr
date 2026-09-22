@@ -7,6 +7,7 @@ import {
   addLiteralPaths,
   add as addOp,
 } from "../../ops/staging/staging.js";
+import { readOperationHeaderOwned } from "../../store/operations/operation-journal.js";
 import { gitCliResult } from "../result.js";
 import type { GitCliHandlers } from "../types.js";
 import {
@@ -133,5 +134,3 @@ export function createGitCliAddCommitHandlers(context: GitContext): AddCommitHan
     },
   };
 }
-
-import { readOperationHeaderOwned } from "../../store/operations/operation-journal.js";

@@ -42,6 +42,7 @@ import {
   worktreeRemoveOwned as worktreeRemoveOp,
 } from "./ops/worktree/worktrees.js";
 import { checkoutStoreMutations } from "./store/core/checkout-mutations-registry.js";
+import { readOperationHeaderOwned } from "./store/operations/operation-journal.js";
 
 type CoreMethods = Pick<
   Git,
@@ -271,5 +272,3 @@ function publicStatusEntry(row: StatusDetail): import("./ops/core/kinds.js").Sta
   }
   return { path: row.path, index: row.index, worktree: row.worktree };
 }
-
-import { readOperationHeaderOwned } from "./store/operations/operation-journal.js";

@@ -178,6 +178,41 @@ describe("cherry-pick lifecycle", () => {
     }
   });
 
+  it("rolls back an ordinary object write that fails during replay adoption", async () => {
+    const body = (top: string, bottom: string): string =>
+      [top, "one", "two", "three", "four", "five", "six", bottom, ""].join("\n");
+    const source = fixture();
+    source.write("conflict.txt", body("base top", "base bottom"));
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("conflict.txt", body("topic top", "base bottom"));
+    const picked = source.commit("topic");
+    source.git("checkout", "-q", "main");
+    source.write("conflict.txt", body("base top", "main bottom"));
+    source.commit("main");
+    const workspace = await imported(source);
+    const before = durableSnapshot(workspace);
+    // Adoption is the one point that copies generated integration output into
+    // ordinary objects, so the fault is scoped to an OID the live workspace owns.
+    workspace.repo.store.db.run(
+      `CREATE TRIGGER fault_replay_adoption
+       BEFORE INSERT ON git_objects
+       WHEN NEW.repo_id = ${workspace.repo.store.repoId}
+        AND EXISTS (
+          SELECT 1 FROM git_integration_objects o
+           WHERE o.repo_id = NEW.repo_id AND o.oid = NEW.oid
+        )
+       BEGIN
+         SELECT RAISE(ABORT, 'fault adoption');
+       END`,
+    );
+
+    expect(() =>
+      cherryPick(workspace.context, workspace.repo, workspace.worktree, { source: picked }),
+    ).toThrow("fault adoption");
+    expect(durableSnapshot(workspace)).toEqual(before);
+  });
+
   it("rolls back an empty replay journal failure", async () => {
     const source = fixture();
     source.write("base.txt", "base\n");

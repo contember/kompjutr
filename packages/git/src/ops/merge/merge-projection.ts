@@ -341,18 +341,32 @@ export function projectMergePlanOwned(
     add: (path) => occupied.add([{ path, logicalPath: path, purpose: "primary", identity: null }]),
   };
   let count = 0;
+  let projectionFailed = false;
   function* entries() {
-    for (const entry of projectEntries(
-      plan.entries,
-      options,
-      reserved,
-      collisions?.untracked ?? options.untrackedCollisions ?? new Set<string>(),
-    )) {
-      count++;
-      yield entry;
+    try {
+      for (const entry of projectEntries(
+        plan.entries,
+        options,
+        reserved,
+        collisions?.untracked ?? options.untrackedCollisions ?? new Set<string>(),
+      )) {
+        count++;
+        yield entry;
+      }
+    } catch (error) {
+      projectionFailed = true;
+      throw error;
     }
   }
-  projected.entries.write(entries());
+  try {
+    projected.entries.write(entries());
+  } catch (error) {
+    // The stored plan is keyed by its physical path, so the one invariant this
+    // write can break is a path projected twice. Storage reports that as a raw
+    // driver constraint failure, and callers branch on `code`.
+    if (projectionFailed) throw error;
+    throw new GitError("ECORRUPT", "merge projection emitted duplicate path", { cause: error });
+  }
   projected.finish(plan.sourceRows, count);
   return projected;
 }
