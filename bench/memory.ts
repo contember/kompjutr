@@ -87,6 +87,11 @@ class CountingWorktree implements Worktree {
 
   constructor(protected readonly inner: Worktree) {}
 
+  /** Mutating scenarios compare this identity against the store's; hiding it is `EUNSUPPORTED`. */
+  get mutationScope(): object | undefined {
+    return this.inner.mutationScope;
+  }
+
   stat(path: string): WorktreeStat | null {
     return this.inner.stat(path);
   }

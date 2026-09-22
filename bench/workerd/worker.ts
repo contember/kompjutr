@@ -122,10 +122,11 @@ function validateCheckout(workspace: Workspace): {
                 OR index_entry.mode NOT IN (33188, 33261, 40960)
               THEN 1 ELSE 0 END), 0) AS invalid_files
        FROM git_index index_entry
-       JOIN git_repositories repo ON repo.id = index_entry.repo_id
-       LEFT JOIN fs_paths path ON path.path = repo.root || '/' || index_entry.path
+       JOIN git_checkouts checkout
+         ON checkout.id = index_entry.checkout_id AND checkout.root = '/repo'
+       LEFT JOIN fs_paths path ON path.path = checkout.root || '/' || index_entry.path
        LEFT JOIN fs_nodes node ON node.inode = path.inode
-      WHERE repo.root = '/repo' AND index_entry.stage = 0`,
+      WHERE index_entry.stage = 0`,
   );
   if (
     row === undefined ||
