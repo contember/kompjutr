@@ -21,3 +21,6 @@ decided work or status.
 - [`git-sqlite-architecture-review-triage.md`](git-sqlite-architecture-review-triage.md)
   — verify or dismiss the unresolved hypotheses from the 2026-09-02 storage
   architecture review before they enter the backlog.
+- [`resolve-filesystem-paths-incrementally.md`](resolve-filesystem-paths-incrementally.md)
+  — the filesystem path planner rebuilds every ancestor prefix, so one resolve
+  costs `O(components²)`; a 1,000-component merge abort spends 8.6 s of 10 s there.
