@@ -2776,6 +2776,17 @@ describe("pack deferred resolution", () => {
       cyclic.chain[0]!.oid,
     );
     expect(() => cyclic.store.packs.read(cyclic.targets[0]!.oid)).toThrow(/cyclic delta chain/);
+    let pairVerdict = "";
+    try {
+      cyclic.store.packs.readObjects([cyclic.targets[1]!.oid, cyclic.targets[0]!.oid]);
+    } catch (error) {
+      pairVerdict = error instanceof Error ? error.message : String(error);
+    }
+    // Both origins re-enter an exit they already recorded, so every move in one
+    // batched advance conflicts; the verdict still names an object on the cycle.
+    expect(cyclic.chain.map((entry) => `cyclic delta chain at ${entry.oid}`)).toContain(
+      pairVerdict,
+    );
 
     await expect(pagedUnionFixture(new TestDatabase(), { maxDeltaDepth: 12 })).rejects.toThrow(
       /delta chain deeper than 12/,

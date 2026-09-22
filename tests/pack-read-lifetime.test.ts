@@ -388,6 +388,54 @@ function chainPack(length: number): { bytes: Uint8Array; outputs: Uint8Array[]; 
   return { bytes, outputs, oids };
 }
 
+/** `count` independent delta chains, so every origin walks its own bases. */
+function independentChains(count: number, length: number): { bytes: Uint8Array; tips: string[] } {
+  const tips: string[] = [];
+  const plan: { base: string | null; output: Uint8Array }[] = [];
+  let value = 0;
+  for (let chain = 0; chain < count; chain++) {
+    let previous: string | null = null;
+    for (let index = 0; index < length; index++) {
+      const output = target(value++);
+      plan.push({ base: previous, output });
+      previous = hashObject("blob", output);
+    }
+    if (previous === null) throw new Error("a chain needs at least one object");
+    tips.push(previous);
+  }
+  const bytes = pack(plan.length, (writer) => {
+    for (const entry of plan) {
+      if (entry.base === null) writer.object("blob", entry.output);
+      else writer.refDelta(entry.base, literal(8, entry.output));
+    }
+  });
+  return { bytes, tips };
+}
+
+/** Scratch statements and discovery pages one paged read over `origins` costs. */
+async function frontierCost(origins: number): Promise<{ statements: number; pages: number }> {
+  const inner = new TestDatabase();
+  const observed = new ObservingDatabase(inner);
+  const database = new SqliteGitDatabase(observed, {
+    objectCacheBytes: 0,
+    chunkBytes: 0,
+    graphPageEntries: 4,
+  });
+  const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+  const store = database.openCheckout(checkout);
+  const chains = independentChains(origins, 6);
+  await store.packs.ingest(slices(chains.bytes, 4096));
+  observed.reset();
+
+  expect([...store.packs.readObjects(chains.tips).keys()]).toEqual(chains.tips);
+
+  expect(scratchCounts(inner)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
+  return {
+    statements: observed.matching(/git_pack_read_/).length,
+    pages: observed.pageRows.length,
+  };
+}
+
 async function pagedChain(db: SqlDatabase, options: StoreOptions = {}, length = 17) {
   const database = new SqliteGitDatabase(db, {
     objectCacheBytes: 0,
@@ -637,6 +685,20 @@ describe("paged packed read scope", () => {
     expect(peakFrontier).toBeLessThanOrEqual(wanted.length * observed.pageRows.length);
     expect(peakPages).toBeLessThanOrEqual(observed.pageRows.length);
     expect(scratchCounts(inner)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
+  });
+
+  it("costs scratch statements per page, never per origin", async () => {
+    const small = await frontierCost(16);
+    const large = await frontierCost(32);
+
+    expect(small.pages).toBeGreaterThan(1);
+    expect(large.pages).toBe(small.pages);
+    // Independent chains of equal length page identically at both widths, so
+    // doubling the origins must not cost a single extra statement.
+    expect(large.statements).toBe(small.statements);
+    // Discovery spends four per page - frontier read, page row, union graph,
+    // move batch - and resolution two; the scope itself seeds, owns, releases.
+    expect(large.statements).toBeLessThanOrEqual(6 * large.pages + 4);
   });
 
   it("pages a union graph that crosses the 4,096-entry discovery limit", async () => {

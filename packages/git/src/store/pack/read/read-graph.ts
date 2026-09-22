@@ -8,9 +8,10 @@ import type { ObjectType, RawObject } from "../../../common/objects.js";
 import { isPackGraphLimit, type PackGraphExit } from "../shared.js";
 import {
   advanceFrontier,
+  type FrontierMove,
   insertScratchPage,
   packGraphPageSql,
-  readFrontierOrigins,
+  readFrontierGroups,
   readFrontierRoots,
   readPreviousScratchPage,
   seedFrontier,
@@ -26,12 +27,6 @@ export type PackObjectGraphReader = (
   bypassCache: boolean,
   graphEntryLimit: number,
 ) => Map<string, RawObject>;
-
-interface FrontierMove {
-  readonly originId: number;
-  readonly exit: string;
-  readonly depth: number;
-}
 
 export class PackGraphPager {
   constructor(
@@ -77,22 +72,17 @@ export class PackGraphPager {
     const seedJson = JSON.stringify([...seeds.keys()]);
     const visiblePendingPackId = pendingPackId ?? -1;
     for (let step = 0; ; step++) {
-      const roots = readFrontierRoots(this.db, this.repoId, scope, step);
-      let originCount = 0;
-      for (const root of roots) originCount += root.origins;
-      if (!Number.isSafeInteger(originCount) || originCount < 1 || originCount > wanted.length) {
-        throw new CorruptError("paged pack frontier state is invalid");
-      }
-      const entryLimit = Math.max(this.graphPageEntries, roots.length);
+      const groups = readFrontierGroups(this.db, this.repoId, scope, step, wanted.length);
+      const entryLimit = Math.max(this.graphPageEntries, groups.length);
       insertScratchPage(this.db, this.repoId, scope.readId, step, entryLimit);
       const links = this.#readPageLinks(scope, step, seedJson, visiblePendingPackId, entryLimit);
       const exitOf = pageExits(links);
 
       const moves: FrontierMove[] = [];
-      for (const root of roots) {
-        const exit = exitOf(root.oid);
+      for (const group of groups) {
+        const exit = exitOf(group.oid);
         if (exit === null) continue;
-        for (const origin of readFrontierOrigins(this.db, this.repoId, scope, step, root.oid)) {
+        for (const origin of group.origins) {
           const depth = origin.depth + exit.distance;
           if (!Number.isSafeInteger(depth) || depth > this.maxDeltaDepth) {
             const rootOid = wanted[origin.originId];
@@ -106,18 +96,8 @@ export class PackGraphPager {
         }
       }
       if (moves.length === 0) return step;
-      for (const move of moves) {
-        const advanced = advanceFrontier(
-          this.db,
-          this.repoId,
-          scope.readId,
-          step + 1,
-          move.exit,
-          move.originId,
-          move.depth,
-        );
-        if (!advanced) throw new CorruptError(`cyclic delta chain at ${move.exit}`);
-      }
+      const cyclic = advanceFrontier(this.db, this.repoId, scope, step + 1, moves);
+      if (cyclic !== null) throw new CorruptError(`cyclic delta chain at ${cyclic}`);
     }
   }
 
@@ -176,9 +156,7 @@ export class PackGraphPager {
     for (let before = lastStep + 1; ; ) {
       const page = readPreviousScratchPage(this.db, this.repoId, scope.readId, before);
       if (page === null) break;
-      const roots = readFrontierRoots(this.db, this.repoId, scope, page.step).map(
-        (root) => root.oid,
-      );
+      const roots = readFrontierRoots(this.db, this.repoId, scope, page.step);
       let pageSeeds = seeds;
       if (checkpoint !== null) {
         const combined = new Map(seeds);
