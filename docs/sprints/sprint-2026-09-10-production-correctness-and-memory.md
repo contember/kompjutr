@@ -614,74 +614,788 @@ only follow-ups need direct inspection unless they change a contract or claim.
   replay/virtual-base/local test selection is recorded in Test cadence; re-check
   that selection against the adopted WU6 design before implementation.
 
-## WU5 integration contract — draft 2026-09-21
+## WU5 integration contract — revised 2026-09-22
 
-The user selected SQL read scratch plus immediate-edge maintenance discovery.
-Exact snapshot, generation and repack settlement semantics below require review
-and approval before implementation.
+The user selected scoped SQL cold-read metadata plus immediate-edge maintenance
+expansion trusting WU3's admitted canonical graph. This revision closes the five
+review gates named in the 2026-09-21 draft and the seven blockers raised by
+`ses_f3b9e4d73ffeICHWBEUjLSPyn1`. Every claim about current behavior carries a
+`file:line`. Independent review and user approval are still required before
+implementation.
 
-### Cold-read scope
+### 0. What licenses the whole design
 
-- One internal synchronous read scope covers source selection, bounded blob
-  prefix selection, graph discovery and payload consumption. Public packed reads,
-  pending resolution and source authentication all enter it. Do not scope only
-  `PackGraphPager`, because loose/packed metadata selection happens earlier.
-- Owner-qualified SQL rows replace cumulative page descriptors, origin checkpoint
-  sets and reverse replay metadata. Keys include repository and unique read ID;
-  nested reads have distinct owners. Keep existing bounded graph pages and WU4's
-  bounded payload lifetime. No scratch cursor or reference escapes the call.
-- Use `transactionSync()` without reacquiring the public mutation guard, so reads
-  within guarded operations continue to work. On local SQLite this reserves the
-  writer lock even for a cold read. Cleanup deletes only this owner before return.
-  Respect abort-only nested adapters; do not catch a failed transaction and claim
-  the enclosing operation can safely proceed.
-- A durable repository source generation identifies the selected sources. Check
-  generation around external resolver callbacks and before returning. A callback
-  that changes sources causes `ESTALE` and rollback of the read scope, including
-  its nested writes; do not silently retry user callbacks. Revalidate caches on
-  rollback through the existing coordinator. Pure nested reads remain supported.
-  Review must verify this error fits current resolver contracts and enumerate
-  every callback seam; transaction isolation alone is not a reentry guarantee.
-- Keep canonical/pending visibility, supplied seeds, authentication cache bypass,
-  expected types, allowed missing roots and request-prefix ordering per invocation.
-  WU3's complete-graph invariant does not justify dropping checks for pending or
-  authenticated physical reads.
+The packed read path is **synchronous end to end and takes no caller-supplied
+callback**. The only two "external resolver" seams are store-internal closures
+bound at construction to the store's own loose reader and loose metadata reader:
+`packages/git/src/store/repository/shared-core.ts:97-98`, whose targets are
+`ObjectTable.readLooseObjects` / `looseObjectMetadata`
+(`packages/git/src/store/objects/objects.ts:401-407`), both pure SQL reads.
+`PackDataReader` has no callback at all
+(`packages/git/src/store/pack/read/read-data.ts:25-359`).
 
-### Maintenance discovery and source drift
+Therefore, inside one packed read, no source mutation can interleave. Anything
+that *does* change sources inside an open read scope is a reentrancy bug in the
+store, not a race with another writer. That is what the source generation
+detects, and it fixes the error contract (blocker 5).
 
-- Trust WU3 admission for canonical complete-graph acyclicity, type and depth.
-  Expand only the immediate physical dependency through existing run-owned queue
-  state, rather than checking a complete suffix for each queued OID. Existing
-  physical-only and pending-source protection remains independently enforced.
-- Persist the source generation observed by each run alongside its root epoch.
-  Source changes must invalidate already-expanded dependency assumptions even
-  when roots and promises are unchanged. Generation covers canonical publication,
-  fallback selection/deletion and loose-source availability changes relevant to
-  reads/discovery. Define pending source coverage explicitly at review.
-- Central state decoding, reset, owned-batch settlement and destructive gates
-  compare both identities. On external drift, settle the existing owned repack
-  batch, clear run-owned discovery and restart before further destruction.
-- Maintenance-owned source changes need explicit progress reconciliation, not an
-  unconditional restart after every repack. The proposed rule is to adopt the new
-  generation atomically only for a batch whose replacement introduces no new
-  dependency outside the existing marked closure; otherwise settle and restart.
-  Review must identify the exact existing full-object repack invariant or replace
-  this rule with a concrete bounded reconciliation. No generic exemption for
-  maintenance writes is permitted.
+Maintenance is licensed to expand only the immediate physical edge because
+ADR-0023 validates the affected canonical graph — type, termination, <=50,000
+delta edges — inside every publication and deletion transaction
+(`packages/git/src/store/pack/ingest.ts:158-170`;
+`packages/git/src/store/pack/lifecycle/lifecycle-delete.ts:279-284`). The source
+generation is the durable proof that the graph a run traverses is still the graph
+WU3 admitted. Without the generation, WU3's invariant may not be trusted.
 
-### Remaining review gates
+### 1. Source generation — owners, storage, and pending coverage
 
-Specify source-generation mutation owners, read-scope entry points, exact scratch
-schema, rollback/cursor behavior on both adapters and the repack reconciliation
-proof before calling this contract implementation-ready. Current root epoch and
-in-memory pack cache counters are insufficient substitutes.
+**Storage.** One new column `source_generation INTEGER NOT NULL DEFAULT 0` on
+`git_repositories` (`packages/git/src/store/schema/schema-core-statements.ts:28-63`),
+beside the existing `fetch_generation`, `shallow_revision` and
+`checkout_revision` counters. It is *not* on `git_maintenance_control`, because
+that row is installed lazily (`ensureMaintenanceControl`,
+`packages/git/src/store/maintenance/control.ts:43-57`) and a read must never
+create maintenance state.
 
-Acceptance includes nested reads, rejected source-changing callbacks, pending
-authentication, local rollback cursor semantics, cold resume after every durable
-maintenance boundary, source-only drift and owned-repack drift without infinite
-restart. Measure descriptor/checkpoint maxima and N/2N dependency work with native
-SQL instrumentation; emitted rows and statement counts alone do not establish
-bounded internal work. Keep WU3 lifecycle and WU4 payload regressions in the gate.
+**Writer.** One helper pair in a new `packages/git/src/store/core/source-generation.ts`,
+modelled exactly on `bumpMaintenanceRootEpoch`
+(`packages/git/src/store/maintenance/control.ts:60-75`), including the
+`E2BIG` exhaustion shape:
+
+- `readRepositorySourceGeneration(db, repoId): number`
+- `bumpRepositorySourceGeneration(db, repoId): number` — `UPDATE … SET
+  source_generation = source_generation + 1 WHERE id = ? AND source_generation < ?
+  RETURNING source_generation`.
+
+`store/core/` is a leaf that `pack/`, `objects/` and `maintenance/` already
+import, so no import-graph rank or cycle is added.
+
+**Definition.** The generation identifies *the set of sources visible to an
+ordinary complete read*: for every OID, which loose row or which complete pack
+serves it, and which canonical delta edge it carries.
+
+**Exact mutation owners.** These are the only writes that change that set. Each
+bumps once, inside the transaction that performs the change:
+
+| # | Owner | Site | What changes |
+|---|---|---|---|
+| 1 | Pack publication | `packages/git/src/store/pack/ingest.ts:136-171` (the `UPDATE git_pack_meta … state='complete'` at `:141`) — bump after `auditPublishedMembership` and `graph.validate()` | a pending pack's objects become visible |
+| 2 | Pack storage deletion | `PackDeletion.deletePacks`, `packages/git/src/store/pack/lifecycle/lifecycle-delete.ts:277-285` | covers fallback promotion (`:287-329`) and storage removal (`:331-396`), and therefore **every** deletion caller: `discardPending` (`:46-81`), `discardOwnedComplete` (`:84-154`), `deleteCompletePacks` (`:157-191`), and `reclaimPending` via `#reclaimPendingRows` (`packages/git/src/store/pack/lifecycle/lifecycle-ingest.ts:150`) |
+| 3 | Loose object write | `packages/git/src/store/objects/objects-write.ts:43`, `:162`, `:227`; `packages/git/src/store/objects/objects-batch.ts:144` — one bump per write / per batch flush, not per row | a loose copy shadows a packed source in logical reads (`packages/git/src/store/objects/objects-read.ts:66-70`) and can be a packed chain's terminal base |
+| 4 | Loose object deletion | `deleteExactLooseObjects`, `packages/git/src/store/maintenance/repack/repack-finalize-sources.ts:270-277`; `packages/git/src/store/maintenance/sweep/sweep-loose.ts:206` | the shadow disappears; the packed source becomes authoritative |
+
+**Explicitly not owners, with the reason:**
+
+- **Canonical claim during ingest** — `PackObjectBatch.flush`,
+  `packages/git/src/store/pack/pack-ingest-index.ts:144`. `INSERT OR IGNORE`
+  takes only an *unowned* `(repo_id, oid)` slot
+  (`git_pack_objects` PK is `(repo_id, oid)`,
+  `packages/git/src/store/schema/schema-object-statements.ts:147`), and a row
+  pointing at a pending pack is invisible to every complete read
+  (`pack.state = 'complete'` in `packages/git/src/store/pack/read.ts:76`,
+  `read/read-resolver.ts:152`, `read/read-graph.ts:76`). No visible change.
+- **Pending pack reservation** — `lifecycle-ingest.ts:187-192`. Same reason.
+- **Promise fulfilment** — `packages/git/src/store/objects/objects-promises.ts:21`.
+  Promises are metadata, not sources (`packages/git/src/store/CLAUDE.md:51-53`).
+  It already bumps the *root epoch*, which is the correct identity for the
+  verdict it changes (`reachability-publish.ts:88-93`). Unchanged.
+
+**Pending source coverage.** Pending sources are **covered by ownership, not by
+the generation counter**. A pending pack's rows can be written only by its ingest
+owner: ordinary ingest holds the exclusive `git_pack_ingest_control` lease and a
+second reservation fails `EBUSY` (`lifecycle-ingest.ts:179-181`), and maintenance
+ingest holds its `git_maintenance_repack_batches` row (`repack-publish.ts:139-152`).
+The only reader that passes a `pendingPackId` is that same owner
+(`packages/git/src/store/pack/ingest/ingest-pending.ts:402,405`). A read scope
+that carries a non-null `pendingPackId` therefore snapshots **one extra scalar**,
+that pack's `git_pack_meta.state`, and re-asserts it at scope exit. Any observed
+change is reentrancy by the owner. Bumping the generation for pending writes is
+explicitly rejected: `PackObjectBatch.flush` runs per batch during a fetch and
+would restart every concurrent maintenance run.
+
+**Cost note.** Owner 3 adds one `UPDATE` per loose write or batch flush. This
+matches established practice: `bumpMaintenanceRootEpoch` is already called per
+ref mutation, per shallow change, per index mutation
+(`packages/git/src/store/indexes/index-table-store.ts:231,283,296,304,318,344`)
+and per journal write. In practice loose writes coincide with index mutations, so
+no new restart pressure is introduced for maintenance.
+
+### 2. Read-scope entry points
+
+**Chokepoint.** Every packed read funnels into
+`PackReadEngine.readObjectsBounded` (`packages/git/src/store/pack/read.ts:204-220`),
+which delegates to `PackObjectResolver.readObjectsBounded`
+(`read/read-resolver.ts:107-128`). The scope is entered there and nowhere else.
+
+**Entries that reach it, named:**
+
+| Entry | Site | Role |
+|---|---|---|
+| `PackReadEngine.read` | `read.ts:158-161` | scalar object read |
+| `PackReadEngine.readBlobs` | `read.ts:164-175` | bounded blob prefix selection |
+| `PackReadEngine.readObjects` | `read.ts:177-183` | typed batch |
+| `PackReadEngine.readAuthenticatedObject` | `read.ts:186-196` | cache-bypassing authenticated read |
+| `PackSourceAuthenticator.authenticateCompleteSources` -> `resolver.readObjectsBounded` | `read.ts:198-202`, `read/read-authenticate.ts:156-163` | source authentication; **nested** |
+| `PackPendingResolver.#readBaseBatch` -> `read.readObjectsBounded` | `ingest/ingest-pending.ts:402,405` | pending resolution |
+
+**Entries that do source selection but open no scope** (single statements,
+already atomic, and within one synchronous call chain nothing can interleave):
+`PackReadEngine.lookup` (`read.ts:70-94`), `typeAndSize` (`:96-108`), `count`
+(`:110-122`), `findPrefix` (`:124-140`), `oids` (`:142-156`); the logical
+loose-vs-packed selection in `readObjects`
+(`packages/git/src/store/objects/objects-read.ts:62-82`) and
+`packages/git/src/store/objects/objects-query.ts:43,90,198,208`. The draft's
+objection that "loose/packed metadata selection happens earlier" is answered by
+the outermost scope's exit re-check: the selection and the packed read are one
+synchronous turn, and the exit check proves the generation held across both.
+
+**Nesting.** A `PackReadScopeCoordinator` per database (a `WeakMap`, exactly like
+`scratchTransactionsFor`, `packages/git/src/store/repository/shared-support.ts:134-142`)
+tracks depth.
+
+- Each entry allocates its **own owner id** (`crypto.randomUUID()`, as
+  `PackGraphAdmission` does at `packages/git/src/store/pack/graph/graph-admission.ts:48`
+  and `withIntegrationWorkspaceOwned` at
+  `packages/git/src/store/operations/integration-workspace/workspace.ts:93`), so
+  nested scratch rows never collide.
+- Only the **outermost** scope reads the generation (one combined statement:
+  `SELECT r.source_generation, p.state FROM git_repositories r LEFT JOIN
+  git_pack_meta p ON p.repo_id = r.id AND p.pack_id = ? WHERE r.id = ?`) and
+  re-checks it at exit. Nested scopes inherit the snapshot and perform **no**
+  additional read — nothing can change inside one synchronous outer scope.
+  Net cost: two extra statements per outermost packed read.
+- A **pure nested read stays supported**: `authenticateCompleteSources` nests
+  inside the maintenance finalize transaction (`repack-finalize.ts:69,71,113,115,137,139`),
+  and `scanHeaders` nests a packed read inside `advanceMark`'s `transactionSync`
+  (`packages/git/src/store/maintenance/reachability/reachability-headers.ts:183`
+  under `reachability-advance.ts:209`). Neither reacquires the mutation guard.
+
+**No escape.** The scope returns only `Map<string, RawObject>`. No cursor, handle
+or scratch reference leaves it. Handles carry `requireActive()` and are revoked on
+every exit, mirroring `IntegrationWorkspaceOwner`
+(`packages/git/src/store/operations/integration-workspace/storage.ts:19-32`);
+use after revocation is `ESTALE`, consistent with `storage.ts:20`.
+
+### 3. Exact scratch schema
+
+**What is being replaced.** `PackGraphPager.readObjectsPaged` accumulates, in the
+isolate heap: the `pages: PackGraphPage[]` array of per-page root lists
+(`read/read-graph.ts:48,60`) and one `checkpoints: Set<string>` per origin
+(`:46,181`). Both grow as `origins x depth`, with origins <=
+`MAX_PACK_BLOB_INPUTS = 4096` (`store/pack/shared.ts:53`) and depth <=
+`MAX_DELTA_DEPTH = 50_000` (`shared.ts:48`). Per-page state — `links`, `memo`,
+`visiting`, `moves` (`:62,122,123,157`) — is already bounded by
+`entryLimit <= MAX_PACK_BLOB_GRAPH_ENTRIES = 4096` (`shared.ts:52`) and stays in JS.
+
+**New file `packages/git/src/store/schema/schema-pack-read-statements.ts`,
+registered in `schema/schema.ts:34-42`.** Three tables, all `WITHOUT ROWID`,
+CHECK-constrained in the style of `schema-pack-graph-statements.ts:1-6`:
+
+```sql
+CREATE TABLE IF NOT EXISTS git_pack_read_scopes (
+  repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
+  read_id TEXT NOT NULL CHECK (typeof(read_id) = 'text' AND length(read_id) > 0),
+  PRIMARY KEY (repo_id, read_id),
+  FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
+) WITHOUT ROWID
+
+CREATE TABLE IF NOT EXISTS git_pack_read_pages (
+  repo_id …, read_id …,
+  step INTEGER NOT NULL CHECK (typeof(step) = 'integer' AND step BETWEEN 0 AND 50000),
+  entry_limit INTEGER NOT NULL CHECK (typeof(entry_limit) = 'integer'
+    AND entry_limit BETWEEN 1 AND 4096),
+  PRIMARY KEY (repo_id, read_id, step),
+  FOREIGN KEY (repo_id, read_id)
+    REFERENCES git_pack_read_scopes (repo_id, read_id) ON DELETE CASCADE
+) WITHOUT ROWID
+
+CREATE TABLE IF NOT EXISTS git_pack_read_frontier (
+  repo_id …, read_id …,
+  step INTEGER NOT NULL CHECK (typeof(step) = 'integer' AND step BETWEEN 0 AND 50000),
+  oid TEXT NOT NULL COLLATE BINARY
+    CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
+  origin_id INTEGER NOT NULL CHECK (typeof(origin_id) = 'integer'
+    AND origin_id BETWEEN 0 AND 4095),
+  depth INTEGER NOT NULL CHECK (typeof(depth) = 'integer' AND depth BETWEEN 0 AND 50000),
+  PRIMARY KEY (repo_id, read_id, step, oid, origin_id),
+  UNIQUE (repo_id, read_id, origin_id, oid),
+  FOREIGN KEY (repo_id, read_id)
+    REFERENCES git_pack_read_scopes (repo_id, read_id) ON DELETE CASCADE
+) WITHOUT ROWID
+```
+
+`origin_id` is the index into the JS `wanted` array (`read-graph.ts:43`), which is
+resident anyway and <=4,096, so `rootOid` for the depth error message
+(`read-graph.ts:165`) needs no column.
+
+**Which index serves which query, and why each is a seek:**
+
+| Query | SQL | Access |
+|---|---|---|
+| Seed the discovery page | `frontier(oid) AS MATERIALIZED (SELECT DISTINCT oid FROM git_pack_read_frontier WHERE repo_id = ?1 AND read_id = ?2 AND step = ?3 ORDER BY oid)` | PK prefix `(repo_id, read_id, step)`, already ordered by `oid` — ordered covering seek, no sort. Replaces the `json_each(rootJson)` seed at `read-graph.ts:67`. Same shape as WU3's seed CTE (`store/pack/graph/graph-sql.ts:33-36`) |
+| Cycle detection + advance | `INSERT INTO git_pack_read_frontier … ON CONFLICT (repo_id, read_id, origin_id, oid) DO NOTHING RETURNING oid` | UNIQUE index point insert; no row returned => cycle => `CorruptError(\`cyclic delta chain at ${oid}\`)`, byte-identical to `read-graph.ts:178`. Precedent for `ON CONFLICT DO NOTHING RETURNING`: `store/core/mutation-guard.ts:11-14` |
+| Origins sitting on one frontier OID | `SELECT origin_id, depth FROM git_pack_read_frontier WHERE repo_id = ? AND read_id = ? AND step = ? AND oid = ? ORDER BY origin_id` | PK prefix seek `(repo_id, read_id, step, oid)` |
+| Reverse-pass page walk | `SELECT step, entry_limit FROM git_pack_read_pages WHERE repo_id = ? AND read_id = ? AND step < ? ORDER BY step DESC LIMIT 1` | PK keyset seek, descending |
+| Reverse-pass page roots | the same `DISTINCT oid` seek as the first row | PK prefix seek |
+
+**Ordering invariant.** All ordered columns here are 40-character lowercase hex
+OIDs, but they are declared and ordered `COLLATE BINARY` to match the store's
+existing habit (`lifecycle-delete.ts:208`, `repack-finalize-sources.ts:23`,
+`reachability-advance.ts:66`) and to keep the seek a byte-order seek. No path is
+stored or ordered here, so `comparePaths` does not apply; no `<`, `>` or bare
+`.sort()` is introduced on any OID (the existing
+`missingChunks.sort((l, r) => l.p - r.p || l.q - r.q)` at
+`read/read-resolver.ts:308` is numeric and unchanged).
+
+**Invariant 3.** Every scratch read uses `db.iterate()` in a bounded page; the
+only `db.one` uses are the single-row page-walk and generation statements. No
+`db.all()` is added.
+
+**Declared envelope.**
+
+- Live JS metadata per page: <= `entryLimit` links + <= `entryLimit` memo entries +
+  <= `originCount` moves, with `originCount <= wanted.length <= 4096` — enforced
+  today at `read-graph.ts:53-57` and kept.
+- Live JS metadata **across pages: O(1)**. This is the whole point: the page list
+  and the checkpoint sets leave the heap.
+- Scratch rows: `git_pack_read_pages` <= 50,001; `git_pack_read_frontier` <=
+  `origins x (maxDeltaDepth + 1)` — the *same product* that bounds today's
+  in-memory sets (`read-graph.ts:46,181`), now in scratch storage that is deleted
+  at scope exit. Honest limitation: this trades isolate heap for scratch storage
+  rather than reducing the product. If measurement shows the scratch table is the
+  binding cost, the recorded fallback is to drop the per-origin checkpoint rows
+  entirely and rely on the existing depth cap (`read-graph.ts:163-166`), which
+  already terminates a cycle within `maxDeltaDepth` steps. That fallback is a
+  measured follow-up, not a speculative part of this contract.
+
+**File size.** `read-graph.ts` is 226 lines; the SQL text and row decoders go in a
+new `packages/git/src/store/pack/read/read-graph-scratch.ts` so neither file
+approaches the 500-line cap and `store/pack/read/` stays at 6 direct files.
+
+### 4. Transaction, rollback and cursor behavior on both adapters
+
+**No mutation guard.** The scope calls `db.transactionSync()` directly and never
+`withGitMutationGuard`. `withGitMutationGuard` inserts an uncommitted `git_meta`
+guard row and refuses reentry with `EREENTRANT`
+(`packages/git/src/store/core/mutation-guard.ts:8-25`); a packed read nested
+inside a guarded public mutation — e.g. `maintenance()` at
+`packages/git/src/ops/repository/maintenance.ts:140` -> `advanceMark` ->
+`scanHeaders` -> `store.packs.readObjects` — would otherwise fail. This is exactly
+`withIntegrationWorkspaceOwned`'s rule (`workspace.ts:97`, ADR-0024).
+
+**Lazy transaction — deviation from the draft, recorded deliberately.** The scope
+is entered by every packed read, but the `transactionSync()` and the scratch
+owner row are opened **only when scratch is actually written**, i.e. only on the
+paged path taken when the bounded graph query exceeds its entry limit
+(`read/read-resolver.ts:115-127`). Rationale: on the Node adapter the outermost
+`transactionSync` executes `BEGIN IMMEDIATE`
+(`packages/local/src/sqlite/database.ts:284`), which takes SQLite's writer
+reservation. Making *every* cold read a write transaction is a real cost the draft
+accepted implicitly; the user's 2026-09-21 log entry recorded it as a
+*consequence* ("Local read scratch would acquire the adapter's writer
+reservation"), not a requirement. Confining it to paged reads preserves the chosen
+direction and narrows the cost to the reads that need scratch. **This narrowing
+needs explicit user confirmation before implementation.**
+
+**Local adapter consequences, stated.**
+
+- A paged read at top level takes the writer reservation for its duration. This
+  adds no cross-process contention, because a second local writer is already
+  excluded by the lifetime process lock
+  (`docs/reference/concurrency.md:19-22`; `packages/local/src/CLAUDE.md:35`).
+  It does mean a top-level paged read is a write transaction, and a read-only
+  caller can no longer assume otherwise.
+- A paged read nested in an enclosing transaction is a savepoint
+  (`packages/local/src/sqlite/database.ts:355-380`). A read performs no disk
+  work, so `#recovery.diskEffects` stays 0 and `#nestedFailureLeftEffects` is not
+  set (`:373`); the enclosing transaction therefore stays committable after an
+  SQL-only read failure, matching `docs/reference/concurrency.md:28-30`. The error
+  still propagates — see below.
+- **Abort-only adapters must not be swallowed.** The scope never catches. It calls
+  `coordinator.requireHealthy()` at entry (`shared-support.ts:107-109`) so a
+  poisoned enclosing scratch transaction refuses to open a read scope, and it
+  rethrows every failure. An `ERECOVERY` abort-only condition
+  (`packages/local/src/sqlite/database.ts:308-316`) reaches the caller unchanged.
+
+**Cursor behavior on rollback.**
+
+- **Local (`@kompjutr/local`) — defined and already documented.** Cursors created
+  or advanced in a rolled-back scope are invalidated and closed before the SQL
+  rollback; advancing them again throws `ESTALE` "SQLite cursor belongs to a
+  rolled-back scope" (`packages/local/src/sqlite/cursors.ts:23,69`;
+  `docs/reference/concurrency.md:33-37`). A successful `RELEASE` re-attaches
+  cursors to the parent scope, so they survive (`cursors.ts:15-21`).
+  **Hazard to assert in the acceptance:** `scopedSqliteRows.next()` re-attaches a
+  cursor to the *current* scope on every step (`cursors.ts:70-71`), so an
+  **enclosing** cursor advanced inside a failed read scope is also invalidated.
+  Contract: a consumer must not resume an outer cursor after a nested read scope
+  threw. No current caller does — `readNextObject` drains its two-row cursor
+  before expansion (`reachability-advance.ts:55-113`) — but the witness pins it.
+- **DO (`@kompjutr/do`) — undefined at the kompjutr level, so the contract is
+  structural.** `Database.iterate` wraps `storage.sql.exec` with no scope tracking
+  and no invalidation (`packages/do/src/db/db.ts:96-102`);
+  `Database.transactionSync` delegates every nesting level to the platform
+  (`:105-110`). Because kompjutr defines nothing there, the scope **drains or
+  closes every scratch cursor before the transaction boundary**, exactly as
+  `IntegrationWorkspaceOwner.closeCursors()` does before deleting the owner row
+  (`store/operations/integration-workspace/storage.ts:29-32`, called at
+  `workspace.ts:111` and inside `revoke()` at `:24-27`). No lazy scratch reader
+  escapes a page.
+
+**Cleanup.** On success the scope deletes only its own owner row and verifies it,
+mirroring `workspace.ts:112-119`:
+`DELETE FROM git_pack_read_scopes WHERE repo_id = ? AND read_id = ? RETURNING read_id`;
+a different or absent value is `CorruptError`. Child rows cascade. On failure the
+transaction rolls the rows back and the owner is revoked in a `finally`.
+
+### 5. Callback scope and the drift error contract
+
+**Every callback seam that can run inside the read scope — the complete list:**
+
+| Seam | Site | Can it change sources? |
+|---|---|---|
+| `ExternalMetadataResolver` | bound at `shared-core.ts:98` to `looseObjectMetadata`; invoked at `read/read-external.ts:28,43` | No — a `SELECT` over `git_objects` (`store/objects/objects-query.ts:211`) |
+| `ExternalBatchResolver` | bound at `shared-core.ts:97` to `readLooseObjects`; invoked at `read/read-external.ts:61` | No — a `SELECT` cursor decode (`store/objects/objects.ts:249-395`) |
+
+That is the entire list. `PackIngestOptions.lifecycle` (`reserved` / `published`),
+`releaseOwnership` in `discardPending` / `discardOwnedComplete`, `yieldNow`, and
+the `withIntegrationWorkspaceOwned` body are all ingest, deletion or integration
+seams; none is reachable from a packed read.
+
+**Therefore the draft's `ESTALE` contract is replaced.** `ESTALE` in this codebase
+means "a durable ownership or identity you held was taken or expired" — pack
+ingest ownership (`lifecycle-ingest.ts:250,274`; `ingest.ts:156`), pack membership
+claimed by another ingest (`lifecycle-ingest.ts:299`), a revoked workspace handle
+(`integration-workspace/storage.ts:20`), maintenance roots changed before
+reclamation (`sweep/sweep-shared.ts:50`) — and it is a public CLI-visible code
+(`packages/git/src/cli/write/write-errors.ts:218`). A read scope holds no durable
+ownership another writer can take. **`ESTALE` does not fit.**
+
+The contract is:
+
+- **Source generation changed inside a read scope -> `CorruptError`** (`ECORRUPT`,
+  `packages/git/src/common/errors.ts:101-106`), message
+  `"packed read observed a source change"`. The exact precedent is
+  `CorruptError("canonical packed source changed before authentication")`
+  (`read/read-authenticate.ts:120`), which guards the identical concern one layer
+  up and already uses `CorruptError`.
+- **Observer:** none, by construction. No caller can legitimately cause it; it is
+  a store-invariant assertion, and `ECORRUPT` is the code for a broken store
+  premise (ADR-0004, `packages/git/src/CLAUDE.md:24-28`).
+- **Can a caller distinguish it?** Yes, by `error.code === "ECORRUPT"`, like every
+  other corruption verdict. It is deliberately *not* distinguishable from other
+  corruption, because a caller must not branch on it.
+- **Why no silent retry:** there is nothing to retry. A generation change inside a
+  synchronous scope means a store seam mutated sources reentrantly; retrying would
+  re-enter the same bug and could publish results derived from two different source
+  sets. Rollback plus propagation is the only safe outcome.
+- **Rollback:** the scope's transaction rolls back its scratch rows; the enclosing
+  `ScratchTransactionCoordinator`, if active, is poisoned through the existing
+  `runScratchAwareOperation` seam (`shared-core.ts:130-139`), and storage caches are
+  revalidated through the existing coordinator outcome
+  (`workspace.ts:133-135`, `shared-core.ts:180-200`).
+- **If a caller-supplied resolver is ever introduced**, it arrives with its own
+  contract and its own error code. This contract does not pre-build one.
+
+**Preserved unchanged, per invocation:** packed-first physical dependency
+selection stays distinct from loose-first logical reads (`read.ts:76` /
+`read-resolver.ts:152` vs `objects-read.ts:66-70`); canonical-vs-pending
+visibility (`pendingPackId`); supplied `seeds`; `bypassCache`; `expectedType`;
+`allowMissing`; and request-prefix ordering (`objects-read.ts:106-118`) — all
+arguments of `readObjectsBounded` (`read.ts:204-220`), none of which change shape.
+WU3's complete-graph invariant does **not** remove the per-chain `seen` cycle sets
+(`read-resolver.ts:241-246,372-377`), the depth checks (`:248,384`), the
+`materializeBase` size check (`:356-363`) or the post-apply type/size checks
+(`:408-419`): a *pending* pack is read before WU3's admission runs
+(`ingest.ts:139-145` precedes `:158-170`), so pending and authenticated physical
+reads keep every check they have today.
+
+### 6. Repack reconciliation — the proof, and the rule it replaces
+
+**The draft's conditional rule is withdrawn.** The side condition it proposed —
+"adopt the new generation only for a batch whose replacement introduces no new
+dependency outside the existing marked closure" — is *always satisfied* for a
+maintenance repack. Here is the exact existing invariant and the argument.
+
+**Invariant: a maintenance repack pack contains only full objects.**
+
+1. `streamFullObjectPack` emits entries only through `writer.startObject(...)`
+   (`packages/git/src/store/pack/full-object-stream.ts:104,177`). It never calls
+   `PackWriter.refDelta` (`packages/git/src/store/pack/writer.ts:64-68`), which is
+   the only code path that emits a `REF_DELTA` entry. Hence every indexed entry of
+   that pack has `base_oid IS NULL`.
+2. That is re-asserted independently in the finalize transaction:
+   `verifyCompletePack` raises `CorruptError` for any `git_pack_entries` row of
+   the published pack with `row.base_oid !== null`
+   (`packages/git/src/store/maintenance/repack/repack-finalize-sources.ts:36`,
+   called at `repack-finalize.ts:67`). The rule is therefore licensed by a named
+   structural invariant re-checked at use, not by the writer's identity — the
+   "no generic exemption for maintenance writes" requirement is met.
+
+**Consequences, step by step:**
+
+3. Canonical insertion is non-replacing — `INSERT OR IGNORE INTO git_pack_objects`
+   (`pack-ingest-index.ts:144`) — so the new pack becomes canonical owner only for
+   OIDs that had no canonical packed row. For those OIDs the canonical edge goes
+   from *absent* to `base_oid IS NULL`: **no new dependency edge**.
+4. `deleteExactLooseObjects` (`repack-finalize-sources.ts:210-308`) removes only
+   loose copies of objects the batch has just proved packed, complete and full —
+   `finalizedPackedSources` requires `state = 'complete'` and `exact_source = 1`
+   (`:119-120`), and `verifyFinalizedSources` afterwards requires
+   `row.loose_oid === null` (`:179`). A loose row is never a canonical *delta*
+   source, so its removal deletes no edge. A loose object that a surviving pack
+   still names as a delta base is independently protected — at pack deletion by
+   `#authenticateLooseDeltaBases` (`lifecycle-delete.ts:193-243`, `EBUSY` at
+   `:231-235`) and at sweep by the `LOOSE_DELTA_BASE` pin
+   (`sweep/sweep-loose.ts:15-21,57-59`).
+5. The redundant-pack discard branch (`repack-finalize.ts:74-82`) is entered only
+   when `finalized.every((object) => object.packId !== packId)` — i.e. no canonical
+   row points at the new pack. It calls `discardOwnedComplete` -> `deletePacks` ->
+   `#promoteFallbacks(packId, [packId])`, whose `SELECT` is gated on
+   `EXISTS (SELECT 1 FROM git_pack_objects current … current.pack_id = ?)`
+   (`lifecycle-delete.ts:302-306`). With no canonical row pointing at that pack the
+   promotion selects nothing, so **no canonical edge changes** on this path either.
+
+**The rule this contract adopts instead:**
+
+> A maintenance step that changes sources bumps the generation and records the new
+> value into `git_maintenance_runs.observed_source_generation` **in the same
+> transaction**. A step that does not change sources compares the run's recorded
+> value against `git_repositories.source_generation`; a mismatch settles the owned
+> repack batch and restarts discovery before any further destruction.
+
+Adoption points, exactly:
+
+- Repack publication — the `published` lifecycle callback's `runMutation` block,
+  `packages/git/src/store/maintenance/repack/repack-publish.ts:227-252`, which
+  already runs inside the publication transaction that bumps the generation.
+- Loose finalization — inside the `transactionSync` of `finalizePublished`
+  (`repack-finalize.ts:62-86`), `finalizeShadows` (`:111-118`) and
+  `finalizeSelectedShadows` (`:135-143`), after `deleteExactLooseObjects`.
+- Sweep — inside the existing sweep transactions
+  (`sweep/sweep-loose.ts:206` and the pack-deletion path reached from
+  `sweep/sweep-packs.ts`), which already re-assert the root epoch via
+  `requireStableEpoch` (`sweep/sweep-shared.ts:43-50`).
+
+**Termination — no infinite restart.** Adoption is atomic with the change, so
+after any maintenance step `observed_source_generation === source_generation`
+unless a **foreign** writer bumped in between. Maintenance therefore cannot cause
+its own restart. Each non-restarting step makes durable progress (phase, cursor or
+counters advance and are CAS-verified — `reachability-advance.ts:118-144`,
+`repack-finalize.ts:20-53`), so in the absence of external writers the run
+terminates. Under continuous external writes it restarts — which is exactly the
+pre-existing root-epoch behavior (`ops/repository/maintenance.ts:107-117`), not a
+new loop. The checkable form of this argument: **the adopt-vs-restart comparison
+must be against the value the step itself wrote, in the same transaction.** A
+witness that mutates sources *between* the bump and the adoption must observe a
+restart, not an adoption.
+
+**Sweep-side promotion is not exempted.** `#promoteFallbacks` during an ordinary
+pack deletion *can* promote a delta entry and add a canonical edge
+(`lifecycle-delete.ts:290-328`). That is not made safe by the marked closure; it is
+made safe independently by `PackGraphAdmission(..., "deletion")` validating the
+final graph inside the same transaction (`lifecycle-delete.ts:279-284`, `EBUSY`
+via `graph-admission.ts:102-105`) and by `hasRequiredPackDependency` refusing a
+pack whose removal leaves a non-terminating chain
+(`sweep/sweep-pack-dependencies.ts:4-58`). The generation rule additionally forces
+the run to re-derive discovery after such a change if it was not the step's own.
+
+**Source-drift restart path.** `resetMaintenanceRunForRootChange` currently
+*requires* root-epoch drift (`state/state-transitions.ts:81-83`). Its precondition
+widens to "root epoch **or** source generation drifted", and
+`advanceSynchronousMaintenance` (`ops/repository/maintenance.ts:107-117`) routes
+source-only drift through the same settle-then-reset path. No second reset
+mechanism is introduced. A source-only drift resets to `roots`; re-deriving roots
+is bounded work and reuses the audited path rather than inventing a partial reset.
+
+### 7. Maintenance work bound — the measurable quantity
+
+**Today's quadratic.** `validatedPackedBaseChain` runs a recursive CTE that returns
+the **entire remaining delta suffix** of one OID
+(`reachability/reachability-packed.ts:29-88`), and then only the immediate base is
+enqueued (`:136-142`, `reachability-expand.ts:198-209`). It is invoked once per
+physical-only expansion (`reachability-expand.ts:192`) and once per semantic
+completion in `headerExpansion` (`:23,40,84`) and `treeExpansion` (`:183`). For a
+chain of N delta edges this delivers Theta(N^2/2) rows.
+
+**The replacement.** One **non-recursive, single-row** statement per expansion,
+carrying a stable SQL comment so it can be attributed:
+
+```sql
+SELECT /* maintenance-pack-base */ object.type, object.base_oid,
+       base.oid  AS base_packed_oid,  base.type  AS base_packed_type,
+       loose.oid AS base_loose_oid,   loose.type AS base_loose_type
+  FROM git_pack_objects object
+  JOIN git_pack_meta pack
+    ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+   AND pack.state = 'complete'
+  LEFT JOIN git_pack_objects base
+    ON base.repo_id = ? AND base.oid = object.base_oid
+  LEFT JOIN git_pack_meta base_pack
+    ON base_pack.repo_id = base.repo_id AND base_pack.pack_id = base.pack_id
+   AND base_pack.state = 'complete'
+  LEFT JOIN git_objects loose
+    ON loose.repo_id = ? AND loose.oid = object.base_oid
+ WHERE object.repo_id = ? AND object.oid = ?
+```
+
+Every join is a `(repo_id, oid)` primary-key seek. What each existing check becomes:
+
+| Check today | Where | Where it lives now |
+|---|---|---|
+| `pack.state = 'complete'` — pending sources never satisfy a dependency | `reachability-packed.ts:37,45` | the same predicate, per edge |
+| base type equals source type along the chain | `:102-104,118-120` | `base_packed_type` / `base_loose_type` compared to `object.type`, per edge; transitively covers the chain because each base is itself queued as physical-only |
+| base present (packed-complete or loose) | `:115-117` | the enqueued base's own expansion: `physicalExpansion` -> `requireObjectInfo` raises `reachable object <oid> is missing` (`reachability-headers.ts:152-154`) |
+| cycle and depth | `:98-108` | **trusted from WU3**, licensed by an unchanged source generation (ADR-0023). Termination is still structural: `git_maintenance_objects` PK `(repo_id, run_id, oid)` (`schema-maintenance-statements.ts:116`) means a cycle re-marks an already-expanded object and enqueues nothing |
+| physical-only edges skip target validation | `reachability-publish.ts:54` | unchanged — physical-only protection remains independently enforced |
+
+**The quantity, stated precisely.** Fix a source generation G and a run R observing
+G. For each canonical physical dependency edge `e = (child -> base)` in the
+complete-packed canonical graph, define
+
+> `visits(e, R)` = the number of `git_pack_objects` rows attributable to `e` that
+> any maintenance SQL statement **delivers to JavaScript** during R while the
+> generation is G.
+
+"Constant amortized work per generation per edge" means: `visits(e, R) <= C` for a
+fixed C independent of chain length, repository size, and how many
+`maintenance()` calls R spans.
+
+**C = 2.** `publishExpansion` inserts marks with
+`ON CONFLICT (repo_id, run_id, oid) DO UPDATE SET physical_only = min(…), expanded
+= CASE WHEN physical_only = 1 AND excluded.physical_only = 0 THEN 0 ELSE expanded END`
+(`reachability-publish.ts:214-224`), so an object expands at most **twice** per run:
+once as physical-only and once more if it is later requeued as a logical edge. Each
+expansion issues exactly one `/* maintenance-pack-base */` statement returning
+exactly one row. Baseline: `visits(e, R) = Theta(d)` where d is the number of
+descendants of `e` in its chain.
+
+**Why the measurement is faithful.** JS-delivered rows understate work only when a
+statement scans internally without returning. That failure mode is eliminated here
+**by construction on both sides of the comparison**:
+
+- The new statement is non-recursive and returns one row, so delivered rows equal
+  visited dependency rows.
+- The baseline statement also returns every row it visits: the recursive CTE's
+  final `SELECT` projects the whole `packed_chain`
+  (`reachability-packed.ts:47-60`) and the loop consumes all of it (`:66-88`).
+
+So the before/after comparison is apples to apples, and it is pinned by an
+`EXPLAIN QUERY PLAN` witness asserting the new statement has **no `RECURSIVE STEP`**
+and only `SEARCH … USING … (repo_id=? AND oid=?)` lookups — the same technique as
+the pager witness added in `dd0005c` (`tests/pack.test.ts`, "drives graph pages
+from the frontier with canonical oid seeks").
+
+**Instrumentation — what exists, what must be added.**
+
+Exists:
+- `SqliteTestStorage.statementCount` and `.rowCount`
+  (`tests/helpers/storage.ts:111-112`), incremented per statement and per delivered
+  row (`:135,139-141,148-151,184,189-190`), with `resetCounters()` (`:174-178`).
+- The opt-in statement `histogram` keyed by a 120-character query fingerprint
+  (`tests/helpers/storage.ts:119,157-161`) — long enough to retain the leading SQL
+  comments already used by maintenance queries: `/* maintenance-pack-chain */`
+  (`reachability-packed.ts:30`), `/* maintenance-tree-edges */`
+  (`reachability-expand.ts:162`), `/* maintenance-object-info */`
+  (`reachability-headers.ts:136`), `/* maintenance-edge-targets */`
+  (`reachability-publish.ts:63`).
+- `NodeSqliteDatabase.metrics()` -> `{ statements, rows }` and `resetMetrics()`
+  (`packages/local/src/sqlite/database.ts:241-247`).
+- `bench/statements.ts` already records whole-operation `storage.statementCount` /
+  `storage.rowCount` against frozen baselines (`bench/statements.ts:441-453`,
+  `:318-332`) and is gated by `npm run bench:statements -- --check`.
+
+Must be added — **one thing**:
+- A per-fingerprint **row** counter in `SqliteTestStorage`: widen `histogram` to
+  `Map<string, { statements: number; rows: number }>` (or add a parallel
+  `rowHistogram`), incrementing in the `Cursor` `onRow` callback
+  (`tests/helpers/storage.ts:137-141,148-151`) and in `iterate` (`:189-190`).
+  This is required only for the unit-level *attribution* assertion; the bench
+  N/2N ratio needs no new instrumentation because the maintenance advance loop is
+  the whole operation being measured.
+- The new statement must carry `/* maintenance-pack-base */` within its first 120
+  characters so the fingerprint keeps it.
+
+Explicitly **not** claimed: rows scanned inside a query are not observable through
+`node:sqlite` or the DO SQL surface. The contract does not pretend otherwise; it
+removes the need for that observation by making the statement single-row and
+pinning that with `EXPLAIN`.
+
+### Acceptance — the exact witnesses
+
+**`tests/pack-read-lifetime.test.ts`** (extend; created by WU4)
+
+1. *Nested read scopes get distinct owners.* A cold paged read invoked from inside
+   `authenticateCompleteSources` completes; a `RecordingDatabase` shows two
+   distinct `read_id` values inserted into `git_pack_read_scopes`, and zero rows in
+   all three scratch tables after return.
+2. *Pure nested read.* A paged read nested inside an enclosing `transactionSync`
+   that is itself inside `withGitMutationGuard` succeeds and does not raise
+   `EREENTRANT`.
+3. *Source drift inside a scope is `ECORRUPT`.* A test-only seam that bumps
+   `source_generation` between the scope's entry snapshot and its exit check makes
+   the read fail with `error.code === "ECORRUPT"`, the scratch rows roll back, and
+   the enclosing transaction is not silently continued. Assert the code, not the
+   message alone.
+4. *Pending authentication.* A pending-pack read (`pendingPackId` non-null) that
+   observes a `git_pack_meta.state` change inside its scope fails `ECORRUPT`;
+   an unchanged pending read succeeds and still resolves pending-visible bases.
+5. *Rejected source-changing callback.* Assert the *structural* form: the resolver
+   seams are store-internal and read-only — a test that injects a mutating
+   `ExternalBatchResolver` through the `PackStore` constructor makes the read fail
+   `ECORRUPT` rather than returning mixed-generation results.
+6. *Local rollback cursor semantics* (`tests/local/`): a paged read that throws
+   invalidates cursors created in its scope — resuming one fails `ESTALE`
+   (`packages/local/src/sqlite/cursors.ts:69`) — while a successful scope preserves
+   an enclosing cursor across the scope (`cursors.ts:15-21`).
+7. *DO cursor drain.* A paged read leaves no open scratch cursor at the transaction
+   boundary; assert via the owner's cursor registry being empty before the owner
+   row is deleted.
+8. *Descriptor / checkpoint maxima.* On a fixture crossing 4,096 union-graph
+   entries and many pages: per-page delivered rows never exceed `entryLimit` (the
+   existing `rowCount > entryLimit -> CorruptError` at `read-graph.ts:111` stays),
+   scratch row counts match the declared bound, and the scratch tables are empty
+   after the read. The *memory* number — that JS-resident metadata does not grow
+   with page count — is a WU8 `bench/` measurement under `cpu-lease`, reported as
+   added process HWM for depth N vs 2N; a unit test must not headline it.
+9. *No regression of WU4 or WU3.* Existing lifetime and prefix cases stay green.
+
+**`tests/pack.test.ts`** — the `dd0005c` witness "drives graph pages from the
+frontier with canonical oid seeks" must still pass with the seed CTE now reading
+`git_pack_read_frontier` instead of `json_each`; extend it to assert the new seed
+is an ordered PK-prefix seek and that frontier -> canonical OID -> visible-pack
+ordering is preserved.
+
+**`tests/maintenance-reachability.test.ts`** (extend)
+
+10. *N / 2N dependency work.* Two packed fixtures of depth N and 2N. With the row
+    histogram scoped to `/* maintenance-pack-base */`, assert delivered dependency
+    rows scale linearly (`rows(2N) <= 2.5 x rows(N)`), and record that the baseline
+    statement gives ~4x. Add a negative control that fails against the current
+    `validatedPackedBaseChain`.
+11. *`EXPLAIN` witness.* The `/* maintenance-pack-base */` plan contains no
+    `RECURSIVE STEP` and every `object`/`base`/`loose` lookup is
+    `SEARCH … USING … (repo_id=? AND oid=?)`.
+12. *Preserved verdicts.* Every existing case at
+    `tests/maintenance-reachability.test.ts:776-1000` — exact physical bases, self
+    / two-node / longer cycles, wrong-type and missing terminals, source-qualified
+    loose terminals, complete pack id zero, no semantic expansion from a
+    physical-only base, deferred bases after an exact 256-edge page — keeps its
+    current verdict and error text.
+13. *Cold resume after every durable maintenance boundary.* Reopen between each of
+    `roots`, `mark`, `classify-loose`, `repack`, `classify-packs`, `sweep-loose`,
+    `sweep-packs`, `finish`, and assert the run resumes at the same cursor with an
+    unchanged `observed_source_generation`.
+
+**`tests/concurrency-maintenance.test.ts`** (extend)
+
+14. *Source-only drift.* With roots and promises unchanged, a loose write (owner 3)
+    between two `maintenance()` calls settles the owned batch and restarts
+    discovery before any destruction; no object is swept on the drifted state.
+15. *Owned-repack drift without infinite restart.* A full repack cycle bumps the
+    generation at publication and at loose finalization and **adopts** each bump in
+    the same transaction; the run reaches `finish` in a bounded number of calls and
+    `restarted` is 0. A control that mutates a source between the bump and the
+    adoption must restart instead.
+16. *Physical / pending base protection survives.* A repack that would orphan a
+    packed delta base still fails `EBUSY` through
+    `#authenticateLooseDeltaBases` / `hasRequiredPackDependency`; promise semantics
+    and root-epoch invalidation are unchanged.
+
+**`tests/schema.test.ts`** — the three new tables, their indexes, the
+`git_repositories.source_generation` column and the
+`git_maintenance_runs.observed_source_generation` column are registered and
+asserted; foreign-key cascade from `git_repositories` is covered in
+`tests/foreign-keys.test.ts`.
+
+**`bench/statements.ts`** — two new frozen rows, `maintenance-mark-depth-N` and
+`maintenance-mark-depth-2N`, gated by `npm run bench:statements -- --check`.
+
+**Focused command.**
+`cpu-lease run -n 4 -- npx vitest run --maxWorkers=2 tests/pack-read-lifetime.test.ts
+tests/pack.test.ts tests/pack-prefix-selection.test.ts tests/pack-cold-admission.test.ts
+tests/maintenance-reachability.test.ts tests/maintenance-repack.test.ts
+tests/maintenance-sweep.test.ts tests/concurrency-maintenance.test.ts
+tests/schema.test.ts tests/client.test.ts`, then routine smoke, typecheck and lint.
+
+### Territory
+
+Schema change: **yes** — three new tables, one new column on `git_repositories`,
+one new column on `git_maintenance_runs`. No migration is required
+(`CLAUDE.md`: schema version 1 is editable).
+
+New files
+- `packages/git/src/store/schema/schema-pack-read-statements.ts`
+- `packages/git/src/store/core/source-generation.ts`
+- `packages/git/src/store/pack/read/read-scope.ts`
+- `packages/git/src/store/pack/read/read-graph-scratch.ts`
+- `docs/decisions/0025-scope-cold-read-metadata-and-linearize-maintenance-expansion.md`
+
+Modified — read side
+- `packages/git/src/store/schema/schema.ts`, `schema-core-statements.ts`
+- `packages/git/src/store/pack/read.ts`, `read/read-resolver.ts`, `read/read-graph.ts`
+- `packages/git/src/store/pack/ingest.ts`, `pack/lifecycle/lifecycle-delete.ts`
+- `packages/git/src/store/objects/objects-write.ts`, `objects/objects-batch.ts`
+
+Modified — maintenance side
+- `packages/git/src/store/maintenance/reachability/reachability-packed.ts`,
+  `reachability-expand.ts`, `reachability-advance.ts`
+- `packages/git/src/store/maintenance/state/state-view.ts`, `state-contracts.ts`,
+  `state-transitions.ts`
+- `packages/git/src/store/maintenance/repack/repack-publish.ts`, `repack-finalize.ts`
+- `packages/git/src/store/maintenance/sweep/sweep-shared.ts`, `sweep-loose.ts`,
+  `sweep-packs.ts`
+- `packages/git/src/store/schema/schema-maintenance-statements.ts`
+- `packages/git/src/ops/repository/maintenance.ts`
+
+Tests, bench and docs
+- `tests/helpers/storage.ts` (row histogram), `tests/pack-read-lifetime.test.ts`,
+  `tests/pack.test.ts`, `tests/maintenance-reachability.test.ts`,
+  `tests/concurrency-maintenance.test.ts`, `tests/schema.test.ts`,
+  `tests/foreign-keys.test.ts`, `tests/local/` (cursor rollback)
+- `bench/statements.ts`
+- `docs/reference/concurrency.md`, `docs/INDEX.md`, `docs/decisions/README.md`
+
+Not touched: `read/read-external.ts`, `read/read-data.ts`, `read/read-authenticate.ts`
+(the scope is entered below them), and the WU3 `pack/graph/` admission.
+
+### Risks — what this contract does not settle
+
+1. **Scratch storage, not scratch removal.** The `origins x depth` product is moved
+   out of the isolate heap, not reduced. Pathological inputs write many scratch
+   rows. Mitigation is recorded (drop checkpoints, rely on the depth cap) but is a
+   measured follow-up.
+2. **Statement count on paged reads rises.** Each page now costs additional scratch
+   inserts and seeks. ADR-0005 makes this a target, not admission, but the
+   50,000-edge cold-reopen witness (10.88 s today) may get slower. If it does, the
+   answer is a measurement and a decision, not a fixture reduction.
+3. **The lazy-transaction refinement deviates from the draft's literal wording.**
+   It narrows cost and preserves the direction, but a reviewer may want the
+   always-on variant. Needs the user's confirmation.
+4. **Loose-write generation cost.** One extra `UPDATE` per loose write / batch.
+   Believed negligible and consistent with `bumpMaintenanceRootEpoch`, but it is a
+   hot path and must appear in WU8's statement numbers.
+5. **DO cursor semantics stay platform-defined.** The contract is structural
+   (drain before the boundary). If workerd's behavior changes, the witness is a
+   structural assertion, not a platform guarantee.
+6. **Source-only drift resets to `roots`.** Correct but not minimal; a partial
+   reset that keeps roots would be cheaper. Deliberately not built.
+7. **Rows scanned inside SQL remain unobservable.** The N/2N claim holds only
+   because both statements return what they visit; the `EXPLAIN` witness is what
+   keeps that true. If a future rewrite reintroduces a recursive dependency query,
+   the metric silently stops meaning what it says.
+
+### Per-blocker status against the 2026-09-21 review
+
+| # | Blocker | Status |
+|---|---|---|
+| 1 | Source-generation semantics | Resolved. Four owners, three explicit non-owners, storage, writer, pending coverage. |
+| 2 | Read-scope entry points | Resolved. Six entries named; nesting, owner allocation and pure-nested support specified. |
+| 3 | Exact scratch schema | Resolved. Three tables with keys, indexes, per-query access and bounds. Caveat: the `origins x depth` product is relocated, not reduced. |
+| 4 | Rollback / cursor on both adapters | Resolved for local (documented `ESTALE` invalidation, abort-only propagation, writer-lock consequence). Structurally specified for DO — kompjutr defines no cursor invalidation there, so the contract is "drain before the boundary". |
+| 5 | External resolver callback scope | Resolved. The seam inventory is exhaustive and store-internal; `ESTALE` is shown not to fit and `CorruptError` matches `read-authenticate.ts:120`. |
+| 6 | Repack reconciliation proof | Resolved. Invariant at `full-object-stream.ts:104,177` + `writer.ts:64` + `repack-finalize-sources.ts:36`; four-step consequence argument; loop-freedom argument. |
+| 7 | Maintenance work bound | Partially resolved. The quantity, the constant and the measurement are exact and the metric is faithful by construction. Rows scanned inside a query are not available on any adapter; the contract removes the need rather than measuring it, and pins that with `EXPLAIN`. True VDBE-level counting is not possible — `node:sqlite` exposes no `sqlite3_stmt_status`. |
 
 ## WU6 integration contract — approved 2026-09-21
 
@@ -875,6 +1589,73 @@ active input/output, copies and caches separately; unchanged per-object limits
 do not imply that every legal single candidate fits the 100 MiB target.
 
 ## Run log
+
+- 2026-09-22: WU5's revised contract was independently reviewed by
+  `ses_ae3ce2e2f5aa33d4a` and came back **blocked** on three defects. The
+  replacement dependency statement joins `base_pack` on `state='complete'` but
+  projects no column from it, so a base in a pending pack would read as
+  satisfied; the cycle witnesses build their fixtures by mutating
+  `git_pack_objects` after ingest, so trusting WU3 deletes both their verdict
+  and their histogram key; and the per-edge constant is 3, not 2, because
+  `headerExpansion`/`treeExpansion` discard an already-executed base edge when
+  the 256-edge page is full. The review verified the full-object repack
+  invariant independently and found it stronger than claimed: `PackWriter.refDelta`
+  has no callers anywhere in `packages/git/src`. The user decided four open
+  questions: the read scope snapshots, opens its transaction and re-checks only
+  on the paged path, which removes the conflict with ADR-0023's recorded
+  consequence and needs no ADR rewrite; moving cycle/depth validation to WU3
+  admission is approved as an explicit amendment to WU5's scope line, with the
+  existing witnesses rewritten to reject at ingest; relocating `origins x depth`
+  into scratch rows is accepted as satisfying backlog 63, provided 63 records
+  that the product is relocated rather than reduced and WU8 reports scratch rows
+  and bytes beside the heap high-water; and the `EXPLAIN` witness is accepted in
+  place of counting repeated internal scans, which no adapter can observe.
+  A second contract revision is in progress. Implementation stays gated.
+
+- 2026-09-22: WU7 landed as `c928a53`. Five journeys cover complete and blobless
+  clone and fetch, cold packed reads and promisor hydration after eviction,
+  checkpoint refs, merge and rebase conflict through continue and abort, push,
+  and maintenance with generated integration output still rooted. The
+  interrupted-fetch journey cuts a 3,073-commit fetch at each ingest yield in
+  turn -- twelve interruptions before publication -- and compares the whole
+  snapshot after every cut and reopen; making a mid-ingest pack visible fails
+  it, so the witness is load-bearing. Two limitations are recorded rather than
+  papered over. Restoring the pre-WU1 projection leak did **not** fail the
+  journey, because every public read authenticates the OID first and a pending
+  pack's rows are unreachable from the client, so
+  `tests/pack-projection-publication.test.ts` remains WU1's only witness. The
+  maintenance journey proves classify and repack (6 objects) and that generated
+  output survives reopen, but the harness pins the clock inside the 14-day GC
+  grace, so the sweep's root decision is never exercised. Authoring also found a
+  real parity gap outside the sprint: kompjutr orders an unmerged status row
+  among the ordinary rows while Git prints every changed row first, reproduced
+  with paths chosen to exclude path ordering. Filed as
+  [backlog 83](../backlog/83-order-unmerged-status-rows-after-changed-rows.md);
+  the journey avoids the shape instead of asserting the wrong order.
+
+- 2026-09-22: WU6 passed independent review by `ses_add69c6a5a41850f3` with no
+  blocking correctness defect; all seven consumer-ownership rows are proven at
+  file:line, and `adoptMany` is reachable only from the two publishing paths, so
+  validation-only consumers publish nothing. Two behavioural regressions it
+  found are fixed in `8a90a8a`. `replaySnapshot` had moved caller-input
+  validation inside `withIntegrationWorkspaceOwned`, whose unconditional
+  `coordinator.fail()` then poisoned the enclosing scratch index on a caught
+  `GitError`; the validation is hoisted out and the witness restored to asserting
+  an unchanged `writeTree()`. The restored non-advancing-cursor guard tracked
+  progress only on the `after` branch, so the `afterSubtree` branch could still
+  page forever; it now records the tail on both branches. Also fixed: the stable
+  `ECORRUPT` code on duplicate projected paths, a witness for an ordinary-object
+  write failing during adoption, the dead `maxEntries`, and three trailing
+  imports. Two items are deferred with the user's disposition still open --
+  `planIntegration`, `planVirtualAncestorIntegration` and `planReplay` are
+  reachable only from tests while still exported, and `detach()` issues one blob
+  read per plan entry. One latent defect is recorded, not fixed: `startReplay`
+  validates caller revisions inside its workspace exactly as `replaySnapshot`
+  did, but no public path nests it in a scratch scope today. **WU6's measurement
+  gate remains open**: `bench/results/integration-baseline-2026-09-21/` is the
+  pre-change baseline at `dd0005c` and `3a37c27` added nothing under `bench/`,
+  so "behaviorally green" is accurate and the memory half belongs to WU8.
+
 
 - 2026-09-22: WU6 integration is behaviorally green after four defects were
   fixed. The shared worktree walk lost the non-advancing-cursor guard when merge

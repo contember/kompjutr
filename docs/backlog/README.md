@@ -165,3 +165,4 @@ does not schedule these issues into a sprint.
 - [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
 - [81 — Copy object bytes only when a cache actually retains them](81-copy-object-bytes-only-when-retained.md)
 - [82 — Restore the clone statement target after canonical graph admission](82-restore-clone-statement-target-after-graph-admission.md)
+- [83 — Order unmerged status rows after changed rows](83-order-unmerged-status-rows-after-changed-rows.md)
