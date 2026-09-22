@@ -11,7 +11,7 @@ import {
   type ReachabilityObjectInfo,
 } from "./reachability-contracts.js";
 import { requireObjectInfo, scanHeaders } from "./reachability-headers.js";
-import { packedBaseEdge, validatedPackedBaseChain } from "./reachability-packed.js";
+import { packedBaseEdge, validatedPackedBase } from "./reachability-packed.js";
 
 export function headerExpansion(
   store: SharedRepoStore,
@@ -189,23 +189,10 @@ export function treeExpansion(
   return { edges, nextCursor, complete };
 }
 export function physicalExpansion(store: SharedRepoStore, object: QueueObject): ObjectExpansion {
-  const packed = validatedPackedBaseChain(store, object.oid);
+  const packed = validatedPackedBase(store, object.oid);
   if (packed === null) {
     requireObjectInfo(store, object.oid);
     return { edges: [], nextCursor: 0, complete: true };
   }
-  if (packed.baseOid === null) return { edges: [], nextCursor: 0, complete: true };
-  return {
-    edges: [
-      {
-        oid: packed.baseOid,
-        type: packed.sourceType,
-        optionalMissing: false,
-        allowPromisedMissing: false,
-        physicalOnly: true,
-      },
-    ],
-    nextCursor: 0,
-    complete: true,
-  };
+  return { edges: packed.base === null ? [] : [packed.base], nextCursor: 0, complete: true };
 }

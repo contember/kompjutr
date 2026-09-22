@@ -13,6 +13,8 @@ export interface MaintenanceRunView {
   runId: number;
   observedRootEpoch: number;
   rootEpoch: number;
+  observedSourceGeneration: number;
+  sourceGeneration: number;
   nextRunId: number;
   phase: MaintenancePhase;
   startedMs: number;

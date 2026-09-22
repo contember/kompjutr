@@ -47,6 +47,14 @@ constant number of times. Wide and deep graph reads must have bounded measured
 high-water, and deep-chain maintenance work must grow linearly. Do not lower
 structural limits or introduce a projected-work refusal.
 
+The `origins x depth` discovery product is **relocated, not reduced**: it moves
+out of the isolate heap into owner-scoped scratch rows
+([ADR-0025](../decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md)),
+where a `WITHOUT ROWID` table with a second `UNIQUE` index costs roughly two
+index entries per frontier row. The measurement therefore reports **scratch rows
+and bytes** for depth N against depth 2N alongside the heap high-water; heap
+numbers alone no longer describe the cost.
+
 Exercise public cold reads with format-valid multi-megabyte delta chains and
 public maintenance with N/2N depth fixtures. Measure under the benchmark rules;
 cache size, returned batch size, and statement count alone are not sufficient.

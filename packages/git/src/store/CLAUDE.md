@@ -64,8 +64,13 @@ it does not re-read and re-inflate the pack. Only complete packs are readable.
 
 Ordinary ingest uses a renewable five-minute repository lease and monotonic pack
 IDs. Maintenance has exact batch ownership instead. One `maintenance()` call
-advances one bounded durable action. Root mutations bump the repository epoch;
-epoch drift restarts discovery before destructive work. Sweep eligibility is 14
+advances one bounded durable action. Root mutations bump the repository epoch
+and source changes bump `git_repositories.source_generation`; drift on either
+identity restarts discovery before destructive work. A step that changes sources
+adopts its own bump as the last statement of its transaction (ADR-0025).
+A paged packed read owns its discovery frontier in `git_pack_read_*` scratch
+rows and re-asserts that generation before releasing its owner; an ordinary
+non-paged read opens no transaction and writes nothing. Sweep eligibility is 14
 days after stable classification. A loose object that a surviving pack still
 names as a delta base is never nominated and never swept.
 

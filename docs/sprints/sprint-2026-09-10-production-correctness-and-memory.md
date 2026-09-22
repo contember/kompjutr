@@ -701,7 +701,7 @@ traversing an admitted graph.
 
 **Witness cost, stated up front.** The current cycle witnesses fabricate their
 fixtures with a raw `UPDATE git_pack_objects SET base_oid = ?` *after* ingest
-(`tests/maintenance-reachability.test.ts:822-828`), i.e. exactly the undefined
+(`tests/maintenance-reachability.test.ts:821-827`), i.e. exactly the undefined
 behavior ADR-0004 excludes. They must be rewritten to reject at ingest. Section
 "Acceptance" item 12 specifies the rewrite; it is a deliberate, approved cost,
 not a weakening.
@@ -742,7 +742,7 @@ serves it, and which canonical delta edge it carries.
 | 1 | Pack publication | `packages/git/src/store/pack/ingest.ts:136-171` — place the bump after `graph.cleanup()` (`:166`) and **before** the `published` lifecycle callback (`:167-169`), so the callback can adopt the new value | unconditional: the `UPDATE … state='complete'` at `:141` makes a whole pack visible |
 | 2 | Pack storage deletion | `PackDeletion.deletePacks`, `packages/git/src/store/pack/lifecycle/lifecycle-delete.ts:277-285` | **conditional — see below** |
 | 3 | Loose object write | `packages/git/src/store/objects/objects-write.ts:43`, `:162`, `:227`; `packages/git/src/store/objects/objects-batch.ts` — gate on the existing `wroteLoose` flag (`:135`, set at `:176`, consumed at `:247`), so the `fresh.length === 0` early return at `:172-175` bumps nothing | conditional on actually writing a `git_objects` row |
-| 4 | Loose object deletion | `deleteExactLooseObjects`, `packages/git/src/store/maintenance/repack/repack-finalize-sources.ts:270-277`; `packages/git/src/store/maintenance/sweep/sweep-loose.ts:206` | unconditional: both paths verify a non-empty deletion set (`repack-finalize-sources.ts:291-293`) |
+| 4 | Loose object deletion | `deleteExactLooseObjects`, `packages/git/src/store/maintenance/repack/repack-finalize-sources.ts:270-277`; `packages/git/src/store/maintenance/sweep/sweep-loose.ts:206` | unconditional: both paths verify a non-empty deletion set (`repack-finalize-sources.ts:215-217`, `sweep-loose.ts:176`) |
 
 **Owner 2 is conditional.** `deletePacks` is reached by `discardPending`
 (`lifecycle-delete.ts:76`), by `settleMaintenanceRepackForRestart`'s pending
@@ -1076,7 +1076,7 @@ calls `fail()`**. Three reasons:
 - Not every in-scope error is a store error. `read-resolver.ts:216-218` throws
   `E2BIG` for a caller batch over `MAX_PACK_BLOB_INPUTS`, and `:190` throws the
   `E2BIG` graph-limit signal that `:118` catches to *enter* paging. Caller mistakes
-  must not poison anything (`packages/git/src/store/CLAUDE.md:45-46`).
+  must not poison anything (`packages/git/src/store/CLAUDE.md:50-51`).
 
 ### 5. Callback scope and the drift error contract
 
@@ -1206,8 +1206,9 @@ The draft's conditional rule is withdrawn: its side condition is always satisfie
 - Settle-then-reset: `ops/repository/maintenance.ts:112-115` runs
   `settleMaintenanceRepackForRestart` and `resetMaintenanceRunForRootChange` in one
   transaction, and the settle can bump (it reaches `discardPending` at
-  `repack-finalize.ts:245` and `discardOwnedComplete` at `:254-260`). The reset must
-  therefore **read the generation after the settle**, and
+  `repack-finalize.ts:245`; the `discardOwnedComplete` citation is struck —
+  `repack-finalize.ts:254-260` is the *published* branch and never discards). The
+  reset must therefore **read the generation after the settle**, and
   `resetMaintenanceRunForRootChange`'s `UPDATE`
   (`packages/git/src/store/maintenance/state/state-transitions.ts:91-104`) must
   actually `SET observed_source_generation = ?` and assert it in the returned row
@@ -1303,6 +1304,12 @@ Decision rules in JS, preserving every current verdict and message:
 `` `packed copy of ${oid} disagrees with its authoritative type` `` (`:131-134`) —
 and `physicalExpansion` keeps `requireObjectInfo` for a queued object with no
 complete packed row (`reachability-expand.ts:192-196`).
+
+**Consequence, stated:** the base *type* verdict is now deferred to the child's
+own expansion rather than raised at the origin's. It is never lost — `finishMark`
+refuses to leave `mark` while any `expanded = 0` row remains
+(`reachability-advance.ts:119-126`) — but a multi-edge fixture will fail on a
+later `maintenance()` call than it does today.
 
 **What moves, per section 0a:** cycle (`:97-101`) and depth (`:106-108`) verdicts,
 which ADR-0023 now owns.
@@ -1427,7 +1434,7 @@ seek and that frontier, canonical OID and visible-pack ordering is preserved.
 12. *Cycle rejection moves to ingest.* The three cases in "rejects self, two-node,
     and longer complete-pack delta cycles in one bounded query" (`:810-839`) build
     their fixtures with a raw `UPDATE git_pack_objects SET base_oid = ?` after ingest
-    (`:822-828`) — undefined behavior under ADR-0004 — and then assert
+    (`:821-827`) — undefined behavior under ADR-0004 — and then assert
     `toThrow(/contains a cycle/)` plus a `/* maintenance-pack-chain */` histogram of
     exactly one entry with one row (`:833-838`). **Both assertions die with the scope
     change.** Replace with: the same three shapes (self, two-node, three-node) built
@@ -1447,7 +1454,7 @@ seek and that frontier, canonical OID and visible-pack ordering is preserved.
     base (`:895-903`).
 15. *What survives unchanged.* The missing-terminal case (`:842,866-875`) asserts
     `/is missing/` and keeps it, because the replacement raises that message
-    directly at the child's expansion. The wrong-type case (`:842-862`) survives via
+    directly at the child's expansion. The wrong-type case (`:842-864`) survives via
     the per-edge `base_packed_type` check. Both still use a raw `UPDATE` to build
     their fixtures; that is acceptable because neither verdict is being delegated to
     admission — note it so a later reader does not mistake it for endorsement.

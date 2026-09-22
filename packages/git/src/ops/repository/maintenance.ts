@@ -104,7 +104,12 @@ function advanceSynchronousMaintenance(
     return durableResult(repo);
   }
 
-  if (before.observedRootEpoch !== before.rootEpoch) {
+  // A run carries two identities: the root epoch and the source generation.
+  // Either drifting restarts discovery before any further destruction.
+  if (
+    before.observedRootEpoch !== before.rootEpoch ||
+    before.observedSourceGeneration !== before.sourceGeneration
+  ) {
     if (before.phase === "roots" || before.phase === "mark") {
       advanceMaintenanceRootSnapshotOwned(context.database, repoId, { nowMs });
       return durableResult(repo);

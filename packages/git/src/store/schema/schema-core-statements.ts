@@ -54,6 +54,10 @@ export const CORE_SCHEMA_STATEMENTS = [
        typeof(checkout_revision) = 'integer'
        AND checkout_revision BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
      ),
+     source_generation INTEGER NOT NULL DEFAULT 0 CHECK (
+       typeof(source_generation) = 'integer'
+       AND source_generation BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
      CHECK (
        (lifecycle = 'ready' AND clone_generation IS NULL AND clone_expires_ms IS NULL)
        OR

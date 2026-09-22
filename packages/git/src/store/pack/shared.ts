@@ -25,8 +25,6 @@ export {
   type IngestBase,
   MAX_PACK_DELTA_WORKING_BYTES,
   type PackGraphExit,
-  type PackGraphOrigin,
-  type PackGraphPage,
   type PackIngestMemory,
   type PackRangeRequest,
   validateDeltaWorkingSet,

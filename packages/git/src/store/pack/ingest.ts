@@ -5,6 +5,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { GitError } from "../../common/errors.js";
 import type { ByteLru } from "../../common/lru.js";
 import type { RawObject } from "../../common/objects.js";
+import { bumpRepositorySourceGeneration } from "../core/source-generation.js";
 import { ChunkPool } from "./chunks.js";
 import { PackGraphAdmission } from "./graph/graph-admission.js";
 import { PackIndexer } from "./ingest/ingest-index.js";
@@ -166,6 +167,7 @@ export class PackIngestEngine {
         graph.validate();
         commits.finish();
         graph.cleanup();
+        bumpRepositorySourceGeneration(this.#db, this.#repoId);
         if (options.lifecycle !== undefined) {
           requireLifecycleResult(options.lifecycle.published(result), "published");
         }

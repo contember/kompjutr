@@ -88,6 +88,30 @@ function expectEnforcedBehavior(db: ForeignKeyDatabase): void {
       db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries WHERE source_key = ?", sourceKey),
     ).toBe(0);
   }
+
+  // A paged read's scratch is owner-scoped: releasing the owner row must take
+  // its pages and frontier with it, and an orphan insert must be refused.
+  expect(() =>
+    db.run(
+      `INSERT INTO git_pack_read_pages (repo_id, read_id, step, entry_limit)
+       VALUES (91, 'absent', 0, 1)`,
+    ),
+  ).toThrow(/FOREIGN KEY constraint failed/);
+  db.run("INSERT INTO git_pack_read_scopes (repo_id, read_id) VALUES (91, 'scope')");
+  db.run(
+    `INSERT INTO git_pack_read_pages (repo_id, read_id, step, entry_limit)
+     VALUES (91, 'scope', 0, 1)`,
+  );
+  db.run(
+    `INSERT INTO git_pack_read_frontier (repo_id, read_id, step, oid, origin_id, depth)
+     VALUES (91, 'scope', 0, ?, 0, 0)`,
+    "c".repeat(40),
+  );
+  db.run("DELETE FROM git_pack_read_scopes WHERE repo_id = 91 AND read_id = 'scope'");
+  expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_read_pages WHERE repo_id = 91")).toBe(0);
+  expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_read_frontier WHERE repo_id = 91")).toBe(
+    0,
+  );
 }
 
 class IgnoringForeignKeysDatabase implements SqlDatabase {

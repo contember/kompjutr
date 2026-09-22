@@ -4,6 +4,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
+import { bumpRepositorySourceGeneration } from "../../core/source-generation.js";
 import { PackGraphAdmission } from "../graph/graph-admission.js";
 import {
   type CompletePackObject,
@@ -278,13 +279,41 @@ export class PackDeletion {
     if (deletingPackIds.length === 0) return;
     const graph = new PackGraphAdmission(this.db, this.repoId, this.maxDeltaDepth, "deletion");
     graph.seedPacks(deletingPackIds);
-    for (const packId of deletingPackIds) this.#promoteFallbacks(packId, deletingPackIds);
+    // Read before the first promotion: afterwards the canonical rows already
+    // point at the surviving packs and a complete owner looks like none.
+    const ownedCanonicalRows = this.#ownsVisibleCanonicalRows(deletingPackIds);
+    let promoted = 0;
+    for (const packId of deletingPackIds) {
+      promoted += this.#promoteFallbacks(packId, deletingPackIds);
+    }
     for (const packId of deletingPackIds) this.#deletePackStorage(packId, deletingPackIds);
     graph.validate();
     graph.cleanup();
+    // Pending rows are invisible to complete reads, so a pending-only deletion
+    // that promotes nothing changes no source an ordinary reader can observe.
+    if (ownedCanonicalRows || promoted > 0) {
+      bumpRepositorySourceGeneration(this.db, this.repoId);
+    }
   }
 
-  #promoteFallbacks(packId: number, deletingPackIds: readonly number[]): void {
+  #ownsVisibleCanonicalRows(deletingPackIds: readonly number[]): boolean {
+    const owned = this.db.scalar<unknown>(
+      `SELECT EXISTS(
+         SELECT 1 FROM git_pack_objects o
+         JOIN git_pack_meta m
+           ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id AND m.state = 'complete'
+         WHERE o.repo_id = ? AND o.pack_id IN (SELECT value FROM json_each(?))
+       )`,
+      this.repoId,
+      JSON.stringify(deletingPackIds),
+    );
+    if (owned !== 0 && owned !== 1) {
+      throw new CorruptError("canonical pack ownership probe returned an invalid value");
+    }
+    return owned === 1;
+  }
+
+  #promoteFallbacks(packId: number, deletingPackIds: readonly number[]): number {
     const encodedDeletingPackIds = JSON.stringify(deletingPackIds);
     this.db.run(
       `INSERT OR REPLACE INTO git_pack_objects
@@ -326,6 +355,13 @@ export class PackDeletion {
       packId,
       encodedDeletingPackIds,
     );
+    // `#promoteFallbacks` runs once per deleted pack, so the promotions have to
+    // accumulate: a later iteration must not hide an earlier one.
+    const promoted = this.db.scalar<unknown>("SELECT changes()");
+    if (typeof promoted !== "number" || !Number.isSafeInteger(promoted) || promoted < 0) {
+      throw new CorruptError("pack fallback promotion returned an invalid row count");
+    }
+    return promoted;
   }
 
   #deletePackStorage(packId: number, deletingPackIds: readonly number[]): void {

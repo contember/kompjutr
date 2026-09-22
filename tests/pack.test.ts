@@ -2690,6 +2690,20 @@ describe("pack deferred resolution", () => {
       expect(recursiveStep).toBeGreaterThanOrEqual(0);
       expect(reachableScan).toBeGreaterThan(recursiveStep);
       expect(childSeek).toBeGreaterThan(reachableScan);
+      // The page roots now come from the owner-scoped frontier rows, which the
+      // primary key already orders: an ordered prefix seek, ahead of every
+      // canonical OID seek, and with no temporary b-tree for the DISTINCT.
+      const frontierSeek = plan.findIndex((detail) =>
+        detail.startsWith("SEARCH git_pack_read_frontier "),
+      );
+      expect(plan[frontierSeek]).toMatch(
+        /SEARCH git_pack_read_frontier USING PRIMARY KEY \(repo_id=\? AND read_id=\? AND step=\?\)/,
+      );
+      expect(plan.join("\n")).not.toContain("TEMP B-TREE");
+      expect(frontierSeek).toBeLessThan(
+        plan.findIndex((detail) => detail.startsWith("SEARCH object ")),
+      );
+      expect(frontierSeek).toBeLessThan(recursiveStep);
     } finally {
       inner.storage.db.close();
     }

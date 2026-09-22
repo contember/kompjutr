@@ -15,6 +15,7 @@ import {
 } from "../packages/git/src/common/objects.js";
 import { deflate } from "../packages/git/src/common/zlib.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { MAINTENANCE_PACK_BASE_SQL } from "../packages/git/src/store/maintenance/reachability/reachability-packed.js";
 import {
   advanceMaintenanceReachability,
   MARK_EXPANSIONS_PER_CALL,
@@ -254,6 +255,56 @@ function packedDelta(
   writer.refDelta(baseOid, literalDelta(base.length, target));
   writer.finish();
   return { bytes: concat(chunks), baseOid, targetOid: hashObject(type, target) };
+}
+
+function chainPack(depth: number): { bytes: Uint8Array; headOid: string } {
+  const chunks: Uint8Array[] = [];
+  const writer = new PackWriter((chunk) => chunks.push(chunk));
+  writer.header(depth + 1);
+  let value = utf8.encode("chain terminal\n");
+  let oid = hashObject("blob", value);
+  writer.object("blob", value);
+  for (let index = 0; index < depth; index++) {
+    const base = value;
+    const baseOid = oid;
+    value = utf8.encode(`chain link ${index}\n`);
+    oid = hashObject("blob", value);
+    writer.refDelta(baseOid, literalDelta(base.length, value));
+  }
+  writer.finish();
+  return { bytes: concat(chunks), headOid: oid };
+}
+
+/** Drain the mark without resetting the counters the caller is measuring. */
+function markToCompletion(
+  shared: ReturnType<typeof open>["store"]["shared"],
+  limit = 10_000,
+): void {
+  for (let call = 0; call < limit; call++) {
+    if (advanceMaintenanceReachability(shared).status === "complete") return;
+  }
+  throw new Error("reachability did not complete within the test bound");
+}
+
+function deltaPack(baseOid: string, base: Uint8Array, target: Uint8Array): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  const writer = new PackWriter((chunk) => chunks.push(chunk));
+  writer.header(1);
+  writer.refDelta(baseOid, literalDelta(base.length, target));
+  writer.finish();
+  return concat(chunks);
+}
+
+/** Statements and rows the replacement base query delivered since the last reset. */
+function baseQueries(db: TestDatabase): { statements: number; rows: number } {
+  const match = (entries: ReadonlyMap<string, number> | null): number => {
+    let total = 0;
+    for (const [query, count] of entries ?? []) {
+      if (query.includes("maintenance-pack-base")) total += count;
+    }
+    return total;
+  };
+  return { statements: match(db.storage.histogram), rows: match(db.storage.rowHistogram) };
 }
 
 function fullBlobPack(values: readonly Uint8Array[]): Uint8Array {
@@ -807,38 +858,62 @@ describe("maintenance reachability", () => {
     ).toBe(1);
   });
 
-  it("rejects self, two-node, and longer complete-pack delta cycles in one bounded query", async () => {
-    for (const links of [[0], [1, 0], [1, 2, 0]]) {
+  /**
+   * WU5 moved cycle and depth validation to ADR-0023's admission, which runs in
+   * the transaction of the source change that would create the cycle. The old
+   * fixtures closed their cycles with a raw `UPDATE git_pack_objects` after
+   * ingest — the out-of-band mutation ADR-0004 calls undefined behavior — so
+   * they are rebuilt out of real packs and assert the admission verdict.
+   */
+  it("rejects self, two-node, and three-node delta cycles at ingest", async () => {
+    for (const nodes of [1, 2, 3]) {
       const { db, checkout, store } = open();
-      const values = links.map((_, index) => utf8.encode(`cycle ${links.length} ${index}\n`));
+      const values = Array.from({ length: nodes }, (_, index) =>
+        utf8.encode(`cycle ${nodes} ${index}\n`),
+      );
       const oids = values.map((value) => hashObject("blob", value));
-      await store.packs.ingest(slices(fullBlobPack(values), 17));
-      for (let index = 0; index < links.length; index++) {
-        const baseIndex = links[index];
-        const oid = oids[index];
-        const baseOid = baseIndex === undefined ? undefined : oids[baseIndex];
-        if (oid === undefined || baseOid === undefined) throw new Error("cycle fixture is invalid");
-        db.run(
-          "UPDATE git_pack_objects SET base_oid = ? WHERE repo_id = ? AND oid = ?",
-          baseOid,
-          checkout.repoId,
-          oid,
+      const terminal = values[0];
+      if (terminal === undefined) throw new Error("cycle fixture has no terminal");
+      store.write("blob", terminal);
+      for (let index = 1; index < nodes; index++) {
+        await store.packs.ingest(
+          slices(deltaPack(oids[index - 1]!, values[index - 1]!, values[index]!), 17),
         );
       }
-      const root = oids[0];
-      if (root === undefined) throw new Error("cycle fixture has no root");
-      seedMark(db, checkout.repoId, [{ oid: root }]);
-      db.storage.histogram = new Map();
+      const completePacks = () =>
+        db.all<{ pack_id: number }>(
+          "SELECT pack_id FROM git_pack_meta WHERE state = 'complete' ORDER BY pack_id",
+        );
+      const before = {
+        refs: db.all<{ name: string; target: string }>(
+          "SELECT name, target FROM git_refs ORDER BY name",
+        ),
+        packs: completePacks(),
+      };
 
-      expect(() => advanceMaintenanceReachability(store.shared)).toThrow(/contains a cycle/);
-      const chainQueries = [...db.storage.histogram.entries()].filter(([query]) =>
-        query.includes("maintenance-pack-chain"),
-      );
-      expect(chainQueries).toHaveLength(1);
-      expect(chainQueries[0]?.[1]).toBe(1);
+      // The closing delta makes the terminal depend on the last node.
+      await expect(
+        store.packs.ingest(slices(deltaPack(oids[nodes - 1]!, values[nodes - 1]!, terminal), 17)),
+      ).rejects.toThrow(/cyclic delta chain at /);
+
+      expect(
+        db.all<{ name: string; target: string }>("SELECT name, target FROM git_refs ORDER BY name"),
+      ).toEqual(before.refs);
+      expect(completePacks()).toEqual(before.packs);
+      expect(store.read(oids[0]!)?.data).toEqual(terminal);
+
+      // The admitted graph still has no cycle, so the mark runs to completion.
+      seedMark(db, checkout.repoId, [{ oid: oids[nodes - 1]! }]);
+      drain(db, store.shared);
     }
   });
 
+  /**
+   * Both fixtures still close their edge with a raw `UPDATE git_pack_objects`.
+   * That is acceptable only because neither verdict moved to admission: the
+   * per-edge type check and the missing-terminal check are raised by the
+   * replacement statement itself, at the child's own expansion.
+   */
   it("rejects wrong-type and missing packed delta terminals", async () => {
     const wrong = open();
     const blobBytes = utf8.encode("wrong type source\n");
@@ -889,6 +964,7 @@ describe("maintenance reachability", () => {
     await store.packs.ingest(slices(concat(chunks), 13));
     seedMark(db, checkout.repoId, [{ oid: targetOid }]);
     db.storage.histogram = new Map();
+    db.storage.rowHistogram = new Map();
 
     const progress = advanceMaintenanceReachability(store.shared);
 
@@ -901,11 +977,152 @@ describe("maintenance reachability", () => {
         baseOid,
       ),
     ).toEqual({ physical_only: 1, expanded: 0 });
-    const chainQueries = [...db.storage.histogram.entries()].filter(([query]) =>
-      query.includes("maintenance-pack-chain"),
+    expect(baseQueries(db)).toEqual({ statements: 1, rows: 1 });
+  });
+
+  it("plans the packed base query as bounded primary-key seeks", () => {
+    const { db, checkout } = open();
+    const plan = db
+      .all<{ detail: string }>(
+        `EXPLAIN QUERY PLAN ${MAINTENANCE_PACK_BASE_SQL}`,
+        checkout.repoId,
+        "0".repeat(40),
+      )
+      .map((row) => row.detail);
+
+    expect(plan.join("\n")).not.toContain("RECURSIVE STEP");
+    for (const alias of ["object", "base", "loose"]) {
+      const lookups = plan.filter((detail) => new RegExp(`^(SEARCH|SCAN) ${alias} `).test(detail));
+      expect(lookups.length, alias).toBeGreaterThan(0);
+      for (const lookup of lookups) {
+        expect(lookup).toMatch(/SEARCH .* USING INDEX .* \(repo_id=\? AND oid=\?\)/);
+      }
+    }
+  });
+
+  it("treats a base owned only by a pending pack as a missing dependency", async () => {
+    const { db, checkout, store } = open();
+    const base = utf8.encode("pending-owned base\n");
+    const target = utf8.encode("pending-owned target\n");
+    const baseOid = hashObject("blob", base);
+    const targetOid = hashObject("blob", target);
+    const basePack = await store.packs.ingest(slices(fullBlobPack([base]), 17));
+    await store.packs.ingest(slices(deltaPack(baseOid, base, target), 17));
+    // No public operation demotes a complete pack, so the state this guards —
+    // a base whose only canonical row is invisible to complete reads — has to
+    // be written. What is under test is the query's precedence rule.
+    db.run(
+      "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = ? AND pack_id = ?",
+      checkout.repoId,
+      basePack.packId,
     );
-    expect(chainQueries).toHaveLength(1);
-    expect(chainQueries[0]?.[1]).toBe(1);
+    seedMark(db, checkout.repoId, [{ oid: targetOid }]);
+
+    expect(() => advanceMaintenanceReachability(store.shared)).toThrow(
+      new RegExp(`packed delta base ${baseOid} is missing`),
+    );
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
+        checkout.repoId,
+        baseOid,
+      ),
+    ).toBe(0);
+  });
+
+  it("bounds packed dependency rows by edge count from a depth-N to a depth-2N chain", async () => {
+    const measure = async (depth: number): Promise<number> => {
+      const { db, checkout, store } = open();
+      const chain = chainPack(depth);
+      await store.packs.ingest(slices(chain.bytes, 64));
+      seedMark(db, checkout.repoId, [{ oid: chain.headOid }]);
+      db.storage.histogram = new Map();
+      db.storage.rowHistogram = new Map();
+      markToCompletion(store.shared);
+      return baseQueries(db).rows;
+    };
+
+    const atN = await measure(16);
+    const at2N = await measure(32);
+
+    // The recursive predecessor delivered the whole remaining suffix per queued
+    // object — on the order of depth^2/2 rows, and about 4x from N to 2N.
+    expect(atN).toBeLessThanOrEqual(3 * 16 + 4);
+    expect(at2N).toBeLessThanOrEqual(3 * 32 + 4);
+    expect(at2N).toBeLessThanOrEqual(2.5 * atN);
+  });
+
+  it("visits one packed commit edge three times across deferral and promotion", async () => {
+    const { db, checkout, store } = open();
+    const commitTree = store.write("tree", serializeTree([]));
+    const parents: string[] = [];
+    for (let index = 0; index < 255; index++) {
+      parents.push(store.write("commit", commit(commitTree, [], `edge page parent ${index}\n`)));
+    }
+    const packed = packedDelta(
+      "commit",
+      commit(commitTree, [], "edge page base\n"),
+      commit(commitTree, parents, "edge page target\n"),
+    );
+    await store.packs.ingest(slices(packed.bytes, 37));
+    const tag = store.write(
+      "tag",
+      serializeTag({ object: packed.targetOid, type: "commit", tag: "promote", message: "\n" }),
+    );
+
+    // Worst case for C = 3: the child is expanded physically once, promoted to
+    // logical, and then defers its packed base across an exact 256-edge page.
+    // The settled root keeps the run's logical counter consistent throughout.
+    const settled = store.write("blob", utf8.encode("edge page settled root\n"));
+    seedMark(db, checkout.repoId, [{ oid: settled }]);
+    db.run(
+      "UPDATE git_maintenance_objects SET expanded = 1 WHERE repo_id = ? AND oid = ?",
+      checkout.repoId,
+      settled,
+    );
+    db.run(
+      `INSERT INTO git_maintenance_objects
+         (repo_id, run_id, oid, source_mask, expanded, shallow_boundary,
+          physical_only, edge_cursor)
+       VALUES (?, 1, ?, 0, 0, 0, 1, 0)`,
+      checkout.repoId,
+      packed.targetOid,
+    );
+    db.run(
+      `UPDATE git_maintenance_runs SET reachable_objects = 1, queued_objects = 1
+        WHERE repo_id = ?`,
+      checkout.repoId,
+    );
+    let visits = 0;
+    const step = () => {
+      db.storage.histogram = new Map();
+      db.storage.rowHistogram = new Map();
+      const progress = advanceMaintenanceReachability(store.shared);
+      if (progress.processedOid === packed.targetOid) visits += baseQueries(db).rows;
+      return progress;
+    };
+
+    expect(step()).toMatchObject({ processedOid: packed.targetOid });
+    expect(visits).toBe(1);
+    db.run(
+      `INSERT INTO git_maintenance_objects
+         (repo_id, run_id, oid, source_mask, expanded, shallow_boundary,
+          physical_only, edge_cursor)
+       VALUES (?, 1, ?, 1, 0, 0, 0, 0)`,
+      checkout.repoId,
+      tag,
+    );
+    db.run(
+      `UPDATE git_maintenance_runs
+          SET queued_objects = queued_objects + 1, reachable_objects = reachable_objects + 1
+        WHERE repo_id = ?`,
+      checkout.repoId,
+    );
+    for (let call = 0; call < 1_000; call++) {
+      if (step().status === "complete") break;
+    }
+
+    expect(visits).toBe(3);
   });
 
   it("accepts complete pack id zero in the bounded base-chain validator", () => {

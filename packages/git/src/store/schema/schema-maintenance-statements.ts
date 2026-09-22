@@ -29,6 +29,10 @@ export const MAINTENANCE_SCHEMA_STATEMENTS = [
        typeof(observed_root_epoch) = 'integer'
        AND observed_root_epoch BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
      ),
+     observed_source_generation INTEGER NOT NULL DEFAULT 0 CHECK (
+       typeof(observed_source_generation) = 'integer'
+       AND observed_source_generation BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
      phase TEXT NOT NULL CHECK (typeof(phase) = 'text' AND phase IN (
        'roots', 'mark', 'classify-loose', 'repack',
        'classify-packs', 'sweep-loose', 'sweep-packs', 'finish'

@@ -9,6 +9,11 @@ function isObjectRow<Row extends object>(value: unknown): value is Row {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Leading SQL comments survive: they are what identifies a query's owner. */
+function fingerprint(query: string): string {
+  return query.replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
 class Cursor<Row extends object> implements SQLCursorLike<Row>, IterableIterator<Row> {
   #prefetched: IteratorResult<unknown> | null;
   #finished = false;
@@ -118,6 +123,13 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
    */
   histogram: Map<string, number> | null = null;
 
+  /**
+   * Rows delivered per query text, on the same opt-in terms as `histogram`.
+   * Kept beside it rather than folded into it so the two dozen call sites that
+   * already read statement counts stay unchanged.
+   */
+  rowHistogram: Map<string, number> | null = null;
+
   constructor(path = ":memory:") {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL");
@@ -137,6 +149,7 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
             [][Symbol.iterator](),
             () => {
               this.rowCount++;
+              this.#recordRow(query);
             },
             () => {},
           );
@@ -147,6 +160,7 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
           stmt.iterate(...bindings.map(toSQLiteValue)),
           () => {
             this.rowCount++;
+            this.#recordRow(query);
           },
           () => this.#release(query, stmt),
         );
@@ -155,9 +169,17 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
   }
 
   #record(query: string): void {
-    if (this.histogram === null) return;
-    const fingerprint = query.replace(/\s+/g, " ").trim().slice(0, 120);
-    this.histogram.set(fingerprint, (this.histogram.get(fingerprint) ?? 0) + 1);
+    const statements = this.histogram;
+    if (statements === null) return;
+    const key = fingerprint(query);
+    statements.set(key, (statements.get(key) ?? 0) + 1);
+  }
+
+  #recordRow(query: string): void {
+    const rows = this.rowHistogram;
+    if (rows === null) return;
+    const key = fingerprint(query);
+    rows.set(key, (rows.get(key) ?? 0) + 1);
   }
 
   #acquire(query: string): StatementSync {
@@ -175,6 +197,7 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
     this.statementCount = 0;
     this.rowCount = 0;
     this.histogram?.clear();
+    this.rowHistogram?.clear();
   }
 
   *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
@@ -188,6 +211,7 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
           throw new Error("SQLite yielded a non-row value");
         }
         this.rowCount++;
+        this.#recordRow(query);
         yield Object.fromEntries(Object.entries(value));
       }
     } finally {

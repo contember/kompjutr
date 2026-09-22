@@ -21,17 +21,6 @@ export interface CompressedEntry {
   filled: number;
 }
 
-export interface PackGraphOrigin {
-  readonly rootOid: string;
-  depth: number;
-  readonly checkpoints: Set<string>;
-}
-
-export interface PackGraphPage {
-  readonly roots: readonly string[];
-  readonly entryLimit: number;
-}
-
 export interface PackGraphExit {
   readonly oid: string | null;
   readonly distance: number;

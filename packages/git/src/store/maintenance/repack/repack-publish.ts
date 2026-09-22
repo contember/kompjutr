@@ -9,6 +9,7 @@ import {
   streamFullObjectPack,
 } from "../../pack/full-object-stream.js";
 import type { PackIngestResult } from "../../pack/packs.js";
+import { adoptMaintenanceSourceGeneration } from "../state/state-transitions.js";
 import {
   type FinalizedObject,
   MAX_REPACK_INFLATED_BYTES,
@@ -249,6 +250,9 @@ export async function publishBatch(
               published.packId,
               published.bytes,
             );
+            // Runs inside the publication transaction, after the pack's own
+            // generation bump: the run adopts the change it just caused.
+            adoptMaintenanceSourceGeneration(store.db, store.repoId, run.runId);
           });
         },
       },

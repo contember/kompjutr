@@ -3,6 +3,7 @@ import { isOid } from "../../../common/bytes.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import type { ObjectType } from "../../../common/objects.js";
 import { expectSafeInteger } from "../../../common/rows.js";
+import { readRepositorySourceGeneration } from "../../core/source-generation.js";
 import { ensureMaintenanceControl } from "../control.js";
 import type { MaintenanceRunView } from "../state/state-contracts.js";
 import { readMaintenanceRunView } from "../state/state-view.js";
@@ -69,11 +70,13 @@ function createRun(
   const runId = nextRunId - 1;
   db.run(
     `INSERT INTO git_maintenance_runs
-       (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source)
-     VALUES (?, ?, ?, 'roots', ?, 'refs')`,
+       (repo_id, run_id, observed_root_epoch, observed_source_generation,
+        phase, started_ms, root_source)
+     VALUES (?, ?, ?, ?, 'roots', ?, 'refs')`,
     repoId,
     runId,
     rootEpoch,
+    readRepositorySourceGeneration(db, repoId),
     startedMs,
   );
   const run = readRun(db, repoId);
@@ -83,6 +86,7 @@ function createRun(
   return run;
 }
 
+/** Re-snapshot both run identities: the root epoch and the source generation. */
 function restartRun(db: SqlDatabase, run: RunState, rootEpoch: number): RunState {
   db.run(
     "DELETE FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?",
@@ -96,12 +100,14 @@ function restartRun(db: SqlDatabase, run: RunState, rootEpoch: number): RunState
   );
   const row = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_runs
-        SET observed_root_epoch = ?, phase = 'roots', root_source = 'refs',
+        SET observed_root_epoch = ?, observed_source_generation = ?,
+            phase = 'roots', root_source = 'refs',
             cursor_checkout_id = NULL, cursor_text = NULL, cursor_ordinal = NULL,
             reachable_objects = 0, queued_objects = 0, restarted = 1
       WHERE repo_id = ? AND run_id = ?
       RETURNING run_id`,
     rootEpoch,
+    run.sourceGeneration,
     run.repoId,
     run.runId,
   );
@@ -394,7 +400,10 @@ export function advanceMaintenanceRootSnapshot(
     if (run === null) {
       run = createRun(db, options.repoId, control.rootEpoch, options.nowMs);
     }
-    if (run.observedRootEpoch !== control.rootEpoch) {
+    if (
+      run.observedRootEpoch !== control.rootEpoch ||
+      run.observedSourceGeneration !== run.sourceGeneration
+    ) {
       if (run.phase !== "roots" && run.phase !== "mark") {
         throw new GitError("ESTALE", MAINTENANCE_ROOT_EPOCH_DRIFTED);
       }

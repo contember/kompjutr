@@ -1,6 +1,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import { decodeRow, expectSafeInteger, int, nullable, text } from "../../../common/rows.js";
+import { bumpRepositorySourceGeneration } from "../../core/source-generation.js";
 import type { LooseRow, RunState, SliceResult } from "./sweep-contracts.js";
 import {
   eligibilityTime,
@@ -207,6 +208,7 @@ function deleteLooseObjects(db: SqlDatabase, repoId: number, oids: readonly stri
     repoId,
     payload,
   );
+  bumpRepositorySourceGeneration(db, repoId);
 }
 
 function nextLooseEligibility(db: SqlDatabase, repoId: number, run: RunState): number | null {

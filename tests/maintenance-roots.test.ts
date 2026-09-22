@@ -52,12 +52,16 @@ function installRootRun(db: TestDatabase, repoId: number, source: MaintenanceRoo
   } else {
     db.run("UPDATE git_maintenance_control SET next_run_id = 2 WHERE repo_id = ?", repoId);
   }
+  // A run observes both identities; seeding only the epoch would look like
+  // source drift to the first call and restart discovery.
   db.run(
     `INSERT INTO git_maintenance_runs
-       (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source)
-     VALUES (?, 1, ?, 'roots', ?, ?)`,
+       (repo_id, run_id, observed_root_epoch, observed_source_generation,
+        phase, started_ms, root_source)
+     VALUES (?, 1, ?, ?, 'roots', ?, ?)`,
     repoId,
     rootEpoch ?? 0,
+    db.scalar<number>("SELECT source_generation FROM git_repositories WHERE id = ?", repoId) ?? 0,
     NOW,
     source,
   );

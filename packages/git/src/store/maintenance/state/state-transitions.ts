@@ -1,8 +1,39 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import { decodeRow, int, nullable, oneOf } from "../../../common/rows.js";
+import { readRepositorySourceGeneration } from "../../core/source-generation.js";
 import type { MaintenanceMarkReconciliation, MaintenanceRunView } from "./state-contracts.js";
 import { readMaintenanceRunView, validateRepositoryId } from "./state-view.js";
+
+/**
+ * Record the sources a step just changed, as the last statement of that step's
+ * own transaction. Adoption is atomic with the change, so a run can never
+ * restart itself — only a foreign writer's bump survives the comparison.
+ */
+export function adoptMaintenanceSourceGeneration(
+  db: SqlDatabase,
+  repoId: number,
+  runId: number,
+): number {
+  const current = readRepositorySourceGeneration(db, repoId);
+  const row = db.one<Record<string, unknown>>(
+    `UPDATE git_maintenance_runs SET observed_source_generation = ?
+      WHERE repo_id = ? AND run_id = ?
+      RETURNING repo_id, run_id, observed_source_generation`,
+    current,
+    repoId,
+    runId,
+  );
+  if (
+    row === undefined ||
+    row.repo_id !== repoId ||
+    row.run_id !== runId ||
+    row.observed_source_generation !== current
+  ) {
+    throw new CorruptError("maintenance source generation was not adopted atomically");
+  }
+  return current;
+}
 
 export function reconcileMaintenanceMark(
   db: SqlDatabase,
@@ -78,7 +109,11 @@ export function resetMaintenanceRunForRootChange(
     if (before === null || before.runId !== expectedRunId) {
       throw new CorruptError("maintenance restart lost its active run");
     }
-    if (before.phase === "finish" || before.observedRootEpoch === before.rootEpoch) {
+    if (
+      before.phase === "finish" ||
+      (before.observedRootEpoch === before.rootEpoch &&
+        before.observedSourceGeneration === before.sourceGeneration)
+    ) {
       throw new CorruptError("maintenance restart requires a drifted unfinished run");
     }
     const owned = db.scalar<unknown>(
@@ -88,19 +123,25 @@ export function resetMaintenanceRunForRootChange(
     );
     if (owned !== 0) throw new CorruptError("maintenance restart retained an owned repack batch");
     clearRunOwnedReachability(db, repoId, expectedRunId);
+    // `before` is read after the settle, so the generation adopted here already
+    // includes whatever the settle itself bumped.
     const updatedRow = db.one<Record<string, unknown>>(
       `UPDATE git_maintenance_runs
-          SET observed_root_epoch = ?, phase = 'roots', root_source = 'refs',
+          SET observed_root_epoch = ?, observed_source_generation = ?,
+              phase = 'roots', root_source = 'refs',
               cursor_checkout_id = NULL, cursor_text = NULL, cursor_ordinal = NULL,
               reachable_objects = 0, queued_objects = 0, next_eligible_ms = NULL,
               restarted = 1
-        WHERE repo_id = ? AND run_id = ? AND observed_root_epoch = ? AND phase != 'finish'
-        RETURNING repo_id, run_id, observed_root_epoch, phase, root_source,
-                  reachable_objects, queued_objects, next_eligible_ms, restarted`,
+        WHERE repo_id = ? AND run_id = ? AND observed_root_epoch = ?
+          AND observed_source_generation = ? AND phase != 'finish'
+        RETURNING repo_id, run_id, observed_root_epoch, observed_source_generation, phase,
+                  root_source, reachable_objects, queued_objects, next_eligible_ms, restarted`,
       before.rootEpoch,
+      before.sourceGeneration,
       repoId,
       expectedRunId,
       before.observedRootEpoch,
+      before.observedSourceGeneration,
     );
     if (updatedRow === undefined) {
       throw new CorruptError("maintenance restart was not published atomically");
@@ -114,6 +155,11 @@ export function resetMaintenanceRunForRootChange(
           0,
           Number.MAX_SAFE_INTEGER,
           "maintenance restart root epoch is invalid",
+        ),
+        observed_source_generation: int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance restart source generation is invalid",
         ),
         phase: oneOf(["roots"], "maintenance restart phase is invalid"),
         root_source: oneOf(["refs"], "maintenance restart root source is invalid"),
@@ -130,6 +176,7 @@ export function resetMaintenanceRunForRootChange(
       updated.repo_id !== repoId ||
       updated.run_id !== expectedRunId ||
       updated.observed_root_epoch !== before.rootEpoch ||
+      updated.observed_source_generation !== before.sourceGeneration ||
       updated.phase !== "roots" ||
       updated.root_source !== "refs" ||
       updated.reachable_objects !== 0 ||
@@ -257,14 +304,17 @@ export function rolloverFinishedMaintenanceRun(
     if (retained !== 0) throw new CorruptError("maintenance rollover retained old run rows");
     const insertedRow = db.one<Record<string, unknown>>(
       `INSERT INTO git_maintenance_runs
-         (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source)
-       VALUES (?, ?, ?, 'roots', ?, 'refs')
-       RETURNING repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
+         (repo_id, run_id, observed_root_epoch, observed_source_generation,
+          phase, started_ms, root_source)
+       VALUES (?, ?, ?, ?, 'roots', ?, 'refs')
+       RETURNING repo_id, run_id, observed_root_epoch, observed_source_generation, phase,
+                 started_ms, root_source,
                  reachable_objects, queued_objects, repacked_objects, reclaimed_objects,
                  reclaimed_packs, reclaimed_bytes, next_eligible_ms, restarted`,
       repoId,
       runId,
       rootEpoch,
+      before.sourceGeneration,
       nowMs,
     );
     if (insertedRow === undefined) {
@@ -279,6 +329,11 @@ export function rolloverFinishedMaintenanceRun(
           0,
           Number.MAX_SAFE_INTEGER,
           "maintenance rollover root epoch is invalid",
+        ),
+        observed_source_generation: int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance rollover source generation is invalid",
         ),
         phase: oneOf(["roots"], "maintenance rollover phase is invalid"),
         started_ms: int(0, Number.MAX_SAFE_INTEGER, "maintenance rollover start time is invalid"),
@@ -300,6 +355,7 @@ export function rolloverFinishedMaintenanceRun(
       inserted.repo_id !== repoId ||
       inserted.run_id !== runId ||
       inserted.observed_root_epoch !== rootEpoch ||
+      inserted.observed_source_generation !== before.sourceGeneration ||
       inserted.phase !== "roots" ||
       inserted.started_ms !== nowMs ||
       inserted.root_source !== "refs" ||

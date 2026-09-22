@@ -29,6 +29,12 @@ Maintenance records the observed epoch, restarts root discovery when it drifts,
 and rechecks the epoch before every destructive transaction. Normal Git
 mutations stay available; sustained churn may delay collection safely.
 
+A run records **two** identities, not one: the root epoch and the repository
+source generation ([ADR-0025](0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md)).
+It restarts on either. A maintenance step that changes sources adopts its own
+bump as the last statement of that step's transaction, so a run can never
+restart itself; only a foreign writer's bump survives the comparison.
+
 Fulfilling a promised blob also advances that epoch atomically with physical
 publication and promise removal. A previous mark may have omitted the absent
 leaf even though its tree remains reachable. Promise rows themselves are not
@@ -59,7 +65,8 @@ fallback order, including dependencies held by pending packs.
   to its SQLite metadata graph; the page bound does not make that graph fixed-size.
 - Foreground writes never wait for a repository-wide maintenance lock.
 - Root churn can repeat bounded marking work but cannot make a stale mark safe
-  for deletion.
+  for deletion. Source churn — loose writes, pack publication, pack and loose
+  deletion — now does the same, on the second identity.
 - `nextEligibleAt` tells a scheduler when grace is the only remaining work.
 - Full-object maintenance packs use more bytes than delta-compressed packs, but
   keep publication and recovery simple and independently verifiable.

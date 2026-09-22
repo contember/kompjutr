@@ -4,6 +4,7 @@ import { toHex } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { hashObject, type ObjectType, objectHeader } from "../../common/objects.js";
 import { Sha1 } from "../../common/sha1.js";
+import { bumpRepositorySourceGeneration } from "../core/source-generation.js";
 import { insertCommitCaches, prepareCommitCache } from "../trees/commits.js";
 import { indexSeededTreeSource } from "../trees/tree-index.js";
 import { fulfillLoosePromises } from "./objects-promises.js";
@@ -47,6 +48,7 @@ export function writeObject(
       data.length,
       stored,
     );
+    bumpRepositorySourceGeneration(context.db, context.repoId);
     context.db.run(
       `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
        VALUES (?, ?, ?)`,
@@ -165,6 +167,7 @@ export function writeObjectStream(
         type,
         size,
       );
+      bumpRepositorySourceGeneration(context.db, context.repoId);
       context.db.run(
         `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
          VALUES (?, ?, ?)`,
@@ -230,6 +233,7 @@ export function writeObjectStream(
       type,
       size,
     );
+    bumpRepositorySourceGeneration(context.db, context.repoId);
     context.db.run(
       `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
        VALUES (?, ?, ?)`,

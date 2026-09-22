@@ -39,7 +39,9 @@ import { add, lsFiles, lsFilesWithWorktree, rm } from "../packages/git/src/ops/s
 import { eagerStatus } from "../packages/git/src/ops/status/status.js";
 import { dirtyPaths } from "../packages/git/src/ops/worktree/worktree-io.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { advanceMaintenanceMark } from "../packages/git/src/store/maintenance/reachability.js";
 import { advanceMaintenanceRepack } from "../packages/git/src/store/maintenance/repack.js";
+import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "../tests/helpers/db.js";
 import { GitFixture, slices } from "../tests/helpers/git.js";
@@ -98,6 +100,9 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "table:git_pack_meta",
   "table:git_pack_objects",
   "table:git_pack_pending",
+  "table:git_pack_read_frontier",
+  "table:git_pack_read_pages",
+  "table:git_pack_read_scopes",
   "table:git_promised_blobs",
   "table:git_promisor_remotes",
   "table:git_reflog_entries",
@@ -160,6 +165,8 @@ type RequiredRow =
   | "index-tracker.dirty"
   | "index-tracker.reseal"
   | "maintenance.repack.select"
+  | "maintenance.mark-depth-n"
+  | "maintenance.mark-depth-2n"
   | "transport.discovery"
   | "transport.fetch"
   | "transport.push";
@@ -198,6 +205,8 @@ const REQUIRED_ROWS: readonly RequiredRow[] = [
   "index-tracker.dirty",
   "index-tracker.reseal",
   "maintenance.repack.select",
+  "maintenance.mark-depth-n",
+  "maintenance.mark-depth-2n",
   "transport.discovery",
   "transport.fetch",
   "transport.push",
@@ -2023,6 +2032,98 @@ async function maintenanceRow(rows: ResultRow[]): Promise<void> {
   }
 }
 
+/** One packed delta chain of `depth` edges, terminating in a full blob. */
+function markChainPack(depth: number): { bytes: Uint8Array; headOid: string } {
+  const chunks: Uint8Array[] = [];
+  const writer = new PackWriter((chunk) => chunks.push(chunk));
+  writer.header(depth + 1);
+  let value = utf8.encode("mark chain terminal\n");
+  let oid = hashObject("blob", value);
+  writer.object("blob", value);
+  for (let index = 0; index < depth; index++) {
+    const baseLength = value.length;
+    const baseOid = oid;
+    value = utf8.encode(`mark chain link ${index}\n`);
+    oid = hashObject("blob", value);
+    writer.refDelta(
+      baseOid,
+      concat([encodeDeltaHeader(baseLength, value.length), new Uint8Array([value.length]), value]),
+    );
+  }
+  writer.finish();
+  return { bytes: concat(chunks), headOid: oid };
+}
+
+/** Dependency work over a chain of N and 2N canonical physical edges. */
+async function maintenanceMarkRows(rows: ResultRow[]): Promise<void> {
+  const depths: readonly (readonly [RequiredRow, number])[] = [
+    ["maintenance.mark-depth-n", 64],
+    ["maintenance.mark-depth-2n", 128],
+  ];
+  for (const [operation, depth] of depths) {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(checkout);
+    const chain = markChainPack(depth);
+    await store.packs.ingest(slices(chain.bytes, 64 * 1024));
+    const generation = db.scalar<number>(
+      "SELECT source_generation FROM git_repositories WHERE id = ?",
+      checkout.repoId,
+    );
+    assert(generation !== undefined, "maintenance mark fixture lost its source generation");
+    db.run(
+      `INSERT OR IGNORE INTO git_maintenance_control (repo_id, root_epoch, next_run_id)
+       VALUES (?, 0, 2)`,
+      checkout.repoId,
+    );
+    db.run(
+      `INSERT INTO git_maintenance_runs
+         (repo_id, run_id, observed_root_epoch, observed_source_generation, phase, started_ms,
+          root_source, reachable_objects, queued_objects)
+       VALUES (?, 1, 0, ?, 'mark', 1, 'done', 0, 1)`,
+      checkout.repoId,
+      generation,
+    );
+    db.run(
+      `INSERT INTO git_maintenance_objects
+         (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, physical_only, edge_cursor)
+       VALUES (?, 1, ?, 1, 0, 0, 0, 0)`,
+      checkout.repoId,
+      chain.headOid,
+    );
+    await measure(
+      rows,
+      db.storage,
+      operation,
+      () => {
+        for (let calls = 0; calls < 10_000; calls++) {
+          if (advanceMaintenanceMark(store.shared).status === "complete") return calls + 1;
+        }
+        throw new Error("maintenance mark did not complete");
+      },
+      (calls) => {
+        assert(calls > 0, "maintenance mark made no progress");
+        assert(
+          db.scalar<string>(
+            "SELECT phase FROM git_maintenance_runs WHERE repo_id = ?",
+            checkout.repoId,
+          ) === "classify-loose",
+          "maintenance mark did not settle",
+        );
+        assert(
+          db.scalar<number>(
+            "SELECT count(*) FROM git_maintenance_objects WHERE repo_id = ?",
+            checkout.repoId,
+          ) ===
+            depth + 1,
+          "maintenance mark did not reach the whole chain",
+        );
+      },
+    );
+  }
+}
+
 async function transportRows(rows: ResultRow[]): Promise<void> {
   const fixture = new GitFixture().init();
   fixture.write("README.md", "base\n");
@@ -2271,6 +2372,17 @@ function checkReport(report: StatementReport): void {
       `rebase transition growth is not linear: N=${n.statements}/${n.rowsRead}, 2N=${twoN.statements}/${twoN.rowsRead}`,
     );
   }
+  const markN = report.rows.find((row) => row.operation === "maintenance.mark-depth-n");
+  const mark2N = report.rows.find((row) => row.operation === "maintenance.mark-depth-2n");
+  if (markN === undefined || mark2N === undefined) {
+    throw new Error("maintenance mark scaling rows are missing");
+  }
+  if (mark2N.statements > markN.statements * 2.5 || mark2N.rowsRead > markN.rowsRead * 2.5) {
+    throw new Error(
+      `maintenance mark growth is not linear: N=${markN.statements}/${markN.rowsRead}, ` +
+        `2N=${mark2N.statements}/${mark2N.rowsRead}`,
+    );
+  }
   for (const required of REQUIRED_ROWS) {
     if (!seen.has(required)) throw new Error(`missing statement row: ${required}`);
   }
@@ -2312,6 +2424,7 @@ await packUncachedAuthRow(rows);
 await packFallbackAuditRow(rows);
 await indexTrackerDirtyRow(rows);
 await maintenanceRow(rows);
+await maintenanceMarkRows(rows);
 await transportRows(rows);
 
 const report: StatementReport = {

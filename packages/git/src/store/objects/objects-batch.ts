@@ -4,6 +4,7 @@ import { CorruptError, GitError } from "../../common/errors.js";
 import { hashObject, type ObjectType } from "../../common/objects.js";
 import type { ObjectBatch, ObjectBatchOptions, OwnedObjectBatch } from "../core/contracts.js";
 import { isThenableResult } from "../core/json-pages.js";
+import { bumpRepositorySourceGeneration } from "../core/source-generation.js";
 import { insertCommitCaches, prepareCommitCache } from "../trees/commits.js";
 import { indexSeededTreeSources } from "../trees/tree-index.js";
 import { fulfillLoosePromises } from "./objects-promises.js";
@@ -174,6 +175,7 @@ function flushObjects(
       return;
     }
     wroteLoose = true;
+    bumpRepositorySourceGeneration(context.db, context.repoId);
 
     const payloads: ChunkPayload[] = [{ parts: [], length: 0, rows: [] }];
     for (const object of fresh) {

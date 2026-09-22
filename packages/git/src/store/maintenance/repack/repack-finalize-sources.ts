@@ -2,6 +2,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError } from "../../../common/errors.js";
 import { expectSafeInteger } from "../../../common/rows.js";
+import { bumpRepositorySourceGeneration } from "../../core/source-generation.js";
 import type { FullObjectPackInput } from "../../pack/full-object-stream.js";
 import { type FinalizedObject, MAX_REPACK_OBJECTS, type RepackBatch } from "./repack-contracts.js";
 import { objectType, oidField } from "./repack-helpers.js";
@@ -306,4 +307,5 @@ export function deleteExactLooseObjects(
   if (absent?.loose_count !== 0 || absent.lifecycle_count !== 0) {
     throw new CorruptError("maintenance loose deletion left authoritative rows behind");
   }
+  bumpRepositorySourceGeneration(db, repoId);
 }

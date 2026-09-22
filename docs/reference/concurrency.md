@@ -30,10 +30,23 @@ including the `EREENTRANT` rejection above, leaves the outer transaction
 committable. A failed drive operation can also mark the transaction abort-only
 before recording an effect.
 
+A **paged** packed read opens its own `transactionSync()` to own its scratch
+frontier, so at top level on `@kompjutr/local` it takes SQLite's writer
+reservation and produces WAL traffic for what the caller issued as a read. A
+second local writer is already excluded by the lifetime process lock, so this
+adds no cross-process contention, but a read-only caller can no longer assume a
+paged read takes no write lock. An ordinary non-paged packed read opens no
+transaction at all. The scope never reacquires the public mutation guard, and it
+refuses to open inside a poisoned scratch transaction without ever poisoning one
+itself. See [ADR-0025](../decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md).
+
 Local cursors created or advanced in a rolled-back scope are closed before SQL
 rollback; advancing them again fails with `ESTALE`. This includes unstarted
 cursors, so a failed scope cannot defer a write until after rollback. Successful
-scopes preserve their read cursors. SQLite requires pending write statements to
+scopes preserve their read cursors. Because `scopedSqliteRows.next()` re-attaches
+a cursor to the *current* scope on every step, an **enclosing** cursor advanced
+inside a failed nested scope is invalidated with it: a consumer must not resume
+an outer cursor after a nested read scope threw. SQLite requires pending write statements to
 finish before a savepoint can be released or the outer transaction committed.
 See [ADR-0021](../decisions/0021-recover-local-worktree-mutations-with-an-undo-journal.md).
 
@@ -81,7 +94,9 @@ The conformance suite uses these outcomes:
 - **`active-reject`** — an existing operation journal rejects a public caller
   before network work or another integration starts.
 - **`root-restart`** — a foreground mutation advances the maintenance root
-  epoch. Maintenance discards stale traversal results and restarts the same run.
+  epoch, or changes the sources an ordinary complete read sees and advances the
+  repository source generation. Maintenance discards stale traversal results and
+  restarts the same run on either axis.
 - **`busy/fenced`** — an exact durable owner excludes a competing claimant
   without blocking unrelated repository work.
 - **`unfenced`** — a durable checkpoint has no expected-state or ownership
@@ -236,6 +251,17 @@ lost their dependents without rescanning every blocker before each deletion.
 Cold reopen preserves the cursor; root-epoch restart and phase exit clear it.
 Candidate analysis uses SQLite metadata, including the actual canonical fallback
 order, without loading object payloads.
+
+A run carries a second drift axis beside the root epoch: the repository source
+generation, recorded in `git_maintenance_runs.observed_source_generation`. Pack
+publication, loose writes, loose deletion, and a pack deletion that removes a
+complete canonical owner or promotes a fallback all advance
+`git_repositories.source_generation` inside their own transaction; a pending-only
+reclamation that promotes nothing does not, because no complete read can see it.
+A maintenance step that changes sources adopts its own bump as the last statement
+of that step's transaction, so it never restarts itself. Drift from a foreign
+writer settles the owned repack batch and resets discovery to `roots` before any
+further destruction.
 
 Promise rows do not become maintenance roots. A missing blob reached through a
 tree is a valid terminal leaf only while the same repository owns its promise.

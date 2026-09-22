@@ -1,6 +1,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import type { SharedRepoStore } from "../../index.js";
+import { adoptMaintenanceSourceGeneration } from "../state/state-transitions.js";
 import { readBatch } from "./repack-batch.js";
 import type {
   FinalizedObject,
@@ -83,6 +84,9 @@ export function finalizePublished(
     } else {
       releaseBatchRow(store.db, store.repoId, run.runId, batch, "published", packId);
     }
+    // Last statement of this transaction: the redundant-pack branch above can
+    // bump again, and adopting before it would restart the run every time.
+    adoptMaintenanceSourceGeneration(store.db, store.repoId, run.runId);
   });
   return {
     runId: run.runId,
@@ -115,6 +119,7 @@ export function finalizeShadows(
     store.packs.authenticateCompleteSources(finalized);
     verifyFinalizedSources(store.db, store.repoId, finalized);
     incrementRepacked(store.db, store.repoId, run, finalized.length);
+    adoptMaintenanceSourceGeneration(store.db, store.repoId, run.runId);
   });
   return {
     runId: run.runId,
@@ -140,6 +145,7 @@ export function finalizeSelectedShadows(
     verifyFinalizedSources(store.db, store.repoId, shadows);
     incrementRepacked(store.db, store.repoId, run, shadows.length);
     releaseBatchRow(store.db, store.repoId, run.runId, batch, "selected", null);
+    adoptMaintenanceSourceGeneration(store.db, store.repoId, run.runId);
   });
   return {
     runId: run.runId,

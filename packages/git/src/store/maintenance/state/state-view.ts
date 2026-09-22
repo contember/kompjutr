@@ -8,6 +8,7 @@ const ABSENT_RUN_FIELDS = [
   "run_repo_id",
   "run_id",
   "observed_root_epoch",
+  "observed_source_generation",
   "phase",
   "started_ms",
   "root_source",
@@ -49,6 +50,11 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
       next_run_id: nullable(
         int(1, Number.MAX_SAFE_INTEGER, "maintenance next run id is not a bounded safe integer"),
       ),
+      source_generation: int(
+        0,
+        Number.MAX_SAFE_INTEGER,
+        "repository source generation is not a bounded safe integer",
+      ),
       run_repo_id: nullable(
         int(1, Number.MAX_SAFE_INTEGER, "maintenance run repository id is invalid"),
       ),
@@ -60,6 +66,13 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
           0,
           Number.MAX_SAFE_INTEGER,
           "maintenance observed root epoch is not a bounded safe integer",
+        ),
+      ),
+      observed_source_generation: nullable(
+        int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance observed source generation is not a bounded safe integer",
         ),
       ),
       phase: nullable(
@@ -199,6 +212,11 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
       "maintenance observed root epoch is not a bounded safe integer",
     ),
     rootEpoch,
+    observedSourceGeneration: requiredField(
+      decoded.observed_source_generation,
+      "maintenance observed source generation is not a bounded safe integer",
+    ),
+    sourceGeneration: decoded.source_generation,
     nextRunId,
     phase,
     startedMs: requiredField(
@@ -250,9 +268,10 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
 export function readMaintenanceRunView(db: SqlDatabase, repoId: number): MaintenanceRunView | null {
   validateRepositoryId(repoId);
   const row = db.one<Record<string, unknown>>(
-    `SELECT repository.id AS repository_id,
+    `SELECT repository.id AS repository_id, repository.source_generation,
             control.repo_id AS control_repo_id, control.root_epoch, control.next_run_id,
-            run.repo_id AS run_repo_id, run.run_id, run.observed_root_epoch, run.phase,
+            run.repo_id AS run_repo_id, run.run_id, run.observed_root_epoch,
+            run.observed_source_generation, run.phase,
             run.started_ms, run.root_source, run.cursor_checkout_id,
             run.cursor_text,
             run.cursor_ordinal, run.reachable_objects, run.queued_objects,

@@ -1,5 +1,6 @@
 import { GitError } from "../../../common/errors.js";
 import type { SharedRepoStore } from "../../index.js";
+import { adoptMaintenanceSourceGeneration } from "../state/state-transitions.js";
 import {
   type AdvanceMaintenanceSweepOptions,
   DEFAULT_PAGE_ROWS,
@@ -35,16 +36,20 @@ export function advanceMaintenanceSweep(
     if (run.phase === "repack") {
       throw new GitError("EINVAL", "maintenance repack phase belongs to the repack coordinator");
     }
-    if (run.phase === "classify-loose") {
-      return classifyLoose(store.db, store.repoId, run, nowMs, pageRows);
+    const slice =
+      run.phase === "classify-loose"
+        ? classifyLoose(store.db, store.repoId, run, nowMs, pageRows)
+        : run.phase === "classify-packs"
+          ? classifyPacks(store.db, store.repoId, run, nowMs)
+          : run.phase === "sweep-loose"
+            ? sweepLoose(store.db, store.repoId, run, nowMs, pageRows)
+            : sweepPacks(store, run, nowMs, pageRows);
+    // A slice that reclaimed storage bumped the generation itself; adopting it
+    // as the transaction's last statement keeps the run from restarting itself.
+    if (slice.storageChanged) {
+      adoptMaintenanceSourceGeneration(store.db, store.repoId, run.runId);
     }
-    if (run.phase === "classify-packs") {
-      return classifyPacks(store.db, store.repoId, run, nowMs);
-    }
-    if (run.phase === "sweep-loose") {
-      return sweepLoose(store.db, store.repoId, run, nowMs, pageRows);
-    }
-    return sweepPacks(store, run, nowMs, pageRows);
+    return slice;
   });
   if (result.storageChanged) store.revalidateStorageCaches();
   return result.progress;

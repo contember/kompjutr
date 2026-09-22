@@ -36,7 +36,6 @@ const GRANDFATHERED_SYMBOLS: ReadonlySet<string> = new Set([
   "git/store/pack/ingest/ingest-pending.ts::PackPendingResolver.drainPending",
   "git/store/pack/read/read-resolver.ts::PackObjectResolver.#readObjects",
   "git/store/pack/ingest/ingest-index.ts::PackIndexer.indexPack",
-  "git/store/pack/read/read-graph.ts::PackGraphPager.readObjectsPaged",
   "git/store/objects/objects-write.ts::writeObjectStream",
   "git/store/refs/refs.ts::RefTable.#mutateRefs",
   "git/store/fetch/fetch-publication.ts::FetchPublicationTable.beginFetchPublication",

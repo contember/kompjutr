@@ -65,6 +65,9 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_pack_graph_affected", "shared"],
   ["git_pack_graph_memo", "shared"],
   ["git_pack_graph_path", "shared"],
+  ["git_pack_read_scopes", "shared"],
+  ["git_pack_read_pages", "shared"],
+  ["git_pack_read_frontier", "shared"],
   ["git_tree_sources", "shared"],
   ["git_tree_entries", "shared"],
   ["git_tree_effective", "shared"],
@@ -142,6 +145,9 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "index", name: "git_pack_objects_reverse" },
   { type: "table", name: "git_pack_pending" },
   { type: "index", name: "git_pack_pending_by_base" },
+  { type: "table", name: "git_pack_read_frontier" },
+  { type: "table", name: "git_pack_read_pages" },
+  { type: "table", name: "git_pack_read_scopes" },
   { type: "table", name: "git_promised_blobs" },
   { type: "trigger", name: "git_promised_blobs_loose_present" },
   { type: "table", name: "git_promisor_remotes" },
@@ -183,6 +189,7 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
       "fetch_generation",
       "shallow_revision",
       "checkout_revision",
+      "source_generation",
     ],
   ],
   ["git_checkouts", ["id", "repo_id", "root", "head", "is_primary"]],
@@ -328,6 +335,7 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
       "repo_id",
       "run_id",
       "observed_root_epoch",
+      "observed_source_generation",
       "phase",
       "started_ms",
       "root_source",
@@ -466,6 +474,9 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   ["git_pack_graph_affected", ["repo_id", "op_id", "oid", "pending", "cursor"]],
   ["git_pack_graph_memo", ["repo_id", "op_id", "oid", "depth", "type"]],
   ["git_pack_graph_path", ["repo_id", "op_id", "oid", "position"]],
+  ["git_pack_read_scopes", ["repo_id", "read_id"]],
+  ["git_pack_read_pages", ["repo_id", "read_id", "step", "entry_limit"]],
+  ["git_pack_read_frontier", ["repo_id", "read_id", "step", "oid", "origin_id", "depth"]],
   [
     "git_pack_objects",
     [
@@ -661,6 +672,24 @@ describe("git schema", () => {
       expect(cascadeForeignKeysOf(db, table)).toEqual([
         { table: "git_pack_graph_operations", from: "repo_id", to: "repo_id" },
         { table: "git_pack_graph_operations", from: "op_id", to: "op_id" },
+      ]);
+    }
+    expect(primaryKeyOf(db, "git_pack_read_scopes")).toEqual(["repo_id", "read_id"]);
+    expect(cascadeForeignKeysOf(db, "git_pack_read_scopes")).toEqual([
+      { table: "git_repositories", from: "repo_id", to: "id" },
+    ]);
+    expect(primaryKeyOf(db, "git_pack_read_pages")).toEqual(["repo_id", "read_id", "step"]);
+    expect(primaryKeyOf(db, "git_pack_read_frontier")).toEqual([
+      "repo_id",
+      "read_id",
+      "step",
+      "oid",
+      "origin_id",
+    ]);
+    for (const table of ["git_pack_read_pages", "git_pack_read_frontier"]) {
+      expect(cascadeForeignKeysOf(db, table), table).toEqual([
+        { table: "git_pack_read_scopes", from: "repo_id", to: "repo_id" },
+        { table: "git_pack_read_scopes", from: "read_id", to: "read_id" },
       ]);
     }
     expect(cascadeForeignKeysOf(db, "git_pack_commit_staging")).toEqual([
