@@ -22,7 +22,9 @@ terminates and has at most 50,000 delta edges.
 
 Read `git_pack_objects` directly through indexed forward/reverse queries. Keep
 affected closure, memoized depths and active paths in repository/operation-owned
-transaction-local SQL scratch. JavaScript pages are bounded to 256 records.
+transaction-local SQL scratch. JavaScript pages are bounded to 4,096 records,
+matching the pack read graph page; witnesses that must cross a page boundary
+pass a smaller page explicitly rather than relying on the production value.
 Delete scratch before callbacks; nested mutations validate with separate owners.
 
 Deletion captures all old canonical OIDs, promotes fallbacks excluding the whole

@@ -5,9 +5,16 @@ import { hashObject } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/paths.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { PackGraphAdmission } from "../packages/git/src/store/pack/graph/graph-admission.js";
+import { GRAPH_PAGE } from "../packages/git/src/store/pack/graph/graph-sql.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { lifecycleDelta, lifecyclePack } from "./helpers/pack-maintenance.js";
+
+/**
+ * The page the root-boundary fixtures below are sized against. Production pages
+ * at `GRAPH_PAGE`; pinning these two cases keeps their crossings affordable.
+ */
+const BOUNDARY_PAGE = 256;
 
 interface BlobFixture {
   oid: string;
@@ -127,7 +134,13 @@ describe("pack graph starting roots", () => {
       verifyNative(native, objects);
 
       db.transactionSync(() => {
-        const graph = new PackGraphAdmission(db, store.sharedRepoId, 600, "deletion");
+        const graph = new PackGraphAdmission(
+          db,
+          store.sharedRepoId,
+          600,
+          "deletion",
+          BOUNDARY_PAGE,
+        );
         graph.seedPacks([removedPack, retainedPack]);
         db.run(
           "DELETE FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
@@ -185,7 +198,13 @@ describe("pack graph starting roots", () => {
       verifyNative(native, [...chain, tip, ...gap, last]);
 
       db.transactionSync(() => {
-        const graph = new PackGraphAdmission(db, store.sharedRepoId, 600, "deletion");
+        const graph = new PackGraphAdmission(
+          db,
+          store.sharedRepoId,
+          600,
+          "deletion",
+          BOUNDARY_PAGE,
+        );
         graph.seedPacks([tipPack, gapPack, lastPack]);
         db.run(
           "DELETE FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
@@ -200,6 +219,62 @@ describe("pack graph starting roots", () => {
       expect(reopened.read(tip.oid)?.data).toEqual(tip.data);
       expect(reopened.read(last.oid)?.data).toEqual(last.data);
       for (const entry of gap) expect(reopened.read(entry.oid)).toBeNull();
+      expectClean(db);
+    } finally {
+      fixture.dispose();
+    }
+  });
+
+  it("visits the same graph rows at the production page as at a 256-record page", async () => {
+    const fixture = open();
+    const { db, ingest, native, store } = fixture;
+    try {
+      const roots = Array.from({ length: GRAPH_PAGE + 64 }, (_, index) => numberedObject(index));
+      const chain = Array.from({ length: 320 }, (_, index) => numberedObject(1_000_000 + index));
+      const head = chain[0];
+      if (head === undefined) throw new Error("chain fixture is empty");
+      const packId = await ingest(
+        lifecyclePack((writer) => {
+          for (const entry of roots) writer.object("blob", entry.data);
+          writer.object("blob", head.data);
+          let previous = head;
+          for (const entry of chain.slice(1)) {
+            writer.refDelta(previous.oid, lifecycleDelta(previous.data.length, entry.data));
+            previous = entry;
+          }
+        }, roots.length + chain.length),
+      );
+      verifyNative(native, [...roots, ...chain]);
+
+      const walk = (page: number) =>
+        db.transactionSync(() => {
+          db.storage.resetCounters();
+          const graph = new PackGraphAdmission(db, store.sharedRepoId, 600, "publication", page);
+          graph.seedPacks([packId]);
+          graph.validate();
+          const statements = db.storage.statementCount;
+          const memo = db.all<{ oid: string; depth: number; type: string }>(
+            "SELECT oid, depth, type FROM git_pack_graph_memo ORDER BY oid",
+          );
+          // `cursor` is spent reverse-walk progress, dead once `pending` is 0.
+          const affected = db.all<{ oid: string; pending: number }>(
+            "SELECT oid, pending FROM git_pack_graph_affected ORDER BY oid",
+          );
+          graph.cleanup();
+          return { statements, memo, affected };
+        });
+
+      const paged = walk(BOUNDARY_PAGE);
+      const production = walk(GRAPH_PAGE);
+
+      // The page changes how many round trips the same closure costs, nothing else.
+      const pages = Math.ceil((roots.length + chain.length) / GRAPH_PAGE);
+      expect(production.statements).toBeLessThan(10 * (pages + 1));
+      expect(production.statements).toBeLessThan(paged.statements);
+      expect(production.memo).toEqual(paged.memo);
+      expect(production.affected).toEqual(paged.affected);
+      expect(paged.memo).toHaveLength(roots.length + chain.length);
+      expect(paged.affected.every((row) => row.pending === 0)).toBe(true);
       expectClean(db);
     } finally {
       fixture.dispose();

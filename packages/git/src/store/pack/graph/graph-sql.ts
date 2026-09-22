@@ -1,4 +1,12 @@
-export const GRAPH_PAGE = 256;
+/**
+ * Rows one admission page materializes: the bound on both recursive CTEs, on
+ * the JavaScript that consumes a page, and on each batched JSON write. It is
+ * the same page the pack read graph walks (`MAX_PACK_BLOB_GRAPH_ENTRIES`),
+ * because both traverse the same delta graph. Statements per admission are
+ * affected objects divided by this page, so a page that is small relative to a
+ * published pack turns a clone into hundreds of round trips.
+ */
+export const GRAPH_PAGE = 4_096;
 
 const nextChild = (parent: string, cursor: string) => `(SELECT c.oid
   FROM git_pack_objects c INDEXED BY git_pack_objects_reverse
@@ -28,27 +36,40 @@ const reverseParent = `CASE WHEN ${descend} THEN lane.child
 const reverseCursor = `CASE WHEN ${descend} THEN ''
   WHEN lane.child IS NOT NULL THEN lane.child ELSE lane.parent END`;
 
-export const graphSql = {
-  reverse: `WITH RECURSIVE
+export interface GraphSql {
+  readonly reverse: string;
+  readonly seed: string;
+  readonly advance: string;
+  readonly firstRoot: string;
+  readonly forward: string;
+  readonly memo: string;
+  readonly path: string;
+  readonly unwind: string;
+  readonly trim: string;
+}
+
+export function graphSql(page: number): GraphSql {
+  return {
+    reverse: `WITH RECURSIVE
     seeds AS MATERIALIZED (
       SELECT oid, cursor FROM git_pack_graph_affected INDEXED BY git_pack_graph_pending
-      WHERE repo_id = ?1 AND op_id = ?2 AND pending = 1 ORDER BY oid LIMIT ${GRAPH_PAGE}
+      WHERE repo_id = ?1 AND op_id = ?2 AND pending = 1 ORDER BY oid LIMIT ${page}
     ),
     lane(root, parent, child) AS (
       SELECT oid, oid, ${nextChild("seeds.oid", "seeds.cursor")} FROM seeds
       UNION ALL
       SELECT root, ${reverseParent}, ${nextChild(reverseParent, reverseCursor)}
       FROM lane WHERE child IS NOT NULL OR parent != root
-      LIMIT ${GRAPH_PAGE}
+      LIMIT ${page}
     ) SELECT parent, child FROM lane`,
-  seed: `INSERT OR IGNORE INTO git_pack_graph_affected
+    seed: `INSERT OR IGNORE INTO git_pack_graph_affected
     SELECT ?1, ?2, value, 1, '' FROM json_each(?3)`,
-  advance: `INSERT INTO git_pack_graph_affected
+    advance: `INSERT INTO git_pack_graph_affected
     SELECT ?1, ?2, json_extract(value, '$.oid'), json_extract(value, '$.pending'),
       json_extract(value, '$.cursor') FROM json_each(?3) WHERE 1
     ON CONFLICT(repo_id, op_id, oid) DO UPDATE SET
       cursor = excluded.cursor, pending = excluded.pending`,
-  firstRoot: `SELECT a.oid FROM git_pack_graph_affected a
+    firstRoot: `SELECT a.oid FROM git_pack_graph_affected a
     WHERE a.repo_id = ?1 AND a.op_id = ?2 AND a.oid > ?3
       AND (EXISTS (
         SELECT 1 FROM git_pack_objects p
@@ -58,14 +79,14 @@ export const graphSql = {
         SELECT 1 FROM git_objects l WHERE l.repo_id = a.repo_id AND l.oid = a.oid
       ))
     ORDER BY a.oid LIMIT 1`,
-  forward: `WITH RECURSIVE w(oid, root) AS (
+    forward: `WITH RECURSIVE w(oid, root) AS (
     SELECT ?3, ?4
     UNION ALL
     SELECT CASE WHEN ${terminal} THEN ${nextRoot} ELSE p.base_oid END,
            CASE WHEN ${terminal} THEN ${nextRoot} ELSE w.root END
     FROM w ${joins}
     WHERE w.oid IS NOT NULL AND NOT (w.root = ?4 AND h.oid IS NOT NULL)
-    LIMIT ${GRAPH_PAGE}
+    LIMIT ${page}
   )
   SELECT w.oid, w.root,
     CASE WHEN v.pack_id IS NOT NULL THEN p.type ELSE l.type END AS type,
@@ -73,18 +94,19 @@ export const graphSql = {
     m.depth, m.type AS memo_type,
     CASE WHEN w.root = ?4 AND h.oid IS NOT NULL THEN 1 ELSE 0 END AS active
   FROM w ${joins} WHERE w.oid IS NOT NULL`,
-  memo: `INSERT OR IGNORE INTO git_pack_graph_memo
+    memo: `INSERT OR IGNORE INTO git_pack_graph_memo
     SELECT ?1, ?2, json_extract(value, '$.oid'), json_extract(value, '$.depth'),
       json_extract(value, '$.type') FROM json_each(?3)`,
-  path: `INSERT INTO git_pack_graph_path
+    path: `INSERT INTO git_pack_graph_path
     SELECT ?1, ?2, json_extract(value, '$.oid'), json_extract(value, '$.position')
     FROM json_each(?3)`,
-  unwind: `INSERT INTO git_pack_graph_memo
+    unwind: `INSERT INTO git_pack_graph_memo
     SELECT repo_id, op_id, oid, ?3 + ?4 - position, ?5
     FROM git_pack_graph_path
     WHERE repo_id = ?1 AND op_id = ?2 AND position >= ?6 AND position < ?7
-    ORDER BY position DESC LIMIT ${GRAPH_PAGE}
+    ORDER BY position DESC LIMIT ${page}
     ON CONFLICT(repo_id, op_id, oid) DO NOTHING`,
-  trim: `DELETE FROM git_pack_graph_path
+    trim: `DELETE FROM git_pack_graph_path
     WHERE repo_id = ?1 AND op_id = ?2 AND position >= ?3 AND position < ?4`,
-};
+  };
+}

@@ -2,7 +2,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import type { ObjectType } from "../../../common/objects.js";
 import { int, nullable, oneOf, RowShape, text } from "../../../common/rows.js";
-import { GRAPH_PAGE, graphSql } from "./graph-sql.js";
+import { GRAPH_PAGE, type GraphSql, graphSql } from "./graph-sql.js";
 
 const objectType = oneOf(["blob", "tree", "commit", "tag"]);
 const reverseRow = new RowShape({ parent: text(), child: nullable(text()) });
@@ -17,17 +17,38 @@ const forwardRow = new RowShape({
 });
 const rootRow = new RowShape({ oid: text() });
 
+type GraphQuery = keyof GraphSql;
+interface PositionalStatement {
+  sql: string;
+  positions: number[];
+}
+
 // The shared adapters accept anonymous positional bindings, not SQLite's numbered names.
-const statements = new Map(
-  Object.values(graphSql).map((source) => {
-    const positions: number[] = [];
-    const sql = source.replace(/\?(\d+)/g, (_match, index: string) => {
-      positions.push(Number(index) - 1);
-      return "?";
-    });
-    return [source, { sql, positions }];
-  }),
-);
+function positional(source: string): PositionalStatement {
+  const positions: number[] = [];
+  const sql = source.replace(/\?(\d+)/g, (_match, index: string) => {
+    positions.push(Number(index) - 1);
+    return "?";
+  });
+  return { sql, positions };
+}
+
+function compile(page: number): Record<GraphQuery, PositionalStatement> {
+  const sql = graphSql(page);
+  return {
+    reverse: positional(sql.reverse),
+    seed: positional(sql.seed),
+    advance: positional(sql.advance),
+    firstRoot: positional(sql.firstRoot),
+    forward: positional(sql.forward),
+    memo: positional(sql.memo),
+    path: positional(sql.path),
+    unwind: positional(sql.unwind),
+    trim: positional(sql.trim),
+  };
+}
+
+const productionStatements = compile(GRAPH_PAGE);
 
 interface Memo {
   oid: string;
@@ -46,13 +67,17 @@ interface Progress {
 
 export class PackGraphAdmission {
   readonly #opId = crypto.randomUUID();
+  readonly #statements: Record<GraphQuery, PositionalStatement>;
 
   constructor(
     private readonly db: SqlDatabase,
     private readonly repoId: number,
     private readonly maxDepth: number,
     private readonly failure: "publication" | "deletion",
+    /** Test seam; production pages at `GRAPH_PAGE`. */
+    private readonly page: number = GRAPH_PAGE,
   ) {
+    this.#statements = page === GRAPH_PAGE ? productionStatements : compile(page);
     db.run(
       "INSERT INTO git_pack_graph_operations (repo_id, op_id) VALUES (?, ?)",
       repoId,
@@ -71,9 +96,8 @@ export class PackGraphAdmission {
     );
   }
 
-  #bind(source: string, values: readonly (string | number)[]): [string, ...(string | number)[]] {
-    const statement = statements.get(source);
-    if (statement === undefined) throw new Error("unknown pack graph statement");
+  #bind(query: GraphQuery, values: readonly (string | number)[]): [string, ...(string | number)[]] {
+    const statement = this.#statements[query];
     const parameters = [this.repoId, this.#opId, ...values];
     return [
       statement.sql,
@@ -85,18 +109,18 @@ export class PackGraphAdmission {
     ];
   }
 
-  #run(source: string, ...values: (string | number)[]): void {
-    this.db.run(...this.#bind(source, values));
+  #run(query: GraphQuery, ...values: (string | number)[]): void {
+    this.db.run(...this.#bind(query, values));
   }
 
-  #rows(source: string, ...values: (string | number)[]): Iterable<Record<string, unknown>> {
-    return this.db.iterate(...this.#bind(source, values));
+  #rows(query: GraphQuery, ...values: (string | number)[]): Iterable<Record<string, unknown>> {
+    return this.db.iterate(...this.#bind(query, values));
   }
 
-  #json(source: string, rows: readonly (string | Memo | Path | Progress)[]): void {
+  #json(query: GraphQuery, rows: readonly (string | Memo | Path | Progress)[]): void {
     if (rows.length === 0) return;
-    if (rows.length > GRAPH_PAGE) throw new CorruptError("pack graph page exceeds its bound");
-    this.#run(source, JSON.stringify(rows));
+    if (rows.length > this.page) throw new CorruptError("pack graph page exceeds its bound");
+    this.#run(query, JSON.stringify(rows));
   }
 
   #reject(message: string): never {
@@ -108,7 +132,7 @@ export class PackGraphAdmission {
     for (;;) {
       const updates = new Map<string, Progress>();
       const children: string[] = [];
-      for (const raw of this.#rows(graphSql.reverse)) {
+      for (const raw of this.#rows("reverse")) {
         const row = reverseRow.decode(raw);
         const previous = updates.get(row.parent);
         updates.set(row.parent, {
@@ -119,8 +143,8 @@ export class PackGraphAdmission {
         if (row.child !== null) children.push(row.child);
       }
       if (updates.size === 0) return;
-      this.#json(graphSql.seed, children);
-      this.#json(graphSql.advance, [...updates.values()]);
+      this.#json("seed", children);
+      this.#json("advance", [...updates.values()]);
     }
   }
 
@@ -131,15 +155,15 @@ export class PackGraphAdmission {
   #unwind(length: number, depth: number, type: ObjectType): void {
     this.#checkDepth(length + depth);
     for (let high = length; high > 0; ) {
-      const low = Math.max(0, high - GRAPH_PAGE);
-      this.#run(graphSql.unwind, depth, length, type, low, high);
-      this.#run(graphSql.trim, low, high);
+      const low = Math.max(0, high - this.page);
+      this.#run("unwind", depth, length, type, low, high);
+      this.#run("trim", low, high);
       high = low;
     }
   }
 
   #firstRoot(cursor: string): string | undefined {
-    for (const raw of this.#rows(graphSql.firstRoot, cursor)) return rootRow.decode(raw).oid;
+    for (const raw of this.#rows("firstRoot", cursor)) return rootRow.decode(raw).oid;
     return undefined;
   }
 
@@ -151,9 +175,7 @@ export class PackGraphAdmission {
     let expectedType: ObjectType | undefined;
     while (start !== undefined && root !== undefined) {
       // Finish reading the page before unwind writes invalidate its active-path snapshot.
-      const rows = Array.from(this.#rows(graphSql.forward, start, root), (raw) =>
-        forwardRow.decode(raw),
-      );
+      const rows = Array.from(this.#rows("forward", start, root), (raw) => forwardRow.decode(raw));
       const memo: Memo[] = [];
       let segment: Path[] = [];
       let seen = new Set<string>();
@@ -193,8 +215,8 @@ export class PackGraphAdmission {
           next = row.base;
         }
       }
-      this.#json(graphSql.memo, memo);
-      this.#json(graphSql.path, segment);
+      this.#json("memo", memo);
+      this.#json("path", segment);
       length += segment.length;
       start = next ?? this.#firstRoot(cursor);
       if (next === undefined) root = start;
