@@ -1834,6 +1834,40 @@ do not imply that every legal single candidate fits the 100 MiB target.
 
 ## Run log
 
+- 2026-09-22: WU5 landed as `924fb06`; rationale in
+  [ADR-0025](../decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md).
+  Leader verified 358 focused tests including the restored clone witness, 160
+  smoke, 101 e2e, typecheck and Biome on a quiet tree. Every load-bearing
+  behavior was proven by mutating the implementation and watching the witness
+  fail first: the paged-only scope, the `ECORRUPT` drift verdict, the
+  pending-base exclusion against the dead-join version, the conditional owner-2
+  bump, and the linearization itself -- 153 dependency rows against the old
+  recursive suffix walk, 17 at N=16 and 33 at 2N after.
+  Condition 4 is resolved empirically against the reviewer's doubt: a
+  self-referential `REF_DELTA` does reach admission and is rejected with
+  `cyclic delta chain at <oid>`; base resolution does not fail first, so all
+  three cycle shapes stay.
+  `outsideTerritory` was **not** empty, and one entry is a real gap in the
+  approved contract: `maintenance/roots/root-advance.ts` had to record the
+  current generation in `createRun`, because a fresh run otherwise sees drift
+  immediately and restarts forever -- the contract routed source drift through
+  the roots/mark branch without saying that branch must seed the identity. The
+  other four were the symbol-ceiling ratchet, the sweep transaction's actual
+  home in `sweep-advance.ts`, and two fixture/catalog updates. A behavior change
+  beyond the listed witnesses is recorded: a source change during `roots` or
+  `mark` now restarts root discovery.
+  Three acceptance items are partly vacuous through public paths, proven rather
+  than asserted: `auditPublishedMembership` refuses to publish a pack whose
+  canonical owner is not complete, so a pending pack holding a canonical row
+  with a complete fallback is unreachable, and no public settle can bump. Items
+  18, 22 and 24 therefore use declared seams; item 23's redundant-batch branch
+  and `restarted === 0` are mutually exclusive through public paths, so only the
+  termination half is witnessed. `bench:statements --check` was not run and the
+  two new scenario rows carry no frozen baselines on purpose -- `--check`
+  compares `rowsRead` for exact equality, so WU8 must freeze them from a real
+  measurement.
+
+
 - 2026-09-22: WU6's open measurement gate is closed. Measured at `fe4e4e2`,
   extracted with `git archive` so the concurrently dirty tree never entered a
   run, under a self-leased runner and per-measurement transient scopes with
