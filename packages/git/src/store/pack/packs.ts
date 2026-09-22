@@ -230,18 +230,24 @@ export class PackStore {
           return lifecycle?.reserved(packId);
         },
         published: (result) => {
-          this.#db.run(
+          // RETURNING replaces a separate `changes()` probe. SQLite buffers its
+          // output, so the delete is already complete at the first row and the
+          // rest of the cursor is abandoned without keeping every fulfilled OID.
+          let fulfilled = false;
+          for (const _oid of this.#db.iterate(
             `DELETE FROM git_promised_blobs
               WHERE repo_id = ? AND oid IN (
                 SELECT oid FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?
-              )`,
+              )
+              RETURNING oid`,
             this.#repoId,
             this.#repoId,
             result.packId,
-          );
-          if (this.#db.scalar<number>("SELECT changes()") !== 0) {
-            bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+          )) {
+            fulfilled = true;
+            break;
           }
+          if (fulfilled) bumpMaintenanceRootEpoch(this.#db, this.#repoId);
           return lifecycle?.published(result);
         },
       },

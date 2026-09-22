@@ -16,6 +16,7 @@ import {
   INTEGRATION_PAGE_ROWS,
   type IntegrationWorkspaceOwner,
   integrationJsonPages,
+  isFinalKeysetPage,
 } from "./storage.js";
 
 export interface IntegrationTouchedShape {
@@ -146,6 +147,8 @@ export class IntegrationTouched implements Iterable<MergeTouchedPath> {
       owner.requireActive();
       const page: OperationTouchedRow[] = [];
       let bytes = 0;
+      let scanned = 0;
+      let byteCapped = false;
       for (const row of owner.db.iterate(
         `SELECT ordinal, path, logical_path, purpose,
            index_stage, index_mode, index_oid, index_size, index_mtime, index_ino, index_rev,
@@ -157,8 +160,12 @@ export class IntegrationTouched implements Iterable<MergeTouchedPath> {
         this.planId,
         after,
       )) {
+        scanned++;
         const size = utf8ByteLength(JSON.stringify(row));
-        if (page.length > 0 && bytes + size > JSON_BATCH_BYTES) break;
+        if (page.length > 0 && bytes + size > JSON_BATCH_BYTES) {
+          byteCapped = true;
+          break;
+        }
         page.push({
           ordinal: row.ordinal,
           path: row.path,
@@ -178,13 +185,18 @@ export class IntegrationTouched implements Iterable<MergeTouchedPath> {
         });
         bytes += size;
         after = expectText(row.path);
-        if (bytes >= JSON_BATCH_BYTES) break;
+        if (bytes >= JSON_BATCH_BYTES) {
+          byteCapped = true;
+          break;
+        }
       }
       if (page.length === 0) return;
+      const final = isFinalKeysetPage(scanned, byteCapped);
       for (const row of page) {
         owner.requireActive();
         yield row;
       }
+      if (final) return;
     }
   }
 }

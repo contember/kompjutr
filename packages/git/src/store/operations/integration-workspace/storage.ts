@@ -49,6 +49,17 @@ export class IntegrationWorkspaceOwner {
   }
 }
 
+/**
+ * A keyset page that drained its whole cursor below the row limit is the last
+ * one: the limit did not truncate the query, so no row beyond it exists. A page
+ * the byte cap cut short stopped before its cursor ran out, so rows may remain
+ * even when it carries fewer than `INTEGRATION_PAGE_ROWS` of them, and that
+ * page must still be followed by the next query.
+ */
+export function isFinalKeysetPage(scanned: number, byteCapped: boolean): boolean {
+  return !byteCapped && scanned < INTEGRATION_PAGE_ROWS;
+}
+
 export function decodeDescriptor<T>(decoder: Decoder<T>, value: unknown, stored: boolean): T {
   const result = decoder.tryDecode(value);
   if (result.ok) return result.value;
@@ -163,6 +174,8 @@ export class IntegrationPlanEntries<T extends { path: string }> implements Itera
       owner.requireActive();
       const page: T[] = [];
       let bytes = 0;
+      let scanned = 0;
+      let byteCapped = false;
       for (const row of owner.db.iterate(
         `SELECT path, descriptor FROM git_integration_plan_entries
          WHERE repo_id = ? AND workspace_id = ? AND plan_id = ? AND path > ? COLLATE BINARY
@@ -172,20 +185,29 @@ export class IntegrationPlanEntries<T extends { path: string }> implements Itera
         this.planId,
         after,
       )) {
+        scanned++;
         const descriptor = expectText(row.descriptor);
         const size = utf8ByteLength(descriptor);
-        if (page.length > 0 && bytes + size > JSON_BATCH_BYTES) break;
+        if (page.length > 0 && bytes + size > JSON_BATCH_BYTES) {
+          byteCapped = true;
+          break;
+        }
         const value: unknown = JSON.parse(descriptor);
         page.push(decodeDescriptor(this.decoder, value, true));
         after = expectText(row.path);
         bytes += size;
-        if (bytes >= JSON_BATCH_BYTES) break;
+        if (bytes >= JSON_BATCH_BYTES) {
+          byteCapped = true;
+          break;
+        }
       }
       if (page.length === 0) return;
+      const final = isFinalKeysetPage(scanned, byteCapped);
       for (const entry of page) {
         owner.requireActive();
         yield entry;
       }
+      if (final) return;
     }
   }
 }

@@ -10,13 +10,19 @@ export function fulfillLoosePromises(
 ): void {
   let fulfilled = false;
   for (const page of jsonPages(oids, "loose promise fulfillment")) {
-    db.run(
+    // RETURNING replaces a separate `changes()` probe. SQLite buffers its
+    // output, so the delete is already complete at the first row and the rest
+    // of the cursor is abandoned without keeping every fulfilled OID.
+    for (const _oid of db.iterate(
       `DELETE FROM git_promised_blobs
-        WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))`,
+        WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))
+        RETURNING oid`,
       repoId,
       page,
-    );
-    if (db.scalar<number>("SELECT changes()") !== 0) fulfilled = true;
+    )) {
+      fulfilled = true;
+      break;
+    }
   }
   if (fulfilled) bumpMaintenanceRootEpoch(db, repoId);
 }
