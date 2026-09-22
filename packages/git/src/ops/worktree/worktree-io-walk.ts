@@ -1,6 +1,6 @@
 import type { RealPath, ScanEntry, ScanOptions } from "@kompjutr/drive";
 import { nativeRealpathOwned, nativeScanOwned } from "@kompjutr/drive";
-import { GitError } from "../../common/errors.js";
+import { CorruptError, GitError } from "../../common/errors.js";
 import { joinPath, relativeTo, subtreeSuccessor } from "../../common/paths.js";
 import { comparePaths } from "../../common/streams.js";
 import type { IgnoreMatcher } from "../../ignore/index.js";
@@ -167,6 +167,7 @@ function* walkWorktreeEntriesStreamCore(
     return;
   }
   while (true) {
+    const requestedAfter = afterSubtree === undefined ? after : undefined;
     const read =
       afterSubtree === undefined
         ? readWorktreeScanPage(worktree, base, {
@@ -182,6 +183,16 @@ function* walkWorktreeEntriesStreamCore(
     const entries = read.page;
     afterSubtree = undefined;
     if (entries.length === 0) return;
+    // A drive that ignores the cursor would page the same rows forever, so the
+    // walk would never terminate and every consumer would accumulate its rows.
+    const tail = entries[entries.length - 1];
+    if (
+      requestedAfter !== undefined &&
+      tail !== undefined &&
+      comparePaths(tail.path, requestedAfter) <= 0
+    ) {
+      throw new CorruptError("worktree scan cursor made no progress");
+    }
 
     for (let index = 0; index < entries.length; index++) {
       const entry = entries[index];

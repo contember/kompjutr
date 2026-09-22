@@ -5,6 +5,10 @@ import {
   type RebaseJournalCursor,
 } from "../operations/operation-journal.js";
 import type {
+  OperationHeader,
+  OperationTouchedSource,
+} from "../operations/operation-journal-types.js";
+import type {
   CherryPickJournal,
   MergeJournal,
   MergeOperationJournal,
@@ -45,15 +49,30 @@ export class CheckoutOperationStore {
     return this.#table.readOperationState();
   }
 
+  readOperationHeaderOwned(): OperationHeader | null {
+    this.#requireActive();
+    return this.#table.readOperationHeader();
+  }
+
+  readOperationStepOwned(ordinal: number): OperationStepMetadata | null {
+    this.#requireActive();
+    return this.#table.readOperationStep(ordinal);
+  }
+
+  *iterateOperationTouchedOwned(): Generator<MergeTouchedPath> {
+    this.#requireActive();
+    for (const entry of this.#table.iterateOperationTouched()) {
+      this.#requireActive();
+      yield entry;
+    }
+  }
+
   readRebaseCursorOwned(): RebaseJournalCursor | null {
     this.#requireActive();
     return this.#table.readRebaseCursorOwned();
   }
 
-  writeOperationStateOwned(
-    state: OperationStateMetadata,
-    touched: readonly MergeTouchedPath[],
-  ): void {
+  writeOperationStateOwned(state: OperationStateMetadata, touched: OperationTouchedSource): void {
     this.#requireActive();
     this.#table.writeOperationState(state, touched);
   }
@@ -61,7 +80,7 @@ export class CheckoutOperationStore {
   writeOperationJournalOwned(
     state: OperationStateMetadata,
     steps: readonly OperationStepMetadata[],
-    touched: readonly MergeTouchedPath[],
+    touched: OperationTouchedSource,
   ): void {
     this.#requireActive();
     this.#table.writeOperationJournal(state, steps, touched);
@@ -72,7 +91,7 @@ export class CheckoutOperationStore {
     this.#table.markReplayEmpty(kind, reason);
   }
 
-  suspendRebaseOwned(currentStep: number, touched: readonly MergeTouchedPath[]): void {
+  suspendRebaseOwned(currentStep: number, touched: OperationTouchedSource): void {
     this.#requireActive();
     this.#table.suspendRebase(currentStep, touched);
   }
@@ -119,7 +138,7 @@ export class CheckoutOperationStore {
     return this.#table.readMergeState();
   }
 
-  writeMergeStateOwned(state: MergeStateMetadata, touched: readonly MergeTouchedPath[]): void {
+  writeMergeStateOwned(state: MergeStateMetadata, touched: OperationTouchedSource): void {
     this.#requireActive();
     this.#table.writeMergeState(state, touched);
   }

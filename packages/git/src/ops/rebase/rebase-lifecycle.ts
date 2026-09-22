@@ -196,7 +196,7 @@ function continueRebaseInternal(
   if (prepared.phase === "running") {
     return driveRebase(context, repo, worktree, options, exclusions);
   }
-  repo.store.db.transactionSync(() => {
+  withIntegrationWorkspaceOwned(repo.store, (workspace) => {
     const current = requireRebaseCursor(repo);
     if (
       current.state.phase !== "conflicted" ||
@@ -210,7 +210,7 @@ function continueRebaseInternal(
     }
     requireRebaseIndex(repo);
     requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
-    const plan = planCurrentStep(repo, current);
+    const plan = planCurrentStep(workspace, repo, current);
     const currentTree = repo.readCommit(current.state.currentParentOid).tree;
     const resultEmpty = integrationIndexMatchesTree(repo, currentTree);
     const baseline = resultEmpty ? preflightBaselineTransition(repo, currentTree) : null;
@@ -350,3 +350,5 @@ function abortRebaseInternal(
     checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
   });
 }
+
+import { withIntegrationWorkspaceOwned } from "../../store/operations/integration-workspace/workspace.js";

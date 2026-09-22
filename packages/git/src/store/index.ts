@@ -46,6 +46,12 @@ export {
 export { indexScanOwned } from "./indexes/index-table.js";
 export { contentIdKey } from "./objects/blob-ids.js";
 export { readAuthenticatedObjectOwned } from "./objects/objects.js";
+export type { IntegrationSource } from "./operations/integration-workspace/objects.js";
+export type { IntegrationPlanHandle } from "./operations/integration-workspace/storage.js";
+export {
+  IntegrationWorkspace,
+  withIntegrationWorkspaceOwned,
+} from "./operations/integration-workspace/workspace.js";
 export {
   type OperationRootPage,
   type RebaseJournalCursor,

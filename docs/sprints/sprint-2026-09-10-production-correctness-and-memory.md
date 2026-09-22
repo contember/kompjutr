@@ -876,6 +876,35 @@ do not imply that every legal single candidate fits the 100 MiB target.
 
 ## Run log
 
+- 2026-09-22: WU6 integration is behaviorally green after four defects were
+  fixed. The shared worktree walk lost the non-advancing-cursor guard when merge
+  apply moved onto it, so a drive that ignores the scan cursor looped forever;
+  the guard is now `CorruptError` in `worktree-io-walk.ts`, where the paging loop
+  lives, and covers every walk consumer. `applyProjectedMerge` widened its
+  outcome literal to `string` and failed typecheck. Two witnesses encoded the
+  ceiling this contract removes: `merge-apply`'s structural-ancestor case now
+  requires a 1,000-component path to apply, round-trip and abort, and
+  `merge-state`'s journal case no longer asserts the deleted
+  `MAX_MERGE_TOUCHED_PATHS`. The dead constant, `worktreeSnapshotScan`,
+  `indexSnapshots`, `applyDestructiveRoots`, `structuralRemovals`,
+  `materialiseWrites`, `validateSourceBlobs`, `restoreWorktree`,
+  `abortDestructiveRoots` and their types are removed. Stale inventories updated:
+  the trusted-read policy scopes for the new journal readers, the store facade
+  surface, and the schema table list (WU1 staging, WU3 graph, WU6 workspace).
+  Typecheck and repository Biome pass.
+
+- 2026-09-22: A committed WU3 regression is recorded as
+  [backlog 82](../backlog/82-restore-clone-statement-target-after-graph-admission.md)
+  and blocks sprint closure. One public 24,252-file clone costs 1,264 SQL
+  statements at `491189b`, against 784 at `2af7f69`, so
+  `tests/clone-initial.test.ts` fails its unchanged <1,000 assertion. Bisected
+  over detached worktrees at `7b958e0`, `187b9dd`, `e0c34d9`, `2af7f69` and
+  `491189b`; only `491189b` fails, and the counts come from replacing the
+  assertion with `toBe(-1)` on the same fixture. WU3's recorded 673-statement
+  reclaim measurement does not cover this witness. The user directed that WU6
+  continue and that WU3 receive its own unit; no admission constant was changed
+  and the failing assertion was not relaxed.
+
 - 2026-09-21: WU3 landed as `491189b`; design rationale →
   [ADR-0023](../decisions/0023-validate-canonical-pack-dependencies-at-source-changes.md).
   The independently approved source-less starting-root filter reduces the actual

@@ -42,7 +42,7 @@ export type {
   StructuralIntegrationPlan,
 } from "./integration-structure-types.js";
 
-class PlanBudget {
+export class PlanBudget {
   #entries = 0;
   #planBytes = 0;
   #prefixBytes = 0;
@@ -132,7 +132,7 @@ function retainedEntryBytes(entry: StructuralIntegrationEntry): number {
   return PLAN_ENTRY_BYTES + pathBytes + identities * IDENTITY_BYTES;
 }
 
-function retainedPrefixBytes(
+export function retainedPrefixBytes(
   path: string,
   base: TargetEntry | undefined,
   current: TargetEntry | undefined,
@@ -220,7 +220,7 @@ function resolveDimension(base: string, current: string, incoming: string): stri
   return null;
 }
 
-function classifyRow(
+export function classifyRow(
   path: string,
   base: TargetEntry | undefined,
   current: TargetEntry | undefined,
@@ -299,7 +299,7 @@ function validateEntry(entry: TargetEntry, source: string): void {
     throw new CorruptError(`${source} tree yielded invalid oid '${entry.oid}'`);
 }
 
-function* validated(entries: Iterable<TargetEntry>, source: string): Generator<TargetEntry> {
+export function* validated(entries: Iterable<TargetEntry>, source: string): Generator<TargetEntry> {
   let previous: string | null = null;
   for (const entry of entries) {
     validateEntry(entry, source);

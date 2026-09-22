@@ -1,12 +1,9 @@
 import { GitError } from "../../common/errors.js";
-import { MODE_COMMIT } from "../../common/objects.js";
-import { comparePaths } from "../../common/streams.js";
 import { applyIndexOwned } from "../../store/checkout/checkout.js";
 import type { IndexEntry, IndexSink, IndexStore } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
-import type { WorktreeStat } from "../worktree/worktree.js";
 import { contentObjects } from "./merge-apply-blobs.js";
-import type { OwnedPaths, TouchedSpec } from "./merge-apply-types.js";
+import type { TouchedSpec } from "./merge-apply-types.js";
 import {
   requireIdentity,
   touchedSpecs,
@@ -34,17 +31,13 @@ function putIdentity(
   });
 }
 
-export function applyIndex(
+export function applyIndex<Content>(
   index: IndexStore,
-  entries: readonly ProjectedMergeEntry[],
-  specs: readonly TouchedSpec[],
+  entries: Iterable<ProjectedMergeEntry<Content>>,
+  specs: Iterable<TouchedSpec>,
 ): void {
-  const projected = new Set<string>();
-  for (const entry of entries) projected.add(entry.path);
   applyIndexOwned(index, (sink) => {
-    for (const spec of specs) {
-      if (!projected.has(spec.path)) sink.remove(spec.path);
-    }
+    for (const spec of specs) sink.remove(spec.path);
     for (const entry of entries) {
       sink.remove(entry.path);
       if (entry.stageZero !== null) {
@@ -84,52 +77,7 @@ export function applyProjectedIndex(
   );
 }
 
-export function applyDestructiveRoots(entries: readonly ProjectedMergeEntry[]): OwnedPaths {
-  const roots: string[] = [];
-  for (const entry of entries) {
-    if (entry.worktree === null || entry.worktree.mode !== MODE_COMMIT) roots.push(entry.path);
-  }
-  roots.sort(comparePaths);
-  return { entries: roots };
-}
-
-export function structuralRemovals(
-  entries: readonly ProjectedMergeEntry[],
-  snapshots: ReadonlyMap<string, WorktreeStat>,
-): OwnedPaths {
-  const removals = new Set<string>();
-  const add = (path: string): void => {
-    if (removals.has(path)) return;
-    removals.add(path);
-  };
-  for (const entry of entries) {
-    if (entry.worktree === null || snapshots.get(entry.path)?.type === "dir") {
-      add(entry.path);
-    }
-    if (entry.worktree === null) continue;
-    let slash = entry.path.lastIndexOf("/");
-    while (slash > 0) {
-      const ancestor = entry.path.slice(0, slash);
-      const stat = snapshots.get(ancestor);
-      if (stat !== undefined && stat.type !== "dir") {
-        add(ancestor);
-      }
-      slash = ancestor.lastIndexOf("/");
-    }
-  }
-  const paths = [...removals].sort(comparePaths);
-  return { entries: paths };
-}
-export function abortDestructiveRoots(touched: readonly MergeTouchedPath[]): OwnedPaths {
-  const roots: string[] = [];
-  for (const entry of touched) {
-    if (entry.worktree.kind !== "directory") roots.push(entry.path);
-  }
-  roots.sort(comparePaths);
-  return { entries: roots };
-}
-
-export function restoreIndex(repo: Repository, touched: readonly MergeTouchedPath[]): void {
+export function restoreIndex(repo: Repository, touched: Iterable<MergeTouchedPath>): void {
   applyIndexOwned(repo.checkout, (sink) => {
     for (const entry of touched) {
       sink.remove(entry.path);

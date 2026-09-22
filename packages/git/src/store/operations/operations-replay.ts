@@ -7,7 +7,6 @@ import {
   MAX_MERGE_LABEL_BYTES,
   MAX_MERGE_MESSAGE_BYTES,
   MAX_MERGE_REF_BYTES,
-  MAX_MERGE_TOUCHED_PATHS,
   type MergeJournal,
   type MergeSavedIdentity,
   type MergeStateMetadata,
@@ -73,29 +72,42 @@ export type OperationStateMetadata =
   | ReplayStateMetadata
   | RebaseStateMetadata;
 
-interface OperationJournalFields<S extends OperationStateMetadata> {
+interface OperationJournalFields<
+  S extends OperationStateMetadata,
+  Touched = readonly MergeTouchedPath[],
+> {
   state: S;
   steps: readonly OperationStepMetadata[];
-  touched: readonly MergeTouchedPath[];
+  touched: Touched;
   replayed: number;
   skipped: number;
 }
 
-export type MergeOperationJournal = OperationJournalFields<MergeOperationStateMetadata> & {
+export type MergeOperationJournal<Touched = readonly MergeTouchedPath[]> = OperationJournalFields<
+  MergeOperationStateMetadata,
+  Touched
+> & {
   kind: "merge";
 };
-export type CherryPickJournal = OperationJournalFields<
-  ReplayStateMetadata & { kind: "cherry-pick" }
+export type CherryPickJournal<Touched = readonly MergeTouchedPath[]> = OperationJournalFields<
+  ReplayStateMetadata & { kind: "cherry-pick" },
+  Touched
 > & { kind: "cherry-pick" };
-export type RevertJournal = OperationJournalFields<ReplayStateMetadata & { kind: "revert" }> & {
+export type RevertJournal<Touched = readonly MergeTouchedPath[]> = OperationJournalFields<
+  ReplayStateMetadata & { kind: "revert" },
+  Touched
+> & {
   kind: "revert";
 };
-export type RebaseJournal = OperationJournalFields<RebaseStateMetadata> & { kind: "rebase" };
-export type OperationJournal =
-  | MergeOperationJournal
-  | CherryPickJournal
-  | RevertJournal
-  | RebaseJournal;
+export type RebaseJournal<Touched = readonly MergeTouchedPath[]> = OperationJournalFields<
+  RebaseStateMetadata,
+  Touched
+> & { kind: "rebase" };
+export type OperationJournal<Touched = readonly MergeTouchedPath[]> =
+  | MergeOperationJournal<Touched>
+  | CherryPickJournal<Touched>
+  | RevertJournal<Touched>
+  | RebaseJournal<Touched>;
 
 function replayBoundedTextBytes(
   value: string,
@@ -339,7 +351,7 @@ function validateSequencedState(
 
 export function validateOperationJournal(
   state: OperationStateMetadata,
-  touched: readonly MergeTouchedPath[],
+  touched: Iterable<MergeTouchedPath> & { readonly length: number },
   steps: readonly OperationStepMetadata[],
 ): void {
   if (state.kind === "merge") {
@@ -347,12 +359,6 @@ export function validateOperationJournal(
     const { kind: _kind, ...mergeState } = state;
     validateMergeJournal(mergeState, touched);
     return;
-  }
-  if (touched.length > MAX_MERGE_TOUCHED_PATHS) {
-    throw new GitError(
-      "E2BIG",
-      `operation journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`,
-    );
   }
   if (state.phase === "conflicted" && touched.length === 0) {
     throw new CorruptError("a conflicted replay journal must retain a touched path");

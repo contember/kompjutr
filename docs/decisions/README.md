@@ -41,6 +41,7 @@ so the two cannot drift.
 - [0009 — Choose the persisted Git storage formats](0009-persisted-git-storage-formats.md) — accepted (2026-08-26)
 - [0022 — Stage pack commit projections until publication](0022-stage-pack-commit-projections-until-publication.md) — accepted (2026-09-11)
 - [0023 — Validate canonical pack dependencies at source changes](0023-validate-canonical-pack-dependencies-at-source-changes.md) — accepted (2026-09-21)
+- [0024 — Own integration output in a scoped SQL workspace](0024-own-integration-output-in-a-scoped-sql-workspace.md) — accepted (2026-09-22)
 
 **Git domain**
 

@@ -1,7 +1,9 @@
 import type { GitContext } from "../../ops/core/context.js";
 import type { RebaseResult } from "../../ops/core/kinds.js";
-import type { RebaseJournal } from "../../ops/core/operation-state.js";
+import { requireRebaseCursor } from "../../ops/rebase/rebase-lifecycle-baseline.js";
 import type { Repository } from "../../ops/repository/repository.js";
+import { readOperationStepOwned } from "../../store/operations/operation-journal.js";
+import type { RebaseJournalCursor } from "../../store/operations/operation-journal-types.js";
 import { gitCliResult, gitCliUtf8ByteLength } from "../result.js";
 import type { GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
 import {
@@ -12,7 +14,7 @@ import {
 import { formatCommit, subject } from "./write-summary.js";
 
 interface RebaseMutation {
-  before: RebaseJournal;
+  before: RebaseJournalCursor;
   result: RebaseResult;
 }
 
@@ -32,13 +34,12 @@ export function formatRebaseContinue(
       retainedStderrCeiling(options),
       "git CLI rebase stderr",
     );
-    appendRebaseProgress(stderr, before.state.currentStep, before.steps.length, mutation.result);
+    appendRebaseProgress(stderr, before.state.currentStep, before.stepCount, mutation.result);
     if (mutation.result.outcome === "completed") {
       stderr.append(`Successfully rebased and updated ${before.state.originalHeadRef}.\n`);
     } else if (mutation.result.outcome === "conflicted") {
-      const current = repo.checkout.requireOperationState("rebase");
-      const step = current.steps[current.state.currentStep];
-      if (step === undefined) throw new Error("conflicted rebase has no current step");
+      const step = requireRebaseCursor(repo).step;
+      if (step === null) throw new Error("conflicted rebase has no current step");
       const source = repo.readCommit(step.sourceOid);
       stderr.append(
         `error: could not apply ${step.sourceOid.slice(0, 7)}... ${subject(source.message)}\n`,
@@ -69,9 +70,8 @@ export function formatRebaseResult(repo: Repository, result: RebaseResult): GitC
     const destination = ref === null ? "detached HEAD" : ref;
     return gitCliResult("", `Successfully rebased and updated ${destination}.\n`, 0);
   }
-  const journal = repo.checkout.requireOperationState("rebase");
-  const step = journal.steps[journal.state.currentStep];
-  if (step === undefined) throw new Error("conflicted rebase has no current step");
+  const step = requireRebaseCursor(repo).step;
+  if (step === null) throw new Error("conflicted rebase has no current step");
   const source = repo.readCommit(step.sourceOid);
   return gitCliResult(
     "",
@@ -83,14 +83,11 @@ export function formatRebaseResult(repo: Repository, result: RebaseResult): GitC
 function continuedCommitOid(repo: Repository, mutation: RebaseMutation): string | undefined {
   const before = mutation.before;
   if (mutation.result.outcome === "conflicted") {
-    return (
-      repo.checkout.requireOperationState("rebase").steps[before.state.currentStep]?.resultOid ??
-      undefined
-    );
+    return readOperationStepOwned(repo.checkout, before.state.currentStep)?.resultOid ?? undefined;
   }
   if (mutation.result.outcome !== "completed") return undefined;
   let current = mutation.result.oid;
-  for (let count = 0; count <= before.steps.length; count++) {
+  for (let count = 0; count <= before.stepCount; count++) {
     const commit = repo.readCommit(current);
     const parent = commit.parent[0];
     if (parent === before.state.currentParentOid) return current;

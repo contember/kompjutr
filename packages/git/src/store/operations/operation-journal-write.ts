@@ -4,6 +4,7 @@ import { comparePaths } from "../../common/paths.js";
 import { jsonPages } from "../core/json-pages.js";
 import { bumpMaintenanceRootEpoch } from "../maintenance/control.js";
 import type { ObjectTable } from "../objects/objects.js";
+import { integrationJsonPages } from "./integration-workspace/storage.js";
 import {
   operationJournal,
   persistedOperationStep,
@@ -11,6 +12,7 @@ import {
   requireOperationKind,
 } from "./operation-journal-rows.js";
 import type {
+  OperationTouchedSource,
   PersistedOperationStep,
   PersistedOperationTouched,
 } from "./operation-journal-types.js";
@@ -21,7 +23,6 @@ import {
 } from "./operation-journal-validation.js";
 import {
   type MergeSavedIdentity,
-  type MergeTouchedPath,
   type OperationStateMetadata,
   type OperationStepMetadata,
   operationAlreadyActive,
@@ -40,7 +41,7 @@ export interface OperationJournalWriteContext extends OperationJournalValidation
 export function writeOperationState(
   context: OperationJournalWriteContext,
   state: OperationStateMetadata,
-  touched: readonly MergeTouchedPath[],
+  touched: OperationTouchedSource,
 ): void {
   if (state.kind === "rebase") {
     throw new CorruptError("rebase creation requires an explicit replay sequence");
@@ -52,7 +53,7 @@ export function writeOperationJournal(
   context: OperationJournalWriteContext,
   state: OperationStateMetadata,
   steps: readonly OperationStepMetadata[],
-  touched: readonly MergeTouchedPath[],
+  touched: OperationTouchedSource,
 ): void {
   validateOperationJournal(state, touched, steps);
   let replayed = 0;
@@ -150,7 +151,7 @@ function insertOperationSteps(
 
 function replaceTouched(
   context: OperationJournalWriteContext,
-  touched: readonly MergeTouchedPath[],
+  touched: OperationTouchedSource,
 ): void {
   let previousPath: string | null = null;
   for (const entry of touched) {
@@ -161,13 +162,14 @@ function replaceTouched(
   }
   context.db.run("DELETE FROM git_operation_touched WHERE checkout_id = ?", context.checkoutId);
   function* rows(): Generator<PersistedOperationTouched> {
-    for (let ordinal = 0; ordinal < touched.length; ordinal++) {
-      const entry = touched[ordinal];
-      if (entry === undefined) throw new CorruptError("operation touched sequence is sparse");
-      yield persistedOperationTouched(entry, ordinal);
+    let ordinal = 0;
+    for (const entry of touched) {
+      yield persistedOperationTouched(entry, ordinal++);
     }
+    if (ordinal !== touched.length)
+      throw new CorruptError("operation touched count differs from its rows");
   }
-  for (const page of jsonPages(rows(), "operation touched path")) {
+  for (const page of integrationJsonPages(rows())) {
     context.db.run(
       `INSERT INTO git_operation_touched
          (checkout_id, ordinal, path, logical_path, purpose, index_stage, index_mode,
@@ -219,7 +221,7 @@ export function markReplayEmpty(
 export function suspendRebase(
   context: OperationJournalWriteContext,
   currentStep: number,
-  touched: readonly MergeTouchedPath[],
+  touched: OperationTouchedSource,
 ): void {
   if (touched.length === 0) throw new CorruptError("conflicted rebase lost its touched paths");
   context.db.transactionSync(() => {

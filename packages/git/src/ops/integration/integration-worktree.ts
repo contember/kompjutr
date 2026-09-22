@@ -1,12 +1,18 @@
 // Shared bounded index, worktree, projection, and commit preflight for integration operations.
 
 import { GitError } from "../../common/errors.js";
-import { comparePaths, joinSorted } from "../../common/streams.js";
+import { comparePaths, joinSorted, joinSorted3 } from "../../common/streams.js";
 import { type IndexEntry, indexScanOwned } from "../../store/index.js";
+import type {
+  IntegrationEntry as StoredIntegrationEntry,
+  ProjectedMergeEntry as StoredProjectedEntry,
+} from "../../store/operations/integration-workspace/descriptors.js";
+import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
+import type { IntegrationTouched } from "../../store/operations/integration-workspace/touched.js";
 import type { ProjectedMergeEntry } from "../merge/merge-projection.js";
-import { projectMergePlan } from "../merge/merge-projection.js";
 import type { MergeTouchedPath } from "../merge/merge-state.js";
 import { checkoutBlockersAgainstOwned, checkoutBlockersOwned } from "../refs/refs.js";
+import type { CheckoutPathSelection } from "../refs/refs-checkout-guard.js";
 import type { Repository } from "../repository/repository.js";
 import {
   MAX_TREE_BUILD_LEAF_ENTRIES,
@@ -15,17 +21,10 @@ import {
 } from "../tree/tree-build.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
-import {
-  type DirtyPathLimits,
-  dirtyPathStreamOwned,
-  walkWorktreeEntriesStreamOwned,
-} from "../worktree/worktree-io.js";
-import type { IntegrationPlan } from "./integration.js";
+import { type DirtyPathLimits, dirtyPathStreamOwned } from "../worktree/worktree-io.js";
 
 export const MAX_INTEGRATION_INDEX_ENTRIES = MAX_TREE_BUILD_LEAF_ENTRIES;
 const MAX_REPOSITORY_ROWS = 50_000;
-const MAX_RELOCATION_COLLISIONS = 1_000;
-const NO_OMITTED_PATHS: ReadonlySet<string> = new Set();
 
 function dirtyPathLimits(): DirtyPathLimits {
   return {
@@ -63,36 +62,12 @@ export function requireBoundedIntegrationTree(
   });
 }
 
-function projectedIdentity(entry: ProjectedMergeEntry): { mode: string; oid: string } | null {
+function projectedIdentity<Content>(
+  entry: ProjectedMergeEntry<Content>,
+): { mode: string; oid: string } | null {
   if (entry.stageZero !== null) return entry.stageZero;
   if (entry.stages === null) return null;
   return entry.stages.current ?? entry.stages.incoming ?? entry.stages.base;
-}
-
-export function* prospectiveIntegrationIndexEntries(
-  repo: Repository,
-  projected: readonly ProjectedMergeEntry[],
-): Generator<IndexEntry> {
-  const owned = projectedTouchedShape(projected);
-  let ownedIndex = 0;
-  for (const row of joinSorted(indexScanOwned(repo.checkout), projected, {
-    left: (entry) => entry.path,
-    right: (entry) => entry.path,
-  })) {
-    if (row.right !== undefined) {
-      const identity = projectedIdentity(row.right);
-      if (identity !== null) yield indexEntry(row.right.path, identity.mode, identity.oid);
-      continue;
-    }
-    if (row.left === undefined) continue;
-    while (
-      owned[ownedIndex] !== undefined &&
-      comparePaths(owned[ownedIndex]?.path ?? "", row.left.path) < 0
-    ) {
-      ownedIndex++;
-    }
-    if (owned[ownedIndex]?.path !== row.left.path) yield row.left;
-  }
 }
 
 function* continuationIndexEntries(repo: Repository): Generator<IndexEntry> {
@@ -173,20 +148,19 @@ export function requireCleanIntegrationWorktree(
   }
 }
 
-export function requireSafeIntegrationWorktree(
+function requireSafeIntegrationSelection(
   repo: Repository,
   worktree: Worktree,
   incomingTree: string | null,
-  entries: readonly { path: string }[],
+  paths: string[] | CheckoutPathSelection,
   operation: IntegrationOperation,
-  baselineTree?: string | null,
+  baselineTree: string | null | undefined,
+  maxHashCandidates: number,
 ): void {
-  if (entries.length === 0) return;
-  const paths = entries.map((entry) => entry.path);
   const limits = {
     maxRows: MAX_REPOSITORY_ROWS,
     rows: 0,
-    maxHashCandidates: 1_000,
+    maxHashCandidates,
     hashCandidates: 0,
   };
   const blockers =
@@ -215,142 +189,10 @@ export function requireSafeIntegrationWorktree(
   }
 }
 
-function collisionCandidateEnd(base: string, path: string): number | null {
-  if (path === base || (path.startsWith(base) && path[base.length] === "/")) return base.length;
-  if (!path.startsWith(base) || path[base.length] !== "_") return null;
-  let end = base.length + 1;
-  while (end < path.length && path.charCodeAt(end) >= 0x30 && path.charCodeAt(end) <= 0x39) end++;
-  if (end === base.length + 1 || (end < path.length && path.charCodeAt(end) !== 0x2f)) return null;
-  return end;
-}
-
-function retainCollision(
-  path: string,
-  bases: readonly string[],
-  collisions: Set<string>,
-  operation: IntegrationOperation,
-): void {
-  for (const base of bases) {
-    const end = collisionCandidateEnd(base, path);
-    if (end === null) continue;
-    const candidate = end === base.length ? base : path.slice(0, end);
-    if (collisions.has(candidate)) continue;
-    if (collisions.size >= MAX_RELOCATION_COLLISIONS) {
-      throw new GitError(
-        "E2BIG",
-        `${operation} relocation collisions exceed ${MAX_RELOCATION_COLLISIONS} paths`,
-      );
-    }
-    collisions.add(candidate);
-  }
-}
-
-function relocationCollisions(
-  repo: Repository,
-  worktree: Worktree,
-  baseTree: string | null,
-  incomingTree: string | null,
-  initial: readonly ProjectedMergeEntry[],
-  omitted: ReadonlySet<string>,
-  operation: IntegrationOperation,
-): { tracked: ReadonlySet<string>; untracked: ReadonlySet<string> } {
-  let baseCount = 0;
-  for (const entry of initial) {
-    if (entry.purpose === "primary") continue;
-    baseCount++;
-  }
-  const bases: string[] = [];
-  for (const entry of initial) {
-    if (entry.purpose !== "primary") bases.push(entry.path);
-  }
-  const tracked = new Set<string>();
-  const untracked = new Set<string>();
-  if (baseCount === 0) return { tracked, untracked };
-  let indexRows = 0;
-  for (const entry of indexScanOwned(repo.checkout)) {
-    if (indexRows >= MAX_REPOSITORY_ROWS) {
-      throw new GitError(
-        "E2BIG",
-        `${operation} collision scan exceeds ${MAX_REPOSITORY_ROWS} rows`,
-      );
-    }
-    indexRows++;
-    if (!omitted.has(entry.path)) {
-      retainCollision(entry.path, bases, tracked, operation);
-    }
-  }
-  for (const entry of treeStream(repo, baseTree)) {
-    retainCollision(entry.path, bases, tracked, operation);
-  }
-  for (const entry of treeStream(repo, incomingTree)) {
-    retainCollision(entry.path, bases, tracked, operation);
-  }
-
-  let worktreeRows = 0;
-  for (const row of joinSorted(
-    indexScanOwned(repo.checkout),
-    walkWorktreeEntriesStreamOwned(worktree, repo.root, {
-      includeIgnored: true,
-    }),
-    { left: (entry) => entry.path, right: (entry) => entry.path },
-  )) {
-    if (worktreeRows >= MAX_REPOSITORY_ROWS) {
-      throw new GitError(
-        "E2BIG",
-        `${operation} collision scan exceeds ${MAX_REPOSITORY_ROWS} rows`,
-      );
-    }
-    worktreeRows++;
-    if (omitted.has(row.path)) continue;
-    if (row.right !== undefined && row.left === undefined) {
-      retainCollision(row.path, bases, untracked, operation);
-    }
-  }
-  return { tracked, untracked };
-}
-
-export function projectIntegrationWithCollisions(
-  repo: Repository,
-  worktree: Worktree,
-  baseTree: string | null,
-  incomingTree: string | null,
-  plan: IntegrationPlan,
-  currentLabel: string,
-  incomingLabel: string,
-  omitted: ReadonlySet<string> = NO_OMITTED_PATHS,
-  operation: IntegrationOperation = "merge",
-): readonly ProjectedMergeEntry[] {
-  const initial = projectMergePlan(plan, { currentLabel, incomingLabel });
-  const collisions = relocationCollisions(
-    repo,
-    worktree,
-    baseTree,
-    incomingTree,
-    initial,
-    omitted,
-    operation,
-  );
-  return projectMergePlan(plan, {
-    currentLabel,
-    incomingLabel,
-    trackedCollisions: collisions.tracked,
-    untrackedCollisions: collisions.untracked,
-  });
-}
-
 export interface TouchedShape {
   path: string;
   logicalPath: string;
   purpose: MergeTouchedPath["purpose"];
-}
-
-export function touchedPathSet(entries: readonly { path: string }[]): ReadonlySet<string> {
-  const paths = new Set<string>();
-  for (const entry of entries) {
-    if (paths.has(entry.path)) continue;
-    paths.add(entry.path);
-  }
-  return paths;
 }
 
 function buildProjectedTouchedShape(entries: readonly ProjectedMergeEntry[]): TouchedShape[] {
@@ -361,9 +203,6 @@ function buildProjectedTouchedShape(entries: readonly ProjectedMergeEntry[]): To
     purpose: MergeTouchedPath["purpose"],
   ): void => {
     if (byPath.has(path)) return;
-    if (byPath.size >= 1_000) {
-      throw new GitError("E2BIG", "integration ownership exceeds 1000 touched paths");
-    }
     byPath.set(path, { path, logicalPath, purpose });
   };
   const retainAncestor = (path: string): void => {
@@ -371,9 +210,6 @@ function buildProjectedTouchedShape(entries: readonly ProjectedMergeEntry[]): To
     while (slash > 0) {
       const ancestor = path.slice(0, slash);
       if (!byPath.has(ancestor)) {
-        if (byPath.size >= 1_000) {
-          throw new GitError("E2BIG", "integration ownership exceeds 1000 touched paths");
-        }
         byPath.set(ancestor, {
           path: ancestor,
           logicalPath: ancestor,
@@ -396,4 +232,65 @@ function buildProjectedTouchedShape(entries: readonly ProjectedMergeEntry[]): To
 
 export function projectedTouchedShape(entries: readonly ProjectedMergeEntry[]): TouchedShape[] {
   return buildProjectedTouchedShape(entries);
+}
+
+export function requireSafeIntegrationWorktreeOwned(
+  repo: Repository,
+  worktree: Worktree,
+  incomingTree: string | null,
+  plan: IntegrationPlanHandle<StoredIntegrationEntry>,
+  operation: IntegrationOperation,
+  baselineTree?: string | null,
+): void {
+  if (plan.entryCount === 0) return;
+  const iterator = plan.entries[Symbol.iterator]();
+  let next = iterator.next();
+  let active: string[] = [];
+  const paths: CheckoutPathSelection = {
+    matches(path) {
+      while (!next.done && comparePaths(next.value.path, path) <= 0) {
+        const candidate = next.value.path;
+        active = active.filter((prefix) => comparePaths(candidate, `${prefix}0`) < 0);
+        if (!active.some((prefix) => candidate.startsWith(`${prefix}/`))) active.push(candidate);
+        next = iterator.next();
+      }
+      active = active.filter((prefix) => comparePaths(path, `${prefix}0`) < 0);
+      return active.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+    },
+  };
+  try {
+    requireSafeIntegrationSelection(
+      repo,
+      worktree,
+      incomingTree,
+      paths,
+      operation,
+      baselineTree,
+      MAX_REPOSITORY_ROWS,
+    );
+  } finally {
+    iterator.return(undefined);
+  }
+}
+
+export function* prospectiveIntegrationIndexEntriesOwned(
+  repo: Repository,
+  projected: IntegrationPlanHandle<StoredProjectedEntry>,
+  touched: IntegrationTouched,
+): Generator<IndexEntry> {
+  for (const row of joinSorted3(
+    indexScanOwned(repo.checkout),
+    projected.entries,
+    touched.shapes(),
+    {
+      a: (entry) => entry.path,
+      b: (entry) => entry.path,
+      c: (entry) => entry.path,
+    },
+  )) {
+    if (row.b !== undefined) {
+      const identity = projectedIdentity(row.b);
+      if (identity !== null) yield indexEntry(row.b.path, identity.mode, identity.oid);
+    } else if (row.a !== undefined && row.c === undefined) yield row.a;
+  }
 }

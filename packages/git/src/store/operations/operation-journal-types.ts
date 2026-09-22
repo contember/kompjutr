@@ -1,4 +1,9 @@
-import type { MergeTouchedPath, OperationStepMetadata, RebaseStateMetadata } from "./operations.js";
+import type {
+  MergeTouchedPath,
+  OperationStateMetadata,
+  OperationStepMetadata,
+  RebaseStateMetadata,
+} from "./operations.js";
 
 export interface OperationStateRow {
   kind: unknown;
@@ -95,7 +100,20 @@ export interface RebaseJournalCursor {
   state: RebaseStateMetadata;
   stepCount: number;
   step: OperationStepMetadata | null;
-  touched: readonly MergeTouchedPath[];
+  touched: OperationTouchedSource;
+  touchedCount: number;
+  replayed: number;
+  skipped: number;
+}
+
+export interface OperationTouchedSource extends Iterable<MergeTouchedPath> {
+  readonly length: number;
+}
+
+export interface OperationHeader {
+  state: OperationStateMetadata;
+  stepCount: number;
+  touchedCount: number;
   replayed: number;
   skipped: number;
 }

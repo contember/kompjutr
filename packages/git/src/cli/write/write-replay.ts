@@ -80,7 +80,7 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
           repo,
           options,
           () => {
-            const before = repo.checkout.requireOperationState("rebase");
+            const before = requireRebaseCursor(repo);
             const result = rebaseContinueExcluding(
               context,
               repo,
@@ -137,3 +137,5 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
     },
   };
 }
+
+import { requireRebaseCursor } from "../../ops/rebase/rebase-lifecycle-baseline.js";

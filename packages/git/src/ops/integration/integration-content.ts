@@ -11,34 +11,6 @@ import type { ContentCandidate, IntegrationEntry } from "./integration-types.js"
 
 const EMPTY_BLOB = new Uint8Array();
 
-export function stableIdentityVector(entries: readonly ContentCandidate[]): string[] {
-  const seen = new Set<string>();
-  const oids: string[] = [];
-  for (const entry of entries) {
-    const identities =
-      entry.base === null
-        ? [entry.current, entry.incoming]
-        : [entry.base, entry.current, entry.incoming];
-    for (const identity of identities) {
-      const oid = identity.oid;
-      if (seen.has(oid)) continue;
-      seen.add(oid);
-      oids.push(oid);
-    }
-  }
-  return oids;
-}
-
-export function identityUseCounts(entries: readonly ContentCandidate[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const entry of entries) {
-    for (const oid of new Set(candidateOids(entry))) {
-      counts.set(oid, (counts.get(oid) ?? 0) + 1);
-    }
-  }
-  return counts;
-}
-
 export function candidateOids(entry: ContentCandidate): readonly string[] {
   return entry.base === null
     ? [entry.current.oid, entry.incoming.oid]

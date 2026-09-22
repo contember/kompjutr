@@ -30,6 +30,10 @@ export interface CheckoutBlockerLimits {
   hashCandidates: number;
 }
 
+export interface CheckoutPathSelection {
+  matches(path: string): boolean;
+}
+
 /**
  * What stands between the working tree and `tree`. git refuses a checkout
  * for two separate reasons and says so in two separate messages, so they
@@ -55,7 +59,7 @@ export function checkoutBlockersOwned(
   repo: Repository,
   worktree: Worktree,
   tree: string | null,
-  paths: string[] | undefined,
+  paths: string[] | CheckoutPathSelection | undefined,
   prune: boolean,
   limits?: CheckoutBlockerLimits,
 ): CheckoutBlockers {
@@ -91,7 +95,7 @@ export function checkoutBlockersAgainstOwned(
   worktree: Worktree,
   baselineTree: string | null,
   tree: string | null,
-  paths: string[] | undefined,
+  paths: string[] | CheckoutPathSelection | undefined,
   prune: boolean,
   limits?: CheckoutBlockerLimits,
   excludeRoots: string[] = [],
@@ -148,7 +152,7 @@ function checkoutBlockersAgainstMode(
   worktree: Worktree,
   baselineTree: string | null,
   tree: string | null,
-  paths: string[] | undefined,
+  paths: string[] | CheckoutPathSelection | undefined,
   prune: boolean,
   limits: CheckoutBlockerLimits | undefined,
   discardTrackedChanges: boolean,
@@ -196,7 +200,11 @@ function checkoutBlockersAgainstMode(
 
     const target = row.target;
     const existing = row.index;
-    if (!matchesPaths(row.path, paths)) continue;
+    const selected =
+      paths === undefined || Array.isArray(paths)
+        ? matchesPaths(row.path, paths)
+        : paths.matches(row.path);
+    if (!selected) continue;
 
     if (target === undefined) {
       // Only the checkout that prunes would remove this path.

@@ -77,8 +77,8 @@ export function createGitCliAddCommitHandlers(context: GitContext): AddCommitHan
           repo,
           options,
           () => {
-            const operation = repo.checkout.readOperationState();
-            if (operation?.kind === "merge") {
+            const operation = readOperationHeaderOwned(repo.checkout);
+            if (operation?.state.kind === "merge") {
               if (invocation.command.amend === true) {
                 throw new GitError("EINVAL", "cannot amend while continuing a merge");
               }
@@ -133,3 +133,5 @@ export function createGitCliAddCommitHandlers(context: GitContext): AddCommitHan
     },
   };
 }
+
+import { readOperationHeaderOwned } from "../../store/operations/operation-journal.js";

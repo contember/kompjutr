@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createGit, type Git } from "../packages/git/src/client.js";
 import { utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
-import { MODE_FILE, serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
+import {
+  hashObject,
+  MODE_FILE,
+  serializeCommit,
+  serializeTree,
+} from "../packages/git/src/common/objects.js";
 import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
 import type { GitContext } from "../packages/git/src/ops/core/context.js";
 import { operationRefLogMetadata } from "../packages/git/src/ops/core/ref-log.js";
@@ -229,6 +234,45 @@ function nativeGit(workspace: TestRepository): Git {
     defaultIdentity: IDENTITY,
   });
 }
+
+it.each(["commit", "continue", "abort"])(
+  "merges 1001 changed paths with native parity (%s)",
+  async (finish) => {
+    const fixture = newFixture();
+    fixture.write("base", "base\n");
+    fixture.commit("base");
+    fixture.git("checkout", "-qb", "topic");
+    for (let index = 0; index < 1001; index++) {
+      fixture.write(`file-${String(index).padStart(4, "0")}`, `incoming ${index}\n`);
+    }
+    fixture.commit("incoming");
+    fixture.git("checkout", "-q", "main");
+    fixture.write("current", "current\n");
+    fixture.commit("current");
+    const workspace = await clonedFrom(fixture);
+    let repo = workspace.repo;
+    if (finish === "commit") {
+      fixture.git("merge", "--no-edit", "topic");
+      await nativeGit(workspace).merge({ theirs: "topic" });
+    } else {
+      fixture.git("merge", "--no-commit", "topic");
+      await nativeGit(workspace).merge({ theirs: "topic", commit: false });
+      expect(repo.checkout.requireMergeState().touched).toHaveLength(1001);
+      const cold = reopen(workspace);
+      repo = cold.repo;
+      if (finish === "abort") {
+        fixture.git("merge", "--abort");
+        mergeAbort(repo, workspace.worktree);
+      } else {
+        fixture.git("commit", "--no-edit");
+        mergeContinue(cold.context, repo);
+      }
+    }
+    expect(repo.headTree()).toBe(fixture.git("rev-parse", "HEAD^{tree}"));
+    expect(indexLines(repo)).toEqual(gitIndexLines(fixture));
+    expect(repo.checkout.readOperationState()).toBeNull();
+  },
+);
 
 function snapshot(workspace: TestRepository): {
   refs: ReturnType<TestRepository["repo"]["store"]["listRefs"]>;
@@ -1165,6 +1209,31 @@ describe("merge lifecycle", () => {
     expect(workspace.repo.store.objectInfo([stageOne.oid])).toEqual([
       expect.objectContaining({ oid: stageOne.oid, source: "loose", type: "blob" }),
     ]);
+    const markerOid = hashObject("blob", utf8.encode(expectedWorktree));
+    expect(workspace.repo.store.has(markerOid)).toBe(false);
+    const git = nativeGit(workspace);
+    let maintenance = await git.maintenance();
+    for (let calls = 0; calls < 100 && maintenance.phase !== "classify-loose"; calls++) {
+      maintenance = await git.maintenance();
+    }
+    expect(maintenance.phase).toBe("classify-loose");
+    const db = new TestDatabase(workspace.storage);
+    expect(
+      db.scalar(
+        "SELECT count(*) FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
+        workspace.repo.store.repoId,
+        stageOne.oid,
+      ),
+    ).toBe(1);
+    expect(
+      db.scalar(
+        "SELECT count(*) FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
+        workspace.repo.store.repoId,
+        markerOid,
+      ),
+    ).toBe(0);
+    expect(db.scalar("SELECT count(*) FROM git_integration_workspaces")).toBe(0);
+    expect(reopen(workspace).repo.read(stageOne.oid).data).toEqual(synthetic.data);
   });
 
   it("aborts recursive merge recovery past the former first-excess model", async () => {

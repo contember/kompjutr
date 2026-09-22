@@ -11,6 +11,10 @@ import {
 import type { MergeTouchedPath } from "../packages/git/src/ops/merge/merge-state.js";
 import { checkoutStoreMutations } from "../packages/git/src/store/core/checkout-mutations-registry.js";
 import { readOperationStateOwned, SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import {
+  iterateOperationTouched,
+  readOperationHeader,
+} from "../packages/git/src/store/operations/operation-journal-read.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const TREE_BYTES = serializeTree([]);
@@ -178,6 +182,32 @@ function open() {
 }
 
 describe("durable operation journal", () => {
+  it("writes a repeatable 1001-path source and reads it after cold reopen", () => {
+    const { db, repository, store } = open();
+    const state = replay("cherry-pick", { phase: "conflicted", emptyReason: null });
+    const source = {
+      length: 1001,
+      *[Symbol.iterator](): Generator<MergeTouchedPath> {
+        for (let index = 0; index < this.length; index++) {
+          const path = `${"long-".repeat(300)}${String(index).padStart(4, "0")}`;
+          yield {
+            path,
+            logicalPath: path,
+            purpose: "primary",
+            index: { stage: 0, mode: 0o100644, oid: FILE, size: 7, mtime: 1, ino: 2, rev: 3 },
+            worktree: { kind: "file", mode: 0o100644, oid: FILE, revision: 4 },
+          };
+        }
+      },
+    };
+    checkoutStoreMutations(store).writeOperationStateOwned(state, source);
+    const cold = new SqliteGitDatabase(db).openCheckout(repository);
+    const header = readOperationHeader(db, cold.checkoutId);
+    expect(header?.touchedCount).toBe(1001);
+    expect([...iterateOperationTouched(db, cold.checkoutId)]).toEqual([...source]);
+    expect(cold.requireOperationState("cherry-pick").touched).toEqual([...source]);
+  });
+
   it("round-trips trusted replay metadata through a cold reopen", () => {
     const kinds: readonly ("cherry-pick" | "revert")[] = ["cherry-pick", "revert"];
     for (const kind of kinds) {

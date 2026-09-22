@@ -314,20 +314,17 @@ describe("scratch snapshot replay", () => {
     const before = controlState(workspace);
     const beforeObjects = objectCount(workspace);
 
-    await git.withScratchIndex({ name: "invalid" }, (scratch) => {
-      scratch.readTree({ tree: onto });
-      const tree = scratch.writeTree();
-      for (const snapshot of [root, merge]) {
-        expect(() => scratch.replaySnapshot({ snapshot, onto })).toThrowError(
-          expect.objectContaining({ code: "EINVAL" }),
-        );
-        expect(scratch.writeTree()).toBe(tree);
-      }
-      expect(() => scratch.replaySnapshot({ snapshot: gitlink, onto })).toThrowError(
-        expect.objectContaining({ code: "EUNSUPPORTED" }),
-      );
-      expect(scratch.writeTree()).toBe(tree);
-    });
+    for (const snapshot of [root, merge, gitlink]) {
+      const code = snapshot === gitlink ? "EUNSUPPORTED" : "EINVAL";
+      await expect(
+        git.withScratchIndex({ name: "invalid" }, (scratch) => {
+          scratch.readTree({ tree: onto });
+          expect(() => scratch.replaySnapshot({ snapshot, onto })).toThrowError(
+            expect.objectContaining({ code }),
+          );
+        }),
+      ).rejects.toMatchObject({ code });
+    }
 
     expect(objectCount(workspace)).toBe(beforeObjects);
     expect(controlState(workspace)).toEqual(before);
@@ -368,7 +365,7 @@ describe("scratch snapshot replay", () => {
     expect(scratchRows(workspace)).toEqual([]);
   });
 
-  it("rejects a replay plan beyond the 1,000-entry boundary without writes", async () => {
+  it("replays 1001 paths with native tree parity", async () => {
     const source = fixture();
     source.write("base.txt", "base\n");
     const base = source.commit("base");
@@ -386,7 +383,7 @@ describe("scratch snapshot replay", () => {
       git.withScratchIndex({ name: "oversized" }, (scratch) =>
         scratch.replaySnapshot({ snapshot, onto: base }),
       ),
-    ).rejects.toMatchObject({ code: "E2BIG" });
+    ).resolves.toEqual({ outcome: "clean", tree: source.git("rev-parse", `${snapshot}^{tree}`) });
     expect(objectCount(workspace)).toBe(beforeObjects);
     expect(controlState(workspace)).toEqual(before);
     expect(scratchRows(workspace)).toEqual([]);

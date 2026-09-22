@@ -4,7 +4,6 @@ import { utf8 } from "../packages/git/src/common/bytes.js";
 import { hashObject, serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
 import {
   MAX_MERGE_MESSAGE_BYTES,
-  MAX_MERGE_TOUCHED_PATHS,
   type MergeStateMetadata,
   type MergeTouchedPath,
 } from "../packages/git/src/ops/merge/merge-state.js";
@@ -221,20 +220,6 @@ describe("durable merge journal", () => {
       expect.objectContaining({ code: "ECORRUPT" }),
     );
 
-    const tooMany: MergeTouchedPath[] = [];
-    for (let index = 0; index <= MAX_MERGE_TOUCHED_PATHS; index++) {
-      const path = `p${index.toString().padStart(4, "0")}`;
-      tooMany.push({
-        path,
-        logicalPath: path,
-        purpose: "primary",
-        index: null,
-        worktree: { kind: "absent" },
-      });
-    }
-    expect(() => store.writeMergeState(metadata(), tooMany)).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
     expect(() =>
       store.writeMergeState(
         metadata({ message: "x".repeat(MAX_MERGE_MESSAGE_BYTES + 1) }),

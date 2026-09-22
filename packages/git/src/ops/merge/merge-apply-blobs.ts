@@ -1,13 +1,11 @@
 import type { WriteEntry } from "@kompjutr/drive";
 import { fromHex, utf8Decoder } from "../../common/bytes.js";
 import { CorruptError } from "../../common/errors.js";
-import { MODE_SYMLINK } from "../../common/objects.js";
 import { joinPath } from "../../common/paths.js";
-import { comparePaths } from "../../common/streams.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../../store/index.js";
 import { writeObjectsOwned } from "../../store/repository/shared.js";
 import type { Repository } from "../repository/repository.js";
-import { fileModeFor, type Worktree, type WorktreeStat } from "../worktree/worktree.js";
+import type { Worktree } from "../worktree/worktree.js";
 import type { AdmittedBlobBatch, BlobMetadata, ContentObjects } from "./merge-apply-types.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
 import type { MergeTouchedPath } from "./merge-state.js";
@@ -43,18 +41,6 @@ export function collectBlobMetadata<T>(
     if (!sizes.has(oid)) throw new CorruptError(`${label} lost object ${oid}`);
   }
   return { sizes };
-}
-
-export function validateSourceBlobs(
-  repo: Repository,
-  entries: readonly ProjectedMergeEntry[],
-): BlobMetadata {
-  return collectBlobMetadata(
-    repo,
-    entries,
-    (entry) => (entry.content === null ? (entry.worktree?.oid ?? null) : null),
-    "merge output",
-  );
 }
 
 function readAdmittedBlobBatch<T>(
@@ -141,100 +127,12 @@ export function contentObjects(
   return { entries: oids };
 }
 
-export function materialiseWrites(
+export function restoreWorktreeFiles(
   repo: Repository,
   worktree: Worktree,
-  entries: readonly ProjectedMergeEntry[],
-  contentOids: ReadonlyMap<string, string>,
+  pending: readonly MergeTouchedPath[],
   metadata: BlobMetadata,
 ): void {
-  const inline: WriteEntry[] = [];
-  const pending: ProjectedMergeEntry[] = [];
-  for (const entry of entries) {
-    if (entry.worktree === null) continue;
-    if (entry.content !== null) {
-      const oid = contentOids.get(entry.path);
-      if (oid === undefined) throw new CorruptError(`merge output lacks content ${entry.path}`);
-      inline.push({
-        path: joinPath(repo.root, entry.path),
-        bytes: entry.content,
-        mode: fileModeFor(entry.worktree.mode),
-        contentId: fromHex(oid),
-      });
-    } else {
-      pending.push(entry);
-    }
-  }
-  if (inline.length > 0) {
-    worktree.writeFiles(inline);
-  }
-
-  let offset = 0;
-  while (offset < pending.length) {
-    const batch = readAdmittedBlobBatch(
-      repo,
-      pending,
-      offset,
-      metadata,
-      (entry) => entry.worktree?.oid ?? "",
-      "merge output batch",
-    );
-    const writes: WriteEntry[] = [];
-    for (let index = offset; index < batch.end; index++) {
-      const entry = pending[index];
-      if (entry === undefined) throw new CorruptError("merge output batch selection is incomplete");
-      const identity = entry.worktree;
-      if (identity === null) continue;
-      const bytes = batch.blobs.get(identity.oid);
-      if (bytes === undefined) throw new CorruptError(`merge output lost object ${identity.oid}`);
-      const path = joinPath(repo.root, entry.path);
-      const contentId = fromHex(identity.oid);
-      writes.push(
-        identity.mode === MODE_SYMLINK
-          ? { path, target: utf8Decoder.decode(bytes), contentId }
-          : { path, bytes, mode: fileModeFor(identity.mode), contentId },
-      );
-    }
-    if (writes.length > 0) worktree.writeFiles(writes);
-    offset = batch.end;
-  }
-}
-export function restoreWorktree(
-  repo: Repository,
-  worktree: Worktree,
-  touched: readonly MergeTouchedPath[],
-  current: ReadonlyMap<string, WorktreeStat>,
-  metadata: BlobMetadata,
-): void {
-  const removals = new Set<string>();
-  const directories: WriteEntry[] = [];
-  const pending: MergeTouchedPath[] = [];
-  const addRemoval = (path: string): void => {
-    if (removals.has(path)) return;
-    removals.add(path);
-  };
-  for (const entry of touched) {
-    if (entry.worktree.kind === "absent") {
-      addRemoval(entry.path);
-    } else if (entry.worktree.kind === "directory") {
-      const found = current.get(entry.path);
-      if (found !== undefined && found.type !== "dir") addRemoval(entry.path);
-      directories.push({
-        path: joinPath(repo.root, entry.path),
-        mode: entry.worktree.mode & 0o7777,
-      });
-    } else {
-      if (current.get(entry.path)?.type === "dir") addRemoval(entry.path);
-      pending.push(entry);
-    }
-  }
-  if (removals.size > 0) {
-    const ordered = [...removals].sort(comparePaths);
-    const absolute = ordered.map((path) => joinPath(repo.root, path));
-    worktree.removeFiles(absolute, { recursive: true });
-  }
-  if (directories.length > 0) worktree.writeFiles(directories);
-
   let offset = 0;
   while (offset < pending.length) {
     const batch = readAdmittedBlobBatch(

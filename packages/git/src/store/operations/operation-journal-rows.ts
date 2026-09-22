@@ -167,13 +167,13 @@ export function operationMetadataFromRow(
   };
 }
 
-export function operationJournal(
+export function operationJournal<Touched extends Iterable<MergeTouchedPath>>(
   state: OperationStateMetadata,
   steps: readonly OperationStepMetadata[],
-  touched: readonly MergeTouchedPath[],
+  touched: Touched,
   replayed: number,
   skipped: number,
-): OperationJournal {
+): OperationJournal<Touched> {
   const fields = { steps, touched, replayed, skipped };
   if (state.kind === "merge") return { kind: state.kind, state, ...fields };
   if (state.kind === "cherry-pick") return { kind: state.kind, state, ...fields };

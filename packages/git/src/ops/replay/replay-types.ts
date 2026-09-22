@@ -1,5 +1,7 @@
 import type { Commit } from "../../common/objects.js";
 import type { TextMergeOptions } from "../../diff/xmerge.js";
+import type { IntegrationEntry } from "../../store/operations/integration-workspace/descriptors.js";
+import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
 import type {
   IntegrationConflictKind,
   IntegrationLimits,
@@ -26,7 +28,7 @@ export interface ReplayLabels {
   incoming: string;
 }
 
-export interface ReplayPlan {
+export interface ReplayPlan<Integration = IntegrationPlan> {
   kind: ReplayKind;
   sourceOid: string;
   sourceCommit: Commit;
@@ -40,8 +42,10 @@ export interface ReplayPlan {
   baseTreeOid: string | null;
   incomingTreeOid: string | null;
   labels: ReplayLabels;
-  integration: IntegrationPlan;
+  integration: Integration;
 }
+
+export type OwnedReplayPlan = ReplayPlan<IntegrationPlanHandle<IntegrationEntry>>;
 
 export interface ReplaySnapshotOptions {
   snapshot: string;

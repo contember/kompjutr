@@ -83,13 +83,27 @@ function ordinaryReadInventory(): ReadQuery[] {
       name: "rebase cursor read",
       path: journalReads,
       start: "export function readRebaseCursor(",
-      end: "function readTouched(",
+      end: "export function* iterateOperationTouched(",
     },
     {
       category: "operation journal",
-      name: "touched-path read",
+      name: "touched-path page",
       path: journalReads,
-      start: "function readTouched(",
+      start: "export function* iterateOperationTouched(",
+      end: "export function readOperationHeader(",
+    },
+    {
+      category: "operation journal",
+      name: "operation header read",
+      path: journalReads,
+      start: "export function readOperationHeader(",
+      end: "export function readOperationStep(",
+    },
+    {
+      category: "operation journal",
+      name: "operation step read",
+      path: journalReads,
+      start: "export function readOperationStep(",
     },
     {
       category: "operation journal",
@@ -222,7 +236,7 @@ describe("trusted ordinary read policy", () => {
       expect(policyViolations(query.sql, "ordinary-read"), query.name).toEqual([]);
     }
     expect(categories).toEqual({
-      "operation journal": 6,
+      "operation journal": 9,
       "index tracker": 2,
       "sparse selection": 7,
       "sparse tree resolution": 1,

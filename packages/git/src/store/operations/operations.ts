@@ -3,7 +3,6 @@ export {
   MAX_MERGE_LABEL_BYTES,
   MAX_MERGE_MESSAGE_BYTES,
   MAX_MERGE_REF_BYTES,
-  MAX_MERGE_TOUCHED_PATHS,
   type MergeIndexSnapshot,
   type MergeJournal,
   type MergeOrigin,

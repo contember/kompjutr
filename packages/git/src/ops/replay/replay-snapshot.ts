@@ -1,32 +1,41 @@
-import { CorruptError, GitError, ObjectNotFoundError } from "../../common/errors.js";
+import { CorruptError, GitError } from "../../common/errors.js";
 import { MODE_COMMIT } from "../../common/objects.js";
-import { comparePaths, joinSorted } from "../../common/streams.js";
+import { joinSorted3 } from "../../common/streams.js";
 import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { withGitMutationGuard } from "../../store/core/mutation-guard.js";
 import type { IndexEntry, IndexStore } from "../../store/index.js";
+import type {
+  IntegrationEntry,
+  ProjectedMergeEntry,
+} from "../../store/operations/integration-workspace/descriptors.js";
+import {
+  type IntegrationPlanHandle,
+  integrationPages,
+} from "../../store/operations/integration-workspace/storage.js";
+import type { IntegrationTouched } from "../../store/operations/integration-workspace/touched.js";
+import {
+  type IntegrationWorkspace,
+  withIntegrationWorkspaceOwned,
+} from "../../store/operations/integration-workspace/workspace.js";
 import { indexFromTree } from "../checkout/checkout.js";
-import {
-  type IntegrationConflictKind,
-  type IntegrationPlan,
-  MAX_INTEGRATION_SOURCE_ROWS,
-} from "../integration/integration.js";
+import { MAX_INTEGRATION_SOURCE_ROWS } from "../integration/integration.js";
+import { adoptProjectedIndex } from "../integration/integration-apply-owned.js";
 import type { IntegrationStages } from "../integration/integration-structure.js";
-import {
-  projectedTouchedShape,
-  requireBoundedIntegrationTree,
-} from "../integration/integration-worktree.js";
-import { applyProjectedIndex, validateProjectedIndexEntries } from "../merge/merge-apply.js";
-import { type ProjectedMergeEntry, projectMergePlan } from "../merge/merge-projection.js";
+import { integrationTouched } from "../integration/integration-touched.js";
+import { requireBoundedIntegrationTree } from "../integration/integration-worktree.js";
+import { validateProjectedIndexEntries } from "../merge/merge-apply.js";
+import { applyIndex } from "../merge/merge-apply-index.js";
+import { projectMergePlanOwned } from "../merge/merge-projection.js";
 import { writeTreeOwned } from "../repository/plumbing.js";
 import type { Repository } from "../repository/repository.js";
-import { planReplay } from "./replay-planning.js";
+import { planReplayOwned } from "./replay-planning.js";
 import {
   readReplayCommit,
   requireBoundedRevision,
   resolveBoundedCommitRevision,
 } from "./replay-revision.js";
 import type {
-  ReplayPlan,
+  OwnedReplayPlan as ReplayPlan,
   ReplaySnapshotConflict,
   ReplaySnapshotConflictStage,
   ReplaySnapshotOptions,
@@ -34,7 +43,6 @@ import type {
 } from "./replay-types.js";
 
 export const MAX_SNAPSHOT_REPLAY_SOURCE_ROWS = MAX_INTEGRATION_SOURCE_ROWS;
-const SNAPSHOT_OBJECT_INFO_PAGE = 4_096;
 function requireSnapshotTreesWithoutGitlinks(repo: Repository, plan: ReplayPlan): void {
   const trees = new Set([plan.selectedParentTreeOid, plan.sourceTreeOid, plan.currentTreeOid]);
   trees.delete(null);
@@ -71,21 +79,26 @@ function conflictStages(stagesBySide: IntegrationStages): ReplaySnapshotConflict
 }
 
 function snapshotConflicts(
-  plan: IntegrationPlan,
-  projected: readonly ProjectedMergeEntry[],
+  plan: IntegrationPlanHandle<IntegrationEntry>,
+  projected: IntegrationPlanHandle<ProjectedMergeEntry>,
 ): ReplaySnapshotConflict[] {
-  const kinds = new Map<string, IntegrationConflictKind>();
-  for (const entry of plan.entries) {
-    if (entry.kind === "conflict") kinds.set(entry.path, entry.conflict);
-  }
   const conflicts: ReplaySnapshotConflict[] = [];
-  for (const entry of projected) {
-    if (entry.stages === null) continue;
-    const kind = kinds.get(entry.logicalPath);
-    if (kind === undefined) {
-      throw new CorruptError(`projected conflict ${entry.path} lost its logical conflict kind`);
+  for (const page of integrationPages(projected.entries)) {
+    const logicalEntries = plan.entries.getMany(
+      page.filter((entry) => entry.stages !== null).map((entry) => entry.logicalPath),
+    );
+    for (const entry of page) {
+      if (entry.stages === null) continue;
+      const logical = logicalEntries.get(entry.logicalPath);
+      if (logical === undefined || logical.kind !== "conflict") {
+        throw new CorruptError(`projected conflict ${entry.path} lost its logical conflict kind`);
+      }
+      conflicts.push({
+        path: entry.path,
+        kind: logical.conflict,
+        stages: conflictStages(entry.stages),
+      });
     }
-    conflicts.push({ path: entry.path, kind, stages: conflictStages(entry.stages) });
   }
   return conflicts;
 }
@@ -93,22 +106,27 @@ function snapshotConflicts(
 function* prospectiveSnapshotIndex(
   repo: Repository,
   currentTreeOid: string,
-  projected: readonly ProjectedMergeEntry[],
+  projected: IntegrationPlanHandle<ProjectedMergeEntry>,
+  touched: IntegrationTouched,
 ): Generator<IndexEntry> {
-  const owned = projectedTouchedShape(projected);
-  let ownedIndex = 0;
-  for (const row of joinSorted(indexFromTree(repo, currentTreeOid), projected, {
-    left: (entry) => entry.path,
-    right: (entry) => entry.path,
-  })) {
-    if (row.right !== undefined) {
-      if (row.right.stages !== null) {
+  for (const row of joinSorted3(
+    indexFromTree(repo, currentTreeOid),
+    projected.entries,
+    touched.shapes(),
+    {
+      a: (entry) => entry.path,
+      b: (entry) => entry.path,
+      c: (entry) => entry.path,
+    },
+  )) {
+    if (row.b !== undefined) {
+      if (row.b.stages !== null) {
         throw new CorruptError("clean snapshot projection retained conflict stages");
       }
-      const identity = row.right.stageZero;
+      const identity = row.b.stageZero;
       if (identity !== null) {
         yield {
-          path: row.right.path,
+          path: row.b.path,
           stage: 0,
           mode: Number.parseInt(identity.mode, 8),
           oid: identity.oid,
@@ -120,42 +138,28 @@ function* prospectiveSnapshotIndex(
       }
       continue;
     }
-    if (row.left === undefined) continue;
-    while (
-      owned[ownedIndex] !== undefined &&
-      comparePaths(owned[ownedIndex]?.path ?? "", row.left.path) < 0
-    ) {
-      ownedIndex++;
-    }
-    if (owned[ownedIndex]?.path !== row.left.path) yield row.left;
+    if (row.a !== undefined && row.c === undefined) yield row.a;
   }
 }
 
 function validateSnapshotResultObjects(
+  workspace: IntegrationWorkspace,
   repo: Repository,
   currentTreeOid: string,
-  projected: readonly ProjectedMergeEntry[],
+  projected: IntegrationPlanHandle<ProjectedMergeEntry>,
+  touched: IntegrationTouched,
 ): void {
-  const generated = new Set<string>();
-  for (const entry of projected) {
-    if (entry.content !== null && entry.stageZero !== null) generated.add(entry.stageZero.oid);
-  }
-  const required = new Set<string>();
-  for (const entry of prospectiveSnapshotIndex(repo, currentTreeOid, projected)) {
-    if (entry.mode === 0o160000) {
-      throw new GitError("EUNSUPPORTED", `snapshot replay rejects gitlink ${entry.path}`);
+  for (const page of integrationPages(
+    prospectiveSnapshotIndex(repo, currentTreeOid, projected, touched),
+  )) {
+    const required = new Set<string>();
+    for (const entry of page) {
+      if (entry.mode === 0o160000) {
+        throw new GitError("EUNSUPPORTED", `snapshot replay rejects gitlink ${entry.path}`);
+      }
+      required.add(entry.oid);
     }
-    required.add(entry.oid);
-  }
-  const missing = new Set(repo.store.missing(required));
-  for (const oid of missing) {
-    if (!generated.has(oid)) throw new ObjectNotFoundError(oid);
-  }
-  const present = [...required].filter((oid) => !missing.has(oid));
-  for (let offset = 0; offset < present.length; offset += SNAPSHOT_OBJECT_INFO_PAGE) {
-    for (const object of repo.store.objectInfo(
-      present.slice(offset, offset + SNAPSHOT_OBJECT_INFO_PAGE),
-    )) {
+    for (const object of workspace.source.objectInfo([...required])) {
       if (object.type !== "blob") {
         throw new CorruptError(`snapshot replay result ${object.oid} is not a blob`);
       }
@@ -178,6 +182,17 @@ export function replaySnapshotOwned(
   index: IndexStore,
   options: ReplaySnapshotOptions,
 ): ReplaySnapshotResult {
+  return withIntegrationWorkspaceOwned(repo.store, (workspace) =>
+    replayInWorkspace(workspace, repo, index, options),
+  );
+}
+
+function replayInWorkspace(
+  workspace: IntegrationWorkspace,
+  repo: Repository,
+  index: IndexStore,
+  options: ReplaySnapshotOptions,
+): ReplaySnapshotResult {
   const snapshot = requireBoundedRevision(Reflect.get(options, "snapshot"), {
     input: "snapshot",
     operation: "snapshot replay",
@@ -194,7 +209,7 @@ export function replaySnapshotOwned(
     throw new GitError("EINVAL", "snapshot replay requires exactly one parent");
   }
   const currentOid = repo.peel(repo.revParse(onto));
-  const plan = planReplay(repo, {
+  const plan = planReplayOwned(workspace, repo, {
     kind: "cherry-pick",
     source: sourceOid,
     currentOid,
@@ -204,18 +219,19 @@ export function replaySnapshotOwned(
     throw new CorruptError("validated snapshot replay source lost its selected parent");
   }
   requireSnapshotTreesWithoutGitlinks(repo, plan);
-  const projected = projectMergePlan(plan.integration, {
+  const projected = projectMergePlanOwned(workspace, plan.integration, {
     currentLabel: plan.labels.current,
     incomingLabel: plan.labels.incoming,
   });
-  validateProjectedIndexEntries(projected);
+  validateProjectedIndexEntries(projected.entries);
   const conflicts = snapshotConflicts(plan.integration, projected);
   if (conflicts.length > 0) return { outcome: "conflicted", conflicts };
 
+  const touched = integrationTouched(workspace, projected);
   requireBoundedIntegrationTree(repo, () =>
-    prospectiveSnapshotIndex(repo, plan.currentTreeOid, projected),
+    prospectiveSnapshotIndex(repo, plan.currentTreeOid, projected, touched),
   );
-  validateSnapshotResultObjects(repo, plan.currentTreeOid, projected);
+  validateSnapshotResultObjects(workspace, repo, plan.currentTreeOid, projected, touched);
   return repo.store.runScratchAwareOperation(() =>
     repo.store.db.transactionSync(() => {
       if (index === repo.checkout) {
@@ -225,7 +241,8 @@ export function replaySnapshotOwned(
       } else {
         index.indexReplace(indexFromTree(repo, plan.currentTreeOid));
       }
-      applyProjectedIndex(repo, index, projected);
+      adoptProjectedIndex(workspace, projected);
+      applyIndex(index, projected.entries, touched.shapes());
       return { outcome: "clean", tree: writeTreeOwned(repo, index) };
     }),
   );

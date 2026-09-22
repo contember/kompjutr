@@ -1140,6 +1140,49 @@ describe("checkout", () => {
     expect(workspace.repo.checkout.indexEntries()).toHaveLength(paths.length);
   });
 
+  it("preserves checkout blockers with an owned path selector", () => {
+    checkout(ws.context, ws.repo, ws.worktree, { ref: "main" });
+    writeWorkFile(ws, "/modified.txt", "locally changed content\n");
+    const side = ws.repo.resolveRef("refs/heads/side");
+    if (side === null) throw new Error("side branch is missing");
+    const tree = ws.repo.readCommit(side).tree;
+    const selected = checkoutBlockersOwned(ws.repo, ws.worktree, tree, ["modified.txt"], true);
+    expect(selected.tracked).toContain("modified.txt");
+    expect(
+      checkoutBlockersOwned(
+        ws.repo,
+        ws.worktree,
+        tree,
+        {
+          matches: (path) => path === "modified.txt" || path.startsWith("modified.txt/"),
+        },
+        true,
+      ),
+    ).toEqual(selected);
+    expect(
+      checkoutBlockersOwned(
+        ws.repo,
+        ws.worktree,
+        tree,
+        {
+          matches: () => false,
+        },
+        true,
+      ),
+    ).toEqual({ tracked: [], untracked: [] });
+    expect(
+      checkoutBlockersOwned(
+        ws.repo,
+        ws.worktree,
+        tree,
+        {
+          matches: () => true,
+        },
+        true,
+      ),
+    ).toEqual(checkoutBlockersOwned(ws.repo, ws.worktree, tree, [], true));
+  });
+
   it("preserves local changes when the target keeps the index entry", () => {
     checkout(ws.context, ws.repo, ws.worktree, { ref: "main" });
     writeWorkFile(ws, "/common.txt", "local common\n");

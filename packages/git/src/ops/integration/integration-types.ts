@@ -1,5 +1,9 @@
 import type { TextMergeOptions } from "../../diff/xmerge.js";
 import type {
+  CleanIntegrationEntry as StoredCleanEntry,
+  ConflictIntegrationEntry as StoredConflictEntry,
+} from "../../store/operations/integration-workspace/descriptors.js";
+import type {
   IntegrationIdentity,
   IntegrationStages,
   StructuralConflictKind,
@@ -10,26 +14,8 @@ export const MAX_INTEGRATION_PLAN_ENTRIES = 1_000;
 
 export type IntegrationConflictKind = StructuralConflictKind | "content" | "binary";
 
-export interface CleanIntegrationEntry {
-  kind: "clean";
-  path: string;
-  before: IntegrationIdentity | null;
-  result: IntegrationIdentity | null;
-  /** Null reuses `result.oid`; bytes name a new content-addressed blob. */
-  content: Uint8Array | null;
-}
-
-export interface ConflictIntegrationEntry {
-  kind: "conflict";
-  path: string;
-  conflict: IntegrationConflictKind;
-  stages: IntegrationStages;
-  /** Worktree mode after independently resolving the mode dimension, when defined. */
-  resultMode?: string;
-  /** Conflict-marker bytes, or the current bytes for a binary conflict. */
-  content: Uint8Array | null;
-  conflicts?: number;
-}
+export type CleanIntegrationEntry = StoredCleanEntry<Uint8Array>;
+export type ConflictIntegrationEntry = StoredConflictEntry<Uint8Array>;
 
 export type IntegrationEntry = CleanIntegrationEntry | ConflictIntegrationEntry;
 

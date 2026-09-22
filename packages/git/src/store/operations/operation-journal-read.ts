@@ -1,5 +1,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../common/errors.js";
+import { JSON_BATCH_BYTES, utf8ByteLength } from "../core/json-pages.js";
+import { INTEGRATION_PAGE_ROWS } from "./integration-workspace/storage.js";
 import {
   operationIdentityFromRow,
   operationJournal,
@@ -9,6 +11,7 @@ import {
   requireOperationKind,
 } from "./operation-journal-rows.js";
 import type {
+  OperationHeader,
   OperationStateRow,
   OperationStepRow,
   OperationTouchedRow,
@@ -54,7 +57,7 @@ export function readOperationState(db: SqlDatabase, checkoutId: number): Operati
     steps.push(operationStepFromRow(stepRow));
   }
   const state = operationMetadataFromRow(row, steps);
-  const touched = readTouched(db, checkoutId);
+  const touched = [...iterateOperationTouched(db, checkoutId)];
   const touchedCount = requireMergeInteger(row.touched_count, "touched-path count");
   if (touched.length !== touchedCount) {
     throw new CorruptError("operation touched-path count does not match its rows");
@@ -125,48 +128,117 @@ export function readRebaseCursor(db: SqlDatabase, checkoutId: number): RebaseJou
   } else if (currentStep !== stepCount) {
     throw new CorruptError("rebase cursor exceeds its step count");
   }
-  const touched = readTouched(db, checkoutId);
   const touchedCount = requireMergeInteger(row.touched_count, "touched-path count");
-  if (touched.length !== touchedCount) {
-    throw new CorruptError("operation touched-path count does not match its rows");
-  }
   return {
     state,
     stepCount,
     step,
-    touched,
+    touchedCount,
+    touched: {
+      length: touchedCount,
+      [Symbol.iterator]: () => iterateOperationTouched(db, checkoutId),
+    },
     replayed: requireMergeInteger(row.replayed_count, "replayed count"),
     skipped: requireMergeInteger(row.skipped_count, "skipped count"),
   };
 }
 
-function readTouched(db: SqlDatabase, checkoutId: number): MergeTouchedPath[] {
-  const touched: MergeTouchedPath[] = [];
-  for (const raw of db.iterate(
-    `SELECT ordinal, path, logical_path, purpose, index_stage, index_mode, index_oid,
+export function* iterateOperationTouched(
+  db: SqlDatabase,
+  checkoutId: number,
+): Generator<MergeTouchedPath> {
+  let after = -1;
+  while (true) {
+    const page: MergeTouchedPath[] = [];
+    let bytes = 0;
+    for (const raw of db.iterate(
+      `SELECT ordinal, path, logical_path, purpose, index_stage, index_mode, index_oid,
             index_size, index_mtime, index_ino, index_rev, worktree_kind, worktree_mode,
             worktree_oid, worktree_revision
-       FROM git_operation_touched WHERE checkout_id = ? ORDER BY ordinal`,
-    checkoutId,
-  )) {
-    const touchedRow: OperationTouchedRow = {
-      ordinal: raw.ordinal,
-      path: raw.path,
-      logical_path: raw.logical_path,
-      purpose: raw.purpose,
-      index_stage: raw.index_stage,
-      index_mode: raw.index_mode,
-      index_oid: raw.index_oid,
-      index_size: raw.index_size,
-      index_mtime: raw.index_mtime,
-      index_ino: raw.index_ino,
-      index_rev: raw.index_rev,
-      worktree_kind: raw.worktree_kind,
-      worktree_mode: raw.worktree_mode,
-      worktree_oid: raw.worktree_oid,
-      worktree_revision: raw.worktree_revision,
-    };
-    touched.push(operationTouchedFromRow(touchedRow));
+       FROM git_operation_touched WHERE checkout_id = ? AND ordinal > ?
+       ORDER BY ordinal LIMIT ${INTEGRATION_PAGE_ROWS}`,
+      checkoutId,
+      after,
+    )) {
+      const rowBytes = utf8ByteLength(JSON.stringify(raw));
+      if (page.length > 0 && bytes + rowBytes > JSON_BATCH_BYTES) break;
+      const touchedRow: OperationTouchedRow = {
+        ordinal: raw.ordinal,
+        path: raw.path,
+        logical_path: raw.logical_path,
+        purpose: raw.purpose,
+        index_stage: raw.index_stage,
+        index_mode: raw.index_mode,
+        index_oid: raw.index_oid,
+        index_size: raw.index_size,
+        index_mtime: raw.index_mtime,
+        index_ino: raw.index_ino,
+        index_rev: raw.index_rev,
+        worktree_kind: raw.worktree_kind,
+        worktree_mode: raw.worktree_mode,
+        worktree_oid: raw.worktree_oid,
+        worktree_revision: raw.worktree_revision,
+      };
+      page.push(operationTouchedFromRow(touchedRow));
+      after = requireMergeInteger(raw.ordinal, "touched ordinal");
+      bytes += rowBytes;
+      if (bytes >= JSON_BATCH_BYTES) break;
+    }
+    if (page.length === 0) return;
+    yield* page;
   }
-  return touched;
+}
+
+export function readOperationHeader(db: SqlDatabase, checkoutId: number): OperationHeader | null {
+  const row = db.one<OperationStateRow>(
+    `SELECT kind, original_head_ref, original_head_oid, phase, empty_reason,
+            current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode,
+            merge_origin, current_step, step_count, current_label, incoming_label,
+            message, author_name, author_email, committer_name, committer_email,
+            touched_count, replayed_count, skipped_count
+       FROM git_operation_state WHERE checkout_id = ?`,
+    checkoutId,
+  );
+  if (row === undefined) return null;
+  if (requireOperationKind(row.kind) === "rebase") {
+    const cursor = readRebaseCursor(db, checkoutId);
+    if (cursor === null) throw new CorruptError("operation header disappeared");
+    return {
+      state: cursor.state,
+      stepCount: cursor.stepCount,
+      touchedCount: cursor.touchedCount,
+      replayed: cursor.replayed,
+      skipped: cursor.skipped,
+    };
+  }
+  const steps: OperationStepMetadata[] = [];
+  if (row.kind !== "merge") {
+    const step = db.one<OperationStepRow>(
+      `SELECT ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid
+       FROM git_operation_steps WHERE checkout_id = ? AND ordinal = 0`,
+      checkoutId,
+    );
+    if (step === undefined) throw new CorruptError("operation source step is missing");
+    steps.push(operationStepFromRow(step));
+  }
+  return {
+    state: operationMetadataFromRow(row, steps),
+    stepCount: requireMergeInteger(row.step_count, "step count"),
+    touchedCount: requireMergeInteger(row.touched_count, "touched-path count"),
+    replayed: requireMergeInteger(row.replayed_count, "replayed count"),
+    skipped: requireMergeInteger(row.skipped_count, "skipped count"),
+  };
+}
+export function readOperationStep(
+  db: SqlDatabase,
+  checkoutId: number,
+  ordinal: number,
+): OperationStepMetadata | null {
+  const row = db.one<OperationStepRow>(
+    `SELECT ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid
+     FROM git_operation_steps WHERE checkout_id = ? AND ordinal = ?`,
+    checkoutId,
+    ordinal,
+  );
+  return row === undefined ? null : operationStepFromRow(row);
 }

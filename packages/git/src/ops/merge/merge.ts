@@ -3,32 +3,35 @@ import { repositoryMutations } from "../repository/repository.js";
 // Two-head merge orchestration over bounded graph, integration, and apply seams.
 
 import { GitError } from "../../common/errors.js";
+import type { ProjectedMergeEntry } from "../../store/operations/integration-workspace/descriptors.js";
+import { withIntegrationWorkspaceOwned } from "../../store/operations/integration-workspace/workspace.js";
 import type { GitContext, GitIdentity } from "../core/context.js";
 import type { MergeResult } from "../core/kinds.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata, type RefLogReason } from "../core/ref-log.js";
-import { planIntegration } from "../integration/integration.js";
+import { applyIntegrationOwned } from "../integration/integration-apply-owned.js";
+import { projectIntegrationWithCollisionsOwned } from "../integration/integration-collisions-owned.js";
+import { planIntegrationOwned } from "../integration/integration-plan-owned.js";
+import { restoreIntegrationOwned } from "../integration/integration-restore-owned.js";
+import { integrationTouched } from "../integration/integration-touched.js";
 import {
-  projectIntegrationWithCollisions,
-  prospectiveIntegrationIndexEntries,
+  prospectiveIntegrationIndexEntriesOwned,
   requireBoundedIntegrationIndex,
   requireBoundedIntegrationTree,
   requireCleanIntegrationIndex,
-  requireSafeIntegrationWorktree,
+  requireSafeIntegrationWorktreeOwned,
 } from "../integration/integration-worktree.js";
 import { type CommitIdentities, commitIndex, resolveIdentity } from "../repository/commit.js";
 import type { Repository, ResolvedHead } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { abortProjectedMerge, applyProjectedMerge } from "./merge-apply.js";
 import { selectMergeBases } from "./merge-base.js";
 import { requireJournalOwnership, requireMergeJournalOwned } from "./merge-journal.js";
-import type { ProjectedMergeEntry } from "./merge-projection.js";
 import {
   type MergeOrigin,
   type MergeStateMetadata,
   validateMergeStateMetadata,
 } from "./merge-state.js";
-import { commitTree, selectedBaseTree, type VirtualState } from "./merge-virtual-base.js";
+import { commitTree, selectedBaseTreeOwned, type VirtualState } from "./merge-virtual-base.js";
 
 const HEADS = "refs/heads/";
 const MAX_MERGE_REVISION_CODE_UNITS = 1_024;
@@ -139,30 +142,32 @@ function metadata(
   };
 }
 
-function conflictedPaths(entries: readonly ProjectedMergeEntry[]): string[] {
-  const paths: string[] = [];
+function* conflictedPaths(entries: Iterable<ProjectedMergeEntry>): Generator<string> {
   for (const entry of entries) {
-    if (entry.stages !== null) paths.push(entry.path);
+    if (entry.stages !== null) yield entry.path;
   }
-  return paths;
 }
 
-function compatibilityConflict(paths: readonly string[]): GitError {
+function compatibilityConflict(paths: Iterable<string>): GitError {
   const prefix =
     "git merge failed: Automatic merge failed with one or more merge conflicts in the following files: ";
   const suffix = ". Fix conflicts then commit the result.";
-  return new GitError("EMERGEFAIL", `${prefix}${paths.join(", ")}${suffix}`);
+  let names = "";
+  for (const path of paths) names += `${names === "" ? "" : ", "}${path}`;
+  return new GitError("EMERGEFAIL", `${prefix}${names}${suffix}`);
 }
 
 function messageWithConflicts(
   supplied: string | undefined,
   nextLabel: string,
-  paths: readonly string[],
+  paths: Iterable<string>,
 ): string {
   const message = supplied ?? defaultMessage(nextLabel);
-  if (paths.length === 0) return message;
+  let conflicts = "";
+  for (const path of paths) conflicts += `#\t${path}\n`;
+  if (conflicts === "") return message;
   const body = message.endsWith("\n") ? message : `${message}\n`;
-  return `${body}\n# Conflicts:\n${paths.map((path) => `#\t${path}\n`).join("")}`;
+  return `${body}\n# Conflicts:\n${conflicts}`;
 }
 
 function validateMergeCommitInput(
@@ -250,93 +255,110 @@ function mergeInTransaction(
     requireBoundedIntegrationIndex(repo);
     requireCleanIntegrationIndex(repo, currentTree, "merge");
   }
-  const baseTree = isFastForward
-    ? currentTree
-    : selectedBaseTree(repo, selection.bases, virtualState);
-  const plan = planIntegration(repo, {
-    baseTreeOid: baseTree,
-    currentTreeOid: currentTree,
-    incomingTreeOid: nextTree,
-    text: { labels: { current: currentLabel, base: "base", incoming: nextLabel } },
-  });
-  const projected = projectIntegrationWithCollisions(
-    repo,
-    worktree,
-    baseTree,
-    nextTree,
-    plan,
-    currentLabel,
-    nextLabel,
-    undefined,
-    "merge",
-  );
-  requireSafeIntegrationWorktree(repo, worktree, nextTree, plan.entries, "merge", undefined);
-  const conflicts = conflictedPaths(projected);
-  if (conflicts.length > 0 && behavior.persistConflicts === false) {
-    throw compatibilityConflict(conflicts);
-  }
-  if (!isFastForward) {
-    requireBoundedIntegrationTree(repo, () => prospectiveIntegrationIndexEntries(repo, projected));
-  }
-
-  const current = repo.head();
-  if (current.ref !== head.ref || current.oid !== head.oid) {
-    throw new GitError("ESTALEHEAD", "HEAD changed while the merge was being prepared");
-  }
-  const retainedMessage = messageWithConflicts(options.message, nextLabel, conflicts);
-  const mergeMetadata = metadata(
-    head,
-    incomingOid,
-    currentLabel,
-    nextLabel,
-    isFastForward ? { ...options, commit: true } : options,
-    behavior.origin ?? "merge",
-    retainedMessage,
-  );
-  const applied = applyProjectedMerge(repo, worktree, projected, mergeMetadata);
-  if (isFastForward) {
-    repositoryMutations(repo).mutateRefsOwned(
-      {
-        expected: { name: head.ref, target: head.oid },
-        puts: [{ name: head.ref, target: incomingOid }],
-      },
-      operationRefLogMetadata(
-        context,
-        repo,
-        mergeReason(mergeMetadata.mergeOrigin, "fast-forward"),
-        {
-          identity: options.committer ?? options.author,
-          env: options.env,
-        },
-      ),
+  return withIntegrationWorkspaceOwned(repo.store, (workspace) => {
+    const baseTree = isFastForward
+      ? currentTree
+      : selectedBaseTreeOwned(workspace, repo, selection.bases, virtualState);
+    const plan = planIntegrationOwned(workspace, {
+      baseTreeOid: baseTree,
+      currentTreeOid: currentTree,
+      incomingTreeOid: nextTree,
+      text: { labels: { current: currentLabel, base: "base", incoming: nextLabel } },
+    });
+    const projected = projectIntegrationWithCollisionsOwned(
+      workspace,
+      repo,
+      worktree,
+      baseTree,
+      nextTree,
+      plan,
+      currentLabel,
+      nextLabel,
+      undefined,
+      "merge",
     );
-    // A failed optional advance leaves a baseline mismatch, which forces the safe full path.
-    context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, nextTree);
-    return { oid: incomingOid, fastForward: true };
-  }
-  requireBoundedIntegrationIndex(repo);
-  if (applied.outcome === "conflicted") {
-    return { conflicted: true, pendingCommit: true };
-  }
-  if (applied.outcome === "ready") return { pendingCommit: true };
+    requireSafeIntegrationWorktreeOwned(repo, worktree, nextTree, plan, "merge", undefined);
+    let conflictCount = 0;
+    for (const _path of conflictedPaths(projected.entries)) conflictCount++;
+    if (conflictCount > 0 && behavior.persistConflicts === false) {
+      throw compatibilityConflict(conflictedPaths(projected.entries));
+    }
+    const touched = integrationTouched(workspace, projected);
+    if (!isFastForward) {
+      requireBoundedIntegrationTree(repo, () =>
+        prospectiveIntegrationIndexEntriesOwned(repo, projected, touched),
+      );
+    }
 
-  const identities = resolveIdentity(context, repo, options);
-  validateMergeCommitInput(
-    { ...mergeMetadata, phase: "conflicted" },
-    mergeMetadata.message,
-    identities,
-  );
-  return commitIndex(
-    repo,
-    {
-      message: mergeMetadata.message,
-      parent: [head.oid, incomingOid],
+    const current = repo.head();
+    if (current.ref !== head.ref || current.oid !== head.oid) {
+      throw new GitError("ESTALEHEAD", "HEAD changed while the merge was being prepared");
+    }
+    const retainedMessage = messageWithConflicts(
+      options.message,
+      nextLabel,
+      conflictedPaths(projected.entries),
+    );
+    const mergeMetadata = metadata(
+      head,
+      incomingOid,
+      currentLabel,
+      nextLabel,
+      isFastForward ? { ...options, commit: true } : options,
+      behavior.origin ?? "merge",
+      retainedMessage,
+    );
+    const outcome =
+      conflictCount > 0 ? "conflicted" : mergeMetadata.mode === "no-commit" ? "ready" : "clean";
+    if (outcome === "clean") validateMergeStateMetadata({ ...mergeMetadata, phase: "conflicted" });
+    applyIntegrationOwned(workspace, repo, worktree, projected, {
+      suspendedState:
+        outcome === "clean" ? null : { kind: "merge", ...mergeMetadata, phase: outcome },
+    });
+    if (isFastForward) {
+      repositoryMutations(repo).mutateRefsOwned(
+        {
+          expected: { name: head.ref, target: head.oid },
+          puts: [{ name: head.ref, target: incomingOid }],
+        },
+        operationRefLogMetadata(
+          context,
+          repo,
+          mergeReason(mergeMetadata.mergeOrigin, "fast-forward"),
+          {
+            identity: options.committer ?? options.author,
+            env: options.env,
+          },
+        ),
+      );
+      // A failed optional advance leaves a baseline mismatch, which forces the safe full path.
+      context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, nextTree);
+      return { oid: incomingOid, fastForward: true };
+    }
+    requireBoundedIntegrationIndex(repo);
+    if (outcome === "conflicted") {
+      return { conflicted: true, pendingCommit: true };
+    }
+    if (outcome === "ready") return { pendingCommit: true };
+
+    const identities = resolveIdentity(context, repo, options);
+    validateMergeCommitInput(
+      { ...mergeMetadata, phase: "conflicted" },
+      mergeMetadata.message,
       identities,
-      expectedHead: head,
-      refLogReason: mergeReason(mergeMetadata.mergeOrigin, "commit"),
-    },
-    context,
-  );
+    );
+    return commitIndex(
+      repo,
+      {
+        message: mergeMetadata.message,
+        parent: [head.oid, incomingOid],
+        identities,
+        expectedHead: head,
+        refLogReason: mergeReason(mergeMetadata.mergeOrigin, "commit"),
+      },
+      context,
+    );
+  });
 }
 
 function requireOriginalHead(repo: Repository, state: MergeStateMetadata): ResolvedHead {
@@ -391,6 +413,13 @@ export function mergeAbort(repo: Repository, worktree: Worktree): void {
     const journal = requireMergeJournalOwned(repo);
     requireOriginalHead(repo, journal.state);
     requireJournalOwnership(repo, worktree, journal);
-    abortProjectedMerge(repo, worktree, journal);
+    withIntegrationWorkspaceOwned(repo.store, (workspace) => {
+      restoreIntegrationOwned(workspace, repo, worktree, journal.touched, [
+        journal.state.originalHeadOid,
+        journal.state.currentParentOid,
+        journal.state.incomingParentOid,
+      ]);
+      checkoutStoreMutations(repo.checkout).clearMergeStateOwned();
+    });
   });
 }

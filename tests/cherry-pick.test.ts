@@ -137,7 +137,7 @@ describe("cherry-pick lifecycle", () => {
       if (fault === "object") {
         workspace.repo.store.db.run(
           `CREATE TRIGGER fault_replay_object
-           BEFORE INSERT ON git_objects
+           BEFORE INSERT ON git_integration_objects
            WHEN NEW.repo_id = ${workspace.repo.store.repoId} AND NEW.type = 'blob'
            BEGIN
              SELECT RAISE(ABORT, 'fault object');

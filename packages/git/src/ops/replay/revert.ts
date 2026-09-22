@@ -6,7 +6,6 @@ import type { ReplayResult } from "../core/kinds.js";
 import { resolveIdentity } from "../repository/commit.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
-import type { ReplayPlan } from "./replay.js";
 import {
   cancelReplay,
   continueReplay,
@@ -15,6 +14,7 @@ import {
   type ReplayStartOptions,
   startReplay,
 } from "./replay-lifecycle.js";
+import type { OwnedReplayPlan } from "./replay-types.js";
 
 export interface RevertOptions {
   source: string;
@@ -39,7 +39,7 @@ function sourceSubject(message: string): string {
   return (newline < 0 ? message.slice(start) : message.slice(start, newline)).replace(/\r$/, "");
 }
 
-function defaultMessage(plan: ReplayPlan): string {
+function defaultMessage(plan: OwnedReplayPlan): string {
   const subject = sourceSubject(plan.sourceCommit.message);
   if (plan.sourceCommit.parent.length > 1) {
     const selectedParent = plan.selectedParentOid;

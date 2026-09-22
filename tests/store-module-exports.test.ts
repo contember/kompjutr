@@ -14,6 +14,7 @@ describe("sqlite store module exports", () => {
       "CONFIG_SECTION_MOVE_UPDATE_SQL",
       "CheckoutStore",
       "FetchPublicationToken",
+      "IntegrationWorkspace",
       "MAX_CONFIG_SECTION_MOVE_ROWS",
       "MAX_LOG_COMMITS",
       "MAX_REFLOG_ROOT_SCAN_ENTRIES",
@@ -34,6 +35,7 @@ describe("sqlite store module exports", () => {
       "readOperationStateOwned",
       "readRebaseCursorOwned",
       "readShallowOwned",
+      "withIntegrationWorkspaceOwned",
     ]);
     expect(store.CheckoutStore).toBe(CheckoutStore);
     expect(store.SharedRepoStore).toBe(SharedRepoStore);

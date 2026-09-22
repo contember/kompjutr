@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { createGit } from "../packages/git/src/client.js";
 
 import { utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
 import { hasErrorCode } from "../packages/git/src/common/errors.js";
@@ -47,6 +48,57 @@ async function imported(source: GitFixture): Promise<TestRepository> {
   workspace.repo.store.configSet("user.email", "fixture@example.com");
   return workspace;
 }
+
+it.each(["clean", "continue", "abort"])(
+  "rebases a 1001-path step with native parity (%s)",
+  async (finish) => {
+    const source = fixture();
+    source.write("base", "base\n");
+    source.commit("base");
+    source.git("checkout", "-qb", "topic");
+    if (finish !== "clean") source.write("base", "topic\n");
+    for (let index = 0; index < 1001; index++) {
+      source.write(`file-${String(index).padStart(4, "0")}`, `topic ${index}\n`);
+    }
+    source.commit("topic");
+    source.git("checkout", "-q", "main");
+    if (finish !== "clean") source.write("base", "upstream\n");
+    source.write("upstream", "upstream\n");
+    source.commit("upstream");
+    source.git("checkout", "-q", "topic");
+    const workspace = await imported(source);
+    const git = createGit()({
+      database: workspace.database,
+      worktree: workspace.worktree,
+      now: workspace.context.now,
+      timezoneOffset: workspace.context.timezoneOffset,
+      defaultIdentity: { name: "Fixture", email: "fixture@example.com" },
+    });
+    let repo = workspace.repo;
+    if (finish === "clean") {
+      source.git("rebase", "main");
+      await git.rebase({ upstream: "main" });
+    } else {
+      expect(() => source.git("rebase", "main")).toThrow();
+      expect(await git.rebase({ upstream: "main" })).toMatchObject({ outcome: "conflicted" });
+      expect(repo.checkout.requireOperationState("rebase").touched).toHaveLength(1002);
+      repo = reopenRepo(workspace);
+      if (finish === "abort") {
+        source.git("rebase", "--abort");
+        rebaseAbort(repo, workspace.worktree);
+      } else {
+        source.write("base", "resolved\n");
+        source.git("add", "base");
+        source.git("rebase", "--continue");
+        writeWorkFile(workspace, "/base", "resolved\n");
+        add(repo, workspace.worktree, { paths: ["base"] });
+        rebaseContinue(workspace.context, repo, workspace.worktree);
+      }
+    }
+    expect(repo.headTree()).toBe(source.git("rev-parse", "HEAD^{tree}"));
+    expect(repo.checkout.readOperationState()).toBeNull();
+  },
+);
 
 function textAt(workspace: TestRepository, path: string): string | null {
   if (workspace.worktree.stat(`/${path}`) === null) return null;

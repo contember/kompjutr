@@ -16,7 +16,8 @@ objects/       loose objects, object batching, and filesystem-content OID cache
 refs/          refs, reflogs, configuration, and shallow boundaries
 fetch/         promisor metadata and atomic fetch publication
 indexes/       checkout/scratch indexes and filesystem change tracker
-operations/    restartable merge, replay, and rebase state
+operations/    restartable merge, replay, and rebase state; the scoped
+               integration workspace that owns provisional integration output
 schema/        editable schema version 1; no migrations
 trees/         tree/commit projections and streaming walks
 pack/          pack read, ingest, publication, deletion, and delta workspace
@@ -32,7 +33,11 @@ fetch state, direct-ref reflogs, projections, blob IDs, and maintenance.
 `checkout_id` owns the root, raw `HEAD`, index and tracker state, operation
 journals, and `HEAD` reflog. `git_tree_entries` is owned through its source
 surrogate. `git_scratch_index*` rows are transaction-local and never become
-maintenance roots. This boundary is ADR-0003.
+maintenance roots. `git_integration_*` rows are owned by one live
+`(repo_id, workspace_id)` inside a single transaction, are invisible to every
+ordinary object, projection, promise and maintenance query, and reach the
+ordinary store only through explicit adoption at a consumer's publication
+point (ADR-0024). This boundary is ADR-0003.
 
 ## Trust and cost rules
 

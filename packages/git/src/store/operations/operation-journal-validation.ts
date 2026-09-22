@@ -7,6 +7,7 @@ import { type CommitCacheEntry, prepareCommitCache } from "../trees/commits.js";
 import type { ExpectedOperationObject } from "./operation-journal-types.js";
 import type {
   CherryPickJournal,
+  MergeTouchedPath,
   OperationJournal,
   OperationStepMetadata,
   RebaseJournal,
@@ -50,10 +51,11 @@ export function validateResultCommit(
 
 export function validateOperationObjects(
   context: OperationJournalValidationContext,
-  journal: OperationJournal,
+  journal: OperationJournal<Iterable<MergeTouchedPath>>,
 ): void {
   const expected = new Map<string, ExpectedOperationObject>();
   const objectSizes = new Map<string, number>();
+  let retainSizes = true;
   const add = (object: ExpectedOperationObject): void => {
     const previous = expected.get(object.oid);
     if (previous !== undefined && previous.type !== object.type) {
@@ -62,6 +64,7 @@ export function validateOperationObjects(
       );
     }
     if (previous === undefined) expected.set(object.oid, object);
+    if (expected.size >= 256) flush();
   };
   add({ oid: journal.state.originalHeadOid, type: "commit", label: "original HEAD" });
   if (journal.state.kind === "merge") {
@@ -81,6 +84,8 @@ export function validateOperationObjects(
       add({ oid: step.resultOid, type: "commit", label: "step result" });
     }
   }
+  flush();
+  retainSizes = false;
   for (const entry of journal.touched) {
     if (entry.index !== null) {
       add({
@@ -97,27 +102,32 @@ export function validateOperationObjects(
       });
     }
   }
-  for (const page of objectPages(expected.keys())) {
-    let info: ObjectReadInfo[];
-    try {
-      info = context.objects.objectInfo(page);
-    } catch (error) {
-      if (hasErrorCode(error, "ENOTFOUND")) {
-        throw new CorruptError("operation journal references a missing object", { cause: error });
-      }
-      throw error;
-    }
-    for (const object of info) {
-      const wanted = expected.get(object.oid);
-      if (wanted === undefined || object.type !== wanted.type) {
-        throw new CorruptError(
-          `operation ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
-        );
-      }
-      objectSizes.set(object.oid, object.size);
-    }
-  }
+  flush();
   if (journal.kind !== "merge") validateReplayTopology(context, journal, objectSizes);
+
+  function flush(): void {
+    for (const page of objectPages(expected.keys())) {
+      let info: ObjectReadInfo[];
+      try {
+        info = context.objects.objectInfo(page);
+      } catch (error) {
+        if (hasErrorCode(error, "ENOTFOUND")) {
+          throw new CorruptError("operation journal references a missing object", { cause: error });
+        }
+        throw error;
+      }
+      for (const object of info) {
+        const wanted = expected.get(object.oid);
+        if (wanted === undefined || object.type !== wanted.type) {
+          throw new CorruptError(
+            `operation ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
+          );
+        }
+        if (retainSizes) objectSizes.set(object.oid, object.size);
+      }
+    }
+    expected.clear();
+  }
 }
 
 function* objectPages(oids: Iterable<string>): Generator<string[]> {
@@ -134,7 +144,10 @@ function* objectPages(oids: Iterable<string>): Generator<string[]> {
 
 function validateReplayTopology(
   context: OperationJournalValidationContext,
-  journal: CherryPickJournal | RevertJournal | RebaseJournal,
+  journal:
+    | CherryPickJournal<Iterable<MergeTouchedPath>>
+    | RevertJournal<Iterable<MergeTouchedPath>>
+    | RebaseJournal<Iterable<MergeTouchedPath>>,
   objectSizes: ReadonlyMap<string, number>,
 ): void {
   if (journal.kind !== "rebase") {

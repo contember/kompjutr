@@ -2,9 +2,20 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import type { CheckoutStore } from "../checkout/checkout.js";
 import { checkoutStoreMutations } from "../core/checkout-mutations-registry.js";
 import type { ObjectTable } from "../objects/objects.js";
-import { readOperationState, readRebaseCursor } from "./operation-journal-read.js";
+import {
+  iterateOperationTouched,
+  readOperationHeader,
+  readOperationState,
+  readOperationStep,
+  readRebaseCursor,
+} from "./operation-journal-read.js";
 import { operationRootPage as readOperationRootPage } from "./operation-journal-roots.js";
-import type { OperationRootPage, RebaseJournalCursor } from "./operation-journal-types.js";
+import type {
+  OperationHeader,
+  OperationRootPage,
+  OperationTouchedSource,
+  RebaseJournalCursor,
+} from "./operation-journal-types.js";
 import {
   clearOperationState as deleteOperationState,
   type OperationJournalWriteContext,
@@ -72,11 +83,26 @@ export function readRebaseCursorOwned(store: OperationJournalOwner): RebaseJourn
   return store.readRebaseCursorOwned();
 }
 
+export function readOperationHeaderOwned(store: CheckoutStore): OperationHeader | null {
+  return checkoutStoreMutations(store).readOperationHeaderOwned();
+}
+
+export function readOperationStepOwned(
+  store: CheckoutStore,
+  ordinal: number,
+): OperationStepMetadata | null {
+  return checkoutStoreMutations(store).readOperationStepOwned(ordinal);
+}
+
+export function iterateOperationTouchedOwned(store: CheckoutStore): Iterable<MergeTouchedPath> {
+  return checkoutStoreMutations(store).iterateOperationTouchedOwned();
+}
+
 export function writeOperationJournalOwned(
   store: CheckoutStore,
   state: OperationStateMetadata,
   steps: readonly OperationStepMetadata[],
-  touched: readonly MergeTouchedPath[],
+  touched: OperationTouchedSource,
 ): void {
   checkoutStoreMutations(store).writeOperationJournalOwned(state, steps, touched);
 }
@@ -92,7 +118,7 @@ export function markReplayEmptyOwned(
 export function suspendRebaseOwned(
   store: CheckoutStore,
   currentStep: number,
-  touched: readonly MergeTouchedPath[],
+  touched: OperationTouchedSource,
 ): void {
   checkoutStoreMutations(store).suspendRebaseOwned(currentStep, touched);
 }
@@ -128,18 +154,30 @@ export class OperationJournalTable {
     return readOperationState(this.db, this.checkoutId);
   }
 
+  readOperationHeader(): OperationHeader | null {
+    return readOperationHeader(this.db, this.checkoutId);
+  }
+
+  readOperationStep(ordinal: number): OperationStepMetadata | null {
+    return readOperationStep(this.db, this.checkoutId, ordinal);
+  }
+
+  iterateOperationTouched(): Iterable<MergeTouchedPath> {
+    return iterateOperationTouched(this.db, this.checkoutId);
+  }
+
   readRebaseCursorOwned(): RebaseJournalCursor | null {
     return readRebaseCursor(this.db, this.checkoutId);
   }
 
-  writeOperationState(state: OperationStateMetadata, touched: readonly MergeTouchedPath[]): void {
+  writeOperationState(state: OperationStateMetadata, touched: OperationTouchedSource): void {
     persistOperationState(this.#writeContext(), state, touched);
   }
 
   writeOperationJournal(
     state: OperationStateMetadata,
     steps: readonly OperationStepMetadata[],
-    touched: readonly MergeTouchedPath[],
+    touched: OperationTouchedSource,
   ): void {
     persistOperationJournal(this.#writeContext(), state, steps, touched);
   }
@@ -148,7 +186,7 @@ export class OperationJournalTable {
     transitionReplayEmpty(this.#writeContext(), kind, reason);
   }
 
-  suspendRebase(currentStep: number, touched: readonly MergeTouchedPath[]): void {
+  suspendRebase(currentStep: number, touched: OperationTouchedSource): void {
     transitionRebaseSuspension(this.#writeContext(), currentStep, touched);
   }
 
@@ -176,7 +214,7 @@ export class OperationJournalTable {
   }
 
   requireNoOperationState(): void {
-    const active = this.readOperationState();
+    const active = this.readOperationHeader();
     if (active !== null) throw operationAlreadyActive(active.state.kind);
   }
 
@@ -203,7 +241,7 @@ export class OperationJournalTable {
     return mergeJournalFromOperation(journal);
   }
 
-  writeMergeState(state: MergeStateMetadata, touched: readonly MergeTouchedPath[]): void {
+  writeMergeState(state: MergeStateMetadata, touched: OperationTouchedSource): void {
     this.writeOperationState(mergeOperationState(state), touched);
   }
 

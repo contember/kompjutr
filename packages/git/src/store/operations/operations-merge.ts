@@ -3,7 +3,6 @@
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 
-export const MAX_MERGE_TOUCHED_PATHS = 1_000;
 export const MAX_MERGE_PATH_BYTES = 2_200;
 export const MAX_MERGE_REF_BYTES = 1_024;
 export const MAX_MERGE_LABEL_BYTES = 256;
@@ -58,9 +57,9 @@ export interface MergeTouchedPath {
   worktree: MergeWorktreeSnapshot;
 }
 
-export interface MergeJournal {
+export interface MergeJournal<Touched = readonly MergeTouchedPath[]> {
   state: MergeStateMetadata;
-  touched: readonly MergeTouchedPath[];
+  touched: Touched;
 }
 
 function boundedTextBytes(
@@ -359,11 +358,8 @@ export function validateMergeTouchedPath(entry: MergeTouchedPath): void {
 
 export function validateMergeJournal(
   state: MergeStateMetadata,
-  touched: readonly MergeTouchedPath[],
+  touched: Iterable<MergeTouchedPath> & { readonly length: number },
 ): void {
-  if (touched.length > MAX_MERGE_TOUCHED_PATHS) {
-    throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`);
-  }
   if (state.phase === "conflicted" && touched.length === 0) {
     throw new CorruptError("a conflicted merge journal must retain a touched path");
   }

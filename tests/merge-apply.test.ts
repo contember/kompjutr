@@ -361,9 +361,9 @@ describe("projected merge apply", () => {
       const batch = readFiles([first], options);
       return { files: batch.files, remaining: [...batch.remaining, ...paths.slice(1)] };
     };
-    const readBlobs = workspace.repo.readBlobs.bind(workspace.repo);
+    const readBlobs = workspace.repo.store.readBlobs.bind(workspace.repo.store);
     let blobReads = 0;
-    workspace.repo.readBlobs = (oids, options) => {
+    workspace.repo.store.readBlobs = (oids, options) => {
       const first = oids[0];
       if (first === undefined) throw new Error("test blob batch is empty");
       blobReads++;
@@ -399,7 +399,7 @@ describe("projected merge apply", () => {
     expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
-  it("bounds structural ancestors while they are retained", () => {
+  it("pages structural ancestors of a long valid path instead of refusing it", () => {
     const workspace = makeRepo();
     const path = `${"a/".repeat(1_000)}z`;
     const entries: readonly ProjectedMergeEntry[] = [
@@ -414,15 +414,30 @@ describe("projected merge apply", () => {
       },
     ];
 
-    expect(() =>
-      applyProjectedMerge(
-        workspace.repo,
-        workspace.worktree,
-        entries,
-        metadata(workspace.repo, "no-commit"),
-      ),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    const result = applyProjectedMerge(
+      workspace.repo,
+      workspace.worktree,
+      entries,
+      metadata(workspace.repo, "no-commit"),
+    );
+
+    expect(result.outcome).toBe("ready");
+    const ancestors = Array.from({ length: 1_000 }, (_, depth) => `${"a/".repeat(depth)}a`);
+    const owned = [...ancestors, path];
+    expect(result.journal?.touched.map((entry) => entry.path)).toEqual(owned);
+    const durable = workspace.repo.checkout.requireMergeState();
+    expect(durable.touched.map((entry) => entry.path)).toEqual(owned);
+    expect(durable.touched.every((entry) => entry.purpose === "primary")).toBe(true);
+    expect(durable.touched.every((entry) => entry.index === null)).toBe(true);
+
+    const journal = result.journal;
+    if (journal === null) throw new Error("ready merge omitted its journal");
+    workspace.repo.store.db.transactionSync(() =>
+      abortProjectedMerge(workspace.repo, workspace.worktree, journal),
+    );
     expect(workspace.repo.checkout.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.indexEntries()).toHaveLength(0);
+    expect(workspace.worktree.stat("/a")).toBeNull();
   });
 
   it("applies clean text, add, and delete entries and durably restores them", () => {

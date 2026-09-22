@@ -45,14 +45,6 @@ export interface TouchedSpecs {
   entries: TouchedSpec[];
 }
 
-export interface WorktreeSnapshotScan {
-  entries: Map<string, WorktreeStat>;
-}
-
-export interface IndexSnapshots {
-  entries: Map<string, MergeIndexSnapshot>;
-}
-
 export interface SnapshotObjects {
   entries: Map<string, HashedPath>;
 }
@@ -68,10 +60,6 @@ export interface BlobMetadata {
 export interface AdmittedBlobBatch {
   end: number;
   blobs: ReadonlyMap<string, Uint8Array>;
-}
-
-export interface OwnedPaths {
-  entries: string[];
 }
 
 export interface ProjectedRebaseTransitionOptions<T> extends ActiveRebaseApply {

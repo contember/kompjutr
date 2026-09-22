@@ -3,7 +3,15 @@
 import { GitError } from "../../common/errors.js";
 import { MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../../common/objects.js";
 import { comparePaths } from "../../common/streams.js";
-import type { IntegrationEntry, IntegrationPlan } from "../integration/integration.js";
+import type {
+  IntegrationContentReference,
+  IntegrationEntry,
+  IntegrationReservation,
+  ProjectedMergeEntry as StoredProjectedEntry,
+} from "../../store/operations/integration-workspace/descriptors.js";
+import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
+import type { IntegrationWorkspace } from "../../store/operations/integration-workspace/workspace.js";
+import type { IntegrationPlan } from "../integration/integration.js";
 import type {
   IntegrationIdentity,
   IntegrationStages,
@@ -14,14 +22,11 @@ export const MAX_MERGE_RELOCATION_ATTEMPTS = 1_000;
 
 export type MergePathPurpose = "primary" | "current-relocation" | "incoming-relocation";
 
-export interface ProjectedMergeEntry {
-  path: string;
-  logicalPath: string;
-  purpose: MergePathPurpose;
-  stageZero: IntegrationIdentity | null;
-  stages: IntegrationStages | null;
-  worktree: IntegrationIdentity | null;
-  content: Uint8Array | null;
+export type ProjectedMergeEntry<Content = Uint8Array> = StoredProjectedEntry<Content>;
+
+interface MergeReservations {
+  has(path: string): boolean;
+  add(path: string): void;
 }
 
 export interface MergeProjectionOptions {
@@ -42,7 +47,7 @@ function selectedWorktree(
   return { mode: resultMode, oid: selected.oid };
 }
 
-function ordinary(entry: IntegrationEntry): ProjectedMergeEntry {
+function ordinary<Content>(entry: IntegrationEntry<Content>): ProjectedMergeEntry<Content> {
   if (entry.kind === "clean") {
     return {
       path: entry.path,
@@ -93,8 +98,8 @@ function safeRelocationLabel(label: string): string {
 function uniqueRelocation(
   logicalPath: string,
   label: string,
-  reserved: Set<string>,
-  untracked: ReadonlySet<string>,
+  reserved: MergeReservations,
+  untracked: Pick<ReadonlySet<string>, "has">,
 ): string {
   const base = `${logicalPath}~${safeRelocationLabel(label)}`;
   for (let attempt = 0; attempt < MAX_MERGE_RELOCATION_ATTEMPTS; attempt++) {
@@ -116,8 +121,8 @@ function uniqueRelocation(
   );
 }
 
-function sideStages(
-  entry: Extract<IntegrationEntry, { kind: "conflict" }>,
+function sideStages<Content>(
+  entry: Extract<IntegrationEntry<Content>, { kind: "conflict" }>,
   side: "current" | "incoming",
 ): IntegrationStages {
   return {
@@ -137,8 +142,8 @@ function materializableModeClass(
   return identity.mode === MODE_SYMLINK ? "symlink" : null;
 }
 
-function stagesForModeClass(
-  entry: Extract<IntegrationEntry, { kind: "conflict" }>,
+function stagesForModeClass<Content>(
+  entry: Extract<IntegrationEntry<Content>, { kind: "conflict" }>,
   modeClass: MaterializableModeClass,
 ): IntegrationStages {
   return {
@@ -150,8 +155,8 @@ function stagesForModeClass(
   };
 }
 
-function distinctMaterializableSides(
-  entry: Extract<IntegrationEntry, { kind: "conflict" }>,
+function distinctMaterializableSides<Content>(
+  entry: Extract<IntegrationEntry<Content>, { kind: "conflict" }>,
 ): { regular: "current" | "incoming"; symlink: "current" | "incoming" } | null {
   if (entry.conflict !== "add/add" && entry.conflict !== "symlink") return null;
   const currentClass = materializableModeClass(entry.stages.current);
@@ -165,13 +170,13 @@ function distinctMaterializableSides(
   return null;
 }
 
-function projectDistinctMaterializableConflict(
-  entry: Extract<IntegrationEntry, { kind: "conflict" }>,
+function projectDistinctMaterializableConflict<Content>(
+  entry: Extract<IntegrationEntry<Content>, { kind: "conflict" }>,
   sides: { regular: "current" | "incoming"; symlink: "current" | "incoming" },
   options: MergeProjectionOptions,
-  reserved: Set<string>,
-  untracked: ReadonlySet<string>,
-): ProjectedMergeEntry[] {
+  reserved: MergeReservations,
+  untracked: Pick<ReadonlySet<string>, "has">,
+): ProjectedMergeEntry<Content>[] {
   const regular = entry.stages[sides.regular];
   const symlink = entry.stages[sides.symlink];
   if (regular === null || symlink === null) {
@@ -200,10 +205,10 @@ function projectDistinctMaterializableConflict(
   ];
 }
 
-function descendant(
-  entry: Extract<IntegrationEntry, { kind: "conflict" }>,
+function descendant<Content>(
+  entry: Extract<IntegrationEntry<Content>, { kind: "conflict" }>,
   directorySide: "current" | "incoming",
-): ProjectedMergeEntry {
+): ProjectedMergeEntry<Content> {
   const identity = entry.stages[directorySide];
   const other = directorySide === "current" ? entry.stages.incoming : entry.stages.current;
   if (entry.stages.base === null && identity !== null && other === null) {
@@ -225,71 +230,10 @@ export function projectMergePlan(
   plan: IntegrationPlan,
   options: MergeProjectionOptions,
 ): readonly ProjectedMergeEntry[] {
-  const projected: ProjectedMergeEntry[] = [];
   const reserved = new Set(options.trackedCollisions ?? []);
   const untracked = options.untrackedCollisions ?? new Set<string>();
   for (const entry of plan.entries) reserved.add(entry.path);
-  let index = 0;
-  while (index < plan.entries.length) {
-    const entry = plan.entries[index]!;
-    if (entry.kind === "conflict") {
-      const distinctSides = distinctMaterializableSides(entry);
-      if (distinctSides !== null) {
-        projected.push(
-          ...projectDistinctMaterializableConflict(
-            entry,
-            distinctSides,
-            options,
-            reserved,
-            untracked,
-          ),
-        );
-        index++;
-        continue;
-      }
-    }
-    if (entry.kind !== "conflict" || entry.conflict !== "file/directory") {
-      projected.push(ordinary(entry));
-      index++;
-      continue;
-    }
-
-    const currentFile = entry.stages.current;
-    const incomingFile = entry.stages.incoming;
-    if ((currentFile === null) === (incomingFile === null)) {
-      throw new GitError("ECORRUPT", `file/directory root ${entry.path} has no unique file side`);
-    }
-    const fileSide = currentFile === null ? "incoming" : "current";
-    const directorySide = fileSide === "current" ? "incoming" : "current";
-    const fileIdentity = entry.stages[fileSide];
-    if (fileIdentity === null) {
-      throw new GitError("ECORRUPT", `file/directory root ${entry.path} lost its file identity`);
-    }
-    const label = fileSide === "current" ? options.currentLabel : options.incomingLabel;
-    projected.push({
-      path: uniqueRelocation(entry.path, label, reserved, untracked),
-      logicalPath: entry.path,
-      purpose: fileSide === "current" ? "current-relocation" : "incoming-relocation",
-      stageZero: null,
-      stages: sideStages(entry, fileSide),
-      worktree: fileIdentity,
-      content: null,
-    });
-
-    index++;
-    const prefix = `${entry.path}/`;
-    while (index < plan.entries.length && plan.entries[index]!.path.startsWith(prefix)) {
-      const child = plan.entries[index]!;
-      if (child.kind !== "conflict" || child.conflict !== "file/directory") {
-        throw new GitError(
-          "ECORRUPT",
-          `file/directory group ${entry.path} has a non-conflict child`,
-        );
-      }
-      projected.push(descendant(child, directorySide));
-      index++;
-    }
-  }
+  const projected = [...projectEntries(plan.entries, options, reserved, untracked)];
   projected.sort((left, right) => comparePaths(left.path, right.path));
   for (let position = 1; position < projected.length; position++) {
     if (comparePaths(projected[position - 1]!.path, projected[position]!.path) === 0) {
@@ -299,5 +243,116 @@ export function projectMergePlan(
       );
     }
   }
+  return projected;
+}
+
+function* projectEntries<Content>(
+  entries: Iterable<IntegrationEntry<Content>>,
+  options: MergeProjectionOptions,
+  reserved: MergeReservations,
+  untracked: Pick<ReadonlySet<string>, "has">,
+): Generator<ProjectedMergeEntry<Content>> {
+  const cursor = entries[Symbol.iterator]();
+  try {
+    let current = cursor.next();
+    while (!current.done) {
+      const entry = current.value;
+      if (entry.kind === "conflict") {
+        const distinctSides = distinctMaterializableSides(entry);
+        if (distinctSides !== null) {
+          yield* projectDistinctMaterializableConflict(
+            entry,
+            distinctSides,
+            options,
+            reserved,
+            untracked,
+          );
+          current = cursor.next();
+          continue;
+        }
+      }
+      if (entry.kind !== "conflict" || entry.conflict !== "file/directory") {
+        yield ordinary(entry);
+        current = cursor.next();
+        continue;
+      }
+
+      const currentFile = entry.stages.current;
+      const incomingFile = entry.stages.incoming;
+      if ((currentFile === null) === (incomingFile === null)) {
+        throw new GitError("ECORRUPT", `file/directory root ${entry.path} has no unique file side`);
+      }
+      const fileSide = currentFile === null ? "incoming" : "current";
+      const directorySide = fileSide === "current" ? "incoming" : "current";
+      const fileIdentity = entry.stages[fileSide];
+      if (fileIdentity === null) {
+        throw new GitError("ECORRUPT", `file/directory root ${entry.path} lost its file identity`);
+      }
+      const label = fileSide === "current" ? options.currentLabel : options.incomingLabel;
+      yield {
+        path: uniqueRelocation(entry.path, label, reserved, untracked),
+        logicalPath: entry.path,
+        purpose: fileSide === "current" ? "current-relocation" : "incoming-relocation",
+        stageZero: null,
+        stages: sideStages(entry, fileSide),
+        worktree: fileIdentity,
+        content: null,
+      };
+
+      current = cursor.next();
+      const prefix = `${entry.path}/`;
+      while (!current.done && current.value.path.startsWith(prefix)) {
+        const child = current.value;
+        if (child.kind !== "conflict" || child.conflict !== "file/directory") {
+          throw new GitError(
+            "ECORRUPT",
+            `file/directory group ${entry.path} has a non-conflict child`,
+          );
+        }
+        yield descendant(child, directorySide);
+        current = cursor.next();
+      }
+    }
+  } finally {
+    cursor.return?.();
+  }
+}
+
+export function projectMergePlanOwned(
+  workspace: IntegrationWorkspace,
+  plan: IntegrationPlanHandle<IntegrationEntry>,
+  options: MergeProjectionOptions,
+  collisions?: {
+    tracked: Pick<ReadonlySet<string>, "has">;
+    untracked: Pick<ReadonlySet<string>, "has">;
+  },
+): IntegrationPlanHandle<ProjectedMergeEntry<IntegrationContentReference>> {
+  const projected = workspace.projectedPlan();
+  const occupied = workspace.reservations(projected, "occupied");
+  function* paths(): Generator<IntegrationReservation> {
+    for (const entry of plan.entries)
+      yield { path: entry.path, logicalPath: entry.path, purpose: "primary", identity: null };
+    for (const path of options.trackedCollisions ?? [])
+      yield { path, logicalPath: path, purpose: "primary", identity: null };
+  }
+  occupied.add(paths());
+  const reserved: MergeReservations = {
+    has: (path) => occupied.has(path) || collisions?.tracked.has(path) === true,
+    add: (path) => occupied.add([{ path, logicalPath: path, purpose: "primary", identity: null }]),
+  };
+  let count = 0;
+  function* entries() {
+    for (const entry of projectEntries(
+      plan.entries,
+      options,
+      reserved,
+      collisions?.untracked ?? options.untrackedCollisions ?? new Set<string>(),
+    )) {
+      count++;
+      yield entry;
+    }
+  }
+  projected.entries.write(entries());
+  projected.finish(plan.sourceRows, count);
   return projected;
 }

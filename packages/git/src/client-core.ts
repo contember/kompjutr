@@ -165,8 +165,8 @@ export function createGitClientCoreMethods(services: GitClientServices): CoreMet
     async commit(input) {
       return mutate(() => {
         const repo = at(input.dir);
-        const operation = repo.checkout.readOperationState();
-        if (operation?.kind === "merge") {
+        const operation = readOperationHeaderOwned(repo.checkout);
+        if (operation?.state.kind === "merge") {
           if (input.amend === true) {
             throw new GitError("EINVAL", "cannot amend while continuing a merge");
           }
@@ -271,3 +271,5 @@ function publicStatusEntry(row: StatusDetail): import("./ops/core/kinds.js").Sta
   }
   return { path: row.path, index: row.index, worktree: row.worktree };
 }
+
+import { readOperationHeaderOwned } from "./store/operations/operation-journal.js";

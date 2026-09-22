@@ -15,6 +15,10 @@ import type {
   TrackingRefPublicationToken,
 } from "../core/contracts.js";
 import type {
+  OperationHeader,
+  OperationTouchedSource,
+} from "../operations/operation-journal-types.js";
+import type {
   MergeSavedIdentity,
   MergeStateMetadata,
   MergeTouchedPath,
@@ -28,6 +32,9 @@ import type { CheckoutOperationStore } from "./checkout-operation.js";
 import type { CheckoutRefStore } from "./checkout-refs.js";
 
 export interface CheckoutStoreMutations {
+  readOperationHeaderOwned(): OperationHeader | null;
+  readOperationStepOwned(ordinal: number): OperationStepMetadata | null;
+  iterateOperationTouchedOwned(): Iterable<MergeTouchedPath>;
   upsertBlobIdsOwned(mappings: Iterable<BlobIdMapping>): void;
   registerPromisorRemoteOwned(remoteName: string, url: string): PromisorRemote;
   addPromisedBlobsOwned(remoteName: string, oids: Iterable<string>): void;
@@ -54,17 +61,14 @@ export interface CheckoutStoreMutations {
   configAddOwned(path: string, value: string): void;
   configUnsetOwned(path: string): void;
   configMoveSectionOwned(sourcePrefix: string, destinationPrefix: string): void;
-  writeOperationStateOwned(
-    state: OperationStateMetadata,
-    touched: readonly MergeTouchedPath[],
-  ): void;
+  writeOperationStateOwned(state: OperationStateMetadata, touched: OperationTouchedSource): void;
   writeOperationJournalOwned(
     state: OperationStateMetadata,
     steps: readonly OperationStepMetadata[],
-    touched: readonly MergeTouchedPath[],
+    touched: OperationTouchedSource,
   ): void;
   markReplayEmptyOwned(kind: "cherry-pick" | "revert", reason: "source" | "result"): void;
-  suspendRebaseOwned(currentStep: number, touched: readonly MergeTouchedPath[]): void;
+  suspendRebaseOwned(currentStep: number, touched: OperationTouchedSource): void;
   advanceRebaseOwned(
     phase: "running" | "conflicted",
     currentStep: number,
@@ -74,7 +78,7 @@ export interface CheckoutStoreMutations {
     committer: MergeSavedIdentity | null,
   ): void;
   clearOperationStateOwned(): boolean;
-  writeMergeStateOwned(state: MergeStateMetadata, touched: readonly MergeTouchedPath[]): void;
+  writeMergeStateOwned(state: MergeStateMetadata, touched: OperationTouchedSource): void;
   clearMergeStateOwned(): boolean;
   tryCreateInitialStateOwned<T>(body: (session: InitialStateSession) => T): InitialStateResult<T>;
   indexPutOwned(entry: IndexEntry): void;
@@ -101,6 +105,9 @@ export function createCheckoutStoreMutations(
 ): CheckoutStoreMutations {
   const sharedMutations = () => sharedRepoStoreMutations(dependencies.shared());
   return {
+    readOperationHeaderOwned: () => dependencies.operations.readOperationHeaderOwned(),
+    readOperationStepOwned: (ordinal) => dependencies.operations.readOperationStepOwned(ordinal),
+    iterateOperationTouchedOwned: () => dependencies.operations.iterateOperationTouchedOwned(),
     upsertBlobIdsOwned: (mappings) => sharedMutations().upsertBlobIdsOwned(mappings),
     registerPromisorRemoteOwned: (remoteName, url) =>
       sharedMutations().registerPromisorRemoteOwned(remoteName, url),

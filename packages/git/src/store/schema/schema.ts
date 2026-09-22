@@ -5,6 +5,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../common/errors.js";
 import { SCHEMA_VERSION } from "./schema-constants.js";
 import { CORE_SCHEMA_STATEMENTS } from "./schema-core-statements.js";
+import { INTEGRATION_WORKSPACE_SCHEMA_STATEMENTS } from "./schema-integration-workspace-statements.js";
 import { MAINTENANCE_SCHEMA_STATEMENTS } from "./schema-maintenance-statements.js";
 import { OBJECT_SCHEMA_STATEMENTS } from "./schema-object-statements.js";
 import { PACK_GRAPH_SCHEMA_STATEMENTS } from "./schema-pack-graph-statements.js";
@@ -33,6 +34,7 @@ export {
 
 const STATEMENTS = [
   ...CORE_SCHEMA_STATEMENTS,
+  ...INTEGRATION_WORKSPACE_SCHEMA_STATEMENTS,
   ...WORKTREE_SCHEMA_STATEMENTS,
   ...OBJECT_SCHEMA_STATEMENTS,
   ...PACK_GRAPH_SCHEMA_STATEMENTS,

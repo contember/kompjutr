@@ -8,13 +8,10 @@ import {
   MODE_SYMLINK,
 } from "../../common/objects.js";
 import { comparePaths } from "../../common/streams.js";
+import type { IntegrationContentReference } from "../../store/operations/integration-workspace/descriptors.js";
 import type { TouchedSpec, TouchedSpecs } from "./merge-apply-types.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
-import {
-  MAX_MERGE_TOUCHED_PATHS,
-  type MergeTouchedPath,
-  validateMergePath,
-} from "./merge-state.js";
+import { type MergeTouchedPath, validateMergePath } from "./merge-state.js";
 
 function validMode(mode: string): boolean {
   return mode === MODE_FILE || mode === MODE_EXECUTABLE || mode === MODE_SYMLINK;
@@ -29,10 +26,9 @@ export function requireIdentity(mode: string, oid: string, path: string): number
   return Number.parseInt(mode, 8);
 }
 
-export function validateProjectedIndexEntries(entries: readonly ProjectedMergeEntry[]): void {
-  if (entries.length > MAX_MERGE_TOUCHED_PATHS) {
-    throw new GitError("E2BIG", `merge apply exceeds ${MAX_MERGE_TOUCHED_PATHS} projected paths`);
-  }
+export function validateProjectedIndexEntries(
+  entries: Iterable<ProjectedMergeEntry<Uint8Array | IntegrationContentReference>>,
+): void {
   let previous: string | null = null;
   for (const entry of entries) {
     validateMergePath(entry.path, "projected path");
@@ -90,7 +86,9 @@ export function validateProjectedIndexEntries(entries: readonly ProjectedMergeEn
     if (
       entry.content !== null &&
       entry.stageZero !== null &&
-      hashObject("blob", entry.content) !== entry.stageZero.oid
+      (entry.content instanceof Uint8Array
+        ? hashObject("blob", entry.content)
+        : entry.content.oid) !== entry.stageZero.oid
     ) {
       throw new CorruptError(`merged content identity does not match ${entry.path}`);
     }
@@ -106,9 +104,6 @@ export function touchedSpecs(entries: readonly ProjectedMergeEntry[]): TouchedSp
     purpose: MergeTouchedPath["purpose"],
   ): void => {
     if (byPath.has(path)) return;
-    if (byPath.size >= MAX_MERGE_TOUCHED_PATHS) {
-      throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`);
-    }
     const spec: TouchedSpec = { path, logicalPath, purpose };
     byPath.set(spec.path, spec);
   };

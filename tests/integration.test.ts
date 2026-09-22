@@ -457,9 +457,9 @@ describe("bounded three-way integration plan", () => {
     const current = writeTree(store, currentFiles);
     const incoming = writeTree(store, incomingFiles);
     const repo = new Repository(store);
-    const readBlobs = repo.readBlobs.bind(repo);
+    const readBlobs = repo.store.readBlobs.bind(repo.store);
     let readCalls = 0;
-    repo.readBlobs = (oids, options) => {
+    repo.store.readBlobs = (oids, options) => {
       const first = oids[0];
       if (first === undefined) throw new Error("test blob batch is empty");
       readCalls++;
