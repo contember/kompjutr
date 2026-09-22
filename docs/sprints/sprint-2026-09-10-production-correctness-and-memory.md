@@ -1834,6 +1834,43 @@ do not imply that every legal single candidate fits the 100 MiB target.
 
 ## Run log
 
+- 2026-09-22: the exhaustive suite is green on a quiet machine -- 3,782 tests
+  across 17 lanes, exit 0, 501 s wall under a 6 vCPU lease. An earlier run had
+  failed `root 4/8`; that lane passes alone (544 tests) and passed again in the
+  clean run, so the failure was contention from a concurrent clone measurement,
+  not a defect. The script's own note applies: vitest's fixed 60 s
+  `onTaskUpdate` RPC timeout trips under long store batches when the machine is
+  oversubscribed.
+
+- 2026-09-22: the Next.js clone row growth is attributed per commit, each jump
+  measured against its own direct parent on the real 24,252-file fixture, never
+  a small one. **The sprint's statement work is not what grew the rows.** Every
+  batching and page-size change together costs +110 rows for -766 statements:
+  `bc9bd3f` -704 rows, `e7d31b0` +110, `4eb104f` 0, `e355936` -1. The whole
+  +135,212 belongs to two correctness validations. `3fc7965`, which predates
+  this sprint, added +67,208 rows validating fetched connectivity; that walk is
+  mostly honest, re-emitting the same blob once per path for only 8.9% of its
+  jump. `491189b` (WU3) added +68,595, and `e7d31b0` is what returned the
+  statements it cost from 1,833 back to 1,067 -- the intended trade, and nearly
+  free at +110 rows.
+  The over-read is in WU3's seed, not its batching: the pages are honest, 3.4k
+  to 3.8k rows against a 4,096 limit with every row decoded and acted on, but
+  `seedPacks` seeds every object of the pack. In this clone only 5,233 of 30,613
+  objects (17.1%) take part in any delta relation, so 25,380 objects are walked
+  twice to re-derive `base_oid IS NULL`, a fact `git_pack_objects` already
+  stores: 30,613 of 34,229 reverse rows report `child IS NULL` and 29,404 of
+  34,468 forward rows report `base IS NULL`. Nothing is super-linear -- the
+  seven queries holding 213,296 of the 214,485 rows each track a real quantity,
+  and the growth is three extra linear passes over the same object set.
+  Narrowing the seed to delta participants was probed at 164,287 rows / 1,031
+  statements with the clone still `ok`, so the row gate is not rebaselined at
+  214,485; the narrowing lands first. Its soundness is an invariant, not a
+  heuristic: both endpoints of every delta edge stay seeded, because the child
+  carries `base_oid` and the base has a row pointing at it, so only objects
+  lying on no chain are dropped.
+  `docs/backlog/86` carried the wrong cause for this delta -- it said +72
+  statements spread across WU1, WU3, WU5 and WU6 -- and is corrected.
+
 - 2026-09-22: WU5 landed as `924fb06`; rationale in
   [ADR-0025](../decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md).
   Leader verified 358 focused tests including the restored clone witness, 160
