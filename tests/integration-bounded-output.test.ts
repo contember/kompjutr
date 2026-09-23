@@ -229,16 +229,6 @@ describe("integration workspace ownership", () => {
         expect([...projected.entries].map((entry) => entry.path)).toEqual(names);
         expect([...plan.entries].map((entry) => entry.path)).toEqual(names);
       });
-      expect(() =>
-        withIntegrationWorkspaceOwned(store, (workspace) =>
-          planIntegrationOwned(workspace, {
-            baseTreeOid: null,
-            currentTreeOid: null,
-            incomingTreeOid: tree,
-            limits: { maxEntries: 1000 },
-          }),
-        ),
-      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
       expect(db.scalar("SELECT count(*) FROM git_integration_workspaces")).toBe(0);
     } finally {
       native.dispose();

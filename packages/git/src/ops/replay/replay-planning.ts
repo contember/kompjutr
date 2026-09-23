@@ -123,7 +123,6 @@ export function planReplayOwned(
       ...input.text,
       labels,
     },
-    limits: input.limits,
   });
 
   return {
@@ -161,7 +160,6 @@ export function planFixedReplayStepOwned(
     source: input.sourceOid,
     currentOid: input.currentOid,
     incomingLabelStyle: "source-subject",
-    limits: input.limits,
   });
   if (
     plan.sourceOid !== input.sourceOid ||

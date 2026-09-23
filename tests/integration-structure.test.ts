@@ -317,79 +317,22 @@ describe("ordering, bounds, and trust", () => {
     expect(plan.entries.map(({ path }) => path)).toEqual(["\ue000", "😀"]);
   });
 
-  it("accepts the exact row and retained-byte boundaries", () => {
+  it("accepts the exact source-row boundary", () => {
     const incoming = [entry("a", 1)];
-    expect(
-      classifyTrees([], [], incoming, {
-        maxRows: 1,
-        maxEntries: 1,
-        maxRetainedBytes: 676,
-      }).entries,
-    ).toHaveLength(1);
+    expect(classifyTrees([], [], incoming, { maxRows: 1 }).entries).toHaveLength(1);
     expect(() => classifyTrees([], [], incoming, { maxRows: 0 })).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
-    expect(() => classifyTrees([], [], incoming, { maxEntries: 0 })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(() => classifyTrees([], [], incoming, { maxRetainedBytes: 675 })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
   });
 
-  it("bounds many no-output prefix candidates without counting them as entries", () => {
+  it("emits no entries for many no-output prefix candidates", () => {
     const current = Array.from({ length: 1_000 }, (_, index) =>
       entry(`p${String(index).padStart(3, "0")}`, index + 1),
     );
-    expect(
-      classifyCurrentOnly(current, {
-        maxRows: 1_000,
-        maxEntries: 0,
-        maxRetainedBytes: 312,
-      }),
-    ).toEqual({ entries: [], sourceRows: 1_000 });
-    expect(() =>
-      classifyCurrentOnly(current, {
-        maxRows: 1_000,
-        maxEntries: 0,
-        maxRetainedBytes: 311,
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-  });
-
-  it("accounts for nested live prefixes at the exact peak", () => {
-    expect(
-      classifyTrees([], [entry("a", 1)], [entry("a/b", 2)], {
-        maxRows: 2,
-        maxEntries: 2,
-        maxRetainedBytes: 1_360,
-      }).entries,
-    ).toHaveLength(2);
-    expect(() =>
-      classifyTrees([], [entry("a", 1)], [entry("a/b", 2)], {
-        maxRows: 2,
-        maxEntries: 2,
-        maxRetainedBytes: 1_359,
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-  });
-
-  it("charges the complete retained deep-prefix path", () => {
-    const path = `${"d/".repeat(999)}f`;
-    expect(
-      classifyCurrentOnly([entry(path, 1)], {
-        maxRows: 1,
-        maxEntries: 0,
-        maxRetainedBytes: 4_302,
-      }),
-    ).toEqual({ entries: [], sourceRows: 1 });
-    expect(() =>
-      classifyCurrentOnly([entry(path, 1)], {
-        maxRows: 1,
-        maxEntries: 0,
-        maxRetainedBytes: 4_301,
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(classifyCurrentOnly(current, { maxRows: 1_000 })).toEqual({
+      entries: [],
+      sourceRows: 1_000,
+    });
   });
 
   it("does not pull beyond the first rejected source row", () => {

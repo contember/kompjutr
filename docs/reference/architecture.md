@@ -205,9 +205,8 @@ through signatures. Work is bounded by construction:
 - caller-unbounded materialized results fail instead of truncating.
 
 A byte budget is legitimate only when it charges bytes an operation actually
-retains: the shell's intermediate pipeline buffers, and the caller-declared
-integration plan ceiling. Five Git operations — push planning, full status,
-rename detection, rebase planning, and selected-path staging — still charge a
+retains: the shell's intermediate pipeline buffers. Four Git operations — push
+planning, full status, rename detection, and selected-path staging — still charge a
 hand-computed estimate of a JavaScript object's footprint on top of a structural
 count cap that already bounds the same structure — except full status and
 `clean`, where the byte charge is currently the only bound on the tracked-path

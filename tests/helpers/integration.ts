@@ -57,8 +57,6 @@ export interface StructureTrees {
 
 export interface StructureLimits {
   maxRows?: number;
-  maxEntries?: number;
-  maxRetainedBytes?: number;
 }
 
 function readContent(
@@ -124,8 +122,6 @@ export function collectStructure(
     prepare(workspace);
     const plan = classifyIntegrationStructureOwned(workspace, trees, {
       maxRows: limits.maxRows ?? MAX_INTEGRATION_SOURCE_ROWS,
-      maxEntries: limits.maxEntries ?? Number.MAX_SAFE_INTEGER,
-      maxRetainedBytes: limits.maxRetainedBytes,
     });
     return { entries: [...plan.entries], sourceRows: plan.sourceRows };
   });

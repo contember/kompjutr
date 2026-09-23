@@ -48,8 +48,6 @@ export type StructuralIntegrationEntry =
 
 export interface ResolvedLimits {
   maxRows: number;
-  maxEntries: number;
-  maxRetainedBytes: number | undefined;
 }
 
 export interface ClassifiedRow {

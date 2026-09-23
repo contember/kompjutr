@@ -163,7 +163,7 @@ describe("bounded rebase planner", () => {
     }
   });
 
-  it("accepts exact planner count and retained-plan bounds", () => {
+  it("accepts exact planner count bounds", () => {
     const { fixture, current, upstream } = divergentFixture();
     try {
       const { store, repo } = harness();
@@ -208,8 +208,6 @@ describe("bounded rebase planner", () => {
     const invalidLimits = [
       { maxSteps: 0 },
       { maxSteps: MAX_OPERATION_STEPS + 1 },
-      { maxRetainedBytes: 0 },
-      { maxRetainedBytes: Number.MAX_SAFE_INTEGER + 1 },
       { maxGraphCommits: MAX_MERGE_BASE_COMMITS + 1 },
     ];
 

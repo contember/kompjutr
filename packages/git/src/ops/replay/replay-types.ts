@@ -2,7 +2,7 @@ import type { Commit } from "../../common/objects.js";
 import type { TextMergeOptions } from "../../diff/xmerge.js";
 import type { IntegrationEntry } from "../../store/operations/integration-workspace/descriptors.js";
 import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
-import type { IntegrationConflictKind, IntegrationLimits } from "../integration/integration.js";
+import type { IntegrationConflictKind } from "../integration/integration.js";
 
 export type ReplayKind = "cherry-pick" | "revert";
 export type ReplayIncomingLabelStyle = "tree" | "source-subject" | "parent-of-source-subject";
@@ -13,7 +13,6 @@ export interface ReplayInput {
   currentOid: string;
   mainline?: number;
   text?: TextMergeOptions;
-  limits?: IntegrationLimits;
   /** Select Git's command-specific sequencer label or the planner's tree label. */
   incomingLabelStyle?: ReplayIncomingLabelStyle;
 }
@@ -66,7 +65,6 @@ export interface FixedReplayStepInput {
   sourceOid: string;
   selectedParentOid: string | null;
   currentOid: string;
-  limits?: IntegrationLimits;
 }
 
 export interface BoundedRevisionLabels {

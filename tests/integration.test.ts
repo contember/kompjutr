@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import { concat } from "../packages/git/src/common/bytes.js";
-import { hasErrorCode } from "../packages/git/src/common/errors.js";
 import { hashObject, MODE_FILE, serializeTree } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
 import { DEFAULT_TEXT_MERGE_LIMITS } from "../packages/git/src/diff/xmerge.js";
@@ -585,93 +584,6 @@ describe("bounded three-way integration plan", () => {
         currentIdentity.oid,
       ),
     ).toEqual(corrupt);
-  });
-
-  it("rejects limits that try to raise a hard ceiling", () => {
-    const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const repo = new Repository(store);
-    expect(() =>
-      collectIntegration(repo, {
-        baseTreeOid: null,
-        currentTreeOid: null,
-        incomingTreeOid: null,
-        limits: { maxEntries: 1_001 },
-      }),
-    ).toThrow(RangeError);
-  });
-
-  it("rejects a source row limit above its hard ceiling", () => {
-    const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    expect(() =>
-      collectIntegration(new Repository(store), {
-        baseTreeOid: null,
-        currentTreeOid: null,
-        incomingTreeOid: null,
-        limits: { maxSourceRows: Number.MAX_SAFE_INTEGER },
-      }),
-    ).toThrow(RangeError);
-  });
-
-  it("uses a stable error code when the retained plan limit is crossed", () => {
-    const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const base = writeTree(store, { file: { content: "base\n" } });
-    const current = writeTree(store, { file: { content: "current\n" } });
-    const incoming = writeTree(store, { file: { content: "incoming\n" } });
-    const repo = new Repository(store);
-
-    try {
-      collectIntegration(repo, {
-        baseTreeOid: base.tree,
-        currentTreeOid: current.tree,
-        incomingTreeOid: incoming.tree,
-        limits: { maxPlanBytes: 0 },
-      });
-      throw new Error("expected the integration plan limit to reject content");
-    } catch (error) {
-      expect(hasErrorCode(error, "E2BIG")).toBe(true);
-    }
-  });
-
-  it("caps text output before merge allocation and binary content before retention", () => {
-    const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const base = writeTree(store, {
-      binary: { content: new Uint8Array([0, 1]) },
-      text: { content: "base\n" },
-    });
-    const current = writeTree(store, {
-      binary: { content: new Uint8Array([0, ...Array.from({ length: 31 }, () => 2)]) },
-      text: { content: "current contents\n" },
-    });
-    const incoming = writeTree(store, {
-      binary: { content: new Uint8Array([0, 3]) },
-      text: { content: "incoming contents\n" },
-    });
-    const repo = new Repository(store);
-
-    expect(() =>
-      collectIntegration(repo, {
-        baseTreeOid: base.tree,
-        currentTreeOid: current.tree,
-        incomingTreeOid: incoming.tree,
-        limits: { maxPlanBytes: 600 },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-
-    const textBase = writeTree(store, { text: { content: "base\n" } });
-    const textCurrent = writeTree(store, { text: { content: "current contents\n" } });
-    const textIncoming = writeTree(store, { text: { content: "incoming contents\n" } });
-    expect(() =>
-      collectIntegration(repo, {
-        baseTreeOid: textBase.tree,
-        currentTreeOid: textCurrent.tree,
-        incomingTreeOid: textIncoming.tree,
-        limits: { maxPlanBytes: 600 },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
 
   it("does not hide a text output limit above the xmerge hard ceiling", () => {

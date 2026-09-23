@@ -2,22 +2,15 @@
 // to the bounded content phase; this layer only compares tree identities.
 
 import { isOid } from "../../common/bytes.js";
-import { CorruptError, GitError } from "../../common/errors.js";
+import { CorruptError } from "../../common/errors.js";
 import { MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../../common/objects.js";
 import { comparePaths } from "../../common/streams.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
-
-const PLAN_ENTRY_BYTES = 192;
-const IDENTITY_BYTES = 128;
-const PREFIX_STATE_BYTES = 128;
-
 import type {
   ClassifiedRow,
   IntegrationIdentity,
   IntegrationStages,
-  ResolvedLimits,
   StructuralConflictKind,
-  StructuralIntegrationEntry,
 } from "./integration-structure-types.js";
 
 export type {
@@ -29,109 +22,6 @@ export type {
   StructuralConflictKind,
   StructuralIntegrationEntry,
 } from "./integration-structure-types.js";
-
-export class PlanBudget {
-  #entries = 0;
-  #planBytes = 0;
-  #prefixBytes = 0;
-
-  constructor(private readonly limits: ResolvedLimits) {}
-
-  add(entry: StructuralIntegrationEntry): void {
-    if (this.#entries >= this.limits.maxEntries) {
-      throw new GitError(
-        "E2BIG",
-        `integration structure exceeds ${this.limits.maxEntries} plan entries`,
-      );
-    }
-    const bytes = retainedEntryBytes(entry);
-    if (
-      this.limits.maxRetainedBytes !== undefined &&
-      bytes > this.limits.maxRetainedBytes - this.#planBytes - this.#prefixBytes
-    ) {
-      throw new GitError(
-        "E2BIG",
-        `integration structure exceeds ${this.limits.maxRetainedBytes} retained bytes`,
-      );
-    }
-    this.#entries++;
-    this.#planBytes += bytes;
-  }
-
-  replace(before: StructuralIntegrationEntry, after: StructuralIntegrationEntry): void {
-    const beforeBytes = retainedEntryBytes(before);
-    const afterBytes = retainedEntryBytes(after);
-    if (
-      this.limits.maxRetainedBytes !== undefined &&
-      afterBytes >
-        this.limits.maxRetainedBytes - (this.#planBytes - beforeBytes) - this.#prefixBytes
-    ) {
-      throw new GitError(
-        "E2BIG",
-        `integration structure exceeds ${this.limits.maxRetainedBytes} retained bytes`,
-      );
-    }
-    this.#planBytes += afterBytes - beforeBytes;
-  }
-
-  addPrefix(bytes: number): void {
-    if (
-      this.limits.maxRetainedBytes !== undefined &&
-      bytes > this.limits.maxRetainedBytes - this.#planBytes - this.#prefixBytes
-    ) {
-      throw new GitError(
-        "E2BIG",
-        `integration structure exceeds ${this.limits.maxRetainedBytes} retained bytes`,
-      );
-    }
-    this.#prefixBytes += bytes;
-  }
-
-  removePrefix(bytes: number): void {
-    this.#prefixBytes -= bytes;
-  }
-
-  finish(): void {
-    this.#prefixBytes = 0;
-  }
-
-  clear(): void {
-    this.#entries = 0;
-    this.#planBytes = 0;
-    this.#prefixBytes = 0;
-  }
-}
-
-function retainedEntryBytes(entry: StructuralIntegrationEntry): number {
-  const pathBytes = 48 + entry.path.length * 2;
-  if (entry.kind === "clean") {
-    return (
-      PLAN_ENTRY_BYTES +
-      pathBytes +
-      (entry.before === null ? 0 : IDENTITY_BYTES) +
-      (entry.result === null ? 0 : IDENTITY_BYTES)
-    );
-  }
-  if (entry.kind === "content") return PLAN_ENTRY_BYTES + pathBytes + IDENTITY_BYTES * 3;
-  let identities = 0;
-  if (entry.stages.base !== null) identities++;
-  if (entry.stages.current !== null) identities++;
-  if (entry.stages.incoming !== null) identities++;
-  return PLAN_ENTRY_BYTES + pathBytes + identities * IDENTITY_BYTES;
-}
-
-export function retainedPrefixBytes(
-  path: string,
-  base: TargetEntry | undefined,
-  current: TargetEntry | undefined,
-  incoming: TargetEntry | undefined,
-): number {
-  let identities = 0;
-  if (base !== undefined) identities++;
-  if (current !== undefined) identities++;
-  if (incoming !== undefined) identities++;
-  return PREFIX_STATE_BYTES + 48 + path.length * 2 + identities * IDENTITY_BYTES;
-}
 
 function same(left: TargetEntry | undefined, right: TargetEntry | undefined): boolean {
   if (left === undefined || right === undefined) return left === right;

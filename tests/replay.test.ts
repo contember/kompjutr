@@ -569,22 +569,6 @@ describe("one-commit replay planner", () => {
     );
   });
 
-  it("returns an empty plan at an exact zero-entry limit", () => {
-    const { store, repo } = harness();
-    const unchanged = tree(store, "same\n");
-    const parent = commit(store, unchanged.tree, [], "parent");
-    const source = commit(store, unchanged.tree, [parent], "empty source");
-
-    const plan = collectReplay(repo, {
-      kind: "cherry-pick",
-      source,
-      currentOid: parent,
-      limits: { maxEntries: 0 },
-    });
-    expect(plan.integration.entries).toEqual([]);
-    expect(plan.integration.sourceRows).toBe(0);
-  });
-
   it("parses and preflights a commit above the former 1 MiB validity threshold", () => {
     const { store, repo } = harness();
     const unchanged = tree(store, "same\n");

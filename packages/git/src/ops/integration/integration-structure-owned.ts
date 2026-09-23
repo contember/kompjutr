@@ -4,12 +4,7 @@ import { joinSorted3 } from "../../common/streams.js";
 import type { StructuralIntegrationEntry } from "../../store/operations/integration-workspace/descriptors.js";
 import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
 import type { IntegrationWorkspace } from "../../store/operations/integration-workspace/workspace.js";
-import {
-  classifyRow,
-  PlanBudget,
-  retainedPrefixBytes,
-  validated,
-} from "./integration-structure.js";
+import { classifyRow, validated } from "./integration-structure.js";
 import type { IntegrationStages, ResolvedLimits } from "./integration-structure-types.js";
 import type { IntegrationInput } from "./integration-types.js";
 
@@ -17,7 +12,6 @@ interface Prefix {
   path: string;
   stages: IntegrationStages;
   entry: StructuralIntegrationEntry | null;
-  retainedBytes: number;
 }
 
 export function classifyIntegrationStructureOwned(
@@ -47,7 +41,6 @@ export function classifyIntegrationStructureOwned(
     return plan;
   }
   const stream = (oid: string | null) => (oid === null ? [] : workspace.source.walkTree(oid));
-  const budget = new PlanBudget(limits);
   let sourceRows = 0;
   let entryCount = 0;
   function* classify(): Generator<StructuralIntegrationEntry> {
@@ -64,7 +57,7 @@ export function classifyIntegrationStructureOwned(
         throw new GitError("E2BIG", `integration structure exceeds ${limits.maxRows} source rows`);
       sourceRows++;
       while (prefixes.length > 0 && !isNestedPath(prefixes[prefixes.length - 1]!.path, row.path)) {
-        budget.removePrefix(prefixes.pop()!.retainedBytes);
+        prefixes.pop();
       }
       const stages: IntegrationStages = {
         base: row.a ?? null,
@@ -81,17 +74,13 @@ export function classifyIntegrationStructureOwned(
             conflict: "file/directory",
             stages: prefix.stages,
           };
-          if (prefix.entry === null) {
-            budget.add(replacement);
-            entryCount++;
-          } else budget.replace(prefix.entry, replacement);
+          if (prefix.entry === null) entryCount++;
           prefix.entry = replacement;
           yield replacement;
         }
         entry = { kind: "conflict", path: row.path, conflict: "file/directory", stages };
       }
       if (entry !== null) {
-        budget.add(entry);
         entryCount++;
         yield entry;
       }
@@ -99,12 +88,9 @@ export function classifyIntegrationStructureOwned(
         classified.occupiesPath &&
         (row.a === undefined || row.b === undefined || row.c === undefined)
       ) {
-        const retainedBytes = retainedPrefixBytes(row.path, row.a, row.b, row.c);
-        budget.addPrefix(retainedBytes);
-        prefixes.push({ path: row.path, stages, entry, retainedBytes });
+        prefixes.push({ path: row.path, stages, entry });
       }
     }
-    budget.finish();
   }
   plan.entries.write(classify());
   plan.finish(sourceRows, entryCount);

@@ -1,7 +1,6 @@
-import { CorruptError, GitError } from "../../common/errors.js";
+import { CorruptError } from "../../common/errors.js";
 import { hashObject, MODE_EXECUTABLE, MODE_FILE } from "../../common/objects.js";
 import { mergeText, type TextMergeOptions } from "../../diff/xmerge.js";
-import { boundTextOutput, checkedAdd } from "./integration-limits.js";
 import type {
   ConflictStructuralEntry,
   ContentStructuralEntry,
@@ -35,7 +34,7 @@ export function validateBlobBatch(
     if (data === undefined || hashObject("blob", data) !== oid) {
       throw new CorruptError(`blob ${oid} did not match its object id`);
     }
-    bytes = checkedAdd(bytes, data.length, "blob batch");
+    bytes += data.length;
   }
   for (let index = 0; index < remaining.length; index++) {
     if (remaining[index] !== requested[index + returned.length]) {
@@ -97,7 +96,6 @@ export function resolveContentCandidate(
   entry: ContentCandidate,
   loaded: ReadonlyMap<string, Uint8Array>,
   text: TextMergeOptions,
-  maxContentBytes: number,
   virtualAncestor: boolean,
 ): IntegrationEntry {
   const base = entry.base === null ? EMPTY_BLOB : loaded.get(entry.base.oid);
@@ -106,13 +104,9 @@ export function resolveContentCandidate(
   if (base === undefined || current === undefined || incoming === undefined) {
     throw new CorruptError("integration blob batch omitted a required candidate object");
   }
-  const boundedText = boundTextOutput(text, maxContentBytes);
-  const merged = mergeText(base, current, incoming, boundedText);
+  const merged = mergeText(base, current, incoming, text);
   const stages = entry.stages;
   if (merged.kind === "binary") {
-    if (current.length > maxContentBytes) {
-      throw new GitError("E2BIG", `integration plan exceeds its retained content capacity`);
-    }
     if (!virtualAncestor) {
       return {
         kind: "conflict",

@@ -952,9 +952,8 @@ At most 1,000 SQL statements is a benchmark target. Representative statement
 and returned-row costs live in `bench/`; a miss is optimization evidence and
 never a runtime rejection. Operations fail only for real memory, format,
 platform, corruption, CAS, or structural limits instead of truncating. The
-per-operation caps (integration plan entries, tree bytes, worktree scan rows,
-path length, journal steps) are listed in
-[`architecture.md`](architecture.md).
+per-operation caps (tree bytes, worktree scan rows, path length, journal steps)
+are listed in [`architecture.md`](architecture.md).
 
 One object is at most 48 MiB, because a read materialises it as a single buffer
 inside the isolate. `add` refuses an oversized working-tree file from its stat,

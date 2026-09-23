@@ -54,30 +54,24 @@ number cannot be verified, drifts with every engine and every field added, and
 usually duplicates a structural count cap that already bounds the same
 structure.
 
-Two budgets satisfy the rule and are part of the contract:
+One budget satisfies the rule and is part of the contract:
+`packages/do/src/shell/exec/context.ts` — `RetainedBudget` charges the real byte
+length of intermediate pipeline buffers and releases each reservation when the
+buffer leaves scope. It is a documented shell limit
+([ADR-0018](0018-compile-shell-commands-to-bounded-queries.md),
+[ADR-0019](0019-admit-a-bounded-posix-shell-surface.md)).
 
-- `packages/do/src/shell/exec/context.ts` — `RetainedBudget` charges the real byte length of
-  intermediate pipeline buffers and releases each reservation when the buffer
-  leaves scope. It is a documented shell limit
-  ([ADR-0018](0018-compile-shell-commands-to-bounded-queries.md),
-  [ADR-0019](0019-admit-a-bounded-posix-shell-surface.md)).
-- `packages/git/src/ops/integration/integration-limits.ts` — `maxPlanBytes` is supplied by
-  the caller and converted into remaining text-merge output capacity. Absent a
-  caller value, the text-merge output ceiling still bounds the result.
-
-Five charge modeled object sizes and are debt, not contract:
+Four charge modeled object sizes and are debt, not contract:
 `packages/git/src/ops/push/push-plan-types.ts` (`COMMIT_ENTRY_BYTES`, `MAP_ENTRY_BYTES`,
 and a `PushRetainedTracker` with reservation transfer and ownership),
 `packages/git/src/ops/status/status-full.ts`,
-`packages/git/src/ops/status/rename-detection.ts`,
-`packages/git/src/ops/rebase/rebase-plan.ts`, and
+`packages/git/src/ops/status/rename-detection.ts`, and
 `packages/git/src/ops/staging/staging-selected-validation.ts`.
 
-Four of the five sit on top of a structural count cap that already bounds the
+Three of the four sit on top of a structural count cap that already bounds the
 same structure — 512 commits and 100,000 objects for push, 10,000 candidates for
-rename detection, a step ceiling for rebase, 1,000 paths for selected staging —
-so the estimate cannot fire first. The rebase byte limit additionally defaults to
-`Number.MAX_SAFE_INTEGER`, bounding nothing unless a caller sets it. Status is
+rename detection, 1,000 paths for selected staging — so the estimate cannot fire
+first. Status is
 the exception: `STATUS_RETAINED_BYTES` is currently the only bound on its
 tracked-path set, so retiring that charge means introducing a real cap rather
 than deleting one.

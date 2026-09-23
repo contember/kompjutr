@@ -26,7 +26,6 @@ export interface RebasePlanInput {
 
 export interface RebasePlanLimits {
   maxSteps?: number;
-  maxRetainedBytes?: number;
   maxGraphCommits?: number;
 }
 
@@ -41,11 +40,8 @@ export interface RebasePlan {
 
 interface ResolvedLimits {
   maxSteps: number;
-  maxRetainedBytes: number;
   graph: MergeBaseLimits;
 }
-
-const PENDING_REBASE_STEP_BYTES = 336;
 
 function boundedLimit(value: number | undefined, ceiling: number, label: string): number {
   if (value === undefined) return ceiling;
@@ -55,33 +51,13 @@ function boundedLimit(value: number | undefined, ceiling: number, label: string)
   return value;
 }
 
-function retainedLimit(value: number | undefined): number {
-  if (value === undefined) return Number.MAX_SAFE_INTEGER;
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new RangeError("invalid rebase retained byte limit");
-  }
-  return value;
-}
-
 function resolveLimits(limits: RebasePlanLimits | undefined): ResolvedLimits {
   return {
     maxSteps: boundedLimit(limits?.maxSteps, MAX_OPERATION_STEPS, "step"),
-    maxRetainedBytes: retainedLimit(limits?.maxRetainedBytes),
     graph: {
       maxCommits: boundedLimit(limits?.maxGraphCommits, MAX_MERGE_BASE_COMMITS, "graph commit"),
     },
   };
-}
-
-function checkedAdd(left: number, right: number): number {
-  if (
-    !Number.isSafeInteger(left) ||
-    !Number.isSafeInteger(right) ||
-    right > Number.MAX_SAFE_INTEGER - left
-  ) {
-    throw new GitError("E2BIG", "rebase plan byte accounting overflow");
-  }
-  return left + right;
 }
 
 function zeroStepPlan(
@@ -123,7 +99,6 @@ function selectSteps(
   limits: ResolvedLimits,
 ): readonly OperationStepMetadata[] {
   const newestFirst: OperationStepMetadata[] = [];
-  let retainedBytes = 0;
   let oid = currentOid;
   let foundBase = false;
   for (const entry of walkIndexedOwned(repo, currentOid, limits.graph)) {
@@ -144,10 +119,6 @@ function selectSteps(
     if (selectedParentOid === undefined) {
       throw new CorruptError(`rebase commit ${oid} lost its selected parent`);
     }
-    const nextRetainedBytes = checkedAdd(retainedBytes, PENDING_REBASE_STEP_BYTES);
-    if (nextRetainedBytes > limits.maxRetainedBytes) {
-      throw new GitError("E2BIG", `rebase plan exceeds ${limits.maxRetainedBytes} retained bytes`);
-    }
     const step: OperationStepMetadata = {
       sourceOid: oid,
       selectedParentOid,
@@ -157,7 +128,6 @@ function selectSteps(
     };
     validateOperationStepMetadata(step);
     newestFirst.push(step);
-    retainedBytes = nextRetainedBytes;
     oid = selectedParentOid;
   }
   if (!foundBase) throw new CorruptError("rebase linear walk did not reach the selected base");
