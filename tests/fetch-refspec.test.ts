@@ -1,5 +1,9 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createGit, type FetchRefspec, type Git } from "../packages/do/src/index.js";
+import { openRepository } from "../packages/git/src/ops/core/context.js";
+import { clone, fetchInto } from "../packages/git/src/ops/network/network.js";
 import { worktreeAdd } from "../packages/git/src/ops/worktree/worktrees.js";
 import {
   fetchHttpClient,
@@ -10,7 +14,7 @@ import { PACK_BLOB_BATCH_TARGET_BYTES } from "../packages/git/src/store/index.js
 import { GitFixture } from "./helpers/git.js";
 import { type GitServer, startGitServer } from "./helpers/http-backend.js";
 import { reopenTestRepository } from "./helpers/repository-invariants.js";
-import { makeRepo, type TestRepository } from "./helpers/workspace.js";
+import { makeRepo, makeWorkspace, type TestRepository } from "./helpers/workspace.js";
 
 let fixture: GitFixture;
 let server: GitServer;
@@ -486,5 +490,120 @@ describe("mapped fetch refspecs", () => {
     expect(bodies).toHaveLength(2);
     expect(bodies[1]).toEqual(bodies[0]);
     expect(workspace.repo.store.getRef("refs/snapshots/authenticated")).toBe(baseOid);
+  });
+});
+
+describe("mapped fetch through the shared engine", () => {
+  function uploadLines(request: GitHttpRequest): string[] {
+    if (!(request.body instanceof Uint8Array)) throw new Error("upload body must be bytes");
+    return new TextDecoder().decode(request.body).split("\n");
+  }
+
+  it("negotiates shallow boundaries and local haves from a depth-1 clone", async () => {
+    const shallowFixture = new GitFixture().init();
+    shallowFixture.write("one.txt", "one\n");
+    shallowFixture.commit("one");
+    shallowFixture.write("two.txt", "two\n");
+    const cloned = shallowFixture.commit("two");
+    const shallowServer = await startGitServer(shallowFixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, { url: shallowServer.url, dir: "/work", depth: 1 });
+      const repo = openRepository(workspace.context, "/work");
+      expect(repo.shallow()).toEqual(new Set([cloned]));
+      shallowFixture.write("three.txt", "three\n");
+      const tip = shallowFixture.commit("three");
+      const before = shallowServer.requests.length;
+      const bodies: string[][] = [];
+      const http: GitHttpClient = (request) => {
+        if (request.method === "POST") bodies.push(uploadLines(request));
+        return fetchHttpClient(request);
+      };
+
+      await expect(
+        fetchInto({ ...workspace.context, http }, repo, {
+          refspecs: [{ source: "refs/heads/main", destination: "refs/snapshots/main" }],
+        }),
+      ).resolves.toMatchObject({ mode: "mapped", updates: [{ oid: tip }] });
+
+      expect(shallowServer.requests.slice(before).filter((r) => r.method === "POST")).toHaveLength(
+        1,
+      );
+      const [body] = bodies;
+      if (body === undefined) throw new Error("mapped fetch sent no upload request");
+      expect(body.some((line) => line.endsWith(`shallow ${cloned}`))).toBe(true);
+      expect(body.some((line) => line.endsWith(`have ${cloned}`))).toBe(true);
+      expect(repo.store.getRef("refs/snapshots/main")).toBe(tip);
+      expect(repo.shallow()).toEqual(new Set([cloned]));
+    } finally {
+      await shallowServer.close();
+      shallowFixture.dispose();
+    }
+  });
+
+  it("keeps promised blobs unread in a blob:none clone", async () => {
+    const partialFixture = new GitFixture().init();
+    partialFixture.write("base.txt", "base\n");
+    partialFixture.commit("base");
+    partialFixture.git("config", "uploadpack.allowFilter", "true");
+    const partialServer = await startGitServer(partialFixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, {
+        url: partialServer.url,
+        dir: "/work",
+        depth: 0,
+        filter: "blob:none",
+      });
+      const repo = openRepository(workspace.context, "/work");
+      partialFixture.write("promised.txt", "promised\n");
+      const tip = partialFixture.commit("promised");
+      const blob = partialFixture.git("rev-parse", "HEAD:promised.txt");
+      const before = partialServer.requests.length;
+
+      await expect(
+        fetchInto(workspace.context, repo, {
+          filter: "blob:none",
+          refspecs: [{ source: "refs/heads/main", destination: "refs/snapshots/main" }],
+        }),
+      ).resolves.toMatchObject({ mode: "mapped", updates: [{ oid: tip }] });
+
+      const posts = partialServer.requests.slice(before).filter((r) => r.method === "POST");
+      expect(posts).toHaveLength(1);
+      expect(repo.store.getRef("refs/snapshots/main")).toBe(tip);
+      expect(repo.store.has(blob)).toBe(false);
+      expect(repo.store.promisedMissing([blob])).toEqual([blob]);
+    } finally {
+      await partialServer.close();
+      partialFixture.dispose();
+    }
+  });
+
+  it("rejects a remote branch that does not point to a commit", async () => {
+    const corruptFixture = new GitFixture().init();
+    corruptFixture.write("base.txt", "base\n");
+    corruptFixture.commit("base");
+    const blob = corruptFixture.git("hash-object", "-w", "base.txt");
+    // Git refuses a non-commit branch through update-ref; a hostile server can still advertise one.
+    writeFileSync(join(corruptFixture.dir, ".git", "refs", "heads", "blob"), `${blob}\n`);
+    const corruptServer = await startGitServer(corruptFixture.dir);
+    const workspace = makeRepo();
+    const destination = "refs/snapshots/blob";
+    try {
+      await expect(
+        gitFor(workspace).fetch({
+          url: corruptServer.url,
+          refspecs: [{ source: "refs/heads/blob", destination }],
+        }),
+      ).rejects.toMatchObject({
+        code: "ECORRUPT",
+        message: expect.stringContaining("does not point to a commit"),
+      });
+      expect(workspace.repo.store.getRef(destination)).toBeNull();
+      expect(workspace.repo.store.reflog(destination)).toEqual([]);
+    } finally {
+      await corruptServer.close();
+      corruptFixture.dispose();
+    }
   });
 });

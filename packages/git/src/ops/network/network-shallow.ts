@@ -1,5 +1,44 @@
 import { CorruptError, hasErrorCode } from "../../common/errors.js";
+import type { RemoteRef } from "../../protocol/remote.js";
 import type { Repository } from "../repository/repository.js";
+import type { ShallowRequest } from "./network-types.js";
+
+const PROTOCOL_UNSHALLOW_DEPTH = 0x7fffffff;
+
+/** A positive depth, deepen, or unshallow moves the boundary and must authenticate it. */
+export function requestsBoundary(request: ShallowRequest | undefined): boolean {
+  if (request === undefined) return false;
+  return request.kind !== "depth" || request.depth > 0;
+}
+
+/**
+ * Whether every root is wanted even when held. An unproven depth request must
+ * renegotiate boundaries even when a prior failed publication already left the
+ * advertised tip object complete.
+ */
+export function wantsHeldRoots(
+  request: ShallowRequest | undefined,
+  roots: readonly RemoteRef[],
+  published: readonly string[],
+): boolean {
+  if (request === undefined) return false;
+  if (request.kind !== "depth") return true;
+  if (!(request.depth > 0)) return false;
+  if (request.depth !== 1) return true;
+  const heads = roots.filter((ref) => ref.name.startsWith("refs/heads/"));
+  const boundary = new Set(published);
+  return heads.length === 0 || !heads.every((ref) => boundary.has(ref.oid));
+}
+
+export function shallowTransfer(request: ShallowRequest | undefined): {
+  depth?: number;
+  deepenRelative?: true;
+} {
+  if (request === undefined) return {};
+  if (request.kind === "deepen") return { depth: request.deepen, deepenRelative: true };
+  if (request.kind === "unshallow") return { depth: PROTOCOL_UNSHALLOW_DEPTH };
+  return { depth: request.depth };
+}
 
 export function applyShallowResponse(
   boundary: Set<string>,

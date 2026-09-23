@@ -133,14 +133,11 @@ export function normalizeFetchPublication(
     }
   }
 
-  const exactPut = (row: RefRow, label: string, requireTag: boolean): void => {
+  const exactPut = (row: RefRow, label: string): void => {
     if (typeof row !== "object" || row === null) {
       throw new GitError("EINVAL", `${label} update row is invalid`);
     }
     const name = requireRefName(row.name, `${label} name`, "input");
-    if (requireTag && !name.startsWith("refs/tags/")) {
-      throw new GitError("EINVAL", `${label} ${name} is not a tag ref`);
-    }
     const target = requireRawRefTarget(row.target, `target of ${name}`, "input");
     if (!isOid(target)) {
       throw new GitError("EINVAL", `${label} ${name} must target an object id`);
@@ -154,8 +151,7 @@ export function normalizeFetchPublication(
     countInput(name, `${label} name`, target);
     puts.set(name, target);
   };
-  for (const row of plan.globalTagPuts ?? []) exactPut(row, "fetch global tag", true);
-  for (const row of plan.exactPuts ?? []) exactPut(row, "fetch exact ref", false);
+  for (const row of plan.exactPuts ?? []) exactPut(row, "fetch exact ref");
 
   const shallowAdd = new Set<string>();
   const shallowRemove = new Set<string>();

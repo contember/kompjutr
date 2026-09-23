@@ -1836,14 +1836,14 @@ describe("refs, config and index", () => {
       expect(
         store.publishFetchRefs(
           winner,
-          { globalTagPuts: [{ name: tag, target: "1".repeat(40) }] },
+          { exactPuts: [{ name: tag, target: "1".repeat(40) }] },
           fetchMetadata,
         ),
       ).toBe(true);
       expect(
         store.publishFetchRefs(
           same,
-          { globalTagPuts: [{ name: tag, target: "1".repeat(40) }] },
+          { exactPuts: [{ name: tag, target: "1".repeat(40) }] },
           fetchMetadata,
         ),
       ).toBe(false);
@@ -1857,13 +1857,13 @@ describe("refs, config and index", () => {
     try {
       store.publishFetchRefs(
         replacement,
-        { globalTagPuts: [{ name: tag, target: "2".repeat(40) }] },
+        { exactPuts: [{ name: tag, target: "2".repeat(40) }] },
         fetchMetadata,
       );
       expect(() =>
         store.publishFetchRefs(
           different,
-          { globalTagPuts: [{ name: tag, target: "3".repeat(40) }] },
+          { exactPuts: [{ name: tag, target: "3".repeat(40) }] },
           fetchMetadata,
         ),
       ).toThrowError(expect.objectContaining({ code: "ESTALEFETCH" }));
@@ -1889,7 +1889,7 @@ describe("refs, config and index", () => {
           token,
           {
             trackingPuts: [{ name: "refs/remotes/origin/main", target: "3".repeat(40) }],
-            globalTagPuts: [{ name: selected, target: "2".repeat(40) }],
+            exactPuts: [{ name: selected, target: "2".repeat(40) }],
           },
           fetchMetadata,
         ),

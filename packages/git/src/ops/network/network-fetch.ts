@@ -4,7 +4,6 @@ import type { GitContext } from "../core/context.js";
 import { compileFetchRefspecs } from "../refs/refspec.js";
 import type { Repository } from "../repository/repository.js";
 import { runFetchCheckpoint } from "./network-checkpoint.js";
-import { fetchLegacyInto } from "./network-fetch-legacy.js";
 import { fetchMappedInto } from "./network-fetch-mapped.js";
 import {
   fetchAuth,
@@ -16,12 +15,14 @@ import {
   validateRemoteAuthOptions,
 } from "./network-options.js";
 import { requirePartialFetchTarget } from "./network-promisor.js";
+import { lowerLegacyFetch } from "./network-selection.js";
 import { fetchAdvertisement } from "./network-transfer.js";
 import type {
   FetchBehavior,
   FetchOperationOptions,
   FetchResult,
   FetchTarget,
+  MappedFetchPlan,
   MappedFetchSelection,
 } from "./network-types.js";
 
@@ -75,35 +76,49 @@ export async function fetchInto(
     ? compileFetchRefspecs(options.refspecs)
     : undefined;
   const target = fetchRemoteUrl(repo, options);
-  const { remote, url } = target;
-  if (options.filter !== undefined) requirePartialFetchTarget(repo, remote, url);
+  if (options.filter !== undefined) requirePartialFetchTarget(repo, target.remote, target.url);
   const auth = fetchAuth(context, options);
   await runFetchCheckpoint(behavior.checkpoint, "before-discovery", options.signal);
-  const advertisement = await fetchAdvertisement(url, auth);
+  const advertisement = await fetchAdvertisement(target.url, auth);
   throwIfAborted(options.signal);
-  if (isMappedFetchOptions(options)) {
-    if (compiler === undefined) throw new Error("mapped fetch lost its compiled refspecs");
-    return await fetchMappedInto(
+  const defaultBranch = advertisement.headRef;
+  const run = (plan: MappedFetchPlan) =>
+    fetchMappedInto(
       context,
       repo,
       options,
       behavior,
       refLogReason,
-      remote,
-      url,
+      target,
       advertisement,
       auth,
-      compiler.expand(advertisement.refs),
+      plan,
     );
+
+  if (isMappedFetchOptions(options)) {
+    if (compiler === undefined) throw new Error("mapped fetch lost its compiled refspecs");
+    const refs = compiler.expand(advertisement.refs);
+    if (refs.length === 0) {
+      await runFetchCheckpoint(behavior.checkpoint, "after-discovery", options.signal);
+      return { mode: "mapped", defaultBranch, fetchHead: null, updates: [] };
+    }
+    await run({
+      roots: refs.map((ref) => ({ name: ref.source, oid: ref.oid })),
+      updates: refs,
+      followTags: false,
+    });
+    return {
+      mode: "mapped",
+      defaultBranch,
+      fetchHead: null,
+      updates: refs.map((ref) => ({
+        source: ref.source,
+        destination: ref.destination,
+        oid: ref.oid,
+      })),
+    };
   }
-  return await fetchLegacyInto(
-    context,
-    repo,
-    options,
-    behavior,
-    refLogReason,
-    target,
-    advertisement,
-    auth,
-  );
+  const lowered = lowerLegacyFetch(advertisement, options, behavior, target);
+  await run(lowered.plan);
+  return { mode: "legacy", defaultBranch, fetchHead: lowered.fetchHead, updates: [] };
 }

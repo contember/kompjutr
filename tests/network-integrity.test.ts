@@ -356,7 +356,7 @@ describe("fetched graph connectivity", () => {
     }
   });
 
-  it("mapped publication retains a fresh transferred pack when maintenance deletes the aged copy", async () => {
+  it("rejects mapped publication when public maintenance removes its reused aged pack", async () => {
     const fixture = new GitFixture().init();
     fixture.write("file.txt", "mapped lifetime\n");
     const tip = fixture.commit("mapped lifetime");
@@ -372,7 +372,7 @@ describe("fetched graph connectivity", () => {
       }
       workspace.tick(GC_GRACE_MS + 1);
       const before = publicationState(repo);
-      await fetchInto(
+      const outcome = await fetchInto(
         context,
         repo,
         {
@@ -383,9 +383,6 @@ describe("fetched graph connectivity", () => {
         {
           async checkpoint(stage) {
             if (stage !== "before-ref-publication") return;
-            expect(
-              repo.store.db.scalar("SELECT count(*) FROM git_pack_meta WHERE state='complete'"),
-            ).toBe(2);
             let reclaimed = 0;
             for (let call = 0; call < 40; call++) {
               const progress = await maintenance(context, repo);
@@ -394,19 +391,19 @@ describe("fetched graph connectivity", () => {
               if (call === 39) throw new Error("mapped sweep did not finish");
             }
             expect(reclaimed).toBe(1);
-            expect(repo.store.has(tip)).toBe(true);
+            expect(repo.store.has(tip)).toBe(false);
             seam = true;
           },
         },
+      ).then(
+        () => "accepted",
+        (error: unknown) => error,
       );
       expect(seam).toBe(true);
-      expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(1);
+      expect(outcome).toMatchObject({ code: "EFETCHFAIL" });
+      expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(0);
       const cold = reopenTestRepository(workspace, "/work");
-      expect(cold.repo.store.getRef("refs/remotes/origin/main")).toBe(tip);
-      expect(cold.repo.readCommit(tip).message).toContain("mapped lifetime");
-      for (const entry of cold.repo.store.walkTree(cold.repo.readCommit(tip).tree)) {
-        expect(cold.repo.store.read(entry.oid)?.data).toEqual(fixture.catFile(entry.oid));
-      }
+      expect(cold.repo.store.getRef("refs/remotes/origin/main")).toBeNull();
       expect(cold.repo.shallow()).toEqual(before.shallow);
       expect(cold.repo.checkout.indexEntries()).toEqual(before.index);
       expect(cold.repo.head()).toEqual(before.head);

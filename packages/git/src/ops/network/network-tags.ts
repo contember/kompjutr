@@ -25,7 +25,7 @@ export function advertisedTags(advertisement: Advertisement): AdvertisedTag[] {
 }
 
 function snapshottedTagNames(snapshot: FetchPublicationToken): Set<string> {
-  return new Set(snapshot.globalRefs.filter((ref) => ref.target !== null).map((ref) => ref.name));
+  return new Set(snapshot.exactRefs.filter((ref) => ref.target !== null).map((ref) => ref.name));
 }
 
 export function eligibleAutoTags(
@@ -36,20 +36,6 @@ export function eligibleAutoTags(
   const local = snapshottedTagNames(snapshot);
   const present = repo.store.hasAll(tags.map((tag) => tag.peeledOid));
   return tags.filter((tag) => !local.has(tag.ref.name) && present.has(tag.peeledOid));
-}
-
-export function preflightAllTags(
-  snapshot: FetchPublicationToken,
-  tags: readonly AdvertisedTag[],
-): void {
-  if (tags.length === 0) return;
-  const existing = new Map(snapshot.globalRefs.map((ref) => [ref.name, ref.target]));
-  for (const tag of tags) {
-    const target = existing.get(tag.ref.name);
-    if (target !== undefined && target !== null && target !== tag.ref.oid) {
-      throw new GitError("ETAGFAIL", `fetch would clobber existing tag ${tag.ref.name}`);
-    }
-  }
 }
 
 function readTagObjects(repo: Repository, oids: readonly string[]): Map<string, RawObject> {
@@ -71,7 +57,7 @@ interface TagPeelState {
   seen: Set<string>;
 }
 
-export function objectTypes(repo: Repository, oids: readonly string[]): Map<string, ObjectType> {
+function objectTypes(repo: Repository, oids: readonly string[]): Map<string, ObjectType> {
   const types = new Map<string, ObjectType>();
   const unique = [...new Set(oids)];
   for (let offset = 0; offset < unique.length; offset += TAG_OBJECT_PAGE) {

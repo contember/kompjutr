@@ -1,8 +1,8 @@
 import type { MessageCallback, ProgressCallback } from "../../protocol/progress.js";
 import type { RemoteRef, UploadPackFilter } from "../../protocol/remote.js";
 import type { AuthCallback } from "../../protocol/transport.js";
-import type { FetchPublicationPlan, FetchPublicationToken } from "../../store/index.js";
 import type {
+  ExpandedFetchRefspec,
   FetchRefspec,
   RemoteTarget,
   FetchResult as StructuredFetchResult,
@@ -118,16 +118,24 @@ export interface FetchTarget {
   readonly configured: boolean;
 }
 
-export interface LegacyFetchResult {
-  readonly mode: "legacy";
-  readonly defaultBranch: string | null;
-  readonly fetchHead: string | null;
-  readonly updates: readonly [];
-}
+export type ShallowRequest =
+  | { readonly kind: "depth"; readonly depth: number }
+  | { readonly kind: "deepen"; readonly deepen: number }
+  | { readonly kind: "unshallow" };
 
-export interface PreparedLegacyFetchPublication {
-  readonly roots: readonly string[];
-  readonly publication: FetchPublicationToken;
-  plan: FetchPublicationPlan | null;
-  readonly result: LegacyFetchResult;
+/**
+ * One fetch as mappings. Mapped refspecs arrive in this shape; legacy selectors
+ * lower to forced tracking mappings plus the extras only they request.
+ */
+export interface MappedFetchPlan {
+  /** Advertised refs the transfer must deliver, including sources fetched for FETCH_HEAD alone. */
+  readonly roots: readonly RemoteRef[];
+  readonly updates: readonly ExpandedFetchRefspec[];
+  /** Auto-follow advertised tags whose peeled targets become held. */
+  readonly followTags: boolean;
+  readonly shallow?: ShallowRequest;
+  /** When pruning, the tracking refs that survive; every other one is deleted. */
+  readonly trackingKeep?: readonly string[];
+  /** The tracking ref remote HEAD names, `null` when it names no branch; absent leaves HEAD alone. */
+  readonly remoteHead?: string | null;
 }

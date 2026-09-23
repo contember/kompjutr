@@ -149,10 +149,10 @@ describe("exact fetch publication", () => {
             exactPuts: [
               { name: branch, target: branchOid },
               { name: checkpoint, target: checkpointOid },
+              { name: tag, target: tagOid },
             ],
             trackingPuts: [{ name: tracking, target: trackingOid }],
             remoteHead: `ref: ${tracking}`,
-            globalTagPuts: [{ name: tag, target: tagOid }],
             shallowAdd: [shallowOid],
           },
           metadata,
@@ -320,8 +320,10 @@ describe("exact fetch publication", () => {
         store.publishFetchRefs(
           token,
           {
-            exactPuts: [{ name: checkpoint, target: "1".repeat(40) }],
-            globalTagPuts: [{ name: tag, target: "2".repeat(40) }],
+            exactPuts: [
+              { name: checkpoint, target: "1".repeat(40) },
+              { name: tag, target: "2".repeat(40) },
+            ],
             trackingPuts: [{ name: tracking, target: "3".repeat(40) }],
             remoteHead: `ref: ${tracking}`,
             shallowAdd: ["4".repeat(40)],
@@ -530,7 +532,6 @@ describe("exact fetch publication", () => {
     const token = store.beginFetchPublication("refs/remotes/origin/", tags);
     try {
       expect(token.exactRefs).toHaveLength(MAPPED_CANDIDATE_COUNT + 1);
-      expect(token.globalRefs).toEqual(token.exactRefs);
     } finally {
       token.dispose();
     }

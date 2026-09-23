@@ -652,7 +652,17 @@ stored values are authenticated before either operation returns or mutates.
 Legacy fetch returns `{ mode: "legacy", defaultBranch, fetchHead, updates: [] }`.
 Mapped fetch returns `{ mode: "mapped", defaultBranch, fetchHead: null,
 updates }`, with updates ordered by destination UTF-8 bytes. Exact missing
-sources fail; an unmatched wildcard is a successful discovery-only no-op. One
+sources fail; an unmatched wildcard is a successful discovery-only no-op.
+Both forms run one engine. Legacy selection lowers to mappings: each selected
+branch of a remote the URL belongs to becomes a forced
+`refs/heads/<b>:refs/remotes/<remote>/<b>` mapping, each selected tag a
+non-forced tag mapping, and any other selected ref is fetched for `fetchHead`
+alone. Depth, deepening, prune, remote HEAD, and tag following are options only
+legacy selection sets. Every fetch sends the captured shallow boundary and
+recent local commits as `have`s, and skips the transfer when every wanted object
+is held unless a depth request must renegotiate the boundary. A remote
+`refs/heads/*` source that does not point to a commit fails with `ECORRUPT`,
+whatever its destination. One
 complete validated pack precedes atomic publication of selected destinations.
 Interrupted ingest, a stale candidate, or one invalid destination moves no ref.
 Every selected ref is authenticated against the received objects before

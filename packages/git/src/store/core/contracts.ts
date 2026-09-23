@@ -97,11 +97,6 @@ export class FetchPublicationToken {
     this.#dispose = dispose;
   }
 
-  /** Legacy tag-publication snapshot. */
-  get globalRefs(): readonly FetchPublicationExpectedRef[] {
-    return this.exactRefs;
-  }
-
   get disposed(): boolean {
     return this.#isDisposed();
   }
@@ -142,8 +137,6 @@ export interface FetchPublicationPlan {
   trackingKeep?: Iterable<string>;
   /** `undefined` leaves remote HEAD alone; `null` deletes it. */
   remoteHead?: string | null;
-  /** Global tags selected from the candidates supplied when the token was issued. */
-  globalTagPuts?: Iterable<RefRow>;
   /** Exact direct refs selected from the candidates supplied when the token was issued. */
   exactPuts?: Iterable<RefRow>;
   shallowAdd?: Iterable<string>;
