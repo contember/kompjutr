@@ -340,6 +340,7 @@ describe("worktree add", () => {
           if (failure === "throw") throw new Error("injected reseal failure");
           return false;
         },
+        advanceBaseline: () => false,
       };
       const root = `/rollback-${failure}`;
       const branch = `rollback-${failure}`;

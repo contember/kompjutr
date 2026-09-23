@@ -1,5 +1,4 @@
 import { CorruptError, GitError } from "../../common/errors.js";
-import { comparePaths } from "../../common/streams.js";
 
 export function checkedBytes(total: number, bytes: number, label: string): number {
   if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > Number.MAX_SAFE_INTEGER - total) {
@@ -69,20 +68,7 @@ export function pathDepth(path: string): number {
   return depth;
 }
 
-export function expectedDirectoryPaths(paths: readonly { path: string }[]): string[] {
-  const expected = new Set<string>([""]);
-  for (const row of paths) {
-    const path = row.path;
-    let slash = path.indexOf("/");
-    while (slash >= 0) {
-      expected.add(path.slice(0, slash));
-      slash = path.indexOf("/", slash + 1);
-    }
-  }
-  return [...expected].sort(comparePaths);
-}
-
-export function validatePathShape(path: string): void {
+function validatePathShape(path: string): void {
   if (typeof path !== "string" || path.length === 0 || path.startsWith("/") || path.endsWith("/")) {
     throw new CorruptError("tree-build index path is invalid");
   }

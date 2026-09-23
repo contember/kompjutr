@@ -992,6 +992,7 @@ async function statusFullRow(rows: ResultRow[]): Promise<void> {
           flags: number;
         }>,
       ) => resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries),
+      advanceBaseline: () => false,
     },
   };
   await measure(
@@ -1079,6 +1080,7 @@ async function statusSparseRows(rows: ResultRow[]): Promise<void> {
         reseals++;
         return resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries);
       },
+      advanceBaseline: () => false,
     },
   };
   assert(
@@ -1266,6 +1268,7 @@ async function checkoutInitialRow(rows: ResultRow[]): Promise<void> {
             flags: number;
           }>,
         ) => resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries),
+        advanceBaseline: () => false,
       },
     };
     await measure(

@@ -11,7 +11,6 @@ import type {
   SparseWorktreeLeaf,
 } from "../../store/core/contracts.js";
 import type { IndexEntry } from "../../store/index.js";
-import { bindSparseSource } from "../../store/sparse/receipt.js";
 import { iterateIndexTrackerDirty, readIndexTrackerState } from "../indexes/index-tracker.js";
 import { decodeSparseWorktreeRow, validatedSparseIndexEntry } from "./index-rows.js";
 import { inputError, MAX_PATHS, validateIndexAncestorRequest, validateRequest } from "./shared.js";
@@ -198,7 +197,7 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
 }
 
 export function createSqliteSparseWorkspaceSource(db: SqlDatabase): SparseWorkspaceSource {
-  return bindSparseSource(db, "workspace", {
+  return {
     readState: (checkoutId) => readIndexTrackerState(db, checkoutId),
     dirtyPaths: (checkoutId) => iterateIndexTrackerDirty(db, checkoutId),
     hydrate: (request) => {
@@ -210,5 +209,5 @@ export function createSqliteSparseWorkspaceSource(db: SqlDatabase): SparseWorksp
       }
     },
     indexAncestorFacts: (request) => indexAncestorFacts(db, request),
-  });
+  };
 }

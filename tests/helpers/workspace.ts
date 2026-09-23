@@ -2,7 +2,7 @@ import { NodeFsCompat } from "../../packages/do/src/fs/compat/node.js";
 import { createExactPathStateSource } from "../../packages/do/src/fs/exact-path-states.js";
 import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
 import type { Filesystem } from "../../packages/do/src/fs/types.js";
-import { createSqliteSparseWorkspaceSource } from "../../packages/git/src/do-fs/index.js";
+import { createSqliteSparseCapability } from "../../packages/git/src/do-fs/index.js";
 import { initializeIndexTracker } from "../../packages/git/src/do-fs/indexes/index-tracker.js";
 import type { GitContext } from "../../packages/git/src/ops/core/context.js";
 import { initRepository } from "../../packages/git/src/ops/repository/init.js";
@@ -41,7 +41,7 @@ export function makeWorkspace(options: MakeWorkspaceOptions = {}): TestWorkspace
     database,
     worktree,
     exactRootStates: createExactPathStateSource(db),
-    sparseWorkspace: createSqliteSparseWorkspaceSource(db),
+    sparseWorkspace: createSqliteSparseCapability(db).workspace,
     now,
     timezoneOffset: () => options.timezoneOffset ?? 0,
   };

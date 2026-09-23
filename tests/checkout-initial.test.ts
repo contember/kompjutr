@@ -50,6 +50,7 @@ function makeInitialRepository(
     indexTracker: {
       reseal: (checkoutId, baselineTreeOid, entries) =>
         resealIndexTracker(db, checkoutId, baselineTreeOid, entries),
+      advanceBaseline: () => false,
     },
     now,
     timezoneOffset: () => 0,
@@ -408,6 +409,7 @@ describe("initial standalone checkout", () => {
         tracker.reseal(checkoutId, baselineTreeOid, entries);
         throw injected;
       },
+      advanceBaseline: () => false,
     };
 
     try {

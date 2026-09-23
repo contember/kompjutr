@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createGit, type Git } from "../packages/git/src/client.js";
+import { createSqliteSparseCapability } from "../packages/git/src/do-fs/index.js";
 import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
 import type { GitContext } from "../packages/git/src/ops/core/context.js";
 import { recoverRef } from "../packages/git/src/ops/core/ref-log.js";
@@ -360,7 +361,7 @@ describe("local operation concurrency", () => {
     expect(test.workspace.repo.store.getRef("refs/heads/scratch-reentry")).toBeNull();
   });
 
-  it("rolls back an IndexTrackerWriter callback after two caught reentry attempts", async () => {
+  it("rolls back a sparse tracker callback after two caught reentry attempts", async () => {
     const test = await operationFixture();
     test.workspace.worktree.writeFile("/callback.txt", new TextEncoder().encode("callback\n"));
     await test.git.add({ paths: ["callback.txt"] });
@@ -372,19 +373,22 @@ describe("local operation concurrency", () => {
       worktree: test.workspace.worktree,
       now: test.workspace.context.now,
       timezoneOffset: test.workspace.context.timezoneOffset,
-      indexTracker: {
-        reseal: () => true,
-        advanceBaseline: () => {
-          for (let attempt = 0; attempt < 2; attempt++) {
-            expect(() =>
-              updateRef(test.workspace.context, test.workspace.repo, {
-                ref: `refs/heads/callback-reentry-${attempt}`,
-                value: test.topic,
-              }),
-            ).toThrowError(expect.objectContaining({ code: "EREENTRANT" }));
-            attempts++;
-          }
-          throw callbackFailure;
+      sparse: {
+        ...createSqliteSparseCapability(test.workspace.database.db),
+        tracker: {
+          reseal: () => true,
+          advanceBaseline: () => {
+            for (let attempt = 0; attempt < 2; attempt++) {
+              expect(() =>
+                updateRef(test.workspace.context, test.workspace.repo, {
+                  ref: `refs/heads/callback-reentry-${attempt}`,
+                  value: test.topic,
+                }),
+              ).toThrowError(expect.objectContaining({ code: "EREENTRANT" }));
+              attempts++;
+            }
+            throw callbackFailure;
+          },
         },
       },
     });

@@ -5,13 +5,12 @@ import { GitError, hasErrorCode, MissingIdentityError } from "../../common/error
 import { type Commit, hashObject, type Person, serializeCommit } from "../../common/objects.js";
 import { indexScanOwned } from "../../store/index.js";
 import { writeObjectsOwned } from "../../store/repository/shared.js";
-import { snapshotCommitTreeOwned } from "../../store/sparse/sparse-workspace.js";
 import type { GitContext, GitIdentity } from "../core/context.js";
 import type { CommitResult } from "../core/kinds.js";
 import { committerRefLogMetadata, type RefLogReason } from "../core/ref-log.js";
 import { buildTreeInBatch } from "../tree/tree-build-full.js";
 import {
-  planSparseTreeBuildFromSource,
+  planSparseTreeBuild,
   type SparseTreeBuildPlan,
   writeSparseTreePlanInBatch,
 } from "../tree/tree-build-sparse.js";
@@ -199,14 +198,14 @@ function sparseTreePlan(
   const source = context.commitTrees;
   if (source === undefined) return null;
   try {
-    const snapshot = snapshotCommitTreeOwned(source, {
+    const snapshot = source.snapshot({
       repoId: repo.store.repoId,
       checkoutId: repo.checkout.checkoutId,
       root: repo.root,
       baselineTreeOid,
     });
     if (!snapshot.available) return null;
-    const plan = planSparseTreeBuildFromSource(repo.checkout.db, source, snapshot, baselineTreeOid);
+    const plan = planSparseTreeBuild(snapshot, baselineTreeOid);
     return plan.available ? plan : null;
   } catch (error) {
     if (hasErrorCode(error, "E2BIG")) return null;
@@ -255,7 +254,7 @@ function publishCommitResult(
     );
   }
   // A false result leaves the prior baseline mismatched, so sparse readers safely use full scans.
-  context?.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, result.tree);
+  context?.indexTracker?.advanceBaseline(repo.checkout.checkoutId, result.tree);
   return { oid: result.oid };
 }
 

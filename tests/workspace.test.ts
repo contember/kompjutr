@@ -96,8 +96,7 @@ describe("workspace fixture", () => {
     const otherWrapper = new SqliteGitDatabase(captured.database.db);
     expect(captured.initialWorktree?.supportsDatabase?.(captured.database)).toBe(true);
     expect(captured.initialWorktree?.supportsDatabase?.(otherWrapper)).toBe(false);
-    expect(captured.selectedPaths).toBeDefined();
-    expect(captured.commitTrees).toBeDefined();
+    expect(captured.sparse?.database).toBe(captured.database.db);
   });
 
   it("opens one checkout-bound view from one routing lookup", () => {

@@ -2,67 +2,37 @@ import { GitError } from "../../common/errors.js";
 import { comparePaths } from "../../common/streams.js";
 import type { SelectedWorktreeFact } from "../../store/core/contracts.js";
 import type { IndexEntry } from "../../store/index.js";
-import { ADD_RETAINED_BYTES } from "./staging-add-stage.js";
-import type { AvailableSelectedPaths } from "./staging-selected-validation.js";
+import type { AvailableSelectedPaths } from "./staging-selected-shared.js";
 
-const SELECTED_MERGE_FIXED_BYTES = 128;
-const SELECTED_MERGE_SLOT_BYTES = 8;
 const ADD_SELECTED_PATHS = 1_000;
 
+/** Merge the exact and recursive selections, falling back past 1,000 distinct paths. */
 export function mergeSelectedAddResults(
   exact: AvailableSelectedPaths,
   recursive: AvailableSelectedPaths,
 ): AvailableSelectedPaths | null {
-  if (exact.trusted && recursive.trusted) {
-    const retainedPaths = new Set<string>();
-    const retain = (path: string): boolean => {
-      if (retainedPaths.has(path)) return true;
-      if (retainedPaths.size === ADD_SELECTED_PATHS) return false;
-      retainedPaths.add(path);
-      return true;
-    };
-    const index = mergeSelectedIndexRows(exact.index, recursive.index, retain);
-    if (index === null) return null;
-    const worktree = mergeSelectedWorktreeRows(exact.worktree, recursive.worktree, retain);
-    if (worktree === null) return null;
-    return {
-      available: true,
-      index,
-      worktree,
-      structuralBytes: 0,
-      trusted: true,
-    };
-  }
-  const slots =
-    exact.index.length + recursive.index.length + exact.worktree.length + recursive.worktree.length;
-  const mergeCharge = SELECTED_MERGE_FIXED_BYTES + slots * SELECTED_MERGE_SLOT_BYTES;
-  if (
-    !Number.isSafeInteger(mergeCharge) ||
-    exact.structuralBytes > ADD_RETAINED_BYTES - recursive.structuralBytes ||
-    exact.structuralBytes + recursive.structuralBytes > ADD_RETAINED_BYTES - mergeCharge
-  ) {
-    return null;
-  }
-  const index = mergeSelectedIndexRows(exact.index, recursive.index);
-  const worktree = mergeSelectedWorktreeRows(exact.worktree, recursive.worktree);
-  if (index === null || worktree === null) return null;
-  return {
-    available: true,
-    index,
-    worktree,
-    structuralBytes: exact.structuralBytes + recursive.structuralBytes + mergeCharge,
-    trusted: false,
+  const retainedPaths = new Set<string>();
+  const retain = (path: string): boolean => {
+    if (retainedPaths.has(path)) return true;
+    if (retainedPaths.size === ADD_SELECTED_PATHS) return false;
+    retainedPaths.add(path);
+    return true;
   };
+  const index = mergeSelectedIndexRows(exact.index, recursive.index, retain);
+  if (index === null) return null;
+  const worktree = mergeSelectedWorktreeRows(exact.worktree, recursive.worktree, retain);
+  if (worktree === null) return null;
+  return { available: true, index, worktree };
 }
 
 function mergeSelectedIndexRows(
   left: readonly IndexEntry[],
   right: readonly IndexEntry[],
-  retain?: (path: string) => boolean,
+  retain: (path: string) => boolean,
 ): IndexEntry[] | null {
   const rows: IndexEntry[] = [];
   const append = (row: IndexEntry): boolean => {
-    if (retain !== undefined && !retain(row.path)) return false;
+    if (!retain(row.path)) return false;
     rows.push(row);
     return true;
   };
@@ -116,11 +86,11 @@ function sameIndexEntry(left: IndexEntry, right: IndexEntry): boolean {
 function mergeSelectedWorktreeRows(
   left: readonly SelectedWorktreeFact[],
   right: readonly SelectedWorktreeFact[],
-  retain?: (path: string) => boolean,
+  retain: (path: string) => boolean,
 ): SelectedWorktreeFact[] | null {
   const rows: SelectedWorktreeFact[] = [];
   const append = (row: SelectedWorktreeFact): boolean => {
-    if (retain !== undefined && !retain(row.path)) return false;
+    if (!retain(row.path)) return false;
     rows.push(row);
     return true;
   };

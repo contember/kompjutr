@@ -8,14 +8,9 @@ import type {
 } from "../../store/core/contracts.js";
 import { contentIdKey, type IndexEntry } from "../../store/index.js";
 import { sharedRepoStoreMutations } from "../../store/repository/shared.js";
-import {
-  hasSparseSourceReceipt,
-  hydrateSparseWorkspaceOwned,
-  sparseDirtyPathsOwned,
-  sparseIndexAncestorFactsOwned,
-} from "../../store/sparse/sparse-workspace.js";
+import type { SparseTrackerSeedEntry } from "../../store/sparse/capability.js";
 import type { TargetEntry } from "../checkout/checkout.js";
-import type { GitContext, IndexTrackerSeedEntry } from "../core/context.js";
+import type { GitContext } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
@@ -82,7 +77,7 @@ export interface SparseStatusResult {
 interface PreparedSparseStatus {
   details: StatusDetail[];
   renames: ExactRenameClassification | undefined;
-  reseal: { currentTreeOid: string | null; seed: IndexTrackerSeedEntry[] } | null;
+  reseal: { currentTreeOid: string | null; seed: SparseTrackerSeedEntry[] } | null;
 }
 
 function prepareSparseStatus(
@@ -99,7 +94,7 @@ function prepareSparseStatus(
   try {
     candidates = sparseStatusCandidates(
       repo,
-      sparseDirtyPathsOwned(source, repo.checkout.checkoutId),
+      source.dirtyPaths(repo.checkout.checkoutId),
       baselineTreeOid,
       currentTreeOid,
     );
@@ -115,7 +110,7 @@ function prepareSparseStatus(
     return { details: [], renames: renameClassifier?.finish(), reseal: null };
   }
 
-  const hydrated: SparseWorkspaceResult = hydrateSparseWorkspaceOwned(source, {
+  const hydrated: SparseWorkspaceResult = source.hydrate({
     repoId: repo.store.repoId,
     checkoutId: repo.checkout.checkoutId,
     root: repo.root,
@@ -170,16 +165,14 @@ function prepareSparseStatus(
       const ancestors = sparseUntrackedAncestors(reportableUntracked);
       if (ancestors.paths.length !== 0) {
         if (source.indexAncestorFacts === undefined) return null;
-        const result = sparseIndexAncestorFactsOwned(source, {
+        const result = source.indexAncestorFacts({
           checkoutId: repo.checkout.checkoutId,
           ancestors: ancestors.paths,
         });
         if (result.facts.length !== ancestors.paths.length) {
           throw new CorruptError("sparse index ancestor lookup returned the wrong fact count");
         }
-        ancestorFacts = hasSparseSourceReceipt(repo.checkout.db, "workspace", source)
-          ? new Map(result.facts.map((fact) => [fact.path, fact]))
-          : validatedAncestorFacts(ancestors.paths, result.facts);
+        ancestorFacts = new Map(result.facts.map((fact) => [fact.path, fact]));
       }
     } catch (error) {
       if (hasErrorCode(error, "E2BIG")) return null;
@@ -235,7 +228,7 @@ function prepareSparseStatus(
   const details = [
     ...flushStatusRows(repo, worktree, buffered, undefined, true, worktreeComparison.hashes),
   ];
-  const seed: IndexTrackerSeedEntry[] = [];
+  const seed: SparseTrackerSeedEntry[] = [];
   for (const path of candidates) {
     const flags = retained.get(path);
     if (flags !== undefined) seed.push({ path, flags });
@@ -361,28 +354,6 @@ function sparseUntrackedAncestors(paths: readonly string[]): { paths: string[] }
     }
   }
   return { paths: [...ancestors].sort(comparePaths) };
-}
-
-function validatedAncestorFacts(
-  ancestors: readonly string[],
-  facts: readonly SparseIndexAncestorFact[],
-): Map<string, SparseIndexAncestorFact> {
-  const result = new Map<string, SparseIndexAncestorFact>();
-  for (let index = 0; index < ancestors.length; index++) {
-    const path = ancestors[index];
-    const fact = facts[index];
-    if (
-      path === undefined ||
-      fact === undefined ||
-      fact.path !== path ||
-      typeof fact.exact !== "boolean" ||
-      typeof fact.descendant !== "boolean"
-    ) {
-      throw new CorruptError("sparse index ancestor lookup returned unordered facts");
-    }
-    result.set(path, fact);
-  }
-  return result;
 }
 
 function sparseCollapsedUntrackedPath(

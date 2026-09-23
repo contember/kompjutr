@@ -282,12 +282,18 @@ rows before untracked rows and ignored rows in eager `status()` and
 ordering inside each group. The staged deletion thus precedes the same path's
 untracked row; `statusStream()` remains path/window ordered.
 
-Native status, staging, and commit-tree snapshot fast paths accept only an
-internal sparse-source receipt bound to the exact SQLite `Database` instance.
-A spread, wrapper, custom source, or source from another database uses the
-generic streaming path. Selected-path projection retains at most 1,000 distinct
-paths, each with up to four conflict-stage index rows. Native workspace
-hydration bounds its 1,000-path request and retained index rows. Commit-tree
+Native status, staging, checkout, and commit-tree snapshot fast paths come
+from one sparse capability that `createSqliteSparseCapability` builds over the
+Git store's SQLite `Database`; `createGit` refuses a capability built over any
+other database with `EINVAL`, and that database identity is the only check.
+The capability's sources read rows the store wrote, so their results are
+trusted like any stored row. A capability not built by
+`createSqliteSparseCapability`, or with replaced members, is host code trusted
+as-is: wrong results are undefined behavior, like out-of-band table mutation.
+Selected-path
+projection retains at most 1,000 distinct paths, each with up to four
+conflict-stage index rows. Native workspace hydration bounds its 1,000-path
+request and retained index rows. Commit-tree
 snapshot instead shares one global 1,000-item counter across its materialized
 dirty, index, directory, and tree-entry results. Overflow makes the fast path
 unavailable and falls back without truncating caller-visible results.

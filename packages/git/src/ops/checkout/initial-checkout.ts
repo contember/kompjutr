@@ -5,7 +5,8 @@ import { fromHex } from "../../common/bytes.js";
 import { CorruptError } from "../../common/errors.js";
 import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { type InitialStateSession, PACK_BLOB_BATCH_TARGET_BYTES } from "../../store/index.js";
-import type { GitContext, IndexTrackerSeedEntry, InitialWorktreeSession } from "../core/context.js";
+import type { SparseTrackerSeedEntry } from "../../store/sparse/capability.js";
+import type { GitContext, InitialWorktreeSession } from "../core/context.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import type { Repository } from "../repository/repository.js";
 import { type TargetEntry, treeStream } from "../tree/tree-stream.js";
@@ -104,9 +105,9 @@ function writeInitialCheckout(
   treeOid: string,
   worktree: InitialWorktreeSession,
   index: InitialStateSession,
-): IndexTrackerSeedEntry[] | null {
+): SparseTrackerSeedEntry[] | null {
   const window: TargetEntry[] = [];
-  let trackerSeed: IndexTrackerSeedEntry[] | null = [];
+  let trackerSeed: SparseTrackerSeedEntry[] | null = [];
   let trackerSeedBytes = INITIAL_TRACKER_FIXED_BYTES;
   for (const entry of treeStream(repo, treeOid)) {
     if (entry.mode === "160000") {

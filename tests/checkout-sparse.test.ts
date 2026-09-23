@@ -10,21 +10,18 @@ import type {
 import { fromHex, toHex, utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
 import { CorruptError } from "../packages/git/src/common/errors.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
-import {
-  createSqliteSelectedPathSource,
-  createSqliteSparseWorkspaceSource,
-} from "../packages/git/src/do-fs/index.js";
-import type { GitContext, IndexTrackerSeedEntry } from "../packages/git/src/ops/core/context.js";
+import { createSqliteSparseCapability } from "../packages/git/src/do-fs/index.js";
+import type { GitContext } from "../packages/git/src/ops/core/context.js";
 import { checkout } from "../packages/git/src/ops/refs/refs.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
 import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
 import { hashWorktreePath } from "../packages/git/src/ops/worktree/worktree-io.js";
 import type {
   SelectedPathRequest,
-  SelectedPathResult,
   SparseWorkspaceSource,
 } from "../packages/git/src/store/core/contracts.js";
 import type { IndexEntry } from "../packages/git/src/store/index.js";
+import type { SparseTrackerSeedEntry } from "../packages/git/src/store/sparse/capability.js";
 import {
   configureFixtureIdentity,
   requireSparseWorkspace,
@@ -172,7 +169,7 @@ function selectedCheckoutContext(
   calls: SelectedCheckoutCalls,
 ): GitContext {
   const sparse = requireSparseWorkspace(workspace);
-  const selected = createSqliteSelectedPathSource(workspace.database.db);
+  const selected = createSqliteSparseCapability(workspace.database.db).selected;
   return {
     ...sparseTrackerContext(workspace),
     sparseWorkspace: {
@@ -190,24 +187,6 @@ function selectedCheckoutContext(
         const result = selected.select(request);
         calls.statements.push(workspace.storage.statementCount - before);
         return result;
-      },
-    },
-  };
-}
-
-function selectedResultContext(
-  workspace: TestRepository,
-  transform: (
-    result: Extract<SelectedPathResult, { available: true }>,
-  ) => Extract<SelectedPathResult, { available: true }> | { available: false },
-): GitContext {
-  const native = createSqliteSelectedPathSource(workspace.database.db);
-  return {
-    ...sparseTrackerContext(workspace),
-    selectedPaths: {
-      select(request) {
-        const result = native.select(request);
-        return result.available ? transform(result) : result;
       },
     },
   };
@@ -368,7 +347,7 @@ describe("sparse checkout", () => {
     sealIndexTracker(workspace);
 
     const probe = new WorktreePayloadProbe(workspace.database.db);
-    const source = createSqliteSparseWorkspaceSource(probe);
+    const source = createSqliteSparseCapability(probe).workspace;
     const exact = source.hydrate({
       repoId: workspace.repo.store.repoId,
       checkoutId: workspace.repo.checkout.checkoutId,
@@ -488,65 +467,6 @@ describe("sparse checkout", () => {
     expectFile(workspace, `/${path}`, "after\n");
     expect(calls.requests).toHaveLength(1);
     expect(calls.hydrates).toBe(0);
-  });
-
-  it("rejects malformed, duplicate, unordered, and extraneous selected facts before mutation", () => {
-    const assertRejected = (
-      transform: (
-        result: Extract<SelectedPathResult, { available: true }>,
-      ) => Extract<SelectedPathResult, { available: true }>,
-    ): void => {
-      const { workspace, base, target, paths } = makeChangedFiles(3, 2);
-      const worktree = new NoScanWorktree(workspace.worktree);
-      const before = paths.map((path) =>
-        utf8Decoder.decode(workspace.worktree.readFile(`/${path}`)),
-      );
-
-      expect(() =>
-        checkout(selectedResultContext(workspace, transform), workspace.repo, worktree, {
-          ref: target,
-        }),
-      ).toThrow(CorruptError);
-      expect(workspace.repo.head().oid).toBe(base);
-      expect(worktree.writes).toEqual([]);
-      expect(worktree.removals).toEqual([]);
-      expect(
-        paths.map((path) => utf8Decoder.decode(workspace.worktree.readFile(`/${path}`))),
-      ).toEqual(before);
-    };
-
-    assertRejected((result) => ({
-      ...result,
-      index: result.index.map((entry, index) => (index === 0 ? { ...entry, stage: 5 } : entry)),
-    }));
-    assertRejected((result) => ({
-      ...result,
-      index: result.index.map((entry, index) =>
-        index === 0 ? { ...entry, path: "invalid\ud800path" } : entry,
-      ),
-    }));
-    assertRejected((result) => ({ ...result, index: [...result.index, ...result.index] }));
-    assertRejected((result) => ({ ...result, worktree: [...result.worktree].reverse() }));
-    assertRejected((result) => ({
-      ...result,
-      worktree: [
-        ...result.worktree,
-        {
-          path: "unrelated.txt",
-          stat: {
-            type: "file",
-            mode: 0o100644,
-            size: 0,
-            mtime: 0,
-            ino: 1,
-            nlink: 1,
-            rev: 0,
-            target: null,
-            contentId: null,
-          },
-        },
-      ],
-    }));
   });
 
   it("uses exact selected facts for non-structural additions and deletions", () => {
@@ -983,7 +903,7 @@ describe("sparse checkout", () => {
   it("does not fall back or reseal when sparse apply fails", () => {
     const { workspace, target } = makeChangedFiles(2, 1);
     const source = requireSparseWorkspace(workspace);
-    const reseals: Array<{ baseline: string | null; entries: IndexTrackerSeedEntry[] }> = [];
+    const reseals: Array<{ baseline: string | null; entries: SparseTrackerSeedEntry[] }> = [];
     const context: GitContext = {
       ...workspace.context,
       sparseWorkspace: source,
@@ -992,6 +912,7 @@ describe("sparse checkout", () => {
           reseals.push({ baseline, entries: [...entries] });
           return true;
         },
+        advanceBaseline: () => false,
       },
     };
     const worktree: Worktree = new FailingWriteWorktree(workspace.worktree);
@@ -1028,6 +949,7 @@ describe("sparse checkout", () => {
         reseal() {
           throw new Error("injected tracker reseal failure");
         },
+        advanceBaseline: () => false,
       },
     };
     const worktree = new NoScanWorktree(workspace.worktree);

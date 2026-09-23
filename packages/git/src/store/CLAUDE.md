@@ -21,7 +21,7 @@ operations/    restartable merge, replay, and rebase state; the scoped
 schema/        editable schema version 1; no migrations
 trees/         tree/commit projections and streaming walks
 pack/          pack read, ingest, publication, deletion, and delta workspace
-sparse/        sparse snapshots, selection, index rows, and tree resolution
+sparse/        the sparse capability contract; `do-fs` implements it
 maintenance/   roots, reachability, repack, sweep, and durable run control
 @kompjutr/sqlite  database contract, GitError base, and routing limits
 ```

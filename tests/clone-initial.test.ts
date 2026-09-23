@@ -374,15 +374,21 @@ describe("clone initial-state fast path", () => {
     fixture.commit("tracker failure");
     const server = await startGitServer(fixture.dir);
     const injected = new GitError("EIO", "injected tracker failure");
-    const factory: GitFactory = (binding) =>
-      createGit()({
+    const factory: GitFactory = (binding) => {
+      if (binding.sparse === undefined) throw new Error("runtime has no sparse capability");
+      return createGit()({
         ...binding,
-        indexTracker: {
-          reseal() {
-            throw injected;
+        sparse: {
+          ...binding.sparse,
+          tracker: {
+            reseal() {
+              throw injected;
+            },
+            advanceBaseline: () => true,
           },
         },
       });
+    };
     const storage = new RecordingStorage();
     const workspace = makeRuntime(storage, factory);
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CorruptError, GitError } from "../packages/git/src/common/errors.js";
-import { createSqliteCommitTreeSnapshotSource } from "../packages/git/src/do-fs/index.js";
+import { createSqliteSparseCapability } from "../packages/git/src/do-fs/index.js";
 import {
   advanceIndexTrackerBaseline,
   INDEX_DIRTY,
@@ -8,7 +8,7 @@ import {
   resealIndexTracker,
   WORKTREE_DIRTY,
 } from "../packages/git/src/do-fs/indexes/index-tracker.js";
-import type { GitContext, IndexTrackerSeedEntry } from "../packages/git/src/ops/core/context.js";
+import type { GitContext } from "../packages/git/src/ops/core/context.js";
 import { openRepository } from "../packages/git/src/ops/core/context.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
 import { add } from "../packages/git/src/ops/staging/staging.js";
@@ -23,6 +23,7 @@ import { hashWorktreePath, indexEntryFor } from "../packages/git/src/ops/worktre
 import type { SparseWorkspaceSource } from "../packages/git/src/store/core/contracts.js";
 import type { IndexEntry } from "../packages/git/src/store/index.js";
 import { MAINTENANCE_ROOT_EPOCH_EXHAUSTED } from "../packages/git/src/store/maintenance/control.js";
+import type { SparseTrackerSeedEntry } from "../packages/git/src/store/sparse/capability.js";
 import { GitFixture } from "./helpers/git.js";
 import {
   configureFixtureIdentity,
@@ -56,7 +57,7 @@ function recordingContext(workspace: TestRepository) {
   const reseals: Array<{
     checkoutId: number;
     baselineTreeOid: string | null;
-    entries: IndexTrackerSeedEntry[];
+    entries: SparseTrackerSeedEntry[];
   }> = [];
   const context: Pick<GitContext, "sparseWorkspace" | "indexTracker"> = {
     sparseWorkspace: workspace.context.sparseWorkspace,
@@ -65,6 +66,7 @@ function recordingContext(workspace: TestRepository) {
         reseals.push({ checkoutId, baselineTreeOid, entries: [...entries] });
         return true;
       },
+      advanceBaseline: () => false,
     },
   };
   return { context, reseals };
@@ -877,7 +879,7 @@ describe("sparse eager status", () => {
     stageWorktreePaths(workspace, ["a.txt"]);
     const context: GitContext = {
       ...workspace.context,
-      commitTrees: createSqliteCommitTreeSnapshotSource(workspace.database.db),
+      commitTrees: createSqliteSparseCapability(workspace.database.db).commitTrees,
       indexTracker: {
         reseal: (checkoutId, baselineTreeOid, entries) =>
           resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries),
@@ -920,6 +922,7 @@ describe("sparse eager status", () => {
             reseals++;
             return true;
           },
+          advanceBaseline: () => false,
         },
       };
       return { workspace, state, context, reseals: () => reseals };
@@ -956,6 +959,7 @@ describe("sparse eager status", () => {
         reseal() {
           throw new GitError("E2BIG", "injected sparse tracker publication failure");
         },
+        advanceBaseline: () => false,
       },
     };
 
@@ -987,6 +991,7 @@ describe("sparse eager status", () => {
         reseal(checkoutId, baselineTreeOid, entries) {
           return resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries);
         },
+        advanceBaseline: () => false,
       },
     };
 
@@ -1022,6 +1027,7 @@ describe("sparse eager status", () => {
           reseals++;
           return true;
         },
+        advanceBaseline: () => false,
       },
     };
 
@@ -1053,6 +1059,7 @@ describe("sparse eager status", () => {
           reseals++;
           return true;
         },
+        advanceBaseline: () => false,
       },
     };
 

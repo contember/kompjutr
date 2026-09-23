@@ -103,7 +103,6 @@ export type {
   GitCliNetworkBinding,
   GitContext,
   GitIdentity,
-  IndexTrackerWriter,
   InitialWorktreeWriter,
 } from "./ops/core/context.js";
 export { findRepository, nestedRoots, openRepository } from "./ops/core/context.js";
@@ -231,3 +230,8 @@ export {
   type StoreOptions,
 } from "./store/index.js";
 export { initializeGitSchema, SCHEMA_VERSION } from "./store/schema/schema.js";
+export type {
+  SparseCapability,
+  SparseIndexTracker,
+  SparseTrackerSeedEntry,
+} from "./store/sparse/capability.js";

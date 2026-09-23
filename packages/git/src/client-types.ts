@@ -3,7 +3,6 @@ import type {
   ExactRootStateSource,
   GitCliNetworkBinding,
   GitIdentity,
-  IndexTrackerWriter,
   InitialWorktreeWriter,
 } from "./ops/core/context.js";
 import type {
@@ -94,12 +93,8 @@ import type {
   WorktreeRemoveOptions,
 } from "./ops/worktree/worktrees.js";
 import type { AuthCallback, GitHttpClient } from "./protocol/transport.js";
-import type {
-  CommitTreeSnapshotSource,
-  SelectedPathSource,
-  SparseWorkspaceSource,
-} from "./store/core/contracts.js";
 import type { SqliteGitDatabase } from "./store/database/database.js";
+import type { SparseCapability } from "./store/sparse/capability.js";
 
 export type { PullResult } from "./ops/core/kinds.js";
 export type { AbortableNetworkOptions, CloneOptions, FetchOptions } from "./ops/network/network.js";
@@ -294,10 +289,8 @@ export interface GitWorkspaceBinding {
   worktree: Worktree;
   exactRootStates?: ExactRootStateSource;
   initialWorktree?: InitialWorktreeWriter;
-  indexTracker?: IndexTrackerWriter;
-  sparseWorkspace?: SparseWorkspaceSource;
-  selectedPaths?: SelectedPathSource;
-  commitTrees?: CommitTreeSnapshotSource;
+  /** Must be built over `database.db`; the client refuses any other database. */
+  sparse?: SparseCapability;
   now: () => number;
   timezoneOffset: () => number;
   defaultIdentity?: GitIdentity;

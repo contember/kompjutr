@@ -10,7 +10,6 @@ import type {
   SelectedWorktreeFact,
 } from "../../store/core/contracts.js";
 import type { IndexEntry } from "../../store/index.js";
-import { bindSparseSource } from "../../store/sparse/receipt.js";
 import { decodeSparseWorktreeRow, validatedSparseIndexEntry } from "./index-rows.js";
 import {
   encoder,
@@ -334,7 +333,7 @@ function selectPaths(db: SqlDatabase, request: SelectedPathRequest): SelectedPat
 }
 
 export function createSqliteSelectedPathSource(db: SqlDatabase): SelectedPathSource {
-  return bindSparseSource(db, "selected-paths", {
+  return {
     select: (request) => selectPaths(db, request),
-  });
+  };
 }

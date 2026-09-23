@@ -118,8 +118,7 @@ function runAdd(
   let pathspec: CompiledPathspecMatcher | undefined;
   pathspec = all ? undefined : compilePathspecs(specs);
   if (!all && pathspec !== undefined) {
-    const selected =
-      index === repo.checkout ? selectAddPaths(repo, specs, pathspec, context) : null;
+    const selected = index === repo.checkout ? selectAddPaths(repo, specs, context) : null;
     if (selected !== null) {
       assertSelectedPathspecsMatch(specs, selected);
       applyAdd(

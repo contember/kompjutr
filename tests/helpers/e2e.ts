@@ -19,7 +19,7 @@ import { Workspace } from "../../packages/do/src/runtime/workspace.js";
 import type { Git } from "../../packages/git/src/client.js";
 import { createGit } from "../../packages/git/src/client.js";
 import { comparePaths } from "../../packages/git/src/common/streams.js";
-import { createSqliteSparseWorkspaceSource } from "../../packages/git/src/do-fs/index.js";
+import { createSqliteSparseCapability } from "../../packages/git/src/do-fs/index.js";
 import type { GitContext } from "../../packages/git/src/ops/core/context.js";
 import { openRepository } from "../../packages/git/src/ops/core/context.js";
 import type { StatusBranch } from "../../packages/git/src/ops/status/status.js";
@@ -1099,7 +1099,7 @@ function probeContext(workspace: Workspace, storage: SqliteTestStorage): GitCont
   return {
     database: new SqliteGitDatabase(new Database(storage)),
     worktree: workspace.filesystem,
-    sparseWorkspace: createSqliteSparseWorkspaceSource(workspace.db),
+    sparseWorkspace: createSqliteSparseCapability(workspace.db).workspace,
     now: () => FIXED_TIME,
     timezoneOffset: () => 0,
   };

@@ -7,6 +7,7 @@ import type {
   SparseWorkspaceSource,
 } from "../../store/core/contracts.js";
 import type { SqliteGitDatabase } from "../../store/index.js";
+import type { SparseIndexTracker } from "../../store/sparse/capability.js";
 import { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 
@@ -49,22 +50,6 @@ export interface InitialWorktreeWriter {
   ): InitialWorktreeResult<T>;
 }
 
-export interface IndexTrackerSeedEntry {
-  path: string;
-  flags: number;
-}
-
-/** Optional sparse-state writer. Core supplies bounded, complete snapshots only. */
-export interface IndexTrackerWriter {
-  reseal(
-    checkoutId: number,
-    baselineTreeOid: string | null,
-    entries: Iterable<IndexTrackerSeedEntry>,
-  ): boolean;
-  /** Move a sealed baseline without clearing its dirty journal. */
-  advanceBaseline?(checkoutId: number, baselineTreeOid: string | null): boolean;
-}
-
 export type ExactRootState = "present" | "missing";
 
 /** Optional bulk path-state capability used by repository checkout lifecycle operations. */
@@ -78,7 +63,7 @@ export interface GitContext {
   worktree: Worktree;
   exactRootStates?: ExactRootStateSource;
   initialWorktree?: InitialWorktreeWriter;
-  indexTracker?: IndexTrackerWriter;
+  indexTracker?: SparseIndexTracker;
   sparseWorkspace?: SparseWorkspaceSource;
   selectedPaths?: SelectedPathSource;
   commitTrees?: CommitTreeSnapshotSource;

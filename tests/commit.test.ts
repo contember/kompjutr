@@ -13,7 +13,7 @@ import {
   serializeCommit,
   serializeTree,
 } from "../packages/git/src/common/objects.js";
-import { createSqliteCommitTreeSnapshotSource } from "../packages/git/src/do-fs/index.js";
+import { createSqliteSparseCapability } from "../packages/git/src/do-fs/index.js";
 import {
   advanceIndexTrackerBaseline,
   invalidateIndexTracker,
@@ -78,9 +78,9 @@ function stagePath(workspace: TestRepository, path: string): void {
 
 function acceleratedContext(
   workspace: TestRepository,
-  commitTrees: CommitTreeSnapshotSource = createSqliteCommitTreeSnapshotSource(
+  commitTrees: CommitTreeSnapshotSource = createSqliteSparseCapability(
     workspace.database.db,
-  ),
+  ).commitTrees,
 ): GitContext {
   return {
     ...workspace.context,
@@ -991,9 +991,9 @@ describe("bounded commit tree acceleration", () => {
       writeWorkFile(workspace, "/a.txt", "two\n");
       stagePath(workspace, "a.txt");
 
-      let source: CommitTreeSnapshotSource = createSqliteCommitTreeSnapshotSource(
+      let source: CommitTreeSnapshotSource = createSqliteSparseCapability(
         workspace.database.db,
-      );
+      ).commitTrees;
       if (mode === "unavailable") source = { snapshot: () => ({ available: false }) };
       if (mode === "capacity") {
         source = {
@@ -1086,80 +1086,6 @@ describe("bounded commit tree acceleration", () => {
       ...(workspace.context.sparseWorkspace?.dirtyPaths(workspace.repo.checkout.checkoutId) ?? []),
     ]).toEqual([{ path: "a.txt", flags: 3 }]);
     expect(eagerStatus(workspace.repo, workspace.worktree, {}, context)).toEqual([]);
-  });
-
-  it("propagates malformed tracker, index, and authenticated ancestry snapshots", () => {
-    const corruptions: Array<"tracker" | "index" | "ancestry"> = ["tracker", "index", "ancestry"];
-    for (const corruption of corruptions) {
-      const workspace = makeRepo("/");
-      useIdentity(workspace);
-      writeWorkFile(workspace, "/dir/a.txt", "one\n");
-      stageAll(workspace);
-      commit(workspace.context, workspace.repo, { message: "base" });
-      sealCommitBaseline(workspace);
-      writeWorkFile(workspace, "/dir/a.txt", "two\n");
-      stagePath(workspace, "dir/a.txt");
-      const native = createSqliteCommitTreeSnapshotSource(workspace.database.db);
-      const corrupt: CommitTreeSnapshotSource = {
-        snapshot(request) {
-          const result = native.snapshot(request);
-          if (!result.available) return result;
-          if (corruption === "tracker") {
-            return {
-              ...result,
-              dirty: result.dirty.map((entry, ordinal) =>
-                ordinal === 0 ? { ...entry, flags: 0 } : entry,
-              ),
-            };
-          }
-          if (corruption === "index") {
-            return {
-              ...result,
-              index: result.index.map((entry, ordinal) =>
-                ordinal === 0 ? { ...entry, mode: 0 } : entry,
-              ),
-            };
-          }
-          const empty = serializeTree([]);
-          return {
-            ...result,
-            directories: result.directories.map((directory) =>
-              directory.path === "dir"
-                ? { ...directory, oid: hashObject("tree", empty), entries: [] }
-                : directory,
-            ),
-          };
-        },
-      };
-      const before = {
-        head: workspace.repo.head(),
-        objects: workspace.repo.store.objectCount(),
-        refs: workspace.repo.store.listRefs(),
-        index: workspace.repo.checkout.indexEntries(),
-        tracker: readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
-        dirty: [
-          ...(workspace.context.sparseWorkspace?.dirtyPaths(workspace.repo.checkout.checkoutId) ??
-            []),
-        ],
-      };
-
-      expect(() =>
-        commit(acceleratedContext(workspace, corrupt), workspace.repo, {
-          message: corruption,
-        }),
-      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-      expect({
-        head: workspace.repo.head(),
-        objects: workspace.repo.store.objectCount(),
-        refs: workspace.repo.store.listRefs(),
-        index: workspace.repo.checkout.indexEntries(),
-        tracker: readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
-        dirty: [
-          ...(workspace.context.sparseWorkspace?.dirtyPaths(workspace.repo.checkout.checkoutId) ??
-            []),
-        ],
-      }).toEqual(before);
-    }
   });
 });
 

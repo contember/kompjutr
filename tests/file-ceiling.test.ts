@@ -41,7 +41,6 @@ const GRANDFATHERED_SYMBOLS: ReadonlySet<string> = new Set([
   "git/store/fetch/fetch-publication.ts::FetchPublicationTable.beginFetchPublication",
   "git/store/maintenance/state/state-transitions.ts::rolloverFinishedMaintenanceRun",
   "git/ops/network/network-fetch-legacy.ts::prepareLegacyFetchPublication",
-  "git/ops/tree/tree-build-sparse.ts::planSparseTreeBuildOwned",
   "git/diff/myers-search.ts::findSplit",
   // One flag-by-flag option surface each, compared byte-for-byte against the
   // real binaries in tests/shell/parity-{grep,rg}.test.ts.

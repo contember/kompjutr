@@ -364,7 +364,7 @@ export type SelectedPathResult =
       worktree: SelectedWorktreeFact[];
     };
 
-/** Optional selected-subtree projection; native provenance remains internal. */
+/** Selected-subtree projection; trusted, supplied through `SparseCapability`. */
 export interface SelectedPathSource {
   select(request: SelectedPathRequest): SelectedPathResult;
 }
@@ -399,12 +399,15 @@ export type CommitTreeSnapshotResult =
       directories: CommitTreeSnapshotDirectory[];
     };
 
-/** Optional baseline projection for narrow tree rebuilds. */
+/**
+ * Baseline projection for narrow tree rebuilds; trusted, supplied through
+ * `SparseCapability`.
+ */
 export interface CommitTreeSnapshotSource {
   snapshot(request: CommitTreeSnapshotRequest): CommitTreeSnapshotResult;
 }
 
-/** Optional sparse workspace projection. Generic clients may supply their own. */
+/** Sparse workspace projection; trusted, supplied through `SparseCapability`. */
 export interface SparseWorkspaceSource {
   readState(checkoutId: number): SparseWorkspaceState;
   dirtyPaths(checkoutId: number): Iterable<SparseWorkspaceDirty>;

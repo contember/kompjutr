@@ -5,18 +5,10 @@ import {
   type GitHttpClient,
   type GitIdentity,
   type GitPromisorAuth,
-  type IndexTrackerWriter,
   SqliteGitDatabase,
   type StoreOptions,
 } from "@kompjutr/git";
-import {
-  advanceIndexTrackerBaseline,
-  createSqliteCommitTreeSnapshotSource,
-  createSqliteSelectedPathSource,
-  createSqliteSparseWorkspaceSource,
-  initializeIndexTracker,
-  resealIndexTracker,
-} from "@kompjutr/git/do-fs";
+import { createSqliteSparseCapability, initializeIndexTracker } from "@kompjutr/git/do-fs";
 import { Database, type DurableObjectStorageLike } from "../db/db.js";
 import { NodeFsCompat } from "../fs/compat/node.js";
 import { createExactPathStateSource } from "../fs/exact-path-states.js";
@@ -67,12 +59,6 @@ export class Workspace {
       this.#gitDatabase = new SqliteGitDatabase(this.db, this.#options);
       initializeIndexTracker(this.db);
       const now = this.#options.now ?? Date.now;
-      const indexTracker: IndexTrackerWriter = {
-        reseal: (checkoutId, baselineTreeOid, entries) =>
-          resealIndexTracker(this.db, checkoutId, baselineTreeOid, entries),
-        advanceBaseline: (checkoutId, baselineTreeOid) =>
-          advanceIndexTrackerBaseline(this.db, checkoutId, baselineTreeOid),
-      };
       const initialWorktree = createInitialWorktreeWriter(
         this.db,
         now,
@@ -83,10 +69,7 @@ export class Workspace {
         worktree: this.filesystem,
         exactRootStates: createExactPathStateSource(this.db),
         initialWorktree,
-        indexTracker,
-        sparseWorkspace: createSqliteSparseWorkspaceSource(this.db),
-        selectedPaths: createSqliteSelectedPathSource(this.db),
-        commitTrees: createSqliteCommitTreeSnapshotSource(this.db),
+        sparse: createSqliteSparseCapability(this.db),
         now,
         timezoneOffset: this.#options.timezoneOffset ?? (() => 0),
         defaultIdentity: this.#options.defaultGitIdentity,

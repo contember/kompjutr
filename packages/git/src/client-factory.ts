@@ -7,6 +7,7 @@ import { createGitClientRefMethods } from "./client-refs.js";
 import { createGitClientReplayMethods } from "./client-replay.js";
 import type { GitClientServices } from "./client-services.js";
 import type { CreateGitOptions, Git, GitFactory, GitWorkspaceBinding } from "./client-types.js";
+import { GitError } from "./common/errors.js";
 import { type GitContext, nestedRoots, openRepository } from "./ops/core/context.js";
 import type { Repository } from "./ops/repository/repository.js";
 import { withGitMutationGuardOwned } from "./store/database/database.js";
@@ -30,10 +31,17 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
   if (binding.promisorHeaders !== undefined) context.promisorHeaders = binding.promisorHeaders;
   if (binding.cliNetwork !== undefined) context.cliNetwork = binding.cliNetwork;
   if (binding.initialWorktree !== undefined) context.initialWorktree = binding.initialWorktree;
-  if (binding.indexTracker !== undefined) context.indexTracker = binding.indexTracker;
-  if (binding.sparseWorkspace !== undefined) context.sparseWorkspace = binding.sparseWorkspace;
-  if (binding.selectedPaths !== undefined) context.selectedPaths = binding.selectedPaths;
-  if (binding.commitTrees !== undefined) context.commitTrees = binding.commitTrees;
+  const sparse = binding.sparse;
+  if (sparse !== undefined) {
+    // Sparse sources are trusted like stored rows, so they must read this store.
+    if (sparse.database !== binding.database.db) {
+      throw new GitError("EINVAL", "sparse capability reads a different database");
+    }
+    context.indexTracker = sparse.tracker;
+    context.sparseWorkspace = sparse.workspace;
+    context.selectedPaths = sparse.selected;
+    context.commitTrees = sparse.commitTrees;
+  }
   const yieldNow = options.yieldNow ?? binding.yieldNow;
   if (yieldNow !== undefined) context.yieldNow = yieldNow;
   const cliRunner = createContextGitCliRunner(context);

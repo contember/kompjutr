@@ -2,22 +2,13 @@
 
 import { CorruptError, hasErrorCode } from "../../common/errors.js";
 import type { SelectedPathResult, SparseWorkspaceResult } from "../../store/core/contracts.js";
-import {
-  hasSparseSourceReceipt,
-  hydrateSparseWorkspaceOwned,
-  selectSparsePathsOwned,
-  sparseDirtyPathsOwned,
-} from "../../store/sparse/sparse-workspace.js";
 import type { GitContext } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { checkoutSparseChanges, type SparseCheckoutChange } from "./sparse-checkout-apply.js";
 import { selectedSparseWorkspaceRows } from "./sparse-checkout-selected.js";
-import {
-  sparseCheckoutWorktreeMatches,
-  validateSparseCheckoutRows,
-} from "./sparse-checkout-validation.js";
+import { sparseCheckoutWorktreeMatches } from "./sparse-checkout-worktree.js";
 
 const SPARSE_CHECKOUT_PATHS = 1_000;
 
@@ -28,10 +19,6 @@ export interface SparseCheckoutCandidate {
 }
 
 type AvailableSparseWorkspaceResult = Extract<SparseWorkspaceResult, { available: true }>;
-interface SparseCheckoutHydration {
-  result: AvailableSparseWorkspaceResult;
-  trusted: boolean;
-}
 
 export function trySparseCleanCheckout(
   context: GitContext,
@@ -48,7 +35,7 @@ export function trySparseCleanCheckout(
     const baselineTreeOid = repo.headTree();
     const state = source.readState(repo.checkout.checkoutId);
     if (!state.available || state.baselineTreeOid !== baselineTreeOid) return false;
-    for (const _entry of sparseDirtyPathsOwned(source, repo.checkout.checkoutId)) {
+    for (const _entry of source.dirtyPaths(repo.checkout.checkoutId)) {
       return false;
     }
     if (repo.checkout.hasCheckoutBlockingIndexEntries()) return false;
@@ -57,24 +44,19 @@ export function trySparseCleanCheckout(
     if (candidates === null) return false;
     if (candidates.length === 0) return true;
 
-    const selected = selectSparseCheckoutRows(context, repo, candidates);
-    const loaded =
-      selected ??
+    const hydrated =
+      selectSparseCheckoutRows(context, repo, candidates) ??
       hydrateSparseCheckoutRows(source, repo, candidates, baselineTreeOid, targetTreeOid);
-    if (loaded === null) return false;
-    const hydrated = loaded.result;
+    if (hydrated === null) return false;
     if (hydrated.rows.length !== candidates.length) {
       throw new CorruptError("sparse checkout hydration returned the wrong row count");
     }
-    if (!loaded.trusted && !validateSparseCheckoutRows(candidates, hydrated.rows)) return false;
-    if (!sparseCheckoutWorktreeMatches(repo, worktree, hydrated.rows)) return false;
-
     const changes: SparseCheckoutChange[] = [];
     for (let index = 0; index < candidates.length; index++) {
       const candidate = candidates[index];
       const row = hydrated.rows[index];
-      if (candidate === undefined || row === undefined) {
-        throw new CorruptError("sparse checkout hydration lost a candidate");
+      if (candidate === undefined || row === undefined || row.path !== candidate.path) {
+        throw new CorruptError("sparse checkout hydration returned unordered rows");
       }
       changes.push({
         path: candidate.path,
@@ -83,6 +65,7 @@ export function trySparseCleanCheckout(
         worktreeType: row.worktree?.type ?? null,
       });
     }
+    if (!sparseCheckoutWorktreeMatches(repo, worktree, hydrated.rows)) return false;
     applying = true;
     return checkoutSparseChanges(repo, worktree, changes);
   } catch (error) {
@@ -97,8 +80,8 @@ function hydrateSparseCheckoutRows(
   candidates: readonly SparseCheckoutCandidate[],
   baselineTreeOid: string | null,
   targetTreeOid: string,
-): SparseCheckoutHydration | null {
-  const hydrated = hydrateSparseWorkspaceOwned(source, {
+): AvailableSparseWorkspaceResult | null {
+  const hydrated = source.hydrate({
     repoId: repo.store.repoId,
     checkoutId: repo.checkout.checkoutId,
     root: repo.root,
@@ -106,30 +89,24 @@ function hydrateSparseCheckoutRows(
     currentTreeOid: targetTreeOid,
     paths: candidates.map((candidate) => candidate.path),
   });
-  return hydrated.available
-    ? {
-        result: hydrated,
-        trusted: hasSparseSourceReceipt(repo.checkout.db, "workspace", source),
-      }
-    : null;
+  return hydrated.available ? hydrated : null;
 }
 
 function selectSparseCheckoutRows(
   context: GitContext,
   repo: Repository,
   candidates: readonly SparseCheckoutCandidate[],
-): SparseCheckoutHydration | null {
+): AvailableSparseWorkspaceResult | null {
   const source = context.selectedPaths;
   if (source === undefined || hasStructuralCandidates(candidates)) return null;
-  const selected: SelectedPathResult = selectSparsePathsOwned(source, {
+  const selected: SelectedPathResult = source.select({
     repoId: repo.store.repoId,
     checkoutId: repo.checkout.checkoutId,
     root: repo.root,
     specs: candidates.map((candidate) => ({ path: candidate.path, recursive: false })),
   });
   if (!selected.available) return null;
-  const trusted = hasSparseSourceReceipt(repo.checkout.db, "selected-paths", source);
-  return { result: selectedSparseWorkspaceRows(candidates, selected, trusted), trusted };
+  return selectedSparseWorkspaceRows(candidates, selected);
 }
 
 function hasStructuralCandidates(candidates: readonly SparseCheckoutCandidate[]): boolean {

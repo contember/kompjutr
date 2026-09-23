@@ -1,9 +1,7 @@
 import { comparePaths } from "../../common/paths.js";
-import type { IndexEntry } from "../../store/index.js";
+import type { SelectedPathResult } from "../../store/core/contracts.js";
 
-export function hasExactSelectedIndexPath(rows: readonly IndexEntry[], path: string): boolean {
-  return rows[lowerBoundSelectedPath(rows, path)]?.path === path;
-}
+export type AvailableSelectedPaths = Extract<SelectedPathResult, { available: true }>;
 
 export function lowerBoundSelectedPath<T extends { path: string }>(
   rows: readonly T[],

@@ -1,6 +1,6 @@
 import type { IndexEntry } from "../../store/index.js";
+import type { SparseTrackerSeedEntry } from "../../store/sparse/capability.js";
 import type { TargetEntry } from "../checkout/checkout.js";
-import type { IndexTrackerSeedEntry } from "../core/context.js";
 import type { WorktreePath } from "../worktree/worktree-io.js";
 import { type BufferedStatusRow, octalMode } from "./status-rows.js";
 
@@ -61,7 +61,7 @@ export class FullStatusTrackerSeed {
     this.#finished = true;
   }
 
-  *entries(): Generator<IndexTrackerSeedEntry> {
+  *entries(): Generator<SparseTrackerSeedEntry> {
     for (const [path, flags] of this.#entries) yield { path, flags };
   }
 

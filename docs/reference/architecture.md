@@ -175,10 +175,10 @@ driver values through `RowShape`, `expectText`, `expectSafeInteger`, and
 `expectBlob`. A failed stored-row decode is `CorruptError`; it is not an
 invitation to re-prove the row. Reads do not use SQL storage-class witnesses,
 two-phase metadata preflights, or projection-to-object re-authentication.
-Same-database sparse sources carry an internal receipt bound to the exact
-`Database` instance; structural copies, wrappers, custom sources, and sources
-from another database take the generic path. Out-of-band mutation of `git_*` or
-`fs_*` tables is undefined behavior.
+Sparse fast-path sources are rows the store wrote, read through one capability;
+`createGit` checks once that the capability reads the Git store's `Database`
+and then trusts its results. Out-of-band mutation of `git_*` or `fs_*` tables
+is undefined behavior.
 
 Algorithm and concurrency checks remain. These include traversal cycle and
 termination guards, arbitrary-iterable ordering checks, conditional transition

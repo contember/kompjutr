@@ -1,61 +1,13 @@
-import { CorruptError } from "../../common/errors.js";
 import type { SparseWorkspaceRow } from "../../store/core/contracts.js";
 import { contentIdKey } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
-import { gitModeFor, type Worktree } from "../worktree/worktree.js";
+import type { Worktree } from "../worktree/worktree.js";
 import {
   hashExactWorktreePaths,
   indexMatchesStat,
   type WorktreePath,
 } from "../worktree/worktree-io.js";
-import type { SparseCheckoutCandidate } from "./sparse-checkout-operation.js";
-
-export function validateSparseCheckoutRows(
-  candidates: readonly SparseCheckoutCandidate[],
-  rows: readonly SparseWorkspaceRow[],
-): boolean {
-  for (let index = 0; index < candidates.length; index++) {
-    const candidate = candidates[index];
-    const row = rows[index];
-    if (candidate === undefined || row === undefined || row.path !== candidate.path) {
-      throw new CorruptError("sparse checkout hydration returned unordered rows");
-    }
-    if (
-      !sameSparseLeaf(row.baseline, candidate.before) ||
-      !sameSparseLeaf(row.current, candidate.after)
-    ) {
-      throw new CorruptError("sparse checkout hydration disagrees with the tree difference");
-    }
-    if (candidate.before === undefined) {
-      if (row.index.length !== 0) return false;
-      if (row.worktree !== null && row.worktree.type !== "dir") return false;
-      continue;
-    }
-    const entry = row.index[0];
-    if (
-      row.index.length !== 1 ||
-      entry === undefined ||
-      entry.stage !== 0 ||
-      entry.oid !== candidate.before.oid ||
-      entry.mode !== Number.parseInt(candidate.before.mode, 8) ||
-      row.worktree === null ||
-      row.worktree.type === "dir" ||
-      gitModeFor(row.worktree) !== candidate.before.mode
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function sameSparseLeaf(
-  leaf: { mode: string; oid: string } | null,
-  entry: TargetEntry | undefined,
-): boolean {
-  if (leaf === null || entry === undefined) return leaf === null && entry === undefined;
-  return leaf.mode === entry.mode && leaf.oid === entry.oid;
-}
 
 export function sparseCheckoutWorktreeMatches(
   repo: Repository,

@@ -1,11 +1,12 @@
 import { expect } from "vitest";
 import { resealIndexTracker } from "../../packages/git/src/do-fs/indexes/index-tracker.js";
-import type { GitContext, IndexTrackerSeedEntry } from "../../packages/git/src/ops/core/context.js";
+import type { GitContext } from "../../packages/git/src/ops/core/context.js";
 import {
   hashWorktreePath,
   indexEntryFor,
 } from "../../packages/git/src/ops/worktree/worktree-io.js";
 import type { SparseWorkspaceSource } from "../../packages/git/src/store/core/contracts.js";
+import type { SparseTrackerSeedEntry } from "../../packages/git/src/store/sparse/capability.js";
 import type { TestRepository } from "./workspace.js";
 
 export function configureFixtureIdentity(workspace: TestRepository): void {
@@ -38,13 +39,14 @@ export function sparseTrackerContext(
       reseal(checkoutId, baselineTreeOid, entries) {
         return resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries);
       },
+      advanceBaseline: () => false,
     },
   };
 }
 
 export interface SealIndexTrackerOptions {
   baselineTreeOid?: string | null;
-  entries?: Iterable<IndexTrackerSeedEntry>;
+  entries?: Iterable<SparseTrackerSeedEntry>;
 }
 
 export function sealIndexTracker(

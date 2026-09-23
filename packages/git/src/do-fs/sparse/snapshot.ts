@@ -12,7 +12,6 @@ import type {
   SelectedPathRequest,
   SparseWorkspaceDirty,
 } from "../../store/core/contracts.js";
-import { bindSparseSource } from "../../store/sparse/receipt.js";
 import { readSelectedIndex, validateSelectedPathRequest } from "./selection.js";
 import {
   inputError,
@@ -410,7 +409,7 @@ function snapshotCommitTreeNative(
 }
 
 export function createSqliteCommitTreeSnapshotSource(db: SqlDatabase): CommitTreeSnapshotSource {
-  return bindSparseSource(db, "commit-tree", {
+  return {
     snapshot: (request) => snapshotCommitTreeNative(db, request),
-  });
+  };
 }

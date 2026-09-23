@@ -22,6 +22,7 @@ import {
   type PushLeaseExpectation,
 } from "../packages/git/src/client.js";
 import { utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { createSqliteSparseCapability } from "../packages/git/src/do-fs/index.js";
 import {
   iterateIndexTrackerDirty,
   readIndexTrackerState,
@@ -947,6 +948,23 @@ describe("git client", () => {
     await expect(reopened.status()).resolves.toEqual([
       { path: "conflict.txt", index: "U", worktree: "U" },
     ]);
+  });
+  it("refuses a sparse capability built over another database", () => {
+    const workspace = makeTestWorkspace();
+    const binding = {
+      database: workspace.database,
+      worktree: workspace.worktree,
+      now: workspace.context.now,
+      timezoneOffset: workspace.context.timezoneOffset,
+    };
+    const foreign = createSqliteSparseCapability(new TestDatabase(workspace.storage));
+
+    expect(() => createGit()({ ...binding, sparse: foreign })).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    expect(() =>
+      createGit()({ ...binding, sparse: createSqliteSparseCapability(workspace.database.db) }),
+    ).not.toThrow();
   });
   it("blocks ordinary native commit during replay and lets hard reset clear it", async () => {
     const { workspace, storage } = makeWorkspace();

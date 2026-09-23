@@ -50,6 +50,10 @@ We validate at the boundary and trust the store.
 - The schema at open — version and exact shape.
 - Write time — schema `CHECK` constraints and write-path validation. They are
   the reason reads may trust rows.
+- The sparse capability — `createGit` checks only that it reads the Git
+  store's database. Its results are trusted; a capability not built by
+  `createSqliteSparseCapability`, or with replaced members, is host code, and
+  its wrong results are undefined behavior like out-of-band table mutation.
 
 **Reads trust stored rows.** A read decodes a driver value through a shared
 guard (`expectText`, `expectSafeInteger`, `expectBlob`, declarative row shapes)

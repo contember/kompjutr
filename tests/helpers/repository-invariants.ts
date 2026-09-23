@@ -3,7 +3,7 @@ import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
 import type { Filesystem } from "../../packages/do/src/fs/types.js";
 import { isOid } from "../../packages/git/src/common/bytes.js";
 import { CorruptError, GitError } from "../../packages/git/src/common/errors.js";
-import { createSqliteSparseWorkspaceSource } from "../../packages/git/src/do-fs/index.js";
+import { createSqliteSparseCapability } from "../../packages/git/src/do-fs/index.js";
 import {
   initializeIndexTracker,
   iterateIndexTrackerDirty,
@@ -49,7 +49,7 @@ export function reopenTestRepository(
     database,
     worktree,
     exactRootStates: createExactPathStateSource(db),
-    sparseWorkspace: createSqliteSparseWorkspaceSource(db),
+    sparseWorkspace: createSqliteSparseCapability(db).workspace,
     now: workspace.context.now,
     timezoneOffset: workspace.context.timezoneOffset,
   };
