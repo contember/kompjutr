@@ -229,19 +229,7 @@ export function boundedGitCliResult(
   result: GitCliResult,
   options: ResolvedGitCliRunOptions,
 ): GitCliResult {
-  if (typeof result !== "object" || result === null || Array.isArray(result)) {
-    throw new GitError("EINVAL", "git CLI handler result must be an object");
-  }
-  const stdout: unknown = Reflect.get(result, "stdout");
-  const stderr: unknown = Reflect.get(result, "stderr");
-  const exitCode: unknown = Reflect.get(result, "exitCode");
-  const truncated: unknown = Reflect.get(result, "truncated");
-  validateResultString(stdout, "stdout");
-  validateResultString(stderr, "stderr");
-  validateExitCode(exitCode);
-  if (typeof truncated !== "boolean") {
-    throw new GitError("EINVAL", "git CLI truncated must be a boolean");
-  }
+  const { stdout, stderr, exitCode, truncated } = result;
   const stdoutBytes = gitCliUtf8ByteLength(stdout, "git CLI stdout", false);
   if (stdoutBytes > options.maxStdoutBytes) {
     throw new GitError("E2BIG", `git CLI stdout exceeds ${options.maxStdoutBytes} bytes`);
@@ -336,17 +324,6 @@ export function gitCliUtf8ByteLength(value: string, label: string, rejectNul: bo
 function validateResultString(value: unknown, stream: string): asserts value is string {
   if (typeof value !== "string") {
     throw new GitError("EINVAL", `git CLI ${stream} must be a string`);
-  }
-}
-
-function validateExitCode(exitCode: unknown): asserts exitCode is number {
-  if (
-    typeof exitCode !== "number" ||
-    !Number.isSafeInteger(exitCode) ||
-    exitCode < 0 ||
-    exitCode > 255
-  ) {
-    throw new GitError("EINVAL", "git CLI exit code must be a safe integer from 0 through 255");
   }
 }
 

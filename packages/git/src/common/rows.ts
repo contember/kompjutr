@@ -209,6 +209,42 @@ export function array<T>(
   });
 }
 
+export function callable(
+  message = "value is not a function",
+): Decoder<(...args: never[]) => unknown> {
+  return new Decoder((value) => (isCallable(value) ? success(value) : failure(message)));
+}
+
+function isCallable(value: unknown): value is (...args: never[]) => unknown {
+  return typeof value === "function";
+}
+
+export function instanceOf<T>(
+  type: abstract new (...args: never[]) => T,
+  message: string,
+): Decoder<T> {
+  return new Decoder((value) => (value instanceof type ? success(value) : failure(message)));
+}
+
+/** Decode every own enumerable value of a non-array object. */
+export function record<T>(
+  decoder: Decoder<T>,
+  message = "value is not a record",
+): Decoder<Record<string, T>> {
+  return new Decoder((value) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return failure(message);
+    }
+    const decoded: Array<[string, T]> = [];
+    for (const [key, entry] of Object.entries(value)) {
+      const item = decoder.tryDecode(entry);
+      if (!item.ok) return item;
+      decoded.push([key, item.value]);
+    }
+    return success(Object.fromEntries(decoded));
+  });
+}
+
 export function unknownArray(message = "stored value is not an array"): Decoder<unknown[]> {
   return new Decoder((value) => (Array.isArray(value) ? success(value) : failure(message)));
 }

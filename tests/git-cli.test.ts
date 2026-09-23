@@ -485,14 +485,7 @@ describe("git CLI runtime validation and bounds", () => {
     expect(validateGitCliInput({ argv: [argument] }).argv).toEqual([argument]);
     expect((await createGitCliRunner({}).runCli({ argv: [argument] })).exitCode).toBe(1);
   });
-  it("rejects argv mutation after capturing its checked length", async () => {
-    let calls = 0;
-    const runner = createGitCliRunner({
-      status() {
-        calls++;
-        return gitCliResult("", "", 0);
-      },
-    });
+  it("copies argv only up to its checked length", () => {
     const argv = ["status", "--porcelain"];
     Object.defineProperty(argv, 0, {
       configurable: true,
@@ -501,13 +494,17 @@ describe("git CLI runtime validation and bounds", () => {
         return "status";
       },
     });
-    await expect(runner.runCli({ argv })).rejects.toThrowError(
+    expect(validateGitCliInput({ argv }).argv).toEqual(["status", "--porcelain"]);
+  });
+  it("rejects a huge sparse argv from its length without visiting entries", () => {
+    const argv: string[] = [];
+    argv.length = 2 ** 32 - 1;
+    expect(() => validateGitCliInput({ argv })).toThrowError(
       expect.objectContaining({
-        code: "EINVAL",
-        message: "git CLI argv changed during validation",
+        code: "E2BIG",
+        message: `git CLI argv exceeds ${GIT_CLI_MAX_ARGV_ENTRIES} entries`,
       }),
     );
-    expect(calls).toBe(0);
   });
   it("accepts cwd, stdin, and env crossing their former component thresholds", async () => {
     const cwd = `/${"x".repeat(4 * 1024)}`;

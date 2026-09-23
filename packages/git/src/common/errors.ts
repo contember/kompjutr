@@ -15,6 +15,15 @@ export function hasErrorCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
+export function errorCode(error: unknown): string | undefined {
+  return typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
 export class NotARepositoryError extends GitError {
   constructor(dir: string, options?: { cause?: unknown }) {
     super("ENOTAREPO", `not a git repository: ${dir}`, options);

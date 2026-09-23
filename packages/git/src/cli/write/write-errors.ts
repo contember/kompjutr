@@ -1,4 +1,4 @@
-import { hasErrorCode } from "../../common/errors.js";
+import { errorCode, hasErrorCode } from "../../common/errors.js";
 import { type GitContext, nestedRoots } from "../../ops/core/context.js";
 import type { Repository } from "../../ops/repository/repository.js";
 import type { AddLiteralPathsResult } from "../../ops/staging/staging.js";
@@ -39,7 +39,7 @@ export function mapAddFailure(
   paths: readonly ResolvedAddPath[],
   output: GitCliOutputContext,
 ): GitCliResult | undefined {
-  const message = untrustedErrorMessage(error);
+  const message = errorMessage(error);
   if (hasErrorCode(error, "EPATHOUTSIDE") && message !== undefined) {
     return gitCliDiagnosticResult("fatal: ", message, "\n", 128, output);
   }
@@ -70,15 +70,13 @@ export function mapAddFailure(
   return undefined;
 }
 
-function untrustedErrorMessage(error: unknown): string | undefined {
-  if ((typeof error !== "object" && typeof error !== "function") || error === null) {
-    return undefined;
-  }
-  try {
-    return "message" in error && typeof error.message === "string" ? error.message : undefined;
-  } catch {
-    return undefined;
-  }
+function errorMessage(error: unknown): string | undefined {
+  return typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof error.message === "string"
+    ? error.message
+    : undefined;
 }
 
 export function mapCommitFailure(
@@ -173,7 +171,7 @@ export function mapPathMutationFailure(
   paths: readonly ResolvedAddPath[],
   output: GitCliOutputContext,
 ): GitCliResult | undefined {
-  const message = untrustedErrorMessage(error);
+  const message = errorMessage(error);
   if (hasErrorCode(error, "EPATHSPEC") && message !== undefined) {
     for (const path of paths) {
       if (message.includes(`'${path.path}'`)) {
@@ -194,8 +192,8 @@ export function mapLocalMutationFailure(
   error: unknown,
   output: GitCliOutputContext,
 ): GitCliResult | undefined {
-  const code = untrustedErrorCode(error);
-  const message = untrustedErrorMessage(error);
+  const code = errorCode(error);
+  const message = errorMessage(error);
   if (code === undefined || message === undefined || !LOCAL_FAILURE_CODES.has(code))
     return undefined;
   return gitCliDiagnosticResult("fatal: ", message, "\n", 128, output);
@@ -219,18 +217,6 @@ const LOCAL_FAILURE_CODES = new Set([
   "ESTALEHEAD",
   "EWRONGHEAD",
 ]);
-
-function untrustedErrorCode(error: unknown): string | undefined {
-  if ((typeof error !== "object" && typeof error !== "function") || error === null) {
-    return undefined;
-  }
-  try {
-    const code: unknown = Reflect.get(error, "code");
-    return typeof code === "string" ? code : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 export function mapRebaseContinueFailure(
   repo: Repository,

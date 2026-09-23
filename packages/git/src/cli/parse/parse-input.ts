@@ -27,22 +27,19 @@ export function validateGitCliInputInternal(input: unknown): ValidatedGitCliInpu
   if (!Array.isArray(inputArgv)) {
     throw new GitError("EINVAL", "git CLI argv must be an array");
   }
-  const argvLength = inputArgv.length;
+  const argvLength: number = inputArgv.length;
   if (argvLength > GIT_CLI_MAX_ARGV_ENTRIES) {
     throw new GitError("E2BIG", `git CLI argv exceeds ${GIT_CLI_MAX_ARGV_ENTRIES} entries`);
   }
-  const argv = new Array<string>(argvLength);
+  const argv: string[] = [];
   for (let index = 0; index < argvLength; index++) {
-    if (inputArgv.length !== argvLength) throw mutatedArgv();
     const argument: unknown = inputArgv[index];
-    if (inputArgv.length !== argvLength) throw mutatedArgv();
     if (typeof argument !== "string") {
       throw new GitError("EINVAL", "git CLI argv entries must be strings");
     }
     gitCliUtf8ByteLength(argument, "git CLI argument", true);
-    argv[index] = argument;
+    argv.push(argument);
   }
-  if (inputArgv.length !== argvLength) throw mutatedArgv();
   const cwd = validateCwd(input);
   const env = validateEnvironment(input);
   let stdin: string | undefined;
@@ -113,10 +110,6 @@ function validateEnvironment(input: object): GitCliEnvironment {
     GIT_COMMITTER_NAME: committerName,
     GIT_COMMITTER_EMAIL: committerEmail,
   };
-}
-
-function mutatedArgv(): GitError {
-  return new GitError("EINVAL", "git CLI argv changed during validation");
 }
 
 function isPlainRecord(value: unknown): value is object {

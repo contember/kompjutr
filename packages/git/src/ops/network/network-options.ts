@@ -1,89 +1,133 @@
 import { GitError } from "../../common/errors.js";
+import {
+  bool,
+  callable,
+  instanceOf,
+  int,
+  OptionsSchema,
+  optional,
+  record,
+  text,
+  unknownArray,
+  unknownValue,
+} from "../../common/rows.js";
 import { normalizeRemoteUrl } from "../../protocol/remote.js";
 import { type GitAuth, RemoteAuthSession } from "../../protocol/transport.js";
 import type { GitContext } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";
 import type { FetchOperationOptions, RemoteAuthOptions } from "./network-types.js";
 
+const SIGNAL = optional(instanceOf(AbortSignal, "network signal must be an AbortSignal"));
+const HEADERS = optional(
+  record(
+    text("remote authentication headers must contain strings"),
+    "remote authentication headers must be a string record",
+  ),
+);
+
+const ABORTABLE_OPTIONS = new OptionsSchema(
+  { signal: SIGNAL },
+  "network options must be an object",
+);
+
+const REMOTE_AUTH_OPTIONS = new OptionsSchema(
+  {
+    headers: HEADERS,
+    onAuth: optional(callable("remote onAuth must be a function")),
+    onProgress: optional(callable("remote onProgress must be a function")),
+    onMessage: optional(callable("remote onMessage must be a function")),
+  },
+  "remote options must be an object",
+);
+
+const FETCH_TARGET_OPTIONS = new OptionsSchema(
+  {
+    remote: optional(
+      text("fetch remote must be a non-empty string").where(
+        (remote) => remote !== "",
+        "fetch remote must be a non-empty string",
+      ),
+    ),
+    url: optional(text("fetch url must be a string")),
+    refspecs: optional(unknownArray("fetch refspecs must be an array")),
+    filter: unknownValue(),
+    depth: unknownValue(),
+    deepen: unknownValue(),
+    unshallow: unknownValue(),
+    ref: unknownValue(),
+    remoteRef: unknownValue(),
+    singleBranch: unknownValue(),
+    prune: unknownValue(),
+    tags: unknownValue(),
+  },
+  "fetch options must be an object",
+);
+const MAPPED_FETCH_EXCLUDED = [
+  "depth",
+  "deepen",
+  "unshallow",
+  "ref",
+  "remoteRef",
+  "singleBranch",
+  "prune",
+  "tags",
+] as const;
+
+const DEEPENING_OPTIONS = new OptionsSchema(
+  {
+    depth: unknownValue(),
+    deepen: optional(
+      int(1, Number.MAX_SAFE_INTEGER, "fetch deepen must be a positive safe integer"),
+    ),
+    unshallow: optional(bool("fetch unshallow must be a boolean")),
+  },
+  "fetch options must be an object",
+);
+
+const CREDENTIALS = new OptionsSchema(
+  {
+    username: optional(text("remote authentication username must be a string")),
+    password: optional(text("remote authentication password must be a string")),
+    headers: HEADERS,
+  },
+  "remote authentication callback returned invalid credentials",
+  "EAUTH",
+);
+
 export function validateAbortableNetworkOptions(options: unknown): void {
-  if (typeof options !== "object" || options === null || Array.isArray(options)) {
-    throw new GitError("EINVAL", "network options must be an object");
-  }
-  const signal = Reflect.get(options, "signal");
-  if (signal !== undefined && !(signal instanceof AbortSignal)) {
-    throw new GitError("EINVAL", "network signal must be an AbortSignal");
-  }
+  ABORTABLE_OPTIONS.decode(options);
 }
 
 /** Validate the static remote/auth callback surface before any network request. */
 export function validateRemoteAuthOptions(options: unknown): void {
-  if (typeof options !== "object" || options === null || Array.isArray(options)) {
-    throw new GitError("EINVAL", "remote options must be an object");
-  }
-  validateFetchHeaders(Reflect.get(options, "headers"), "EINVAL");
-  for (const field of ["onAuth", "onProgress", "onMessage"]) {
-    const callback = Reflect.get(options, field);
-    if (callback !== undefined && typeof callback !== "function") {
-      throw new GitError("EINVAL", `remote ${field} must be a function`);
-    }
-  }
+  REMOTE_AUTH_OPTIONS.decode(options);
 }
 
 export function validateFetchOptions(options: unknown): void {
-  if (typeof options !== "object" || options === null || Array.isArray(options)) {
-    throw new GitError("EINVAL", "fetch options must be an object");
-  }
+  const target = FETCH_TARGET_OPTIONS.decode(options);
   validateRemoteAuthOptions(options);
   validateAbortableNetworkOptions(options);
   validateLegacyDeepeningOptions(options);
-  const remote = Reflect.get(options, "remote");
-  const url = Reflect.get(options, "url");
-  if (remote !== undefined && url !== undefined) {
+  if (target.remote !== undefined && target.url !== undefined) {
     throw new GitError("EINVAL", "fetch accepts either remote or url, not both");
   }
-  if (remote !== undefined && (typeof remote !== "string" || remote === "")) {
-    throw new GitError("EINVAL", "fetch remote must be a non-empty string");
-  }
-  if (url !== undefined && typeof url !== "string") {
-    throw new GitError("EINVAL", "fetch url must be a string");
-  }
-  const refspecs = Reflect.get(options, "refspecs");
-  const filter = Reflect.get(options, "filter");
-  if (filter !== undefined && filter !== "blob:none") {
+  if (target.filter !== undefined && target.filter !== "blob:none") {
     throw new GitError("EUNSUPPORTED", "fetch filter is not supported");
   }
-  if (refspecs !== undefined) {
-    if (!Array.isArray(refspecs)) throw new GitError("EINVAL", "fetch refspecs must be an array");
-    for (const field of [
-      "depth",
-      "deepen",
-      "unshallow",
-      "ref",
-      "remoteRef",
-      "singleBranch",
-      "prune",
-      "tags",
-    ]) {
-      if (Reflect.get(options, field) !== undefined) {
+  if (target.refspecs !== undefined) {
+    for (const field of MAPPED_FETCH_EXCLUDED) {
+      if (target[field] !== undefined) {
         throw new GitError("EINVAL", `mapped fetch cannot set ${field}`);
       }
     }
   }
 }
 
-export function validateLegacyDeepeningOptions(options: object): void {
-  const depth = Reflect.get(options, "depth");
-  const deepen = Reflect.get(options, "deepen");
-  const unshallow = Reflect.get(options, "unshallow");
+export function validateLegacyDeepeningOptions(options: unknown): void {
+  const { depth, deepen, unshallow } = DEEPENING_OPTIONS.decode(options);
   const selected = [depth, deepen, unshallow].filter((value) => value !== undefined).length;
   if (selected > 1) {
     throw new GitError("EINVAL", "fetch depth, deepen, and unshallow are mutually exclusive");
-  }
-  if (deepen !== undefined && (!Number.isSafeInteger(deepen) || deepen <= 0)) {
-    throw new GitError("EINVAL", "fetch deepen must be a positive safe integer");
-  }
-  if (unshallow !== undefined && typeof unshallow !== "boolean") {
-    throw new GitError("EINVAL", "fetch unshallow must be a boolean");
   }
 }
 
@@ -91,30 +135,8 @@ export function remoteUrlFor(repo: Repository, remote: string): string | undefin
   return repo.store.configGet(`remote.${remote}.url`);
 }
 
-function validateFetchHeaders(headers: unknown, code: "EAUTH" | "EINVAL"): void {
-  if (headers === undefined) return;
-  if (typeof headers !== "object" || headers === null || Array.isArray(headers)) {
-    throw new GitError(code, "remote authentication headers must be a string record");
-  }
-  for (const value of Object.values(headers)) {
-    if (typeof value !== "string") {
-      throw new GitError(code, "remote authentication headers must contain strings");
-    }
-  }
-}
-
 function validateFetchCredentials(credentials: GitAuth | undefined): void {
-  if (credentials === undefined) return;
-  if (typeof credentials !== "object" || credentials === null || Array.isArray(credentials)) {
-    throw new GitError("EAUTH", "remote authentication callback returned invalid credentials");
-  }
-  if (credentials.username !== undefined && typeof credentials.username !== "string") {
-    throw new GitError("EAUTH", "remote authentication username must be a string");
-  }
-  if (credentials.password !== undefined && typeof credentials.password !== "string") {
-    throw new GitError("EAUTH", "remote authentication password must be a string");
-  }
-  validateFetchHeaders(credentials.headers, "EAUTH");
+  if (credentials !== undefined) CREDENTIALS.decode(credentials);
 }
 
 /** A URL stored for a remote that is not an HTTP remote can never be this fetch's target. */

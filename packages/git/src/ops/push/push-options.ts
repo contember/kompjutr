@@ -1,6 +1,14 @@
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import {
+  bool,
+  OptionsSchema,
+  optional,
+  text,
+  unknownArray,
+  unknownValue,
+} from "../../common/rows.js";
+import {
   requireBranchRef,
   validatePushOptions as validateReceivePushOptions,
 } from "../../protocol/receive-pack.js";
@@ -13,49 +21,39 @@ import type { NormalizedPushLease, PushRefspec, RefspecSourceRef } from "../refs
 import type { Repository } from "../repository/repository.js";
 import type { LegacyPushSelection, PushOptions } from "./push-types.js";
 
+const PUSH_OPTIONS = new OptionsSchema(
+  {
+    remote: optional(
+      text("push remote must be a non-empty string").where(
+        (remote) => remote !== "",
+        "push remote must be a non-empty string",
+      ),
+    ),
+    url: optional(text("push url must be a string")),
+    atomic: optional(bool("push atomic must be a boolean")),
+    pushOptions: unknownValue(),
+    refspecs: optional(unknownArray("push refspecs must be an array")),
+    ref: optional(text("push ref must be a string")),
+    remoteRef: optional(text("push remoteRef must be a string")),
+    force: optional(bool("push force must be a boolean")),
+    delete: optional(bool("push delete must be a boolean")),
+  },
+  "push options must be an object",
+);
+const MAPPED_PUSH_EXCLUDED = ["ref", "remoteRef", "force", "delete"] as const;
+
 export function validatePushOperationOptions(options: unknown): void {
-  if (typeof options !== "object" || options === null || Array.isArray(options)) {
-    throw new GitError("EINVAL", "push options must be an object");
-  }
+  const push = PUSH_OPTIONS.decode(options);
   validateRemoteAuthOptions(options);
   validateAbortableNetworkOptions(options);
-  const remote = Reflect.get(options, "remote");
-  const url = Reflect.get(options, "url");
-  if (remote !== undefined && url !== undefined) {
+  if (push.remote !== undefined && push.url !== undefined) {
     throw new GitError("EINVAL", "push accepts either remote or url, not both");
   }
-  if (remote !== undefined && (typeof remote !== "string" || remote === "")) {
-    throw new GitError("EINVAL", "push remote must be a non-empty string");
-  }
-  if (url !== undefined && typeof url !== "string") {
-    throw new GitError("EINVAL", "push url must be a string");
-  }
-  const atomic = Reflect.get(options, "atomic");
-  if (atomic !== undefined && typeof atomic !== "boolean") {
-    throw new GitError("EINVAL", "push atomic must be a boolean");
-  }
-  validateReceivePushOptions(Reflect.get(options, "pushOptions"));
-
-  const refspecs = Reflect.get(options, "refspecs");
-  if (refspecs !== undefined) {
-    if (!Array.isArray(refspecs)) throw new GitError("EINVAL", "push refspecs must be an array");
-    for (const field of ["ref", "remoteRef", "force", "delete"]) {
-      if (Reflect.get(options, field) !== undefined) {
-        throw new GitError("EINVAL", `mapped push cannot set ${field}`);
-      }
-    }
-    return;
-  }
-  for (const field of ["ref", "remoteRef"]) {
-    const value = Reflect.get(options, field);
-    if (value !== undefined && typeof value !== "string") {
-      throw new GitError("EINVAL", `push ${field} must be a string`);
-    }
-  }
-  for (const field of ["force", "delete"]) {
-    const value = Reflect.get(options, field);
-    if (value !== undefined && typeof value !== "boolean") {
-      throw new GitError("EINVAL", `push ${field} must be a boolean`);
+  validateReceivePushOptions(push.pushOptions);
+  if (push.refspecs === undefined) return;
+  for (const field of MAPPED_PUSH_EXCLUDED) {
+    if (push[field] !== undefined) {
+      throw new GitError("EINVAL", `mapped push cannot set ${field}`);
     }
   }
 }
