@@ -96,9 +96,6 @@ export const MAINTENANCE_SCHEMA_STATEMENTS = [
      shallow_boundary INTEGER NOT NULL CHECK (
        typeof(shallow_boundary) = 'integer' AND shallow_boundary IN (0, 1)
      ),
-     physical_only INTEGER NOT NULL CHECK (
-       typeof(physical_only) = 'integer' AND physical_only IN (0, 1)
-     ),
      edge_cursor INTEGER NOT NULL CHECK (
        typeof(edge_cursor) = 'integer' AND edge_cursor BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
      ),
@@ -108,7 +105,7 @@ export const MAINTENANCE_SCHEMA_STATEMENTS = [
    ) WITHOUT ROWID`,
 
   `CREATE INDEX IF NOT EXISTS git_maintenance_objects_queue
-     ON git_maintenance_objects (repo_id, run_id, expanded, physical_only, oid)`,
+     ON git_maintenance_objects (repo_id, run_id, expanded, oid)`,
 
   `CREATE TABLE IF NOT EXISTS git_maintenance_shallow (
      repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),

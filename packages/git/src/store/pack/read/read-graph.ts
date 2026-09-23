@@ -5,6 +5,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError } from "../../../common/errors.js";
 import type { ObjectType, RawObject } from "../../../common/objects.js";
+import { int, nullable, RowShape, text } from "../../../common/rows.js";
 import { isPackGraphLimit, type PackGraphExit } from "../shared.js";
 import {
   advanceFrontier,
@@ -17,6 +18,33 @@ import {
   seedFrontier,
 } from "./read-graph-scratch.js";
 import { type PackReadScope, withPackReadScope } from "./read-scope.js";
+
+const INVALID_PAGE = "paged pack graph contains invalid metadata";
+
+const PAGE_LINK_ROW = new RowShape(
+  {
+    oid: text(INVALID_PAGE).where(isOid, INVALID_PAGE),
+    pack_id: int(0, Number.MAX_SAFE_INTEGER, INVALID_PAGE),
+    offset: int(0, Number.MAX_SAFE_INTEGER, INVALID_PAGE),
+    base_offset: nullable(int(0, Number.MAX_SAFE_INTEGER, INVALID_PAGE)),
+    base_oid: nullable(text(INVALID_PAGE).where(isOid, INVALID_PAGE)),
+    start: int(0, 1, INVALID_PAGE),
+  },
+  INVALID_PAGE,
+);
+
+/** One page entry, keyed physically; `baseKey` is null for a full object. */
+interface PageLink {
+  readonly oid: string;
+  readonly baseKey: string | null;
+  readonly baseOid: string | null;
+}
+
+interface PageLinks {
+  readonly links: ReadonlyMap<string, PageLink>;
+  /** The entry where each requested OID's chain starts. */
+  readonly starts: ReadonlyMap<string, string>;
+}
 
 export type PackObjectGraphReader = (
   oids: readonly string[],
@@ -75,12 +103,13 @@ export class PackGraphPager {
       const groups = readFrontierGroups(this.db, this.repoId, scope, step, wanted.length);
       const entryLimit = Math.max(this.graphPageEntries, groups.length);
       insertScratchPage(this.db, this.repoId, scope.readId, step, entryLimit);
-      const links = this.#readPageLinks(scope, step, seedJson, visiblePendingPackId, entryLimit);
-      const exitOf = pageExits(links);
+      const page = this.#readPageLinks(scope, step, seedJson, visiblePendingPackId, entryLimit);
+      const exitOf = pageExits(page.links);
 
       const moves: FrontierMove[] = [];
       for (const group of groups) {
-        const exit = exitOf(group.oid);
+        const start = page.starts.get(group.oid);
+        const exit = start === undefined ? null : exitOf(start);
         if (exit === null) continue;
         for (const origin of group.origins) {
           const depth = origin.depth + exit.distance;
@@ -107,8 +136,9 @@ export class PackGraphPager {
     seedJson: string,
     visiblePendingPackId: number,
     entryLimit: number,
-  ): Map<string, string | null> {
-    const links = new Map<string, string | null>();
+  ): PageLinks {
+    const links = new Map<string, PageLink>();
+    const starts = new Map<string, string>();
     let rowCount = 0;
     for (const row of scope.scoped(
       this.db.iterate(
@@ -121,25 +151,22 @@ export class PackGraphPager {
         visiblePendingPackId,
         this.repoId,
         visiblePendingPackId,
-        visiblePendingPackId,
+        this.repoId,
         this.repoId,
       ),
     )) {
       rowCount++;
-      const oid = row.oid;
-      const baseOid = row.base_oid;
-      if (
-        rowCount > entryLimit ||
-        typeof oid !== "string" ||
-        !isOid(oid) ||
-        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid))) ||
-        links.has(oid)
-      ) {
-        throw new CorruptError("paged pack graph contains invalid metadata");
-      }
-      links.set(oid, baseOid);
+      const entry = PAGE_LINK_ROW.decode(row);
+      const key = `${entry.pack_id}:${entry.offset}`;
+      if (rowCount > entryLimit || links.has(key)) throw new CorruptError(INVALID_PAGE);
+      links.set(key, {
+        oid: entry.oid,
+        baseKey: entry.base_offset === null ? null : `${entry.pack_id}:${entry.base_offset}`,
+        baseOid: entry.base_oid,
+      });
+      if (entry.start === 1) starts.set(entry.oid, key);
     }
-    return links;
+    return { links, starts };
   }
 
   /** Resolve the recorded pages back to front, each seeded by its successor. */
@@ -189,9 +216,7 @@ export class PackGraphPager {
 }
 
 /** Memoized exit of one page-local chain: where it leaves the page, and how far. */
-function pageExits(
-  links: ReadonlyMap<string, string | null>,
-): (start: string) => PackGraphExit | null {
+function pageExits(links: ReadonlyMap<string, PageLink>): (start: string) => PackGraphExit | null {
   const memo = new Map<string, PackGraphExit>();
   const visiting = new Set<string>();
   return (start: string): PackGraphExit | null => {
@@ -199,30 +224,29 @@ function pageExits(
     const path: string[] = [];
     let current = start;
     for (;;) {
-      const known = memo.get(current);
-      if (known !== undefined) break;
-      if (visiting.has(current)) throw new CorruptError(`cyclic delta chain at ${current}`);
+      if (memo.has(current)) break;
+      const link = links.get(current)!;
+      if (visiting.has(current)) throw new CorruptError(`cyclic delta chain at ${link.oid}`);
       visiting.add(current);
       path.push(current);
-      const base = links.get(current);
-      if (base === null || base === undefined || !links.has(base)) break;
-      current = base;
+      if (link.baseKey === null || !links.has(link.baseKey)) break;
+      current = link.baseKey;
     }
     for (let index = path.length - 1; index >= 0; index--) {
-      const oid = path[index]!;
-      const base = links.get(oid);
+      const key = path[index]!;
+      const link = links.get(key)!;
       let exit: PackGraphExit;
-      if (base === null || base === undefined) exit = { oid: null, distance: 0 };
-      else if (!links.has(base)) exit = { oid: base, distance: 1 };
+      if (link.baseKey === null) exit = { oid: null, distance: 0 };
+      else if (!links.has(link.baseKey)) exit = { oid: link.baseOid, distance: 1 };
       else {
-        const next = memo.get(base);
+        const next = memo.get(link.baseKey);
         if (next === undefined) {
           throw new CorruptError("paged pack graph did not resolve a local dependency");
         }
         exit = { oid: next.oid, distance: next.distance + 1 };
       }
-      memo.set(oid, exit);
-      visiting.delete(oid);
+      memo.set(key, exit);
+      visiting.delete(key);
     }
     return memo.get(start) ?? null;
   };

@@ -12,18 +12,8 @@ import {
   updateReclamationCounters,
 } from "./sweep-shared.js";
 
-// A pack delta resolves its base by OID, so a loose base outlives its own
-// reachability for as long as any pack that deltas against it survives. Both
-// tables cascade with the pack, so a surviving row means a surviving pack.
-const LOOSE_DELTA_BASE = `EXISTS (
-      SELECT 1 FROM git_pack_entries child
-       WHERE child.repo_id = object.repo_id AND child.base_oid = object.oid)
-    OR EXISTS (
-      SELECT 1 FROM git_pack_pending pending
-       WHERE pending.repo_id = object.repo_id AND pending.base_oid = object.oid)`;
-
 const LOOSE_COLUMNS = `object.repo_id, object.oid, candidate.unreachable_since_ms,
-  mark.oid IS NOT NULL AS marked, (${LOOSE_DELTA_BASE}) AS pinned,
+  mark.oid IS NOT NULL AS marked,
   coalesce((SELECT sum(length(chunk.data)) FROM git_object_chunks chunk
     WHERE chunk.repo_id = object.repo_id AND chunk.oid = object.oid), 0) AS stored_bytes`;
 
@@ -37,7 +27,6 @@ function readLooseRow(row: Record<string, unknown>, repoId: number): LooseRow {
         int(0, Number.MAX_SAFE_INTEGER, "loose unreachable time is invalid"),
       ),
       marked: int(0, 1, "loose maintenance mark is invalid"),
-      pinned: int(0, 1, "loose delta-base pin is invalid"),
       stored_bytes: int(0, Number.MAX_SAFE_INTEGER, "loose stored byte count is invalid"),
     },
     "loose maintenance row is malformed",
@@ -49,13 +38,8 @@ function readLooseRow(row: Record<string, unknown>, repoId: number): LooseRow {
     oid: decoded.oid,
     storedBytes: decoded.stored_bytes,
     marked: decoded.marked === 1,
-    pinned: decoded.pinned === 1,
     candidateSince: decoded.unreachable_since_ms,
   };
-}
-
-function retained(row: LooseRow): boolean {
-  return row.marked || row.pinned;
 }
 
 // One page holds the next loose objects after the cursor whose candidate row is
@@ -78,7 +62,7 @@ function readLooseActions(
        LEFT JOIN git_maintenance_objects mark
          ON mark.repo_id = object.repo_id AND mark.run_id = ? AND mark.oid = object.oid
       WHERE object.repo_id = ? AND object.oid > ?
-        AND CASE WHEN mark.oid IS NOT NULL OR ${LOOSE_DELTA_BASE}
+        AND CASE WHEN mark.oid IS NOT NULL
                  THEN candidate.oid IS NOT NULL
                  ELSE candidate.oid IS NULL OR candidate.unreachable_since_ms <= ? END
       ORDER BY object.oid COLLATE BINARY LIMIT ?`,
@@ -185,15 +169,15 @@ export function advanceLoose(
   deleteLooseCandidates(
     db,
     repoId,
-    page.filter(retained).map((row) => row.oid),
+    page.filter((row) => row.marked).map((row) => row.oid),
   );
   insertLooseCandidates(
     db,
     repoId,
-    page.filter((row) => !retained(row) && row.candidateSince === null).map((row) => row.oid),
+    page.filter((row) => !row.marked && row.candidateSince === null).map((row) => row.oid),
     nowMs,
   );
-  const doomed = page.filter((row) => !retained(row) && row.candidateSince !== null);
+  const doomed = page.filter((row) => !row.marked && row.candidateSince !== null);
   let bytes = 0;
   for (const row of doomed) {
     bytes += row.storedBytes;

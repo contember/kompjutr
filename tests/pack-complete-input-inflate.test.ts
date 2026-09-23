@@ -38,7 +38,7 @@ function decode(read: PackDataReader, bytes: Uint8Array, size: number): Uint8Arr
       type: "blob",
       size,
       entrySize: size,
-      baseOid: null,
+      baseOffset: null,
     },
     bytes,
     false,

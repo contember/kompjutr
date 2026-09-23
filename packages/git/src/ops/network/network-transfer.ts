@@ -93,7 +93,6 @@ export async function transferPack(
     deepenRelative?: boolean;
     includeTag?: boolean;
     filter?: UploadPackFilter;
-    thinPack?: boolean;
     promisorRemote?: string;
     advertised: Set<string>;
     haves?: string[];
@@ -126,7 +125,6 @@ export async function transferPack(
         ...(request.deepenRelative === undefined ? {} : { deepenRelative: request.deepenRelative }),
         ...(request.includeTag === undefined ? {} : { includeTag: request.includeTag }),
         ...(request.filter === undefined ? {} : { filter: request.filter }),
-        ...(request.thinPack === undefined ? {} : { thinPack: request.thinPack }),
         ...(say === undefined ? {} : { onProgress: say, onMessage: say }),
       },
       auth,

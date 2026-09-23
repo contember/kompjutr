@@ -987,7 +987,7 @@ describe("upload-pack", () => {
 
     expect(sent).toEqual(
       concat([
-        pkt(`want ${OID} side-band-64k thin-pack ofs-delta shallow filter agent=${AGENT}\n`),
+        pkt(`want ${OID} side-band-64k ofs-delta shallow filter agent=${AGENT}\n`),
         pkt(`want ${otherWant}\n`),
         pkt(`shallow ${shallow}\n`),
         pkt("deepen 7\n"),
@@ -1119,26 +1119,25 @@ describe("upload-pack", () => {
     expect(calls).toBe(0);
   });
 
-  it("can disable thin-pack while preserving the enabled default", async () => {
-    const sent: string[] = [];
+  it("never requests a thin pack, even when the server advertises one", async () => {
+    let sent = "";
     const responseBody = concat([pkt("NAK\n"), pkt(concat([new Uint8Array([1]), PACK])), FLUSH]);
     const http: GitHttpClient = (request) => {
-      sent.push(new TextDecoder().decode(bufferedBody(request.body)));
+      sent = new TextDecoder().decode(bufferedBody(request.body));
       return Promise.resolve(respond(responseBody, "application/x-git-upload-pack-result"));
     };
-    const request = {
-      url: "http://host/repo",
-      wants: [OID],
-      advertised: new Set(["side-band-64k", "thin-pack"]),
-    };
+    const result = await uploadPack(
+      {
+        url: "http://host/repo",
+        wants: [OID],
+        advertised: new Set(["side-band-64k", "thin-pack", "ofs-delta"]),
+      },
+      { http },
+    );
+    await collect(result.pack);
 
-    const defaultResult = await uploadPack(request, { http });
-    await collect(defaultResult.pack);
-    const fullResult = await uploadPack({ ...request, thinPack: false }, { http });
-    await collect(fullResult.pack);
-
-    expect(sent[0]).toContain(" thin-pack ");
-    expect(sent[1]).not.toContain("thin-pack");
+    expect(sent).toContain(" side-band-64k ofs-delta ");
+    expect(sent).not.toContain("thin-pack");
   });
 
   it("bounds structural outbound entries before sending the request", async () => {

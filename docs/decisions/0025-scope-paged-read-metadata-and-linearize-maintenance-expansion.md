@@ -26,8 +26,8 @@ Both are reachable through ordinary reads and public `maintenance()` calls, with
 no out-of-band database mutation (backlog 63, shipped with the 2026-09-10 sprint).
 
 The second path was only expensive because it duplicated a guarantee the store
-already owns: [ADR-0023](0023-validate-canonical-pack-dependencies-at-source-changes.md)
-validates the affected canonical graph — type consistency, termination, and at
+already owns: ADR-0023 (since deleted; packs are now self-contained and ingest
+bounds chain depth) validates the affected canonical graph — type consistency, termination, and at
 most 50,000 delta edges — inside *every* publication and deletion transaction.
 What maintenance lacked was not the validation but a durable way to tell that
 the graph it is traversing is still the graph admission accepted.

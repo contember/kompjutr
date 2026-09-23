@@ -3,7 +3,7 @@
 //
 // Pack-native object storage. A received packfile is written to SQLite
 // verbatim, still compressed, in fixed-size chunk rows, and indexed
-// (oid -> pack, offset, delta base). Reads pull only the chunks an object
+// (oid -> pack, offset, in-pack delta base). Reads pull only the chunks an object
 // actually spans, so nothing ever inflates a whole repository.
 
 import { isOid, toHex } from "../../common/bytes.js";
@@ -19,11 +19,9 @@ export {
   type CompressedEntry,
   checkDeltaInflateBudget,
   DeltaHeaderProbe,
-  type ExternalBatchResolver,
-  type ExternalMetadataResolver,
-  type ExternalObjectMetadata,
   type IngestBase,
   MAX_PACK_DELTA_WORKING_BYTES,
+  type PackBaseMetadata,
   type PackGraphExit,
   type PackIngestMemory,
   type PackRangeRequest,
@@ -32,7 +30,6 @@ export {
 
 /** Bytes per `git_pack_data` row. Comfortably under the DO row limit. */
 export const PACK_CHUNK = 1024 * 1024;
-export const MAX_PACK_MEMBERSHIP_OBJECTS = 2_048;
 export const MAX_PACK_DELETE_BATCH = 48;
 export const PACK_INGEST_LEASE_MS = 5 * 60 * 1_000;
 export const MAX_PACK_INGEST_OBJECTS = 128 * 1024;
@@ -40,9 +37,8 @@ export const PACK_MEMBERSHIP_DIGEST_BYTES = 20;
 
 /**
  * Git's default pack depth is 50, but a pack from another implementation can
- * legitimately chain deeper. The base walk is iterative and separately
- * cycle-checked by a seen-set, so this bounds chain *length* rather than
- * guarding stack depth — which means it can be generous without risk.
+ * legitimately chain deeper. Ingest rejects a longer in-pack chain, so every
+ * stored chain is bounded; the iterative base walk never guards stack depth.
  */
 export const MAX_DELTA_DEPTH = 50_000;
 
@@ -217,7 +213,7 @@ export interface PackedEntry {
   type: ObjectType;
   size: number;
   entrySize: number;
-  baseOid: string | null;
+  baseOffset: number | null;
 }
 
 export interface PackObjectRow {
@@ -228,7 +224,7 @@ export interface PackObjectRow {
   type: ObjectType;
   size: number;
   entry_size: number;
-  base_oid: string | null;
+  base_offset: number | null;
 }
 
 export interface PackIngestControl {
@@ -306,6 +302,15 @@ export class ExpectedPackMembership {
 
   record(row: PackObjectInput): void {
     const offset = row[2];
+    const ordinal = this.ordinalOf(offset);
+    if (this.#completed[ordinal] !== 0) {
+      throw new CorruptError(`pack entry at ${offset} was indexed more than once`);
+    }
+    this.#digests.set(packMembershipDigest(row), ordinal * PACK_MEMBERSHIP_DIGEST_BYTES);
+    this.#completed[ordinal] = 1;
+  }
+
+  ordinalOf(offset: number): number {
     let low = 0;
     let high = this.#offsetCount - 1;
     while (low <= high) {
@@ -313,14 +318,7 @@ export class ExpectedPackMembership {
       const candidate = this.#offsets[middle]!;
       if (candidate < offset) low = middle + 1;
       else if (candidate > offset) high = middle - 1;
-      else {
-        if (this.#completed[middle] !== 0) {
-          throw new CorruptError(`pack entry at ${offset} was indexed more than once`);
-        }
-        this.#digests.set(packMembershipDigest(row), middle * PACK_MEMBERSHIP_DIGEST_BYTES);
-        this.#completed[middle] = 1;
-        return;
-      }
+      else return middle;
     }
     throw new CorruptError(`pack entry at ${offset} has no physical ordinal`);
   }
@@ -364,17 +362,10 @@ export interface PackIngestLifecycle {
   published(result: PackIngestResult): unknown;
 }
 
-export interface CompletePackObject {
-  oid: string;
-  type: ObjectType;
-  size: number;
-}
-
 export interface CompletePackedEntry {
   packId: number;
   type: ObjectType;
   size: number;
-  baseOid: string | null;
 }
 
 export function requirePackId(packId: number): void {

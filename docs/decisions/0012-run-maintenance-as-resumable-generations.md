@@ -56,22 +56,20 @@ A run moves through five phases: `roots`, `mark`, `loose`, `packs`, and
 page: one query selects rows whose candidate record is wrong or whose grace has
 elapsed, and the page nominates, withdraws, or deletes each one. A nomination
 records the current time, so it is never eligible in the page that wrote it.
-Loose objects go first; a loose object that a surviving pack still names as a
-delta base is retained by the same statement that selects the page.
+Loose objects go first. Packs are self-contained, so no pack depends on a loose
+object or on another pack.
 
-The `packs` phase persists its last examined pack ID and a sticky deletion
-marker in the existing phase-specific cursor fields. Each call examines one
-bounded page and deletes at most one pack. A pass that deleted a pack must
-restart, because that deletion may unblock an earlier candidate. Only an
-exhausted deletion-free pass completes. Epoch restart and phase exit clear the
-cursor. Prospective dependency checks use metadata and the actual canonical
-fallback order, including dependencies held by pending packs.
+The `packs` phase is one monotone pass. It persists its last examined pack ID in
+the phase-specific cursor. Each call examines one bounded page and deletes at
+most one pack; the pass then continues after that pack. A deletion only
+promotes canonical rows into later packs, so it never changes a verdict the
+pass already made, and an exhausted pass completes the phase. Epoch restart and
+phase exit clear the cursor.
 
 ## Consequences
 
 - Each invocation has bounded pages and candidate checks, and every durable
-  boundary is restartable. A candidate's dependency analysis remains proportional
-  to its SQLite metadata graph; the page bound does not make that graph fixed-size.
+  boundary is restartable. A pack candidate needs no dependency analysis.
 - Foreground writes never wait for a repository-wide maintenance lock.
 - Root churn can repeat bounded marking work but cannot make a stale mark safe
   for deletion. Source churn — loose writes, pack publication, pack and loose

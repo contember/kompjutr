@@ -23,7 +23,6 @@ import { createObjectWriteBatch, writeObjects } from "./objects-batch.js";
 import {
   hasAllObjects,
   hasObject,
-  looseObjectMetadata,
   missingObjects,
   objectCount,
   objectInfo,
@@ -359,17 +358,5 @@ export class ObjectTable {
     }
     finishCurrent();
     return result;
-  }
-
-  #looseObjectMetadata(oids: readonly string[]): Map<string, { type: ObjectType; size: number }> {
-    return looseObjectMetadata(this.#context, oids);
-  }
-
-  readLooseObjects(oids: readonly string[]): Map<string, RawObject> {
-    return this.#readLooseObjects(oids);
-  }
-
-  looseObjectMetadata(oids: readonly string[]): Map<string, { type: ObjectType; size: number }> {
-    return this.#looseObjectMetadata(oids);
   }
 }

@@ -317,8 +317,8 @@ function publishCompletedMark(
     db.run("DELETE FROM git_maintenance_shallow WHERE repo_id = ? AND run_id = ?", repoId, runId);
     db.run(
       `INSERT INTO git_maintenance_objects
-       (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, physical_only, edge_cursor)
-       SELECT ?, ?, value, 0, 1, 0, 0, 0 FROM json_each(?)`,
+       (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, edge_cursor)
+       SELECT ?, ?, value, 0, 1, 0, 0 FROM json_each(?)`,
       repoId,
       runId,
       payload,

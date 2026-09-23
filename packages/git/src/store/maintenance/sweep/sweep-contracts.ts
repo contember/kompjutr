@@ -30,7 +30,6 @@ export interface LooseRow {
   oid: string;
   storedBytes: number;
   marked: boolean;
-  pinned: boolean;
   candidateSince: number | null;
 }
 

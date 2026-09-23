@@ -11,7 +11,7 @@ import {
   type QueueObject,
   type RunState,
 } from "./reachability-contracts.js";
-import { headerExpansion, physicalExpansion, treeExpansion } from "./reachability-expand.js";
+import { headerExpansion, treeExpansion } from "./reachability-expand.js";
 import { requireObjectInfo } from "./reachability-headers.js";
 import { publishExpansion } from "./reachability-publish.js";
 
@@ -24,7 +24,7 @@ function readRun(db: SqlDatabase, repoId: number): RunState {
 
 function initializeCounters(db: SqlDatabase, repoId: number, run: RunState): RunState {
   if (run.reachableObjects !== 0 || run.queuedObjects === 0) return run;
-  // Root discovery queues only logical marks, so every queued root is reachable.
+  // Every queued root is reachable.
   const logical = run.queuedObjects;
   const updated = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_runs SET reachable_objects = ?
@@ -50,12 +50,11 @@ function initializeCounters(db: SqlDatabase, repoId: number, run: RunState): Run
 
 function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueObject | null {
   let result: QueueObject | null = null;
-  let previous: { oid: string; physicalOnly: boolean } | null = null;
+  let previous: string | null = null;
   let rows = 0;
   for (const row of db.iterate(
     `SELECT object.repo_id, object.run_id, object.oid, object.source_mask,
-            object.expanded, object.shallow_boundary, object.physical_only,
-            object.edge_cursor,
+            object.expanded, object.shallow_boundary, object.edge_cursor,
             EXISTS (
               SELECT 1 FROM git_maintenance_shallow shallow
                WHERE shallow.repo_id = object.repo_id AND shallow.run_id = object.run_id
@@ -63,7 +62,7 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
             ) AS stored_shallow
        FROM git_maintenance_objects object
       WHERE object.repo_id = ? AND object.run_id = ? AND object.expanded = 0
-      ORDER BY object.physical_only ASC, object.oid COLLATE BINARY LIMIT 2`,
+      ORDER BY object.oid COLLATE BINARY LIMIT 2`,
     repoId,
     runId,
   )) {
@@ -72,11 +71,10 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
       throw new CorruptError("maintenance mark queue crossed run boundaries");
     }
     const oid = oidField(row.oid, "maintenance queued OID");
-    const physicalOnly = booleanInteger(row.physical_only, "maintenance physical-only marker");
     const expanded = booleanInteger(row.expanded, "maintenance expanded marker");
     const shallowBoundary = booleanInteger(row.shallow_boundary, "maintenance shallow marker");
     const storedShallow = booleanInteger(row.stored_shallow, "maintenance shallow membership");
-    if (expanded || shallowBoundary !== storedShallow || (physicalOnly && shallowBoundary)) {
+    if (expanded || shallowBoundary !== storedShallow) {
       throw new CorruptError("maintenance queued object has inconsistent state");
     }
     const edgeCursor = expectSafeInteger(
@@ -85,17 +83,10 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
       Number.MAX_SAFE_INTEGER,
       "maintenance edge cursor",
     );
-    if (physicalOnly && edgeCursor !== 0) {
-      throw new CorruptError("physical-only maintenance object retained a semantic cursor");
-    }
-    if (
-      previous !== null &&
-      ((previous.physicalOnly === physicalOnly && oid <= previous.oid) ||
-        (previous.physicalOnly && !physicalOnly))
-    ) {
+    if (previous !== null && oid <= previous) {
       throw new CorruptError("maintenance mark queue is not in deterministic order");
     }
-    previous = { oid, physicalOnly };
+    previous = oid;
     if (result === null) {
       result = {
         oid,
@@ -106,7 +97,6 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
           "maintenance source mask",
         ),
         shallowBoundary,
-        physicalOnly,
         edgeCursor,
       };
     }
@@ -159,7 +149,6 @@ interface MarkExpansion {
   run: RunState;
   processedOid: string;
   discoveredObjects: number;
-  discoveredLogicalObjects: number;
 }
 
 function expandNextMarkObject(store: SharedRepoStore, run: RunState): MarkExpansion | null {
@@ -168,19 +157,14 @@ function expandNextMarkObject(store: SharedRepoStore, run: RunState): MarkExpans
   if (run.queuedObjects === 0) {
     throw new CorruptError("maintenance queued count omitted an unexpanded mark");
   }
-  let expansion: ObjectExpansion;
-  if (object.physicalOnly) {
-    expansion = physicalExpansion(store, object);
-  } else {
-    const info = requireObjectInfo(store, object.oid);
-    if (object.shallowBoundary && info.type !== "commit") {
-      throw new CorruptError("maintenance shallow boundary is not a commit");
-    }
-    expansion =
-      info.type === "tree"
-        ? treeExpansion(store.db, store, object)
-        : headerExpansion(store, object, info);
+  const info = requireObjectInfo(store, object.oid);
+  if (object.shallowBoundary && info.type !== "commit") {
+    throw new CorruptError("maintenance shallow boundary is not a commit");
   }
+  const expansion: ObjectExpansion =
+    info.type === "tree"
+      ? treeExpansion(store.db, store, object)
+      : headerExpansion(store, object, info);
   const published = publishExpansion(store.db, store, run, object, expansion);
   return {
     run: {
@@ -190,7 +174,6 @@ function expandNextMarkObject(store: SharedRepoStore, run: RunState): MarkExpans
     },
     processedOid: object.oid,
     discoveredObjects: published.discoveredObjects,
-    discoveredLogicalObjects: published.discoveredLogicalObjects,
   };
 }
 
@@ -210,12 +193,10 @@ function advanceMark(
         status: gate.kind,
         processedOid: null,
         discoveredObjects: 0,
-        discoveredLogicalObjects: 0,
       };
     }
     let processedOid: string | null = null;
     let discoveredObjects = 0;
-    let discoveredLogicalObjects = 0;
     for (let expansions = 0; expansions < expansionBudget; expansions++) {
       const expansion = expandNextMarkObject(store, run);
       if (expansion === null) {
@@ -227,20 +208,17 @@ function advanceMark(
           status: "complete",
           processedOid,
           discoveredObjects,
-          discoveredLogicalObjects,
         };
       }
       run = expansion.run;
       processedOid = expansion.processedOid;
       discoveredObjects += expansion.discoveredObjects;
-      discoveredLogicalObjects += expansion.discoveredLogicalObjects;
     }
     return {
       runId: run.runId,
       status: "progress",
       processedOid,
       discoveredObjects,
-      discoveredLogicalObjects,
     };
   });
 }

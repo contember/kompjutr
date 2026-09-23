@@ -96,7 +96,6 @@ export async function hydratePromisedBlobs(
         shallows: [],
         advertised: advertisement.capabilities,
         useLocalHaves: false,
-        thinPack: false,
       },
       auth,
       fetchProgressSink(options.onProgress, options.onMessage),

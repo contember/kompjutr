@@ -26,7 +26,6 @@ import {
   MAX_DELTA_DEPTH,
   MAX_PACK_DELETE_BATCH,
   MAX_PACK_DELTA_WORKING_BYTES,
-  PACK_BLOB_BATCH_TARGET_BYTES,
   PACK_CHUNK,
 } from "../packages/git/src/store/pack/packs.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
@@ -1066,7 +1065,7 @@ describe("synthetic pack ingest", () => {
     ).toEqual(target);
   });
 
-  it("drives the packed base lookup from the requested oids", async () => {
+  it("drives the packed base lookup from the pack's own base offsets", async () => {
     const inner = new TestDatabase();
     const recorder = new RecordingDatabase(inner);
     const database = new SqliteGitDatabase(recorder);
@@ -1091,12 +1090,9 @@ describe("synthetic pack ingest", () => {
     const plan = inner
       .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
       .map((row) => row.detail);
-    // Without the CROSS JOIN, SQLite drives from git_pack_objects and rescans
-    // the bound oids once per packed object: 450 ms rather than 0.4 ms on a
-    // 30,613-object pack.
     expect(plan[0]).toMatch(/VIRTUAL TABLE/);
     expect(plan.slice(1).join("\n")).toMatch(
-      /SEARCH object USING INDEX sqlite_autoindex_git_pack_objects_1/,
+      /SEARCH entry USING PRIMARY KEY \(repo_id=\? AND pack_id=\? AND offset=\?\)/,
     );
   });
 
@@ -1117,31 +1113,6 @@ describe("synthetic pack ingest", () => {
       () => Reflect.apply(store.packs.readObjects, store.packs, [[oid], "invalid"]),
       "EINVAL",
     );
-  });
-
-  it("rejects a non-hex base object id returned by the packed graph query", async () => {
-    const store = open();
-    const base = utf8.encode("packed graph base\n");
-    const baseOid = hashObject("blob", base);
-    const target = utf8.encode("packed graph target\n");
-    const targetOid = hashObject("blob", target);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(2);
-    writer.object("blob", base);
-    writer.refDelta(baseOid, literalDelta(base.length, target));
-    writer.finish();
-    await store.packs.ingest(slices(concat(chunks), 64));
-    const corruptOid = "g".repeat(40);
-    store.db.run("PRAGMA ignore_check_constraints = ON");
-    store.db.run(
-      "UPDATE git_pack_objects SET base_oid = ? WHERE repo_id = ? AND oid = ?",
-      corruptOid,
-      store.sharedRepoId,
-      targetOid,
-    );
-
-    expect(() => store.packs.readObjects([targetOid])).toThrow(/invalid metadata/);
   });
 
   it("indexes all 500 commit objects during ingest", async () => {
@@ -1333,7 +1304,7 @@ describe("synthetic pack ingest", () => {
 
 describe("pack fallback preservation", () => {
   it.each([false, true])(
-    "promotes the whole safe deletion batch before checking dependencies (reverse: %s)",
+    "promotes a whole deletion batch into a self-contained pack (reverse: %s)",
     async (reverse) => {
       const store = open();
       const a = utf8.encode("batch promotion A\n");
@@ -1344,11 +1315,11 @@ describe("pack fallback preservation", () => {
       const p2 = await store.packs.ingest(slices(singleBlobPack(b), 64));
       const chunks: Uint8Array[] = [];
       const writer = new PackWriter((chunk) => chunks.push(chunk));
-      writer.header(1);
+      writer.header(2);
       writer.refDelta(bOid, literalDelta(b.length, a));
+      writer.object("blob", b);
       writer.finish();
       const p3 = await store.packs.ingest(slices(concat(chunks), 64));
-      const p4 = await store.packs.ingest(slices(singleBlobPack(b), 64));
       const ids = [p1.packId, p2.packId];
       expect(store.packs.deleteCompletePacks(reverse ? ids.reverse() : ids)).toBe(2);
       const database = new SqliteGitDatabase(store.db, { objectCacheBytes: 0 });
@@ -1358,104 +1329,66 @@ describe("pack fallback preservation", () => {
       expect(cold.read(aOid)?.data).toEqual(a);
       expect(cold.read(bOid)?.data).toEqual(b);
       expect(cold.packs.completePackedEntry(aOid)?.packId).toBe(p3.packId);
-      expect(cold.packs.completePackedEntry(bOid)?.packId).toBe(p4.packId);
+      expect(cold.packs.completePackedEntry(bOid)?.packId).toBe(p3.packId);
+      expect(cold.packs.lookup(aOid)?.baseOffset).toBe(cold.packs.lookup(bOid)?.offset);
     },
   );
 
-  it("checks a promoted dependency closure through indexed metadata lookups", async () => {
-    const inner = new TestDatabase();
-    const recording = new RecordingDatabase(inner);
-    const database = new SqliteGitDatabase(recording, { objectCacheBytes: 0 });
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const members = Array.from({ length: 65 }, (_, index) =>
-      utf8.encode(`promotion chain ${index}\n`),
-    );
-    const last = members[64]!;
-    const primary = await store.packs.ingest(slices(singleBlobPack(last), 64));
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(members.length);
-    writer.object("blob", members[0]!);
-    for (let index = 1; index < members.length; index++) {
-      const base = members[index - 1]!;
-      writer.refDelta(hashObject("blob", base), literalDelta(base.length, members[index]!));
-    }
-    writer.finish();
-    await store.packs.ingest(slices(concat(chunks), 64));
-    recording.queries.length = 0;
-    expect(store.packs.deleteCompletePacks([primary.packId])).toBe(1);
-    const issued = recording.queries.find(({ query }) =>
-      query.includes("WITH RECURSIVE w(oid, root)"),
-    );
-    if (issued === undefined) throw new Error("promotion closure was not checked");
-    const plan = inner
-      .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
-      .map((row) => row.detail);
-    expect(
-      plan
-        .filter((detail) => /^SEARCH (p|l) /.test(detail))
-        .every((detail) => detail.includes("(repo_id=? AND oid=?)")),
-    ).toBe(true);
-    expect(plan.join("\n")).toMatch(/SEARCH p USING INDEX sqlite_autoindex_git_pack_objects_1/);
-    expect(plan.filter((detail) => /^SCAN (p|l|v|m|h)$/.test(detail))).toEqual([]);
-    const reverse = recording.queries.find(({ query }) =>
-      query.includes("lane(root, parent, child)"),
-    );
-    if (reverse === undefined) throw new Error("reverse dependencies were not checked");
-    const reversePlan = inner
-      .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${reverse.query}`, ...reverse.bindings)
-      .map((row) => row.detail)
-      .join("\n");
-    expect(reversePlan).toContain("git_pack_objects_reverse (repo_id=? AND base_oid=? AND oid>?)");
-    const protection = recording.queries.find(({ query }) =>
-      query.includes("SELECT DISTINCT base.oid"),
-    );
-    if (protection === undefined) throw new Error("surviving dependencies were not checked");
-    const protectionPlan = inner
-      .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${protection.query}`, ...protection.bindings)
-      .map((row) => row.detail)
-      .join("\n");
-    expect(protectionPlan).toContain("git_pack_entries_by_base (repo_id=? AND base_oid=?)");
-    expect(protectionPlan).toContain("git_pack_pending_by_base (repo_id=? AND base_oid=?)");
-    const cold = new SqliteGitDatabase(inner, { objectCacheBytes: 0 });
-    const checkout = cold.findCheckout("/repo");
-    if (checkout === null) throw new Error("promotion fixture disappeared");
-    expect(cold.openCheckout(checkout).read(hashObject("blob", last))?.data).toEqual(last);
-  });
-
-  it.each(["three-pack", "self-referential"])(
-    "rejects a %s canonical promotion cycle without losing cold readability",
-    async (variant) => {
+  it.each(["first", "second"])(
+    "reads crossed packs A (X→Y) and B (Y→X) before and after deleting the %s",
+    async (deleted) => {
       const store = open();
-      const a = utf8.encode("canonical cycle A\n");
-      const b = utf8.encode("canonical cycle B\n");
-      const aOid = hashObject("blob", a);
-      const bOid = hashObject("blob", b);
-      const first = await store.packs.ingest(slices(singleBlobPack(a), 64));
-      const deltaPack = (baseOid: string, base: Uint8Array, target: Uint8Array) => {
+      const x = utf8.encode("crossed pack X\n");
+      const y = utf8.encode("crossed pack Y\n");
+      const xOid = hashObject("blob", x);
+      const yOid = hashObject("blob", y);
+      const crossed = (base: Uint8Array, target: Uint8Array, baseFirst: boolean) => {
         const chunks: Uint8Array[] = [];
         const writer = new PackWriter((chunk) => chunks.push(chunk));
-        writer.header(1);
-        writer.refDelta(baseOid, literalDelta(base.length, target));
+        writer.header(2);
+        if (baseFirst) writer.object("blob", base);
+        writer.refDelta(hashObject("blob", base), literalDelta(base.length, target));
+        if (!baseFirst) writer.object("blob", base);
         writer.finish();
         return concat(chunks);
       };
-      if (variant === "three-pack") {
-        await store.packs.ingest(slices(deltaPack(aOid, a, b), 64));
-        await store.packs.ingest(slices(deltaPack(bOid, b, a), 64));
-      } else {
-        await store.packs.ingest(slices(deltaPack(aOid, a, a), 64));
+      // A resolves its ref-delta immediately; B only once the later base drains.
+      const a = await store.packs.ingest(slices(crossed(y, x, true), 64));
+      const b = await store.packs.ingest(slices(crossed(x, y, false), 64));
+      for (const [pack, delta, base] of [
+        [a.packId, xOid, yOid],
+        [b.packId, yOid, xOid],
+      ] as const) {
+        expect(
+          store.db.scalar<number>(
+            `SELECT count(*) FROM git_pack_entries delta
+               JOIN git_pack_entries base
+                 ON base.repo_id = delta.repo_id AND base.pack_id = delta.pack_id
+                AND base.offset = delta.base_offset
+              WHERE delta.pack_id = ? AND delta.oid = ? AND base.oid = ?`,
+            pack,
+            delta,
+            base,
+          ),
+        ).toBe(1);
       }
-      expect
-        .soft(() => store.packs.deleteCompletePacks([first.packId]))
-        .toThrowError(expect.objectContaining({ code: "EBUSY" }));
+      const expected = new Map([
+        [xOid, { type: "blob", data: x }],
+        [yOid, { type: "blob", data: y }],
+      ]);
+      expect(store.packs.readObjects([xOid, yOid])).toEqual(expected);
+
+      const survivor = deleted === "first" ? b.packId : a.packId;
+      expect(store.packs.deleteCompletePacks([deleted === "first" ? a.packId : b.packId])).toBe(1);
       const database = new SqliteGitDatabase(store.db, { objectCacheBytes: 0 });
       const checkout = database.findCheckout("/repo");
-      if (checkout === null) throw new Error("cycle witness repository disappeared");
+      if (checkout === null) throw new Error("crossed pack repository disappeared");
       const cold = database.openCheckout(checkout);
-      expect(cold.read(aOid)?.data).toEqual(a);
-      if (variant === "three-pack") expect(cold.read(bOid)?.data).toEqual(b);
-      expect(cold.packs.completePackedEntry(aOid)?.packId).toBe(first.packId);
+      expect(cold.packs.completePackedEntry(xOid)?.packId).toBe(survivor);
+      expect(cold.packs.completePackedEntry(yOid)?.packId).toBe(survivor);
+      expect(cold.packs.readObjects([yOid, xOid])).toEqual(expected);
+      expect(cold.read(xOid)?.data).toEqual(x);
+      expect(cold.read(yOid)?.data).toEqual(y);
     },
   );
 
@@ -1482,40 +1415,6 @@ describe("pack fallback preservation", () => {
     expect(await reclaimPending(store)).toBe(1);
     expect(store.cachedCommit(oid)?.commit).toEqual(parseCommit(data));
     expect(store.packs.completePackedEntry(oid)?.packId).toBe(second.packId);
-  });
-
-  it("rejects deletion when a promoted delta would lose its only base", async () => {
-    const store = open();
-    const base = utf8.encode("fallback delta base\n");
-    const baseOid = hashObject("blob", base);
-    const target = utf8.encode("fallback delta target\n");
-    const targetOid = hashObject("blob", target);
-    const primaryChunks: Uint8Array[] = [];
-    const primaryWriter = new PackWriter((chunk) => primaryChunks.push(chunk));
-    primaryWriter.header(2);
-    primaryWriter.object("blob", base);
-    primaryWriter.object("blob", target);
-    primaryWriter.finish();
-    const primary = await store.packs.ingest(slices(concat(primaryChunks), 64));
-
-    const fallbackChunks: Uint8Array[] = [];
-    const fallbackWriter = new PackWriter((chunk) => fallbackChunks.push(chunk));
-    fallbackWriter.header(1);
-    fallbackWriter.refDelta(baseOid, literalDelta(base.length, target));
-    fallbackWriter.finish();
-    const fallback = await store.packs.ingest(slices(concat(fallbackChunks), 64));
-
-    expect(() => store.packs.deleteCompletePacks([primary.packId])).toThrow(
-      /required by a surviving delta chain/,
-    );
-    expect(store.packs.completePackedEntry(baseOid)?.packId).toBe(primary.packId);
-    expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(primary.packId);
-    expect(
-      completePackMatches(store, fallback.packId, [
-        { oid: targetOid, type: "blob", size: target.length },
-      ]),
-    ).toBe(true);
-    expect(store.read(targetOid)?.data).toEqual(target);
   });
 
   it("promotes a complete delta fallback closure before deleting its owner", async () => {
@@ -1545,153 +1444,6 @@ describe("pack fallback preservation", () => {
     expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(fallback.packId);
     expect(store.read(baseOid)?.data).toEqual(base);
     expect(store.read(targetOid)?.data).toEqual(target);
-  });
-
-  it("promotes a thin delta fallback whose base exists only as a loose object", async () => {
-    const store = open();
-    const base = utf8.encode("loose-only fallback base\n");
-    const baseOid = store.write("blob", base);
-    const target = utf8.encode("thin fallback target\n");
-    const targetOid = hashObject("blob", target);
-    const primary = await store.packs.ingest(slices(singleBlobPack(target), 64));
-    const fallbackChunks: Uint8Array[] = [];
-    const fallbackWriter = new PackWriter((chunk) => fallbackChunks.push(chunk));
-    fallbackWriter.header(1);
-    fallbackWriter.refDelta(baseOid, literalDelta(base.length, target));
-    fallbackWriter.finish();
-    const fallback = await store.packs.ingest(slices(concat(fallbackChunks), 64));
-
-    expect(store.packs.deleteCompletePacks([primary.packId])).toBe(1);
-    expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(fallback.packId);
-    expect(store.read(baseOid)?.data).toEqual(base);
-    expect(store.read(targetOid)?.data).toEqual(target);
-  });
-
-  it("keeps a thin fallback whose doomed packed base survives loose", async () => {
-    const store = open();
-    const base = utf8.encode("loose and packed fallback base\n");
-    const baseOid = store.write("blob", base);
-    const target = utf8.encode("loose-backed fallback target\n");
-    const targetOid = hashObject("blob", target);
-    const primaryChunks: Uint8Array[] = [];
-    const primaryWriter = new PackWriter((chunk) => primaryChunks.push(chunk));
-    primaryWriter.header(2);
-    primaryWriter.object("blob", base);
-    primaryWriter.object("blob", target);
-    primaryWriter.finish();
-    const primary = await store.packs.ingest(slices(concat(primaryChunks), 64));
-    const fallbackChunks: Uint8Array[] = [];
-    const fallbackWriter = new PackWriter((chunk) => fallbackChunks.push(chunk));
-    fallbackWriter.header(1);
-    fallbackWriter.refDelta(baseOid, literalDelta(base.length, target));
-    fallbackWriter.finish();
-    const fallback = await store.packs.ingest(slices(concat(fallbackChunks), 64));
-
-    expect(store.packs.deleteCompletePacks([primary.packId])).toBe(1);
-    expect(store.packs.completePackedEntry(baseOid)).toBeNull();
-    expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(fallback.packId);
-    expect(store.read(baseOid)?.data).toEqual(base);
-    expect(store.read(targetOid)?.data).toEqual(target);
-  });
-
-  it("protects a non-canonical physical delta child in every deletion order", async () => {
-    for (const order of ["primary", "primary-duplicate", "duplicate-primary"]) {
-      const store = open();
-      const base = utf8.encode(`hidden physical base ${order}\n`);
-      const baseOid = hashObject("blob", base);
-      const target = utf8.encode(`hidden physical target ${order}\n`);
-      const targetOid = hashObject("blob", target);
-      const primaryChunks: Uint8Array[] = [];
-      const primaryWriter = new PackWriter((chunk) => primaryChunks.push(chunk));
-      primaryWriter.header(2);
-      primaryWriter.object("blob", base);
-      primaryWriter.object("blob", target);
-      primaryWriter.finish();
-      const primary = await store.packs.ingest(slices(concat(primaryChunks), 64));
-      const duplicate = await store.packs.ingest(slices(singleBlobPack(target), 64));
-      const deltaChunks: Uint8Array[] = [];
-      const deltaWriter = new PackWriter((chunk) => deltaChunks.push(chunk));
-      deltaWriter.header(1);
-      deltaWriter.refDelta(baseOid, literalDelta(base.length, target));
-      deltaWriter.finish();
-      const delta = await store.packs.ingest(slices(concat(deltaChunks), 64));
-      const deleting =
-        order === "primary"
-          ? [primary.packId]
-          : order === "primary-duplicate"
-            ? [primary.packId, duplicate.packId]
-            : [duplicate.packId, primary.packId];
-
-      expect(() => store.packs.deleteCompletePacks(deleting)).toThrow(
-        /required by a surviving delta chain/,
-      );
-      expect(store.db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(3);
-      expect(store.packs.completePackedEntry(baseOid)?.packId).toBe(primary.packId);
-      expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(primary.packId);
-      expect(completePackMatches(store, duplicate.packId, [blobMembership(target)])).toBe(true);
-      expect(completePackMatches(store, delta.packId, [blobMembership(target)])).toBe(true);
-      expect(store.packs.read(baseOid)?.data).toEqual(base);
-      expect(store.packs.read(targetOid)?.data).toEqual(target);
-    }
-
-    const store = open();
-    const base = utf8.encode("hidden physical loose base\n");
-    const baseOid = store.write("blob", base);
-    const target = utf8.encode("hidden physical loose target\n");
-    const targetOid = hashObject("blob", target);
-    const primaryChunks: Uint8Array[] = [];
-    const primaryWriter = new PackWriter((chunk) => primaryChunks.push(chunk));
-    primaryWriter.header(2);
-    primaryWriter.object("blob", base);
-    primaryWriter.object("blob", target);
-    primaryWriter.finish();
-    const primary = await store.packs.ingest(slices(concat(primaryChunks), 64));
-    const duplicate = await store.packs.ingest(slices(singleBlobPack(target), 64));
-    const deltaChunks: Uint8Array[] = [];
-    const deltaWriter = new PackWriter((chunk) => deltaChunks.push(chunk));
-    deltaWriter.header(1);
-    deltaWriter.refDelta(baseOid, literalDelta(base.length, target));
-    deltaWriter.finish();
-    const delta = await store.packs.ingest(slices(concat(deltaChunks), 64));
-
-    expect(store.packs.deleteCompletePacks([primary.packId])).toBe(1);
-    expect(store.packs.completePackedEntry(baseOid)).toBeNull();
-    expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(duplicate.packId);
-    expect(completePackMatches(store, delta.packId, [blobMembership(target)])).toBe(true);
-    expect(store.read(baseOid)?.data).toEqual(base);
-    expect(store.read(targetOid)?.data).toEqual(target);
-  });
-
-  it("rejects deletion when a hidden physical delta has no surviving base", async () => {
-    const store = open();
-    const base = utf8.encode("absent hidden physical base\n");
-    const baseOid = hashObject("blob", base);
-    const target = utf8.encode("absent hidden physical target\n");
-    const targetOid = hashObject("blob", target);
-    const primaryChunks: Uint8Array[] = [];
-    const primaryWriter = new PackWriter((chunk) => primaryChunks.push(chunk));
-    primaryWriter.header(2);
-    primaryWriter.object("blob", base);
-    primaryWriter.object("blob", target);
-    primaryWriter.finish();
-    const primary = await store.packs.ingest(slices(concat(primaryChunks), 64));
-    const duplicate = await store.packs.ingest(slices(singleBlobPack(target), 64));
-    const deltaChunks: Uint8Array[] = [];
-    const deltaWriter = new PackWriter((chunk) => deltaChunks.push(chunk));
-    deltaWriter.header(1);
-    deltaWriter.refDelta(baseOid, literalDelta(base.length, target));
-    deltaWriter.finish();
-    const delta = await store.packs.ingest(slices(concat(deltaChunks), 64));
-    expect(() => store.packs.deleteCompletePacks([primary.packId])).toThrow(
-      /required by a surviving delta chain/,
-    );
-    expect(store.db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(3);
-    expect(store.packs.completePackedEntry(baseOid)?.packId).toBe(primary.packId);
-    expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(primary.packId);
-    expect(completePackMatches(store, duplicate.packId, [blobMembership(target)])).toBe(true);
-    expect(completePackMatches(store, delta.packId, [blobMembership(target)])).toBe(true);
-    expect(store.packs.read(baseOid)?.data).toEqual(base);
-    expect(store.packs.read(targetOid)?.data).toEqual(target);
   });
 
   it("preserves one complete delta closure when deleting two owners in either order", async () => {
@@ -1789,7 +1541,7 @@ describe("pack fallback preservation", () => {
     writer.finish();
     const packed = await store.packs.ingest(slices(concat(chunks), 64));
     store.db.run(
-      "UPDATE git_pack_objects SET data_len = ? WHERE repo_id = ? AND pack_id = ? AND oid = ?",
+      "UPDATE git_pack_entries SET data_len = ? WHERE repo_id = ? AND pack_id = ? AND oid = ?",
       80 * 1024 * 1024,
       store.sharedRepoId,
       packed.packId,
@@ -2195,14 +1947,19 @@ describe("pack deferred resolution", () => {
       const plan = inner
         .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
         .map((row) => row.detail);
-      for (const alias of ["object", "child", "base"]) {
+      const seeks = {
+        object: /SEARCH .* USING .*INDEX .* \(repo_id=\? AND oid=\?\)/,
+        child: /SEARCH .* USING PRIMARY KEY \(repo_id=\? AND pack_id=\? AND offset=\?\)/,
+        base: /SEARCH .* USING PRIMARY KEY \(repo_id=\? AND pack_id=\? AND offset=\?\)/,
+        entry: /SEARCH .* USING PRIMARY KEY \(repo_id=\? AND pack_id=\? AND offset=\?\)/,
+        own: /SEARCH .* USING .*INDEX git_pack_entries_by_oid \(repo_id=\? AND oid=\? AND pack_id=\?\)/,
+      };
+      for (const [alias, seek] of Object.entries(seeks)) {
         const lookups = plan.filter((detail) =>
           new RegExp(`^(SEARCH|SCAN) ${alias} `).test(detail),
         );
         expect(lookups.length).toBeGreaterThan(0);
-        for (const lookup of lookups) {
-          expect(lookup).toMatch(/SEARCH .* USING .*INDEX .* \(repo_id=\? AND oid=\?\)/);
-        }
+        for (const lookup of lookups) expect(lookup).toMatch(seek);
       }
       const recursiveStep = plan.indexOf("RECURSIVE STEP");
       const reachableScan = plan.indexOf("SCAN reachable", recursiveStep);
@@ -2271,23 +2028,35 @@ describe("pack deferred resolution", () => {
       ),
     ).toThrow(/is a blob, not a tree/);
 
+    const entryOffset = (fixture: Awaited<ReturnType<typeof pagedUnionFixture>>, oid: string) => {
+      const offset = fixture.db.scalar<number>(
+        "SELECT offset FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND oid = ?",
+        fixture.store.sharedRepoId,
+        fixture.packId,
+        oid,
+      );
+      if (offset === undefined) throw new Error(`pack entry ${oid} disappeared`);
+      return offset;
+    };
     const missing = await pagedUnionFixture();
-    const missingBase = missing.chain[3]!;
+    const missingOffset = entryOffset(missing, missing.chain[3]!.oid);
     const missingChild = missing.chain[4]!;
     missing.db.run(
-      "DELETE FROM git_pack_objects WHERE repo_id = ? AND oid = ?",
+      "DELETE FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND offset = ?",
       missing.store.sharedRepoId,
-      missingBase.oid,
+      missing.packId,
+      missingOffset,
     );
     expect(() => missing.store.packs.read(missing.targets[0]!.oid)).toThrow(
-      `missing delta base ${missingBase.oid} for ${missingChild.oid}`,
+      `missing delta base at pack ${missing.packId} offset ${missingOffset} for ${missingChild.oid}`,
     );
 
     const cyclic = await pagedUnionFixture();
     cyclic.db.run(
-      "UPDATE git_pack_objects SET base_oid = ? WHERE repo_id = ? AND oid = ?",
-      cyclic.chain[cyclic.chain.length - 1]!.oid,
+      "UPDATE git_pack_entries SET base_offset = ? WHERE repo_id = ? AND pack_id = ? AND oid = ?",
+      entryOffset(cyclic, cyclic.chain[cyclic.chain.length - 1]!.oid),
       cyclic.store.sharedRepoId,
+      cyclic.packId,
       cyclic.chain[0]!.oid,
     );
     expect(() => cyclic.store.packs.read(cyclic.targets[0]!.oid)).toThrow(/cyclic delta chain/);
@@ -2320,7 +2089,36 @@ describe("pack deferred resolution", () => {
     expect(db.graphIteratorReturns).toBe(1);
   });
 
-  it("resolves thin deltas from every loose object type in one bounded batch", async () => {
+  it("rejects an in-pack REF delta cycle with no full object", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const a = utf8.encode("cycle member A\n");
+    const b = utf8.encode("cycle member B\n");
+    const aOid = hashObject("blob", a);
+    const bOid = hashObject("blob", b);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.refDelta(bOid, literalDelta(b.length, a));
+    writer.refDelta(aOid, literalDelta(a.length, b));
+    writer.finish();
+
+    await expect(store.packs.ingest(slices(concat(chunks), 64))).rejects.toMatchObject({
+      code: "ECORRUPT",
+      message: expect.stringMatching(
+        /cannot resolve 2 delta object\(s\): missing base in the pack/,
+      ),
+    });
+    expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'complete'")).toBe(
+      0,
+    );
+    expect(store.read(aOid)).toBeNull();
+    expect(store.read(bOid)).toBeNull();
+    expect(await reclaimPending(store)).toBe(1);
+  });
+
+  it("rejects a thin pack whose bases exist only loose, for every object type", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
@@ -2367,62 +2165,17 @@ describe("pack deferred resolution", () => {
     }
     writer.finish();
 
-    db.storage.histogram = new Map();
-    db.storage.resetCounters();
-    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
-
-    expect(db.storage.statementCount).toBeLessThan(1_000);
-    expect(
-      [...db.storage.histogram].filter(([query]) =>
-        query.includes("SELECT data FROM git_object_chunks WHERE repo_id = ? AND oid = ?"),
+    await expect(store.packs.ingest(slices(concat(chunks), 64 * 1024))).rejects.toMatchObject({
+      code: "ECORRUPT",
+      message: expect.stringMatching(
+        /cannot resolve 4 delta object\(s\): missing base in the pack/,
       ),
-    ).toEqual([]);
-    for (const object of expected) {
-      expect(store.read(object.oid)).toEqual({ type: object.type, data: object.data });
-    }
-  });
-
-  it("resolves a large transitive loose base for a packed ingest base", async () => {
-    const looseBase = new Uint8Array(4.5 * 1024 * 1024);
-    const looseBaseOid = hashObject("blob", looseBase);
-    const packedBase = new Uint8Array([0x61]);
-    const packedBaseOid = hashObject("blob", packedBase);
-    const target = new Uint8Array([0x62]);
-    const targetOid = hashObject("blob", target);
-    const basePackChunks: Uint8Array[] = [];
-    const basePackWriter = new PackWriter((chunk) => basePackChunks.push(chunk));
-    basePackWriter.header(2);
-    basePackWriter.object("blob", looseBase);
-    basePackWriter.refDelta(looseBaseOid, literalDelta(looseBase.length, packedBase));
-    basePackWriter.finish();
-    const basePack = concat(basePackChunks);
-    const targetPackChunks: Uint8Array[] = [];
-    const targetPackWriter = new PackWriter((chunk) => targetPackChunks.push(chunk));
-    targetPackWriter.header(1);
-    targetPackWriter.refDelta(packedBaseOid, literalDelta(packedBase.length, target));
-    targetPackWriter.finish();
-    const targetPack = concat(targetPackChunks);
-    const fixture = async () => {
-      const db = new TestDatabase();
-      const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
-      const repository = database.createRepository("/repo", "ref: refs/heads/main");
-      const store = database.openCheckout(repository);
-      expect(store.write("blob", looseBase)).toBe(looseBaseOid);
-      const packed = await store.packs.ingest(slices(basePack, 64 * 1024));
-      db.run(
-        "DELETE FROM git_pack_objects WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-        repository.repoId,
-        packed.packId,
-        looseBaseOid,
-      );
-      expect(store.packs.completePackedEntry(looseBaseOid)).toBeNull();
-      expect(store.packs.completePackedEntry(packedBaseOid)?.packId).toBe(packed.packId);
-      return { db, store };
-    };
-
-    const measured = await fixture();
-    await measured.store.packs.ingest(slices(targetPack, 64 * 1024));
-    expect(measured.store.read(targetOid)?.data).toEqual(target);
+    });
+    expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'complete'")).toBe(
+      0,
+    );
+    for (const object of expected) expect(store.read(object.oid)).toBeNull();
+    expect(await reclaimPending(store)).toBe(1);
   });
 
   it("keeps every scalar pack API blind to the pack being indexed", async () => {
@@ -2493,45 +2246,6 @@ describe("pack deferred resolution", () => {
 
     const result = await store.packs.ingest(slices(concat(chunks), 64 * 1024));
     expect(result.count).toBe(4);
-    expect(store.read(hashObject("blob", new Uint8Array([1])))?.data).toEqual(new Uint8Array([1]));
-    expect(store.read(hashObject("blob", new Uint8Array([2])))?.data).toEqual(new Uint8Array([2]));
-  });
-
-  it("resolves mixed packed and loose bases beyond the blob batching target", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const packedBase = utf8.encode("packed base\n");
-    const packedChunks: Uint8Array[] = [];
-    const packedWriter = new PackWriter((chunk) => packedChunks.push(chunk));
-    packedWriter.header(1);
-    packedWriter.object("blob", packedBase);
-    packedWriter.finish();
-    await store.packs.ingest(slices(concat(packedChunks), 64 * 1024));
-
-    const looseSize = PACK_BLOB_BATCH_TARGET_BYTES;
-    const looseChunk = new Uint8Array(64 * 1024).fill(0x61);
-    const looseChunks = function* (): Generator<Uint8Array> {
-      for (let offset = 0; offset < looseSize; offset += looseChunk.length) {
-        yield looseChunk.subarray(0, Math.min(looseChunk.length, looseSize - offset));
-      }
-    };
-    const looseOid = store.writeStream("blob", looseSize, looseChunks);
-
-    const thinChunks: Uint8Array[] = [];
-    const thinWriter = new PackWriter((chunk) => thinChunks.push(chunk));
-    thinWriter.header(2);
-    thinWriter.refDelta(
-      hashObject("blob", packedBase),
-      literalDelta(packedBase.length, new Uint8Array([1])),
-    );
-    thinWriter.refDelta(looseOid, literalDelta(looseSize, new Uint8Array([2])));
-    thinWriter.finish();
-
-    db.storage.resetCounters();
-    const result = await store.packs.ingest(slices(concat(thinChunks), 64 * 1024));
-    expect(result.count).toBe(2);
-    expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(store.read(hashObject("blob", new Uint8Array([1])))?.data).toEqual(new Uint8Array([1]));
     expect(store.read(hashObject("blob", new Uint8Array([2])))?.data).toEqual(new Uint8Array([2]));
   });
@@ -2715,10 +2429,12 @@ describe("pack deferred resolution", () => {
     writer.object("blob", data);
     writer.finish();
     await store.packs.ingest(slices(concat(chunks), 64 * 1024));
-    store.db.run(
-      "UPDATE git_pack_objects SET size = 1, entry_size = 1 WHERE repo_id = 1 AND oid = ?",
-      oid,
-    );
+    for (const table of ["git_pack_objects", "git_pack_entries"]) {
+      store.db.run(
+        `UPDATE ${table} SET size = 1, entry_size = 1 WHERE repo_id = 1 AND oid = ?`,
+        oid,
+      );
+    }
 
     expect(() => store.readBlobs([oid])).toThrow(/exceeds its indexed size/);
   });
@@ -2766,8 +2482,8 @@ describe("pack publication and deletion", () => {
     );
     store.db.run(
       `INSERT INTO git_pack_objects
-         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
-       VALUES (1, ?, 7, 0, 0, 0, 'tree', 0, 0, NULL)`,
+         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
+       VALUES (1, ?, 7, 0, 0, 0, 'tree', 0, 0)`,
       oid,
     );
 
@@ -3219,7 +2935,6 @@ describe("pack publication and deletion", () => {
       packId: result.packId,
       type: "blob",
       size: data.length,
-      baseOid: null,
     });
     store.db.run(
       "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = ? AND pack_id = ?",
@@ -3383,7 +3098,7 @@ describe("real git packs", () => {
     await store.packs.ingest(slices(pack, 4096));
 
     const deltas = store.db.scalar<number>(
-      "SELECT COUNT(*) FROM git_pack_objects WHERE base_oid IS NOT NULL",
+      "SELECT COUNT(*) FROM git_pack_entries WHERE base_offset IS NOT NULL",
     );
     expect(deltas).toBeGreaterThan(0);
 

@@ -18,13 +18,8 @@ export class PackLifecycle {
   readonly #ingest: PackIngestLifecycleControl;
   readonly #membership: PackMembershipReader;
 
-  constructor(
-    db: SqlDatabase,
-    repoId: number,
-    sharedState: PackSharedState,
-    maxDeltaDepth: number,
-  ) {
-    this.#deletion = new PackDeletion(db, repoId, sharedState, maxDeltaDepth);
+  constructor(db: SqlDatabase, repoId: number, sharedState: PackSharedState) {
+    this.#deletion = new PackDeletion(db, repoId, sharedState);
     this.#ingest = new PackIngestLifecycleControl(db, repoId, sharedState, this.#deletion);
     this.#membership = new PackMembershipReader(db, repoId);
   }

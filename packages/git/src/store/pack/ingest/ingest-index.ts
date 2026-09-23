@@ -19,13 +19,8 @@ import {
   PackTreeIndex,
 } from "../pack-ingest-index.js";
 import type { PackReadEngine } from "../read.js";
-import {
-  ExpectedPackMembership,
-  type ExternalBatchResolver,
-  type ExternalMetadataResolver,
-  hashByteSource,
-  type PackIngestMemory,
-} from "../shared.js";
+import { ExpectedPackMembership, hashByteSource, type PackIngestMemory } from "../shared.js";
+import { PackDeltaDepths } from "./ingest-depth.js";
 import { PackIngestInflater } from "./ingest-inflate.js";
 import { throwIfIngestAborted } from "./ingest-options.js";
 import { PackPendingResolver } from "./ingest-pending.js";
@@ -41,19 +36,16 @@ export class PackIndexer {
     private readonly db: SqlDatabase,
     private readonly repoId: number,
     private readonly objects: ByteLru<string, RawObject>,
-    externalBatch: ExternalBatchResolver,
-    externalMetadata: ExternalMetadataResolver,
     private readonly read: PackReadEngine,
     maxBufferedEntry: number,
     private readonly cacheEntryLimit: number,
+    private readonly maxDeltaDepth: number,
   ) {
     this.#inflater = new PackIngestInflater(read, maxBufferedEntry, cacheEntryLimit);
     this.#projection = new PackResolvedProjection(repoId, read);
     this.#pending = new PackPendingResolver(
       db,
       repoId,
-      externalBatch,
-      externalMetadata,
       objects,
       read,
       cacheEntryLimit,
@@ -90,16 +82,17 @@ export class PackIndexer {
     if (version !== 2 && version !== 3)
       throw new CorruptError(`unsupported pack version ${version}`);
     const membership = new ExpectedPackMembership(count);
+    const depths = new PackDeltaDepths(membership, this.maxDeltaDepth);
 
     const offsets = new OffsetWindow();
-    const objectIndex = new PackObjectBatch(this.db, this.repoId, (row) => membership.record(row));
+    const objectIndex = new PackObjectBatch(this.db, this.repoId, (row) => {
+      membership.record(row);
+      depths.record(row[2], row[8]);
+    });
     const pendingIndex = new PackPendingBatch(this.db, this.repoId, packId);
     const treeIndex = new PackTreeIndex(this.db);
     const commitIndex = new PackCommitIndex(this.db, this.repoId, packId, objectIndex);
     const missingBases = new Set<string>();
-    const offsetToOid = (offset: number): string | null => {
-      return offsets.get(offset);
-    };
 
     let deferred = 0;
     for (let i = 0; i < count; i++) {
@@ -166,10 +159,13 @@ export class PackIndexer {
         missingBases.delete(oid);
         if (entry.data !== null) this.read.cacheObject(packId, oid, { type, data: entry.data });
       } else {
-        const baseOid =
-          header.kind === "ref" ? header.baseOid! : offsetToOid(header.offset - header.baseDelta!);
+        const baseOffset =
+          header.kind === "ref"
+            ? offsets.offsetOf(header.baseOid!)
+            : header.offset - header.baseDelta!;
+        const baseOid = baseOffset === null ? null : offsets.get(baseOffset);
         let resolved = false;
-        if (entry.data !== null && baseOid !== null) {
+        if (entry.data !== null && baseOffset !== null && baseOid !== null) {
           const base = missingBases.has(baseOid)
             ? undefined
             : this.objects.get(this.read.objectCacheKey(packId, baseOid));
@@ -187,7 +183,7 @@ export class PackIndexer {
                 base.type,
                 target.length,
                 header.entrySize,
-                baseOid,
+                baseOffset,
               ];
               this.#projection.insertResolved(
                 row,
@@ -250,7 +246,6 @@ export class PackIndexer {
     if (deferred > 0) this.read.clearCaches();
     await this.#pending.drainPending(
       packId,
-      offsets,
       objectIndex,
       treeIndex,
       commitIndex,

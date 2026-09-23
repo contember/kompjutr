@@ -228,8 +228,8 @@ function insertRoots(
   const payload = JSON.stringify(roots);
   db.run(
     `INSERT INTO git_maintenance_objects
-       (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, physical_only, edge_cursor)
-     SELECT ?, ?, value, ?, 0, ?, 0, 0 FROM json_each(?)
+       (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, edge_cursor)
+     SELECT ?, ?, value, ?, 0, ?, 0 FROM json_each(?)
      WHERE true
      ON CONFLICT(repo_id, run_id, oid) DO UPDATE SET
        source_mask = source_mask | excluded.source_mask,

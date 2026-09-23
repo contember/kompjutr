@@ -9,6 +9,11 @@ import { CorruptError } from "../../../common/errors.js";
 import { int, RowShape, text } from "../../../common/rows.js";
 import { jsonPages } from "../../core/json-pages.js";
 import { MAX_DELTA_DEPTH, MAX_PACK_BLOB_GRAPH_ENTRIES, MAX_PACK_BLOB_INPUTS } from "../shared.js";
+import {
+  PACK_GRAPH_BASE_STEP,
+  PACK_GRAPH_ENTRY_SELECT,
+  packGraphStartsSql,
+} from "./read-graph-sql.js";
 import type { PackReadScope } from "./read-scope.js";
 
 const INVALID_FRONTIER = "paged pack frontier state is invalid";
@@ -238,33 +243,12 @@ export function packGraphPageSql(entryLimit: number): string {
           WHERE repo_id = ? AND read_id = ? AND step = ?
        ),
        seeds(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
-       reachable(oid) AS (
-         SELECT object.oid
-           FROM frontier
-           CROSS JOIN git_pack_objects object
-             ON object.repo_id = ? AND object.oid = frontier.oid
-           CROSS JOIN git_pack_meta pack
-             ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-            AND (pack.state = 'complete' OR object.pack_id = ?)
+       ${packGraphStartsSql("frontier")},
+       reachable(pack_id, offset) AS (
+         SELECT pack_id, offset FROM starts
          UNION
-         SELECT base.oid
-           FROM reachable
-           CROSS JOIN git_pack_objects child
-             ON child.repo_id = ? AND child.oid = reachable.oid
-           CROSS JOIN git_pack_meta child_pack
-             ON child_pack.repo_id = child.repo_id
-            AND child_pack.pack_id = child.pack_id
-            AND (child_pack.state = 'complete' OR child.pack_id = ?)
-           CROSS JOIN git_pack_objects base
-             ON base.repo_id = child.repo_id AND base.oid = child.base_oid
-           CROSS JOIN git_pack_meta base_pack
-             ON base_pack.repo_id = base.repo_id AND base_pack.pack_id = base.pack_id
-            AND (base_pack.state = 'complete' OR base.pack_id = ?)
-          WHERE NOT EXISTS (SELECT 1 FROM seeds WHERE seeds.oid = base.oid)
+         ${PACK_GRAPH_BASE_STEP}
           LIMIT ${entryLimit}
        )
-     SELECT object.oid, object.base_oid
-       FROM reachable
-       CROSS JOIN git_pack_objects object
-         ON object.repo_id = ? AND object.oid = reachable.oid`;
+     ${PACK_GRAPH_ENTRY_SELECT}`;
 }

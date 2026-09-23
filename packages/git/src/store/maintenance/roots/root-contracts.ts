@@ -8,7 +8,6 @@ import { requireRefName } from "../../refs/ref-validation.js";
 export const DEFAULT_PAGE_ROWS = 128;
 export const MAX_PAGE_ROWS = 128;
 export const MAINTENANCE_ROOT_EPOCH_DRIFTED = "maintenance roots changed after root discovery";
-export const PACK_SWEEP_RETRY = "retry";
 
 export const ROOT_REFS = 1;
 export const ROOT_HEADS = 2;
@@ -91,10 +90,9 @@ export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): 
     if (
       run.rootSource !== "done" ||
       run.cursorCheckoutId !== null ||
-      (run.cursorText !== null && run.cursorText !== PACK_SWEEP_RETRY) ||
+      run.cursorText !== null ||
       (run.cursorOrdinal !== null &&
-        (!Number.isSafeInteger(run.cursorOrdinal) || run.cursorOrdinal < 0)) ||
-      (run.cursorText !== null && run.cursorOrdinal === null)
+        (!Number.isSafeInteger(run.cursorOrdinal) || run.cursorOrdinal < 0))
     ) {
       throw new CorruptError("maintenance pack sweep cursor is invalid");
     }

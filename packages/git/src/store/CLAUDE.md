@@ -62,6 +62,13 @@ workspace separately uses operation-local 64 KiB chunks. Publication validates
 the trailer and compares stored membership with digests recorded during parse;
 it does not re-read and re-inflate the pack. Only complete packs are readable.
 
+Packs are self-contained. `git_pack_entries.base_offset` names a delta's base
+inside the same pack; ingest converts REF deltas to it, rejects a base outside
+the pack, and rejects a chain above `MAX_DELTA_DEPTH`, all with `ECORRUPT`. A
+read starts at the canonical `git_pack_objects` row and follows base offsets
+within that pack, so pack deletion only promotes fallbacks and never checks a
+dependency.
+
 Loose objects are always zlib-deflated; maintenance never repacks them.
 Ordinary ingest uses a renewable five-minute repository lease and monotonic pack
 IDs. Maintenance owns no pack. One `maintenance()` call advances one bounded
@@ -73,9 +80,7 @@ A paged packed read owns its discovery frontier in `git_pack_read_*` scratch
 rows and re-asserts that generation before releasing its owner; an ordinary
 non-paged read opens no transaction and writes nothing. Phases are `roots`,
 `mark`, `loose`, `packs`, `finish`; the loose and pack phases classify and sweep
-in the same page. Sweep eligibility is 14 days after stable classification. A
-loose object that a surviving pack still names as a delta base is never
-nominated and never swept.
+in the same page. Sweep eligibility is 14 days after stable classification.
 
 Pack code derives from dgit (MIT). Keep the attribution headers when splitting
 or moving it. `../diff/` is a separate LGPL boundary.

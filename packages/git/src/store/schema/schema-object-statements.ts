@@ -135,9 +135,6 @@ export const OBJECT_SCHEMA_STATEMENTS = [
        typeof(size) = 'integer' AND size BETWEEN 0 AND ${MAX_OBJECT_BYTES}
      ),
      entry_size INTEGER NOT NULL CHECK (typeof(entry_size) = 'integer' AND entry_size >= 0),
-     base_oid TEXT CHECK (
-       base_oid IS NULL OR (typeof(base_oid) = 'text' AND length(CAST(base_oid AS BLOB)) = 40)
-     ),
      PRIMARY KEY (repo_id, oid),
      FOREIGN KEY (repo_id, pack_id) REFERENCES git_pack_meta (repo_id, pack_id) ON DELETE CASCADE
    )`,
@@ -146,7 +143,8 @@ export const OBJECT_SCHEMA_STATEMENTS = [
      ON git_pack_objects (repo_id, pack_id, offset)`,
 
   // Every pack keeps its own authenticated index while git_pack_objects
-  // remains the canonical read owner for each OID.
+  // remains the canonical read owner for each OID. Packs are self-contained:
+  // a delta names its base by offset inside the same pack.
   `CREATE TABLE IF NOT EXISTS git_pack_entries (
      repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
      pack_id INTEGER NOT NULL CHECK (typeof(pack_id) = 'integer' AND pack_id >= 0),
@@ -159,8 +157,10 @@ export const OBJECT_SCHEMA_STATEMENTS = [
        typeof(size) = 'integer' AND size BETWEEN 0 AND ${MAX_OBJECT_BYTES}
      ),
      entry_size INTEGER NOT NULL CHECK (typeof(entry_size) = 'integer' AND entry_size >= 0),
-     base_oid TEXT CHECK (
-       base_oid IS NULL OR (typeof(base_oid) = 'text' AND length(CAST(base_oid AS BLOB)) = 40)
+     base_offset INTEGER CHECK (
+       base_offset IS NULL OR (
+         typeof(base_offset) = 'integer' AND base_offset >= 0 AND base_offset != offset
+       )
      ),
      PRIMARY KEY (repo_id, pack_id, offset),
      FOREIGN KEY (repo_id, pack_id)
@@ -169,11 +169,6 @@ export const OBJECT_SCHEMA_STATEMENTS = [
 
   `CREATE INDEX IF NOT EXISTS git_pack_entries_by_oid
      ON git_pack_entries (repo_id, oid, pack_id, offset)`,
-
-  // Maintenance asks the reverse question — which OIDs a surviving pack still
-  // needs as a delta base — once per swept loose object.
-  `CREATE INDEX IF NOT EXISTS git_pack_entries_by_base
-     ON git_pack_entries (repo_id, base_oid) WHERE base_oid IS NOT NULL`,
 
   // Delta entries whose base had not been seen yet when the pack was
   // scanned. Drained before the pack is marked complete.
@@ -189,7 +184,4 @@ export const OBJECT_SCHEMA_STATEMENTS = [
      PRIMARY KEY (repo_id, pack_id, offset),
      FOREIGN KEY (repo_id, pack_id) REFERENCES git_pack_meta (repo_id, pack_id) ON DELETE CASCADE
    )`,
-
-  `CREATE INDEX IF NOT EXISTS git_pack_pending_by_base
-     ON git_pack_pending (repo_id, base_oid) WHERE base_oid IS NOT NULL`,
 ] as const;

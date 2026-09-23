@@ -1760,7 +1760,56 @@ describe("fetch", () => {
     }
   });
 
-  it("transfers only the new objects, then nothing at all", async () => {
+  it("rejects a thin pack the server sends anyway and recovers on the next fetch", async () => {
+    const fixture = new GitFixture().init();
+    const body = Array.from({ length: 2_000 }, (_, i) => `line ${i}: thin pack base\n`).join("");
+    fixture.write("big.txt", body);
+    fixture.commit("base");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    // Real Git only sends a thin pack when asked, so the client's request is rewritten to ask.
+    const thin: GitHttpClient = (request) =>
+      fetchHttpClient(
+        rewriteFirstUploadLine(request, (line) =>
+          line.replace(" ofs-delta", " thin-pack ofs-delta"),
+        ),
+      );
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work" });
+      const repo = openRepository(workspace.context, "/work");
+      const before = repo.store.getRef("refs/remotes/origin/main");
+      fixture.write("big.txt", `${body}one appended line\n`);
+      const next = fixture.commit("append");
+
+      await expect(fetchInto({ ...workspace.context, http: thin }, repo, {})).rejects.toMatchObject(
+        {
+          code: "ECORRUPT",
+          message: expect.stringMatching(/missing base in the pack/),
+        },
+      );
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(before);
+      expect(
+        tableRows<{ count: number }>(
+          workspace,
+          "SELECT count(*) AS count FROM git_pack_meta WHERE state = 'pending'",
+        ),
+      ).toEqual([{ count: 1 }]);
+
+      await fetchInto(workspace.context, repo, {});
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(next);
+      expect(
+        tableRows<{ count: number }>(
+          workspace,
+          "SELECT count(*) AS count FROM git_pack_meta WHERE state = 'pending'",
+        ),
+      ).toEqual([{ count: 0 }]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("transfers the new shallow snapshot, then nothing at all", async () => {
     const { fixture, head } = makeFixture();
     const server = await startGitServer(fixture.dir);
     const workspace = makeWorkspace({
@@ -1793,8 +1842,18 @@ describe("fetch", () => {
       );
       expect(packs.length).toBe(2);
       expect(packs[1]?.state).toBe("complete");
-      // The new commit, the new root tree and the one new blob — nothing else.
-      expect(packs[1]?.count).toBe(3);
+      // Without a thin pack, a depth-1 fetch carries the new commit's whole snapshot.
+      const snapshot = fixture
+        .git("rev-list", "--objects", "--no-walk", next)
+        .split("\n")
+        .map((line) => line.split(" ")[0]!)
+        .sort();
+      expect(
+        tableRows<{ oid: string }>(
+          workspace,
+          `SELECT oid FROM git_pack_entries WHERE pack_id = ${packs[1]?.pack_id} ORDER BY oid`,
+        ).map((row) => row.oid),
+      ).toEqual(snapshot);
       expect(packs[1]?.count ?? 0).toBeLessThan(firstPack[0]?.count ?? 0);
       expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
         oldRaw: head,

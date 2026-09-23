@@ -19,7 +19,7 @@ export class PackMembershipReader {
     let rows = 0;
     for (const row of this.db.iterate(
       `SELECT /* complete-packed-entry */ object.oid, object.pack_id,
-              object.type, object.size, object.base_oid
+              object.type, object.size
          FROM git_pack_objects object
          JOIN git_pack_meta pack
            ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
@@ -33,7 +33,6 @@ export class PackMembershipReader {
       const packId = row.pack_id;
       const type = row.type;
       const size = row.size;
-      const baseOid = row.base_oid;
       if (
         typeof rowOid !== "string" ||
         rowOid !== oid ||
@@ -45,14 +44,13 @@ export class PackMembershipReader {
         !isObjectType(type) ||
         typeof size !== "number" ||
         !Number.isSafeInteger(size) ||
-        size < 0 ||
-        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid)))
+        size < 0
       ) {
         throw new CorruptError(`packed entry ${oid} has invalid metadata`);
       }
       rows++;
       if (rows > 1) throw new CorruptError(`packed entry ${oid} is not unique`);
-      result = { packId, type, size, baseOid };
+      result = { packId, type, size };
     }
     return result;
   }

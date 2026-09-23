@@ -227,8 +227,8 @@ function installPackCopy(
     );
     workspace.database.db.run(
       `INSERT INTO git_pack_objects
-         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
-       SELECT repo_id, oid, ?, 0, 0, 0, type, size, 0, NULL
+         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
+       SELECT repo_id, oid, ?, 0, 0, 0, type, size, 0
          FROM git_objects WHERE repo_id = ? AND oid = ?`,
       packId,
       repoId,

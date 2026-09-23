@@ -7,15 +7,12 @@ import type { ByteLru } from "../../common/lru.js";
 import type { RawObject } from "../../common/objects.js";
 import { bumpRepositorySourceGeneration } from "../core/source-generation.js";
 import { ChunkPool } from "./chunks.js";
-import { PackGraphAdmission } from "./graph/graph-admission.js";
 import { PackIndexer } from "./ingest/ingest-index.js";
 import { type AbortablePackIngestOptions, throwIfIngestAborted } from "./ingest/ingest-options.js";
 import { PackChunkWriter } from "./ingest/ingest-write.js";
 import type { PackLifecycle } from "./lifecycle.js";
 import type { PackReadEngine } from "./read.js";
 import {
-  type ExternalBatchResolver,
-  type ExternalMetadataResolver,
   type PackIngestLease,
   type PackIngestMemory,
   type PackIngestResult,
@@ -38,15 +35,13 @@ export class PackIngestEngine {
     db: SqlDatabase,
     repoId: number,
     objects: ByteLru<string, RawObject>,
-    externalBatch: ExternalBatchResolver,
-    externalMetadata: ExternalMetadataResolver,
     read: PackReadEngine,
     lifecycle: PackLifecycle,
     sharedState: PackSharedState,
     now: () => number,
     maxBufferedEntry: number,
     cacheEntryLimit: number,
-    private readonly maxDeltaDepth: number,
+    maxDeltaDepth: number,
   ) {
     this.#db = db;
     this.#repoId = repoId;
@@ -59,11 +54,10 @@ export class PackIngestEngine {
       db,
       repoId,
       objects,
-      externalBatch,
-      externalMetadata,
       read,
       maxBufferedEntry,
       cacheEntryLimit,
+      maxDeltaDepth,
     );
   }
 
@@ -143,16 +137,7 @@ export class PackIngestEngine {
           throw new GitError("ESTALE", "pack ingest ownership changed before publication");
         }
         this.#lifecycle.auditPublishedMembership(reservation.packId, membership);
-        const graph = new PackGraphAdmission(
-          this.#db,
-          this.#repoId,
-          this.maxDeltaDepth,
-          "publication",
-        );
-        graph.seedPacks([reservation.packId]);
-        graph.validate();
         commits.finish();
-        graph.cleanup();
         bumpRepositorySourceGeneration(this.#db, this.#repoId);
         if (options.lifecycle !== undefined) {
           requireLifecycleResult(options.lifecycle.published(result), "published");

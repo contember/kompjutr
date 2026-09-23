@@ -12,7 +12,6 @@ export interface MaintenanceReachabilityProgress {
   status: MaintenanceReachabilityStatus;
   processedOid: string | null;
   discoveredObjects: number;
-  discoveredLogicalObjects: number;
 }
 
 export type RunState = MaintenanceRunView;
@@ -21,7 +20,6 @@ export interface QueueObject {
   oid: string;
   sourceMask: number;
   shallowBoundary: boolean;
-  physicalOnly: boolean;
   edgeCursor: number;
 }
 
@@ -30,7 +28,6 @@ export interface ReachabilityEdge {
   type: ObjectType;
   optionalMissing: boolean;
   allowPromisedMissing: boolean;
-  physicalOnly: boolean;
 }
 
 export interface ObjectExpansion {
@@ -51,16 +48,8 @@ export interface NormalizedEdge extends ReachabilityEdge {
   present: boolean;
 }
 
-export interface ExistingMark {
-  exists: boolean;
-  physicalOnly: boolean;
-  expanded: boolean;
-  edgeCursor: number;
-}
-
 export interface PublicationResult {
   discoveredObjects: number;
-  discoveredLogicalObjects: number;
   queuedObjects: number;
   reachableObjects: number;
 }

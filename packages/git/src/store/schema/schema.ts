@@ -8,7 +8,6 @@ import { CORE_SCHEMA_STATEMENTS } from "./schema-core-statements.js";
 import { INTEGRATION_WORKSPACE_SCHEMA_STATEMENTS } from "./schema-integration-workspace-statements.js";
 import { MAINTENANCE_SCHEMA_STATEMENTS } from "./schema-maintenance-statements.js";
 import { OBJECT_SCHEMA_STATEMENTS } from "./schema-object-statements.js";
-import { PACK_GRAPH_SCHEMA_STATEMENTS } from "./schema-pack-graph-statements.js";
 import { PACK_READ_SCHEMA_STATEMENTS } from "./schema-pack-read-statements.js";
 import { TREE_SCHEMA_STATEMENTS } from "./schema-tree-statements.js";
 import { WORKTREE_SCHEMA_STATEMENTS } from "./schema-worktree-statements.js";
@@ -38,7 +37,6 @@ const STATEMENTS = [
   ...INTEGRATION_WORKSPACE_SCHEMA_STATEMENTS,
   ...WORKTREE_SCHEMA_STATEMENTS,
   ...OBJECT_SCHEMA_STATEMENTS,
-  ...PACK_GRAPH_SCHEMA_STATEMENTS,
   ...PACK_READ_SCHEMA_STATEMENTS,
   ...TREE_SCHEMA_STATEMENTS,
   ...MAINTENANCE_SCHEMA_STATEMENTS,

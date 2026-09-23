@@ -203,10 +203,9 @@ access outside those catches. Incremental stored-entry error handling is separat
 
 Packed resolution retains the active decoded chain value, requested outputs and
 the bounded object cache. It releases other decoded intermediates as the chain
-advances. Shared intermediates outside the cache can be inflated again. External
-base payloads load in 4 MiB windows, allowing one larger base for progress; each
-new window releases the previous one. Discovery-time cache entries evicted before
-consumption are loaded again from their stored source.
+advances. Shared intermediates outside the cache can be inflated again.
+Discovery-time cache entries evicted before consumption are loaded again from
+their stored source.
 
 `git_pack_entries` authenticates every physical entry of each pack, including
 duplicate OIDs. `git_pack_objects` remains the single canonical read location
@@ -215,40 +214,28 @@ identities and query completed sources in one batch. Only completed projections
 are reused; unavailable sources remain eligible for another indexing attempt.
 Every physical occurrence still passes object authentication, and generic tree
 indexing continues to validate its input rather than trusting a duplicate key.
-Deferred OFS deltas resolve their pack-relative base offset through
-physical entries before using canonical OID reads; an older canonical owner does
-not hide an incoming occurrence. Publication compares the exact ordered rows with
-the digest made while parsing and requires every entry's canonical owner to be complete.
-Deleting that owner promotes one complete fallback entry atomically before the
-old rows disappear. The structural closure check covers canonical and
-non-canonical physical delta entries and requires every surviving dependency to
-retain a base. Publication trusts the parse-time membership digests; deletion
-does not re-hash stored objects. Page and read sizes shape the work, but
-accumulated pages or projected reads do not reject it. Deletion rejects when a
-surviving delta chain would lose its base or a real pack-cardinality, format,
-delta, corruption, or structural bound is exhausted.
-
-Deletion protects external bases named by both unresolved pending deltas and
-resolved physical entries in pending packs. All canonical fallback promotions in
-a deletion batch precede metadata validation of terminating surviving chains;
-an unsafe promotion fails atomically with `EBUSY`.
-
-Publication and final-batch deletion validate the affected canonical dependency
-graph through indexed reverse closure and forward traversal. Complete canonical
-packed sources take precedence over loose terminals for this check; promises
-and pending sources cannot satisfy dependencies. Chains must preserve object
-type, terminate and stay within 50,000 delta edges. Repository/operation-owned
-SQL scratch holds affected nodes, depth memo and active paths; JavaScript pages
-contain at most 256 records. Scratch is removed before publication callbacks.
+Packs are self-contained: every delta names its base by offset inside its own
+pack. Fetch never requests `thin-pack`. Ingest stores a REF delta with the offset
+of the in-pack entry that carries its base OID and rejects a base outside the pack
+with `ECORRUPT`. It carries each entry's chain depth while deferred deltas drain
+and rejects a chain longer than 50,000 edges with `ECORRUPT`. A read takes the
+canonical row's pack and follows base offsets within it, so an older canonical
+owner never redirects a chain into another pack. Publication compares the exact
+ordered rows with the digest made while parsing and requires every entry's
+canonical owner to be complete. Deleting that owner promotes one complete
+fallback entry atomically before the old rows disappear. No surviving chain can
+lose its base to a deletion, so deletion checks no dependency. Publication trusts
+the parse-time membership digests; deletion does not re-hash stored objects.
+Page and read sizes shape the work, but accumulated pages or projected reads do
+not reject it.
 Ingest and cold reads share the 48 MiB logical base/instructions/target limit;
 the separate rounded chunk-allocation guard also applies.
 
 The `packs` phase classifies and sweeps in one pass. It examines at most one
 bounded page per call and deletes at most one pack. Its durable cursor records
-the last examined pack and a sticky retry marker after deletion. An exhausted
-dirty pass resets and returns; an exhausted deletion-free pass completes. This
-revisits earlier candidates that lost their dependents without rescanning every
-blocker before each deletion.
+the last examined pack, and one pass over the packs completes the phase: a
+deletion only promotes canonical rows into later packs, so no earlier verdict
+changes.
 Cold reopen preserves the cursor; root-epoch restart and phase exit clear it.
 Candidate analysis uses SQLite metadata, including the actual canonical fallback
 order, without loading object payloads.

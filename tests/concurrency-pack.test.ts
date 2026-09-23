@@ -360,47 +360,42 @@ describe("concurrent pack ownership", () => {
     }
   });
 
-  it.each(["unresolved", "flushed"])(
-    "protects a %s pending thin delta base across cold deletion",
-    async (stage) => {
-      const opened = createStore();
-      const base = utf8.encode("thin external base\n");
-      const target = utf8.encode("thin resolved target\n");
-      const baseOid = hashObject("blob", base);
-      const first = await opened.store.packs.ingest(singleChunk(fullObjectPack([base])));
-      const cold = reopenStore(opened.storage);
-      const bytes = lifecyclePack((writer) => {
-        writer.refDelta(baseOid, lifecycleDelta(base.length, target));
-        for (let i = 0; i < 1023; i++) writer.object("blob", utf8.encode(`thin filler ${i}\n`));
-      }, 1024);
-      const barrier = checkpointBarrier<boolean>(`thin delta ${stage}`, Boolean);
-      const owner = cold.store.packs.ingest(singleChunk(bytes), {
+  it("resolves a pending delta from its own base while another pack's copy is deleted", async () => {
+    const opened = createStore();
+    const base = utf8.encode("duplicated in-pack base\n");
+    const target = utf8.encode("delta target over the duplicated base\n");
+    const baseOid = hashObject("blob", base);
+    const duplicate = await opened.store.packs.ingest(singleChunk(fullObjectPack([base])));
+    const cold = reopenStore(opened.storage);
+    // The delta precedes its base, so it stays pending until the drain reads the base.
+    const bytes = lifecyclePack((writer) => {
+      writer.refDelta(baseOid, lifecycleDelta(base.length, target));
+      writer.object("blob", base);
+      for (let i = 0; i < 1022; i++) writer.object("blob", utf8.encode(`own base filler ${i}\n`));
+    }, 1024);
+    let deleted = 0;
+    // The pending pack's own base resolves the delta; only publication notices that
+    // the base's canonical owner vanished, and that is the retryable ESTALE.
+    await expect(
+      cold.store.packs.ingest(singleChunk(bytes), {
         async yieldNow() {
-          const table = stage === "unresolved" ? "git_pack_pending" : "git_pack_entries";
-          const found = cold.db.scalar<number>(
-            `SELECT count(*) FROM ${table} WHERE base_oid = ?`,
-            baseOid,
-          );
-          await barrier.checkpoint((found ?? 0) > 0);
+          const pending = cold.db.scalar<number>("SELECT count(*) FROM git_pack_pending") ?? 0;
+          if (deleted === 0 && pending > 0) {
+            deleted = reopenStore(opened.storage).store.packs.deleteCompletePacks([
+              duplicate.packId,
+            ]);
+          }
         },
-      });
-      await awaitBarrierEntry(barrier, owner);
-      try {
-        const deleting = reopenStore(opened.storage);
-        expect(() => deleting.store.packs.deleteCompletePacks([first.packId])).toThrowError(
-          expect.objectContaining({ code: "EBUSY" }),
-        );
-        expect(deleting.store.read(baseOid)?.data).toEqual(base);
-      } finally {
-        barrier.release();
-        await owner;
-      }
-      expect(reopenStore(opened.storage).store.read(hashObject("blob", target))?.data).toEqual(
-        target,
-      );
-      expect(await reclaimPending(reopenStore(opened.storage).store)).toBe(0);
-    },
-  );
+      }),
+    ).rejects.toMatchObject({ code: "ESTALE" });
+    expect(deleted).toBe(1);
+    expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_pending")).toBe(0);
+    await cold.store.packs.ingest(singleChunk(bytes));
+    const reader = reopenStore(opened.storage).store;
+    expect(reader.read(baseOid)?.data).toEqual(base);
+    expect(reader.read(hashObject("blob", target))?.data).toEqual(target);
+    expect(await reclaimPending(reader)).toBe(0);
+  });
 
   it("fences a same-store overlap and preserves its duplicate fallback after retry", async () => {
     const opened = createStore();

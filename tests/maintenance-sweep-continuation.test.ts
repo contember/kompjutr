@@ -3,7 +3,6 @@ import { utf8 } from "../packages/git/src/common/bytes.js";
 import { hashObject } from "../packages/git/src/common/objects.js";
 import {
   type MaintenanceRootCursorState,
-  PACK_SWEEP_RETRY,
   validateMaintenanceRootCursor,
 } from "../packages/git/src/store/maintenance/roots/root-contracts.js";
 import { DEFAULT_PAGE_ROWS } from "../packages/git/src/store/maintenance/sweep/sweep-contracts.js";
@@ -11,14 +10,13 @@ import {
   advanceMaintenanceSweep,
   GC_GRACE_MS,
 } from "../packages/git/src/store/maintenance/sweep.js";
-import { lifecycleDelta, lifecyclePack, packMaintenance } from "./helpers/pack-maintenance.js";
+import { packMaintenance } from "./helpers/pack-maintenance.js";
 
 function observe(fixture: ReturnType<typeof packMaintenance>) {
-  const counts = { examined: 0, pages: 0, checks: 0 };
+  const counts = { examined: 0, pages: 0 };
   const exec = fixture.storage.sql.exec;
   fixture.storage.sql.exec = <Row extends object>(query: string, ...bindings: unknown[]) => {
     const cursor = exec<Row>(query, ...bindings);
-    if (query.startsWith("WITH RECURSIVE target(repo_id, pack_id)")) counts.checks++;
     if (query.includes("/* pack-sweep-page */")) {
       counts.pages++;
       expect(query).toContain("pack.pack_id > ?");
@@ -62,7 +60,7 @@ describe("pack sweep continuation", () => {
     const store = fixture.store();
     const run = store.db.run.bind(store.db);
     store.db.run = (query: string, ...bindings: unknown[]): void => {
-      if (query.includes("SET cursor_ordinal = ?, cursor_text = ?"))
+      if (query.includes("SET cursor_ordinal = ? WHERE"))
         throw new Error("cursor publication failed");
       run(query, ...bindings);
     };
@@ -80,100 +78,63 @@ describe("pack sweep continuation", () => {
       fixture.db.scalar("SELECT count(*) FROM git_pack_meta WHERE pack_id = ?", packed.packId),
     ).toBe(1);
     expect(await fixture.call()).toMatchObject({ reclaimedPacks: 1 });
-    expect(cursor(fixture)).toMatchObject({
-      cursor_ordinal: packed.packId,
-      cursor_text: PACK_SWEEP_RETRY,
-    });
+    expect(cursor(fixture)).toMatchObject({ cursor_ordinal: packed.packId, cursor_text: null });
   });
 
-  it("bounds cold public pages, preserves dirty progress, retries earlier bases, and clears the finish cursor", async () => {
+  it("bounds cold public pages, finishes in one pass across deletions, and clears the finish cursor", async () => {
     const fixture = packMaintenance();
     await fixture.runtime().git.init({ dir: "/repo" });
-    const early = utf8.encode("earlier dead base\n");
-    const earlyPack = await fixture.full(early);
     const firstDead = await fixture.full(utf8.encode("first pass deletion\n"));
-    const blockedCount = 2 * DEFAULT_PAGE_ROWS + 1;
-    const bases = [];
-    for (let index = 0; index < blockedCount; index++) {
-      const data = utf8.encode(`blocked base ${index}\n`);
-      bases.push({ data, packId: (await fixture.full(data)).packId });
+    const liveCount = 2 * DEFAULT_PAGE_ROWS + 1;
+    const lives = [];
+    for (let index = 0; index < liveCount; index++) {
+      const data = utf8.encode(`revived member ${index}\n`);
+      lives.push(data);
+      await fixture.full(data);
     }
-    for (let index = 0; index < bases.length; index++) {
-      const base = bases[index]!;
-      const live = utf8.encode(`live member ${index}\n`);
-      await fixture.ingest(
-        lifecyclePack((writer) => {
-          writer.refDelta(
-            hashObject("blob", base.data),
-            lifecycleDelta(base.data.length, utf8.encode(`dead child ${index}\n`)),
-          );
-          writer.object("blob", live);
-        }, 2),
-      );
+    const lastDead = await fixture.full(utf8.encode("last dead pack\n"));
+    // Nominate every pack, then revive the middle ones: each still carries a
+    // candidate row, so the sweep pages over them without deleting.
+    await fixture.until("finish", 3 * liveCount + 30);
+    for (let index = 0; index < liveCount; index++) {
       await fixture.runtime().git.updateRef({
         dir: "/repo",
         ref: `refs/tags/live-${index}`,
-        value: hashObject("blob", live),
+        value: hashObject("blob", lives[index]!),
       });
     }
-    const child = await fixture.ingest(
-      lifecyclePack(
-        (writer) =>
-          writer.refDelta(
-            hashObject("blob", early),
-            lifecycleDelta(early.length, utf8.encode("later dead child\n")),
-          ),
-        1,
-      ),
-    );
-    const lastDead = await fixture.full(utf8.encode("last dead pack\n"));
-    await fixture.until("finish", 3 * blockedCount + 30);
     fixture.clock.value += GC_GRACE_MS;
     const young = utf8.encode("young loose object between sweep passes\n");
     fixture.store().write("blob", young);
-    await fixture.until("packs", 3 * blockedCount + 30);
+    await fixture.until("packs", 3 * liveCount + 30);
     expect(cursor(fixture).next_eligible_ms).toBe(fixture.clock.value + GC_GRACE_MS);
     const counts = observe(fixture);
-    let stickyPages = 0;
-    let restarts = 0;
+    let fullPages = 0;
     let finished = false;
-    let deletedEarlierOnRetry = false;
     let previousReclaimed = 0;
-    const bound = 3 * (Math.ceil((blockedCount + 4) / DEFAULT_PAGE_ROWS) + 4 + 1);
+    const bound = 3 * (Math.ceil((liveCount + 2) / DEFAULT_PAGE_ROWS) + 4 + 1);
     for (let call = 0; call < bound; call++) {
       counts.examined = 0;
       counts.pages = 0;
-      counts.checks = 0;
       const before = cursor(fixture);
       const result = await fixture.call();
       const after = cursor(fixture);
       expect(counts.pages).toBe(1);
       expect(counts.examined).toBeLessThanOrEqual(DEFAULT_PAGE_ROWS);
       expect(result.reclaimedPacks - previousReclaimed).toBeLessThanOrEqual(1);
-      // The page is read whole before any write; a deletion ends the call early.
-      if (result.reclaimedPacks === previousReclaimed) expect(counts.checks).toBe(counts.examined);
-      else expect(counts.checks).toBeLessThanOrEqual(counts.examined);
       previousReclaimed = result.reclaimedPacks;
       expect(after.cursor_checkout_id).toBeNull();
       expect(after.root_source).toBe("done");
       if (result.phase === "packs") expect(after.next_eligible_ms).toBe(before.next_eligible_ms);
-      if (
-        before.cursor_text === PACK_SWEEP_RETRY &&
-        counts.examined === DEFAULT_PAGE_ROWS &&
-        result.reclaimedPacks === 1
-      ) {
-        stickyPages++;
-        expect(after.cursor_text).toBe(PACK_SWEEP_RETRY);
+      expect(after.cursor_text).toBeNull();
+      if (result.phase === "packs") {
+        // The cursor only advances within the one pass: nothing restarts from the first pack.
+        expect(after.cursor_ordinal).not.toBeNull();
+        if (before.cursor_ordinal !== null) {
+          expect(after.cursor_ordinal).toBeGreaterThan(before.cursor_ordinal);
+        }
+        if (counts.examined === DEFAULT_PAGE_ROWS) fullPages++;
       }
-      if (
-        before.cursor_text === PACK_SWEEP_RETRY &&
-        after.cursor_ordinal === null &&
-        result.phase === "packs"
-      ) {
-        restarts++;
-        expect(after.cursor_text).toBeNull();
-      }
-      if (restarts > 0 && after.cursor_ordinal === earlyPack.packId) deletedEarlierOnRetry = true;
       if (result.phase === "finish") {
         expect(after.cursor_ordinal).toBeNull();
         expect(after.cursor_text).toBeNull();
@@ -182,19 +143,18 @@ describe("pack sweep continuation", () => {
       }
     }
     expect(finished).toBe(true);
-    expect(stickyPages).toBeGreaterThanOrEqual(2);
-    expect(restarts).toBe(2);
-    expect(deletedEarlierOnRetry).toBe(true);
-    for (const packId of [earlyPack.packId, firstDead.packId, child.packId, lastDead.packId]) {
+    expect(fullPages).toBeGreaterThanOrEqual(2);
+    expect(previousReclaimed).toBe(2);
+    for (const packId of [firstDead.packId, lastDead.packId]) {
       expect(
         fixture.db.scalar("SELECT count(*) FROM git_pack_meta WHERE pack_id = ?", packId),
       ).toBe(0);
     }
-    for (const base of bases)
-      expect(fixture.store().read(hashObject("blob", base.data))?.data).toEqual(base.data);
+    for (const live of lives)
+      expect(fixture.store().read(hashObject("blob", live))?.data).toEqual(live);
   });
 
-  it("clears a dirty cold sweep cursor when the root epoch changes", async () => {
+  it("clears a mid-pass cold sweep cursor when the root epoch changes", async () => {
     const fixture = packMaintenance();
     await fixture.runtime().git.init({ dir: "/repo" });
     await fixture.full(utf8.encode("epoch dead pack\n"));
@@ -204,7 +164,8 @@ describe("pack sweep continuation", () => {
     fixture.clock.value += GC_GRACE_MS;
     await fixture.until("packs");
     await fixture.call();
-    expect(cursor(fixture).cursor_text).toBe(PACK_SWEEP_RETRY);
+    expect(cursor(fixture)).toMatchObject({ cursor_text: null });
+    expect(cursor(fixture).cursor_ordinal).not.toBeNull();
     await fixture.runtime().git.updateRef({
       dir: "/repo",
       ref: "refs/tags/new-root",
@@ -229,15 +190,13 @@ describe("pack sweep continuation", () => {
       cursorOrdinal: 0,
     };
     expect(() => validateMaintenanceRootCursor(sweep)).not.toThrow();
-    expect(() =>
-      validateMaintenanceRootCursor({ ...sweep, cursorText: PACK_SWEEP_RETRY }),
-    ).not.toThrow();
+    expect(() => validateMaintenanceRootCursor({ ...sweep, cursorOrdinal: null })).not.toThrow();
     for (const changed of [
       { ...sweep, phase: "finish" },
       { ...sweep, phase: "mark" },
       { ...sweep, cursorOrdinal: -1 },
       { ...sweep, cursorText: "unknown" },
-      { ...sweep, cursorText: PACK_SWEEP_RETRY, cursorOrdinal: null },
+      { ...sweep, cursorText: "retry" },
       { ...sweep, cursorCheckoutId: 1 },
     ])
       expect(() => validateMaintenanceRootCursor(changed)).toThrow();

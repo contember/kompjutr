@@ -58,10 +58,6 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_pack_entries", "shared"],
   ["git_pack_objects", "shared"],
   ["git_pack_pending", "shared"],
-  ["git_pack_graph_operations", "shared"],
-  ["git_pack_graph_affected", "shared"],
-  ["git_pack_graph_memo", "shared"],
-  ["git_pack_graph_path", "shared"],
   ["git_pack_read_scopes", "shared"],
   ["git_pack_read_pages", "shared"],
   ["git_pack_read_frontier", "shared"],
@@ -124,21 +120,13 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_pack_commit_staging" },
   { type: "table", name: "git_pack_data" },
   { type: "table", name: "git_pack_entries" },
-  { type: "index", name: "git_pack_entries_by_base" },
   { type: "index", name: "git_pack_entries_by_oid" },
   { type: "table", name: "git_pack_gc_candidates" },
-  { type: "table", name: "git_pack_graph_affected" },
-  { type: "table", name: "git_pack_graph_memo" },
-  { type: "table", name: "git_pack_graph_operations" },
-  { type: "table", name: "git_pack_graph_path" },
-  { type: "index", name: "git_pack_graph_pending" },
   { type: "table", name: "git_pack_ingest_control" },
   { type: "table", name: "git_pack_meta" },
   { type: "table", name: "git_pack_objects" },
   { type: "index", name: "git_pack_objects_loc" },
-  { type: "index", name: "git_pack_objects_reverse" },
   { type: "table", name: "git_pack_pending" },
-  { type: "index", name: "git_pack_pending_by_base" },
   { type: "table", name: "git_pack_read_frontier" },
   { type: "table", name: "git_pack_read_pages" },
   { type: "table", name: "git_pack_read_scopes" },
@@ -317,7 +305,7 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
       "type",
       "size",
       "entry_size",
-      "base_oid",
+      "base_offset",
     ],
   ],
   ["git_maintenance_control", ["repo_id", "root_epoch", "next_run_id"]],
@@ -345,16 +333,7 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   ],
   [
     "git_maintenance_objects",
-    [
-      "repo_id",
-      "run_id",
-      "oid",
-      "source_mask",
-      "expanded",
-      "shallow_boundary",
-      "physical_only",
-      "edge_cursor",
-    ],
+    ["repo_id", "run_id", "oid", "source_mask", "expanded", "shallow_boundary", "edge_cursor"],
   ],
   ["git_maintenance_shallow", ["repo_id", "run_id", "oid"]],
   ["git_loose_gc_candidates", ["repo_id", "oid", "unreachable_since_ms"]],
@@ -405,7 +384,6 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   ["git_pack_meta", ["repo_id", "pack_id", "size", "count", "state", "created"]],
   ["git_pack_gc_candidates", ["repo_id", "pack_id", "unreachable_since_ms"]],
   ["git_pack_data", ["repo_id", "pack_id", "seq", "data"]],
-  ["git_pack_graph_operations", ["repo_id", "op_id"]],
   ["git_integration_workspaces", ["repo_id", "workspace_id"]],
   ["git_integration_objects", ["repo_id", "workspace_id", "oid", "type", "size"]],
   ["git_integration_object_chunks", ["repo_id", "workspace_id", "oid", "seq", "data"]],
@@ -445,26 +423,12 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
       "worktree_revision",
     ],
   ],
-  ["git_pack_graph_affected", ["repo_id", "op_id", "oid", "pending", "cursor"]],
-  ["git_pack_graph_memo", ["repo_id", "op_id", "oid", "depth", "type"]],
-  ["git_pack_graph_path", ["repo_id", "op_id", "oid", "position"]],
   ["git_pack_read_scopes", ["repo_id", "read_id"]],
   ["git_pack_read_pages", ["repo_id", "read_id", "step", "entry_limit"]],
   ["git_pack_read_frontier", ["repo_id", "read_id", "step", "oid", "origin_id", "depth"]],
   [
     "git_pack_objects",
-    [
-      "repo_id",
-      "oid",
-      "pack_id",
-      "offset",
-      "data_off",
-      "data_len",
-      "type",
-      "size",
-      "entry_size",
-      "base_oid",
-    ],
+    ["repo_id", "oid", "pack_id", "offset", "data_off", "data_len", "type", "size", "entry_size"],
   ],
   [
     "git_pack_pending",
@@ -634,17 +598,6 @@ describe("git schema", () => {
     expect(primaryKeyOf(db, "git_pack_ingest_control")).toEqual(["repo_id"]);
     expect(primaryKeyOf(db, "git_pack_entries")).toEqual(["repo_id", "pack_id", "offset"]);
     expect(primaryKeyOf(db, "git_pack_commit_staging")).toEqual(["repo_id", "pack_id", "oid"]);
-    expect(primaryKeyOf(db, "git_pack_graph_operations")).toEqual(["repo_id", "op_id"]);
-    expect(cascadeForeignKeysOf(db, "git_pack_graph_operations")).toEqual([
-      { table: "git_repositories", from: "repo_id", to: "id" },
-    ]);
-    for (const table of ["git_pack_graph_affected", "git_pack_graph_memo", "git_pack_graph_path"]) {
-      expect(primaryKeyOf(db, table)).toEqual(["repo_id", "op_id", "oid"]);
-      expect(cascadeForeignKeysOf(db, table)).toEqual([
-        { table: "git_pack_graph_operations", from: "repo_id", to: "repo_id" },
-        { table: "git_pack_graph_operations", from: "op_id", to: "op_id" },
-      ]);
-    }
     expect(primaryKeyOf(db, "git_pack_read_scopes")).toEqual(["repo_id", "read_id"]);
     expect(cascadeForeignKeysOf(db, "git_pack_read_scopes")).toEqual([
       { table: "git_repositories", from: "repo_id", to: "id" },

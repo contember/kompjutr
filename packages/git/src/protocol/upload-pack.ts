@@ -31,8 +31,6 @@ export interface UploadPackRequest {
   includeTag?: boolean;
   /** Limit the server response to objects allowed by this partial-clone filter. */
   filter?: UploadPackFilter;
-  /** Ask for a thin pack. Defaults to true. */
-  thinPack?: boolean;
   advertised: Set<string>;
   onProgress?: (message: string) => void;
   onMessage?: (message: string) => void;
@@ -65,9 +63,8 @@ export async function uploadPack(
   if (filter !== undefined && !request.advertised.has("filter")) {
     throw new GitError("EUNSUPPORTED", "remote does not support upload-pack filter");
   }
-  const wanted = ["side-band-64k"];
-  if (request.thinPack !== false) wanted.push("thin-pack");
-  wanted.push("ofs-delta", "no-done");
+  // Never `thin-pack`: stored packs must be self-contained.
+  const wanted = ["side-band-64k", "ofs-delta", "no-done"];
   if (request.includeTag === true) wanted.push("include-tag");
   const shallows = request.shallows ?? [];
   const shallowRequested = request.depth !== undefined || shallows.length > 0;

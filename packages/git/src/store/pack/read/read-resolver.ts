@@ -12,8 +12,6 @@ import {
   type CompressedEntry,
   checkDeltaInflateBudget,
   checkedPackBytes,
-  type ExternalBatchResolver,
-  type ExternalMetadataResolver,
   isPackGraphLimit,
   MAX_PACK_BLOB_GRAPH_ENTRIES,
   MAX_PACK_BLOB_INPUTS,
@@ -25,8 +23,12 @@ import {
   validateDeltaWorkingSet,
 } from "../shared.js";
 import type { PackDataReader } from "./read-data.js";
-import { PackExternalWindow } from "./read-external.js";
 import { PackGraphPager } from "./read-graph.js";
+import {
+  PACK_GRAPH_BASE_STEP,
+  PACK_GRAPH_ENTRY_SELECT,
+  packGraphStartsSql,
+} from "./read-graph-sql.js";
 
 const INVALID_ENTRY = "packed blob index contains invalid metadata";
 const INVALID_CHUNK = "pack chunk query returned invalid coordinates";
@@ -41,10 +43,22 @@ const PACKED_ENTRY_ROW = new RowShape(
     type: oneOf(["blob", "tree", "commit", "tag"], INVALID_ENTRY),
     size: int(0, Number.MAX_SAFE_INTEGER, INVALID_ENTRY),
     entry_size: int(0, MAX_PACK_DELTA_WORKING_BYTES, INVALID_ENTRY),
+    base_offset: nullable(int(0, Number.MAX_SAFE_INTEGER, INVALID_ENTRY)),
     base_oid: nullable(text(INVALID_ENTRY).where(isOid, INVALID_ENTRY)),
+    start: int(0, 1, INVALID_ENTRY),
   },
   INVALID_ENTRY,
 );
+
+/** A graph entry carries its in-pack base's OID so a seeded base ends the walk. */
+interface GraphEntry extends PackedEntry {
+  baseOid: string | null;
+  start: boolean;
+}
+
+function entryKey(packId: number, offset: number): string {
+  return `${packId}:${offset}`;
+}
 
 const CHUNK_COORDINATES_ROW = new RowShape(
   {
@@ -54,7 +68,7 @@ const CHUNK_COORDINATES_ROW = new RowShape(
   INVALID_CHUNK,
 );
 
-function decodePackedEntry(row: Record<string, unknown>): PackedEntry {
+function decodePackedEntry(row: Record<string, unknown>): GraphEntry {
   const decoded = PACKED_ENTRY_ROW.decode(row);
   // The entry is addressed as [data_off, data_off + data_len); an inexact sum would misread it.
   if (!Number.isSafeInteger(decoded.data_off + decoded.data_len)) {
@@ -69,7 +83,9 @@ function decodePackedEntry(row: Record<string, unknown>): PackedEntry {
     type: decoded.type,
     size: decoded.size,
     entrySize: decoded.entry_size,
+    baseOffset: decoded.base_offset,
     baseOid: decoded.base_oid,
+    start: decoded.start === 1,
   };
 }
 
@@ -79,8 +95,6 @@ export class PackObjectResolver {
   constructor(
     private readonly db: SqlDatabase,
     private readonly repoId: number,
-    private readonly externalBatch: ExternalBatchResolver,
-    private readonly externalMetadata: ExternalMetadataResolver,
     private readonly objects: ByteLru<string, RawObject>,
     private readonly data: PackDataReader,
     private readonly maxDeltaDepth: number,
@@ -131,65 +145,46 @@ export class PackObjectResolver {
     return new CorruptError(`delta chain deeper than ${this.maxDeltaDepth} at ${oid}`);
   }
 
-  /** Discover the bounded delta closure of `wanted` and decode it into one entry table. */
+  /**
+   * Discover the bounded delta closure of `wanted`: each chain start, then its
+   * in-pack bases by offset. Keys are physical, since one OID can sit in
+   * several packs of the closure.
+   */
   #readGraph(
     wanted: readonly string[],
     seeds: ReadonlyMap<string, RawObject>,
     pendingPackId: number | null,
     graphEntryLimit: number,
-  ): Map<string, PackedEntry> {
+  ): Map<string, GraphEntry> {
     const rows = this.db.iterate(
       `WITH RECURSIVE
          roots(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
          seeds(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
-         reachable(oid) AS (
-           SELECT o.oid
-             FROM roots r
-             CROSS JOIN git_pack_objects o
-             CROSS JOIN git_pack_meta m
-            WHERE o.repo_id = ? AND o.oid = r.oid
-              AND m.repo_id = o.repo_id AND m.pack_id = o.pack_id
-              AND (m.state = 'complete' OR o.pack_id = ?)
+         ${packGraphStartsSql("roots")},
+         reachable(pack_id, offset) AS (
+           SELECT pack_id, offset FROM starts
            UNION
-           SELECT base.oid
-             FROM reachable r
-             CROSS JOIN git_pack_objects child
-             CROSS JOIN git_pack_meta child_meta
-             CROSS JOIN git_pack_objects base
-             CROSS JOIN git_pack_meta base_meta
-            WHERE child.repo_id = ? AND child.oid = r.oid
-              AND child_meta.repo_id = child.repo_id
-              AND child_meta.pack_id = child.pack_id
-              AND (child_meta.state = 'complete' OR child.pack_id = ?)
-              AND base.repo_id = child.repo_id AND base.oid = child.base_oid
-              AND base_meta.repo_id = base.repo_id
-               AND base_meta.pack_id = base.pack_id
-               AND (base_meta.state = 'complete' OR base.pack_id = ?)
-               AND NOT EXISTS (SELECT 1 FROM seeds WHERE seeds.oid = base.oid)
-             LIMIT ${graphEntryLimit + 1}
-          )
-       SELECT o.oid, o.pack_id, o.offset, o.data_off, o.data_len, o.type,
-              o.size, o.entry_size, o.base_oid
-         FROM reachable r
-         CROSS JOIN git_pack_objects o
-        WHERE o.repo_id = ? AND o.oid = r.oid`,
+           ${PACK_GRAPH_BASE_STEP}
+            LIMIT ${graphEntryLimit + 1}
+         )
+       ${PACK_GRAPH_ENTRY_SELECT}`,
       JSON.stringify(wanted),
       JSON.stringify([...seeds.keys()]),
       this.repoId,
       pendingPackId ?? -1,
       this.repoId,
       pendingPackId ?? -1,
-      pendingPackId ?? -1,
+      this.repoId,
       this.repoId,
     );
 
-    const entries = new Map<string, PackedEntry>();
+    const entries = new Map<string, GraphEntry>();
     let rowCount = 0;
     for (const row of rows) {
       rowCount++;
       if (rowCount > graphEntryLimit) throw new GitError("E2BIG", PACK_GRAPH_LIMIT_MESSAGE);
       const entry = decodePackedEntry(row);
-      entries.set(entry.oid, entry);
+      entries.set(entryKey(entry.packId, entry.offset), entry);
     }
     return entries;
   }
@@ -221,9 +216,16 @@ export class PackObjectResolver {
     const cachedObject = (entry: PackedEntry): RawObject | undefined =>
       bypassCache ? undefined : this.objects.get(this.data.objectCacheKey(entry.packId, entry.oid));
 
+    const byOid = new Map<string, GraphEntry>();
+    for (const entry of entries.values()) {
+      if (entry.start) byOid.set(entry.oid, entry);
+    }
+    const baseOf = (entry: GraphEntry): GraphEntry | undefined =>
+      entry.baseOffset === null ? undefined : entries.get(entryKey(entry.packId, entry.baseOffset));
+
     const available: string[] = [];
     for (const oid of wanted) {
-      const entry = entries.get(oid);
+      const entry = byOid.get(oid);
       if (entry === undefined) {
         if (allowMissing) continue;
         throw new CorruptError(`packed object ${oid} has no visible source`);
@@ -233,26 +235,22 @@ export class PackObjectResolver {
       }
       available.push(oid);
     }
-    const needed = new Map<string, PackedEntry>();
-    const externalOids = new Set<string>();
+    const needed = new Map<string, GraphEntry>();
     for (const oid of available) {
-      let current = entries.get(oid)!;
+      let current = byOid.get(oid)!;
       if (cachedObject(current) !== undefined) continue;
       const seen = new Set<string>();
       let depth = 0;
       for (;;) {
-        if (seen.has(current.oid)) throw new CorruptError(`cyclic delta chain at ${current.oid}`);
-        seen.add(current.oid);
-        needed.set(current.oid, current);
-        if (current.baseOid === null) break;
+        const key = entryKey(current.packId, current.offset);
+        if (seen.has(key)) throw new CorruptError(`cyclic delta chain at ${current.oid}`);
+        seen.add(key);
+        needed.set(key, current);
+        if (current.baseOffset === null) break;
         if (depth >= this.maxDeltaDepth) throw this.#deltaDepthExceeded(oid);
         depth++;
-        const next = entries.get(current.baseOid);
-        if (next === undefined) {
-          if (!seeds.has(current.baseOid)) externalOids.add(current.baseOid);
-          break;
-        }
-        if (cachedObject(next) !== undefined) break;
+        const next = baseOf(current);
+        if (next === undefined || cachedObject(next) !== undefined) break;
         current = next;
       }
     }
@@ -261,25 +259,25 @@ export class PackObjectResolver {
     const streamedCompressed = new Set<string>();
     const compressed = new Map<string, CompressedEntry>();
     const consumers = new Map<string, { entry: PackedEntry; output: CompressedEntry }[]>();
-    for (const entry of needed.values()) {
+    for (const [key, entry] of needed) {
       if (entry.dataLen > PACK_BLOB_BATCH_TARGET_BYTES - compressedBytes) {
-        streamedCompressed.add(entry.oid);
+        streamedCompressed.add(key);
         continue;
       }
       compressedBytes = checkedPackBytes(compressedBytes, entry.dataLen, "compressed input");
     }
-    for (const entry of needed.values()) {
-      if (streamedCompressed.has(entry.oid)) continue;
+    for (const [key, entry] of needed) {
+      if (streamedCompressed.has(key)) continue;
       const output = { bytes: new Uint8Array(entry.dataLen), filled: 0 };
-      compressed.set(entry.oid, output);
+      compressed.set(key, output);
       if (entry.dataLen === 0) continue;
       const first = Math.floor(entry.dataOff / PACK_CHUNK);
       const last = Math.floor((entry.dataOff + entry.dataLen - 1) / PACK_CHUNK);
       for (let seq = first; seq <= last; seq++) {
-        const key = `${entry.packId}:${seq}`;
-        const list = consumers.get(key);
+        const chunkKey = `${entry.packId}:${seq}`;
+        const list = consumers.get(chunkKey);
         const consumer = { entry, output };
-        if (list === undefined) consumers.set(key, [consumer]);
+        if (list === undefined) consumers.set(chunkKey, [consumer]);
         else list.push(consumer);
       }
     }
@@ -333,26 +331,24 @@ export class PackObjectResolver {
         throw new CorruptError(`pack ${chunk.p}: missing chunk ${chunk.q}`);
       }
     }
-    for (const [oid, value] of compressed) {
+    for (const [key, value] of compressed) {
       if (value.filled !== value.bytes.length) {
-        throw new CorruptError(`packed blob entry ${oid} exceeds its stored chunks`);
+        throw new CorruptError(
+          `packed blob entry ${needed.get(key)?.oid} exceeds its stored chunks`,
+        );
       }
     }
 
-    const external = new PackExternalWindow(
-      [...externalOids],
-      this.externalBatch,
-      this.externalMetadata,
-    );
-
     const result = new Map<string, RawObject>();
-    const inflate = (entry: PackedEntry): Uint8Array =>
-      this.data.inflateCompressed(
+    const inflate = (entry: PackedEntry): Uint8Array => {
+      const key = entryKey(entry.packId, entry.offset);
+      return this.data.inflateCompressed(
         entry,
-        compressed.get(entry.oid)?.bytes,
-        !compressed.has(entry.oid),
+        compressed.get(key)?.bytes,
+        !compressed.has(key),
         bypassCache,
       );
+    };
     const materializeBase = (entry: PackedEntry): RawObject => {
       if (entry.entrySize !== entry.size) {
         throw new CorruptError(`pack entry at ${entry.offset} has inconsistent size metadata`);
@@ -362,7 +358,7 @@ export class PackObjectResolver {
       return object;
     };
     for (const oid of available) {
-      const first = entries.get(oid)!;
+      const first = byOid.get(oid)!;
       const hit = result.get(oid) ?? cachedObject(first);
       if (hit !== undefined) {
         result.set(oid, hit);
@@ -373,21 +369,24 @@ export class PackObjectResolver {
       let current = first;
       let object: RawObject | undefined;
       for (;;) {
-        if (seen.has(current.oid)) throw new CorruptError(`cyclic delta chain at ${current.oid}`);
-        seen.add(current.oid);
+        const key = entryKey(current.packId, current.offset);
+        if (seen.has(key)) throw new CorruptError(`cyclic delta chain at ${current.oid}`);
+        seen.add(key);
         object = result.get(current.oid) ?? cachedObject(current);
         if (object !== undefined) break;
-        if (current.baseOid === null) {
+        if (current.baseOffset === null) {
           object = materializeBase(current);
           break;
         }
         if (chain.length >= this.maxDeltaDepth) throw this.#deltaDepthExceeded(oid);
         chain.push(current);
-        const next = entries.get(current.baseOid);
+        const next = baseOf(current);
         if (next === undefined) {
-          object = seeds.get(current.baseOid) ?? external.get(current.baseOid);
+          object = current.baseOid === null ? undefined : seeds.get(current.baseOid);
           if (object !== undefined) break;
-          throw new CorruptError(`missing delta base ${current.baseOid} for ${current.oid}`);
+          throw new CorruptError(
+            `missing delta base at pack ${current.packId} offset ${current.baseOffset} for ${current.oid}`,
+          );
         }
         object = cachedObject(next);
         if (object !== undefined) break;

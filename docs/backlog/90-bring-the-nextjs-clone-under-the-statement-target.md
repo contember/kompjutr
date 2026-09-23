@@ -23,11 +23,13 @@ parent:
 | `e7d31b0` admission page 256 -> 4,096 | 1,067 | 214,485 |
 | `924fb06` source generation | 1,068 | 214,486 |
 | HEAD with the narrowed admission seed | 1,031 | 164,287 |
+| 2026-09-23 self-contained packs, admission deleted | 1,004 | 145,778 |
 
-The whole excursion is [ADR-0023](../decisions/0023-validate-canonical-pack-dependencies-at-source-changes.md)
-admission. `491189b` added 827 statements, `e7d31b0` returned 766 of them by
-matching the production page to the read graph's, and narrowing the seed to
-delta participants returned a further 36 along with 50,198 rows. What is left
+The whole excursion was ADR-0023 admission, since deleted with self-contained
+packs; the clone is still 4 statements over the target. `491189b` added 827
+statements, `e7d31b0` returned 766 of them by matching the production page to
+the read graph's, and narrowing the seed to delta participants returned a
+further 36 along with 50,198 rows. What is left
 is the residue of a validation the clone did not previously perform, plus one
 statement per batch flush from ADR-0025's source generation.
 

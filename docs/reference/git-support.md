@@ -662,7 +662,10 @@ legacy selection sets. Every fetch sends the captured shallow boundary and
 recent local commits as `have`s, and skips the transfer when every wanted object
 is held unless a depth request must renegotiate the boundary. A remote
 `refs/heads/*` source that does not point to a commit fails with `ECORRUPT`,
-whatever its destination. One
+whatever its destination. Fetch never requests `thin-pack`, so an incremental
+fetch may transfer more than Git's; a depth-limited fetch receives the whole
+snapshot of its new boundary. A server that sends a thin pack anyway, or a
+delta chain deeper than 50,000 edges, fails with `ECORRUPT` and moves no ref. One
 complete validated pack precedes atomic publication of selected destinations.
 Interrupted ingest, a stale candidate, or one invalid destination moves no ref.
 Every selected ref is authenticated against the received objects before

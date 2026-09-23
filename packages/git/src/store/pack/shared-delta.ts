@@ -2,19 +2,15 @@
 // https://github.com/littledivy/dgit — the three-phase ingest, the rotating offset window, the deferred-delta table and the iterative delta-chain walk all follow dgit's src/git/packstore.ts.
 
 import { CorruptError } from "../../common/errors.js";
-import type { ObjectType, RawObject } from "../../common/objects.js";
+import type { ObjectType } from "../../common/objects.js";
 import type { ByteSource, ChunkedBytes, ChunkPool } from "./chunks.js";
 
 export const MAX_PACK_DELTA_WORKING_BYTES = 48 * 1024 * 1024;
 
-export type ExternalBatchResolver = (oids: readonly string[]) => Map<string, RawObject>;
-export interface ExternalObjectMetadata {
+export interface PackBaseMetadata {
   type: ObjectType;
   size: number;
 }
-export type ExternalMetadataResolver = (
-  oids: readonly string[],
-) => Map<string, ExternalObjectMetadata>;
 
 export interface CompressedEntry {
   bytes: Uint8Array;

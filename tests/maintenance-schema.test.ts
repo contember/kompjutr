@@ -42,8 +42,8 @@ describe("maintenance schema", () => {
     );
     db.run(
       `INSERT INTO git_maintenance_objects
-         (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, physical_only, edge_cursor)
-       VALUES (?, 1, ?, 1, 0, 0, 0, 0)`,
+         (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, edge_cursor)
+       VALUES (?, 1, ?, 1, 0, 0, 0)`,
       checkout.repoId,
       oid,
     );

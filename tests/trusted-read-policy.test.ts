@@ -166,7 +166,6 @@ function ordinaryReadInventory(): ReadQuery[] {
       name: "joined payload stream",
       path: "packages/git/src/store/objects/objects.ts",
       start: "  #readLooseObjects(oids: readonly string[]): Map<string, RawObject> {",
-      end: "  #looseObjectMetadata(",
     },
     {
       category: "maintenance roots",

@@ -18,9 +18,6 @@ import {
 } from "../pack-ingest-index.js";
 import type { PackReadEngine } from "../read.js";
 import {
-  type ExternalBatchResolver,
-  type ExternalMetadataResolver,
-  type ExternalObjectMetadata,
   FlatByteSource,
   hashByteSource,
   type IngestBase,
@@ -28,20 +25,50 @@ import {
   MAX_PACK_DELTA_WORKING_BYTES,
   PACK_BLOB_BATCH_TARGET_BYTES,
   PACK_RANGE_BATCH_BYTES,
+  type PackBaseMetadata,
   type PackIngestMemory,
   type PackRangeRequest,
 } from "../shared.js";
 import type { PackIngestInflater } from "./ingest-inflate.js";
 import { throwIfIngestAborted } from "./ingest-options.js";
 import type { PackResolvedProjection } from "./ingest-projection.js";
-import type { OffsetWindow } from "./ingest-reader.js";
+
+/**
+ * Deferred deltas name their base by offset, or by OID for a ref-delta, and the
+ * base must be an entry of the same pack. A ref-delta is stored with the
+ * offset of the in-pack entry it resolved against; a base outside the pack
+ * never resolves, so a thin pack fails here.
+ */
+const PENDING_PAGE_SQL = `SELECT pending.offset, pending.data_off, pending.data_len,
+         pending.entry_size, pending.base_oid, pending.base_offset,
+         base.offset AS resolved_offset, base.oid AS resolved_oid
+    FROM git_pack_pending pending
+    LEFT JOIN git_pack_entries base
+      ON base.repo_id = pending.repo_id AND base.pack_id = pending.pack_id
+     AND base.offset = coalesce(pending.base_offset, (
+       SELECT min(named.offset) FROM git_pack_entries named
+        WHERE named.repo_id = pending.repo_id AND named.oid = pending.base_oid
+          AND named.pack_id = pending.pack_id
+     ))
+   WHERE pending.repo_id = ? AND pending.pack_id = ? AND pending.offset > ?
+   ORDER BY pending.offset LIMIT ${PACK_PENDING_PAGE_ROWS}`;
+
+interface ReadyDelta {
+  row: PendingRow;
+  baseOid: string;
+  baseOffset: number;
+}
+
+function push<K>(map: Map<K, PendingRow[]>, key: K, row: PendingRow): void {
+  const children = map.get(key);
+  if (children === undefined) map.set(key, [row]);
+  else children.push(row);
+}
 
 export class PackPendingResolver {
   constructor(
     private readonly db: SqlDatabase,
     private readonly repoId: number,
-    private readonly externalBatch: ExternalBatchResolver,
-    private readonly externalMetadata: ExternalMetadataResolver,
     private readonly objects: ByteLru<string, RawObject>,
     private readonly read: PackReadEngine,
     private readonly cacheEntryLimit: number,
@@ -50,7 +77,6 @@ export class PackPendingResolver {
   ) {}
   async drainPending(
     packId: number,
-    offsets: OffsetWindow,
     objectIndex: PackObjectBatch,
     treeIndex: PackTreeIndex,
     commitIndex: PackCommitIndex,
@@ -70,89 +96,41 @@ export class PackPendingResolver {
       let progressed = 0;
       let after = -1;
       for (;;) {
-        const page = this.db.all<PendingRow>(
-          `SELECT pending.offset, pending.data_off, pending.data_len, pending.entry_size,
-                   pending.base_oid, pending.base_offset,
-                   COALESCE(pending.base_oid, base.oid) AS resolved_oid
-             FROM git_pack_pending pending
-             LEFT JOIN git_pack_entries base
-                ON base.repo_id = pending.repo_id AND base.pack_id = pending.pack_id
-               AND base.offset = pending.base_offset
-             WHERE pending.repo_id = ? AND pending.pack_id = ? AND pending.offset > ?
-             ORDER BY pending.offset LIMIT ${PACK_PENDING_PAGE_ROWS}`,
-          this.repoId,
-          packId,
-          after,
-        );
+        const page = this.db.all<PendingRow>(PENDING_PAGE_SQL, this.repoId, packId, after);
         if (page.length === 0) break;
         for (const row of page) validatePendingRow(row);
         throwIfIngestAborted(signal);
         const last = page[page.length - 1]!;
         after = last.offset;
 
-        const byBaseOid = new Map<string, PendingRow[]>();
         const byBaseOffset = new Map<number, PendingRow[]>();
-        const resolvedOffsets = new Map<number, string>();
-        const baseOidSet = new Set<string>();
+        const byBaseOid = new Map<string, PendingRow[]>();
+        const indexedBases = new Map<number, string>();
         for (const row of page) {
-          if (row.base_oid !== null) {
-            baseOidSet.add(row.base_oid);
-            const children = byBaseOid.get(row.base_oid);
-            if (children === undefined) byBaseOid.set(row.base_oid, [row]);
-            else children.push(row);
+          const baseOffset = row.resolved_offset ?? row.base_offset;
+          if (baseOffset === null) {
+            push(byBaseOid, row.base_oid!, row);
             continue;
           }
-          if (row.base_offset === null) continue;
-          const children = byBaseOffset.get(row.base_offset);
-          if (children === undefined) byBaseOffset.set(row.base_offset, [row]);
-          else children.push(row);
-          const oid = row.resolved_oid ?? offsets.get(row.base_offset);
-          if (oid !== null) {
-            baseOidSet.add(oid);
-            resolvedOffsets.set(row.base_offset, oid);
-          }
+          push(byBaseOffset, baseOffset, row);
+          if (row.resolved_oid !== null) indexedBases.set(baseOffset, row.resolved_oid);
         }
-        const baseOids = [...baseOidSet];
-        const allPackedMetadata = this.#packedBaseMetadata(baseOids, packId);
-        const externalOids = baseOids.filter((oid) => !allPackedMetadata.has(oid));
-        const allExternalMetadata = this.externalMetadata(externalOids);
-        const admittedOids = this.#selectBaseGroup(
-          baseOids,
-          allPackedMetadata,
-          allExternalMetadata,
-        );
-        const packedMetadata = new Map<string, ExternalObjectMetadata>();
-        const externalMetadata = new Map<string, ExternalObjectMetadata>();
-        for (const oid of admittedOids) {
-          const packed = allPackedMetadata.get(oid);
-          const external = allExternalMetadata.get(oid);
-          if (packed !== undefined) packedMetadata.set(oid, packed);
-          else if (external !== undefined) externalMetadata.set(oid, external);
-        }
-        const materialized = this.#readBaseBatch([...packedMetadata.keys()], packId);
+        const baseOids = [...new Set(indexedBases.values())];
+        const allMetadata = this.#packedBaseMetadata([...indexedBases.keys()], packId);
+        const admittedOids = this.#selectBaseGroup(baseOids, allMetadata);
+        const metadata = new Map<string, PackBaseMetadata>();
+        for (const oid of admittedOids) metadata.set(oid, allMetadata.get(oid)!);
+        const materialized = this.#readBaseBatch([...metadata.keys()], packId);
+        const bases = new Map<string, IngestBase>();
         for (const [oid, object] of materialized) {
-          const metadata = packedMetadata.get(oid);
+          const admitted = metadata.get(oid);
           if (
-            metadata === undefined ||
-            metadata.type !== object.type ||
-            metadata.size !== object.data.length
+            admitted === undefined ||
+            admitted.type !== object.type ||
+            admitted.size !== object.data.length
           ) {
             throw new CorruptError("materialized pack base disagrees with its admitted metadata");
           }
-        }
-        for (const [oid, object] of this.externalBatch([...externalMetadata.keys()])) {
-          const metadata = externalMetadata.get(oid);
-          if (
-            metadata === undefined ||
-            metadata.type !== object.type ||
-            metadata.size !== object.data.length
-          ) {
-            throw new CorruptError("materialized loose base disagrees with its admitted metadata");
-          }
-          materialized.set(oid, object);
-        }
-        const bases = new Map<string, IngestBase>();
-        for (const [oid, object] of materialized) {
           bases.set(oid, {
             type: object.type,
             source: new FlatByteSource(object.data),
@@ -169,30 +147,23 @@ export class PackPendingResolver {
           throw new GitError("E2BIG", "pack ingest bases exceed the bounded live-set limit");
         }
         const remainingUses = new Map<string, number>();
-        for (const [oid, children] of byBaseOid) {
-          remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + children.length);
-        }
-        for (const [offset, oid] of resolvedOffsets) {
+        for (const [offset, oid] of indexedBases) {
           remainingUses.set(
             oid,
             (remainingUses.get(oid) ?? 0) + (byBaseOffset.get(offset)?.length ?? 0),
           );
         }
 
-        const ready: { row: PendingRow; baseOid: string }[] = [];
+        const ready: ReadyDelta[] = [];
         const queued = new Set<number>();
-        const enqueue = (row: PendingRow, baseOid: string): void => {
+        const enqueue = (row: PendingRow, baseOid: string, baseOffset: number): void => {
           if (queued.has(row.offset)) return;
           queued.add(row.offset);
-          ready.push({ row, baseOid });
+          ready.push({ row, baseOid, baseOffset });
         };
-        for (const [oid, children] of byBaseOid) {
-          if (bases.has(oid)) for (const row of children) enqueue(row, oid);
-        }
-        for (const [offset, oid] of resolvedOffsets) {
-          if (bases.has(oid)) {
-            for (const row of byBaseOffset.get(offset) ?? []) enqueue(row, oid);
-          }
+        for (const [offset, oid] of indexedBases) {
+          if (!bases.has(oid)) continue;
+          for (const row of byBaseOffset.get(offset) ?? []) enqueue(row, oid, offset);
         }
 
         const completed: number[] = [];
@@ -215,13 +186,11 @@ export class PackPendingResolver {
             });
           }
           compressedBatch = this.read.readRangeBatch(packId, requests);
-        } else {
-          compressedBatchBytes = 0;
         }
         try {
           for (let cursor = 0; cursor < ready.length; cursor++) {
             throwIfIngestAborted(signal);
-            const { row, baseOid } = ready[cursor]!;
+            const { row, baseOid, baseOffset } = ready[cursor]!;
             const base = bases.get(baseOid);
             if (base === undefined) continue;
             const compressed = compressedBatch.get(row.offset) ?? null;
@@ -246,9 +215,10 @@ export class PackPendingResolver {
             let retainedTarget = false;
             try {
               const oid = hashByteSource(base.type, target);
-              const offsetChildren = byBaseOffset.get(row.offset) ?? [];
-              const oidChildren = byBaseOid.get(oid) ?? [];
-              const hasChildren = oidChildren.length > 0 || offsetChildren.length > 0;
+              const children = [
+                ...(byBaseOffset.get(row.offset) ?? []),
+                ...(byBaseOid.get(oid) ?? []),
+              ];
               const objectRow: PackObjectInput = [
                 oid,
                 packId,
@@ -258,7 +228,7 @@ export class PackPendingResolver {
                 base.type,
                 target.length,
                 row.entry_size,
-                baseOid,
+                baseOffset,
               ];
               this.projection.insertResolved(
                 objectRow,
@@ -275,11 +245,10 @@ export class PackPendingResolver {
                 target,
               );
               completed.push(row.offset);
-              offsets.set(row.offset, oid);
-              if (offsetChildren.length > 0) {
-                remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + offsetChildren.length);
+              if (children.length > 0) {
+                remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + children.length);
               }
-              if (hasChildren && !bases.has(oid)) {
+              if (children.length > 0 && !bases.has(oid)) {
                 const nextBaseBytes = retainedBaseBytes + target.length;
                 if (
                   Number.isSafeInteger(nextBaseBytes) &&
@@ -291,8 +260,7 @@ export class PackPendingResolver {
                 }
               }
               if (retainedTarget) {
-                for (const child of oidChildren) enqueue(child, oid);
-                for (const child of offsetChildren) enqueue(child, oid);
+                for (const child of children) enqueue(child, oid, row.offset);
               }
               if (target.length <= this.cacheEntryLimit) {
                 this.#cacheChunked(packId, oid, base.type, target);
@@ -324,29 +292,23 @@ export class PackPendingResolver {
       objectIndex.flush();
       remaining -= progressed;
       if (progressed === 0 && remaining > 0) {
-        throw new CorruptError(`cannot resolve ${remaining} delta object(s): missing base`);
+        throw new CorruptError(
+          `cannot resolve ${remaining} delta object(s): missing base in the pack`,
+        );
       }
     }
   }
 
-  #packedBaseMetadata(
-    oids: readonly string[],
-    packId: number,
-  ): Map<string, ExternalObjectMetadata> {
-    const wanted = [...new Set(oids)];
-    if (wanted.length === 0) return new Map();
-    const result = new Map<string, ExternalObjectMetadata>();
+  /** Base metadata from this pack's own entries; another pack's copy may vanish meanwhile. */
+  #packedBaseMetadata(offsets: readonly number[], packId: number): Map<string, PackBaseMetadata> {
+    if (offsets.length === 0) return new Map();
+    const result = new Map<string, PackBaseMetadata>();
     for (const row of this.db.all<{ oid: string; type: string; size: number }>(
-      // CROSS JOIN pins the order: without it SQLite drives from
-      // git_pack_objects and re-scans the bound set once per packed object.
-      `SELECT object.oid, object.type, object.size
+      `SELECT entry.oid, entry.type, entry.size
          FROM json_each(?) wanted
-         CROSS JOIN git_pack_objects object
-           ON object.repo_id = ? AND object.oid = wanted.value
-         JOIN git_pack_meta pack
-           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-          AND (pack.state = 'complete' OR object.pack_id = ?)`,
-      JSON.stringify(wanted),
+         CROSS JOIN git_pack_entries entry
+           ON entry.repo_id = ? AND entry.pack_id = ? AND entry.offset = wanted.value`,
+      JSON.stringify(offsets),
       this.repoId,
       packId,
     )) {
@@ -355,8 +317,7 @@ export class PackPendingResolver {
         !isObjectType(row.type) ||
         !Number.isSafeInteger(row.size) ||
         row.size < 0 ||
-        row.size > MAX_PACK_DELTA_WORKING_BYTES ||
-        result.has(row.oid)
+        row.size > MAX_PACK_DELTA_WORKING_BYTES
       ) {
         throw new CorruptError("pack ingest base has invalid size metadata");
       }
@@ -367,13 +328,12 @@ export class PackPendingResolver {
 
   #selectBaseGroup(
     oids: readonly string[],
-    packed: ReadonlyMap<string, ExternalObjectMetadata>,
-    external: ReadonlyMap<string, ExternalObjectMetadata>,
+    packed: ReadonlyMap<string, PackBaseMetadata>,
   ): string[] {
     const group: string[] = [];
     let bytes = 0;
     for (const oid of oids) {
-      const metadata = packed.get(oid) ?? external.get(oid);
+      const metadata = packed.get(oid);
       if (metadata === undefined) continue;
       if (group.length > 0 && metadata.size > PACK_BLOB_BATCH_TARGET_BYTES - bytes) break;
       group.push(oid);

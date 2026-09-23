@@ -88,16 +88,7 @@ export abstract class SharedRepoCore {
     this.#promisor = new PromisorTable(db, repoId);
     this.#scratchTransactions = scratchTransactionsFor(db);
     this.cacheNamespace = `${repoId}:${storeGeneration}`;
-    this.#packs = new PackStore(
-      db,
-      repoId,
-      objects,
-      packRows,
-      this.cacheNamespace,
-      (oids: readonly string[]) => this.requireObjectTable().readLooseObjects(oids),
-      (oids) => this.requireObjectTable().looseObjectMetadata(oids),
-      options,
-    );
+    this.#packs = new PackStore(db, repoId, objects, packRows, this.cacheNamespace, options);
     this.#objectTable = new ObjectTable(db, repoId, objects, this.#packs, this);
     const availability = db.one<{ has_loose: unknown }>(
       `SELECT

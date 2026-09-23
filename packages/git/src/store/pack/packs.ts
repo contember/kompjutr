@@ -3,7 +3,7 @@
 //
 // Pack-native object storage. A received packfile is written to SQLite
 // verbatim, still compressed, in fixed-size chunk rows, and indexed
-// (oid -> pack, offset, delta base). Reads pull only the chunks an object
+// (oid -> pack, offset, in-pack delta base). Reads pull only the chunks an object
 // actually spans, so nothing ever inflates a whole repository.
 
 import type { SqlDatabase } from "@kompjutr/sqlite";
@@ -17,8 +17,6 @@ import {
   type CompletePackedEntry,
   DEFAULT_CACHE_ENTRY_LIMIT,
   DEFAULT_MAX_BUFFERED_ENTRY,
-  type ExternalBatchResolver,
-  type ExternalMetadataResolver,
   MAX_DELTA_DEPTH,
   MAX_PACK_BLOB_GRAPH_ENTRIES,
   type PackCacheOptions,
@@ -30,9 +28,6 @@ import {
 
 export type {
   CompletePackedEntry,
-  ExternalBatchResolver,
-  ExternalMetadataResolver,
-  ExternalObjectMetadata,
   PackCacheOptions,
   PackedEntry,
   PackIngestLifecycle,
@@ -43,7 +38,6 @@ export {
   MAX_DELTA_DEPTH,
   MAX_PACK_DELETE_BATCH,
   MAX_PACK_DELTA_WORKING_BYTES,
-  MAX_PACK_MEMBERSHIP_OBJECTS,
   MAX_PACK_ROW_CACHE_BYTES,
   PACK_BLOB_BATCH_TARGET_BYTES,
   PACK_CHUNK,
@@ -64,8 +58,6 @@ export class PackStore {
     objects: ByteLru<string, RawObject>,
     chunks: ByteLru<string, Uint8Array>,
     cacheNamespace: string,
-    externalBatch: ExternalBatchResolver,
-    externalMetadata: ExternalMetadataResolver,
     options: PackCacheOptions = {},
   ) {
     this.#db = db;
@@ -103,20 +95,16 @@ export class PackStore {
       objects,
       chunks,
       cacheNamespace,
-      externalBatch,
-      externalMetadata,
       sharedState,
       cacheEntryLimit,
       boundedMaxDeltaDepth,
       boundedGraphPageEntries,
     );
-    this.#lifecycle = new PackLifecycle(db, repoId, sharedState, boundedMaxDeltaDepth);
+    this.#lifecycle = new PackLifecycle(db, repoId, sharedState);
     this.#ingest = new PackIngestEngine(
       db,
       repoId,
       objects,
-      externalBatch,
-      externalMetadata,
       this.#read,
       this.#lifecycle,
       sharedState,

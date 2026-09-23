@@ -10,8 +10,7 @@ import {
   type ReachabilityEdge,
   type ReachabilityObjectInfo,
 } from "./reachability-contracts.js";
-import { requireObjectInfo, scanHeaders } from "./reachability-headers.js";
-import { packedBaseEdge, validatedPackedBase } from "./reachability-packed.js";
+import { scanHeaders } from "./reachability-headers.js";
 
 export function headerExpansion(
   store: SharedRepoStore,
@@ -20,8 +19,7 @@ export function headerExpansion(
 ): ObjectExpansion {
   if (info.type === "blob") {
     if (object.edgeCursor !== 0) throw new CorruptError("blob retained a semantic edge cursor");
-    const base = packedBaseEdge(store, object.oid, info.type);
-    return { edges: base === null ? [] : [base], nextCursor: 0, complete: true };
+    return { edges: [], nextCursor: 0, complete: true };
   }
   if (info.type === "tag") {
     if (object.edgeCursor !== 0) throw new CorruptError("tag retained a semantic edge cursor");
@@ -34,11 +32,8 @@ export function headerExpansion(
         type: parsed.tagType,
         optionalMissing: false,
         allowPromisedMissing: false,
-        physicalOnly: false,
       },
     ];
-    const base = packedBaseEdge(store, object.oid, info.type);
-    if (base !== null) edges.push(base);
     return { edges, nextCursor: 0, complete: true };
   }
   if (info.type !== "commit") {
@@ -62,7 +57,6 @@ export function headerExpansion(
       type: "tree",
       optionalMissing: false,
       allowPromisedMissing: false,
-      physicalOnly: false,
     });
   }
   if (!object.shallowBoundary) {
@@ -73,21 +67,11 @@ export function headerExpansion(
         type: "commit",
         optionalMissing: false,
         allowPromisedMissing: false,
-        physicalOnly: false,
       });
     }
   }
   const nextCursor = Math.min(semanticCount, object.edgeCursor + edges.length);
-  const semanticComplete = nextCursor === semanticCount;
-  let complete = semanticComplete;
-  if (semanticComplete) {
-    const base = packedBaseEdge(store, object.oid, info.type);
-    if (base !== null) {
-      if (edges.length < EDGE_PAGE) edges.push(base);
-      else complete = false;
-    }
-  }
-  return { edges, nextCursor, complete };
+  return { edges, nextCursor, complete: nextCursor === semanticCount };
 }
 
 function treeEdge(
@@ -115,7 +99,6 @@ function treeEdge(
     type,
     optionalMissing: mode === "160000",
     allowPromisedMissing: type === "blob",
-    physicalOnly: false,
   };
 }
 
@@ -177,22 +160,5 @@ export function treeExpansion(
     throw new CorruptError("tree source rows are incomplete");
   }
   const nextCursor = object.edgeCursor + Math.min(remaining, EDGE_PAGE);
-  const semanticComplete = nextCursor === entryCount;
-  let complete = semanticComplete;
-  if (semanticComplete) {
-    const base = packedBaseEdge(store, object.oid, "tree");
-    if (base !== null) {
-      if (edges.length < EDGE_PAGE) edges.push(base);
-      else complete = false;
-    }
-  }
-  return { edges, nextCursor, complete };
-}
-export function physicalExpansion(store: SharedRepoStore, object: QueueObject): ObjectExpansion {
-  const packed = validatedPackedBase(store, object.oid);
-  if (packed === null) {
-    requireObjectInfo(store, object.oid);
-    return { edges: [], nextCursor: 0, complete: true };
-  }
-  return { edges: packed.base === null ? [] : [packed.base], nextCursor: 0, complete: true };
+  return { edges, nextCursor, complete: nextCursor === entryCount };
 }

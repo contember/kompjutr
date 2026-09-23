@@ -444,8 +444,8 @@ describe("parsed commit cache", () => {
     );
     db.run(
       `INSERT INTO git_pack_objects
-         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       1,
       oid,
       7,

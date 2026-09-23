@@ -58,12 +58,8 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "index:git_checkouts_attached_branch",
   "index:git_checkouts_primary",
   "index:git_maintenance_objects_queue",
-  "index:git_pack_entries_by_base",
   "index:git_pack_entries_by_oid",
-  "index:git_pack_graph_pending",
   "index:git_pack_objects_loc",
-  "index:git_pack_objects_reverse",
-  "index:git_pack_pending_by_base",
   "index:git_reflog_entries_by_ref",
   "index:git_reflog_entries_by_timestamp",
   "index:git_tree_entries_by_name_bytes",
@@ -101,10 +97,6 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "table:git_pack_data",
   "table:git_pack_entries",
   "table:git_pack_gc_candidates",
-  "table:git_pack_graph_affected",
-  "table:git_pack_graph_memo",
-  "table:git_pack_graph_operations",
-  "table:git_pack_graph_path",
   "table:git_pack_ingest_control",
   "table:git_pack_meta",
   "table:git_pack_objects",
@@ -2184,7 +2176,7 @@ function markChainPack(depth: number): { bytes: Uint8Array; headOid: string } {
   return { bytes: concat(chunks), headOid: oid };
 }
 
-/** Dependency work over a chain of N and 2N canonical physical edges. */
+/** Mark cost at the head of an N and a 2N packed delta chain; in-pack bases add no edge. */
 async function maintenanceMarkRows(rows: ResultRow[]): Promise<void> {
   const depths: readonly (readonly [RequiredRow, number])[] = [
     ["maintenance.mark-depth-n", 64],
@@ -2217,8 +2209,8 @@ async function maintenanceMarkRows(rows: ResultRow[]): Promise<void> {
     );
     db.run(
       `INSERT INTO git_maintenance_objects
-         (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, physical_only, edge_cursor)
-       VALUES (?, 1, ?, 1, 0, 0, 0, 0)`,
+         (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, edge_cursor)
+       VALUES (?, 1, ?, 1, 0, 0, 0)`,
       checkout.repoId,
       chain.headOid,
     );
@@ -2245,9 +2237,8 @@ async function maintenanceMarkRows(rows: ResultRow[]): Promise<void> {
           db.scalar<number>(
             "SELECT count(*) FROM git_maintenance_objects WHERE repo_id = ?",
             checkout.repoId,
-          ) ===
-            depth + 1,
-          "maintenance mark did not reach the whole chain",
+          ) === 1,
+          "maintenance mark followed an in-pack delta base",
         );
       },
     );

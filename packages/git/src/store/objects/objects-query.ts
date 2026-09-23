@@ -5,7 +5,6 @@ import { int, nullable, oneOf, RowShape } from "../../common/rows.js";
 import type { ObjectReadInfo } from "../core/contracts.js";
 import { nextPrefix } from "../refs/config.js";
 import {
-  isObjectType,
   MAX_BLOB_BATCH_OIDS,
   OBJECT_CHUNK,
   type ObjectDatabaseContext,
@@ -201,31 +200,4 @@ export function objectCount(context: ObjectQueryContext): number {
       context.repoId,
     ) ?? 0;
   return loose + context.packs.count();
-}
-
-export function looseObjectMetadata(
-  context: ObjectDatabaseContext,
-  oids: readonly string[],
-): Map<string, { type: ObjectType; size: number }> {
-  if (oids.length === 0) return new Map();
-  const result = new Map<string, { type: ObjectType; size: number }>();
-  for (const row of context.db.all<{ oid: string; type: string; size: number }>(
-    `SELECT wanted.value AS oid, object.type, object.size
-       FROM json_each(?) wanted
-       JOIN git_objects object ON object.repo_id = ? AND object.oid = wanted.value`,
-    JSON.stringify(oids),
-    context.repoId,
-  )) {
-    if (
-      !isOid(row.oid) ||
-      !isObjectType(row.type) ||
-      !Number.isSafeInteger(row.size) ||
-      row.size < 0 ||
-      result.has(row.oid)
-    ) {
-      throw new CorruptError("loose object metadata query returned an invalid row");
-    }
-    result.set(row.oid, { type: row.type, size: row.size });
-  }
-  return result;
 }

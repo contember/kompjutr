@@ -52,7 +52,7 @@ export type PackObjectInput = [
   type: ObjectType,
   size: number,
   entrySize: number,
-  baseOid: string | null,
+  baseOffset: number | null,
 ];
 
 export type PendingInput = [
@@ -64,6 +64,7 @@ export type PendingInput = [
   baseOffset: number | null,
 ];
 
+/** `resolved_*` name the in-pack base once it is indexed, for either delta kind. */
 export interface PendingRow {
   offset: number;
   data_off: number;
@@ -71,6 +72,7 @@ export interface PendingRow {
   entry_size: number;
   base_oid: string | null;
   base_offset: number | null;
+  resolved_offset: number | null;
   resolved_oid: string | null;
 }
 
@@ -88,6 +90,9 @@ export function validatePendingRow(row: PendingRow): void {
     (row.base_oid === null) === (row.base_offset === null) ||
     (row.base_oid !== null && !isOid(row.base_oid)) ||
     (row.base_offset !== null && (!Number.isSafeInteger(row.base_offset) || row.base_offset < 0)) ||
+    (row.resolved_offset === null) !== (row.resolved_oid === null) ||
+    (row.resolved_offset !== null &&
+      (!Number.isSafeInteger(row.resolved_offset) || row.resolved_offset < 0)) ||
     (row.resolved_oid !== null && !isOid(row.resolved_oid))
   ) {
     throw new CorruptError("pending pack delta has invalid metadata");
@@ -130,7 +135,7 @@ export class PackObjectBatch {
     this.db.transactionSync(() => {
       this.db.run(
         `INSERT OR IGNORE INTO git_pack_entries
-           (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
+           (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_offset)
          SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'),
                 json_extract(value, '$[2]'), json_extract(value, '$[3]'),
                 json_extract(value, '$[4]'), json_extract(value, '$[5]'),
@@ -142,12 +147,11 @@ export class PackObjectBatch {
       );
       this.db.run(
         `INSERT OR IGNORE INTO git_pack_objects
-           (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
+           (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
          SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'),
                 json_extract(value, '$[2]'), json_extract(value, '$[3]'),
                 json_extract(value, '$[4]'), json_extract(value, '$[5]'),
-                json_extract(value, '$[6]'), json_extract(value, '$[7]'),
-                json_extract(value, '$[8]')
+                json_extract(value, '$[6]'), json_extract(value, '$[7]')
            FROM json_each(?)`,
         this.repoId,
         rows,

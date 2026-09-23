@@ -6,21 +6,30 @@ import { CorruptError } from "../../../common/errors.js";
 import { NUMBER_TYPE } from "../../../common/objects.js";
 import { OFFSET_WINDOW, PACK_CHUNK } from "../shared.js";
 
-/** Rotating (offset -> oid) map: ofs-delta bases are almost always recent. */
+/** Rotating (offset <-> oid) maps: delta bases are almost always recent. */
 export class OffsetWindow {
   #current = new Map<number, string>();
   #previous = new Map<number, string>();
+  #currentOffsets = new Map<string, number>();
+  #previousOffsets = new Map<string, number>();
 
   set(offset: number, oid: string): void {
     this.#current.set(offset, oid);
+    this.#currentOffsets.set(oid, offset);
     if (this.#current.size >= OFFSET_WINDOW) {
       this.#previous = this.#current;
+      this.#previousOffsets = this.#currentOffsets;
       this.#current = new Map();
+      this.#currentOffsets = new Map();
     }
   }
 
   get(offset: number): string | null {
     return this.#current.get(offset) ?? this.#previous.get(offset) ?? null;
+  }
+
+  offsetOf(oid: string): number | null {
+    return this.#currentOffsets.get(oid) ?? this.#previousOffsets.get(oid) ?? null;
   }
 }
 

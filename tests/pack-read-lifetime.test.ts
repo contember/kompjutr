@@ -5,7 +5,6 @@ import { concat } from "../packages/git/src/common/bytes.js";
 import { hashObject } from "../packages/git/src/common/objects.js";
 import { withGitMutationGuard } from "../packages/git/src/store/core/mutation-guard.js";
 import { SqliteGitDatabase, type StoreOptions } from "../packages/git/src/store/index.js";
-import { ObjectTable } from "../packages/git/src/store/objects/objects.js";
 import { withIntegrationWorkspaceOwned } from "../packages/git/src/store/operations/integration-workspace/workspace.js";
 import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import { PackDataReader } from "../packages/git/src/store/pack/read/read-data.js";
@@ -45,13 +44,6 @@ function nativeIngest(native: GitFixture, bytes: Uint8Array): void {
     cwd: native.dir,
     input: bytes,
     stdio: ["pipe", "pipe", "pipe"],
-  });
-}
-
-function nativeWrite(native: GitFixture, bytes: Uint8Array): void {
-  execFileSync("git", ["hash-object", "-w", "--stdin"], {
-    cwd: native.dir,
-    input: bytes,
   });
 }
 
@@ -161,88 +153,7 @@ describe("packed read payload lifetime", () => {
     },
   );
 
-  it.each([1024 * 1024, 8 * 1024 * 1024])(
-    "bounds external materialization batches for distinct roots of %i bytes",
-    async (size) => {
-      const db = new TestDatabase();
-      const native = new GitFixture().init();
-      try {
-        const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
-        const checkout = database.createRepository("/repo", "ref: refs/heads/main");
-        const store = database.openCheckout(checkout);
-        const bases = Array.from({ length: 6 }, (_, index) => {
-          const bytes = new Uint8Array(size).fill(index + 65);
-          nativeWrite(native, bytes);
-          return store.write("blob", bytes);
-        });
-        const outputs = bases.map((_, index) => target(index));
-        const oids = outputs.map((bytes) => hashObject("blob", bytes));
-        const bytes = pack(bases.length, (writer) => {
-          for (let index = 0; index < bases.length; index++) {
-            writer.refDelta(bases[index]!, literal(size, outputs[index]!));
-          }
-        });
-        nativeIngest(native, bytes);
-        await store.packs.ingest(slices(bytes, 4096));
-        const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(checkout);
-        const external = vi.spyOn(ObjectTable.prototype, "readLooseObjects");
-        const result = cold.packs.readObjects(oids);
-        for (const oid of oids) expect(result.get(oid)?.data).toEqual(native.catFile(oid));
-        expect(external.mock.calls.map(([batch]) => batch.length)).toEqual(
-          size === 1024 * 1024 ? [4, 2] : [1, 1, 1, 1, 1, 1],
-        );
-      } finally {
-        native.dispose();
-        db.storage.db.close();
-      }
-    },
-  );
-
-  it.each([false, true])(
-    "reloads a discovery-time cache hit evicted before use (external=%s)",
-    async (externalBase) => {
-      const db = new TestDatabase();
-      const native = new GitFixture().init();
-      try {
-        const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
-        const checkout = database.createRepository("/repo", "ref: refs/heads/main");
-        const store = database.openCheckout(checkout);
-        const base = target(0);
-        const intermediate = target(99);
-        const output = target(100);
-        const fillers = [1, 2, 3, 4, 5].map(target);
-        const baseOid = hashObject("blob", base);
-        const intermediateOid = hashObject("blob", intermediate);
-        const oid = hashObject("blob", output);
-        if (externalBase) {
-          store.write("blob", base);
-          nativeWrite(native, base);
-        }
-        const bytes = pack(externalBase ? 7 : 8, (writer) => {
-          if (!externalBase) writer.object("blob", base);
-          writer.refDelta(baseOid, literal(8, intermediate));
-          writer.refDelta(intermediateOid, literal(8, output));
-          for (const filler of fillers) writer.object("blob", filler);
-        });
-        nativeIngest(native, bytes);
-        await store.packs.ingest(slices(bytes, 4096));
-        const cold = new SqliteGitDatabase(db, { objectCacheBytes: 1024 }).openCheckout(checkout);
-        expect(cold.packs.read(intermediateOid)?.data).toEqual(native.catFile(intermediateOid));
-        const inflate = vi.spyOn(PackDataReader.prototype, "inflateCompressed");
-        const wanted = [...fillers.map((bytes) => hashObject("blob", bytes)), oid];
-        const result = cold.packs.readObjects(wanted);
-        for (const oid of wanted) expect(result.get(oid)?.data).toEqual(native.catFile(oid));
-        expect(inflate.mock.calls.filter(([entry]) => entry.oid === intermediateOid)).toHaveLength(
-          1,
-        );
-      } finally {
-        native.dispose();
-        db.storage.db.close();
-      }
-    },
-  );
-
-  it("retries external materialization after a failed read", async () => {
+  it("reloads a discovery-time cache hit evicted before use", async () => {
     const db = new TestDatabase();
     const native = new GitFixture().init();
     try {
@@ -250,24 +161,27 @@ describe("packed read payload lifetime", () => {
       const checkout = database.createRepository("/repo", "ref: refs/heads/main");
       const store = database.openCheckout(checkout);
       const base = target(0);
-      const output = target(1);
-      nativeWrite(native, base);
-      const baseOid = store.write("blob", base);
+      const intermediate = target(99);
+      const output = target(100);
+      const fillers = [1, 2, 3, 4, 5].map(target);
+      const baseOid = hashObject("blob", base);
+      const intermediateOid = hashObject("blob", intermediate);
       const oid = hashObject("blob", output);
-      const bytes = pack(1, (writer) => writer.refDelta(baseOid, literal(base.length, output)));
+      const bytes = pack(8, (writer) => {
+        writer.object("blob", base);
+        writer.refDelta(baseOid, literal(8, intermediate));
+        writer.refDelta(intermediateOid, literal(8, output));
+        for (const filler of fillers) writer.object("blob", filler);
+      });
       nativeIngest(native, bytes);
       await store.packs.ingest(slices(bytes, 4096));
-      const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(checkout);
-      const external = vi.spyOn(ObjectTable.prototype, "readLooseObjects");
-      const failure = new Error("external reader failed");
-      external.mockImplementationOnce(() => {
-        throw failure;
-      });
-      expect(() => cold.packs.read(oid)).toThrow(failure);
-      expect(cold.packs.read(oid)?.data).toEqual(native.catFile(oid));
-      expect(external).toHaveBeenCalledTimes(2);
-      expect(() => cold.packs.readObjects([oid], "tree")).toThrow(/not a tree/);
-      expect(cold.packs.read("f".repeat(40))).toBeNull();
+      const cold = new SqliteGitDatabase(db, { objectCacheBytes: 1024 }).openCheckout(checkout);
+      expect(cold.packs.read(intermediateOid)?.data).toEqual(native.catFile(intermediateOid));
+      const inflate = vi.spyOn(PackDataReader.prototype, "inflateCompressed");
+      const wanted = [...fillers.map((bytes) => hashObject("blob", bytes)), oid];
+      const result = cold.packs.readObjects(wanted);
+      for (const oid of wanted) expect(result.get(oid)?.data).toEqual(native.catFile(oid));
+      expect(inflate.mock.calls.filter(([entry]) => entry.oid === intermediateOid)).toHaveLength(1);
     } finally {
       native.dispose();
       db.storage.db.close();

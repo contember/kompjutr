@@ -8,8 +8,6 @@ import { hashObject, type ObjectType, type RawObject } from "../../common/object
 import { PackDataReader } from "./read/read-data.js";
 import { PackObjectResolver } from "./read/read-resolver.js";
 import {
-  type ExternalBatchResolver,
-  type ExternalMetadataResolver,
   type PackedEntry,
   type PackObjectRow,
   type PackRangeRequest,
@@ -29,8 +27,6 @@ export class PackReadEngine {
     objects: ByteLru<string, RawObject>,
     chunks: ByteLru<string, Uint8Array>,
     cacheNamespace: string,
-    externalBatch: ExternalBatchResolver,
-    externalMetadata: ExternalMetadataResolver,
     sharedState: PackSharedState,
     cacheEntryLimit: number,
     maxDeltaDepth: number,
@@ -50,8 +46,6 @@ export class PackReadEngine {
     this.#resolver = new PackObjectResolver(
       db,
       repoId,
-      externalBatch,
-      externalMetadata,
       objects,
       this.#data,
       maxDeltaDepth,
@@ -66,12 +60,15 @@ export class PackReadEngine {
 
   lookup(oid: string): PackedEntry | null {
     const row = this.#db.one<PackObjectRow>(
-      `SELECT object.pack_id, object.offset, object.data_off, object.data_len,
-              object.type, object.size, object.entry_size, object.base_oid
+      `SELECT entry.pack_id, entry.offset, entry.data_off, entry.data_len,
+              entry.type, entry.size, entry.entry_size, entry.base_offset
          FROM git_pack_objects object
          JOIN git_pack_meta pack
            ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
           AND pack.state = 'complete'
+         JOIN git_pack_entries entry
+           ON entry.repo_id = object.repo_id AND entry.pack_id = object.pack_id
+          AND entry.offset = object.offset
         WHERE object.repo_id = ? AND object.oid = ?`,
       this.#repoId,
       oid,
@@ -86,7 +83,7 @@ export class PackReadEngine {
       type: row.type,
       size: row.size,
       entrySize: row.entry_size,
-      baseOid: row.base_oid,
+      baseOffset: row.base_offset,
     };
   }
 

@@ -2,9 +2,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../../common/errors.js";
 import { decodeRow, expectSafeInteger, int, nullable, oneOf } from "../../../common/rows.js";
 import type { SharedRepoStore } from "../../index.js";
-import { PACK_SWEEP_RETRY } from "../roots/root-contracts.js";
 import type { PackAudit, RunState, SliceResult } from "./sweep-contracts.js";
-import { hasRequiredPackDependency } from "./sweep-pack-dependencies.js";
 import {
   eligibilityTime,
   progress,
@@ -149,25 +147,16 @@ function nextPackEligibility(db: SqlDatabase, repoId: number, run: RunState): nu
       );
 }
 
-function saveSweepCursor(
-  store: SharedRepoStore,
-  run: RunState,
-  ordinal: number | null,
-  marker: string | null,
-): RunState {
+function saveSweepCursor(store: SharedRepoStore, run: RunState, ordinal: number | null): RunState {
   store.db.run(
-    `UPDATE git_maintenance_runs SET cursor_ordinal = ?, cursor_text = ?
-      WHERE repo_id = ? AND run_id = ?`,
+    "UPDATE git_maintenance_runs SET cursor_ordinal = ? WHERE repo_id = ? AND run_id = ?",
     ordinal,
-    marker,
     store.repoId,
     run.runId,
   );
-  return { ...run, cursorOrdinal: ordinal, cursorText: marker };
+  return { ...run, cursorOrdinal: ordinal };
 }
 
-// A deletion can release an earlier pack's dependency, so a pass that deleted
-// restarts from the first pack before the phase may finish.
 export function advancePacks(
   store: SharedRepoStore,
   run: RunState,
@@ -191,7 +180,6 @@ export function advancePacks(
     if (nowMs < eligibilityTime(since)) {
       throw new CorruptError("pack sweep selected an ineligible candidate");
     }
-    if (hasRequiredPackDependency(store.db, store.repoId, pack.packId)) continue;
     deletePackStorage(store, run, pack);
     const counted = updateReclamationCounters(
       store.db,
@@ -201,17 +189,14 @@ export function advancePacks(
       1,
       pack.size,
     );
-    const updated = saveSweepCursor(store, counted, last, PACK_SWEEP_RETRY);
+    const updated = saveSweepCursor(store, counted, last);
     return { progress: progress(updated, updated.phase, "progress"), storageChanged: true };
   }
   if (examined === pageRows) {
-    const updated = saveSweepCursor(store, run, last, run.cursorText);
+    const updated = saveSweepCursor(store, run, last);
     return { progress: progress(updated, updated.phase, "progress"), storageChanged: false };
   }
-  const cleared = saveSweepCursor(store, run, null, null);
-  if (run.cursorText === PACK_SWEEP_RETRY) {
-    return { progress: progress(cleared, cleared.phase, "progress"), storageChanged: false };
-  }
+  const cleared = saveSweepCursor(store, run, null);
   const packEligible = nextPackEligibility(store.db, store.repoId, run);
   const nextEligibleMs =
     run.nextEligibleMs === null
