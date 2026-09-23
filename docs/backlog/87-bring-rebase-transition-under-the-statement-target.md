@@ -23,17 +23,22 @@ keyset page (`e355936`) took it to 1,279. It passes the harness's linearity
 gate (1,279 <= 2 x 699), and no frozen baseline existed until now, so
 `--check` never mentioned it.
 
-The remaining cost is the traversal *count*, not the per-traversal price.
-ADR-0024 deliberately made a plan traversable more than once rather than
-holding it in memory; whether a rebase step needs forty traversals is a
-separate question that was never asked.
+A per-step histogram at `4c333ce` (2026-09-23) corrects the earlier reading:
+the marginal cost is 145 statements per step over a fixed ~119, spread across
+~80 query shapes. Integration plan traversals are the largest family at 21 per
+step (planning 3, projection 3, worktree safety 2, touched shapes 2, apply 7,
+the step itself 2), then index reads 9, `git_objects` type lookups 8, tree
+walks 7, worktree path walks 11, and ref DWIM probes 6. Removing every plan
+traversal would still leave ~1,150. Reaching ≤1,000 at eight steps needs
+≤ ~110 per step, which means fusing integration phases.
 
 ## Approach / acceptance
 
-Count the traversals per step and name what each one reads before changing
-anything — the number comes from a per-query histogram, not from reading the
-code. Look for consumers that re-traverse a plan they could read once, and for
-per-step work that could be hoisted across steps.
+This is a design question before it is an optimisation: decide whether
+ADR-0024's traversal contract should let apply fuse its seven passes (and
+projection its three) into fewer streamed passes, and write that decision
+first. Cheap cuts alone (ref DWIM probes, the step's own conflict scan) do not
+change the verdict.
 
 Witness: `rebase.transition-2n` reports `pass` against the 1,000-statement
 target with unchanged rows read and unchanged rebase semantics, and the frozen

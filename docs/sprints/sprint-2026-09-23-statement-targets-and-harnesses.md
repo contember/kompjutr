@@ -327,3 +327,43 @@ miss is recorded with its histogram and filed as backlog, not forced (see WU4).
   10–11. Cadence commands and small grounding slips → fixed.
 
 ## Run log
+
+- **WU3 landed** (`4c333ce`). The journal's byte-cap witness needed JSON
+  escaping to reach the cap: journal paths stop at 2,200 bytes, so plain rows
+  fit 256 per page under `JSON_BATCH_BYTES`. Each U+0001 costs six bytes.
+  Frozen rows moved down: `merge.recovery` 104 → 101, `merge.restore` 99 → 90,
+  `replay.recovery` 118 → 115, `transport.fetch` 84/66 → 82/64, the Next.js
+  clone 1,031/164,287 → 1,029/164,285. The rebase rows did not move, because
+  rebase writes an empty touched journal.
+- **WU2 landed** (`2e20f45`). The journey failed before the fix with exactly
+  the class-order diff.
+- **WU1: `clone-storage` landed** (`ce701af`). Every Next.js table lands in a
+  named family. Empty tables stay in the group totals (one page each, which is
+  real billed storage); the object table already hides tables under two pages.
+- **WU1: reachability is escalated.** The scenario exists to witness a commit
+  header *above* the former 48 MiB reachability ceiling, and `memory-protocol.ts:608`
+  refuses any scenario whose workload does not cross its former limit. Since
+  `b2cabed` the `git_objects` size CHECK caps every object at `MAX_OBJECT_BYTES`
+  = 48 MiB, so that workload cannot be stored. Setting the header to the limit
+  fails the crossing check. Repair needs a decision: retire the scenario, or
+  redefine what it measures.
+- **WU4: partial outcome.** Per-step histogram of `rebase.transition-n` vs
+  `-2n`: 145 statements per step across ~80 query shapes. Integration plan
+  traversals are the largest family at 21 per step (one statement each on this
+  fixture), named by call site: planning (3), projection and collisions (3),
+  worktree safety and prospective index (2), touched shapes (2), apply (7:
+  validation, snapshot, materialize, oids, removals ×2, index), and the step
+  itself (2). Next: index reads 9, `git_objects` type lookups 8, tree walks 7,
+  worktree path walks 11, ref DWIM probes 6. Collapsing every plan traversal
+  would still leave ~1,150; the target needs ≤ ~110 per step, which means
+  fusing integration phases — a change to ADR-0024's traversal contract. No
+  cut landed. → backlog 87 rescoped.
+- **WU5: the residue is not admission.** Clone histogram at 1,029: pack graph
+  admission is ~25 statements in total. The rest is data-proportional (worktree
+  writes 383, pack reads 84 + 51 delta-chain resolutions, object batches) plus
+  small per-mutation costs: 5 mutation-guard pairs (10), 4 config keys written
+  as DELETE+INSERT each (8), user identity read twice per reflog writer (4),
+  two ref-mutation transactions each listing all refs, pruning reflogs, bumping
+  the root epoch and fetch namespaces (~10), full ref listings 5×. Reaching
+  ≤1,000 means several small cuts across refs, config, and identity — not the
+  admission changes the plan scoped. → backlog 90 rescoped.

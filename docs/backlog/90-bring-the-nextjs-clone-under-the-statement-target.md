@@ -37,7 +37,15 @@ Nothing refuses work because of it.
 
 ## Approach / acceptance
 
-Attribute the remaining 31 from a per-query histogram before changing anything.
+A clone histogram at `4c333ce` (1,029 statements, 2026-09-23) shows the
+residue is not in admission: pack graph admission is ~25 statements in total.
+The candidates are small per-mutation costs — five mutation-guard pairs (10),
+four config keys written as DELETE+INSERT each (8), user identity read twice per
+reflog writer (4), two ref-mutation transactions each listing all refs, pruning
+reflogs and bumping epochs (~10), and five full ref listings. Several of these
+together reach the target; admission changes alone do not.
+
+The original plan, kept for reference:
 The admission walk is now seeded at 5,233 of 30,613 objects, so the question is
 no longer how many objects it visits but how many statements one bounded page
 costs — six query shapes per page plus the scratch lifecycle. Check whether the
