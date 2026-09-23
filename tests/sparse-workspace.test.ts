@@ -253,9 +253,9 @@ function installPackCopy(
     );
     workspace.database.db.run(
       `INSERT INTO git_tree_entries
-         (source_key, ordinal, mode, name_bytes, oid, raw_entry, cumulative_base)
+         (source_key, ordinal, mode, name_bytes, oid, cumulative_base)
        SELECT packed.source_key, entry.ordinal, entry.mode, entry.name_bytes, entry.oid,
-              entry.raw_entry, entry.cumulative_base
+              entry.cumulative_base
          FROM git_tree_entries entry
          JOIN git_tree_sources loose ON loose.source_key = entry.source_key
          JOIN git_tree_sources packed
@@ -748,9 +748,6 @@ describe("SQLite sparse workspace source", () => {
 
     expect(explained.queries).toBe(1);
     expect(explained.details.some((detail) => detail.includes("SEARCH entry USING"))).toBe(true);
-    expect(explained.details.some((detail) => detail.includes("git_tree_entries_wide"))).toBe(
-      false,
-    );
   });
 
   it("authenticates clean, packed, missing, mismatched, incomplete, and unborn baselines", () => {
@@ -1130,8 +1127,9 @@ describe("SQLite sparse workspace source", () => {
     const root = workspace.repo.headTree();
     if (root === null) throw new Error("missing HEAD tree");
     const child = workspace.database.db.scalar<string>(
-      `SELECT oid FROM git_tree_entries_wide
-        WHERE repo_id = ? AND tree_oid = ? AND name = 'dir'`,
+      `SELECT e.oid FROM git_tree_entries e
+         JOIN git_tree_sources s ON s.source_key = e.source_key
+        WHERE s.repo_id = ? AND s.tree_oid = ? AND e.name_bytes = CAST('dir' AS BLOB)`,
       workspace.repo.store.repoId,
       root,
     );
@@ -1232,7 +1230,6 @@ describe("SQLite sparse workspace source", () => {
       ),
     ).toBe(true);
     expect(plan.some((row) => row.detail.includes("SEARCH edge USING"))).toBe(true);
-    expect(plan.some((row) => row.detail.includes("git_tree_entries_wide"))).toBe(false);
     expect(plan.some((row) => /SCAN (effective|edge)(?:\s|$)/.test(row.detail))).toBe(false);
   });
 

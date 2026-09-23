@@ -264,7 +264,12 @@ describe("pack physical offset membership", () => {
           ),
         ).toBe(1);
         expect(
-          db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries_wide WHERE tree_oid = ?", oid),
+          db.scalar<number>(
+            `SELECT COUNT(*) FROM git_tree_entries e
+               JOIN git_tree_sources s ON s.source_key = e.source_key
+              WHERE s.tree_oid = ?`,
+            oid,
+          ),
         ).toBe(count);
       } finally {
         native.dispose();

@@ -22,12 +22,11 @@ function expectForeignKeysEnabled(db: ForeignKeyDatabase): void {
 function insertTreeEntry(db: ForeignKeyDatabase, sourceKey: number): void {
   db.run(
     `INSERT INTO git_tree_entries
-       (source_key, ordinal, mode, name_bytes, oid, raw_entry, cumulative_base)
-     VALUES (?, 0, '100644', ?, ?, ?, 0)`,
+       (source_key, ordinal, mode, name_bytes, oid, cumulative_base)
+     VALUES (?, 0, '100644', ?, ?, 0)`,
     sourceKey,
     new TextEncoder().encode("file"),
     "1".repeat(40),
-    new Uint8Array([1]),
   );
 }
 
@@ -198,8 +197,9 @@ describe("foreign-key contract", () => {
     ]);
     expect(
       reopened.all<{ storage: string; source_id: number; tree_oid: string }>(
-        `SELECT storage, source_id, tree_oid
-         FROM git_tree_entries_wide WHERE repo_id = 91 ORDER BY source_id`,
+        `SELECT s.storage, s.source_id, s.tree_oid
+         FROM git_tree_entries e JOIN git_tree_sources s ON s.source_key = e.source_key
+        WHERE s.repo_id = 91 ORDER BY s.source_id`,
       ),
     ).toEqual([
       { storage: "loose", source_id: 0, tree_oid: "a".repeat(40) },

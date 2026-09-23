@@ -145,7 +145,6 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "trigger:git_tree_effective_pack_delete",
   "trigger:git_tree_effective_pack_hide",
   "view:git_blob_id_updates",
-  "view:git_tree_entries_wide",
 ];
 
 type RequiredRow =

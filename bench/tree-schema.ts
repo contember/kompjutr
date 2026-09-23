@@ -389,7 +389,6 @@ function newSchema(): string {
         typeof(name_bytes) = 'blob' AND length(name_bytes) BETWEEN 1 AND 2200
       ),
       oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
-      raw_entry BLOB NOT NULL CHECK (typeof(raw_entry) = 'blob'),
       cumulative_base INTEGER NOT NULL CHECK (
         typeof(cumulative_base) = 'integer' AND cumulative_base >= 0
       ),
@@ -401,13 +400,6 @@ function newSchema(): string {
     CREATE INDEX git_tree_entries_by_name_bytes
       ON git_tree_entries (source_key, name_bytes)
       WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200;
-    CREATE VIEW git_tree_entries_wide AS
-      SELECT s.repo_id, s.tree_oid, s.storage, s.source_id,
-             e.source_key, e.ordinal, e.mode,
-             CAST(e.name_bytes AS TEXT) AS name, e.name_bytes, e.oid,
-             e.raw_entry, e.cumulative_base
-        FROM git_tree_entries e
-        JOIN git_tree_sources s ON s.source_key = e.source_key;
     CREATE TABLE git_tree_effective (
       repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
       tree_oid TEXT NOT NULL CHECK (
@@ -474,19 +466,11 @@ function populateNew(db: DatabaseSync, dataset: Dataset): void {
     keys.set(row.treeOid, sourceKey);
     effective.run(row.treeOid, sourceKey);
   }
-  const entry = db.prepare("INSERT INTO git_tree_entries VALUES (?, ?, ?, ?, ?, ?, ?)");
+  const entry = db.prepare("INSERT INTO git_tree_entries VALUES (?, ?, ?, ?, ?, ?)");
   for (const row of dataset.entries) {
     const sourceKey = keys.get(row.treeOid);
     if (sourceKey === undefined) throw new Error(`tree entry has no source key: ${row.treeOid}`);
-    entry.run(
-      sourceKey,
-      row.ordinal,
-      row.mode,
-      row.nameBytes,
-      row.oid,
-      row.rawEntry,
-      row.cumulativeBase,
-    );
+    entry.run(sourceKey, row.ordinal, row.mode, row.nameBytes, row.oid, row.cumulativeBase);
   }
 }
 
@@ -519,7 +503,6 @@ function hashEntry(hash: Hash, row: Record<string, unknown>): void {
   hashText(hash, requireText(row.name, "tree name"));
   hashBytes(hash, requireBytes(row.name_bytes, "tree name bytes"));
   hashText(hash, requireOid(requireText(row.oid, "entry OID"), "entry OID"));
-  hashBytes(hash, requireBytes(row.raw_entry, "raw tree entry"));
   hashText(hash, String(requireInteger(row.cumulative_base, "tree cumulative base")));
 }
 
@@ -552,11 +535,12 @@ function snapshot(db: DatabaseSync, layout: Layout): LogicalSnapshot {
   const entriesSql =
     layout === "v11-wide"
       ? "SELECT tree_oid, storage, source_id, ordinal, mode, name, name_bytes, oid, " +
-        "raw_entry, cumulative_base FROM git_tree_entries " +
+        "cumulative_base FROM git_tree_entries " +
         "ORDER BY repo_id, tree_oid, storage, source_id, ordinal"
-      : "SELECT tree_oid, storage, source_id, ordinal, mode, name, name_bytes, oid, " +
-        "raw_entry, cumulative_base FROM git_tree_entries_wide " +
-        "ORDER BY repo_id, tree_oid, storage, source_id, ordinal";
+      : "SELECT s.tree_oid, s.storage, s.source_id, e.ordinal, e.mode, " +
+        "CAST(e.name_bytes AS TEXT) AS name, e.name_bytes, e.oid, e.cumulative_base " +
+        "FROM git_tree_entries e JOIN git_tree_sources s ON s.source_key = e.source_key " +
+        "ORDER BY s.repo_id, s.tree_oid, s.storage, s.source_id, e.ordinal";
   for (const row of db.prepare(entriesSql).iterate()) {
     hashText(hash, "entry");
     hashText(hash, requireOid(requireText(row.tree_oid, "entry tree OID"), "entry tree OID"));
@@ -596,13 +580,13 @@ function traversalProfile(
 ): WorkloadProfile {
   const sql =
     layout === "v11-wide"
-      ? "SELECT e.ordinal, e.mode, e.name, e.name_bytes, e.oid, e.raw_entry, " +
+      ? "SELECT e.ordinal, e.mode, e.name, e.name_bytes, e.oid, " +
         "e.cumulative_base FROM git_tree_effective f JOIN git_tree_entries e " +
         "ON e.repo_id = f.repo_id AND e.tree_oid = f.tree_oid " +
         "AND e.storage = f.storage AND e.source_id = f.source_id " +
         "WHERE f.repo_id = ? AND f.tree_oid = ? ORDER BY e.ordinal"
       : "SELECT e.ordinal, e.mode, CAST(e.name_bytes AS TEXT) AS name, e.name_bytes, e.oid, " +
-        "e.raw_entry, e.cumulative_base FROM git_tree_effective f " +
+        "e.cumulative_base FROM git_tree_effective f " +
         "JOIN git_tree_sources s ON s.source_key = f.source_key " +
         "JOIN git_tree_entries e ON e.source_key = s.source_key " +
         "WHERE f.repo_id = ? AND f.tree_oid = ? AND s.complete = 1 ORDER BY e.ordinal";
@@ -635,13 +619,13 @@ function lookupProfile(
 ): WorkloadProfile {
   const sql =
     layout === "v11-wide"
-      ? "SELECT e.ordinal, e.mode, e.name, e.name_bytes, e.oid, e.raw_entry, " +
+      ? "SELECT e.ordinal, e.mode, e.name, e.name_bytes, e.oid, " +
         "e.cumulative_base FROM git_tree_effective f JOIN git_tree_entries e " +
         "ON e.repo_id = f.repo_id AND e.tree_oid = f.tree_oid " +
         "AND e.storage = f.storage AND e.source_id = f.source_id " +
         "WHERE f.repo_id = ? AND f.tree_oid = ? AND e.name_bytes = ?"
       : "SELECT e.ordinal, e.mode, CAST(e.name_bytes AS TEXT) AS name, e.name_bytes, e.oid, " +
-        "e.raw_entry, e.cumulative_base FROM git_tree_effective f " +
+        "e.cumulative_base FROM git_tree_effective f " +
         "JOIN git_tree_sources s ON s.source_key = f.source_key " +
         "JOIN git_tree_entries e ON e.source_key = s.source_key " +
         "WHERE f.repo_id = ? AND f.tree_oid = ? AND s.complete = 1 AND e.name_bytes = ?";

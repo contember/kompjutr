@@ -169,7 +169,6 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "trigger", name: "git_tree_effective_pack_hide" },
   { type: "table", name: "git_tree_entries" },
   { type: "index", name: "git_tree_entries_by_name_bytes" },
-  { type: "view", name: "git_tree_entries_wide" },
   { type: "table", name: "git_tree_sources" },
 ];
 
@@ -519,10 +518,7 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
       "base_cost",
     ],
   ],
-  [
-    "git_tree_entries",
-    ["source_key", "ordinal", "mode", "name_bytes", "oid", "raw_entry", "cumulative_base"],
-  ],
+  ["git_tree_entries", ["source_key", "ordinal", "mode", "name_bytes", "oid", "cumulative_base"]],
   ["git_tree_effective", ["repo_id", "tree_oid", "source_key"]],
 ];
 

@@ -90,9 +90,9 @@ class ObservedDatabase implements SqlDatabase {
         throw new GitError("E2BIG", "injected SQLite row-size limit");
       }
       if (this.entryInserts === this.failEntryInsert) throw new Error("injected tree INSERT");
-      const encoded = bindings[2];
-      const offset = bindings[3];
-      const length = bindings[4];
+      const encoded = bindings[1];
+      const offset = bindings[2];
+      const length = bindings[3];
       if (
         !(encoded instanceof Uint8Array) ||
         typeof offset !== "number" ||
@@ -106,7 +106,7 @@ class ObservedDatabase implements SqlDatabase {
       if (!Array.isArray(parsed)) throw new Error("tree entry JSON binding is not an array");
       this.maxEntryRows = Math.max(this.maxEntryRows, parsed.length);
       this.entryRowCounts.push(parsed.length);
-      this.sharedEntryPayload &&= bindings[0] === bindings[1] && bindings[1] === bindings[2];
+      this.sharedEntryPayload &&= bindings[0] === bindings[1];
       for (const binding of bindings) {
         const bytes =
           typeof binding === "string"
@@ -346,24 +346,30 @@ describe("incremental tree index sink", () => {
     });
     expect(
       inner.scalar<number>(
-        "SELECT COUNT(*) FROM git_tree_entries_wide WHERE repo_id = 1 AND tree_oid = ?",
+        `SELECT COUNT(*) FROM git_tree_entries e
+           JOIN git_tree_sources s ON s.source_key = e.source_key
+          WHERE s.repo_id = 1 AND s.tree_oid = ?`,
         TREE_OID,
       ),
     ).toBe(count);
     const edges = inner.all<{
       ordinal: number;
-      raw_entry: Uint8Array;
+      name_bytes: Uint8Array;
       cumulative_base: number;
     }>(
-      `SELECT ordinal, raw_entry, cumulative_base FROM git_tree_entries_wide
-        WHERE repo_id = 1 AND tree_oid = ? AND ordinal IN (0, ?)
-        ORDER BY ordinal`,
+      `SELECT e.ordinal, e.name_bytes, e.cumulative_base FROM git_tree_entries e
+         JOIN git_tree_sources s ON s.source_key = e.source_key
+        WHERE s.repo_id = 1 AND s.tree_oid = ? AND e.ordinal IN (0, ?)
+        ORDER BY e.ordinal`,
       TREE_OID,
       count - 1,
     );
-    expect(readBlob(edges[0]?.raw_entry).length).toBe(entrySize);
+    const lastName = `${"a".repeat(nameLength - 6)}${String(count - 1).padStart(6, "0")}`;
+    expect(utf8Decoder.decode(readBlob(edges[0]?.name_bytes))).toBe(
+      `${"a".repeat(nameLength - 6)}000000`,
+    );
     expect(edges[0]?.cumulative_base).toBe(perEntryBase);
-    expect(readBlob(edges[1]?.raw_entry).length).toBe(entrySize);
+    expect(utf8Decoder.decode(readBlob(edges[1]?.name_bytes))).toBe(lastName);
     expect(edges[1]?.cumulative_base).toBe(count * perEntryBase);
     expect(maxRetainedRows).toBeLessThanOrEqual(2_048);
     expect(db.maxEntryRows).toBeLessThanOrEqual(2_048);
@@ -445,15 +451,17 @@ describe("incremental tree index sink", () => {
     });
 
     const direct = db.all<Record<string, unknown>>(
-      `SELECT ordinal, mode, name, hex(name_bytes) AS name_bytes, oid,
-              hex(raw_entry) AS raw_entry, cumulative_base
-         FROM git_tree_entries_wide WHERE tree_oid = ? ORDER BY ordinal`,
+      `SELECT e.ordinal, e.mode, hex(e.name_bytes) AS name_bytes, e.oid, e.cumulative_base
+         FROM git_tree_entries e
+         JOIN git_tree_sources s ON s.source_key = e.source_key
+        WHERE s.tree_oid = ? ORDER BY e.ordinal`,
       TREE_OID,
     );
     const legacy = db.all<Record<string, unknown>>(
-      `SELECT ordinal, mode, name, hex(name_bytes) AS name_bytes, oid,
-              hex(raw_entry) AS raw_entry, cumulative_base
-         FROM git_tree_entries_wide WHERE tree_oid = ? ORDER BY ordinal`,
+      `SELECT e.ordinal, e.mode, hex(e.name_bytes) AS name_bytes, e.oid, e.cumulative_base
+         FROM git_tree_entries e
+         JOIN git_tree_sources s ON s.source_key = e.source_key
+        WHERE s.tree_oid = ? ORDER BY e.ordinal`,
       "55".repeat(20),
     );
     expect(legacy).toEqual(direct);

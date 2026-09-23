@@ -150,22 +150,27 @@ export class TreeIndexBatch {
 
   addEntry(source: TreeSource, parsed: ParsedTreeEntry, cumulativeBase: number): boolean {
     let entries = this.#entryArena();
-    const payloadBytes = parsed.rawEntry.length;
-    const rawAt = entries.payloadLength + 1;
-    const nameAt = rawAt + parsed.entry.mode.length + 1;
-    return (() => {
-      let json = `{"p":${source.repoId},"t":"${source.treeOid}","s":"${source.storage}","x":${source.sourceId},"b":${source.objectSize},"q":${parsed.ordinal},"m":"${parsed.entry.mode}","o":"${parsed.entry.oid}","a":${nameAt},"l":${parsed.nameBytes.length},"r":${rawAt},"z":${parsed.rawEntry.length},"c":${cumulativeBase}}`;
-      if (this.retainedRows >= TREE_INDEX_ROWS || !entries.canAppend(payloadBytes, json)) {
-        this.flush();
-        entries = this.#entryArena();
-        json = `{"p":${source.repoId},"t":"${source.treeOid}","s":"${source.storage}","x":${source.sourceId},"b":${source.objectSize},"q":${parsed.ordinal},"m":"${parsed.entry.mode}","o":"${parsed.entry.oid}","a":${parsed.entry.mode.length + 2},"l":${parsed.nameBytes.length},"r":1,"z":${parsed.rawEntry.length},"c":${cumulativeBase}}`;
-      }
-      if (!entries.canAppend(payloadBytes, json)) {
-        return this.#insertOversizedEntry(source, parsed, cumulativeBase);
-      }
-      entries.append(parsed.rawEntry, json);
-      return true;
-    })();
+    const payloadBytes = parsed.nameBytes.length;
+    let json = this.#entryJson(source, parsed, cumulativeBase, entries.payloadLength + 1);
+    if (this.retainedRows >= TREE_INDEX_ROWS || !entries.canAppend(payloadBytes, json)) {
+      this.flush();
+      entries = this.#entryArena();
+      json = this.#entryJson(source, parsed, cumulativeBase, 1);
+    }
+    if (!entries.canAppend(payloadBytes, json)) {
+      return this.#insertOversizedEntry(source, parsed, cumulativeBase);
+    }
+    entries.append(parsed.nameBytes, json);
+    return true;
+  }
+
+  #entryJson(
+    source: TreeSource,
+    parsed: ParsedTreeEntry,
+    cumulativeBase: number,
+    nameAt: number,
+  ): string {
+    return `{"p":${source.repoId},"t":"${source.treeOid}","s":"${source.storage}","x":${source.sourceId},"b":${source.objectSize},"q":${parsed.ordinal},"m":"${parsed.entry.mode}","o":"${parsed.entry.oid}","a":${nameAt},"l":${parsed.nameBytes.length},"c":${cumulativeBase}}`;
   }
 
   #insertOversizedEntry(
@@ -180,8 +185,8 @@ export class TreeIndexBatch {
     try {
       this.db.run(
         `INSERT INTO git_tree_entries
-             (source_key, ordinal, mode, name_bytes, oid, raw_entry, cumulative_base)
-           SELECT source.source_key, ?, ?, ?, ?, ?, ?
+             (source_key, ordinal, mode, name_bytes, oid, cumulative_base)
+           SELECT source.source_key, ?, ?, ?, ?, ?
              FROM git_tree_sources source
             WHERE source.repo_id = ? AND source.tree_oid = ?
               AND source.storage = ? AND source.source_id = ?`,
@@ -189,7 +194,6 @@ export class TreeIndexBatch {
         parsed.entry.mode,
         blob(parsed.nameBytes),
         parsed.entry.oid,
-        blob(parsed.rawEntry),
         cumulativeBase,
         source.repoId,
         source.treeOid,
@@ -278,19 +282,16 @@ export class TreeIndexBatch {
     }
     this.db.run(
       `INSERT INTO git_tree_entries
-         (source_key, ordinal, mode, name_bytes, oid, raw_entry, cumulative_base)
+         (source_key, ordinal, mode, name_bytes, oid, cumulative_base)
        SELECT s.source_key, json_extract(j.value, '$.q'), json_extract(j.value, '$.m'),
               substr(?, json_extract(j.value, '$.a'), json_extract(j.value, '$.l')),
-              json_extract(j.value, '$.o'),
-              substr(?, json_extract(j.value, '$.r'), json_extract(j.value, '$.z')),
-              json_extract(j.value, '$.c')
+              json_extract(j.value, '$.o'), json_extract(j.value, '$.c')
          FROM json_each(CAST(substr(?, ?, ?) AS TEXT)) j
          JOIN git_tree_sources s
            ON s.repo_id = json_extract(j.value, '$.p')
           AND s.tree_oid = json_extract(j.value, '$.t')
           AND s.storage = json_extract(j.value, '$.s')
           AND s.source_id = json_extract(j.value, '$.x')`,
-      blob(entries.bytes),
       blob(entries.bytes),
       blob(entries.bytes),
       json.offset,

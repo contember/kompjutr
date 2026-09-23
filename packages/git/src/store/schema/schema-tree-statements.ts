@@ -32,7 +32,6 @@ export const TREE_SCHEMA_STATEMENTS = [
        typeof(name_bytes) = 'blob' AND length(name_bytes) >= 1
      ),
      oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
-     raw_entry BLOB NOT NULL CHECK (typeof(raw_entry) = 'blob'),
      cumulative_base INTEGER NOT NULL CHECK (
        typeof(cumulative_base) = 'integer' AND cumulative_base >= 0
      ),
@@ -44,14 +43,6 @@ export const TREE_SCHEMA_STATEMENTS = [
 
   `CREATE INDEX IF NOT EXISTS git_tree_entries_by_name_bytes
      ON git_tree_entries (source_key, name_bytes)`,
-
-  `CREATE VIEW IF NOT EXISTS git_tree_entries_wide AS
-     SELECT s.repo_id, s.tree_oid, s.storage, s.source_id,
-            e.source_key, e.ordinal, e.mode,
-            CAST(e.name_bytes AS TEXT) AS name, e.name_bytes, e.oid,
-            e.raw_entry, e.cumulative_base
-       FROM git_tree_entries e
-       JOIN git_tree_sources s ON s.source_key = e.source_key`,
 
   // The source selected for traversal. A loose object always shadows its
   // packed copy, including while its parsed marker is missing or corrupt.
