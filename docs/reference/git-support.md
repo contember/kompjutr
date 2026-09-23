@@ -579,12 +579,14 @@ non-401 HTTP response, malformed response, or incomplete or invalid
 `report-status` is `EPUSHUNCERTAIN`: the remote may have applied the update, so
 callers must inspect remote state rather than automatically retry. Known-local
 request-body failures remain `E2BIG` or `EPUSHLOCAL`; authentication failure
-remains `EAUTH`; and a fully consumed 401 is safe to authenticate and retry, or
+remains `EAUTH`; and a 401 rejects the attempt before the remote consumes it,
+so it is safe to authenticate and retry once as soon as its status arrives, or
 to return `EABORTED` if cancelled before that retry. Complete `report-status`
-always returns the confirmed `PushResult`. A later abort or failure during
-configured-remote tracking reconciliation appears only as
-`tracking: { outcome: "failed", code, message }`; it does not replace the
-confirmed remote result with `EABORTED` or `EPUSHUNCERTAIN`.
+always returns the confirmed `PushResult`. Configured-remote tracking
+reconciliation then runs synchronously and does not observe cancellation; a
+local failure appears only as `tracking: { outcome: "failed", code, message }`
+and never replaces the confirmed remote result with `EABORTED` or
+`EPUSHUNCERTAIN`.
 
 ### `git ls-remote` — `lsRemote()`
 
@@ -738,8 +740,10 @@ or incomplete status after POST is uncertain and throws. No-op destinations are
 reported without commands, and a wholly unmatched wildcard returns an exact
 empty result without discovery. A configured remote reconciles only successful
 branch destinations after status; custom refs and explicit URLs never create
-tracking refs. Reconciliation reports `updated`, `unchanged`, `stale`,
-`deferred`, or `failed` without hiding a confirmed remote result. Pushing from a
+tracking refs. Like Git, tracking refs take the targets `report-status`
+confirmed; push does not rediscover, so a server hook that rewrites a ref is
+seen on the next fetch. Reconciliation reports `updated`, `unchanged`, `stale`,
+or `failed` without hiding a confirmed remote result. Pushing from a
 detached HEAD without an explicit legacy `ref` throws `EDETACHED`.
 
 Lease keys normalize to expanded destination refs. Every listed destination,

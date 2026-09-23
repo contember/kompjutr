@@ -218,54 +218,6 @@ describe("mapped fetch refspecs", () => {
     );
   });
 
-  it("rejects a corrupt loose peeled-target shadow during tag-chain authentication", async () => {
-    const { workspace, git } = configured();
-    const tagOid = fixture.git("rev-parse", "refs/tags/release");
-    await git.fetch({
-      refspecs: [{ source: "refs/tags/release", destination: "refs/tags/packed" }],
-    });
-    const packed = workspace.repo.store.read(tipOid);
-    if (packed === null || packed.type !== "commit") {
-      throw new Error("fetched peeled target is missing");
-    }
-    expect(workspace.repo.store.readAuthenticatedObject(tagOid, "tag")).not.toBeNull();
-    workspace.repo.store.write("blob", new Uint8Array([1]));
-    const corrupt = packed.data.slice();
-    corrupt[corrupt.length - 1] = (corrupt.at(-1) ?? 0) ^ 1;
-    workspace.repo.store.db.run(
-      `INSERT INTO git_objects (repo_id, oid, type, size, stored)
-       VALUES (?, ?, 'commit', ?, 'raw')`,
-      workspace.repo.store.repoId,
-      tipOid,
-      corrupt.length,
-    );
-    workspace.repo.store.db.run(
-      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
-      workspace.repo.store.repoId,
-      tipOid,
-      corrupt,
-    );
-    const destination = "refs/tags/corrupt-peeled-shadow";
-
-    await expect(
-      git.fetch({
-        refspecs: [{ source: "refs/tags/release", destination }],
-      }),
-    ).rejects.toMatchObject({ code: "ECORRUPT" });
-
-    expect(workspace.repo.store.getRef(destination)).toBeNull();
-    expect(workspace.repo.store.reflog(destination)).toEqual([]);
-    const cold = reopenTestRepository(workspace);
-    expect(cold.repo.store.getRef(destination)).toBeNull();
-    expect(cold.repo.store.reflog(destination)).toEqual([]);
-    expect(
-      cold.repo.store.db.scalar<number>(
-        "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND state = 'complete'",
-        cold.repo.store.repoId,
-      ),
-    ).toBeGreaterThan(0);
-  });
-
   it("requires force to replace an existing tag and rejects before POST", async () => {
     const { workspace, git } = configured();
     const mapping = {

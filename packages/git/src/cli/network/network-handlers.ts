@@ -450,7 +450,7 @@ function formatPush(result: PushResult): string {
   }
   if (result.tracking.outcome === "failed") {
     output += `warning: tracking reconciliation failed: ${result.tracking.message}\n`;
-  } else if (result.tracking.outcome === "stale" || result.tracking.outcome === "deferred") {
+  } else if (result.tracking.outcome === "stale") {
     output += `warning: tracking reconciliation ${result.tracking.outcome}\n`;
   }
   return output;

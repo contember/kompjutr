@@ -3,7 +3,7 @@ import type { ObjectType } from "../../common/objects.js";
 import { ZERO_OID } from "../../protocol/receive-pack.js";
 import type { PushPlanningUpdate } from "../refs/refspec.js";
 import { type Repository, walkIndexedOwned } from "../repository/repository.js";
-import { resolveRoots } from "./push-plan-auth.js";
+import { resolveRoots } from "./push-plan-roots.js";
 import {
   ARRAY_SLOT_BYTES,
   COMMIT_ENTRY_BYTES,

@@ -11,16 +11,10 @@ import {
 import { openRepository } from "../packages/git/src/ops/core/context.js";
 import { clone } from "../packages/git/src/ops/network/network.js";
 import {
-  authenticatePushBranchTargets,
-  disposePushPlan,
-  MAX_PUSH_BRANCH_TARGETS,
   MAX_PUSH_COMMITS,
   openPushPack,
   type PushPlan,
   planPushUpdates,
-  pushPlanHasObject,
-  pushPlanObjectCount,
-  pushPlanObjectOidAt,
 } from "../packages/git/src/ops/push/push-plan.js";
 import type { PushPlanningUpdate } from "../packages/git/src/ops/refs/refspec.js";
 import { FLUSH, pkt } from "../packages/git/src/protocol/pktline.js";
@@ -66,13 +60,7 @@ function requirePlan(plan: PushPlan | null): PushPlan {
 }
 
 function planOids(plan: PushPlan): string[] {
-  const result: string[] = [];
-  for (let index = 0; index < pushPlanObjectCount(plan); index++) {
-    const oid = pushPlanObjectOidAt(plan, index);
-    if (oid === null) throw new Error("push plan lost an object");
-    result.push(oid);
-  }
-  return result;
+  return plan.objects.map((object) => object.oid);
 }
 
 function update(
@@ -84,97 +72,6 @@ function update(
 ): PushPlanningUpdate {
   return { source, destination, oid, oldOid, force };
 }
-
-describe("post-push branch target authentication", () => {
-  it("authenticates direct commits", () => {
-    const workspace = makeRepo();
-    const tree = workspace.repo.store.write("tree", serializeTree([]));
-    const commit = workspace.repo.store.write(
-      "commit",
-      serializeCommit({
-        tree,
-        parent: [],
-        author: person,
-        committer: person,
-        message: "target\n",
-      }),
-    );
-    expect(() => authenticatePushBranchTargets(workspace.repo, [commit])).not.toThrow();
-  });
-
-  it("rejects tags and blobs while classifying missing and corrupt commits as local failures", () => {
-    const workspace = makeRepo();
-    const blob = workspace.repo.store.write("blob", new TextEncoder().encode("blob\n"));
-    const tree = workspace.repo.store.write("tree", serializeTree([]));
-    const commit = workspace.repo.store.write(
-      "commit",
-      serializeCommit({
-        tree,
-        parent: [],
-        author: person,
-        committer: person,
-        message: "target\n",
-      }),
-    );
-    const tag = workspace.repo.store.write(
-      "tag",
-      serializeTag({ object: commit, type: "commit", tag: "target", message: "target\n" }),
-    );
-    for (const oid of [tag, blob]) {
-      expect(() => authenticatePushBranchTargets(workspace.repo, [oid])).toThrow(
-        expect.objectContaining({ code: "EINVALIDREF" }),
-      );
-    }
-
-    expect(() => authenticatePushBranchTargets(workspace.repo, ["f".repeat(40)])).toThrow(
-      expect.objectContaining({ code: "EPUSHLOCAL" }),
-    );
-
-    workspace.repo.store.db.run(
-      "UPDATE git_object_chunks SET data = zeroblob(length(data)) WHERE repo_id = ? AND oid = ?",
-      1,
-      commit,
-    );
-    expect(() => authenticatePushBranchTargets(workspace.repo, [commit])).toThrow(
-      expect.objectContaining({ code: "EPUSHLOCAL" }),
-    );
-  });
-
-  it("accepts the exact input bound after deduplication and rejects the first excess", () => {
-    const workspace = makeRepo();
-    const tree = workspace.repo.store.write("tree", serializeTree([]));
-    const commit = workspace.repo.store.write(
-      "commit",
-      serializeCommit({
-        tree,
-        parent: [],
-        author: person,
-        committer: person,
-        message: "target\n",
-      }),
-    );
-
-    authenticatePushBranchTargets(workspace.repo, [commit]);
-
-    authenticatePushBranchTargets(
-      workspace.repo,
-      Array.from({ length: MAX_PUSH_BRANCH_TARGETS }, () => commit),
-    );
-
-    expect(() =>
-      authenticatePushBranchTargets(
-        workspace.repo,
-        Array.from({ length: MAX_PUSH_BRANCH_TARGETS + 1 }, () => commit),
-      ),
-    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
-
-    for (const oid of [ZERO_OID, "not-an-object-id"]) {
-      expect(() => authenticatePushBranchTargets(workspace.repo, [oid])).toThrow(
-        expect.objectContaining({ code: "EINVAL" }),
-      );
-    }
-  });
-});
 
 describe("multi-ref push planning", () => {
   it("sends one deterministic union pack for commits, tags, a tree, a blob, force and deletion", async () => {
@@ -262,11 +159,11 @@ describe("multi-ref push planning", () => {
       const planned = planOids(plan);
       expect(new Set(planned).size).toBe(planned.length);
       expect(plan.newCommits).toBe(2);
-      expect(pushPlanHasObject(plan, base)).toBe(false);
-      expect(pushPlanHasObject(plan, baseCommit.tree)).toBe(false);
-      expect(pushPlanHasObject(plan, annotated)).toBe(true);
-      expect(pushPlanHasObject(plan, directTree)).toBe(true);
-      expect(pushPlanHasObject(plan, directBlob)).toBe(true);
+      expect(planned.includes(base)).toBe(false);
+      expect(planned.includes(baseCommit.tree)).toBe(false);
+      expect(planned.includes(annotated)).toBe(true);
+      expect(planned.includes(directTree)).toBe(true);
+      expect(planned.includes(directBlob)).toBe(true);
 
       const firstPack = await collect(openPushPack(repo, plan));
       const reorderedPlan = requirePlan(
@@ -276,7 +173,6 @@ describe("multi-ref push planning", () => {
       );
       expect(planOids(reorderedPlan)).toEqual(planned);
       expect(await collect(openPushPack(repo, reorderedPlan))).toEqual(firstPack);
-      disposePushPlan(reorderedPlan);
       const captured: Uint8Array[] = [];
       const http: GitHttpClient = async (request) => {
         if (request.method === "GET") return fetchHttpClient(request);
@@ -314,7 +210,6 @@ describe("multi-ref push planning", () => {
         fixture.gitResult(`--git-dir=${origin}`, "show-ref", "--verify", "refs/heads/delete-me")
           .status,
       ).toBeGreaterThan(0);
-      disposePushPlan(plan);
     } finally {
       await server.close();
     }
@@ -368,7 +263,6 @@ describe("multi-ref push planning", () => {
       ]),
     );
     expect(planOids(forced)).toEqual([blob]);
-    disposePushPlan(forced);
   });
 
   it("returns no pack for 1,024 deletion commands and rejects the first excess", () => {
@@ -399,14 +293,13 @@ describe("multi-ref push planning", () => {
     const statementStart = workspace.storage.statementCount;
     const plan = requirePlan(planPushUpdates(workspace.repo, updates));
     const observedStatements = workspace.storage.statementCount - statementStart;
-    expect(pushPlanObjectCount(plan)).toBe(1);
+    expect(plan.objects).toHaveLength(1);
     expect(
       [...workspace.storage.histogram].filter(([query]) =>
         query.startsWith("SELECT target FROM git_refs WHERE repo_id = ? AND name = ?"),
       ),
     ).toEqual([]);
     expect(observedStatements).toBeLessThan(1_000);
-    disposePushPlan(plan);
   });
 
   it("classifies a missing full-oid source as a safe local failure", () => {
@@ -417,23 +310,7 @@ describe("multi-ref push planning", () => {
     ).toThrow(expect.objectContaining({ code: "EPUSHLOCAL" }));
   });
 
-  it("rejects a corrupt source, missing transitive object and shallow boundary locally", () => {
-    const corruptWorkspace = makeRepo();
-    const corruptBlob = corruptWorkspace.repo.store.write(
-      "blob",
-      new TextEncoder().encode("corrupt me\n"),
-    );
-    corruptWorkspace.repo.store.db.run(
-      "UPDATE git_object_chunks SET data = zeroblob(length(data)) WHERE repo_id = ? AND oid = ?",
-      1,
-      corruptBlob,
-    );
-    expect(() =>
-      planPushUpdates(corruptWorkspace.repo, [
-        update(corruptBlob, "refs/checkpoints/corrupt", corruptBlob),
-      ]),
-    ).toThrow(expect.objectContaining({ code: "EPUSHLOCAL" }));
-
+  it("rejects a missing transitive object and shallow boundary locally", () => {
     const missingWorkspace = makeRepo();
     const missingOid = "e".repeat(40);
     const incompleteTree = missingWorkspace.repo.store.write(
@@ -492,8 +369,7 @@ describe("multi-ref push planning", () => {
         { maxObjects: 3 },
       ),
     );
-    expect(pushPlanObjectCount(exactObjects)).toBe(3);
-    disposePushPlan(exactObjects);
+    expect(exactObjects.objects).toHaveLength(3);
 
     expect(() =>
       planPushUpdates(
@@ -522,7 +398,6 @@ describe("multi-ref push planning", () => {
       planPushUpdates(exactWorkspace.repo, [update(tip, "refs/heads/exact-commits", tip)]),
     );
     expect(exact.newCommits).toBe(MAX_PUSH_COMMITS);
-    disposePushPlan(exact);
 
     const excessTip = exactWorkspace.repo.store.write(
       "commit",
@@ -564,7 +439,6 @@ describe("multi-ref push planning", () => {
     );
 
     expect(plan.newCommits).toBe(10);
-    disposePushPlan(plan);
   });
 
   it("lets a long canonical source and destination reach receive-pack framing", async () => {
@@ -576,7 +450,7 @@ describe("multi-ref push planning", () => {
     ).join("/");
     const source = `refs/checkpoints/source/${components}`;
     const destination = `refs/checkpoints/destination/${components}`;
-    const plan = requirePlan(planPushUpdates(workspace.repo, [update(source, destination, blob)]));
+    expect(planPushUpdates(workspace.repo, [update(source, destination, blob)])).not.toBeNull();
     let requestBody: Uint8Array | undefined;
     const http: GitHttpClient = async (request) => {
       requestBody = await collectBody(request.body);
@@ -601,7 +475,6 @@ describe("multi-ref push planning", () => {
     expect(result.refs.get(destination)).toEqual({ ok: true });
     if (requestBody === undefined) throw new Error("receive-pack did not send a request body");
     expect(new TextDecoder().decode(requestBody)).toContain(destination);
-    disposePushPlan(plan);
   });
 
   it("does not reach receive-pack when local preflight fails", async () => {
@@ -633,7 +506,7 @@ describe("multi-ref push planning", () => {
 });
 
 describe("push pack lifecycle", () => {
-  it("allows two replayable pack reads and rejects the third", async () => {
+  it("replays a byte-identical pack for each HTTP attempt", async () => {
     const workspace = makeRepo();
     const blob = workspace.repo.store.write("blob", new TextEncoder().encode("one\n"));
     const plan = requirePlan(
@@ -642,25 +515,5 @@ describe("push pack lifecycle", () => {
     const first = await collect(openPushPack(workspace.repo, plan));
     const second = await collect(openPushPack(workspace.repo, plan));
     expect(second).toEqual(first);
-    await expect(collect(openPushPack(workspace.repo, plan))).rejects.toMatchObject({
-      code: "EPUSHLOCAL",
-    });
-    disposePushPlan(plan);
-  });
-
-  it("marks a disposed plan unavailable while its active stream closes", async () => {
-    const workspace = makeRepo();
-    const blob = workspace.repo.store.write("blob", new TextEncoder().encode("one\n"));
-    const plan = requirePlan(
-      planPushUpdates(workspace.repo, [update(blob, "refs/checkpoints/blob", blob)]),
-    );
-    const stream = openPushPack(workspace.repo, plan);
-    expect((await stream.next()).done).toBe(false);
-    disposePushPlan(plan);
-    expect(() => pushPlanObjectCount(plan)).toThrow(expect.objectContaining({ code: "EINVAL" }));
-    await expect(collect(openPushPack(workspace.repo, plan))).rejects.toMatchObject({
-      code: "EINVAL",
-    });
-    await stream.return(undefined);
   });
 });

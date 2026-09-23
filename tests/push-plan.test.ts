@@ -2,12 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { isTreeMode, serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
 import { openRepository } from "../packages/git/src/ops/core/context.js";
 import { clone } from "../packages/git/src/ops/network/network.js";
-import {
-  type PushPlan,
-  planPushObjects,
-  pushPlanObjectCount,
-  pushPlanObjectOidAt,
-} from "../packages/git/src/ops/push/push-plan.js";
+import { type PushPlan, planPushObjects } from "../packages/git/src/ops/push/push-plan.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
 import type { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { add } from "../packages/git/src/ops/staging/staging.js";
@@ -45,13 +40,7 @@ function completeClosure(repo: Repository, root: string): Set<string> {
 }
 
 function planOids(plan: PushPlan): Set<string> {
-  const result = new Set<string>();
-  for (let index = 0; index < pushPlanObjectCount(plan); index++) {
-    const oid = pushPlanObjectOidAt(plan, index);
-    if (oid === null) throw new Error("push plan lost an object");
-    result.add(oid);
-  }
-  return result;
+  return new Set(plan.objects.map((object) => object.oid));
 }
 
 describe("push object planning", () => {

@@ -33,7 +33,7 @@ import {
   snapshotPushLeases,
   validatePushOperationOptions,
 } from "./push-options.js";
-import { disposePushPlan, openPushPack, type PushPlan, planPushUpdates } from "./push-plan.js";
+import { openPushPack, type PushPlan, planPushUpdates } from "./push-plan.js";
 import { reconcileTracking } from "./push-tracking.js";
 import type { PushOptions } from "./push-types.js";
 
@@ -57,7 +57,6 @@ export async function push(
   options: PushOptions,
 ): Promise<PushResult> {
   let compiler: CompiledPushRefspecs | null = null;
-  let plan: PushPlan | null = null;
   let publication: FetchPublicationToken | null = null;
   try {
     validatePushOperationOptions(options);
@@ -80,9 +79,8 @@ export async function push(
     const joined = joinAdvertisement(mappings, advertisement);
     verifyPushLeases(joined.updates, leaseSnapshot);
     const activeUpdates = activePlanningUpdates(joined.updates);
-    if (activeUpdates.length === 0) {
-      plan = null;
-    } else {
+    let plan: PushPlan | null = null;
+    if (activeUpdates.length > 0) {
       plan = await withPromisorHydration(
         context,
         repo,
@@ -132,10 +130,6 @@ export async function push(
         auth,
       );
     }
-    if (plan !== null) {
-      disposePushPlan(plan);
-      plan = null;
-    }
 
     let confirmed: Omit<PushResult, "tracking">;
     try {
@@ -144,21 +138,10 @@ export async function push(
       if (commands.length > 0) throw uncertainResult(cause);
       throw cause;
     }
-    const tracking = await reconcileTracking(
-      context,
-      repo,
-      joined.updates,
-      confirmed,
-      target.url,
-      auth,
-      commands.length > 0,
-      publication,
-      options.signal,
-    );
+    const tracking = reconcileTracking(context, repo, joined.updates, confirmed, publication);
     return { ...confirmed, tracking };
   } finally {
     publication?.dispose();
-    if (plan !== null) disposePushPlan(plan);
   }
 }
 

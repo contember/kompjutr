@@ -313,7 +313,7 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "maintenance.mark-depth-2n": 783,
   "transport.discovery": 2,
   "transport.fetch": 82,
-  "transport.push": 53,
+  "transport.push": 50,
 };
 
 const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
@@ -358,7 +358,7 @@ const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
   "maintenance.mark-depth-2n": 653,
   "transport.discovery": 2,
   "transport.fetch": 64,
-  "transport.push": 59,
+  "transport.push": 57,
 };
 
 const FULL_INDEX_SCAN_SQL =

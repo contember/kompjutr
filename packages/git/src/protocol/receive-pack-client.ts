@@ -66,27 +66,6 @@ function authOptions(options: ReceivePackOptions): ReceivePackOptions {
   };
 }
 
-async function* tracked401Body(
-  body: AsyncIterable<Uint8Array>,
-  certainty: PostCertainty,
-): AsyncGenerator<Uint8Array> {
-  const iterator = body[Symbol.asyncIterator]();
-  let complete = false;
-  try {
-    for (;;) {
-      const next = await iterator.next();
-      if (next.done === true) {
-        complete = true;
-        return;
-      }
-      yield next.value;
-    }
-  } finally {
-    if (!complete) await iterator.return?.();
-    certainty.safeAbort = true;
-  }
-}
-
 function certaintyOptions(
   options: ReceivePackOptions,
   certainty: PostCertainty,
@@ -99,9 +78,10 @@ function certaintyOptions(
       certainty.invoked = true;
       certainty.safeAbort = false;
       const response = await upstream(request);
-      return response.status === 401
-        ? { ...response, body: tracked401Body(response.body, certainty) }
-        : response;
+      // A 401 rejected this attempt before the remote consumed it, so an abort
+      // while it drains or reauthenticates cannot leave the push uncertain.
+      certainty.safeAbort = response.status === 401;
+      return response;
     },
   };
 }

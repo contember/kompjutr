@@ -4,7 +4,6 @@ import type { ObjectType } from "../../common/objects.js";
 import { comparePaths } from "../../common/streams.js";
 import type { PushPlanningUpdate } from "../refs/refspec.js";
 import type { Repository } from "../repository/repository.js";
-import { resolveRoots } from "./push-plan-auth.js";
 import { localPushError } from "./push-plan-errors.js";
 import {
   addObject,
@@ -14,7 +13,7 @@ import {
   requireNamespaceKinds,
   requireNamespaceRules,
 } from "./push-plan-graph.js";
-import { registerPushPlan } from "./push-plan-runtime.js";
+import { resolveRoots } from "./push-plan-roots.js";
 import {
   ARRAY_SLOT_BYTES,
   CONTAINER_BASE_BYTES,
@@ -186,7 +185,7 @@ function planUpdateSet(
     tracker.clear("update-input");
     tracker.set("plan-state", PUSH_PLAN_FIXED_BYTES);
     tracker.keepOnly("hydrated-plan", "plan-state");
-    return registerPushPlan(hydrated, newCommitCount);
+    return { objects: hydrated, newCommits: newCommitCount };
   } catch (error) {
     tracker.clearAll();
     return localPushError(error);

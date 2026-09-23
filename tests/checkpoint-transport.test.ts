@@ -1,6 +1,8 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { createGit, type Git } from "../packages/do/src/index.js";
+import { concat } from "../packages/git/src/common/bytes.js";
 import { openRepository } from "../packages/git/src/ops/core/context.js";
+import { FLUSH, pkt } from "../packages/git/src/protocol/pktline.js";
 import { fetchHttpClient, type GitHttpClient } from "../packages/git/src/protocol/transport.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
@@ -283,7 +285,49 @@ describe("checkpoint transport workflow", () => {
     }
   });
 
-  it("defers tracking when a post-receive hook replaces the accepted target", async () => {
+  it("does not track a no-op branch target that is not a local commit", async () => {
+    // Real Git refuses a non-commit branch, so only a canned advertisement can offer one.
+    const workspace = makeWorkspace();
+    const methods: string[] = [];
+    const http: GitHttpClient = async (request) => {
+      methods.push(request.method);
+      return {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/x-git-receive-pack-advertisement" },
+        body: (async function* (): AsyncGenerator<Uint8Array> {
+          yield concat([
+            pkt("# service=git-receive-pack\n"),
+            FLUSH,
+            pkt(`${blob} refs/heads/main\0report-status\n`),
+            FLUSH,
+          ]);
+        })(),
+      };
+    };
+    const git = bindGit(workspace, http);
+    await git.init({});
+    await git.remoteAdd({ name: "origin", url: "http://host/repo" });
+    const blob = openRepository(workspace.context, "/").store.write(
+      "blob",
+      new TextEncoder().encode("not a commit\n"),
+    );
+
+    await expect(
+      git.push({
+        remote: "origin",
+        refspecs: [{ source: blob, destination: "refs/heads/main" }],
+      }),
+    ).resolves.toMatchObject({
+      ok: true,
+      refs: [{ ref: "refs/heads/main", ok: true, error: null }],
+      tracking: { outcome: "failed", code: "EINVALIDREF" },
+    });
+    expect(methods).toEqual(["GET"]);
+    expect(await git.readRef({ ref: "refs/remotes/origin/main" })).toEqual({ kind: "absent" });
+  });
+
+  it("tracks the confirmed target when a post-receive hook replaces it, like Git", async () => {
     const fixture = originFixture();
     const base = fixture.git("rev-parse", "refs/heads/main");
     fixture.git("update-ref", "refs/heads/session", base);
@@ -318,12 +362,10 @@ describe("checkpoint transport workflow", () => {
       expect(result).toMatchObject({
         ok: true,
         refs: [{ ref: "refs/heads/session", ok: true }],
-        tracking: { outcome: "deferred" },
+        tracking: { outcome: "updated" },
       });
       expect(fixture.git("rev-parse", "refs/heads/session")).not.toBe(tip);
-      await expect(git.revParse({ ref: "refs/remotes/origin/session" })).rejects.toMatchObject({
-        code: "ENOTFOUND",
-      });
+      expect(await git.revParse({ ref: "refs/remotes/origin/session" })).toBe(tip);
     } finally {
       await server.close();
     }
@@ -340,13 +382,9 @@ describe("checkpoint transport workflow", () => {
       await normalGit.clone({ url: server.url, dir: "/", singleBranch: true });
       const intermediate = await commit(workspace, normalGit, "intermediate\n", "intermediate");
       const tip = await commit(workspace, normalGit, "tip\n", "tip");
-      let posted = false;
-      let raced = false;
       const racingHttp: GitHttpClient = async (request) => {
         const response = await fetchHttpClient(request);
-        if (request.method === "POST") posted = true;
-        else if (posted && !raced) {
-          raced = true;
+        if (request.method === "POST") {
           openRepository(workspace.context, "/").store.setRef(
             "refs/remotes/origin/session",
             intermediate,

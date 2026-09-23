@@ -154,7 +154,7 @@ does not schedule these issues into a sprint.
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
 - [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
 - [66 — Retire modeled retained-byte charges](66-retire-modeled-retained-byte-charges.md)
-- [75 — Bound payload lifetime during network object validation](75-bound-network-authentication-payloads.md)
+- [75 — Bound payload lifetime during shallow-history validation](75-bound-network-authentication-payloads.md)
 - [76 — Bound full-tree construction before serialization allocation](76-bound-full-tree-construction.md)
 - [77 — Remove repeated local traversal and recovery work](77-remove-repeated-local-traversal-work.md)
 - [78 — Make SQL cursors seek and deliver incrementally](78-make-sql-cursors-seek-and-deliver-incrementally.md)

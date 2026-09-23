@@ -3,13 +3,12 @@ import type { ObjectType } from "../../common/objects.js";
 
 export const MAX_PUSH_COMMITS = 512;
 export const MAX_PUSH_OBJECTS = 100_000;
-export const MAX_PUSH_BRANCH_TARGETS = 1_024;
 
 export const PUSH_PLAN_OBJECT_BYTES = 160;
 export const PUSH_PLAN_FIXED_BYTES = 256;
 export const OBJECT_PAGE = 4096;
 export const MAX_TAG_DEPTH = 16;
-export const MAX_PUSH_UPDATES = MAX_PUSH_BRANCH_TARGETS;
+export const MAX_PUSH_UPDATES = 1_024;
 // An unbounded push plan otherwise grows with remote size until the isolate OOMs.
 const MAX_PUSH_PLAN_BYTES = 64 * 1024 * 1024;
 
@@ -34,6 +33,7 @@ export interface PushObject {
 }
 
 export interface PushPlan {
+  readonly objects: readonly PushObject[];
   readonly newCommits: number;
 }
 
@@ -56,22 +56,14 @@ export interface ResolvedRoot {
   tags: readonly string[];
 }
 
-export interface AuthenticationState {
+export interface RootResolutionState {
   readonly types: Map<string, ObjectType>;
-  readonly tags: Map<string, AuthenticatedTagTarget>;
+  readonly tags: Map<string, TagTarget>;
 }
 
-export interface AuthenticatedTagTarget {
+export interface TagTarget {
   readonly object: string;
   readonly type: ObjectType;
-}
-
-export interface PushPlanState {
-  readonly objects: PushObject[];
-  openings: number;
-  activeStreams: number;
-  disposeRequested: boolean;
-  disposed: boolean;
 }
 
 export interface NormalizedPushPlanOptions {

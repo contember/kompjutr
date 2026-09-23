@@ -70,7 +70,7 @@ export interface PushRefStatus {
 }
 
 export type PushTrackingResult =
-  | { readonly outcome: "not-applicable" | "unchanged" | "updated" | "stale" | "deferred" }
+  | { readonly outcome: "not-applicable" | "unchanged" | "updated" | "stale" }
   | { readonly outcome: "failed"; readonly code: string; readonly message: string };
 
 export interface PushResult {

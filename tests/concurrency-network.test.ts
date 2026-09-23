@@ -1,12 +1,10 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { createGit, type Git } from "../packages/git/src/client.js";
-import { GitError } from "../packages/git/src/common/errors.js";
 import { openRepository } from "../packages/git/src/ops/core/context.js";
 import type { MergeStateMetadata } from "../packages/git/src/ops/merge/merge-state.js";
 import { clone, fetchInto } from "../packages/git/src/ops/network/network.js";
 import { push } from "../packages/git/src/ops/push/push.js";
 import { maintenance } from "../packages/git/src/ops/repository/maintenance.js";
-import type { Repository } from "../packages/git/src/ops/repository/repository.js";
 import {
   fetchHttpClient,
   type GitHttpClient,
@@ -57,28 +55,6 @@ async function localCommit(git: Git, workspace: TestWorkspace, content: string):
   await workspace.workspace.fs.writeFile("/work/local.txt", content);
   await git.add({ dir: "/work", paths: ["local.txt"] });
   return (await git.commit({ dir: "/work", message: content.trim() })).oid;
-}
-
-function corruptLooseObject(repo: Repository, oid: string): void {
-  repo.store.db.run(
-    "UPDATE git_objects SET stored = 'raw' WHERE repo_id = ? AND oid = ?",
-    repo.store.repoId,
-    oid,
-  );
-  repo.store.db.run(
-    `UPDATE git_object_chunks SET data = zeroblob((
-       SELECT size FROM git_objects WHERE repo_id = ? AND oid = ?
-     )) WHERE repo_id = ? AND oid = ? AND seq = 0`,
-    repo.store.repoId,
-    oid,
-    repo.store.repoId,
-    oid,
-  );
-  repo.store.db.run(
-    "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ? AND seq > 0",
-    repo.store.repoId,
-    oid,
-  );
 }
 
 function pauseBeforeFirstPost(
@@ -353,19 +329,11 @@ describe("push and pull concurrency", () => {
     },
   );
 
-  it("does not let a failed refresh fallback overwrite a same-target newer fetch", async () => {
+  it("does not let a buffered push overwrite a same-target newer fetch", async () => {
     const { fixture, initial } = remoteFixture();
     const server = await startGitServer(fixture.dir);
     const workspace = makeWorkspace();
-    let pushDiscoveries = 0;
-    const upstream: GitHttpClient = async (request) => {
-      if (request.method === "GET") {
-        pushDiscoveries++;
-        if (pushDiscoveries >= 2) throw new Error("post-success refresh failed");
-      }
-      return fetchHttpClient(request);
-    };
-    const response = bufferedHttpResponseBarrier(upstream, {
+    const response = bufferedHttpResponseBarrier(fetchHttpClient, {
       name: "push fallback after same-target fetch",
       select: (request) => request.method === "POST",
     });
@@ -388,9 +356,8 @@ describe("push and pull concurrency", () => {
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(initial);
 
       response.release();
-      await expect(pushing).resolves.toMatchObject({ ok: true });
+      await expect(pushing).resolves.toMatchObject({ ok: true, tracking: { outcome: "stale" } });
 
-      expect(pushDiscoveries).toBeGreaterThanOrEqual(2);
       expect(fixture.git("rev-parse", "main")).toBe(initial);
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(initial);
       assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
@@ -440,58 +407,12 @@ describe("push and pull concurrency", () => {
     }
   });
 
-  it("does not let a buffered refresh overwrite a fetch published after its snapshot", async () => {
+  it("does not let a buffered push overwrite a fetch published after its snapshot", async () => {
     const { fixture } = remoteFixture();
     const server = await startGitServer(fixture.dir);
     const workspace = makeWorkspace();
-    let discoveries = 0;
-    const refresh = bufferedHttpResponseBarrier(fetchHttpClient, {
-      name: "buffered post-success push refresh",
-      select: (request) => {
-        if (request.method !== "GET") return false;
-        discoveries++;
-        return discoveries === 2;
-      },
-    });
-    let pushing: Promise<unknown> | null = null;
-    try {
-      await clone(workspace.context, {
-        url: server.url,
-        dir: "/work",
-        depth: 0,
-        noTags: true,
-      });
-      const repo = openRepository(workspace.context, "/work");
-      const pushed = await localCommit(gitFor(workspace), workspace, "refreshed push\n");
-
-      pushing = push({ ...workspace.context, http: refresh.http }, repo, {});
-      await awaitBarrierEntry(refresh, pushing);
-      expect(fixture.git("rev-parse", "main")).toBe(pushed);
-      fixture.write("newer-remote.txt", "newer\n");
-      const fetched = fixture.commit("newer remote tip after buffered refresh");
-      await fetchInto(workspace.context, repo, { tags: false }, "fetch");
-      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(fetched);
-
-      refresh.release();
-      await expect(pushing).resolves.toMatchObject({ ok: true });
-
-      expect(discoveries).toBe(2);
-      expect(fixture.git("rev-parse", "main")).toBe(fetched);
-      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(fetched);
-      assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
-    } finally {
-      refresh.release();
-      await Promise.allSettled([pushing].filter((value) => value !== null));
-      await server.close();
-    }
-  });
-
-  it("does not publish an unreadable tip observed after confirmed push success", async () => {
-    const { fixture, initial } = remoteFixture();
-    const server = await startGitServer(fixture.dir);
-    const workspace = makeWorkspace();
     const response = bufferedHttpResponseBarrier(fetchHttpClient, {
-      name: "push followed by unknown remote tip",
+      name: "buffered confirmed push response",
       select: (request) => request.method === "POST",
     });
     let pushing: Promise<unknown> | null = null;
@@ -503,23 +424,21 @@ describe("push and pull concurrency", () => {
         noTags: true,
       });
       const repo = openRepository(workspace.context, "/work");
-      const pushed = await localCommit(gitFor(workspace), workspace, "pushed\n");
+      const pushed = await localCommit(gitFor(workspace), workspace, "buffered push\n");
 
       pushing = push({ ...workspace.context, http: response.http }, repo, {});
       await awaitBarrierEntry(response, pushing);
       expect(fixture.git("rev-parse", "main")).toBe(pushed);
-      fixture.write("unknown.txt", "unknown locally\n");
-      const unknown = fixture.commit("unknown local object");
-      expect(repo.has(unknown)).toBe(false);
+      fixture.write("newer-remote.txt", "newer\n");
+      const fetched = fixture.commit("newer remote tip after buffered push");
+      await fetchInto(workspace.context, repo, { tags: false }, "fetch");
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(fetched);
 
       response.release();
-      await expect(pushing).resolves.toMatchObject({
-        ok: true,
-        tracking: { outcome: "deferred" },
-      });
+      await expect(pushing).resolves.toMatchObject({ ok: true, tracking: { outcome: "stale" } });
 
-      expect(fixture.git("rev-parse", "main")).toBe(unknown);
-      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(initial);
+      expect(fixture.git("rev-parse", "main")).toBe(fetched);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(fetched);
       assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
     } finally {
       response.release();
@@ -527,145 +446,6 @@ describe("push and pull concurrency", () => {
       await server.close();
     }
   });
-
-  it("authenticates a locally present refreshed commit before publishing it", async () => {
-    const { fixture, initial } = remoteFixture();
-    const server = await startGitServer(fixture.dir);
-    const workspace = makeWorkspace();
-    const response = bufferedHttpResponseBarrier(fetchHttpClient, {
-      name: "push followed by corrupt local refresh target",
-      select: (request) => request.method === "POST",
-    });
-    let pushing: Promise<unknown> | null = null;
-    try {
-      await clone(workspace.context, {
-        url: server.url,
-        dir: "/work",
-        depth: 0,
-        noTags: true,
-      });
-      const repo = openRepository(workspace.context, "/work");
-      fixture.write("candidate.txt", "candidate\n");
-      const candidate = fixture.commit("candidate refresh tip");
-      expect(repo.store.write("commit", fixture.catFile(candidate))).toBe(candidate);
-      fixture.git("reset", "--hard", initial);
-      const pushed = await localCommit(gitFor(workspace), workspace, "pushed before corrupt tip\n");
-      const cold = reopenTestRepository(workspace, "/work");
-
-      pushing = push({ ...cold.context, http: response.http }, cold.repo, {});
-      await awaitBarrierEntry(response, pushing);
-      expect(fixture.git("rev-parse", "main")).toBe(pushed);
-      fixture.git("reset", "--hard", candidate);
-      corruptLooseObject(cold.repo, candidate);
-
-      response.release();
-      await expect(pushing).resolves.toMatchObject({
-        ok: true,
-        tracking: { outcome: "deferred" },
-      });
-
-      expect(fixture.git("rev-parse", "main")).toBe(candidate);
-      expect(cold.repo.store.getRef("refs/remotes/origin/main")).toBe(initial);
-      expect(cold.repo.readCommit(pushed).message).toContain("pushed before corrupt tip");
-      cold.repo.store.db.run(
-        "DELETE FROM git_commits WHERE repo_id = ? AND oid = ?",
-        cold.repo.store.repoId,
-        candidate,
-      );
-      cold.repo.store.db.run(
-        "DELETE FROM git_objects WHERE repo_id = ? AND oid = ?",
-        cold.repo.store.repoId,
-        candidate,
-      );
-      assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
-    } finally {
-      response.release();
-      await Promise.allSettled([pushing].filter((value) => value !== null));
-      await server.close();
-    }
-  });
-
-  it("re-authenticates a no-op push target after discovery before tracking publication", async () => {
-    const { fixture, initial } = remoteFixture();
-    const server = await startGitServer(fixture.dir);
-    const workspace = makeWorkspace();
-    const discovery = bufferedHttpResponseBarrier(fetchHttpClient, {
-      name: "no-op push discovery before local corruption",
-      select: (request) => request.method === "GET",
-    });
-    let pushing: Promise<unknown> | null = null;
-    try {
-      await clone(workspace.context, {
-        url: server.url,
-        dir: "/work",
-        depth: 0,
-        noTags: true,
-      });
-      const repo = openRepository(workspace.context, "/work");
-      const pushed = await localCommit(gitFor(workspace), workspace, "no-op target\n");
-      await push(workspace.context, repo, {});
-      repo.store.setRef("refs/remotes/origin/main", initial);
-      const cold = reopenTestRepository(workspace, "/work");
-
-      pushing = push({ ...cold.context, http: discovery.http }, cold.repo, {});
-      await awaitBarrierEntry(discovery, pushing);
-      corruptLooseObject(cold.repo, pushed);
-      discovery.release();
-      await expect(pushing).resolves.toMatchObject({ ok: true });
-
-      expect(fixture.git("rev-parse", "main")).toBe(pushed);
-      expect(cold.repo.store.getRef("refs/remotes/origin/main")).toBe(initial);
-      cold.repo.store.db.run(
-        "DELETE FROM git_objects WHERE repo_id = ? AND oid = ?",
-        cold.repo.store.repoId,
-        pushed,
-      );
-      expect(cold.repo.store.write("commit", fixture.catFile(pushed))).toBe(pushed);
-      assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
-    } finally {
-      discovery.release();
-      await Promise.allSettled([pushing].filter((value) => value !== null));
-      await server.close();
-    }
-  });
-
-  it.each(["ECORRUPT", "E2BIG", "EFETCHFAIL", "EURLSCHEME"])(
-    "keeps confirmed push success certain when tracking refresh fails with %s",
-    async (code) => {
-      const { fixture } = remoteFixture();
-      const server = await startGitServer(fixture.dir);
-      const workspace = makeWorkspace();
-      let discoveries = 0;
-      const http: GitHttpClient = async (request) => {
-        if (request.method === "GET") {
-          discoveries++;
-          if (discoveries >= 2) throw new GitError(code, "tracking refresh failed");
-        }
-        return fetchHttpClient(request);
-      };
-      try {
-        await clone(workspace.context, {
-          url: server.url,
-          dir: "/work",
-          depth: 0,
-          noTags: true,
-        });
-        const repo = openRepository(workspace.context, "/work");
-        const pushed = await localCommit(gitFor(workspace), workspace, "confirmed\n");
-
-        await expect(push({ ...workspace.context, http }, repo, {})).resolves.toMatchObject({
-          ok: true,
-        });
-
-        expect(discoveries).toBe(3);
-        expect(fixture.git("rev-parse", "main")).toBe(pushed);
-        expect(repo.store.getRef("refs/remotes/origin/main")).toBe(pushed);
-        assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
-      } finally {
-        await server.close();
-      }
-    },
-  );
 
   it("lets only one same-ref push win the advertised remote CAS in both orders", async () => {
     await runPairInBothCompletionOrders(async (order) => {

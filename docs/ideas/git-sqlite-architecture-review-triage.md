@@ -64,7 +64,7 @@ acceptance witness of the listed verified finding.
 | Missing operation gitlinks | Journal gitlink OIDs may be mandatory roots while index gitlinks are optional. | Create an operation over an absent gitlink and establish maintenance and recovery semantics. |
 | Clean sibling ordering | Ignored-subtree state may reset at an interleaving sibling prefix. | Build the ordering fixture and compare clean selection with Git before any deletion. |
 | Join equality | `joinSorted` and `joinSorted3` use different equality definitions. | Find reachable distinct strings that compare equal, or prove boundary validation makes the difference unreachable. |
-| Tracking reconciliation | Similar target-authentication failures may map to `deferred` and `failed` inconsistently. | Exercise each error code and define retryable versus terminal outcomes. |
+| Tracking reconciliation | Resolved 2026-09-23: `deferred` was removed; tracking follows `report-status` without rediscovery. | None. |
 
 ## Architecture and cost candidates
 

@@ -1,19 +1,9 @@
 import { CorruptError, GitError, hasErrorCode } from "../../common/errors.js";
-import {
-  hashObject,
-  type ObjectType,
-  parseCommit,
-  parseTree,
-  type RawObject,
-} from "../../common/objects.js";
+import type { ObjectType } from "../../common/objects.js";
 import type { Advertisement, uploadPack } from "../../protocol/remote.js";
 import { throwIfAborted } from "../../protocol/stream.js";
 import { withGitMutationGuardOwned } from "../../store/database/database.js";
-import {
-  type FetchPublicationToken,
-  listCheckoutsOwned,
-  PACK_BLOB_BATCH_TARGET_BYTES,
-} from "../../store/index.js";
+import { type FetchPublicationToken, listCheckoutsOwned } from "../../store/index.js";
 import type { GitContext } from "../core/context.js";
 import { operationRefLogMetadata } from "../core/ref-log.js";
 import { selectMergeBases } from "../merge/merge-base.js";
@@ -22,7 +12,7 @@ import type { Repository } from "../repository/repository.js";
 import { repositoryMutations } from "../repository/repository.js";
 import { runFetchCheckpoint } from "./network-checkpoint.js";
 import { validateFetchedConnectivity } from "./network-connectivity.js";
-import { advertisedTags, authenticateTags, parseAuthenticatedTag } from "./network-tags.js";
+import { advertisedTags, authenticateTags, objectTypes } from "./network-tags.js";
 import { fetchProgressSink, transferPack } from "./network-transfer.js";
 import type {
   AdvertisedTag,
@@ -90,71 +80,23 @@ function preflightMappedUpdates(
   }
 }
 
-function validateMappedObject(oid: string, object: RawObject): void {
-  if (hashObject(object.type, object.data) !== oid) {
-    throw new CorruptError(`fetched object ${oid} does not match its bytes`);
-  }
-  if (object.type === "commit") parseCommit(object.data);
-  else if (object.type === "tree") parseTree(object.data);
-  else if (object.type === "tag") parseAuthenticatedTag(oid, object.data);
-}
-
-function authenticateMappedRoots(
+function mappedRootTypes(
   repo: Repository,
   refs: readonly ExpandedFetchRefspec[],
 ): ReadonlyMap<string, ObjectType> {
-  const types = new Map<string, ObjectType>();
-  const rememberType = (oid: string, type: ObjectType): void => {
-    types.set(oid, type);
-  };
-  let remaining = [...new Set(refs.map((ref) => ref.oid))];
-  while (remaining.length > 0) {
-    let info: ReturnType<Repository["store"]["objectInfo"]>;
-    try {
-      info = repo.store.objectInfo(remaining);
-    } catch (error) {
-      if (hasErrorCode(error, "ENOTFOUND")) {
-        throw new GitError("EFETCHFAIL", "fetch did not receive every selected object", {
-          cause: error,
-        });
-      }
-      throw error;
+  try {
+    return objectTypes(
+      repo,
+      refs.map((ref) => ref.oid),
+    );
+  } catch (error) {
+    if (hasErrorCode(error, "ENOTFOUND")) {
+      throw new GitError("EFETCHFAIL", "fetch did not receive every selected object", {
+        cause: error,
+      });
     }
-    let selected = 0;
-    let selectedBytes = 0;
-    while (selected < info.length) {
-      const object = info[selected];
-      const oid = remaining[selected];
-      if (object === undefined || oid === undefined || object.oid !== oid) {
-        throw new CorruptError("fetch authentication metadata is incomplete");
-      }
-      if (selected > 0 && object.size > PACK_BLOB_BATCH_TARGET_BYTES - selectedBytes) {
-        break;
-      }
-      selectedBytes += object.size;
-      selected++;
-    }
-    try {
-      const selectedOids = remaining.slice(0, selected);
-      const batch = repo.readObjects(selectedOids, { budgetBytes: Math.max(1, selectedBytes) });
-      if (batch.objects.size !== selectedOids.length || batch.remaining.length !== 0) {
-        throw new CorruptError("fetch object authentication made no progress");
-      }
-      for (const [oid, object] of batch.objects) {
-        validateMappedObject(oid, object);
-        rememberType(oid, object.type);
-      }
-      remaining = remaining.slice(selected);
-    } catch (error) {
-      if (hasErrorCode(error, "ENOTFOUND")) {
-        throw new GitError("EFETCHFAIL", "fetch did not receive every selected object", {
-          cause: error,
-        });
-      }
-      throw error;
-    }
+    throw error;
   }
-  return types;
 }
 
 function requireMappedUpdateRules(
@@ -246,7 +188,7 @@ export async function fetchMappedInto(
     if (transfer.shallow.length > 0 || transfer.unshallow.length > 0) {
       throw new CorruptError("mapped fetch received an unsolicited shallow response");
     }
-    const types = authenticateMappedRoots(repo, refs);
+    const types = mappedRootTypes(repo, refs);
     requireMappedUpdateRules(repo, refs, publication, types);
     authenticateTags(repo, tags);
 

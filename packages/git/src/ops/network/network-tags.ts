@@ -1,5 +1,5 @@
 import { CorruptError, GitError } from "../../common/errors.js";
-import { hashObject, type ObjectType, parseTag, type RawObject } from "../../common/objects.js";
+import { type ObjectType, parseTag, type RawObject } from "../../common/objects.js";
 import type { Advertisement, RemoteRef } from "../../protocol/remote.js";
 import { type FetchPublicationToken, PACK_BLOB_BATCH_TARGET_BYTES } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
@@ -54,39 +54,12 @@ export function preflightAllTags(
 
 function readTagObjects(repo: Repository, oids: readonly string[]): Map<string, RawObject> {
   const objects = new Map<string, RawObject>();
-  let pending = [...new Set(oids)];
+  let pending = oids;
   while (pending.length > 0) {
     const page = pending.slice(0, TAG_OBJECT_PAGE);
-    const tail = pending.slice(TAG_OBJECT_PAGE);
-    const info = repo.store.objectInfo(page);
-    let selected = 0;
-    let selectedBytes = 0;
-    while (selected < info.length) {
-      const entry = info[selected];
-      const oid = page[selected];
-      if (entry === undefined || oid === undefined || entry.oid !== oid) {
-        throw new CorruptError("tag authentication metadata is incomplete");
-      }
-      if (selected > 0 && entry.size > PACK_BLOB_BATCH_TARGET_BYTES - selectedBytes) {
-        break;
-      }
-      selectedBytes += entry.size;
-      selected++;
-    }
-    const selectedOids = page.slice(0, selected);
-    const batch = repo.readObjects(selectedOids, {
-      budgetBytes: Math.max(1, selectedBytes),
-    });
-    if (batch.remaining.length > 0 || batch.objects.size !== selectedOids.length) {
-      throw new CorruptError("tag authentication made no progress");
-    }
-    for (const [oid, object] of batch.objects) {
-      if (hashObject(object.type, object.data) !== oid) {
-        throw new CorruptError(`tag object ${oid} does not match its bytes`);
-      }
-      objects.set(oid, object);
-    }
-    pending = [...page.slice(selected), ...tail];
+    const batch = repo.readObjects(page, { budgetBytes: PACK_BLOB_BATCH_TARGET_BYTES });
+    for (const [oid, object] of batch.objects) objects.set(oid, object);
+    pending = [...batch.remaining, ...pending.slice(TAG_OBJECT_PAGE)];
   }
   return objects;
 }
@@ -98,7 +71,7 @@ interface TagPeelState {
   seen: Set<string>;
 }
 
-function objectTypes(repo: Repository, oids: readonly string[]): Map<string, ObjectType> {
+export function objectTypes(repo: Repository, oids: readonly string[]): Map<string, ObjectType> {
   const types = new Map<string, ObjectType>();
   const unique = [...new Set(oids)];
   for (let offset = 0; offset < unique.length; offset += TAG_OBJECT_PAGE) {
@@ -186,25 +159,31 @@ export function authenticateTags(repo: Repository, tags: readonly AdvertisedTag[
         );
       }
     }
-    const objects = readTagObjects(repo, [...frontier]);
+    const types = objectTypes(repo, [...frontier]);
+    const objects = readTagObjects(
+      repo,
+      [...frontier].filter((oid) => types.get(oid) === "tag"),
+    );
     const next: TagPeelState[] = [];
     for (const state of pending) {
-      const object = objects.get(state.current);
-      if (object === undefined) {
+      const type = types.get(state.current);
+      if (type === undefined) {
         throw new GitError(
           "EFETCHFAIL",
           `fetch did not receive complete tag ${state.tag.ref.name}`,
         );
       }
-      if (state.expectedType !== undefined && object.type !== state.expectedType) {
+      if (state.expectedType !== undefined && type !== state.expectedType) {
         throw new CorruptError(`tag ${state.tag.ref.name} has a mismatched target type`);
       }
-      if (object.type !== "tag") {
+      if (type !== "tag") {
         if (state.current !== state.tag.peeledOid) {
           throw new CorruptError(`tag ${state.tag.ref.name} does not match its advertised target`);
         }
         continue;
       }
+      const object = objects.get(state.current);
+      if (object === undefined) throw new CorruptError(`tag ${state.tag.ref.name} was not read`);
       if (state.seen.has(state.current)) {
         throw new CorruptError(`tag ${state.tag.ref.name} contains a cycle`);
       }
