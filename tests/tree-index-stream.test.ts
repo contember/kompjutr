@@ -162,15 +162,14 @@ describe("incremental tree parser", () => {
       { mode: "40000", name: "z", oid: "44".repeat(20) },
     ];
     const data = serializeTree(entries);
-    const scalar = [...parseTreeStream([data])].map(({ entry, nameBytes, rawEntry }) => ({
+    const scalar = [...parseTreeStream([data])].map(({ entry, nameBytes }) => ({
       entry,
       nameBytes,
-      rawEntry,
     }));
 
     for (let split = 0; split <= data.length; split++) {
       const parsed = [...parseTreeStream([data.subarray(0, split), data.subarray(split)])].map(
-        ({ entry, nameBytes, rawEntry }) => ({ entry, nameBytes, rawEntry }),
+        ({ entry, nameBytes }) => ({ entry, nameBytes }),
       );
       expect(parsed).toEqual(scalar);
     }

@@ -19,7 +19,6 @@ export interface TreeEntry {
 export interface ParsedTreeEntry {
   entry: TreeEntry;
   nameBytes: Uint8Array;
-  rawEntry: Uint8Array;
   ordinal: number;
   observedSize: number;
 }
@@ -138,7 +137,6 @@ export class TreeParser {
   #oid: Uint8Array;
   #state: "mode" | "name" | "oid" = "mode";
   #modeText = "";
-  #modeBytes: Uint8Array = new Uint8Array(0);
   #nameBytes: Uint8Array = new Uint8Array(0);
   #oidAt = 0;
   #entryCount = 0;
@@ -162,8 +160,7 @@ export class TreeParser {
         }
         if (this.#state === "mode") {
           if (byte === 0x20) {
-            this.#modeBytes = this.#mode.take();
-            this.#modeText = utf8Decoder.decode(this.#modeBytes);
+            this.#modeText = utf8Decoder.decode(this.#mode.take());
             this.#state = "name";
           } else {
             this.#mode.push(byte);
@@ -180,26 +177,16 @@ export class TreeParser {
           this.#oid[this.#oidAt++] = byte;
           if (this.#oidAt === this.#oid.length) {
             const modeText = this.#modeText;
-            const modeBytes = this.#modeBytes;
             const nameBytes = this.#nameBytes;
-            const rawEntryBytes = modeBytes.length + nameBytes.length + 22;
-            const rawEntry = new Uint8Array(rawEntryBytes);
-            rawEntry.set(modeBytes, 0);
-            rawEntry[modeBytes.length] = 0x20;
-            rawEntry.set(nameBytes, modeBytes.length + 1);
-            rawEntry[modeBytes.length + nameBytes.length + 1] = 0;
-            rawEntry.set(this.#oid, rawEntry.length - this.#oid.length);
             const name = decodeTreeName(nameBytes);
             const oid = toHex(this.#oid);
             const ordinal = this.#entryCount++;
             this.#state = "mode";
             this.#modeText = "";
-            this.#modeBytes = new Uint8Array(0);
             this.#nameBytes = new Uint8Array(0);
             yield {
               entry: { mode: modeText, name, oid },
               nameBytes,
-              rawEntry,
               ordinal,
               observedSize: this.#observedSize,
             };
@@ -229,7 +216,6 @@ export class TreeParser {
     this.#mode.dispose();
     this.#name.dispose();
     this.#oid = new Uint8Array(0);
-    this.#modeBytes = new Uint8Array(0);
     this.#nameBytes = new Uint8Array(0);
     this.#modeText = "";
   }

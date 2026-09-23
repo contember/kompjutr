@@ -13,7 +13,7 @@ import type {
 } from "../core/contracts.js";
 import { withGitMutationGuard } from "../core/mutation-guard.js";
 import { requireConfigPath, requireConfigSectionMove } from "../refs/config.js";
-import { activeRefLogOids, readRefLog } from "../refs/reflog.js";
+import { readRefLog } from "../refs/reflog.js";
 import type { HeadOwner } from "../refs/refs.js";
 import {
   type CommitCacheEntry,
@@ -151,15 +151,6 @@ export abstract class SharedRepoRefStore extends SharedRepoObjectStore {
       this.refLogClock(),
       refName,
       options,
-    );
-  }
-
-  activeRefLogOids(): Generator<string> {
-    return activeRefLogOids(
-      this.db,
-      this.repoId,
-      this.requireOperations().checkoutId,
-      this.refLogClock(),
     );
   }
 

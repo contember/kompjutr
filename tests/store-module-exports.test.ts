@@ -17,7 +17,6 @@ describe("sqlite store module exports", () => {
       "IntegrationWorkspace",
       "MAX_CONFIG_SECTION_MOVE_ROWS",
       "MAX_LOG_COMMITS",
-      "MAX_REFLOG_ROOT_SCAN_ENTRIES",
       "PACK_BLOB_BATCH_TARGET_BYTES",
       "PROVISIONAL_CLONE_LEASE_MS",
       "PROVISIONAL_CLONE_RENEW_WINDOW_MS",

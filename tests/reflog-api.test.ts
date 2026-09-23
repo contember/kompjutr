@@ -9,11 +9,7 @@ import {
 import { createGit, type Git, type GitRecoverRefOptions } from "../packages/git/src/client.js";
 import { recoverRef } from "../packages/git/src/ops/core/ref-log.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
-import {
-  MAX_REFLOG_ROOT_SCAN_ENTRIES,
-  type RefLogMetadata,
-  SqliteGitDatabase,
-} from "../packages/git/src/store/index.js";
+import { type RefLogMetadata, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
@@ -222,7 +218,7 @@ function appendRefLog(db: SqlDatabase, repoId: number, ref: string, ordinal: num
   });
 }
 
-function seedCombinedActiveRefLogs(
+function seedCombinedRefLogs(
   db: SqlDatabase,
   repoId: number,
   checkoutIds: readonly number[],
@@ -292,47 +288,6 @@ function seedCombinedActiveRefLogs(
     db.run("UPDATE git_reflog_state SET next_ordinal = ? WHERE repo_id = ?", allocated, repoId);
   });
   return Object.freeze(checkoutEndpoints);
-}
-
-class GuardedDatabase implements SqlDatabase {
-  readonly inner = new TestDatabase();
-  iterateCalls = 0;
-  closedIterators = 0;
-  forbidAll = false;
-
-  run(query: string, ...bindings: unknown[]): void {
-    this.inner.run(query, ...bindings);
-  }
-
-  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
-    if (this.forbidAll) throw new Error("db.all is forbidden during the root stream");
-    return this.inner.all<Row>(query, ...bindings);
-  }
-
-  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
-    return this.inner.one<Row>(query, ...bindings);
-  }
-
-  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
-    return this.inner.scalar<T>(query, ...bindings);
-  }
-
-  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
-    this.iterateCalls++;
-    const source = this.inner.iterate(query, ...bindings);
-    const owner = this;
-    return (function* (): Generator<Record<string, unknown>> {
-      try {
-        yield* source;
-      } finally {
-        owner.closedIterators++;
-      }
-    })();
-  }
-
-  transactionSync<T>(closure: () => T): T {
-    return this.inner.transactionSync(closure);
-  }
 }
 
 class ReflogWitnessDatabase implements SqlDatabase {
@@ -406,26 +361,18 @@ class ReflogWitnessDatabase implements SqlDatabase {
 }
 
 describe("reflog query plans", () => {
-  it("keeps mutation and active-root headers off both histories", () => {
+  it("keeps mutation headers off both histories", () => {
     const db = new ReflogWitnessDatabase();
     const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
     const repository = database.createRepository("/repo", "ref: refs/heads/main");
     const store = database.openCheckout(repository);
-    seedCombinedActiveRefLogs(db, store.repoId, [repository.id], 1_024, 1_024);
+    seedCombinedRefLogs(db, store.repoId, [repository.id], 1_024, 1_024);
 
     db.resetQueries();
     store.setRef("refs/tags/query-plan", THIRD);
     const mutationPlan = db.planFor("repository.checkout_revision").join("\n");
     expect(mutationPlan).not.toContain("git_reflog_entries");
     expect(mutationPlan).not.toContain("git_checkout_reflog_entries");
-
-    db.resetQueries();
-    const roots = store.activeRefLogOids();
-    expect(roots.next().done).toBe(false);
-    roots.return(undefined);
-    const activeRootHeaderPlan = db.planFor("checkout.head, state.next_ordinal").join("\n");
-    expect(activeRootHeaderPlan).not.toContain("git_reflog_entries");
-    expect(activeRootHeaderPlan).not.toContain("git_checkout_reflog_entries");
   });
 
   it("keeps exact reads off the unrelated history", () => {
@@ -433,7 +380,7 @@ describe("reflog query plans", () => {
     const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
     const repository = database.createRepository("/repo", "ref: refs/heads/main");
     const store = database.openCheckout(repository);
-    seedCombinedActiveRefLogs(db, store.repoId, [repository.id], 1_024, 1_024);
+    seedCombinedRefLogs(db, store.repoId, [repository.id], 1_024, 1_024);
 
     db.resetQueries();
     expect(store.reflog("refs/tags/combined-0001")).toHaveLength(1);
@@ -888,21 +835,7 @@ describe("reflog recovery", () => {
   });
 });
 
-describe("active reflog roots", () => {
-  it("deduplicates active non-null endpoints in SQL and excludes expired roots", () => {
-    let now = NOW_MILLISECONDS;
-    const workspace = makeRepo("/", { now: () => now });
-    seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 10);
-    workspace.repo.mutateRefs(
-      { puts: [{ name: "refs/tags/created", target: THIRD }] },
-      metadata("null-old-endpoint"),
-    );
-
-    expect([...workspace.repo.activeRefLogOids()]).toEqual([FIRST, SECOND, THIRD]);
-    now += (RETENTION_SECONDS + 1) * 1_000;
-    expect([...workspace.repo.activeRefLogOids()]).toEqual([]);
-  });
-
+describe("reflog integrity", () => {
   it("fails closed on a persisted 1,025th row without cleaning it up", () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 1_025);
@@ -920,111 +853,6 @@ describe("active reflog roots", () => {
     expect(() => coldDatabase.openCheckout(coldCheckout).reflog("HEAD")).toThrow(
       expect.objectContaining({ code: "E2BIG" }),
     );
-  });
-
-  it("is lazy, uses one iterate query, never calls all, and closes early", () => {
-    const db = new GuardedDatabase();
-    const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
-    const repository = database.createRepository("/repo", "ref: refs/heads/main");
-    const store = database.openCheckout(repository);
-    seedRefLog(db, store.repoId, "HEAD", 10);
-    db.iterateCalls = 0;
-    db.closedIterators = 0;
-    db.forbidAll = true;
-
-    const roots = store.activeRefLogOids();
-    expect(db.iterateCalls).toBe(0);
-    expect(roots.next()).toEqual({ done: false, value: FIRST });
-    expect(db.iterateCalls).toBe(1);
-    roots.return(undefined);
-    expect(db.iterateCalls).toBe(1);
-    expect(db.closedIterators).toBe(1);
-  });
-
-  it("enumerates the valid 9,329-ref mutation shape in one validated traversal", () => {
-    const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
-    const refs = Array.from({ length: 9_329 }, (_, index) => ({
-      name: `refs/remotes/origin/branch-${index.toString().padStart(4, "0")}`,
-      target: index.toString(16).padStart(40, "0"),
-    }));
-    workspace.repo.store.updateRefs(refs);
-    workspace.storage.resetCounters();
-
-    const roots = [...workspace.repo.activeRefLogOids()];
-    expect(roots).toHaveLength(9_329);
-    expect(roots[0]).toBe("0".repeat(40));
-    expect(roots.at(-1)).toBe((9_328).toString(16).padStart(40, "0"));
-    expect(workspace.storage.statementCount).toBeLessThan(1_000);
-  });
-
-  it("accepts 9,727 combined retained rows and rejects 9,728 before traversal", () => {
-    const db = new GuardedDatabase();
-    const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
-    const repository = database.createRepository("/repo", "ref: refs/heads/main");
-    const store = database.openCheckout(repository);
-    const checkoutIds = [repository.id];
-    for (let index = 1; index < 8; index++) {
-      checkoutIds.push(database.createCheckout(store.repoId, `/checkout-${index}`, FIRST).id);
-    }
-    const checkoutRows = 1_024;
-    const directRows = MAX_REFLOG_ROOT_SCAN_ENTRIES - checkoutIds.length * checkoutRows;
-    const checkoutEndpoints = seedCombinedActiveRefLogs(
-      db,
-      store.repoId,
-      checkoutIds,
-      checkoutRows,
-      directRows,
-    );
-    db.forbidAll = true;
-    db.iterateCalls = 0;
-
-    expect(
-      db.scalar<number>("SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?", store.repoId),
-    ).toBe(directRows);
-    expect(
-      db.scalar<number>(
-        "SELECT count(DISTINCT ref_name) FROM git_reflog_entries WHERE repo_id = ?",
-        store.repoId,
-      ),
-    ).toBe(directRows);
-    expect(
-      db.scalar<number>(
-        "SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?",
-        store.repoId,
-      ),
-    ).toBe(checkoutIds.length * checkoutRows);
-    for (const checkoutId of checkoutIds) {
-      expect(
-        db.scalar<number>(
-          "SELECT count(*) FROM git_checkout_reflog_entries WHERE checkout_id = ?",
-          checkoutId,
-        ),
-      ).toBe(checkoutRows);
-    }
-    expect(directRows + checkoutIds.length * checkoutRows).toBe(9_727);
-    expect(new Set(checkoutEndpoints).size).toBe(checkoutEndpoints.length);
-    const accepted = store.activeRefLogOids();
-    expect(db.iterateCalls).toBe(0);
-    const roots = [...accepted];
-    expect(roots).toHaveLength(checkoutEndpoints.length + 2);
-    expect(roots).toEqual(expect.arrayContaining([FIRST, SECOND, ...checkoutEndpoints]));
-    expect(db.iterateCalls).toBe(1);
-
-    appendRefLog(db, store.repoId, "refs/tags/root-overflow", MAX_REFLOG_ROOT_SCAN_ENTRIES + 1);
-    expect(
-      db.scalar<number>(
-        `SELECT (SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?)
-              + (SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?)`,
-        store.repoId,
-        store.repoId,
-      ),
-    ).toBe(9_728);
-    db.iterateCalls = 0;
-    db.closedIterators = 0;
-    const over = store.activeRefLogOids();
-    expect(() => over.next()).toThrow(expect.objectContaining({ code: "E2BIG" }));
-    expect(db.iterateCalls).toBe(1);
-    expect(db.closedIterators).toBe(1);
   });
 
   it("rejects cross-owner checkout reflog writes", () => {
@@ -1075,7 +903,7 @@ describe("active reflog roots", () => {
     ).toBe(0);
   });
 
-  it("validates allocation state before listing or yielding roots", () => {
+  it("validates allocation state before listing", () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 3);
     workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
@@ -1086,9 +914,6 @@ describe("active reflog roots", () => {
     workspace.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");
 
     expect(() => workspace.repo.reflog("HEAD")).toThrow(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(() => workspace.repo.activeRefLogOids().next()).toThrow(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
   });

@@ -285,10 +285,6 @@ export class CheckoutStore implements Api.IndexStore {
     return this.#state.refs.reflog(refName, options);
   }
 
-  *activeRefLogOids(): Generator<string> {
-    yield* this.#state.refs.activeRefLogOids();
-  }
-
   configGetAll(path: string): string[] {
     return this.shared.configGetAll(path);
   }

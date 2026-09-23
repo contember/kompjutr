@@ -64,7 +64,6 @@ export {
   configGetOwned,
   MAX_CONFIG_SECTION_MOVE_ROWS,
 } from "./refs/config.js";
-export { MAX_REFLOG_ROOT_SCAN_ENTRIES } from "./refs/reflog.js";
 export { readShallowOwned } from "./refs/shallow.js";
 export { SharedRepoStore } from "./repository/shared.js";
 export { MAX_LOG_COMMITS } from "./trees/commits.js";

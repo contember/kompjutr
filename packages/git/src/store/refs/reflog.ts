@@ -8,13 +8,11 @@ import type {
   RefLogReadOptions,
 } from "../core/contracts.js";
 import { jsonPages } from "../core/json-pages.js";
-import { requireSafeId } from "../database/lifecycle.js";
 import { MAX_REFLOG_ORDINAL, MAX_REFLOG_TIMEZONE_MINUTES } from "../schema/reflog-schema.js";
 import { refTextBytes, requireRefName } from "./ref-validation.js";
 
 export const REFLOG_RETENTION_SECONDS = 90 * 24 * 60 * 60;
 export const REFLOG_RETENTION_ROWS = 1_024;
-export const MAX_REFLOG_ROOT_SCAN_ENTRIES = 9_727;
 
 export type Clock = () => number;
 
@@ -337,128 +335,4 @@ export function readRefLog(
     if (page.length < limit) page.push(entry);
   }
   return page;
-}
-
-/** Distinct active reflog roots in strict byte order. */
-export function* activeRefLogOids(
-  db: SqlDatabase,
-  repoId: number,
-  checkoutId: number,
-  clock: Clock,
-): Generator<string> {
-  const now = nowSeconds(clock);
-  const cutoff = Math.max(0, now - REFLOG_RETENTION_SECONDS);
-  const header = db.one<Record<string, unknown>>(
-    `SELECT repository.id AS repo_id, checkout.head, state.next_ordinal
-         FROM git_repositories repository
-         JOIN git_reflog_state state ON state.repo_id = repository.id
-         JOIN git_checkouts checkout ON checkout.repo_id = repository.id
-        WHERE repository.id = ? AND checkout.id = ?`,
-    repoId,
-    checkoutId,
-  );
-  if (header === undefined) throw new CorruptError("repository is missing its reflog state");
-  const nextOrdinal = requireRefLogHeader(header, repoId);
-  let previousRef: string | null = null;
-  let directEntriesForRef = 0;
-  let previousCheckoutId: number | null = null;
-  let checkoutEntries = 0;
-  let scannedEntries = 0;
-  for (const row of db.iterate(
-    `WITH direct_ranked AS (
-         SELECT entry.*, NULL AS checkout_id,
-                row_number() OVER (
-                  PARTITION BY entry.ref_name ORDER BY entry.ordinal DESC
-                ) AS retained_rank
-           FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
-          WHERE entry.repo_id = ?
-       ), checkout_ranked AS (
-         SELECT entry.*, 'HEAD' AS ref_name,
-                row_number() OVER (
-                  PARTITION BY entry.checkout_id ORDER BY entry.ordinal DESC
-                ) AS retained_rank
-           FROM git_checkout_reflog_entries entry
-          WHERE entry.repo_id = ?
-       ), retained AS (
-         SELECT 0 AS kind, checkout_id, ref_name, ordinal,
-                old_raw, new_raw, old_oid, new_oid, actor_name, actor_email,
-                timestamp, timezone, reason
-           FROM direct_ranked WHERE retained_rank <= ${REFLOG_RETENTION_ROWS}
-         UNION ALL
-         SELECT 1 AS kind, checkout_id, ref_name, ordinal,
-                old_raw, new_raw, old_oid, new_oid, actor_name, actor_email,
-                timestamp, timezone, reason
-           FROM checkout_ranked WHERE retained_rank <= ${REFLOG_RETENTION_ROWS}
-       ), retained_limited AS MATERIALIZED (
-         SELECT * FROM retained
-          ORDER BY kind, ref_name COLLATE BINARY, checkout_id, ordinal DESC
-          LIMIT ${MAX_REFLOG_ROOT_SCAN_ENTRIES + 1}
-       ), output AS (
-         SELECT retained_limited.*, NULL AS root_oid FROM retained_limited
-         UNION ALL
-         SELECT 2 AS kind, NULL AS checkout_id, NULL AS ref_name, NULL AS ordinal,
-                NULL AS old_raw, NULL AS new_raw,
-                NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
-                NULL AS timestamp, NULL AS timezone, NULL AS reason, endpoint.oid AS root_oid
-           FROM (
-             SELECT oid FROM (
-               SELECT old_oid AS oid FROM retained_limited WHERE timestamp >= ?
-               UNION ALL
-               SELECT new_oid AS oid FROM retained_limited WHERE timestamp >= ?
-             ) WHERE oid IS NOT NULL GROUP BY oid
-           ) endpoint
-       )
-       SELECT kind, checkout_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
-              actor_name, actor_email, timestamp, timezone, reason, root_oid
-         FROM output
-       ORDER BY kind, ref_name COLLATE BINARY, checkout_id, ordinal DESC, root_oid COLLATE BINARY`,
-    repoId,
-    repoId,
-    cutoff,
-    cutoff,
-  )) {
-    if (row.kind === 0) {
-      scannedEntries++;
-      if (scannedEntries > MAX_REFLOG_ROOT_SCAN_ENTRIES) {
-        throw new GitError("E2BIG", "reflog root scan exceeds its structural row bound");
-      }
-      const entry = requireStoredRefLogEntry(row);
-      if (entry.ordinal > nextOrdinal) {
-        throw new CorruptError("reflog entry exceeds the repository allocation state");
-      }
-      if (previousRef === null || entry.refName !== previousRef) {
-        previousRef = entry.refName;
-        directEntriesForRef = 0;
-      }
-      directEntriesForRef++;
-      if (directEntriesForRef > REFLOG_RETENTION_ROWS) {
-        throw new CorruptError("reflog root query exceeded its retained row bound");
-      }
-      continue;
-    }
-    if (row.kind === 1) {
-      scannedEntries++;
-      if (scannedEntries > MAX_REFLOG_ROOT_SCAN_ENTRIES) {
-        throw new GitError("E2BIG", "reflog root scan exceeds its structural row bound");
-      }
-      const ownerCheckoutId = requireSafeId(row.checkout_id, "checkout reflog owner id");
-      const entry = requireStoredRefLogEntry(row);
-      if (entry.refName !== "HEAD" || entry.ordinal > nextOrdinal) {
-        throw new CorruptError("checkout reflog entry is invalid");
-      }
-      if (ownerCheckoutId !== previousCheckoutId) {
-        previousCheckoutId = ownerCheckoutId;
-        checkoutEntries = 0;
-      }
-      checkoutEntries++;
-      if (checkoutEntries > REFLOG_RETENTION_ROWS) {
-        throw new CorruptError("checkout reflog query exceeded its retained row bound");
-      }
-      continue;
-    }
-    if (row.kind !== 2) {
-      throw new CorruptError("reflog root query returned an invalid object id");
-    }
-    yield expectText(row.root_oid, "reflog root object id");
-  }
 }

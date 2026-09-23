@@ -328,10 +328,6 @@ export class Repository {
     return sharedRepoStoreMutations(this.store).publishFetchRefsOwned(token, plan, metadata);
   }
 
-  activeRefLogOids(): Generator<string> {
-    return this.store.activeRefLogOids();
-  }
-
   resolveRevision(expression: string): RevisionResolution {
     return resolveRevision(this, expression);
   }

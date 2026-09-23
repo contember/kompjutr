@@ -18,12 +18,7 @@ import {
   requireStoredCheckoutRow,
 } from "../database/lifecycle.js";
 import { rawSymbolicTarget, requireRefName } from "../refs/ref-validation.js";
-import {
-  activeRefLogOids,
-  type CheckoutRefLogEvent,
-  REFLOG_RETENTION_ROWS,
-  readRefLog,
-} from "../refs/reflog.js";
+import { type CheckoutRefLogEvent, REFLOG_RETENTION_ROWS, readRefLog } from "../refs/reflog.js";
 import type { HeadOwner } from "../refs/refs.js";
 import { type SharedRepoStore, sharedRepoStoreMutations } from "../repository/shared.js";
 import { MAX_CHECKOUTS_PER_REPOSITORY } from "../schema/schema.js";
@@ -179,10 +174,6 @@ export class CheckoutRefStore {
 
   reflog(refName: string, options: RefLogReadOptions = {}): RefLogEntry[] {
     return readRefLog(this.#db(), this.#repoId, this.#checkoutId, this.#now, refName, options);
-  }
-
-  *activeRefLogOids(): Generator<string> {
-    yield* activeRefLogOids(this.#db(), this.#repoId, this.#checkoutId, this.#now);
   }
 
   genericRefLogMetadata(reason: string): RefLogMetadata {

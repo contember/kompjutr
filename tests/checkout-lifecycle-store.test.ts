@@ -453,7 +453,6 @@ describe("checkout lifecycle storage", () => {
     shared.configSet("survivor.value", "alive");
     expect(survivor.shared.configGet("survivor.value")).toBe("alive");
     expect(shared.packs.count()).toBe(0);
-    expect(new Set(shared.activeRefLogOids())).toEqual(new Set([before, after]));
   });
 
   it("rolls back the root callback and keeps the cached checkout on failed removal", () => {

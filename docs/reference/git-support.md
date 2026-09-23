@@ -973,9 +973,7 @@ excess with `E2BIG` and never truncates.
 
 One shared store has at most 1,024 checkouts. A checkout root is at most 4,096
 UTF-8 bytes, raw `HEAD` is at most 1,024 bytes, and one complete checkout listing
-retains at most 6 MiB. An active reflog-root scan fails closed above 9,727
-physical direct-ref and checkout-HEAD rows; its SQL state, shared caches, and JS
-headroom total at most 100 MiB minus one byte.
+retains at most 6 MiB.
 
 One repository admits at most 16 simultaneous scratch-index names, each at most
 255 UTF-8 bytes. A scratch callback is synchronous and cannot escape its owning
