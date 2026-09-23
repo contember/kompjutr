@@ -8,6 +8,29 @@ On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
 
 # Sprint — Statement targets and harnesses (2026-09-23)
 
+> **PAUSED 2026-09-23 at `22a265f`.** Landed: WU3 (`4c333ce`), WU2
+> (`2e20f45`), WU1 `clone-storage` half (`ce701af`). Decided by the user after
+> the run-log escalations below:
+> - **WU1 reachability → retire the scenario.** Not started. Remove the
+>   `sqlite.maintenance.reachability` spec in `bench/memory-protocol.ts`
+>   (`LARGE_HEADER_BYTES`, the union members), `maintenanceReachabilityScenario`
+>   and its registration in `bench/memory.ts`, and `largeHeaderChunks` /
+>   `streamedObjectOid` if nothing else uses them; then typecheck and
+>   `npm run bench:memory -- --runtime-check`.
+> - **WU4 → deferred.** Partial outcome; backlog 87 is rescoped as an ADR-0024
+>   design question. No code change in this sprint.
+> - **WU5 → do the small cuts.** Not started. Batch the clone's four config
+>   writes, read the user identity once per operation, and dedupe full ref
+>   listings; each with its own witness and independent review. Re-measure
+>   with `bench:nextjs` then `bench:statements -- --check`, update
+>   `FROZEN_NEXTJS_REFERENCES`. Estimated −10 to −15 of the −29 needed; if
+>   that falls short, the next candidates are the two ref-mutation transactions
+>   and the mutation-guard pairs, which need their own decision.
+>
+> Not yet run since WU2/WU1 landed: `npm test`, typecheck. Closure still owes
+> `test:full`, the OUTCOME header, archiving, and deleting backlog 83, 85
+> (once reachability is retired), 88 and 89. Nothing is pushed.
+
 **Goal.** Every row that `bench:statements` and the Next.js workflow report meets
 the 1,000-statement target, and every benchmark harness runs again.
 
