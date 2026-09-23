@@ -46,46 +46,40 @@ const STATEMENT_TARGET = 1_000;
 type StatementTarget = "pass" | "miss";
 
 /**
- * Every table the runtime may create, mapped to the cost it belongs to.
- * A table missing from here fails the run: an unclassified table would
- * silently drop out of the totals and make the report understate the cost.
+ * Table families by name prefix, first match wins. A table no rule names is
+ * reported in `other` by name rather than failing the run, so a new table
+ * shows up in the report instead of taking the harness down.
  */
-const TABLE_GROUPS = new Map<string, string>([
-  ["git_pack_meta", "pack"],
-  ["git_pack_data", "pack"],
-  ["git_pack_objects", "pack"],
-  ["git_pack_pending", "pack"],
+const TABLE_GROUP_RULES: readonly (readonly [prefix: string, group: string])[] = [
+  ["git_pack_", "pack"],
   ["git_objects", "loose objects"],
   ["git_object_chunks", "loose objects"],
+  ["git_loose_", "loose objects"],
   ["git_commits", "loose objects"],
-  ["git_tree_sources", "tree projection"],
-  ["git_tree_entries", "tree projection"],
-  ["git_tree_effective", "tree projection"],
+  ["git_tree_", "tree projection"],
   ["git_index", "index"],
-  ["git_index_state", "index"],
-  ["git_index_dirty", "index"],
-  ["git_blob_ids", "index"],
-  ["git_blob_id_state", "index"],
-  ["fs_meta", "working tree"],
-  ["fs_nodes", "working tree"],
-  ["fs_paths", "working tree"],
-  ["fs_chunks", "working tree"],
+  ["git_scratch_index", "index"],
+  ["git_blob_id", "index"],
+  ["fs_", "working tree"],
+  ["git_integration_", "integration scratch"],
+  ["git_maintenance_", "maintenance"],
   ["git_meta", "repository"],
   ["git_repositories", "repository"],
-  ["git_checkouts", "repository"],
+  ["git_identity_", "repository"],
+  ["git_checkout", "repository"],
   ["git_refs", "repository"],
+  ["git_reflog_", "repository"],
   ["git_config", "repository"],
   ["git_shallow", "repository"],
-  ["git_reflog_state", "repository"],
-  ["git_reflog_entries", "repository"],
-  ["git_checkout_reflog_entries", "repository"],
-  ["git_operation_state", "repository"],
-  ["git_operation_steps", "repository"],
-  ["git_operation_touched", "repository"],
-  ["shell_sessions", "repository"],
-  ["sqlite_schema", "schema"],
-  ["sqlite_sequence", "schema"],
-]);
+  ["git_fetch_", "repository"],
+  ["git_tracking_", "repository"],
+  ["git_promis", "repository"],
+  ["git_operation_", "repository"],
+  ["shell_", "repository"],
+  ["sqlite_", "schema"],
+];
+
+const OTHER_GROUP = "other";
 
 const GROUP_ORDER = [
   "pack",
@@ -93,9 +87,19 @@ const GROUP_ORDER = [
   "tree projection",
   "index",
   "working tree",
+  "integration scratch",
+  "maintenance",
   "repository",
   "schema",
+  OTHER_GROUP,
 ] as const;
+
+function tableGroup(table: string): string {
+  for (const [prefix, group] of TABLE_GROUP_RULES) {
+    if (table.startsWith(prefix)) return group;
+  }
+  return OTHER_GROUP;
+}
 
 /** Tables whose row count says something about the bytes above it. */
 const COUNTED_TABLES = [
@@ -289,13 +293,8 @@ function objectUsage(db: DatabaseSync): ObjectUsage[] {
 
 function groupUsage(objects: readonly ObjectUsage[]): GroupUsage[] {
   const totals = new Map<string, GroupUsage>();
-  const unclassified: string[] = [];
   for (const usage of objects) {
-    const group = TABLE_GROUPS.get(usage.table);
-    if (group === undefined) {
-      unclassified.push(usage.table);
-      continue;
-    }
+    const group = tableGroup(usage.table);
     const total = totals.get(group) ?? {
       group,
       pages: 0,
@@ -306,9 +305,6 @@ function groupUsage(objects: readonly ObjectUsage[]): GroupUsage[] {
     total.allocatedBytes += usage.allocatedBytes;
     total.payloadBytes += usage.payloadBytes;
     totals.set(group, total);
-  }
-  if (unclassified.length > 0) {
-    throw new Error(`unclassified tables: ${[...new Set(unclassified)].sort().join(", ")}`);
   }
   const ordered: GroupUsage[] = [];
   for (const group of GROUP_ORDER) {
@@ -683,6 +679,14 @@ function groupTable(result: FixtureResult): string[] {
       `${percent(result.storage.databaseBytes - result.storage.payloadBytes, result.storage.databaseBytes)} | ` +
       "100.0% |",
   );
+  const other = new Set(
+    result.storage.objects
+      .filter((usage) => tableGroup(usage.table) === OTHER_GROUP)
+      .map((usage) => usage.table),
+  );
+  if (other.size > 0) {
+    lines.push("", `\`${OTHER_GROUP}\` has no table family yet: ${[...other].sort().join(", ")}.`);
+  }
   return lines;
 }
 
