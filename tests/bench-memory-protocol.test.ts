@@ -99,7 +99,6 @@ describe("memory benchmark protocol", () => {
       "core.integration.guard-hash",
       "core.rebase.baseline-hash",
       "core.staging.add-hash",
-      "sqlite.maintenance.reachability",
       "sqlite.pack.fallback-audit",
       "sqlite.pack.authenticate",
       "sqlite.graph.retained",

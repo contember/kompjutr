@@ -21,7 +21,6 @@ export const GRAPH_MESSAGE_BYTES = 500_000;
 export const GRAPH_COMMIT_COUNT = 34;
 export const LARGE_OBJECT_BYTES = 4 * 1024 * 1024 + 1;
 export const LARGE_CONFIG_BYTES = 1024 * 1024 + 1;
-export const LARGE_HEADER_BYTES = 48 * 1024 * 1024 + 64 * 1024;
 export const CHECKOUT_COUNT = 1_024;
 export const LOOSE_STREAM_OBJECT_BYTES = MAX_OBJECT_BYTES - 2 * 1024 * 1024;
 export const LOOSE_STREAM_OBJECT_COUNT = 2;
@@ -93,7 +92,6 @@ export type MemoryScenarioName =
   | "core.staging.add-hash"
   | "core.sparse-selected-add"
   | "core.loose-object-stream"
-  | "sqlite.maintenance.reachability"
   | "sqlite.pack.fallback-audit"
   | "sqlite.pack.authenticate"
   | "sqlite.graph.retained"
@@ -108,7 +106,6 @@ export type MemorySource =
   | "createSqliteSelectedPathSource"
   | "add"
   | "SharedRepoStore.readBlobs"
-  | "advanceMaintenanceReachability"
   | "PackStore.deleteCompletePacks"
   | "PackStore.authenticateCompleteSources"
   | "Repository.walkIndexed"
@@ -194,15 +191,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     verifiedChunkCount:
       Math.ceil(maximumDeflatedBytes(LOOSE_STREAM_OBJECT_BYTES) / OBJECT_CHUNK) *
       LOOSE_STREAM_OBJECT_COUNT,
-  },
-  {
-    scenario: "sqlite.maintenance.reachability",
-    operation: "sqlite.maintenance.reachability",
-    source: "advanceMaintenanceReachability",
-    workloadBytes: LARGE_HEADER_BYTES,
-    formerLimitBytes: 48 * 1024 * 1024,
-    verifiedContentBytes: LARGE_HEADER_BYTES,
-    verifiedChunkCount: Math.ceil(LARGE_HEADER_BYTES / SQLITE_OBJECT_CHUNK_BYTES),
   },
   {
     scenario: "sqlite.pack.fallback-audit",

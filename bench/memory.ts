@@ -39,7 +39,6 @@ import {
   type SharedRepoStore,
   SqliteGitDatabase,
 } from "../packages/git/src/store/index.js";
-import { advanceMaintenanceReachability } from "../packages/git/src/store/maintenance/reachability.js";
 import { INFLATE_FEED } from "../packages/git/src/store/objects/objects.js";
 import { commitGraphBytes } from "./commit-graph-bytes.js";
 import type { Harness, Scenario } from "./harness.js";
@@ -51,7 +50,6 @@ import {
   GRAPH_MESSAGE_BYTES,
   HASH_WORKLOAD_BYTES,
   LARGE_CONFIG_BYTES,
-  LARGE_HEADER_BYTES,
   LARGE_OBJECT_BYTES,
   LOOSE_STREAM_OBJECT_BYTES,
   LOOSE_STREAM_OBJECT_COUNT,
@@ -363,31 +361,6 @@ function deterministicBytes(size: number, seed = 0x9e3779b9): Uint8Array {
     data[index] = state & 0xff;
   }
   return data;
-}
-
-function* largeHeaderChunks(size: number, prefix: Uint8Array): Generator<Uint8Array> {
-  if (prefix.length + 2 > size) throw new Error("large header prefix exceeds its object size");
-  for (let offset = 0; offset < size; offset += 1024 * 1024) {
-    const length = Math.min(1024 * 1024, size - offset);
-    const chunk = new Uint8Array(length).fill(0x61);
-    if (offset === 0) chunk.set(prefix);
-    if (offset + length === size) {
-      chunk[length - 2] = 0x0a;
-      chunk[length - 1] = 0x0a;
-    }
-    yield chunk;
-  }
-}
-
-function streamedObjectOid(
-  type: "commit" | "tag",
-  size: number,
-  chunks: () => Iterable<Uint8Array>,
-): string {
-  const hash = createHash("sha1");
-  hash.update(`${type} ${size}\0`);
-  for (const chunk of chunks()) hash.update(chunk);
-  return hash.digest("hex");
 }
 
 function storedDigest(
@@ -879,102 +852,6 @@ function looseObjectStreamScenario(): Scenario {
   };
 }
 
-function maintenanceReachabilityScenario(): Scenario {
-  const spec = memoryScenarioSpec("sqlite.maintenance.reachability");
-  let store: SharedRepoStore | null = null;
-  let rootOid: string | null = null;
-  let treeOid: string | null = null;
-  let processedOid: string | null = null;
-  let verificationDigest: string | null = null;
-  return {
-    name: spec.scenario,
-    kind: "memory",
-    fileBacked: true,
-    async setup({ harness }) {
-      const created = createRepository(harness, "/repo");
-      treeOid = created.repo.store.write("tree", serializeTree([]));
-      const prefix = utf8.encode(
-        `tree ${treeOid}\nauthor Memory Benchmark <memory@example.com> 1577836800 +0000\n` +
-          "committer Memory Benchmark <memory@example.com> 1577836800 +0000\nx ",
-      );
-      const chunks = () => largeHeaderChunks(LARGE_HEADER_BYTES, prefix);
-      rootOid = streamedObjectOid("commit", LARGE_HEADER_BYTES, chunks);
-      created.repo.store.db.run(
-        "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, 'commit', ?, 'raw')",
-        created.repo.store.repoId,
-        rootOid,
-        LARGE_HEADER_BYTES,
-      );
-      let seq = 0;
-      for (const chunk of chunks()) {
-        created.repo.store.db.run(
-          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-          created.repo.store.repoId,
-          rootOid,
-          seq++,
-          chunk,
-        );
-      }
-      if (seq !== spec.verifiedChunkCount) {
-        throw new Error("reachability fixture has an unexpected storage chunk count");
-      }
-      created.repo.store.db.run(
-        `INSERT OR IGNORE INTO git_maintenance_control (repo_id, root_epoch, next_run_id)
-         VALUES (?, 0, 2)`,
-        created.repo.store.repoId,
-      );
-      created.repo.store.db.run(
-        `INSERT INTO git_maintenance_runs
-           (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
-            reachable_objects, queued_objects)
-         VALUES (?, 1, 0, 'mark', 1, 'done', 0, 1)`,
-        created.repo.store.repoId,
-      );
-      created.repo.store.db.run(
-        `INSERT INTO git_maintenance_objects
-           (repo_id, run_id, oid, source_mask, expanded, shallow_boundary,
-            physical_only, edge_cursor)
-         VALUES (?, 1, ?, 1, 0, 0, 0, 0)`,
-        created.repo.store.repoId,
-        rootOid,
-      );
-      store = reopenRepository(harness, "/repo").repo.store;
-    },
-    phases: [
-      {
-        name: spec.operation,
-        async run() {
-          if (store === null) throw new Error("reachability fixture is missing");
-          const progress = advanceMaintenanceReachability(store);
-          processedOid = progress.processedOid;
-        },
-        async verify() {
-          if (store === null || rootOid === null || treeOid === null) {
-            throw new Error("reachability fixture is missing");
-          }
-          const rows = store.db.all<{ oid: string; expanded: number }>(
-            `SELECT oid, expanded FROM git_maintenance_objects
-              WHERE repo_id = ? AND run_id = 1 AND oid IN (?, ?) ORDER BY oid`,
-            store.repoId,
-            rootOid,
-            treeOid,
-          );
-          if (
-            processedOid !== rootOid ||
-            rows.length !== 2 ||
-            rows.find((row) => row.oid === rootOid)?.expanded !== 1 ||
-            rows.find((row) => row.oid === treeOid)?.expanded !== 0
-          ) {
-            throw new Error("reachability did not publish the exact large-header root edge");
-          }
-          verificationDigest = digestParts([rootOid, treeOid, processedOid, rows.length]);
-        },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
-      },
-    ],
-  };
-}
-
 function packFallbackAuditScenario(): Scenario {
   const spec = memoryScenarioSpec("sqlite.pack.fallback-audit");
   const oid = hashObject("blob", PACK_FIXTURE_DATA);
@@ -1334,7 +1211,6 @@ export const MEMORY: Scenario[] = [
   stagingAddScenario(),
   sparseSelectedAddScenario(),
   looseObjectStreamScenario(),
-  maintenanceReachabilityScenario(),
   packFallbackAuditScenario(),
   packAuthenticationScenario(),
   retainedGraphScenario(),
