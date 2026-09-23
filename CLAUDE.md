@@ -26,7 +26,7 @@ Benchmarks have their own rules. Read `bench/CLAUDE.md` before running one.
 
 ```
 packages/sqlite/  Shared SQLite contracts, errors, limits, and codecs
-packages/drive/   Synchronous Git drive contracts and capability receipts
+packages/drive/   Synchronous Git drive contracts
 packages/git/     Generic Git engine; `do-fs` is the isolated DO integration
 packages/do/      Worker adapter, SQLite filesystem, shell, and Workspace
 packages/local/   Unix node:sqlite adapter, disk drive, recovery, LocalWorkspace

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../packages/do/src/db/db.js";
 import type {
+  OrderedScanOptions,
+  RealPath,
   RemoveOptions,
   ScanEntry,
   ScanOptions,
@@ -76,6 +78,10 @@ class NoScanWorktree extends CountingWorktree {
     return rows;
   }
 
+  override scanStream(): never {
+    throw new Error("sparse checkout must not scan the worktree");
+  }
+
   override readdir(): never {
     throw new Error("sparse checkout must not scan the worktree");
   }
@@ -104,11 +110,11 @@ class FailingHashWorktree extends NoScanWorktree {
 }
 
 class LegacyScanWorktree extends CountingWorktree {
-  scans: Array<{ root: string; limit: number }> = [];
+  scans: RealPath[] = [];
 
-  override scan(root: string, options: ScanOptions): ScanEntry[] {
-    this.scans.push({ root, limit: options.limit });
-    return super.scan(root, options);
+  override scanStream(root: RealPath, options?: OrderedScanOptions): Iterable<ScanEntry> {
+    this.scans.push(root);
+    return super.scanStream(root, options);
   }
 }
 
@@ -530,7 +536,7 @@ describe("sparse checkout", () => {
       force: true,
     });
 
-    expect(worktree.scans.some((scan) => scan.limit > 1)).toBe(true);
+    expect(worktree.scans.length).toBeGreaterThan(0);
     expectFile(workspace, `/${paths[0]}`, "after\n");
     expectFile(workspace, `/${unchanged}`, "before\n");
     expect(workspace.repo.head().oid).toBe(target);

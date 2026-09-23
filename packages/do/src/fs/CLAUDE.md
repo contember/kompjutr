@@ -17,7 +17,7 @@ import.ts       bulk import of an external tree
 ## The bulk API is the product
 
 Single-path calls exist for compatibility. The reason this layer was written is
-`scan`, `globPage`, `listEntries`, `discoverFiles`,
+`scan`, `scanStream`, `globPage`, `listEntries`, `discoverFiles`,
 `discoverFilesContaining`, `readFileHandles`, `readFiles`, `writeFiles`,
 `copyFiles`, and `touchFiles`. Reads and discovery use indexed, bounded pages;
 copy keeps content inside SQLite; touch changes metadata without reading file
@@ -52,6 +52,8 @@ readable it looks.
   the first non-ASCII byte. Use `codePointLength` for the TEXT side.
 - **The platform caps a GLOB pattern at 50 bytes.** Longer patterns must be
   split or rejected, not silently truncated.
+- **`scanStream` holds no SQL cursor across a yield.** Git writes between
+  rows, so each 1,000-row page is a fresh keyset statement from the last path.
 - One mutating *call* bumps the revision once, not once per row.
 - Mutations land in a single `db.transactionSync()`: path, node, and chunk state
   together.

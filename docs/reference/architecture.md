@@ -7,7 +7,7 @@ the two runtime compositions:
 
 ```text
 @kompjutr/sqlite    synchronous SQLite contracts, errors, limits, codecs
-@kompjutr/drive     synchronous working-tree contracts and capability receipts
+@kompjutr/drive     synchronous working-tree contracts
         │
         └──── @kompjutr/git       generic Git engine
                     │
@@ -89,7 +89,9 @@ The working tree is relational:
 Paths are resolved component by component before store access. Mutations update
 path, node, and chunk state in one `transactionSync()` call and bump one
 filesystem revision per public mutation. Scans use indexed path ranges and
-keyset cursors. Discovery returns revision-bearing regular-file handles; batched
+keyset cursors. `scanStream` pages 1,000 rows per statement and holds no cursor
+across a yield; a page that ends inside a pruned directory resumes past its
+subtree. Discovery returns revision-bearing regular-file handles; batched
 reads revalidate every handle before exposing content.
 
 ## Local disk and recovery
@@ -101,7 +103,8 @@ lifetime lock must not replace directory topology concurrently. DiskDrive
 streams trees in Git UTF-8 order. Wide directories are sorted in fixed-size runs
 under the state directory and merged with bounded fan-in; a fixed aggregate
 frontier budget also spills deep traversals. The worktree is never materialized
-as one path array.
+as one path array. A scan that resumes `after` a path skips earlier entries and
+whole earlier subtrees without a stat.
 
 Exact directory aliases are rejected by device and inode identity. Portable Node
 APIs do not identify bind-mounted ancestry, so pre-existing aliases of nested
@@ -135,6 +138,8 @@ calls `transactionSync()` and never emits `BEGIN`, `COMMIT`, or `ROLLBACK`.
 Several repositories can share one database. Each repository can have several
 checkout-bound views. The nearest registered checkout ancestor selects the
 view, and nested checkout roots are excluded from parent worktree scans.
+Worktree list and prune stat each checkout root through the drive; a missing
+root, including one behind an ancestor symlink loop, is prunable.
 
 | Owner | State |
 | --- | --- |

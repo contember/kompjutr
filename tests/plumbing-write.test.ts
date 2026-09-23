@@ -123,57 +123,74 @@ function syntheticWorktree(
   contentId: Uint8Array | null,
   size = 0,
 ): Worktree {
+  const row = (index: number): ScanEntry => ({
+    path: `/f${index.toString().padStart(5, "0")}.txt`,
+    type: "file",
+    mode: 0o100644,
+    size,
+    mtime: 1,
+    ino: index + 2,
+    nlink: 1,
+    rev: 1,
+    target: null,
+    contentId,
+  });
+  const start = (after: string | undefined): number =>
+    after === undefined ? 0 : Number.parseInt(after.slice(after.lastIndexOf("f") + 1, -4), 10) + 1;
   return {
     ...inner,
     scan(_root, options): ScanEntry[] {
-      const after = options.after;
-      const start =
-        after === undefined
-          ? 0
-          : Number.parseInt(after.slice(after.lastIndexOf("f") + 1, -4), 10) + 1;
       const rows: ScanEntry[] = [];
-      for (let index = start; index < count && rows.length < options.limit; index++) {
-        rows.push({
-          path: `/f${index.toString().padStart(5, "0")}.txt`,
-          type: "file",
-          mode: 0o100644,
-          size,
-          mtime: 1,
-          ino: index + 2,
-          nlink: 1,
-          rev: 1,
-          target: null,
-          contentId,
-        });
+      for (
+        let index = start(options.after);
+        index < count && rows.length < options.limit;
+        index++
+      ) {
+        rows.push(row(index));
       }
       return rows;
+    },
+    *scanStream(_root, options) {
+      for (let index = start(options?.after); index < count; index++) yield row(index);
     },
   };
 }
 
 function syntheticDirectoryWorktree(inner: Worktree, count: number): Worktree {
+  const row = (index: number): ScanEntry => ({
+    path: `/d${index.toString().padStart(5, "0")}`,
+    type: "dir",
+    mode: 0o40755,
+    size: 0,
+    mtime: 1,
+    ino: index + 2,
+    nlink: 1,
+    rev: 1,
+    target: null,
+    contentId: null,
+  });
+  const start = (after: string | undefined): number =>
+    after === undefined ? 0 : Number.parseInt(after.slice(after.lastIndexOf("d") + 1), 10) + 1;
   return {
     ...inner,
     scan(_root, options): ScanEntry[] {
-      const after = options.after;
-      const start =
-        after === undefined ? 0 : Number.parseInt(after.slice(after.lastIndexOf("d") + 1), 10) + 1;
       const rows: ScanEntry[] = [];
-      for (let index = start; index < count && rows.length < options.limit; index++) {
-        rows.push({
-          path: `/d${index.toString().padStart(5, "0")}`,
-          type: "dir",
-          mode: 0o40755,
-          size: 0,
-          mtime: 1,
-          ino: index + 2,
-          nlink: 1,
-          rev: 1,
-          target: null,
-          contentId: null,
-        });
+      for (
+        let index = start(options.after);
+        index < count && rows.length < options.limit;
+        index++
+      ) {
+        rows.push(row(index));
       }
       return rows;
+    },
+    *scanStream(_root, options) {
+      if (options?.filesOnly === true) return;
+      for (let index = start(options?.after); index < count; index++) {
+        const entry = row(index);
+        yield entry;
+        options?.pruneDirectory?.(entry.path);
+      }
     },
   };
 }

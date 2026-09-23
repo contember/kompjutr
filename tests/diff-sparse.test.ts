@@ -20,6 +20,10 @@ class NoScanWorktree extends CountingWorktree {
   override scan(): never {
     throw new Error("sparse diff must not scan the worktree");
   }
+
+  override scanStream(): never {
+    throw new Error("sparse diff must not scan the worktree");
+  }
 }
 
 function commitPaths(workspace: TestRepository, paths: readonly string[], message: string): string {

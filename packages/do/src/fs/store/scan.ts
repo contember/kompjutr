@@ -242,11 +242,6 @@ function toListItem(row: ListRow): ListItem {
   };
 }
 
-/** Read one page through the native provider without widening its public contract. */
-export function scanOwned(db: SqlDatabase, root: RealPath, options: ScanOptions): ScanEntry[] {
-  return scan(db, root, options);
-}
-
 /**
  * One page of everything under `root`, in path byte order.
  *

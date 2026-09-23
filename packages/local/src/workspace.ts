@@ -168,14 +168,9 @@ export class LocalWorkspace {
       });
       const gitDatabase = new SqliteGitDatabase(database, options);
       const factory = options.git ?? createGit();
-      const worktree = drive;
       const git = factory({
         database: gitDatabase,
-        worktree,
-        exactRootStates: {
-          states: (roots) =>
-            roots.map((root) => (worktree.stat(root) === null ? "missing" : "present")),
-        },
+        worktree: drive,
         now: options.now ?? Date.now,
         timezoneOffset: options.timezoneOffset ?? (() => new Date().getTimezoneOffset()),
         defaultIdentity: options.defaultGitIdentity,

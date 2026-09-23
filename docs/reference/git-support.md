@@ -216,7 +216,7 @@ repository behind. Later lazy reads use binding-level `promisorHeaders` or
 | `worktree add <path> <branch>` | `worktreeAdd({ root, target: { kind: "existing-branch", name } })` | ★ ✔ the branch must exist and must not be attached elsewhere |
 | `worktree add -b <name> <path> [<start>]` | `target: { kind: "new-branch", name, startPoint? }` | ★ ~ branch creation, checkout state, and filesystem population are atomic, unlike Git's possible leftover branch after a later add failure |
 | `worktree add --detach <path> [<start>]` | `target: { kind: "detached", startPoint? }` | ✔ |
-| `worktree list` | `worktreeList()` | ★ ~ returns frozen `WorktreeInfo[]` in UTF-8 root order, including exact `present` or `missing` root state |
+| `worktree list` | `worktreeList()` | ★ ~ returns frozen `WorktreeInfo[]` in UTF-8 root order, with each root's state from an lstat-style drive stat: `present`, or `missing` when the root is absent or unreachable (`ENOENT`, `ELOOP`) |
 | `worktree remove <path>` | `worktreeRemove({ root })` | ★ ✔ refuses the primary, dirty, or busy checkout |
 | `worktree remove --force <path>` | `worktreeRemove({ root, force: true })` | ★ ~ bypasses dirtiness only; a live operation still fails with `EWORKTREEBUSY` |
 | `worktree prune` | `worktreePrune()` | ★ ✔ atomically removes every missing non-primary checkout, or none if an eligible checkout is busy |

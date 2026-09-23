@@ -1,14 +1,11 @@
-import type { RealPath, ScanEntry, ScanOptions } from "@kompjutr/drive";
-import { nativeRealpathOwned, nativeScanOwned } from "@kompjutr/drive";
+import type { ScanEntry } from "@kompjutr/drive";
 import { CorruptError, GitError } from "../../common/errors.js";
-import { joinPath, relativeTo, subtreeSuccessor } from "../../common/paths.js";
+import { joinPath, relativeTo } from "../../common/paths.js";
 import { comparePaths } from "../../common/streams.js";
 import type { IgnoreMatcher } from "../../ignore/index.js";
 import type { Worktree, WorktreeStat } from "./worktree.js";
 import { type CompiledPathspecMatcher, compilePathspecs } from "./worktree-io-pathspec.js";
 
-/** Rows per working-tree scan. This is also the metadata memory bound. */
-export const WORKTREE_SCAN_PAGE = 1000;
 export interface WalkOptions {
   /**
    * Absolute paths that are the root of a *different* registered
@@ -62,7 +59,7 @@ export function walkWorktree(
  * The filesystem's path-key order is git's tree order. `a.txt` really does
  * sort before `a/x`, since "." is 0x2E and "/" is 0x2F.
  *
- * Bound: one scan page of metadata.
+ * Bound: the drive's scan window of metadata.
  */
 export function* walkWorktreeStream(
   worktree: Worktree,
@@ -95,162 +92,69 @@ export function* walkWorktreeEntriesStream(
     throw new Error("files-only worktree walks cannot prune directories");
   }
   const lexicalRoot = root.replace(/\/+$/, "") || "/";
-  const base = readWorktreeRealpath(worktree, lexicalRoot);
+  const base = worktree.realpath(lexicalRoot);
   const excluded = new Set<string>();
-  let after: string | undefined;
-  let afterSubtree: string | undefined;
-  // `after` is cleared on the subtree branch, so progress needs its own record.
-  let lastScanned: string | undefined;
+  const prunedDirectories = new Set<string>();
+  const pathspec = options.pathspec ?? compilePathspecs(options.paths);
   let scannedRows = 0;
-  const pruned: Array<{ directory: string; lower: string; upper: string }> = [];
-  let pathspec = options.pathspec;
 
-  if (pathspec === undefined) {
-    pathspec = compilePathspecs(options.paths);
-  }
   for (const path of options.excludeRoots ?? []) {
     const relative = relativeTo(lexicalRoot, path);
     const excludedPath = relative === null ? path.replace(/\/+$/, "") : joinPath(base, relative);
     excluded.add(excludedPath);
   }
-  const orderedScan = worktree.scanStream;
-  if (orderedScan !== undefined) {
-    const prunedDirectories = new Set<string>();
-    for (const entry of orderedScan.call(worktree, base, {
+  for (const entry of strictlyOrderedScan(
+    worktree.scanStream(base, {
       filesOnly: options.filesOnly,
       pruneDirectory: (path) => prunedDirectories.delete(path),
-    })) {
-      if (options.maxScanRows !== undefined && scannedRows >= options.maxScanRows) {
-        throw new GitError("E2BIG", `worktree scan exceeds ${options.maxScanRows} rows`);
-      }
-      scannedRows++;
-      const relative = relativeTo(base, entry.path);
-      if (relative === null) continue;
-      if (excluded.has(entry.path)) {
-        if (entry.type === "dir") prunedDirectories.add(entry.path);
-        continue;
-      }
-      if (entry.type === "dir") {
-        const outsidePathspec = !pathspec.includesDirectory(relative);
-        const ignored =
-          options.includeIgnored !== true && options.ignores?.ignores(relative, true) === true;
-        if (outsidePathspec || ignored || options.pruneDirectory?.(relative) === true) {
-          prunedDirectories.add(entry.path);
-          continue;
-        }
-        if (options.includeDirectories === true) {
-          yield { path: relative, stat: statFromScan(entry) };
-        }
-        continue;
-      }
-      if (!pathspec.matchesEntry(relative)) continue;
-      if (options.includeIgnored !== true && options.ignores?.ignores(relative, false) === true) {
-        continue;
-      }
-      yield { path: relative, stat: statFromScan(entry) };
+    }),
+  )) {
+    if (options.maxScanRows !== undefined && scannedRows >= options.maxScanRows) {
+      throw new GitError("E2BIG", `worktree scan exceeds ${options.maxScanRows} rows`);
     }
-    return;
-  }
-  while (true) {
-    const read =
-      afterSubtree === undefined
-        ? readWorktreeScanPage(worktree, base, {
-            after,
-            filesOnly: options.filesOnly,
-            limit: WORKTREE_SCAN_PAGE,
-          })
-        : readWorktreeScanPage(worktree, base, {
-            afterSubtree,
-            filesOnly: options.filesOnly,
-            limit: WORKTREE_SCAN_PAGE,
-          });
-    const entries = read.page;
-    afterSubtree = undefined;
-    if (entries.length === 0) return;
-    // A drive that ignores either cursor would page the same rows forever, so
-    // the walk would never terminate and every consumer would accumulate its
-    // rows. Both cursors resume strictly past the previous page's last row.
-    const tail = entries[entries.length - 1];
-    if (tail !== undefined) {
-      if (lastScanned !== undefined && comparePaths(tail.path, lastScanned) <= 0) {
-        throw new CorruptError("worktree scan cursor made no progress");
-      }
-      lastScanned = tail.path;
+    scannedRows++;
+    const relative = relativeTo(base, entry.path);
+    if (relative === null) continue;
+    if (excluded.has(entry.path)) {
+      if (entry.type === "dir") prunedDirectories.add(entry.path);
+      continue;
     }
-
-    for (let index = 0; index < entries.length; index++) {
-      const entry = entries[index];
-      if (entry === undefined) continue;
-      if (options.maxScanRows !== undefined && scannedRows >= options.maxScanRows) {
-        throw new GitError("E2BIG", `worktree scan exceeds ${options.maxScanRows} rows`);
-      }
-      scannedRows++;
-      after = entry.path;
-
-      while (
-        pruned.length > 0 &&
-        comparePaths(entry.path, pruned[pruned.length - 1]?.upper ?? "") >= 0
-      ) {
-        pruned.pop();
-      }
-      const active = pruned[pruned.length - 1];
-      if (active !== undefined && comparePaths(entry.path, active.lower) >= 0) continue;
-
-      const relative = relativeTo(base, entry.path);
-      if (relative === null) continue;
-
-      if (excluded.has(entry.path)) {
-        if (entry.type === "dir") {
-          retainPrunedRange(pruned, entry.path);
-        }
+    if (entry.type === "dir") {
+      const outsidePathspec = !pathspec.includesDirectory(relative);
+      // git never descends into an ignored directory, which is also why a
+      // re-include below one cannot take effect.
+      const ignored =
+        options.includeIgnored !== true && options.ignores?.ignores(relative, true) === true;
+      if (outsidePathspec || ignored || options.pruneDirectory?.(relative) === true) {
+        prunedDirectories.add(entry.path);
         continue;
       }
-
-      if (entry.type === "dir") {
-        const outsidePathspec = !pathspec.includesDirectory(relative);
-        // git never descends into an ignored directory, which is also why a
-        // re-include below one cannot take effect.
-        const ignored =
-          options.includeIgnored !== true && options.ignores?.ignores(relative, true) === true;
-        if (outsidePathspec || ignored || options.pruneDirectory?.(relative) === true) {
-          retainPrunedRange(pruned, entry.path);
-          continue;
-        }
-        if (options.includeDirectories === true) {
-          yield { path: relative, stat: statFromScan(entry) };
-        }
-        continue;
+      if (options.includeDirectories === true) {
+        yield { path: relative, stat: statFromScan(entry) };
       }
-
-      if (!pathspec.matchesEntry(relative)) continue;
-      if (options.includeIgnored !== true && options.ignores?.ignores(relative, false) === true) {
-        continue;
-      }
-      yield { path: relative, stat: statFromScan(entry) };
+      continue;
     }
-
-    if (entries.length < WORKTREE_SCAN_PAGE) return;
-
-    const active = pruned[pruned.length - 1];
-    const last = entries[entries.length - 1];
-    if (
-      active !== undefined &&
-      last !== undefined &&
-      comparePaths(last.path, active.lower) >= 0 &&
-      comparePaths(last.path, active.upper) < 0
-    ) {
-      after = undefined;
-      afterSubtree = active.directory;
-      pruned.pop();
+    if (!pathspec.matchesEntry(relative)) continue;
+    if (options.includeIgnored !== true && options.ignores?.ignores(relative, false) === true) {
+      continue;
     }
+    yield { path: relative, stat: statFromScan(entry) };
   }
 }
 
-function retainPrunedRange(
-  ranges: Array<{ directory: string; lower: string; upper: string }>,
-  path: string,
-): void {
-  ranges.push(prunedRange(path));
+/**
+ * Every merge join over a drive scan assumes strict `comparePaths` order; a
+ * repeated or backward row would silently corrupt the join or never end.
+ */
+export function* strictlyOrderedScan(entries: Iterable<ScanEntry>): Generator<ScanEntry> {
+  let previous: string | undefined;
+  for (const entry of entries) {
+    if (previous !== undefined && comparePaths(entry.path, previous) <= 0) {
+      throw new CorruptError(`worktree scan is not strictly ordered at ${entry.path}`);
+    }
+    previous = entry.path;
+    yield entry;
+  }
 }
 
 export function statFromScan(entry: ScanEntry): WorktreeStat {
@@ -265,24 +169,4 @@ export function statFromScan(entry: ScanEntry): WorktreeStat {
     target: entry.target,
     contentId: entry.contentId,
   };
-}
-
-function prunedRange(directory: string): { directory: string; lower: string; upper: string } {
-  return {
-    directory,
-    lower: `${directory}/`,
-    upper: subtreeSuccessor(directory),
-  };
-}
-
-export function readWorktreeRealpath(worktree: Worktree, path: string): RealPath {
-  return nativeRealpathOwned(worktree, path) ?? worktree.realpath(path);
-}
-
-export function readWorktreeScanPage(
-  worktree: Worktree,
-  root: RealPath,
-  options: ScanOptions,
-): { page: ScanEntry[] } {
-  return { page: nativeScanOwned(worktree, root, options) ?? worktree.scan(root, options) };
 }

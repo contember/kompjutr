@@ -34,7 +34,6 @@ function binding(workspace: TestWorkspace, scoped: boolean): GitWorkspaceBinding
       ...workspace.worktree,
       mutationScope: scoped ? workspace.worktree.mutationScope : undefined,
     },
-    exactRootStates: workspace.context.exactRootStates,
     now: workspace.context.now,
     timezoneOffset: workspace.context.timezoneOffset,
     defaultIdentity: { name: "Scope Test", email: "scope@example.test" },

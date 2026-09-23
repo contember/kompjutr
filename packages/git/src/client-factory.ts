@@ -25,7 +25,6 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     timezoneOffset: options.timezoneOffset ?? binding.timezoneOffset,
   };
   if (binding.defaultIdentity !== undefined) context.defaultIdentity = binding.defaultIdentity;
-  if (binding.exactRootStates !== undefined) context.exactRootStates = binding.exactRootStates;
   if (binding.http !== undefined) context.http = binding.http;
   if (binding.promisorAuth !== undefined) context.promisorAuth = binding.promisorAuth;
   if (binding.promisorHeaders !== undefined) context.promisorHeaders = binding.promisorHeaders;

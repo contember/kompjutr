@@ -1,87 +1,86 @@
 import { describe, expect, it } from "vitest";
-import type { ScanEntry, ScanOptions } from "../packages/do/src/fs/types.js";
+import { SCAN_STREAM_PAGE } from "../packages/do/src/fs/store/scan/scan-stream.js";
+import type { ScanEntry } from "../packages/do/src/fs/types.js";
+import { hashObject } from "../packages/git/src/common/objects.js";
 import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
 import {
-  WORKTREE_SCAN_PAGE,
+  dirtyPaths,
   walkWorktreeEntriesStream,
 } from "../packages/git/src/ops/worktree/worktree-io.js";
-import { makeWorkspace } from "./helpers/workspace.js";
+import { makeRepo, makeWorkspace } from "./helpers/workspace.js";
 
-/**
- * A drive that pages the same rows forever would never let the walk terminate,
- * so the walk must reject it. An unbounded regression is an infinite
- * synchronous loop that no test timeout can interrupt, so every walk here also
- * carries `maxScanRows`: a miss then fails as E2BIG instead of hanging.
- */
-const SCAN_ROW_CEILING = WORKTREE_SCAN_PAGE * 3;
-
-function file(path: string): ScanEntry {
+/** A drive whose stream yields every row twice. */
+function repeatingDrive(inner: Worktree): Worktree {
   return {
-    path,
-    type: "file",
-    mode: 0o644,
-    size: 0,
-    mtime: 0,
-    ino: 1,
-    nlink: 1,
-    rev: 1,
-    target: null,
-    contentId: null,
+    ...inner,
+    *scanStream(root, options): Generator<ScanEntry> {
+      for (const entry of inner.scanStream(root, options)) {
+        yield entry;
+        yield entry;
+      }
+    },
   };
 }
 
-function directory(path: string): ScanEntry {
-  return { ...file(path), type: "dir", mode: 0o755 };
-}
-
-/** One full page whose tail sits inside the pruned directory `/d`. */
-function prunedTailPage(): ScanEntry[] {
-  const page: ScanEntry[] = [directory("/d")];
-  for (let ordinal = 1; ordinal < WORKTREE_SCAN_PAGE; ordinal++) {
-    page.push(file(`/d/f${String(ordinal).padStart(4, "0")}`));
+/** One full page whose tail sits inside the directory `/d`, then `/e.txt`. */
+function prunedTailWorkspace(): ReturnType<typeof makeWorkspace> {
+  const workspace = makeWorkspace();
+  const bytes = new TextEncoder().encode("x");
+  const entries = [{ path: "/e.txt", bytes }];
+  for (let ordinal = 1; ordinal <= SCAN_STREAM_PAGE; ordinal++) {
+    entries.push({ path: `/d/f${String(ordinal).padStart(4, "0")}`, bytes });
   }
-  return page;
-}
-
-/** A drive that honours `after` and answers every `afterSubtree` with `page`. */
-function subtreeCursorDrive(inner: Worktree, page: ScanEntry[]): Worktree {
-  const first = prunedTailPage();
-  return new Proxy(inner, {
-    get(target, property, receiver) {
-      if (property === "scan") {
-        return (_root: string, options: ScanOptions): ScanEntry[] => {
-          if (options.afterSubtree !== undefined) return page;
-          return options.after === undefined ? first : [];
-        };
-      }
-      const value = Reflect.get(target, property, receiver);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
+  workspace.worktree.writeFiles(entries);
+  return workspace;
 }
 
 describe("worktree scan cursor", () => {
-  it("fails a drive that ignores afterSubtree instead of paging the same rows forever", () => {
-    const stubborn = subtreeCursorDrive(makeWorkspace().worktree, prunedTailPage());
-
-    expect(() => [
-      ...walkWorktreeEntriesStream(stubborn, "/", {
-        pruneDirectory: (path) => path === "d",
-        maxScanRows: SCAN_ROW_CEILING,
-      }),
-    ]).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-  }, 10_000);
-
-  it("still walks past a pruned subtree when the drive honours afterSubtree", () => {
-    const honest = subtreeCursorDrive(makeWorkspace().worktree, [file("/e.txt")]);
+  it("restarts past a pruned subtree when a page ends inside it", () => {
+    const workspace = prunedTailWorkspace();
+    workspace.storage.resetCounters();
 
     const walked = [
-      ...walkWorktreeEntriesStream(honest, "/", {
+      ...walkWorktreeEntriesStream(workspace.worktree, "/", {
         pruneDirectory: (path) => path === "d",
-        maxScanRows: SCAN_ROW_CEILING,
       }),
     ];
 
     expect(walked.map((entry) => entry.path)).toEqual(["e.txt"]);
+    // realpath, the first page, and one page resumed past `/d`.
+    expect(workspace.storage.statementCount).toBe(3);
+  });
+
+  it("resumes a drive stream strictly after the given path", () => {
+    const workspace = prunedTailWorkspace();
+    const root = workspace.worktree.realpath("/");
+
+    const resumed = [
+      ...workspace.worktree.scanStream(root, { filesOnly: true, after: "/d/f0999" }),
+    ];
+
+    expect(resumed.map((entry) => entry.path)).toEqual(["/d/f1000", "/e.txt"]);
+  });
+
+  it("fails closed when a drive repeats a row", () => {
+    const workspace = makeRepo("/");
+    const bytes = new TextEncoder().encode("x\n");
+    workspace.worktree.writeFiles([{ path: "/a.txt", bytes }]);
+    workspace.repo.checkout.indexPut({
+      path: "a.txt",
+      stage: 0,
+      mode: 0o100644,
+      oid: hashObject("blob", bytes),
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    const repeating = repeatingDrive(workspace.worktree);
+
+    expect(() => [...walkWorktreeEntriesStream(repeating, "/")]).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(() => dirtyPaths(workspace.repo, repeating)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
   });
 });

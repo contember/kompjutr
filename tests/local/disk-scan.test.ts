@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
 import { classifyDirectoryEntry } from "../../packages/local/src/drive/external-sort.js";
+import { comparePaths } from "../../packages/local/src/paths.js";
 import { TestDatabase } from "../helpers/db.js";
 import { localFixture } from "./helpers.js";
 
@@ -233,6 +234,63 @@ describe("DiskDrive ordered traversal", () => {
           })
           .handles.map((handle) => handle.path),
       ).toEqual(["/visible"]);
+    } finally {
+      workspace.close();
+      fixture.dispose();
+    }
+  });
+});
+
+describe("DiskDrive scan seek", () => {
+  const WIDE = 1_100;
+
+  function seekFixture(): ReturnType<typeof localFixture> {
+    const fixture = localFixture();
+    mkdirSync(join(fixture.root, "a", "deep", "deeper"), { recursive: true });
+    writeFileSync(join(fixture.root, "a.b"), "a.b");
+    writeFileSync(join(fixture.root, "a", "b"), "a/b");
+    writeFileSync(join(fixture.root, "a", "deep", "deeper", "leaf"), "leaf");
+    writeFileSync(join(fixture.root, ""), "private use");
+    mkdirSync(join(fixture.root, "\u{10000}"));
+    writeFileSync(join(fixture.root, "\u{10000}", "astral"), "astral");
+    mkdirSync(join(fixture.root, "wide"));
+    for (let index = 0; index < WIDE; index++) {
+      writeFileSync(join(fixture.root, "wide", `f${index.toString().padStart(4, "0")}`), "w");
+    }
+    return fixture;
+  }
+
+  it("resumes strictly after directory rows, lookalike names, spilled rows, and astral names", () => {
+    const fixture = seekFixture();
+    const workspace = fixture.workspace();
+    try {
+      const drive = workspace.drive;
+      for (const filesOnly of [false, true]) {
+        const full = [...drive.scanStream("/", { filesOnly })].map((entry) => entry.path);
+        for (const after of [
+          "/a",
+          "/a.b",
+          "/a/b",
+          "/a/deep",
+          "/a/deep/deeper/leaf",
+          "/wide",
+          "/wide/f0550",
+          "/wide/f0550x",
+          "/",
+          "/\u{10000}",
+          "/\u{10000}/astral",
+        ]) {
+          const expected = full.filter((path) => comparePaths(path, after) > 0);
+          const resumed = [...drive.scanStream("/", { filesOnly, after })].map(
+            (entry) => entry.path,
+          );
+          expect(resumed, `${after} filesOnly=${filesOnly}`).toEqual(expected);
+          expect(
+            drive.scan("/", { filesOnly, after, limit: 3 }).map((entry) => entry.path),
+            `scan ${after} filesOnly=${filesOnly}`,
+          ).toEqual(expected.slice(0, 3));
+        }
+      }
     } finally {
       workspace.close();
       fixture.dispose();

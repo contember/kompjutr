@@ -19,6 +19,7 @@ import {
   realpaths,
   realpathsNoFollow,
 } from "../../../packages/do/src/fs/store/resolve.js";
+import { scanStream } from "../../../packages/do/src/fs/store/scan/scan-stream.js";
 import {
   discoverFiles,
   glob,
@@ -44,6 +45,7 @@ function createTestProvider(): NodeFsCompat {
     rev: () => currentRev(db),
     realpath: (path) => realpath(db, path),
     scan: (root, options) => scan(db, realpath(db, root), options),
+    scanStream: (root, options) => scanStream(db, root, options),
     discoverFiles: (root, pattern, options) => discoverFiles(db, root, pattern, options),
     discoverFilesContaining: (root, pattern, needle, options) =>
       discoverFilesContaining(db, root, pattern, needle, options),

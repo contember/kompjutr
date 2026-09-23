@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ScanEntry, ScanOptions } from "../packages/do/src/fs/types.js";
+import { SCAN_STREAM_PAGE } from "../packages/do/src/fs/store/scan/scan-stream.js";
+import type { OrderedScanOptions, RealPath, ScanEntry } from "../packages/do/src/fs/types.js";
 import { fromHex } from "../packages/git/src/common/bytes.js";
 import { hashObject } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
@@ -12,7 +13,6 @@ import {
   dirtyPaths,
   hashWorktreePaths,
   MAX_COMPILED_PATHS,
-  WORKTREE_SCAN_PAGE,
   type WorktreePath,
   walkWorktree,
   walkWorktreeEntriesStream,
@@ -56,14 +56,15 @@ function mutateAfterFirstScan(inner: Worktree, mutate: () => void): Worktree {
   let armed = true;
   return new Proxy(inner, {
     get(target, property, receiver) {
-      if (property === "scan") {
-        return (root: string, options: ScanOptions): ScanEntry[] => {
-          const entries = target.scan(root, options);
-          if (armed) {
-            armed = false;
-            mutate();
+      if (property === "scanStream") {
+        return function* (root: RealPath, options?: OrderedScanOptions): Generator<ScanEntry> {
+          for (const entry of target.scanStream(root, options)) {
+            yield entry;
+            if (armed) {
+              armed = false;
+              mutate();
+            }
           }
-          return entries;
         };
       }
       const value = Reflect.get(target, property, receiver);
@@ -667,7 +668,7 @@ describe("batched worktree hashing", () => {
   });
 
   it("releases a full hash-refresh page after an injected next-page failure", () => {
-    const { workspace, paths } = candidates(WORKTREE_SCAN_PAGE + 1);
+    const { workspace, paths } = candidates(SCAN_STREAM_PAGE + 1);
     workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
     workspace.repo.store.db.run(
       `UPDATE fs_nodes SET type = 'injected'

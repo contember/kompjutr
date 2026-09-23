@@ -1,10 +1,4 @@
-import { exactPathStatesOwned } from "@kompjutr/drive";
-import {
-  CorruptError,
-  GitError,
-  RefNotFoundError,
-  UnsupportedOperationError,
-} from "../../common/errors.js";
+import { CorruptError, errorCode, GitError, RefNotFoundError } from "../../common/errors.js";
 import { normalizePath } from "../../common/paths.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../../common/ref-name.js";
 import {
@@ -14,18 +8,20 @@ import {
 import { type CheckoutRow, type CheckoutStore, listCheckoutsOwned } from "../../store/index.js";
 import { mutateRefsOwned } from "../../store/refs/refs.js";
 import { checkoutTree } from "../checkout/checkout.js";
-import type { ExactRootState, GitContext } from "../core/context.js";
+import type { GitContext } from "../core/context.js";
 import { requireSharedDatabaseScope, requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata } from "../core/ref-log.js";
 import { Repository } from "../repository/repository.js";
 import { statusStream } from "../status/status.js";
+
+type WorktreeRootState = "present" | "missing";
 
 export interface WorktreeInfo {
   readonly checkoutId: number;
   readonly root: string;
   readonly head: string;
   readonly isPrimary: boolean;
-  readonly state: "present" | "missing";
+  readonly state: WorktreeRootState;
 }
 
 export type WorktreeAddTarget =
@@ -48,11 +44,6 @@ interface AddPlan {
   treeOid: string;
   branch: string | null;
   createBranch: boolean;
-}
-
-interface WorktreeSnapshot {
-  rows: readonly CheckoutRow[];
-  states: readonly ExactRootState[];
 }
 
 function worktreeError(code: string, message: string): GitError {
@@ -170,7 +161,7 @@ function initializeCheckout(
   return undefined;
 }
 
-function info(row: CheckoutRow, state: ExactRootState): WorktreeInfo {
+function info(row: CheckoutRow, state: WorktreeRootState): WorktreeInfo {
   return Object.freeze({
     checkoutId: row.id,
     root: row.root,
@@ -180,22 +171,21 @@ function info(row: CheckoutRow, state: ExactRootState): WorktreeInfo {
   });
 }
 
-function snapshot(context: GitContext, repo: Repository): WorktreeSnapshot {
-  const source = context.exactRootStates;
-  if (source === undefined) throw new UnsupportedOperationError("worktree listing");
-  const rows = listCheckoutsOwned(context.database, repo.store.repoId);
-  const roots = rows.map((row) => row.root);
-  const ownedStates = exactPathStatesOwned(source, roots);
-  const states = ownedStates ?? source.states(roots);
-  if (states.length !== rows.length) {
-    throw new CorruptError("worktree state source returned an invalid result length");
+/** An lstat of the root; a root that cannot be reached is prunable. */
+function rootState(context: GitContext, root: string): WorktreeRootState {
+  try {
+    return context.worktree.stat(root) === null ? "missing" : "present";
+  } catch (error) {
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ELOOP") return "missing";
+    throw error;
   }
-  for (const state of states) {
-    if (state !== "present" && state !== "missing") {
-      throw new CorruptError("worktree state source returned an invalid state");
-    }
-  }
-  return { rows, states };
+}
+
+/** One root stat per checkout. */
+function snapshot(context: GitContext, repo: Repository): WorktreeInfo[] {
+  return listCheckoutsOwned(context.database, repo.store.repoId).map((row) =>
+    info(row, rootState(context, row.root)),
+  );
 }
 
 export function worktreeAdd(
@@ -231,17 +221,7 @@ export function worktreeAddOwned(
 }
 
 export function worktreeList(context: GitContext, repo: Repository): readonly WorktreeInfo[] {
-  const current = snapshot(context, repo);
-  const result: WorktreeInfo[] = [];
-  for (let index = 0; index < current.rows.length; index++) {
-    const row = current.rows[index];
-    const state = current.states[index];
-    if (row === undefined || state === undefined) {
-      throw new CorruptError("worktree state source returned an incomplete result");
-    }
-    result.push(info(row, state));
-  }
-  return Object.freeze(result);
+  return Object.freeze(snapshot(context, repo));
 }
 
 export function worktreeRemove(
@@ -292,18 +272,12 @@ export function worktreePrune(context: GitContext, repo: Repository): readonly W
 
 /** @internal Prune worktrees while the caller owns the Git mutation guard. */
 export function worktreePruneOwned(context: GitContext, repo: Repository): readonly WorktreeInfo[] {
-  const current = snapshot(context, repo);
   const checkoutIds: number[] = [];
   const selected = new Map<number, WorktreeInfo>();
-  for (let index = 0; index < current.rows.length; index++) {
-    const row = current.rows[index];
-    const state = current.states[index];
-    if (row === undefined || state === undefined) {
-      throw new CorruptError("worktree state source returned an incomplete result");
-    }
-    if (state === "missing" && !row.isPrimary) {
-      checkoutIds.push(row.id);
-      selected.set(row.id, info(row, state));
+  for (const item of snapshot(context, repo)) {
+    if (item.state === "missing" && !item.isPrimary) {
+      checkoutIds.push(item.checkoutId);
+      selected.set(item.checkoutId, item);
     }
   }
   const removed = sqliteGitDatabaseMutations(context.database).removeCheckoutsOwned(

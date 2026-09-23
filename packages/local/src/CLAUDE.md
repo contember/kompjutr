@@ -27,7 +27,8 @@ Unix Node.js composition over `node:sqlite` and a host disk working tree.
 - Keep disk `contentId` as `null`. Correctness rehashes host content instead of
   trusting inode, size, or timestamp equality.
 - Stream traversals in Git UTF-8 path order. Wide-directory sorting uses bounded
-  runs and fan-in; never materialize the whole tree.
+  runs and fan-in; never materialize the whole tree. A scan resumed `after` a
+  path skips earlier entries and subtrees before any stat.
 
 ## Boundaries
 

@@ -23,7 +23,6 @@ import {
   type LsFilesOptions,
 } from "../packages/git/src/ops/worktree/pathspec.js";
 import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
-import { WORKTREE_SCAN_PAGE } from "../packages/git/src/ops/worktree/worktree-io.js";
 import type { IndexEntry } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -749,9 +748,8 @@ describe("ls-files selection", () => {
     expect(indexed).toBeLessThanOrEqual(100_000);
     expect(walked).toBeLessThanOrEqual(100_000);
     expect(indexed + walked).toBe(100_002);
-    expect(synthetic.scanCalls()).toBe(51);
+    expect(synthetic.scanStarts()).toBe(1);
     expect(synthetic.scannedRows()).toBe(walked);
-    expect(synthetic.maxScanLimit()).toBe(WORKTREE_SCAN_PAGE);
   });
 
   it("continues after the former 100,000-row worktree scan ceiling", () => {
@@ -762,9 +760,8 @@ describe("ls-files selection", () => {
       paths: ["never"],
     });
     expect(result).toEqual([]);
-    expect(exact.scanCalls()).toBe(101);
+    expect(exact.scanStarts()).toBe(1);
     expect(exact.scannedRows()).toBe(formerLimit);
-    expect(exact.maxScanLimit()).toBe(WORKTREE_SCAN_PAGE);
 
     const excess = syntheticWorktreeSelection(formerLimit + 1, { selectedLast: true });
     expect(
@@ -773,9 +770,8 @@ describe("ls-files selection", () => {
         paths: ["*selected"],
       }),
     ).toEqual(["z-selected"]);
-    expect(excess.scanCalls()).toBe(101);
+    expect(excess.scanStarts()).toBe(1);
     expect(excess.scannedRows()).toBe(formerLimit + 1);
-    expect(excess.maxScanLimit()).toBe(WORKTREE_SCAN_PAGE);
   });
 });
 
@@ -785,24 +781,18 @@ function syntheticWorktreeSelection(
 ): {
   workspace: TestRepository;
   worktree: Worktree;
-  scanCalls(): number;
+  scanStarts(): number;
   scannedRows(): number;
-  maxScanLimit(): number;
 } {
   const workspace = makeRepo("/");
   const prefix = fixtureOptions.prefix ?? "p";
-  let calls = 0;
+  let starts = 0;
   let rows = 0;
-  let maxLimit = 0;
-  const scan = (_root: string, options: ScanOptions): ScanEntry[] => {
-    calls++;
-    maxLimit = Math.max(maxLimit, options.limit);
-    const prior = options.after;
-    const start = prior === undefined ? 0 : Number.parseInt(prior.slice(2), 10) + 1;
-    const end = Math.min(total, start + options.limit);
-    const page: ScanEntry[] = [];
-    for (let index = start; index < end; index++) {
-      page.push({
+  const scanStream = function* (): Generator<ScanEntry> {
+    starts++;
+    for (let index = 0; index < total; index++) {
+      rows++;
+      yield {
         path:
           fixtureOptions.selectedLast === true && index === total - 1
             ? "/z-selected"
@@ -816,18 +806,15 @@ function syntheticWorktreeSelection(
         rev: 0,
         target: null,
         contentId: null,
-      });
+      };
     }
-    rows += page.length;
-    return page;
   };
   const worktree = new CountingWorktree(workspace.worktree);
-  Object.defineProperty(worktree, "scan", { value: scan });
+  Object.defineProperty(worktree, "scanStream", { value: scanStream });
   return {
     workspace,
     worktree,
-    scanCalls: () => calls,
+    scanStarts: () => starts,
     scannedRows: () => rows,
-    maxScanLimit: () => maxLimit,
   };
 }

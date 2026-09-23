@@ -1,6 +1,5 @@
 import type { GitCliInput, GitCliResult, GitCliRunner } from "./cli/types.js";
 import type {
-  ExactRootStateSource,
   GitCliNetworkBinding,
   GitIdentity,
   InitialWorktreeWriter,
@@ -287,7 +286,6 @@ export interface Git extends GitCliRunner {
 export interface GitWorkspaceBinding {
   database: SqliteGitDatabase;
   worktree: Worktree;
-  exactRootStates?: ExactRootStateSource;
   initialWorktree?: InitialWorktreeWriter;
   /** Must be built over `database.db`; the client refuses any other database. */
   sparse?: SparseCapability;

@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import type { ScanEntry } from "../packages/do/src/fs/types.js";
 import { utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
 import { hashObject, type Person, serializeCommit } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
@@ -77,21 +76,6 @@ function mergeTopic(
 function textAt(workspace: TestRepository, path: string): string | null {
   const stat = workspace.worktree.stat(`/${path}`);
   return stat === null ? null : utf8Decoder.decode(workspace.worktree.readFile(`/${path}`));
-}
-
-function scanEntry(path: string, ino: number): ScanEntry {
-  return {
-    path,
-    type: "file",
-    mode: 0o100644,
-    size: 0,
-    mtime: 0,
-    ino,
-    nlink: 1,
-    rev: 1,
-    target: null,
-    contentId: null,
-  };
 }
 
 describe("merge apply and abort", () => {
@@ -206,29 +190,6 @@ describe("merge apply and abort", () => {
       oid: hashObject("blob", utf8.encode("next\n")),
     });
     expect(workspace.repo.checkout.readMergeState()).toBeNull();
-  });
-
-  it("rejects a worktree snapshot cursor that does not advance", () => {
-    const workspace = makeRepo();
-    history(
-      workspace,
-      { "base.txt": "base\n" },
-      { "base.txt": "base\n" },
-      {
-        "base.txt": "base\n",
-        "z.txt": "next\n",
-      },
-    );
-    const page = Array.from({ length: 1_000 }, (_, ordinal) =>
-      scanEntry(`/a-${ordinal.toString().padStart(4, "0")}`, ordinal + 1),
-    );
-    const fallbackWorktree: Worktree = { ...workspace.worktree, scan: () => page };
-
-    expect(() => mergeTopic(workspace, true, fallbackWorktree)).toThrow(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(workspace.repo.checkout.readMergeState()).toBeNull();
-    expect(textAt(workspace, "z.txt")).toBeNull();
   });
 
   it("snapshots and restores files past the former read-call caps", () => {

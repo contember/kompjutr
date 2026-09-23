@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import type { ScanEntry, ScanOptions } from "../packages/do/src/fs/types.js";
+import type { OrderedScanOptions, RealPath, ScanEntry } from "../packages/do/src/fs/types.js";
 import { fromHex, utf8 } from "../packages/git/src/common/bytes.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
 import type { IgnoreMatcher } from "../packages/git/src/ignore/index.js";
@@ -153,23 +153,31 @@ class BulkOnlyWorktree extends CountingWorktree {
 }
 
 class ScanCountingWorktree extends BulkOnlyWorktree {
-  readonly scanPages: Array<{
+  readonly scanStarts: Array<{
     after: string | undefined;
-    afterSubtree: string | undefined;
     filesOnly: boolean | undefined;
     rows: ScanEntry[];
   }> = [];
 
-  override scan(root: string, options: ScanOptions): ScanEntry[] {
-    const rows = super.scan(root, options);
-    this.scanPages.push({
-      after: options.after,
-      afterSubtree: options.afterSubtree,
-      filesOnly: options.filesOnly,
-      rows,
-    });
-    return rows;
+  override *scanStream(root: RealPath, options: OrderedScanOptions = {}): Generator<ScanEntry> {
+    const start = { after: options.after, filesOnly: options.filesOnly, rows: [] as ScanEntry[] };
+    this.scanStarts.push(start);
+    for (const entry of super.scanStream(root, options)) {
+      start.rows.push(entry);
+      yield entry;
+    }
   }
+}
+
+/** Keyset scan pages the DO drive issued, from the statement histogram. */
+function scanPageStatements(histogram: Map<string, number> | null): number {
+  let pages = 0;
+  for (const [statement, calls] of histogram ?? []) {
+    if (statement.startsWith("SELECT fs_paths.path AS path, fs_paths.inode AS inode,")) {
+      pages += calls;
+    }
+  }
+  return pages;
 }
 
 function buildStatusScale(
@@ -1052,8 +1060,8 @@ describe("status cost", () => {
 
     expect(status(workspace.repo, worktree, { renames: false })).toHaveLength(paths.length);
 
-    const refreshes = worktree.scanPages.filter((page) => page.filesOnly === true);
-    expect(refreshes.map((page) => page.after)).toEqual([undefined, "/f0999.txt", "/f1999.txt"]);
+    const refreshes = worktree.scanStarts.filter((start) => start.filesOnly === true);
+    expect(refreshes.map((start) => start.after)).toEqual([undefined, "/f0999.txt", "/f1999.txt"]);
   });
 
   it("streams a 24,252-file index and reports all 100 modifications", () => {
@@ -1184,6 +1192,7 @@ describe("status cost", () => {
         },
       };
       const worktree = new ScanCountingWorktree(workspace.worktree);
+      workspace.storage.histogram = new Map();
       workspace.storage.resetCounters();
       const rows = status(workspace.repo, worktree, {
         renames: false,
@@ -1193,7 +1202,8 @@ describe("status cost", () => {
       return {
         rows,
         joinedFiles,
-        pages: worktree.scanPages,
+        pages: scanPageStatements(workspace.storage.histogram),
+        streamed: worktree.scanStarts.flatMap((start) => start.rows),
         statements: workspace.storage.statementCount,
       };
     };
@@ -1202,13 +1212,11 @@ describe("status cost", () => {
     const wider = measure(5_000, false, false);
     expect(pruned.rows).toEqual([]);
     expect(pruned.joinedFiles).toBe(0);
-    expect(pruned.pages).toHaveLength(2);
-    expect(pruned.pages[0]?.rows.filter((row) => row.path.startsWith("/ignored/"))).toHaveLength(
-      999,
-    );
-    expect(pruned.pages[1]).toMatchObject({ afterSubtree: "/ignored", rows: [] });
+    // 2,501 rows fit two pages only because the second resumes past `/ignored`.
+    expect(pruned.pages).toBe(2);
+    expect(pruned.streamed.map((row) => row.path)).toEqual(["/ignored"]);
     expect(wider.joinedFiles).toBe(0);
-    expect(wider.pages).toHaveLength(2);
+    expect(wider.pages).toBe(2);
     expect(wider.statements).toBeLessThan(1_000);
     expect(pruned.statements).toBeLessThan(1_000);
 
@@ -1217,14 +1225,12 @@ describe("status cost", () => {
       expect.objectContaining({ path: "ignored/file0000.txt", index: "A" }),
     ]);
     expect(withTracked.joinedFiles).toBe(2_499);
-    expect(withTracked.pages).toHaveLength(3);
-    expect(withTracked.pages.every((page) => page.afterSubtree === undefined)).toBe(true);
+    expect(withTracked.pages).toBe(3);
 
     const included = measure(2_500, false, true);
     expect(included.rows).toEqual([expect.objectContaining({ path: "ignored/", ignored: true })]);
     expect(included.joinedFiles).toBe(2_500);
-    expect(included.pages).toHaveLength(3);
-    expect(included.pages.every((page) => page.afterSubtree === undefined)).toBe(true);
+    expect(included.pages).toBe(3);
   });
 
   it("fails before one retained tracked path and directory crosses the memory cap", () => {

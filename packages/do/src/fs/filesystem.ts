@@ -5,10 +5,10 @@ import { createFilesystemOps } from "./ops.js";
 import { initializeFsSchema } from "./schema.js";
 import { COPY_ENTRY_LIMIT, copyFiles as copyStoredFiles } from "./store/copy.js";
 import { currentRev } from "./store/meta.js";
-import { registerNativeOwnedReads } from "./store/owned-read.js";
 import { readFileHandles, readFiles as readStoredFiles } from "./store/read.js";
 import { removeFiles as removeStoredFiles } from "./store/remove.js";
 import { realpath, realpaths, realpathsNoFollow } from "./store/resolve.js";
+import { scanStream } from "./store/scan/scan-stream.js";
 import {
   discoverFiles,
   glob as scanGlob,
@@ -121,6 +121,7 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
       else scanRoots.set(root, resolved);
       return page;
     },
+    scanStream: (root, streamOptions) => scanStream(db, root, streamOptions),
     discoverFiles: (root, pattern, discoverOptions) =>
       discoverFiles(db, root, pattern, discoverOptions),
     discoverFilesContaining: (
@@ -248,6 +249,5 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
     },
     withReadScope: (work) => work(),
   };
-  registerNativeOwnedReads(filesystem, db);
   return filesystem;
 }

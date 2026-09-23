@@ -185,6 +185,7 @@ export class DiskDrive implements GitDrive {
     }
     if (!rootStat.isDirectory()) return;
     const revision = this.#observations.next();
+    let after = options.after;
     const stack: TraversalFrame[] = [
       {
         virtual: canonicalRoot,
@@ -201,12 +202,20 @@ export class DiskDrive implements GitDrive {
           continue;
         }
         const path = joinVirtual(frame.virtual, step.value.name);
+        // Seek without a stat: skip rows and whole subtrees at or before `after`.
+        if (after !== undefined) {
+          const end = step.value.descend ? subtreeSuccessor(path) : path;
+          if (comparePaths(end, after) <= 0) continue;
+          if (!step.value.descend) after = undefined;
+        }
         const host = this.#mapper.lexicalHost(path);
         const stat = statAt(host, revision);
         if (stat === null) continue;
         if (step.value.descend) {
           if (stat.type !== "dir") {
-            if (options.filesOnly === true) yield { path, ...stat };
+            // The seek kept this subtree, but a file that replaced it may sort before `after`.
+            const resumed = after === undefined || comparePaths(path, after) > 0;
+            if (options.filesOnly === true && resumed) yield { path, ...stat };
             continue;
           }
           if (options.pruneDirectory?.(path) === true) continue;
@@ -234,8 +243,10 @@ export class DiskDrive implements GitDrive {
     const afterSubtree =
       options.afterSubtree === undefined ? undefined : subtreeSuccessor(options.afterSubtree);
     const entries: ScanEntry[] = [];
-    for (const entry of this.scanStream(root, { filesOnly: options.filesOnly })) {
-      if (options.after !== undefined && comparePaths(entry.path, options.after) <= 0) continue;
+    for (const entry of this.scanStream(root, {
+      filesOnly: options.filesOnly,
+      after: options.after,
+    })) {
       if (afterSubtree !== undefined && comparePaths(entry.path, afterSubtree) < 0) continue;
       entries.push(entry);
       if (entries.length === options.limit) break;

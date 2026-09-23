@@ -10,6 +10,15 @@ measured cost.
 The first release is a library API. It is not a replacement for the `git`
 executable and does not read or write a conventional `.git` directory.
 
+> **Correction (2026-09-23, simplification sprint WU17).** The native realpath,
+> scan, and exact-state receipt registries, `realpathOwned()`, `scanOwned()`, the
+> exact-path source, and the optional scan stream are removed. Every `GitDrive`
+> implements a required `scanStream` over a `RealPath` root; the Durable Object
+> drive streams 1,000-row keyset pages. Worktree list and prune stat each root
+> through the drive, one stat per checkout, instead of one bounded `fs_*` query.
+> Items 1–3 of "Durable Object fast path" and the matching bullets below are
+> historical.
+
 ## Package graph
 
 The repository is a private npm workspace root with five publishable packages.

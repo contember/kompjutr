@@ -154,7 +154,13 @@ export interface RemoveOptions {
 
 export interface OrderedScanOptions {
   filesOnly?: boolean;
-  /** Called after a directory row is observed and before its descendants are read. */
+  /** Start strictly after this path. */
+  after?: string;
+  /**
+   * Called after a directory row is yielded and before its descendants are
+   * read. A files-only scan may yield no directory rows, so callers that need
+   * the exclusion still filter.
+   */
   pruneDirectory?: (path: string) => boolean;
 }
 
@@ -169,7 +175,8 @@ export interface GitDrive {
   readlink(path: string): string;
   readdir(path: string): Dirent[];
   scan(root: string, options: ScanOptions): ScanEntry[];
-  scanStream?(root: string, options?: OrderedScanOptions): Iterable<ScanEntry>;
+  /** Everything under `root` in `comparePaths` order, streamed in bounded memory. */
+  scanStream(root: RealPath, options?: OrderedScanOptions): Iterable<ScanEntry>;
   discoverFiles(root: RealPath, pattern: string, options?: DiscoverFilesOptions): DiscoverFilesPage;
   readFileHandles(
     handles: readonly RegularFileHandle[],
@@ -193,22 +200,7 @@ export interface GitDrive {
   removeFiles(paths: readonly string[], options?: RemoveOptions): void;
 }
 
-export interface OrderedScanSource {
-  scanStream(root: string, options?: OrderedScanOptions): Iterable<ScanEntry>;
-}
-
 export const S_IFMT = 0o170000;
 export const S_IFREG = 0o100000;
 export const S_IFDIR = 0o040000;
 export const S_IFLNK = 0o120000;
-
-export {
-  type ExactPathState,
-  type ExactPathStateSource,
-  exactPathStatesOwned,
-  type NativeDriveReads,
-  nativeRealpathOwned,
-  nativeScanOwned,
-  registerExactPathStates,
-  registerNativeDriveReads,
-} from "./receipts.js";

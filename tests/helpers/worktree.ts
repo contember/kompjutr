@@ -4,6 +4,7 @@ import type {
   DiscoverFilesOptions,
   DiscoverFilesPage,
   HandleReadBatch,
+  OrderedScanOptions,
   ReadBatch,
   RealPath,
   RegularFileHandle,
@@ -89,6 +90,9 @@ export class CountingWorktree implements Worktree {
   }
   scan(root: string, options: ScanOptions): ScanEntry[] {
     return this.inner.scan(root, options);
+  }
+  scanStream(root: RealPath, options?: OrderedScanOptions): Iterable<ScanEntry> {
+    return this.inner.scanStream(root, options);
   }
   discoverFiles(
     root: RealPath,

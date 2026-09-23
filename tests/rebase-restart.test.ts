@@ -1,7 +1,7 @@
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { ScanEntry, ScanOptions } from "../packages/do/src/fs/types.js";
+import type { OrderedScanOptions, RealPath, ScanEntry } from "../packages/do/src/fs/types.js";
 import { fromHex } from "../packages/git/src/common/bytes.js";
 import { serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
 import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
@@ -96,16 +96,16 @@ class LateMetadataWorktree extends CountingWorktree {
     super(inner);
   }
 
-  override scan(root: string, options: ScanOptions): ScanEntry[] {
-    const page = super.scan(root, options);
+  override *scanStream(root: RealPath, options?: OrderedScanOptions): Generator<ScanEntry> {
     this.scanCalls++;
-    return page.map((entry) =>
-      entry.path === "/guard.bin"
-        ? this.scanCalls <= 2
+    const call = this.scanCalls;
+    for (const entry of super.scanStream(root, options)) {
+      yield entry.path === "/guard.bin"
+        ? call <= 2
           ? { ...entry, contentId: this.cleanContentId }
           : { ...entry, mtime: entry.mtime + 1, rev: entry.rev + 1, contentId: null }
-        : entry,
-    );
+        : entry;
+    }
   }
 }
 

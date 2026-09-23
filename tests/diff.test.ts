@@ -266,6 +266,10 @@ class NoTraversalWorktree extends BulkOnlyWorktree {
     throw new Error(`worktree scan is forbidden during staged diff: ${root}`);
   }
 
+  override scanStream(root: string): never {
+    throw new Error(`worktree scan is forbidden during staged diff: ${root}`);
+  }
+
   override discoverFiles(root: string): never {
     throw new Error(`worktree discovery is forbidden during staged diff: ${root}`);
   }

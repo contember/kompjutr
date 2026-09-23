@@ -1,5 +1,4 @@
 import { NodeFsCompat } from "../../packages/do/src/fs/compat/node.js";
-import { createExactPathStateSource } from "../../packages/do/src/fs/exact-path-states.js";
 import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
 import type { Filesystem } from "../../packages/do/src/fs/types.js";
 import { createSqliteSparseCapability } from "../../packages/git/src/do-fs/index.js";
@@ -40,7 +39,6 @@ export function makeWorkspace(options: MakeWorkspaceOptions = {}): TestWorkspace
   const context: GitContext = {
     database,
     worktree,
-    exactRootStates: createExactPathStateSource(db),
     sparseWorkspace: createSqliteSparseCapability(db).workspace,
     now,
     timezoneOffset: () => options.timezoneOffset ?? 0,

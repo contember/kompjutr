@@ -11,7 +11,6 @@ import {
 import { createSqliteSparseCapability, initializeIndexTracker } from "@kompjutr/git/do-fs";
 import { Database, type DurableObjectStorageLike } from "../db/db.js";
 import { NodeFsCompat } from "../fs/compat/node.js";
-import { createExactPathStateSource } from "../fs/exact-path-states.js";
 import { createFilesystem } from "../fs/filesystem.js";
 import { createInitialWorktreeWriter } from "../fs/store/initial-write.js";
 import type { Filesystem } from "../fs/types.js";
@@ -67,7 +66,6 @@ export class Workspace {
       const binding = {
         database: this.#gitDatabase,
         worktree: this.filesystem,
-        exactRootStates: createExactPathStateSource(this.db),
         initialWorktree,
         sparse: createSqliteSparseCapability(this.db),
         now,

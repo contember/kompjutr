@@ -21,7 +21,6 @@ export {
   MAX_COMPILED_PATHS,
 } from "./worktree-io-pathspec.js";
 export {
-  WORKTREE_SCAN_PAGE,
   type WorktreePath,
   walkWorktree,
   walkWorktreeEntriesStream,

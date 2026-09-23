@@ -9,12 +9,7 @@ import { type IndexEntry, PACK_BLOB_BATCH_TARGET_BYTES } from "../../store/index
 import { sharedRepoStoreMutations, writeObjectsOwned } from "../../store/repository/shared.js";
 import type { Repository } from "../repository/repository.js";
 import { gitModeFor, type Worktree, type WorktreeStat } from "./worktree.js";
-import {
-  readWorktreeRealpath,
-  readWorktreeScanPage,
-  WORKTREE_SCAN_PAGE,
-  type WorktreePath,
-} from "./worktree-io-walk.js";
+import { strictlyOrderedScan, type WorktreePath } from "./worktree-io-walk.js";
 
 /** Bytes pulled from the working tree at a time when a file is streamed. */
 const READ_CHUNK = 64 * 1024;
@@ -77,7 +72,7 @@ export function hashWorktreePaths(
   cursor?: WorktreeHashCursor,
 ): Map<string, HashedPath> {
   if (paths.length === 0) return new Map();
-  const root = cursor?.root ?? readWorktreeRealpath(worktree, repo.root);
+  const root = cursor?.root ?? worktree.realpath(repo.root);
   if (cursor !== undefined && cursor.canonicalExcludeRoots === null) {
     cursor.canonicalExcludeRoots = cursor.excludeRoots.map((path) => {
       const relative = relativeTo(repo.root, path);
@@ -204,7 +199,7 @@ export function hashExactWorktreePaths(
   options: WorktreeHashOptions = {},
 ): Map<string, HashedPath> {
   if (paths.length === 0) return new Map();
-  const root = readWorktreeRealpath(worktree, repo.root);
+  const root = worktree.realpath(repo.root);
   return hashWorktreePathsAtRoot(repo, worktree, root, paths, options);
 }
 
@@ -291,7 +286,7 @@ export function hashWorktreePath(
   relative: string,
   options: WorktreeHashOptions = {},
 ): HashedPath | null {
-  const root = readWorktreeRealpath(worktree, repo.root);
+  const root = worktree.realpath(repo.root);
   const absolute = joinPath(root, relative);
   const stat = worktree.stat(absolute);
   if (stat === null || stat.type === "dir") return null;
@@ -361,36 +356,16 @@ export function indexMatchesStat(entry: IndexEntry, stat: WorktreeStat): boolean
 function* scanWorktreeEntries(
   worktree: Worktree,
   root: RealPath,
-  initialAfter?: string,
+  after?: string,
   excludeRoots: readonly string[] = [],
 ): Generator<ScanEntry> {
   const isExcluded = (path: string): boolean =>
     excludeRoots.some(
       (excludedRoot) => path === excludedRoot || path.startsWith(`${excludedRoot}/`),
     );
-  const orderedScan = worktree.scanStream;
-  if (orderedScan !== undefined) {
-    for (const entry of orderedScan.call(worktree, root, {
-      filesOnly: true,
-      pruneDirectory: isExcluded,
-    })) {
-      if (initialAfter === undefined || comparePaths(entry.path, initialAfter) > 0) yield entry;
-    }
-    return;
-  }
-  let after = initialAfter;
-  while (true) {
-    const read = readWorktreeScanPage(worktree, root, {
-      after,
-      filesOnly: true,
-      limit: WORKTREE_SCAN_PAGE,
-    });
-    const page = read.page;
-    if (page.length === 0) return;
-    for (const entry of page) {
-      if (!isExcluded(entry.path)) yield entry;
-    }
-    if (page.length < WORKTREE_SCAN_PAGE) return;
-    after = page[page.length - 1]?.path;
+  for (const entry of strictlyOrderedScan(
+    worktree.scanStream(root, { filesOnly: true, after, pruneDirectory: isExcluded }),
+  )) {
+    if (!isExcluded(entry.path)) yield entry;
   }
 }

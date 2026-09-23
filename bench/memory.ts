@@ -6,6 +6,7 @@ import type {
   DiscoverFilesPage,
   Filesystem,
   HandleReadBatch,
+  OrderedScanOptions,
   ReadBatch,
   RealPath,
   RegularFileHandle,
@@ -137,6 +138,9 @@ class CountingWorktree implements Worktree {
   scan(root: string, options: ScanOptions): ScanEntry[] {
     return this.inner.scan(root, options);
   }
+  scanStream(root: RealPath, options?: OrderedScanOptions): Iterable<ScanEntry> {
+    return this.inner.scanStream(root, options);
+  }
   discoverFiles(
     root: RealPath,
     pattern: string,
@@ -177,16 +181,16 @@ class LateMetadataWorktree extends CountingWorktree {
     super(inner);
   }
 
-  override scan(root: string, options: ScanOptions): ScanEntry[] {
-    const page = super.scan(root, options);
+  override *scanStream(root: RealPath, options?: OrderedScanOptions): Generator<ScanEntry> {
     this.#scanCalls++;
-    return page.map((entry) =>
-      entry.path === "/guard.bin" && this.#scanCalls > 2
+    const call = this.#scanCalls;
+    for (const entry of super.scanStream(root, options)) {
+      yield entry.path === "/guard.bin" && call > 2
         ? { ...entry, mtime: entry.mtime + 1, rev: entry.rev + 1, contentId: null }
         : entry.path === "/guard.bin"
           ? { ...entry, contentId: this.cleanContentId }
-          : entry,
-    );
+          : entry;
+    }
   }
 }
 

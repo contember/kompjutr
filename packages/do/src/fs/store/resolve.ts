@@ -236,11 +236,6 @@ export function realpath(db: SqlDatabase, path: string): RealPath {
   return resolve(db, path, true);
 }
 
-/** Resolve through the native provider without widening its public contract. */
-export function realpathOwned(db: SqlDatabase, path: string): RealPath {
-  return resolve(db, path, true);
-}
-
 /** Resolve ancestors through symlinks but leave a final named link alone. */
 export function realpathNoFollow(db: SqlDatabase, path: string): RealPath {
   return resolve(db, path, false);

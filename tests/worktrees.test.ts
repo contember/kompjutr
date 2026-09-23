@@ -87,13 +87,9 @@ function insertMissingCheckoutWitnesses(workspace: TestRepository, count = 64): 
 }
 
 function bindGit(workspace: TestWorkspace, database = workspace.database): Git {
-  const exactRootStates = workspace.context.exactRootStates;
-  if (exactRootStates === undefined)
-    throw new Error("test workspace has no exact root state source");
   return createGit()({
     database,
     worktree: workspace.worktree,
-    exactRootStates,
     now: workspace.context.now,
     timezoneOffset: workspace.context.timezoneOffset,
     defaultIdentity: IDENTITY,
@@ -421,48 +417,32 @@ describe("worktree list and checkout sharing", () => {
     await expect(cold.worktreeList({ dir: "/a" })).resolves.toEqual(listed);
   });
 
-  it("uses native root-state reads and preserves custom-provider failures", () => {
+  it("reads each root state through the worktree stat and propagates its failures", () => {
     const workspace = makeRepo("/");
     seedMain(workspace);
-    const native = workspace.context.exactRootStates;
-    if (native === undefined) throw new Error("test workspace has no exact root state source");
-    const originalStates = native.states;
-    let fallbackCalls = 0;
-    native.states = () => {
-      fallbackCalls++;
-      throw new Error("native fallback must not run");
+    const statted: string[] = [];
+    const missingRoot = {
+      ...workspace.worktree,
+      stat: (path: string) => {
+        statted.push(path);
+        return null;
+      },
     };
-    try {
-      expect(worktreeList(workspace.context, workspace.repo)).toEqual([
-        expect.objectContaining({ root: "/", state: "present" }),
-      ]);
-      expect(fallbackCalls).toBe(0);
-    } finally {
-      native.states = originalStates;
-    }
+    expect(worktreeList({ ...workspace.context, worktree: missingRoot }, workspace.repo)).toEqual([
+      expect.objectContaining({ root: "/", state: "missing" }),
+    ]);
+    expect(statted).toEqual(["/"]);
 
-    const custom = {
-      states: (roots: readonly string[]): Array<"present" | "missing"> =>
-        roots.map(() => "present"),
+    const failure = new Error("root stat failure");
+    const failing = {
+      ...workspace.worktree,
+      stat: () => {
+        throw failure;
+      },
     };
-    expect(worktreeList({ ...workspace.context, exactRootStates: custom }, workspace.repo)).toEqual(
-      [expect.objectContaining({ root: "/", state: "present" })],
+    expect(() => worktreeList({ ...workspace.context, worktree: failing }, workspace.repo)).toThrow(
+      failure,
     );
-
-    const failure = new Error("custom root-state failure");
-    expect(() =>
-      worktreeList(
-        {
-          ...workspace.context,
-          exactRootStates: {
-            states: () => {
-              throw failure;
-            },
-          },
-        },
-        workspace.repo,
-      ),
-    ).toThrow(failure);
   });
 
   it("lists checkout and state snapshots", () => {
@@ -490,16 +470,6 @@ describe("worktree list and checkout sharing", () => {
     expect(two.checkout.indexGet("file.txt")?.oid).toBe(base.blob);
     expect(new TextDecoder().decode(workspace.worktree.readFile("/two/file.txt"))).toBe("base\n");
     await expect(git.status({ dir: "/two" })).resolves.toEqual([]);
-  });
-
-  it("fails list and prune without an exact-root state source", () => {
-    const workspace = makeRepo("/");
-    expect(() =>
-      worktreeList({ ...workspace.context, exactRootStates: undefined }, workspace.repo),
-    ).toThrowError(expect.objectContaining({ code: "EUNSUPPORTED" }));
-    expect(() =>
-      worktreePrune({ ...workspace.context, exactRootStates: undefined }, workspace.repo),
-    ).toThrowError(expect.objectContaining({ code: "EUNSUPPORTED" }));
   });
 });
 
@@ -636,6 +606,26 @@ describe("worktree prune", () => {
     expect(workspace.database.checkoutAt("/")).not.toBeNull();
   });
 
+  it("prunes a checkout whose ancestor became a symlink loop", async () => {
+    const workspace = makeRepo("/");
+    seedMain(workspace);
+    const git = bindGit(workspace);
+    await git.worktreeAdd({ root: "/loop/linked", target: { kind: "new-branch", name: "linked" } });
+    workspace.worktree.removeFiles(["/loop"], { recursive: true });
+    workspace.worktree.symlink("/loop", "/loop");
+    expect(() => workspace.worktree.stat("/loop/linked")).toThrowError(
+      expect.objectContaining({ code: "ELOOP" }),
+    );
+
+    await expect(git.worktreeList()).resolves.toEqual([
+      expect.objectContaining({ root: "/", state: "present" }),
+      expect.objectContaining({ root: "/loop/linked", state: "missing" }),
+    ]);
+    const removed = await git.worktreePrune();
+    expect(removed.map((item) => item.root)).toEqual(["/loop/linked"]);
+    expect(workspace.database.checkoutAt("/loop/linked")).toBeNull();
+  });
+
   it("treats a nested checkout as parent dirt and prunes it after forced parent removal", async () => {
     const workspace = makeRepo("/");
     seedMain(workspace);
@@ -665,7 +655,7 @@ describe("worktree prune", () => {
     expect(workspace.database.listCheckouts(workspace.repo.store.repoId)).toHaveLength(1);
   });
 
-  it("lists and prunes the 1,024-checkout ceiling within the statement target", () => {
+  it("lists and prunes the 1,024-checkout ceiling with one root stat per checkout", () => {
     const workspace = makeRepo("/");
     const commit = seedMain(workspace);
     workspace.database.db.run(
@@ -680,10 +670,12 @@ describe("worktree prune", () => {
     workspace.database.db.run(
       "UPDATE git_identity_control SET last_checkout_id = 1024 WHERE singleton = 1",
     );
+    // A DO stat is a resolve plus a node read; the listing itself is one statement.
+    const rootStatStatements = 2 * 1_024 + 1;
     workspace.storage.resetCounters();
     const listed = worktreeList(workspace.context, workspace.repo);
     expect(listed).toHaveLength(1_024);
-    expect(workspace.storage.statementCount).toBeLessThan(1_000);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(rootStatStatements);
     expect(() =>
       worktreeAdd(workspace.context, workspace.repo, {
         root: "/first-over-limit",
@@ -695,7 +687,7 @@ describe("worktree prune", () => {
     workspace.storage.resetCounters();
     const pruned = worktreePrune(workspace.context, workspace.repo);
     expect(pruned).toHaveLength(1_023);
-    expect(workspace.storage.statementCount).toBeLessThan(1_000);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(rootStatStatements + 16);
     expect(workspace.database.listCheckouts(workspace.repo.store.repoId)).toHaveLength(1);
   });
 });

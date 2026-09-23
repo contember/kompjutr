@@ -19,6 +19,7 @@ import type {
   HandleReadBatch,
   ListOptions,
   ListPage,
+  OrderedScanOptions,
   ReadBatch,
   ReadOptions,
   RealPath,
@@ -52,6 +53,7 @@ export type {
   ListItem,
   ListOptions,
   ListPage,
+  OrderedScanOptions,
   ReadBatch,
   ReadOptions,
   RealPath,
@@ -110,6 +112,14 @@ export interface Filesystem extends GitDrive {
    * traversal. The merge joins above this layer consume it directly.
    */
   scan(root: string, options: ScanOptions): ScanEntry[];
+
+  /**
+   * The same rows as a lazy stream over an already resolved root: one keyset
+   * statement per 1,000 rows, no cursor held across a yield. A pruned
+   * directory's subtree is skipped, and a page ending inside it restarts past
+   * the subtree.
+   */
+  scanStream(root: RealPath, options?: OrderedScanOptions): Iterable<ScanEntry>;
 
   /**
    * Discover regular files only, without following matching symlinks.
