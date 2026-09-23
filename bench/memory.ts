@@ -617,7 +617,7 @@ function rebaseBaselineScenario(): Scenario {
           if (context === null || repo === null || worktree === null) {
             throw new Error("rebase fixture is missing");
           }
-          result = rebase(context, repo, worktree, { upstream: "upstream" });
+          result = rebase(context, repo, worktree, [], { upstream: "upstream" });
         },
         async verify({ harness }) {
           if (repo === null || worktree === null || upstreamOid === null || result === null) {

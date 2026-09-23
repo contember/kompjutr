@@ -836,9 +836,9 @@ describe("pull", () => {
           return originalTransaction(closure);
         };
         try {
-          expect(() => rebaseContinue(workspace.context, repo, workspace.worktree)).toThrowError(
-            expect.objectContaining({ code: "ESTALEHEAD" }),
-          );
+          expect(() =>
+            rebaseContinue(workspace.context, repo, workspace.worktree, []),
+          ).toThrowError(expect.objectContaining({ code: "ESTALEHEAD" }));
         } finally {
           repo.store.db.transactionSync = originalTransaction;
         }
@@ -851,14 +851,14 @@ describe("pull", () => {
         const cold = reopenTestRepository(workspace, "/work");
         expect(cold.repo.head().oid).toBe(incoming);
         expect(cold.repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
-        expect(() => rebaseContinue(cold.context, cold.repo, cold.worktree)).toThrowError(
+        expect(() => rebaseContinue(cold.context, cold.repo, cold.worktree, [])).toThrowError(
           expect.objectContaining({ code: "ESTALEHEAD" }),
         );
         const retained = cold.repo.checkout.requireOperationState("rebase");
         expect(retained.state.currentStep).toBe(retained.steps.length);
 
         cold.repo.store.setRef("refs/heads/main", local.oid);
-        const recovered = rebaseContinue(cold.context, cold.repo, cold.worktree);
+        const recovered = rebaseContinue(cold.context, cold.repo, cold.worktree, []);
         expect(recovered).toMatchObject({ outcome: "completed", replayed: 1 });
         expect(cold.repo.checkout.readOperationState()).toBeNull();
         const rewritten = cold.repo.head().oid;

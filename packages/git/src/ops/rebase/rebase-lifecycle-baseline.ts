@@ -20,13 +20,12 @@ import {
   requireBoundedIntegrationTree,
   requireCleanIntegrationWorktree,
 } from "../integration/integration-worktree.js";
-import type { CheckoutBlockerLimits } from "../refs/refs.js";
-import { checkoutBlockersAgainstOwned, hardResetBlockersAgainstOwned } from "../refs/refs.js";
-import { preflightReplayCommitObjects } from "../replay/replay.js";
+import { type CheckoutBlockerLimits, checkoutBlockers } from "../refs/refs.js";
+import { preflightReplayCommitObjects } from "../replay/replay-revision.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
-import type { BaselineTransition, RebaseExclusions } from "./rebase-lifecycle-types.js";
+import type { RebaseExclusions } from "./rebase-lifecycle-types.js";
 import type { RebasePlan } from "./rebase-plan.js";
 
 const REBASE_BASELINE_MAX_ENTRIES = 4_096;
@@ -144,19 +143,17 @@ export function materializeTree(
   repo: Repository,
   worktree: Worktree,
   baselineTree: string,
-  target: BaselineTransition,
+  targetTree: string,
   exclusions: RebaseExclusions,
 ): void {
-  const blockers = checkoutBlockersAgainstOwned(
-    repo,
-    worktree,
+  const blockers = checkoutBlockers(repo, worktree, {
     baselineTree,
-    target.treeOid,
-    undefined,
-    true,
-    checkoutGuardLimits(),
-    exclusions.absolute,
-  );
+    tree: targetTree,
+    prune: true,
+    limits: checkoutGuardLimits(),
+    excludeRoots: exclusions.absolute,
+    mode: "checkout",
+  });
   if (blockers.tracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",
@@ -169,7 +166,7 @@ export function materializeTree(
       `untracked working tree files would be overwritten by rebase: ${blockers.untracked.join(", ")}`,
     );
   }
-  checkoutTreeExcluding(repo, worktree, target.treeOid, exclusions.absolute, {
+  checkoutTreeExcluding(repo, worktree, targetTree, exclusions.absolute, {
     preserveMatchingIndex: true,
     maxWorktreeRowsPerPass: 50_000,
   });
@@ -188,24 +185,24 @@ export function hardMaterializeTree(
   repo: Repository,
   worktree: Worktree,
   baselineTree: string,
-  target: BaselineTransition,
+  targetTree: string,
   exclusions: RebaseExclusions,
 ): void {
-  const blockers = hardResetBlockersAgainstOwned(
-    repo,
-    worktree,
+  const blockers = checkoutBlockers(repo, worktree, {
     baselineTree,
-    target.treeOid,
-    checkoutGuardLimits(),
-    exclusions.absolute,
-  );
+    tree: targetTree,
+    prune: true,
+    limits: checkoutGuardLimits(),
+    excludeRoots: exclusions.absolute,
+    mode: "hard-reset",
+  });
   if (blockers.untracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",
       `untracked working tree files would be overwritten by rebase: ${blockers.untracked.join(", ")}`,
     );
   }
-  checkoutTreeExcluding(repo, worktree, target.treeOid, exclusions.absolute, {
+  checkoutTreeExcluding(repo, worktree, targetTree, exclusions.absolute, {
     preserveMatchingIndex: false,
     restoreStructure: true,
     discardUnmerged: true,
@@ -213,7 +210,7 @@ export function hardMaterializeTree(
   });
 }
 
-export function preflightBaselineTransition(repo: Repository, treeOid: string): BaselineTransition {
+export function preflightBaselineTree(repo: Repository, treeOid: string): void {
   const oids: string[] = [];
   const entries = function* (): Generator<IndexEntry> {
     for (const entry of treeStream(repo, treeOid)) {
@@ -255,7 +252,6 @@ export function preflightBaselineTransition(repo: Repository, treeOid: string): 
       throw new CorruptError(`rebase baseline object ${object.oid} is not a blob`);
     }
   }
-  return { treeOid };
 }
 
 export function initialState(

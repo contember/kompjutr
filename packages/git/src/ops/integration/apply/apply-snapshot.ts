@@ -1,9 +1,9 @@
-import { CorruptError } from "../../common/errors.js";
-import type { Repository } from "../repository/repository.js";
-import type { Worktree, WorktreeStat } from "../worktree/worktree.js";
-import { type HashedPath, hashExactWorktreePaths } from "../worktree/worktree-io.js";
-import type { SnapshotDraft, SnapshotObjects } from "./merge-apply-types.js";
-import type { MergeTouchedPath, MergeWorktreeSnapshot } from "./merge-state.js";
+import { CorruptError } from "../../../common/errors.js";
+import type { MergeTouchedPath, MergeWorktreeSnapshot } from "../../merge/merge-state.js";
+import type { Repository } from "../../repository/repository.js";
+import type { Worktree, WorktreeStat } from "../../worktree/worktree.js";
+import { type HashedPath, hashExactWorktreePaths } from "../../worktree/worktree-io.js";
+import type { SnapshotDraft } from "./apply-types.js";
 
 function validateCanonicalUtf16(value: string, label: string): void {
   for (let index = 0; index < value.length; index++) {
@@ -22,7 +22,7 @@ export function snapshotWorktreeObjects(
   repo: Repository,
   worktree: Worktree,
   drafts: readonly SnapshotDraft[],
-): SnapshotObjects {
+): Map<string, HashedPath> {
   const paths: { path: string; stat: WorktreeStat }[] = [];
   for (const draft of drafts) {
     const stat = draft.stat;
@@ -47,7 +47,7 @@ export function snapshotWorktreeObjects(
       throw new CorruptError(`merge snapshot lost worktree path ${draft.spec.path}`);
     }
   }
-  return { entries: hashed };
+  return hashed;
 }
 
 function worktreeSnapshot(draft: SnapshotDraft, oid: string | undefined): MergeWorktreeSnapshot {

@@ -3,7 +3,7 @@ import type { GitClientServices } from "./client-services.js";
 import type { Git, GitScratchIndex } from "./client-types.js";
 import { GitError } from "./common/errors.js";
 import { withPromisorHydration } from "./ops/network/network.js";
-import { replaySnapshotOwned as replaySnapshotOp } from "./ops/replay/replay.js";
+import { replaySnapshotOwned as replaySnapshotOp } from "./ops/replay/replay-snapshot.js";
 import {
   catFile as catFileOp,
   commitTreeOwned as commitTreeOp,

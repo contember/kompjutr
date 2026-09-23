@@ -18,13 +18,13 @@ import {
   withIntegrationWorkspaceOwned,
 } from "../../store/operations/integration-workspace/workspace.js";
 import { indexFromTree } from "../checkout/checkout.js";
-import { MAX_INTEGRATION_SOURCE_ROWS } from "../integration/integration.js";
+import { applyIndex } from "../integration/apply/apply-index.js";
+import { validateProjectedIndexEntries } from "../integration/apply/apply-validation.js";
 import { adoptProjectedIndex } from "../integration/integration-apply-owned.js";
 import type { IntegrationStages } from "../integration/integration-structure.js";
 import { integrationTouched } from "../integration/integration-touched.js";
+import { MAX_INTEGRATION_SOURCE_ROWS } from "../integration/integration-types.js";
 import { requireBoundedIntegrationTree } from "../integration/integration-worktree.js";
-import { validateProjectedIndexEntries } from "../merge/merge-apply.js";
-import { applyIndex } from "../merge/merge-apply-index.js";
 import { projectMergePlanOwned } from "../merge/merge-projection.js";
 import { writeTreeOwned } from "../repository/plumbing.js";
 import type { Repository } from "../repository/repository.js";

@@ -15,7 +15,7 @@ import {
   rebaseContinue,
   rebaseSkip,
 } from "../packages/git/src/ops/rebase/rebase.js";
-import { preflightReplayCommitObjects } from "../packages/git/src/ops/replay/replay.js";
+import { preflightReplayCommitObjects } from "../packages/git/src/ops/replay/replay-revision.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
 import { Repository, repositoryMutations } from "../packages/git/src/ops/repository/repository.js";
 import { add } from "../packages/git/src/ops/staging/staging.js";
@@ -211,9 +211,9 @@ async function suspendedMultiCheckout(): Promise<{
   if (row === null) throw new Error("checkout B is missing");
   const b = new Repository(workspace.database.openCheckout(row));
 
-  expect(rebase(workspace.context, workspace.repo, workspace.worktree, { upstream })).toMatchObject(
-    { outcome: "conflicted", replayed: 1 },
-  );
+  expect(
+    rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
+  ).toMatchObject({ outcome: "conflicted", replayed: 1 });
   expect(workspace.repo.checkout.requireOperationState("rebase").state.phase).toBe("conflicted");
   expect(b.checkout.readOperationState()).toBeNull();
   expect(status(b, workspace.worktree)).toEqual([]);
@@ -276,7 +276,7 @@ describe("rebase restart recovery", () => {
     }
     source.commit("maximum integration entries");
     const workspace = await imported(source);
-    const result = rebase(workspace.context, workspace.repo, workspace.worktree, { upstream });
+    const result = rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream });
     expect(result).toMatchObject({ outcome: "completed", replayed: 1 });
     if (result.outcome !== "completed") throw new Error("maximum-entry rebase did not complete");
     expect(workspace.repo.head().oid).toBe(result.oid);
@@ -312,7 +312,7 @@ describe("rebase restart recovery", () => {
     const workspace = await imported(source);
 
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toMatchObject({ outcome: "conflicted", replayed: 0 });
     const cold = reopen(workspace);
     expect(cold.repo.checkout.requireOperationState("rebase").state.phase).toBe("conflicted");
@@ -322,7 +322,7 @@ describe("rebase restart recovery", () => {
 
     writeWorkFile(workspace, "/conflict.txt", "resolved\n");
     add(cold.repo, workspace.worktree, { paths: ["conflict.txt"] });
-    const result = rebaseContinue(cold.context, cold.repo, workspace.worktree);
+    const result = rebaseContinue(cold.context, cold.repo, workspace.worktree, []);
 
     expect(result).toMatchObject({ outcome: "completed", replayed: 1 });
     if (result.outcome !== "completed") throw new Error("large-baseline rebase did not complete");
@@ -372,14 +372,14 @@ describe("rebase restart recovery", () => {
     const workspace = await imported(source);
 
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toMatchObject({ outcome: "conflicted", replayed: 0 });
     const cold = reopen(workspace);
     const journal = cold.repo.checkout.requireOperationState("rebase");
     expect(journal.steps).toHaveLength(1);
     expect(journal.touched).toHaveLength(1);
 
-    rebaseAbort(cold.repo, workspace.worktree);
+    rebaseAbort(cold.repo, workspace.worktree, []);
 
     const durable = reopen(workspace);
     expect(durable.repo.head()).toEqual({ ref: "refs/heads/current", oid: current });
@@ -412,7 +412,7 @@ describe("rebase restart recovery", () => {
     if (guard === null) throw new Error("guard index entry is missing");
     const worktree = new LateMetadataWorktree(workspace.worktree, fromHex(guard.oid));
 
-    const result = rebase(workspace.context, workspace.repo, worktree, { upstream });
+    const result = rebase(workspace.context, workspace.repo, worktree, [], { upstream });
 
     expect(result).toMatchObject({ outcome: "completed", replayed: 0, fastForward: true });
     expect(worktree.rangeReads).toBe(65);
@@ -468,7 +468,7 @@ describe("rebase restart recovery", () => {
     );
 
     expect(() =>
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toThrow("maximum replay journal seam");
     expect(workspace.repo.head().oid).toBe(current);
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
@@ -488,7 +488,7 @@ describe("rebase restart recovery", () => {
     );
 
     expect(() =>
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toThrow("initial journal fault");
     expect(workspace.repo.head().oid).toBe(original);
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
@@ -513,7 +513,7 @@ describe("rebase restart recovery", () => {
     };
 
     expect(() =>
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream: second }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream: second }),
     ).toThrow(/changed|stale/i);
     const durable = reopen(workspace);
     expect(durable.repo.head()).toEqual({ ref: "refs/heads/behind", oid: first });
@@ -539,7 +539,7 @@ describe("rebase restart recovery", () => {
     );
 
     expect(() =>
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toThrow("conflict journal fault");
     const durable = reopen(workspace);
     const journal = durable.repo.checkout.requireOperationState("rebase");
@@ -554,7 +554,7 @@ describe("rebase restart recovery", () => {
     const { upstream } = history(source, true);
     const workspace = await imported(source);
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }).outcome,
     ).toBe("conflicted");
     writeWorkFile(workspace, "/one.txt", "conflict-time staged edit\n");
     add(workspace.repo, workspace.worktree, { paths: ["one.txt"] });
@@ -568,7 +568,7 @@ describe("rebase restart recovery", () => {
        END`,
     );
 
-    expect(() => rebaseSkip(workspace.context, workspace.repo, workspace.worktree)).toThrow(
+    expect(() => rebaseSkip(workspace.context, workspace.repo, workspace.worktree, [])).toThrow(
       "skip cursor fault",
     );
     const durable = reopen(workspace);
@@ -584,7 +584,7 @@ describe("rebase restart recovery", () => {
     const { upstream } = history(source, true);
     const workspace = await imported(source);
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }).outcome,
     ).toBe("conflicted");
     writeWorkFile(workspace, "/one.txt", "abort-time edit\n");
     const before = workspace.repo.checkout.requireOperationState("rebase");
@@ -595,7 +595,7 @@ describe("rebase restart recovery", () => {
       throw new Error("abort clear fault");
     };
 
-    expect(() => rebaseAbort(workspace.repo, workspace.worktree)).toThrow("abort clear fault");
+    expect(() => rebaseAbort(workspace.repo, workspace.worktree, [])).toThrow("abort clear fault");
     const durable = reopen(workspace);
     expect(durable.repo.checkout.requireOperationState("rebase")).toEqual(before);
     expect(workspace.worktree.readFile("/one.txt")).toEqual(
@@ -618,7 +618,7 @@ describe("rebase restart recovery", () => {
     );
 
     expect(() =>
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toThrow("clean cursor fault");
     const durable = reopen(workspace);
     const journal = durable.repo.checkout.requireOperationState("rebase");
@@ -654,7 +654,7 @@ describe("rebase restart recovery", () => {
     };
 
     expect(() =>
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toThrow("restart after baseline");
     const durable = reopen(workspace);
     const journal = durable.repo.checkout.requireOperationState("rebase");
@@ -669,7 +669,7 @@ describe("rebase restart recovery", () => {
       true,
     );
 
-    const result = rebaseContinue(durable.context, durable.repo, workspace.worktree);
+    const result = rebaseContinue(durable.context, durable.repo, workspace.worktree, []);
     expect(result.outcome).toBe("completed");
     expect(durable.repo.checkout.readOperationState()).toBeNull();
   });
@@ -692,11 +692,11 @@ describe("rebase restart recovery", () => {
       return originalOne<Row>(query, ...bindings);
     };
     expect(() =>
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toThrow("restart at running baseline");
 
     const durable = reopen(workspace);
-    rebaseAbort(durable.repo, workspace.worktree);
+    rebaseAbort(durable.repo, workspace.worktree, []);
     expect(durable.repo.head().oid).toBe(original);
     expect(durable.repo.checkout.readOperationState()).toBeNull();
     expect(integrationIndexMatchesTree(durable.repo, durable.repo.readCommit(original).tree)).toBe(
@@ -709,7 +709,7 @@ describe("rebase restart recovery", () => {
     const { original } = history(source, true);
     const workspace = await imported(source);
 
-    const suspended = rebase(workspace.context, workspace.repo, workspace.worktree, {
+    const suspended = rebase(workspace.context, workspace.repo, workspace.worktree, [], {
       upstream: "upstream",
     });
     expect(suspended).toMatchObject({ outcome: "conflicted", replayed: 1 });
@@ -720,7 +720,7 @@ describe("rebase restart recovery", () => {
     const durable = reopen(workspace);
     writeWorkFile(workspace, "/shared.txt", "cold resolution\n");
     add(durable.repo, workspace.worktree, { paths: ["shared.txt"] });
-    const result = rebaseContinue(durable.context, durable.repo, workspace.worktree);
+    const result = rebaseContinue(durable.context, durable.repo, workspace.worktree, []);
 
     expect(result).toMatchObject({ outcome: "completed", replayed: 2 });
     expect(durable.repo.checkout.readOperationState()).toBeNull();
@@ -738,7 +738,7 @@ describe("rebase restart recovery", () => {
     };
 
     expect(() =>
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toThrow("restart before publication");
     const durable = reopen(workspace);
     const journal = durable.repo.checkout.requireOperationState("rebase");
@@ -758,6 +758,7 @@ describe("rebase restart recovery", () => {
       durable.context,
       durable.repo,
       workspace.worktree,
+      [],
     );
     expect(result).toMatchObject({ outcome: "completed", replayed: 2 });
     if (result.outcome !== "completed") throw new Error("rebase did not complete");
@@ -791,7 +792,7 @@ describe("rebase restart recovery", () => {
     };
 
     expect(() =>
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toThrowError(expect.objectContaining({ code: "ESTALEHEAD" }));
 
     const durable = reopen(workspace);
@@ -801,7 +802,7 @@ describe("rebase restart recovery", () => {
     expect(durable.repo.store.reflog("refs/heads/current")).toEqual([]);
     expect(durable.repo.checkout.reflog("HEAD")).toEqual([]);
 
-    const result = rebaseContinue(durable.context, durable.repo, workspace.worktree);
+    const result = rebaseContinue(durable.context, durable.repo, workspace.worktree, []);
     expect(result.outcome).toBe("completed");
     const named = durable.repo.store.reflog("refs/heads/current")[0];
     const head = durable.repo.checkout.reflog("HEAD")[0];
@@ -821,13 +822,13 @@ describe("rebase restart recovery", () => {
       throw new Error("restart before completed abort");
     };
     expect(() =>
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toThrow("restart before completed abort");
 
     const durable = reopen(workspace);
     const journal = durable.repo.checkout.requireOperationState("rebase");
     expect(journal.state.currentStep).toBe(journal.steps.length);
-    rebaseAbort(durable.repo, workspace.worktree);
+    rebaseAbort(durable.repo, workspace.worktree, []);
     expect(durable.repo.head().oid).toBe(original);
     expect(durable.repo.checkout.readOperationState()).toBeNull();
     expect(integrationIndexMatchesTree(durable.repo, durable.repo.readCommit(original).tree)).toBe(
@@ -842,13 +843,13 @@ describe("rebase restart recovery", () => {
     const { upstream } = history(source, true);
     const workspace = await imported(source);
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }).outcome,
     ).toBe("conflicted");
     const journal = workspace.repo.checkout.requireOperationState("rebase");
     workspace.repo.store.setRef(journal.state.originalHeadRef, upstream);
 
     expect(() =>
-      rebaseContinue(workspace.context, workspace.repo, workspace.worktree),
+      rebaseContinue(workspace.context, workspace.repo, workspace.worktree, []),
     ).toThrowError("HEAD changed during the rebase operation");
     expect(workspace.repo.checkout.requireOperationState("rebase")).toEqual(journal);
   });
@@ -872,7 +873,7 @@ describe("multi-checkout rebase restart isolation", () => {
 
     writeWorkFile(suspended.workspace, "/shared.txt", "continued by A\n");
     add(cold.a, suspended.workspace.worktree, { paths: ["shared.txt"] });
-    const result = rebaseContinue(cold.context, cold.a, suspended.workspace.worktree);
+    const result = rebaseContinue(cold.context, cold.a, suspended.workspace.worktree, []);
 
     expect(result).toMatchObject({ outcome: "completed", replayed: 2 });
     if (result.outcome !== "completed") throw new Error("checkout A rebase did not complete");
@@ -896,7 +897,7 @@ describe("multi-checkout rebase restart isolation", () => {
     expect(cold.b.store).toBe(cold.a.store);
     expect(cold.b.checkout.readOperationState()).toBeNull();
     expect(cold.a.checkout.requireOperationState("rebase").state.phase).toBe("conflicted");
-    rebaseAbort(cold.a, suspended.workspace.worktree);
+    rebaseAbort(cold.a, suspended.workspace.worktree, []);
 
     expect(cold.a.head()).toEqual({ ref: "refs/heads/current", oid: suspended.original });
     expect(cold.a.checkout.readOperationState()).toBeNull();

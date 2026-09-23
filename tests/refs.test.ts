@@ -21,7 +21,7 @@ import {
   branchList,
   branchRename,
   checkout,
-  checkoutBlockersOwned,
+  checkoutBlockers,
   currentBranch,
   switchBranch,
   tag,
@@ -1092,7 +1092,8 @@ describe("checkout", () => {
     const sideTree = ws.repo.readCommit(side).tree;
 
     expect(
-      checkoutBlockersOwned(ws.repo, ws.worktree, sideTree, undefined, true).tracked,
+      checkoutBlockers(ws.repo, ws.worktree, { tree: sideTree, prune: true, mode: "checkout" })
+        .tracked,
     ).toContain("modified.txt");
     expect(ws.repo.head().ref).toBe("refs/heads/main");
   });
@@ -1134,7 +1135,7 @@ describe("checkout", () => {
     const tree = workspace.repo.readCommit(current.oid).tree;
 
     expect(
-      checkoutBlockersOwned(workspace.repo, workspace.worktree, tree, undefined, true),
+      checkoutBlockers(workspace.repo, workspace.worktree, { tree, prune: true, mode: "checkout" }),
     ).toEqual({ tracked: [], untracked: [] });
     expect(workspace.repo.head().oid).toBe(current.oid);
     expect(workspace.repo.checkout.indexEntries()).toHaveLength(paths.length);
@@ -1146,41 +1147,41 @@ describe("checkout", () => {
     const side = ws.repo.resolveRef("refs/heads/side");
     if (side === null) throw new Error("side branch is missing");
     const tree = ws.repo.readCommit(side).tree;
-    const selected = checkoutBlockersOwned(ws.repo, ws.worktree, tree, ["modified.txt"], true);
+    const selected = checkoutBlockers(ws.repo, ws.worktree, {
+      tree,
+      paths: ["modified.txt"],
+      prune: true,
+      mode: "checkout",
+    });
     expect(selected.tracked).toContain("modified.txt");
     expect(
-      checkoutBlockersOwned(
-        ws.repo,
-        ws.worktree,
+      checkoutBlockers(ws.repo, ws.worktree, {
         tree,
-        {
+        paths: {
           matches: (path) => path === "modified.txt" || path.startsWith("modified.txt/"),
         },
-        true,
-      ),
+        prune: true,
+        mode: "checkout",
+      }),
     ).toEqual(selected);
     expect(
-      checkoutBlockersOwned(
-        ws.repo,
-        ws.worktree,
+      checkoutBlockers(ws.repo, ws.worktree, {
         tree,
-        {
-          matches: () => false,
-        },
-        true,
-      ),
+        paths: { matches: () => false },
+        prune: true,
+        mode: "checkout",
+      }),
     ).toEqual({ tracked: [], untracked: [] });
     expect(
-      checkoutBlockersOwned(
-        ws.repo,
-        ws.worktree,
+      checkoutBlockers(ws.repo, ws.worktree, {
         tree,
-        {
-          matches: () => true,
-        },
-        true,
-      ),
-    ).toEqual(checkoutBlockersOwned(ws.repo, ws.worktree, tree, [], true));
+        paths: { matches: () => true },
+        prune: true,
+        mode: "checkout",
+      }),
+    ).toEqual(
+      checkoutBlockers(ws.repo, ws.worktree, { tree, paths: [], prune: true, mode: "checkout" }),
+    );
   });
 
   it("preserves local changes when the target keeps the index entry", () => {

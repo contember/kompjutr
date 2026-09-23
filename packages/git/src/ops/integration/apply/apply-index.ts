@@ -1,10 +1,10 @@
-import { applyIndexOwned } from "../../store/checkout/checkout.js";
-import type { IndexEntry, IndexSink, IndexStore } from "../../store/index.js";
-import type { Repository } from "../repository/repository.js";
-import type { TouchedSpec } from "./merge-apply-types.js";
-import { requireIdentity } from "./merge-apply-validation.js";
-import type { ProjectedMergeEntry } from "./merge-projection.js";
-import type { MergeTouchedPath } from "./merge-state.js";
+import { applyIndexOwned } from "../../../store/checkout/checkout.js";
+import type { IndexEntry, IndexSink, IndexStore } from "../../../store/index.js";
+import type { ProjectedMergeEntry } from "../../merge/merge-projection.js";
+import type { MergeTouchedPath } from "../../merge/merge-state.js";
+import type { Repository } from "../../repository/repository.js";
+import type { TouchedSpec } from "./apply-types.js";
+import { requireIdentity } from "./apply-validation.js";
 
 function putIdentity(
   sink: IndexSink,

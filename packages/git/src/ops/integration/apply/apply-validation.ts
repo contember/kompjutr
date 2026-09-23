@@ -1,16 +1,16 @@
-import { isOid } from "../../common/bytes.js";
-import { CorruptError, GitError } from "../../common/errors.js";
+import { isOid } from "../../../common/bytes.js";
+import { CorruptError, GitError } from "../../../common/errors.js";
 import {
   hashObject,
   MODE_COMMIT,
   MODE_EXECUTABLE,
   MODE_FILE,
   MODE_SYMLINK,
-} from "../../common/objects.js";
-import { comparePaths } from "../../common/streams.js";
-import type { IntegrationContentReference } from "../../store/operations/integration-workspace/descriptors.js";
-import type { ProjectedMergeEntry } from "./merge-projection.js";
-import { validateMergePath } from "./merge-state.js";
+} from "../../../common/objects.js";
+import { comparePaths } from "../../../common/streams.js";
+import type { IntegrationContentReference } from "../../../store/operations/integration-workspace/descriptors.js";
+import type { ProjectedMergeEntry } from "../../merge/merge-projection.js";
+import { validateMergePath } from "../../merge/merge-state.js";
 
 function validMode(mode: string): boolean {
   return mode === MODE_FILE || mode === MODE_EXECUTABLE || mode === MODE_SYMLINK;

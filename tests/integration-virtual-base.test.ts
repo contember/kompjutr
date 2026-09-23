@@ -10,7 +10,7 @@ import {
   MODE_SYMLINK,
 } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
-import type { IntegrationEntry } from "../packages/git/src/ops/integration/integration.js";
+import type { IntegrationEntry } from "../packages/git/src/ops/integration/integration-types.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { buildTree } from "../packages/git/src/ops/tree/tree-build-full.js";
 import {

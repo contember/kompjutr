@@ -12,7 +12,7 @@ import {
   MAX_REPLAY_REVISION_CODE_UNITS,
   MAX_REPLAY_REVISION_HOPS,
   preflightReplayCommitObjects,
-} from "../packages/git/src/ops/replay/replay.js";
+} from "../packages/git/src/ops/replay/replay-revision.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";

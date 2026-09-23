@@ -118,7 +118,7 @@ async function conflictedNative(
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   expect(gitResult(source, ["rebase", "upstream"]).status).toBe(1);
   expect(
-    rebase(workspace.context, workspace.repo, workspace.worktree, {
+    rebase(workspace.context, workspace.repo, workspace.worktree, [], {
       upstream: "upstream",
       env: IDENTITY_ENV,
     }),
@@ -195,7 +195,7 @@ async function conflictedBackend(): Promise<ReopenableBackend> {
   await importFixture(source, target.repo.checkout);
   checkoutTree(target.repo, target.context.worktree, target.repo.headTree());
   expect(
-    rebase(target.context, target.repo, target.context.worktree, {
+    rebase(target.context, target.repo, target.context.worktree, [], {
       upstream: "upstream",
       env: IDENTITY_ENV,
     }),

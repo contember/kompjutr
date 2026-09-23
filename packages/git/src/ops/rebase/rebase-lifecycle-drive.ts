@@ -50,7 +50,7 @@ function publishCompleted(
       persistedRefLogMetadata(context, journal.state.committer, "rebase: replay"),
     );
     // False leaves the old baseline mismatched, so later sparse reads fall back safely.
-    context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, tree);
+    context.indexTracker?.advanceBaseline(repo.checkout.checkoutId, tree);
     checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
     return {
       outcome: "completed",

@@ -144,7 +144,7 @@ async function createRebaseConflict(
   const workspace = await importAt(fixture);
   expect(gitResultAt(fixture, ["rebase", "upstream"]).exitCode).toBe(1);
   expect(
-    rebase(workspace.context, workspace.repo, workspace.worktree, {
+    rebase(workspace.context, workspace.repo, workspace.worktree, [], {
       upstream,
       committer: { name: "Fixture", email: "fixture@example.com" },
     }).outcome,
@@ -797,7 +797,7 @@ describe("plain git diff semantics and cumulative bounds", () => {
     const workspace = await importAt(fixture);
     expect(gitResultAt(fixture, ["rebase", "upstream"]).exitCode).toBe(1);
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, {
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], {
         upstream,
         committer: { name: "Fixture", email: "fixture@example.com" },
       }).outcome,
@@ -844,7 +844,7 @@ describe("plain git diff semantics and cumulative bounds", () => {
       const workspace = await importAt(fixture);
       expect(gitResultAt(fixture, ["rebase", "upstream"]).exitCode).toBe(1);
       expect(
-        rebase(workspace.context, workspace.repo, workspace.worktree, {
+        rebase(workspace.context, workspace.repo, workspace.worktree, [], {
           upstream,
           committer: { name: "Fixture", email: "fixture@example.com" },
         }).outcome,
@@ -887,7 +887,7 @@ describe("plain git diff semantics and cumulative bounds", () => {
     const workspace = await importAt(fixture);
     expect(gitResultAt(fixture, ["rebase", "upstream"]).exitCode).toBe(1);
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, {
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], {
         upstream,
         committer: { name: "Fixture", email: "fixture@example.com" },
       }).outcome,
@@ -927,7 +927,7 @@ describe("plain git diff semantics and cumulative bounds", () => {
     const workspace = await importAt(fixture);
     expect(gitResultAt(fixture, ["rebase", "upstream"]).exitCode).toBe(1);
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, {
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], {
         upstream,
         committer: { name: "Fixture", email: "fixture@example.com" },
       }).outcome,

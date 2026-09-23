@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
-
-import type { IntegrationConflictKind } from "../packages/git/src/ops/integration/integration.js";
 import type { IntegrationIdentity } from "../packages/git/src/ops/integration/integration-structure.js";
+import type { IntegrationConflictKind } from "../packages/git/src/ops/integration/integration-types.js";
 import type {
   MergeProjectionCollisions,
   MergeProjectionOptions,

@@ -1,89 +1,204 @@
-// Internal rebase command family; the native client surface is wired separately.
+// Rebase lifecycle entry points. Each validates and mutates in one transaction,
+// then `driveRebase` replays the remaining steps one transaction per step.
 
+import { GitError } from "../../common/errors.js";
+import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
+import { withIntegrationWorkspaceOwned } from "../../store/operations/integration-workspace/workspace.js";
+import { writeOperationJournalOwned } from "../../store/operations/operation-journal.js";
 import type { GitContext } from "../core/context.js";
+import { requireSharedMutationScope } from "../core/mutation-scope.js";
+import { operationRefLogMetadata } from "../core/ref-log.js";
+import {
+  integrationIndexMatchesTree,
+  requireCleanIntegrationIndex,
+  requireCleanIntegrationWorktree,
+} from "../integration/integration-worktree.js";
+import { writeUnpublishedCommit } from "../repository/commit.js";
 import type { Repository } from "../repository/repository.js";
+import { repositoryMutations } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import {
-  abortRebase,
-  abortRebaseExcluding,
-  continueRebase,
-  continueRebaseExcluding,
-  type RebaseContinueOptions,
-  type RebaseLifecycleResult,
-  type RebaseStartOptions,
-  skipRebase,
-  skipRebaseExcluding,
-  startRebase,
-  startRebaseExcluding,
-} from "./rebase-lifecycle.js";
+  advance,
+  hardMaterializeTree,
+  initialState,
+  materializeTree,
+  preflightBaselineTree,
+  preflightRebaseReplayObjects,
+  rebaseExclusions,
+  requireCurrentBaseline,
+  requireHead,
+  requireOriginalHead,
+  requireRebaseCursor,
+  requireRebaseIndex,
+} from "./rebase-lifecycle-baseline.js";
+import { driveRebase } from "./rebase-lifecycle-drive.js";
+import { requireConflictOwnership, stepIdentities } from "./rebase-lifecycle-step.js";
+import type {
+  RebaseContinueOptions,
+  RebaseLifecycleResult,
+  RebaseStartOptions,
+} from "./rebase-lifecycle-types.js";
+import { planRebase } from "./rebase-plan.js";
 
-export type { RebaseContinueOptions, RebaseLifecycleResult, RebaseStartOptions };
+export type {
+  RebaseContinueOptions,
+  RebaseLifecycleResult,
+  RebaseStartOptions,
+} from "./rebase-lifecycle-types.js";
 
+/** `excludeRoots` are absolute roots of nested checkouts that the rebase must not touch. */
 export function rebase(
-  context: GitContext,
-  repo: Repository,
-  worktree: Worktree,
-  options: RebaseStartOptions,
-): RebaseLifecycleResult {
-  return startRebase(context, repo, worktree, options);
-}
-
-export function rebaseExcluding(
   context: GitContext,
   repo: Repository,
   worktree: Worktree,
   excludeRoots: readonly string[],
   options: RebaseStartOptions,
 ): RebaseLifecycleResult {
-  return startRebaseExcluding(context, repo, worktree, excludeRoots, options);
+  const exclusions = rebaseExclusions(repo, excludeRoots);
+  requireSharedMutationScope(repo.store.db, worktree);
+  const started = repo.store.db.transactionSync(() => {
+    repo.checkout.requireNoOperationState();
+    const head = requireHead(repo);
+    const originalTree = repo.readCommit(head.oid).tree;
+    requireRebaseIndex(repo);
+    requireCleanIntegrationIndex(repo, originalTree, "rebase");
+    requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
+    const plan = planRebase(repo, { upstream: options.upstream, currentOid: head.oid });
+    if (plan.relation === "up-to-date") {
+      return { relation: plan.relation, oid: head.oid };
+    }
+    preflightRebaseReplayObjects(repo, plan);
+    const upstreamTree = repo.readCommit(plan.upstreamOid).tree;
+    preflightBaselineTree(repo, upstreamTree);
+    if (plan.relation === "replay") {
+      preflightBaselineTree(repo, originalTree);
+    }
+    materializeTree(repo, worktree, originalTree, upstreamTree, exclusions);
+    const observed = repo.head();
+    if (observed.ref !== head.ref || observed.oid !== head.oid) {
+      throw new GitError("ESTALEHEAD", "HEAD changed while rebase was being prepared");
+    }
+    if (plan.relation === "fast-forward") {
+      repositoryMutations(repo).mutateRefsOwned(
+        {
+          expected: { name: head.ref, target: head.oid },
+          puts: [{ name: head.ref, target: plan.upstreamOid }],
+        },
+        operationRefLogMetadata(context, repo, "rebase: fast-forward", {
+          identity: options.committer,
+          env: options.env,
+        }),
+      );
+      // False leaves the old baseline mismatched, so later sparse reads fall back safely.
+      context.indexTracker?.advanceBaseline(repo.checkout.checkoutId, upstreamTree);
+      return { relation: plan.relation, oid: plan.upstreamOid };
+    }
+    const actor = operationRefLogMetadata(context, repo, "rebase: replay", {
+      identity: options.committer,
+      env: options.env,
+    }).actor;
+    const state = initialState(head, plan.upstreamOid, plan.baseOid, actor);
+    writeOperationJournalOwned(repo.checkout, state, plan.steps, []);
+    return { relation: plan.relation, oid: plan.upstreamOid };
+  });
+  if (started.relation === "up-to-date") return { outcome: "up-to-date", oid: started.oid };
+  if (started.relation === "fast-forward") {
+    return {
+      outcome: "completed",
+      oid: started.oid,
+      replayed: 0,
+      skipped: 0,
+      fastForward: true,
+    };
+  }
+  return driveRebase(context, repo, worktree, options, exclusions);
 }
 
 export function rebaseContinue(
   context: GitContext,
   repo: Repository,
   worktree: Worktree,
-  options: RebaseContinueOptions = {},
-): RebaseLifecycleResult {
-  return continueRebase(context, repo, worktree, options);
-}
-
-export function rebaseContinueExcluding(
-  context: GitContext,
-  repo: Repository,
-  worktree: Worktree,
   excludeRoots: readonly string[],
   options: RebaseContinueOptions = {},
 ): RebaseLifecycleResult {
-  return continueRebaseExcluding(context, repo, worktree, excludeRoots, options);
+  const exclusions = rebaseExclusions(repo, excludeRoots);
+  requireSharedMutationScope(repo.store.db, worktree);
+  repo.store.db.transactionSync(() => {
+    const journal = requireRebaseCursor(repo);
+    requireOriginalHead(repo, journal.state);
+    if (journal.state.phase === "running") {
+      requireCurrentBaseline(repo, worktree, journal.state, exclusions);
+      return;
+    }
+    withIntegrationWorkspaceOwned(repo.store, (workspace) => {
+      const plan = requireConflictOwnership(workspace, repo, worktree, journal);
+      if (repo.checkout.hasConflicts()) {
+        throw new GitError("EUNMERGED", "cannot continue rebase: the index has unmerged paths");
+      }
+      requireRebaseIndex(repo);
+      requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
+      const currentTree = repo.readCommit(journal.state.currentParentOid).tree;
+      if (integrationIndexMatchesTree(repo, currentTree)) {
+        preflightBaselineTree(repo, currentTree);
+        hardMaterializeTree(repo, worktree, currentTree, currentTree, exclusions);
+        advance(repo, journal, "skipped", null);
+        return;
+      }
+      const identities = stepIdentities(context, repo, plan, options);
+      const result = writeUnpublishedCommit(repo, {
+        message: plan.sourceCommit.message,
+        parent: [journal.state.currentParentOid],
+        identities,
+      });
+      advance(repo, journal, "applied", result.oid, identities.committer);
+    });
+  });
+  return driveRebase(context, repo, worktree, options, exclusions);
 }
 
 export function rebaseSkip(
   context: GitContext,
   repo: Repository,
   worktree: Worktree,
-  options: RebaseContinueOptions = {},
-): RebaseLifecycleResult {
-  return skipRebase(context, repo, worktree, options);
-}
-
-export function rebaseSkipExcluding(
-  context: GitContext,
-  repo: Repository,
-  worktree: Worktree,
   excludeRoots: readonly string[],
   options: RebaseContinueOptions = {},
 ): RebaseLifecycleResult {
-  return skipRebaseExcluding(context, repo, worktree, excludeRoots, options);
+  const exclusions = rebaseExclusions(repo, excludeRoots);
+  requireSharedMutationScope(repo.store.db, worktree);
+  withIntegrationWorkspaceOwned(repo.store, (workspace) => {
+    const journal = requireRebaseCursor(repo);
+    requireOriginalHead(repo, journal.state);
+    if (journal.state.phase !== "conflicted") {
+      throw new GitError("EOPMISMATCH", "rebase skip requires a conflicted step");
+    }
+    requireConflictOwnership(workspace, repo, worktree, journal);
+    const currentTree = repo.readCommit(journal.state.currentParentOid).tree;
+    preflightBaselineTree(repo, currentTree);
+    hardMaterializeTree(repo, worktree, currentTree, currentTree, exclusions);
+    advance(repo, journal, "skipped", null);
+  });
+  return driveRebase(context, repo, worktree, options, exclusions);
 }
 
-export function rebaseAbort(repo: Repository, worktree: Worktree): void {
-  abortRebase(repo, worktree);
-}
-
-export function rebaseAbortExcluding(
+export function rebaseAbort(
   repo: Repository,
   worktree: Worktree,
   excludeRoots: readonly string[],
 ): void {
-  abortRebaseExcluding(repo, worktree, excludeRoots);
+  const exclusions = rebaseExclusions(repo, excludeRoots);
+  requireSharedMutationScope(repo.store.db, worktree);
+  repo.store.db.transactionSync(() => {
+    const journal = requireRebaseCursor(repo);
+    requireOriginalHead(repo, journal.state);
+    if (journal.state.phase === "conflicted") {
+      withIntegrationWorkspaceOwned(repo.store, (workspace) => {
+        requireConflictOwnership(workspace, repo, worktree, journal);
+      });
+    }
+    const originalTree = repo.readCommit(journal.state.originalHeadOid).tree;
+    const baselineTree = repo.readCommit(journal.state.currentParentOid).tree;
+    preflightBaselineTree(repo, originalTree);
+    hardMaterializeTree(repo, worktree, baselineTree, originalTree, exclusions);
+    checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
+  });
 }

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
 import { applyIntegrationOwned } from "../packages/git/src/ops/integration/integration-apply-owned.js";
 import { planIntegrationOwned } from "../packages/git/src/ops/integration/integration-plan-owned.js";
+import { integrationTouched } from "../packages/git/src/ops/integration/integration-touched.js";
 import { projectMergePlanOwned } from "../packages/git/src/ops/merge/merge-projection.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import type { IntegrationEntry } from "../packages/git/src/store/operations/integration-workspace/descriptors.js";
@@ -136,8 +137,12 @@ describe("integration workspace ownership", () => {
         },
       ]);
       projected.finish(1, 1);
-      applyIntegrationOwned(workspace, repo, worktree, projected, {
-        suspendedState: {
+      applyIntegrationOwned(
+        workspace,
+        repo,
+        worktree,
+        { projected, touched: integrationTouched(workspace, projected) },
+        {
           kind: "merge",
           originalHeadRef: "refs/heads/main",
           originalHeadOid: head,
@@ -152,7 +157,7 @@ describe("integration workspace ownership", () => {
           author: null,
           committer: null,
         },
-      });
+      );
       return { base, content, markers };
     });
     expect(repo.checkout.indexGet("file", 1)?.oid).toBe(result.base);
@@ -185,8 +190,14 @@ describe("integration workspace ownership", () => {
         incomingLabel: "topic",
       });
       expect(
-        applyIntegrationOwned(workspace, repo, worktree, projected, { suspendedState: null }),
-      ).toEqual({ touched: null });
+        applyIntegrationOwned(
+          workspace,
+          repo,
+          worktree,
+          { projected, touched: integrationTouched(workspace, projected) },
+          null,
+        ),
+      ).toBeUndefined();
     });
     expect(repo.checkout.indexEntries()).toHaveLength(1001);
     expect(worktree.readFile("/file-1000")).toEqual(body);

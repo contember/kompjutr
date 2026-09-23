@@ -10,8 +10,7 @@ import type {
 import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
 import type { IntegrationTouched } from "../../store/operations/integration-workspace/touched.js";
 import type { ProjectedMergeEntry } from "../merge/merge-projection.js";
-import { checkoutBlockersAgainstOwned, checkoutBlockersOwned } from "../refs/refs.js";
-import type { CheckoutPathSelection } from "../refs/refs-checkout-guard.js";
+import { type CheckoutPathSelection, checkoutBlockers } from "../refs/refs.js";
 import type { Repository } from "../repository/repository.js";
 import {
   MAX_TREE_BUILD_LEAF_ENTRIES,
@@ -162,18 +161,14 @@ function requireSafeIntegrationSelection(
     maxHashCandidates,
     hashCandidates: 0,
   };
-  const blockers =
-    baselineTree === undefined
-      ? checkoutBlockersOwned(repo, worktree, incomingTree, paths, true, limits)
-      : checkoutBlockersAgainstOwned(
-          repo,
-          worktree,
-          baselineTree,
-          incomingTree,
-          paths,
-          true,
-          limits,
-        );
+  const blockers = checkoutBlockers(repo, worktree, {
+    baselineTree,
+    tree: incomingTree,
+    paths,
+    prune: true,
+    limits,
+    mode: "checkout",
+  });
   if (blockers.tracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",

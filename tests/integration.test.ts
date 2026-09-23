@@ -4,7 +4,7 @@ import { concat } from "../packages/git/src/common/bytes.js";
 import { hashObject, MODE_FILE, serializeTree } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
 import { DEFAULT_TEXT_MERGE_LIMITS } from "../packages/git/src/diff/xmerge.js";
-import type { IntegrationEntry } from "../packages/git/src/ops/integration/integration.js";
+import type { IntegrationEntry } from "../packages/git/src/ops/integration/integration-types.js";
 import { requireCleanIntegrationWorktree } from "../packages/git/src/ops/integration/integration-worktree.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import {

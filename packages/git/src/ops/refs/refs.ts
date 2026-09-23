@@ -10,7 +10,7 @@ import { treeOf } from "../repository/reads.js";
 import { expandRefOwned, type Repository, resolveHeadOwned } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { branch } from "./refs-branches.js";
-import { checkoutBlockersAgainstOwned } from "./refs-checkout-guard.js";
+import { checkoutBlockers } from "./refs-checkout-guard.js";
 
 // Branches, tags and HEAD movement, plus the working-tree reconciliation
 // that goes with moving HEAD. Refs are rows; HEAD is a column on the
@@ -34,15 +34,13 @@ export {
   tagDelete,
   tagList,
 } from "./refs-branches.js";
-export type { CheckoutBlockerLimits, CheckoutBlockers } from "./refs-checkout-guard.js";
-export {
-  checkoutBlockers,
-  checkoutBlockersAgainst,
-  checkoutBlockersAgainstOwned,
-  checkoutBlockersOwned,
-  hardResetBlockersAgainst,
-  hardResetBlockersAgainstOwned,
+export type {
+  CheckoutBlockerLimits,
+  CheckoutBlockers,
+  CheckoutGuard,
+  CheckoutPathSelection,
 } from "./refs-checkout-guard.js";
+export { checkoutBlockers } from "./refs-checkout-guard.js";
 
 const HEADS = "refs/heads/";
 
@@ -171,16 +169,13 @@ function requireCheckoutAllowed(
   excludeRoots: readonly string[],
 ): void {
   if (force) return;
-  const blocked = checkoutBlockersAgainstOwned(
-    repo,
-    worktree,
-    repo.headTree(),
+  const blocked = checkoutBlockers(repo, worktree, {
     tree,
     paths,
     prune,
-    undefined,
-    [...excludeRoots],
-  );
+    excludeRoots: [...excludeRoots],
+    mode: "checkout",
+  });
   if (blocked.tracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",

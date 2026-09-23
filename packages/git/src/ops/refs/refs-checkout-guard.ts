@@ -34,10 +34,22 @@ export interface CheckoutPathSelection {
   matches(path: string): boolean;
 }
 
+export interface CheckoutGuard {
+  /** The tree the working tree is checked out at; HEAD's tree when omitted. */
+  baselineTree?: string | null;
+  tree: string | null;
+  paths?: string[] | CheckoutPathSelection;
+  prune: boolean;
+  limits?: CheckoutBlockerLimits;
+  excludeRoots?: string[];
+  /** `hard-reset` intentionally discards tracked edits, as a sequencer reset does. */
+  mode: "checkout" | "hard-reset";
+}
+
 /**
- * What stands between the working tree and `tree`. git refuses a checkout
- * for two separate reasons and says so in two separate messages, so they
- * are kept apart here.
+ * What stands between the working tree and `guard.tree`. git refuses a
+ * checkout for two separate reasons and says so in two separate messages, so
+ * they are kept apart here.
  *
  * "Uncommitted" covers both halves: a file differing from the index, and an
  * index entry differing from HEAD. Either would be lost, and only the first
@@ -46,118 +58,12 @@ export interface CheckoutPathSelection {
 export function checkoutBlockers(
   repo: Repository,
   worktree: Worktree,
-  tree: string | null,
-  paths: string[] | undefined,
-  prune: boolean,
-  limits?: CheckoutBlockerLimits,
+  guard: CheckoutGuard,
 ): CheckoutBlockers {
-  return checkoutBlockersOwned(repo, worktree, tree, paths, prune, limits);
-}
-
-/** Internal checkout guard shared by integration operations. */
-export function checkoutBlockersOwned(
-  repo: Repository,
-  worktree: Worktree,
-  tree: string | null,
-  paths: string[] | CheckoutPathSelection | undefined,
-  prune: boolean,
-  limits?: CheckoutBlockerLimits,
-): CheckoutBlockers {
-  return checkoutBlockersAgainstOwned(repo, worktree, repo.headTree(), tree, paths, prune, limits);
-}
-
-/** Checkout safety when an operation's checked-out baseline is not the published HEAD tree. */
-export function checkoutBlockersAgainst(
-  repo: Repository,
-  worktree: Worktree,
-  baselineTree: string | null,
-  tree: string | null,
-  paths: string[] | undefined,
-  prune: boolean,
-  limits?: CheckoutBlockerLimits,
-  excludeRoots: string[] = [],
-): CheckoutBlockers {
-  return checkoutBlockersAgainstOwned(
-    repo,
-    worktree,
-    baselineTree,
-    tree,
-    paths,
-    prune,
-    limits,
-    excludeRoots,
-  );
-}
-
-/** Internal checkout guard with an explicit baseline. */
-export function checkoutBlockersAgainstOwned(
-  repo: Repository,
-  worktree: Worktree,
-  baselineTree: string | null,
-  tree: string | null,
-  paths: string[] | CheckoutPathSelection | undefined,
-  prune: boolean,
-  limits?: CheckoutBlockerLimits,
-  excludeRoots: string[] = [],
-): CheckoutBlockers {
-  return checkoutBlockersAgainstMode(
-    repo,
-    worktree,
-    baselineTree,
-    tree,
-    paths,
-    prune,
-    limits,
-    false,
-    excludeRoots,
-  );
-}
-
-/** Checkout safety for a sequencer hard reset that intentionally discards tracked edits. */
-export function hardResetBlockersAgainst(
-  repo: Repository,
-  worktree: Worktree,
-  baselineTree: string | null,
-  tree: string | null,
-  limits: CheckoutBlockerLimits,
-  excludeRoots: string[] = [],
-): CheckoutBlockers {
-  return hardResetBlockersAgainstOwned(repo, worktree, baselineTree, tree, limits, excludeRoots);
-}
-
-/** Internal hard-reset guard shared by sequencer operations. */
-export function hardResetBlockersAgainstOwned(
-  repo: Repository,
-  worktree: Worktree,
-  baselineTree: string | null,
-  tree: string | null,
-  limits: CheckoutBlockerLimits,
-  excludeRoots: string[] = [],
-): CheckoutBlockers {
-  return checkoutBlockersAgainstMode(
-    repo,
-    worktree,
-    baselineTree,
-    tree,
-    undefined,
-    true,
-    limits,
-    true,
-    excludeRoots,
-  );
-}
-
-function checkoutBlockersAgainstMode(
-  repo: Repository,
-  worktree: Worktree,
-  baselineTree: string | null,
-  tree: string | null,
-  paths: string[] | CheckoutPathSelection | undefined,
-  prune: boolean,
-  limits: CheckoutBlockerLimits | undefined,
-  discardTrackedChanges: boolean,
-  excludeRoots: string[],
-): CheckoutBlockers {
+  const baselineTree = guard.baselineTree === undefined ? repo.headTree() : guard.baselineTree;
+  const { tree, paths, prune, limits } = guard;
+  const excludeRoots = guard.excludeRoots ?? [];
+  const discardTrackedChanges = guard.mode === "hard-reset";
   const tracked: string[] = [];
   const untracked: string[] = [];
   const dirtyCandidates: GuardCandidate[] = [];

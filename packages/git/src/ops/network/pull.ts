@@ -9,8 +9,8 @@ import { withGitMutationGuardOwned } from "../../store/database/database.js";
 import { type GitContext, type GitIdentity, nestedRoots } from "../core/context.js";
 import type { PullResult } from "../core/kinds.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
-import { type MergeBehavior, mergeOwned } from "../merge/merge.js";
-import { startRebaseExcluding } from "../rebase/rebase-lifecycle.js";
+import { type MergeBehavior, merge } from "../merge/merge.js";
+import { rebase } from "../rebase/rebase.js";
 import { type Repository, resolveHeadOwned } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { type AbortableNetworkOptions, fetchInto, type RemoteAuthOptions } from "./network.js";
@@ -168,9 +168,9 @@ function pullStrategy(repo: Repository, options: PullOptions): PullPlan["strateg
     }
     return explicit ? "rebase" : "merge";
   }
-  const rebase = configured(repo, "pull.rebase");
-  if (rebase === undefined) return "merge";
-  const normalized = rebase.trim().toLowerCase();
+  const setting = configured(repo, "pull.rebase");
+  if (setting === undefined) return "merge";
+  const normalized = setting.trim().toLowerCase();
   if (FALSE_CONFIG_VALUES.has(normalized)) return "merge";
   if (TRUE_CONFIG_VALUES.has(normalized)) return "rebase";
   if (
@@ -181,7 +181,7 @@ function pullStrategy(repo: Repository, options: PullOptions): PullPlan["strateg
   ) {
     throw new UnsupportedOperationError("rebase-based pull");
   }
-  throw new GitError("EINVAL", `config pull.rebase has invalid value ${rebase}`);
+  throw new GitError("EINVAL", `config pull.rebase has invalid value ${setting}`);
 }
 
 function requireRebaseOptions(options: PullOptions): void {
@@ -373,18 +373,12 @@ export async function pull(
       };
       return {
         strategy: "rebase",
-        result: startRebaseExcluding(
-          context,
-          repo,
-          worktree,
-          nestedRoots(context, repo.root),
-          rebaseOptions,
-        ),
+        result: rebase(context, repo, worktree, nestedRoots(context, repo.root), rebaseOptions),
       };
     }
 
     const message = options.message === undefined ? defaultPullMessage(plan) : options.message;
-    const result = mergeOwned(
+    const result = merge(
       context,
       repo,
       worktree,

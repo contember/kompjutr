@@ -1,17 +1,17 @@
 // Runs the owned integration planners inside one workspace and collects their
 // stored plans into arrays, so tests can assert whole plans after the scope ends.
 
-import { MAX_INTEGRATION_SOURCE_ROWS } from "../../packages/git/src/ops/integration/integration.js";
 import {
   planIntegrationOwned,
   planVirtualAncestorIntegrationOwned,
 } from "../../packages/git/src/ops/integration/integration-plan-owned.js";
 import { classifyIntegrationStructureOwned } from "../../packages/git/src/ops/integration/integration-structure-owned.js";
 import { integrationTouched } from "../../packages/git/src/ops/integration/integration-touched.js";
-import type {
-  IntegrationEntry,
-  IntegrationInput,
-  VirtualAncestorIntegrationInput,
+import {
+  type IntegrationEntry,
+  type IntegrationInput,
+  MAX_INTEGRATION_SOURCE_ROWS,
+  type VirtualAncestorIntegrationInput,
 } from "../../packages/git/src/ops/integration/integration-types.js";
 import {
   type MergeProjectionCollisions,

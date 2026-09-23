@@ -7,10 +7,10 @@ import {
   merge as mergeOp,
 } from "./ops/merge/merge.js";
 import {
-  rebaseAbortExcluding as rebaseAbortOp,
-  rebaseContinueExcluding as rebaseContinueOp,
-  rebaseExcluding as rebaseOp,
-  rebaseSkipExcluding as rebaseSkipOp,
+  rebaseAbort as rebaseAbortOp,
+  rebaseContinue as rebaseContinueOp,
+  rebase as rebaseOp,
+  rebaseSkip as rebaseSkipOp,
 } from "./ops/rebase/rebase.js";
 import {
   cherryPickAbort as cherryPickAbortOp,

@@ -31,8 +31,8 @@ steps, and their recovery state must all be authenticated.
 
 ## Touch points
 
-`packages/git/src/ops/rebase/rebase-plan.ts`, `packages/git/src/ops/rebase/rebase-lifecycle.ts`,
-`packages/git/src/ops/core/operation-state.ts`, `packages/git/src/ops/merge/merge-apply.ts`,
+`packages/git/src/ops/rebase/rebase-plan.ts`, `packages/git/src/ops/rebase/rebase.ts`,
+`packages/git/src/ops/core/operation-state.ts`, `packages/git/src/ops/integration/apply/`,
 `packages/git/src/store/schema/schema.ts`, `packages/git/src/store/`, `tests/rebase*.test.ts`, reference
 docs
 

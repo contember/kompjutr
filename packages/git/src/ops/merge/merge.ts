@@ -10,16 +10,13 @@ import type { MergeResult } from "../core/kinds.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata, type RefLogReason } from "../core/ref-log.js";
 import { applyIntegrationOwned } from "../integration/integration-apply-owned.js";
-import { projectIntegrationWithCollisionsOwned } from "../integration/integration-collisions-owned.js";
 import { planIntegrationOwned } from "../integration/integration-plan-owned.js";
 import { restoreIntegrationOwned } from "../integration/integration-restore-owned.js";
-import { integrationTouched } from "../integration/integration-touched.js";
+import { projectIntegrationStepOwned } from "../integration/integration-step.js";
 import {
-  prospectiveIntegrationIndexEntriesOwned,
   requireBoundedIntegrationIndex,
   requireBoundedIntegrationTree,
   requireCleanIntegrationIndex,
-  requireSafeIntegrationWorktreeOwned,
 } from "../integration/integration-worktree.js";
 import { type CommitIdentities, commitIndex, resolveIdentity } from "../repository/commit.js";
 import type { Repository, ResolvedHead } from "../repository/repository.js";
@@ -192,18 +189,6 @@ export function merge(
   behavior: MergeBehavior = {},
 ): MergeResult {
   requireSharedMutationScope(repo.store.db, worktree);
-  return mergeOwned(context, repo, worktree, options, behavior);
-}
-
-/** Internal merge seam shared with pull. */
-export function mergeOwned(
-  context: GitContext,
-  repo: Repository,
-  worktree: Worktree,
-  options: MergeOptions,
-  behavior: MergeBehavior,
-): MergeResult {
-  requireSharedMutationScope(repo.store.db, worktree);
   return repo.store.db.transactionSync(() =>
     mergeInTransaction(context, repo, worktree, options, behavior),
   );
@@ -265,29 +250,21 @@ function mergeInTransaction(
       incomingTreeOid: nextTree,
       text: { labels: { current: currentLabel, base: "base", incoming: nextLabel } },
     });
-    const projected = projectIntegrationWithCollisionsOwned(
-      workspace,
-      repo,
-      worktree,
-      baseTree,
-      nextTree,
+    const integration = projectIntegrationStepOwned(workspace, repo, worktree, {
+      operation: "merge",
+      baseTreeOid: baseTree,
+      incomingTreeOid: nextTree,
       plan,
-      currentLabel,
-      nextLabel,
-      undefined,
-      "merge",
-    );
-    requireSafeIntegrationWorktreeOwned(repo, worktree, nextTree, plan, "merge", undefined);
+      labels: { current: currentLabel, incoming: nextLabel },
+      requireResultTree: isFastForward
+        ? undefined
+        : (entries) => requireBoundedIntegrationTree(repo, entries),
+    });
+    const projected = integration.projected;
     let conflictCount = 0;
     for (const _path of conflictedPaths(projected.entries)) conflictCount++;
     if (conflictCount > 0 && behavior.persistConflicts === false) {
       throw compatibilityConflict(conflictedPaths(projected.entries));
-    }
-    const touched = integrationTouched(workspace, projected);
-    if (!isFastForward) {
-      requireBoundedIntegrationTree(repo, () =>
-        prospectiveIntegrationIndexEntriesOwned(repo, projected, touched),
-      );
     }
 
     const current = repo.head();
@@ -311,10 +288,13 @@ function mergeInTransaction(
     const outcome =
       conflictCount > 0 ? "conflicted" : mergeMetadata.mode === "no-commit" ? "ready" : "clean";
     if (outcome === "clean") validateMergeStateMetadata({ ...mergeMetadata, phase: "conflicted" });
-    applyIntegrationOwned(workspace, repo, worktree, projected, {
-      suspendedState:
-        outcome === "clean" ? null : { kind: "merge", ...mergeMetadata, phase: outcome },
-    });
+    applyIntegrationOwned(
+      workspace,
+      repo,
+      worktree,
+      integration,
+      outcome === "clean" ? null : { kind: "merge", ...mergeMetadata, phase: outcome },
+    );
     if (isFastForward) {
       repositoryMutations(repo).mutateRefsOwned(
         {
@@ -332,7 +312,7 @@ function mergeInTransaction(
         ),
       );
       // A failed optional advance leaves a baseline mismatch, which forces the safe full path.
-      context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, nextTree);
+      context.indexTracker?.advanceBaseline(repo.checkout.checkoutId, nextTree);
       return { oid: incomingOid, fastForward: true };
     }
     requireBoundedIntegrationIndex(repo);

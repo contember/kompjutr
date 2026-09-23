@@ -8,12 +8,9 @@ import {
 import type { GitContext } from "../core/context.js";
 import { applyIntegrationOwned } from "../integration/integration-apply-owned.js";
 import { projectIntegrationWithCollisionsOwned } from "../integration/integration-collisions-owned.js";
+import { projectIntegrationStepOwned } from "../integration/integration-step.js";
 import { integrationTouched } from "../integration/integration-touched.js";
-import {
-  integrationIndexMatchesTree,
-  prospectiveIntegrationIndexEntriesOwned,
-  requireSafeIntegrationWorktreeOwned,
-} from "../integration/integration-worktree.js";
+import { integrationIndexMatchesTree } from "../integration/integration-worktree.js";
 import { planFixedReplayStepOwned } from "../replay/replay-planning.js";
 import type { ReplayPlan } from "../replay/replay-types.js";
 import { resolveIdentity, writeUnpublishedCommit } from "../repository/commit.js";
@@ -110,50 +107,30 @@ export function applyOneStep(
       advance(repo, journal, "skipped", null);
       return "advanced";
     }
-    const projected = projectIntegrationWithCollisionsOwned(
-      workspace,
-      repo,
-      worktree,
-      plan.baseTreeOid,
-      plan.incomingTreeOid,
-      plan.integration,
-      plan.labels.current,
-      plan.labels.incoming,
-      undefined,
-      "rebase",
-    );
-    for (const entry of projected.entries) {
-      requirePathsOutsideExclusions([entry.path, entry.logicalPath], exclusions);
-    }
-    requireSafeIntegrationWorktreeOwned(
-      repo,
-      worktree,
-      plan.incomingTreeOid,
-      plan.integration,
-      "rebase",
-      currentTree,
-    );
-    const touched = integrationTouched(workspace, projected);
-    requireRebaseTree(repo, () =>
-      prospectiveIntegrationIndexEntriesOwned(repo, projected, touched),
-    );
+    const integration = projectIntegrationStepOwned(workspace, repo, worktree, {
+      operation: "rebase",
+      baseTreeOid: plan.baseTreeOid,
+      incomingTreeOid: plan.incomingTreeOid,
+      plan: plan.integration,
+      labels: plan.labels,
+      baselineTree: currentTree,
+      requireProjection: (projected) => {
+        for (const entry of projected.entries) {
+          requirePathsOutsideExclusions([entry.path, entry.logicalPath], exclusions);
+        }
+      },
+      requireResultTree: (entries) => requireRebaseTree(repo, entries),
+    });
     let conflicted = false;
     for (const entry of plan.integration.entries)
       if (entry.kind === "conflict") {
         conflicted = true;
         break;
       }
-    applyIntegrationOwned(
-      workspace,
-      repo,
-      worktree,
-      projected,
-      { suspendedState: null },
-      {
-        currentStep: journal.state.currentStep,
-        conflictState: conflicted ? { ...journal.state, phase: "conflicted" } : null,
-      },
-    );
+    applyIntegrationOwned(workspace, repo, worktree, integration, null, {
+      currentStep: journal.state.currentStep,
+      conflictState: conflicted ? { ...journal.state, phase: "conflicted" } : null,
+    });
     if (conflicted) return "conflicted";
     if (integrationIndexMatchesTree(repo, currentTree)) {
       advance(repo, journal, "skipped", null);
@@ -170,22 +147,13 @@ export function applyOneStep(
   });
 }
 
+/** Re-plan the conflicted step and require the journal to own exactly its paths. */
 export function requireConflictOwnership(
-  repo: Repository,
-  worktree: Worktree,
-  journal: RebaseJournalCursor,
-): void {
-  withIntegrationWorkspaceOwned(repo.store, (workspace) =>
-    validateConflictOwnership(workspace, repo, worktree, journal),
-  );
-}
-
-function validateConflictOwnership(
   workspace: IntegrationWorkspace,
   repo: Repository,
   worktree: Worktree,
   journal: RebaseJournalCursor,
-): void {
+): ReplayPlan {
   requireConflictSnapshots(repo, journal);
   const plan = planCurrentStep(workspace, repo, journal);
   const omitted = workspace.touched(plan.integration);
@@ -222,6 +190,7 @@ function validateConflictOwnership(
       throw new CorruptError("rebase conflict ownership differs from its replay plan");
     }
   }
+  return plan;
 }
 
 function requireConflictSnapshots(repo: Repository, journal: RebaseJournalCursor): void {

@@ -1,12 +1,7 @@
 import { GitError } from "../../common/errors.js";
 import { type GitContext, nestedRoots } from "../../ops/core/context.js";
 import { mergeAbort, mergeContinue } from "../../ops/merge/merge.js";
-import {
-  rebaseAbortExcluding,
-  rebaseContinueExcluding,
-  rebaseExcluding,
-  rebaseSkipExcluding,
-} from "../../ops/rebase/rebase.js";
+import { rebase, rebaseAbort, rebaseContinue, rebaseSkip } from "../../ops/rebase/rebase.js";
 import { requireRebaseCursor } from "../../ops/rebase/rebase-lifecycle-baseline.js";
 import { gitCliResult } from "../result.js";
 import type { GitCliHandlers } from "../types.js";
@@ -34,7 +29,7 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
             context,
             repo,
             options,
-            () => rebaseAbortExcluding(repo, context.worktree, nestedRoots(context, repo.root)),
+            () => rebaseAbort(repo, context.worktree, nestedRoots(context, repo.root)),
             () => gitCliResult("", "", 0),
             mapRebaseFailure,
           );
@@ -47,13 +42,10 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
             () => {
               const upstream = invocation.command.upstream;
               if (upstream === undefined) throw new Error("parsed rebase start lost its upstream");
-              return rebaseExcluding(
-                context,
-                repo,
-                context.worktree,
-                nestedRoots(context, repo.root),
-                { upstream, env: environmentRecord(invocation.env) },
-              );
+              return rebase(context, repo, context.worktree, nestedRoots(context, repo.root), {
+                upstream,
+                env: environmentRecord(invocation.env),
+              });
             },
             (result) => formatRebaseResult(repo, result),
             (error) => mapLocalMutationFailure(error, outputContext(options)),
@@ -65,13 +57,9 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
             repo,
             options,
             () =>
-              rebaseSkipExcluding(
-                context,
-                repo,
-                context.worktree,
-                nestedRoots(context, repo.root),
-                { env: environmentRecord(invocation.env) },
-              ),
+              rebaseSkip(context, repo, context.worktree, nestedRoots(context, repo.root), {
+                env: environmentRecord(invocation.env),
+              }),
             (result) => formatRebaseResult(repo, result),
             (error) => mapRebaseContinueFailure(repo, error, options),
           );
@@ -82,7 +70,7 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
           options,
           () => {
             const before = requireRebaseCursor(repo);
-            const result = rebaseContinueExcluding(
+            const result = rebaseContinue(
               context,
               repo,
               context.worktree,

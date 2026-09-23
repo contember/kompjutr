@@ -11,7 +11,6 @@ import {
   rebase,
   rebaseAbort,
   rebaseContinue,
-  rebaseContinueExcluding,
   rebaseSkip,
 } from "../packages/git/src/ops/rebase/rebase.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
@@ -85,14 +84,14 @@ it.each(["clean", "continue", "abort"])(
       repo = reopenRepo(workspace);
       if (finish === "abort") {
         source.git("rebase", "--abort");
-        rebaseAbort(repo, workspace.worktree);
+        rebaseAbort(repo, workspace.worktree, []);
       } else {
         source.write("base", "resolved\n");
         source.git("add", "base");
         source.git("rebase", "--continue");
         writeWorkFile(workspace, "/base", "resolved\n");
         add(repo, workspace.worktree, { paths: ["base"] });
-        rebaseContinue(workspace.context, repo, workspace.worktree);
+        rebaseContinue(workspace.context, repo, workspace.worktree, []);
       }
     }
     expect(repo.headTree()).toBe(source.git("rev-parse", "HEAD^{tree}"));
@@ -196,7 +195,7 @@ describe("rebase lifecycle", () => {
       });
 
       expectCode(
-        () => rebase(workspace.context, repo, workspace.worktree, { upstream }),
+        () => rebase(workspace.context, repo, workspace.worktree, [], { upstream }),
         "ESHALLOW",
       );
       await fetchInto(workspace.context, repo, {
@@ -205,7 +204,7 @@ describe("rebase lifecycle", () => {
         tags: false,
       });
       expect(repo.shallow()).toEqual(new Set());
-      expect(rebase(workspace.context, repo, workspace.worktree, { upstream })).toMatchObject({
+      expect(rebase(workspace.context, repo, workspace.worktree, [], { upstream })).toMatchObject({
         outcome: "completed",
         replayed: 1,
       });
@@ -225,7 +224,7 @@ describe("rebase lifecycle", () => {
     const namedReflogBefore = workspace.repo.store.reflog("refs/heads/current").length;
     const recorded = recordingBaselineContext(workspace);
 
-    const result = rebase(recorded.context, workspace.repo, workspace.worktree, {
+    const result = rebase(recorded.context, workspace.repo, workspace.worktree, [], {
       upstream,
     });
 
@@ -283,7 +282,7 @@ describe("rebase lifecycle", () => {
     const behindRecorded = recordingBaselineContext(behind);
     const fastActor = { name: "Fast Forward", email: "fast-forward@example.com" };
     expect(
-      rebase(behindRecorded.context, behind.repo, behind.worktree, {
+      rebase(behindRecorded.context, behind.repo, behind.worktree, [], {
         upstream: second,
         committer: fastActor,
       }),
@@ -322,7 +321,7 @@ describe("rebase lifecycle", () => {
     const current = await imported(source);
     const currentRecorded = recordingBaselineContext(current);
     expect(
-      rebase(currentRecorded.context, current.repo, current.worktree, { upstream: first }),
+      rebase(currentRecorded.context, current.repo, current.worktree, [], { upstream: first }),
     ).toEqual({
       outcome: "up-to-date",
       oid: second,
@@ -347,9 +346,15 @@ describe("rebase lifecycle", () => {
     emptySource.git("rebase", "upstream");
     const expectedEmpty = emptySource.git("rev-parse", "HEAD");
 
-    const retained = rebase(emptyWorkspace.context, emptyWorkspace.repo, emptyWorkspace.worktree, {
-      upstream: emptyUpstream,
-    });
+    const retained = rebase(
+      emptyWorkspace.context,
+      emptyWorkspace.repo,
+      emptyWorkspace.worktree,
+      [],
+      {
+        upstream: emptyUpstream,
+      },
+    );
     expect(retained).toMatchObject({ outcome: "completed", oid: expectedEmpty, replayed: 1 });
     expect(emptyWorkspace.repo.readCommit(expectedEmpty)).toMatchObject({
       parent: [emptyUpstream],
@@ -374,6 +379,7 @@ describe("rebase lifecycle", () => {
       redundantWorkspace.context,
       redundantWorkspace.repo,
       redundantWorkspace.worktree,
+      [],
       {
         upstream: redundantUpstream,
         committer: { name: "Invalid <Actor", email: "invalid>actor@example.com" },
@@ -401,14 +407,16 @@ describe("rebase lifecycle", () => {
     const { upstream } = divergent(source, true);
     const workspace = await imported(source);
 
-    const suspended = rebase(workspace.context, workspace.repo, workspace.worktree, { upstream });
+    const suspended = rebase(workspace.context, workspace.repo, workspace.worktree, [], {
+      upstream,
+    });
     expect(suspended.outcome).toBe("conflicted");
     expect(workspace.repo.head().oid).not.toBe(upstream);
     expect(workspace.repo.checkout.requireOperationState("rebase").state.phase).toBe("conflicted");
 
     writeWorkFile(workspace, "/shared.txt", "resolved\n");
     add(workspace.repo, workspace.worktree, { paths: ["shared.txt"] });
-    const completed = rebaseContinue(workspace.context, workspace.repo, workspace.worktree);
+    const completed = rebaseContinue(workspace.context, workspace.repo, workspace.worktree, []);
 
     expect(completed.outcome).toBe("completed");
     expect(textAt(workspace, "shared.txt")).toBe("resolved\n");
@@ -420,7 +428,7 @@ describe("rebase lifecycle", () => {
     const { upstream } = divergent(source, true);
     const workspace = await imported(source);
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }).outcome,
     ).toBe("conflicted");
     const roots = Array.from(
       { length: 64 },
@@ -428,7 +436,7 @@ describe("rebase lifecycle", () => {
     );
 
     expectCode(
-      () => rebaseContinueExcluding(workspace.context, workspace.repo, workspace.worktree, roots),
+      () => rebaseContinue(workspace.context, workspace.repo, workspace.worktree, roots),
       "EUNMERGED",
     );
   });
@@ -446,7 +454,7 @@ describe("rebase lifecycle", () => {
     const workspace = await imported(source);
 
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toMatchObject({ outcome: "conflicted", replayed: 0 });
     expect(workspace.worktree.readlink("/lnk")).toBe("target.txt");
     expect(textAt(workspace, "lnk~HEAD")).toBe("upstream file\n");
@@ -465,14 +473,14 @@ describe("rebase lifecycle", () => {
     workspace.worktree.removeFiles(["/lnk~HEAD"]);
     writeWorkFile(workspace, "/lnk~HEAD/outside.txt", "outside\n");
 
-    expectCode(() => rebaseAbort(cold, workspace.worktree), "ECHECKOUTFAIL");
+    expectCode(() => rebaseAbort(cold, workspace.worktree, []), "ECHECKOUTFAIL");
     expect(textAt(workspace, "lnk~HEAD/outside.txt")).toBe("outside\n");
     expect(cold.checkout.readOperationState()).not.toBeNull();
     expect(cold.head().oid).toBe(original);
 
     workspace.worktree.removeFiles(["/lnk~HEAD/outside.txt"]);
     workspace.worktree.rmdir("/lnk~HEAD");
-    rebaseAbort(cold, workspace.worktree);
+    rebaseAbort(cold, workspace.worktree, []);
     expect(cold.head().oid).toBe(original);
     expect(workspace.worktree.readlink("/lnk")).toBe("target.txt");
     expect(workspace.worktree.stat("/lnk~HEAD")).toBeNull();
@@ -494,16 +502,18 @@ describe("rebase lifecycle", () => {
     const workspace = await imported(source);
 
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
     ).toMatchObject({ outcome: "conflicted", replayed: 0 });
     expect(workspace.repo.checkout.requireOperationState("rebase").state.currentStep).toBe(0);
     writeWorkFile(workspace, "/shared.txt", "resolved first\n");
     add(workspace.repo, workspace.worktree, { paths: ["shared.txt"] });
 
-    expect(rebaseContinue(workspace.context, workspace.repo, workspace.worktree)).toMatchObject({
-      outcome: "completed",
-      replayed: 2,
-    });
+    expect(rebaseContinue(workspace.context, workspace.repo, workspace.worktree, [])).toMatchObject(
+      {
+        outcome: "completed",
+        replayed: 2,
+      },
+    );
     expect(textAt(workspace, "later.txt")).toBe("later\n");
   });
 
@@ -520,12 +530,12 @@ describe("rebase lifecycle", () => {
     const workspace = await imported(source);
 
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }).outcome,
     ).toBe("conflicted");
     writeWorkFile(workspace, "/shared.txt", "upstream\n");
     add(workspace.repo, workspace.worktree, { paths: ["shared.txt"] });
 
-    expect(rebaseContinue(workspace.context, workspace.repo, workspace.worktree)).toEqual({
+    expect(rebaseContinue(workspace.context, workspace.repo, workspace.worktree, [])).toEqual({
       outcome: "completed",
       oid: upstream,
       replayed: 0,
@@ -548,10 +558,10 @@ describe("rebase lifecycle", () => {
     const workspace = await imported(source);
 
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }).outcome,
     ).toBe("conflicted");
     rm(workspace.repo, workspace.worktree, { paths: ["deleted.txt"] });
-    const result = rebaseContinue(workspace.context, workspace.repo, workspace.worktree);
+    const result = rebaseContinue(workspace.context, workspace.repo, workspace.worktree, []);
 
     expect(result.outcome).toBe("completed");
     if (result.outcome !== "completed") throw new Error("delete resolution did not complete");
@@ -575,12 +585,12 @@ describe("rebase lifecycle", () => {
     const workspace = await imported(source);
 
     expect(
-      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }).outcome,
     ).toBe("conflicted");
     expect(workspace.repo.checkout.hasConflicts()).toBe(true);
     expect(textAt(workspace, "deleted.txt")).toBe("upstream\n");
 
-    rebaseAbort(workspace.repo, workspace.worktree);
+    rebaseAbort(workspace.repo, workspace.worktree, []);
 
     expect(workspace.repo.head().oid).toBe(original);
     expect(workspace.repo.checkout.hasConflicts()).toBe(false);
@@ -596,21 +606,21 @@ describe("rebase lifecycle", () => {
     const { upstream: skippedUpstream } = divergent(skippedSource, true);
     const skipped = await imported(skippedSource);
     expect(
-      rebase(skipped.context, skipped.repo, skipped.worktree, { upstream: skippedUpstream })
+      rebase(skipped.context, skipped.repo, skipped.worktree, [], { upstream: skippedUpstream })
         .outcome,
     ).toBe("conflicted");
-    const skippedResult = rebaseSkip(skipped.context, skipped.repo, skipped.worktree);
+    const skippedResult = rebaseSkip(skipped.context, skipped.repo, skipped.worktree, []);
     expect(skippedResult.outcome).toBe("completed");
     expect(textAt(skipped, "shared.txt")).toBe("upstream\n");
 
     const abortedSource = fixture();
     const { original, upstream } = divergent(abortedSource, true);
     const aborted = await imported(abortedSource);
-    expect(rebase(aborted.context, aborted.repo, aborted.worktree, { upstream }).outcome).toBe(
+    expect(rebase(aborted.context, aborted.repo, aborted.worktree, [], { upstream }).outcome).toBe(
       "conflicted",
     );
     writeWorkFile(aborted, "/keep.txt", "untracked\n");
-    rebaseAbort(aborted.repo, aborted.worktree);
+    rebaseAbort(aborted.repo, aborted.worktree, []);
     expect(aborted.repo.head().oid).toBe(original);
     expect(textAt(aborted, "shared.txt")).toBe("current\n");
     expect(textAt(aborted, "keep.txt")).toBe("untracked\n");
@@ -633,7 +643,7 @@ describe("rebase lifecycle", () => {
       source.commit("conflict");
       const workspace = await imported(source);
       expect(
-        rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
+        rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }).outcome,
       ).toBe("conflicted");
       writeWorkFile(workspace, "/staged.txt", "staged edit\n");
       writeWorkFile(workspace, "/staged-add.txt", "staged addition\n");
@@ -646,7 +656,7 @@ describe("rebase lifecycle", () => {
 
     const skipped = await prepare();
     expect(
-      rebaseSkip(skipped.workspace.context, skipped.workspace.repo, skipped.workspace.worktree),
+      rebaseSkip(skipped.workspace.context, skipped.workspace.repo, skipped.workspace.worktree, []),
     ).toMatchObject({ outcome: "completed", oid: skipped.upstream, skipped: 1 });
     for (const expected of [
       { path: "staged.txt", content: "base staged\n" },
@@ -659,7 +669,7 @@ describe("rebase lifecycle", () => {
     expect(textAt(skipped.workspace, "untracked.txt")).toBe("keep me\n");
 
     const aborted = await prepare();
-    rebaseAbort(aborted.workspace.repo, aborted.workspace.worktree);
+    rebaseAbort(aborted.workspace.repo, aborted.workspace.worktree, []);
     for (const expected of [
       { path: "staged.txt", content: "base staged\n" },
       { path: "unstaged.txt", content: "base unstaged\n" },
@@ -679,7 +689,7 @@ describe("rebase lifecycle", () => {
     writeWorkFile(workspace, "/one.txt", "dirty\n");
 
     expectCode(
-      () => rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      () => rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
       "ECHECKOUTFAIL",
     );
     expect(workspace.repo.head().oid).toBe(original);
@@ -711,7 +721,7 @@ describe("rebase lifecycle", () => {
       const workspace = await imported(source);
 
       expectCode(
-        () => rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+        () => rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
         "EUNSUPPORTED",
       );
       expect(workspace.repo.head()).toEqual({ ref: "refs/heads/current", oid: unsupported });
@@ -735,7 +745,7 @@ describe("rebase lifecycle", () => {
     writeWorkFile(workspace, "/x~HEAD", "pre-existing untracked\n");
 
     expectCode(
-      () => rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+      () => rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }),
       "ECHECKOUTFAIL",
     );
     expect(textAt(workspace, "x~HEAD")).toBe("pre-existing untracked\n");
@@ -747,7 +757,7 @@ describe("rebase lifecycle", () => {
     expect(textAt(workspace, "x")).toBe("upstream file\n");
 
     const cold = reopenRepo(workspace);
-    rebaseAbort(cold, workspace.worktree);
+    rebaseAbort(cold, workspace.worktree, []);
     expect(cold.head().oid).toBe(original);
     expect(textAt(workspace, "x/y.txt")).toBe("current child\n");
     expect(textAt(workspace, "x~HEAD")).toBe("pre-existing untracked\n");
@@ -769,7 +779,7 @@ describe("rebase lifecycle", () => {
     const upstreamTree = absent.repo.readCommit(upstream).tree;
     const upstreamFile = absent.repo.readTree(upstreamTree).find((entry) => entry.name === "x");
     if (upstreamFile === undefined) throw new Error("upstream file is missing");
-    expect(rebase(absent.context, absent.repo, absent.worktree, { upstream }).outcome).toBe(
+    expect(rebase(absent.context, absent.repo, absent.worktree, [], { upstream }).outcome).toBe(
       "conflicted",
     );
     const relocation = absent.repo.checkout
@@ -784,12 +794,12 @@ describe("rebase lifecycle", () => {
       upstreamFile.oid,
       absent.repo.checkout.checkoutId,
     );
-    expectCode(() => rebaseSkip(absent.context, absent.repo, absent.worktree), "ECORRUPT");
+    expectCode(() => rebaseSkip(absent.context, absent.repo, absent.worktree, []), "ECORRUPT");
 
     const directory = await imported(source);
     directory.worktree.writeFiles([{ path: "/x~HEAD", mode: 0o755 }]);
     expect(
-      rebase(directory.context, directory.repo, directory.worktree, { upstream }).outcome,
+      rebase(directory.context, directory.repo, directory.worktree, [], { upstream }).outcome,
     ).toBe("conflicted");
     expect(
       directory.repo.checkout

@@ -52,7 +52,7 @@ import type {
   PushResult as StructuredPushResult,
 } from "./ops/refs/refspec.js";
 import type { CherryPickContinueOptions, CherryPickOptions } from "./ops/replay/cherry-pick.js";
-import type { ReplaySnapshotOptions, ReplaySnapshotResult } from "./ops/replay/replay.js";
+import type { ReplaySnapshotOptions, ReplaySnapshotResult } from "./ops/replay/replay-types.js";
 import type { RevertContinueOptions, RevertOptions } from "./ops/replay/revert.js";
 import type { CommitOptions } from "./ops/repository/commit.js";
 import type { InitOptions } from "./ops/repository/init.js";

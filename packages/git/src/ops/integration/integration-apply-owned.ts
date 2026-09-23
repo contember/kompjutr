@@ -17,19 +17,16 @@ import {
   writeOperationJournalOwned,
 } from "../../store/operations/operation-journal.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
+import type { OperationStateMetadata } from "../core/operation-state.js";
 import { operationStepsForState } from "../core/operation-state.js";
-import { applyIndex } from "../merge/merge-apply-index.js";
-import { snapshotWorktreeObjects, touchedFromDrafts } from "../merge/merge-apply-snapshot.js";
-import type {
-  ActiveRebaseApply,
-  OperationApplyOptions,
-  SnapshotDraft,
-} from "../merge/merge-apply-types.js";
-import { validateProjectedIndexEntries } from "../merge/merge-apply-validation.js";
 import type { Repository } from "../repository/repository.js";
 import { fileModeFor, type Worktree } from "../worktree/worktree.js";
 import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
-import { integrationTouched } from "./integration-touched.js";
+import { applyIndex } from "./apply/apply-index.js";
+import { snapshotWorktreeObjects, touchedFromDrafts } from "./apply/apply-snapshot.js";
+import type { ActiveRebaseApply, SnapshotDraft } from "./apply/apply-types.js";
+import { validateProjectedIndexEntries } from "./apply/apply-validation.js";
+import type { ProjectedIntegration } from "./integration-step.js";
 
 function* snapshotDrafts(
   repo: Repository,
@@ -176,19 +173,18 @@ export function applyIntegrationOwned(
   workspace: IntegrationWorkspace,
   repo: Repository,
   worktree: Worktree,
-  plan: IntegrationPlanHandle<ProjectedMergeEntry>,
-  options: OperationApplyOptions,
+  { projected: plan, touched }: ProjectedIntegration,
+  suspendedState: OperationStateMetadata | null,
   activeRebase: ActiveRebaseApply | null = null,
-): { touched: IntegrationTouched | null } {
+): void {
   requireSharedMutationScope(repo.store.db, worktree);
   validateProjectedIndexEntries(plan.entries);
   if (activeRebase === null) repo.checkout.requireNoOperationState();
-  else if (options.suspendedState !== null)
+  else if (suspendedState !== null)
     throw new CorruptError("rebase apply supplied two journal transitions");
-  const state = activeRebase?.conflictState ?? options.suspendedState;
-  const touched = integrationTouched(workspace, plan);
+  const state = activeRebase?.conflictState ?? suspendedState;
   for (const page of integrationPages(snapshotDrafts(repo, worktree, plan, touched))) {
-    const objects = state === null ? null : snapshotWorktreeObjects(repo, worktree, page).entries;
+    const objects = state === null ? null : snapshotWorktreeObjects(repo, worktree, page);
     touched.save(touchedFromDrafts(page, objects));
   }
   const removals = workspace.projectedPlan();
@@ -249,5 +245,4 @@ export function applyIntegrationOwned(
       writeOperationJournalOwned(repo.checkout, state, operationStepsForState(state), touched);
     }
   }
-  return { touched: state === null ? null : touched };
 }

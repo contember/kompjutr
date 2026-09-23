@@ -13,7 +13,7 @@ import {
   type MergeBaseSelection,
   selectMergeBases,
 } from "../merge/merge-base.js";
-import { resolveBoundedCommitRevision } from "../replay/replay.js";
+import { resolveBoundedCommitRevision } from "../replay/replay-revision.js";
 import { type Repository, walkIndexedOwned } from "../repository/repository.js";
 
 export type RebasePlanRelation = "up-to-date" | "fast-forward" | "replay";

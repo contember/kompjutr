@@ -2,7 +2,7 @@ import type { Commit } from "../../common/objects.js";
 import type { TextMergeOptions } from "../../diff/xmerge.js";
 import type { IntegrationEntry } from "../../store/operations/integration-workspace/descriptors.js";
 import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
-import type { IntegrationConflictKind } from "../integration/integration.js";
+import type { IntegrationConflictKind } from "../integration/integration-types.js";
 
 export type ReplayKind = "cherry-pick" | "revert";
 export type ReplayIncomingLabelStyle = "tree" | "source-subject" | "parent-of-source-subject";

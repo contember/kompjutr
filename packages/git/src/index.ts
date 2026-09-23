@@ -155,13 +155,13 @@ export {
   type RemoteRefView,
   type RemoteTarget,
 } from "./ops/refs/refspec.js";
-export {
-  type ReplaySnapshotConflict,
-  type ReplaySnapshotConflictStage,
-  type ReplaySnapshotOptions,
-  type ReplaySnapshotResult,
-  replaySnapshot,
-} from "./ops/replay/replay.js";
+export { replaySnapshot } from "./ops/replay/replay-snapshot.js";
+export type {
+  ReplaySnapshotConflict,
+  ReplaySnapshotConflictStage,
+  ReplaySnapshotOptions,
+  ReplaySnapshotResult,
+} from "./ops/replay/replay-types.js";
 export {
   type CommitTreeOptions,
   commitTree,

@@ -17,9 +17,3 @@ export interface RebaseExclusions {
   absolute: string[];
   relative: string[];
 }
-
-export const NO_REBASE_EXCLUSIONS: RebaseExclusions = { absolute: [], relative: [] };
-
-export interface BaselineTransition {
-  treeOid: string;
-}

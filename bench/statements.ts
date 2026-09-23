@@ -33,7 +33,7 @@ import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
 import { planRebase } from "../packages/git/src/ops/rebase/rebase-plan.js";
 import { checkout } from "../packages/git/src/ops/refs/refs.js";
 import { cherryPick, cherryPickContinue } from "../packages/git/src/ops/replay/cherry-pick.js";
-import { preflightReplayCommitObjects } from "../packages/git/src/ops/replay/replay.js";
+import { preflightReplayCommitObjects } from "../packages/git/src/ops/replay/replay-revision.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { add, lsFiles, lsFilesWithWorktree, rm } from "../packages/git/src/ops/staging/staging.js";
@@ -1950,7 +1950,8 @@ async function rebaseRows(rows: ResultRow[]): Promise<void> {
       rows,
       workspace.storage,
       "rebase.transition",
-      () => rebase(workspace.context, workspace.repo, workspace.worktree, { upstream: "upstream" }),
+      () =>
+        rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream: "upstream" }),
       (value) => {
         assert(value.outcome === "completed", "clean rebase did not complete");
         assert(value.replayed === 2, "clean rebase replayed another queue length");
@@ -1996,7 +1997,9 @@ async function rebaseRows(rows: ResultRow[]): Promise<void> {
         workspace.storage,
         operation,
         () =>
-          rebase(workspace.context, workspace.repo, workspace.worktree, { upstream: "upstream" }),
+          rebase(workspace.context, workspace.repo, workspace.worktree, [], {
+            upstream: "upstream",
+          }),
         (value) => {
           assert(value.outcome === "completed", `${operation} did not complete`);
           assert(value.replayed === steps, `${operation} replayed another queue length`);

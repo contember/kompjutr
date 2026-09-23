@@ -8,11 +8,11 @@ import type { IntegrationWorkspace } from "../../store/operations/integration-wo
 import type { OperationTouchedSource } from "../../store/operations/operation-journal-types.js";
 import type { MergeTouchedPath } from "../../store/operations/operations.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
-import { collectBlobMetadata, restoreWorktreeFiles } from "../merge/merge-apply-blobs.js";
-import { restoreIndex } from "../merge/merge-apply-index.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
+import { collectBlobSizes, restoreWorktreeFiles } from "./apply/apply-blobs.js";
+import { restoreIndex } from "./apply/apply-index.js";
 
 function validateObjects(
   repo: Repository,
@@ -146,7 +146,7 @@ export function restoreIntegrationOwned(
       if (entry.worktree.kind === "file" || entry.worktree.kind === "symlink") yield entry;
   }
   for (const page of integrationPages(files())) {
-    const metadata = collectBlobMetadata(
+    const sizes = collectBlobSizes(
       repo,
       page,
       (entry) =>
@@ -155,7 +155,7 @@ export function restoreIntegrationOwned(
           : null,
       "merge abort",
     );
-    restoreWorktreeFiles(repo, worktree, page, metadata);
+    restoreWorktreeFiles(repo, worktree, page, sizes);
   }
   restoreIndex(repo, touched);
 }

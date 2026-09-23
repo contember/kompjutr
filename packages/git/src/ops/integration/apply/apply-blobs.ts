@@ -1,21 +1,21 @@
 import type { WriteEntry } from "@kompjutr/drive";
-import { fromHex, utf8Decoder } from "../../common/bytes.js";
-import { CorruptError } from "../../common/errors.js";
-import { joinPath } from "../../common/paths.js";
-import { PACK_BLOB_BATCH_TARGET_BYTES } from "../../store/index.js";
-import type { Repository } from "../repository/repository.js";
-import type { Worktree } from "../worktree/worktree.js";
-import type { AdmittedBlobBatch, BlobMetadata } from "./merge-apply-types.js";
-import type { MergeTouchedPath } from "./merge-state.js";
+import { fromHex, utf8Decoder } from "../../../common/bytes.js";
+import { CorruptError } from "../../../common/errors.js";
+import { joinPath } from "../../../common/paths.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES } from "../../../store/index.js";
+import type { MergeTouchedPath } from "../../merge/merge-state.js";
+import type { Repository } from "../../repository/repository.js";
+import type { Worktree } from "../../worktree/worktree.js";
+import type { AdmittedBlobBatch } from "./apply-types.js";
 
 const OBJECT_INFO_PAGE = 4_096;
 
-export function collectBlobMetadata<T>(
+export function collectBlobSizes<T>(
   repo: Repository,
   entries: readonly T[],
   oidOf: (entry: T) => string | null,
   label: "merge output" | "merge abort",
-): BlobMetadata {
+): ReadonlyMap<string, number> {
   const seen = new Set<string>();
   const oids: string[] = [];
   for (const entry of entries) {
@@ -38,14 +38,14 @@ export function collectBlobMetadata<T>(
   for (const oid of oids) {
     if (!sizes.has(oid)) throw new CorruptError(`${label} lost object ${oid}`);
   }
-  return { sizes };
+  return sizes;
 }
 
 function readAdmittedBlobBatch<T>(
   repo: Repository,
   entries: readonly T[],
   start: number,
-  metadata: BlobMetadata,
+  sizes: ReadonlyMap<string, number>,
   oidOf: (entry: T) => string,
   label: string,
 ): AdmittedBlobBatch {
@@ -56,7 +56,7 @@ function readAdmittedBlobBatch<T>(
     const entry = entries[end];
     if (entry === undefined) throw new CorruptError(`${label} selection is incomplete`);
     const oid = oidOf(entry);
-    const size = metadata.sizes.get(oid);
+    const size = sizes.get(oid);
     if (size === undefined) throw new CorruptError(`${label} lost object ${oid}`);
     const nextPayload = selected.has(oid) ? payloadBytes : payloadBytes + size;
     if (!Number.isSafeInteger(nextPayload)) throw new CorruptError(`${label} payload is invalid`);
@@ -77,7 +77,7 @@ function readAdmittedBlobBatch<T>(
     if (oid === undefined) throw new CorruptError(`${label} admitted object list is incomplete`);
     const bytes = read.blobs.get(oid);
     if (bytes === undefined) break;
-    const expectedSize = metadata.sizes.get(oid);
+    const expectedSize = sizes.get(oid);
     if (expectedSize === undefined || bytes.byteLength !== expectedSize) {
       throw new CorruptError(`${label} object ${oid} differs from its admitted metadata`);
     }
@@ -111,7 +111,7 @@ export function restoreWorktreeFiles(
   repo: Repository,
   worktree: Worktree,
   pending: readonly MergeTouchedPath[],
-  metadata: BlobMetadata,
+  sizes: ReadonlyMap<string, number>,
 ): void {
   let offset = 0;
   while (offset < pending.length) {
@@ -119,7 +119,7 @@ export function restoreWorktreeFiles(
       repo,
       pending,
       offset,
-      metadata,
+      sizes,
       (entry) =>
         entry.worktree.kind === "file" || entry.worktree.kind === "symlink"
           ? entry.worktree.oid

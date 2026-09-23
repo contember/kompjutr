@@ -5,7 +5,7 @@ import { serializeCommit, serializeTree } from "../packages/git/src/common/objec
 import { MAX_OPERATION_STEPS } from "../packages/git/src/ops/core/operation-state.js";
 import { MAX_MERGE_BASE_COMMITS } from "../packages/git/src/ops/merge/merge-base.js";
 import { planRebase } from "../packages/git/src/ops/rebase/rebase-plan.js";
-import { MAX_REPLAY_REVISION_CODE_UNITS } from "../packages/git/src/ops/replay/replay.js";
+import { MAX_REPLAY_REVISION_CODE_UNITS } from "../packages/git/src/ops/replay/replay-revision.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { commitCacheBytes } from "../packages/git/src/store/trees/commits.js";

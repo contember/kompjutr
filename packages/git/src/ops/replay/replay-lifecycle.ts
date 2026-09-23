@@ -33,14 +33,13 @@ import {
 import { applyIntegrationOwned } from "../integration/integration-apply-owned.js";
 import { projectIntegrationWithCollisionsOwned } from "../integration/integration-collisions-owned.js";
 import { restoreIntegrationOwned } from "../integration/integration-restore-owned.js";
+import { projectIntegrationStepOwned } from "../integration/integration-step.js";
 import { integrationTouched } from "../integration/integration-touched.js";
 import {
   integrationIndexMatchesTree,
-  prospectiveIntegrationIndexEntriesOwned,
   requireBoundedIntegrationIndex,
   requireBoundedIntegrationTree,
   requireCleanIntegrationIndex,
-  requireSafeIntegrationWorktreeOwned,
 } from "../integration/integration-worktree.js";
 import { type CommitIdentities, commitIndex } from "../repository/commit.js";
 import type { Repository, ResolvedHead } from "../repository/repository.js";
@@ -321,29 +320,14 @@ export function startReplay(
       }
       return { outcome: "empty", reason };
     }
-    const projected = projectIntegrationWithCollisionsOwned(
-      workspace,
-      repo,
-      worktree,
-      plan.baseTreeOid,
-      plan.incomingTreeOid,
-      plan.integration,
-      plan.labels.current,
-      plan.labels.incoming,
-      undefined,
-      policy.kind,
-    );
-    requireSafeIntegrationWorktreeOwned(
-      repo,
-      worktree,
-      plan.incomingTreeOid,
-      plan.integration,
-      policy.kind,
-    );
-    const touched = integrationTouched(workspace, projected);
-    requireBoundedIntegrationTree(repo, () =>
-      prospectiveIntegrationIndexEntriesOwned(repo, projected, touched),
-    );
+    const integration = projectIntegrationStepOwned(workspace, repo, worktree, {
+      operation: policy.kind,
+      baseTreeOid: plan.baseTreeOid,
+      incomingTreeOid: plan.incomingTreeOid,
+      plan: plan.integration,
+      labels: plan.labels,
+      requireResultTree: (entries) => requireBoundedIntegrationTree(repo, entries),
+    });
     const conflicted = conflicts(plan.integration.entries);
     const current = repo.head();
     if (current.ref !== head.ref || current.oid !== head.oid) {
@@ -352,7 +336,7 @@ export function startReplay(
     const state = conflicted
       ? replayState(policy, plan, head, "conflicted", null, message, input)
       : null;
-    applyIntegrationOwned(workspace, repo, worktree, projected, { suspendedState: state });
+    applyIntegrationOwned(workspace, repo, worktree, integration, state);
     if (conflicted) return { outcome: "conflicted" };
     const identities = policy.resolveIdentities(context, repo, plan, input);
     const result = commitIndex(
