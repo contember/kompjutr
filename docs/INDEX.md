@@ -18,7 +18,7 @@ decisions → reference → archive.
 
 - [`sprints/sprint-2026-09-23-statement-targets-and-harnesses.md`](sprints/sprint-2026-09-23-statement-targets-and-harnesses.md)
   — every statement row under the 1,000 target, broken bench harnesses
-  restored, porcelain v2 unmerged order. Plan review pending.
+  restored, porcelain v2 unmerged order. Plan review approved.
 
 ## Specs
 
