@@ -1,5 +1,6 @@
 import { lstatSync, readdirSync, readFileSync, readlinkSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 
 import { ownedBytes } from "@kompjutr/sqlite";
 import { afterEach, describe, expect, it } from "vitest";
@@ -225,17 +226,16 @@ function readOnlyIndex(open: () => IterableIterator<IndexEntry>): IndexStore {
 }
 
 function corruptLooseObject(workspace: TestRepository, oid: string): void {
-  workspace.database.db.run(
-    "UPDATE git_objects SET stored = 'raw' WHERE repo_id = ? AND oid = ?",
-    workspace.repo.store.repoId,
-    oid,
+  const zeroed = new Uint8Array(
+    workspace.database.db.scalar<number>(
+      "SELECT size FROM git_objects WHERE repo_id = ? AND oid = ?",
+      workspace.repo.store.repoId,
+      oid,
+    ) ?? 0,
   );
   workspace.database.db.run(
-    `UPDATE git_object_chunks SET data = zeroblob((
-       SELECT size FROM git_objects WHERE repo_id = ? AND oid = ?
-     )) WHERE repo_id = ? AND oid = ? AND seq = 0`,
-    workspace.repo.store.repoId,
-    oid,
+    "UPDATE git_object_chunks SET data = ? WHERE repo_id = ? AND oid = ? AND seq = 0",
+    deflateSync(zeroed),
     workspace.repo.store.repoId,
     oid,
   );

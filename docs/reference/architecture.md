@@ -227,8 +227,8 @@ capped transient is 54,423,552 bytes.
 
 ## Objects, packs, and projections
 
-Small loose objects are stored raw. Larger loose objects are compressed and
-split into 1 MiB `git_object_chunks` rows. A loose read joins metadata and
+Loose objects are zlib-compressed at every size and split into 1 MiB
+`git_object_chunks` rows. Maintenance never repacks them. A loose read joins metadata and
 ordered payload rows in one cursor, retains only the final output plus the
 current payload feed and fixed inflater state, and checks sequence, encoded
 size, inflate progress, and final size while decoding. Incoming packs stay
@@ -285,7 +285,7 @@ leaves none. This is local transaction serialization, not a lease or a
 cross-process lock
 ([ADR-0006](../decisions/0006-own-local-git-mutations-with-sqlite-transactions.md)).
 
-Clone, fetch, push, pull, maintenance repack, and promise-hydrating content
+Clone, fetch, push, pull, and promise-hydrating content
 operations cross asynchronous boundaries after repository state has opened.
 No guarded repository, index, or worktree publication phase holds the local
 mutation guard across `await`; a later guarded publication phase reacquires it
@@ -302,8 +302,7 @@ epochs, CAS, or leases rather than the local mutation guard.
 - Ref updates and integration publication use expected-state CAS checks.
 - Maintenance consumes each root source as a single decoded keyset page and
   operation journals through bounded root pages. A repository root epoch
-  restarts discovery before destructive work. Maintenance pack batches have
-  their own exact owner.
+  restarts discovery before destructive work. Maintenance owns no pack.
 - Pending packs are durable but invisible; complete packs may survive a stale
   publication and be reused.
 

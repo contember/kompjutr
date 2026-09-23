@@ -3,10 +3,6 @@ import { withGitMutationGuard } from "../../store/core/mutation-guard.js";
 import { advanceMaintenanceRootSnapshotOwned } from "../../store/database/database.js";
 import { advanceMaintenanceMark } from "../../store/maintenance/reachability.js";
 import {
-  advanceMaintenanceRepack,
-  settleMaintenanceRepackForRestart,
-} from "../../store/maintenance/repack.js";
-import {
   type MaintenancePhase,
   type MaintenanceRunView,
   readMaintenanceRunView,
@@ -24,7 +20,6 @@ export interface MaintenanceProgressResult {
   restarted: boolean;
   reachableObjects: number;
   queuedObjects: number;
-  repackedObjects: number;
   reclaimedObjects: number;
   reclaimedPacks: number;
   reclaimedBytes: number;
@@ -38,7 +33,6 @@ export interface MaintenanceCompleteResult {
   restarted: boolean;
   reachableObjects: number;
   queuedObjects: number;
-  repackedObjects: number;
   reclaimedObjects: number;
   reclaimedPacks: number;
   reclaimedBytes: number;
@@ -53,7 +47,6 @@ function result(view: MaintenanceRunView): MaintenanceResult {
     restarted: view.restarted,
     reachableObjects: view.reachableObjects,
     queuedObjects: view.queuedObjects,
-    repackedObjects: view.repackedObjects,
     reclaimedObjects: view.reclaimedObjects,
     reclaimedPacks: view.reclaimedPacks,
     reclaimedBytes: view.reclaimedBytes,
@@ -80,11 +73,11 @@ function durableResult(repo: Repository): MaintenanceResult {
   return result(view);
 }
 
-function advanceSynchronousMaintenance(
+function advanceMaintenance(
   context: GitContext,
   repo: Repository,
   nowMs: number,
-): MaintenanceResult | null {
+): MaintenanceResult {
   const repoId = repo.store.repoId;
   const before = readMaintenanceRunView(repo.store.db, repoId);
   if (before === null) {
@@ -114,10 +107,7 @@ function advanceSynchronousMaintenance(
       advanceMaintenanceRootSnapshotOwned(context.database, repoId, { nowMs });
       return durableResult(repo);
     }
-    repo.store.db.transactionSync(() => {
-      settleMaintenanceRepackForRestart(repo.store, before.runId);
-      resetMaintenanceRunForRootChange(repo.store.db, repoId, before.runId);
-    });
+    resetMaintenanceRunForRootChange(repo.store.db, repoId, before.runId);
     return durableResult(repo);
   }
 
@@ -125,8 +115,6 @@ function advanceSynchronousMaintenance(
     advanceMaintenanceRootSnapshotOwned(context.database, repoId, { nowMs });
   } else if (before.phase === "mark") {
     advanceMaintenanceMark(repo.store);
-  } else if (before.phase === "repack") {
-    return null;
   } else {
     advanceMaintenanceSweep(repo.store, { nowMs });
   }
@@ -142,15 +130,5 @@ export async function maintenance(
   if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
     throw new GitError("EINVAL", "maintenance clock must return non-negative integer milliseconds");
   }
-  const immediate = withGitMutationGuard(repo.checkout.db, () =>
-    advanceSynchronousMaintenance(context, repo, nowMs),
-  );
-  if (immediate !== null) return immediate;
-
-  if (context.yieldNow === undefined) {
-    await advanceMaintenanceRepack(repo.store, { nowMs });
-  } else {
-    await advanceMaintenanceRepack(repo.store, { nowMs, yieldNow: context.yieldNow });
-  }
-  return withGitMutationGuard(repo.checkout.db, () => durableResult(repo));
+  return withGitMutationGuard(repo.checkout.db, () => advanceMaintenance(context, repo, nowMs));
 }

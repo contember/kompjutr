@@ -16,8 +16,6 @@ import {
 
 const PACK_COLUMNS = `pack.repo_id, pack.pack_id, pack.size, pack.count, pack.state,
   candidate.unreachable_since_ms,
-  EXISTS (SELECT 1 FROM git_maintenance_repack_batches batch
-    WHERE batch.repo_id = pack.repo_id AND batch.pack_id = pack.pack_id) AS owned,
   EXISTS (
     SELECT 1 FROM git_pack_objects object
     JOIN git_maintenance_objects mark
@@ -37,7 +35,6 @@ function readPackRow(row: Record<string, unknown>, repoId: number): PackAudit {
       unreachable_since_ms: nullable(
         int(0, Number.MAX_SAFE_INTEGER, "pack unreachable time is invalid"),
       ),
-      owned: int(0, 1, "maintenance pack ownership marker is invalid"),
       marked: int(0, 1, "maintenance pack mark marker is invalid"),
     },
     "maintenance pack row is malformed",
@@ -50,7 +47,6 @@ function readPackRow(row: Record<string, unknown>, repoId: number): PackAudit {
     size: decoded.size,
     count: decoded.count,
     state: decoded.state,
-    owned: decoded.owned === 1,
     marked: decoded.marked === 1,
     candidateSince: decoded.unreachable_since_ms,
   };
@@ -72,8 +68,7 @@ function readPackClassificationMismatch(
      )
      SELECT * FROM audits
       WHERE (state != 'complete' AND unreachable_since_ms IS NOT NULL)
-         OR (owned != 0 AND unreachable_since_ms IS NOT NULL)
-         OR (state = 'complete' AND owned = 0 AND marked = 0
+         OR (state = 'complete' AND marked = 0
            AND unreachable_since_ms IS NULL)
          OR (state = 'complete' AND marked != 0 AND unreachable_since_ms IS NOT NULL)
       ORDER BY pack_id LIMIT 2`,
@@ -106,7 +101,7 @@ export function classifyPacks(
       storageChanged: false,
     };
   }
-  if (pack.state !== "complete" || pack.owned || pack.marked) {
+  if (pack.state !== "complete" || pack.marked) {
     deletePackCandidate(db, repoId, pack.packId);
   } else {
     db.run(
@@ -136,7 +131,7 @@ function* readPackSweepPage(
         WHERE candidate.repo_id = ? AND candidate.pack_id > ?
      )
       SELECT /* pack-sweep-page */ * FROM audits
-        WHERE state != 'complete' OR owned != 0 OR marked != 0
+        WHERE state != 'complete' OR marked != 0
           OR unreachable_since_ms <= ?
         ORDER BY pack_id LIMIT ?`,
     run.runId,
@@ -178,8 +173,6 @@ function nextPackEligibility(db: SqlDatabase, repoId: number, run: RunState): nu
                 ON pack.repo_id = candidate.repo_id AND pack.pack_id = candidate.pack_id
               WHERE candidate.repo_id = ? AND (
                 pack.state != 'complete' OR
-                EXISTS (SELECT 1 FROM git_maintenance_repack_batches batch
-                  WHERE batch.repo_id = pack.repo_id AND batch.pack_id = pack.pack_id) OR
                 EXISTS (
                   SELECT 1 FROM git_pack_objects object
                   JOIN git_maintenance_objects mark
@@ -240,7 +233,7 @@ export function sweepPacks(
   for (const pack of readPackSweepPage(store.db, store.repoId, run, nowMs, pageRows)) {
     examined++;
     last = pack.packId;
-    if (pack.state !== "complete" || pack.owned || pack.marked) {
+    if (pack.state !== "complete" || pack.marked) {
       deletePackCandidate(store.db, store.repoId, pack.packId);
       const updated = saveSweepCursor(store, run, last, run.cursorText);
       return { progress: progress(updated, updated.phase, "progress"), storageChanged: false };

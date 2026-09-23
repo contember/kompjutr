@@ -1,3 +1,4 @@
+import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../packages/do/src/db/db.js";
 import { utf8 } from "../packages/git/src/common/bytes.js";
@@ -137,18 +138,23 @@ function commitChain(store: ReturnType<typeof open>, count: number): string[] {
 function insertAuthoritativeCommit(db: SqlDatabase, data: Uint8Array): string {
   const oid = hashObject("commit", data);
   db.run(
-    "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, 'commit', ?, 'raw')",
+    "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, 'commit', ?)",
     1,
     oid,
     data.length,
   );
-  for (let offset = 0, sequence = 0; offset < data.length; offset += 1024 * 1024, sequence++) {
+  const compressed = deflateSync(data);
+  for (
+    let offset = 0, sequence = 0;
+    offset < compressed.length;
+    offset += 1024 * 1024, sequence++
+  ) {
     db.run(
       "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
       1,
       oid,
       sequence,
-      data.subarray(offset, offset + 1024 * 1024),
+      compressed.subarray(offset, offset + 1024 * 1024),
     );
   }
   return oid;

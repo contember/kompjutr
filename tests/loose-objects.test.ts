@@ -88,16 +88,16 @@ function rechunk(db: TestDatabase, oid: string, chunkBytes: number): number {
 }
 
 describe("loose object payload streaming", () => {
-  it("reads scalar raw and many-chunk zlib encodings with exactly one payload query each", () => {
+  it("reads single-chunk and many-chunk objects with exactly one payload query each", () => {
     const { db, recording, store } = open();
-    const raw = deterministicBytes(4_096, 0x1020_3040);
+    const small = deterministicBytes(4_096, 0x1020_3040);
     const compressed = deterministicBytes(96 * 1024, 0x5060_7080);
-    const rawOid = store.write("blob", raw);
+    const smallOid = store.write("blob", small);
     const compressedOid = store.write("blob", compressed);
     expect(rechunk(db, compressedOid, 997)).toBeGreaterThan(2);
 
     const cases: readonly (readonly [string, Uint8Array])[] = [
-      [rawOid, raw],
+      [smallOid, small],
       [compressedOid, compressed],
     ];
     for (const [oid, expected] of cases) {
@@ -109,24 +109,24 @@ describe("loose object payload streaming", () => {
     }
   });
 
-  it("reads a mixed-encoding batch with exactly one ordered payload query", () => {
+  it("reads a mixed single- and many-chunk batch with exactly one ordered payload query", () => {
     const { db, recording, store } = open();
-    const raw = deterministicBytes(37, 0x1111_1111);
+    const small = deterministicBytes(37, 0x1111_1111);
     const compressed = deterministicBytes(128 * 1024, 0x2222_2222);
-    const rawOid = store.write("blob", raw);
+    const smallOid = store.write("blob", small);
     const compressedOid = store.write("blob", compressed);
     expect(rechunk(db, compressedOid, 2_003)).toBeGreaterThan(2);
     recording.resetObjectChunkQueries();
 
-    const batch = store.readBlobs([rawOid, compressedOid], { budgetBytes: 1024 * 1024 });
+    const batch = store.readBlobs([smallOid, compressedOid], { budgetBytes: 1024 * 1024 });
 
     expect(batch).toEqual({
       blobs: new Map([
-        [rawOid, raw],
+        [smallOid, small],
         [compressedOid, compressed],
       ]),
       remaining: [],
-      bytes: raw.length + compressed.length,
+      bytes: small.length + compressed.length,
     });
     expect(recording.objectChunkQueries).toHaveLength(1);
     expect(recording.objectChunkQueries[0]).toContain("loose-object-payload");
@@ -157,7 +157,7 @@ describe("loose object payload streaming", () => {
     );
   });
 
-  it("rejects raw encoded bytes that disagree with the indexed size", () => {
+  it("rejects a small object whose indexed size disagrees with its bytes", () => {
     const { db, store } = open();
     const data = deterministicBytes(257);
     const oid = store.write("blob", data);
@@ -225,6 +225,31 @@ describe("loose object payload streaming", () => {
       expect(() => store.read(oid), label).toThrowError(
         expect.objectContaining({ code: "ECORRUPT", message: expect.stringContaining(message) }),
       );
+    }
+  });
+});
+
+describe("loose object writes", () => {
+  it("rolls every loose write path back when its chunk insert fails", () => {
+    const writers: readonly [string, (store: ReturnType<typeof open>["store"]) => unknown][] = [
+      ["scalar", (store) => store.write("blob", new Uint8Array([1]))],
+      ["small stream", (store) => store.writeStream("blob", 2, () => [new Uint8Array([2, 2])])],
+      [
+        "large stream",
+        (store) => store.writeStream("blob", 200_000, () => [deterministicBytes(200_000)]),
+      ],
+      ["batch", (store) => store.writeObjects((batch) => batch.write("blob", new Uint8Array([3])))],
+    ];
+
+    for (const [name, write] of writers) {
+      const { db, store } = open();
+      db.run(`CREATE TRIGGER fail_loose_chunk
+        BEFORE INSERT ON git_object_chunks
+        BEGIN SELECT RAISE(ABORT, 'injected chunk failure'); END`);
+
+      expect(() => write(store), name).toThrow(/injected chunk failure/);
+      expect(db.scalar<number>("SELECT count(*) FROM git_objects"), name).toBe(0);
+      expect(db.scalar<number>("SELECT count(*) FROM git_object_chunks"), name).toBe(0);
     }
   });
 });

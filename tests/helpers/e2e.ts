@@ -223,7 +223,7 @@ export interface E2EWorldOptions {
   /** Clone both sides partially, the way an orchestrator clones a project. */
   filter?: UploadPackFilter;
   /**
-   * Run at every pack-ingest and repack yield point, so a journey can cut a
+   * Run at every pack-ingest yield point, so a journey can cut a
    * transfer off where a Durable Object would really lose it. Both the first
    * `Workspace` and every one a `reopen` builds receive it.
    */

@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RemoveOptions, WriteEntry, WriteOptions } from "../packages/do/src/fs/types.js";
@@ -492,17 +493,16 @@ describe("branch", () => {
       ws.repo.store.repoId,
       valid,
     );
-    ws.repo.store.db.run(
-      "UPDATE git_objects SET stored = 'raw' WHERE repo_id = ? AND oid = ?",
-      ws.repo.store.repoId,
-      valid,
+    const zeroed = new Uint8Array(
+      ws.repo.store.db.scalar<number>(
+        "SELECT size FROM git_objects WHERE repo_id = ? AND oid = ?",
+        ws.repo.store.repoId,
+        valid,
+      ) ?? 0,
     );
     ws.repo.store.db.run(
-      `UPDATE git_object_chunks SET data = zeroblob((
-         SELECT size FROM git_objects WHERE repo_id = ? AND oid = ?
-       )) WHERE repo_id = ? AND oid = ? AND seq = 0`,
-      ws.repo.store.repoId,
-      valid,
+      "UPDATE git_object_chunks SET data = ? WHERE repo_id = ? AND oid = ? AND seq = 0",
+      deflateSync(zeroed),
       ws.repo.store.repoId,
       valid,
     );
@@ -821,17 +821,16 @@ describe("branch", () => {
     expect(ws.repo.store.cachedCommit(corrupt)).not.toBeNull();
     ws.repo.store.setRef("refs/heads/corrupt-source", corrupt);
     ws.repo.store.configSet("branch.corrupt-source.remote", "origin");
-    ws.repo.store.db.run(
-      "UPDATE git_objects SET stored = 'raw' WHERE repo_id = ? AND oid = ?",
-      ws.repo.store.repoId,
-      corrupt,
+    const zeroed = new Uint8Array(
+      ws.repo.store.db.scalar<number>(
+        "SELECT size FROM git_objects WHERE repo_id = ? AND oid = ?",
+        ws.repo.store.repoId,
+        corrupt,
+      ) ?? 0,
     );
     ws.repo.store.db.run(
-      `UPDATE git_object_chunks SET data = zeroblob((
-         SELECT size FROM git_objects WHERE repo_id = ? AND oid = ?
-       )) WHERE repo_id = ? AND oid = ? AND seq = 0`,
-      ws.repo.store.repoId,
-      corrupt,
+      "UPDATE git_object_chunks SET data = ? WHERE repo_id = ? AND oid = ? AND seq = 0",
+      deflateSync(zeroed),
       ws.repo.store.repoId,
       corrupt,
     );

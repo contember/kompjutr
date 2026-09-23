@@ -4,15 +4,13 @@ import { toHex } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { hashObject, type ObjectType, objectHeader } from "../../common/objects.js";
 import { Sha1 } from "../../common/sha1.js";
+import { deflate } from "../../common/zlib.js";
 import { bumpRepositorySourceGeneration } from "../core/source-generation.js";
 import { insertCommitCaches, prepareCommitCache } from "../trees/commits.js";
 import { indexSeededTreeSource } from "../trees/tree-index.js";
 import { fulfillLoosePromises } from "./objects-promises.js";
 import { hasObject } from "./objects-query.js";
 import {
-  encodeLoose,
-  looseEncoding,
-  nowMilliseconds,
   OBJECT_CHUNK,
   type ObjectWriteContext,
   requireCommitCacheWrites,
@@ -35,54 +33,30 @@ export function writeObject(
     }
     return oid;
   }
-  const stored = looseEncoding(data.length);
-  const storedData = encodeLoose(data, stored);
-  const createdMs = nowMilliseconds(context);
+  const storedData = deflate(data);
   context.db.transactionSync(() => {
     if (type === "blob") fulfillLoosePromises(context.db, context.repoId, [oid]);
     context.db.run(
-      "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, ?, ?)",
       context.repoId,
       oid,
       type,
       data.length,
-      stored,
     );
     bumpRepositorySourceGeneration(context.db, context.repoId);
-    context.db.run(
-      `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
-       VALUES (?, ?, ?)`,
-      context.repoId,
-      oid,
-      createdMs,
-    );
     context.db.run(
       "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
       context.repoId,
       oid,
     );
-    for (
-      let seq = 0, offset = 0;
-      offset < storedData.length || seq === 0;
-      seq++, offset += OBJECT_CHUNK
-    ) {
-      const part = storedData.subarray(offset, offset + OBJECT_CHUNK);
-      if (part.length === 0) {
-        context.db.run(
-          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, zeroblob(0))",
-          context.repoId,
-          oid,
-          seq,
-        );
-      } else {
-        context.db.run(
-          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-          context.repoId,
-          oid,
-          seq,
-          blob(part),
-        );
-      }
+    for (let seq = 0, offset = 0; offset < storedData.length; seq++, offset += OBJECT_CHUNK) {
+      context.db.run(
+        "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+        context.repoId,
+        oid,
+        seq,
+        blob(storedData.subarray(offset, offset + OBJECT_CHUNK)),
+      );
     }
     if (type === "tree") {
       indexSeededTreeSource(
@@ -140,107 +114,24 @@ export function writeObjectStream(
     return oid;
   }
 
-  const stored = looseEncoding(size);
-  if (stored === "raw") {
-    const data = commitData ?? new Uint8Array(size);
-    const storageHash = new Sha1().update(objectHeader(type, size));
-    let offset = 0;
-    for (const chunk of chunks()) {
-      if (offset + chunk.length > size) {
-        throw new CorruptError(`stream changed after hashing ${oid}`);
-      }
-      data.set(chunk, offset);
-      storageHash.update(chunk);
-      offset += chunk.length;
-    }
-    if (offset !== size) throw new CorruptError(`stream changed after hashing ${oid}`);
-    if (toHex(storageHash.digest()) !== oid) {
-      throw new CorruptError(`stream changed after hashing ${oid}`);
-    }
-    const createdMs = nowMilliseconds(context);
-    context.db.transactionSync(() => {
-      if (type === "blob") fulfillLoosePromises(context.db, context.repoId, [oid]);
-      context.db.run(
-        "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'raw')",
-        context.repoId,
-        oid,
-        type,
-        size,
-      );
-      bumpRepositorySourceGeneration(context.db, context.repoId);
-      context.db.run(
-        `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
-         VALUES (?, ?, ?)`,
-        context.repoId,
-        oid,
-        createdMs,
-      );
-      context.db.run(
-        "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
-        context.repoId,
-        oid,
-      );
-      if (data.length === 0) {
-        context.db.run(
-          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, zeroblob(0))",
-          context.repoId,
-          oid,
-        );
-      } else {
-        context.db.run(
-          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
-          context.repoId,
-          oid,
-          blob(data),
-        );
-      }
-      if (type === "tree") {
-        indexSeededTreeSource(
-          context.db,
-          {
-            repoId: context.repoId,
-            treeOid: oid,
-            storage: "loose",
-            sourceId: 0,
-            objectSize: size,
-          },
-          [data],
-        );
-      }
-      if (commitEntry !== undefined) {
-        requireCommitCacheWrites(insertCommitCaches(context.db, [commitEntry]), 1);
-      }
-    });
-    context.cacheKeys.markLoose();
-    return oid;
-  }
-
   const rows: Uint8Array[] = [];
-  const deflate = new pako.Deflate({ chunkSize: STREAM_CHUNK });
-  deflate.onData = (chunk) => {
+  const deflater = new pako.Deflate({ chunkSize: STREAM_CHUNK });
+  deflater.onData = (chunk) => {
     if (!(chunk instanceof Uint8Array))
       throw new CorruptError("deflate produced a non-binary chunk");
     rows.push(chunk);
   };
 
-  const createdMs = nowMilliseconds(context);
   context.db.transactionSync(() => {
     if (type === "blob") fulfillLoosePromises(context.db, context.repoId, [oid]);
     context.db.run(
-      "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'zlib')",
+      "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, ?, ?)",
       context.repoId,
       oid,
       type,
       size,
     );
     bumpRepositorySourceGeneration(context.db, context.repoId);
-    context.db.run(
-      `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
-       VALUES (?, ?, ?)`,
-      context.repoId,
-      oid,
-      createdMs,
-    );
     context.db.run(
       "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
       context.repoId,
@@ -268,13 +159,13 @@ export function writeObjectStream(
         if (streamed > size) throw new CorruptError(`stream changed after hashing ${oid}`);
         commitData?.set(chunk, offset);
         storageHash.update(chunk);
-        deflate.push(chunk, false);
-        if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
+        deflater.push(chunk, false);
+        if (deflater.err !== 0) throw new CorruptError(`deflate failed: ${deflater.msg}`);
         drain();
         yield chunk;
       }
-      deflate.push(new Uint8Array(0), true);
-      if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
+      deflater.push(new Uint8Array(0), true);
+      if (deflater.err !== 0) throw new CorruptError(`deflate failed: ${deflater.msg}`);
       drain();
       if (streamed !== size || toHex(storageHash.digest()) !== oid) {
         throw new CorruptError(`stream changed after hashing ${oid}`);
@@ -297,16 +188,6 @@ export function writeObjectStream(
       for (const _chunk of storage) {
         // Storage and hashing advance together without retaining the object.
       }
-    }
-    // An empty object still deserves one row, matching `write`.
-    if (seq === 0) {
-      context.db.run(
-        "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-        context.repoId,
-        oid,
-        0,
-        blob(new Uint8Array(0)),
-      );
     }
     if (commitEntry !== undefined) {
       requireCommitCacheWrites(insertCommitCaches(context.db, [commitEntry]), 1);

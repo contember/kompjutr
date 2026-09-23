@@ -5,7 +5,6 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../common/errors.js";
 import type { ByteLru } from "../../common/lru.js";
 import { hashObject, type ObjectType, type RawObject } from "../../common/objects.js";
-import { PackSourceAuthenticator } from "./read/read-authenticate.js";
 import { PackDataReader } from "./read/read-data.js";
 import { PackObjectResolver } from "./read/read-resolver.js";
 import {
@@ -23,7 +22,6 @@ export class PackReadEngine {
   readonly #repoId: number;
   readonly #data: PackDataReader;
   readonly #resolver: PackObjectResolver;
-  readonly #authenticator: PackSourceAuthenticator;
 
   constructor(
     db: SqlDatabase,
@@ -59,7 +57,6 @@ export class PackReadEngine {
       maxDeltaDepth,
       graphPageEntries,
     );
-    this.#authenticator = new PackSourceAuthenticator(db, repoId, this.#resolver, this.#data);
   }
 
   /** Bytes the chunk cache currently holds. */
@@ -193,12 +190,6 @@ export class PackReadEngine {
       throw new CorruptError(`packed ${expectedType} ${oid} does not match its bytes`);
     }
     return object;
-  }
-
-  authenticateCompleteSources(
-    objects: readonly { oid: string; type: ObjectType; size: number; packId: number }[],
-  ): void {
-    this.#authenticator.authenticateCompleteSources(objects);
   }
 
   readObjectsBounded(

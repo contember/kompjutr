@@ -13,9 +13,6 @@ import {
   MAX_PACK_DELTA_WORKING_BYTES,
   MAX_PACK_MEMBERSHIP_OBJECTS,
   type PackSharedState,
-  requireIngestControl,
-  requireLifecycleResult,
-  requirePackId,
   uniquePackIds,
 } from "../shared.js";
 
@@ -29,129 +26,6 @@ export class PackDeletion {
 
   #clearCaches(): void {
     this.sharedState.cacheGeneration++;
-  }
-
-  #assertNotDurablyActive(packId: number): void {
-    const row = this.db.one<Record<string, unknown>>(
-      `SELECT repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms
-         FROM git_pack_ingest_control WHERE repo_id = ?`,
-      this.repoId,
-    );
-    if (row === undefined) throw new CorruptError("pack ingest control is missing");
-    if (requireIngestControl(row, this.repoId).activePackId === packId) {
-      throw new GitError("EBUSY", `pack ${packId} is active`);
-    }
-  }
-
-  /** Delete exactly one pending pack after its owner releases the durable reference. */
-  discardPending(packId: number, releaseOwnership?: (packId: number) => unknown): boolean {
-    requirePackId(packId);
-    const removed = this.db.transactionSync(() => {
-      if (this.sharedState.activePending.has(packId)) {
-        throw new GitError("EBUSY", `pack ${packId} is active`);
-      }
-      this.#assertNotDurablyActive(packId);
-      const row = this.db.one<{ state: unknown }>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-        this.repoId,
-        packId,
-      );
-      if (row === undefined) return false;
-      if (row.state !== "pending" && row.state !== "complete") {
-        throw new CorruptError(`pack ${packId}: invalid state`);
-      }
-      if (row.state !== "pending") {
-        throw new GitError("EBUSY", `pack ${packId} is already complete`);
-      }
-      if (releaseOwnership !== undefined) {
-        requireLifecycleResult(releaseOwnership(packId), "ownership release");
-      }
-      const current = this.db.one<{ state: unknown }>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-        this.repoId,
-        packId,
-      );
-      if (current?.state !== "pending") {
-        throw new CorruptError(`pack ${packId}: ownership release changed pending pack state`);
-      }
-      this.deletePacks([packId]);
-      return true;
-    });
-    if (removed) this.#clearCaches();
-    return removed;
-  }
-
-  /** Release and delete exactly one complete pack owned by a durable maintenance batch. */
-  discardOwnedComplete(packId: number, releaseOwnership: (packId: number) => unknown): boolean {
-    requirePackId(packId);
-    if (typeof releaseOwnership !== "function") {
-      throw new RangeError("complete pack ownership release must be a function");
-    }
-    const removed = this.db.transactionSync(() => {
-      if (this.sharedState.activePending.has(packId)) {
-        throw new GitError("EBUSY", `pack ${packId} is active`);
-      }
-      this.#assertNotDurablyActive(packId);
-      const row = this.db.one<{ state: unknown }>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-        this.repoId,
-        packId,
-      );
-      if (row === undefined) return false;
-      if (row.state !== "pending" && row.state !== "complete") {
-        throw new CorruptError(`pack ${packId}: invalid state`);
-      }
-      if (row.state !== "complete") {
-        throw new GitError("EBUSY", `pack ${packId} is still pending`);
-      }
-      requireLifecycleResult(releaseOwnership(packId), "ownership release");
-      const current = this.db.one<{ state: unknown }>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-        this.repoId,
-        packId,
-      );
-      if (current?.state !== "complete") {
-        throw new CorruptError(`pack ${packId}: ownership release changed complete pack state`);
-      }
-      this.deletePacks([packId]);
-      let rows = 0;
-      for (const validation of this.db.iterate(
-        `SELECT /* owned-complete-discard-validation */ EXISTS(
-           SELECT 1 FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?
-           UNION ALL SELECT 1 FROM git_pack_data WHERE repo_id = ? AND pack_id = ?
-           UNION ALL SELECT 1 FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?
-           UNION ALL SELECT 1 FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?
-           UNION ALL SELECT 1 FROM git_pack_pending WHERE repo_id = ? AND pack_id = ?
-           UNION ALL SELECT 1 FROM git_tree_sources
-             WHERE repo_id = ? AND storage = 'pack' AND source_id = ?
-         ) AS remains`,
-        this.repoId,
-        packId,
-        this.repoId,
-        packId,
-        this.repoId,
-        packId,
-        this.repoId,
-        packId,
-        this.repoId,
-        packId,
-        this.repoId,
-        packId,
-      )) {
-        if (validation.remains !== 0 || rows !== 0) {
-          throw new CorruptError(
-            `pack ${packId}: complete discard did not remove exactly one pack`,
-          );
-        }
-        rows++;
-      }
-      if (rows !== 1) {
-        throw new CorruptError(`pack ${packId}: complete discard validation returned no row`);
-      }
-      return true;
-    });
-    if (removed) this.#clearCaches();
-    return removed;
   }
 
   /** Delete a bounded set of complete packs; absent ids make retries idempotent. */

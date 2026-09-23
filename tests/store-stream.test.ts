@@ -988,18 +988,11 @@ describe("writeStream", () => {
     expect(store.read(oid)?.data).toEqual(new Uint8Array(0));
   });
 
-  it("uses raw storage through 4 KiB and zlib immediately above it", () => {
+  it("round-trips streamed 4 KiB and 4 KiB plus one objects", () => {
     for (const size of [4_096, 4_097]) {
       const store = open();
       const data = new Uint8Array(randomBytes(size));
       const oid = store.writeStream("blob", data.length, slice(data, 7));
-      expect(
-        store.db.scalar<string>(
-          "SELECT stored FROM git_objects WHERE repo_id = ? AND oid = ?",
-          1,
-          oid,
-        ),
-      ).toBe(size === 4_096 ? "raw" : "zlib");
       expect(oid).toBe(hashObject("blob", data));
       expect(store.read(oid)?.data).toEqual(data);
       expect(concat([...(store.readChunks(oid) ?? [])])).toEqual(data);
@@ -1100,9 +1093,9 @@ describe("object batches", () => {
 
     // The count means nothing unless every object actually landed.
     expect(new Set(oids).size).toBe(objects.length);
-    expect(
-      inner.scalar<number>("SELECT COUNT(*) FROM git_loose_object_lifecycle WHERE repo_id = ?", 1),
-    ).toBe(objects.length);
+    expect(inner.scalar<number>("SELECT COUNT(*) FROM git_objects WHERE repo_id = ?", 1)).toBe(
+      objects.length,
+    );
     objects.forEach((data, at) => {
       expect(oids[at]).toBe(hashObject("tree", data));
       expect(store.read(oids[at]!)?.data).toEqual(data);

@@ -94,7 +94,7 @@ function clearRunOwnedReachability(db: SqlDatabase, repoId: number, runId: numbe
   if (remains !== 0) throw new CorruptError("maintenance restart retained reachability state");
 }
 
-/** Reset one drifted run after its owned repack batch has been settled. */
+/** Reset one drifted run to root discovery. */
 export function resetMaintenanceRunForRootChange(
   db: SqlDatabase,
   repoId: number,
@@ -116,15 +116,7 @@ export function resetMaintenanceRunForRootChange(
     ) {
       throw new CorruptError("maintenance restart requires a drifted unfinished run");
     }
-    const owned = db.scalar<unknown>(
-      "SELECT EXISTS(SELECT 1 FROM git_maintenance_repack_batches WHERE repo_id = ? AND run_id = ?)",
-      repoId,
-      expectedRunId,
-    );
-    if (owned !== 0) throw new CorruptError("maintenance restart retained an owned repack batch");
     clearRunOwnedReachability(db, repoId, expectedRunId);
-    // `before` is read after the settle, so the generation adopted here already
-    // includes whatever the settle itself bumped.
     const updatedRow = db.one<Record<string, unknown>>(
       `UPDATE git_maintenance_runs
           SET observed_root_epoch = ?, observed_source_generation = ?,
@@ -220,12 +212,6 @@ export function rolloverFinishedMaintenanceRun(
     ) {
       throw new GitError("EINVAL", "maintenance run is not eligible to roll over");
     }
-    const owned = db.scalar<unknown>(
-      "SELECT EXISTS(SELECT 1 FROM git_maintenance_repack_batches WHERE repo_id = ? AND run_id = ?)",
-      repoId,
-      expectedRunId,
-    );
-    if (owned !== 0) throw new CorruptError("finished maintenance run retained a repack batch");
     const allocatedRow = db.one<Record<string, unknown>>(
       `UPDATE git_maintenance_control SET next_run_id = next_run_id + 1
         WHERE repo_id = ? AND next_run_id < ?
@@ -291,11 +277,7 @@ export function rolloverFinishedMaintenanceRun(
          SELECT 1 FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?
          UNION ALL
          SELECT 1 FROM git_maintenance_shallow WHERE repo_id = ? AND run_id = ?
-         UNION ALL
-         SELECT 1 FROM git_maintenance_repack_batches WHERE repo_id = ? AND run_id = ?
        )`,
-      repoId,
-      expectedRunId,
       repoId,
       expectedRunId,
       repoId,
@@ -309,7 +291,7 @@ export function rolloverFinishedMaintenanceRun(
        VALUES (?, ?, ?, ?, 'roots', ?, 'refs')
        RETURNING repo_id, run_id, observed_root_epoch, observed_source_generation, phase,
                  started_ms, root_source,
-                 reachable_objects, queued_objects, repacked_objects, reclaimed_objects,
+                 reachable_objects, queued_objects, reclaimed_objects,
                  reclaimed_packs, reclaimed_bytes, next_eligible_ms, restarted`,
       repoId,
       runId,
@@ -340,7 +322,6 @@ export function rolloverFinishedMaintenanceRun(
         root_source: oneOf(["refs"], "maintenance rollover root source is invalid"),
         reachable_objects: int(0, 0, "maintenance rollover reachable count is invalid"),
         queued_objects: int(0, 0, "maintenance rollover queued count is invalid"),
-        repacked_objects: int(0, 0, "maintenance rollover repacked count is invalid"),
         reclaimed_objects: int(0, 0, "maintenance rollover reclaimed object count is invalid"),
         reclaimed_packs: int(0, 0, "maintenance rollover reclaimed pack count is invalid"),
         reclaimed_bytes: int(0, 0, "maintenance rollover reclaimed byte count is invalid"),
@@ -361,7 +342,6 @@ export function rolloverFinishedMaintenanceRun(
       inserted.root_source !== "refs" ||
       inserted.reachable_objects !== 0 ||
       inserted.queued_objects !== 0 ||
-      inserted.repacked_objects !== 0 ||
       inserted.reclaimed_objects !== 0 ||
       inserted.reclaimed_packs !== 0 ||
       inserted.reclaimed_bytes !== 0 ||

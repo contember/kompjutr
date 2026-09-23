@@ -33,9 +33,6 @@ export function advanceMaintenanceSweep(
     if (run.phase === "finish") {
       return { progress: progress(run, run.phase, "complete"), storageChanged: false };
     }
-    if (run.phase === "repack") {
-      throw new GitError("EINVAL", "maintenance repack phase belongs to the repack coordinator");
-    }
     const slice =
       run.phase === "classify-loose"
         ? classifyLoose(store.db, store.repoId, run, nowMs, pageRows)

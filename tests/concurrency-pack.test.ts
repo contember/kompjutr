@@ -3,7 +3,6 @@ import { concat, utf8 } from "../packages/git/src/common/bytes.js";
 import { hashObject } from "../packages/git/src/common/objects.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import {
-  type CompletePackObject,
   PACK_INGEST_LEASE_MS,
   type PackIngestResult,
 } from "../packages/git/src/store/pack/packs.js";
@@ -12,6 +11,7 @@ import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { awaitBarrierEntry, checkpointBarrier } from "./helpers/interleaving.js";
 import { lifecycleDelta, lifecyclePack } from "./helpers/pack-maintenance.js";
+import { completePackMatches, type PackMember, reclaimPending } from "./helpers/pack-store.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 const INDEX_CHECKPOINT_OBJECTS = 1_024;
@@ -25,7 +25,7 @@ interface OpenedStore {
 
 interface CheckpointPack {
   readonly bytes: Uint8Array;
-  readonly members: readonly CompletePackObject[];
+  readonly members: readonly PackMember[];
   readonly targetData: Uint8Array;
   readonly targetOid: string;
   readonly uniqueData: Uint8Array;
@@ -77,7 +77,7 @@ function checkpointPack(targetData: Uint8Array, prefix: string): CheckpointPack 
   const writer = new PackWriter((chunk) => chunks.push(chunk));
   writer.header(INDEX_CHECKPOINT_OBJECTS);
   writer.object("blob", targetData);
-  const members: CompletePackObject[] = [blobMembership(targetData)];
+  const members: PackMember[] = [blobMembership(targetData)];
   let uniqueData: Uint8Array | undefined;
   for (let index = 1; index < INDEX_CHECKPOINT_OBJECTS; index++) {
     const data = utf8.encode(`${prefix}-${index}\n`);
@@ -163,7 +163,7 @@ function startPausedIngest(
   };
 }
 
-function blobMembership(data: Uint8Array): CompletePackObject {
+function blobMembership(data: Uint8Array): PackMember {
   return { oid: hashObject("blob", data), type: "blob", size: data.length };
 }
 
@@ -249,17 +249,12 @@ describe("concurrent pack ownership", () => {
       expect(
         cold.db.scalar<number | null>("SELECT active_pack_id FROM git_pack_ingest_control"),
       ).toBeNull();
-      expect(() =>
-        cold.store.packs.discardPending(1, () => {
-          expect(cold.store.packs.discardPending(1)).toBe(true);
-          expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(0);
-          throw failure;
-        }),
-      ).toThrow(failure);
-      expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(1);
-      expect(cold.store.packs.discardPending(1)).toBe(true);
-      expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(0);
+      // The retry's reservation reclaims the abandoned pack and its staging.
       await cold.store.packs.ingest(singleChunk(bytes));
+      expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE pack_id = 1")).toBe(
+        0,
+      );
+      expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(0);
       expect(reopenStore(opened.storage).store.cachedCommit(oid)?.commit.message).toBe(
         "rollback\n",
       );
@@ -347,9 +342,9 @@ describe("concurrent pack ownership", () => {
     try {
       await awaitBarrierEntry(barrier, owner);
       const cold = reopenStore(opened.storage, now);
-      expect(cold.store.packs.reclaimPending()).toBe(0);
+      await expect(reclaimPending(cold.store)).rejects.toMatchObject({ code: "EBUSY" });
       clock.value += PACK_INGEST_LEASE_MS;
-      expect(cold.store.packs.reclaimPending()).toBe(1);
+      expect(await reclaimPending(cold.store)).toBe(1);
       expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(0);
       expect(cold.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
       barrier.release();
@@ -403,7 +398,7 @@ describe("concurrent pack ownership", () => {
       expect(reopenStore(opened.storage).store.read(hashObject("blob", target))?.data).toEqual(
         target,
       );
-      expect(reopenStore(opened.storage).store.packs.reclaimPending()).toBe(0);
+      expect(await reclaimPending(reopenStore(opened.storage).store)).toBe(0);
     },
   );
 
@@ -448,11 +443,9 @@ describe("concurrent pack ownership", () => {
     expect(opened.storage.statementCount - retryStart).toBeLessThan(1_000);
 
     const cold = reopenStore(opened.storage);
-    expect(cold.store.packs.reclaimPending()).toBe(0);
-    expect(cold.store.packs.completePackMatches(retry.packId, [blobMembership(targetData)])).toBe(
-      true,
-    );
-    expect(cold.store.packs.completePackMatches(first.packId, pending.members)).toBe(true);
+    expect(await reclaimPending(cold.store)).toBe(0);
+    expect(completePackMatches(cold.store, retry.packId, [blobMembership(targetData)])).toBe(true);
+    expect(completePackMatches(cold.store, first.packId, pending.members)).toBe(true);
     expectCheckpointReadable(cold.store, pending);
     expect(cold.store.packs.deleteCompletePacks([first.packId])).toBe(1);
     expect(cold.store.read(pending.targetOid)?.data).toEqual(targetData);
@@ -514,7 +507,7 @@ describe("concurrent pack ownership", () => {
     expect(activeStatements).toBeLessThan(1_000);
 
     const cold = reopenStore(first.storage);
-    const reclaimed = cold.store.packs.reclaimPending();
+    const reclaimed = await reclaimPending(cold.store);
     expect({
       activePackId,
       activeStateAfterWinner,
@@ -532,7 +525,7 @@ describe("concurrent pack ownership", () => {
       activeReadable: pending.targetData,
       competingReadable: null,
     });
-    expect(cold.store.packs.completePackMatches(completed.packId, pending.members)).toBe(true);
+    expect(completePackMatches(cold.store, completed.packId, pending.members)).toBe(true);
     expectCheckpointReadable(cold.store, pending);
   });
 
@@ -628,15 +621,15 @@ describe("concurrent pack ownership", () => {
     ]);
 
     const cold = reopenStore(opened.storage);
-    expect(cold.store.packs.reclaimPending()).toBe(0);
-    expect(cold.store.packs.reclaimPending()).toBe(0);
+    expect(await reclaimPending(cold.store)).toBe(0);
+    expect(await reclaimPending(cold.store)).toBe(0);
     expect(
-      cold.store.packs.completePackMatches(winner.packId, [
+      completePackMatches(cold.store, winner.packId, [
         blobMembership(targetData),
         blobMembership(winnerOnlyData),
       ]),
     ).toBe(true);
-    expect(cold.store.packs.completePackMatches(retry.packId, pending.members)).toBe(true);
+    expect(completePackMatches(cold.store, retry.packId, pending.members)).toBe(true);
     expectCheckpointReadable(cold.store, pending);
     expect(cold.store.read(hashObject("blob", targetData))?.data).toEqual(targetData);
     expect(cold.store.read(hashObject("blob", winnerOnlyData))?.data).toEqual(winnerOnlyData);
@@ -650,49 +643,6 @@ describe("concurrent pack ownership", () => {
       { pack_id: winner.packId, state: "complete" },
       { pack_id: retry.packId, state: "complete" },
     ]);
-  });
-
-  it("rejects publication that depends on another owner's pending membership", async () => {
-    const first = createStore();
-    const pending = checkpointPack(utf8.encode("pending canonical owner\n"), "pending-canonical");
-    first.storage.resetCounters();
-    const active = startPausedIngest(first.store, pending, "pending canonical checkpoint");
-    await awaitBarrierEntry(active.barrier, active.owner);
-    const activePrefixStatements = first.storage.statementCount;
-
-    const competing = reopenStore(first.storage);
-    const rejectedStart = first.storage.statementCount;
-    await expect(
-      competing.store.packs.ingest(slices(fullObjectPack([pending.targetData]), 4 * 1024), {
-        reclaimPending: false,
-      }),
-    ).rejects.toMatchObject({ code: "ESTALE" });
-    expect(first.storage.statementCount - rejectedStart).toBeLessThan(1_000);
-    expect(
-      first.db.scalar<string>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = 2",
-        first.store.sharedRepoId,
-      ),
-    ).toBe("pending");
-
-    const activeTailStart = first.storage.statementCount;
-    active.barrier.release();
-    const winner = await active.owner;
-    expect(activePrefixStatements + first.storage.statementCount - activeTailStart).toBeLessThan(
-      1_000,
-    );
-    const cold = reopenStore(first.storage);
-    expect(cold.store.packs.reclaimPending()).toBe(1);
-    expect(cold.store.packs.reclaimPending()).toBe(0);
-    expect(cold.store.read(pending.targetOid)?.data).toEqual(pending.targetData);
-    expect(cold.store.packs.completePackMatches(winner.packId, pending.members)).toBe(true);
-    expectCheckpointReadable(cold.store, pending);
-    expect(
-      cold.db.all<{ pack_id: number; state: string }>(
-        "SELECT pack_id, state FROM git_pack_meta WHERE repo_id = ? ORDER BY pack_id",
-        cold.store.sharedRepoId,
-      ),
-    ).toEqual([{ pack_id: winner.packId, state: "complete" }]);
   });
 
   it("allows reentrant deletion during ingest", async () => {
@@ -717,13 +667,11 @@ describe("concurrent pack ownership", () => {
     expect(opened.store.read(hashObject("blob", published))?.data).toEqual(published);
 
     const cold = reopenStore(opened.storage);
-    expect(cold.store.packs.reclaimPending()).toBe(0);
-    expect(cold.store.packs.reclaimPending()).toBe(0);
+    expect(await reclaimPending(cold.store)).toBe(0);
+    expect(await reclaimPending(cold.store)).toBe(0);
     expect(cold.store.read(hashObject("blob", retained))).toBeNull();
     expect(cold.store.read(hashObject("blob", published))?.data).toEqual(published);
-    expect(cold.store.packs.completePackMatches(second.packId, [blobMembership(published)])).toBe(
-      true,
-    );
+    expect(completePackMatches(cold.store, second.packId, [blobMembership(published)])).toBe(true);
     expect(
       cold.db.all<{ pack_id: number; state: string }>(
         "SELECT pack_id, state FROM git_pack_meta WHERE repo_id = ? ORDER BY pack_id",
@@ -746,7 +694,9 @@ describe("concurrent pack ownership", () => {
     writer.finish();
     const pack = concat(chunks);
     let progressCalls = 0;
-    let reclaimed = -1;
+    const emptyPack = lifecyclePack(() => {}, 0);
+    const probes: ReturnType<typeof competing.store.packs.ingest>[] = [];
+    let reclaimed = false;
     first.storage.resetCounters();
 
     await expect(
@@ -756,17 +706,23 @@ describe("concurrent pack ownership", () => {
           if (!message.startsWith("Resolving deltas:")) return;
           progressCalls++;
           clock.value += PACK_INGEST_LEASE_MS;
-          reclaimed = competing.store.packs.reclaimPending();
+          // Reservation runs synchronously, so the competitor reclaims the expired pack here.
+          probes.push(competing.store.packs.ingest(singleChunk(emptyPack)));
+          reclaimed =
+            first.db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE pack_id = 1") === 0;
         },
       }),
     ).rejects.toMatchObject({ code: "ESTALE" });
 
     expect(progressCalls).toBe(1);
-    expect(reclaimed).toBe(1);
+    expect(reclaimed).toBe(true);
+    const [probe] = probes;
+    if (probe === undefined) throw new Error("competitor did not reserve");
+    competing.store.packs.deleteCompletePacks([(await probe).packId]);
     expect(first.storage.statementCount).toBeLessThan(1_000);
     const cold = reopenStore(first.storage, now);
-    expect(cold.store.packs.reclaimPending()).toBe(0);
-    expect(cold.store.packs.reclaimPending()).toBe(0);
+    expect(await reclaimPending(cold.store)).toBe(0);
+    expect(await reclaimPending(cold.store)).toBe(0);
     expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(0);
   });
 
@@ -829,9 +785,7 @@ describe("concurrent pack ownership", () => {
       prefixStatements + middleStatements + opened.storage.statementCount - tailStart;
     expect(activeStatements).toBeLessThan(1_000);
     const cold = reopenStore(opened.storage, now);
-    expect(cold.store.packs.completePackMatches(completed.packId, [blobMembership(data)])).toBe(
-      true,
-    );
+    expect(completePackMatches(cold.store, completed.packId, [blobMembership(data)])).toBe(true);
     expect(cold.store.read(hashObject("blob", data))?.data).toEqual(data);
   });
 
@@ -872,13 +826,13 @@ describe("concurrent pack ownership", () => {
     );
 
     const cold = reopenStore(first.storage, now);
-    expect(cold.store.packs.reclaimPending()).toBe(0);
-    expect(cold.store.packs.reclaimPending()).toBe(0);
+    expect(await reclaimPending(cold.store)).toBe(0);
+    expect(await reclaimPending(cold.store)).toBe(0);
     expect(cold.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE pack_id = 1")).toBe(0);
     expect(cold.store.read(stale.targetOid)?.data).toEqual(stale.targetData);
     expect(cold.store.read(hashObject("blob", winnerData))?.data).toEqual(winnerData);
     expect(
-      cold.store.packs.completePackMatches(winner.packId, [
+      completePackMatches(cold.store, winner.packId, [
         blobMembership(stale.targetData),
         blobMembership(winnerData),
       ]),

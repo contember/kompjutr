@@ -22,13 +22,8 @@ export class PackIngestLifecycleControl {
     private readonly db: SqlDatabase,
     private readonly repoId: number,
     private readonly sharedState: PackSharedState,
-    private readonly now: () => number,
     private readonly deletion: PackDeletion,
   ) {}
-
-  #clearCaches(): void {
-    this.sharedState.cacheGeneration++;
-  }
 
   #ensureIngestControl(): PackIngestControl {
     const row = this.db.one<Record<string, unknown>>(
@@ -68,18 +63,12 @@ export class PackIngestLifecycleControl {
     if (control.activePackId !== null) {
       if (control.expiresMs === null) throw new CorruptError("pack ingest lease expiry is missing");
       const owner = this.db.one<Record<string, unknown>>(
-        `SELECT pack.state AS state,
-                EXISTS(
-                  SELECT 1 FROM git_maintenance_repack_batches batch
-                   WHERE batch.repo_id = pack.repo_id AND batch.pack_id = pack.pack_id
-                ) AS maintenance_owned
-           FROM git_pack_meta pack
-          WHERE pack.repo_id = ? AND pack.pack_id = ?`,
+        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
         this.repoId,
         control.activePackId,
       );
       if (owner === undefined) throw new CorruptError("active pack ingest identity is missing");
-      if (owner.state !== "pending" || owner.maintenance_owned !== 0) {
+      if (owner.state !== "pending") {
         throw new CorruptError("active ordinary pack ingest ownership is invalid");
       }
       if (nowMs < control.expiresMs) {
@@ -118,10 +107,6 @@ export class PackIngestLifecycleControl {
           WHERE pack.repo_id = ? AND pack.state IS NOT 'complete'
             AND (? IS NULL OR pack.pack_id != ?)
             AND pack.pack_id NOT IN (SELECT value FROM json_each(?))
-            AND NOT EXISTS (
-              SELECT 1 FROM git_maintenance_repack_batches batch
-               WHERE batch.repo_id = pack.repo_id AND batch.pack_id = pack.pack_id
-            )
           ORDER BY pack.pack_id LIMIT ?`,
         this.repoId,
         livePackId,
@@ -151,37 +136,21 @@ export class PackIngestLifecycleControl {
     return { control: current, removed: ids.size };
   }
 
-  /** Drop only unowned or expired ordinary packs. */
-  reclaimPending(now: () => number = this.now): number {
-    const nowMs = requireIngestTime(now);
-    const removed = this.db.transactionSync(() => {
-      const control = this.#ensureIngestControl();
-      return this.#reclaimPendingRows(control, nowMs).removed;
-    });
-    if (removed > 0) this.#clearCaches();
-    return removed;
-  }
-
   reservePending(
     nowMs: number,
     lifecycle: PackIngestLifecycle | undefined,
-    ownership: { ordinary: boolean },
-  ): { packId: number; lease: PackIngestLease | null; reclaimed: number } {
+  ): { packId: number; lease: PackIngestLease; reclaimed: number } {
     let activePackId: number | undefined;
     try {
       return this.db.transactionSync(() => {
-        let control = this.#ensureIngestControl();
-        let reclaimed = 0;
-        if (ownership.ordinary) {
-          const cleanup = this.#reclaimPendingRows(control, nowMs);
-          control = cleanup.control;
-          reclaimed = cleanup.removed;
-          if (control.activePackId !== null) {
-            throw new GitError("EBUSY", "pack ingest is active");
-          }
-          if (control.ownerGeneration === Number.MAX_SAFE_INTEGER) {
-            throw new GitError("E2BIG", "pack ingest generation is exhausted");
-          }
+        const cleanup = this.#reclaimPendingRows(this.#ensureIngestControl(), nowMs);
+        const control = cleanup.control;
+        const reclaimed = cleanup.removed;
+        if (control.activePackId !== null) {
+          throw new GitError("EBUSY", "pack ingest is active");
+        }
+        if (control.ownerGeneration === Number.MAX_SAFE_INTEGER) {
+          throw new GitError("E2BIG", "pack ingest generation is exhausted");
         }
         const packId = this.#nextPackId(control);
         this.db.run(
@@ -190,30 +159,19 @@ export class PackIngestLifecycleControl {
           packId,
           nowMs,
         );
-        let lease: PackIngestLease | null = null;
-        let updated: Record<string, unknown> | undefined;
-        if (ownership.ordinary) {
-          const generation = control.ownerGeneration + 1;
-          updated = this.db.one<Record<string, unknown>>(
-            `UPDATE git_pack_ingest_control
-                SET owner_generation = ?, last_pack_id = ?, active_pack_id = ?, expires_ms = ?
-              WHERE repo_id = ?
-            RETURNING repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms`,
-            generation,
-            packId,
-            packId,
-            nowMs + PACK_INGEST_LEASE_MS,
-            this.repoId,
-          );
-          lease = { generation, packId, expiresMs: nowMs + PACK_INGEST_LEASE_MS };
-        } else {
-          updated = this.db.one<Record<string, unknown>>(
-            `UPDATE git_pack_ingest_control SET last_pack_id = ? WHERE repo_id = ?
-            RETURNING repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms`,
-            packId,
-            this.repoId,
-          );
-        }
+        const generation = control.ownerGeneration + 1;
+        const updated = this.db.one<Record<string, unknown>>(
+          `UPDATE git_pack_ingest_control
+              SET owner_generation = ?, last_pack_id = ?, active_pack_id = ?, expires_ms = ?
+            WHERE repo_id = ?
+          RETURNING repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms`,
+          generation,
+          packId,
+          packId,
+          nowMs + PACK_INGEST_LEASE_MS,
+          this.repoId,
+        );
+        const lease = { generation, packId, expiresMs: nowMs + PACK_INGEST_LEASE_MS };
         if (
           updated === undefined ||
           requireIngestControl(updated, this.repoId).lastPackId !== packId

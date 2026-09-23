@@ -38,7 +38,6 @@ const PACK_FIXTURE_OBJECT_BYTES = 1;
 const PACK_STREAM_CHUNK_BYTES = 1024 * 1024;
 const SQLITE_OBJECT_CHUNK_BYTES = 1024 * 1024;
 const FALLBACK_COMPRESSED_BYTES = storedZlibBytes(PACK_FIXTURE_OBJECT_BYTES, 48 * 1024 * 1024);
-const AUTH_COMPRESSED_BYTES = storedZlibBytes(PACK_FIXTURE_OBJECT_BYTES, 64 * 1024 * 1024);
 const GRAPH_MESSAGE = `${"g".repeat(GRAPH_MESSAGE_BYTES - 1)}\n`;
 const GRAPH_PERSON = {
   name: "Memory Benchmark",
@@ -93,7 +92,6 @@ export type MemoryScenarioName =
   | "core.sparse-selected-add"
   | "core.loose-object-stream"
   | "sqlite.pack.fallback-audit"
-  | "sqlite.pack.authenticate"
   | "sqlite.graph.retained"
   | "sqlite.object.singleton"
   | "sqlite.config.move"
@@ -107,7 +105,6 @@ export type MemorySource =
   | "add"
   | "SharedRepoStore.readBlobs"
   | "PackStore.deleteCompletePacks"
-  | "PackStore.authenticateCompleteSources"
   | "Repository.walkIndexed"
   | "CheckoutStore.configMoveSection"
   | "SqliteGitDatabase.listCheckouts";
@@ -200,15 +197,6 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     formerLimitBytes: 48 * 1024 * 1024,
     verifiedContentBytes: PACK_FIXTURE_OBJECT_BYTES,
     verifiedChunkCount: Math.ceil(FALLBACK_COMPRESSED_BYTES / PACK_STREAM_CHUNK_BYTES),
-  },
-  {
-    scenario: "sqlite.pack.authenticate",
-    operation: "sqlite.pack.authenticate",
-    source: "PackStore.authenticateCompleteSources",
-    workloadBytes: AUTH_COMPRESSED_BYTES,
-    formerLimitBytes: 64 * 1024 * 1024,
-    verifiedContentBytes: PACK_FIXTURE_OBJECT_BYTES,
-    verifiedChunkCount: Math.ceil(AUTH_COMPRESSED_BYTES / PACK_STREAM_CHUNK_BYTES),
   },
   {
     scenario: "sqlite.graph.retained",

@@ -79,10 +79,6 @@ export class PackIngestEngine {
     source: AsyncIterable<Uint8Array>,
     options: AbortablePackIngestOptions,
   ): Promise<PackIngestResult> {
-    const reclaimPending = options.reclaimPending ?? true;
-    if (typeof reclaimPending !== "boolean") {
-      throw new RangeError("reclaimPending must be a boolean");
-    }
     const now = options.now ?? this.#now;
     const say = options.onProgress ?? (() => {});
     const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
@@ -93,21 +89,12 @@ export class PackIngestEngine {
     let lease: PackIngestLease | null = null;
     try {
       throwIfIngestAborted(signal);
-      const reservation = this.#lifecycle.reservePending(
-        requireIngestTime(now),
-        options.lifecycle,
-        {
-          ordinary: reclaimPending,
-        },
-      );
+      const reservation = this.#lifecycle.reservePending(requireIngestTime(now), options.lifecycle);
       activePackId = reservation.packId;
-      lease = reservation.lease;
+      const activeLease = reservation.lease;
+      lease = activeLease;
       if (reservation.reclaimed > 0) this.#read.clearCaches();
-      const activeLease = lease;
-      const heartbeat =
-        activeLease === null
-          ? () => undefined
-          : () => this.#lifecycle.renewIngestLease(activeLease, now);
+      const heartbeat = () => this.#lifecycle.renewIngestLease(activeLease, now);
 
       const total = await this.#writer.writeChunks(
         source,
@@ -132,12 +119,11 @@ export class PackIngestEngine {
       );
       heartbeat();
       const result = { packId: reservation.packId, count, bytes: total };
-      const publishingLease = lease;
 
       throwIfIngestAborted(signal);
       commits.checkpoint();
       this.#db.transactionSync(() => {
-        if (publishingLease !== null) this.#lifecycle.renewIngestLease(publishingLease, now);
+        this.#lifecycle.renewIngestLease(activeLease, now);
         const published = this.#db.one<Record<string, unknown>>(
           `UPDATE git_pack_meta SET size = ?, count = ?, state = 'complete'
             WHERE repo_id = ? AND pack_id = ? AND state = 'pending'
@@ -171,9 +157,9 @@ export class PackIngestEngine {
         if (options.lifecycle !== undefined) {
           requireLifecycleResult(options.lifecycle.published(result), "published");
         }
-        if (publishingLease !== null) this.#lifecycle.releaseIngestLease(publishingLease, true);
+        this.#lifecycle.releaseIngestLease(activeLease, true);
       });
-      if (publishingLease !== null) lease = null;
+      lease = null;
       return result;
     } finally {
       if (activePackId !== undefined) this.#sharedState.activePending.delete(activePackId);

@@ -2,16 +2,11 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../common/errors.js";
 import type { ByteLru } from "../../common/lru.js";
 import { MAX_OBJECT_BYTES, type ObjectType, type RawObject } from "../../common/objects.js";
-import { deflate } from "../../common/zlib.js";
 import type { PackStore } from "../pack/packs.js";
-import type { Clock } from "../refs/reflog.js";
 import type { CommitCacheEntry, CommitCacheWriteResult } from "../trees/commits.js";
 
 /** Bytes per `git_object_chunks` row. */
 export const OBJECT_CHUNK = 1024 * 1024;
-
-/** Small loose objects cost more to deflate than storing their bytes directly. */
-export const RAW_OBJECT_MAX = 4 * 1024;
 
 /** Deflate output chunk, and one row, for a streamed write. Smaller than
  *  OBJECT_CHUNK so a streamed object's peak is a chunk, not a megabyte. */
@@ -36,14 +31,11 @@ export const MAX_BLOB_BATCH_OIDS = 4096;
 /** Parsed commits staged beside encoded object bytes before a batch flush. */
 export const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
 
-export type LooseEncoding = "raw" | "zlib";
-
 /** One object staged in a batch, already hashed and encoded for storage. */
 export interface StagedObject {
   oid: string;
   type: ObjectType;
   size: number;
-  stored: LooseEncoding;
   storedData: Uint8Array;
   treeData?: Uint8Array;
   commitEntry?: CommitCacheEntry;
@@ -80,15 +72,11 @@ export interface ObjectReadContext extends ObjectQueryContext {
   readonly objects: ByteLru<string, RawObject>;
 }
 
-export interface ObjectClockContext {
-  readonly clock: Clock;
-}
-
-export interface ObjectBatchContext extends ObjectDatabaseContext, ObjectClockContext {
+export interface ObjectBatchContext extends ObjectDatabaseContext {
   readonly cacheKeys: ObjectCacheKeys;
 }
 
-export interface ObjectWriteContext extends ObjectReadContext, ObjectClockContext {}
+export type ObjectWriteContext = ObjectReadContext;
 
 export function requireStorableObjectSize(type: ObjectType, size: number): void {
   if (size > MAX_OBJECT_BYTES) {
@@ -105,14 +93,6 @@ export function requireCommitCacheWrites(result: CommitCacheWriteResult, expecte
   }
 }
 
-export function looseEncoding(size: number): LooseEncoding {
-  return size <= RAW_OBJECT_MAX ? "raw" : "zlib";
-}
-
-export function encodeLoose(data: Uint8Array, stored: LooseEncoding): Uint8Array {
-  return stored === "raw" ? data : deflate(data);
-}
-
 export function maximumDeflatedBytes(bytes: number): number {
   const maximum =
     bytes +
@@ -126,19 +106,6 @@ export function maximumDeflatedBytes(bytes: number): number {
   return maximum;
 }
 
-export function parseLooseEncoding(stored: string): LooseEncoding {
-  if (stored === "raw" || stored === "zlib") return stored;
-  throw new CorruptError(`loose object has unknown storage encoding '${stored}'`);
-}
-
 export function isObjectType(value: string | null): value is ObjectType {
   return value === "blob" || value === "tree" || value === "commit" || value === "tag";
-}
-
-export function nowMilliseconds(context: ObjectClockContext): number {
-  const now = context.clock();
-  if (!Number.isSafeInteger(now) || now < 0) {
-    throw new GitError("EINVAL", "Git store clock must return non-negative integer milliseconds");
-  }
-  return now;
 }

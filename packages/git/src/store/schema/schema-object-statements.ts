@@ -28,10 +28,6 @@ const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
 
 export const OBJECT_SCHEMA_STATEMENTS = [
   // Loose objects: everything created locally, zlib-deflated and chunked.
-  // A future repack folds them into a pack; nothing here depends on that.
-  // `stored` names the encoding of the chunk bytes: 'zlib' or 'raw'.
-  // Deflating an already-incompressible or tiny object costs more than it
-  // saves, and the threshold is a client option.
   `CREATE TABLE IF NOT EXISTS git_objects (
      repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
      oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
@@ -39,8 +35,6 @@ export const OBJECT_SCHEMA_STATEMENTS = [
      size INTEGER NOT NULL CHECK (
        typeof(size) = 'integer' AND size BETWEEN 0 AND ${MAX_OBJECT_BYTES}
      ),
-     stored TEXT NOT NULL DEFAULT 'zlib'
-       CHECK (typeof(stored) = 'text' AND stored IN ('zlib','raw')),
      PRIMARY KEY (repo_id, oid),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,

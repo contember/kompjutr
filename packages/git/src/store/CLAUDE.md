@@ -22,7 +22,7 @@ schema/        editable schema version 1; no migrations
 trees/         tree/commit projections and streaming walks
 pack/          pack read, ingest, publication, deletion, and delta workspace
 sparse/        the sparse capability contract; `do-fs` implements it
-maintenance/   roots, reachability, repack, sweep, and durable run control
+maintenance/   roots, reachability, sweep, and durable run control
 @kompjutr/sqlite  database contract, GitError base, and routing limits
 ```
 
@@ -62,9 +62,10 @@ workspace separately uses operation-local 64 KiB chunks. Publication validates
 the trailer and compares stored membership with digests recorded during parse;
 it does not re-read and re-inflate the pack. Only complete packs are readable.
 
+Loose objects are always zlib-deflated; maintenance never repacks them.
 Ordinary ingest uses a renewable five-minute repository lease and monotonic pack
-IDs. Maintenance has exact batch ownership instead. One `maintenance()` call
-advances one bounded durable action. Root mutations bump the repository epoch
+IDs. Maintenance owns no pack. One `maintenance()` call advances one bounded
+durable action synchronously. Root mutations bump the repository epoch
 and source changes bump `git_repositories.source_generation`; drift on either
 identity restarts discovery before destructive work. A step that changes sources
 adopts its own bump as the last statement of its transaction (ADR-0025).

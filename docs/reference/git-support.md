@@ -881,13 +881,13 @@ cold reopen.
 
 `maintenance({ dir? })` advances one durable repository-scoped action. Repeated
 calls snapshot roots from every linked checkout, mark logical and physical
-reachability, repack reachable loose objects, classify unreachable storage, and
-sweep objects whose fixed 14-day grace period has elapsed. The operation has no
-public page-size, grace, or pack-tuning options.
+reachability, classify unreachable storage, and sweep objects whose fixed
+14-day grace period has elapsed. Reachable loose objects stay loose; nothing is
+repacked. The operation has no public page-size, grace, or pack-tuning options.
 
 The result is discriminated by `status: "progress" | "complete"`. It reports the
 durable phase after the call, stable run ID, restart marker, reachable and queued
-objects, repacked objects, reclaimed objects and packs, and reclaimed bytes.
+objects, reclaimed objects and packs, and reclaimed bytes.
 `nextEligibleAt` is `null` during progress and reports the next grace boundary
 only on a complete `finish` result. While the root epoch is stable, calling
 again before a future boundary returns the same terminal result. Root drift or

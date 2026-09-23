@@ -2,6 +2,7 @@ import { blob, ownedBytes } from "@kompjutr/sqlite";
 import { concat } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { hashObject, type ObjectType } from "../../common/objects.js";
+import { deflate } from "../../common/zlib.js";
 import type { ObjectBatch, ObjectBatchOptions, OwnedObjectBatch } from "../core/contracts.js";
 import { isThenableResult } from "../core/json-pages.js";
 import { bumpRepositorySourceGeneration } from "../core/source-generation.js";
@@ -12,9 +13,6 @@ import {
   type ChunkPayload,
   COMMIT_STAGE_CACHE_BYTES,
   DEFAULT_OBJECT_FLUSH,
-  encodeLoose,
-  looseEncoding,
-  nowMilliseconds,
   OBJECT_CHUNK,
   OBJECT_PAYLOAD,
   type ObjectBatchContext,
@@ -60,20 +58,14 @@ export function createObjectWriteBatch(
         requireStorableObjectSize(type, data.length);
         const oid = hashObject(type, data);
         if (staged.has(oid)) return oid;
-        const stored = looseEncoding(data.length);
-        const storedData = stored === "raw" ? ownedBytes(data) : encodeLoose(data, stored);
-        const object: StagedObject = { oid, type, size: data.length, stored, storedData };
-        if (type === "tree") object.treeData = stored === "raw" ? storedData : ownedBytes(data);
+        const storedData = deflate(data);
+        const object: StagedObject = { oid, type, size: data.length, storedData };
+        if (type === "tree") object.treeData = ownedBytes(data);
         if (type === "commit") {
           const commitEntry = prepareCommitCache({ repoId: context.repoId, oid, data });
           object.commitEntry = commitEntry;
         }
-        const nextBytes =
-          bytes +
-          storedData.length +
-          (object.treeData !== undefined && object.treeData !== storedData
-            ? object.treeData.length
-            : 0);
+        const nextBytes = bytes + storedData.length + (object.treeData?.length ?? 0);
         const nextCommitBytes = commitBytes + (object.commitEntry?.cacheBytes ?? 0);
         staged.set(oid, object);
         bytes = nextBytes;
@@ -131,7 +123,7 @@ function flushObjects(
     object.commitEntry === undefined ? [] : [object.commitEntry],
   );
   const meta = JSON.stringify(
-    staged.map((object) => ({ o: object.oid, t: object.type, s: object.size, e: object.stored })),
+    staged.map((object) => ({ o: object.oid, t: object.type, s: object.size })),
   );
   let wroteLoose = false;
   context.db.transactionSync(() => {
@@ -142,9 +134,9 @@ function flushObjects(
     );
     const fresh: StagedObject[] = [];
     for (const row of context.db.iterate(
-      `INSERT INTO git_objects (repo_id, oid, type, size, stored)
+      `INSERT INTO git_objects (repo_id, oid, type, size)
        SELECT ?, json_extract(j.value, '$.o'), json_extract(j.value, '$.t'),
-              json_extract(j.value, '$.s'), json_extract(j.value, '$.e')
+              json_extract(j.value, '$.s')
          FROM json_each(?) j
         WHERE NOT EXISTS (
           SELECT 1
@@ -180,11 +172,7 @@ function flushObjects(
     const payloads: ChunkPayload[] = [{ parts: [], length: 0, rows: [] }];
     for (const object of fresh) {
       const storedData = object.storedData;
-      for (
-        let seq = 0, offset = 0;
-        offset < storedData.length || seq === 0;
-        seq++, offset += OBJECT_CHUNK
-      ) {
+      for (let seq = 0, offset = 0; offset < storedData.length; seq++, offset += OBJECT_CHUNK) {
         const part = storedData.subarray(offset, offset + OBJECT_CHUNK);
         let current = payloads[payloads.length - 1]!;
         if (current.length > 0 && current.length + part.length > payloadBytes) {
@@ -199,13 +187,6 @@ function flushObjects(
     }
 
     const oids = JSON.stringify(fresh.map((object) => object.oid));
-    context.db.run(
-      `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
-       SELECT ?, value, ? FROM json_each(?)`,
-      context.repoId,
-      nowMilliseconds(context),
-      oids,
-    );
     // The transaction keeps metadata invisible until all chunks and parsed
     // tree rows are ready, while RETURNING replaces a separate probe.
     context.db.run(
@@ -217,9 +198,7 @@ function flushObjects(
       context.db.run(
         `INSERT INTO git_object_chunks (repo_id, oid, seq, data)
          SELECT ?, json_extract(j.value, '$.o'), json_extract(j.value, '$.q'),
-                CASE WHEN json_extract(j.value, '$.n') = 0 THEN zeroblob(0)
-                     ELSE substr(?, json_extract(j.value, '$.a'), json_extract(j.value, '$.n'))
-                 END
+                substr(?, json_extract(j.value, '$.a'), json_extract(j.value, '$.n'))
            FROM json_each(?) j
           WHERE true
          ON CONFLICT(repo_id, oid, seq) DO UPDATE SET data = excluded.data`,

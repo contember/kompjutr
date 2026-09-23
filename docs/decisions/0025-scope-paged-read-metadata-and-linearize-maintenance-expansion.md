@@ -68,8 +68,7 @@ invalidation are preserved and independently enforced.
 `git_maintenance_runs.observed_source_generation`. A step that changes sources
 adopts its own bump as the **last statement of that step's transaction**; a step
 that does not change sources compares the recorded value against the repository's,
-and a mismatch settles the owned repack batch and restarts discovery before any
-further destruction.
+and a mismatch restarts discovery before any further destruction.
 
 ## Consequences
 

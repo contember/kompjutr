@@ -17,7 +17,6 @@ const OBJECT_INFO_ROW = new RowShape({
   source: nullable(oneOf(["loose", "pack"])),
   type: nullable(oneOf(["blob", "tree", "commit", "tag"])),
   size: nullable(int(0)),
-  stored: nullable(oneOf(["raw", "zlib"])),
   chunk_rows: int(0),
   first_chunk: nullable(int(0)),
   last_chunk: nullable(int(0)),
@@ -28,10 +27,10 @@ const OBJECT_INFO_ROW = new RowShape({
 export function looseRow(
   context: ObjectDatabaseContext,
   oid: string,
-): { type: ObjectType; size: number; stored: string } | null {
+): { type: ObjectType; size: number } | null {
   return (
-    context.db.one<{ type: ObjectType; size: number; stored: string }>(
-      "SELECT type, size, stored FROM git_objects WHERE repo_id = ? AND oid = ?",
+    context.db.one<{ type: ObjectType; size: number }>(
+      "SELECT type, size FROM git_objects WHERE repo_id = ? AND oid = ?",
       context.repoId,
       oid,
     ) ?? null
@@ -123,7 +122,6 @@ export function objectInfo(
                  WHEN pack.pack_id IS NOT NULL THEN packed.type END AS type,
             CASE WHEN loose.oid IS NOT NULL THEN loose.size
                  WHEN pack.pack_id IS NOT NULL THEN packed.size END AS size,
-            CASE WHEN loose.oid IS NOT NULL THEN loose.stored END AS stored,
             CASE WHEN loose.oid IS NULL THEN 0 ELSE COALESCE(chunks.chunk_rows, 0) END AS chunk_rows,
             CASE WHEN loose.oid IS NULL THEN NULL ELSE chunks.first_chunk END AS first_chunk,
             CASE WHEN loose.oid IS NULL THEN NULL ELSE chunks.last_chunk END AS last_chunk,
@@ -153,16 +151,13 @@ export function objectInfo(
       row.source === null ||
       row.type === null ||
       row.size === null ||
-      (row.source === "loose" && row.stored !== "raw" && row.stored !== "zlib") ||
       (row.source === "loose" && row.chunk_rows <= 0) ||
       (row.source === "loose" && row.first_chunk !== 0) ||
       (row.source === "loose" && row.last_chunk !== row.chunk_rows - 1) ||
       (row.source === "loose" && row.largest_chunk > OBJECT_CHUNK) ||
-      (row.source === "loose" && row.stored === "raw" && row.stored_bytes !== row.size) ||
-      (row.source === "loose" && row.stored === "zlib" && row.stored_bytes === 0) ||
+      (row.source === "loose" && row.stored_bytes === 0) ||
       (row.source === "pack" &&
-        (row.stored !== null ||
-          row.chunk_rows !== 0 ||
+        (row.chunk_rows !== 0 ||
           row.first_chunk !== null ||
           row.last_chunk !== null ||
           row.largest_chunk !== 0 ||

@@ -8,12 +8,7 @@ import { createInitialWorktreeWriter } from "../packages/do/src/fs/store/initial
 import { Workspace } from "../packages/do/src/runtime/workspace.js";
 import { createGit } from "../packages/git/src/client.js";
 import { concat, utf8 } from "../packages/git/src/common/bytes.js";
-import {
-  hashObject,
-  MODE_FILE,
-  serializeCommit,
-  serializeTree,
-} from "../packages/git/src/common/objects.js";
+import { hashObject, MODE_FILE, serializeTree } from "../packages/git/src/common/objects.js";
 import { createSqliteCommitTreeSnapshotSource } from "../packages/git/src/do-fs/index.js";
 import {
   advanceIndexTrackerBaseline,
@@ -41,7 +36,6 @@ import { eagerStatus } from "../packages/git/src/ops/status/status.js";
 import { dirtyPaths } from "../packages/git/src/ops/worktree/worktree-io.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { advanceMaintenanceMark } from "../packages/git/src/store/maintenance/reachability.js";
-import { advanceMaintenanceRepack } from "../packages/git/src/store/maintenance/repack.js";
 import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "../tests/helpers/db.js";
@@ -93,11 +87,8 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "table:git_integration_tree_entries",
   "table:git_integration_workspaces",
   "table:git_loose_gc_candidates",
-  "table:git_loose_object_lifecycle",
   "table:git_maintenance_control",
   "table:git_maintenance_objects",
-  "table:git_maintenance_repack_batches",
-  "table:git_maintenance_repack_objects",
   "table:git_maintenance_runs",
   "table:git_maintenance_shallow",
   "table:git_meta",
@@ -180,12 +171,10 @@ type RequiredRow =
   | "rebase.transition"
   | "rebase.transition-n"
   | "rebase.transition-2n"
-  | "pack.uncached-auth"
   | "pack.uncached-read"
   | "pack.fallback-audit"
   | "index-tracker.dirty"
   | "index-tracker.reseal"
-  | "maintenance.repack.select"
   | "maintenance.mark-depth-n"
   | "maintenance.mark-depth-2n"
   | "transport.discovery"
@@ -224,12 +213,10 @@ const REQUIRED_ROWS: readonly RequiredRow[] = [
   "rebase.transition",
   "rebase.transition-n",
   "rebase.transition-2n",
-  "pack.uncached-auth",
   "pack.uncached-read",
   "pack.fallback-audit",
   "index-tracker.dirty",
   "index-tracker.reseal",
-  "maintenance.repack.select",
   "maintenance.mark-depth-n",
   "maintenance.mark-depth-2n",
   "transport.discovery",
@@ -303,12 +290,10 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "rebase.transition": 404,
   "rebase.transition-n": 699,
   "rebase.transition-2n": 1279,
-  "pack.uncached-auth": 3,
   "pack.uncached-read": 3,
   "pack.fallback-audit": 20,
   "index-tracker.dirty": 2,
   "index-tracker.reseal": 8,
-  "maintenance.repack.select": 8,
   "maintenance.mark-depth-n": 398,
   "maintenance.mark-depth-2n": 783,
   "transport.discovery": 2,
@@ -348,12 +333,10 @@ const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
   "rebase.transition": 413,
   "rebase.transition-n": 689,
   "rebase.transition-2n": 1273,
-  "pack.uncached-auth": 3,
   "pack.uncached-read": 2,
   "pack.fallback-audit": 4,
   "index-tracker.dirty": 1_025,
   "index-tracker.reseal": 3,
-  "maintenance.repack.select": 7,
   "maintenance.mark-depth-n": 332,
   "maintenance.mark-depth-2n": 653,
   "transport.discovery": 2,
@@ -2015,7 +1998,7 @@ async function rebaseRows(rows: ResultRow[]): Promise<void> {
   await measureScale("rebase.transition-2n", 8);
 }
 
-async function packUncachedAuthRow(rows: ResultRow[]): Promise<void> {
+async function packUncachedReadRow(rows: ResultRow[]): Promise<void> {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db);
   const checkout = database.createRepository("/repo", "ref: refs/heads/main");
@@ -2023,27 +2006,6 @@ async function packUncachedAuthRow(rows: ResultRow[]): Promise<void> {
   const data = utf8.encode("cold packed source authentication\n");
   const oid = hashObject("blob", data);
   const packed = await store.packs.ingest(slices(singleBlobPack(data), 64));
-
-  const coldDb = new TestDatabase(db.storage);
-  const coldDatabase = new SqliteGitDatabase(coldDb, { chunkBytes: 0, objectCacheBytes: 0 });
-  const coldCheckout = coldDatabase.checkoutAt("/repo");
-  assert(coldCheckout !== null, "uncached authentication lost its checkout");
-  const cold = coldDatabase.openCheckout(coldCheckout);
-  await measure(
-    rows,
-    coldDb.storage,
-    "pack.uncached-auth",
-    () =>
-      cold.packs.authenticateCompleteSources([
-        { oid, type: "blob", size: data.length, packId: packed.packId },
-      ]),
-    () => {
-      assert(
-        cold.packs.completePackedEntry(oid)?.packId === packed.packId,
-        "authenticated source changed canonical pack ownership",
-      );
-    },
-  );
 
   const genericDb = new TestDatabase(db.storage);
   const genericDatabase = new SqliteGitDatabase(genericDb, { chunkBytes: 0, objectCacheBytes: 0 });
@@ -2198,101 +2160,6 @@ async function indexTrackerDirtyRow(rows: ResultRow[]): Promise<void> {
       }
     },
   );
-}
-
-async function maintenanceRow(rows: ResultRow[]): Promise<void> {
-  const db = new TestDatabase();
-  const database = new SqliteGitDatabase(db);
-  const checkout = database.createRepository("/repo", "ref: refs/heads/main");
-  const store = database.openCheckout(checkout);
-  const blobData = utf8.encode("reachable blob\n");
-  const blob = store.write("blob", blobData);
-  const treeData = serializeTree([{ mode: MODE_FILE, name: "file", oid: blob }]);
-  const tree = store.write("tree", treeData);
-  const person = {
-    name: IDENTITY.name,
-    email: IDENTITY.email,
-    timestamp: 1_700_000_000,
-    timezoneOffset: 0,
-  };
-  const commitData = serializeCommit({
-    tree,
-    parent: [],
-    author: person,
-    committer: person,
-    message: "root\n",
-  });
-  const commitOid = store.write("commit", commitData);
-  store.setRef("refs/heads/main", commitOid);
-  const rootEpoch = db.scalar<number>(
-    "SELECT root_epoch FROM git_maintenance_control WHERE repo_id = ?",
-    checkout.repoId,
-  );
-  assert(rootEpoch !== undefined, "maintenance root epoch is missing");
-  db.run(
-    `UPDATE git_maintenance_control
-        SET next_run_id = 2
-      WHERE repo_id = ? AND next_run_id = 1`,
-    checkout.repoId,
-  );
-  db.run(
-    `INSERT INTO git_maintenance_runs
-       (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
-        reachable_objects, queued_objects)
-     VALUES (?, 1, ?, 'repack', 1, 'done', 3, 0)`,
-    checkout.repoId,
-    rootEpoch,
-  );
-  db.run(
-    `INSERT INTO git_maintenance_objects
-       (repo_id, run_id, oid, source_mask, expanded, shallow_boundary,
-        physical_only, edge_cursor)
-     SELECT ?, 1, json_extract(value, '$.oid'), 1, 1, 0,
-            json_extract(value, '$.physicalOnly'), 0
-       FROM json_each(?)`,
-    checkout.repoId,
-    JSON.stringify([
-      { oid: commitOid, physicalOnly: 0 },
-      { oid: tree, physicalOnly: 0 },
-      { oid: blob, physicalOnly: 0 },
-    ]),
-  );
-  await measure(
-    rows,
-    db.storage,
-    "maintenance.repack.select",
-    () => advanceMaintenanceRepack(store.shared, { nowMs: 1 }),
-    (value) => {
-      assert(value.boundary === "selected", "maintenance did not select a repack batch");
-      assert(value.objectCount === 3, "maintenance selected another object count");
-      assert(value.packId === null, "maintenance selection published a pack early");
-    },
-  );
-  const published = await advanceMaintenanceRepack(store.shared, { nowMs: 1 });
-  assert(published.boundary === "published", "maintenance did not publish its selected batch");
-  assert(published.objectCount === 3, "maintenance published another object count");
-  assert(published.packId !== null, "maintenance publication did not create a pack");
-  const reopenedDb = new TestDatabase(db.storage);
-  const reopenedDatabase = new SqliteGitDatabase(reopenedDb);
-  const reopenedCheckout = reopenedDatabase.checkoutAt("/repo");
-  assert(reopenedCheckout !== null, "maintenance cold reopen lost its checkout");
-  const reopened = reopenedDatabase.openCheckout(reopenedCheckout);
-  assert(reopened.getRef("refs/heads/main") === commitOid, "maintenance cold reopen moved main");
-  const expectedObjects: readonly {
-    oid: string;
-    type: "commit" | "tree" | "blob";
-    data: Uint8Array;
-  }[] = [
-    { oid: commitOid, type: "commit", data: commitData },
-    { oid: tree, type: "tree", data: treeData },
-    { oid: blob, type: "blob", data: blobData },
-  ];
-  for (const expected of expectedObjects) {
-    const object = reopened.readAuthenticatedObject(expected.oid, expected.type);
-    assert(object !== null, `maintenance cold reopen lost ${expected.type}`);
-    assert(object.type === expected.type, `maintenance cold reopen changed ${expected.type}`);
-    sameBytes(object.data, expected.data, `maintenance authenticated ${expected.type}`);
-  }
 }
 
 /** One packed delta chain of `depth` edges, terminating in a full blob. */
@@ -2682,10 +2549,9 @@ await fetchPublicationRow(rows);
 await mergeRows(rows);
 await replayRows(rows);
 await rebaseRows(rows);
-await packUncachedAuthRow(rows);
+await packUncachedReadRow(rows);
 await packFallbackAuditRow(rows);
 await indexTrackerDirtyRow(rows);
-await maintenanceRow(rows);
 await maintenanceMarkRows(rows);
 await transportRows(rows);
 

@@ -776,7 +776,6 @@ function schema(encoding: Encoding): string {
     );
     CREATE TABLE git_objects (
       repo_id INTEGER NOT NULL, oid ${oid} NOT NULL, type TEXT NOT NULL, size INTEGER NOT NULL,
-      stored TEXT NOT NULL DEFAULT 'zlib',
       PRIMARY KEY (repo_id, oid)
     );
     CREATE TABLE git_object_chunks (
@@ -855,7 +854,7 @@ function populate(db: DatabaseSync, encoding: Encoding, dataset: Dataset): void 
   const shallow = db.prepare("INSERT INTO git_shallow VALUES (1, ?)");
   for (const oid of dataset.shallow) shallow.run(encodeOid(encoding, oid));
 
-  const object = db.prepare("INSERT INTO git_objects VALUES (1, ?, ?, ?, 'zlib')");
+  const object = db.prepare("INSERT INTO git_objects VALUES (1, ?, ?, ?)");
   const objectChunk = db.prepare("INSERT INTO git_object_chunks VALUES (1, ?, 0, ?)");
   if (dataset.workload === "loose-shaped") {
     for (const row of dataset.objects) {
@@ -1027,13 +1026,12 @@ function snapshot(db: DatabaseSync, encoding: Encoding): Snapshot {
     observeOid(hash, oids, decodeOid(encoding, row.oid));
   }
   for (const row of db
-    .prepare("SELECT oid, type, size, stored FROM git_objects ORDER BY repo_id, oid")
+    .prepare("SELECT oid, type, size FROM git_objects ORDER BY repo_id, oid")
     .iterate()) {
     hashString(hash, "object");
     observeOid(hash, oids, decodeOid(encoding, row.oid));
     hashString(hash, requireText(row.type, "object type"));
     hashString(hash, String(requireInteger(row.size, "object size")));
-    hashString(hash, requireText(row.stored, "object encoding"));
   }
   for (const row of db
     .prepare("SELECT oid, seq, data FROM git_object_chunks ORDER BY repo_id, oid, seq")

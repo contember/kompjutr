@@ -80,9 +80,7 @@ live database graph represents one Durable Object isolate, as described in
 
 The direct behavior witnesses are
 [`concurrency-operations.test.ts`](../../tests/concurrency-operations.test.ts),
-[`operation-state.test.ts`](../../tests/operation-state.test.ts), the
-maintenance repack release and reacquisition witness in
-[`maintenance-repack.test.ts`](../../tests/maintenance-repack.test.ts), and the
+[`operation-state.test.ts`](../../tests/operation-state.test.ts), and the
 public boundary inventory in
 [`public-exports.test.ts`](../../tests/public-exports.test.ts).
 

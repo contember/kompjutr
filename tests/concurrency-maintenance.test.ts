@@ -16,31 +16,14 @@ import { SqliteTestStorage } from "./helpers/storage.js";
 
 const IDENTITY = { name: "Concurrency Fixture", email: "concurrency@example.com" };
 
-function workspace(storage: SqliteTestStorage, yieldNow?: () => Promise<void>): Workspace {
+function workspace(storage: SqliteTestStorage): Workspace {
   return new Workspace({
     storage,
     git: createGit(),
     now: () => 100,
     defaultGitIdentity: IDENTITY,
     http: fetchHttpClient,
-    ...(yieldNow === undefined ? {} : { yieldNow }),
   });
-}
-
-function pendingMaintenance(
-  storage: SqliteTestStorage,
-  name: string,
-): {
-  readonly barrier: ReturnType<typeof checkpointBarrier<number>>;
-  readonly owner: Promise<GitMaintenanceResult>;
-  readonly runtime: Workspace;
-} {
-  const barrier = checkpointBarrier<number>(name, (yielded) => yielded === 1);
-  let yields = 0;
-  const runtime = workspace(storage, () => barrier.checkpoint(++yields));
-  storage.resetCounters();
-  const owner = runtime.git.maintenance({ dir: "/repo" });
-  return { barrier, owner, runtime };
 }
 
 async function measuredMaintenance(
@@ -94,17 +77,13 @@ async function ingestPack(
   return result.packId;
 }
 
-async function reachSelected(storage: SqliteTestStorage): Promise<GitMaintenanceResult> {
+/** Advance past the mark, where drift must reset the run instead of re-snapshotting roots. */
+async function reachClassification(storage: SqliteTestStorage): Promise<GitMaintenanceResult> {
   for (let calls = 0; calls < 200; calls++) {
     const result = await measuredMaintenance(storage);
-    if (result.phase !== "repack") continue;
-    await measuredMaintenance(storage);
-    const state = new TestDatabase(storage).scalar<string>(
-      "SELECT state FROM git_maintenance_repack_batches",
-    );
-    if (state === "selected") return result;
+    if (result.phase === "classify-packs") return result;
   }
-  throw new Error("maintenance did not select a repack batch");
+  throw new Error("maintenance did not reach pack classification");
 }
 
 describe("maintenance concurrency", () => {
@@ -396,282 +375,10 @@ describe("maintenance concurrency", () => {
       remote.dispose();
     }
   });
-  it("admits one selected owner, fences a pending rival, and finalizes published state once", async () => {
-    const storage = new SqliteTestStorage();
-    const commitOid = await committedRepository(storage);
-    await reachSelected(storage);
-    const first = pendingMaintenance(storage, "maintenance pending pack");
-    await awaitBarrierEntry(first.barrier, first.owner);
-    const ownerPrefixStatements = storage.statementCount;
-    const db = new TestDatabase(storage);
-    const pendingPackId = db.scalar<number>(
-      "SELECT pack_id FROM git_maintenance_repack_batches WHERE state = 'pending'",
-    );
-    if (pendingPackId === undefined)
-      throw new Error("maintenance did not publish pending ownership");
-
-    try {
-      const rivalStart = storage.statementCount;
-      await expect(first.runtime.git.maintenance({ dir: "/repo" })).rejects.toMatchObject({
-        code: "EBUSY",
-      });
-      expect(storage.statementCount - rivalStart).toBeLessThan(1_000);
-      expect(
-        db.one<{ pack_id: number; state: string }>(
-          "SELECT pack_id, state FROM git_pack_meta WHERE repo_id = 1 AND pack_id = ?",
-          pendingPackId,
-        ),
-      ).toEqual({ pack_id: pendingPackId, state: "pending" });
-    } finally {
-      const ownerTailStart = storage.statementCount;
-      first.barrier.release();
-      await expect(first.owner).resolves.toMatchObject({ phase: "repack" });
-      expect(ownerPrefixStatements + storage.statementCount - ownerTailStart).toBeLessThan(1_000);
-    }
-
-    expect(
-      db.one<{ pack_id: number; state: string }>(
-        "SELECT pack_id, state FROM git_pack_meta WHERE repo_id = 1 AND pack_id = ?",
-        pendingPackId,
-      ),
-    ).toEqual({ pack_id: pendingPackId, state: "complete" });
-    // Published finalization and cache revalidation are synchronous before this call yields.
-    storage.resetCounters();
-    const finalized = first.runtime.git.maintenance({ dir: "/repo" });
-    const follower = first.runtime.git.maintenance({ dir: "/repo" });
-    await expect(finalized).resolves.toMatchObject({ phase: "classify-packs" });
-    await expect(follower).resolves.toMatchObject({ phase: "classify-packs" });
-    expect(storage.statementCount).toBeLessThan(1_000);
-    expect(db.scalar<number>("SELECT repacked_objects FROM git_maintenance_runs")).toBe(3);
-    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
-    await expect(
-      workspace(storage).git.catFile({ dir: "/repo", oid: commitOid }),
-    ).resolves.toMatchObject({
-      oid: commitOid,
-    });
-    await expect(workspace(storage).git.status({ dir: "/repo" })).resolves.toEqual([]);
-  });
-
-  it("lets a fetch and read-only operations proceed after maintenance owns a pending pack", async () => {
-    const fixture = new GitFixture().init();
-    fixture.write("remote.txt", "remote maintenance race\n");
-    const remoteOid = fixture.commit("remote maintenance race");
-    const server = await startGitServer(fixture.dir);
-    const storage = new SqliteTestStorage();
-    let active: ReturnType<typeof pendingMaintenance> | null = null;
-    try {
-      const localOid = await committedRepository(storage);
-      await workspace(storage).git.remoteAdd({ dir: "/repo", name: "origin", url: server.url });
-      await reachSelected(storage);
-      active = pendingMaintenance(storage, "maintenance before fetch pack");
-      await awaitBarrierEntry(active.barrier, active.owner);
-      const ownerPrefixStatements = storage.statementCount;
-      const db = new TestDatabase(storage);
-      const maintenancePackId = db.scalar<number>(
-        "SELECT pack_id FROM git_maintenance_repack_batches WHERE state = 'pending'",
-      );
-      if (maintenancePackId === undefined) throw new Error("maintenance pending pack is missing");
-
-      await expect(active.runtime.git.status({ dir: "/repo" })).resolves.toEqual([]);
-      await expect(
-        active.runtime.git.catFile({ dir: "/repo", oid: localOid }),
-      ).resolves.toMatchObject({
-        oid: localOid,
-      });
-      await expect(
-        active.runtime.git.fetch({ dir: "/repo", remote: "origin", tags: false }),
-      ).resolves.toBeDefined();
-      expect(
-        db.one<{ pack_id: number; state: string }>(
-          "SELECT pack_id, state FROM git_pack_meta WHERE repo_id = 1 AND pack_id = ?",
-          maintenancePackId,
-        ),
-      ).toEqual({ pack_id: maintenancePackId, state: "pending" });
-      expect(
-        db.scalar<string>("SELECT target FROM git_refs WHERE name = ?", "refs/remotes/origin/main"),
-      ).toBe(remoteOid);
-
-      const ownerTailStart = storage.statementCount;
-      active.barrier.release();
-      await expect(active.owner).resolves.toMatchObject({ phase: "repack" });
-      expect(ownerPrefixStatements + storage.statementCount - ownerTailStart).toBeLessThan(1_000);
-      await expect(measuredMaintenance(storage)).resolves.toMatchObject({
-        phase: "roots",
-        restarted: true,
-      });
-      expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
-      expect(
-        db.scalar<number>(
-          "SELECT count(*) FROM git_pack_meta WHERE pack_id = ?",
-          maintenancePackId,
-        ),
-      ).toBe(0);
-      await expect(
-        workspace(storage).git.catFile({ dir: "/repo", oid: remoteOid }),
-      ).resolves.toMatchObject({
-        oid: remoteOid,
-      });
-      await expect(
-        workspace(storage).git.catFile({ dir: "/repo", oid: localOid }),
-      ).resolves.toMatchObject({
-        oid: localOid,
-      });
-      await expect(workspace(storage).git.status({ dir: "/repo" })).resolves.toEqual([]);
-    } finally {
-      active?.barrier.release();
-      if (active !== null) await Promise.allSettled([active.owner]);
-      await server.close();
-      fixture.dispose();
-    }
-  });
-
-  it("keeps a confirmed push while the older maintenance owner restarts for root drift", async () => {
-    const fixture = new GitFixture().init();
-    fixture.write("README.md", "push baseline\n");
-    fixture.commit("push baseline");
-    fixture.git("config", "receive.denyCurrentBranch", "updateInstead");
-    const server = await startGitServer(fixture.dir);
-    const storage = new SqliteTestStorage();
-    let active: ReturnType<typeof pendingMaintenance> | null = null;
-    try {
-      const opened = workspace(storage);
-      await opened.git.clone({ url: server.url, dir: "/repo" });
-      opened.filesystem.writeFiles([
-        { path: "/repo/pushed.txt", bytes: utf8.encode("pushed during maintenance\n") },
-      ]);
-      await opened.git.add({ dir: "/repo", paths: ["pushed.txt"] });
-      const pushedOid = (await opened.git.commit({ dir: "/repo", message: "push race" })).oid;
-      await reachSelected(storage);
-      active = pendingMaintenance(storage, "maintenance before push");
-      await awaitBarrierEntry(active.barrier, active.owner);
-      const ownerPrefixStatements = storage.statementCount;
-      const db = new TestDatabase(storage);
-      const maintenancePackId = db.scalar<number>(
-        "SELECT pack_id FROM git_maintenance_repack_batches WHERE state = 'pending'",
-      );
-      if (maintenancePackId === undefined) throw new Error("maintenance pending pack is missing");
-
-      await expect(active.runtime.git.push({ dir: "/repo" })).resolves.toMatchObject({
-        ok: true,
-      });
-      expect(fixture.git("rev-parse", "refs/heads/main")).toBe(pushedOid);
-      expect(
-        db.scalar<string>("SELECT target FROM git_refs WHERE name = ?", "refs/remotes/origin/main"),
-      ).toBe(pushedOid);
-      expect(
-        db.scalar<string>("SELECT state FROM git_pack_meta WHERE pack_id = ?", maintenancePackId),
-      ).toBe("pending");
-
-      const ownerTailStart = storage.statementCount;
-      active.barrier.release();
-      await expect(active.owner).resolves.toMatchObject({ phase: "repack" });
-      expect(ownerPrefixStatements + storage.statementCount - ownerTailStart).toBeLessThan(1_000);
-      await expect(measuredMaintenance(storage)).resolves.toMatchObject({
-        phase: "roots",
-        restarted: true,
-      });
-      expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
-      expect(
-        db.scalar<number>(
-          "SELECT count(*) FROM git_pack_meta WHERE pack_id = ?",
-          maintenancePackId,
-        ),
-      ).toBe(0);
-      await expect(
-        workspace(storage).git.catFile({ dir: "/repo", oid: pushedOid }),
-      ).resolves.toMatchObject({
-        oid: pushedOid,
-      });
-      await expect(workspace(storage).git.status({ dir: "/repo" })).resolves.toEqual([]);
-    } finally {
-      active?.barrier.release();
-      if (active !== null) await Promise.allSettled([active.owner]);
-      await server.close();
-      fixture.dispose();
-    }
-  });
-
-  it("settles selected, abandoned pending, and published owners exactly once after cold reopen", async () => {
-    const boundaries: readonly ("selected" | "pending" | "published")[] = [
-      "selected",
-      "pending",
-      "published",
-    ];
-    for (const boundary of boundaries) {
-      const storage = new SqliteTestStorage();
-      const commitOid = await committedRepository(storage);
-      await reachSelected(storage);
-      const db = new TestDatabase(storage);
-
-      if (boundary === "pending") {
-        const failure = new Error("abandoned maintenance owner");
-        storage.resetCounters();
-        await expect(
-          workspace(storage, () => Promise.reject(failure)).git.maintenance({ dir: "/repo" }),
-        ).rejects.toBe(failure);
-        expect(storage.statementCount).toBeLessThan(1_000);
-        expect(db.scalar<string>("SELECT state FROM git_maintenance_repack_batches")).toBe(
-          "pending",
-        );
-        expect(await measuredMaintenance(storage)).toMatchObject({
-          phase: "repack",
-          repackedObjects: 0,
-        });
-        expect(db.scalar<string>("SELECT state FROM git_maintenance_repack_batches")).toBe(
-          "selected",
-        );
-        expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(0);
-      } else if (boundary === "published") {
-        expect(await measuredMaintenance(storage)).toMatchObject({
-          phase: "repack",
-          repackedObjects: 0,
-        });
-        expect(db.scalar<string>("SELECT state FROM git_maintenance_repack_batches")).toBe(
-          "published",
-        );
-      } else {
-        expect(db.scalar<string>("SELECT state FROM git_maintenance_repack_batches")).toBe(
-          "selected",
-        );
-      }
-
-      if (boundary !== "published") {
-        expect(await measuredMaintenance(storage)).toMatchObject({
-          phase: "repack",
-          repackedObjects: 0,
-        });
-      }
-      expect(db.scalar<string>("SELECT state FROM git_maintenance_repack_batches")).toBe(
-        "published",
-      );
-      expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'complete'")).toBe(
-        1,
-      );
-
-      expect(await measuredMaintenance(storage)).toMatchObject({
-        phase: "repack",
-        repackedObjects: 3,
-      });
-      expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
-      expect(db.scalar<number>("SELECT repacked_objects FROM git_maintenance_runs")).toBe(3);
-      expect(await measuredMaintenance(storage)).toMatchObject({
-        phase: "classify-packs",
-        repackedObjects: 3,
-      });
-      expect(db.scalar<number>("SELECT repacked_objects FROM git_maintenance_runs")).toBe(3);
-      await expect(
-        workspace(storage).git.catFile({ dir: "/repo", oid: commitOid }),
-      ).resolves.toMatchObject({
-        oid: commitOid,
-      });
-      await expect(workspace(storage).git.status({ dir: "/repo" })).resolves.toEqual([]);
-    }
-  });
-
   it("restarts after sibling checkout creation and removal without losing shared objects", async () => {
     const storage = new SqliteTestStorage();
     const commitOid = await committedRepository(storage);
-    const selected = await reachSelected(storage);
+    const selected = await reachClassification(storage);
     await workspace(storage).git.worktreeAdd({
       dir: "/repo",
       root: "/linked",
@@ -689,7 +396,7 @@ describe("maintenance concurrency", () => {
     });
     await expect(workspace(storage).git.status({ dir: "/linked" })).resolves.toEqual([]);
 
-    await reachSelected(storage);
+    await reachClassification(storage);
     await workspace(storage).git.worktreeRemove({ dir: "/repo", root: "/linked", force: true });
     await expect(measuredMaintenance(storage)).resolves.toMatchObject({
       phase: "roots",
@@ -704,10 +411,10 @@ describe("maintenance concurrency", () => {
     await expect(workspace(storage).git.status({ dir: "/repo" })).resolves.toEqual([]);
   });
 
-  it("restarts a selected batch after an exact ref mutation and roots the new ref", async () => {
+  it("restarts a classifying run after an exact ref mutation and roots the new ref", async () => {
     const storage = new SqliteTestStorage();
     const commitOid = await committedRepository(storage);
-    const selected = await reachSelected(storage);
+    const selected = await reachClassification(storage);
     await workspace(storage).git.updateRef({
       dir: "/repo",
       ref: "refs/tags/during-maintenance",
@@ -720,7 +427,6 @@ describe("maintenance concurrency", () => {
       phase: "roots",
       restarted: true,
     });
-    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
     expect(
       db.scalar<string>(
         "SELECT target FROM git_refs WHERE name = ?",
@@ -746,10 +452,10 @@ describe("maintenance concurrency", () => {
     await expect(workspace(storage).git.status({ dir: "/repo" })).resolves.toEqual([]);
   });
 
-  it("restarts a selected batch after a loose write that moves no root", async () => {
+  it("restarts a classifying run after a loose write that moves no root", async () => {
     const storage = new SqliteTestStorage();
     await committedRepository(storage);
-    const selected = await reachSelected(storage);
+    const selected = await reachClassification(storage);
     const db = new TestDatabase(storage);
     const rootEpoch = db.scalar<number>("SELECT root_epoch FROM git_maintenance_control");
     const before = generations(storage);
@@ -769,14 +475,13 @@ describe("maintenance concurrency", () => {
       reclaimedObjects: 0,
       reclaimedPacks: 0,
     });
-    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
     expect(generations(storage)).toEqual({ source: after.source, observed: after.source });
   });
 
   it("does not restart for a pending pack whose reclamation promotes nothing", async () => {
     const storage = new SqliteTestStorage();
     await committedRepository(storage);
-    const selected = await reachSelected(storage);
+    const selected = await reachClassification(storage);
     const db = new TestDatabase(storage);
     const before = generations(storage);
     expect(before.observed).toBe(before.source);
@@ -799,7 +504,13 @@ describe("maintenance concurrency", () => {
       ),
     ).rejects.toThrow(/interrupted publication/);
     expect(generations(storage)).toEqual(before);
-    expect(sharedStore(storage).packs.discardPending(pendingPackId)).toBe(true);
+    // The next reservation reclaims it; a checksum failure keeps that ingest from publishing.
+    const corrupt = lifecyclePack((writer) => writer.object("blob", utf8.encode("probe\n")), 1);
+    corrupt[corrupt.length - 1]! ^= 0xff;
+    await expect(ingestPack(storage, corrupt)).rejects.toThrow(/checksum/);
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE pack_id = ?", pendingPackId),
+    ).toBe(0);
 
     expect(generations(storage)).toEqual(before);
     await expect(measuredMaintenance(storage)).resolves.toMatchObject({
@@ -825,7 +536,7 @@ describe("maintenance concurrency", () => {
         writer.object("blob", other);
       }, 2),
     );
-    const selected = await reachSelected(storage);
+    const selected = await reachClassification(storage);
     const before = generations(storage);
     expect(before.observed).toBe(before.source);
 
@@ -849,7 +560,6 @@ describe("maintenance concurrency", () => {
   it("reaches finish cold at every durable boundary without restarting", async () => {
     const storage = new SqliteTestStorage();
     await committedRepository(storage);
-    const db = new TestDatabase(storage);
     const seen = new Set<string>();
     let runId: number | null = null;
     for (let calls = 0; calls < 400; calls++) {
@@ -867,52 +577,9 @@ describe("maintenance concurrency", () => {
       "classify-packs",
       "finish",
       "mark",
-      "repack",
       "roots",
       "sweep-loose",
       "sweep-packs",
     ]);
-    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
-  });
-
-  it("adopts the post-settle generation when the settle itself changes sources", async () => {
-    const storage = new SqliteTestStorage();
-    await committedRepository(storage);
-    const selected = await reachSelected(storage);
-    const db = new TestDatabase(storage);
-    const commitOid = db.scalar<string>("SELECT target FROM git_refs LIMIT 1");
-    if (commitOid === undefined) throw new Error("maintenance fixture has no ref");
-    await workspace(storage).git.updateRef({
-      dir: "/repo",
-      ref: "refs/tags/settle-drift",
-      value: commitOid,
-    });
-
-    // No public settle path changes sources today, so the seam stands in for one:
-    // the reset must read the generation the settle left behind, not the one it
-    // saw before.
-    const exec = storage.sql.exec;
-    let bumped = false;
-    storage.sql.exec = <Row extends object>(query: string, ...bindings: unknown[]) => {
-      const cursor = exec<Row>(query, ...bindings);
-      if (!bumped && query.includes("DELETE FROM git_maintenance_repack_batches")) {
-        bumped = true;
-        exec(
-          "UPDATE git_repositories SET source_generation = source_generation + 1 WHERE id = ?",
-          1,
-        );
-      }
-      return cursor;
-    };
-
-    await expect(measuredMaintenance(storage)).resolves.toMatchObject({
-      runId: selected.runId,
-      phase: "roots",
-      restarted: true,
-    });
-
-    expect(bumped).toBe(true);
-    const after = generations(storage);
-    expect(after.observed).toBe(after.source);
   });
 });

@@ -980,8 +980,7 @@ describe("SQLite sparse workspace source", () => {
     );
     if (object === undefined) throw new Error("missing packed tree metadata");
     workspace.database.db.run(
-      `INSERT INTO git_objects (repo_id, oid, type, size, stored)
-       VALUES (?, ?, 'tree', ?, 'raw')`,
+      "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, 'tree', ?)",
       workspace.repo.store.repoId,
       tree,
       object.size,

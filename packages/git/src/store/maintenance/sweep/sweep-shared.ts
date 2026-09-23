@@ -15,7 +15,7 @@ export function readRun(db: SqlDatabase, repoId: number): RunState {
   if (run === null) throw new GitError("ENOTFOUND", "maintenance run does not exist");
   expectPhase(
     run,
-    ["classify-loose", "repack", "classify-packs", "sweep-loose", "sweep-packs", "finish"],
+    ["classify-loose", "classify-packs", "sweep-loose", "sweep-packs", "finish"],
     `maintenance sweep cannot advance phase ${run.phase}`,
   );
   expectRootsSettled(run);

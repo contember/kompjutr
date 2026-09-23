@@ -98,7 +98,7 @@ export abstract class SharedRepoCore {
       (oids) => this.requireObjectTable().looseObjectMetadata(oids),
       options,
     );
-    this.#objectTable = new ObjectTable(db, repoId, objects, this.#packs, this, clock);
+    this.#objectTable = new ObjectTable(db, repoId, objects, this.#packs, this);
     const availability = db.one<{ has_loose: unknown }>(
       `SELECT
          (SELECT COUNT(*) FROM (SELECT 1 FROM git_objects WHERE repo_id = ? LIMIT 1)) AS has_loose`,

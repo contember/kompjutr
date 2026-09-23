@@ -15,7 +15,6 @@ import { PackLifecycle } from "./lifecycle.js";
 import { PackReadEngine } from "./read.js";
 import {
   type CompletePackedEntry,
-  type CompletePackObject,
   DEFAULT_CACHE_ENTRY_LIMIT,
   DEFAULT_MAX_BUFFERED_ENTRY,
   type ExternalBatchResolver,
@@ -31,7 +30,6 @@ import {
 
 export type {
   CompletePackedEntry,
-  CompletePackObject,
   ExternalBatchResolver,
   ExternalMetadataResolver,
   ExternalObjectMetadata,
@@ -112,7 +110,7 @@ export class PackStore {
       boundedMaxDeltaDepth,
       boundedGraphPageEntries,
     );
-    this.#lifecycle = new PackLifecycle(db, repoId, sharedState, this.#now, boundedMaxDeltaDepth);
+    this.#lifecycle = new PackLifecycle(db, repoId, sharedState, boundedMaxDeltaDepth);
     this.#ingest = new PackIngestEngine(
       db,
       repoId,
@@ -174,38 +172,12 @@ export class PackStore {
     return this.#read.readAuthenticatedObject(oid, expectedType);
   }
 
-  authenticateCompleteSources(
-    objects: readonly { oid: string; type: ObjectType; size: number; packId: number }[],
-  ): void {
-    this.#read.authenticateCompleteSources(objects);
-  }
-
   readRaw(packId: number, offset: number, length: number): Uint8Array {
     return this.#read.readRaw(packId, offset, length);
   }
 
   clearCaches(): void {
     this.#read.clearCaches();
-  }
-
-  /** Drop only unowned or expired ordinary packs. */
-  reclaimPending(now: () => number = this.#now): number {
-    return this.#lifecycle.reclaimPending(now);
-  }
-
-  /** Delete exactly one pending pack after its owner releases the durable reference. */
-  discardPending(packId: number, releaseOwnership?: (packId: number) => unknown): boolean {
-    return this.#lifecycle.discardPending(packId, releaseOwnership);
-  }
-
-  /** Release and delete exactly one complete pack owned by a durable maintenance batch. */
-  discardOwnedComplete(packId: number, releaseOwnership: (packId: number) => unknown): boolean {
-    return this.#lifecycle.discardOwnedComplete(packId, releaseOwnership);
-  }
-
-  /** Verify that one complete pack contains exactly the requested object metadata. */
-  completePackMatches(packId: number, objects: readonly CompletePackObject[]): boolean {
-    return this.#lifecycle.completePackMatches(packId, objects);
   }
 
   /** Read packed metadata directly, ignoring any loose object that shadows it. */

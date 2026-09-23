@@ -7,13 +7,7 @@ import { InflateStream } from "../../common/zlib.js";
 import type { ObjectReadBatch } from "../core/contracts.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../pack/packs.js";
 import { looseRow } from "./objects-query.js";
-import {
-  INFLATE_FEED,
-  type LooseEncoding,
-  MAX_BLOB_BATCH_OIDS,
-  type ObjectReadContext,
-  parseLooseEncoding,
-} from "./objects-shared.js";
+import { INFLATE_FEED, MAX_BLOB_BATCH_OIDS, type ObjectReadContext } from "./objects-shared.js";
 
 interface ObjectReadMetadata {
   oid: string;
@@ -147,31 +141,14 @@ export function readObjectChunks(
 ): Iterable<Uint8Array> | null {
   const cached = context.objects.get(context.cacheKeys.objectCacheKey(oid));
   if (cached !== undefined) return [cached.data];
-  if (context.cacheKeys.hasLoose) {
-    const row = looseRow(context, oid);
-    if (row !== null) return looseChunks(context, oid, parseLooseEncoding(row.stored));
+  if (context.cacheKeys.hasLoose && looseRow(context, oid) !== null) {
+    return looseChunks(context, oid);
   }
   const packed = context.packs.read(oid);
   return packed === null ? null : [packed.data];
 }
 
-function* looseChunks(
-  context: ObjectReadContext,
-  oid: string,
-  stored: LooseEncoding,
-): Generator<Uint8Array> {
-  if (stored === "raw") {
-    for (let seq = 0; ; seq++) {
-      const row = context.db.one<{ data: unknown }>(
-        "SELECT data FROM git_object_chunks WHERE repo_id = ? AND oid = ? AND seq = ?",
-        context.repoId,
-        oid,
-        seq,
-      );
-      if (row === undefined) return;
-      yield readBlob(row.data);
-    }
-  }
+function* looseChunks(context: ObjectReadContext, oid: string): Generator<Uint8Array> {
   const ready: Uint8Array[] = [];
   const stream = new InflateStream((chunk) => ready.push(chunk));
   for (let seq = 0; ; seq++) {

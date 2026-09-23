@@ -768,9 +768,9 @@ describe("maintenance roots", () => {
     });
     db.run(
       `UPDATE git_maintenance_runs
-          SET phase = 'repack', root_source = 'done', cursor_checkout_id = NULL,
+          SET phase = 'classify-loose', root_source = 'done', cursor_checkout_id = NULL,
               cursor_text = NULL, cursor_ordinal = NULL, reachable_objects = 7,
-              queued_objects = 0, repacked_objects = 3
+              queued_objects = 0, reclaimed_objects = 3
         WHERE repo_id = ?`,
       checkout.repoId,
     );

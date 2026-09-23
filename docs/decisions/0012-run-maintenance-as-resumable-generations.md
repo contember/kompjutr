@@ -11,7 +11,7 @@ date: 2026-08-27
 
 Reachability spans refs, checkouts, retained reflogs, indexes, shallow
 boundaries, and active operation journals. A large repository cannot snapshot,
-mark, repack, and sweep that state inside one bounded Durable Object invocation.
+mark, and sweep that state inside one bounded Durable Object invocation.
 
 Maintenance also competes with normal repository mutations. A long write lock
 would make foreground Git operations unavailable, while sweeping against a stale
@@ -20,9 +20,9 @@ root set could delete authoritative data.
 ## Decision
 
 We run one durable maintenance generation per repository. Each public
-`maintenance()` call advances one bounded phase and persists its keyset cursor,
-marks, exact shallow snapshot, counters, and repack batch membership. A cold
-reopen resumes the same run without caller-owned tokens.
+`maintenance()` call synchronously advances one bounded phase and persists its
+keyset cursor, marks, exact shallow snapshot, and counters. A cold reopen
+resumes the same run without caller-owned tokens.
 
 Root-changing mutations increment a repository epoch in their own transaction.
 Maintenance records the observed epoch, restarts root discovery when it drifts,
@@ -45,10 +45,11 @@ a complete stable mark. Collection starts 14 days after its first unreachable
 observation, and retained reflog expiry happens before that clock starts. There
 is no zero-grace public option.
 
-Maintenance repacks reachable loose objects into independently validated packs
-containing full objects, and publishes a pack before deleting its loose sources.
-Garbage collection deletes only wholly unreachable packs; it does not evacuate
-live objects from mixed packs.
+Maintenance does not repack. Reachable loose objects stay loose: every loose
+object is already zlib-deflated at write, so a full-object pack would save no
+bytes and cost more statements to read. Garbage collection deletes unreachable
+loose objects and wholly unreachable packs; it does not evacuate live objects
+from mixed packs.
 
 Pack sweeping persists its last examined pack ID and a sticky deletion marker
 in the existing phase-specific cursor fields. Each call examines one bounded
@@ -68,8 +69,11 @@ fallback order, including dependencies held by pending packs.
   for deletion. Source churn — loose writes, pack publication, pack and loose
   deletion — now does the same, on the second identity.
 - `nextEligibleAt` tells a scheduler when grace is the only remaining work.
-- Full-object maintenance packs use more bytes than delta-compressed packs, but
-  keep publication and recovery simple and independently verifiable.
+- Loose storage is not delta-compressed. A repository that writes many
+  revisions of large files locally stores each revision whole until a future
+  delta-producing compaction exists.
+- No maintenance step owns a pack, so ordinary ingest's pending-pack cleanup
+  and pack sweeping need no maintenance exclusions.
 - Mixed packs can retain unreachable objects until a later compaction design.
 
 ## Alternatives considered
@@ -78,7 +82,11 @@ fallback order, including dependencies held by pending packs.
   normal repository work across multiple invocations.
 - **Sweep immediately after one mark.** Gives deleted history no recovery margin
   beyond reflog retention and amplifies any clock or classification defect.
-- **Rewrite mixed packs in the first collector.** Combines loose repacking, pack
-  compaction, and source switching into one larger destructive mechanism.
-- **Resume a partially generated compressed stream.** Batch-level retry is
-  simpler and keeps every published pack independently valid.
+- **Rewrite mixed packs in the first collector.** Combines pack compaction and
+  source switching into one larger destructive mechanism.
+- **Repack reachable loose objects into full-object packs.** Measured on a
+  30-commit source-file fixture: once loose objects are always deflated, the
+  pack stores the same bytes (329 KB vs 328 KB) while `cat-file` costs 18% more
+  statements. The repack phase also needed durable batch ownership, an
+  asynchronous pack stream, and pins in ingest and sweep. Removed in the
+  2026-09-23 simplification sprint.

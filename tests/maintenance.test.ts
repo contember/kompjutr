@@ -16,7 +16,6 @@ const RESULT_KEYS = [
   "restarted",
   "reachableObjects",
   "queuedObjects",
-  "repackedObjects",
   "reclaimedObjects",
   "reclaimedPacks",
   "reclaimedBytes",
@@ -34,25 +33,12 @@ class CountingClock {
   };
 }
 
-function runtime(
-  storage: SqliteTestStorage,
-  clock: CountingClock,
-  yieldNow?: () => Promise<void>,
-): Workspace {
-  if (yieldNow === undefined) {
-    return new Workspace({
-      storage,
-      git: createGit(),
-      now: clock.now,
-      defaultGitIdentity: IDENTITY,
-    });
-  }
+function runtime(storage: SqliteTestStorage, clock: CountingClock): Workspace {
   return new Workspace({
     storage,
     git: createGit(),
     now: clock.now,
     defaultGitIdentity: IDENTITY,
-    yieldNow,
   });
 }
 
@@ -90,15 +76,16 @@ async function createCommittedRepository(
   return (await opened.git.commit({ dir: "/repo", message: "reachable" })).oid;
 }
 
-async function advanceToRepack(
+async function advanceTo(
   storage: SqliteTestStorage,
   clock: CountingClock,
+  phase: GitMaintenanceResult["phase"],
 ): Promise<GitMaintenanceResult> {
   for (let calls = 0; calls < 100; calls++) {
     const result = await call(storage, clock);
-    if (result.phase === "repack") return result;
+    if (result.phase === phase) return result;
   }
-  throw new Error("maintenance did not reach repack");
+  throw new Error(`maintenance did not reach ${phase}`);
 }
 
 function mutateRoot(storage: SqliteTestStorage, oid: string): void {
@@ -148,7 +135,6 @@ describe("public maintenance lifecycle", () => {
       "roots",
       "mark",
       "classify-loose",
-      "repack",
       "classify-packs",
       "sweep-loose",
       "sweep-packs",
@@ -157,7 +143,6 @@ describe("public maintenance lifecycle", () => {
       expect(phases.has(phase)).toBe(true);
     }
     expect(complete.runId).toBe(first.runId);
-    expect(complete.repackedObjects).toBeGreaterThan(0);
     expect(complete.queuedObjects).toBe(0);
     expect(complete.nextEligibleAt).toBeNull();
     await expect(
@@ -174,7 +159,6 @@ describe("public maintenance lifecycle", () => {
       restarted: false,
       reachableObjects: 0,
       queuedObjects: 0,
-      repackedObjects: 0,
       reclaimedObjects: 0,
       reclaimedPacks: 0,
       reclaimedBytes: 0,
@@ -232,7 +216,6 @@ describe("public maintenance lifecycle", () => {
       runId: runId + 1,
       reachableObjects: 0,
       queuedObjects: 0,
-      repackedObjects: 0,
       reclaimedObjects: 0,
       reclaimedPacks: 0,
       reclaimedBytes: 0,
@@ -240,7 +223,6 @@ describe("public maintenance lifecycle", () => {
     expect(db.scalar<number>("SELECT count(*) FROM git_loose_gc_candidates")).toBe(1);
     expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_objects")).toBe(0);
     expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_shallow")).toBe(0);
-    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
   });
 
   it("rolls a future finished run immediately after root drift", async () => {
@@ -276,7 +258,6 @@ describe("public maintenance lifecycle", () => {
       restarted: false,
       reachableObjects: 0,
       queuedObjects: 0,
-      repackedObjects: 0,
       reclaimedObjects: 0,
       reclaimedPacks: 0,
       reclaimedBytes: 0,
@@ -353,90 +334,88 @@ describe("public maintenance lifecycle", () => {
     },
   );
 
-  it.each(["selected", "pending", "published"])(
-    "settles a %s repack batch before a same-run root reset",
-    async (boundary) => {
-      const storage = new SqliteTestStorage();
-      const clock = new CountingClock(10);
-      const commitOid = await createCommittedRepository(storage, clock);
-      const repack = await advanceToRepack(storage, clock);
-      expect(await call(storage, clock)).toMatchObject({ phase: "repack" });
+  it("resets a post-mark run for root drift and keeps its reclamation counters", async () => {
+    const storage = new SqliteTestStorage();
+    const clock = new CountingClock(10);
+    const commitOid = await createCommittedRepository(storage, clock);
+    const classifying = await advanceTo(storage, clock, "classify-packs");
+    const db = inspect(storage);
+    db.run(
+      `UPDATE git_maintenance_runs
+          SET reclaimed_objects = 3, reclaimed_packs = 2, reclaimed_bytes = 99`,
+    );
+    db.run(
+      `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
+       SELECT repo_id, ?, 1 FROM git_objects WHERE oid = ?`,
+      commitOid,
+      commitOid,
+    );
+    mutateRoot(storage, commitOid);
 
-      if (boundary === "pending") {
-        const crashing = runtime(storage, clock, () => Promise.reject(new Error("pending crash")));
-        storage.resetCounters();
-        clock.calls = 0;
-        await expect(crashing.git.maintenance({ dir: "/repo" })).rejects.toThrow(/pending crash/);
-        expect(clock.calls).toBe(1);
-        expect(storage.statementCount).toBeLessThan(1_000);
-      } else if (boundary === "published") {
-        expect(await call(storage, clock)).toMatchObject({ phase: "repack" });
-      }
-      const db = inspect(storage);
-      expect(db.scalar<string>("SELECT state FROM git_maintenance_repack_batches")).toBe(boundary);
-      const packId = db.scalar<number>("SELECT pack_id FROM git_maintenance_repack_batches");
-      db.run(
-        `UPDATE git_maintenance_runs
-            SET repacked_objects = 7, reclaimed_objects = 3,
-                reclaimed_packs = 2, reclaimed_bytes = 99`,
-      );
-      db.run(
-        `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
-         SELECT repo_id, ?, 1 FROM git_objects WHERE oid = ?`,
-        commitOid,
-        commitOid,
-      );
-      mutateRoot(storage, commitOid);
+    const reset = await call(storage, clock);
+    expect(reset).toMatchObject({
+      status: "progress",
+      phase: "roots",
+      runId: classifying.runId,
+      restarted: true,
+      reachableObjects: 0,
+      queuedObjects: 0,
+      reclaimedObjects: 3,
+      reclaimedPacks: 2,
+      reclaimedBytes: 99,
+    });
+    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_objects")).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_shallow")).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_loose_gc_candidates")).toBe(1);
+    expect(
+      db.one<{
+        root_source: string;
+        cursor_checkout_id: number | null;
+        cursor_text: string | null;
+        cursor_ordinal: number | null;
+      }>(
+        `SELECT root_source, cursor_checkout_id, cursor_text, cursor_ordinal
+           FROM git_maintenance_runs`,
+      ),
+    ).toEqual({
+      root_source: "refs",
+      cursor_checkout_id: null,
+      cursor_text: null,
+      cursor_ordinal: null,
+    });
+    await expect(
+      runtime(storage, clock).git.catFile({ dir: "/repo", oid: commitOid }),
+    ).resolves.toMatchObject({
+      oid: commitOid,
+    });
+  });
 
-      const reset = await call(storage, clock);
-      expect(reset).toMatchObject({
-        status: "progress",
-        phase: "roots",
-        runId: repack.runId,
-        restarted: true,
-        reachableObjects: 0,
-        queuedObjects: 0,
-        repackedObjects: 7,
-        reclaimedObjects: 3,
-        reclaimedPacks: 2,
-        reclaimedBytes: 99,
-      });
-      expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
-      expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_objects")).toBe(0);
-      expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_shallow")).toBe(0);
-      expect(db.scalar<number>("SELECT count(*) FROM git_loose_gc_candidates")).toBe(1);
-      expect(
-        db.one<{
-          root_source: string;
-          cursor_checkout_id: number | null;
-          cursor_text: string | null;
-          cursor_ordinal: number | null;
-        }>(
-          `SELECT root_source, cursor_checkout_id, cursor_text, cursor_ordinal
-             FROM git_maintenance_runs`,
-        ),
-      ).toEqual({
-        root_source: "refs",
-        cursor_checkout_id: null,
-        cursor_text: null,
-        cursor_ordinal: null,
-      });
-      if (boundary === "pending") {
-        expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(0);
-      } else if (boundary === "published") {
-        expect(db.scalar<string>("SELECT state FROM git_pack_meta WHERE pack_id = ?", packId)).toBe(
-          "complete",
-        );
-      } else {
-        expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(0);
-      }
-      await expect(
-        runtime(storage, clock).git.catFile({ dir: "/repo", oid: commitOid }),
-      ).resolves.toMatchObject({
-        oid: commitOid,
-      });
-    },
-  );
+  it("keeps reachable loose objects loose and readable across full runs and a cold reopen", async () => {
+    const storage = new SqliteTestStorage();
+    const clock = new CountingClock(10);
+    const commitOid = await createCommittedRepository(storage, clock);
+    const db = inspect(storage);
+    const looseBefore = db.all<{ oid: string }>("SELECT oid FROM git_objects ORDER BY oid");
+    expect(looseBefore.length).toBe(3);
+
+    for (let run = 0; run < 2; run++) {
+      const complete = await advanceTo(storage, clock, "finish");
+      expect(complete).toMatchObject({ reclaimedObjects: 0, reclaimedPacks: 0 });
+      clock.value += GC_GRACE_MS + 1;
+    }
+
+    expect(db.all<{ oid: string }>("SELECT oid FROM git_objects ORDER BY oid")).toEqual(
+      looseBefore,
+    );
+    expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_loose_gc_candidates")).toBe(0);
+    const cold = runtime(storage, clock);
+    for (const { oid } of looseBefore) {
+      await expect(cold.git.catFile({ dir: "/repo", oid })).resolves.toMatchObject({ oid });
+    }
+    expect(await cold.git.log({ dir: "/repo" })).toMatchObject([{ oid: commitOid }]);
+    await expect(cold.git.status({ dir: "/repo" })).resolves.toEqual([]);
+  });
 
   it("fails closed when common run metadata violates a phase invariant", async () => {
     const storage = new SqliteTestStorage();

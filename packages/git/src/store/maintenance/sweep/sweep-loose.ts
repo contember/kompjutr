@@ -120,7 +120,7 @@ export function classifyLoose(
 ): SliceResult {
   const rows = readLooseMismatch(db, repoId, run, pageRows);
   if (rows.length === 0) {
-    const updated = transitionPhase(db, repoId, run, "repack", null);
+    const updated = transitionPhase(db, repoId, run, "classify-packs", null);
     return {
       progress: progress(updated, updated.phase, "phase-complete"),
       storageChanged: false,

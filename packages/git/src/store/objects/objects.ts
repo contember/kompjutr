@@ -19,7 +19,6 @@ import type {
   OwnedObjectBatch,
 } from "../core/contracts.js";
 import type { PackStore } from "../pack/packs.js";
-import type { Clock } from "../refs/reflog.js";
 import { createObjectWriteBatch, writeObjects } from "./objects-batch.js";
 import {
   hasAllObjects,
@@ -43,7 +42,6 @@ import { writeObject, writeObjectStream } from "./objects-write.js";
 
 export type {
   ChunkPayload,
-  LooseEncoding,
   ObjectCacheKeys,
   ObjectTableOwner,
   StagedObject,
@@ -51,17 +49,13 @@ export type {
 export {
   COMMIT_STAGE_CACHE_BYTES,
   DEFAULT_OBJECT_FLUSH,
-  encodeLoose,
   INFLATE_FEED,
   isObjectType,
-  looseEncoding,
   MAX_BLOB_BATCH_OIDS,
   maximumDeflatedBytes,
   OBJECT_CHUNK,
   OBJECT_PAYLOAD,
   OID_PROBE_PAGE,
-  parseLooseEncoding,
-  RAW_OBJECT_MAX,
   requireCommitCacheWrites,
   STREAM_CHUNK,
 } from "./objects-shared.js";
@@ -71,7 +65,6 @@ const LOOSE_PAYLOAD_ROW = new RowShape({
   oid: text(),
   type: oneOf(["blob", "tree", "commit", "tag"]),
   size: int(0, MAX_OBJECT_BYTES),
-  stored: oneOf(["raw", "zlib"]),
   seq: nullable(int(0)),
   data: nullable(blobRow()),
 });
@@ -93,9 +86,8 @@ export class ObjectTable {
     objects: ByteLru<string, RawObject>,
     packs: PackStore,
     cacheKeys: ObjectCacheKeys,
-    clock: Clock,
   ) {
-    this.#context = { db, repoId, objects, packs, cacheKeys, clock };
+    this.#context = { db, repoId, objects, packs, cacheKeys };
   }
 
   has(oid: string): boolean {
@@ -255,11 +247,9 @@ export class ObjectTable {
       oid: string;
       type: ObjectType;
       size: number;
-      stored: "raw" | "zlib";
       nextSeq: number;
       encodedBytes: number;
-      data: Uint8Array | null;
-      inflater: InflateInto | null;
+      inflater: InflateInto;
     } | null = null;
 
     const finishCurrent = (): void => {
@@ -269,22 +259,15 @@ export class ObjectTable {
       if (state.nextSeq === 0) {
         throw new CorruptError(`loose blob ${state.oid} has no payload rows`);
       }
-      if (state.stored === "raw") {
-        if (state.encodedBytes !== state.size || state.data === null) {
-          throw new CorruptError(`loose blob ${state.oid} size does not match its metadata`);
-        }
-        data = state.data;
-      } else {
-        if (state.encodedBytes === 0 || state.inflater?.ended !== true) {
-          throw new CorruptError(`loose object ${state.oid} size does not match its metadata`);
-        }
-        try {
-          data = state.inflater.finish();
-        } catch (error) {
-          throw new CorruptError(`loose object ${state.oid} size does not match its metadata`, {
-            cause: error,
-          });
-        }
+      if (state.encodedBytes === 0 || !state.inflater.ended) {
+        throw new CorruptError(`loose object ${state.oid} size does not match its metadata`);
+      }
+      try {
+        data = state.inflater.finish();
+      } catch (error) {
+        throw new CorruptError(`loose object ${state.oid} size does not match its metadata`, {
+          cause: error,
+        });
       }
       if (data.length !== state.size) {
         throw new CorruptError(`loose blob ${state.oid} size does not match its metadata`);
@@ -298,8 +281,7 @@ export class ObjectTable {
       `WITH /* loose-object-payload */ wanted(ordinal, oid) AS (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
        )
-       SELECT wanted.ordinal, object.oid, object.type, object.size, object.stored,
-              chunk.seq, chunk.data
+       SELECT wanted.ordinal, object.oid, object.type, object.size, chunk.seq, chunk.data
          FROM wanted
          JOIN git_objects object ON object.repo_id = ? AND object.oid = wanted.oid
          LEFT JOIN git_object_chunks chunk
@@ -323,17 +305,14 @@ export class ObjectTable {
           oid: row.oid,
           type: row.type,
           size: row.size,
-          stored: row.stored,
           nextSeq: 0,
           encodedBytes: 0,
-          data: row.stored === "raw" ? new Uint8Array(row.size) : null,
-          inflater: row.stored === "zlib" ? new InflateInto(row.size) : null,
+          inflater: new InflateInto(row.size),
         };
       } else if (
         row.oid !== current.oid ||
         row.type !== current.type ||
-        row.size !== current.size ||
-        row.stored !== current.stored
+        row.size !== current.size
       ) {
         throw new CorruptError(`loose object ${current.oid} metadata changed between payload rows`);
       }
@@ -343,10 +322,7 @@ export class ObjectTable {
       if (row.seq !== current.nextSeq) {
         throw new CorruptError(`loose blob ${row.oid} has an invalid chunk sequence`);
       }
-      if (
-        row.data.length === 0 &&
-        !(current.stored === "raw" && current.size === 0 && row.seq === 0)
-      ) {
+      if (row.data.length === 0) {
         throw new CorruptError(`loose blob ${row.oid} has an empty payload row`);
       }
       if (row.data.length > OBJECT_CHUNK) {
@@ -355,18 +331,9 @@ export class ObjectTable {
       if (row.data.length > Number.MAX_SAFE_INTEGER - current.encodedBytes) {
         throw new CorruptError(`loose blob ${row.oid} encoded size overflowed`);
       }
-      const offset = current.encodedBytes;
       current.encodedBytes += row.data.length;
       current.nextSeq++;
-      if (current.stored === "raw") {
-        if (current.data === null || current.encodedBytes > current.size) {
-          throw new CorruptError(`loose blob ${row.oid} size does not match its metadata`);
-        }
-        current.data.set(row.data, offset);
-        continue;
-      }
       const inflater = current.inflater;
-      if (inflater === null) throw new CorruptError(`loose object ${row.oid} lost its inflater`);
       for (let feedOffset = 0; feedOffset < row.data.length; feedOffset += INFLATE_FEED) {
         const input = row.data.subarray(feedOffset, feedOffset + INFLATE_FEED);
         let used: number;

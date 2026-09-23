@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { deflateSync } from "node:zlib";
 
 import { afterAll, describe, expect, it } from "vitest";
 import { blob, readBlob, type SqlDatabase } from "../packages/do/src/db/db.js";
@@ -22,7 +23,6 @@ import {
   streamFullObjectPack,
 } from "../packages/git/src/store/pack/full-object-stream.js";
 import {
-  type CompletePackObject,
   MAX_DELTA_DEPTH,
   MAX_PACK_DELETE_BATCH,
   MAX_PACK_DELTA_WORKING_BYTES,
@@ -33,6 +33,7 @@ import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { COMMIT_CACHE_FLUSH_BYTES } from "../packages/git/src/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
+import { completePackMatches, type PackMember, reclaimPending } from "./helpers/pack-store.js";
 import { TIMING_GATE } from "./helpers/timing.js";
 
 class ReorderedRangeDatabase implements SqlDatabase {
@@ -342,22 +343,6 @@ function literalDelta(baseSize: number, target: Uint8Array): Uint8Array {
   return concat(chunks);
 }
 
-function copyDelta(baseSize: number, offset: number, size: number): Uint8Array {
-  return concat([
-    encodeDeltaHeader(baseSize, size),
-    new Uint8Array([
-      0xff,
-      offset & 0xff,
-      (offset >>> 8) & 0xff,
-      (offset >>> 16) & 0xff,
-      (offset >>> 24) & 0xff,
-      size & 0xff,
-      (size >>> 8) & 0xff,
-      (size >>> 16) & 0xff,
-    ]),
-  ]);
-}
-
 function repeatedCopyDelta(baseSize: number, targetSize: number, lastByte?: number): Uint8Array {
   const chunks: Uint8Array[] = [encodeDeltaHeader(baseSize, targetSize)];
   let remaining = targetSize - (lastByte === undefined ? 0 : 1);
@@ -473,112 +458,7 @@ function singleBlobPack(data: Uint8Array): Uint8Array {
   return singleObjectPack("blob", data);
 }
 
-function storedZlibWithEmptyBlocks(data: Uint8Array, minimumBytes: number): Uint8Array {
-  if (data.length > 0xffff) throw new Error("stored zlib fixture data is too large");
-  const fixedBytes = 2 + 5 + data.length + 4;
-  const emptyBlocks = Math.max(0, Math.ceil((minimumBytes + 1 - fixedBytes) / 5));
-  const compressed = new Uint8Array(fixedBytes + emptyBlocks * 5);
-  compressed.set([0x78, 0x01]);
-  let offset = 2;
-  for (let index = 0; index < emptyBlocks; index++) {
-    compressed.set([0, 0, 0, 0xff, 0xff], offset);
-    offset += 5;
-  }
-  compressed.set(
-    [1, data.length & 0xff, data.length >>> 8, ~data.length & 0xff, (~data.length >>> 8) & 0xff],
-    offset,
-  );
-  offset += 5;
-  compressed.set(data, offset);
-  offset += data.length;
-  let first = 1;
-  let second = 0;
-  for (const byte of data) {
-    first = (first + byte) % 65_521;
-    second = (second + first) % 65_521;
-  }
-  const checksum = second * 65_536 + first;
-  compressed.set(
-    [checksum >>> 24, (checksum >>> 16) & 0xff, (checksum >>> 8) & 0xff, checksum & 0xff],
-    offset,
-  );
-  return compressed;
-}
-
-function singleBlobPackWithCompressed(data: Uint8Array, compressed: Uint8Array): Uint8Array {
-  if (data.length > 15) throw new Error("compressed pack fixture data is too large");
-  const pack = new Uint8Array(12 + 1 + compressed.length + 20);
-  pack.set([0x50, 0x41, 0x43, 0x4b, 0, 0, 0, 2, 0, 0, 0, 1]);
-  pack[12] = 0x30 | data.length;
-  pack.set(compressed, 13);
-  pack.set(createHash("sha1").update(pack.subarray(0, -20)).digest(), pack.length - 20);
-  return pack;
-}
-
-function packEntryHeader(type: number, size: number): Uint8Array {
-  const bytes: number[] = [];
-  let remaining = Math.floor(size / 16);
-  bytes.push((type << 4) | (size & 0x0f) | (remaining > 0 ? 0x80 : 0));
-  while (remaining > 0) {
-    const byte = remaining & 0x7f;
-    remaining = Math.floor(remaining / 128);
-    bytes.push(byte | (remaining > 0 ? 0x80 : 0));
-  }
-  return new Uint8Array(bytes);
-}
-
-function singleRefDeltaPackWithCompressed(
-  baseOid: string,
-  instructionSize: number,
-  compressed: Uint8Array,
-): Uint8Array {
-  const entryHeader = packEntryHeader(7, instructionSize);
-  const pack = new Uint8Array(12 + entryHeader.length + 20 + compressed.length + 20);
-  pack.set([0x50, 0x41, 0x43, 0x4b, 0, 0, 0, 2, 0, 0, 0, 1]);
-  pack.set(entryHeader, 12);
-  let offset = 12 + entryHeader.length;
-  for (let index = 0; index < 20; index++) {
-    pack[offset + index] = Number.parseInt(baseOid.slice(index * 2, index * 2 + 2), 16);
-  }
-  offset += 20;
-  pack.set(compressed, offset);
-  pack.set(createHash("sha1").update(pack.subarray(0, -20)).digest(), pack.length - 20);
-  return pack;
-}
-
-function corruptPackedObjectBytes(
-  db: TestDatabase,
-  repoId: number,
-  packId: number,
-  oid: string,
-): void {
-  const entry = db.one<{ data_off: number }>(
-    "SELECT data_off FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-    repoId,
-    packId,
-    oid,
-  );
-  if (entry === undefined) throw new Error("packed corruption fixture entry is missing");
-  const seq = Math.floor(entry.data_off / PACK_CHUNK);
-  const row = db.one<{ data: unknown }>(
-    "SELECT data FROM git_pack_data WHERE repo_id = ? AND pack_id = ? AND seq = ?",
-    repoId,
-    packId,
-    seq,
-  );
-  if (row === undefined) throw new Error("packed corruption fixture row is missing");
-  const data = readBlob(row.data).slice();
-  data[entry.data_off - seq * PACK_CHUNK]! ^= 0xff;
-  db.run(
-    "UPDATE git_pack_data SET data = ? WHERE repo_id = ? AND pack_id = ? AND seq = ?",
-    blob(data),
-    repoId,
-    packId,
-    seq,
-  );
-}
-
-function blobMembership(data: Uint8Array): CompletePackObject {
+function blobMembership(data: Uint8Array): PackMember {
   return { oid: hashObject("blob", data), type: "blob", size: data.length };
 }
 
@@ -594,80 +474,25 @@ function deterministicBytes(length: number): Uint8Array {
   return out;
 }
 
-interface SharedOversizedDeltaFixture {
-  base: Uint8Array;
-  baseOid: string;
-  basePackId: number;
-  deltaPackId: number;
-  deltaBytes: Uint8Array;
-  targets: CompletePackObject[];
-}
-
-async function sharedOversizedDeltaFixture(
-  store: ReturnType<typeof open>,
-): Promise<SharedOversizedDeltaFixture> {
-  const base = deterministicBytes(PACK_BLOB_BATCH_TARGET_BYTES + 64 * 1024);
-  const baseOid = hashObject("blob", base);
-  const basePack = await store.packs.ingest(slices(singleBlobPack(base), 64 * 1024));
-  const targetSize = 2 * 1024 * 1024 + 64 * 1024;
-  const count = 33;
-  const chunks: Uint8Array[] = [];
-  const writer = new PackWriter((chunk) => chunks.push(chunk));
-  writer.header(count);
-  const targets: CompletePackObject[] = [];
-  for (let index = 0; index < count; index++) {
-    const offset = index * 4096;
-    const data = base.subarray(offset, offset + targetSize);
-    writer.refDelta(baseOid, copyDelta(base.length, offset, targetSize));
-    targets.push({ oid: hashObject("blob", data), type: "blob", size: data.length });
-  }
-  writer.finish();
-  if (new Set(targets.map((target) => target.oid)).size !== targets.length) {
-    throw new Error("shared oversized delta targets are not unique");
-  }
-  const deltaBytes = concat(chunks);
-  const deltaPack = await store.packs.ingest(slices(deltaBytes, 64 * 1024));
-  const compressedBase = store.db.scalar<number>(
-    "SELECT data_len FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-    store.sharedRepoId,
-    basePack.packId,
-    baseOid,
-  );
-  if (compressedBase === undefined || compressedBase <= PACK_BLOB_BATCH_TARGET_BYTES) {
-    throw new Error("shared delta base is not oversized");
-  }
-  return {
-    base,
-    baseOid,
-    basePackId: basePack.packId,
-    deltaPackId: deltaPack.packId,
-    deltaBytes,
-    targets,
-  };
-}
-
 async function collectPack(source: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   for await (const chunk of source) chunks.push(chunk);
   return concat(chunks);
 }
 
-function seedRepackBatch(store: ReturnType<typeof open>): void {
+/** A stand-in pack owner: the pack store's ownership hooks are generic. */
+function seedPackOwner(store: ReturnType<typeof open>): void {
   store.db.run(
-    `INSERT INTO git_maintenance_control (repo_id, root_epoch, next_run_id)
-     VALUES (?, 0, 2)`,
-    store.sharedRepoId,
+    `CREATE TABLE test_pack_owner (
+       repo_id INTEGER NOT NULL,
+       state TEXT NOT NULL,
+       pack_id INTEGER,
+       stored_bytes INTEGER NOT NULL DEFAULT 0,
+       FOREIGN KEY (repo_id, pack_id) REFERENCES git_pack_meta (repo_id, pack_id)
+     )`,
   );
   store.db.run(
-    `INSERT INTO git_maintenance_runs
-       (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source)
-     VALUES (?, 1, 0, 'repack', 1, 'done')`,
-    store.sharedRepoId,
-  );
-  store.db.run(
-    `INSERT INTO git_maintenance_repack_batches
-       (repo_id, run_id, batch_id, state, pack_id, object_count, inflated_bytes, stored_bytes)
-     VALUES (?, 1, 1, 'selected', NULL, 1, 1, 0)`,
+    "INSERT INTO test_pack_owner (repo_id, state, pack_id) VALUES (?, 'selected', NULL)",
     store.sharedRepoId,
   );
 }
@@ -913,12 +738,13 @@ describe("synthetic pack ingest", () => {
     bad[bad.length - 1]! ^= 0xff;
     await expect(store.packs.ingest(slices(bad, 64))).rejects.toThrow(/checksum/);
     expect(store.packs.readRaw(1, 0, bad.length)).toEqual(bad);
-    expect(store.packs.reclaimPending()).toBe(1);
 
+    // The next ordinary ingest reclaims pack 1 before it reserves pack 2.
     const current = utf8.encode("replacement pack row\n");
     const oid = hashObject("blob", current);
     const result = await store.packs.ingest(slices(singleBlobPack(current), 64));
     expect(result.packId).toBe(2);
+    expect(store.db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE pack_id = 1")).toBe(0);
     expect(store.read(oid)?.data).toEqual(current);
   });
 
@@ -1031,12 +857,6 @@ describe("synthetic pack ingest", () => {
         store.sharedRepoId,
       ),
     ).toEqual({ pack_id: 1, state: "pending" });
-    expect(() => store.packs.discardPending(1)).toThrowError(
-      expect.objectContaining({ code: "EBUSY" }),
-    );
-    expect(() => store.packs.discardOwnedComplete(1, () => undefined)).toThrowError(
-      expect.objectContaining({ code: "EBUSY" }),
-    );
     expect(
       store.db.scalar<string>(
         "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = 1",
@@ -1063,7 +883,7 @@ describe("synthetic pack ingest", () => {
     expect(store.read(hashObject("blob", secondData))?.data).toEqual(secondData);
   });
 
-  it("defaults to broad pending cleanup while maintenance can skip it", async () => {
+  it("reclaims an abandoned pending pack during ordinary ingest", async () => {
     const ordinary = open();
     ordinary.db.run(
       `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
@@ -1075,29 +895,9 @@ describe("synthetic pack ingest", () => {
     );
     expect(ordinaryResult.packId).toBe(1);
     expect(ordinary.db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(1);
-
-    const maintenance = open();
-    maintenance.db.run(
-      `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
-       VALUES (?, 1, 0, 0, 'pending', 0)`,
-      maintenance.sharedRepoId,
-    );
-    const maintenanceResult = await maintenance.packs.ingest(
-      slices(singleBlobPack(utf8.encode("maintenance skip\n")), 13),
-      { reclaimPending: false },
-    );
-    expect(maintenanceResult.packId).toBe(2);
-    expect(
-      maintenance.db.all<{ pack_id: number; state: string }>(
-        "SELECT pack_id, state FROM git_pack_meta ORDER BY pack_id",
-      ),
-    ).toEqual([
-      { pack_id: 1, state: "pending" },
-      { pack_id: 2, state: "complete" },
-    ]);
   });
 
-  it("fails closed when broad cleanup observes an invalid pack state", () => {
+  it("fails closed when broad cleanup observes an invalid pack state", async () => {
     const inner = new TestDatabase();
     const db = new MutatingQueryDatabase(inner, "pack.pack_id AS pack_id, pack.state AS state", {
       state: "invalid",
@@ -1110,7 +910,9 @@ describe("synthetic pack ingest", () => {
       store.sharedRepoId,
     );
 
-    expect(() => store.packs.reclaimPending()).toThrow(/invalid pending cleanup state/);
+    await expect(
+      store.packs.ingest(slices(singleBlobPack(utf8.encode("cleanup probe\n")), 13)),
+    ).rejects.toThrow(/invalid pending cleanup state/);
     expect(
       inner.one<{ pack_id: number; state: string }>(
         "SELECT pack_id, state FROM git_pack_meta WHERE repo_id = ?",
@@ -1119,7 +921,7 @@ describe("synthetic pack ingest", () => {
     ).toEqual({ pack_id: 1, state: "pending" });
   });
 
-  it("uses a NULL-inclusive predicate for invalid pending cleanup", () => {
+  it("uses a NULL-inclusive predicate for invalid pending cleanup", async () => {
     const inner = new TestDatabase();
     const recording = new RecordingDatabase(inner);
     const database = new SqliteGitDatabase(recording);
@@ -1130,42 +932,13 @@ describe("synthetic pack ingest", () => {
       store.sharedRepoId,
     );
 
-    expect(store.packs.reclaimPending()).toBe(1);
+    expect(await reclaimPending(store)).toBe(1);
     const cleanup = recording.queries.find((entry) =>
       entry.query.includes("pack.pack_id AS pack_id, pack.state AS state"),
     );
     if (cleanup === undefined) throw new Error("pending cleanup query was not issued");
     expect(cleanup.query).toContain("pack.state IS NOT 'complete'");
     expect(cleanup.query).not.toContain("pack.state != 'complete'");
-  });
-
-  it("skips broad cleanup and the ordinary ingest lease when requested", async () => {
-    const ordinary = open();
-    const ordinaryDb = ordinary.db;
-    if (!(ordinaryDb instanceof TestDatabase)) throw new Error("expected test database");
-    ordinaryDb.storage.histogram = new Map();
-    ordinaryDb.storage.resetCounters();
-    await ordinary.packs.ingest(slices(singleBlobPack(utf8.encode("count ordinary\n")), 17));
-    const ordinaryStatements = ordinaryDb.storage.statementCount;
-
-    const maintenance = open();
-    const maintenanceDb = maintenance.db;
-    if (!(maintenanceDb instanceof TestDatabase)) throw new Error("expected test database");
-    maintenanceDb.storage.histogram = new Map();
-    maintenanceDb.storage.resetCounters();
-    await maintenance.packs.ingest(slices(singleBlobPack(utf8.encode("count maintenance\n")), 17), {
-      reclaimPending: false,
-    });
-    expect(maintenanceDb.storage.statementCount).toBe(ordinaryStatements - 3);
-
-    const invalidOptions = {};
-    Reflect.set(invalidOptions, "reclaimPending", "no");
-    await expect(
-      maintenance.packs.ingest(
-        slices(singleBlobPack(utf8.encode("invalid option\n")), 17),
-        invalidOptions,
-      ),
-    ).rejects.toThrow(/reclaimPending must be a boolean/);
   });
 
   it("reclaims an abandoned unowned pack after a cold reopen", async () => {
@@ -1180,7 +953,7 @@ describe("synthetic pack ingest", () => {
     if (checkout === null) throw new Error("repository missing after reopen");
     const cold = coldDatabase.openCheckout(checkout);
 
-    expect(cold.packs.reclaimPending()).toBe(1);
+    expect(await reclaimPending(cold)).toBe(1);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta")).toBe(0);
   });
 
@@ -1274,7 +1047,7 @@ describe("synthetic pack ingest", () => {
     writer.finish();
     await store.packs.ingest(slices(concat(chunks), 64));
     store.db.run(
-      "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (1, ?, 'blob', ?, 'raw')",
+      "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (1, ?, 'blob', ?)",
       baseOid,
       base.length,
     );
@@ -1469,7 +1242,7 @@ describe("synthetic pack ingest", () => {
     expect(
       store.db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'complete'"),
     ).toBe(0);
-    expect(store.packs.reclaimPending()).toBe(1);
+    expect(await reclaimPending(store)).toBe(1);
   });
 
   it("matches loose caching for a commit above the SQL page byte limit", async () => {
@@ -1706,7 +1479,7 @@ describe("pack fallback preservation", () => {
       "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = 1 AND pack_id = ?",
       first.packId,
     );
-    expect(store.packs.reclaimPending()).toBe(1);
+    expect(await reclaimPending(store)).toBe(1);
     expect(store.cachedCommit(oid)?.commit).toEqual(parseCommit(data));
     expect(store.packs.completePackedEntry(oid)?.packId).toBe(second.packId);
   });
@@ -1738,7 +1511,7 @@ describe("pack fallback preservation", () => {
     expect(store.packs.completePackedEntry(baseOid)?.packId).toBe(primary.packId);
     expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(primary.packId);
     expect(
-      store.packs.completePackMatches(fallback.packId, [
+      completePackMatches(store, fallback.packId, [
         { oid: targetOid, type: "blob", size: target.length },
       ]),
     ).toBe(true);
@@ -1855,10 +1628,8 @@ describe("pack fallback preservation", () => {
       expect(store.db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(3);
       expect(store.packs.completePackedEntry(baseOid)?.packId).toBe(primary.packId);
       expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(primary.packId);
-      expect(store.packs.completePackMatches(duplicate.packId, [blobMembership(target)])).toBe(
-        true,
-      );
-      expect(store.packs.completePackMatches(delta.packId, [blobMembership(target)])).toBe(true);
+      expect(completePackMatches(store, duplicate.packId, [blobMembership(target)])).toBe(true);
+      expect(completePackMatches(store, delta.packId, [blobMembership(target)])).toBe(true);
       expect(store.packs.read(baseOid)?.data).toEqual(base);
       expect(store.packs.read(targetOid)?.data).toEqual(target);
     }
@@ -1886,7 +1657,7 @@ describe("pack fallback preservation", () => {
     expect(store.packs.deleteCompletePacks([primary.packId])).toBe(1);
     expect(store.packs.completePackedEntry(baseOid)).toBeNull();
     expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(duplicate.packId);
-    expect(store.packs.completePackMatches(delta.packId, [blobMembership(target)])).toBe(true);
+    expect(completePackMatches(store, delta.packId, [blobMembership(target)])).toBe(true);
     expect(store.read(baseOid)?.data).toEqual(base);
     expect(store.read(targetOid)?.data).toEqual(target);
   });
@@ -1917,8 +1688,8 @@ describe("pack fallback preservation", () => {
     expect(store.db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(3);
     expect(store.packs.completePackedEntry(baseOid)?.packId).toBe(primary.packId);
     expect(store.packs.completePackedEntry(targetOid)?.packId).toBe(primary.packId);
-    expect(store.packs.completePackMatches(duplicate.packId, [blobMembership(target)])).toBe(true);
-    expect(store.packs.completePackMatches(delta.packId, [blobMembership(target)])).toBe(true);
+    expect(completePackMatches(store, duplicate.packId, [blobMembership(target)])).toBe(true);
+    expect(completePackMatches(store, delta.packId, [blobMembership(target)])).toBe(true);
     expect(store.packs.read(baseOid)?.data).toEqual(base);
     expect(store.packs.read(targetOid)?.data).toEqual(target);
   });
@@ -1946,7 +1717,7 @@ describe("pack fallback preservation", () => {
 
       expect(store.packs.deleteCompletePacks(deleting)).toBe(2);
       expect(
-        store.packs.completePackMatches(survivor.packId, [
+        completePackMatches(store, survivor.packId, [
           { oid: baseOid, type: "blob", size: base.length },
           { oid: targetOid, type: "blob", size: target.length },
         ]),
@@ -1975,219 +1746,11 @@ describe("pack fallback preservation", () => {
     );
     expect(inner.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(2);
     expect(store.packs.completePackedEntry(oid)?.packId).toBe(primary.packId);
-    expect(store.packs.completePackMatches(fallback.packId, [blobMembership(data)])).toBe(true);
+    expect(completePackMatches(store, fallback.packId, [blobMembership(data)])).toBe(true);
 
     db.fail = false;
     expect(store.packs.deleteCompletePacks([primary.packId])).toBe(1);
     expect(store.packs.completePackedEntry(oid)?.packId).toBe(fallback.packId);
-  });
-
-  it("authenticates a valid compressed stream beyond the former 64 MiB total", async () => {
-    const store = open();
-    const data = new Uint8Array([0x62]);
-    const oid = hashObject("blob", data);
-    const compressed = storedZlibWithEmptyBlocks(data, 64 * 1024 * 1024);
-    const packed = await store.packs.ingest(
-      slices(singleBlobPackWithCompressed(data, compressed), 64 * 1024),
-    );
-    expect(compressed.length).toBeGreaterThan(64 * 1024 * 1024);
-
-    expect(() =>
-      store.packs.authenticateCompleteSources([
-        { oid, type: "blob", size: data.length, packId: packed.packId },
-      ]),
-    ).not.toThrow();
-    expect(store.read(oid)?.data).toEqual(data);
-  }, 30_000);
-
-  it("cold authentication rejects truncated and corrupt exact compressed sources", async () => {
-    for (const failure of ["truncated", "corrupt"]) {
-      const db = new TestDatabase();
-      const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
-      const store = database.openCheckout(
-        database.createRepository("/repo", "ref: refs/heads/main"),
-      );
-      const data = deterministicBytes(5 * 1024 * 1024);
-      const oid = hashObject("blob", data);
-      const packed = await store.packs.ingest(slices(singleBlobPack(data), 64 * 1024));
-      if (failure === "truncated") {
-        db.run(
-          "UPDATE git_pack_objects SET data_len = data_len - 1 WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-          store.sharedRepoId,
-          packed.packId,
-          oid,
-        );
-        db.run(
-          "UPDATE git_pack_entries SET data_len = data_len - 1 WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-          store.sharedRepoId,
-          packed.packId,
-          oid,
-        );
-      } else {
-        corruptPackedObjectBytes(db, store.sharedRepoId, packed.packId, oid);
-      }
-      const reopened = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
-      const checkout = reopened.findCheckout("/repo");
-      if (checkout === null) throw new Error("cold authentication repository disappeared");
-      const cold = reopened.openCheckout(checkout);
-
-      expect(() =>
-        cold.packs.authenticateCompleteSources([
-          { oid, type: "blob", size: data.length, packId: packed.packId },
-        ]),
-      ).toThrow(/canonical packed source/);
-      expect(
-        db.scalar<string>(
-          "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-          store.sharedRepoId,
-          packed.packId,
-        ),
-      ).toBe("complete");
-      expect(cold.packs.completePackedEntry(oid)?.packId).toBe(packed.packId);
-    }
-  }, 30_000);
-
-  it("cold authentication rejects real inflated-output and delta-memory first excesses", async () => {
-    const fullDb = new TestDatabase();
-    const fullDatabase = new SqliteGitDatabase(fullDb, { chunkBytes: 0, objectCacheBytes: 0 });
-    const full = fullDatabase.openCheckout(
-      fullDatabase.createRepository("/repo", "ref: refs/heads/main"),
-    );
-    const fullData = new Uint8Array([0x61]);
-    const fullOid = hashObject("blob", fullData);
-    const compressed = storedZlibWithEmptyBlocks(fullData, 1024);
-    const fullPack = await full.packs.ingest(
-      slices(singleBlobPackWithCompressed(fullData, compressed), 64),
-    );
-    const alternate = storedZlibWithEmptyBlocks(new Uint8Array([0x61, 0x62]), 512);
-    const fullRow = fullDb.one<{ data: unknown }>(
-      "SELECT data FROM git_pack_data WHERE repo_id = ? AND pack_id = ? AND seq = 0",
-      full.sharedRepoId,
-      fullPack.packId,
-    );
-    if (fullRow === undefined) throw new Error("inflated-output fixture is missing");
-    const fullBytes = readBlob(fullRow.data).slice();
-    fullBytes.set(alternate, 13);
-    fullDb.run(
-      "UPDATE git_pack_data SET data = ? WHERE repo_id = ? AND pack_id = ? AND seq = 0",
-      blob(fullBytes),
-      full.sharedRepoId,
-      fullPack.packId,
-    );
-    fullDb.run(
-      "UPDATE git_pack_objects SET data_len = ? WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-      alternate.length,
-      full.sharedRepoId,
-      fullPack.packId,
-      fullOid,
-    );
-    fullDb.run(
-      "UPDATE git_pack_entries SET data_len = ? WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-      alternate.length,
-      full.sharedRepoId,
-      fullPack.packId,
-      fullOid,
-    );
-    expect(() =>
-      full.packs.authenticateCompleteSources([
-        { oid: fullOid, type: "blob", size: 1, packId: fullPack.packId },
-      ]),
-    ).toThrow(/exceeds its indexed size/);
-    expect(full.packs.completePackedEntry(fullOid)?.packId).toBe(fullPack.packId);
-
-    const deltaDb = new TestDatabase();
-    const deltaDatabase = new SqliteGitDatabase(deltaDb, { chunkBytes: 0, objectCacheBytes: 0 });
-    const deltaStore = deltaDatabase.openCheckout(
-      deltaDatabase.createRepository("/repo", "ref: refs/heads/main"),
-    );
-    const base = utf8.encode("delta memory base\n");
-    const baseOid = deltaStore.write("blob", base);
-    const target = utf8.encode("delta memory target\n");
-    const delta = literalDelta(base.length, target);
-    const deltaCompressed = storedZlibWithEmptyBlocks(delta, 2048);
-    const deltaPack = await deltaStore.packs.ingest(
-      slices(singleRefDeltaPackWithCompressed(baseOid, delta.length, deltaCompressed), 64),
-    );
-    const targetOid = hashObject("blob", target);
-    const excessDelta = new Uint8Array(delta.length);
-    excessDelta.set(encodeDeltaHeader(base.length, MAX_PACK_DELTA_WORKING_BYTES));
-    const excessCompressed = storedZlibWithEmptyBlocks(excessDelta, 1024);
-    const deltaEntry = deltaDb.one<{ data_off: number }>(
-      "SELECT data_off FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-      deltaStore.sharedRepoId,
-      deltaPack.packId,
-      targetOid,
-    );
-    const deltaRow = deltaDb.one<{ data: unknown }>(
-      "SELECT data FROM git_pack_data WHERE repo_id = ? AND pack_id = ? AND seq = 0",
-      deltaStore.sharedRepoId,
-      deltaPack.packId,
-    );
-    if (deltaEntry === undefined || deltaRow === undefined)
-      throw new Error("delta fixture is missing");
-    const deltaBytes = readBlob(deltaRow.data).slice();
-    deltaBytes.set(excessCompressed, deltaEntry.data_off);
-    deltaDb.run(
-      "UPDATE git_pack_data SET data = ? WHERE repo_id = ? AND pack_id = ? AND seq = 0",
-      blob(deltaBytes),
-      deltaStore.sharedRepoId,
-      deltaPack.packId,
-    );
-    deltaDb.run(
-      "UPDATE git_pack_objects SET data_len = ?, size = ? WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-      excessCompressed.length,
-      MAX_PACK_DELTA_WORKING_BYTES,
-      deltaStore.sharedRepoId,
-      deltaPack.packId,
-      targetOid,
-    );
-    deltaDb.run(
-      "UPDATE git_pack_entries SET data_len = ?, size = ? WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-      excessCompressed.length,
-      MAX_PACK_DELTA_WORKING_BYTES,
-      deltaStore.sharedRepoId,
-      deltaPack.packId,
-      targetOid,
-    );
-    const coldDeltaDatabase = new SqliteGitDatabase(deltaDb, {
-      chunkBytes: 0,
-      objectCacheBytes: 0,
-    });
-    const coldDeltaCheckout = coldDeltaDatabase.findCheckout("/repo");
-    if (coldDeltaCheckout === null) throw new Error("cold delta repository disappeared");
-    const coldDelta = coldDeltaDatabase.openCheckout(coldDeltaCheckout);
-    expect(() =>
-      coldDelta.packs.authenticateCompleteSources([
-        {
-          oid: targetOid,
-          type: "blob",
-          size: MAX_PACK_DELTA_WORKING_BYTES,
-          packId: deltaPack.packId,
-        },
-      ]),
-    ).toThrow(/delta working set exceeds/);
-    expect(coldDelta.packs.completePackedEntry(targetOid)?.packId).toBe(deltaPack.packId);
-  });
-
-  it("rejects duplicate packed-source authentication before issuing SQL", async () => {
-    const store = open();
-    const data = utf8.encode("duplicate authentication source\n");
-    const oid = hashObject("blob", data);
-    const packed = await store.packs.ingest(slices(singleBlobPack(data), 64));
-    const db = store.db;
-    if (!(db instanceof TestDatabase)) throw new Error("expected test database");
-    db.storage.resetCounters();
-    const source: { oid: string; type: ObjectType; size: number; packId: number } = {
-      oid,
-      type: "blob",
-      size: data.length,
-      packId: packed.packId,
-    };
-
-    expect(() => store.packs.authenticateCompleteSources([source, source])).toThrow(
-      /duplicate object id/,
-    );
-    expect(db.storage.statementCount).toBe(0);
   });
 
   it("reads multiple objects beyond the batching target", async () => {
@@ -2210,49 +1773,6 @@ describe("pack fallback preservation", () => {
     const read = measured.packs.readObjects(oids, "blob");
     expect(read.get(oids[0]!)?.data).toEqual(objects[0]);
     expect(read.get(oids[1]!)?.data).toEqual(objects[1]);
-  });
-
-  it("authenticates beyond the former 180 uncached dependency-read limit", async () => {
-    const store = open();
-    const fixture = await sharedOversizedDeltaFixture(store);
-    const db = store.db;
-    if (!(db instanceof TestDatabase)) throw new Error("expected test database");
-    const baseSource = db.one<{ data_off: number; data_len: number }>(
-      "SELECT data_off, data_len FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND oid = ?",
-      store.sharedRepoId,
-      fixture.basePackId,
-      fixture.baseOid,
-    );
-    if (baseSource === undefined) throw new Error("shared delta base source disappeared");
-    let formerReadsPerPage = 0;
-    for (let consumed = 0; consumed < baseSource.data_len; consumed += PACK_CHUNK) {
-      const window = Math.min(PACK_CHUNK, baseSource.data_len - consumed);
-      const first = Math.floor((baseSource.data_off + consumed) / PACK_CHUNK);
-      const last = Math.floor((baseSource.data_off + consumed + window - 1) / PACK_CHUNK);
-      formerReadsPerPage += last - first + 1;
-    }
-    expect(formerReadsPerPage).toBe(9);
-    const firstExcessPages = Math.floor(180 / formerReadsPerPage) + 1;
-    const authenticated = fixture.targets.slice(0, firstExcessPages);
-    const priorReads = formerReadsPerPage * (firstExcessPages - 1);
-    const admittedReads = formerReadsPerPage * firstExcessPages;
-    expect(firstExcessPages).toBe(21);
-    expect(authenticated).toHaveLength(21);
-    expect(priorReads).toBe(180);
-    expect(priorReads + 1).toBe(181);
-    expect(admittedReads).toBe(189);
-    db.storage.resetCounters();
-
-    store.packs.authenticateCompleteSources(
-      authenticated.map((target) => ({ ...target, packId: fixture.deltaPackId })),
-    );
-    expect(fixture.targets).toHaveLength(33);
-    expect(db.storage.statementCount).toBeGreaterThan(0);
-    expect(store.packs.completePackedEntry(fixture.baseOid)?.packId).toBe(fixture.basePackId);
-    for (const target of fixture.targets) {
-      expect(store.packs.completePackedEntry(target.oid)?.packId).toBe(fixture.deltaPackId);
-    }
-    expect(store.packs.completePackMatches(fixture.deltaPackId, fixture.targets)).toBe(true);
   });
 
   it("reports oversized delta metadata that extends beyond stored chunks as corruption", async () => {
@@ -2710,7 +2230,7 @@ describe("pack deferred resolution", () => {
   });
 
   it("pages one shared union graph across every public packed read path", async () => {
-    const { db, targets, packId, store } = await pagedUnionFixture();
+    const { db, targets, store } = await pagedUnionFixture();
     if (!(db instanceof TestDatabase)) throw new Error("expected pager test database");
     const targetOids = targets.map((target) => target.oid);
     const statements: number[] = [];
@@ -2739,11 +2259,6 @@ describe("pack deferred resolution", () => {
     expect(store.packs.readAuthenticatedObject(first.oid, "blob")?.data).toEqual(first.data);
     statements.push(db.storage.statementCount);
 
-    db.storage.resetCounters();
-    store.packs.authenticateCompleteSources([
-      { oid: first.oid, type: "blob", size: first.data.length, packId },
-    ]);
-    statements.push(db.storage.statementCount);
     expect(statements.every((count) => count < 1_000)).toBe(true);
   });
 
@@ -3310,7 +2825,7 @@ describe("pack publication and deletion", () => {
         oid,
       ),
     ).toBeUndefined();
-    expect(store.packs.reclaimPending()).toBe(1);
+    expect(await reclaimPending(store)).toBe(1);
     expect(
       store.db.scalar<number>(
         "SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1 AND storage = 'pack' AND source_id = ?",
@@ -3401,7 +2916,7 @@ describe("pack publication and deletion", () => {
       store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'"),
     ).toBe(0);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_data")).toBeGreaterThan(0);
-    expect(store.packs.reclaimPending()).toBe(1);
+    expect(await reclaimPending(store)).toBe(1);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_data")).toBe(0);
   });
 
@@ -3459,7 +2974,7 @@ describe("pack publication and deletion", () => {
 
   it("records an owned reservation and publication in the pack transactions", async () => {
     const store = open();
-    seedRepackBatch(store);
+    seedPackOwner(store);
     const data = new Uint8Array([1]);
     const oid = hashObject("blob", data);
     let reservedVisible = false;
@@ -3475,9 +2990,9 @@ describe("pack publication and deletion", () => {
               packId,
             ) === "pending";
           store.db.run(
-            `UPDATE git_maintenance_repack_batches
+            `UPDATE test_pack_owner
                 SET state = 'pending', pack_id = ?
-              WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+              WHERE repo_id = ?`,
             packId,
             store.sharedRepoId,
           );
@@ -3490,9 +3005,9 @@ describe("pack publication and deletion", () => {
               published.packId,
             ) === "complete";
           store.db.run(
-            `UPDATE git_maintenance_repack_batches
+            `UPDATE test_pack_owner
                 SET state = 'published', stored_bytes = ?
-              WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+              WHERE repo_id = ?`,
             published.bytes,
             store.sharedRepoId,
           );
@@ -3506,19 +3021,19 @@ describe("pack publication and deletion", () => {
     });
     expect(
       store.db.one<{ state: string; pack_id: number; stored_bytes: number }>(
-        `SELECT state, pack_id, stored_bytes FROM git_maintenance_repack_batches
+        `SELECT state, pack_id, stored_bytes FROM test_pack_owner
           WHERE repo_id = ?`,
         store.sharedRepoId,
       ),
     ).toEqual({ state: "published", pack_id: result.packId, stored_bytes: result.bytes });
     expect(
-      store.packs.completePackMatches(result.packId, [{ oid, type: "blob", size: data.length }]),
+      completePackMatches(store, result.packId, [{ oid, type: "blob", size: data.length }]),
     ).toBe(true);
   });
 
   it("rolls back the pack reservation when its owner cannot record it", async () => {
     const store = open();
-    seedRepackBatch(store);
+    seedPackOwner(store);
     const data = new Uint8Array([1]);
 
     await expect(
@@ -3526,9 +3041,9 @@ describe("pack publication and deletion", () => {
         lifecycle: {
           reserved: async (packId) => {
             store.db.run(
-              `UPDATE git_maintenance_repack_batches
+              `UPDATE test_pack_owner
                   SET state = 'pending', pack_id = ?
-                WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+                WHERE repo_id = ?`,
               packId,
               store.sharedRepoId,
             );
@@ -3541,7 +3056,7 @@ describe("pack publication and deletion", () => {
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta")).toBe(0);
     expect(
       store.db.one<{ state: string; pack_id: number | null }>(
-        "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
+        "SELECT state, pack_id FROM test_pack_owner WHERE repo_id = ?",
         store.sharedRepoId,
       ),
     ).toEqual({ state: "selected", pack_id: null });
@@ -3549,7 +3064,7 @@ describe("pack publication and deletion", () => {
 
   it("rolls pack and owner publication back when the published hook throws", async () => {
     const store = open();
-    seedRepackBatch(store);
+    seedPackOwner(store);
     const data = serializeTree([]);
     const oid = hashObject("tree", data);
 
@@ -3558,18 +3073,18 @@ describe("pack publication and deletion", () => {
         lifecycle: {
           reserved: (packId) => {
             store.db.run(
-              `UPDATE git_maintenance_repack_batches
+              `UPDATE test_pack_owner
                   SET state = 'pending', pack_id = ?
-                WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+                WHERE repo_id = ?`,
               packId,
               store.sharedRepoId,
             );
           },
           published: (published) => {
             store.db.run(
-              `UPDATE git_maintenance_repack_batches
+              `UPDATE test_pack_owner
                   SET state = 'published', stored_bytes = ?
-                WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+                WHERE repo_id = ?`,
               published.bytes,
               store.sharedRepoId,
             );
@@ -3587,7 +3102,7 @@ describe("pack publication and deletion", () => {
     ).toEqual({ state: "pending", count: 0 });
     expect(
       store.db.one<{ state: string; pack_id: number; stored_bytes: number }>(
-        "SELECT state, pack_id, stored_bytes FROM git_maintenance_repack_batches WHERE repo_id = ?",
+        "SELECT state, pack_id, stored_bytes FROM test_pack_owner WHERE repo_id = ?",
         store.sharedRepoId,
       ),
     ).toEqual({ state: "pending", pack_id: 1, stored_bytes: 0 });
@@ -3595,305 +3110,14 @@ describe("pack publication and deletion", () => {
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_effective")).toBe(0);
     expect(store.packs.completePackedEntry(oid)).toBeNull();
     expect(store.read(oid)).toBeNull();
-    expect(
-      store.packs.discardPending(1, (packId) => {
-        store.db.run(
-          `UPDATE git_maintenance_repack_batches
-              SET state = 'selected', pack_id = NULL
-            WHERE repo_id = ? AND pack_id = ?`,
-          store.sharedRepoId,
-          packId,
-        );
-      }),
-    ).toBe(true);
-  });
-
-  it("preserves owned pending packs during broad cleanup and discards one exactly", async () => {
-    const store = open();
-    seedRepackBatch(store);
-    const bad = singleBlobPack(new Uint8Array([1]));
-    bad[bad.length - 1]! ^= 0xff;
-    let ownedPackId = -1;
-
-    await expect(
-      store.packs.ingest(slices(bad, 7), {
-        lifecycle: {
-          reserved: (packId) => {
-            ownedPackId = packId;
-            store.db.run(
-              `UPDATE git_maintenance_repack_batches
-                  SET state = 'pending', pack_id = ?
-                WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
-              packId,
-              store.sharedRepoId,
-            );
-          },
-          published: () => {},
-        },
-      }),
-    ).rejects.toThrow(/checksum/);
-
-    expect(store.packs.reclaimPending()).toBe(0);
-    expect(
-      store.packs.discardPending(ownedPackId, (packId) => {
-        store.db.run(
-          `UPDATE git_maintenance_repack_batches
-              SET state = 'selected', pack_id = NULL
-            WHERE repo_id = ? AND run_id = 1 AND batch_id = 1 AND pack_id = ?`,
-          store.sharedRepoId,
-          packId,
-        );
-      }),
-    ).toBe(true);
-    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta")).toBe(0);
-    expect(
-      store.db.one<{ state: string; pack_id: number | null }>(
-        "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
-        store.sharedRepoId,
-      ),
-    ).toEqual({ state: "selected", pack_id: null });
-  });
-
-  it.each(["throw", "return", "promise"])(
-    "rolls pending discard back when release hooks %s",
-    (mode) => {
-      const store = open();
-      seedRepackBatch(store);
-      store.db.run(
-        `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
-         VALUES (?, 1, 0, 0, 'pending', 0)`,
-        store.sharedRepoId,
-      );
-      store.db.run(
-        `UPDATE git_maintenance_repack_batches
-            SET state = 'pending', pack_id = 1 WHERE repo_id = ?`,
-        store.sharedRepoId,
-      );
-
-      expect(() =>
-        store.packs.discardPending(1, (packId) => {
-          store.db.run(
-            `UPDATE git_maintenance_repack_batches
-                SET state = 'selected', pack_id = NULL WHERE repo_id = ? AND pack_id = ?`,
-            store.sharedRepoId,
-            packId,
-          );
-          if (mode === "throw") throw new Error("pending release failed");
-          if (mode === "promise") return Promise.resolve();
-          return "not undefined";
-        }),
-      ).toThrow(
-        mode === "throw"
-          ? /pending release failed/
-          : /ownership release hook must return undefined/,
-      );
-      expect(
-        store.db.one<{ state: string; pack_id: number }>(
-          "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
-          store.sharedRepoId,
-        ),
-      ).toEqual({ state: "pending", pack_id: 1 });
-      expect(
-        store.db.scalar<string>(
-          "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = 1",
-          store.sharedRepoId,
-        ),
-      ).toBe("pending");
-    },
-  );
-
-  it("atomically releases and discards only one owned complete pack", async () => {
-    const store = open();
-    seedRepackBatch(store);
-    const looseData = utf8.encode("unrelated loose\n");
-    const looseOid = store.write("blob", looseData);
-    let activeDiscardCode: string | undefined;
-    const owned = await store.packs.ingest(
-      slices(singleBlobPack(utf8.encode("owned complete\n")), 11),
-      {
-        reclaimPending: false,
-        lifecycle: {
-          reserved: (packId) => {
-            store.db.run(
-              `UPDATE git_maintenance_repack_batches
-                SET state = 'pending', pack_id = ? WHERE repo_id = ? AND run_id = 1`,
-              packId,
-              store.sharedRepoId,
-            );
-          },
-          published: (result) => {
-            try {
-              store.packs.discardOwnedComplete(result.packId, () => undefined);
-            } catch (error) {
-              if (error instanceof GitError) activeDiscardCode = error.code;
-              else throw error;
-            }
-            store.db.run(
-              `UPDATE git_maintenance_repack_batches
-                SET state = 'published', stored_bytes = ? WHERE repo_id = ? AND run_id = 1`,
-              result.bytes,
-              store.sharedRepoId,
-            );
-          },
-        },
-      },
-    );
-    expect(activeDiscardCode).toBe("EBUSY");
-    const other = await store.packs.ingest(
-      slices(singleBlobPack(utf8.encode("other complete\n")), 11),
-      { reclaimPending: false },
-    );
-    const pendingId = other.packId + 1;
     store.db.run(
-      `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
-       VALUES (?, ?, 0, 0, 'pending', 0)`,
+      "UPDATE test_pack_owner SET state = 'selected', pack_id = NULL WHERE repo_id = ?",
       store.sharedRepoId,
-      pendingId,
     );
-
-    expect(() => store.packs.discardOwnedComplete(owned.packId, () => undefined)).toThrow();
-    expect(
-      store.db.one<{ state: string; pack_id: number }>(
-        "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
-        store.sharedRepoId,
-      ),
-    ).toEqual({ state: "published", pack_id: owned.packId });
-    expect(
-      store.db.scalar<string>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-        store.sharedRepoId,
-        owned.packId,
-      ),
-    ).toBe("complete");
-
-    expect(
-      store.packs.discardOwnedComplete(owned.packId, (packId) => {
-        store.db.run(
-          `UPDATE git_maintenance_repack_batches
-              SET state = 'selected', pack_id = NULL, stored_bytes = 0
-            WHERE repo_id = ? AND run_id = 1 AND pack_id = ?`,
-          store.sharedRepoId,
-          packId,
-        );
-      }),
-    ).toBe(true);
-    expect(store.packs.discardOwnedComplete(owned.packId, () => undefined)).toBe(false);
-    expect(store.packs.discardPending(owned.packId)).toBe(false);
-    expect(
-      store.db.all<{ pack_id: number; state: string }>(
-        "SELECT pack_id, state FROM git_pack_meta ORDER BY pack_id",
-      ),
-    ).toEqual([
-      { pack_id: other.packId, state: "complete" },
-      { pack_id: pendingId, state: "pending" },
-    ]);
-    expect(
-      store.db.one<{ state: string; pack_id: number | null }>(
-        "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
-        store.sharedRepoId,
-      ),
-    ).toEqual({ state: "selected", pack_id: null });
-    expect(store.read(looseOid)?.data).toEqual(looseData);
-    expect(() => store.packs.discardOwnedComplete(pendingId, () => undefined)).toThrowError(
-      expect.objectContaining({ code: "EBUSY" }),
-    );
+    expect(await reclaimPending(store)).toBe(1);
   });
 
-  it.each(["throw", "return", "promise", "state"])(
-    "rolls owned complete discard back when release hooks %s",
-    async (mode) => {
-      const store = open();
-      seedRepackBatch(store);
-      const owned = await store.packs.ingest(
-        slices(singleBlobPack(utf8.encode(`rollback ${mode}\n`)), 9),
-        {
-          reclaimPending: false,
-          lifecycle: {
-            reserved: (packId) => {
-              store.db.run(
-                "UPDATE git_maintenance_repack_batches SET state = 'pending', pack_id = ? WHERE repo_id = ?",
-                packId,
-                store.sharedRepoId,
-              );
-            },
-            published: (result) => {
-              store.db.run(
-                "UPDATE git_maintenance_repack_batches SET state = 'published', stored_bytes = ? WHERE repo_id = ?",
-                result.bytes,
-                store.sharedRepoId,
-              );
-            },
-          },
-        },
-      );
-
-      expect(() =>
-        store.packs.discardOwnedComplete(owned.packId, (packId) => {
-          store.db.run(
-            "UPDATE git_maintenance_repack_batches SET state = 'selected', pack_id = NULL WHERE repo_id = ? AND pack_id = ?",
-            store.sharedRepoId,
-            packId,
-          );
-          if (mode === "throw") throw new Error("release failed");
-          if (mode === "promise") return Promise.resolve();
-          if (mode === "state") {
-            store.db.run(
-              "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = ? AND pack_id = ?",
-              store.sharedRepoId,
-              packId,
-            );
-            return undefined;
-          }
-          return "not undefined";
-        }),
-      ).toThrow(
-        mode === "throw"
-          ? /release failed/
-          : mode === "state"
-            ? /ownership release changed complete pack state/
-            : /ownership release hook must return undefined/,
-      );
-      expect(
-        store.db.one<{ state: string; pack_id: number }>(
-          "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
-          store.sharedRepoId,
-        ),
-      ).toEqual({ state: "published", pack_id: owned.packId });
-      expect(
-        store.db.scalar<string>(
-          "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-          store.sharedRepoId,
-          owned.packId,
-        ),
-      ).toBe("complete");
-    },
-  );
-
-  it("rolls owned complete discard back when exact deletion validation fails", async () => {
-    const inner = new TestDatabase();
-    const db = new MutatingQueryDatabase(inner, "owned-complete-discard-validation", {
-      remains: 1,
-    });
-    const database = new SqliteGitDatabase(db);
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const result = await store.packs.ingest(
-      slices(singleBlobPack(utf8.encode("validation rollback\n")), 13),
-      { reclaimPending: false },
-    );
-
-    expect(() => store.packs.discardOwnedComplete(result.packId, () => undefined)).toThrow(
-      /complete discard did not remove exactly one pack/,
-    );
-    expect(
-      inner.scalar<string>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-        store.sharedRepoId,
-        result.packId,
-      ),
-    ).toBe("complete");
-  });
-
-  it("matches exact complete membership and deletes complete packs in bounded batches", async () => {
+  it("deletes complete packs in bounded batches and refuses pending ones", async () => {
     const store = open();
     const firstData = utf8.encode("first complete pack\n");
     const secondData = utf8.encode("second complete pack\n");
@@ -3903,23 +3127,23 @@ describe("pack publication and deletion", () => {
     const second = await store.packs.ingest(slices(singleBlobPack(secondData), 17));
 
     expect(
-      store.packs.completePackMatches(first.packId, [
+      completePackMatches(store, first.packId, [
         { oid: firstOid, type: "blob", size: firstData.length },
       ]),
     ).toBe(true);
-    expect(store.packs.completePackMatches(first.packId, [])).toBe(false);
+    expect(completePackMatches(store, first.packId, [])).toBe(false);
     expect(
-      store.packs.completePackMatches(first.packId, [
+      completePackMatches(store, first.packId, [
         { oid: secondOid, type: "blob", size: secondData.length },
       ]),
     ).toBe(false);
     expect(
-      store.packs.completePackMatches(first.packId, [
+      completePackMatches(store, first.packId, [
         { oid: firstOid, type: "tree", size: firstData.length },
       ]),
     ).toBe(false);
     expect(
-      store.packs.completePackMatches(first.packId, [
+      completePackMatches(store, first.packId, [
         { oid: firstOid, type: "blob", size: firstData.length + 1 },
       ]),
     ).toBe(false);
@@ -3940,11 +3164,11 @@ describe("pack publication and deletion", () => {
     );
     expect(() => store.packs.deleteCompletePacks([first.packId, pendingId])).toThrow(/pending/);
     expect(
-      store.packs.completePackMatches(first.packId, [
+      completePackMatches(store, first.packId, [
         { oid: firstOid, type: "blob", size: firstData.length },
       ]),
     ).toBe(true);
-    expect(store.packs.discardPending(pendingId)).toBe(true);
+    expect(await reclaimPending(store)).toBe(1);
 
     expect(store.packs.deleteCompletePacks([first.packId, second.packId])).toBe(2);
     expect(store.read(firstOid)).toBeNull();
@@ -3973,30 +3197,13 @@ describe("pack publication and deletion", () => {
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("rejects duplicate and invalid pack membership expectations", async () => {
-    const store = open();
-    const data = utf8.encode("membership expectations\n");
-    const oid = hashObject("blob", data);
-    const result = await store.packs.ingest(slices(singleBlobPack(data), 19));
-    const object: CompletePackObject = { oid, type: "blob", size: data.length };
-
-    expect(() => store.packs.completePackMatches(result.packId, [object, object])).toThrow(
-      /duplicate pack object/,
-    );
-    expect(() =>
-      store.packs.completePackMatches(result.packId, [
-        { oid: "invalid", type: "blob", size: data.length },
-      ]),
-    ).toThrow(/invalid object metadata/);
-  });
-
   it("reads complete packed metadata through a loose shadow", async () => {
     const store = open();
     const data = utf8.encode("packed metadata shadow\n");
     const oid = hashObject("blob", data);
     const result = await store.packs.ingest(slices(singleBlobPack(data), 23));
     store.db.run(
-      "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, 'blob', ?, 'raw')",
+      "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, 'blob', ?)",
       store.sharedRepoId,
       oid,
       data.length,
@@ -4005,13 +3212,7 @@ describe("pack publication and deletion", () => {
       "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
       store.sharedRepoId,
       oid,
-      data,
-    );
-    store.db.run(
-      `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
-       VALUES (?, ?, 1)`,
-      store.sharedRepoId,
-      oid,
+      deflateSync(data),
     );
 
     expect(store.packs.completePackedEntry(oid)).toEqual({

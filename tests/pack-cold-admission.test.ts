@@ -13,6 +13,7 @@ import {
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
+import { reclaimPending } from "./helpers/pack-store.js";
 
 function literalDelta(base: Uint8Array, target: Uint8Array): Uint8Array {
   const chunks = [encodeDeltaHeader(base.length, target.length)];
@@ -193,7 +194,7 @@ describe("cold pack admission", () => {
       db.storage.db.close();
     }
   });
-  it.each(["missing", "promised", "pending"])(
+  it.each(["missing", "promised"])(
     "does not accept a %s base as a terminal",
     async (availability) => {
       const db = new TestDatabase();
@@ -214,21 +215,8 @@ describe("cold pack admission", () => {
         if (availability === "promised") {
           store.registerPromisorRemote("origin", "https://example.test/repo.git");
           store.addPromisedBlobs("origin", [baseOid]);
-        } else if (availability === "pending") {
-          await expect(
-            store.packs.ingest(slices(full, 4096), {
-              lifecycle: {
-                reserved() {},
-                published() {
-                  throw new Error("leave pending");
-                },
-              },
-            }),
-          ).rejects.toThrow("leave pending");
         }
-        await expect(
-          store.packs.ingest(slices(thin, 4096), { reclaimPending: false }),
-        ).rejects.toThrow();
+        await expect(store.packs.ingest(slices(thin, 4096))).rejects.toThrow();
         const cold = new SqliteGitDatabase(db).openCheckout(checkout);
         expect(cold.read(baseOid)).toBeNull();
         expect(cold.read(targetOid)).toBeNull();
@@ -300,75 +288,72 @@ describe("cold pack admission", () => {
     }
   });
 
-  it.each(["discard", "reclaim", "reservation"])(
-    "rejects a physical full replacement that closes an old canonical cycle, then cleans up via %s",
-    async (cleanup) => {
-      const db = new TestDatabase();
-      const native = new GitFixture().init();
-      try {
-        const a = utf8.encode("loose terminal A\n");
-        const b = utf8.encode("packed dependent B\n");
-        const aOid = hashObject("blob", a);
-        const bOid = hashObject("blob", b);
-        const first = pack(1, (writer) => writer.refDelta(aOid, literalDelta(a, b)));
-        const candidate = pack(2, (writer) => {
-          writer.object("blob", b);
-          writer.refDelta(bOid, literalDelta(b, a));
-        });
-        native.gitInput("loose terminal A\n", "hash-object", "-w", "--stdin");
-        nativeIngest(native, first);
-        nativeIngest(native, candidate);
-        expect(new Uint8Array(native.gitBinary("cat-file", "blob", aOid))).toEqual(a);
-        expect(new Uint8Array(native.gitBinary("cat-file", "blob", bOid))).toEqual(b);
+  it("rejects a physical full replacement that closes an old canonical cycle, then cleans up via the next reservation", async () => {
+    const db = new TestDatabase();
+    const native = new GitFixture().init();
+    try {
+      const a = utf8.encode("loose terminal A\n");
+      const b = utf8.encode("packed dependent B\n");
+      const aOid = hashObject("blob", a);
+      const bOid = hashObject("blob", b);
+      const first = pack(1, (writer) => writer.refDelta(aOid, literalDelta(a, b)));
+      const candidate = pack(2, (writer) => {
+        writer.object("blob", b);
+        writer.refDelta(bOid, literalDelta(b, a));
+      });
+      native.gitInput("loose terminal A\n", "hash-object", "-w", "--stdin");
+      nativeIngest(native, first);
+      nativeIngest(native, candidate);
+      expect(new Uint8Array(native.gitBinary("cat-file", "blob", aOid))).toEqual(a);
+      expect(new Uint8Array(native.gitBinary("cat-file", "blob", bOid))).toEqual(b);
 
-        const options = { objectCacheBytes: 0 };
-        const database = new SqliteGitDatabase(db, options);
-        const checkout = database.createRepository("/repo", "ref: refs/heads/main");
-        const store = database.openCheckout(checkout);
-        store.write("blob", a);
-        const original = await store.packs.ingest(slices(first, 4096));
-        expect(store.packs.completePackedEntry(bOid)?.packId).toBe(original.packId);
-        let published = false;
-        let pendingPackId = 0;
-        await expect(
-          store.packs.ingest(slices(candidate, 4096), {
-            lifecycle: {
-              reserved(packId) {
-                pendingPackId = packId;
-              },
-              published() {
-                published = true;
-              },
+      const options = { objectCacheBytes: 0 };
+      const database = new SqliteGitDatabase(db, options);
+      const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+      const store = database.openCheckout(checkout);
+      store.write("blob", a);
+      const original = await store.packs.ingest(slices(first, 4096));
+      expect(store.packs.completePackedEntry(bOid)?.packId).toBe(original.packId);
+      let published = false;
+      let pendingPackId = 0;
+      await expect(
+        store.packs.ingest(slices(candidate, 4096), {
+          lifecycle: {
+            reserved(packId) {
+              pendingPackId = packId;
             },
-          }),
-        ).rejects.toThrow();
-        expect(published).toBe(false);
-        const cold = new SqliteGitDatabase(db, options).openCheckout(checkout);
-        expect(cold.packs.completePackedEntry(aOid)).toBeNull();
-        expect(cold.packs.completePackedEntry(bOid)?.packId).toBe(original.packId);
-        expect(cold.read(aOid)?.data).toEqual(a);
-        expect(cold.read(bOid)?.data).toEqual(b);
-        expectNoGraphScratch(db);
-        if (cleanup === "discard") expect(cold.packs.discardPending(pendingPackId)).toBe(true);
-        else if (cleanup === "reclaim") expect(cold.packs.reclaimPending()).toBe(1);
-        else
-          await cold.packs.ingest(
-            slices(
-              pack(1, (writer) => writer.object("blob", b)),
-              4096,
-            ),
-          );
-        expect(
-          db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'pending'"),
-        ).toBe(0);
-        expect(cold.packs.read(bOid)?.data).toEqual(b);
-        expectNoGraphScratch(db);
-      } finally {
-        native.dispose();
-        db.storage.db.close();
-      }
-    },
-  );
+            published() {
+              published = true;
+            },
+          },
+        }),
+      ).rejects.toThrow();
+      expect(published).toBe(false);
+      const cold = new SqliteGitDatabase(db, options).openCheckout(checkout);
+      expect(cold.packs.completePackedEntry(aOid)).toBeNull();
+      expect(cold.packs.completePackedEntry(bOid)?.packId).toBe(original.packId);
+      expect(cold.read(aOid)?.data).toEqual(a);
+      expect(cold.read(bOid)?.data).toEqual(b);
+      expectNoGraphScratch(db);
+      await cold.packs.ingest(
+        slices(
+          pack(1, (writer) => writer.object("blob", b)),
+          4096,
+        ),
+      );
+      expect(
+        db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE pack_id = ?", pendingPackId),
+      ).toBe(0);
+      expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'pending'")).toBe(
+        0,
+      );
+      expect(cold.packs.read(bOid)?.data).toEqual(b);
+      expectNoGraphScratch(db);
+    } finally {
+      native.dispose();
+      db.storage.db.close();
+    }
+  });
 
   it("rejects a new short suffix that puts an old dependent over its admitted depth", async () => {
     const db = new TestDatabase();
@@ -413,9 +398,6 @@ describe("cold pack admission", () => {
       const { db, native, store, checkout, first, second, aOid, bOid, a, b } = fixture;
       try {
         expect(() => store.packs.deleteCompletePacks([first])).toThrow(/cyclic delta chain/);
-        expect(() => store.packs.discardOwnedComplete(first, () => undefined)).toThrow(
-          /cyclic delta chain/,
-        );
         const cold = new SqliteGitDatabase(db).openCheckout(checkout);
         expect(cold.packs.completePackedEntry(aOid)?.packId).toBe(first);
         expect(cold.packs.completePackedEntry(bOid)?.packId).toBe(second);
@@ -488,7 +470,7 @@ describe("cold pack admission", () => {
         expect(cold.read(oid)).toBeNull();
         expect(cold.promisedMissing([oid])).toEqual([oid]);
         expectNoGraphScratch(db);
-        expect(cold.packs.reclaimPending()).toBe(1);
+        expect(await reclaimPending(cold)).toBe(1);
         await cold.packs.ingest(slices(bytes, 4096));
         expect(cold.read(oid)?.data).toEqual(data);
         expectNoGraphScratch(db);
@@ -552,7 +534,7 @@ describe("cold pack admission", () => {
         expect(reader.promisedMissing([targetOid])).toEqual([targetOid]);
       }
       expectNoGraphScratch(db);
-      expect(cold.packs.reclaimPending()).toBe(1);
+      expect(await reclaimPending(cold)).toBe(1);
       expect(db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(0);
       expectNoGraphScratch(db);
     } finally {

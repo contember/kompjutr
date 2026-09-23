@@ -17,7 +17,6 @@ const ABSENT_RUN_FIELDS = [
   "cursor_ordinal",
   "reachable_objects",
   "queued_objects",
-  "repacked_objects",
   "reclaimed_objects",
   "reclaimed_packs",
   "reclaimed_bytes",
@@ -81,7 +80,6 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
             "roots",
             "mark",
             "classify-loose",
-            "repack",
             "classify-packs",
             "sweep-loose",
             "sweep-packs",
@@ -119,9 +117,6 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
       ),
       queued_objects: nullable(
         int(0, Number.MAX_SAFE_INTEGER, "maintenance queued count is not a bounded safe integer"),
-      ),
-      repacked_objects: nullable(
-        int(0, Number.MAX_SAFE_INTEGER, "maintenance repacked count is not a bounded safe integer"),
       ),
       reclaimed_objects: nullable(
         int(
@@ -235,10 +230,6 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
       decoded.queued_objects,
       "maintenance queued count is not a bounded safe integer",
     ),
-    repackedObjects: requiredField(
-      decoded.repacked_objects,
-      "maintenance repacked count is not a bounded safe integer",
-    ),
     reclaimedObjects: requiredField(
       decoded.reclaimed_objects,
       "maintenance reclaimed object count is not a bounded safe integer",
@@ -275,7 +266,7 @@ export function readMaintenanceRunView(db: SqlDatabase, repoId: number): Mainten
             run.started_ms, run.root_source, run.cursor_checkout_id,
             run.cursor_text,
             run.cursor_ordinal, run.reachable_objects, run.queued_objects,
-            run.repacked_objects, run.reclaimed_objects, run.reclaimed_packs,
+            run.reclaimed_objects, run.reclaimed_packs,
             run.reclaimed_bytes, run.next_eligible_ms, run.restarted
        FROM git_repositories repository
        LEFT JOIN git_maintenance_control control ON control.repo_id = repository.id

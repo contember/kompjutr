@@ -70,5 +70,4 @@ export interface ReachabilityObjectInfo {
   type: ObjectType;
   size: number;
   source: "loose" | "pack";
-  stored: "raw" | "zlib" | null;
 }

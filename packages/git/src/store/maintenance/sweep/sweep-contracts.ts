@@ -7,7 +7,6 @@ export const MAX_PAGE_ROWS = 128;
 
 export type SweepPhase =
   | "classify-loose"
-  | "repack"
   | "classify-packs"
   | "sweep-loose"
   | "sweep-packs"
@@ -45,7 +44,6 @@ export interface PackAudit {
   size: number;
   count: number;
   state: "pending" | "complete";
-  owned: boolean;
   marked: boolean;
   candidateSince: number | null;
 }

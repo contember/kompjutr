@@ -3,6 +3,7 @@ import { fetchInto } from "../packages/git/src/ops/network/network.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { awaitBarrierEntry, checkpointBarrier } from "./helpers/interleaving.js";
+import { reclaimPending } from "./helpers/pack-store.js";
 import { reopenTestRepository } from "./helpers/repository-invariants.js";
 import { makeRepo } from "./helpers/workspace.js";
 
@@ -65,7 +66,7 @@ describe("pack commit projection publication", () => {
         expect(reader.store.getRef("refs/remotes/origin/main")).toBeNull();
         expect(reader.checkout.getRef("HEAD")).toBe(beforeHead);
       }
-      expect(second.repo.store.packs.reclaimPending()).toBe(0);
+      await expect(reclaimPending(second.repo.store)).rejects.toMatchObject({ code: "EBUSY" });
       controller.abort();
       barrier.release();
       await expect(fetching).rejects.toMatchObject({ code: "EABORTED" });
@@ -74,7 +75,7 @@ describe("pack commit projection publication", () => {
       expect(() => [...cold.repo.walk(oid)]).toThrow();
       expect(cold.repo.store.getRef("refs/remotes/origin/main")).toBeNull();
       expect(cold.repo.checkout.getRef("HEAD")).toBe(beforeHead);
-      expect(cold.repo.store.packs.reclaimPending()).toBe(1);
+      expect(await reclaimPending(cold.repo.store)).toBe(1);
       expect(
         cold.repo.store.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging"),
       ).toBe(0);

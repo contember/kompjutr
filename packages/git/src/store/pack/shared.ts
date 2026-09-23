@@ -351,8 +351,6 @@ export interface PackIngestOptions {
   now?: () => number;
   /** Synchronous hooks run inside the reservation and publication transactions. */
   lifecycle?: PackIngestLifecycle;
-  /** Ordinary ingest reclaims abandoned packs; owned maintenance retries skip that broad scan. */
-  reclaimPending?: boolean;
 }
 
 export interface PackIngestResult {
@@ -376,17 +374,6 @@ export interface CompletePackedEntry {
   packId: number;
   type: ObjectType;
   size: number;
-  baseOid: string | null;
-}
-
-export interface AuthenticatedPackSource {
-  oid: string;
-  type: ObjectType;
-  size: number;
-  packId: number;
-  dataOff: number;
-  dataLen: number;
-  entrySize: number;
   baseOid: string | null;
 }
 

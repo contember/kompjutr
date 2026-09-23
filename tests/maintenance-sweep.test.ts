@@ -293,7 +293,7 @@ describe("maintenance sweep", () => {
     });
     const reopened = new SqliteGitDatabase(db, { objectCacheBytes: 8 * 1024 * 1024 });
     const cold = reopened.openCheckout(checkout.id);
-    advanceToPhase(db, cold.shared, 100, "repack", 1);
+    advanceToPhase(db, cold.shared, 100, "classify-packs", 1);
 
     expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, retained)).toBeUndefined();
     expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, aged)).toBe(7);
@@ -377,6 +377,14 @@ describe("maintenance sweep", () => {
       );
     }
     seedBlobId(db, checkout.repoId, new Uint8Array([1, 2, 3]), blobOid);
+    const doomedStoredBytes = db.scalar<number>(
+      `SELECT sum(length(data)) FROM git_object_chunks
+        WHERE repo_id = ? AND oid IN (?, ?, ?)`,
+      checkout.repoId,
+      blobOid,
+      treeOid,
+      commitOid,
+    );
     expect(store.read(blobOid)?.data).toEqual(blobData);
     expect(store.read(treeOid)?.data).toEqual(treeData);
     expect(store.cachedCommit(commitOid)?.commit.message).toBe("doomed commit\n");
@@ -399,19 +407,13 @@ describe("maintenance sweep", () => {
       db.scalar<number>("SELECT count(*) FROM git_tree_sources WHERE repo_id = ?", checkout.repoId),
     ).toBe(0);
     expect(
-      db.scalar<number>(
-        "SELECT count(*) FROM git_loose_object_lifecycle WHERE repo_id = ?",
-        checkout.repoId,
-      ),
-    ).toBe(1);
-    expect(
       db.one<{ reclaimed_objects: number; reclaimed_bytes: number }>(
         "SELECT reclaimed_objects, reclaimed_bytes FROM git_maintenance_runs WHERE repo_id = ?",
         checkout.repoId,
       ),
     ).toEqual({
       reclaimed_objects: 3,
-      reclaimed_bytes: blobData.length + treeData.length + commitData.length,
+      reclaimed_bytes: doomedStoredBytes,
     });
   });
 
@@ -432,14 +434,8 @@ describe("maintenance sweep", () => {
         ]),
         17,
       ),
-      { reclaimPending: false },
     );
-    const dead = await store.packs.ingest(
-      slices(fullPack([{ type: "blob", data: deadData }]), 13),
-      {
-        reclaimPending: false,
-      },
-    );
+    const dead = await store.packs.ingest(slices(fullPack([{ type: "blob", data: deadData }]), 13));
     for (const oid of [liveOid, incidentalOid, deadOid]) {
       db.run("DELETE FROM git_objects WHERE repo_id = ? AND oid = ?", checkout.repoId, oid);
     }
@@ -494,7 +490,6 @@ describe("maintenance sweep", () => {
     const { checkout, store } = open(db);
     const result = await store.packs.ingest(
       slices(fullPack([{ type: "blob", data: utf8.encode("aged pack\n") }]), 11),
-      { reclaimPending: false },
     );
     seedRun(db, checkout.repoId, "classify-packs");
     db.run(
@@ -534,9 +529,7 @@ describe("maintenance sweep", () => {
       const db = new TestDatabase();
       const { checkout, store } = open(db);
       const data = utf8.encode(`marked ${physicalOnly}\n`);
-      const result = await store.packs.ingest(slices(fullPack([{ type: "blob", data }]), 11), {
-        reclaimPending: false,
-      });
+      const result = await store.packs.ingest(slices(fullPack([{ type: "blob", data }]), 11));
       const oid = db.scalar<string>(
         "SELECT oid FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?",
         checkout.repoId,
@@ -570,7 +563,6 @@ describe("maintenance sweep", () => {
     const looseOid = store.write("blob", utf8.encode("future loose\n"));
     const packed = await store.packs.ingest(
       slices(fullPack([{ type: "blob", data: utf8.encode("future packed\n") }]), 13),
-      { reclaimPending: false },
     );
     seedRun(db, checkout.repoId, "sweep-loose");
     db.run(
@@ -597,13 +589,9 @@ describe("maintenance sweep", () => {
     });
   });
 
-  it("removes stale pending and maintenance-owned candidates directly during pack sweep", async () => {
+  it("removes a stale pending candidate directly during pack sweep", () => {
     const db = new TestDatabase();
     const { checkout, store } = open(db);
-    const owned = await store.packs.ingest(
-      slices(fullPack([{ type: "blob", data: utf8.encode("owned\n") }]), 11),
-      { reclaimPending: false },
-    );
     seedRun(db, checkout.repoId, "sweep-packs");
     db.run(
       `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
@@ -611,34 +599,11 @@ describe("maintenance sweep", () => {
       checkout.repoId,
     );
     db.run(
-      `INSERT INTO git_maintenance_repack_batches
-         (repo_id, run_id, batch_id, state, pack_id, object_count, inflated_bytes, stored_bytes)
-       VALUES (?, 1, 1, 'published', ?, 0, 0, 0)`,
-      checkout.repoId,
-      owned.packId,
-    );
-    db.run(
       `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
-       VALUES (?, 99, 1), (?, ?, 1)`,
+       VALUES (?, 99, 1)`,
       checkout.repoId,
-      checkout.repoId,
-      owned.packId,
     );
 
-    expect(advance(db, store.shared, 100, 1)).toMatchObject({
-      phase: "sweep-packs",
-      reclaimedObjects: 0,
-      reclaimedPacks: 0,
-    });
-    expect(
-      db.scalar(
-        "SELECT cursor_ordinal FROM git_maintenance_runs WHERE repo_id = ?",
-        checkout.repoId,
-      ),
-    ).toBe(owned.packId);
-    expect(
-      db.scalar("SELECT count(*) FROM git_pack_gc_candidates WHERE repo_id = ?", checkout.repoId),
-    ).toBe(1);
     expect(advance(db, store.shared, 100, 1)).toMatchObject({
       phase: "sweep-packs",
       reclaimedObjects: 0,
@@ -661,7 +626,7 @@ describe("maintenance sweep", () => {
     ).toBeNull();
     expect(
       db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE repo_id = ?", checkout.repoId),
-    ).toBe(2);
+    ).toBe(1);
     expect(advance(db, store.shared, 100)).toMatchObject({ phase: "finish", status: "complete" });
   });
 
@@ -718,7 +683,6 @@ describe("maintenance sweep", () => {
         ]),
         17,
       ),
-      { reclaimPending: false },
     );
     seedRun(db, checkout.repoId, "sweep-packs");
     db.run(
@@ -805,7 +769,6 @@ describe("maintenance sweep", () => {
     const deadOid = hashObject("blob", deadData);
     const packed = await store.packs.ingest(
       slices(fullPack([{ type: "blob", data: deadData }]), 13),
-      { reclaimPending: false },
     );
     seedRun(db, checkout.repoId, "sweep-packs", [{ oid: survivorOid }]);
     db.run(
@@ -921,7 +884,7 @@ describe("maintenance sweep", () => {
     ).toBe(baseOid);
 
     seedRun(db, checkout.repoId, "classify-loose", [{ oid: keeperOid, physicalOnly: true }]);
-    advanceToPhase(db, store.shared, 100, "repack");
+    advanceToPhase(db, store.shared, 100, "classify-packs");
     expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, baseOid)).toBeUndefined();
 
     // A pack ingested after classification leaves an aged nomination behind.
@@ -951,7 +914,7 @@ describe("maintenance sweep", () => {
 
     for (let call = 0; call < 20; call++) {
       const result = advance(db, store.shared, 10, 32);
-      if (result.phase === "repack") break;
+      if (result.phase === "classify-packs") break;
     }
     expect(
       db.scalar<number>(
@@ -964,6 +927,6 @@ describe("maintenance sweep", () => {
         "SELECT phase FROM git_maintenance_runs WHERE repo_id = ?",
         checkout.repoId,
       ),
-    ).toBe("repack");
+    ).toBe("classify-packs");
   });
 });

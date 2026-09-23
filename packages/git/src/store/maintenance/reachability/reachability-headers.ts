@@ -137,8 +137,7 @@ export function requireObjectInfo(store: SharedRepoStore, oid: string): Reachabi
             CASE WHEN loose.oid IS NOT NULL THEN 'loose'
                  WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
             CASE WHEN loose.oid IS NOT NULL THEN loose.type ELSE packed.type END AS type,
-            CASE WHEN loose.oid IS NOT NULL THEN loose.size ELSE packed.size END AS size,
-            loose.stored
+            CASE WHEN loose.oid IS NOT NULL THEN loose.size ELSE packed.size END AS size
        FROM (SELECT ? AS oid) input
        LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = input.oid
        LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = input.oid
@@ -155,19 +154,11 @@ export function requireObjectInfo(store: SharedRepoStore, oid: string): Reachabi
   if (row.source !== "loose" && row.source !== "pack") {
     throw new CorruptError(`reachable object ${oid} is missing`);
   }
-  let stored: "raw" | "zlib" | null = null;
-  if (row.source === "loose") {
-    if (row.stored !== "raw" && row.stored !== "zlib") {
-      throw new CorruptError("reachable loose object encoding is invalid");
-    }
-    stored = row.stored;
-  }
   return {
     oid,
     type: objectType(row.type, "reachable object type"),
     size: expectSafeInteger(row.size, 0, Number.MAX_SAFE_INTEGER, "reachable object size"),
     source: row.source,
-    stored,
   };
 }
 export function scanHeaders(
@@ -196,16 +187,14 @@ function streamLooseHeaders(
   info: ReachabilityObjectInfo,
   parser: StreamingHeaders,
 ): void {
-  if (info.stored === null) throw new CorruptError("loose header stream lost its encoding");
   let rows = 0;
-  let stored: "raw" | "zlib" | null = null;
-  let inflater: InflateStream | null = null;
+  const inflater = new InflateStream((chunk) => parser.push(chunk));
   let iterator: Iterator<Record<string, unknown>> | null = null;
   let finished = false;
   try {
     const source = store.db.iterate(
       `SELECT /* maintenance-loose-headers */ object.repo_id, object.oid,
-             object.stored, chunk.seq, chunk.data
+             chunk.seq, chunk.data
        FROM git_objects object
        JOIN git_object_chunks chunk
          ON chunk.repo_id = object.repo_id AND chunk.oid = object.oid
@@ -229,39 +218,26 @@ function streamLooseHeaders(
       if (row.repo_id !== store.repoId || row.oid !== info.oid || row.seq !== rows) {
         throw new CorruptError("loose header stream returned inconsistent rows");
       }
-      if (row.stored !== "raw" && row.stored !== "zlib") {
-        throw new CorruptError("loose header stream has an invalid encoding");
-      }
-      if (row.stored !== info.stored || (stored !== null && row.stored !== stored)) {
-        throw new CorruptError("loose header stream changed encoding between rows");
-      }
-      stored = row.stored;
       const data = bytesField(row.data, "loose header chunk");
-      if (stored === "raw") parser.push(data);
-      else {
-        if (inflater === null) {
-          inflater = new InflateStream((chunk) => parser.push(chunk));
+      try {
+        if (inflater.push(data) !== data.length) {
+          throw new CorruptError("loose header inflater stopped before its final chunk");
         }
-        try {
-          if (inflater.push(data) !== data.length) {
-            throw new CorruptError("loose header inflater stopped before its final chunk");
-          }
-        } catch (error) {
-          if (hasErrorCode(error, "ECORRUPT")) throw error;
-          throw new CorruptError("loose header object has invalid compressed bytes", {
-            cause: error,
-          });
-        }
+      } catch (error) {
+        if (hasErrorCode(error, "ECORRUPT")) throw error;
+        throw new CorruptError("loose header object has invalid compressed bytes", {
+          cause: error,
+        });
       }
       rows++;
     }
   } finally {
     if (!finished) iterator?.return?.();
   }
-  if (rows === 0 || stored === null) {
+  if (rows === 0) {
     throw new CorruptError("loose header stream returned an incomplete chunk sequence");
   }
-  if (stored === "zlib" && inflater?.ended !== true) {
+  if (!inflater.ended) {
     throw new CorruptError("loose header object ended before its compressed stream");
   }
 }

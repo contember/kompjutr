@@ -198,7 +198,7 @@ async function createFixture(storage: SqliteTestStorage, clock: Clock): Promise<
       ]),
       64 * 1024,
     ),
-    { reclaimPending: false, now: () => clock.value },
+    { now: () => clock.value },
   );
 
   const deadPackBlobData = utf8.encode("dead packed blob\n");
@@ -224,7 +224,7 @@ async function createFixture(storage: SqliteTestStorage, clock: Clock): Promise<
       ]),
       64 * 1024,
     ),
-    { reclaimPending: false, now: () => clock.value },
+    { now: () => clock.value },
   );
 
   const deadLooseTreeSourceKey = treeSourceKey(db, checkout.repoId, deadLoose.treeOid, "loose", 0);
@@ -411,31 +411,6 @@ async function finishRun(
   throw new Error("maintenance cost run did not complete");
 }
 
-function looseRowBytes(db: TestDatabase, repoId: number, oids: readonly string[]): number {
-  return storedByteAggregate(
-    db.scalar<number>(
-      `SELECT coalesce(sum(length(chunk.data)), 0)
-         FROM git_object_chunks chunk
-        WHERE chunk.repo_id = ? AND chunk.oid IN (SELECT value FROM json_each(?))`,
-      repoId,
-      JSON.stringify(oids),
-    ),
-    "loose stored byte aggregate",
-  );
-}
-
-function packRowBytes(db: TestDatabase, repoId: number, packIds: readonly number[]): number {
-  return storedByteAggregate(
-    db.scalar<number>(
-      `SELECT coalesce(sum(length(data)), 0) FROM git_pack_data
-        WHERE repo_id = ? AND pack_id IN (SELECT value FROM json_each(?))`,
-      repoId,
-      JSON.stringify(packIds),
-    ),
-    "pack stored byte aggregate",
-  );
-}
-
 function storageRowBytes(db: TestDatabase, repoId: number): number {
   const row = db.one<{ loose_bytes: number; pack_bytes: number }>(
     `SELECT
@@ -460,14 +435,12 @@ function storageRowBytes(db: TestDatabase, repoId: number): number {
 }
 
 describe("public maintenance storage pressure", () => {
-  it("keeps every cold call bounded while repacking 2,049 live and sweeping 257 dead loose objects", async () => {
+  it("keeps every cold call bounded while retaining 2,049 live and sweeping 257 dead loose objects", async () => {
     const storage = new SqliteTestStorage();
     const clock: Clock = { value: START_MS };
     const fixture = await createFixture(storage, clock);
     const db = new TestDatabase(storage);
     const beforeBytes = storageRowBytes(db, fixture.repoId);
-    const liveLooseStoredBytes = looseRowBytes(db, fixture.repoId, fixture.liveLooseOids);
-    expect(liveLooseStoredBytes).toBeGreaterThan(0);
 
     const startedCall = await publicMaintenanceCall(storage, clock);
     const started = startedCall.result;
@@ -483,26 +456,19 @@ describe("public maintenance storage pressure", () => {
       phase: "finish",
       reachableObjects: LIVE_LOGICAL_OBJECTS,
       queuedObjects: 0,
-      repackedObjects: LIVE_LOOSE_OBJECTS,
       reclaimedObjects: 0,
       reclaimedPacks: 0,
       reclaimedBytes: 0,
       nextEligibleAt: START_MS + GC_GRACE_MS,
     });
     expect(
-      [...new Set(first.calls.map((call) => call.result.repackedObjects))].filter(
-        (count) => count > 0,
+      db.scalar<number>(
+        "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND pack_id NOT IN (?, ?)",
+        fixture.repoId,
+        fixture.mixedPackId,
+        fixture.deadPackId,
       ),
-    ).toEqual([2_048, LIVE_LOOSE_OBJECTS]);
-    const maintenancePacks = db.all<{ pack_id: number; count: number }>(
-      `SELECT pack_id, count FROM git_pack_meta
-        WHERE repo_id = ? AND pack_id NOT IN (?, ?) ORDER BY pack_id`,
-      fixture.repoId,
-      fixture.mixedPackId,
-      fixture.deadPackId,
-    );
-    expect(maintenancePacks.map((pack) => pack.count)).toEqual([2_048, 1]);
-    const maintenancePackIds = maintenancePacks.map((pack) => pack.pack_id);
+    ).toBe(0);
     expect(
       db.scalar<number>(
         "SELECT count(*) FROM git_loose_gc_candidates WHERE repo_id = ?",
@@ -543,7 +509,6 @@ describe("public maintenance storage pressure", () => {
       runId: started.runId + 1,
       reachableObjects: 0,
       queuedObjects: 0,
-      repackedObjects: 0,
       reclaimedObjects: 0,
       reclaimedPacks: 0,
       reclaimedBytes: 0,
@@ -559,7 +524,6 @@ describe("public maintenance storage pressure", () => {
       phase: "finish",
       reachableObjects: LIVE_LOGICAL_OBJECTS,
       queuedObjects: 0,
-      repackedObjects: 0,
       reclaimedObjects: DEAD_LOOSE_OBJECTS + 3,
       reclaimedPacks: 1,
       reclaimedBytes: deadLooseStoredBytes + fixture.deadPackBytes,
@@ -631,13 +595,9 @@ describe("public maintenance storage pressure", () => {
            SELECT 1 FROM git_objects WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))
            UNION ALL SELECT 1 FROM git_object_chunks
              WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))
-           UNION ALL SELECT 1 FROM git_loose_object_lifecycle
-             WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))
            UNION ALL SELECT 1 FROM git_loose_gc_candidates
              WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))
          )`,
-        fixture.repoId,
-        deadLoosePayload,
         fixture.repoId,
         deadLoosePayload,
         fixture.repoId,
@@ -690,16 +650,14 @@ describe("public maintenance storage pressure", () => {
       ),
     ).toBe(0);
 
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_objects WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))",
+        fixture.repoId,
+        JSON.stringify(fixture.liveLooseOids),
+      ),
+    ).toBe(LIVE_LOOSE_OBJECTS);
     const afterBytes = storageRowBytes(db, fixture.repoId);
-    const maintenancePackBytes = packRowBytes(db, fixture.repoId, maintenancePackIds);
-    expect(maintenancePackBytes).toBeGreaterThan(0);
-    expect(afterBytes).toBe(
-      beforeBytes -
-        deadLooseStoredBytes -
-        fixture.deadPackBytes -
-        liveLooseStoredBytes +
-        maintenancePackBytes,
-    );
-    expect(afterBytes).toBeLessThan(beforeBytes);
+    expect(afterBytes).toBe(beforeBytes - deadLooseStoredBytes - fixture.deadPackBytes);
   });
 });

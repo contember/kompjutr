@@ -2,7 +2,6 @@ export type MaintenancePhase =
   | "roots"
   | "mark"
   | "classify-loose"
-  | "repack"
   | "classify-packs"
   | "sweep-loose"
   | "sweep-packs"
@@ -24,7 +23,6 @@ export interface MaintenanceRunView {
   cursorOrdinal: number | null;
   reachableObjects: number;
   queuedObjects: number;
-  repackedObjects: number;
   reclaimedObjects: number;
   reclaimedPacks: number;
   reclaimedBytes: number;

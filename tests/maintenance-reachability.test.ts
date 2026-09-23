@@ -354,7 +354,7 @@ function installLargeLooseHeader(
   const oid = hashObject(type, data);
   const compressed = deflate(data);
   db.run(
-    "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'zlib')",
+    "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, ?, ?)",
     repoId,
     oid,
     type,
@@ -747,7 +747,7 @@ describe("maintenance reachability", () => {
       await store.packs.ingest(slices(fullObjectPack("commit", packedBytes), 17));
       const corrupt = utf8.encode(`tree ${"z".repeat(40)}\n\n`);
       db.run(
-        "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, 'commit', ?, 'raw')",
+        "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, 'commit', ?)",
         checkout.repoId,
         oid,
         corrupt.length,
@@ -756,7 +756,7 @@ describe("maintenance reachability", () => {
         "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
         checkout.repoId,
         oid,
-        corrupt,
+        deflate(corrupt),
       );
       seedMark(db, checkout.repoId, [{ oid }]);
       db.storage.histogram = new Map();
@@ -1337,13 +1337,6 @@ describe("maintenance reachability", () => {
     expect(
       db.scalar<number>(
         "SELECT count(*) FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
-        checkout.repoId,
-        promised,
-      ),
-    ).toBe(0);
-    expect(
-      db.scalar<number>(
-        "SELECT count(*) FROM git_maintenance_repack_objects WHERE repo_id = ? AND oid = ?",
         checkout.repoId,
         promised,
       ),

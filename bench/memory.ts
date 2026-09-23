@@ -917,62 +917,6 @@ function packFallbackAuditScenario(): Scenario {
   };
 }
 
-function packAuthenticationScenario(): Scenario {
-  const spec = memoryScenarioSpec("sqlite.pack.authenticate");
-  const oid = hashObject("blob", PACK_FIXTURE_DATA);
-  let store: SharedRepoStore | null = null;
-  let packId: number | null = null;
-  let verificationDigest: string | null = null;
-  return {
-    name: spec.scenario,
-    kind: "memory",
-    fileBacked: true,
-    async setup({ harness }) {
-      const created = createRepository(harness, "/repo");
-      packId = (
-        await created.repo.store.packs.ingest(
-          singleBlobPackStream(PACK_FIXTURE_DATA, spec.formerLimitBytes),
-        )
-      ).packId;
-      if (
-        storedZlibByteLength(PACK_FIXTURE_DATA.length, spec.formerLimitBytes) !== spec.workloadBytes
-      ) {
-        throw new Error("pack authentication fixture compressed length is inconsistent");
-      }
-      store = reopenRepository(harness, "/repo").repo.store;
-    },
-    phases: [
-      {
-        name: spec.operation,
-        async run() {
-          if (store === null || packId === null) {
-            throw new Error("pack authentication fixture is missing");
-          }
-          store.packs.authenticateCompleteSources([
-            { oid, type: "blob", size: PACK_FIXTURE_DATA.length, packId },
-          ]);
-        },
-        async verify() {
-          if (store === null || packId === null) {
-            throw new Error("pack authentication fixture is missing");
-          }
-          const object = store.read(oid);
-          if (
-            store.packs.completePackedEntry(oid)?.packId !== packId ||
-            object?.type !== "blob" ||
-            object.data.length !== 1 ||
-            object.data[0] !== PACK_FIXTURE_DATA[0]
-          ) {
-            throw new Error("pack authentication did not preserve the exact canonical object");
-          }
-          verificationDigest = bytesDigest(object.data);
-        },
-        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
-      },
-    ],
-  };
-}
-
 function retainedGraphScenario(): Scenario {
   const spec = memoryScenarioSpec("sqlite.graph.retained");
   const message = `${"g".repeat(GRAPH_MESSAGE_BYTES - 1)}\n`;
@@ -1212,7 +1156,6 @@ export const MEMORY: Scenario[] = [
   sparseSelectedAddScenario(),
   looseObjectStreamScenario(),
   packFallbackAuditScenario(),
-  packAuthenticationScenario(),
   retainedGraphScenario(),
   objectSingletonScenario(),
   configMoveScenario(),

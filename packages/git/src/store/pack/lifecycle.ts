@@ -7,7 +7,6 @@ import { PackIngestLifecycleControl } from "./lifecycle/lifecycle-ingest.js";
 import { PackMembershipReader } from "./lifecycle/lifecycle-membership.js";
 import type {
   CompletePackedEntry,
-  CompletePackObject,
   ExpectedPackMembership,
   PackIngestLease,
   PackIngestLifecycle,
@@ -23,28 +22,11 @@ export class PackLifecycle {
     db: SqlDatabase,
     repoId: number,
     sharedState: PackSharedState,
-    now: () => number,
     maxDeltaDepth: number,
   ) {
     this.#deletion = new PackDeletion(db, repoId, sharedState, maxDeltaDepth);
-    this.#ingest = new PackIngestLifecycleControl(db, repoId, sharedState, now, this.#deletion);
+    this.#ingest = new PackIngestLifecycleControl(db, repoId, sharedState, this.#deletion);
     this.#membership = new PackMembershipReader(db, repoId);
-  }
-
-  reclaimPending(now?: () => number): number {
-    return now === undefined ? this.#ingest.reclaimPending() : this.#ingest.reclaimPending(now);
-  }
-
-  discardPending(packId: number, releaseOwnership?: (packId: number) => unknown): boolean {
-    return this.#deletion.discardPending(packId, releaseOwnership);
-  }
-
-  discardOwnedComplete(packId: number, releaseOwnership: (packId: number) => unknown): boolean {
-    return this.#deletion.discardOwnedComplete(packId, releaseOwnership);
-  }
-
-  completePackMatches(packId: number, objects: readonly CompletePackObject[]): boolean {
-    return this.#membership.completePackMatches(packId, objects);
   }
 
   completePackedEntry(oid: string): CompletePackedEntry | null {
@@ -58,9 +40,8 @@ export class PackLifecycle {
   reservePending(
     nowMs: number,
     lifecycle: PackIngestLifecycle | undefined,
-    ownership: { ordinary: boolean },
-  ): { packId: number; lease: PackIngestLease | null; reclaimed: number } {
-    return this.#ingest.reservePending(nowMs, lifecycle, ownership);
+  ): { packId: number; lease: PackIngestLease; reclaimed: number } {
+    return this.#ingest.reservePending(nowMs, lifecycle);
   }
 
   renewIngestLease(lease: PackIngestLease, now: () => number): void {
