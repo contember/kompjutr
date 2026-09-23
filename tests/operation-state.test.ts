@@ -11,6 +11,7 @@ import {
 import type { MergeTouchedPath } from "../packages/git/src/ops/merge/merge-state.js";
 import { checkoutStoreMutations } from "../packages/git/src/store/core/checkout-mutations-registry.js";
 import { readOperationStateOwned, SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { INTEGRATION_PAGE_ROWS } from "../packages/git/src/store/operations/integration-workspace/storage.js";
 import {
   iterateOperationTouched,
   readOperationHeader,
@@ -530,5 +531,59 @@ describe("durable operation journal", () => {
       );
       expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
     }
+  });
+});
+
+describe("operation journal keyset paging", () => {
+  // Journal paths stop at 2,200 bytes, so only JSON escaping can inflate a row
+  // enough for the byte cap to land below the row limit: each U+0001 costs six.
+  const ESCAPED_PADDING = 2_150;
+
+  function journalWith(count: number, padding = 0) {
+    const touchedPaths = Array.from({ length: count }, (_, index): MergeTouchedPath => {
+      const path = `${"\u0001".repeat(padding)}file-${String(index).padStart(5, "0")}`;
+      return {
+        path,
+        logicalPath: path,
+        purpose: "primary",
+        index: null,
+        worktree: { kind: "absent" },
+      };
+    });
+    const written = open();
+    written.store.writeOperationState(
+      replay("cherry-pick", { phase: "conflicted", emptyReason: null }),
+      touchedPaths,
+    );
+    return { ...written, paths: touchedPaths.map((entry) => entry.path) };
+  }
+
+  function traverse(db: TestDatabase, checkoutId: number): { paths: string[]; statements: number } {
+    db.storage.resetCounters();
+    const paths = [...iterateOperationTouched(db, checkoutId)].map((entry) => entry.path);
+    return { paths, statements: db.storage.statementCount };
+  }
+
+  it("ends on a short final page without an empty keyset query", () => {
+    const { db, store, paths } = journalWith(INTEGRATION_PAGE_ROWS + 44);
+    const read = traverse(db, store.checkoutId);
+    expect(read.paths).toEqual(paths);
+    expect(read.statements).toBe(2);
+  });
+
+  it("keeps probing after a final page that fills the row limit exactly", () => {
+    const { db, store, paths } = journalWith(INTEGRATION_PAGE_ROWS * 2);
+    const read = traverse(db, store.checkoutId);
+    expect(read.paths).toEqual(paths);
+    expect(read.statements).toBe(3);
+  });
+
+  it("follows a page the byte cap truncated below the row limit", () => {
+    const { db, store, paths } = journalWith(100, ESCAPED_PADDING);
+    const read = traverse(db, store.checkoutId);
+    expect(read.paths).toEqual(paths);
+    // The first page stops on bytes with about 58 of 256 rows, which proves
+    // nothing about what follows, so the rest needs a second query.
+    expect(read.statements).toBe(2);
   });
 });

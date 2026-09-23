@@ -279,11 +279,11 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "merge-base.select": 9,
   "merge.virtual-base": 204,
   "merge.apply": 147,
-  "merge.recovery": 104,
-  "merge.restore": 99,
+  "merge.recovery": 101,
+  "merge.restore": 90,
   "replay.preflight": 5,
   "replay.plan": 37,
-  "replay.recovery": 118,
+  "replay.recovery": 115,
   "rebase.plan": 18,
   "rebase.transition": 404,
   "rebase.transition-n": 699,
@@ -297,7 +297,7 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "maintenance.mark-depth-n": 398,
   "maintenance.mark-depth-2n": 783,
   "transport.discovery": 2,
-  "transport.fetch": 84,
+  "transport.fetch": 82,
   "transport.push": 53,
 };
 
@@ -338,17 +338,18 @@ const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
   "maintenance.mark-depth-n": 332,
   "maintenance.mark-depth-2n": 653,
   "transport.discovery": 2,
-  "transport.fetch": 66,
+  "transport.fetch": 64,
   "transport.push": 59,
 };
 
 const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
   {
     operation: "git.clone",
-    statements: 1_031,
-    rowsRead: 164_287,
+    statements: 1_029,
+    rowsRead: 164_285,
     source:
-      "2026-09-22 HEAD, rebaselined with per-commit attribution. Statements fell from the " +
+      "2026-09-23 HEAD: commit promotion stopped recounting staged rows (-2 statements, " +
+      "-2 rows). 2026-09-22 HEAD, rebaselined with per-commit attribution. Statements fell from the " +
       "2026-09-07 pre-split 2,381 at bc9bd3f (lease-guard pairs) and e7d31b0 (admission page " +
       "256 -> 4,096). Rows rose from 79,273 through two correctness validations: 3fc7965 " +
       "fetched-connectivity (+67,208) and 491189b pack graph admission (+68,595), the latter " +

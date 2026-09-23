@@ -1,7 +1,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../common/errors.js";
 import { JSON_BATCH_BYTES, utf8ByteLength } from "../core/json-pages.js";
-import { INTEGRATION_PAGE_ROWS } from "./integration-workspace/storage.js";
+import { INTEGRATION_PAGE_ROWS, isFinalKeysetPage } from "./integration-workspace/storage.js";
 import {
   operationIdentityFromRow,
   operationJournal,
@@ -151,6 +151,8 @@ export function* iterateOperationTouched(
   while (true) {
     const page: MergeTouchedPath[] = [];
     let bytes = 0;
+    let scanned = 0;
+    let byteCapped = false;
     for (const raw of db.iterate(
       `SELECT ordinal, path, logical_path, purpose, index_stage, index_mode, index_oid,
             index_size, index_mtime, index_ino, index_rev, worktree_kind, worktree_mode,
@@ -160,8 +162,12 @@ export function* iterateOperationTouched(
       checkoutId,
       after,
     )) {
+      scanned++;
       const rowBytes = utf8ByteLength(JSON.stringify(raw));
-      if (page.length > 0 && bytes + rowBytes > JSON_BATCH_BYTES) break;
+      if (page.length > 0 && bytes + rowBytes > JSON_BATCH_BYTES) {
+        byteCapped = true;
+        break;
+      }
       const touchedRow: OperationTouchedRow = {
         ordinal: raw.ordinal,
         path: raw.path,
@@ -182,10 +188,15 @@ export function* iterateOperationTouched(
       page.push(operationTouchedFromRow(touchedRow));
       after = requireMergeInteger(raw.ordinal, "touched ordinal");
       bytes += rowBytes;
-      if (bytes >= JSON_BATCH_BYTES) break;
+      if (bytes >= JSON_BATCH_BYTES) {
+        byteCapped = true;
+        break;
+      }
     }
     if (page.length === 0) return;
+    const final = isFinalKeysetPage(scanned, byteCapped);
     yield* page;
+    if (final) return;
   }
 }
 

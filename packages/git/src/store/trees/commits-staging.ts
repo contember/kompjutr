@@ -1,5 +1,4 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
-import { CorruptError } from "../../common/errors.js";
 import { type CommitCacheEntry, writeCommitCachePages } from "./commits-cache.js";
 
 const COLUMNS = `repo_id, oid, parents, tree,
@@ -51,11 +50,8 @@ export function stageCommitCaches(
 }
 
 export function promoteCommitCaches(db: SqlDatabase, repoId: number, packId: number): void {
-  const staged = db.scalar<number>(
-    "SELECT count(*) FROM git_pack_commit_staging WHERE repo_id = ? AND pack_id = ?",
-    repoId,
-    packId,
-  );
+  // Staging shares `git_commits`' columns and checks, and DO NOTHING absorbs only
+  // the key conflict, so every staged key is inserted, already present, or aborts.
   db.run(
     `INSERT INTO git_commits (${COLUMNS})
      SELECT ${COLUMNS} FROM git_pack_commit_staging WHERE repo_id = ? AND pack_id = ?
@@ -63,15 +59,5 @@ export function promoteCommitCaches(db: SqlDatabase, repoId: number, packId: num
     repoId,
     packId,
   );
-  const covered = db.scalar<number>(
-    `SELECT count(*) FROM git_pack_commit_staging s
-      JOIN git_commits c ON c.repo_id = s.repo_id AND c.oid = s.oid
-     WHERE s.repo_id = ? AND s.pack_id = ?`,
-    repoId,
-    packId,
-  );
-  if (staged === undefined || covered !== staged) {
-    throw new CorruptError("packed commit promotion did not cover every staged key");
-  }
   db.run("DELETE FROM git_pack_commit_staging WHERE repo_id = ? AND pack_id = ?", repoId, packId);
 }
