@@ -12,7 +12,7 @@ import {
   mapRebaseContinueFailure,
   mapRebaseFailure,
 } from "./write-errors.js";
-import { outputContext, retainedStdoutCeiling } from "./write-output.js";
+import { outputContext, stdoutOutput, truncatedResult } from "./write-output.js";
 import { formatRebaseContinue, formatRebaseResult } from "./write-rebase-format.js";
 import { requireTransactionalWorktree, runMutation, withRepository } from "./write-runtime.js";
 import { formatCommitSummary } from "./write-summary.js";
@@ -109,17 +109,11 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
             }
             return { oid: result.oid, previousHead, amended: false };
           },
-          (mutation) =>
-            gitCliResult(
-              formatCommitSummary(
-                repo,
-                context.worktree,
-                mutation,
-                retainedStdoutCeiling(options, 0),
-              ),
-              "",
-              0,
-            ),
+          (mutation) => {
+            const stdout = stdoutOutput(options);
+            formatCommitSummary(repo, context.worktree, mutation, stdout);
+            return truncatedResult(stdout, undefined, 0);
+          },
           (error) => mapMergeFailure(error, outputContext(options)),
         );
       });

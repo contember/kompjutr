@@ -106,7 +106,7 @@ decisions → reference → archive.
 - [0014 — Make an optionless clone complete](decisions/0014-make-an-optionless-clone-complete.md)
 - [0015 — Model partial-clone blobs as durable promises](decisions/0015-model-partial-clone-blobs-as-durable-promises.md)
 - [0016 — Route Git argv through one asynchronous runner](decisions/0016-route-git-argv-through-one-asynchronous-runner.md)
-- [0017 — Preflight mutating CLI output inside the transaction](decisions/0017-preflight-mutating-cli-output-inside-the-transaction.md)
+- [0017 — Commit mutating CLI commands, then truncate their output](decisions/0017-preflight-mutating-cli-output-inside-the-transaction.md)
 - [0018 — Compile shell commands to bounded queries](decisions/0018-compile-shell-commands-to-bounded-queries.md)
 - [0019 — Admit a bounded POSIX shell surface](decisions/0019-admit-a-bounded-posix-shell-surface.md)
 - [0020 — Publish runtime boundaries as scoped packages](decisions/0020-publish-runtime-boundaries-as-scoped-packages.md)

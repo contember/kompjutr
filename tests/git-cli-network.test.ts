@@ -366,31 +366,27 @@ describe("Git network argv", () => {
     expect(server.requests).toHaveLength(before);
   });
 
-  it("rolls back known local output overflow and truncates confirmed network outcomes", async () => {
+  it("commits local and network mutations and truncates their overflowing output across reopen", async () => {
     const fixture = remoteFixture();
     for (let index = 0; index < 24; index++) fixture.git("branch", `topic-${index}`);
+    const initialMain = fixture.git("rev-parse", "main");
     const server = await serverFor(fixture);
-    const workspace = runtime();
+    const storage = new SqliteTestStorage();
+    const workspace = runtime(storage);
+    const silent = { stdout: "", stderr: "", exitCode: 0, truncated: true };
 
-    await expect(
-      workspace.git.runCli(
+    expect(
+      await workspace.git.runCli(
         { argv: ["init", "too-small"], cwd: "/" },
         { maxStdoutBytes: 0, maxCombinedOutputBytes: 0 },
       ),
-    ).rejects.toMatchObject({ code: "E2BIG" });
-    await expect(workspace.git.repoRoot({ dir: "/clone-overflow" })).rejects.toMatchObject({
-      code: "ENOTAREPO",
-    });
-    await expect(workspace.git.repoRoot({ dir: "/too-small" })).rejects.toMatchObject({
-      code: "ENOTAREPO",
-    });
-
-    await expect(
-      workspace.git.runCli(
+    ).toEqual(silent);
+    expect(
+      await workspace.git.runCli(
         { argv: ["clone", server.url, "clone-overflow"], cwd: "/" },
         { maxStderrBytes: 0, maxCombinedOutputBytes: 0 },
       ),
-    ).rejects.toMatchObject({ code: "E2BIG" });
+    ).toEqual(silent);
 
     await workspace.git.runCli({ argv: ["clone", server.url, "bounded"], cwd: "/" });
     await expect(
@@ -407,20 +403,16 @@ describe("Git network argv", () => {
     ).rejects.toMatchObject({ code: "E2BIG" });
 
     await workspace.git.runCli({ argv: ["clone", server.url, "repo"], cwd: "/" });
-    const trackingBeforeProgress = await workspace.git.revParse({
-      dir: "/repo",
-      ref: "refs/remotes/origin/main",
-    });
     fixture.write("progress.txt", "progress\n".repeat(4_096));
-    fixture.commit("progress");
-    await expect(
-      workspace.git.runCli(
+    const progress = fixture.commit("progress");
+    expect(
+      await workspace.git.runCli(
         { argv: ["fetch", "origin", "main"], cwd: "/repo" },
         { maxStderrBytes: 0, maxCombinedOutputBytes: 0 },
       ),
-    ).rejects.toMatchObject({ code: "E2BIG" });
+    ).toEqual(silent);
     expect(await workspace.git.revParse({ dir: "/repo", ref: "refs/remotes/origin/main" })).toBe(
-      trackingBeforeProgress,
+      progress,
     );
     expect(await workspace.git.runCli({ argv: ["pull", "--ff-only"], cwd: "/repo" })).toMatchObject(
       { exitCode: 0 },
@@ -434,9 +426,6 @@ describe("Git network argv", () => {
     );
     expect(fetched.exitCode).toBe(0);
     expect(fetched.truncated).toBe(true);
-    expect(await workspace.git.revParse({ dir: "/repo", ref: "refs/remotes/many/topic-23" })).toBe(
-      fixture.git("rev-parse", "topic-23"),
-    );
 
     workspace.filesystem.writeFile("/repo/push.txt", ENCODER.encode("push\n"));
     await workspace.git.add({ dir: "/repo", paths: ["push.txt"] });
@@ -450,21 +439,31 @@ describe("Git network argv", () => {
     );
     expect(pushed).toMatchObject({ exitCode: 0, truncated: true });
     expect(fixture.git("rev-parse", "main")).toBe(oid);
+
+    const reopened = runtime(storage);
+    await expect(reopened.git.repoRoot({ dir: "/too-small" })).resolves.toBe("/too-small");
+    expect(await reopened.git.revParse({ dir: "/clone-overflow", ref: "HEAD" })).toBe(initialMain);
+    expect(await reopened.git.revParse({ dir: "/repo", ref: "refs/remotes/many/topic-23" })).toBe(
+      fixture.git("rev-parse", "topic-23"),
+    );
+    expect(await reopened.git.revParse({ dir: "/repo", ref: "refs/remotes/origin/main" })).toBe(
+      oid,
+    );
   });
 
-  it("keeps pull publication and push invocation authoritative when output is full", async () => {
+  it("keeps pull and push outcomes authoritative when output is full", async () => {
     const fixture = remoteFixture();
     const server = await serverFor(fixture);
     const workspace = runtime();
     await workspace.git.runCli({ argv: ["clone", server.url, "repo"], cwd: "/" });
     const originalHead = await workspace.git.revParse({ dir: "/repo", ref: "HEAD" });
     const requestsBeforeFailedPull = server.requests.length;
-    await expect(
-      workspace.git.runCli(
+    expect(
+      await workspace.git.runCli(
         { argv: ["pull", "missing", "main"], cwd: "/repo" },
         { maxStderrBytes: 0, maxCombinedOutputBytes: 0 },
       ),
-    ).rejects.toMatchObject({ code: "E2BIG" });
+    ).toEqual({ stdout: "", stderr: "", exitCode: 128, truncated: true });
     expect(await workspace.git.revParse({ dir: "/repo", ref: "HEAD" })).toBe(originalHead);
     expect(server.requests).toHaveLength(requestsBeforeFailedPull);
 
@@ -480,18 +479,17 @@ describe("Git network argv", () => {
 
     workspace.filesystem.writeFile("/repo/local.txt", ENCODER.encode("local\n"));
     await workspace.git.add({ dir: "/repo", paths: ["local.txt"] });
-    await workspace.git.commit({ dir: "/repo", message: "local" });
-    const posts = server.requests.filter((request) => request.method === "POST").length;
-    await expect(
-      workspace.git.runCli(
-        { argv: ["push", "origin", "main:main"], cwd: "/repo" },
+    const local = (await workspace.git.commit({ dir: "/repo", message: "local" })).oid;
+    expect(
+      await workspace.git.runCli(
+        { argv: ["push", "origin", "refs/heads/main:refs/heads/main"], cwd: "/repo" },
         { maxStderrBytes: 0, maxCombinedOutputBytes: 0 },
       ),
-    ).rejects.toMatchObject({ code: "E2BIG" });
-    expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(posts);
+    ).toEqual({ stdout: "", stderr: "", exitCode: 0, truncated: true });
+    expect(fixture.git("rev-parse", "main")).toBe(local);
   });
 
-  it("reports bare init paths and keeps unmatched mapped fetch output pre-publication", async () => {
+  it("reports bare init paths and truncates unmatched mapped fetch output", async () => {
     const fixture = remoteFixture();
     const server = await serverFor(fixture);
     const workspace = runtime();
@@ -509,15 +507,15 @@ describe("Git network argv", () => {
       stderr: expect.stringContaining("already exists"),
     });
     await workspace.git.runCli({ argv: ["clone", server.url, "repo"], cwd: "/" });
-    await expect(
-      workspace.git.runCli(
+    expect(
+      await workspace.git.runCli(
         {
           argv: ["fetch", "origin", "refs/heads/missing*:refs/remotes/missing/*"],
           cwd: "/repo",
         },
         { maxStderrBytes: 0, maxCombinedOutputBytes: 0 },
       ),
-    ).rejects.toMatchObject({ code: "E2BIG" });
+    ).toEqual({ stdout: "", stderr: "", exitCode: 0, truncated: true });
     await expect(
       workspace.git.revParse({ dir: "/repo", ref: "refs/remotes/missing/topic" }),
     ).rejects.toMatchObject({ code: "ENOTFOUND" });

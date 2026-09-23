@@ -8,7 +8,6 @@ import {
   add as addOp,
 } from "../../ops/staging/staging.js";
 import { readOperationHeaderOwned } from "../../store/operations/operation-journal.js";
-import { gitCliResult } from "../result.js";
 import type { GitCliHandlers } from "../types.js";
 import {
   environmentRecord,
@@ -16,7 +15,7 @@ import {
   mapAddFailure,
   mapCommitFailure,
 } from "./write-errors.js";
-import { outputContext, retainedStdoutCeiling } from "./write-output.js";
+import { outputContext, stdoutOutput, truncatedResult } from "./write-output.js";
 import {
   type ResolvedAddPath,
   resolveMutationPaths,
@@ -117,17 +116,11 @@ export function createGitCliAddCommitHandlers(context: GitContext): AddCommitHan
             });
             return { oid: result.oid, previousHead, amended: invocation.command.amend === true };
           },
-          (mutation) =>
-            gitCliResult(
-              formatCommitSummary(
-                repo,
-                context.worktree,
-                mutation,
-                retainedStdoutCeiling(options, 0),
-              ),
-              "",
-              0,
-            ),
+          (mutation) => {
+            const stdout = stdoutOutput(options);
+            formatCommitSummary(repo, context.worktree, mutation, stdout);
+            return truncatedResult(stdout, undefined, 0);
+          },
           (error) => mapCommitFailure(context, repo, error, options),
         ),
       );

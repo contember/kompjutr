@@ -1,33 +1,17 @@
 import { GitError, hasErrorCode } from "../../common/errors.js";
 import {
-  boundedGitCliResult,
   boundedPublishedGitCliResult,
   gitCliResult,
   gitCliUtf8ByteLength,
+  utf8Prefix,
 } from "../result.js";
 import type { GitCliHandlers, GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
 
-export function networkFailure(
-  error: unknown,
-  output: NetworkOutput,
-  published: boolean,
-): GitCliResult {
+export function networkFailure(error: unknown, output: NetworkOutput): GitCliResult {
   if (hasErrorCode(error, "EABORTED") || hasErrorCode(error, "EPUSHUNCERTAIN")) throw error;
-  const overflow = errorByCode(error, "E2BIG");
-  if (overflow !== null && !published) throw overflow;
   const mapped = mapFailure(error);
-  if (published) {
-    output.appendPublished(mapped.stderr);
-    return output.published(mapped.exitCode);
-  }
-  output.appendStrict(mapped.stderr);
-  return output.preflight(mapped.exitCode);
-}
-
-function errorByCode(error: unknown, code: string, depth = 0): unknown | null {
-  if (depth > 4 || typeof error !== "object" || error === null) return null;
-  if (hasErrorCode(error, code)) return error;
-  return errorByCode(Reflect.get(error, "cause"), code, depth + 1);
+  output.append(mapped.stderr);
+  return output.result(mapped.exitCode);
 }
 
 export class GitCliPushUncertainError extends GitError {
@@ -82,28 +66,11 @@ export class NetworkOutput {
   constructor(
     private readonly options: ResolvedGitCliRunOptions,
     initial: string,
-    private readonly failBeforePublication: boolean,
   ) {
     this.append(initial);
-    if (!failBeforePublication) boundedGitCliResult(gitCliResult("", initial, 0), options);
   }
 
   append(value: string): void {
-    if (this.options.discardStderr) return;
-    const maximum = Math.min(this.options.maxStderrBytes, this.options.maxCombinedOutputBytes);
-    const bytes = gitCliUtf8ByteLength(value, "git CLI network stderr", false);
-    if (bytes <= maximum - this.#bytes) {
-      this.#stderr += value;
-      this.#bytes += bytes;
-      return;
-    }
-    if (this.failBeforePublication) {
-      throw new GitError("E2BIG", `git CLI stderr exceeds ${maximum} bytes`);
-    }
-    this.appendPublished(value);
-  }
-
-  appendPublished(value: string): void {
     if (this.options.discardStderr) return;
     const maximum = Math.min(this.options.maxStderrBytes, this.options.maxCombinedOutputBytes);
     const room = Math.max(0, maximum - this.#bytes);
@@ -113,39 +80,10 @@ export class NetworkOutput {
     if (prefix !== value) this.#truncated = true;
   }
 
-  appendStrict(value: string): void {
-    if (this.options.discardStderr) return;
-    const maximum = Math.min(this.options.maxStderrBytes, this.options.maxCombinedOutputBytes);
-    const bytes = gitCliUtf8ByteLength(value, "git CLI network stderr", false);
-    if (bytes > maximum - this.#bytes) {
-      throw new GitError("E2BIG", `git CLI stderr exceeds ${maximum} bytes`);
-    }
-    this.#stderr += value;
-    this.#bytes += bytes;
-  }
-
-  preflight(exitCode: number): GitCliResult {
-    return boundedGitCliResult(gitCliResult("", this.#stderr, exitCode), this.options);
-  }
-
-  published(exitCode: number): GitCliResult {
+  result(exitCode: number): GitCliResult {
     return boundedPublishedGitCliResult(
       { stdout: "", stderr: this.#stderr, exitCode, truncated: this.#truncated },
       this.options,
     );
   }
-}
-
-function utf8Prefix(value: string, maximum: number): string {
-  if (gitCliUtf8ByteLength(value, "git CLI network output", false) <= maximum) return value;
-  const bytes = new TextEncoder().encode(value);
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  for (let end = Math.min(maximum, bytes.length); end >= 0; end--) {
-    try {
-      return decoder.decode(bytes.subarray(0, end));
-    } catch {
-      // Continue to the prior complete UTF-8 boundary.
-    }
-  }
-  return "";
 }

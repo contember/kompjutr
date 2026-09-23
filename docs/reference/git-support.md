@@ -109,9 +109,9 @@ to matching commits. `--first-parent` follows only the first-parent chain.
 also handles merge and divergent histories.
 
 Expected command and Git-domain failures are returned as a command-specific
-`{ stdout, stderr, exitCode, truncated }` result. Local handlers return
-`truncated: false`; they fail output preflight rather than publishing partial
-semantic output. Results are not collapsed into one generic
+`{ stdout, stderr, exitCode, truncated }` result. Read handlers fail the first
+output excess with `E2BIG`; mutating handlers commit and truncate, as described
+below. Results are not collapsed into one generic
 usage result. For example, unknown `status` and `diff` options exit 129 with
 usage on stderr; invalid `log` options and counts exit 128 with a fatal line; an
 unknown subcommand exits 1. Commit refusals may report status on
@@ -143,28 +143,28 @@ format. Staged diff merges the selected tree with the ordered stage-0 index,
 does not traverse the worktree, and refuses an unmerged index with `EUNMERGED`.
 Show patch output reuses the same 16 MiB tree-diff renderer and lazily hydrates
 only promised blobs required by the selected parent comparison.
-Reads and pre-publication commands fail the first excess with `E2BIG`. Once
-clone, fetch, or pull has published local state, or push has invoked
-receive-pack, the durable outcome remains authoritative: returned bytes fit the
-destination and `truncated` is true.
+Reads fail the first excess with `E2BIG`. Mutating commands never fail on
+output size: the durable outcome remains authoritative, returned bytes fit the
+destination, and `truncated` is true.
 Scalar worktree metadata reads stay scalar: a 1,001-file plain-diff probe uses
 10,019 statements. That is a measured target
 miss, not a runtime rejection, and the runner adds no projected-count refusal.
 
-Local mutating commands execute their mutation, format their success output,
-and preflight all retained output inside one database
-transaction. `commit -a|--all` performs its tracked-only staging inside that
-same outer transaction. An output failure therefore rolls back index, worktree,
-refs, objects, reflogs, and operation state. The promise-returning dispatcher
-awaits only after this synchronous transaction callback has completed. Expected
-operation failures are mapped only after rollback and cache revalidation.
+Local mutating commands execute their mutation and format its output inside one
+database transaction. `commit -a|--all` performs its tracked-only staging inside
+that same outer transaction. An operation or formatting failure rolls back
+index, worktree, refs, objects, reflogs, and operation state; expected operation
+failures are mapped only after rollback and cache revalidation. After the
+transaction commits, the result is cut to the stdout, stderr, and combined
+ceilings at a UTF-8 boundary, stdout first, and `truncated` records any loss.
+Formatters stream into per-stream truncating buffers, so retained output never
+exceeds its ceiling. The promise-returning dispatcher awaits only after the
+synchronous transaction callback has completed.
 
-Network argv has explicit output certainty boundaries. `init` and mutating
-`remote` forms preflight in their local transaction. `ls-remote` is read-only
-and may fail with `E2BIG`. Clone, fetch, and pull fail known output overflow
-before publication; after publication they preserve state and return bounded
-output with `truncated: true`. Push preflights known output before transport.
-After receive-pack invocation, `EABORTED`, `EPUSHUNCERTAIN`, confirmed report
+Network argv follows the same policy. `init`, mutating `remote` forms, clone,
+fetch, pull, and push run to completion and return bounded output with
+`truncated: true`; `ls-remote`, `remote`, `remote -v`, and `remote get-url` are
+reads and may fail with `E2BIG`. `EABORTED`, `EPUSHUNCERTAIN`, confirmed report
 status, and tracking reconciliation retain their native meanings; output
 truncation never replaces them. A thrown `EPUSHUNCERTAIN` carries its bounded
 `GitCliResult` as `error.result`, including the independent `truncated` bit.
@@ -175,7 +175,7 @@ truncation never replaces them. A thrown `EPUSHUNCERTAIN` carries its bounded
 
 | Git | kompjutr | |
 |---|---|---|
-| exact forms above | strict argv runner | ✔ database-only creation with transactional output preflight |
+| exact forms above | strict argv runner | ✔ database-only creation; output truncated after commit |
 | `--initial-branch=<name>` | `defaultBranch` (default `main`) | ★ ✔ |
 | `--bare` | `bare` | ~ recorded as `core.bare` only; every repository is effectively bare, since the object database is never a directory |
 | working directory, `git -C <dir>` | `dir` (default `/`) | ★ ~ several repositories may share one workspace; `init()` records the checkout in SQLite but does not create `dir` in the filesystem |
@@ -957,8 +957,9 @@ on the surface.
 At most 1,000 SQL statements is a benchmark target. Representative statement
 and returned-row costs live in `bench/`; a miss is optimization evidence and
 never a runtime rejection. Operations fail only for real memory, format,
-platform, corruption, CAS, or structural limits instead of truncating. The
-per-operation caps (tree bytes, worktree scan rows, path length, journal steps)
+platform, corruption, CAS, or structural limits instead of truncating. Only the
+argv presentation of a committed mutation is truncated, and it says so with
+`truncated: true`. The per-operation caps (tree bytes, worktree scan rows, path length, journal steps)
 are listed in [`architecture.md`](architecture.md).
 
 One object is at most 48 MiB, because a read materialises it as a single buffer

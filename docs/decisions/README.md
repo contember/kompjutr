@@ -56,7 +56,7 @@ so the two cannot drift.
 **Command surfaces**
 
 - [0016 — Route Git argv through one asynchronous runner](0016-route-git-argv-through-one-asynchronous-runner.md) — accepted (2026-08-28)
-- [0017 — Preflight mutating CLI output inside the transaction](0017-preflight-mutating-cli-output-inside-the-transaction.md) — accepted (2026-08-28)
+- [0017 — Commit mutating CLI commands, then truncate their output](0017-preflight-mutating-cli-output-inside-the-transaction.md) — accepted (2026-09-23)
 - [0018 — Compile shell commands to bounded queries](0018-compile-shell-commands-to-bounded-queries.md) — accepted (2026-08-21)
 - [0019 — Admit a bounded POSIX shell surface](0019-admit-a-bounded-posix-shell-surface.md) — accepted (2026-09-01)
 

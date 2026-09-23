@@ -16,7 +16,12 @@ import type { PushLeaseExpectation, PushResult } from "../../ops/refs/refspec.js
 import { initRepository } from "../../ops/repository/init.js";
 import type { Repository } from "../../ops/repository/repository.js";
 import { withGitMutationGuardOwned } from "../../store/database/database.js";
-import { boundedGitCliResult, gitCliResult, gitCliStdoutPartsResult } from "../result.js";
+import {
+  boundedGitCliResult,
+  boundedPublishedGitCliResult,
+  gitCliResult,
+  gitCliStdoutPartsResult,
+} from "../result.js";
 import type { GitCliFetchCommand, GitCliHandlers, GitCliPushCommand } from "../types.js";
 import { formatRebaseResult } from "../write/write.js";
 import {
@@ -42,9 +47,8 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
         : `${root === "/" ? "" : root}/.git/`;
       const result = gitCliResult(`Initialized empty Git repository in ${repositoryPath}\n`, "", 0);
       try {
-        return withGitMutationGuardOwned(context.database, () =>
+        withGitMutationGuardOwned(context.database, () =>
           context.database.db.transactionSync(() => {
-            const bounded = boundedGitCliResult(result, options);
             initRepository(context, {
               dir: root,
               ...(invocation.command.defaultBranch === undefined
@@ -52,13 +56,12 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
                 : { defaultBranch: invocation.command.defaultBranch }),
               ...(invocation.command.bare ? { bare: true } : {}),
             });
-            return bounded;
           }),
         );
       } catch (error) {
-        if (hasErrorCode(error, "E2BIG")) throw error;
-        return boundedGitCliResult(mapFailure(error), options);
+        return boundedPublishedGitCliResult(mapFailure(error), options);
       }
+      return boundedPublishedGitCliResult(result, options);
     },
     async clone(invocation, options) {
       const command = invocation.command;
@@ -68,7 +71,7 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
         const inferredDirectory = cloneDirectory(command.url);
         const root = resolveDirectory(invocation.cwd, command.directory ?? inferredDirectory);
         const display = command.directory ?? inferredDirectory;
-        const cloneOutput = new NetworkOutput(options, `Cloning into '${display}'...\n`, true);
+        const cloneOutput = new NetworkOutput(options, `Cloning into '${display}'...\n`);
         output = cloneOutput;
         await clone(context, {
           url: command.url,
@@ -82,21 +85,25 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
           ...networkBinding(context),
           onMessage: (message) => cloneOutput.append(message),
         });
-        return cloneOutput.published(0);
+        return cloneOutput.result(0);
       } catch (error) {
-        if (hasErrorCode(error, "E2BIG") || hasErrorCode(error, "EABORTED")) throw error;
-        if (output === undefined) return boundedGitCliResult(mapFailure(error), options);
-        return networkFailure(error, output, false);
+        if (hasErrorCode(error, "EABORTED")) throw error;
+        if (output === undefined) return boundedPublishedGitCliResult(mapFailure(error), options);
+        return networkFailure(error, output);
       }
     },
     remote(invocation, options) {
+      const command = invocation.command;
+      const reads = command.action === "list" || command.action === "get-url";
       let repo: Repository;
       try {
         repo = openRepository(context, invocation.cwd);
       } catch (error) {
-        return boundedGitCliResult(mapFailure(error), options);
+        const failure = mapFailure(error);
+        return reads
+          ? boundedGitCliResult(failure, options)
+          : boundedPublishedGitCliResult(failure, options);
       }
-      const command = invocation.command;
       if (command.action === "list") {
         return gitCliStdoutPartsResult(
           remoteList(repo).map((remote) =>
@@ -118,7 +125,7 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
         return boundedGitCliResult(gitCliResult(`${url}\n`, "", 0), options);
       }
       try {
-        return withGitMutationGuardOwned(context.database, () =>
+        withGitMutationGuardOwned(context.database, () =>
           repo.store.db.transactionSync(() => {
             if (command.name === undefined) throw new Error("parsed remote mutation lost its name");
             if (command.action === "add") {
@@ -134,14 +141,13 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
               requireCliHttpUrl(command.url);
               remoteSetUrl(repo, { name: command.name, url: command.url });
             }
-            return boundedGitCliResult(gitCliResult("", "", 0), options);
           }),
         );
       } catch (error) {
         repo.store.revalidateStorageCaches();
-        if (hasErrorCode(error, "E2BIG")) throw error;
-        return boundedGitCliResult(mapFailure(error), options);
+        return boundedPublishedGitCliResult(mapFailure(error), options);
       }
+      return gitCliResult("", "", 0);
     },
     async lsRemote(invocation, options) {
       try {
@@ -167,8 +173,7 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
     },
     async fetch(invocation, options) {
       const command = invocation.command;
-      const output = new NetworkOutput(options, "", true);
-      let published = false;
+      const output = new NetworkOutput(options, "");
       try {
         const repo = openRepository(context, invocation.cwd);
         repo.checkout.requireNoOperationState();
@@ -179,23 +184,6 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
           ...networkBinding(context),
           ...(command.filter === undefined ? {} : { filter: command.filter }),
           onMessage: (message: string) => output.append(message),
-        };
-        const checkpoint = {
-          checkpoint(
-            stage:
-              | "before-discovery"
-              | "after-discovery"
-              | "before-upload"
-              | "before-ingest"
-              | "pack-ingest"
-              | "after-ingest"
-              | "after-shallow-response"
-              | "before-ref-publication"
-              | "after-ref-publication",
-          ) {
-            if (stage === "after-ref-publication") published = true;
-            return undefined;
-          },
         };
         let result: Awaited<ReturnType<typeof fetchInto>>;
         if (command.refspecs === undefined) {
@@ -214,31 +202,19 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
             fetchOptions = { ...common, ...selection, deepen: command.deepen };
           else if (command.unshallow) fetchOptions = { ...common, ...selection, unshallow: true };
           else fetchOptions = { ...common, ...selection };
-          result = await fetchInto(context, repo, fetchOptions, "fetch", checkpoint);
+          result = await fetchInto(context, repo, fetchOptions);
         } else {
-          result = await fetchInto(
-            context,
-            repo,
-            { ...common, refspecs: command.refspecs },
-            "fetch",
-            checkpoint,
-          );
+          result = await fetchInto(context, repo, { ...common, refspecs: command.refspecs });
         }
-        const formatted = formatFetch(command, result);
-        if (published) {
-          output.appendPublished(formatted);
-          return output.published(0);
-        }
-        output.append(formatted);
-        return output.preflight(0);
+        output.append(formatFetch(command, result));
+        return output.result(0);
       } catch (error) {
-        return networkFailure(error, output, published);
+        return networkFailure(error, output);
       }
     },
     async pull(invocation, options) {
       const command = invocation.command;
-      const output = new NetworkOutput(options, "", true);
-      let published = false;
+      const output = new NetworkOutput(options, "");
       try {
         const repo = openRepository(context, invocation.cwd);
         repo.checkout.requireNoOperationState();
@@ -253,33 +229,28 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
           env: environmentRecord(invocation.env),
         };
         requireCliHttpUrl(resolvePull(repo, pullOptions).url);
-        const result = await pull(context, repo, context.worktree, pullOptions, {
-          afterFetch: () => (published = true),
-        });
-        published = true;
+        const result = await pull(context, repo, context.worktree, pullOptions);
         if (result.strategy === "rebase") {
           if (result.result.outcome === "up-to-date") {
-            output.appendPublished("Already up to date.\n");
-            return output.published(0);
+            output.append("Already up to date.\n");
+            return output.result(0);
           }
           if (result.result.outcome === "completed" && result.result.fastForward) {
-            output.appendPublished("Fast-forward\n");
-            return output.published(0);
+            output.append("Fast-forward\n");
+            return output.result(0);
           }
           const formatted = formatRebaseResult(repo, result.result);
-          output.appendPublished(formatted.stderr);
-          return output.published(formatted.exitCode);
+          output.append(formatted.stderr);
+          return output.result(formatted.exitCode);
         }
         const merged = result.result;
         if (merged.conflicted)
-          output.appendPublished(
-            "Automatic merge failed; fix conflicts and then commit the result.\n",
-          );
-        else if (merged.alreadyMerged) output.appendPublished("Already up to date.\n");
-        else if (merged.fastForward) output.appendPublished("Fast-forward\n");
-        return output.published(merged.conflicted ? 1 : 0);
+          output.append("Automatic merge failed; fix conflicts and then commit the result.\n");
+        else if (merged.alreadyMerged) output.append("Already up to date.\n");
+        else if (merged.fastForward) output.append("Fast-forward\n");
+        return output.result(merged.conflicted ? 1 : 0);
       } catch (error) {
-        return networkFailure(error, output, published);
+        return networkFailure(error, output);
       }
     },
     async push(invocation, options) {
@@ -290,9 +261,9 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
           requireCliHttpUrl(command.target);
         }
       } catch (error) {
-        return boundedGitCliResult(mapFailure(error), options);
+        return boundedPublishedGitCliResult(mapFailure(error), options);
       }
-      const output = new NetworkOutput(options, `To ${displayTarget(destination)}\n`, false);
+      const output = new NetworkOutput(options, `To ${displayTarget(destination)}\n`);
       try {
         const repo = openRepository(context, invocation.cwd);
         repo.checkout.requireNoOperationState();
@@ -318,15 +289,15 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
                 ...(command.delete ? { delete: true, remoteRef: command.selector } : {}),
               })
             : await push(context, repo, { ...common, refspecs: command.refspecs });
-        output.appendPublished(formatPush(result));
-        return output.published(result.ok ? 0 : 1);
+        output.append(formatPush(result));
+        return output.result(result.ok ? 0 : 1);
       } catch (error) {
         if (hasErrorCode(error, "EABORTED")) throw error;
         if (hasErrorCode(error, "EPUSHUNCERTAIN")) {
-          output.appendPublished(mapFailure(error).stderr);
-          throw new GitCliPushUncertainError(error, output.published(128));
+          output.append(mapFailure(error).stderr);
+          throw new GitCliPushUncertainError(error, output.result(128));
         }
-        return networkFailure(error, output, false);
+        return networkFailure(error, output);
       }
     },
   };

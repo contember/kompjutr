@@ -1,92 +1,88 @@
 ---
 id: 0017
-title: Preflight mutating CLI output inside the transaction
+title: Commit mutating CLI commands, then truncate their output
 status: accepted
-date: 2026-08-28
+date: 2026-09-23
 ---
 
-# 0017 — Preflight mutating CLI output inside the transaction
+# 0017 — Commit mutating CLI commands, then truncate their output
 
 ## Context
 
 [ADR-0016](0016-route-git-argv-through-one-asynchronous-runner.md) requires the
 argv runner to enforce caller-supplied stdout, stderr, and combined-output
-ceilings before it returns a result. The initial kernel validated those ceilings
-after a command handler returned. That is sufficient for reads, but not for
-mutations: `commit` or `rebase --continue` could publish durable state and then
-fail with `E2BIG` while the caller observed no successful command result.
+ceilings before it returns a result. For a mutation, an output ceiling can meet
+a completed operation in two ways: fail the command with `E2BIG` and roll the
+mutation back, or keep the mutation and return less output.
 
-Git operations and filesystem writes join nested `transactionSync()` calls when
-the repository and worktree share one opaque mutation scope, so a thrown outer
-transaction rolls back the whole mutation. Repository storage caches must still
-be revalidated after that rollback, because an operation may have observed newly
-written objects.
+The first policy needed its own machinery. Every mutating handler tracked a
+phase so that only operation errors were mapped; formatting charged a modeled
+retained-byte budget and failed on it; diagnostics were pre-counted; network
+commands split into pre- and post-publication and pre- and post-invocation
+cases with different rules. Rolling back for a presentation limit also
+discarded work the caller asked for, and it could never apply to network side
+effects, so the CLI had two policies.
 
 ## Decision
 
-The dispatcher passes the resolved run options to each awaitable handler, and
-every local mutating handler uses one shared synchronous wrapper in this order:
+Every mutating CLI command, local or network, commits its outcome and then
+fits its output to the destination. Lost bytes set `truncated: true`. Output
+size never fails a mutating command.
 
-1. Open an outer transaction on the selected repository database.
-2. Mark the current phase, then run the native operation, format its success
-   result, and apply the output preflight as three separate phases.
-3. Let every operation, formatting, or output-limit exception escape, so the
-   outer transaction rolls back.
-4. Revalidate repository storage caches after rollback. Only an exception from
-   the native-operation phase may enter command-specific Git-domain mapping;
-   formatting and preflight exceptions, `E2BIG` included, are rethrown
-   unchanged. The same output bounds apply to any mapped failure result.
+A local mutating handler uses one shared synchronous wrapper
+(`packages/git/src/cli/write/write-runtime.ts`):
 
-Before a command that can mutate the worktree enters the wrapper, it must prove
-transaction affinity through opaque scope identity
-(`packages/git/src/cli/write/write-runtime.ts`). A missing or different scope
-fails closed before any mutation.
+1. Open an outer mutation guard transaction on the selected repository database.
+2. Run the native operation and format its result inside that transaction.
+   Any exception rolls the whole mutation back.
+3. After rollback, revalidate repository storage caches, then map expected
+   Git-domain refusals to a command-specific result.
+4. Cut the success or failure result with `boundedPublishedGitCliResult`:
+   stdout first, then stderr within the combined ceiling, at UTF-8 boundaries.
 
-The dispatcher awaits the handler only after the local transaction callback has
-returned, and keeps its own final bounding call as defense in depth.
+Formatters write into per-stream truncating buffers
+(`packages/git/src/cli/write/write-output.ts`), so retained output never
+exceeds the stream ceiling. Memory for a commit summary is bounded by the diff
+summary row cap and by those buffers, not by a byte model.
 
-Network argv uses a different policy, because no transaction can roll back an
-HTTP side effect or an already-published fetch. Four boundaries are explicit:
+Before a command that can mutate the worktree enters the wrapper, it proves
+transaction affinity through opaque scope identity. A missing or different
+scope fails closed before any mutation.
 
-1. Local-only `init` and mutating `remote` forms retain transactional preflight.
-2. Read-only `ls-remote`, and clone, fetch, and pull before publication, may fail
-   with `E2BIG` because no durable command outcome must be reported.
-3. Clone, fetch, and pull after local publication return bounded bytes with
-   `truncated: true`. Output limits never replace success, conflict, or a later
-   integration failure.
-4. Push may fail known output preflight before receive-pack invocation. After
-   invocation, native transport certainty is authoritative: confirmed status,
-   `EPUSHUNCERTAIN`, and tracking reconciliation are preserved, with output
-   truncation recorded separately.
+Network argv follows the same policy. `init` and mutating `remote` forms commit
+in a local transaction, clone, fetch, and pull publish, and push invokes
+receive-pack regardless of output ceilings; each returns bounded stderr with
+`truncated` recording loss. `EABORTED`, `EPUSHUNCERTAIN`, confirmed report
+status, and tracking reconciliation keep their native meanings.
+
+Read commands have nothing to commit and still fail the first output excess
+with `E2BIG`.
 
 ## Consequences
 
-- A destination-specific `E2BIG` from a local-only command, or from a network
-  command before publication, cannot publish an index, worktree, ref, reflog,
-  object, or operation-state mutation.
-- Existing nested operation transactions remain the only mutation
-  implementation; the CLI adds one outer rollback boundary.
-- A new local mutating handler must use the shared wrapper and prove rollback for
-  stdout, retained stderr, and combined-output overflow. With `discardStderr`,
-  stderr is neither validated nor charged, so the mutation commits when stdout
-  and the resulting combined output fit.
+- A mutating command's result always describes a durable outcome. `truncated`
+  means only that output was shortened; it never means the operation was
+  undone. `EPUSHUNCERTAIN` still means receive-pack was invoked without a safely
+  retained final status.
+- One wrapper and one truncation function cover every mutating handler. There
+  is no phase tracking, output preflight, or modeled summary budget.
+- A formatting failure, such as the diff summary row cap, still rolls back the
+  mutation, because formatting runs inside the transaction.
+- With `discardStderr`, stderr is neither retained nor reported as truncated.
+- A caller that needs complete output must raise its ceilings; it cannot use
+  a small ceiling as a dry run.
 - Worktree-mutating commands are unavailable when the repository and worktree do
   not expose the same opaque mutation scope.
-- Handlers receive resolved ceilings even when they only read. The narrow public
-  runner capability is unchanged.
 - A promise-returning runner does not make local transaction ownership
   asynchronous; no transaction spans an await.
-- A caller can distinguish presentation loss from operation uncertainty.
-  `truncated` means only that output was bounded; `EPUSHUNCERTAIN` still means
-  receive-pack was invoked without a safely retained final status.
 
 ## Alternatives considered
 
-- **Validate only after dispatch.** Leaves durable mutations visible after an
-  `E2BIG` failure.
-- **Estimate success output before mutating.** Commit and rebase output depends
-  on the resulting object and lifecycle state, so an estimate drifts from the
-  formatted bytes.
-- **Inject a transaction into the generic runner.** The selected repository and
-  its cache-revalidation seam are resolved by the handler from `cwd`; moving that
-  ownership into the parser kernel would couple it to repository storage.
+- **Preflight output inside the transaction and roll back on overflow.** The
+  prior decision. It needed phase tracking and a modeled retained-byte budget,
+  discarded requested work for a presentation limit, and could not cover
+  network side effects, so network commands followed a second policy.
+- **Format after the transaction commits.** A formatting failure would then
+  surface as an error for a mutation that already persisted.
+- **Validate only after dispatch without truncating.** Leaves durable mutations
+  visible behind an `E2BIG` failure.

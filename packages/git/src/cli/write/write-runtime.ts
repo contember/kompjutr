@@ -8,10 +8,8 @@ import type { Repository } from "../../ops/repository/repository.js";
 import { repositoryMutations } from "../../ops/repository/repository.js";
 import { treeStream } from "../../ops/tree/tree-stream.js";
 import { withGitMutationGuardOwned } from "../../store/database/database.js";
-import { boundedGitCliResult, gitCliResult } from "../result.js";
+import { boundedPublishedGitCliResult, gitCliResult } from "../result.js";
 import type { GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
-
-export type MutationPhase = "native-operation" | "format-success" | "preflight";
 
 export interface ResolvedAddPath {
   input: string;
@@ -26,24 +24,17 @@ export function runMutation<Outcome>(
   formatSuccess: (outcome: Outcome) => GitCliResult,
   mapOperationFailure: (error: unknown) => GitCliResult | undefined,
 ): GitCliResult {
-  let phase: MutationPhase = "native-operation";
+  let result: GitCliResult;
   // Map native refusals only after the guard transaction has rolled every staged write back.
   try {
-    return withGitMutationGuardOwned(context.database, () => {
-      phase = "native-operation";
-      const outcome = operation();
-      phase = "format-success";
-      const result = formatSuccess(outcome);
-      phase = "preflight";
-      return boundedGitCliResult(result, options);
-    });
+    result = withGitMutationGuardOwned(context.database, () => formatSuccess(operation()));
   } catch (error) {
     repo.store.revalidateStorageCaches();
-    if (phase !== "native-operation") throw error;
     const mapped = mapOperationFailure(error);
     if (mapped === undefined) throw error;
-    return boundedGitCliResult(mapped, options);
+    result = mapped;
   }
+  return boundedPublishedGitCliResult(result, options);
 }
 
 export function withRepository(
@@ -57,7 +48,7 @@ export function withRepository(
     repo = openRepository(context, cwd);
   } catch (error) {
     if (!hasErrorCode(error, "ENOTAREPO")) throw error;
-    return boundedGitCliResult(
+    return boundedPublishedGitCliResult(
       gitCliResult(
         "",
         "fatal: not a git repository (or any of the parent directories): .git\n",

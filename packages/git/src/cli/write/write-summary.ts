@@ -5,14 +5,11 @@ import { isBinary } from "../../diff/lines.js";
 import type { GitContext } from "../../ops/core/context.js";
 import type { DiffSummaryEntry } from "../../ops/core/kinds.js";
 import { diffHeaderPath, diffSummaryBounded } from "../../ops/diff/diff.js";
+import { DIFF_REPOSITORY_BYTES } from "../../ops/diff/diff-types.js";
 import type { Repository } from "../../ops/repository/repository.js";
 import { statusFormatOptions } from "../../ops/status/status-format.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES, type WalkTreeDiffEntry } from "../../store/index.js";
-import {
-  BoundedSummaryOutput,
-  SummaryRetainedBudget,
-  summaryRetainedCeiling,
-} from "./write-output.js";
+import { TruncatingOutput } from "./write-output.js";
 
 const HEADS = "refs/heads/";
 const SUMMARY_WINDOW_ROWS = 1_000;
@@ -28,7 +25,7 @@ interface CommitSummary {
   files: number;
   insertions: number;
   deletions: number;
-  details: readonly string[];
+  details: TruncatingOutput;
 }
 
 interface RootSummaryRow {
@@ -41,14 +38,14 @@ export function formatCommitSummary(
   repo: Repository,
   worktree: GitContext["worktree"],
   mutation: CommitMutation,
-  maximum: number,
-): string {
-  return formatCommit(
+  out: TruncatingOutput,
+): void {
+  formatCommit(
     repo,
     worktree,
     mutation.oid,
     branchLabel(mutation.previousHead.ref),
-    maximum,
+    out,
     mutation.amended,
   );
 }
@@ -58,9 +55,9 @@ export function formatCommit(
   worktree: GitContext["worktree"],
   oid: string,
   label: string,
-  maximum: number,
+  out: TruncatingOutput,
   amended = false,
-): string {
+): void {
   const commit = repo.readCommit(oid);
   const quoteNonAscii = statusFormatOptions(repo).quotePath ?? true;
   const summary = summarizeCommit(
@@ -69,15 +66,13 @@ export function formatCommit(
     commit.tree,
     commit.parent[0],
     quoteNonAscii,
-    maximum,
+    out.maximum,
   );
   const root = commit.parent.length === 0 ? " (root-commit)" : "";
-  const out = new BoundedSummaryOutput(maximum, "git CLI commit summary");
   out.append(`[${label}${root} ${abbreviate(repo, oid)}] ${subject(commit.message)}\n`);
   if (amended) out.append(` Date: ${mediumDate(commit.author)}\n`);
   if (summary.files > 0) out.append(` ${shortStat(summary)}\n`);
-  for (const detail of summary.details) out.append(` ${detail}\n`);
-  return out.finish();
+  out.appendOutput(summary.details);
 }
 
 function summarizeCommit(
@@ -90,20 +85,17 @@ function summarizeCommit(
 ): CommitSummary {
   if (parentOid === undefined) return summarizeRoot(repo, tree, quoteNonAscii, maximum);
   const parentTree = repo.readCommit(parentOid).tree;
-  const retainedCeiling = summaryRetainedCeiling(maximum);
   const rows = diffSummaryBounded(
     repo,
     worktree,
     { ref: parentTree, to: tree, renames: true },
     undefined,
-    {
-      maxRows: Math.min(SUMMARY_MAX_ROWS, Math.floor(retainedCeiling / 128)),
-      maxRetainedBytes: retainedCeiling,
-    },
+    { maxRows: SUMMARY_MAX_ROWS, maxRetainedBytes: DIFF_REPOSITORY_BYTES },
   );
   return summaryFromDiffRows(repo, parentTree, tree, rows, quoteNonAscii, maximum);
 }
 
+// Only rename endpoints are retained; every other changed path streams into bounded output.
 function summaryFromDiffRows(
   repo: Repository,
   beforeTree: string,
@@ -112,30 +104,30 @@ function summaryFromDiffRows(
   quoteNonAscii: boolean,
   maximum: number,
 ): CommitSummary {
-  const retained = new SummaryRetainedBudget(maximum);
-  const modes = new Map<string, WalkTreeDiffEntry>();
-  for (const row of repo.walkTreeDiff(beforeTree, afterTree)) {
-    retained.addPath(row.path);
-    modes.set(row.path, row);
-  }
   const renamed = new Set<string>();
   for (const row of rows) {
     if (row.originalPath !== undefined) {
-      retained.addPath(row.originalPath);
-      retained.addPath(row.path);
       renamed.add(row.originalPath);
       renamed.add(row.path);
     }
   }
-  const details: string[] = [];
+  const renamedModes = new Map<string, WalkTreeDiffEntry>();
+  const modeDetails = new TruncatingOutput(maximum);
+  for (const row of repo.walkTreeDiff(beforeTree, afterTree)) {
+    if (renamed.has(row.path)) {
+      renamedModes.set(row.path, row);
+      continue;
+    }
+    const detail = modeDetail(row, quoteNonAscii);
+    if (detail !== undefined) modeDetails.append(` ${detail}\n`);
+  }
+  const details = new TruncatingOutput(maximum);
   for (const row of rows) {
     if (row.originalPath !== undefined && row.similarity !== undefined) {
-      const source = modes.get(row.originalPath);
-      const destination = modes.get(row.path);
-      pushSummaryDetail(
-        details,
-        `rename ${summaryRenamePath(row.originalPath, row.path, quoteNonAscii)} (${row.similarity}%)`,
-        retained,
+      const source = renamedModes.get(row.originalPath);
+      const destination = renamedModes.get(row.path);
+      details.append(
+        ` rename ${summaryRenamePath(row.originalPath, row.path, quoteNonAscii)} (${row.similarity}%)\n`,
       );
       if (
         source !== undefined &&
@@ -144,19 +136,11 @@ function summaryFromDiffRows(
         destination.afterMode !== null &&
         source.beforeMode !== destination.afterMode
       ) {
-        pushSummaryDetail(
-          details,
-          `mode change ${source.beforeMode} => ${destination.afterMode}`,
-          retained,
-        );
+        details.append(` mode change ${source.beforeMode} => ${destination.afterMode}\n`);
       }
     }
   }
-  for (const [path, row] of modes) {
-    if (renamed.has(path)) continue;
-    const detail = modeDetail(row, quoteNonAscii);
-    if (detail !== undefined) pushSummaryDetail(details, detail, retained);
-  }
+  details.appendOutput(modeDetails);
   return {
     files: rows.length,
     insertions: rows.reduce((total, row) => total + row.insertions, 0),
@@ -171,8 +155,7 @@ function summarizeRoot(
   quoteNonAscii: boolean,
   maximum: number,
 ): CommitSummary {
-  const retained = new SummaryRetainedBudget(maximum);
-  const details: string[] = [];
+  const details = new TruncatingOutput(maximum);
   let files = 0;
   let insertions = 0;
   let pending: RootSummaryRow[] = [];
@@ -195,11 +178,7 @@ function summarizeRoot(
         const bytes = batch.blobs.get(row.oid);
         if (bytes === undefined) break;
         if (!isBinary(bytes)) insertions += diffText("", utf8Decoder.decode(bytes)).insertions;
-        pushSummaryDetail(
-          details,
-          `create mode ${row.mode} ${summaryPath(row.path, quoteNonAscii)}`,
-          retained,
-        );
+        details.append(` create mode ${row.mode} ${summaryPath(row.path, quoteNonAscii)}\n`);
         processed++;
       }
       if (processed === 0) throw new Error("commit summary blob batch made no progress");
@@ -211,7 +190,6 @@ function summarizeRoot(
       throw new Error("root commit summary yielded a deletion");
     }
     files++;
-    retained.addPath(row.path);
     pending.push({ path: row.path, mode: row.afterMode, oid: row.afterOid });
     if (pending.length >= SUMMARY_WINDOW_ROWS) flush();
   }
@@ -283,15 +261,6 @@ function compressRenamePath(source: string, destination: string): string | undef
     `{${source.slice(prefixEnd, suffixStart)} => ${destination.slice(prefixEnd, destinationSuffixStart)}}` +
     source.slice(suffixStart)
   );
-}
-
-function pushSummaryDetail(
-  details: string[],
-  detail: string,
-  retained: SummaryRetainedBudget,
-): void {
-  retained.addString(detail);
-  details.push(detail);
 }
 
 function shortStat(summary: CommitSummary): string {

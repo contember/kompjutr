@@ -4,18 +4,13 @@ import type { Repository } from "../../ops/repository/repository.js";
 import type { AddLiteralPathsResult } from "../../ops/staging/staging.js";
 import { eagerStatus } from "../../ops/status/status.js";
 import { formatCommitRefusalStatus, statusFormatOptions } from "../../ops/status/status-format.js";
-import {
-  type GitCliOutputContext,
-  gitCliDiagnosticResult,
-  gitCliResult,
-  gitCliUtf8ByteLength,
-} from "../result.js";
+import { type GitCliOutputContext, gitCliDiagnosticResult, gitCliResult } from "../result.js";
 import type { GitCliEnvironment, GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
 import {
-  BoundedSummaryOutput,
-  boundedFailureStderr,
-  retainedStderrCeiling,
-  retainedStdoutCeiling,
+  stderrOutput,
+  stdoutOutput,
+  type TruncatingOutput,
+  truncatedResult,
 } from "./write-output.js";
 import type { ResolvedAddPath } from "./write-runtime.js";
 import { branchLabel } from "./write-summary.js";
@@ -25,13 +20,12 @@ export function formatAddResult(
   options: ResolvedGitCliRunOptions,
 ): GitCliResult {
   if (result.outcome === "staged") return gitCliResult("", "", 0);
-  if (options.discardStderr) return gitCliResult("", "", 1);
-  const stderr = new BoundedSummaryOutput(retainedStderrCeiling(options), "git CLI add stderr");
+  const stderr = stderrOutput(options);
   stderr.append("The following paths are ignored by one of your .gitignore files:\n");
   for (const path of result.paths) stderr.append(`${path}\n`);
   stderr.append("hint: Use -f if you really want to add them.\n");
   stderr.append('hint: Disable this message with "git config set advice.addIgnoredFile false"\n');
-  return gitCliResult("", stderr.finish(), 1);
+  return truncatedResult(undefined, stderr, 1);
 }
 
 export function mapAddFailure(
@@ -89,27 +83,17 @@ export function mapCommitFailure(
     return gitCliResult("", "Aborting commit due to empty commit message.\n", 1);
   }
   if (hasErrorCode(error, "EEMPTYCOMMIT")) {
-    return gitCliResult(cleanCommitRefusal(context, repo, options), "", 1);
+    return gitCliResult(cleanCommitRefusal(context, repo), "", 1);
   }
   if (hasErrorCode(error, "EUNMERGED")) {
-    const stderr = boundedFailureStderr(
+    const stderr = stderrOutput(options);
+    stderr.append(
       "error: Committing is not possible because you have unmerged files.\n" +
         "hint: Fix them up in the work tree, and then use 'git add/rm <file>'\n" +
         "hint: as appropriate to mark resolution and make a commit.\n" +
         "fatal: Exiting because of an unresolved conflict.\n",
-      options,
     );
-    return gitCliResult(
-      unmergedPaths(
-        repo,
-        retainedStdoutCeiling(
-          options,
-          gitCliUtf8ByteLength(stderr, "git CLI commit stderr", false),
-        ),
-      ),
-      stderr,
-      128,
-    );
+    return truncatedResult(unmergedPaths(repo, options), stderr, 128);
   }
   if (hasErrorCode(error, "EIDENTITY")) {
     return gitCliResult(
@@ -224,7 +208,7 @@ export function mapRebaseContinueFailure(
   options: ResolvedGitCliRunOptions,
 ): GitCliResult | undefined {
   if (hasErrorCode(error, "EUNMERGED")) {
-    return gitCliResult(needsMergePaths(repo, retainedStdoutCeiling(options, 0)), "", 1);
+    return truncatedResult(needsMergePaths(repo, options), undefined, 1);
   }
   return mapRebaseFailure(error);
 }
@@ -246,11 +230,7 @@ export function environmentRecord(environment: GitCliEnvironment): Record<string
   return record;
 }
 
-function cleanCommitRefusal(
-  context: GitContext,
-  repo: Repository,
-  options: ResolvedGitCliRunOptions,
-): string {
+function cleanCommitRefusal(context: GitContext, repo: Repository): string {
   const branch = branchLabel(repo.head().ref);
   const rows = eagerStatus(
     repo,
@@ -258,27 +238,22 @@ function cleanCommitRefusal(
     { excludeRoots: nestedRoots(context, repo.root) },
     context,
   );
-  return formatCommitRefusalStatus(
-    rows,
-    branch,
-    statusFormatOptions(repo),
-    retainedStdoutCeiling(options, 0),
-  );
+  return formatCommitRefusalStatus(rows, branch, statusFormatOptions(repo));
 }
 
-function unmergedPaths(repo: Repository, maximum: number): string {
-  const out = new BoundedSummaryOutput(maximum, "git CLI unmerged paths");
+function unmergedPaths(repo: Repository, options: ResolvedGitCliRunOptions): TruncatingOutput {
+  const out = stdoutOutput(options);
   let previous: string | undefined;
   for (const entry of repo.checkout.indexScan()) {
     if (entry.stage === 0 || entry.path === previous) continue;
     out.append(`U\t${entry.path}\n`);
     previous = entry.path;
   }
-  return out.finish();
+  return out;
 }
 
-function needsMergePaths(repo: Repository, maximum: number): string {
-  const out = new BoundedSummaryOutput(maximum, "git CLI rebase unresolved paths");
+function needsMergePaths(repo: Repository, options: ResolvedGitCliRunOptions): TruncatingOutput {
+  const out = stdoutOutput(options);
   let previous: string | undefined;
   for (const entry of repo.checkout.indexScan()) {
     if (entry.stage === 0 || entry.path === previous) continue;
@@ -287,5 +262,5 @@ function needsMergePaths(repo: Repository, maximum: number): string {
   }
   out.append("You must edit all merge conflicts and then\n");
   out.append("mark them as resolved using git add\n");
-  return out.finish();
+  return out;
 }

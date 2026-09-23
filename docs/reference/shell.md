@@ -182,16 +182,16 @@ redirect gets the atomic redirect ceiling; an upstream pipeline gets Git's
 intrinsic ceiling and any trailing-`head` demand hint. Direct stderr gets the
 remaining stderr sink, merged stderr shares the stage-output budget, and dropped
 stderr retains and charges nothing. The Git runner then applies its intrinsic
-16 MiB stdout, 1 MiB stderr, and 16 MiB combined maxima. Read-only and
-pre-publication excess fails with an output limit. A network command that has
-already published local or remote state instead returns the bounded prefix and
-contributes `truncated: true` to the shell result.
+16 MiB stdout, 1 MiB stderr, and 16 MiB combined maxima. A read-only Git
+command that exceeds its ceiling fails with an output limit.
 
-Every admitted local mutating Git argv command performs its mutation, success
-formatting, and output preflight in one database transaction. A terminal,
-pipeline, merged, or redirect overflow therefore leaves no partial index,
-worktree, ref, or operation-state change. Redirect publication remains atomic as
-for every other command.
+Every admitted mutating Git argv command, local or network, commits its outcome
+first and then returns the prefix that fits the ceiling, contributing
+`truncated: true` to the shell result when bytes are lost. A terminal, pipeline,
+merged, or redirect overflow therefore never undoes an index, worktree, ref, or
+operation-state change. Redirect publication remains atomic as for every other
+command. The policy is documented in
+[Git support](git-support.md#strict-argv-runner).
 
 Clone, fetch, pull, ls-remote, and push remain transport operations owned by the
 Git layer. Their published-result certainty and truncation policy is documented

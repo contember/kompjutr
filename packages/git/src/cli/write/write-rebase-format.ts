@@ -4,12 +4,13 @@ import { requireRebaseCursor } from "../../ops/rebase/rebase-lifecycle-baseline.
 import type { Repository } from "../../ops/repository/repository.js";
 import { readOperationStepOwned } from "../../store/operations/operation-journal.js";
 import type { RebaseJournalCursor } from "../../store/operations/operation-journal-types.js";
-import { gitCliResult, gitCliUtf8ByteLength } from "../result.js";
+import { gitCliResult } from "../result.js";
 import type { GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
 import {
-  BoundedSummaryOutput,
-  retainedStderrCeiling,
-  retainedStdoutCeiling,
+  stderrOutput,
+  stdoutOutput,
+  type TruncatingOutput,
+  truncatedResult,
 } from "./write-output.js";
 import { formatCommit, subject } from "./write-summary.js";
 
@@ -28,37 +29,22 @@ export function formatRebaseContinue(
   if (mutation.result.outcome !== "completed" && mutation.result.outcome !== "conflicted") {
     throw new Error(`rebase continuation returned ${mutation.result.outcome}`);
   }
-  let formattedStderr = "";
-  if (!options.discardStderr) {
-    const stderr = new BoundedSummaryOutput(
-      retainedStderrCeiling(options),
-      "git CLI rebase stderr",
+  const stderr = stderrOutput(options);
+  appendRebaseProgress(stderr, before.state.currentStep, before.stepCount, mutation.result);
+  if (mutation.result.outcome === "completed") {
+    stderr.append(`Successfully rebased and updated ${before.state.originalHeadRef}.\n`);
+  } else {
+    const step = requireRebaseCursor(repo).step;
+    if (step === null) throw new Error("conflicted rebase has no current step");
+    const source = repo.readCommit(step.sourceOid);
+    stderr.append(
+      `error: could not apply ${step.sourceOid.slice(0, 7)}... ${subject(source.message)}\n`,
     );
-    appendRebaseProgress(stderr, before.state.currentStep, before.stepCount, mutation.result);
-    if (mutation.result.outcome === "completed") {
-      stderr.append(`Successfully rebased and updated ${before.state.originalHeadRef}.\n`);
-    } else if (mutation.result.outcome === "conflicted") {
-      const step = requireRebaseCursor(repo).step;
-      if (step === null) throw new Error("conflicted rebase has no current step");
-      const source = repo.readCommit(step.sourceOid);
-      stderr.append(
-        `error: could not apply ${step.sourceOid.slice(0, 7)}... ${subject(source.message)}\n`,
-      );
-    }
-    formattedStderr = stderr.finish();
   }
+  const stdout = stdoutOutput(options);
   const commitOid = continuedCommitOid(repo, mutation);
-  const stdout =
-    commitOid === undefined
-      ? ""
-      : formatCommit(
-          repo,
-          worktree,
-          commitOid,
-          "detached HEAD",
-          retainedStdoutCeiling(options, gitCliUtf8ByteLength(formattedStderr, "stderr", false)),
-        );
-  return gitCliResult(stdout, formattedStderr, mutation.result.outcome === "completed" ? 0 : 1);
+  if (commitOid !== undefined) formatCommit(repo, worktree, commitOid, "detached HEAD", stdout);
+  return truncatedResult(stdout, stderr, mutation.result.outcome === "completed" ? 0 : 1);
 }
 
 export function formatRebaseResult(repo: Repository, result: RebaseResult): GitCliResult {
@@ -98,7 +84,7 @@ function continuedCommitOid(repo: Repository, mutation: RebaseMutation): string 
 }
 
 function appendRebaseProgress(
-  out: BoundedSummaryOutput,
+  out: TruncatingOutput,
   priorStep: number,
   totalSteps: number,
   result: RebaseResult,

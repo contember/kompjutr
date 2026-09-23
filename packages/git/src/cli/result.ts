@@ -256,7 +256,7 @@ export function boundedGitCliResult(
   return { stdout, stderr, exitCode, truncated };
 }
 
-/** Preserve a published network outcome while fitting its presentation to the destination. */
+/** Fit a mutation's committed outcome to the destination; lost bytes set `truncated`. */
 export function boundedPublishedGitCliResult(
   result: GitCliResult,
   options: ResolvedGitCliRunOptions,
@@ -285,7 +285,7 @@ export function boundedPublishedGitCliResult(
   };
 }
 
-function utf8Prefix(value: string, maximum: number): string {
+export function utf8Prefix(value: string, maximum: number): string {
   if (gitCliUtf8ByteLength(value, "git CLI output", false) <= maximum) return value;
   const bytes = new TextEncoder().encode(value);
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -347,23 +347,6 @@ export function gitCliDiagnosticResultParts(
   context?: GitCliOutputContext,
 ): GitCliResult {
   if (context?.options.discardStderr === true) return emptyDiagnostic(exitCode);
-  if (context !== undefined) {
-    const stderrBytes =
-      gitCliUtf8ByteLength(first, "git CLI stderr", false) +
-      gitCliUtf8ByteLength(second, "git CLI stderr", false) +
-      gitCliUtf8ByteLength(third, "git CLI stderr", false) +
-      gitCliUtf8ByteLength(fourth, "git CLI stderr", false) +
-      gitCliUtf8ByteLength(fifth, "git CLI stderr", false);
-    if (stderrBytes > context.options.maxStderrBytes) {
-      throw new GitError("E2BIG", `git CLI stderr exceeds ${context.options.maxStderrBytes} bytes`);
-    }
-    if (stderrBytes > context.options.maxCombinedOutputBytes) {
-      throw new GitError(
-        "E2BIG",
-        `git CLI combined output exceeds ${context.options.maxCombinedOutputBytes} bytes`,
-      );
-    }
-  }
   return gitCliResult("", `${first}${second}${third}${fourth}${fifth}`, exitCode);
 }
 
@@ -376,47 +359,11 @@ export function gitCliDiagnosticSliceResult(
   context?: GitCliOutputContext,
 ): GitCliResult {
   if (context?.options.discardStderr === true) return emptyDiagnostic(exitCode);
-  if (context !== undefined) {
-    const stderrBytes =
-      gitCliUtf8ByteLength(prefix, "git CLI stderr", false) +
-      gitCliUtf8ByteLengthRange(source, start, "git CLI stderr") +
-      gitCliUtf8ByteLength(suffix, "git CLI stderr", false);
-    if (stderrBytes > context.options.maxStderrBytes) {
-      throw new GitError("E2BIG", `git CLI stderr exceeds ${context.options.maxStderrBytes} bytes`);
-    }
-    if (stderrBytes > context.options.maxCombinedOutputBytes) {
-      throw new GitError(
-        "E2BIG",
-        `git CLI combined output exceeds ${context.options.maxCombinedOutputBytes} bytes`,
-      );
-    }
-  }
-  const value = source.slice(start);
-  return gitCliResult("", `${prefix}${value}${suffix}`, exitCode);
+  return gitCliResult("", `${prefix}${source.slice(start)}${suffix}`, exitCode);
 }
 
 function emptyDiagnostic(exitCode: number): GitCliResult {
   return gitCliResult("", "", exitCode);
-}
-
-function gitCliUtf8ByteLengthRange(value: string, start: number, label: string): number {
-  let bytes = 0;
-  for (let index = start; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const low = value.charCodeAt(index + 1);
-      if (!(low >= 0xdc00 && low <= 0xdfff)) {
-        throw new GitError("EINVAL", `${label} must be well-formed UTF-16`);
-      }
-      index++;
-      bytes += 4;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      throw new GitError("EINVAL", `${label} must be well-formed UTF-16`);
-    } else {
-      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
-    }
-  }
-  return bytes;
 }
 
 function validateOptionKeys(value: object): void {
