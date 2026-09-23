@@ -71,16 +71,7 @@ export function formatPorcelainV2(
   preflightPorcelainV2(entries, branch, resolved);
   const records = branch === undefined ? [] : formatStatusBranch(branch);
   for (const entry of entries) {
-    if (entry.ignored === true || entry.worktree === "?") continue;
-    if (entry.unmerged === true) {
-      records.push(
-        `u ${entry.index}${entry.worktree} N... ` +
-          `${entry.baseMode} ${entry.currentMode} ${entry.incomingMode} ${entry.worktreeMode} ` +
-          `${entry.baseOid} ${entry.currentOid} ${entry.incomingOid} ` +
-          formatPath(entry.path, resolved, false),
-      );
-      continue;
-    }
+    if (entry.ignored === true || entry.worktree === "?" || entry.unmerged === true) continue;
     if (entry.renamed === true) {
       const prefix =
         `2 ${entry.index}${v2Code(entry.worktree)} N... ` +
@@ -100,6 +91,15 @@ export function formatPorcelainV2(
       `1 ${v2Code(entry.index)}${v2Code(entry.worktree)} N... ` +
         `${entry.headMode} ${entry.indexMode} ${entry.worktreeMode} ` +
         `${entry.headOid} ${entry.indexOid} ${formatPath(entry.path, resolved, false)}`,
+    );
+  }
+  for (const entry of entries) {
+    if (entry.unmerged !== true) continue;
+    records.push(
+      `u ${entry.index}${entry.worktree} N... ` +
+        `${entry.baseMode} ${entry.currentMode} ${entry.incomingMode} ${entry.worktreeMode} ` +
+        `${entry.baseOid} ${entry.currentOid} ${entry.incomingOid} ` +
+        formatPath(entry.path, resolved, false),
     );
   }
   for (const entry of entries) {

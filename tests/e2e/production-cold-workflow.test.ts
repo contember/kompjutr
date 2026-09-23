@@ -243,6 +243,9 @@ describe("production cold workflow", () => {
         op: "peer",
         act: (peer) => {
           peer.write("c.txt", "upstream\n");
+          // A cleanly merged path beside the conflicted one: porcelain v2 lists
+          // changed rows before unmerged rows, whatever the paths.
+          peer.write("keep.txt", "keep upstream\n");
           peer.commit("colleague edit");
           peer.git("push", "-q", "origin", "main");
         },
