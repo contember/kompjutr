@@ -37,7 +37,6 @@ not effort: a wrong answer outranks a missing one.
   config scopes, `clean -x`, SSH transport. Reopen a case for one only with a
   concrete workload behind it. Textual `apply` is not filed because local
   snapshot replay serves the current workload.
-- **Not a parity gap.** [63](63-bound-packed-dependency-graph-traversal.md)
   retains packed-graph and read-memory scaling; [65](65-git-sqlite-architecture-review.md)
   collects verified architecture-review remediation; [64](64-speed-up-full-test-suite.md)
   tracks exhaustive-suite wall time; [66](66-retire-modeled-retained-byte-charges.md)
@@ -90,9 +89,9 @@ the integration gate. Everything below the gate is re-planned from that result.
 **Phase 2** is production scale; partial clone shipped directly outside a sprint.
 The first architecture-review correction sprint shipped independently because
 its defects were already reproduced. The
-[production correctness and memory sprint](../sprints/sprint-2026-09-10-production-correctness-and-memory.md)
-now owns all of 74 and 63 plus ARCH-9/ARCH-8 from 65. Other findings in 65 remain
-unscheduled. This bounded tranche precedes the broader scale/audit sequence below;
+[production correctness and memory sprint](../archive/sprint-2026-09-10-production-correctness-and-memory.md)
+shipped all of 74 and 63 plus ARCH-9/ARCH-8 from 65, so those items are gone.
+Other findings in 65 remain unscheduled. This bounded tranche precedes the broader scale/audit sequence below;
 it does not replace the external integration gate. Remaining parity work stays unscheduled
 until the external consumer integration gate provides new evidence.
 
@@ -101,7 +100,6 @@ until the external consumer integration gate provides new evidence.
 | **Phase 1 — a consumer can run** | | | | |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Phase 2 — production scale** | | | | |
-| active | [Production correctness and memory](../sprints/sprint-2026-09-10-production-correctness-and-memory.md) | [74](74-align-pack-ingest-with-physical-membership.md), [63](63-bound-packed-dependency-graph-traversal.md), [65](65-git-sqlite-architecture-review.md) ARCH-9/ARCH-8 only | long | Prepare cold-readable publication and bounded packed/integration payload lifetime. |
 | 1 | Architecture review conformance, remainder | [65](65-git-sqlite-architecture-review.md), excluding ARCH-9/ARCH-8 | long | Re-plan remaining findings after the active tranche and consumer gate. |
 | 3 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Audit the settled physical, shallow, promisor, and packed storage shapes. |
 | **Remaining parity without a caller (unscheduled)** | | | | |
@@ -128,13 +126,11 @@ an accepted correctness witness under ADR-0004.
 | Work | Items | Evidence boundary |
 |---|---|---|
 | Public API correctness | shipped — [`archive/sprint-2026-09-08-public-api-correctness.md`](../archive/sprint-2026-09-08-public-api-correctness.md) | Buffer aliasing, nested rollback, repeated mutations, and regular-file discovery. Item 70's scan-ordering claim was refuted, not fixed. |
-| Valid pack handling | [74](74-align-pack-ingest-with-physical-membership.md) | Cold-read admissibility remains. Repeated-tree projection is covered by WU2 of the active [production correctness sprint](../sprints/sprint-2026-09-10-production-correctness-and-memory.md). Lifecycle and network items 71–73 shipped in the [lifecycle/network sprint](../archive/sprint-2026-09-08-lifecycle-and-network-integrity.md). |
 | Valid-input resource scaling | [75](75-bound-network-authentication-payloads.md), [76](76-bound-full-tree-construction.md), [77](77-remove-repeated-local-traversal-work.md), [78](78-make-sql-cursors-seek-and-deliver-incrementally.md), [79](79-bound-materialized-status-and-config-reads.md) | Static live-state/work analysis and specified query-plan observations; target-runtime measurements remain acceptance work. |
 | Architectural test guarantee | [80](80-restore-import-graph-domain-guarantees.md) | Lost enforcement verified; current inspected source edges are clean. |
 
 Existing aggregate integration, ref-limit, sweep, and related
 findings remain in [65](65-git-sqlite-architecture-review.md); packed-read memory
-and chain traversal remain in [63](63-bound-packed-dependency-graph-traversal.md).
 Callback misuse and design experiments are explicitly labeled there. The intake
 does not schedule these issues into a sprint.
 
@@ -152,11 +148,9 @@ does not schedule these issues into a sprint.
 - [39 — Complete the remaining plumbing reads](39-plumbing-read-surface.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
-- [63 — Bound packed dependency graph traversal](63-bound-packed-dependency-graph-traversal.md)
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
 - [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
 - [66 — Retire modeled retained-byte charges](66-retire-modeled-retained-byte-charges.md)
-- [74 — Align pack ingest with cold reads](74-align-pack-ingest-with-physical-membership.md)
 - [75 — Bound payload lifetime during network object validation](75-bound-network-authentication-payloads.md)
 - [76 — Bound full-tree construction before serialization allocation](76-bound-full-tree-construction.md)
 - [77 — Remove repeated local traversal and recovery work](77-remove-repeated-local-traversal-work.md)

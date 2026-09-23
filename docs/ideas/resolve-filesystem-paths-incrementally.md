@@ -18,7 +18,7 @@ makes both `O(d)`.
 
 ## Evidence
 
-WU6 of the [production correctness sprint](../sprints/sprint-2026-09-10-production-correctness-and-memory.md)
+WU6 of the [production correctness sprint](../archive/sprint-2026-09-10-production-correctness-and-memory.md)
 removed the implicit 1,000-entry ceiling, so a path with 1,000 components now
 reaches the filesystem through the public API. Aborting a merge that owns such a
 path, measured on the DO SQLite filesystem under a two-vCPU lease:

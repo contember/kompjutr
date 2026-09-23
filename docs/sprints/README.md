@@ -20,7 +20,5 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [Production correctness and memory](sprint-2026-09-10-production-correctness-and-memory.md)
-  — pack publication/cold reads, packed dependency lifetime, and bounded
-  integration output; eight work units, plan review approved, implementation
-  design gates remain.
+None. The last sprint shipped on 2026-09-23 and is in
+[`../archive/`](../archive/sprint-2026-09-10-production-correctness-and-memory.md).

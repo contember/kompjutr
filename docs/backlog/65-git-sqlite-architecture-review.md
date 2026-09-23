@@ -20,10 +20,8 @@ this entire item as one undifferentiated change.
 Completed findings are removed when their response ships. The tables below
 contain only open work.
 
-ARCH-10 is tracked in
-[`63 - Bound packed dependency graph traversal`](63-bound-packed-dependency-graph-traversal.md),
-which now includes the review's unbounded packed-read memo finding. ARCH-47 is
-already represented by
+ARCH-10, the unbounded packed-read memo, shipped with the 2026-09-10 sprint and
+its backlog item is gone. ARCH-47 is already represented by
 [`09 - Add outbound delta compression`](09-outbound-delta-compression.md).
 Unverified and disputed claims remain in
 [`../ideas/git-sqlite-architecture-review-triage.md`](../ideas/git-sqlite-architecture-review-triage.md).
@@ -32,8 +30,7 @@ Unverified and disputed claims remain in
 
 The follow-up reviewed the working tree containing the scoped-package extraction,
 not a commit-only diff. New issues are indexed in the
-[backlog review intake](README.md#2026-09-08-review-intake). Existing findings stay
-owned here or in [63](63-bound-packed-dependency-graph-traversal.md).
+[backlog review intake](README.md#2026-09-08-review-intake). Existing findings stay owned here.
 
 Re-check current source before implementation. Review probes were temporary and
 were removed; their reported output is evidence, not a committed regression
@@ -41,7 +38,6 @@ suite. Preserve these distinctions when planning acceptance:
 
 | Existing finding | Qualified evidence and required witness |
 |---|---|
-| ARCH-8 | Valid public merges can retain aggregate output content despite the 1,000-entry limit: 150 distinct binary conflicts with 1 MiB current contents retain at least 150 MiB of payload. This is a static live-payload calculation, not measured OOM. Store results as references through bounded operation-owned storage before widening the entry cap. |
 | ARCH-16 | Static verification also found cursorless packed classification and young-prefix sweep. Bound visited-row growth for loose and packed phases; not every all-eligible sweep is quadratic. |
 | ARCH-18 / CORR-18 | A supported writer can cross from 100,000 to 100,001 refs because the preimage alone is checked. Every later mutation, including corrective deletion, fails in the full-ref scan. Statically verified; add a public threshold-crossing/deletion witness. |
 | ARCH-20 | Current combined recursive/exact predicates still produced checkout-only seeks in review query plans. Independent verification checked SQL shape, not a second plan run. Record target-runtime plans before rewriting. Related index and journal cursor work is [78](78-make-sql-cursors-seek-and-deliver-incrementally.md). |
@@ -51,12 +47,6 @@ suite. Preserve these distinctions when planning acceptance:
 | ARCH-33 / ARCH-39 | Runtime-reproduced late writes from an escaped checkout sink after an async callback was rejected with `EINVAL`. This is robustness against misuse of a synchronous callback API, not ordinary supported async execution. Retain the scratch branch's revocation/disposal contract. |
 | ARCH-38 | The detecting repack call can report its unchanged durable phase, with restart on the next call. Current docs define the durable phase, so this is a low-priority progress/observability decision, not demonstrated unsafe publication. The old ARCH-37 null-boundary contradiction is not present in the current reference contract. |
 
-## High-severity work
-
-| IDs | Problem | Acceptance | Touch points |
-|---|---|---|---|
-| ARCH-8 | Three-way integration retains aggregate resolved contents and refuses more than 1,000 changed paths; deleting the cap alone would leave retained plan state unbounded. | Bound live input and result payloads across batches; a 1,001-path integration succeeds under a real retained-state bound or a restart-safe streaming plan. | `packages/git/src/ops/integration/integration-plan.ts`, `packages/git/src/ops/integration/integration-content.ts`, `packages/git/src/ops/integration/integration-structure.ts` |
-
 ## Store and maintenance work
 
 | IDs | Problem | Acceptance | Touch points |
@@ -64,7 +54,7 @@ suite. Preserve these distinctions when planning acceptance:
 | ARCH-13 / ARCH-23 | Repack finalization inflates and hashes the same batch twice in one transaction. | A finalized batch is authenticated at most once, and loose deletion follows a metadata-level proof of complete packed availability. | `packages/git/src/store/maintenance/repack.ts` |
 | ARCH-14 | Candidate selection fragments repack output at every OID-order transition between shadowed and unshadowed objects. | Candidates are partitioned by kind and ordered by OID within each partition, filling bounded batches. | `packages/git/src/store/maintenance/repack.ts` |
 | ARCH-16 | Loose and packed classification/sweep lack durable keyset positions and repeatedly scan settled or young rows. | Phases resume from durable source-appropriate cursors, root drift clears them, and visited rows grow linearly with candidates. | `packages/git/src/store/maintenance/sweep/`, `packages/git/src/store/maintenance/state.ts`, `packages/git/src/store/maintenance/roots.ts` |
-| ARCH-17 / CORR-11 / CORR-12 | Modeled-byte currencies remain in integration, tree walking, checkout, status, diff, rename detection, initial checkout, and rebase planning. Sparse native projections no longer use mutable reserve/release/peak accounting. | Every surviving cap names a real failure; repository-scale sets stream or use a structural page where possible. | `packages/git/src/ops/{integration,checkout,status,diff,rebase}/`, `packages/git/src/ops/tree/`, `packages/git/src/store/trees/tree-walk.ts`, `packages/do/src/fs/store/initial-write.ts` |
+| ARCH-17 / CORR-11 / CORR-12 | Modeled-byte currencies remain in tree walking, checkout, status, diff, rename detection, initial checkout, and rebase planning. Integration's charges are gone with [ADR-0024](../decisions/0024-own-integration-output-in-a-scoped-sql-workspace.md); the five remaining operation sites are enumerated with their constants in [66](66-retire-modeled-retained-byte-charges.md), which owns that work. Sparse native projections no longer use mutable reserve/release/peak accounting. | Every surviving cap names a real failure; repository-scale sets stream or use a structural page where possible. | `packages/git/src/ops/{checkout,status,diff,rebase}/`, `packages/git/src/ops/tree/`, `packages/git/src/store/trees/tree-walk.ts`, `packages/do/src/fs/store/initial-write.ts` |
 | ARCH-18 / CORR-18 | A single-ref mutation materializes the whole ref table, and fetch publication repeats related full scans. | Mutations read only changed, expected, and bounded symbolic-chain refs; cost does not depend on unrelated refs. | `packages/git/src/store/refs/refs.ts`, `packages/git/src/store/fetch/fetch-publication.ts` |
 | ARCH-19 | `activeRefLogOids` duplicates maintenance's reflog-root stream and carries a stale 9,727-row refusal. | One paged reflog-root implementation remains; dead facades, caps, and duplicate tests are removed or redirected. | `packages/git/src/store/refs/reflog.ts`, `packages/git/src/store/maintenance/roots.ts`, store facades |
 | ARCH-20 | Recursive sparse selection prevents an indexed path-range seek, so `git add <dir>` scans the whole index. | Exact and recursive branches use indexable text ranges; a query-plan witness shows work proportional to the selected range. | `packages/git/src/do-fs/sparse/selection.ts`, `packages/git/src/do-fs/sparse/workspace.ts`, `packages/git/src/ops/staging/staging.ts` |

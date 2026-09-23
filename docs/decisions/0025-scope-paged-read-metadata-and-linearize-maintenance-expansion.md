@@ -23,7 +23,7 @@ is on the order of N² delivered rows across the run, even though every edge is
 identical work.
 
 Both are reachable through ordinary reads and public `maintenance()` calls, with
-no out-of-band database mutation ([backlog 63](../backlog/63-bound-packed-dependency-graph-traversal.md)).
+no out-of-band database mutation (backlog 63, shipped with the 2026-09-10 sprint).
 
 The second path was only expensive because it duplicated a guarantee the store
 already owns: [ADR-0023](0023-validate-canonical-pack-dependencies-at-source-changes.md)

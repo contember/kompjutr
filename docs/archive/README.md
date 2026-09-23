@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Production correctness and memory](sprint-2026-09-10-production-correctness-and-memory.md)
+  — cold-readable pack admission, hidden provisional projections, bounded packed
+  reads, and integration output owned by a scoped SQL workspace.
 - [Lifecycle and network integrity](sprint-2026-09-08-lifecycle-and-network-integrity.md)
   — promise fulfillment invalidation, resumable dependency-safe sweep, final fetch
   connectivity, physical OFS membership, and bounded decoder allocation. Records

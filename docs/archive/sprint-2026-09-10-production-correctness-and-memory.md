@@ -1,3 +1,31 @@
+> **OUTCOME — shipped 2026-09-23.** Accepted packs are now readable after
+> reopen, provisional projections are invisible until publication, and live
+> payloads are bounded in packed reads and three-way integration. Commit map:
+> WU1 → `187b9dd` ([ADR-0022](../decisions/0022-stage-pack-commit-projections-until-publication.md));
+> WU2 → `ea75af3`; WU3 → `491189b`
+> ([ADR-0023](../decisions/0023-validate-canonical-pack-dependencies-at-source-changes.md)),
+> with its clone cost repaired in `e7d31b0` and `6c19843`; WU4 → `2af7f69`;
+> WU5 → `924fb06`
+> ([ADR-0025](../decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md))
+> and `4eb104f`; WU6 → `3a37c27`
+> ([ADR-0024](../decisions/0024-own-integration-output-in-a-scoped-sql-workspace.md)),
+> `8a90a8a` and `e355936`; WU7 → `c928a53`; WU8 → `5c30bc2`, `dcea34e` and
+> `a6c5c4d`. User-requested performance work ran between WU2 and WU3 and belongs
+> to no unit: `3be3828`, `49f68c9`, `e0c34d9`, `dd0005c`.
+> Verification: `test:full` 3,786 tests across 17 lanes, exit 0, 496 s under a
+> 6 vCPU lease; `bench:statements --check` exit 0, green for the first time since
+> 2026-09-08; typecheck and Biome clean. WU6's memory gate closed with every case
+> under the 100 MiB added-peak target, 150 binary conflicts falling 287.29 → 91.25
+> MiB, and 1,001-path merge and rebase succeeding where the baseline refused with
+> `E2BIG`. One public 24,252-file clone moved 996 → 1,031 statements and
+> 145,778 → 164,287 rows read across the sprint, each jump attributed to its own
+> direct parent.
+> Backlog closed: 63, 74, and ARCH-8 and ARCH-9 from 65. Deferred with measured
+> numbers: 83, 84, 85, 86, 87, 88, 89, 90.
+> Not qualified here: the workerd clone's process RSS is a regression signal and
+> not evidence about the production 128 MB isolate limit, and `core.sparse-selected-add`
+> still misses its memory target (86).
+
 # Sprint — Production correctness and memory (2026-09-10)
 
 **Goal.** Make accepted packs readable after reopen, keep provisional projections

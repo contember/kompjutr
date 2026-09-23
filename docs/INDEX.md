@@ -16,8 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [Production correctness and memory](sprints/sprint-2026-09-10-production-correctness-and-memory.md)
-  — first production-hardening tranche: backlog 74, 63, and ARCH-9/ARCH-8 from 65.
+None.
 
 ## Specs
 
@@ -35,9 +34,10 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
       If everything is "hot", nothing is. -->
-- [Production correctness and memory](sprints/sprint-2026-09-10-production-correctness-and-memory.md)
-  passed independent plan review: cold-readable pack admission, hidden provisional
-  projections, bounded packed reads, and integration output lifetime.
+- [Production correctness and memory](archive/sprint-2026-09-10-production-correctness-and-memory.md)
+  shipped: cold-readable pack admission, hidden provisional projections, bounded
+  packed reads, and integration output lifetime. It consumed backlog 74 and 63
+  and ARCH-9/ARCH-8 from 65, and left backlog 83–90 with measured numbers.
 - [Lifecycle and network integrity](archive/sprint-2026-09-08-lifecycle-and-network-integrity.md)
   is complete: promise-aware maintenance, pack dependency preservation, and final
   fetch connectivity checks. Default clone meets 990 SQL and the approved
@@ -53,14 +53,12 @@ decisions → reference → archive.
   [`backlog/74–81`](backlog/README.md#2026-09-08-review-intake), with explicit
   separation of valid public API failures, malformed-input validation, store-only
   reproductions, and unmeasured scaling findings. Existing findings were refined
-  in [`65`](backlog/65-git-sqlite-architecture-review.md) and
-  [`63`](backlog/63-bound-packed-dependency-graph-traversal.md).
+  in [`65`](backlog/65-git-sqlite-architecture-review.md).
 - Three tranches from the 2026-09-02 Git-in-SQLite architecture review are
   complete: storage/publication safety, Git result and scale correctness, then
   transaction-owned local mutations with trusted ordinary reads. Remaining
   verified work is in
-  [`backlog/65`](backlog/65-git-sqlite-architecture-review.md) and
-  [`backlog/63`](backlog/63-bound-packed-dependency-graph-traversal.md); unverified
+  [`backlog/65`](backlog/65-git-sqlite-architecture-review.md); unverified
   claims remain in [`ideas`](ideas/git-sqlite-architecture-review-triage.md).
 - The completed everyday Git shell sprint made command execution asynchronous,
   added staged diff and history reads, exposed exact local/network operations,
