@@ -142,11 +142,12 @@ describe("pack physical offset membership", () => {
         const first = await store.packs.ingest(slices(repeatedTreePack(tree).bytes, 4096));
         const second = await store.packs.ingest(slices(repeatedTreePack(tree, 2).bytes, 4096));
         expect(
-          db.all<{ source_id: number }>(
-            "SELECT source_id FROM git_tree_sources WHERE tree_oid = ? AND storage = 'pack' AND complete = 1 ORDER BY source_id",
+          db.scalar<number>(
+            "SELECT COUNT(*) FROM git_tree_sources WHERE tree_oid = ? AND complete = 1",
             oid,
           ),
-        ).toEqual([{ source_id: first.packId }, { source_id: second.packId }]);
+        ).toBe(1);
+        expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(1);
         expect(store.packs.completePackedEntry(oid)?.packId).toBe(first.packId);
         expect(store.packs.deleteCompletePacks([first.packId])).toBe(1);
         const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(
@@ -157,11 +158,8 @@ describe("pack physical offset membership", () => {
         expect(cold.packs.completePackedEntry(oid)?.packId).toBe(second.packId);
         expect(cold.packs.deleteCompletePacks([second.packId])).toBe(1);
         expect(
-          db.scalar<number>(
-            "SELECT COUNT(*) FROM git_tree_sources WHERE tree_oid = ? AND storage = 'pack'",
-            oid,
-          ),
-        ).toBe(0);
+          db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE tree_oid = ?", oid),
+        ).toBe(loose ? 1 : 0);
         expect(cold.has(oid)).toBe(loose);
         if (loose) expect([...cold.walkTree(oid)]).toHaveLength(1);
       } finally {
@@ -170,7 +168,7 @@ describe("pack physical offset membership", () => {
     },
   );
 
-  it("rejects a malformed later tree without publishing earlier repeated projections", async () => {
+  it("rejects a malformed later tree and drops its projections with the pending pack", async () => {
     const tree = serializeTree([{ mode: "100644", name: "file", oid: BASE_OID }]);
     const oid = hashObject("tree", tree);
     const db = new TestDatabase();
@@ -184,10 +182,114 @@ describe("pack physical offset membership", () => {
       const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(checkout).shared;
       expect(cold.has(oid)).toBe(false);
       expect(cold.read(oid)).toBeNull();
-      expect(() => [...cold.walkTree(oid)]).toThrow();
       expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'")).toBe(
         0,
       );
+      // The next ingest reclaims the rejected pending pack and every projection it held.
+      await store.packs.ingest(slices(pack(null).bytes, 4096));
+      expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'pending'")).toBe(
+        0,
+      );
+      expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
+      expect(() => [...cold.walkTree(oid)]).toThrow();
+    } finally {
+      db.storage.db.close();
+    }
+  });
+  describe("a tree held by a rejected pending pack", () => {
+    const tree = serializeTree([{ mode: "100644", name: "file", oid: BASE_OID }]);
+    const oid = hashObject("tree", tree);
+
+    async function pendingProjection() {
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      ).shared;
+      // The fillers fill one tree batch, so the tree commits before the malformed one fails.
+      await expect(
+        store.packs.ingest(slices(repeatedTreePack(tree, 0, 2048, true).bytes, 4096)),
+      ).rejects.toThrow(/malformed tree/);
+      const projection = () =>
+        db.one<{ source_key: number; complete: number }>(
+          "SELECT source_key, complete FROM git_tree_sources WHERE tree_oid = ?",
+          oid,
+        );
+      const entryRows = () =>
+        db.scalar<number>(
+          `SELECT COUNT(*) FROM git_tree_entries e
+             JOIN git_tree_sources s ON s.source_key = e.source_key
+            WHERE s.tree_oid = ?`,
+          oid,
+        );
+      const reclaim = () => store.packs.ingest(slices(pack(null).bytes, 4096));
+      return { db, store, projection, entryRows, reclaim };
+    }
+
+    it("adds no entries when a loose write repeats its complete projection", async () => {
+      const { db, store, projection, entryRows } = await pendingProjection();
+      try {
+        const packed = projection();
+        expect(packed).toMatchObject({ complete: 1 });
+        expect(entryRows()).toBe(1);
+        expect(store.has(oid)).toBe(false);
+
+        expect(store.write("tree", tree)).toBe(oid);
+        expect(projection()).toEqual(packed);
+        expect(entryRows()).toBe(1);
+      } finally {
+        db.storage.db.close();
+      }
+    });
+
+    it("keeps the projection through a loose delete and drops it on reclaim", async () => {
+      const { db, store, projection, entryRows, reclaim } = await pendingProjection();
+      try {
+        const before = projection();
+        expect(before).toMatchObject({ complete: 1 });
+        store.write("tree", tree);
+        db.run("DELETE FROM git_objects WHERE oid = ?", oid);
+        expect(projection()).toEqual(before);
+
+        await reclaim();
+        expect(projection()).toBeUndefined();
+        expect(entryRows()).toBe(0);
+      } finally {
+        db.storage.db.close();
+      }
+    });
+  });
+
+  it("reclaims the streamed tree projection of a rejected ingest", async () => {
+    const tree = serializeTree(
+      Array.from({ length: 30000 }, (_, at) => ({
+        mode: "100644",
+        name: `file-${String(at).padStart(6, "0")}`,
+        oid: BASE_OID,
+      })),
+    );
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0, maxBufferedEntry: 65536 });
+    const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(checkout).shared;
+    const oid = hashObject("tree", tree);
+    const projections = () => db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources");
+    try {
+      // The streamed tree commits its projection, then a later streamed tree fails to parse.
+      await expect(
+        store.packs.ingest(slices(repeatedTreePack(tree, 0, 0, true).bytes, 4096)),
+      ).rejects.toThrow(/malformed tree/);
+      expect(projections()).toBe(1);
+      expect(
+        db.scalar<number>("SELECT COUNT(*) FROM git_pack_entries WHERE oid = ?", oid),
+      ).toBeGreaterThan(0);
+
+      await store.packs.ingest(slices(pack(null).bytes, 4096));
+      expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'pending'")).toBe(
+        0,
+      );
+      expect(projections()).toBe(0);
+      expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
     } finally {
       db.storage.db.close();
     }

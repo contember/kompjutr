@@ -55,8 +55,8 @@ caches, queues, and caps tied to real failures; there is no runtime byte ledger.
 
 - Tree traversal reads no object BLOBs. `ops/tree/tree-stream.ts` walks parsed
   `git_tree_*` edges through the store cursor.
-- Loose sources shadow packed sources, and projection rows stay
-  source-qualified.
+- Loose objects shadow packed objects for reads. A tree OID has one projection,
+  shared by every copy; it is not source-qualified.
 - Pack ingest is provisional. Only a complete, trailer-validated pack is
   readable; interrupted or rejected ingest never moves a ref.
 - Push preflights both pack passes before POST. Reopen only for a 401 retry;

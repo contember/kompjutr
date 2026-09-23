@@ -24,11 +24,8 @@ function validateParsedTreeEntry(parsed: ParsedTreeEntry): void {
 
 function validateTreeSource(source: TreeSource): void {
   expectSafeInteger(source.repoId, 0, Number.MAX_SAFE_INTEGER, "tree source repository id");
-  expectSafeInteger(source.sourceId, 0, Number.MAX_SAFE_INTEGER, "tree source id");
   expectSafeInteger(source.objectSize, 0, Number.MAX_SAFE_INTEGER, "tree source object size");
-  if (!isOid(source.treeOid) || (source.storage !== "loose" && source.storage !== "pack")) {
-    throw new CorruptError("tree source has invalid metadata");
-  }
+  if (!isOid(source.treeOid)) throw new CorruptError("tree source has invalid metadata");
 }
 
 class AsciiJsonArray {
@@ -170,7 +167,7 @@ export class TreeIndexBatch {
     cumulativeBase: number,
     nameAt: number,
   ): string {
-    return `{"p":${source.repoId},"t":"${source.treeOid}","s":"${source.storage}","x":${source.sourceId},"b":${source.objectSize},"q":${parsed.ordinal},"m":"${parsed.entry.mode}","o":"${parsed.entry.oid}","a":${nameAt},"l":${parsed.nameBytes.length},"c":${cumulativeBase}}`;
+    return `{"p":${source.repoId},"t":"${source.treeOid}","b":${source.objectSize},"q":${parsed.ordinal},"m":"${parsed.entry.mode}","o":"${parsed.entry.oid}","a":${nameAt},"l":${parsed.nameBytes.length},"c":${cumulativeBase}}`;
   }
 
   #insertOversizedEntry(
@@ -188,8 +185,7 @@ export class TreeIndexBatch {
              (source_key, ordinal, mode, name_bytes, oid, cumulative_base)
            SELECT source.source_key, ?, ?, ?, ?, ?
              FROM git_tree_sources source
-            WHERE source.repo_id = ? AND source.tree_oid = ?
-              AND source.storage = ? AND source.source_id = ?`,
+            WHERE source.repo_id = ? AND source.tree_oid = ? AND source.complete = 0`,
         parsed.ordinal,
         parsed.entry.mode,
         blob(parsed.nameBytes),
@@ -197,8 +193,6 @@ export class TreeIndexBatch {
         cumulativeBase,
         source.repoId,
         source.treeOid,
-        source.storage,
-        source.sourceId,
       );
       return true;
     } catch (error) {
@@ -211,12 +205,10 @@ export class TreeIndexBatch {
   #seedSource(source: TreeSource): void {
     this.db.run(
       `INSERT OR IGNORE INTO git_tree_sources
-         (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
-       VALUES (?, ?, ?, ?, 0, ?, NULL, NULL)`,
+         (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
+       VALUES (?, ?, 0, ?, NULL, NULL)`,
       source.repoId,
       source.treeOid,
-      source.storage,
-      source.sourceId,
       source.objectSize,
     );
   }
@@ -225,28 +217,17 @@ export class TreeIndexBatch {
     this.db.run(
       `DELETE FROM git_tree_entries WHERE source_key = (
          SELECT source_key FROM git_tree_sources
-          WHERE repo_id = ? AND tree_oid = ? AND storage = ? AND source_id = ?
+          WHERE repo_id = ? AND tree_oid = ? AND complete = 0
        )`,
       source.repoId,
       source.treeOid,
-      source.storage,
-      source.sourceId,
-    );
-    this.db.run(
-      `UPDATE git_tree_sources
-          SET complete = 0, entry_count = NULL, base_cost = NULL
-        WHERE repo_id = ? AND tree_oid = ? AND storage = ? AND source_id = ?`,
-      source.repoId,
-      source.treeOid,
-      source.storage,
-      source.sourceId,
     );
   }
 
   addMarker(source: TreeSource, count: number, baseCost: number): void {
     (() => {
       const markers = this.#markerArena();
-      const json = `{"p":${source.repoId},"t":"${source.treeOid}","s":"${source.storage}","x":${source.sourceId},"z":${source.objectSize},"n":${count},"b":${baseCost}}`;
+      const json = `{"p":${source.repoId},"t":"${source.treeOid}","z":${source.objectSize},"n":${count},"b":${baseCost}}`;
       if (json.length + 2 > markers.bytes.length) {
         throw new CorruptError("tree source marker exceeds the index buffer limit");
       }
@@ -269,9 +250,8 @@ export class TreeIndexBatch {
     if (!this.#sourcesSeeded) {
       this.db.run(
         `INSERT OR IGNORE INTO git_tree_sources
-         (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
+         (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
        SELECT json_extract(j.value, '$.p'), json_extract(j.value, '$.t'),
-              json_extract(j.value, '$.s'), json_extract(j.value, '$.x'),
               0, json_extract(j.value, '$.b'), NULL, NULL
          FROM json_each(CAST(substr(?, ?, ?) AS TEXT)) j`,
         blob(entries.bytes),
@@ -290,8 +270,7 @@ export class TreeIndexBatch {
          JOIN git_tree_sources s
            ON s.repo_id = json_extract(j.value, '$.p')
           AND s.tree_oid = json_extract(j.value, '$.t')
-          AND s.storage = json_extract(j.value, '$.s')
-          AND s.source_id = json_extract(j.value, '$.x')`,
+          AND s.complete = 0`,
       blob(entries.bytes),
       blob(entries.bytes),
       json.offset,
@@ -309,18 +288,16 @@ export class TreeIndexBatch {
       let returnedRows = 0;
       for (const _row of this.db.iterate(
         `INSERT INTO git_tree_sources
-               (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
-             SELECT existing.repo_id, existing.tree_oid, existing.storage, existing.source_id,
+               (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
+             SELECT existing.repo_id, existing.tree_oid,
                     1, json_extract(marker.value, '$.z'), json_extract(marker.value, '$.n'),
                     json_extract(marker.value, '$.b')
                FROM json_each(CAST(substr(?, 1, ?) AS TEXT)) marker
                JOIN git_tree_sources existing
                  ON existing.repo_id = json_extract(marker.value, '$.p')
                 AND existing.tree_oid = json_extract(marker.value, '$.t')
-                AND existing.storage = json_extract(marker.value, '$.s')
-                AND existing.source_id = json_extract(marker.value, '$.x')
               WHERE true
-             ON CONFLICT(repo_id, tree_oid, storage, source_id) DO UPDATE SET
+             ON CONFLICT(repo_id, tree_oid) DO UPDATE SET
                complete = 1, object_size = excluded.object_size,
                entry_count = excluded.entry_count, base_cost = excluded.base_cost
              RETURNING source_key`,
@@ -340,14 +317,13 @@ export class TreeIndexBatch {
     }
     this.db.run(
       `INSERT INTO git_tree_sources
-         (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
+         (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
        SELECT json_extract(value, '$.p'), json_extract(value, '$.t'),
-              json_extract(value, '$.s'), json_extract(value, '$.x'),
               1, json_extract(value, '$.z'), json_extract(value, '$.n'),
               json_extract(value, '$.b')
          FROM json_each(CAST(substr(?, 1, ?) AS TEXT))
         WHERE true
-       ON CONFLICT(repo_id, tree_oid, storage, source_id) DO UPDATE SET
+       ON CONFLICT(repo_id, tree_oid) DO UPDATE SET
          complete = 1, object_size = excluded.object_size,
          entry_count = excluded.entry_count, base_cost = excluded.base_cost`,
       blob(markers.bytes),
@@ -379,16 +355,13 @@ export function seedTreeSources(db: SqlDatabase, sources: readonly TreeSourceInp
   const rows = sources.map((source) => ({
     p: source.repoId,
     t: source.treeOid,
-    s: source.storage,
-    x: source.sourceId,
     z: source.objectSize,
   }));
   const json = JSON.stringify(rows);
   db.run(
     `INSERT OR IGNORE INTO git_tree_sources
-         (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
+         (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
        SELECT json_extract(value, '$.p'), json_extract(value, '$.t'),
-              json_extract(value, '$.s'), json_extract(value, '$.x'),
               0, json_extract(value, '$.z'), NULL, NULL
          FROM json_each(?)`,
     json,
@@ -406,8 +379,7 @@ export class TreeSourceIndexer {
   constructor(
     private readonly source: TreeSource,
     private readonly batch: TreeIndexBatch,
-    private readonly writeEntries = true,
-    private readonly writeMarker = true,
+    private readonly write = true,
   ) {
     validateTreeSource(source);
   }
@@ -432,7 +404,7 @@ export class TreeSourceIndexer {
     if (!Number.isSafeInteger(this.#baseCost)) {
       throw new CorruptError("tree index cost exceeds the safe integer range");
     }
-    if (this.writeEntries && this.#cacheAvailable) {
+    if (this.write && this.#cacheAvailable) {
       this.#cacheAvailable = this.batch.addEntry(this.source, parsed, this.#baseCost);
     }
     this.#count++;
@@ -449,7 +421,7 @@ export class TreeSourceIndexer {
         `tree ${this.source.treeOid} parsed ${parsed.observedSize} bytes, expected ${this.source.objectSize}`,
       );
     }
-    if (this.writeMarker && this.#cacheAvailable) {
+    if (this.write && this.#cacheAvailable) {
       this.batch.addMarker(this.source, this.#count, this.#baseCost);
     }
   }

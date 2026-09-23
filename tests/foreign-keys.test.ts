@@ -30,19 +30,12 @@ function insertTreeEntry(db: ForeignKeyDatabase, sourceKey: number): void {
   );
 }
 
-function insertTreeSource(
-  db: ForeignKeyDatabase,
-  storage: "loose" | "pack",
-  sourceId: number,
-  treeOid: string,
-): void {
+function insertTreeSource(db: ForeignKeyDatabase, treeOid: string): void {
   db.run(
     `INSERT INTO git_tree_sources
-       (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
-     VALUES (91, ?, ?, ?, 1, 1, 1, 1)`,
+       (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
+     VALUES (91, ?, 1, 1, 1, 1)`,
     treeOid,
-    storage,
-    sourceId,
   );
 }
 
@@ -55,34 +48,17 @@ function expectEnforcedBehavior(db: ForeignKeyDatabase): void {
 
   expect(() => insertTreeEntry(db, 999)).toThrow(/FOREIGN KEY constraint failed/);
 
-  const sources: readonly {
-    storage: "loose" | "pack";
-    sourceId: number;
-    treeOid: string;
-  }[] = [
-    { storage: "loose", sourceId: 0, treeOid: "a".repeat(40) },
-    { storage: "pack", sourceId: 7, treeOid: "b".repeat(40) },
-  ];
-  for (const source of sources) {
-    insertTreeSource(db, source.storage, source.sourceId, source.treeOid);
+  for (const treeOid of ["a".repeat(40), "b".repeat(40)]) {
+    insertTreeSource(db, treeOid);
     const sourceKey = db.scalar<number>(
-      `SELECT source_key FROM git_tree_sources
-        WHERE repo_id = 91 AND tree_oid = ? AND storage = ? AND source_id = ?`,
-      source.treeOid,
-      source.storage,
-      source.sourceId,
+      "SELECT source_key FROM git_tree_sources WHERE repo_id = 91 AND tree_oid = ?",
+      treeOid,
     );
     if (sourceKey === undefined) throw new Error("tree source insert did not return a key");
     insertTreeEntry(db, sourceKey);
 
     // Delete the parent directly so no explicit cleanup path can hide a failed cascade.
-    db.run(
-      `DELETE FROM git_tree_sources
-       WHERE repo_id = 91 AND tree_oid = ? AND storage = ? AND source_id = ?`,
-      source.treeOid,
-      source.storage,
-      source.sourceId,
-    );
+    db.run("DELETE FROM git_tree_sources WHERE repo_id = 91 AND tree_oid = ?", treeOid);
     expect(
       db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries WHERE source_key = ?", sourceKey),
     ).toBe(0);
@@ -133,7 +109,7 @@ describe("foreign-key contract", () => {
     expectForeignKeysEnabled(reopened);
   });
 
-  it("preserves current loose and packed tree sources across reopen", () => {
+  it("preserves tree projections across reopen", () => {
     const storage = new SqliteTestStorage();
     const first = new TestDatabase(storage);
     first.run("PRAGMA foreign_keys = OFF");
@@ -141,18 +117,15 @@ describe("foreign-key contract", () => {
     first.run("INSERT INTO git_repositories (id) VALUES (91)");
     first.run("UPDATE git_identity_control SET last_repo_id = 91 WHERE singleton = 1");
 
-    insertTreeSource(first, "loose", 0, "a".repeat(40));
-    const looseKey = first.scalar<number>(
-      "SELECT source_key FROM git_tree_sources WHERE repo_id = 91 AND storage = 'loose'",
-    );
-    if (looseKey === undefined) throw new Error("loose tree source missing");
-    insertTreeEntry(first, looseKey);
-    insertTreeSource(first, "pack", 7, "b".repeat(40));
-    const packKey = first.scalar<number>(
-      "SELECT source_key FROM git_tree_sources WHERE repo_id = 91 AND storage = 'pack'",
-    );
-    if (packKey === undefined) throw new Error("packed tree source missing");
-    insertTreeEntry(first, packKey);
+    for (const treeOid of ["a".repeat(40), "b".repeat(40)]) {
+      insertTreeSource(first, treeOid);
+      const sourceKey = first.scalar<number>(
+        "SELECT source_key FROM git_tree_sources WHERE repo_id = 91 AND tree_oid = ?",
+        treeOid,
+      );
+      if (sourceKey === undefined) throw new Error("tree source missing");
+      insertTreeEntry(first, sourceKey);
+    }
     expect(first.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
       String(SCHEMA_VERSION),
     );
@@ -163,24 +136,17 @@ describe("foreign-key contract", () => {
 
     expectForeignKeysEnabled(reopened);
     expect(
-      reopened.all<{ storage: string; source_id: number; tree_oid: string }>(
-        `SELECT storage, source_id, tree_oid
-         FROM git_tree_sources WHERE repo_id = 91 ORDER BY source_id`,
+      reopened.all<{ tree_oid: string }>(
+        "SELECT tree_oid FROM git_tree_sources WHERE repo_id = 91 ORDER BY tree_oid",
       ),
-    ).toEqual([
-      { storage: "loose", source_id: 0, tree_oid: "a".repeat(40) },
-      { storage: "pack", source_id: 7, tree_oid: "b".repeat(40) },
-    ]);
+    ).toEqual([{ tree_oid: "a".repeat(40) }, { tree_oid: "b".repeat(40) }]);
     expect(
-      reopened.all<{ storage: string; source_id: number; tree_oid: string }>(
-        `SELECT s.storage, s.source_id, s.tree_oid
+      reopened.all<{ tree_oid: string }>(
+        `SELECT s.tree_oid
          FROM git_tree_entries e JOIN git_tree_sources s ON s.source_key = e.source_key
-        WHERE s.repo_id = 91 ORDER BY s.source_id`,
+        WHERE s.repo_id = 91 ORDER BY s.tree_oid`,
       ),
-    ).toEqual([
-      { storage: "loose", source_id: 0, tree_oid: "a".repeat(40) },
-      { storage: "pack", source_id: 7, tree_oid: "b".repeat(40) },
-    ]);
+    ).toEqual([{ tree_oid: "a".repeat(40) }, { tree_oid: "b".repeat(40) }]);
   });
 
   it("enforces foreign keys through the Durable Object database adapter", () => {

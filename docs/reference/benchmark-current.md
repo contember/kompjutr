@@ -124,8 +124,8 @@ rehash path. These small-fixture numbers are not product throughput claims.
 
 ## Tree-schema storage
 
-Measured 2026-08-26 at benchmark commit `6890f53` with Node v24.4.0 and
-SQLite 3.50.2 on Linux 6.17.0-41-generic x64 and an AMD Ryzen 7 PRO 8840HS:
+Measured 2026-09-24 on the working tree at commit `5b5e1a7` with Node v24.4.0
+and SQLite 3.50.2 on Linux 6.17.0-41-generic x64 and an AMD Ryzen 7 PRO 8840HS:
 
 ```bash
 npm run bench:tree-schema
@@ -135,30 +135,31 @@ The harness re-executes measurement through `cpu-lease run -n 2 --no-smt` and
 verified `Cpus_allowed_list=10`, one logical CPU. A correctness-only run uses
 `npm run bench:tree-schema -- --check` without a lease. Both layouts contain the
 same parsed data from Next.js v15.5.2 at revision
-`381a9c8089ed7a244dcfa374fbb27d37032e208a`: 24,252 tracked paths, 11,070 tree
-sources, 34,996 immediate entries, and 11,070 effective sources.
+`381a9c8089ed7a244dcfa374fbb27d37032e208a`: 24,252 tracked paths, 11,070 trees
+and 34,996 immediate entries. v12 keeps one source row per physical copy and
+selects one through `git_tree_effective`; v13 keeps one projection per tree OID.
 
-| Structure | v11 pages | v11 bytes | v12 pages | v12 bytes |
+| Structure | v12 pages | v12 bytes | v13 pages | v13 bytes |
 | --- | ---: | ---: | ---: | ---: |
-| Sources | 163 | 667,648 | 173 | 708,608 |
-| Entries | 1,536 | 6,291,456 | 1,001 | 4,100,096 |
-| Name index | 585 | 2,396,160 | 195 | 798,720 |
-| Effective sources | 144 | 589,824 | 135 | 552,960 |
-| Automatic source indexes | 0 | 0 | 296 | 1,212,416 |
-| **Combined** | **2,428** | **9,945,088** | **1,800** | **7,372,800** |
+| Sources | 173 | 708,608 | 157 | 643,072 |
+| Entries | 634 | 2,596,864 | 634 | 2,596,864 |
+| Name index | 195 | 798,720 | 195 | 798,720 |
+| Effective sources | 135 | 552,960 | 0 | 0 |
+| Automatic source indexes | 296 | 1,212,416 | 135 | 552,960 |
+| **Combined** | **1,433** | **5,869,568** | **1,121** | **4,591,616** |
 
-The source-surrogate layout saves 628 pages and 2,572,288 bytes, or 25.8649%.
-Combined storage falls from 284.17785 to 210.67551 bytes per immediate entry, a
-73.50234-byte reduction. The total includes the two v12 source-key indexes, so
-the result does not hide the surrogate's added indexing cost.
+The per-OID layout saves 312 pages and 1,277,952 bytes, or 21.7725%. Combined
+storage falls from 167.72111 to 131.20402 bytes per immediate entry, a
+36.51709-byte reduction. Entry pages are unchanged: both layouts key entries by
+the source surrogate.
 
 Logical validation produced the same row counts and layout checksum
-`86c7c1c52823ea97e6b1163abaa06c2f16402e2c796fa2b729c9acf1c6c349b5`.
+`bd5ea2781937ddb7e9876d3850432193484b38984c49b14dc189f81b56ba1681`.
 Both layouts completed the traversal profile in 11,070 statements over 34,996
 rows with checksum
-`86cafc000db99382db9972c47129ee5827266564f8bdb1633197cd13f947f309`.
+`18abf0028eac04726a96419e373417ae575c9e6aff0de6e26ac18e7fb0ade82b`.
 The exact-name profile found all 2,048 sampled entries in 2,048 statements with
-checksum `312271501c79dd9cb5d888ea75be8b4c9fc13b3b2f2f756bf11f9a1c2b886619`.
+checksum `3620b285ee34c9e9b87428a8006335a4fe21260fd237623e5f3ad9925a08b0e5`.
 
 This measurement isolates SQLite layout size and logical query profiles. It is
 `node:sqlite`, not Durable Object SQL, and makes no wall-time or production

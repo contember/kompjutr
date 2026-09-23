@@ -215,8 +215,6 @@ function flushObjects(
           {
             repoId: context.repoId,
             treeOid: object.oid,
-            storage: "loose",
-            sourceId: 0,
             objectSize: object.size,
             chunks: [object.treeData],
           },

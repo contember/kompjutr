@@ -100,7 +100,6 @@ describe("commit transactions", () => {
     expect(repo.store.objectCount()).toBe(before.objects);
     expect(repo.store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
     expect(repo.store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
-    expect(repo.store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_effective")).toBe(0);
     expect(repo.store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
   });
 });

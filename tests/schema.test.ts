@@ -60,7 +60,6 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_pack_pending", "shared"],
   ["git_tree_sources", "shared"],
   ["git_tree_entries", "shared"],
-  ["git_tree_effective", "shared"],
   ["git_checkouts", "checkout"],
   ["git_checkout_reflog_entries", "checkout"],
   ["git_index", "checkout"],
@@ -137,15 +136,11 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_scratch_indexes" },
   { type: "table", name: "git_shallow" },
   { type: "table", name: "git_tracking_ref_revisions" },
-  { type: "table", name: "git_tree_effective" },
-  { type: "trigger", name: "git_tree_effective_loose_delete" },
-  { type: "trigger", name: "git_tree_effective_loose_insert" },
-  { type: "trigger", name: "git_tree_effective_pack_complete" },
-  { type: "trigger", name: "git_tree_effective_pack_delete" },
-  { type: "trigger", name: "git_tree_effective_pack_hide" },
   { type: "table", name: "git_tree_entries" },
   { type: "index", name: "git_tree_entries_by_name_bytes" },
   { type: "table", name: "git_tree_sources" },
+  { type: "trigger", name: "git_tree_sources_loose_delete" },
+  { type: "trigger", name: "git_tree_sources_loose_insert" },
 ];
 
 const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] = [
@@ -436,20 +431,9 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   ],
   [
     "git_tree_sources",
-    [
-      "source_key",
-      "repo_id",
-      "tree_oid",
-      "storage",
-      "source_id",
-      "complete",
-      "object_size",
-      "entry_count",
-      "base_cost",
-    ],
+    ["source_key", "repo_id", "tree_oid", "complete", "object_size", "entry_count", "base_cost"],
   ],
   ["git_tree_entries", ["source_key", "ordinal", "mode", "name_bytes", "oid", "cumulative_base"]],
-  ["git_tree_effective", ["repo_id", "tree_oid", "source_key"]],
 ];
 
 function schemaObjects(db: TestDatabase): SchemaObject[] {

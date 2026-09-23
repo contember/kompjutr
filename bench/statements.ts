@@ -111,7 +111,6 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "table:git_scratch_indexes",
   "table:git_shallow",
   "table:git_tracking_ref_revisions",
-  "table:git_tree_effective",
   "table:git_tree_entries",
   "table:git_tree_sources",
   "trigger:git_blob_id_updates_begin",
@@ -120,11 +119,8 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "trigger:git_blob_id_updates_mapping",
   "trigger:git_checkouts_identity_immutable",
   "trigger:git_promised_blobs_loose_present",
-  "trigger:git_tree_effective_loose_delete",
-  "trigger:git_tree_effective_loose_insert",
-  "trigger:git_tree_effective_pack_complete",
-  "trigger:git_tree_effective_pack_delete",
-  "trigger:git_tree_effective_pack_hide",
+  "trigger:git_tree_sources_loose_delete",
+  "trigger:git_tree_sources_loose_insert",
   "view:git_blob_id_updates",
 ];
 

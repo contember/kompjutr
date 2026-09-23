@@ -108,19 +108,13 @@ export function treeExpansion(
   object: QueueObject,
 ): ObjectExpansion {
   const source = db.one<Record<string, unknown>>(
-    `SELECT effective.repo_id, effective.tree_oid, source.source_key,
-            source.complete, source.entry_count
-       FROM git_tree_effective effective
-       JOIN git_tree_sources source ON source.source_key = effective.source_key
-      WHERE effective.repo_id = ? AND effective.tree_oid = ?`,
+    `SELECT source_key, complete, entry_count
+       FROM git_tree_sources WHERE repo_id = ? AND tree_oid = ?`,
     store.repoId,
     object.oid,
   );
   if (source === undefined) {
-    throw new CorruptError(`tree ${object.oid} has no effective parsed source`);
-  }
-  if (source.repo_id !== store.repoId || source.tree_oid !== object.oid) {
-    throw new CorruptError("effective tree source crossed object boundaries");
+    throw new CorruptError(`tree ${object.oid} has no parsed source`);
   }
   if (!booleanInteger(source.complete, "tree source completion marker")) {
     throw new CorruptError("tree source is incomplete");

@@ -235,26 +235,10 @@ function installPackCopy(
       tree,
     );
     workspace.database.db.run(
-      `INSERT INTO git_tree_sources
-         (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
-       SELECT repo_id, tree_oid, 'pack', ?, 1, object_size, entry_count, base_cost
-         FROM git_tree_sources
-        WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose'`,
-      packId,
-      repoId,
-      tree,
-    );
-    workspace.database.db.run(
-      `INSERT INTO git_tree_entries
-         (source_key, ordinal, mode, name_bytes, oid, cumulative_base)
-       SELECT packed.source_key, entry.ordinal, entry.mode, entry.name_bytes, entry.oid,
-              entry.cumulative_base
-         FROM git_tree_entries entry
-         JOIN git_tree_sources loose ON loose.source_key = entry.source_key
-         JOIN git_tree_sources packed
-           ON packed.repo_id = loose.repo_id AND packed.tree_oid = loose.tree_oid
-          AND packed.storage = 'pack' AND packed.source_id = ?
-        WHERE loose.repo_id = ? AND loose.tree_oid = ? AND loose.storage = 'loose'`,
+      `INSERT INTO git_pack_entries
+         (repo_id, pack_id, oid, offset, data_off, data_len, type, size, entry_size, base_offset)
+       SELECT repo_id, ?, oid, 0, 0, 0, type, size, 0, NULL
+         FROM git_objects WHERE repo_id = ? AND oid = ?`,
       packId,
       repoId,
       tree,
@@ -945,7 +929,7 @@ describe("SQLite sparse workspace source", () => {
     ]);
   });
 
-  it("reads a complete pack source and rejects it once the pack is incomplete", () => {
+  it("reads a projection whose only source is a pack", () => {
     const workspace = committedWorkspace();
     const tree = workspace.repo.headTree();
     if (tree === null) throw new Error("missing HEAD tree");
@@ -961,65 +945,6 @@ describe("SQLite sparse workspace source", () => {
     };
 
     expect(source.hydrate(request).available).toBe(true);
-    workspace.database.db.run(
-      "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = ? AND pack_id = 7",
-      workspace.repo.store.repoId,
-    );
-    expect(source.hydrate(request)).toEqual({ available: false });
-  });
-
-  it("does not borrow a packed projection through a corrupt loose shadow", () => {
-    const workspace = committedWorkspace();
-    const tree = workspace.repo.headTree();
-    if (tree === null) throw new Error("missing HEAD tree");
-    installPackCopy(workspace, tree, 7);
-    const object = workspace.database.db.one<{ size: number }>(
-      "SELECT size FROM git_pack_objects WHERE repo_id = ? AND oid = ?",
-      workspace.repo.store.repoId,
-      tree,
-    );
-    if (object === undefined) throw new Error("missing packed tree metadata");
-    workspace.database.db.run(
-      "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, 'tree', ?)",
-      workspace.repo.store.repoId,
-      tree,
-      object.size,
-    );
-    const source = createSqliteSparseCapability(workspace.database.db).workspace;
-
-    expect(
-      source.hydrate({
-        repoId: workspace.repo.store.repoId,
-        checkoutId: workspace.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: tree,
-        currentTreeOid: null,
-        paths: ["a.txt"],
-      }),
-    ).toEqual({ available: false });
-  });
-
-  it("does not lose an invalid active source-key association", () => {
-    const active = committedWorkspace();
-    const activeTree = active.repo.headTree();
-    active.database.db.run("PRAGMA foreign_keys = OFF");
-    active.database.db.run(
-      `UPDATE git_tree_effective SET source_key = source_key + 1000000
-        WHERE repo_id = ? AND tree_oid = ?`,
-      active.repo.store.repoId,
-      activeTree,
-    );
-    active.database.db.run("PRAGMA foreign_keys = ON");
-    expect(
-      createSqliteSparseCapability(active.database.db).workspace.hydrate({
-        repoId: active.repo.store.repoId,
-        checkoutId: active.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: activeTree,
-        currentTreeOid: null,
-        paths: ["a.txt"],
-      }),
-    ).toEqual({ available: false });
   });
 
   it("detects a projected tree cycle before depth fallback", () => {
@@ -1030,7 +955,7 @@ describe("SQLite sparse workspace source", () => {
       `UPDATE git_tree_entries SET oid = ?
         WHERE source_key = (
           SELECT source_key FROM git_tree_sources
-           WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+           WHERE repo_id = ? AND tree_oid = ?
         ) AND name_bytes = CAST('dir' AS BLOB)`,
       tree,
       workspace.repo.store.repoId,
@@ -1066,7 +991,7 @@ describe("SQLite sparse workspace source", () => {
       `UPDATE git_tree_entries SET mode = '40000', oid = ?
         WHERE source_key = (
           SELECT source_key FROM git_tree_sources
-           WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+           WHERE repo_id = ? AND tree_oid = ?
         ) AND name_bytes = CAST('b.txt' AS BLOB)`,
       root,
       workspace.repo.store.repoId,
@@ -1149,13 +1074,11 @@ describe("SQLite sparse workspace source", () => {
 
     expect(
       plan.some(
-        (row) =>
-          row.detail.includes("SEARCH effective USING PRIMARY KEY") &&
-          row.detail.includes("repo_id="),
+        (row) => row.detail.includes("SEARCH source USING") && row.detail.includes("tree_oid="),
       ),
     ).toBe(true);
     expect(plan.some((row) => row.detail.includes("SEARCH edge USING"))).toBe(true);
-    expect(plan.some((row) => /SCAN (effective|edge)(?:\s|$)/.test(row.detail))).toBe(false);
+    expect(plan.some((row) => /SCAN (source|edge)(?:\s|$)/.test(row.detail))).toBe(false);
   });
 
   it("returns unavailable for invalid native hydration bounds before issuing SQL", () => {

@@ -46,14 +46,8 @@ const SNAPSHOT_DIRTY_ROW = new RowShape({
 });
 
 const SNAPSHOT_SOURCE_ROW = new RowShape({ source_key: int(1) });
-const SNAPSHOT_SOURCE_SQL = `SELECT source.source_key
-  FROM git_tree_effective effective
-  JOIN git_tree_sources source
-    ON source.source_key = effective.source_key
-   AND source.repo_id = effective.repo_id
-   AND source.tree_oid = effective.tree_oid
-   AND source.complete = 1
- WHERE effective.repo_id = ? AND effective.tree_oid = ?`;
+const SNAPSHOT_SOURCE_SQL = `SELECT source_key FROM git_tree_sources
+ WHERE repo_id = ? AND tree_oid = ? AND complete = 1`;
 
 const SNAPSHOT_SOURCES_ROW = new RowShape({
   ordinal: int(0),
@@ -251,12 +245,8 @@ function completeSnapshotSources(
      )
      SELECT wanted.ordinal, wanted.oid, source.source_key
        FROM wanted
-       LEFT JOIN git_tree_effective effective
-         ON effective.repo_id = ? AND effective.tree_oid = wanted.oid
        LEFT JOIN git_tree_sources source
-         ON source.source_key = effective.source_key
-        AND source.repo_id = effective.repo_id
-        AND source.tree_oid = wanted.oid
+         ON source.repo_id = ? AND source.tree_oid = wanted.oid
         AND source.complete = 1
       ORDER BY wanted.ordinal`,
     json,

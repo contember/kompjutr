@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../packages/do/src/db/db.js";
 import { concat } from "../packages/git/src/common/bytes.js";
-import { CorruptError, GitError } from "../packages/git/src/common/errors.js";
+import { GitError } from "../packages/git/src/common/errors.js";
 import {
   MODE_COMMIT,
   MODE_EXECUTABLE,
@@ -366,7 +366,7 @@ describe("tree diff", () => {
     });
 
     expect(details.some((detail) => /MATERIALIZE (source_valid|edge)/.test(detail))).toBe(false);
-    expect(details.some((detail) => /SCAN (bx|ax|bps|aps|be|ae)\b/.test(detail))).toBe(false);
+    expect(details.some((detail) => /SCAN (bps|aps|be|ae)\b/.test(detail))).toBe(false);
     expect(
       details.filter(
         (detail) =>
@@ -378,10 +378,8 @@ describe("tree diff", () => {
     expect(details.filter((detail) => detail.startsWith("SCAN json_each "))).toHaveLength(1);
     expect(details.some((detail) => detail.includes("CORRELATED LIST SUBQUERY"))).toBe(false);
     expect(
-      details.some(
-        (detail) =>
-          detail.includes("SEARCH bx USING PRIMARY KEY (repo_id=? AND tree_oid=?)") ||
-          detail.includes("SEARCH ax USING PRIMARY KEY (repo_id=? AND tree_oid=?)"),
+      details.some((detail) =>
+        /SEARCH (bps|aps) USING INDEX \S+ \(repo_id=\? AND tree_oid=\?\)/.test(detail),
       ),
     ).toBe(true);
     expect(
@@ -413,27 +411,10 @@ describe("tree diff", () => {
         { mode: MODE_TREE, name: "later", oid: child },
       ]),
     );
-    db.run("DELETE FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?", child);
+    db.run("DELETE FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?", child);
 
     expect(() => store.walkTreeDiff(null, root).next()).toThrow(/no valid v3 parsed source/);
     expect(() => store.walkTreeDiffObjects(null, root).next()).toThrow(/no valid v3 parsed source/);
-  });
-
-  it("rejects an orphaned active source before either diff cursor yields", () => {
-    const { db, store } = open();
-    const tree = store.write(
-      "tree",
-      serializeTree([{ mode: MODE_FILE, name: "first", oid: oid(1) }]),
-    );
-    db.run("PRAGMA foreign_keys = OFF");
-    db.run(
-      "UPDATE git_tree_effective SET source_key = source_key + 1000000 WHERE repo_id = 1 AND tree_oid = ?",
-      tree,
-    );
-    db.run("PRAGMA foreign_keys = ON");
-
-    expect(() => store.walkTreeDiff(null, tree).next()).toThrow(CorruptError);
-    expect(() => store.walkTreeDiffObjects(null, tree).next()).toThrow(CorruptError);
   });
 
   it("permits DAG reuse and rejects an active-stack cycle", () => {
@@ -479,7 +460,7 @@ describe("tree diff", () => {
       `UPDATE git_tree_entries SET oid = ?
         WHERE source_key = (
           SELECT source_key FROM git_tree_sources
-           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+           WHERE repo_id = 1 AND tree_oid = ?
         ) AND ordinal = 0`,
       cycleRoot,
       cycleChild,
@@ -572,27 +553,6 @@ describe("tree diff", () => {
     expect([...formerExcess.store.walkTreeDiff(null, formerExcess.root)]).toEqual(expected);
     expect(formerExcess.db.storage.statementCount).toBeLessThan(1_000);
   }, 30_000);
-
-  it("reads only complete packed tree sources", async () => {
-    const { db, store } = open();
-    const data = serializeTree([{ mode: MODE_FILE, name: "packed", oid: oid(1) }]);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(1);
-    writer.object("tree", data);
-    writer.finish();
-    const { packId } = await store.packs.ingest(slices(concat(chunks), 64));
-    const tree = store.write("tree", data);
-    db.run("DELETE FROM git_objects WHERE repo_id = 1 AND oid = ?", tree);
-    expect([...store.walkTreeDiff(null, tree)]).toHaveLength(1);
-    db.run("PRAGMA ignore_check_constraints = ON");
-    db.run(
-      "UPDATE git_pack_meta SET state = 'receiving' WHERE repo_id = 1 AND pack_id = ?",
-      packId,
-    );
-    db.run("PRAGMA ignore_check_constraints = OFF");
-    expect(() => [...store.walkTreeDiff(null, tree)]).toThrow(/reimport or reclone/);
-  });
 
   it("uses the packed source after deleting the loose copy", async () => {
     const { db, store } = open();

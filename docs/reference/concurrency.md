@@ -204,11 +204,19 @@ their stored source.
 
 `git_pack_entries` authenticates every physical entry of each pack, including
 duplicate OIDs. `git_pack_objects` remains the single canonical read location
-for each OID. Pack tree projection batches deduplicate exact repository/pack/OID
-identities and query completed sources in one batch. Only completed projections
-are reused; unavailable sources remain eligible for another indexing attempt.
-Every physical occurrence still passes object authentication, and generic tree
-indexing continues to validate its input rather than trusting a duplicate key.
+for each OID. A tree OID has one projection in `git_tree_sources`, shared by
+every loose and packed copy. Pack tree projection batches deduplicate
+repository/OID identities and query completed projections in one batch; a
+completed projection is reused and its tree is not parsed again. An unavailable
+projection remains eligible for another indexing attempt. Every physical
+occurrence still passes object authentication, and loose tree writes still parse
+a duplicate but write no entries. Ingest writes a new tree's projection while its
+pack is still pending, so the projection can exist before any copy is readable.
+`PackTreeIndex` flushes the pack's `git_pack_entries` rows before it commits a
+projection, so reclaim finds every projection a failed ingest wrote and loose
+deletion never drops one that a pending pack still holds.
+Deleting the last loose row (a trigger) or the last pack entry (`PackDeletion`,
+including pending-pack reclaim) deletes the projection.
 Packs are self-contained: every delta names its base by offset inside its own
 pack. Fetch never requests `thin-pack`. Ingest stores a REF delta with the offset
 of the in-pack entry that carries its base OID and rejects a base outside the pack
@@ -379,8 +387,9 @@ after a cold reopen:
   bounded mutable transition state, and a documented continue, skip, or abort
   path. Ordinary reads decode trusted rows; only a newly introduced result is
   authenticated.
-- Pending packs remain invisible and cleanup removes only an abandoned exact
-  owner.
+- Pending pack objects remain invisible and cleanup removes only an abandoned
+  exact owner. Tree projections written during ingest are visible, since they
+  are content-addressed, and reclaim deletes those no other copy holds.
 - Maintenance state is resumable, and a stale root snapshot never authorizes
   deletion of a newer root.
 - Statement cost is observable in benchmarks against the at-most-1,000 target;

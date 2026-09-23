@@ -77,20 +77,11 @@ function storedByteAggregate(value: number | undefined, label: string): number {
   return value;
 }
 
-function treeSourceKey(
-  db: TestDatabase,
-  repoId: number,
-  treeOid: string,
-  storage: "loose" | "pack",
-  sourceId: number,
-): number {
+function treeSourceKey(db: TestDatabase, repoId: number, treeOid: string): number {
   const key = db.scalar<number>(
-    `SELECT source_key FROM git_tree_sources
-      WHERE repo_id = ? AND tree_oid = ? AND storage = ? AND source_id = ?`,
+    "SELECT source_key FROM git_tree_sources WHERE repo_id = ? AND tree_oid = ?",
     repoId,
     treeOid,
-    storage,
-    sourceId,
   );
   if (key === undefined || !Number.isSafeInteger(key) || key < 1) {
     throw new Error("maintenance cost tree source key is invalid");
@@ -227,14 +218,8 @@ async function createFixture(storage: SqliteTestStorage, clock: Clock): Promise<
     { now: () => clock.value },
   );
 
-  const deadLooseTreeSourceKey = treeSourceKey(db, checkout.repoId, deadLoose.treeOid, "loose", 0);
-  const deadPackTreeSourceKey = treeSourceKey(
-    db,
-    checkout.repoId,
-    deadPackTreeOid,
-    "pack",
-    deadPack.packId,
-  );
+  const deadLooseTreeSourceKey = treeSourceKey(db, checkout.repoId, deadLoose.treeOid);
+  const deadPackTreeSourceKey = treeSourceKey(db, checkout.repoId, deadPackTreeOid);
   const deadLooseBlobOid = requiredItem(deadLoose.blobOids, 0, "dead loose blob");
 
   store.setRef("refs/heads/main", live.commitOid);
@@ -627,15 +612,6 @@ describe("public maintenance storage pressure", () => {
     expect(
       db.scalar<number>(
         `SELECT count(*) FROM git_tree_sources
-          WHERE repo_id = ? AND tree_oid IN (?, ?)`,
-        fixture.repoId,
-        fixture.deadLooseTreeOid,
-        fixture.deadPackTreeOid,
-      ),
-    ).toBe(0);
-    expect(
-      db.scalar<number>(
-        `SELECT count(*) FROM git_tree_effective
           WHERE repo_id = ? AND tree_oid IN (?, ?)`,
         fixture.repoId,
         fixture.deadLooseTreeOid,

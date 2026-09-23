@@ -136,7 +136,6 @@ function objectProjectionCounts(workspace: TestRepository): {
   commits: number;
   treeSources: number;
   treeEntries: number;
-  treeEffective: number;
 } {
   const row = workspace.storage.sql
     .exec<{
@@ -144,13 +143,11 @@ function objectProjectionCounts(workspace: TestRepository): {
       commits: number;
       treeSources: number;
       treeEntries: number;
-      treeEffective: number;
     }>(
       `SELECT (SELECT COUNT(*) FROM git_objects) AS objects,
               (SELECT COUNT(*) FROM git_commits) AS commits,
               (SELECT COUNT(*) FROM git_tree_sources) AS treeSources,
-              (SELECT COUNT(*) FROM git_tree_entries) AS treeEntries,
-              (SELECT COUNT(*) FROM git_tree_effective) AS treeEffective`,
+              (SELECT COUNT(*) FROM git_tree_entries) AS treeEntries`,
     )
     .toArray()[0];
   if (row === undefined) throw new Error("object projection counts are missing");

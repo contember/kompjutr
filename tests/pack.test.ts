@@ -1564,7 +1564,7 @@ describe("pack fallback preservation", () => {
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("repairs only promoted tree and commit projections across a cold reopen", async () => {
+  it("promotes a fallback pack without rewriting tree projections across a cold reopen", async () => {
     const store = open();
     const tree = serializeTree([{ mode: MODE_FILE, name: "file", oid: "1".repeat(40) }]);
     const treeOid = hashObject("tree", tree);
@@ -1597,25 +1597,34 @@ describe("pack fallback preservation", () => {
     const unrelatedTree = serializeTree([{ mode: MODE_FILE, name: "other", oid: "2".repeat(40) }]);
     const unrelatedOid = hashObject("tree", unrelatedTree);
     await store.packs.ingest(slices(singleObjectPack("tree", unrelatedTree), 64));
-    store.db.run("CREATE TABLE test_tree_effective_writes (tree_oid TEXT NOT NULL)");
+    store.db.run("CREATE TABLE test_tree_projection_writes (tree_oid TEXT NOT NULL)");
     store.db.run(
-      `CREATE TRIGGER test_tree_effective_insert AFTER INSERT ON git_tree_effective
-       BEGIN INSERT INTO test_tree_effective_writes (tree_oid) VALUES (NEW.tree_oid); END`,
+      `CREATE TRIGGER test_tree_projection_insert AFTER INSERT ON git_tree_sources
+       BEGIN INSERT INTO test_tree_projection_writes (tree_oid) VALUES (NEW.tree_oid); END`,
     );
     store.db.run(
-      `CREATE TRIGGER test_tree_effective_delete AFTER DELETE ON git_tree_effective
-       BEGIN INSERT INTO test_tree_effective_writes (tree_oid) VALUES (OLD.tree_oid); END`,
+      `CREATE TRIGGER test_tree_projection_delete AFTER DELETE ON git_tree_sources
+       BEGIN INSERT INTO test_tree_projection_writes (tree_oid) VALUES (OLD.tree_oid); END`,
     );
+    const projection = () =>
+      store.db.one<{ source_key: number; complete: number }>(
+        "SELECT source_key, complete FROM git_tree_sources WHERE repo_id = ? AND tree_oid = ?",
+        store.sharedRepoId,
+        treeOid,
+      );
+    const before = projection();
 
     expect(store.read(treeOid)?.data).toEqual(tree);
     expect(store.cachedCommit(commitOid)?.commit).toEqual(parseCommit(commitData));
     expect(store.packs.deleteCompletePacks([primary.packId])).toBe(1);
     expect(
       store.db.scalar<number>(
-        "SELECT count(*) FROM test_tree_effective_writes WHERE tree_oid = ?",
+        "SELECT count(*) FROM test_tree_projection_writes WHERE tree_oid IN (?, ?)",
+        treeOid,
         unrelatedOid,
       ),
     ).toBe(0);
+    expect(projection()).toEqual(before);
 
     const reopened = new SqliteGitDatabase(store.db, { objectCacheBytes: 0 });
     const checkout = reopened.findCheckout("/repo");
@@ -1626,16 +1635,10 @@ describe("pack fallback preservation", () => {
     expect(coldTree.data).toEqual(tree);
     expect(parseTree(coldTree.data)).toEqual(parseTree(tree));
     expect(cold.cachedCommit(commitOid)?.commit).toEqual(parseCommit(commitData));
-    expect(
-      cold.db.one<{ storage: string; source_id: number }>(
-        `SELECT source.storage, source.source_id
-           FROM git_tree_effective effective
-           JOIN git_tree_sources source ON source.source_key = effective.source_key
-          WHERE effective.repo_id = ? AND effective.tree_oid = ?`,
-        cold.sharedRepoId,
-        treeOid,
-      ),
-    ).toEqual({ storage: "pack", source_id: fallback.packId });
+    expect(cold.packs.completePackedEntry(treeOid)?.packId).toBe(fallback.packId);
+    expect([...cold.walkTree(treeOid)]).toEqual([
+      { path: "file", mode: MODE_FILE, oid: "1".repeat(40) },
+    ]);
   });
 });
 
@@ -1835,11 +1838,7 @@ describe("pack deferred resolution", () => {
     db.storage.resetCounters();
     await store.packs.ingest(slices(concat(chunks), 97));
 
-    expect(
-      db.scalar<number>(
-        "SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1 AND storage = 'pack'",
-      ),
-    ).toBe(81);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1")).toBe(81);
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
@@ -2456,41 +2455,7 @@ describe("pack deferred resolution", () => {
 });
 
 describe("pack publication and deletion", () => {
-  it("keeps pending trees invisible and selects them only on completion", () => {
-    const store = open();
-    const oid = "1".repeat(40);
-    store.db.run(
-      "INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created) VALUES (1, 7, 0, 1, 'pending', 0)",
-    );
-    store.db.run(
-      `INSERT INTO git_pack_objects
-         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
-       VALUES (1, ?, 7, 0, 0, 0, 'tree', 0, 0)`,
-      oid,
-    );
-
-    expect(
-      store.db.one(
-        `SELECT s.storage
-           FROM git_tree_effective e
-           JOIN git_tree_sources s ON s.source_key = e.source_key
-          WHERE e.repo_id = 1 AND e.tree_oid = ?`,
-        oid,
-      ),
-    ).toBeUndefined();
-    store.db.run("UPDATE git_pack_meta SET state = 'complete' WHERE repo_id = 1 AND pack_id = 7");
-    expect(
-      store.db.one(
-        `SELECT s.storage, s.source_id
-           FROM git_tree_effective e
-           JOIN git_tree_sources s ON s.source_key = e.source_key
-          WHERE e.repo_id = 1 AND e.tree_oid = ?`,
-        oid,
-      ),
-    ).toEqual({ storage: "pack", source_id: 7 });
-  });
-
-  it("removes the selected source when a pack is reclaimed", async () => {
+  it("removes the projection when its only pack is reclaimed", async () => {
     const store = open();
     const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: "1".repeat(40) }]);
     const oid = hashObject("tree", data);
@@ -2500,36 +2465,20 @@ describe("pack publication and deletion", () => {
     writer.object("tree", data);
     writer.finish();
     const { packId } = await store.packs.ingest(slices(concat(chunks), 64));
-    expect(
-      store.db.one(
-        `SELECT s.storage
-           FROM git_tree_effective e
-           JOIN git_tree_sources s ON s.source_key = e.source_key
-          WHERE e.repo_id = 1 AND e.tree_oid = ?`,
+    const projections = () =>
+      store.db.scalar<number>(
+        "SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?",
         oid,
-      ),
-    ).toEqual({ storage: "pack" });
+      );
+    expect(projections()).toBe(1);
 
     store.db.run(
       "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = 1 AND pack_id = ?",
       packId,
     );
-    expect(
-      store.db.one(
-        `SELECT s.storage
-           FROM git_tree_effective e
-           JOIN git_tree_sources s ON s.source_key = e.source_key
-          WHERE e.repo_id = 1 AND e.tree_oid = ?`,
-        oid,
-      ),
-    ).toBeUndefined();
     expect(await reclaimPending(store)).toBe(1);
-    expect(
-      store.db.scalar<number>(
-        "SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1 AND storage = 'pack' AND source_id = ?",
-        packId,
-      ),
-    ).toBe(0);
+    expect(projections()).toBe(0);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
   });
 
   it("indexes full entries and ref-deltas", async () => {
@@ -2805,7 +2754,6 @@ describe("pack publication and deletion", () => {
       ),
     ).toEqual({ state: "pending", pack_id: 1, stored_bytes: 0 });
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(1);
-    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_effective")).toBe(0);
     expect(store.packs.completePackedEntry(oid)).toBeNull();
     expect(store.read(oid)).toBeNull();
     store.db.run(
@@ -2813,6 +2761,7 @@ describe("pack publication and deletion", () => {
       store.sharedRepoId,
     );
     expect(await reclaimPending(store)).toBe(1);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
   });
 
   it("deletes complete packs in bounded batches and refuses pending ones", async () => {
@@ -2956,13 +2905,13 @@ describe("pack publication and deletion", () => {
     expect(store.read(treeOid)?.data).toEqual(tree);
     expect(store.read(commitOid)?.data).toEqual(commitData);
     expect(store.cachedCommit(commitOid)?.commit.message).toBe("packed commit\n");
-    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_effective")).toBe(1);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(1);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(1);
 
     expect(store.packs.deleteCompletePacks([result.packId])).toBe(1);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta")).toBe(0);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
-    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_effective")).toBe(0);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
     expect(store.read(treeOid)).toBeNull();
     expect(store.read(commitOid)).toBeNull();
@@ -2970,7 +2919,7 @@ describe("pack publication and deletion", () => {
     expect(store.packs.deleteCompletePacks([result.packId])).toBe(0);
   });
 
-  it("keeps commit and effective tree projections for loose shadows", async () => {
+  it("keeps commit and tree projections for loose shadows", async () => {
     const store = open();
     const tree = serializeTree([{ mode: MODE_FILE, name: "missing", oid: "1".repeat(40) }]);
     const treeOid = hashObject("tree", tree);
@@ -2998,29 +2947,23 @@ describe("pack publication and deletion", () => {
     writer.finish();
     const result = await store.packs.ingest(slices(concat(chunks), 31));
 
-    expect(
-      store.db.one<{ storage: string }>(
-        `SELECT source.storage FROM git_tree_effective effective
-         JOIN git_tree_sources source ON source.source_key = effective.source_key
-         WHERE effective.repo_id = ? AND effective.tree_oid = ?`,
+    const projection = () =>
+      store.db.one<{ source_key: number; complete: number }>(
+        "SELECT source_key, complete FROM git_tree_sources WHERE repo_id = ? AND tree_oid = ?",
         store.sharedRepoId,
         treeOid,
-      ),
-    ).toEqual({ storage: "loose" });
+      );
+    const before = projection();
+    expect(before).toMatchObject({ complete: 1 });
     expect(store.packs.deleteCompletePacks([result.packId])).toBe(1);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(1);
     expect(store.cachedCommit(commitOid)?.commit.message).toBe("shadowed commit\n");
     expect(store.read(treeOid)?.data).toEqual(tree);
     expect(store.read(commitOid)?.data).toEqual(commitData);
-    expect(
-      store.db.one<{ storage: string }>(
-        `SELECT source.storage FROM git_tree_effective effective
-         JOIN git_tree_sources source ON source.source_key = effective.source_key
-         WHERE effective.repo_id = ? AND effective.tree_oid = ?`,
-        store.sharedRepoId,
-        treeOid,
-      ),
-    ).toEqual({ storage: "loose" });
+    expect(projection()).toEqual(before);
+    expect([...store.walkTree(treeOid)]).toEqual([
+      { path: "missing", mode: MODE_FILE, oid: "1".repeat(40) },
+    ]);
   });
 });
 

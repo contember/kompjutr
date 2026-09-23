@@ -1,4 +1,4 @@
-// Compares the frozen v11 tree projection with the v12 source-key layout.
+// Compares the frozen v12 per-source tree projection with the current per-OID layout.
 
 import { execFileSync } from "node:child_process";
 import { createHash, type Hash } from "node:crypto";
@@ -9,12 +9,10 @@ import { DatabaseSync } from "node:sqlite";
 
 import { FIXTURES, prepareFixture } from "./fixtures.js";
 
-type Layout = "v11-wide" | "v12-surrogate";
+type Layout = "v12-per-source" | "v13-per-oid";
 
 interface TreeSource {
   treeOid: string;
-  storage: "pack";
-  sourceId: number;
   objectSize: number;
   entryCount: number;
   baseCost: number;
@@ -22,14 +20,11 @@ interface TreeSource {
 
 interface TreeEntry {
   treeOid: string;
-  storage: "pack";
-  sourceId: number;
   ordinal: number;
   mode: string;
   name: string;
   nameBytes: Uint8Array;
   oid: string;
-  rawEntry: Uint8Array;
   cumulativeBase: number;
 }
 
@@ -50,7 +45,6 @@ interface FixtureMetadata {
 interface RowCounts {
   gitTreeSources: number;
   gitTreeEntries: number;
-  gitTreeEffective: number;
 }
 
 interface LogicalSnapshot {
@@ -83,7 +77,7 @@ interface StorageResult {
     gitTreeSources: PageUsage;
     gitTreeEntries: PageUsage;
     nameIndex: PageUsage;
-    gitTreeEffective: PageUsage;
+    gitTreeEffective: PageUsage | null;
     autoindexes: PageUsage[];
   };
   combinedTreeContract: {
@@ -144,7 +138,8 @@ const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
 const LOOKUP_SAMPLES = 2_048;
 const OID_PATTERN = /^[0-9a-f]{40}$/;
 const NAME_INDEX = "git_tree_entries_by_name_bytes";
-const TREE_OBJECTS = ["git_tree_sources", "git_tree_entries", NAME_INDEX, "git_tree_effective"];
+const EFFECTIVE_TABLE = "git_tree_effective";
+const TREE_OBJECTS = ["git_tree_sources", "git_tree_entries", NAME_INDEX, EFFECTIVE_TABLE];
 
 let fixtureDirectory = "";
 
@@ -282,19 +277,15 @@ function loadDataset(): Dataset {
       const mode = ascii(output.subarray(cursor, space));
       const nameBytes = output.slice(space + 1, nul);
       const entryOid = decodeOid(output.subarray(nul + 1, nul + 21));
-      const rawEntry = output.slice(cursor, nul + 21);
       cumulativeBase +=
         TREE_QUEUE_ROW_FIXED_BYTES + nameBytes.length + mode.length + entryOid.length;
       entries.push({
         treeOid: expectedOid,
-        storage: "pack",
-        sourceId: 1,
         ordinal,
         mode,
         name: nameDecoder.decode(nameBytes),
         nameBytes,
         oid: entryOid,
-        rawEntry,
         cumulativeBase,
       });
       ordinal++;
@@ -302,8 +293,6 @@ function loadDataset(): Dataset {
     }
     sources.push({
       treeOid: expectedOid,
-      storage: "pack",
-      sourceId: 1,
       objectSize,
       entryCount: ordinal,
       baseCost: cumulativeBase,
@@ -314,49 +303,10 @@ function loadDataset(): Dataset {
   return { sources, entries };
 }
 
+// The previous layout: one source row per physical copy, selected through
+// git_tree_effective. The fixture has one packed copy per tree, so both
+// layouts hold the same logical rows.
 function oldSchema(): string {
-  return `
-    CREATE TABLE git_tree_sources (
-      repo_id INTEGER NOT NULL,
-      tree_oid TEXT NOT NULL,
-      storage TEXT NOT NULL CHECK (storage IN ('loose', 'pack')),
-      source_id INTEGER NOT NULL,
-      object_size INTEGER NOT NULL,
-      entry_count INTEGER NOT NULL,
-      base_cost INTEGER NOT NULL,
-      PRIMARY KEY (repo_id, tree_oid, storage, source_id)
-    ) WITHOUT ROWID;
-    CREATE TABLE git_tree_entries (
-      repo_id INTEGER NOT NULL,
-      tree_oid TEXT NOT NULL,
-      storage TEXT NOT NULL,
-      source_id INTEGER NOT NULL,
-      ordinal INTEGER NOT NULL,
-      mode TEXT NOT NULL,
-      name TEXT COLLATE BINARY NOT NULL,
-      name_bytes BLOB NOT NULL,
-      oid TEXT NOT NULL,
-      raw_entry BLOB NOT NULL,
-      cumulative_base INTEGER NOT NULL,
-      PRIMARY KEY (repo_id, tree_oid, storage, source_id, ordinal),
-      FOREIGN KEY (repo_id, tree_oid, storage, source_id)
-        REFERENCES git_tree_sources (repo_id, tree_oid, storage, source_id)
-        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
-    ) WITHOUT ROWID;
-    CREATE INDEX git_tree_entries_by_name_bytes
-      ON git_tree_entries (repo_id, tree_oid, storage, source_id, name_bytes)
-      WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200;
-    CREATE TABLE git_tree_effective (
-      repo_id INTEGER NOT NULL,
-      tree_oid TEXT NOT NULL,
-      storage TEXT NOT NULL CHECK (storage IN ('loose', 'pack')),
-      source_id INTEGER NOT NULL,
-      PRIMARY KEY (repo_id, tree_oid)
-    ) WITHOUT ROWID;
-  `;
-}
-
-function newSchema(): string {
   return `
     CREATE TABLE git_tree_sources (
       source_key INTEGER PRIMARY KEY,
@@ -379,27 +329,7 @@ function newSchema(): string {
       UNIQUE (repo_id, tree_oid, storage, source_id),
       UNIQUE (source_key, repo_id, tree_oid)
     );
-    CREATE TABLE git_tree_entries (
-      source_key INTEGER NOT NULL CHECK (typeof(source_key) = 'integer' AND source_key >= 1),
-      ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
-      mode TEXT NOT NULL CHECK (
-        typeof(mode) = 'text' AND mode IN ('40000','040000','100644','100755','120000','160000')
-      ),
-      name_bytes BLOB NOT NULL CHECK (
-        typeof(name_bytes) = 'blob' AND length(name_bytes) BETWEEN 1 AND 2200
-      ),
-      oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
-      cumulative_base INTEGER NOT NULL CHECK (
-        typeof(cumulative_base) = 'integer' AND cumulative_base >= 0
-      ),
-      PRIMARY KEY (source_key, ordinal),
-      FOREIGN KEY (source_key)
-        REFERENCES git_tree_sources (source_key)
-        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
-    ) WITHOUT ROWID;
-    CREATE INDEX git_tree_entries_by_name_bytes
-      ON git_tree_entries (source_key, name_bytes)
-      WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200;
+    ${entrySchema()}
     CREATE TABLE git_tree_effective (
       repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
       tree_oid TEXT NOT NULL CHECK (
@@ -413,58 +343,76 @@ function newSchema(): string {
   `;
 }
 
-function populateOld(db: DatabaseSync, dataset: Dataset): void {
-  const source = db.prepare("INSERT INTO git_tree_sources VALUES (1, ?, ?, ?, ?, ?, ?)");
-  const effective = db.prepare("INSERT INTO git_tree_effective VALUES (1, ?, ?, ?)");
-  for (const row of dataset.sources) {
-    source.run(
-      row.treeOid,
-      row.storage,
-      row.sourceId,
-      row.objectSize,
-      row.entryCount,
-      row.baseCost,
+function newSchema(): string {
+  return `
+    CREATE TABLE git_tree_sources (
+      source_key INTEGER PRIMARY KEY,
+      repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
+      tree_oid TEXT NOT NULL CHECK (
+        typeof(tree_oid) = 'text' AND length(CAST(tree_oid AS BLOB)) = 40
+      ),
+      complete INTEGER NOT NULL CHECK (typeof(complete) = 'integer' AND complete IN (0, 1)),
+      object_size INTEGER NOT NULL CHECK (typeof(object_size) = 'integer' AND object_size >= 0),
+      entry_count INTEGER CHECK (
+        (complete = 0 AND entry_count IS NULL) OR
+        (complete = 1 AND typeof(entry_count) = 'integer' AND entry_count >= 0)
+      ),
+      base_cost INTEGER CHECK (
+        (complete = 0 AND base_cost IS NULL) OR
+        (complete = 1 AND typeof(base_cost) = 'integer' AND base_cost >= 0)
+      ),
+      UNIQUE (repo_id, tree_oid)
     );
-    effective.run(row.treeOid, row.storage, row.sourceId);
-  }
-  const entry = db.prepare("INSERT INTO git_tree_entries VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-  for (const row of dataset.entries) {
-    entry.run(
-      row.treeOid,
-      row.storage,
-      row.sourceId,
-      row.ordinal,
-      row.mode,
-      row.name,
-      row.nameBytes,
-      row.oid,
-      row.rawEntry,
-      row.cumulativeBase,
-    );
-  }
+    ${entrySchema()}
+  `;
 }
 
-function populateNew(db: DatabaseSync, dataset: Dataset): void {
+function entrySchema(): string {
+  return `
+    CREATE TABLE git_tree_entries (
+      source_key INTEGER NOT NULL CHECK (typeof(source_key) = 'integer' AND source_key >= 1),
+      ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+      mode TEXT NOT NULL CHECK (
+        typeof(mode) = 'text' AND mode IN ('40000','040000','100644','100755','120000','160000')
+      ),
+      name_bytes BLOB NOT NULL CHECK (
+        typeof(name_bytes) = 'blob' AND length(name_bytes) >= 1
+      ),
+      oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
+      cumulative_base INTEGER NOT NULL CHECK (
+        typeof(cumulative_base) = 'integer' AND cumulative_base >= 0
+      ),
+      PRIMARY KEY (source_key, ordinal),
+      FOREIGN KEY (source_key)
+        REFERENCES git_tree_sources (source_key)
+        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+    ) WITHOUT ROWID;
+    CREATE INDEX git_tree_entries_by_name_bytes
+      ON git_tree_entries (source_key, name_bytes);
+  `;
+}
+
+function populate(db: DatabaseSync, layout: Layout, dataset: Dataset): void {
   const source = db.prepare(
-    "INSERT INTO git_tree_sources " +
-      "(repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost) " +
-      "VALUES (1, ?, ?, ?, 1, ?, ?, ?) RETURNING source_key",
+    layout === "v12-per-source"
+      ? "INSERT INTO git_tree_sources " +
+          "(repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost) " +
+          "VALUES (1, ?, 'pack', 1, 1, ?, ?, ?) RETURNING source_key"
+      : "INSERT INTO git_tree_sources " +
+          "(repo_id, tree_oid, complete, object_size, entry_count, base_cost) " +
+          "VALUES (1, ?, 1, ?, ?, ?) RETURNING source_key",
   );
-  const effective = db.prepare("INSERT INTO git_tree_effective VALUES (1, ?, ?)");
+  const effective =
+    layout === "v12-per-source"
+      ? db.prepare("INSERT INTO git_tree_effective VALUES (1, ?, ?)")
+      : null;
   const keys = new Map<string, number>();
   for (const row of dataset.sources) {
-    const inserted = source.get(
-      row.treeOid,
-      row.storage,
-      row.sourceId,
-      row.objectSize,
-      row.entryCount,
-      row.baseCost,
-    );
+    const inserted = source.get(row.treeOid, row.objectSize, row.entryCount, row.baseCost);
     if (inserted === undefined) throw new Error(`source insert returned no key for ${row.treeOid}`);
     const sourceKey = requireInteger(inserted.source_key, "source key");
     keys.set(row.treeOid, sourceKey);
-    effective.run(row.treeOid, sourceKey);
+    effective?.run(row.treeOid, sourceKey);
   }
   const entry = db.prepare("INSERT INTO git_tree_entries VALUES (?, ?, ?, ?, ?, ?)");
   for (const row of dataset.entries) {
@@ -478,9 +426,8 @@ function buildDatabase(path: string, layout: Layout, dataset: Dataset): void {
   const memory = new DatabaseSync(":memory:");
   try {
     memory.exec("PRAGMA page_size = 4096; PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY");
-    memory.exec(layout === "v11-wide" ? oldSchema() : newSchema());
-    if (layout === "v11-wide") populateOld(memory, dataset);
-    else populateNew(memory, dataset);
+    memory.exec(layout === "v12-per-source" ? oldSchema() : newSchema());
+    populate(memory, layout, dataset);
     memory.prepare("VACUUM INTO ?").run(path);
   } finally {
     memory.close();
@@ -514,63 +461,55 @@ function countRows(db: DatabaseSync, table: string): number {
 
 function snapshot(db: DatabaseSync, layout: Layout): LogicalSnapshot {
   const hash = createHash("sha256");
-  const sourcesSql =
-    layout === "v11-wide"
-      ? "SELECT tree_oid, storage, source_id, object_size, entry_count, base_cost " +
-        "FROM git_tree_sources ORDER BY repo_id, tree_oid, storage, source_id"
-      : "SELECT tree_oid, storage, source_id, complete, object_size, entry_count, base_cost " +
-        "FROM git_tree_sources ORDER BY repo_id, tree_oid, storage, source_id";
-  for (const row of db.prepare(sourcesSql).iterate()) {
+  for (const row of db
+    .prepare(
+      "SELECT tree_oid, complete, object_size, entry_count, base_cost " +
+        "FROM git_tree_sources ORDER BY repo_id, tree_oid",
+    )
+    .iterate()) {
     hashText(hash, "source");
     hashText(hash, requireOid(requireText(row.tree_oid, "tree OID"), "tree OID"));
-    hashText(hash, requireText(row.storage, "tree storage"));
-    hashText(hash, String(requireInteger(row.source_id, "tree source ID")));
-    if (layout === "v12-surrogate" && requireInteger(row.complete, "tree complete") !== 1) {
-      throw new Error("measured v12 source is incomplete");
+    if (requireInteger(row.complete, "tree complete") !== 1) {
+      throw new Error(`measured ${layout} source is incomplete`);
     }
     hashText(hash, String(requireInteger(row.object_size, "tree object size")));
     hashText(hash, String(requireInteger(row.entry_count, "tree entry count")));
     hashText(hash, String(requireInteger(row.base_cost, "tree base cost")));
   }
-  const entriesSql =
-    layout === "v11-wide"
-      ? "SELECT tree_oid, storage, source_id, ordinal, mode, name, name_bytes, oid, " +
-        "cumulative_base FROM git_tree_entries " +
-        "ORDER BY repo_id, tree_oid, storage, source_id, ordinal"
-      : "SELECT s.tree_oid, s.storage, s.source_id, e.ordinal, e.mode, " +
-        "CAST(e.name_bytes AS TEXT) AS name, e.name_bytes, e.oid, e.cumulative_base " +
+  for (const row of db
+    .prepare(
+      "SELECT s.tree_oid, e.ordinal, e.mode, CAST(e.name_bytes AS TEXT) AS name, " +
+        "e.name_bytes, e.oid, e.cumulative_base " +
         "FROM git_tree_entries e JOIN git_tree_sources s ON s.source_key = e.source_key " +
-        "ORDER BY s.repo_id, s.tree_oid, s.storage, s.source_id, e.ordinal";
-  for (const row of db.prepare(entriesSql).iterate()) {
+        "ORDER BY s.repo_id, s.tree_oid, e.ordinal",
+    )
+    .iterate()) {
     hashText(hash, "entry");
     hashText(hash, requireOid(requireText(row.tree_oid, "entry tree OID"), "entry tree OID"));
-    hashText(hash, requireText(row.storage, "entry storage"));
-    hashText(hash, String(requireInteger(row.source_id, "entry source ID")));
     hashEntry(hash, row);
   }
-  const effectiveSql =
-    layout === "v11-wide"
-      ? "SELECT tree_oid, storage, source_id FROM git_tree_effective ORDER BY repo_id, tree_oid"
-      : "SELECT f.tree_oid, s.storage, s.source_id FROM git_tree_effective f " +
-        "JOIN git_tree_sources s ON s.source_key = f.source_key " +
-        "ORDER BY f.repo_id, f.tree_oid";
-  for (const row of db.prepare(effectiveSql).iterate()) {
-    hashText(hash, "effective");
-    hashText(
-      hash,
-      requireOid(requireText(row.tree_oid, "effective tree OID"), "effective tree OID"),
-    );
-    hashText(hash, requireText(row.storage, "effective storage"));
-    hashText(hash, String(requireInteger(row.source_id, "effective source ID")));
-  }
-  return {
-    checksum: hash.digest("hex"),
-    rowCounts: {
-      gitTreeSources: countRows(db, "git_tree_sources"),
-      gitTreeEntries: countRows(db, "git_tree_entries"),
-      gitTreeEffective: countRows(db, "git_tree_effective"),
-    },
+  const rowCounts = {
+    gitTreeSources: countRows(db, "git_tree_sources"),
+    gitTreeEntries: countRows(db, "git_tree_entries"),
   };
+  if (layout === "v12-per-source" && countRows(db, EFFECTIVE_TABLE) !== rowCounts.gitTreeSources) {
+    throw new Error("v12 effective rows do not select exactly one source per tree");
+  }
+  return { checksum: hash.digest("hex"), rowCounts };
+}
+
+function entrySelect(layout: Layout): string {
+  const columns =
+    "SELECT e.ordinal, e.mode, CAST(e.name_bytes AS TEXT) AS name, e.name_bytes, e.oid, " +
+    "e.cumulative_base";
+  return layout === "v12-per-source"
+    ? `${columns} FROM git_tree_effective f ` +
+        "JOIN git_tree_sources s ON s.source_key = f.source_key " +
+        "JOIN git_tree_entries e ON e.source_key = s.source_key " +
+        "WHERE f.repo_id = ? AND f.tree_oid = ? AND s.complete = 1"
+    : `${columns} FROM git_tree_sources s ` +
+        "JOIN git_tree_entries e ON e.source_key = s.source_key " +
+        "WHERE s.repo_id = ? AND s.tree_oid = ? AND s.complete = 1";
 }
 
 function traversalProfile(
@@ -578,18 +517,7 @@ function traversalProfile(
   layout: Layout,
   sources: readonly TreeSource[],
 ): WorkloadProfile {
-  const sql =
-    layout === "v11-wide"
-      ? "SELECT e.ordinal, e.mode, e.name, e.name_bytes, e.oid, " +
-        "e.cumulative_base FROM git_tree_effective f JOIN git_tree_entries e " +
-        "ON e.repo_id = f.repo_id AND e.tree_oid = f.tree_oid " +
-        "AND e.storage = f.storage AND e.source_id = f.source_id " +
-        "WHERE f.repo_id = ? AND f.tree_oid = ? ORDER BY e.ordinal"
-      : "SELECT e.ordinal, e.mode, CAST(e.name_bytes AS TEXT) AS name, e.name_bytes, e.oid, " +
-        "e.cumulative_base FROM git_tree_effective f " +
-        "JOIN git_tree_sources s ON s.source_key = f.source_key " +
-        "JOIN git_tree_entries e ON e.source_key = s.source_key " +
-        "WHERE f.repo_id = ? AND f.tree_oid = ? AND s.complete = 1 ORDER BY e.ordinal";
+  const sql = `${entrySelect(layout)} ORDER BY e.ordinal`;
   const statement = db.prepare(sql);
   const hash = createHash("sha256");
   let returnedRows = 0;
@@ -617,18 +545,7 @@ function lookupProfile(
   layout: Layout,
   entries: readonly TreeEntry[],
 ): WorkloadProfile {
-  const sql =
-    layout === "v11-wide"
-      ? "SELECT e.ordinal, e.mode, e.name, e.name_bytes, e.oid, " +
-        "e.cumulative_base FROM git_tree_effective f JOIN git_tree_entries e " +
-        "ON e.repo_id = f.repo_id AND e.tree_oid = f.tree_oid " +
-        "AND e.storage = f.storage AND e.source_id = f.source_id " +
-        "WHERE f.repo_id = ? AND f.tree_oid = ? AND e.name_bytes = ?"
-      : "SELECT e.ordinal, e.mode, CAST(e.name_bytes AS TEXT) AS name, e.name_bytes, e.oid, " +
-        "e.cumulative_base FROM git_tree_effective f " +
-        "JOIN git_tree_sources s ON s.source_key = f.source_key " +
-        "JOIN git_tree_entries e ON e.source_key = s.source_key " +
-        "WHERE f.repo_id = ? AND f.tree_oid = ? AND s.complete = 1 AND e.name_bytes = ?";
+  const sql = `${entrySelect(layout)} AND e.name_bytes = ?`;
   const statement = db.prepare(sql);
   const samples = sampleLookups(entries);
   const hash = createHash("sha256");
@@ -675,7 +592,7 @@ function storageResult(db: DatabaseSync, path: string, entryCount: number): Stor
   const gitTreeSources = findUsage(usages, "git_tree_sources");
   const gitTreeEntries = findUsage(usages, "git_tree_entries");
   const nameIndex = findUsage(usages, NAME_INDEX);
-  const gitTreeEffective = findUsage(usages, "git_tree_effective");
+  const gitTreeEffective = usages.find((usage) => usage.name === EFFECTIVE_TABLE) ?? null;
   const autoindexes = usages.filter((usage) => usage.name.startsWith("sqlite_autoindex_git_tree_"));
   const included = new Set<string>(TREE_OBJECTS);
   for (const usage of autoindexes) included.add(usage.name);
@@ -687,13 +604,8 @@ function storageResult(db: DatabaseSync, path: string, entryCount: number): Stor
       `unclassified tree dbstat objects: ${unexpected.map((row) => row.name).join(", ")}`,
     );
   }
-  const contractObjects = [
-    gitTreeSources,
-    gitTreeEntries,
-    nameIndex,
-    gitTreeEffective,
-    ...autoindexes,
-  ];
+  const contractObjects = [gitTreeSources, gitTreeEntries, nameIndex, ...autoindexes];
+  if (gitTreeEffective !== null) contractObjects.push(gitTreeEffective);
   const pages = contractObjects.reduce((total, usage) => total + usage.pages, 0);
   const bytes = contractObjects.reduce((total, usage) => total + usage.bytes, 0);
   return {
@@ -737,12 +649,12 @@ function assertEquivalent(old: LayoutResult, next: LayoutResult): void {
   const oldLogical = JSON.stringify(old.logical);
   const nextLogical = JSON.stringify(next.logical);
   if (oldLogical !== nextLogical) {
-    throw new Error(`tree layouts differ logically\nv11 ${oldLogical}\nv12 ${nextLogical}`);
+    throw new Error(`tree layouts differ logically\nv12 ${oldLogical}\nv13 ${nextLogical}`);
   }
   const oldProfiles = JSON.stringify(old.profiles);
   const nextProfiles = JSON.stringify(next.profiles);
   if (oldProfiles !== nextProfiles) {
-    throw new Error(`tree workload profiles differ\nv11 ${oldProfiles}\nv12 ${nextProfiles}`);
+    throw new Error(`tree workload profiles differ\nv12 ${oldProfiles}\nv13 ${nextProfiles}`);
   }
 }
 
@@ -796,8 +708,8 @@ function deltaResult(old: LayoutResult, next: LayoutResult): DeltaResult {
     ),
     nameIndex: pageDelta(oldStorage.objects.nameIndex, nextStorage.objects.nameIndex),
     gitTreeEffective: pageDelta(
-      oldStorage.objects.gitTreeEffective,
-      nextStorage.objects.gitTreeEffective,
+      oldStorage.objects.gitTreeEffective ?? summedUsage(EFFECTIVE_TABLE, []),
+      nextStorage.objects.gitTreeEffective ?? summedUsage(EFFECTIVE_TABLE, []),
     ),
     autoindexes: pageDelta(
       summedUsage("autoindexes", oldStorage.objects.autoindexes),
@@ -942,8 +854,8 @@ function main(): void {
   };
   const temporary = mkdtempSync(join(tmpdir(), "kompjutr-tree-schema-"));
   try {
-    const old = runLayout(temporary, "v11-wide", dataset, checkOnly);
-    const next = runLayout(temporary, "v12-surrogate", dataset, checkOnly);
+    const old = runLayout(temporary, "v12-per-source", dataset, checkOnly);
+    const next = runLayout(temporary, "v13-per-oid", dataset, checkOnly);
     assertEquivalent(old, next);
     const measuredAt = new Date().toISOString();
     process.stdout.write(

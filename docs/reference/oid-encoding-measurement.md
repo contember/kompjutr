@@ -118,6 +118,10 @@ Row counts were also identical between encodings:
 | `git_tree_entries` | 34,996 | 32,768 |
 | `git_tree_effective` | 11,070 | 4,096 |
 
+Note (2026-09-24): the `git_tree_effective` rows here and in the size tables
+below belong to this 2026-08-25 measurement. The harness no longer creates
+`git_tree_effective`, so a rerun reports neither the table nor its bytes.
+
 ## Results
 
 Medians below are the mean of the two central values from the 12 raw samples.
@@ -161,7 +165,7 @@ bytes in all four databases.
 | `git_pack_objects` | 2,461,696 / 601 | 1,748,992 / 427 |
 | `git_pack_objects_loc` | 462,848 / 113 | 462,848 / 113 |
 | `sqlite_autoindex_git_pack_objects_1` | 1,527,808 / 373 | 909,312 / 222 |
-| `git_tree_effective` | 593,920 / 145 | 372,736 / 91 |
+| `git_tree_effective` (no longer created, see note) | 593,920 / 145 | 372,736 / 91 |
 | `git_tree_entries` | 6,320,128 / 1,543 | 4,841,472 / 1,182 |
 | `git_tree_entries_by_name_bytes` | 2,433,024 / 594 | 1,720,320 / 420 |
 | `git_tree_sources` | 675,840 / 165 | 454,656 / 111 |
@@ -181,7 +185,7 @@ The remaining 13 empty/single-row objects total 61,440 bytes in both variants.
 | `sqlite_autoindex_git_object_chunks_1` | 1,667,072 / 407 | 995,328 / 243 |
 | `git_objects` | 2,031,616 / 496 | 1,359,872 / 332 |
 | `sqlite_autoindex_git_objects_1` | 1,630,208 / 398 | 966,656 / 236 |
-| `git_tree_effective` | 221,184 / 54 | 143,360 / 35 |
+| `git_tree_effective` (no longer created, see note) | 221,184 / 54 | 143,360 / 35 |
 | `git_tree_entries` | 5,390,336 / 1,316 | 4,038,656 / 986 |
 | `git_tree_entries_by_name_bytes` | 2,109,440 / 515 | 1,454,080 / 355 |
 | `git_tree_sources` | 253,952 / 62 | 172,032 / 42 |

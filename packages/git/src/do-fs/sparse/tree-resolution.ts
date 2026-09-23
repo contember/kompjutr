@@ -24,12 +24,8 @@ SELECT wanted.ordinal, wanted.side, wanted.tree_oid, wanted.segment, wanted.fina
        source.source_key,
        edge.mode AS edge_mode, edge.oid AS edge_oid, edge.ordinal AS edge_ordinal
   FROM wanted
-  LEFT JOIN git_tree_effective effective
-    ON effective.repo_id = ? AND effective.tree_oid = wanted.tree_oid
   LEFT JOIN git_tree_sources source
-    ON source.source_key = effective.source_key
-   AND source.repo_id = effective.repo_id
-   AND source.tree_oid = wanted.tree_oid
+    ON source.repo_id = ? AND source.tree_oid = wanted.tree_oid
    AND source.complete = 1
   LEFT JOIN git_tree_entries edge
     ON edge.source_key = source.source_key

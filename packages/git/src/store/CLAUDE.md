@@ -31,9 +31,10 @@ maintenance/   roots, reachability, sweep, and durable run control
 `repo_id` owns shared objects, packs, refs, ordinary config, shallow state,
 fetch state, direct-ref reflogs, projections, blob IDs, and maintenance.
 `checkout_id` owns the root, raw `HEAD`, index and tracker state, operation
-journals, and `HEAD` reflog. `git_tree_entries` is owned through its source
-surrogate. `git_scratch_index*` rows are transaction-local and never become
-maintenance roots. `git_integration_*` rows are owned by one live
+journals, and `HEAD` reflog. `git_tree_sources` holds one projection per tree
+OID, shared by every loose and packed copy and deleted with the last copy;
+`git_tree_entries` is owned through its source surrogate. `git_scratch_index*`
+rows are transaction-local and never become maintenance roots. `git_integration_*` rows are owned by one live
 `(repo_id, workspace_id)` inside a single transaction, are invisible to every
 ordinary object, projection, promise and maintenance query, and reach the
 ordinary store only through explicit adoption at a consumer's publication

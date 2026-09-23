@@ -20,7 +20,6 @@ export {
   TreeIndexSink,
   type TreeSource,
   type TreeSourceInput,
-  type TreeStorage,
 } from "../trees/tree-index.js";
 export {
   MAX_CHECKOUTS_PER_REPOSITORY,

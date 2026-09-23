@@ -49,14 +49,14 @@ export class PackResolvedProjection {
     }
     if (type !== "tree") return;
     if (chunked !== null) {
-      treeIndex.addChunked(this.repoId, oid, packId, objectSize, chunked);
+      treeIndex.addChunked(this.repoId, oid, objectSize, chunked);
       return;
     }
     if (data !== null) {
-      treeIndex.addBuffered(this.repoId, oid, packId, objectSize, data);
+      treeIndex.addBuffered(this.repoId, oid, objectSize, data);
       return;
     }
-    treeIndex.addStream(this.repoId, oid, packId, objectSize, () =>
+    treeIndex.addStream(this.repoId, oid, objectSize, () =>
       this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize),
     );
   }

@@ -2,14 +2,10 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
   params(repo_id, root_oid, path_cap, state_cap, queue_cap, queue_fixed)
     AS (VALUES (?, ?, ?, ?, ?, ?)),
   source_valid(repo_id, tree_oid, source_key, entry_count, base_cost) AS NOT MATERIALIZED (
-    SELECT x.repo_id, x.tree_oid, s.source_key, s.entry_count, s.base_cost
-      FROM git_tree_effective x
-      CROSS JOIN params p
+    SELECT s.repo_id, s.tree_oid, s.source_key, s.entry_count, s.base_cost
+      FROM params p
       CROSS JOIN git_tree_sources s
-     WHERE x.repo_id = p.repo_id
-       AND s.source_key = x.source_key
-       AND s.repo_id = x.repo_id AND s.tree_oid = x.tree_oid
-       AND s.complete = 1
+     WHERE s.repo_id = p.repo_id AND s.complete = 1
   ),
   walk(path, mode, oid, ancestry, sort_key, error, error_code,
        path_bytes, state_bytes, descend, reserved_bytes) AS (
@@ -140,12 +136,8 @@ SELECT path, mode, oid,
     OR instr(ancestry, '/' || oid || '/') != 0
     OR (mode IN ('40000', '040000') AND descend != 1)`;
 
-function diffSourceValidSql(effective: string, source: string): string {
-  return `((${effective}.source_key IS NOT NULL
-    AND ${source}.source_key = ${effective}.source_key
-    AND ${source}.repo_id = ${effective}.repo_id
-    AND ${source}.tree_oid = ${effective}.tree_oid
-    AND ${source}.complete = 1) IS TRUE)`;
+function diffSourceValidSql(source: string): string {
+  return `((${source}.source_key IS NOT NULL AND ${source}.complete = 1) IS TRUE)`;
 }
 
 function diffEntryNameSql(entry: string): string {
@@ -206,14 +198,14 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
              WHEN w.before_mode IN ('40000', '040000')
                   AND NOT (COALESCE(w.after_mode IN ('40000', '040000'), 0)
                            AND w.before_oid = w.after_oid)
-                  AND NOT ${diffSourceValidSql("bx", "bps")}
+                  AND NOT ${diffSourceValidSql("bps")}
                THEN CASE WHEN w.path = '' THEN 'tree source is invalid; reimport or reclone'
                          ELSE 'tree ' || w.before_oid
                            || ' has no valid v3 parsed source; reimport or reclone' END
              WHEN w.after_mode IN ('40000', '040000')
                   AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
                            AND w.before_oid = w.after_oid)
-                  AND NOT ${diffSourceValidSql("ax", "aps")}
+                  AND NOT ${diffSourceValidSql("aps")}
                THEN CASE WHEN w.path = '' THEN 'tree source is invalid; reimport or reclone'
                          ELSE 'tree ' || w.after_oid
                            || ' has no valid v3 parsed source; reimport or reclone' END
@@ -222,14 +214,10 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
            'ECORRUPT'
       FROM walk w
       CROSS JOIN params p
-      LEFT JOIN git_tree_effective bx
-        ON bx.repo_id = p.repo_id AND bx.tree_oid = w.before_oid
       LEFT JOIN git_tree_sources bps
-        ON bps.source_key = bx.source_key
-      LEFT JOIN git_tree_effective ax
-        ON ax.repo_id = p.repo_id AND ax.tree_oid = w.after_oid
+        ON bps.repo_id = p.repo_id AND bps.tree_oid = w.before_oid
       LEFT JOIN git_tree_sources aps
-        ON aps.source_key = ax.source_key
+        ON aps.repo_id = p.repo_id AND aps.tree_oid = w.after_oid
      WHERE w.error IS NULL AND w.error_code = 'PENDING'
     UNION ALL
     SELECT w.path, w.path_bytes, w.sort_key,
@@ -238,18 +226,16 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
            'tree traversal queue exceeds 16 MiB', 'E2BIG'
       FROM walk w
       CROSS JOIN params p
-      LEFT JOIN git_tree_effective bx
-        ON bx.repo_id = p.repo_id AND bx.tree_oid = w.before_oid
+      LEFT JOIN git_tree_sources bps
+        ON bps.repo_id = p.repo_id AND bps.tree_oid = w.before_oid
        AND w.before_mode IN ('40000', '040000')
        AND NOT (COALESCE(w.after_mode IN ('40000', '040000'), 0)
                 AND w.before_oid = w.after_oid)
-      LEFT JOIN git_tree_sources bps ON bps.source_key = bx.source_key
-      LEFT JOIN git_tree_effective ax
-        ON ax.repo_id = p.repo_id AND ax.tree_oid = w.after_oid
+      LEFT JOIN git_tree_sources aps
+        ON aps.repo_id = p.repo_id AND aps.tree_oid = w.after_oid
        AND w.after_mode IN ('40000', '040000')
        AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
                 AND w.before_oid = w.after_oid)
-      LEFT JOIN git_tree_sources aps ON aps.source_key = ax.source_key
      WHERE w.error IS NULL
        AND w.error_code = 'ECORRUPT'
        AND (w.before_mode IN ('40000', '040000') OR w.after_mode IN ('40000', '040000'))
@@ -337,13 +323,11 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                 ELSE 'ECORRUPT' END
       FROM walk w
       CROSS JOIN params p
-      CROSS JOIN git_tree_effective bx
       CROSS JOIN git_tree_sources bps
       CROSS JOIN git_tree_entries be
-      LEFT JOIN git_tree_effective ax
-        ON ax.repo_id = p.repo_id AND ax.tree_oid = w.after_oid
+      LEFT JOIN git_tree_sources aps
+        ON aps.repo_id = p.repo_id AND aps.tree_oid = w.after_oid
        AND w.after_mode IN ('40000', '040000')
-      LEFT JOIN git_tree_sources aps ON aps.source_key = ax.source_key
       LEFT JOIN git_tree_entries ae
         ON ae.source_key = aps.source_key AND ae.name_bytes = be.name_bytes
        AND length(ae.name_bytes) <= p.path_cap
@@ -352,8 +336,7 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
        AND (w.before_mode IN ('40000', '040000'))
        AND NOT (COALESCE(w.after_mode IN ('40000', '040000'), 0)
                 AND w.before_oid = w.after_oid)
-       AND bx.repo_id = p.repo_id AND bx.tree_oid = w.before_oid
-       AND bps.source_key = bx.source_key
+       AND bps.repo_id = p.repo_id AND bps.tree_oid = w.before_oid
        AND be.source_key = bps.source_key
        AND w.reserved_bytes
              + bps.base_cost + bps.object_size + bps.entry_count * (w.state_bytes + 51)
@@ -402,13 +385,11 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                 ELSE 'ECORRUPT' END
       FROM walk w
       CROSS JOIN params p
-      CROSS JOIN git_tree_effective ax
       CROSS JOIN git_tree_sources aps
       CROSS JOIN git_tree_entries ae
-      LEFT JOIN git_tree_effective bx
-        ON bx.repo_id = p.repo_id AND bx.tree_oid = w.before_oid
+      LEFT JOIN git_tree_sources bps
+        ON bps.repo_id = p.repo_id AND bps.tree_oid = w.before_oid
        AND w.before_mode IN ('40000', '040000')
-      LEFT JOIN git_tree_sources bps ON bps.source_key = bx.source_key
       LEFT JOIN git_tree_entries be
         ON be.source_key = bps.source_key AND be.name_bytes = ae.name_bytes
        AND length(be.name_bytes) <= p.path_cap
@@ -417,9 +398,8 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
        AND w.after_mode IN ('40000', '040000')
        AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
                 AND w.before_oid = w.after_oid)
-       AND ax.repo_id = p.repo_id AND ax.tree_oid = w.after_oid
+       AND aps.repo_id = p.repo_id AND aps.tree_oid = w.after_oid
        AND w.after_oid NOT IN (SELECT oid FROM checked_trees)
-       AND aps.source_key = ax.source_key
        AND ae.source_key = aps.source_key
        AND be.ordinal IS NULL
        AND w.reserved_bytes

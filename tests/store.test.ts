@@ -137,7 +137,6 @@ describe("repository registry", () => {
       "git_scratch_indexes",
       "git_shallow",
       "git_tracking_ref_revisions",
-      "git_tree_effective",
       "git_tree_entries",
       "git_tree_sources",
     ]);
@@ -1037,15 +1036,15 @@ describe("loose objects", () => {
   });
 });
 
-describe("effective tree sources", () => {
-  const effective = (db: TestDatabase, repoId: number, oid: string) =>
-    db.one<{ storage: string; source_id: number }>(
-      `SELECT source.storage, source.source_id FROM git_tree_effective effective
-       JOIN git_tree_sources source ON source.source_key = effective.source_key
-       WHERE effective.repo_id = ? AND effective.tree_oid = ?`,
+describe("tree projections", () => {
+  const projection = (db: TestDatabase, repoId: number, oid: string) =>
+    db.one<{ source_key: number; complete: number }>(
+      "SELECT source_key, complete FROM git_tree_sources WHERE repo_id = ? AND tree_oid = ?",
       repoId,
       oid,
     );
+  const entryRows = (db: TestDatabase) =>
+    db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries");
 
   it("tracks single and batch loose tree writes", () => {
     const { db, store } = open();
@@ -1054,8 +1053,8 @@ describe("effective tree sources", () => {
     const firstOid = store.write("tree", first);
     const secondOid = store.writeObjects((batch) => batch.write("tree", second));
 
-    expect(effective(db, 1, firstOid)).toEqual({ storage: "loose", source_id: 0 });
-    expect(effective(db, 1, secondOid)).toEqual({ storage: "loose", source_id: 0 });
+    expect(projection(db, 1, firstOid)).toMatchObject({ complete: 1 });
+    expect(projection(db, 1, secondOid)).toMatchObject({ complete: 1 });
   });
 
   it("indexes a small tree written through the streaming path", () => {
@@ -1087,21 +1086,30 @@ describe("effective tree sources", () => {
     expect([...store.walkTree(oid)]).toEqual([{ path: "a", mode: MODE_FILE, oid: "1".repeat(40) }]);
   });
 
-  it("falls back to a complete packed copy when the loose tree is deleted", async () => {
+  it("shares one projection across sources and drops it with the last source", async () => {
     const { db, store } = open();
     const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: "1".repeat(40) }]);
     const oid = store.write("tree", data);
+    const loose = projection(db, 1, oid);
+    expect(loose).toMatchObject({ complete: 1 });
+    expect(entryRows(db)).toBe(1);
+
     const chunks: Uint8Array[] = [];
     const writer = new PackWriter((chunk) => chunks.push(chunk));
     writer.header(1);
     writer.object("tree", data);
     writer.finish();
     const { packId } = await store.packs.ingest(slices(concat(chunks), 64));
+    expect(projection(db, 1, oid)).toEqual(loose);
+    expect(entryRows(db)).toBe(1);
 
-    expect(effective(db, 1, oid)).toEqual({ storage: "loose", source_id: 0 });
     db.run("DELETE FROM git_objects WHERE repo_id = 1 AND oid = ?", oid);
-    expect(effective(db, 1, oid)).toEqual({ storage: "pack", source_id: packId });
+    expect(projection(db, 1, oid)).toEqual(loose);
     expect([...store.walkTree(oid)]).toEqual([{ path: "a", mode: MODE_FILE, oid: "1".repeat(40) }]);
+
+    expect(store.packs.deleteCompletePacks([packId])).toBe(1);
+    expect(projection(db, 1, oid)).toBeUndefined();
+    expect(entryRows(db)).toBe(0);
   });
 
   it("isolates identical tree ids between repositories", () => {
@@ -1114,8 +1122,8 @@ describe("effective tree sources", () => {
     expect(second.write("tree", data)).toBe(oid);
 
     db.run("DELETE FROM git_objects WHERE repo_id = 1 AND oid = ?", oid);
-    expect(effective(db, 1, oid)).toBeUndefined();
-    expect(effective(db, 2, oid)).toEqual({ storage: "loose", source_id: 0 });
+    expect(projection(db, 1, oid)).toBeUndefined();
+    expect(projection(db, 2, oid)).toMatchObject({ complete: 1 });
     expect([...second.walkTree(oid)]).toHaveLength(1);
   });
 });

@@ -131,9 +131,11 @@ export class PromisorTable {
       this.db.run(
         `INSERT INTO git_promised_blobs (repo_id, oid, remote_name, type)
          SELECT ?, entry.oid, ?, 'blob'
-           FROM git_tree_sources source
+           FROM git_pack_entries tree
+           JOIN git_tree_sources source
+             ON source.repo_id = tree.repo_id AND source.tree_oid = tree.oid
            JOIN git_tree_entries entry ON entry.source_key = source.source_key
-          WHERE source.repo_id = ? AND source.storage = 'pack' AND source.source_id = ?
+          WHERE tree.repo_id = ? AND tree.pack_id = ? AND tree.type = 'tree'
             AND source.complete = 1
             AND entry.mode NOT IN ('40000', '040000', '160000')
             AND NOT EXISTS (

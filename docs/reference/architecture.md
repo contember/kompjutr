@@ -145,7 +145,7 @@ root, including one behind an ancestor symlink loop, is prunable.
 | --- | --- |
 | Repository (`repo_id`) | objects, packs, refs, ordinary config, shallow, fetch and promisor state, direct-ref reflogs, tree/commit projections, blob-ID cache, maintenance |
 | Checkout (`checkout_id`) | canonical root, raw `HEAD`, index, tracker state, operation journal, checkout `HEAD` reflog |
-| Source surrogate | `git_tree_entries` for one exact loose or packed tree source |
+| Tree projection (`repo_id`, `tree_oid`) | `git_tree_sources` row and its `git_tree_entries`, shared by every copy; deleted with the last copy |
 | Pack (`repo_id`, `pack_id`) | pending `git_pack_commit_staging` projections; promoted at complete publication or removed with the pack |
 | Synchronous scratch transaction | named scratch indexes; rows never survive the callback and are not maintenance roots |
 
@@ -257,13 +257,14 @@ pending metadata
 
 Only complete packs are readable. Parse records an ordered digest for every
 physical membership row. Publication compares the stored rows with those
-digests; it does not re-read and re-inflate the whole pack. Pack deletion keeps
-the structural rule that every surviving delta dependency has a surviving
-base. Loose objects shadow packed objects, and projections remain qualified by
-their exact source.
+digests; it does not re-read and re-inflate the whole pack. Every pack is
+self-contained: a delta's base is an entry of the same pack, so pack deletion
+only promotes fallbacks and checks no dependency. Loose objects shadow packed
+objects for reads.
 
-Tree objects are parsed into source-qualified edge rows when they become
-visible. Tree walks use one recursive SQLite cursor and read no object BLOBs.
+Tree objects are parsed into edge rows once per tree OID, when the first copy
+is stored; a later loose or packed copy writes no entries. Tree walks use one
+recursive SQLite cursor and read no object BLOBs.
 Commit projections are written atomically with new commit visibility. Hot
 status, diff, checkout, add, reset, and commit paths merge ordered streams and
 batch unresolved content reads and writes. The successful eager tracker-backed
@@ -308,8 +309,9 @@ epochs, CAS, or leases rather than the local mutation guard.
 - Maintenance consumes each root source as a single decoded keyset page and
   operation journals through bounded root pages. A repository root epoch
   restarts discovery before destructive work. Maintenance owns no pack.
-- Pending packs are durable but invisible; complete packs may survive a stale
-  publication and be reused.
+- Pending pack objects are durable but invisible; tree projections that ingest
+  writes are visible, since they are content-addressed. Complete packs may
+  survive a stale publication and be reused.
 
 One live `Workspace` represents one Durable Object isolate. A second facade over
 the same storage is a cold replacement after eviction, not a concurrent peer.

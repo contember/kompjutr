@@ -64,8 +64,6 @@ export function writeObject(
         {
           repoId: context.repoId,
           treeOid: oid,
-          storage: "loose",
-          sourceId: 0,
           objectSize: data.length,
         },
         [data],
@@ -178,8 +176,6 @@ export function writeObjectStream(
         {
           repoId: context.repoId,
           treeOid: oid,
-          storage: "loose",
-          sourceId: 0,
           objectSize: size,
         },
         storage,

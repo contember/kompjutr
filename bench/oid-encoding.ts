@@ -197,7 +197,6 @@ const TABLES = [
   "git_commits",
   "git_tree_sources",
   "git_tree_entries",
-  "git_tree_effective",
 ];
 
 for (let value = 0; value < 256; value++) HEX.push(value.toString(16).padStart(2, "0"));
@@ -827,11 +826,6 @@ function schema(encoding: Encoding): string {
     CREATE INDEX git_tree_entries_by_name_bytes
       ON git_tree_entries (repo_id, tree_oid, storage, source_id, name_bytes)
       WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200;
-    CREATE TABLE git_tree_effective (
-      repo_id INTEGER NOT NULL, tree_oid ${oid} NOT NULL, storage TEXT NOT NULL,
-      source_id INTEGER NOT NULL,
-      PRIMARY KEY (repo_id, tree_oid)
-    ) WITHOUT ROWID;
   `;
 }
 
@@ -925,11 +919,9 @@ function populate(db: DatabaseSync, encoding: Encoding, dataset: Dataset): void 
   }
 
   const treeSource = db.prepare("INSERT INTO git_tree_sources VALUES (1, ?, ?, ?, ?, ?, ?)");
-  const treeEffective = db.prepare("INSERT INTO git_tree_effective VALUES (1, ?, ?, ?)");
   for (const row of dataset.trees) {
     const oid = encodeOid(encoding, row.treeOid);
     treeSource.run(oid, row.storage, row.sourceId, row.objectSize, row.entryCount, row.baseCost);
-    treeEffective.run(oid, row.storage, row.sourceId);
   }
 
   const treeEntry = db.prepare(
@@ -1139,16 +1131,6 @@ function snapshot(db: DatabaseSync, encoding: Encoding): Snapshot {
     observeOid(hash, oids, decodeOid(encoding, row.oid));
     hashBytes(hash, requireBytes(row.raw_entry, "raw tree entry"));
     hashString(hash, String(requireInteger(row.cumulative_base, "tree cumulative base")));
-  }
-  for (const row of db
-    .prepare(
-      "SELECT tree_oid, storage, source_id FROM git_tree_effective ORDER BY repo_id, tree_oid",
-    )
-    .iterate()) {
-    hashString(hash, "tree-effective");
-    observeOid(hash, oids, decodeOid(encoding, row.tree_oid));
-    hashString(hash, requireText(row.storage, "effective tree storage"));
-    hashString(hash, String(requireInteger(row.source_id, "effective tree source ID")));
   }
 
   const sortedOids = Array.from(oids).sort(compareAscii);

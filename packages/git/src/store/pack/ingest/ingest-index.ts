@@ -90,7 +90,7 @@ export class PackIndexer {
       depths.record(row[2], row[8]);
     });
     const pendingIndex = new PackPendingBatch(this.db, this.repoId, packId);
-    const treeIndex = new PackTreeIndex(this.db);
+    const treeIndex = new PackTreeIndex(this.db, objectIndex);
     const commitIndex = new PackCommitIndex(this.db, this.repoId, packId, objectIndex);
     const missingBases = new Set<string>();
 

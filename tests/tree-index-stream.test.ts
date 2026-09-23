@@ -11,7 +11,10 @@ import {
   TreeParser,
 } from "../packages/git/src/common/objects.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
-import { PackTreeIndex } from "../packages/git/src/store/pack/pack-ingest-index.js";
+import {
+  PackObjectBatch,
+  PackTreeIndex,
+} from "../packages/git/src/store/pack/pack-ingest-index.js";
 import {
   createTreeIndexSink,
   indexTreeSource,
@@ -52,14 +55,8 @@ function rawEntryBytes(mode: string, name: Uint8Array, oid = OID): Uint8Array {
   return concat([utf8.encode(`${mode} `), name, new Uint8Array([0]), oidBytes]);
 }
 
-function source(objectSize: number, sourceId = 0): TreeSource {
-  return {
-    repoId: 1,
-    treeOid: TREE_OID,
-    storage: sourceId === 0 ? "loose" : "pack",
-    sourceId,
-    objectSize,
-  };
+function source(objectSize: number): TreeSource {
+  return { repoId: 1, treeOid: TREE_OID, objectSize };
 }
 
 function consume(parser: TreeParser, chunk: Uint8Array): void {
@@ -225,13 +222,13 @@ describe("incremental tree index sink", () => {
     const inner = new TestDatabase();
     initializeTreeSchema(inner);
     const db = new ObservedDatabase(inner);
-    const index = new PackTreeIndex(db);
+    const index = new PackTreeIndex(db, new PackObjectBatch(db, 1));
     inner.storage.resetCounters();
     for (let at = 0; at < 3000; at++) {
       const data = rawEntry("100644", `file-${at}`);
       const oid = hashObject("tree", data);
-      index.addBuffered(1, oid, 1, data.length, data);
-      index.addBuffered(1, oid, 1, data.length, data);
+      index.addBuffered(1, oid, data.length, data);
+      index.addBuffered(1, oid, data.length, data);
     }
     index.flush();
     expect(db.exactSourceLookups).toBe(3);
@@ -243,25 +240,20 @@ describe("incremental tree index sink", () => {
     inner.storage.db.close();
   });
 
-  it("does not confuse repositories or pack IDs in a projection batch", () => {
+  it("keeps one projection per repository and tree OID in a batch", () => {
     const db = new TestDatabase();
     initializeTreeSchema(db);
     db.run("INSERT INTO git_repositories (id) VALUES (2)");
     const data = rawEntry("100644", "file");
     const oid = hashObject("tree", data);
-    const index = new PackTreeIndex(db);
-    for (const [repoId, packId] of [
-      [1, 1],
-      [1, 2],
-      [2, 1],
-    ]) {
-      if (repoId === undefined || packId === undefined) throw new Error("missing fixture identity");
-      index.addBuffered(repoId, oid, packId, data.length, data);
-      index.addBuffered(repoId, oid, packId, data.length, data);
+    const index = new PackTreeIndex(db, new PackObjectBatch(db, 1));
+    for (const repoId of [1, 1, 2]) {
+      index.addBuffered(repoId, oid, data.length, data);
+      index.addBuffered(repoId, oid, data.length, data);
     }
     index.flush();
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(3);
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(3);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(2);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(2);
     db.storage.db.close();
   });
 
@@ -272,8 +264,8 @@ describe("incremental tree index sink", () => {
     db.rejectOversizedEntries = true;
     const data = concat([rawEntry("100644", "a"), rawEntry("100644", `z${"x".repeat(ONE_MIB)}`)]);
     const oid = hashObject("tree", data);
-    const index = new PackTreeIndex(db);
-    for (let at = 0; at < 2; at++) index.addBuffered(1, oid, 1, data.length, data);
+    const index = new PackTreeIndex(db, new PackObjectBatch(db, 1));
+    for (let at = 0; at < 2; at++) index.addBuffered(1, oid, data.length, data);
     index.flush();
     expect(inner.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
     expect(inner.one("SELECT complete, entry_count, base_cost FROM git_tree_sources")).toEqual({
@@ -289,13 +281,13 @@ describe("incremental tree index sink", () => {
     initializeTreeSchema(db);
     const valid = rawEntry("100644", "file");
     const invalid = rawEntry("100600", "file");
-    db.transactionSync(() => indexTreeSource(db, source(valid.length, 1), [valid]));
+    db.transactionSync(() => indexTreeSource(db, source(valid.length), [valid]));
     expect(() =>
-      db.transactionSync(() => indexTreeSource(db, source(invalid.length, 1), [invalid])),
+      db.transactionSync(() => indexTreeSource(db, source(invalid.length), [invalid])),
     ).toThrow("invalid tree mode");
     expect(() =>
       db.transactionSync(() =>
-        indexTreeSources(db, [{ ...source(invalid.length, 1), chunks: [invalid] }]),
+        indexTreeSources(db, [{ ...source(invalid.length), chunks: [invalid] }]),
       ),
     ).toThrow("invalid tree mode");
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(1);
@@ -407,8 +399,6 @@ describe("incremental tree index sink", () => {
     const sources: TreeSourceInput[] = Array.from({ length: count }, (_, at) => ({
       repoId: 1,
       treeOid: (at + 1).toString(16).padStart(40, "0"),
-      storage: "loose",
-      sourceId: 0,
       objectSize: 0,
       chunks: [],
     }));
@@ -417,8 +407,8 @@ describe("incremental tree index sink", () => {
       initializeTreeSchema(db);
       db.run(
         `INSERT INTO git_tree_sources
-           (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
-         SELECT 1, value, 'loose', 0, 0, ?, NULL, NULL FROM json_each(?)`,
+           (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
+         SELECT 1, value, 0, ?, NULL, NULL FROM json_each(?)`,
         0,
         JSON.stringify(sources.map((entry) => entry.treeOid)),
       );
@@ -446,7 +436,7 @@ describe("incremental tree index sink", () => {
       sink.push(data.subarray(0, 1));
       sink.push(data.subarray(1));
       sink.finish();
-      indexTreeSource(db, { ...source(data.length, 7), treeOid: "55".repeat(20) }, [data]);
+      indexTreeSource(db, { ...source(data.length), treeOid: "55".repeat(20) }, [data]);
     });
 
     const direct = db.all<Record<string, unknown>>(
@@ -531,10 +521,10 @@ describe("incremental tree index sink", () => {
 
     function* sources() {
       for (let at = 1; at <= 1_500; at++) {
-        yield { ...source(0, at), treeOid: at.toString(16).padStart(40, "0"), chunks: [] };
+        yield { ...source(0), treeOid: at.toString(16).padStart(40, "0"), chunks: [] };
       }
       yield {
-        ...source(entry.length * 700, 2_000),
+        ...source(entry.length * 700),
         treeOid: "aa".repeat(20),
         chunks: Array.from({ length: 700 }, () => entry),
       };

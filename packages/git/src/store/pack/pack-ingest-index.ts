@@ -9,7 +9,7 @@ import {
   prepareCommitCacheOwned,
 } from "../trees/commits.js";
 import { promoteCommitCaches, stageCommitCaches } from "../trees/commits-staging.js";
-import { indexPackTreeSources, type PackTreeSourceInput } from "../trees/tree-index.js";
+import { indexPackTreeSources, type TreeSourceInput } from "../trees/tree-index.js";
 import { type ChunkedBytes, PACK_CHUNK_BYTES } from "./chunks.js";
 
 export const PACK_TREE_BATCH_BYTES = 1024 * 1024;
@@ -207,21 +207,21 @@ export class PackPendingBatch {
   }
 }
 
-/** Parsed pack trees pending a bounded, transactional index flush. */
+/**
+ * Parsed pack trees pending a bounded, transactional index flush. Pack entries
+ * flush first: a projection without its entry row escapes pending-pack reclaim.
+ */
 export class PackTreeIndex {
-  readonly #sources: PackTreeSourceInput[] = [];
+  readonly #sources: TreeSourceInput[] = [];
   #payloadBytes = 0;
   #retainedBytes = 0;
 
-  constructor(private readonly db: SqlDatabase) {}
+  constructor(
+    private readonly db: SqlDatabase,
+    private readonly objects: PackObjectBatch,
+  ) {}
 
-  addBuffered(
-    repoId: number,
-    treeOid: string,
-    sourceId: number,
-    objectSize: number,
-    data: Uint8Array,
-  ): void {
+  addBuffered(repoId: number, treeOid: string, objectSize: number, data: Uint8Array): void {
     const retained = this.#sourceBytes(data.length, 1);
     if (
       this.#sources.length > 0 &&
@@ -233,13 +233,11 @@ export class PackTreeIndex {
     }
     if (retained > PACK_TREE_BATCH_BYTES) {
       this.#direct(() =>
-        indexPackTreeSources(this.db, [
-          this.#source(repoId, treeOid, sourceId, objectSize, [data]),
-        ]),
+        indexPackTreeSources(this.db, [this.#source(repoId, treeOid, objectSize, [data])]),
       );
       return;
     }
-    this.#sources.push(this.#source(repoId, treeOid, sourceId, objectSize, [data]));
+    this.#sources.push(this.#source(repoId, treeOid, objectSize, [data]));
     this.#payloadBytes += data.length;
     this.#retainedBytes += retained;
   }
@@ -247,33 +245,22 @@ export class PackTreeIndex {
   addStream(
     repoId: number,
     treeOid: string,
-    sourceId: number,
     objectSize: number,
     chunks: () => Iterable<Uint8Array>,
   ): void {
     this.flush();
     this.#direct(() => {
-      indexPackTreeSources(this.db, [
-        this.#source(repoId, treeOid, sourceId, objectSize, chunks()),
-      ]);
+      indexPackTreeSources(this.db, [this.#source(repoId, treeOid, objectSize, chunks())]);
     });
   }
 
-  addChunked(
-    repoId: number,
-    treeOid: string,
-    sourceId: number,
-    objectSize: number,
-    target: ChunkedBytes,
-  ): void {
+  addChunked(repoId: number, treeOid: string, objectSize: number, target: ChunkedBytes): void {
     const chunkCount = Math.max(1, Math.ceil(target.length / PACK_CHUNK_BYTES));
     const retained = this.#sourceBytes(target.length, chunkCount);
     if (retained > PACK_TREE_BATCH_BYTES) {
       this.flush();
       this.#direct(() => {
-        indexPackTreeSources(this.db, [
-          this.#source(repoId, treeOid, sourceId, objectSize, target.chunks()),
-        ]);
+        indexPackTreeSources(this.db, [this.#source(repoId, treeOid, objectSize, target.chunks())]);
       });
       return;
     }
@@ -287,13 +274,14 @@ export class PackTreeIndex {
     }
     const chunks: Uint8Array[] = [];
     for (const chunk of target.chunks()) chunks.push(ownedBytes(chunk));
-    this.#sources.push(this.#source(repoId, treeOid, sourceId, objectSize, chunks));
+    this.#sources.push(this.#source(repoId, treeOid, objectSize, chunks));
     this.#payloadBytes += target.length;
     this.#retainedBytes += retained;
   }
 
   flush(): void {
     if (this.#sources.length === 0) return;
+    this.objects.flush();
     try {
       this.db.transactionSync(() => indexPackTreeSources(this.db, this.#sources));
     } finally {
@@ -318,14 +306,14 @@ export class PackTreeIndex {
   #source(
     repoId: number,
     treeOid: string,
-    sourceId: number,
     objectSize: number,
     chunks: Iterable<Uint8Array>,
-  ): PackTreeSourceInput {
-    return { repoId, treeOid, storage: "pack", sourceId, objectSize, chunks };
+  ): TreeSourceInput {
+    return { repoId, treeOid, objectSize, chunks };
   }
 
   #direct(write: () => void): void {
+    this.objects.flush();
     this.db.transactionSync(write);
   }
 }

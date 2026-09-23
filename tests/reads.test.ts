@@ -1074,31 +1074,6 @@ describe("batched tree reads", () => {
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("does not fall through a corrupt loose-shadowed requested object", async () => {
-    const tree = serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]);
-    const oid = hashObject("tree", tree);
-    const chunks: Uint8Array[] = [];
-    const writer = new PackWriter((chunk) => chunks.push(chunk));
-    writer.header(1);
-    writer.object("tree", tree);
-    writer.finish();
-    const db = new TestDatabase();
-    const store = openScale(db);
-    await store.packs.ingest(slices(concat(chunks), 64));
-    db.run(
-      "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (1, ?, 'tree', ?)",
-      oid,
-      tree.length,
-    );
-    db.run(
-      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (1, ?, 0, ?)",
-      oid,
-      new Uint8Array([0]),
-    );
-
-    expect(() => [...treeStream(reopenScale(db), oid)]).toThrow();
-  });
-
   it("reads shuffled trees from a 16 MB pack in physical order", async () => {
     const count = 500;
     const children = Array.from({ length: count }, (_, index) => {
@@ -1382,37 +1357,12 @@ describe("batched tree reads", () => {
       `UPDATE git_tree_entries SET oid = ?
         WHERE source_key = (
           SELECT source_key FROM git_tree_sources
-           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+           WHERE repo_id = 1 AND tree_oid = ?
         ) AND ordinal = 0`,
       root,
       root,
     );
     expect(() => [...store.walkTree(root)]).toThrow(/tree cycle/);
-  });
-
-  it("rejects an effective tree repointed to a same-shaped source identity", () => {
-    const db = new TestDatabase();
-    const store = openScale(db);
-    const first = store.write(
-      "tree",
-      serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]),
-    );
-    const second = store.write(
-      "tree",
-      serializeTree([{ mode: MODE_FILE, name: "b", oid: numberedOid(2) }]),
-    );
-    const secondSource = db.scalar<number>(
-      "SELECT source_key FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?",
-      second,
-    );
-    if (secondSource === undefined) throw new Error("second tree source is missing");
-    expect(() =>
-      db.run(
-        "UPDATE git_tree_effective SET source_key = ? WHERE repo_id = 1 AND tree_oid = ?",
-        secondSource,
-        first,
-      ),
-    ).toThrow(/FOREIGN KEY constraint failed/);
   });
 
   it("projects tree traversal rows without BLOB payloads", () => {

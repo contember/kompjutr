@@ -736,12 +736,6 @@ describe("maintenance sweep", () => {
       ),
     ).toBe(1);
     expect(
-      inner.scalar<number>(
-        "SELECT count(*) FROM git_tree_effective WHERE repo_id = ?",
-        checkout.repoId,
-      ),
-    ).toBe(1);
-    expect(
       inner.scalar<number>("SELECT count(*) FROM git_commits WHERE repo_id = ?", checkout.repoId),
     ).toBe(1);
     expect(

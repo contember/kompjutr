@@ -247,17 +247,13 @@ function repositoryState(context: GitContext, repo: Repository) {
       repo.store.repoId,
     ),
     treeSources: repo.store.db.all<Record<string, unknown>>(
-      "SELECT * FROM git_tree_sources WHERE repo_id = ? ORDER BY tree_oid, storage, source_id",
+      "SELECT * FROM git_tree_sources WHERE repo_id = ? ORDER BY tree_oid",
       repo.store.repoId,
     ),
     treeEntries: repo.store.db.all<Record<string, unknown>>(
       `SELECT entry.* FROM git_tree_entries entry
        JOIN git_tree_sources source ON source.source_key = entry.source_key
        WHERE source.repo_id = ? ORDER BY entry.source_key, entry.ordinal`,
-      repo.store.repoId,
-    ),
-    treeEffective: repo.store.db.all<Record<string, unknown>>(
-      "SELECT * FROM git_tree_effective WHERE repo_id = ? ORDER BY tree_oid",
       repo.store.repoId,
     ),
     blobIds: repo.store.db.all<Record<string, unknown>>(

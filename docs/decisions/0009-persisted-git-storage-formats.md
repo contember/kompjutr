@@ -53,26 +53,28 @@ transactionally evicts older generations, so an update larger than the cache
 keeps its newest pages. An oversized or evicted identity is a cache miss, and a
 miss produces the same Git-visible result.
 
-**Parsed trees are keyed by an integer source surrogate.** Repeating the natural
-identity `(repo_id, tree_oid, storage, source_id)` in every entry primary key,
-every name-index row, and every trigger made the projection substantially larger
-than the tree objects it represents. Each loose or complete packed tree source
-now gets an integer `source_key`; entries use `(source_key, ordinal)`, and the
-effective `(repo_id, tree_oid)` row points at the selected surrogate through a
-composite foreign key that also matches its natural repository and tree identity.
+**Parsed trees are keyed by an integer source surrogate, one per tree OID.**
+Repeating a natural identity in every entry primary key and every name-index row
+made the projection substantially larger than the tree objects it represents.
+`git_tree_sources` holds one row per `(repo_id, tree_oid)` with an integer
+`source_key`; entries use `(source_key, ordinal)`. The entries depend only on
+the tree bytes, which the OID fixes, so every loose and packed copy of a tree
+shares one projection. There is no per-copy source row, no source qualification
+and no loose-over-pack shadowing. A second copy writes no entries; deleting the
+last copy deletes the projection (a `git_objects` delete trigger for loose rows,
+pack deletion for packed entries, including pending-pack reclaim).
 
-Narrowing the key must not merge sources, so the semantics the traversal depends
-on are preserved explicitly: an explicit incomplete-source marker represents a
-visible authoritative source whose projection is not yet valid, which keeps
-loose-over-pack shadowing fail-closed; pending packs stay invisible; and a packed
-delta base cannot resolve through an unrelated loose entry. `name_bytes` is the
-only stored name representation and remains the canonical BINARY value for Git
-ordering and exact lookup; bounded readers derive TEXT names.
+Pack ingest writes a new tree's projection while its pack is still pending, so
+the projection is visible before any copy is readable. That is safe because the
+projection is content-addressed; pending pack objects themselves stay invisible.
+An incomplete marker (`complete = 0`) represents a tree whose projection is not
+available; indexing may retry it. `name_bytes` is the only stored name
+representation and remains the canonical BINARY value for Git ordering and exact
+lookup; bounded readers derive TEXT names.
 
 Under [ADR-0004](0004-trust-stored-rows-validate-at-the-boundary.md), projection
-rows are trusted at read time. Source qualification exists for shadowing and
-delta-base correctness, not as a corruption witness, and columns kept purely as
-read-time cross-validation witnesses were retired.
+rows are trusted at read time, and columns kept purely as read-time
+cross-validation witnesses were retired.
 
 ## Consequences
 
@@ -88,8 +90,10 @@ read-time cross-validation witnesses were retired.
   unbounded writes are outside the storage contract.
 - Entry primary keys and the name index no longer repeat the wide natural source
   identity or a duplicate TEXT name. The representative fixture's combined
-  tree-schema storage fell by 25.9%.
-- Writers must create or resolve a source marker before inserting entries.
+  tree-schema storage fell by 25.9%, and a further 21.8% when the per-copy
+  source rows and `git_tree_effective` gave way to one projection per OID.
+- Writers must create or resolve the projection row before inserting entries,
+  and insert entries only while it is incomplete.
 
 Reopen the OID encoding if the core API adopts binary OIDs, if database size
 becomes a measured production constraint, or if an operation-level probe shows an

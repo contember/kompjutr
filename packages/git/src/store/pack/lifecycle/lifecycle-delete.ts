@@ -158,40 +158,24 @@ export class PackDeletion {
       packId,
     );
     this.db.run(
-      `DELETE FROM git_tree_effective WHERE source_key IN (
-         SELECT source_key FROM git_tree_sources
-          WHERE repo_id = ? AND storage = 'pack' AND source_id = ?
-       )`,
-      this.repoId,
-      packId,
-    );
-    this.db.run(
-      `INSERT OR REPLACE INTO git_tree_effective (repo_id, tree_oid, source_key)
-       SELECT object.repo_id, object.oid, source.source_key
-         FROM git_pack_objects object
-         JOIN git_pack_meta pack
-           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-          AND pack.state = 'complete'
-         JOIN git_tree_sources source
-           ON source.repo_id = object.repo_id AND source.tree_oid = object.oid
-          AND source.storage = 'pack' AND source.source_id = object.pack_id
-        WHERE object.repo_id = ? AND object.type = 'tree'
-          AND EXISTS (
-            SELECT 1 FROM git_tree_sources doomed
-             WHERE doomed.repo_id = object.repo_id AND doomed.tree_oid = object.oid
-               AND doomed.storage = 'pack' AND doomed.source_id = ?
+      `DELETE FROM git_tree_sources
+        WHERE repo_id = ?
+          AND tree_oid IN (
+            SELECT oid FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND type = 'tree'
           )
           AND NOT EXISTS (
             SELECT 1 FROM git_objects loose
-             WHERE loose.repo_id = object.repo_id AND loose.oid = object.oid
-               AND loose.type = 'tree'
+             WHERE loose.repo_id = git_tree_sources.repo_id AND loose.oid = git_tree_sources.tree_oid
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM git_pack_entries other
+             WHERE other.repo_id = git_tree_sources.repo_id
+               AND other.oid = git_tree_sources.tree_oid
+               AND other.pack_id != ?
           )`,
       this.repoId,
-      packId,
-    );
-    this.db.run(
-      "DELETE FROM git_tree_sources WHERE repo_id = ? AND storage = 'pack' AND source_id = ?",
       this.repoId,
+      packId,
       packId,
     );
     for (const table of [
