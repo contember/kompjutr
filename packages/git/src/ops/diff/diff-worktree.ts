@@ -6,7 +6,7 @@ import type { TargetEntry } from "../tree/tree-stream.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
   hashExactWorktreePaths,
-  hashWorktreePathsOwned,
+  hashWorktreePaths,
   indexMatchesStat,
   type WorktreeHashCursor,
   type WorktreePath,
@@ -88,7 +88,7 @@ export function resolveWorkingCandidateAfters(
   }
   const hashes = exact
     ? hashExactWorktreePaths(repo, worktree, unresolved, { write: false })
-    : hashWorktreePathsOwned(repo, worktree, unresolved, { write: false }, hashCursor);
+    : hashWorktreePaths(repo, worktree, unresolved, { write: false }, hashCursor);
   sharedRepoStoreMutations(repo.store).upsertBlobIdsOwned(
     [...hashes.values()].flatMap((hashed) => {
       const contentId = hashed.stat.contentId;

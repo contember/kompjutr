@@ -5,7 +5,7 @@ import { CorruptError } from "../packages/git/src/common/errors.js";
 import { MODE_COMMIT, serializeTree } from "../packages/git/src/common/objects.js";
 import { diff, diffSummary } from "../packages/git/src/ops/diff/diff.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
-import type { SparseWorkspaceSource } from "../packages/git/src/ops/worktree/sparse-workspace.js";
+import type { SparseWorkspaceSource } from "../packages/git/src/store/core/contracts.js";
 import type { IndexEntry } from "../packages/git/src/store/index.js";
 import {
   configureFixtureIdentity,

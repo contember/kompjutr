@@ -29,13 +29,13 @@ import {
 } from "../packages/git/src/ops/repository/commit.js";
 import { log } from "../packages/git/src/ops/repository/reads.js";
 import { eagerStatus } from "../packages/git/src/ops/status/status.js";
-import { buildTree } from "../packages/git/src/ops/tree/tree-build.js";
-import type { CommitTreeSnapshotSource } from "../packages/git/src/ops/worktree/sparse-workspace.js";
+import { buildTree } from "../packages/git/src/ops/tree/tree-build-full.js";
 import {
   hashWorktreePath,
   indexEntryFor,
   walkWorktree,
 } from "../packages/git/src/ops/worktree/worktree-io.js";
+import type { CommitTreeSnapshotSource } from "../packages/git/src/store/core/contracts.js";
 import type { IndexEntry } from "../packages/git/src/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

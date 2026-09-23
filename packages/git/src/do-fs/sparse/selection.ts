@@ -1,5 +1,5 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
-import { CorruptError, hasErrorCode } from "../../common/errors.js";
+import { CorruptError } from "../../common/errors.js";
 import { int, RowShape, text } from "../../common/rows.js";
 import { comparePaths } from "../../common/streams.js";
 import type {
@@ -331,18 +331,6 @@ function selectPaths(db: SqlDatabase, request: SelectedPathRequest): SelectedPat
   const worktree = readSelectedWorktree(db, validated, retainEntry, exactAncestors);
   if (!index.available || !worktree.available) return { available: false };
   return { available: true, index: index.rows, worktree: worktree.rows };
-}
-
-export function selectSparsePathsOwned(
-  source: SelectedPathSource,
-  request: SelectedPathRequest,
-): SelectedPathResult {
-  try {
-    return source.select(request);
-  } catch (error) {
-    if (hasErrorCode(error, "E2BIG")) return { available: false };
-    throw error;
-  }
 }
 
 export function createSqliteSelectedPathSource(db: SqlDatabase): SelectedPathSource {

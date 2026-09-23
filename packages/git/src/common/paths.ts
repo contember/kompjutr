@@ -86,6 +86,21 @@ export function isPathRoot(root: string, path: string): boolean {
   );
 }
 
+/** Repo-relative forms of nested-repository roots that lie strictly inside `root`. */
+export function relativeExcludeRoots(root: string, paths: readonly string[] | undefined): string[] {
+  const relatives: string[] = [];
+  for (const path of paths ?? []) {
+    const relative = relativeTo(root, path);
+    if (relative === null || relative === "") continue;
+    relatives.push(relative);
+  }
+  return relatives;
+}
+
+export function isExcluded(path: string, roots: readonly string[]): boolean {
+  return roots.some((root) => isPathRoot(root, path));
+}
+
 export function isNestedPath(root: string, path: string): boolean {
   const normalizedRoot = normalizePath(root);
   const normalizedPath = normalizePath(path);

@@ -1,8 +1,8 @@
 import { GitError } from "../../common/errors.js";
 import { comparePaths } from "../../common/streams.js";
+import type { SelectedWorktreeFact } from "../../store/core/contracts.js";
 import type { IndexEntry } from "../../store/index.js";
-import type { SelectedWorktreeFact } from "../worktree/sparse-workspace.js";
-import { ADD_RETAINED_BYTES } from "./staging-rm.js";
+import { ADD_RETAINED_BYTES } from "./staging-add-stage.js";
 import type { AvailableSelectedPaths } from "./staging-selected-validation.js";
 
 const SELECTED_MERGE_FIXED_BYTES = 128;

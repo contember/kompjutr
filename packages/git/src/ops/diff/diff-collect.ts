@@ -1,5 +1,6 @@
 import { CorruptError, GitError } from "../../common/errors.js";
 import { joinSorted, joinSorted3 } from "../../common/streams.js";
+import type { SparseWorkspaceSource } from "../../store/core/contracts.js";
 import { matchesPaths, stageZero } from "../checkout/checkout.js";
 import type { Repository } from "../repository/repository.js";
 import {
@@ -11,7 +12,6 @@ import {
 import { statusIndexGroups } from "../status/status-rows.js";
 import { type TargetEntry, treeStream } from "../tree/tree-stream.js";
 import { sparseCommitPair, sparseWorkingCandidates } from "../worktree/sparse-diff.js";
-import type { SparseWorkspaceSource } from "../worktree/sparse-workspace.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { createWorktreeHashCursor, walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import { hydrateChanges } from "./diff-hydrate.js";

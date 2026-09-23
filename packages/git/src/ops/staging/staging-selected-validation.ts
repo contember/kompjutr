@@ -14,9 +14,9 @@ import {
   unknownArray,
 } from "../../common/rows.js";
 import { comparePaths } from "../../common/streams.js";
+import type { SelectedPathResult, SelectedWorktreeFact } from "../../store/core/contracts.js";
 import type { IndexEntry } from "../../store/index.js";
-import type { SelectedPathResult, SelectedWorktreeFact } from "../worktree/sparse-workspace.js";
-import { structuralStringBytes } from "./staging-rm.js";
+import { structuralStringBytes } from "./staging-add-stage.js";
 import { hasExactSelectedIndexPath } from "./staging-selected-shared.js";
 
 const SELECTED_RESULT_FIXED_BYTES = 64;

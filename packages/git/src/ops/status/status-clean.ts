@@ -1,5 +1,5 @@
 import { GitError } from "../../common/errors.js";
-import { joinPath, relativeTo } from "../../common/paths.js";
+import { isExcluded, joinPath, relativeExcludeRoots, relativeTo } from "../../common/paths.js";
 import { comparePaths } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { matchesPaths } from "../checkout/checkout.js";
@@ -8,7 +8,6 @@ import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { walkWorktree } from "../worktree/worktree-io.js";
 import { statusStream } from "./status-core.js";
-import { excludedRoots, isExcluded } from "./status-full.js";
 import { stagedIndex } from "./status-matrix.js";
 import type { StatusOptions } from "./status-rows.js";
 import {
@@ -101,11 +100,11 @@ function snapshotCleanWorktree(
   options: CleanOptions,
   ignores: IgnoreMatcher,
 ): CleanWorktreeSnapshot {
-  const excluded = excludedRoots(repo.root, options.excludeRoots);
   const visible: string[] = [];
   const ignored: string[] = [];
   const directories: string[] = [];
-  const protectedDirectories = excluded.map((root) => root.relative);
+  const excludedPaths = relativeExcludeRoots(repo.root, options.excludeRoots);
+  const protectedDirectories = [...excludedPaths];
   let retainedBytes = 0;
   const retain = (path: string): void => {
     retainedBytes += DIRECTORY_FIXED_BYTES + statusStringBytes(path);
@@ -125,7 +124,7 @@ function snapshotCleanWorktree(
       const path = relativeTo(root, entry.path);
       if (path === null || path === "") continue;
       if (ignoredRoot !== null && !path.startsWith(`${ignoredRoot}/`)) ignoredRoot = null;
-      if (isExcluded(path, excluded)) continue;
+      if (isExcluded(path, excludedPaths)) continue;
       if (entry.type === "dir") {
         if (ignoredRoot !== null) continue;
         if (ignores.ignores(path, true)) {

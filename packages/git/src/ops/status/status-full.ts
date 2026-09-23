@@ -1,5 +1,5 @@
 import { CorruptError, GitError } from "../../common/errors.js";
-import { relativeTo } from "../../common/paths.js";
+import { isExcluded, relativeTo } from "../../common/paths.js";
 import { joinSorted, joinSorted3 } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import type { IndexEntry } from "../../store/index.js";
@@ -163,6 +163,7 @@ export function* statusStreamInternal(
     options.ignores ??
     loadIgnoreMatcher(worktree, repo.root, { excludeRoots: options.excludeRoots });
   const prunable = prunableExcludeRoots(excluded, snapshot.trackedPaths);
+  const excludedPaths = excluded.map((root) => root.relative);
   const buffered: BufferedStatusRow[] = [];
   const hashCursor = createWorktreeHashCursor(prunable);
   let sourceRows = 0;
@@ -172,7 +173,8 @@ export function* statusStreamInternal(
     seed?.observeUntracked(candidate);
     if (untrackedMode === "no") return;
     const ignored = ignores.ignores(candidate, false);
-    if (isExcluded(candidate, excluded) || (options.includeIgnored !== true && ignored)) return;
+    if (isExcluded(candidate, excludedPaths) || (options.includeIgnored !== true && ignored))
+      return;
 
     let path = candidate;
     if (collapse) {
@@ -263,12 +265,12 @@ function worktreeEntries(
   });
 }
 
-export interface ExcludedRoot {
+interface ExcludedRoot {
   absolute: string;
   relative: string;
 }
 
-export function excludedRoots(root: string, roots: string[] | undefined): ExcludedRoot[] {
+function excludedRoots(root: string, roots: string[] | undefined): ExcludedRoot[] {
   return (roots ?? []).flatMap((candidate) => {
     const relative = relativeTo(root, candidate);
     return relative === null || relative === "" ? [] : [{ absolute: candidate, relative }];
@@ -289,10 +291,6 @@ function hasTrackedPath(root: string, trackedPaths: ReadonlySet<string>): boolea
     if (path === root || path.startsWith(`${root}/`)) return true;
   }
   return false;
-}
-
-export function isExcluded(path: string, roots: readonly ExcludedRoot[]): boolean {
-  return roots.some((root) => path === root.relative || path.startsWith(`${root.relative}/`));
 }
 
 function worktreeWalkOptions(

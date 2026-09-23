@@ -2,7 +2,7 @@ import { GitError } from "../../common/errors.js";
 import { mutateRefsOwned } from "../../store/refs/refs.js";
 import { checkoutTreeExcluding } from "../checkout/checkout.js";
 import { isInitialCheckoutFallback, tryInitialCheckout } from "../checkout/initial-checkout.js";
-import { trySparseCleanCheckout } from "../checkout/sparse-checkout.js";
+import { trySparseCleanCheckout } from "../checkout/sparse-checkout-operation.js";
 import type { GitContext } from "../core/context.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata } from "../core/ref-log.js";

@@ -17,13 +17,13 @@ import {
 import type { GitContext, IndexTrackerSeedEntry } from "../packages/git/src/ops/core/context.js";
 import { checkout } from "../packages/git/src/ops/refs/refs.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
+import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
+import { hashWorktreePath } from "../packages/git/src/ops/worktree/worktree-io.js";
 import type {
   SelectedPathRequest,
   SelectedPathResult,
   SparseWorkspaceSource,
-} from "../packages/git/src/ops/worktree/sparse-workspace.js";
-import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
-import { hashWorktreePath } from "../packages/git/src/ops/worktree/worktree-io.js";
+} from "../packages/git/src/store/core/contracts.js";
 import type { IndexEntry } from "../packages/git/src/store/index.js";
 import {
   configureFixtureIdentity,

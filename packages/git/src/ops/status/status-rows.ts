@@ -18,7 +18,7 @@ import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
   type HashedPath,
   hashExactWorktreePaths,
-  hashWorktreePathsOwned,
+  hashWorktreePaths,
   indexMatchesStat,
   type WorktreeHashCursor,
   type WorktreePath,
@@ -323,7 +323,7 @@ export function* flushStatusRows(
   }
   const freshHashes = exact
     ? hashExactWorktreePaths(repo, worktree, unresolved, { write: false })
-    : hashWorktreePathsOwned(repo, worktree, unresolved, { write: false }, hashCursor);
+    : hashWorktreePaths(repo, worktree, unresolved, { write: false }, hashCursor);
   sharedRepoStoreMutations(repo.store).upsertBlobIdsOwned(
     [...freshHashes.values()].flatMap((hashed) => {
       const contentId = hashed.stat.contentId;

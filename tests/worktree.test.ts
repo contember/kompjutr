@@ -11,13 +11,11 @@ import {
   createWorktreeHashCursor,
   dirtyPaths,
   hashWorktreePaths,
-  hashWorktreePathsOwned,
   MAX_COMPILED_PATHS,
   WORKTREE_SCAN_PAGE,
   type WorktreePath,
   walkWorktree,
   walkWorktreeEntriesStream,
-  walkWorktreeEntriesStreamOwned,
   walkWorktreeStream,
 } from "../packages/git/src/ops/worktree/worktree-io.js";
 import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
@@ -587,7 +585,7 @@ describe("walkWorktreeStream", () => {
     workspace.worktree.writeFile(`/${directory}/kept`, new Uint8Array([1]));
     const paths = [`${directory}/missing`];
 
-    expect([...walkWorktreeEntriesStreamOwned(workspace.worktree, "/", { paths })]).toEqual([]);
+    expect([...walkWorktreeEntriesStream(workspace.worktree, "/", { paths })]).toEqual([]);
   });
 
   it("prunes later pages after observing only the current scan page", () => {
@@ -781,11 +779,7 @@ describe("batched worktree hashing", () => {
     };
 
     const prepared = fixture();
-    const hashes = hashWorktreePathsOwned(
-      prepared.workspace.repo,
-      prepared.worktree,
-      prepared.paths,
-    );
+    const hashes = hashWorktreePaths(prepared.workspace.repo, prepared.worktree, prepared.paths);
     expect(hashes).toHaveLength(prepared.bodies.length);
     expect(prepared.worktree.batches).toBe(prepared.bodies.length);
     for (let index = 0; index < prepared.bodies.length; index++) {
@@ -937,13 +931,9 @@ describe("dirtyPaths content identity", () => {
       const stat = worktree.stat(`/${path}`);
       if (stat === null) throw new Error(`missing test path: ${path}`);
       expect(
-        hashWorktreePathsOwned(
-          workspace.repo,
-          worktree,
-          [{ path, stat }],
-          { write: false },
-          cursor,
-        ).has(path),
+        hashWorktreePaths(workspace.repo, worktree, [{ path, stat }], { write: false }, cursor).has(
+          path,
+        ),
       ).toBe(true);
     }
     expect(worktree.realpaths).toBe(1);

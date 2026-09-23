@@ -1,6 +1,6 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../common/bytes.js";
-import { CorruptError, hasErrorCode } from "../../common/errors.js";
+import { CorruptError } from "../../common/errors.js";
 import { isCanonicalGitPath } from "../../common/paths.js";
 import { int, nullable, oneOf, RowShape, text } from "../../common/rows.js";
 import { comparePaths } from "../../common/streams.js";
@@ -407,18 +407,6 @@ function snapshotCommitTreeNative(
     index: index.rows,
     directories: directories.directories,
   };
-}
-
-export function snapshotCommitTreeOwned(
-  source: CommitTreeSnapshotSource,
-  request: CommitTreeSnapshotRequest,
-): CommitTreeSnapshotResult {
-  try {
-    return source.snapshot(request);
-  } catch (error) {
-    if (hasErrorCode(error, "E2BIG")) return { available: false };
-    throw error;
-  }
 }
 
 export function createSqliteCommitTreeSnapshotSource(db: SqlDatabase): CommitTreeSnapshotSource {

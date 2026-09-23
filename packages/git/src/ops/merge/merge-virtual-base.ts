@@ -5,7 +5,7 @@ import type { IntegrationWorkspace } from "../../store/operations/integration-wo
 import { planVirtualAncestorIntegrationOwned } from "../integration/integration-plan-owned.js";
 import { requireBoundedIntegrationTree } from "../integration/integration-worktree.js";
 import type { Repository } from "../repository/repository.js";
-import { buildTreeInBatch } from "../tree/tree-build.js";
+import { buildTreeInBatch } from "../tree/tree-build-full.js";
 import { selectMergeBases } from "./merge-base.js";
 
 const MAX_VIRTUAL_COMMITS = 1;

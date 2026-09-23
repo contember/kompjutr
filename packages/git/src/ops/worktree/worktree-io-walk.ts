@@ -72,28 +72,11 @@ export function* walkWorktreeStream(
   for (const entry of walkWorktreeEntriesStream(worktree, root, options)) yield entry.path;
 }
 
-/** The metadata-preserving worktree walk used by every path-only projection. */
+/** The metadata-preserving worktree walk over bounded scan pages. */
 export function* walkWorktreeEntriesStream(
   worktree: Worktree,
   root: string,
   options: WalkOptions = {},
-): Generator<WorktreePath> {
-  yield* walkWorktreeEntriesStreamCore(worktree, root, options);
-}
-
-/** Internal worktree walk over bounded scan pages. */
-export function* walkWorktreeEntriesStreamOwned(
-  worktree: Worktree,
-  root: string,
-  options: WalkOptions = {},
-): Generator<WorktreePath> {
-  yield* walkWorktreeEntriesStreamCore(worktree, root, options);
-}
-
-function* walkWorktreeEntriesStreamCore(
-  worktree: Worktree,
-  root: string,
-  options: WalkOptions,
 ): Generator<WorktreePath> {
   if (
     options.maxScanRows !== undefined &&

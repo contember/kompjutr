@@ -4,8 +4,8 @@
 // and a selected tree vs the index. Patch rendering and collection live in
 // phase-specific sidecars; this module preserves the public entry point.
 
+import type { SparseWorkspaceSource } from "../../store/core/contracts.js";
 import type { Repository } from "../repository/repository.js";
-import type { SparseWorkspaceSource } from "../worktree/sparse-workspace.js";
 import type { Worktree } from "../worktree/worktree.js";
 import {
   classifyDiffRenames,

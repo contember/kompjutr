@@ -1,10 +1,9 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
-import { CorruptError, GitError, hasErrorCode } from "../../common/errors.js";
+import { CorruptError, hasErrorCode } from "../../common/errors.js";
 import { int, oneOf, RowShape, text } from "../../common/rows.js";
 import type {
   SparseIndexAncestorRequest,
   SparseIndexAncestorResult,
-  SparseWorkspaceDirty,
   SparseWorkspaceRequest,
   SparseWorkspaceResult,
   SparseWorkspaceRow,
@@ -196,39 +195,6 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
     });
   }
   return { available: true, rows };
-}
-
-/** Use the native seam without widening the public sparse source interface. */
-export function sparseDirtyPathsOwned(
-  source: SparseWorkspaceSource,
-  checkoutId: number,
-): Iterable<SparseWorkspaceDirty> {
-  return source.dirtyPaths(checkoutId);
-}
-
-/** Use the native seam without widening the public sparse source interface. */
-export function hydrateSparseWorkspaceOwned(
-  source: SparseWorkspaceSource,
-  request: SparseWorkspaceRequest,
-): SparseWorkspaceResult {
-  try {
-    return source.hydrate(request);
-  } catch (error) {
-    if (hasErrorCode(error, "E2BIG")) return { available: false };
-    throw error;
-  }
-}
-
-/** Use the native seam without widening the public sparse source interface. */
-export function sparseIndexAncestorFactsOwned(
-  source: SparseWorkspaceSource,
-  request: SparseIndexAncestorRequest,
-): SparseIndexAncestorResult {
-  const result = source.indexAncestorFacts?.(request);
-  if (result === undefined) {
-    throw new GitError("EUNSUPPORTED", "sparse index ancestor source is unavailable");
-  }
-  return result;
 }
 
 export function createSqliteSparseWorkspaceSource(db: SqlDatabase): SparseWorkspaceSource {

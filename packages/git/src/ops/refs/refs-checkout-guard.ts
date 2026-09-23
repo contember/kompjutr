@@ -7,11 +7,11 @@ import { treeStream } from "../tree/tree-stream.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
   createWorktreeHashCursor,
-  hashWorktreePathsOwned,
+  hashWorktreePaths,
   indexMatchesStat,
   type WorktreeHashCursor,
   type WorktreePath,
-  walkWorktreeEntriesStreamOwned,
+  walkWorktreeEntriesStream,
 } from "../worktree/worktree-io.js";
 
 const CHECKOUT_GUARD_BATCH = 1_000;
@@ -284,7 +284,7 @@ function* checkoutGuardRows(
   });
   const current = joinSorted(
     stageZero(indexScanOwned(repo.checkout)),
-    walkWorktreeEntriesStreamOwned(worktree, repo.root, { excludeRoots }),
+    walkWorktreeEntriesStream(worktree, repo.root, { excludeRoots }),
     { left: (entry) => entry.path, right: (entry) => entry.path },
   );
   for (const row of joinSorted(trees, current, {
@@ -381,7 +381,7 @@ function flushGuardCandidates(
     }
     limits.hashCandidates += needsHash.length;
   }
-  const hashed = hashWorktreePathsOwned(
+  const hashed = hashWorktreePaths(
     repo,
     worktree,
     needsHash.map((candidate) => candidate.worktree),

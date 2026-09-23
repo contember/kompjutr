@@ -1,6 +1,7 @@
 // Bounded clean-workspace checkout without traversing the full tree.
 
 import { CorruptError, hasErrorCode } from "../../common/errors.js";
+import type { SelectedPathResult, SparseWorkspaceResult } from "../../store/core/contracts.js";
 import {
   hasSparseSourceReceipt,
   hydrateSparseWorkspaceOwned,
@@ -10,7 +11,6 @@ import {
 import type { GitContext } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
-import type { SelectedPathResult, SparseWorkspaceResult } from "../worktree/sparse-workspace.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { checkoutSparseChanges, type SparseCheckoutChange } from "./sparse-checkout-apply.js";
 import { selectedSparseWorkspaceRows } from "./sparse-checkout-selected.js";

@@ -1,7 +1,7 @@
 import { CorruptError } from "../../common/errors.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree, WorktreeStat } from "../worktree/worktree.js";
-import { type HashedPath, hashExactWorktreePathsOwned } from "../worktree/worktree-io.js";
+import { type HashedPath, hashExactWorktreePaths } from "../worktree/worktree-io.js";
 import type { SnapshotDraft, SnapshotObjects } from "./merge-apply-types.js";
 import type { MergeTouchedPath, MergeWorktreeSnapshot } from "./merge-state.js";
 
@@ -36,7 +36,7 @@ export function snapshotWorktreeObjects(
       paths.push({ path: draft.spec.path, stat });
     }
   }
-  const hashed = hashExactWorktreePathsOwned(repo, worktree, paths, {
+  const hashed = hashExactWorktreePaths(repo, worktree, paths, {
     write: true,
   });
   for (const draft of drafts) {

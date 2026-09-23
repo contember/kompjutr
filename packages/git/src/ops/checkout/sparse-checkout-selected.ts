@@ -1,14 +1,14 @@
 import { isOid } from "../../common/bytes.js";
 import { CorruptError } from "../../common/errors.js";
 import { comparePaths } from "../../common/streams.js";
-import type { IndexEntry } from "../../store/index.js";
 import type {
   SelectedPathResult,
   SelectedWorktreeFact,
   SparseWorkspaceResult,
   SparseWorkspaceRow,
   SparseWorktreeLeaf,
-} from "../worktree/sparse-workspace.js";
+} from "../../store/core/contracts.js";
+import type { IndexEntry } from "../../store/index.js";
 import type { SparseCheckoutCandidate } from "./sparse-checkout-operation.js";
 
 type AvailableSparseWorkspaceResult = Extract<SparseWorkspaceResult, { available: true }>;

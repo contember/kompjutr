@@ -1,25 +1,48 @@
 import { GitError } from "../../common/errors.js";
-import { comparePaths, joinPath } from "../../common/paths.js";
+import { comparePaths, joinPath, relativeExcludeRoots } from "../../common/paths.js";
+import type { IndexEntry } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
+import type { TargetEntry } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
 import {
-  hashExactWorktreePathsOwned,
+  hashExactWorktreePaths,
   indexMatchesStat,
-  walkWorktreeEntriesStreamOwned,
+  type WorktreePath,
+  walkWorktreeEntriesStream,
 } from "../worktree/worktree-io.js";
-import {
-  boundedRmRows,
-  relativeExcludeRoots,
-  requireRmRetained,
-  structuralStringBytes,
-} from "./staging-rm-support.js";
-import type { RmCandidate } from "./staging-rm-types.js";
-import {
-  RM_ARRAY_ENTRY_BYTES,
-  RM_DIRECTORY_FIXED_BYTES,
-  RM_REMOVE_BINDING_BYTES,
-  RM_WINDOW_ROWS,
-} from "./staging-rm-types.js";
+import { ADD_RETAINED_BYTES, structuralStringBytes } from "./staging-add-stage.js";
+
+const RM_MAX_ROWS_PER_STREAM = 50_000;
+export const RM_ARRAY_ENTRY_BYTES = 8;
+const RM_WINDOW_ROWS = 1_000;
+const RM_DIRECTORY_FIXED_BYTES = 96;
+const RM_REMOVE_BINDING_BYTES = 1_000_000;
+
+export interface RmCandidate {
+  path: string;
+  head: TargetEntry | undefined;
+  index: IndexEntry | undefined;
+  worktree: WorktreePath | undefined;
+  conflicted: boolean;
+  worktreeMatchesIndex: boolean;
+}
+
+export function* boundedRmRows<T>(rows: Iterable<T>, label: string): Generator<T> {
+  let count = 0;
+  for (const row of rows) {
+    if (count >= RM_MAX_ROWS_PER_STREAM) {
+      throw new GitError("E2BIG", `rm ${label} scan exceeds ${RM_MAX_ROWS_PER_STREAM} rows`);
+    }
+    count++;
+    yield row;
+  }
+}
+
+export function requireRmRetained(bytes: number): void {
+  if (bytes > ADD_RETAINED_BYTES) {
+    throw new GitError("E2BIG", `rm retained state exceeds ${ADD_RETAINED_BYTES} bytes`);
+  }
+}
 
 export function identifyRmWorktree(
   repo: Repository,
@@ -52,7 +75,7 @@ export function identifyRmWorktree(
     const authoritative = pending.flatMap((candidate) =>
       candidate.worktree === undefined ? [] : [candidate.worktree],
     );
-    const hashes = hashExactWorktreePathsOwned(repo, worktree, authoritative, {
+    const hashes = hashExactWorktreePaths(repo, worktree, authoritative, {
       write: false,
     });
     for (const candidate of pending) {
@@ -107,7 +130,7 @@ export function planRmDirectoryPrune(
 
   for (const root of relativeExcludeRoots(repo.root, excludeRoots)) block(root, true);
   for (const entry of boundedRmRows(
-    walkWorktreeEntriesStreamOwned(worktree, repo.root, {
+    walkWorktreeEntriesStream(worktree, repo.root, {
       excludeRoots: excludeRoots === undefined ? undefined : [...excludeRoots],
       includeIgnored: true,
       includeDirectories: true,

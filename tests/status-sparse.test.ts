@@ -19,8 +19,8 @@ import {
   statusStream,
 } from "../packages/git/src/ops/status/status.js";
 import { sparseStatus } from "../packages/git/src/ops/status/status-sparse.js";
-import type { SparseWorkspaceSource } from "../packages/git/src/ops/worktree/sparse-workspace.js";
 import { hashWorktreePath, indexEntryFor } from "../packages/git/src/ops/worktree/worktree-io.js";
+import type { SparseWorkspaceSource } from "../packages/git/src/store/core/contracts.js";
 import type { IndexEntry } from "../packages/git/src/store/index.js";
 import { MAINTENANCE_ROOT_EPOCH_EXHAUSTED } from "../packages/git/src/store/maintenance/control.js";
 import { GitFixture } from "./helpers/git.js";

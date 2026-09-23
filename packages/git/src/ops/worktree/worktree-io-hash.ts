@@ -74,16 +74,6 @@ export function hashWorktreePaths(
   worktree: Worktree,
   paths: readonly WorktreePath[],
   options: WorktreeHashOptions = {},
-): Map<string, HashedPath> {
-  return hashWorktreePathsOwned(repo, worktree, paths, options);
-}
-
-/** Internal seam for callers that retain hash inputs or results across subsequent work. */
-export function hashWorktreePathsOwned(
-  repo: Repository,
-  worktree: Worktree,
-  paths: readonly WorktreePath[],
-  options: WorktreeHashOptions = {},
   cursor?: WorktreeHashCursor,
 ): Map<string, HashedPath> {
   if (paths.length === 0) return new Map();
@@ -213,16 +203,6 @@ export function hashExactWorktreePaths(
   paths: readonly WorktreePath[],
   options: WorktreeHashOptions = {},
 ): Map<string, HashedPath> {
-  return hashExactWorktreePathsOwned(repo, worktree, paths, options);
-}
-
-/** Internal exact-path hashing seam. */
-export function hashExactWorktreePathsOwned(
-  repo: Repository,
-  worktree: Worktree,
-  paths: readonly WorktreePath[],
-  options: WorktreeHashOptions = {},
-): Map<string, HashedPath> {
   if (paths.length === 0) return new Map();
   const root = readWorktreeRealpath(worktree, repo.root);
   return hashWorktreePathsAtRoot(repo, worktree, root, paths, options);
@@ -306,16 +286,6 @@ function refreshOrderedPaths(
  * absent or is a directory.
  */
 export function hashWorktreePath(
-  repo: Repository,
-  worktree: Worktree,
-  relative: string,
-  options: WorktreeHashOptions = {},
-): HashedPath | null {
-  return hashWorktreePathOwned(repo, worktree, relative, options);
-}
-
-/** Internal single-path hashing seam. */
-export function hashWorktreePathOwned(
   repo: Repository,
   worktree: Worktree,
   relative: string,

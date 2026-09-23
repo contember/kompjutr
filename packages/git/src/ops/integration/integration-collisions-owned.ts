@@ -16,7 +16,7 @@ import type { IntegrationWorkspace } from "../../store/operations/integration-wo
 import { projectMergePlanOwned } from "../merge/merge-projection.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { walkWorktreeEntriesStreamOwned } from "../worktree/worktree-io.js";
+import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import type { IntegrationOperation } from "./integration-worktree.js";
 
 export function projectIntegrationWithCollisionsOwned(
@@ -101,7 +101,7 @@ export function projectIntegrationWithCollisionsOwned(
     let worktreeRows = 0;
     for (const row of joinSorted(
       indexScanOwned(repo.checkout),
-      walkWorktreeEntriesStreamOwned(worktree, repo.root, { includeIgnored: true }),
+      walkWorktreeEntriesStream(worktree, repo.root, { includeIgnored: true }),
       {
         left: (entry) => entry.path,
         right: (entry) => entry.path,

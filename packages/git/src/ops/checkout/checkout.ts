@@ -19,7 +19,6 @@ export {
   writeEntry,
 } from "./checkout-support.js";
 export type { CheckoutOptions } from "./checkout-types.js";
-export { checkoutSparseChanges, type SparseCheckoutChange } from "./sparse-checkout.js";
 
 /**
  * Bring the working tree and the index to `treeOid`. Entries already

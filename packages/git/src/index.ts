@@ -204,11 +204,6 @@ export {
   type StatusFormatOptions,
   statusFormatOptions,
 } from "./ops/status/status-format.js";
-export type {
-  CommitTreeSnapshotSource,
-  SelectedPathSource,
-  SparseWorkspaceSource,
-} from "./ops/worktree/sparse-workspace.js";
 export type { Worktree, WorktreeDirent, WorktreeStat } from "./ops/worktree/worktree.js";
 export {
   type WorktreeAddOptions,
@@ -221,6 +216,11 @@ export {
   worktreeRemove,
 } from "./ops/worktree/worktrees.js";
 export type { GitHttpClient } from "./protocol/transport.js";
+export type {
+  CommitTreeSnapshotSource,
+  SelectedPathSource,
+  SparseWorkspaceSource,
+} from "./store/core/contracts.js";
 export {
   type CheckoutRow,
   CheckoutStore,

@@ -1,6 +1,13 @@
 import { GitError, hasErrorCode, PathspecNotFoundError } from "../../common/errors.js";
 import { isPathRoot } from "../../common/paths.js";
 import { comparePaths } from "../../common/streams.js";
+import type {
+  SelectedPathRequest,
+  SelectedPathResult,
+  SelectedPathSpec,
+  SelectedWorktreeFact,
+  SparseIndexAncestorResult,
+} from "../../store/core/contracts.js";
 import {
   hasSparseSourceReceipt,
   selectSparsePathsOwned,
@@ -8,19 +15,12 @@ import {
 } from "../../store/sparse/sparse-workspace.js";
 import type { GitContext } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";
-import type {
-  SelectedPathRequest,
-  SelectedPathResult,
-  SelectedPathSpec,
-  SelectedWorktreeFact,
-  SparseIndexAncestorResult,
-} from "../worktree/sparse-workspace.js";
 import {
   type CompiledPathspecMatcher,
-  compilePathspecsOwned,
+  compilePathspecs,
   type WorktreePath,
 } from "../worktree/worktree-io.js";
-import { ADD_RETAINED_BYTES } from "./staging-rm.js";
+import { ADD_RETAINED_BYTES } from "./staging-add-stage.js";
 import { mergeSelectedAddResults } from "./staging-selected-merge.js";
 import { lowerBoundSelectedPath } from "./staging-selected-shared.js";
 import {
@@ -90,7 +90,7 @@ function selectAddPathsOwned(
     root: repo.root,
     specs: recursive.map((path) => ({ path, recursive: true })),
   };
-  const recursiveMatcher = compilePathspecsOwned(recursive);
+  const recursiveMatcher = compilePathspecs(recursive);
   const selected = selectAddSource(
     repo,
     source,

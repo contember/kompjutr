@@ -28,7 +28,7 @@ import type {
 import { validateProjectedIndexEntries } from "../merge/merge-apply-validation.js";
 import type { Repository } from "../repository/repository.js";
 import { fileModeFor, type Worktree } from "../worktree/worktree.js";
-import { walkWorktreeEntriesStreamOwned } from "../worktree/worktree-io.js";
+import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import { integrationTouched } from "./integration-touched.js";
 
 function* snapshotDrafts(
@@ -44,7 +44,7 @@ function* snapshotDrafts(
     for (const row of joinSorted3(
       touched.shapes(),
       indexScanOwned(repo.checkout),
-      walkWorktreeEntriesStreamOwned(worktree, repo.root, {
+      walkWorktreeEntriesStream(worktree, repo.root, {
         includeIgnored: true,
         includeDirectories: true,
       }),

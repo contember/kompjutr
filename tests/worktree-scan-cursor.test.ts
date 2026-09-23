@@ -3,7 +3,7 @@ import type { ScanEntry, ScanOptions } from "../packages/do/src/fs/types.js";
 import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
 import {
   WORKTREE_SCAN_PAGE,
-  walkWorktreeEntriesStreamOwned,
+  walkWorktreeEntriesStream,
 } from "../packages/git/src/ops/worktree/worktree-io.js";
 import { makeWorkspace } from "./helpers/workspace.js";
 
@@ -65,7 +65,7 @@ describe("worktree scan cursor", () => {
     const stubborn = subtreeCursorDrive(makeWorkspace().worktree, prunedTailPage());
 
     expect(() => [
-      ...walkWorktreeEntriesStreamOwned(stubborn, "/", {
+      ...walkWorktreeEntriesStream(stubborn, "/", {
         pruneDirectory: (path) => path === "d",
         maxScanRows: SCAN_ROW_CEILING,
       }),
@@ -76,7 +76,7 @@ describe("worktree scan cursor", () => {
     const honest = subtreeCursorDrive(makeWorkspace().worktree, [file("/e.txt")]);
 
     const walked = [
-      ...walkWorktreeEntriesStreamOwned(honest, "/", {
+      ...walkWorktreeEntriesStream(honest, "/", {
         pruneDirectory: (path) => path === "d",
         maxScanRows: SCAN_ROW_CEILING,
       }),

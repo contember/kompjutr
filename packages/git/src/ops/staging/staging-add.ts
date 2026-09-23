@@ -1,5 +1,5 @@
 import { GitError, PathspecNotFoundError } from "../../common/errors.js";
-import { comparePaths, joinPath } from "../../common/paths.js";
+import { comparePaths, isExcluded, joinPath, relativeExcludeRoots } from "../../common/paths.js";
 import { joinSorted3 } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { applyIndexOwned } from "../../store/checkout/checkout.js";
@@ -10,11 +10,11 @@ import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
 import {
   type CompiledPathspecMatcher,
-  compilePathspecsOwned,
+  compilePathspecs,
   createWorktreeHashCursor,
   indexMatchesStat,
   type WorktreePath,
-  walkWorktreeEntriesStreamOwned,
+  walkWorktreeEntriesStream,
 } from "../worktree/worktree-io.js";
 import {
   type AddIndexSnapshot,
@@ -26,7 +26,6 @@ import {
   type StageCandidateBatch,
   stageCandidates,
 } from "./staging-add-stage.js";
-import { isExcluded, relativeExcludeRoots } from "./staging-rm.js";
 import {
   assertSelectedPathspecsMatch,
   selectAddPaths,
@@ -85,7 +84,7 @@ export function addLiteralPaths(
     if (options.all === true) {
       throw new GitError("EINVAL", "literal add requires explicit paths");
     }
-    compilePathspecsOwned(options.paths);
+    compilePathspecs(options.paths);
     const specs = uniqueSpecs(options.paths);
     const preflight =
       options.force === true
@@ -117,7 +116,7 @@ function runAdd(
   const force = options.force === true;
   const trackedOnly = all && options.trackedOnly === true;
   let pathspec: CompiledPathspecMatcher | undefined;
-  pathspec = all ? undefined : compilePathspecsOwned(specs);
+  pathspec = all ? undefined : compilePathspecs(specs);
   if (!all && pathspec !== undefined) {
     const selected =
       index === repo.checkout ? selectAddPaths(repo, specs, pathspec, context) : null;
@@ -142,7 +141,7 @@ function runAdd(
   }
 
   const snapshot = addIndexSource(indexScanOwned(index), pathspec);
-  const walked = walkWorktreeEntriesStreamOwned(worktree, repo.root, {
+  const walked = walkWorktreeEntriesStream(worktree, repo.root, {
     pathspec,
     excludeRoots: options.excludeRoots,
     includeIgnored: true,

@@ -87,11 +87,6 @@ import type {
   StatusOptions,
   StatusReportOptions,
 } from "./ops/status/status.js";
-import type {
-  CommitTreeSnapshotSource,
-  SelectedPathSource,
-  SparseWorkspaceSource,
-} from "./ops/worktree/sparse-workspace.js";
 import type { Worktree } from "./ops/worktree/worktree.js";
 import type {
   WorktreeAddOptions,
@@ -99,6 +94,11 @@ import type {
   WorktreeRemoveOptions,
 } from "./ops/worktree/worktrees.js";
 import type { AuthCallback, GitHttpClient } from "./protocol/transport.js";
+import type {
+  CommitTreeSnapshotSource,
+  SelectedPathSource,
+  SparseWorkspaceSource,
+} from "./store/core/contracts.js";
 import type { SqliteGitDatabase } from "./store/database/database.js";
 
 export type { PullResult } from "./ops/core/kinds.js";

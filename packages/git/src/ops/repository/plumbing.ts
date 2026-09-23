@@ -16,7 +16,7 @@ import {
   buildTreeInBatch,
   MAX_TREE_BUILD_LEAF_ENTRIES,
   preflightTreeBuild,
-} from "../tree/tree-build.js";
+} from "../tree/tree-build-full.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { type CatFileResult, catFile as readObject, treeOf } from "./reads.js";
 import {

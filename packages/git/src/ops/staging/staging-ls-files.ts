@@ -25,7 +25,7 @@ import {
   type LsFilesOptions,
 } from "../worktree/pathspec.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { type WorktreePath, walkWorktreeEntriesStreamOwned } from "../worktree/worktree-io.js";
+import { type WorktreePath, walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 
 export const MAX_LS_FILES_EXCLUDE_ROOTS = MAX_ROUTING_CHECKOUTS;
 
@@ -111,7 +111,7 @@ export function lsFilesWithWorktree(
     ? loadIgnoreMatcher(worktree, repo.root, { excludeRoots })
     : undefined;
   const index = uniqueIndexPaths(repo, null);
-  const walked = walkWorktreeEntriesStreamOwned(worktree, repo.root, {
+  const walked = walkWorktreeEntriesStream(worktree, repo.root, {
     excludeRoots,
     ignores,
   });

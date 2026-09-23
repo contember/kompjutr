@@ -71,13 +71,6 @@ class ByteOrderedPathspecMatcher implements CompiledPathspecMatcher {
 
 /** Compile once when one pathspec list is reused across joins or walks. */
 export function compilePathspecs(paths: readonly string[] | undefined): CompiledPathspecMatcher {
-  return compilePathspecsOwned(paths);
-}
-
-/** Compile a matcher for internal callers. */
-export function compilePathspecsOwned(
-  paths: readonly string[] | undefined,
-): ByteOrderedPathspecMatcher {
   validateCompiledPathspecs(paths);
   return new ByteOrderedPathspecMatcher(paths);
 }

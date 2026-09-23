@@ -8,12 +8,12 @@ import {
   type TreeEntry,
 } from "../../common/objects.js";
 import { comparePaths } from "../../common/streams.js";
-import type { IndexEntry, ObjectBatch } from "../../store/index.js";
-import { hasSparseSourceReceipt } from "../../store/sparse/sparse-workspace.js";
 import type {
   CommitTreeSnapshotResult,
   CommitTreeSnapshotSource,
-} from "../worktree/sparse-workspace.js";
+} from "../../store/core/contracts.js";
+import type { IndexEntry, ObjectBatch } from "../../store/index.js";
+import { hasSparseSourceReceipt } from "../../store/sparse/sparse-workspace.js";
 import {
   basename,
   checkedBytes,

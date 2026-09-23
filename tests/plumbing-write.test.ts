@@ -27,7 +27,7 @@ import {
   writeTree,
 } from "../packages/git/src/ops/repository/plumbing.js";
 import { add } from "../packages/git/src/ops/staging/staging.js";
-import { MAX_TREE_BUILD_LEAF_ENTRIES } from "../packages/git/src/ops/tree/tree-build.js";
+import { MAX_TREE_BUILD_LEAF_ENTRIES } from "../packages/git/src/ops/tree/tree-build-full.js";
 import type { Worktree } from "../packages/git/src/ops/worktree/worktree.js";
 import type { IndexEntry, IndexStore } from "../packages/git/src/store/index.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../packages/git/src/store/pack/packs.js";

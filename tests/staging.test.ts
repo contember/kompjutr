@@ -17,7 +17,7 @@ import { add, lsFiles, reset, rm } from "../packages/git/src/ops/staging/staging
 import type {
   SelectedPathResult,
   SparseIndexAncestorResult,
-} from "../packages/git/src/ops/worktree/sparse-workspace.js";
+} from "../packages/git/src/store/core/contracts.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

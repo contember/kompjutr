@@ -6,7 +6,7 @@ import type { TargetEntry } from "../tree/tree-stream.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
   type CompiledPathspecMatcher,
-  hashWorktreePathsOwned,
+  hashWorktreePaths,
   indexEntryFor,
   indexMatchesStat,
   type WorktreeHashCursor,
@@ -14,6 +14,11 @@ import {
 } from "../worktree/worktree-io.js";
 
 const ADD_MAX_ROWS_PER_STREAM = 50_000;
+export const ADD_RETAINED_BYTES = 16 * 1024 * 1024;
+
+export function structuralStringBytes(value: string): number {
+  return 48 + value.length * 2;
+}
 
 export interface AddIndexPath {
   path: string;
@@ -125,7 +130,7 @@ export function stageCandidates(
         mapped.set(row.path, oid);
       }
     }
-    const hashes = hashWorktreePathsOwned(repo, worktree, unresolved, {}, hashCursor);
+    const hashes = hashWorktreePaths(repo, worktree, unresolved, {}, hashCursor);
     sharedRepoStoreMutations(repo.store).upsertBlobIdsOwned(
       [...hashes.values()].flatMap((hashed) => {
         const contentId = hashed.stat.contentId;

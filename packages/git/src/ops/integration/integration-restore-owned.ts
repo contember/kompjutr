@@ -12,7 +12,7 @@ import { collectBlobMetadata, restoreWorktreeFiles } from "../merge/merge-apply-
 import { restoreIndex } from "../merge/merge-apply-index.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { walkWorktreeEntriesStreamOwned } from "../worktree/worktree-io.js";
+import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 
 function validateObjects(
   repo: Repository,
@@ -82,7 +82,7 @@ export function restoreIntegrationOwned(
     let destructive: string | null = null;
     for (const row of joinSorted(
       touched,
-      walkWorktreeEntriesStreamOwned(worktree, repo.root, {
+      walkWorktreeEntriesStream(worktree, repo.root, {
         includeDirectories: true,
         includeIgnored: true,
       }),

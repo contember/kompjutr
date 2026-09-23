@@ -12,14 +12,14 @@ import {
   indexMatchesStat,
   refreshPaths,
 } from "./worktree-io-hash.js";
-import { compilePathspecsOwned } from "./worktree-io-pathspec.js";
+import { compilePathspecs } from "./worktree-io-pathspec.js";
 import {
   readWorktreeRealpath,
   readWorktreeScanPage,
   statFromScan,
   WORKTREE_SCAN_PAGE,
   type WorktreePath,
-  walkWorktreeEntriesStreamOwned,
+  walkWorktreeEntriesStream,
 } from "./worktree-io-walk.js";
 
 const DIRTY_EXCLUDED_SCAN_ROWS = 100_000;
@@ -59,17 +59,6 @@ export function* dirtyPathStream(
   limits?: DirtyPathLimits,
   excludeRoots: string[] = [],
 ): Generator<string> {
-  yield* dirtyPathStreamOwned(repo, worktree, paths, limits, excludeRoots);
-}
-
-/** Internal dirty-path scan seam. */
-export function* dirtyPathStreamOwned(
-  repo: Repository,
-  worktree: Worktree,
-  paths?: string[],
-  limits?: DirtyPathLimits,
-  excludeRoots: string[] = [],
-): Generator<string> {
   if (worktree.scanStream === undefined) {
     yield* dirtyPathStreamPagedOwned(repo, worktree, paths, limits, excludeRoots);
     return;
@@ -84,7 +73,7 @@ function* dirtyPathStreamOrderedOwned(
   limits?: DirtyPathLimits,
   excludeRoots: string[] = [],
 ): Generator<string> {
-  const pathspec = compilePathspecsOwned(paths);
+  const pathspec = compilePathspecs(paths);
   const excluded: string[] = [];
   let root: RealPath | null = null;
   let scanned: Generator<WorktreePath> | null = null;
@@ -240,7 +229,7 @@ function* dirtyPathStreamPagedOwned(
   limits?: DirtyPathLimits,
   excludeRoots: string[] = [],
 ): Generator<string> {
-  const pathspec = compilePathspecsOwned(paths);
+  const pathspec = compilePathspecs(paths);
   const excluded: string[] = [];
   let root: RealPath | null = null;
   let scanned: Generator<WorktreePath> | null = null;
@@ -366,7 +355,7 @@ function* scanDirtyWorktreeEntries(
     }
     return;
   }
-  for (const entry of walkWorktreeEntriesStreamOwned(worktree, lexicalRoot, {
+  for (const entry of walkWorktreeEntriesStream(worktree, lexicalRoot, {
     excludeRoots,
     includeIgnored: true,
     maxScanRows: DIRTY_EXCLUDED_SCAN_ROWS,

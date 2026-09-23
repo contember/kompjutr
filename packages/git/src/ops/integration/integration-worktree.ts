@@ -18,10 +18,10 @@ import {
   MAX_TREE_BUILD_LEAF_ENTRIES,
   preflightTreeBuild,
   type TreeBuildPreflightStats,
-} from "../tree/tree-build.js";
+} from "../tree/tree-build-full.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { type DirtyPathLimits, dirtyPathStreamOwned } from "../worktree/worktree-io.js";
+import { type DirtyPathLimits, dirtyPathStream } from "../worktree/worktree-io.js";
 
 export const MAX_INTEGRATION_INDEX_ENTRIES = MAX_TREE_BUILD_LEAF_ENTRIES;
 const MAX_REPOSITORY_ROWS = 50_000;
@@ -134,7 +134,7 @@ export function requireCleanIntegrationWorktree(
   operation: IntegrationOperation,
   excludeRoots: string[] = [],
 ): void {
-  const iterator = dirtyPathStreamOwned(repo, worktree, undefined, dirtyPathLimits(), excludeRoots);
+  const iterator = dirtyPathStream(repo, worktree, undefined, dirtyPathLimits(), excludeRoots);
   try {
     const dirty = iterator.next();
     if (dirty.done !== true) {

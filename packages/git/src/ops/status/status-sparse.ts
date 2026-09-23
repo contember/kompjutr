@@ -1,6 +1,11 @@
 import { CorruptError, GitError, hasErrorCode } from "../../common/errors.js";
 import { comparePaths } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
+import type {
+  SparseIndexAncestorFact,
+  SparseWorkspaceResult,
+  SparseWorkspaceRow,
+} from "../../store/core/contracts.js";
 import { contentIdKey, type IndexEntry } from "../../store/index.js";
 import { sharedRepoStoreMutations } from "../../store/repository/shared.js";
 import {
@@ -12,15 +17,10 @@ import {
 import type { TargetEntry } from "../checkout/checkout.js";
 import type { GitContext, IndexTrackerSeedEntry } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";
-import type {
-  SparseIndexAncestorFact,
-  SparseWorkspaceResult,
-  SparseWorkspaceRow,
-} from "../worktree/sparse-workspace.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
   type HashedPath,
-  hashExactWorktreePathsOwned,
+  hashExactWorktreePaths,
   indexMatchesStat,
   type WorktreePath,
 } from "../worktree/worktree-io.js";
@@ -306,7 +306,7 @@ function compareSparseWorktree(
     if (oid === undefined) unresolved.push(candidate.worktree);
     else if (oid !== candidate.entry.oid) dirty.add(candidate.entry.path);
   }
-  const hashed = hashExactWorktreePathsOwned(repo, worktree, unresolved, {
+  const hashed = hashExactWorktreePaths(repo, worktree, unresolved, {
     write: false,
   });
   sharedRepoStoreMutations(repo.store).upsertBlobIdsOwned(

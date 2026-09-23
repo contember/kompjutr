@@ -1,11 +1,11 @@
 import { CorruptError } from "../../common/errors.js";
+import type { SparseWorkspaceRow } from "../../store/core/contracts.js";
 import { contentIdKey } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
-import type { SparseWorkspaceRow } from "../worktree/sparse-workspace.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
-  hashExactWorktreePathsOwned,
+  hashExactWorktreePaths,
   indexMatchesStat,
   type WorktreePath,
 } from "../worktree/worktree-io.js";
@@ -90,7 +90,7 @@ export function sparseCheckoutWorktreeMatches(
     unresolved.push(candidate.worktree);
     unresolvedExpected.set(candidate.expected.path, candidate.expected);
   }
-  const hashed = hashExactWorktreePathsOwned(repo, worktree, unresolved, {
+  const hashed = hashExactWorktreePaths(repo, worktree, unresolved, {
     write: false,
   });
   for (const candidate of unresolved) {

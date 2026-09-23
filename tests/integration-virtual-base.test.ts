@@ -16,7 +16,7 @@ import {
   planVirtualAncestorIntegration,
 } from "../packages/git/src/ops/integration/integration.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
-import { buildTree } from "../packages/git/src/ops/tree/tree-build.js";
+import { buildTree } from "../packages/git/src/ops/tree/tree-build-full.js";
 import {
   type CheckoutStore,
   type IndexEntry,

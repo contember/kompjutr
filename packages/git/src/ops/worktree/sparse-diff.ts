@@ -1,5 +1,6 @@
 import { CorruptError, hasErrorCode } from "../../common/errors.js";
 import { comparePaths } from "../../common/streams.js";
+import type { SparseWorkspaceRow, SparseWorkspaceSource } from "../../store/core/contracts.js";
 import { matchesPaths } from "../checkout/checkout.js";
 import {
   compareIdentities,
@@ -10,7 +11,6 @@ import {
 } from "../diff/diff-internal.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
-import type { SparseWorkspaceRow, SparseWorkspaceSource } from "./sparse-workspace.js";
 import type { WorktreePath } from "./worktree-io.js";
 
 const SPARSE_DIFF_PATHS = 1000;

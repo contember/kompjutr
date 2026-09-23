@@ -1,13 +1,13 @@
 import { NotARepositoryError } from "../../common/errors.js";
 import { normalizePath } from "../../common/paths.js";
 import type { AuthCallback, GitHttpClient } from "../../protocol/transport.js";
-import type { SqliteGitDatabase } from "../../store/index.js";
-import { Repository } from "../repository/repository.js";
 import type {
   CommitTreeSnapshotSource,
   SelectedPathSource,
   SparseWorkspaceSource,
-} from "../worktree/sparse-workspace.js";
+} from "../../store/core/contracts.js";
+import type { SqliteGitDatabase } from "../../store/index.js";
+import { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 
 export interface GitIdentity {

@@ -9,12 +9,12 @@ import { snapshotCommitTreeOwned } from "../../store/sparse/sparse-workspace.js"
 import type { GitContext, GitIdentity } from "../core/context.js";
 import type { CommitResult } from "../core/kinds.js";
 import { committerRefLogMetadata, type RefLogReason } from "../core/ref-log.js";
+import { buildTreeInBatch } from "../tree/tree-build-full.js";
 import {
-  buildTreeInBatch,
   planSparseTreeBuildFromSource,
   type SparseTreeBuildPlan,
   writeSparseTreePlanInBatch,
-} from "../tree/tree-build.js";
+} from "../tree/tree-build-sparse.js";
 import {
   type Repository,
   type ResolvedHead,
