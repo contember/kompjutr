@@ -3,11 +3,9 @@ import { fromHex, utf8Decoder } from "../../common/bytes.js";
 import { CorruptError } from "../../common/errors.js";
 import { joinPath } from "../../common/paths.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../../store/index.js";
-import { writeObjectsOwned } from "../../store/repository/shared.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
-import type { AdmittedBlobBatch, BlobMetadata, ContentObjects } from "./merge-apply-types.js";
-import type { ProjectedMergeEntry } from "./merge-projection.js";
+import type { AdmittedBlobBatch, BlobMetadata } from "./merge-apply-types.js";
 import type { MergeTouchedPath } from "./merge-state.js";
 
 const OBJECT_INFO_PAGE = 4_096;
@@ -107,24 +105,6 @@ function readAdmittedBlobBatch<T>(
   }
   if (actualEnd === start) throw new CorruptError(`${label} made no progress`);
   return { end: actualEnd, blobs: read.blobs };
-}
-
-export function contentObjects(
-  repo: Repository,
-  entries: readonly ProjectedMergeEntry[],
-): ContentObjects {
-  const oids = new Map<string, string>();
-  writeObjectsOwned(repo.store, (batch) => {
-    for (const entry of entries) {
-      if (entry.content === null) continue;
-      const oid = batch.write("blob", entry.content);
-      if (entry.stageZero !== null && oid !== entry.stageZero.oid) {
-        throw new CorruptError(`merged content identity does not match ${entry.path}`);
-      }
-      oids.set(entry.path, oid);
-    }
-  });
-  return { entries: oids };
 }
 
 export function restoreWorktreeFiles(

@@ -5,24 +5,19 @@ import { hasErrorCode } from "../packages/git/src/common/errors.js";
 import { hashObject, MODE_FILE, serializeTree } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
 import { DEFAULT_TEXT_MERGE_LIMITS } from "../packages/git/src/diff/xmerge.js";
-import {
-  type IntegrationEntry,
-  planIntegration,
-} from "../packages/git/src/ops/integration/integration.js";
-import {
-  projectedTouchedShape,
-  requireCleanIntegrationWorktree,
-} from "../packages/git/src/ops/integration/integration-worktree.js";
-import type { ProjectedMergeEntry } from "../packages/git/src/ops/merge/merge-projection.js";
+import type { IntegrationEntry } from "../packages/git/src/ops/integration/integration.js";
+import { requireCleanIntegrationWorktree } from "../packages/git/src/ops/integration/integration-worktree.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import {
   type CheckoutStore,
   PACK_BLOB_BATCH_TARGET_BYTES,
   SqliteGitDatabase,
 } from "../packages/git/src/store/index.js";
+import type { ProjectedMergeEntry } from "../packages/git/src/store/operations/integration-workspace/descriptors.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
+import { collectIntegration, collectTouchedShapes } from "./helpers/integration.js";
 import { makeRepo } from "./helpers/workspace.js";
 import { CountingWorktree } from "./helpers/worktree.js";
 
@@ -130,7 +125,10 @@ describe("bounded three-way integration plan", () => {
         content: null,
       },
     ];
-    expect(projectedTouchedShape(projected).map((entry) => entry.path)).toEqual([
+    const database = new SqliteGitDatabase(new TestDatabase());
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const shapes = collectTouchedShapes(new Repository(store), projected);
+    expect(shapes.map((entry) => entry.path)).toEqual([
       "dir",
       "dir/sub",
       "dir/sub/file",
@@ -281,7 +279,7 @@ describe("bounded three-way integration plan", () => {
       refs: coldStore.listRefs(),
       index: coldStore.indexEntries(),
     };
-    const plan = planIntegration(new Repository(coldStore), {
+    const plan = collectIntegration(new Repository(coldStore), {
       baseTreeOid: base.tree,
       currentTreeOid: current.tree,
       incomingTreeOid: incoming.tree,
@@ -353,7 +351,7 @@ describe("bounded three-way integration plan", () => {
       refs: store.listRefs(),
       index: store.indexEntries(),
     };
-    const plan = planIntegration(repo, {
+    const plan = collectIntegration(repo, {
       baseTreeOid: base.tree,
       currentTreeOid: current.tree,
       incomingTreeOid: incoming.tree,
@@ -430,7 +428,7 @@ describe("bounded three-way integration plan", () => {
     const current = writeTree(store, { "large.bin": { content: large } });
     const incoming = writeTree(store, { "large.bin": { content: "incoming\n" } });
 
-    const plan = planIntegration(new Repository(store), {
+    const plan = collectIntegration(new Repository(store), {
       baseTreeOid: base.tree,
       currentTreeOid: current.tree,
       incomingTreeOid: incoming.tree,
@@ -476,7 +474,7 @@ describe("bounded three-way integration plan", () => {
       index: store.indexEntries(),
     };
 
-    const plan = planIntegration(repo, {
+    const plan = collectIntegration(repo, {
       baseTreeOid: base.tree,
       currentTreeOid: current.tree,
       incomingTreeOid: incoming.tree,
@@ -532,14 +530,14 @@ describe("bounded three-way integration plan", () => {
     };
 
     expect(() =>
-      planIntegration(repo, {
+      collectIntegration(repo, {
         baseTreeOid: missing.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
       }),
     ).toThrowError(expect.objectContaining({ code: "ENOTFOUND" }));
     expect(() =>
-      planIntegration(repo, {
+      collectIntegration(repo, {
         baseTreeOid: wrongType.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -574,7 +572,7 @@ describe("bounded three-way integration plan", () => {
     const coldStore = coldDatabase.openCheckout(repository);
 
     expect(() =>
-      planIntegration(new Repository(coldStore), {
+      collectIntegration(new Repository(coldStore), {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -594,11 +592,24 @@ describe("bounded three-way integration plan", () => {
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const repo = new Repository(store);
     expect(() =>
-      planIntegration(repo, {
+      collectIntegration(repo, {
         baseTreeOid: null,
         currentTreeOid: null,
         incomingTreeOid: null,
         limits: { maxEntries: 1_001 },
+      }),
+    ).toThrow(RangeError);
+  });
+
+  it("rejects a source row limit above its hard ceiling", () => {
+    const database = new SqliteGitDatabase(new TestDatabase());
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    expect(() =>
+      collectIntegration(new Repository(store), {
+        baseTreeOid: null,
+        currentTreeOid: null,
+        incomingTreeOid: null,
+        limits: { maxSourceRows: Number.MAX_SAFE_INTEGER },
       }),
     ).toThrow(RangeError);
   });
@@ -612,7 +623,7 @@ describe("bounded three-way integration plan", () => {
     const repo = new Repository(store);
 
     try {
-      planIntegration(repo, {
+      collectIntegration(repo, {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -642,7 +653,7 @@ describe("bounded three-way integration plan", () => {
     const repo = new Repository(store);
 
     expect(() =>
-      planIntegration(repo, {
+      collectIntegration(repo, {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -654,7 +665,7 @@ describe("bounded three-way integration plan", () => {
     const textCurrent = writeTree(store, { text: { content: "current contents\n" } });
     const textIncoming = writeTree(store, { text: { content: "incoming contents\n" } });
     expect(() =>
-      planIntegration(repo, {
+      collectIntegration(repo, {
         baseTreeOid: textBase.tree,
         currentTreeOid: textCurrent.tree,
         incomingTreeOid: textIncoming.tree,
@@ -671,7 +682,7 @@ describe("bounded three-way integration plan", () => {
     const incoming = writeTree(store, { file: { content: "incoming\n" } });
 
     expect(() =>
-      planIntegration(new Repository(store), {
+      collectIntegration(new Repository(store), {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,

@@ -9,9 +9,8 @@ import {
 } from "../../common/objects.js";
 import { comparePaths } from "../../common/streams.js";
 import type { IntegrationContentReference } from "../../store/operations/integration-workspace/descriptors.js";
-import type { TouchedSpec, TouchedSpecs } from "./merge-apply-types.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
-import { type MergeTouchedPath, validateMergePath } from "./merge-state.js";
+import { validateMergePath } from "./merge-state.js";
 
 function validMode(mode: string): boolean {
   return mode === MODE_FILE || mode === MODE_EXECUTABLE || mode === MODE_SYMLINK;
@@ -94,35 +93,4 @@ export function validateProjectedIndexEntries(
     }
     previous = entry.path;
   }
-}
-
-export function touchedSpecs(entries: readonly ProjectedMergeEntry[]): TouchedSpecs {
-  const byPath = new Map<string, TouchedSpec>();
-  const retain = (
-    path: string,
-    logicalPath: string,
-    purpose: MergeTouchedPath["purpose"],
-  ): void => {
-    if (byPath.has(path)) return;
-    const spec: TouchedSpec = { path, logicalPath, purpose };
-    byPath.set(spec.path, spec);
-  };
-  const retainAncestor = (path: string): void => {
-    let slash = path.lastIndexOf("/");
-    while (slash > 0) {
-      const ancestor = path.slice(0, slash);
-      retain(ancestor, ancestor, "primary");
-      slash = ancestor.lastIndexOf("/");
-    }
-  };
-  for (const entry of entries) {
-    retain(entry.path, entry.logicalPath, entry.purpose);
-    if (entry.purpose !== "primary" && !byPath.has(entry.logicalPath)) {
-      retain(entry.logicalPath, entry.logicalPath, "primary");
-    }
-    retainAncestor(entry.path);
-    retainAncestor(entry.logicalPath);
-  }
-  const specs = [...byPath.values()].sort((left, right) => comparePaths(left.path, right.path));
-  return { entries: specs };
 }

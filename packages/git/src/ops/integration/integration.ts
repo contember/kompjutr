@@ -1,11 +1,9 @@
-export { planIntegration, planVirtualAncestorIntegration } from "./integration-plan.js";
 export type {
   CleanIntegrationEntry,
   IntegrationConflictKind,
   IntegrationEntry,
   IntegrationInput,
   IntegrationLimits,
-  IntegrationPlan,
   VirtualAncestorIntegrationInput,
 } from "./integration-types.js";
 export {

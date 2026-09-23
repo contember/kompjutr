@@ -11,12 +11,12 @@ import {
 import {
   MAX_REPLAY_REVISION_CODE_UNITS,
   MAX_REPLAY_REVISION_HOPS,
-  planReplay,
   preflightReplayCommitObjects,
 } from "../packages/git/src/ops/replay/replay.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
+import { collectReplay } from "./helpers/integration.js";
 
 const PERSON: Person = {
   name: "Replay Fixture",
@@ -99,7 +99,7 @@ describe("one-commit replay planner", () => {
       index: store.indexEntries(),
     };
 
-    const cherryPick = planReplay(repo, {
+    const cherryPick = collectReplay(repo, {
       kind: "cherry-pick",
       source: "topic",
       currentOid: current,
@@ -134,7 +134,7 @@ describe("one-commit replay planner", () => {
       }),
     ]);
 
-    const revert = planReplay(repo, {
+    const revert = collectReplay(repo, {
       kind: "revert",
       source: source,
       currentOid: current,
@@ -181,7 +181,7 @@ describe("one-commit replay planner", () => {
     const current = commit(store, currentTree.tree, [], "current");
 
     expect(
-      planReplay(repo, {
+      collectReplay(repo, {
         kind: "cherry-pick",
         source,
         currentOid: current,
@@ -189,7 +189,7 @@ describe("one-commit replay planner", () => {
       }).labels.incoming,
     ).toBe(`${source.slice(0, 7)} (source subject)`);
     expect(
-      planReplay(repo, {
+      collectReplay(repo, {
         kind: "revert",
         source,
         currentOid: current,
@@ -208,7 +208,7 @@ describe("one-commit replay planner", () => {
     const current = commit(store, currentTree.tree, [], "current");
 
     expect(
-      planReplay(repo, {
+      collectReplay(repo, {
         kind: "cherry-pick",
         source,
         currentOid: current,
@@ -216,7 +216,7 @@ describe("one-commit replay planner", () => {
       }).labels.incoming,
     ).toBe(`${source.slice(0, 7)} (  source subject)`);
     expect(
-      planReplay(repo, {
+      collectReplay(repo, {
         kind: "revert",
         source,
         currentOid: current,
@@ -232,7 +232,7 @@ describe("one-commit replay planner", () => {
     const emptyCurrent = commit(store, empty.tree, [], "empty current");
     const root = commit(store, added.tree, [], "root");
 
-    const cherryPick = planReplay(repo, {
+    const cherryPick = collectReplay(repo, {
       kind: "cherry-pick",
       source: root,
       currentOid: emptyCurrent,
@@ -248,7 +248,7 @@ describe("one-commit replay planner", () => {
       expect.objectContaining({ kind: "clean", path: "file", before: null }),
     ]);
 
-    const revert = planReplay(repo, {
+    const revert = collectReplay(repo, {
       kind: "revert",
       source: root,
       currentOid: root,
@@ -273,14 +273,14 @@ describe("one-commit replay planner", () => {
     const source = commit(store, secondTree.tree, [parent], "source");
 
     expect(
-      planReplay(repo, {
+      collectReplay(repo, {
         kind: "cherry-pick",
         source,
         currentOid: parent,
       }).mainline,
     ).toBeNull();
     expect(
-      planReplay(repo, {
+      collectReplay(repo, {
         kind: "cherry-pick",
         source,
         currentOid: parent,
@@ -288,11 +288,11 @@ describe("one-commit replay planner", () => {
       }).mainline,
     ).toBe(1);
     expectCode(
-      () => planReplay(repo, { kind: "cherry-pick", source, currentOid: parent, mainline: 2 }),
+      () => collectReplay(repo, { kind: "cherry-pick", source, currentOid: parent, mainline: 2 }),
       "EINVAL",
     );
     expectCode(
-      () => planReplay(repo, { kind: "revert", source, currentOid: parent, mainline: 1.5 }),
+      () => collectReplay(repo, { kind: "revert", source, currentOid: parent, mainline: 1.5 }),
       "EINVAL",
     );
   });
@@ -307,13 +307,13 @@ describe("one-commit replay planner", () => {
     const merge = commit(store, mergeTree.tree, [first, second], "merge");
 
     expectCode(
-      () => planReplay(repo, { kind: "cherry-pick", source: merge, currentOid: first }),
+      () => collectReplay(repo, { kind: "cherry-pick", source: merge, currentOid: first }),
       "EINVAL",
     );
     for (const mainline of [0, 3, Number.MAX_SAFE_INTEGER + 1]) {
       expectCode(
         () =>
-          planReplay(repo, {
+          collectReplay(repo, {
             kind: "revert",
             source: merge,
             currentOid: first,
@@ -322,7 +322,7 @@ describe("one-commit replay planner", () => {
         "EINVAL",
       );
     }
-    const selected = planReplay(repo, {
+    const selected = collectReplay(repo, {
       kind: "revert",
       source: merge,
       currentOid: first,
@@ -342,7 +342,8 @@ describe("one-commit replay planner", () => {
     const rootTree = tree(store, "root\n");
     const root = commit(store, rootTree.tree, [], "root");
     expectCode(
-      () => planReplay(repo, { kind: "cherry-pick", source: root, currentOid: root, mainline: 1 }),
+      () =>
+        collectReplay(repo, { kind: "cherry-pick", source: root, currentOid: root, mainline: 1 }),
       "EINVAL",
     );
   });
@@ -356,24 +357,24 @@ describe("one-commit replay planner", () => {
     store.setRef("refs/heads/missing-object", "1".repeat(40));
 
     expectCode(
-      () => planReplay(repo, { kind: "cherry-pick", source: "missing", currentOid: current }),
+      () => collectReplay(repo, { kind: "cherry-pick", source: "missing", currentOid: current }),
       "ENOTFOUND",
     );
     expectCode(
-      () => planReplay(repo, { kind: "cherry-pick", source: "corrupt", currentOid: current }),
+      () => collectReplay(repo, { kind: "cherry-pick", source: "corrupt", currentOid: current }),
       "ECORRUPT",
     );
     expectCode(
       () =>
-        planReplay(repo, { kind: "cherry-pick", source: "missing-object", currentOid: current }),
+        collectReplay(repo, { kind: "cherry-pick", source: "missing-object", currentOid: current }),
       "ENOTFOUND",
     );
     expectCode(
-      () => planReplay(repo, { kind: "revert", source: current, currentOid: "not-an-oid" }),
+      () => collectReplay(repo, { kind: "revert", source: current, currentOid: "not-an-oid" }),
       "EINVAL",
     );
     expectCode(
-      () => planReplay(repo, { kind: "revert", source: current, currentOid: "2".repeat(40) }),
+      () => collectReplay(repo, { kind: "revert", source: current, currentOid: "2".repeat(40) }),
       "ENOTFOUND",
     );
   });
@@ -382,10 +383,10 @@ describe("one-commit replay planner", () => {
     const { repo } = harness();
 
     expect(() =>
-      planReplay(repo, { kind: "cherry-pick", source: "", currentOid: "invalid" }),
+      collectReplay(repo, { kind: "cherry-pick", source: "", currentOid: "invalid" }),
     ).toThrowError("replay source revision is required");
     expect(() =>
-      planReplay(repo, {
+      collectReplay(repo, {
         kind: "revert",
         source: "x".repeat(MAX_REPLAY_REVISION_CODE_UNITS + 1),
         currentOid: "invalid",
@@ -403,7 +404,7 @@ describe("one-commit replay planner", () => {
     const tip = commits[MAX_REPLAY_REVISION_HOPS]!;
 
     expect(
-      planReplay(repo, {
+      collectReplay(repo, {
         kind: "cherry-pick",
         source: `${tip}~${MAX_REPLAY_REVISION_HOPS}`,
         currentOid: tip,
@@ -411,7 +412,7 @@ describe("one-commit replay planner", () => {
     ).toBe(commits[0]);
     expectCode(
       () =>
-        planReplay(repo, {
+        collectReplay(repo, {
           kind: "cherry-pick",
           source: `${tip}~${MAX_REPLAY_REVISION_HOPS + 1}`,
           currentOid: tip,
@@ -420,7 +421,7 @@ describe("one-commit replay planner", () => {
     );
     expectCode(
       () =>
-        planReplay(repo, {
+        collectReplay(repo, {
           kind: "revert",
           source: `${tip}~999999999999999999999999999999999999999999999999999999999999`,
           currentOid: tip,
@@ -428,7 +429,7 @@ describe("one-commit replay planner", () => {
       "E2BIG",
     );
     expect(() =>
-      planReplay(repo, {
+      collectReplay(repo, {
         kind: "revert",
         source: `${tip}~999999999999999999999999999999999999999999999999999999999999`,
         currentOid: tip,
@@ -455,18 +456,20 @@ describe("one-commit replay planner", () => {
     store.setRef("refs/tags/release", tag);
 
     expect(
-      planReplay(repo, { kind: "cherry-pick", source: second.slice(0, 12), currentOid: first })
+      collectReplay(repo, { kind: "cherry-pick", source: second.slice(0, 12), currentOid: first })
         .sourceOid,
     ).toBe(second);
     expect(
-      planReplay(repo, { kind: "cherry-pick", source: "release", currentOid: first }).sourceOid,
+      collectReplay(repo, { kind: "cherry-pick", source: "release", currentOid: first }).sourceOid,
     ).toBe(second);
     expect(
-      planReplay(repo, { kind: "cherry-pick", source: "release^1", currentOid: second }).sourceOid,
+      collectReplay(repo, { kind: "cherry-pick", source: "release^1", currentOid: second })
+        .sourceOid,
     ).toBe(first);
     const merge = commit(store, secondTree.tree, [first, second], "merge");
     expect(
-      planReplay(repo, { kind: "cherry-pick", source: `${merge}^2`, currentOid: second }).sourceOid,
+      collectReplay(repo, { kind: "cherry-pick", source: `${merge}^2`, currentOid: second })
+        .sourceOid,
     ).toBe(second);
   });
 
@@ -477,7 +480,7 @@ describe("one-commit replay planner", () => {
     store.setRef("refs/heads/cycle-a", "ref: refs/heads/cycle-b");
     store.setRef("refs/heads/cycle-b", "ref: refs/heads/cycle-a");
     expectCode(
-      () => planReplay(repo, { kind: "revert", source: "cycle-a", currentOid: current }),
+      () => collectReplay(repo, { kind: "revert", source: "cycle-a", currentOid: current }),
       "ECORRUPT",
     );
   });
@@ -496,7 +499,7 @@ describe("one-commit replay planner", () => {
     );
     expectCode(
       () =>
-        planReplay(nonCommit.repo, {
+        collectReplay(nonCommit.repo, {
           kind: "cherry-pick",
           source: nonCommitSource,
           currentOid: current,
@@ -512,7 +515,7 @@ describe("one-commit replay planner", () => {
     );
     expectCode(
       () =>
-        planReplay(nonCommit.repo, {
+        collectReplay(nonCommit.repo, {
           kind: "revert",
           source: missingSource,
           currentOid: current,
@@ -535,7 +538,7 @@ describe("one-commit replay planner", () => {
     const coldRepo = new Repository(coldDatabase.openCheckout(row));
     expectCode(
       () =>
-        planReplay(coldRepo, {
+        collectReplay(coldRepo, {
           kind: "cherry-pick",
           source: corruptSource,
           currentOid: corruptSource,
@@ -553,11 +556,11 @@ describe("one-commit replay planner", () => {
     store.setRef(exact, root);
 
     expect(
-      planReplay(repo, { kind: "cherry-pick", source: exact, currentOid: root }).sourceOid,
+      collectReplay(repo, { kind: "cherry-pick", source: exact, currentOid: root }).sourceOid,
     ).toBe(root);
     expectCode(
       () =>
-        planReplay(repo, {
+        collectReplay(repo, {
           kind: "cherry-pick",
           source: `${exact}x`,
           currentOid: root,
@@ -572,7 +575,7 @@ describe("one-commit replay planner", () => {
     const parent = commit(store, unchanged.tree, [], "parent");
     const source = commit(store, unchanged.tree, [parent], "empty source");
 
-    const plan = planReplay(repo, {
+    const plan = collectReplay(repo, {
       kind: "cherry-pick",
       source,
       currentOid: parent,
@@ -589,7 +592,7 @@ describe("one-commit replay planner", () => {
     const source = commit(store, unchanged.tree, [parent], "x".repeat(1024 * 1024 + 1));
 
     preflightReplayCommitObjects(repo, [source]);
-    const plan = planReplay(repo, { kind: "cherry-pick", source, currentOid: parent });
+    const plan = collectReplay(repo, { kind: "cherry-pick", source, currentOid: parent });
 
     expect(plan.sourceCommit.message.length).toBeGreaterThan(1024 * 1024);
   });

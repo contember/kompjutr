@@ -1,4 +1,3 @@
-export { planFixedReplayStep, planReplay } from "./replay-planning.js";
 export {
   MAX_REPLAY_REVISION_CODE_UNITS,
   MAX_REPLAY_REVISION_HOPS,
@@ -17,7 +16,6 @@ export type {
   ReplayInput,
   ReplayKind,
   ReplayLabels,
-  ReplayPlan,
   ReplaySnapshotConflict,
   ReplaySnapshotConflictStage,
   ReplaySnapshotOptions,

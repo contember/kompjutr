@@ -19,12 +19,6 @@ export type ConflictIntegrationEntry = StoredConflictEntry<Uint8Array>;
 
 export type IntegrationEntry = CleanIntegrationEntry | ConflictIntegrationEntry;
 
-export interface IntegrationPlan {
-  /** A Git-path-ordered delta relative to the current tree. */
-  entries: readonly IntegrationEntry[];
-  sourceRows: number;
-}
-
 export interface IntegrationLimits {
   maxSourceRows?: number;
   maxEntries?: number;

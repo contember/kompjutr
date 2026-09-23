@@ -15,7 +15,7 @@ import {
   requireSafeIntegrationWorktreeOwned,
 } from "../integration/integration-worktree.js";
 import { planFixedReplayStepOwned } from "../replay/replay-planning.js";
-import type { OwnedReplayPlan as ReplayPlan } from "../replay/replay-types.js";
+import type { ReplayPlan } from "../replay/replay-types.js";
 import { resolveIdentity, writeUnpublishedCommit } from "../repository/commit.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";

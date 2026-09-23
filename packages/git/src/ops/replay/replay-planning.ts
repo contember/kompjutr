@@ -1,15 +1,12 @@
 import { isOid } from "../../common/bytes.js";
 import { GitError } from "../../common/errors.js";
 import type { IntegrationWorkspace } from "../../store/operations/integration-workspace/workspace.js";
-import type { IntegrationInput } from "../integration/integration.js";
-import { planIntegration } from "../integration/integration.js";
 import { planIntegrationOwned } from "../integration/integration-plan-owned.js";
 import type { Repository } from "../repository/repository.js";
 import { readReplayCommit, requireBoundedRevision, resolveRevision } from "./replay-revision.js";
 import type {
   BoundedRevisionLabels,
   FixedReplayStepInput,
-  OwnedReplayPlan,
   ReplayIncomingLabelStyle,
   ReplayInput,
   ReplayKind,
@@ -74,23 +71,11 @@ function incomingLabel(
 }
 
 /** Resolve one source commit and build its bounded integration delta without mutating state. */
-export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
-  return planReplayInternal(repo, input, (input) => planIntegration(repo, input));
-}
-
 export function planReplayOwned(
   workspace: IntegrationWorkspace,
   repo: Repository,
   input: ReplayInput,
-): OwnedReplayPlan {
-  return planReplayInternal(repo, input, (input) => planIntegrationOwned(workspace, input));
-}
-
-function planReplayInternal<Integration>(
-  repo: Repository,
-  input: ReplayInput,
-  integrate: (input: IntegrationInput) => Integration,
-): ReplayPlan<Integration> {
+): ReplayPlan {
   const revisionLabels: BoundedRevisionLabels = {
     input: "replay source",
     operation: "replay",
@@ -130,7 +115,7 @@ function planReplayInternal<Integration>(
         sourceCommit.message,
       ),
   };
-  const integration = integrate({
+  const integration = planIntegrationOwned(workspace, {
     baseTreeOid,
     currentTreeOid: currentCommit.tree,
     incomingTreeOid,
@@ -160,42 +145,24 @@ function planReplayInternal<Integration>(
 }
 
 /** Build one cherry-pick plan from immutable sequencer OIDs and verify its parent selection. */
-export function planFixedReplayStep(repo: Repository, input: FixedReplayStepInput): ReplayPlan {
-  return planFixedReplayStepInternal(repo, input, (input) => planIntegration(repo, input));
-}
-
 export function planFixedReplayStepOwned(
   workspace: IntegrationWorkspace,
   repo: Repository,
   input: FixedReplayStepInput,
-): OwnedReplayPlan {
-  return planFixedReplayStepInternal(repo, input, (input) =>
-    planIntegrationOwned(workspace, input),
-  );
-}
-
-function planFixedReplayStepInternal<Integration>(
-  repo: Repository,
-  input: FixedReplayStepInput,
-  integrate: (input: IntegrationInput) => Integration,
-): ReplayPlan<Integration> {
+): ReplayPlan {
   if (!isOid(input.sourceOid) || !isOid(input.currentOid)) {
     throw new GitError("EINVAL", "rebase replay step requires full object ids");
   }
   if (input.selectedParentOid !== null && !isOid(input.selectedParentOid)) {
     throw new GitError("EINVAL", "rebase replay step selected parent is invalid");
   }
-  const plan = planReplayInternal(
-    repo,
-    {
-      kind: "cherry-pick",
-      source: input.sourceOid,
-      currentOid: input.currentOid,
-      incomingLabelStyle: "source-subject",
-      limits: input.limits,
-    },
-    integrate,
-  );
+  const plan = planReplayOwned(workspace, repo, {
+    kind: "cherry-pick",
+    source: input.sourceOid,
+    currentOid: input.currentOid,
+    incomingLabelStyle: "source-subject",
+    limits: input.limits,
+  });
   if (
     plan.sourceOid !== input.sourceOid ||
     plan.selectedParentOid !== input.selectedParentOid ||

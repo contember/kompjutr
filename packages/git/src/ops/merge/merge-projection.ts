@@ -2,7 +2,6 @@
 
 import { GitError } from "../../common/errors.js";
 import { MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../../common/objects.js";
-import { comparePaths } from "../../common/streams.js";
 import type {
   IntegrationContentReference,
   IntegrationEntry,
@@ -11,7 +10,6 @@ import type {
 } from "../../store/operations/integration-workspace/descriptors.js";
 import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
 import type { IntegrationWorkspace } from "../../store/operations/integration-workspace/workspace.js";
-import type { IntegrationPlan } from "../integration/integration.js";
 import type {
   IntegrationIdentity,
   IntegrationStages,
@@ -32,10 +30,13 @@ interface MergeReservations {
 export interface MergeProjectionOptions {
   currentLabel: string;
   incomingLabel: string;
+}
+
+export interface MergeProjectionCollisions {
   /** Candidate paths already owned by a tracked entry or directory. */
-  trackedCollisions?: ReadonlySet<string>;
+  tracked: Pick<ReadonlySet<string>, "has">;
   /** Candidate paths owned only by untracked worktree content. */
-  untrackedCollisions?: ReadonlySet<string>;
+  untracked: Pick<ReadonlySet<string>, "has">;
 }
 
 function selectedWorktree(
@@ -225,27 +226,6 @@ function descendant<Content>(
   return ordinary(entry);
 }
 
-/** Project structural conflicts to Git's collision-safe physical paths. */
-export function projectMergePlan(
-  plan: IntegrationPlan,
-  options: MergeProjectionOptions,
-): readonly ProjectedMergeEntry[] {
-  const reserved = new Set(options.trackedCollisions ?? []);
-  const untracked = options.untrackedCollisions ?? new Set<string>();
-  for (const entry of plan.entries) reserved.add(entry.path);
-  const projected = [...projectEntries(plan.entries, options, reserved, untracked)];
-  projected.sort((left, right) => comparePaths(left.path, right.path));
-  for (let position = 1; position < projected.length; position++) {
-    if (comparePaths(projected[position - 1]!.path, projected[position]!.path) === 0) {
-      throw new GitError(
-        "ECORRUPT",
-        `merge projection emitted duplicate path ${projected[position]!.path}`,
-      );
-    }
-  }
-  return projected;
-}
-
 function* projectEntries<Content>(
   entries: Iterable<IntegrationEntry<Content>>,
   options: MergeProjectionOptions,
@@ -322,18 +302,13 @@ export function projectMergePlanOwned(
   workspace: IntegrationWorkspace,
   plan: IntegrationPlanHandle<IntegrationEntry>,
   options: MergeProjectionOptions,
-  collisions?: {
-    tracked: Pick<ReadonlySet<string>, "has">;
-    untracked: Pick<ReadonlySet<string>, "has">;
-  },
+  collisions?: MergeProjectionCollisions,
 ): IntegrationPlanHandle<ProjectedMergeEntry<IntegrationContentReference>> {
   const projected = workspace.projectedPlan();
   const occupied = workspace.reservations(projected, "occupied");
   function* paths(): Generator<IntegrationReservation> {
     for (const entry of plan.entries)
       yield { path: entry.path, logicalPath: entry.path, purpose: "primary", identity: null };
-    for (const path of options.trackedCollisions ?? [])
-      yield { path, logicalPath: path, purpose: "primary", identity: null };
   }
   occupied.add(paths());
   const reserved: MergeReservations = {
@@ -348,7 +323,7 @@ export function projectMergePlanOwned(
         plan.entries,
         options,
         reserved,
-        collisions?.untracked ?? options.untrackedCollisions ?? new Set<string>(),
+        collisions?.untracked ?? new Set<string>(),
       )) {
         count++;
         yield entry;

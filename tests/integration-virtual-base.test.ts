@@ -10,11 +10,7 @@ import {
   MODE_SYMLINK,
 } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
-import {
-  type IntegrationEntry,
-  planIntegration,
-  planVirtualAncestorIntegration,
-} from "../packages/git/src/ops/integration/integration.js";
+import type { IntegrationEntry } from "../packages/git/src/ops/integration/integration.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { buildTree } from "../packages/git/src/ops/tree/tree-build-full.js";
 import {
@@ -24,6 +20,7 @@ import {
 } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
+import { collectIntegration, collectVirtualAncestorIntegration } from "./helpers/integration.js";
 
 interface ContentValue {
   mode: typeof MODE_FILE | typeof MODE_EXECUTABLE | typeof MODE_SYMLINK;
@@ -202,7 +199,7 @@ describe("virtual-ancestor integration planning", () => {
       const base = writeState(repo, states.base);
       const current = writeState(repo, states.current);
       const incoming = writeState(repo, states.incoming);
-      const normal = planIntegration(repo, {
+      const normal = collectIntegration(repo, {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -241,7 +238,7 @@ describe("virtual-ancestor integration planning", () => {
         },
       });
 
-      const recursive = planVirtualAncestorIntegration(repo, {
+      const recursive = collectVirtualAncestorIntegration(repo, {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -255,7 +252,7 @@ describe("virtual-ancestor integration planning", () => {
         `<<<<<<<<< ${currentLabel}\nleft\n=========\nright\n>>>>>>>>> ${incomingLabel}\n`,
       );
 
-      const virtual = planVirtualAncestorIntegration(repo, {
+      const virtual = collectVirtualAncestorIntegration(repo, {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -297,7 +294,7 @@ describe("virtual-ancestor integration planning", () => {
       const base = writeState(repo, states.base);
       const current = writeState(repo, states.current);
       const incoming = writeState(repo, states.incoming);
-      const plan = planVirtualAncestorIntegration(repo, {
+      const plan = collectVirtualAncestorIntegration(repo, {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -333,7 +330,7 @@ describe("virtual-ancestor integration planning", () => {
       const base = writeState(repo, {});
       const current = writeState(repo, currentState);
       const incoming = writeState(repo, incomingState);
-      const plan = planVirtualAncestorIntegration(repo, {
+      const plan = collectVirtualAncestorIntegration(repo, {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -372,7 +369,7 @@ describe("virtual-ancestor integration planning", () => {
       const incoming = writeState(repo, states.incoming);
       const afterSetupObjects = store.objectCount();
       expect(afterSetupObjects).toBeGreaterThan(beforeObjects);
-      const plan = planVirtualAncestorIntegration(repo, {
+      const plan = collectVirtualAncestorIntegration(repo, {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -397,7 +394,7 @@ describe("virtual-ancestor integration planning", () => {
       [`${path}/c`]: { mode: MODE_FILE, content: "child\n" },
     });
 
-    const plan = planVirtualAncestorIntegration(repo, {
+    const plan = collectVirtualAncestorIntegration(repo, {
       baseTreeOid: base.tree,
       currentTreeOid: current.tree,
       incomingTreeOid: incoming.tree,
@@ -418,7 +415,7 @@ describe("virtual-ancestor integration planning", () => {
       "node/child": { mode: MODE_FILE, content: "child\n" },
     });
 
-    const plan = planVirtualAncestorIntegration(repo, {
+    const plan = collectVirtualAncestorIntegration(repo, {
       baseTreeOid: base.tree,
       currentTreeOid: current.tree,
       incomingTreeOid: incoming.tree,
@@ -441,7 +438,7 @@ describe("virtual-ancestor integration planning", () => {
       "node/child": { mode: MODE_FILE, content: "child\n" },
     });
     const accepted = writeState(repo, currentState);
-    const plan = planVirtualAncestorIntegration(repo, {
+    const plan = collectVirtualAncestorIntegration(repo, {
       baseTreeOid: base.tree,
       currentTreeOid: accepted.tree,
       incomingTreeOid: incoming.tree,
@@ -452,7 +449,7 @@ describe("virtual-ancestor integration planning", () => {
     currentState["node~current_998"] = { mode: MODE_FILE, content: "occupied\n" };
     const rejected = writeState(repo, currentState);
     expect(() =>
-      planVirtualAncestorIntegration(repo, {
+      collectVirtualAncestorIntegration(repo, {
         baseTreeOid: base.tree,
         currentTreeOid: rejected.tree,
         incomingTreeOid: incoming.tree,

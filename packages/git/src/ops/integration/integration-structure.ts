@@ -4,12 +4,8 @@
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../../common/objects.js";
-import { comparePaths, joinSorted3 } from "../../common/streams.js";
-import type { Repository } from "../repository/repository.js";
-import { type TargetEntry, treeStream } from "../tree/tree-stream.js";
-
-export const MAX_INTEGRATION_STRUCTURE_ROWS = 200_000;
-export const MAX_INTEGRATION_STRUCTURE_ENTRIES = 65_536;
+import { comparePaths } from "../../common/streams.js";
+import type { TargetEntry } from "../tree/tree-stream.js";
 
 const PLAN_ENTRY_BYTES = 192;
 const IDENTITY_BYTES = 128;
@@ -17,16 +13,11 @@ const PREFIX_STATE_BYTES = 128;
 
 import type {
   ClassifiedRow,
-  ConflictStructuralEntry,
   IntegrationIdentity,
   IntegrationStages,
-  IntegrationStructureInput,
-  IntegrationStructureLimits,
-  PrefixCandidate,
   ResolvedLimits,
   StructuralConflictKind,
   StructuralIntegrationEntry,
-  StructuralIntegrationPlan,
 } from "./integration-structure-types.js";
 
 export type {
@@ -35,11 +26,8 @@ export type {
   ContentStructuralEntry,
   IntegrationIdentity,
   IntegrationStages,
-  IntegrationStructureInput,
-  IntegrationStructureLimits,
   StructuralConflictKind,
   StructuralIntegrationEntry,
-  StructuralIntegrationPlan,
 } from "./integration-structure-types.js";
 
 export class PlanBudget {
@@ -143,29 +131,6 @@ export function retainedPrefixBytes(
   if (current !== undefined) identities++;
   if (incoming !== undefined) identities++;
   return PREFIX_STATE_BYTES + 48 + path.length * 2 + identities * IDENTITY_BYTES;
-}
-
-function boundedLimit(value: number | undefined, ceiling: number, label: string): number {
-  if (value === undefined) return ceiling;
-  if (!Number.isSafeInteger(value) || value < 0 || value > ceiling) {
-    throw new RangeError(`invalid integration structure ${label} limit`);
-  }
-  return value;
-}
-
-function optionalByteLimit(value: number | undefined): number | undefined {
-  if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
-    throw new RangeError("invalid integration structure retained-byte limit");
-  }
-  return value;
-}
-
-function resolveLimits(limits: IntegrationStructureLimits | undefined): ResolvedLimits {
-  return {
-    maxRows: boundedLimit(limits?.maxRows, MAX_INTEGRATION_STRUCTURE_ROWS, "row"),
-    maxEntries: boundedLimit(limits?.maxEntries, MAX_INTEGRATION_STRUCTURE_ENTRIES, "entry"),
-    maxRetainedBytes: optionalByteLimit(limits?.maxRetainedBytes),
-  };
 }
 
 function same(left: TargetEntry | undefined, right: TargetEntry | undefined): boolean {
@@ -309,143 +274,4 @@ export function* validated(entries: Iterable<TargetEntry>, source: string): Gene
     previous = entry.path;
     yield entry;
   }
-}
-
-function isDescendant(path: string, parent: string): boolean {
-  return path.length > parent.length && path.startsWith(parent) && path[parent.length] === "/";
-}
-
-function fileDirectoryEntry(path: string, rowStages: IntegrationStages): ConflictStructuralEntry {
-  return { kind: "conflict", path, conflict: "file/directory", stages: rowStages };
-}
-
-function replaceEntry(
-  entries: StructuralIntegrationEntry[],
-  index: number,
-  entry: StructuralIntegrationEntry,
-  budget: PlanBudget,
-): void {
-  const before = entries[index];
-  if (before === undefined) throw new CorruptError("integration prefix state is inconsistent");
-  budget.replace(before, entry);
-  entries[index] = entry;
-}
-
-/**
- * Classify three already path-ordered leaf streams. This is exported so the
- * content phase can reuse the pure join without constructing repositories.
- */
-export function classifyStructuralStreams(
-  baseEntries: Iterable<TargetEntry>,
-  currentEntries: Iterable<TargetEntry>,
-  incomingEntries: Iterable<TargetEntry>,
-  limits?: IntegrationStructureLimits,
-): StructuralIntegrationPlan {
-  const resolved = resolveLimits(limits);
-  const budget = new PlanBudget(resolved);
-  const entries: StructuralIntegrationEntry[] = [];
-  const prefixes: PrefixCandidate[] = [];
-  let sourceRows = 0;
-
-  try {
-    for (const row of joinSorted3(
-      validated(baseEntries, "base"),
-      validated(currentEntries, "current"),
-      validated(incomingEntries, "incoming"),
-      { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
-    )) {
-      if (sourceRows >= resolved.maxRows) {
-        throw new GitError(
-          "E2BIG",
-          `integration structure exceeds ${resolved.maxRows} source rows`,
-        );
-      }
-      sourceRows++;
-      while (prefixes.length > 0) {
-        const candidate = prefixes[prefixes.length - 1];
-        if (candidate !== undefined && isDescendant(row.path, candidate.path)) break;
-        const expired = prefixes.pop();
-        if (expired !== undefined) budget.removePrefix(expired.retainedBytes);
-      }
-
-      const classified = classifyRow(row.path, row.a, row.b, row.c);
-      let entryIndex: number | null = null;
-
-      if (classified.occupiesPath && prefixes.length > 0) {
-        for (const prefix of prefixes) {
-          const replacement = fileDirectoryEntry(prefix.path, prefix.stages);
-          if (prefix.entryIndex === null) {
-            budget.add(replacement);
-            prefix.entryIndex = entries.length;
-            entries.push(replacement);
-          } else {
-            replaceEntry(entries, prefix.entryIndex, replacement, budget);
-          }
-        }
-        const replacement = fileDirectoryEntry(row.path, stages(row.a, row.b, row.c));
-        budget.add(replacement);
-        entryIndex = entries.length;
-        entries.push(replacement);
-      } else if (classified.entry !== null) {
-        budget.add(classified.entry);
-        entryIndex = entries.length;
-        entries.push(classified.entry);
-      }
-
-      const canPrefixAnotherSide =
-        row.a === undefined || row.b === undefined || row.c === undefined;
-      if (classified.occupiesPath && canPrefixAnotherSide) {
-        const retainedBytes = retainedPrefixBytes(row.path, row.a, row.b, row.c);
-        budget.addPrefix(retainedBytes);
-        prefixes.push({
-          path: row.path,
-          stages: stages(row.a, row.b, row.c),
-          entryIndex,
-          retainedBytes,
-        });
-      }
-    }
-
-    budget.finish();
-    return { entries, sourceRows };
-  } catch (error) {
-    budget.clear();
-    throw error;
-  }
-}
-
-/** Build a mutation-free structural delta from three authoritative tree cursors. */
-export function classifyIntegrationStructure(
-  repo: Repository,
-  input: IntegrationStructureInput,
-): StructuralIntegrationPlan {
-  resolveLimits(input.limits);
-  if (
-    input.currentTreeOid === input.incomingTreeOid ||
-    input.baseTreeOid === input.incomingTreeOid
-  ) {
-    const roots: string[] = [];
-    const seen = new Set<string>();
-    for (const treeOid of [input.baseTreeOid, input.currentTreeOid, input.incomingTreeOid]) {
-      if (treeOid === null || seen.has(treeOid)) continue;
-      seen.add(treeOid);
-      roots.push(treeOid);
-    }
-    for (const info of repo.store.objectInfo(roots)) {
-      if (info.type !== "tree") throw new CorruptError(`${info.oid} is a ${info.type}, not a tree`);
-      const stream = treeStream(repo, info.oid);
-      try {
-        stream.next();
-      } finally {
-        stream.return(undefined);
-      }
-    }
-    return { entries: [], sourceRows: 0 };
-  }
-  return classifyStructuralStreams(
-    treeStream(repo, input.baseTreeOid),
-    treeStream(repo, input.currentTreeOid),
-    treeStream(repo, input.incomingTreeOid),
-    input.limits,
-  );
 }

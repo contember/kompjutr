@@ -47,7 +47,7 @@ import type { Repository, ResolvedHead } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { planReplayOwned } from "./replay-planning.js";
-import type { ReplayIncomingLabelStyle, OwnedReplayPlan as ReplayPlan } from "./replay-types.js";
+import type { ReplayIncomingLabelStyle, ReplayPlan } from "./replay-types.js";
 
 const EMPTY_TREE_OID = hashObject("tree", new Uint8Array());
 

@@ -1,20 +1,7 @@
 import type { OperationStateMetadata, RebaseStateMetadata } from "../core/operation-state.js";
 import type { WorktreeStat } from "../worktree/worktree.js";
 import type { HashedPath } from "../worktree/worktree-io.js";
-import type {
-  MergeIndexSnapshot,
-  MergeJournal,
-  MergeStateMetadata,
-  MergeTouchedPath,
-} from "./merge-state.js";
-
-export type MergeApplyMetadata = Omit<MergeStateMetadata, "phase">;
-export type MergeApplyOutcome = "clean" | "conflicted" | "ready";
-
-export interface MergeApplyResult {
-  outcome: MergeApplyOutcome;
-  journal: MergeJournal | null;
-}
+import type { MergeIndexSnapshot, MergeTouchedPath } from "./merge-state.js";
 
 export interface OperationApplyOptions {
   suspendedState: OperationStateMetadata | null;
@@ -23,10 +10,6 @@ export interface OperationApplyOptions {
 export interface ActiveRebaseApply {
   currentStep: number;
   conflictState: RebaseStateMetadata | null;
-}
-
-export interface OperationApplyResult {
-  touched: readonly MergeTouchedPath[] | null;
 }
 
 export interface TouchedSpec {
@@ -41,16 +24,8 @@ export interface SnapshotDraft {
   stat: WorktreeStat | null;
 }
 
-export interface TouchedSpecs {
-  entries: TouchedSpec[];
-}
-
 export interface SnapshotObjects {
   entries: Map<string, HashedPath>;
-}
-
-export interface ContentObjects {
-  entries: Map<string, string>;
 }
 
 export interface BlobMetadata {
@@ -61,11 +36,3 @@ export interface AdmittedBlobBatch {
   end: number;
   blobs: ReadonlyMap<string, Uint8Array>;
 }
-
-export interface ProjectedRebaseTransitionOptions<T> extends ActiveRebaseApply {
-  onClean: (applied: OperationApplyResult) => T;
-}
-
-export type ProjectedRebaseTransitionResult<T> =
-  | { outcome: "clean"; value: T }
-  | { outcome: "conflicted" };

@@ -2,11 +2,7 @@ import type { Commit } from "../../common/objects.js";
 import type { TextMergeOptions } from "../../diff/xmerge.js";
 import type { IntegrationEntry } from "../../store/operations/integration-workspace/descriptors.js";
 import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
-import type {
-  IntegrationConflictKind,
-  IntegrationLimits,
-  IntegrationPlan,
-} from "../integration/integration.js";
+import type { IntegrationConflictKind, IntegrationLimits } from "../integration/integration.js";
 
 export type ReplayKind = "cherry-pick" | "revert";
 export type ReplayIncomingLabelStyle = "tree" | "source-subject" | "parent-of-source-subject";
@@ -28,7 +24,7 @@ export interface ReplayLabels {
   incoming: string;
 }
 
-export interface ReplayPlan<Integration = IntegrationPlan> {
+export interface ReplayPlan {
   kind: ReplayKind;
   sourceOid: string;
   sourceCommit: Commit;
@@ -42,10 +38,8 @@ export interface ReplayPlan<Integration = IntegrationPlan> {
   baseTreeOid: string | null;
   incomingTreeOid: string | null;
   labels: ReplayLabels;
-  integration: Integration;
+  integration: IntegrationPlanHandle<IntegrationEntry>;
 }
-
-export type OwnedReplayPlan = ReplayPlan<IntegrationPlanHandle<IntegrationEntry>>;
 
 export interface ReplaySnapshotOptions {
   snapshot: string;

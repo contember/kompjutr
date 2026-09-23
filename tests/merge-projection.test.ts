@@ -1,14 +1,36 @@
 import { describe, expect, it } from "vitest";
 
-import type {
-  IntegrationConflictKind,
-  IntegrationPlan,
-} from "../packages/git/src/ops/integration/integration.js";
+import type { IntegrationConflictKind } from "../packages/git/src/ops/integration/integration.js";
 import type { IntegrationIdentity } from "../packages/git/src/ops/integration/integration-structure.js";
-import { projectMergePlan } from "../packages/git/src/ops/merge/merge-projection.js";
+import type {
+  MergeProjectionCollisions,
+  MergeProjectionOptions,
+  ProjectedMergeEntry,
+} from "../packages/git/src/ops/merge/merge-projection.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { TestDatabase } from "./helpers/db.js";
+import { type CollectedIntegrationPlan, collectMergeProjection } from "./helpers/integration.js";
 
 function identity(digit: string, mode = "100644"): IntegrationIdentity {
   return { mode, oid: digit.repeat(40) };
+}
+
+function projectPlan(
+  plan: CollectedIntegrationPlan,
+  options: MergeProjectionOptions,
+  collisions?: Partial<MergeProjectionCollisions>,
+): ProjectedMergeEntry<Uint8Array>[] {
+  const database = new SqliteGitDatabase(new TestDatabase());
+  const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+  return collectMergeProjection(
+    new Repository(store),
+    plan,
+    options,
+    collisions === undefined
+      ? undefined
+      : { tracked: collisions.tracked ?? new Set(), untracked: collisions.untracked ?? new Set() },
+  );
 }
 
 function conflictPlan(
@@ -16,7 +38,7 @@ function conflictPlan(
   current: IntegrationIdentity,
   incoming: IntegrationIdentity,
   conflict: IntegrationConflictKind,
-): IntegrationPlan {
+): CollectedIntegrationPlan {
   return {
     entries: [
       {
@@ -37,7 +59,7 @@ describe("merge projection", () => {
     const current = identity("2");
     const incoming = identity("3", "100755");
     const content = new TextEncoder().encode("conflict markers\n");
-    const plan: IntegrationPlan = {
+    const plan: CollectedIntegrationPlan = {
       entries: [
         {
           kind: "conflict",
@@ -51,7 +73,7 @@ describe("merge projection", () => {
       sourceRows: 1,
     };
 
-    expect(projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })).toEqual([
+    expect(projectPlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })).toEqual([
       {
         path: "x",
         logicalPath: "x",
@@ -69,7 +91,7 @@ describe("merge projection", () => {
     const incoming = identity("3", "120000");
 
     expect(
-      projectMergePlan(conflictPlan(null, current, incoming, "add/add"), {
+      projectPlan(conflictPlan(null, current, incoming, "add/add"), {
         currentLabel: "HEAD",
         incomingLabel: "topic",
       }),
@@ -100,7 +122,7 @@ describe("merge projection", () => {
     const incoming = identity("3", "100755");
 
     expect(
-      projectMergePlan(conflictPlan(null, current, incoming, "add/add"), {
+      projectPlan(conflictPlan(null, current, incoming, "add/add"), {
         currentLabel: "HEAD",
         incomingLabel: "topic",
       }),
@@ -132,7 +154,7 @@ describe("merge projection", () => {
     const incoming = identity("3", "120000");
 
     expect(
-      projectMergePlan(conflictPlan(base, current, incoming, "symlink"), {
+      projectPlan(conflictPlan(base, current, incoming, "symlink"), {
         currentLabel: "HEAD",
         incomingLabel: "topic",
       }),
@@ -164,7 +186,7 @@ describe("merge projection", () => {
     const incoming = identity("3", "120000");
 
     expect(
-      projectMergePlan(conflictPlan(base, current, incoming, "symlink"), {
+      projectPlan(conflictPlan(base, current, incoming, "symlink"), {
         currentLabel: "HEAD",
         incomingLabel: "topic",
       }),
@@ -195,7 +217,7 @@ describe("merge projection", () => {
     const incoming = identity("3", "100755");
 
     expect(
-      projectMergePlan(conflictPlan(null, current, incoming, "add/add"), {
+      projectPlan(conflictPlan(null, current, incoming, "add/add"), {
         currentLabel: "HEAD",
         incomingLabel: "topic",
       }),
@@ -218,21 +240,27 @@ describe("merge projection", () => {
     const plan = conflictPlan(null, current, incoming, "add/add");
 
     expect(
-      projectMergePlan(plan, {
-        currentLabel: "HEAD",
-        incomingLabel: "topic",
-        trackedCollisions: new Set(["x~HEAD", "x~HEAD_0"]),
-      })[1]?.path,
+      projectPlan(
+        plan,
+        {
+          currentLabel: "HEAD",
+          incomingLabel: "topic",
+        },
+        { tracked: new Set(["x~HEAD", "x~HEAD_0"]) },
+      )[1]?.path,
     ).toBe("x~HEAD_1");
     expect(() =>
-      projectMergePlan(plan, {
-        currentLabel: "HEAD",
-        incomingLabel: "topic",
-        untrackedCollisions: new Set(["x~HEAD"]),
-      }),
+      projectPlan(
+        plan,
+        {
+          currentLabel: "HEAD",
+          incomingLabel: "topic",
+        },
+        { untracked: new Set(["x~HEAD"]) },
+      ),
     ).toThrow(expect.objectContaining({ code: "ECHECKOUTFAIL" }));
     expect(() =>
-      projectMergePlan(plan, {
+      projectPlan(plan, {
         currentLabel: "z".repeat(2_200),
         incomingLabel: "topic",
       }),
@@ -242,7 +270,7 @@ describe("merge projection", () => {
   it("relocates the current file and makes an added incoming descendant stage zero", () => {
     const current = identity("1");
     const incoming = identity("2");
-    const plan: IntegrationPlan = {
+    const plan: CollectedIntegrationPlan = {
       entries: [
         {
           kind: "conflict",
@@ -262,7 +290,7 @@ describe("merge projection", () => {
       sourceRows: 2,
     };
 
-    expect(projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })).toEqual([
+    expect(projectPlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })).toEqual([
       {
         path: "x/y",
         logicalPath: "x/y",
@@ -288,7 +316,7 @@ describe("merge projection", () => {
     const base = identity("1");
     const current = identity("2", "100755");
     const incoming = identity("3");
-    const plan: IntegrationPlan = {
+    const plan: CollectedIntegrationPlan = {
       entries: [
         {
           kind: "conflict",
@@ -308,7 +336,7 @@ describe("merge projection", () => {
       sourceRows: 2,
     };
 
-    expect(projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })[1]).toEqual({
+    expect(projectPlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })[1]).toEqual({
       path: "x~HEAD",
       logicalPath: "x",
       purpose: "current-relocation",
@@ -323,7 +351,7 @@ describe("merge projection", () => {
     const base = identity("1");
     const current = identity("2");
     const incoming = identity("3", "100755");
-    const plan: IntegrationPlan = {
+    const plan: CollectedIntegrationPlan = {
       entries: [
         {
           kind: "conflict",
@@ -343,7 +371,7 @@ describe("merge projection", () => {
       sourceRows: 2,
     };
 
-    expect(projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })).toEqual([
+    expect(projectPlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })).toEqual([
       {
         path: "x/y",
         logicalPath: "x/y",
@@ -367,7 +395,7 @@ describe("merge projection", () => {
 
   it("sanitizes branch slashes and follows tracked suffixes", () => {
     const incoming = identity("3");
-    const plan: IntegrationPlan = {
+    const plan: CollectedIntegrationPlan = {
       entries: [
         {
           kind: "conflict",
@@ -381,17 +409,20 @@ describe("merge projection", () => {
     };
 
     expect(
-      projectMergePlan(plan, {
-        currentLabel: "HEAD",
-        incomingLabel: "feature/side",
-        trackedCollisions: new Set(["x~feature_side", "x~feature_side_0"]),
-      })[0]?.path,
+      projectPlan(
+        plan,
+        {
+          currentLabel: "HEAD",
+          incomingLabel: "feature/side",
+        },
+        { tracked: new Set(["x~feature_side", "x~feature_side_0"]) },
+      )[0]?.path,
     ).toBe("x~feature_side_1");
   });
 
   it("refuses an untracked collision at the selected path", () => {
     const incoming = identity("3");
-    const plan: IntegrationPlan = {
+    const plan: CollectedIntegrationPlan = {
       entries: [
         {
           kind: "conflict",
@@ -405,18 +436,21 @@ describe("merge projection", () => {
     };
 
     expect(() =>
-      projectMergePlan(plan, {
-        currentLabel: "HEAD",
-        incomingLabel: "topic",
-        untrackedCollisions: new Set(["x~topic"]),
-      }),
+      projectPlan(
+        plan,
+        {
+          currentLabel: "HEAD",
+          incomingLabel: "topic",
+        },
+        { untracked: new Set(["x~topic"]) },
+      ),
     ).toThrow(expect.objectContaining({ code: "ECHECKOUTFAIL" }));
   });
 
   it("reserves a relocation before projecting the next conflict", () => {
     const current = identity("2");
     const incoming = identity("3");
-    const plan: IntegrationPlan = {
+    const plan: CollectedIntegrationPlan = {
       entries: [
         {
           kind: "conflict",
@@ -437,7 +471,7 @@ describe("merge projection", () => {
     };
 
     expect(
-      projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "topic~HEAD" }).map(
+      projectPlan(plan, { currentLabel: "HEAD", incomingLabel: "topic~HEAD" }).map(
         (entry) => entry.path,
       ),
     ).toEqual(["x~topic~HEAD", "x~topic~HEAD_0"]);
@@ -445,7 +479,7 @@ describe("merge projection", () => {
 
   it("bounds generated relocation paths in UTF-8 bytes", () => {
     const incoming = identity("3");
-    const plan: IntegrationPlan = {
+    const plan: CollectedIntegrationPlan = {
       entries: [
         {
           kind: "conflict",
@@ -459,7 +493,7 @@ describe("merge projection", () => {
     };
 
     expect(() =>
-      projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "z".repeat(2_200) }),
+      projectPlan(plan, { currentLabel: "HEAD", incomingLabel: "z".repeat(2_200) }),
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
   });
 });

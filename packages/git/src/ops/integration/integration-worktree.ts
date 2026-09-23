@@ -10,7 +10,6 @@ import type {
 import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
 import type { IntegrationTouched } from "../../store/operations/integration-workspace/touched.js";
 import type { ProjectedMergeEntry } from "../merge/merge-projection.js";
-import type { MergeTouchedPath } from "../merge/merge-state.js";
 import { checkoutBlockersAgainstOwned, checkoutBlockersOwned } from "../refs/refs.js";
 import type { CheckoutPathSelection } from "../refs/refs-checkout-guard.js";
 import type { Repository } from "../repository/repository.js";
@@ -187,51 +186,6 @@ function requireSafeIntegrationSelection(
       `untracked working tree files would be overwritten by ${operation}: ${blockers.untracked.join(", ")}`,
     );
   }
-}
-
-export interface TouchedShape {
-  path: string;
-  logicalPath: string;
-  purpose: MergeTouchedPath["purpose"];
-}
-
-function buildProjectedTouchedShape(entries: readonly ProjectedMergeEntry[]): TouchedShape[] {
-  const byPath = new Map<string, TouchedShape>();
-  const retain = (
-    path: string,
-    logicalPath: string,
-    purpose: MergeTouchedPath["purpose"],
-  ): void => {
-    if (byPath.has(path)) return;
-    byPath.set(path, { path, logicalPath, purpose });
-  };
-  const retainAncestor = (path: string): void => {
-    let slash = path.lastIndexOf("/");
-    while (slash > 0) {
-      const ancestor = path.slice(0, slash);
-      if (!byPath.has(ancestor)) {
-        byPath.set(ancestor, {
-          path: ancestor,
-          logicalPath: ancestor,
-          purpose: "primary",
-        });
-      }
-      slash = ancestor.lastIndexOf("/");
-    }
-  };
-  for (const entry of entries) {
-    retain(entry.path, entry.logicalPath, entry.purpose);
-    if (entry.purpose !== "primary" && !byPath.has(entry.logicalPath)) {
-      retain(entry.logicalPath, entry.logicalPath, "primary");
-    }
-    retainAncestor(entry.path);
-    retainAncestor(entry.logicalPath);
-  }
-  return [...byPath.values()].sort((left, right) => comparePaths(left.path, right.path));
-}
-
-export function projectedTouchedShape(entries: readonly ProjectedMergeEntry[]): TouchedShape[] {
-  return buildProjectedTouchedShape(entries);
 }
 
 export function requireSafeIntegrationWorktreeOwned(

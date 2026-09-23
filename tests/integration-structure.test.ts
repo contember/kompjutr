@@ -9,17 +9,21 @@ import {
   serializeTree,
 } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
-import {
-  classifyIntegrationStructure,
-  classifyStructuralStreams,
-  type IntegrationIdentity,
-  type StructuralIntegrationEntry,
+import type {
+  IntegrationIdentity,
+  StructuralIntegrationEntry,
 } from "../packages/git/src/ops/integration/integration-structure.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
+import { buildTree } from "../packages/git/src/ops/tree/tree-build-full.js";
 import type { TargetEntry } from "../packages/git/src/ops/tree/tree-stream.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
+import {
+  type CollectedStructure,
+  collectStructure,
+  type StructureLimits,
+} from "./helpers/integration.js";
 
 function oid(number: number): string {
   return number.toString(16).padStart(40, "0");
@@ -33,12 +37,74 @@ function identity(number: number, mode = MODE_FILE): IntegrationIdentity {
   return { mode, oid: oid(number) };
 }
 
+function emptyRepository(): Repository {
+  const database = new SqliteGitDatabase(new TestDatabase());
+  return new Repository(
+    database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main")),
+  );
+}
+
+function treeOf(repo: Repository, entries: readonly TargetEntry[]): string {
+  return buildTree(
+    repo,
+    entries.map((entry) => ({
+      path: entry.path,
+      stage: 0,
+      mode: Number.parseInt(entry.mode, 8),
+      oid: entry.oid,
+      size: null,
+      mtime: null,
+      ino: null,
+    })),
+  );
+}
+
+/** An empty side has no tree, as a root commit's missing parent does. */
+function sideTree(repo: Repository, entries: readonly TargetEntry[]): string | null {
+  return entries.length === 0 ? null : treeOf(repo, entries);
+}
+
+function classifyTrees(
+  base: readonly TargetEntry[],
+  current: readonly TargetEntry[],
+  incoming: readonly TargetEntry[],
+  limits?: StructureLimits,
+): CollectedStructure {
+  const repo = emptyRepository();
+  return collectStructure(
+    repo,
+    {
+      baseTreeOid: sideTree(repo, base),
+      currentTreeOid: sideTree(repo, current),
+      incomingTreeOid: sideTree(repo, incoming),
+    },
+    limits,
+  );
+}
+
+/** Classify current-only rows against a base and incoming side that are both empty but distinct. */
+function classifyCurrentOnly(
+  current: readonly TargetEntry[],
+  limits: StructureLimits,
+): CollectedStructure {
+  const repo = emptyRepository();
+  return collectStructure(
+    repo,
+    {
+      baseTreeOid: null,
+      currentTreeOid: treeOf(repo, current),
+      incomingTreeOid: treeOf(repo, []),
+    },
+    limits,
+  );
+}
+
 function classify(
   base: TargetEntry[],
   current: TargetEntry[],
   incoming: TargetEntry[],
 ): readonly StructuralIntegrationEntry[] {
-  return classifyStructuralStreams(base, current, incoming).entries;
+  return classifyTrees(base, current, incoming).entries;
 }
 
 describe("three-tree structural identities", () => {
@@ -229,7 +295,7 @@ describe("file/directory prefixes", () => {
     const incoming = Array.from({ length: 200 }, (_, index) =>
       entry(`node/${String(index).padStart(3, "0")}`, index + 2),
     );
-    const plan = classifyStructuralStreams([], [entry("node", 1)], incoming);
+    const plan = classifyTrees([], [entry("node", 1)], incoming);
     expect(plan.entries).toHaveLength(201);
     expect(plan.entries[0]).toMatchObject({ path: "node", conflict: "file/directory" });
     expect(plan.entries[200]).toMatchObject({
@@ -243,7 +309,7 @@ describe("ordering, bounds, and trust", () => {
   it("preserves Git UTF-8 path order above the BMP", () => {
     const paths = ["\ue000", "😀"];
     paths.sort(comparePaths);
-    const plan = classifyStructuralStreams(
+    const plan = classifyTrees(
       [],
       [],
       paths.map((path, index) => entry(path, index + 1)),
@@ -254,21 +320,21 @@ describe("ordering, bounds, and trust", () => {
   it("accepts the exact row and retained-byte boundaries", () => {
     const incoming = [entry("a", 1)];
     expect(
-      classifyStructuralStreams([], [], incoming, {
+      classifyTrees([], [], incoming, {
         maxRows: 1,
         maxEntries: 1,
         maxRetainedBytes: 676,
       }).entries,
     ).toHaveLength(1);
-    expect(() => classifyStructuralStreams([], [], incoming, { maxRows: 0 })).toThrowError(
+    expect(() => classifyTrees([], [], incoming, { maxRows: 0 })).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
-    expect(() => classifyStructuralStreams([], [], incoming, { maxEntries: 0 })).toThrowError(
+    expect(() => classifyTrees([], [], incoming, { maxEntries: 0 })).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
-    expect(() =>
-      classifyStructuralStreams([], [], incoming, { maxRetainedBytes: 675 }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(() => classifyTrees([], [], incoming, { maxRetainedBytes: 675 })).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
   });
 
   it("bounds many no-output prefix candidates without counting them as entries", () => {
@@ -276,14 +342,14 @@ describe("ordering, bounds, and trust", () => {
       entry(`p${String(index).padStart(3, "0")}`, index + 1),
     );
     expect(
-      classifyStructuralStreams([], current, [], {
+      classifyCurrentOnly(current, {
         maxRows: 1_000,
         maxEntries: 0,
         maxRetainedBytes: 312,
       }),
     ).toEqual({ entries: [], sourceRows: 1_000 });
     expect(() =>
-      classifyStructuralStreams([], current, [], {
+      classifyCurrentOnly(current, {
         maxRows: 1_000,
         maxEntries: 0,
         maxRetainedBytes: 311,
@@ -293,14 +359,14 @@ describe("ordering, bounds, and trust", () => {
 
   it("accounts for nested live prefixes at the exact peak", () => {
     expect(
-      classifyStructuralStreams([], [entry("a", 1)], [entry("a/b", 2)], {
+      classifyTrees([], [entry("a", 1)], [entry("a/b", 2)], {
         maxRows: 2,
         maxEntries: 2,
         maxRetainedBytes: 1_360,
       }).entries,
     ).toHaveLength(2);
     expect(() =>
-      classifyStructuralStreams([], [entry("a", 1)], [entry("a/b", 2)], {
+      classifyTrees([], [entry("a", 1)], [entry("a/b", 2)], {
         maxRows: 2,
         maxEntries: 2,
         maxRetainedBytes: 1_359,
@@ -311,14 +377,14 @@ describe("ordering, bounds, and trust", () => {
   it("charges the complete retained deep-prefix path", () => {
     const path = `${"d/".repeat(999)}f`;
     expect(
-      classifyStructuralStreams([], [entry(path, 1)], [], {
+      classifyCurrentOnly([entry(path, 1)], {
         maxRows: 1,
         maxEntries: 0,
         maxRetainedBytes: 4_302,
       }),
     ).toEqual({ entries: [], sourceRows: 1 });
     expect(() =>
-      classifyStructuralStreams([], [entry(path, 1)], [], {
+      classifyCurrentOnly([entry(path, 1)], {
         maxRows: 1,
         maxEntries: 0,
         maxRetainedBytes: 4_301,
@@ -327,39 +393,29 @@ describe("ordering, bounds, and trust", () => {
   });
 
   it("does not pull beyond the first rejected source row", () => {
+    const repo = emptyRepository();
+    const incoming = treeOf(repo, [entry("a", 1), entry("b", 2), entry("c", 3)]);
     let pulls = 0;
-    function* guarded(): Generator<TargetEntry> {
-      pulls++;
-      yield entry("a", 1);
-      pulls++;
-      yield entry("b", 2);
-      throw new Error("over-consumed source");
-    }
     try {
-      classifyStructuralStreams([], [], guarded(), { maxRows: 1 });
+      collectStructure(
+        repo,
+        { baseTreeOid: null, currentTreeOid: null, incomingTreeOid: incoming },
+        { maxRows: 1 },
+        (workspace) => {
+          const walkTree = workspace.source.walkTree.bind(workspace.source);
+          workspace.source.walkTree = function* (treeOid) {
+            for (const row of walkTree(treeOid)) {
+              pulls++;
+              yield row;
+            }
+          };
+        },
+      );
       throw new Error("expected a row bound failure");
     } catch (error) {
       expect(hasErrorCode(error, "E2BIG")).toBe(true);
     }
     expect(pulls).toBe(2);
-  });
-
-  it("fails closed on corrupt stream rows and order", () => {
-    expect(() => classifyStructuralStreams([], [], [entry("", 1)])).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(() =>
-      classifyStructuralStreams([], [], [{ ...entry("a", 1), oid: "bad" }]),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    expect(() => classifyStructuralStreams([], [], [entry("b", 1), entry("a", 2)])).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-  });
-
-  it("rejects limits above the hard ceiling", () => {
-    expect(() =>
-      classifyStructuralStreams([], [], [], { maxRows: Number.MAX_SAFE_INTEGER }),
-    ).toThrow(RangeError);
   });
 
   it("prunes equal roots only after validating the authoritative object", () => {
@@ -376,21 +432,21 @@ describe("ordering, bounds, and trust", () => {
     const repo = new Repository(store);
 
     expect(
-      classifyIntegrationStructure(repo, {
+      collectStructure(repo, {
         baseTreeOid: written.tree,
         currentTreeOid: written.tree,
         incomingTreeOid: written.tree,
       }),
     ).toEqual({ entries: [], sourceRows: 0 });
     expect(() =>
-      classifyIntegrationStructure(repo, {
+      collectStructure(repo, {
         baseTreeOid: written.blob,
         currentTreeOid: written.blob,
         incomingTreeOid: written.blob,
       }),
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
     expect(() =>
-      classifyIntegrationStructure(repo, {
+      collectStructure(repo, {
         baseTreeOid: oid(999),
         currentTreeOid: oid(999),
         incomingTreeOid: oid(999),
@@ -404,8 +460,8 @@ describe("ordering, bounds, and trust", () => {
     const blob = store.write("blob", new TextEncoder().encode("content\n"));
     const tree = store.write("tree", serializeTree([{ mode: MODE_FILE, name: "file", oid: blob }]));
     const repo = new Repository(store);
-    const classifyEqual = (oid: string): ReturnType<typeof classifyIntegrationStructure> =>
-      classifyIntegrationStructure(repo, {
+    const classifyEqual = (oid: string): CollectedStructure =>
+      collectStructure(repo, {
         baseTreeOid: oid,
         currentTreeOid: oid,
         incomingTreeOid: oid,
@@ -461,7 +517,7 @@ describe("real Git structural parity", () => {
       fixture.write("file", "incoming\n");
       const incomingCommit = fixture.commit("incoming content");
 
-      const plan = classifyStructuralStreams(
+      const plan = classifyTrees(
         gitTree(fixture, baseCommit),
         gitTree(fixture, currentCommit),
         gitTree(fixture, incomingCommit),
@@ -494,7 +550,7 @@ describe("real Git structural parity", () => {
       fixture.write("file", "incoming\n");
       const incomingCommit = fixture.commit("incoming");
 
-      const plan = classifyStructuralStreams(
+      const plan = classifyTrees(
         gitTree(fixture, baseCommit),
         gitTree(fixture, currentCommit),
         gitTree(fixture, incomingCommit),

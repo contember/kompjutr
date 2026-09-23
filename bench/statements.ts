@@ -33,7 +33,7 @@ import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
 import { planRebase } from "../packages/git/src/ops/rebase/rebase-plan.js";
 import { checkout } from "../packages/git/src/ops/refs/refs.js";
 import { cherryPick, cherryPickContinue } from "../packages/git/src/ops/replay/cherry-pick.js";
-import { planReplay, preflightReplayCommitObjects } from "../packages/git/src/ops/replay/replay.js";
+import { preflightReplayCommitObjects } from "../packages/git/src/ops/replay/replay.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { add, lsFiles, lsFilesWithWorktree, rm } from "../packages/git/src/ops/staging/staging.js";
@@ -48,6 +48,7 @@ import { TestDatabase } from "../tests/helpers/db.js";
 import { GitFixture, slices } from "../tests/helpers/git.js";
 import { startGitServer } from "../tests/helpers/http-backend.js";
 import { importFixture } from "../tests/helpers/import.js";
+import { collectReplay } from "../tests/helpers/integration.js";
 import { SqliteTestStorage } from "../tests/helpers/storage.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "../tests/helpers/workspace.js";
 import { type GatedRow, type GateOutcome, gateRows } from "./statement-gate.js";
@@ -1753,7 +1754,7 @@ async function replayRows(rows: ResultRow[]): Promise<void> {
         sameStrings(baseCommit.parent, [], "preflight base parents");
         sameStrings(currentCommit.parent, [planned.base], "preflight current parents");
         sameStrings(incomingCommit.parent, [planned.base], "preflight incoming parents");
-        const plan = planReplay(preflightRepo, {
+        const plan = collectReplay(preflightRepo, {
           kind: "cherry-pick",
           source: "topic",
           currentOid: planned.current,
@@ -1800,7 +1801,7 @@ async function replayRows(rows: ResultRow[]): Promise<void> {
       workspace.storage,
       "replay.plan",
       () =>
-        planReplay(workspace.repo, {
+        collectReplay(workspace.repo, {
           kind: "cherry-pick",
           source: "topic",
           currentOid: planned.current,

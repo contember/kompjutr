@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import { utf8Decoder } from "../packages/git/src/common/bytes.js";
 import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
 import type { GitContext } from "../packages/git/src/ops/core/context.js";
-import { restoreProjectedOperation } from "../packages/git/src/ops/merge/merge-apply.js";
 import {
   cherryPick,
   cherryPickAbort,
@@ -582,12 +581,6 @@ describe("cherry-pick lifecycle", () => {
     writeWorkFile(workspace, "/untracked.txt", "untracked\n");
 
     const journal = workspace.repo.checkout.requireOperationState("cherry-pick");
-    workspace.repo.store.db.transactionSync(() =>
-      restoreProjectedOperation(workspace.repo, workspace.worktree, journal),
-    );
-    expect(textAt(workspace, "conflict.txt")).toBe("current\n");
-    expect(textAt(workspace, "sentinel.txt")).toBe("local sentinel\n");
-    expect(textAt(workspace, "untracked.txt")).toBe("untracked\n");
     expect(reopen(workspace).repo.checkout.requireOperationState("cherry-pick")).toEqual(journal);
 
     cherryPickAbort(workspace.repo, workspace.worktree);

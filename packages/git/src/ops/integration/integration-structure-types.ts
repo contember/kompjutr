@@ -46,25 +46,6 @@ export type StructuralIntegrationEntry =
   | ContentStructuralEntry
   | ConflictStructuralEntry;
 
-export interface StructuralIntegrationPlan {
-  /** A Git-path-ordered delta relative to the current tree. */
-  entries: readonly StructuralIntegrationEntry[];
-  sourceRows: number;
-}
-
-export interface IntegrationStructureLimits {
-  maxRows?: number;
-  maxEntries?: number;
-  maxRetainedBytes?: number;
-}
-
-export interface IntegrationStructureInput {
-  baseTreeOid: string | null;
-  currentTreeOid: string | null;
-  incomingTreeOid: string | null;
-  limits?: IntegrationStructureLimits;
-}
-
 export interface ResolvedLimits {
   maxRows: number;
   maxEntries: number;
@@ -74,11 +55,4 @@ export interface ResolvedLimits {
 export interface ClassifiedRow {
   entry: StructuralIntegrationEntry | null;
   occupiesPath: boolean;
-}
-
-export interface PrefixCandidate {
-  path: string;
-  stages: IntegrationStages;
-  entryIndex: number | null;
-  retainedBytes: number;
 }

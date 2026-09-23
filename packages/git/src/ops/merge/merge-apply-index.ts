@@ -1,14 +1,8 @@
-import { GitError } from "../../common/errors.js";
 import { applyIndexOwned } from "../../store/checkout/checkout.js";
 import type { IndexEntry, IndexSink, IndexStore } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
-import { contentObjects } from "./merge-apply-blobs.js";
 import type { TouchedSpec } from "./merge-apply-types.js";
-import {
-  requireIdentity,
-  touchedSpecs,
-  validateProjectedIndexEntries,
-} from "./merge-apply-validation.js";
+import { requireIdentity } from "./merge-apply-validation.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
 import type { MergeTouchedPath } from "./merge-state.js";
 
@@ -56,25 +50,6 @@ export function applyIndex<Content>(
       }
     }
   });
-}
-
-/** Write a validated clean projection to one caller-selected index. */
-export function applyProjectedIndex(
-  repo: Repository,
-  index: IndexStore,
-  entries: readonly ProjectedMergeEntry[],
-): void {
-  validateProjectedIndexEntries(entries);
-  if (entries.some((entry) => entry.stages !== null)) {
-    throw new GitError("EUNMERGED", "cannot apply a conflicted projection to an index");
-  }
-  const specs = touchedSpecs(entries);
-  repo.store.runScratchAwareOperation(() =>
-    repo.store.db.transactionSync(() => {
-      contentObjects(repo, entries);
-      applyIndex(index, entries, specs.entries);
-    }),
-  );
 }
 
 export function restoreIndex(repo: Repository, touched: Iterable<MergeTouchedPath>): void {
