@@ -27,7 +27,7 @@ const PERSON = {
   timezoneOffset: 0,
 };
 
-type SweepPhase = "classify-loose" | "classify-packs" | "sweep-loose" | "sweep-packs";
+type SweepPhase = "loose" | "packs";
 
 interface MarkInput {
   oid: string;
@@ -242,7 +242,7 @@ describe("maintenance sweep", () => {
       const deadData = utf8.encode("genuinely unreachable\n");
       const dead = hashObject("blob", deadData);
       store.addPromisedBlobs("origin", [dead]);
-      await fixture.until("classify-loose");
+      await fixture.until("loose");
       expect(fixture.marked(oid)).toBe(0);
       if (variant === "loose") {
         store.write("blob", data);
@@ -253,7 +253,7 @@ describe("maintenance sweep", () => {
       }
       expect(store.promisedBlobCount()).toBe(0);
       expect(await fixture.call()).toMatchObject({ phase: "roots", restarted: true });
-      await fixture.until("sweep-loose");
+      await fixture.until("finish");
       expect(fixture.marked(oid)).toBe(1);
       const deadPack = fixture.store().packs.lookup(dead)?.packId;
       expect(
@@ -271,13 +271,13 @@ describe("maintenance sweep", () => {
     },
   );
 
-  it("converges loose candidates without cursors, preserves first age, and resumes cold", () => {
+  it("converges loose candidates behind an OID cursor, preserves first age, and resumes cold", () => {
     const db = new TestDatabase();
     const { checkout, store } = open(db);
     const retained = store.write("blob", utf8.encode("retained\n"));
     const aged = store.write("blob", utf8.encode("aged unreachable\n"));
     const fresh = store.write("blob", utf8.encode("fresh unreachable\n"));
-    seedRun(db, checkout.repoId, "classify-loose", [{ oid: retained }]);
+    seedRun(db, checkout.repoId, "loose", [{ oid: retained }]);
     db.run(
       `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
        VALUES (?, ?, 3), (?, ?, 7)`,
@@ -288,12 +288,20 @@ describe("maintenance sweep", () => {
     );
 
     expect(advance(db, store.shared, 100, 1)).toMatchObject({
-      phase: "classify-loose",
+      phase: "loose",
       status: "progress",
     });
+    // The aged candidate is inside its grace, so only these two need an action.
+    const firstOid = retained < fresh ? retained : fresh;
+    expect(
+      db.scalar<string>(
+        "SELECT cursor_text FROM git_maintenance_runs WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(firstOid);
     const reopened = new SqliteGitDatabase(db, { objectCacheBytes: 8 * 1024 * 1024 });
     const cold = reopened.openCheckout(checkout.id);
-    advanceToPhase(db, cold.shared, 100, "classify-packs", 1);
+    advanceToPhase(db, cold.shared, 100, "packs", 1);
 
     expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, retained)).toBeUndefined();
     expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, aged)).toBe(7);
@@ -311,7 +319,7 @@ describe("maintenance sweep", () => {
     const db = new TestDatabase();
     const { checkout, store } = open(db);
     const oid = store.write("blob", utf8.encode("root drift\n"));
-    seedRun(db, checkout.repoId, "classify-loose");
+    seedRun(db, checkout.repoId, "loose");
     db.run(
       "INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms) VALUES (?, ?, 4)",
       checkout.repoId,
@@ -320,7 +328,7 @@ describe("maintenance sweep", () => {
     db.run("UPDATE git_maintenance_control SET root_epoch = 1 WHERE repo_id = ?", checkout.repoId);
 
     expect(advance(db, store.shared, 100)).toMatchObject({
-      phase: "classify-loose",
+      phase: "loose",
       status: "root-changed",
     });
     expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, oid)).toBe(4);
@@ -329,7 +337,7 @@ describe("maintenance sweep", () => {
         "SELECT phase, reclaimed_objects FROM git_maintenance_runs WHERE repo_id = ?",
         checkout.repoId,
       ),
-    ).toEqual({ phase: "classify-loose", reclaimed_objects: 0 });
+    ).toEqual({ phase: "loose", reclaimed_objects: 0 });
   });
 
   it("deletes loose storage at the exact boundary and clears derived rows and warmed caches", () => {
@@ -337,7 +345,7 @@ describe("maintenance sweep", () => {
     const before = open(beforeDb);
     const beforeData = utf8.encode("not eligible yet\n");
     const beforeOid = before.store.write("blob", beforeData);
-    seedRun(beforeDb, before.checkout.repoId, "sweep-loose");
+    seedRun(beforeDb, before.checkout.repoId, "loose");
     beforeDb.run(
       `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
        VALUES (?, ?, 100)`,
@@ -345,7 +353,7 @@ describe("maintenance sweep", () => {
       beforeOid,
     );
     expect(advance(beforeDb, before.store.shared, 100 + GC_GRACE_MS - 1)).toMatchObject({
-      phase: "sweep-packs",
+      phase: "packs",
       status: "phase-complete",
       nextEligibleMs: 100 + GC_GRACE_MS,
     });
@@ -367,7 +375,7 @@ describe("maintenance sweep", () => {
     const commitOid = store.write("commit", commitData);
     const survivorData = utf8.encode("retained loose object\n");
     const survivorOid = store.write("blob", survivorData);
-    seedRun(db, checkout.repoId, "sweep-loose", [{ oid: survivorOid }]);
+    seedRun(db, checkout.repoId, "loose", [{ oid: survivorOid }]);
     for (const oid of [blobOid, treeOid, commitOid]) {
       db.run(
         `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
@@ -389,7 +397,7 @@ describe("maintenance sweep", () => {
     expect(store.read(treeOid)?.data).toEqual(treeData);
     expect(store.cachedCommit(commitOid)?.commit.message).toBe("doomed commit\n");
 
-    advanceToPhase(db, store.shared, 100 + GC_GRACE_MS, "sweep-packs");
+    advanceToPhase(db, store.shared, 100 + GC_GRACE_MS, "packs");
 
     expect(store.read(blobOid)).toBeNull();
     expect(store.read(treeOid)).toBeNull();
@@ -440,7 +448,7 @@ describe("maintenance sweep", () => {
       db.run("DELETE FROM git_objects WHERE repo_id = ? AND oid = ?", checkout.repoId, oid);
     }
     seedBlobId(db, checkout.repoId, new Uint8Array([9, 9, 9]), deadOid);
-    seedRun(db, checkout.repoId, "classify-packs", [{ oid: liveOid, physicalOnly: true }]);
+    seedRun(db, checkout.repoId, "packs", [{ oid: liveOid, physicalOnly: true }]);
     db.run(
       `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
        VALUES (?, ?, 3)`,
@@ -448,12 +456,20 @@ describe("maintenance sweep", () => {
       mixed.packId,
     );
 
-    advanceToPhase(db, store.shared, 100, "sweep-loose");
+    expect(advance(db, store.shared, 100)).toMatchObject({
+      phase: "finish",
+      reclaimedPacks: 0,
+      nextEligibleMs: 100 + GC_GRACE_MS,
+    });
     expect(
       candidateAge(db, "git_pack_gc_candidates", checkout.repoId, mixed.packId),
     ).toBeUndefined();
     expect(candidateAge(db, "git_pack_gc_candidates", checkout.repoId, dead.packId)).toBe(100);
-    advanceToPhase(db, store.shared, 100, "sweep-packs");
+    // The next run's pack phase, over the same marks, reaches the grace boundary.
+    db.run(
+      "UPDATE git_maintenance_runs SET phase = 'packs' WHERE repo_id = ? AND run_id = 1",
+      checkout.repoId,
+    );
     expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({
       reclaimedObjects: 1,
       reclaimedPacks: 1,
@@ -476,7 +492,7 @@ describe("maintenance sweep", () => {
       ),
     ).toBe(0);
     expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({
-      phase: "sweep-packs",
+      phase: "packs",
       status: "progress",
     });
     expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({
@@ -491,7 +507,7 @@ describe("maintenance sweep", () => {
     const result = await store.packs.ingest(
       slices(fullPack([{ type: "blob", data: utf8.encode("aged pack\n") }]), 11),
     );
-    seedRun(db, checkout.repoId, "classify-packs");
+    seedRun(db, checkout.repoId, "packs");
     db.run(
       `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
        VALUES (?, ?, 7)`,
@@ -499,18 +515,13 @@ describe("maintenance sweep", () => {
       result.packId,
     );
 
-    expect(advance(db, store.shared, 100)).toMatchObject({
-      phase: "sweep-loose",
-      status: "phase-complete",
-    });
-    expect(candidateAge(db, "git_pack_gc_candidates", checkout.repoId, result.packId)).toBe(7);
-    expect(advance(db, store.shared, 100)).toMatchObject({ phase: "sweep-packs" });
     expect(advance(db, store.shared, 7 + GC_GRACE_MS - 1)).toMatchObject({
       phase: "finish",
       status: "complete",
       nextEligibleMs: 7 + GC_GRACE_MS,
       reclaimedPacks: 0,
     });
+    expect(candidateAge(db, "git_pack_gc_candidates", checkout.repoId, result.packId)).toBe(7);
     expect(
       db.scalar<number>(
         "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
@@ -536,7 +547,7 @@ describe("maintenance sweep", () => {
         result.packId,
       );
       if (oid === undefined) throw new Error("pack fixture did not publish its object");
-      seedRun(db, checkout.repoId, "sweep-packs", [{ oid, physicalOnly }]);
+      seedRun(db, checkout.repoId, "packs", [{ oid, physicalOnly }]);
       db.run(
         `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
        VALUES (?, ?, 0)`,
@@ -545,7 +556,7 @@ describe("maintenance sweep", () => {
       );
 
       expect(advance(db, store.shared, GC_GRACE_MS)).toMatchObject({
-        phase: "sweep-packs",
+        phase: "finish",
         reclaimedObjects: 0,
         reclaimedPacks: 0,
         reclaimedBytes: 0,
@@ -564,7 +575,7 @@ describe("maintenance sweep", () => {
     const packed = await store.packs.ingest(
       slices(fullPack([{ type: "blob", data: utf8.encode("future packed\n") }]), 13),
     );
-    seedRun(db, checkout.repoId, "sweep-loose");
+    seedRun(db, checkout.repoId, "loose");
     db.run(
       `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
        VALUES (?, ?, 200)`,
@@ -579,7 +590,7 @@ describe("maintenance sweep", () => {
     );
 
     expect(advance(db, store.shared, 1)).toMatchObject({
-      phase: "sweep-packs",
+      phase: "packs",
       nextEligibleMs: 200 + GC_GRACE_MS,
     });
     expect(advance(db, store.shared, 1)).toMatchObject({
@@ -592,7 +603,7 @@ describe("maintenance sweep", () => {
   it("removes a stale pending candidate directly during pack sweep", () => {
     const db = new TestDatabase();
     const { checkout, store } = open(db);
-    seedRun(db, checkout.repoId, "sweep-packs");
+    seedRun(db, checkout.repoId, "packs");
     db.run(
       `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
        VALUES (?, 99, 0, 0, 'pending', 1)`,
@@ -605,7 +616,7 @@ describe("maintenance sweep", () => {
     );
 
     expect(advance(db, store.shared, 100, 1)).toMatchObject({
-      phase: "sweep-packs",
+      phase: "packs",
       reclaimedObjects: 0,
       reclaimedPacks: 0,
     });
@@ -636,7 +647,7 @@ describe("maintenance sweep", () => {
     const { checkout, store } = open(db);
     const data = utf8.encode("rollback object\n");
     const oid = store.write("blob", data);
-    seedRun(db, checkout.repoId, "sweep-loose");
+    seedRun(db, checkout.repoId, "loose");
     db.run(
       `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
        VALUES (?, ?, 0)`,
@@ -684,7 +695,7 @@ describe("maintenance sweep", () => {
         17,
       ),
     );
-    seedRun(db, checkout.repoId, "sweep-packs");
+    seedRun(db, checkout.repoId, "packs");
     db.run(
       `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
        VALUES (?, ?, 0)`,
@@ -770,7 +781,7 @@ describe("maintenance sweep", () => {
     const packed = await store.packs.ingest(
       slices(fullPack([{ type: "blob", data: deadData }]), 13),
     );
-    seedRun(db, checkout.repoId, "sweep-packs", [{ oid: survivorOid }]);
+    seedRun(db, checkout.repoId, "packs", [{ oid: survivorOid }]);
     db.run(
       `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
        VALUES (?, ?, 0)`,
@@ -808,7 +819,7 @@ describe("maintenance sweep", () => {
     const coldDatabase = new SqliteGitDatabase(inner, { objectCacheBytes: 8 * 1024 * 1024 });
     const cold = coldDatabase.openCheckout(checkout.id);
     expect(advanceMaintenanceSweep(cold.shared, { nowMs: GC_GRACE_MS })).toMatchObject({
-      phase: "sweep-packs",
+      phase: "packs",
       status: "progress",
       reclaimedObjects: 1,
       reclaimedPacks: 1,
@@ -830,7 +841,7 @@ describe("maintenance sweep", () => {
     const { checkout, store } = open(db);
     const data = utf8.encode("counter overflow\n");
     const oid = store.write("blob", data);
-    seedRun(db, checkout.repoId, "sweep-loose");
+    seedRun(db, checkout.repoId, "loose");
     db.run(
       `UPDATE git_maintenance_runs SET reclaimed_objects = ? WHERE repo_id = ?`,
       Number.MAX_SAFE_INTEGER,
@@ -883,13 +894,14 @@ describe("maintenance sweep", () => {
       ),
     ).toBe(baseOid);
 
-    seedRun(db, checkout.repoId, "classify-loose", [{ oid: keeperOid, physicalOnly: true }]);
-    advanceToPhase(db, store.shared, 100, "classify-packs");
+    seedRun(db, checkout.repoId, "loose", [{ oid: keeperOid, physicalOnly: true }]);
+    advanceToPhase(db, store.shared, 100, "packs");
     expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, baseOid)).toBeUndefined();
 
     // A pack ingested after classification leaves an aged nomination behind.
     db.run(
-      "UPDATE git_maintenance_runs SET phase = 'sweep-loose' WHERE repo_id = ? AND run_id = 1",
+      `UPDATE git_maintenance_runs SET phase = 'loose', next_eligible_ms = NULL
+        WHERE repo_id = ? AND run_id = 1`,
       checkout.repoId,
     );
     db.run(
@@ -897,7 +909,7 @@ describe("maintenance sweep", () => {
       checkout.repoId,
       baseOid,
     );
-    advanceToPhase(db, store.shared, 100 + GC_GRACE_MS, "sweep-packs");
+    advanceToPhase(db, store.shared, 100 + GC_GRACE_MS, "packs");
 
     expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, baseOid)).toBeUndefined();
     expect(store.read(baseOid)?.data).toEqual(baseData);
@@ -910,11 +922,11 @@ describe("maintenance sweep", () => {
     for (let index = 0; index < 257; index++) {
       store.write("blob", utf8.encode(`bounded ${index}\n`));
     }
-    seedRun(db, checkout.repoId, "classify-loose");
+    seedRun(db, checkout.repoId, "loose");
 
     for (let call = 0; call < 20; call++) {
       const result = advance(db, store.shared, 10, 32);
-      if (result.phase === "classify-packs") break;
+      if (result.phase === "packs") break;
     }
     expect(
       db.scalar<number>(
@@ -927,6 +939,34 @@ describe("maintenance sweep", () => {
         "SELECT phase FROM git_maintenance_runs WHERE repo_id = ?",
         checkout.repoId,
       ),
-    ).toBe("classify-packs");
+    ).toBe("packs");
+  });
+
+  it("nominates and sweeps in one loose page without sweeping the fresh nomination", () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const aged = store.write("blob", utf8.encode("aged in the same page\n"));
+    const fresh = store.write("blob", utf8.encode("fresh in the same page\n"));
+    seedRun(db, checkout.repoId, "loose");
+    db.run(
+      `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
+       VALUES (?, ?, 0)`,
+      checkout.repoId,
+      aged,
+    );
+
+    expect(advance(db, store.shared, GC_GRACE_MS)).toMatchObject({
+      phase: "loose",
+      status: "progress",
+      reclaimedObjects: 1,
+    });
+    expect(store.read(aged)).toBeNull();
+    expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, fresh)).toBe(GC_GRACE_MS);
+    expect(advance(db, store.shared, GC_GRACE_MS)).toMatchObject({
+      phase: "packs",
+      status: "phase-complete",
+      nextEligibleMs: 2 * GC_GRACE_MS,
+    });
+    expect(store.read(fresh)).not.toBeNull();
   });
 });

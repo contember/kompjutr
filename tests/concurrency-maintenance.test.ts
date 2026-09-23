@@ -81,7 +81,7 @@ async function ingestPack(
 async function reachClassification(storage: SqliteTestStorage): Promise<GitMaintenanceResult> {
   for (let calls = 0; calls < 200; calls++) {
     const result = await measuredMaintenance(storage);
-    if (result.phase === "classify-packs") return result;
+    if (result.phase === "packs") return result;
   }
   throw new Error("maintenance did not reach pack classification");
 }
@@ -117,7 +117,7 @@ describe("maintenance concurrency", () => {
       const dead = await fixture.full(utf8.encode("first fallback unrelated dead\n"));
       await fixture.until("finish");
       fixture.clock.value += GC_GRACE_MS;
-      await fixture.until("sweep-packs");
+      await fixture.until("packs");
       await fixture.until("finish", 1 + 1 + 1);
       expect(
         fixture.db.scalar("SELECT count(*) FROM git_pack_meta WHERE pack_id = ?", dead.packId),
@@ -182,7 +182,7 @@ describe("maintenance concurrency", () => {
         expect(fixture.store().read(hashObject("blob", bytes))?.data).toEqual(bytes);
       await fixture.until("finish");
       fixture.clock.value += GC_GRACE_MS;
-      await fixture.until("sweep-packs");
+      await fixture.until("packs");
       await fixture.call();
       expect(fixture.db.scalar("SELECT count(*) FROM git_pack_meta")).toBe(1);
       for (const bytes of [a, b, c])
@@ -214,7 +214,7 @@ describe("maintenance concurrency", () => {
     );
     await fixture.until("finish");
     fixture.clock.value += GC_GRACE_MS;
-    await fixture.until("sweep-packs");
+    await fixture.until("packs");
     await fixture.until("finish", 3 * 2 + 1);
     expect(fixture.db.scalar("SELECT count(*) FROM git_pack_meta")).toBe(0);
     expect(fixture.store().read(hashObject("blob", a))).toBeNull();
@@ -289,7 +289,7 @@ describe("maintenance concurrency", () => {
       const unrelated = await fixture.full(utf8.encode("unrelated dead pack\n"));
       await fixture.until("finish");
       fixture.clock.value += GC_GRACE_MS;
-      await fixture.until("sweep-packs");
+      await fixture.until("packs");
       await fixture.until("finish", 2 * 6 + 2);
       expect(fixture.db.all("SELECT pack_id FROM git_pack_meta ORDER BY pack_id")).toEqual([
         ...(looseDuplicate ? [] : [{ pack_id: required.packId }]),
@@ -333,7 +333,7 @@ describe("maintenance concurrency", () => {
       await fixture.full(utf8.encode(`${base}changed tail\n`));
       await fixture.until("finish");
       fixture.clock.value += GC_GRACE_MS;
-      await fixture.until("sweep-packs");
+      await fixture.until("packs");
       await fixture.runtime().git.remoteAdd({ dir: "/repo", name: "origin", url: server.url });
       const fetching = fixture.runtime(async () => {
         const flushed = fixture.db.scalar<number>(`SELECT count(*) FROM git_pack_entries entry
@@ -572,14 +572,6 @@ describe("maintenance concurrency", () => {
       expect(generations(storage).observed).toBe(generations(storage).source);
       if (result.phase === "finish") break;
     }
-    expect([...seen].sort()).toEqual([
-      "classify-loose",
-      "classify-packs",
-      "finish",
-      "mark",
-      "roots",
-      "sweep-loose",
-      "sweep-packs",
-    ]);
+    expect([...seen].sort()).toEqual(["finish", "loose", "mark", "packs", "roots"]);
   });
 });

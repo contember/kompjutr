@@ -131,15 +131,7 @@ describe("public maintenance lifecycle", () => {
     }
     if (complete === null) throw new Error("maintenance did not finish");
 
-    for (const phase of [
-      "roots",
-      "mark",
-      "classify-loose",
-      "classify-packs",
-      "sweep-loose",
-      "sweep-packs",
-      "finish",
-    ]) {
+    for (const phase of ["roots", "mark", "loose", "packs", "finish"]) {
       expect(phases.has(phase)).toBe(true);
     }
     expect(complete.runId).toBe(first.runId);
@@ -338,7 +330,7 @@ describe("public maintenance lifecycle", () => {
     const storage = new SqliteTestStorage();
     const clock = new CountingClock(10);
     const commitOid = await createCommittedRepository(storage, clock);
-    const classifying = await advanceTo(storage, clock, "classify-packs");
+    const classifying = await advanceTo(storage, clock, "packs");
     const db = inspect(storage);
     db.run(
       `UPDATE git_maintenance_runs

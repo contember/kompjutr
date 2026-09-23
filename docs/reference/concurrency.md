@@ -111,7 +111,7 @@ The conformance suite uses these outcomes:
 | `fetch` | Advertisement followed by a durable namespace generation and exact tracking/tag/shallow snapshot; pending pack reservation and streamed checkpoints; complete pack; atomic tracking/tag/prune/shallow publication. |
 | `push` | Tracking-derived lease snapshot; discovery and per-destination lease comparison; local OID snapshot; remote receive-pack side effect; configured-remote tracking publication. |
 | `pull` | HEAD, upstream, and strategy snapshot; all fetch checkpoints; snapshot revalidation; synchronous merge publication or captured-OID rebase journal and final branch CAS. |
-| `maintenance` | Run allocation; root pages; mark pages; classification and sweep pages; finish or rollover. Each call is synchronous. |
+| `maintenance` | Run allocation; root pages; mark pages; loose pages; pack pages; finish or rollover. Each call is synchronous. |
 | promised blob hydration | Pinned promisor discovery; exact non-thin pack ingest; atomic physical publication and promise removal; synchronous operation retry. |
 
 Pack data and index checkpoints are durable but invisible to object reads until
@@ -243,11 +243,12 @@ contain at most 256 records. Scratch is removed before publication callbacks.
 Ingest and cold reads share the 48 MiB logical base/instructions/target limit;
 the separate rounded chunk-allocation guard also applies.
 
-Pack sweeping examines at most one bounded candidate page per call and deletes
-at most one pack. Its durable cursor records the last examined pack and a sticky
-retry marker after deletion. An exhausted dirty pass resets and returns; an
-exhausted deletion-free pass completes. This revisits earlier candidates that
-lost their dependents without rescanning every blocker before each deletion.
+The `packs` phase classifies and sweeps in one pass. It examines at most one
+bounded page per call and deletes at most one pack. Its durable cursor records
+the last examined pack and a sticky retry marker after deletion. An exhausted
+dirty pass resets and returns; an exhausted deletion-free pass completes. This
+revisits earlier candidates that lost their dependents without rescanning every
+blocker before each deletion.
 Cold reopen preserves the cursor; root-epoch restart and phase exit clear it.
 Candidate analysis uses SQLite metadata, including the actual canonical fallback
 order, without loading object payloads.
@@ -259,8 +260,10 @@ complete canonical owner or promotes a fallback all advance
 `git_repositories.source_generation` inside their own transaction; a pending-only
 reclamation that promotes nothing does not, because no complete read can see it.
 A maintenance step that changes sources adopts its own bump as the last statement
-of that step's transaction, so it never restarts itself. Drift from a foreign
-writer resets discovery to `roots` before any further destruction.
+of that step's transaction, so it never restarts itself. Adoption is safe only
+because the mutation-guard transaction serializes the drift check with the page:
+no foreign bump can land between them. Drift from a foreign writer resets
+discovery to `roots` before any further destruction.
 
 Promise rows do not become maintenance roots. A missing blob reached through a
 tree is a valid terminal leaf only while the same repository owns its promise.

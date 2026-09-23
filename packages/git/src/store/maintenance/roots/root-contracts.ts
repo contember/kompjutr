@@ -87,7 +87,7 @@ export function isObjectType(value: unknown): value is ObjectType {
 
 /** Validate the phase-specific durable root cursor shape. */
 export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): void {
-  if (run.phase === "sweep-packs") {
+  if (run.phase === "packs") {
     if (
       run.rootSource !== "done" ||
       run.cursorCheckoutId !== null ||
@@ -97,6 +97,17 @@ export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): 
       (run.cursorText !== null && run.cursorOrdinal === null)
     ) {
       throw new CorruptError("maintenance pack sweep cursor is invalid");
+    }
+    return;
+  }
+  if (run.phase === "loose") {
+    if (
+      run.rootSource !== "done" ||
+      run.cursorCheckoutId !== null ||
+      run.cursorOrdinal !== null ||
+      (run.cursorText !== null && !isOid(run.cursorText))
+    ) {
+      throw new CorruptError("maintenance loose sweep cursor is invalid");
     }
     return;
   }

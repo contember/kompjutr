@@ -2,7 +2,6 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import { expectSafeInteger } from "../../../common/rows.js";
 import type { SharedRepoStore } from "../../index.js";
-import { reconcileMaintenanceMark } from "../state/state-transitions.js";
 import { expectPhase, expectRootsSettled, readMaintenanceRunView } from "../state/state-view.js";
 import { booleanInteger, oidField } from "./reachability-codecs.js";
 import {
@@ -25,7 +24,8 @@ function readRun(db: SqlDatabase, repoId: number): RunState {
 
 function initializeCounters(db: SqlDatabase, repoId: number, run: RunState): RunState {
   if (run.reachableObjects !== 0 || run.queuedObjects === 0) return run;
-  const logical = reconcileMaintenanceMark(db, run, "initial");
+  // Root discovery queues only logical marks, so every queued root is reachable.
+  const logical = run.queuedObjects;
   const updated = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_runs SET reachable_objects = ?
       WHERE repo_id = ? AND run_id = ? AND phase = 'mark'
@@ -116,9 +116,8 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
 }
 
 function finishMark(db: SqlDatabase, repoId: number, run: RunState): void {
-  reconcileMaintenanceMark(db, run, "complete");
   const row = db.one<Record<string, unknown>>(
-    `UPDATE git_maintenance_runs SET phase = 'classify-loose'
+    `UPDATE git_maintenance_runs SET phase = 'loose'
       WHERE repo_id = ? AND run_id = ? AND phase = 'mark' AND observed_root_epoch = ?
         AND NOT EXISTS (
           SELECT 1 FROM git_maintenance_objects object
@@ -135,7 +134,7 @@ function finishMark(db: SqlDatabase, repoId: number, run: RunState): void {
     row === undefined ||
     row.repo_id !== repoId ||
     row.run_id !== run.runId ||
-    row.phase !== "classify-loose" ||
+    row.phase !== "loose" ||
     row.reachable_objects !== run.reachableObjects ||
     row.queued_objects !== run.queuedObjects
   ) {
@@ -151,12 +150,8 @@ interface MarkGate {
 function openMarkRun(store: SharedRepoStore): MarkGate {
   const run = readRun(store.db, store.repoId);
   if (run.observedRootEpoch !== run.rootEpoch) return { kind: "root-changed", run };
-  expectPhase(
-    run,
-    ["mark", "classify-loose"],
-    `maintenance reachability cannot advance phase ${run.phase}`,
-  );
-  if (run.phase === "classify-loose") return { kind: "complete", run };
+  expectPhase(run, ["mark", "loose"], `maintenance reachability cannot advance phase ${run.phase}`);
+  if (run.phase === "loose") return { kind: "complete", run };
   return { kind: "mark", run: initializeCounters(store.db, store.repoId, run) };
 }
 

@@ -1,8 +1,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import { decodeRow, int, nullable, oneOf } from "../../../common/rows.js";
-import { readRepositorySourceGeneration } from "../../core/source-generation.js";
-import type { MaintenanceMarkReconciliation, MaintenanceRunView } from "./state-contracts.js";
+import type { MaintenanceRunView } from "./state-contracts.js";
 import { readMaintenanceRunView, validateRepositoryId } from "./state-view.js";
 
 /**
@@ -14,84 +13,21 @@ export function adoptMaintenanceSourceGeneration(
   db: SqlDatabase,
   repoId: number,
   runId: number,
-): number {
-  const current = readRepositorySourceGeneration(db, repoId);
-  const row = db.one<Record<string, unknown>>(
-    `UPDATE git_maintenance_runs SET observed_source_generation = ?
-      WHERE repo_id = ? AND run_id = ?
-      RETURNING repo_id, run_id, observed_source_generation`,
-    current,
+): void {
+  db.run(
+    `UPDATE git_maintenance_runs
+        SET observed_source_generation = (
+          SELECT source_generation FROM git_repositories WHERE id = git_maintenance_runs.repo_id
+        )
+      WHERE repo_id = ? AND run_id = ?`,
     repoId,
     runId,
   );
-  if (
-    row === undefined ||
-    row.repo_id !== repoId ||
-    row.run_id !== runId ||
-    row.observed_source_generation !== current
-  ) {
-    throw new CorruptError("maintenance source generation was not adopted atomically");
-  }
-  return current;
-}
-
-export function reconcileMaintenanceMark(
-  db: SqlDatabase,
-  view: MaintenanceRunView,
-  boundary: MaintenanceMarkReconciliation,
-): number {
-  const row = db.one<Record<string, unknown>>(
-    `SELECT coalesce(sum(CASE WHEN expanded = 0 THEN 1 ELSE 0 END), 0) AS queued,
-            coalesce(sum(CASE WHEN physical_only = 0 THEN 1 ELSE 0 END), 0) AS logical,
-            coalesce(sum(CASE WHEN physical_only != 0 OR expanded != 0 OR edge_cursor != 0
-                              THEN 1 ELSE 0 END), 0) AS non_initial
-       FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?`,
-    view.repoId,
-    view.runId,
-  );
-  if (row === undefined) throw new CorruptError("maintenance mark count returned no row");
-  const counts = decodeRow(
-    row,
-    {
-      queued: int(0, Number.MAX_SAFE_INTEGER, "maintenance queued mark count is invalid"),
-      logical: int(0, Number.MAX_SAFE_INTEGER, "maintenance logical mark count is invalid"),
-      non_initial: int(0, Number.MAX_SAFE_INTEGER, "maintenance initial mark state is invalid"),
-    },
-    "maintenance mark count is malformed",
-  );
-  if (boundary === "initial") {
-    if (counts.queued !== view.queuedObjects || counts.logical !== counts.queued) {
-      throw new CorruptError("initial maintenance counters disagree with their root marks");
-    }
-    if (counts.non_initial !== 0) {
-      throw new CorruptError("uninitialized maintenance roots already contain traversal state");
-    }
-    return counts.logical;
-  }
-  if (view.queuedObjects !== 0) {
-    throw new CorruptError("maintenance mark queue is empty but its counter is not zero");
-  }
-  if (counts.queued !== 0 || counts.logical !== view.reachableObjects) {
-    throw new CorruptError("completed maintenance counters disagree with their mark rows");
-  }
-  return counts.logical;
 }
 
 function clearRunOwnedReachability(db: SqlDatabase, repoId: number, runId: number): void {
   db.run("DELETE FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?", repoId, runId);
   db.run("DELETE FROM git_maintenance_shallow WHERE repo_id = ? AND run_id = ?", repoId, runId);
-  const remains = db.scalar<unknown>(
-    `SELECT EXISTS(
-       SELECT 1 FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?
-       UNION ALL
-       SELECT 1 FROM git_maintenance_shallow WHERE repo_id = ? AND run_id = ?
-     )`,
-    repoId,
-    runId,
-    repoId,
-    runId,
-  );
-  if (remains !== 0) throw new CorruptError("maintenance restart retained reachability state");
 }
 
 /** Reset one drifted run to root discovery. */

@@ -333,7 +333,7 @@ function publishCompletedMark(
     );
     db.run(
       `UPDATE git_maintenance_runs
-          SET phase = 'classify-loose', root_source = 'done',
+          SET phase = 'loose', root_source = 'done',
               cursor_checkout_id = NULL, cursor_text = NULL, cursor_ordinal = NULL,
               reachable_objects = ?, queued_objects = 0, next_eligible_ms = NULL
         WHERE repo_id = ? AND run_id = ? AND phase = 'roots'`,
@@ -360,7 +360,7 @@ function publishCompletedMark(
         runId,
       ),
     ).toEqual({
-      phase: "classify-loose",
+      phase: "loose",
       root_source: "done",
       reachable_objects: liveOids.length,
       queued_objects: 0,

@@ -36,10 +36,8 @@ const GRANDFATHERED_SYMBOLS: ReadonlySet<string> = new Set([
   "git/store/pack/ingest/ingest-pending.ts::PackPendingResolver.drainPending",
   "git/store/pack/read/read-resolver.ts::PackObjectResolver.#readObjects",
   "git/store/pack/ingest/ingest-index.ts::PackIndexer.indexPack",
-  "git/store/objects/objects-write.ts::writeObjectStream",
   "git/store/refs/refs.ts::RefTable.#mutateRefs",
   "git/store/fetch/fetch-publication.ts::FetchPublicationTable.beginFetchPublication",
-  "git/store/maintenance/state/state-transitions.ts::rolloverFinishedMaintenanceRun",
   "git/ops/network/network-fetch-legacy.ts::prepareLegacyFetchPublication",
   "git/diff/myers-search.ts::findSplit",
   // One flag-by-flag option surface each, compared byte-for-byte against the

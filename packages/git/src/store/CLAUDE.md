@@ -71,9 +71,11 @@ identity restarts discovery before destructive work. A step that changes sources
 adopts its own bump as the last statement of its transaction (ADR-0025).
 A paged packed read owns its discovery frontier in `git_pack_read_*` scratch
 rows and re-asserts that generation before releasing its owner; an ordinary
-non-paged read opens no transaction and writes nothing. Sweep eligibility is 14
-days after stable classification. A loose object that a surviving pack still
-names as a delta base is never nominated and never swept.
+non-paged read opens no transaction and writes nothing. Phases are `roots`,
+`mark`, `loose`, `packs`, `finish`; the loose and pack phases classify and sweep
+in the same page. Sweep eligibility is 14 days after stable classification. A
+loose object that a surviving pack still names as a delta base is never
+nominated and never swept.
 
 Pack code derives from dgit (MIT). Keep the attribution headers when splitting
 or moving it. `../diff/` is a separate LGPL boundary.

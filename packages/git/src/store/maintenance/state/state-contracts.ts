@@ -1,11 +1,4 @@
-export type MaintenancePhase =
-  | "roots"
-  | "mark"
-  | "classify-loose"
-  | "classify-packs"
-  | "sweep-loose"
-  | "sweep-packs"
-  | "finish";
+export type MaintenancePhase = "roots" | "mark" | "loose" | "packs" | "finish";
 
 export interface MaintenanceRunView {
   repoId: number;
@@ -29,5 +22,3 @@ export interface MaintenanceRunView {
   nextEligibleMs: number | null;
   restarted: boolean;
 }
-
-export type MaintenanceMarkReconciliation = "initial" | "complete";

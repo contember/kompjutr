@@ -184,7 +184,7 @@ function fullPack(objects: readonly { type: ObjectType; data: Uint8Array }[]): U
   return pack;
 }
 
-function seedSweepLoose(
+function seedLoosePhase(
   db: SqlDatabase,
   repoId: number,
   survivorOid: string,
@@ -199,7 +199,7 @@ function seedSweepLoose(
     `INSERT INTO git_maintenance_runs
        (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
         reachable_objects, queued_objects)
-     VALUES (?, 1, 0, 'sweep-loose', 0, 'done', 1, 0)`,
+     VALUES (?, 1, 0, 'loose', 0, 'done', 1, 0)`,
     repoId,
   );
   db.run(
@@ -361,7 +361,7 @@ describe("maintenance crash and restart qualification", () => {
     ).resolves.toMatchObject({ oid: commitOid });
   });
 
-  it("keeps committed sweep-loose deletion once-only after cache probe response loss", () => {
+  it("keeps committed loose deletion once-only after cache probe response loss", () => {
     const inner = new TestDatabase();
     const failing = new AvailabilityFailureDatabase(inner);
     const database = new SqliteGitDatabase(failing, { objectCacheBytes: 8 * 1024 * 1024 });
@@ -372,7 +372,7 @@ describe("maintenance crash and restart qualification", () => {
     const survivorData = utf8.encode("unrelated sweep survivor\n");
     const doomedOid = store.write("blob", doomedData);
     const survivorOid = store.write("blob", survivorData);
-    seedSweepLoose(failing, checkout.repoId, survivorOid, doomedOid);
+    seedLoosePhase(failing, checkout.repoId, survivorOid, doomedOid);
     inner.run(
       "UPDATE git_object_chunks SET data = ? WHERE repo_id = ? AND oid = ? AND seq = 0",
       deflateSync(staleData),
@@ -428,7 +428,7 @@ describe("maintenance crash and restart qualification", () => {
 
     failing.corruptAvailability = false;
     const cold = new SqliteGitDatabase(failing, { objectCacheBytes: 0 }).openCheckout(checkout.id);
-    let phase = "sweep-loose";
+    let phase = "loose";
     for (let calls = 0; calls < 10 && phase !== "finish"; calls++) {
       phase = advanceMaintenanceSweep(cold.shared, { nowMs: GC_GRACE_MS }).phase;
       expect(
@@ -494,7 +494,7 @@ describe("maintenance crash and restart qualification", () => {
     const storage = new SqliteTestStorage();
     const clock = new CountingClock(60);
     await committedRepository(storage, clock);
-    const classifying = await reachPhase(storage, clock, "classify-packs");
+    const classifying = await reachPhase(storage, clock, "packs");
     const db = inspect(storage);
     const opened = workspace(storage, clock);
     opened.filesystem.writeFiles([
@@ -527,7 +527,7 @@ describe("maintenance crash and restart qualification", () => {
     const storage = new SqliteTestStorage();
     const clock = new CountingClock(61);
     const commitOid = await committedRepository(storage, clock);
-    const classifying = await reachPhase(storage, clock, "classify-packs");
+    const classifying = await reachPhase(storage, clock, "packs");
     const db = inspect(storage);
     const database = new SqliteGitDatabase(db, { now: clock.now });
     const checkout = database.findCheckout("/repo");
@@ -594,7 +594,7 @@ describe("maintenance crash and restart qualification", () => {
     const storage = new SqliteTestStorage();
     const clock = new CountingClock(62);
     await committedRepository(storage, clock);
-    const classifying = await reachPhase(storage, clock, "classify-packs");
+    const classifying = await reachPhase(storage, clock, "packs");
     const db = inspect(storage);
     const opened = workspace(storage, clock);
     opened.filesystem.writeFiles([
@@ -639,7 +639,7 @@ describe("maintenance crash and restart qualification", () => {
 
     try {
       const localOid = await committedRepository(storage, clock);
-      await reachPhase(storage, clock, "classify-loose");
+      await reachPhase(storage, clock, "loose");
       const db = inspect(storage);
       const setup = workspace(storage, clock);
       await setup.git.remoteAdd({ dir: "/repo", name: "origin", url: server.url });
@@ -660,7 +660,7 @@ describe("maintenance crash and restart qualification", () => {
       for (let calls = 0; calls < 100 && !phases.has("finish"); calls++) {
         phases.add((await maintenance(storage, clock)).phase);
       }
-      expect(phases).toEqual(new Set(["classify-packs", "sweep-loose", "sweep-packs", "finish"]));
+      expect(phases).toEqual(new Set(["packs", "finish"]));
       expect(
         db.one<{ pack_id: number; state: string }>(
           "SELECT pack_id, state FROM git_pack_meta WHERE pack_id = ?",

@@ -125,7 +125,7 @@ describe("promisor store", () => {
     try {
       await fixture.runtime().git.clone({ url: server.url, dir: "/repo", filter: "blob:none" });
       expect(fixture.store().promisedMissing([oid])).toEqual([oid]);
-      await fixture.until("classify-loose");
+      await fixture.until("loose");
       expect(fixture.marked(oid)).toBe(0);
       const hydrated = await fixture
         .runtime()
@@ -133,7 +133,7 @@ describe("promisor store", () => {
       expect(hydrated.bytes).toEqual(data);
       expect(fixture.store().promisedBlobCount()).toBe(0);
       expect(await fixture.call()).toMatchObject({ phase: "roots", restarted: true });
-      await fixture.until("sweep-loose");
+      await fixture.until("packs");
       expect(fixture.marked(oid)).toBe(1);
       fixture.clock.value += GC_GRACE_MS + 1;
       await fixture.until("finish");

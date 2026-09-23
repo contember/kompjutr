@@ -5,12 +5,7 @@ export const GC_GRACE_MS = 1_209_600_000;
 export const DEFAULT_PAGE_ROWS = 64;
 export const MAX_PAGE_ROWS = 128;
 
-export type SweepPhase =
-  | "classify-loose"
-  | "classify-packs"
-  | "sweep-loose"
-  | "sweep-packs"
-  | "finish";
+export type SweepPhase = "loose" | "packs" | "finish";
 
 export type MaintenanceSweepStatus = "progress" | "phase-complete" | "complete" | "root-changed";
 

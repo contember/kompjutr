@@ -24,8 +24,7 @@ export const MAINTENANCE_SCHEMA_STATEMENTS = [
        AND observed_source_generation BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
      ),
      phase TEXT NOT NULL CHECK (typeof(phase) = 'text' AND phase IN (
-       'roots', 'mark', 'classify-loose', 'classify-packs',
-       'sweep-loose', 'sweep-packs', 'finish'
+       'roots', 'mark', 'loose', 'packs', 'finish'
      )),
      started_ms INTEGER NOT NULL CHECK (
        typeof(started_ms) = 'integer' AND started_ms BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}

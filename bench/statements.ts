@@ -2238,7 +2238,7 @@ async function maintenanceMarkRows(rows: ResultRow[]): Promise<void> {
           db.scalar<string>(
             "SELECT phase FROM git_maintenance_runs WHERE repo_id = ?",
             checkout.repoId,
-          ) === "classify-loose",
+          ) === "loose",
           "maintenance mark did not settle",
         );
         assert(

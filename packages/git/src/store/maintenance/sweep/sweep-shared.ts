@@ -15,7 +15,7 @@ export function readRun(db: SqlDatabase, repoId: number): RunState {
   if (run === null) throw new GitError("ENOTFOUND", "maintenance run does not exist");
   expectPhase(
     run,
-    ["classify-loose", "classify-packs", "sweep-loose", "sweep-packs", "finish"],
+    ["loose", "packs", "finish"],
     `maintenance sweep cannot advance phase ${run.phase}`,
   );
   expectRootsSettled(run);
@@ -60,9 +60,9 @@ export function transitionPhase(
 ): RunState {
   const row = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_runs
-        SET phase = ?, next_eligible_ms = ?
+        SET phase = ?, next_eligible_ms = ?, cursor_text = NULL, cursor_ordinal = NULL
       WHERE repo_id = ? AND run_id = ? AND phase = ? AND observed_root_epoch = ?
-        AND cursor_checkout_id IS NULL AND cursor_text IS NULL AND cursor_ordinal IS NULL
+        AND cursor_checkout_id IS NULL
       RETURNING repo_id, run_id, phase, next_eligible_ms`,
     nextPhase,
     nextEligibleMs,
@@ -80,7 +80,7 @@ export function transitionPhase(
   ) {
     throw new CorruptError("maintenance phase transition was not published atomically");
   }
-  return { ...run, phase: nextPhase, nextEligibleMs };
+  return { ...run, phase: nextPhase, nextEligibleMs, cursorText: null, cursorOrdinal: null };
 }
 
 export function eligibilityTime(since: number): number {

@@ -1199,10 +1199,10 @@ describe("merge lifecycle", () => {
     expect(workspace.repo.store.has(markerOid)).toBe(false);
     const git = nativeGit(workspace);
     let maintenance = await git.maintenance();
-    for (let calls = 0; calls < 100 && maintenance.phase !== "classify-loose"; calls++) {
+    for (let calls = 0; calls < 100 && maintenance.phase !== "loose"; calls++) {
       maintenance = await git.maintenance();
     }
-    expect(maintenance.phase).toBe("classify-loose");
+    expect(maintenance.phase).toBe("loose");
     const db = new TestDatabase(workspace.storage);
     expect(
       db.scalar(

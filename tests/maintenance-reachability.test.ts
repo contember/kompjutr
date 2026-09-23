@@ -406,7 +406,7 @@ describe("maintenance reachability", () => {
            FROM git_maintenance_runs WHERE repo_id = ?`,
         checkout.repoId,
       ),
-    ).toEqual({ phase: "classify-loose", queued_objects: 0, reachable_objects: 6 });
+    ).toEqual({ phase: "loose", queued_objects: 0, reachable_objects: 6 });
   });
 
   it("pages more than 256 commit parents and persists the exact cursor", () => {
@@ -1347,7 +1347,7 @@ describe("maintenance reachability", () => {
            FROM git_maintenance_runs WHERE repo_id = ?`,
         checkout.repoId,
       ),
-    ).toEqual({ phase: "classify-loose", reachable_objects: 1, queued_objects: 0 });
+    ).toEqual({ phase: "loose", reachable_objects: 1, queued_objects: 0 });
   });
 
   it("does not apply blob promises to missing non-blob edges or roots", () => {
@@ -1417,32 +1417,7 @@ describe("maintenance reachability", () => {
     ).toEqual({ reachable_objects: 0, queued_objects: 1 });
   });
 
-  it("rejects drifted queue and logical counters at their exact audit boundaries", () => {
-    const initialized = open();
-    const first = initialized.store.write("blob", utf8.encode("first\n"));
-    seedMark(initialized.db, initialized.checkout.repoId, [{ oid: first }]);
-    initialized.db.run(
-      "UPDATE git_maintenance_runs SET queued_objects = 2 WHERE repo_id = ?",
-      initialized.checkout.repoId,
-    );
-    expect(() => advanceMaintenanceReachability(initialized.store.shared)).toThrow(
-      /initial maintenance counters disagree/,
-    );
-
-    const completed = open();
-    const second = completed.store.write("blob", utf8.encode("second\n"));
-    seedMark(completed.db, completed.checkout.repoId, [{ oid: second }]);
-    advanceMaintenanceReachability(completed.store.shared);
-    completed.db.run(
-      "UPDATE git_maintenance_runs SET reachable_objects = 2 WHERE repo_id = ?",
-      completed.checkout.repoId,
-    );
-    expect(() => advanceMaintenanceReachability(completed.store.shared)).toThrow(
-      /completed maintenance counters disagree/,
-    );
-  });
-
-  it("returns completion after a cold classify-loose reopen", () => {
+  it("returns completion after a cold loose-phase reopen", () => {
     const stable = open();
     const stableBlob = stable.store.write("blob", utf8.encode("stable complete\n"));
     seedMark(stable.db, stable.checkout.repoId, [{ oid: stableBlob }]);
@@ -1596,7 +1571,7 @@ describe("maintenance reachability", () => {
         checkout.repoId,
       ),
     ).toEqual({
-      phase: "classify-loose",
+      phase: "loose",
       queued_objects: 0,
       reachable_objects: 50_002,
     });
@@ -1644,7 +1619,7 @@ describe("maintenance mark batching", () => {
       expect(storage.statementCount).toBeLessThan(1_000);
     }
 
-    expect(result.phase).toBe("classify-loose");
+    expect(result.phase).toBe("loose");
     const db = new TestDatabase(storage);
     const repoId = db.scalar<number>("SELECT repo_id FROM git_maintenance_runs");
     if (repoId === undefined) throw new Error("the maintenance run is missing");

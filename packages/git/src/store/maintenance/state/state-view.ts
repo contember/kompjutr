@@ -75,18 +75,7 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
         ),
       ),
       phase: nullable(
-        oneOf(
-          [
-            "roots",
-            "mark",
-            "classify-loose",
-            "classify-packs",
-            "sweep-loose",
-            "sweep-packs",
-            "finish",
-          ],
-          "maintenance phase is invalid",
-        ),
+        oneOf(["roots", "mark", "loose", "packs", "finish"], "maintenance phase is invalid"),
       ),
       started_ms: nullable(
         int(0, Number.MAX_SAFE_INTEGER, "maintenance start time is not a bounded safe integer"),
@@ -195,7 +184,7 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
   const cursorText = decoded.cursor_text;
   const cursorOrdinal = decoded.cursor_ordinal;
   const nextEligibleMs = decoded.next_eligible_ms;
-  if (phase !== "sweep-packs" && phase !== "finish" && nextEligibleMs !== null) {
+  if (phase !== "packs" && phase !== "finish" && nextEligibleMs !== null) {
     throw new CorruptError("maintenance phase retained an eligibility time");
   }
   const restarted = requiredField(decoded.restarted, "maintenance restart marker is invalid");
@@ -293,7 +282,7 @@ export function expectPhase<const Phases extends readonly MaintenancePhase[]>(
 
 /** Require root discovery to be settled before a downstream maintenance phase. */
 export function expectRootsSettled(view: MaintenanceRunView): void {
-  if (view.phase === "sweep-packs") {
+  if (view.phase === "loose" || view.phase === "packs") {
     validateMaintenanceRootCursor(view);
     return;
   }

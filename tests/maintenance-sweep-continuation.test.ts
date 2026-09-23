@@ -21,7 +21,7 @@ function observe(fixture: ReturnType<typeof packMaintenance>) {
     if (query.startsWith("WITH RECURSIVE target(repo_id, pack_id)")) counts.checks++;
     if (query.includes("/* pack-sweep-page */")) {
       counts.pages++;
-      expect(query).toContain("candidate.pack_id > ?");
+      expect(query).toContain("pack.pack_id > ?");
       expect(query).toContain("LIMIT ?");
       expect(bindings.at(-1)).toBe(DEFAULT_PAGE_ROWS);
       const next = cursor.next.bind(cursor);
@@ -58,20 +58,20 @@ describe("pack sweep continuation", () => {
     const packed = await fixture.full(bytes);
     await fixture.until("finish");
     fixture.clock.value += GC_GRACE_MS;
-    await fixture.until("sweep-packs");
+    await fixture.until("packs");
     const store = fixture.store();
-    const one = store.db.one.bind(store.db);
-    store.db.one = <Row extends object>(query: string, ...bindings: unknown[]): Row | undefined => {
+    const run = store.db.run.bind(store.db);
+    store.db.run = (query: string, ...bindings: unknown[]): void => {
       if (query.includes("SET cursor_ordinal = ?, cursor_text = ?"))
         throw new Error("cursor publication failed");
-      return one<Row>(query, ...bindings);
+      run(query, ...bindings);
     };
     try {
       expect(() => advanceMaintenanceSweep(store.shared, { nowMs: fixture.clock.value })).toThrow(
         "cursor publication failed",
       );
     } finally {
-      store.db.one = one;
+      store.db.run = run;
     }
     expect(cursor(fixture)).toMatchObject({ cursor_ordinal: null, cursor_text: null });
     expect(fixture.db.scalar("SELECT reclaimed_packs FROM git_maintenance_runs")).toBe(0);
@@ -131,7 +131,7 @@ describe("pack sweep continuation", () => {
     fixture.clock.value += GC_GRACE_MS;
     const young = utf8.encode("young loose object between sweep passes\n");
     fixture.store().write("blob", young);
-    await fixture.until("sweep-packs", 3 * blockedCount + 30);
+    await fixture.until("packs", 3 * blockedCount + 30);
     expect(cursor(fixture).next_eligible_ms).toBe(fixture.clock.value + GC_GRACE_MS);
     const counts = observe(fixture);
     let stickyPages = 0;
@@ -149,13 +149,14 @@ describe("pack sweep continuation", () => {
       const after = cursor(fixture);
       expect(counts.pages).toBe(1);
       expect(counts.examined).toBeLessThanOrEqual(DEFAULT_PAGE_ROWS);
-      expect(counts.checks).toBe(counts.examined);
       expect(result.reclaimedPacks - previousReclaimed).toBeLessThanOrEqual(1);
+      // The page is read whole before any write; a deletion ends the call early.
+      if (result.reclaimedPacks === previousReclaimed) expect(counts.checks).toBe(counts.examined);
+      else expect(counts.checks).toBeLessThanOrEqual(counts.examined);
       previousReclaimed = result.reclaimedPacks;
       expect(after.cursor_checkout_id).toBeNull();
       expect(after.root_source).toBe("done");
-      if (result.phase === "sweep-packs")
-        expect(after.next_eligible_ms).toBe(before.next_eligible_ms);
+      if (result.phase === "packs") expect(after.next_eligible_ms).toBe(before.next_eligible_ms);
       if (
         before.cursor_text === PACK_SWEEP_RETRY &&
         counts.examined === DEFAULT_PAGE_ROWS &&
@@ -167,7 +168,7 @@ describe("pack sweep continuation", () => {
       if (
         before.cursor_text === PACK_SWEEP_RETRY &&
         after.cursor_ordinal === null &&
-        result.phase === "sweep-packs"
+        result.phase === "packs"
       ) {
         restarts++;
         expect(after.cursor_text).toBeNull();
@@ -201,7 +202,7 @@ describe("pack sweep continuation", () => {
     await fixture.full(retained);
     await fixture.until("finish");
     fixture.clock.value += GC_GRACE_MS;
-    await fixture.until("sweep-packs");
+    await fixture.until("packs");
     await fixture.call();
     expect(cursor(fixture).cursor_text).toBe(PACK_SWEEP_RETRY);
     await fixture.runtime().git.updateRef({
@@ -221,7 +222,7 @@ describe("pack sweep continuation", () => {
 
   it("accepts sweep ID zero and rejects cross-phase or malformed continuations", () => {
     const sweep: MaintenanceRootCursorState = {
-      phase: "sweep-packs",
+      phase: "packs",
       rootSource: "done",
       cursorCheckoutId: null,
       cursorText: null,
@@ -238,6 +239,17 @@ describe("pack sweep continuation", () => {
       { ...sweep, cursorText: "unknown" },
       { ...sweep, cursorText: PACK_SWEEP_RETRY, cursorOrdinal: null },
       { ...sweep, cursorCheckoutId: 1 },
+    ])
+      expect(() => validateMaintenanceRootCursor(changed)).toThrow();
+    const loose: MaintenanceRootCursorState = { ...sweep, phase: "loose", cursorOrdinal: null };
+    expect(() => validateMaintenanceRootCursor(loose)).not.toThrow();
+    expect(() =>
+      validateMaintenanceRootCursor({ ...loose, cursorText: hashObject("blob", utf8.encode("")) }),
+    ).not.toThrow();
+    for (const changed of [
+      { ...loose, cursorText: "not an oid" },
+      { ...loose, cursorOrdinal: 0 },
+      { ...loose, cursorCheckoutId: 1 },
     ])
       expect(() => validateMaintenanceRootCursor(changed)).toThrow();
   });

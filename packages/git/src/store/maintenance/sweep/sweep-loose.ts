@@ -58,30 +58,38 @@ function retained(row: LooseRow): boolean {
   return row.marked || row.pinned;
 }
 
-function readLooseMismatch(
+// One page holds the next loose objects after the cursor whose candidate row is
+// wrong or whose grace has elapsed. Each action removes its row from the
+// predicate, so nothing behind the cursor needs a second look, and a fresh
+// nomination is never eligible at once.
+function readLooseActions(
   db: SqlDatabase,
   repoId: number,
   run: RunState,
+  nowMs: number,
   pageRows: number,
 ): LooseRow[] {
   const rows: LooseRow[] = [];
   for (const row of db.iterate(
-    `SELECT /* maintenance-classify-loose */ ${LOOSE_COLUMNS}
+    `SELECT /* maintenance-loose */ ${LOOSE_COLUMNS}
        FROM git_objects object
        LEFT JOIN git_loose_gc_candidates candidate
          ON candidate.repo_id = object.repo_id AND candidate.oid = object.oid
        LEFT JOIN git_maintenance_objects mark
          ON mark.repo_id = object.repo_id AND mark.run_id = ? AND mark.oid = object.oid
-      WHERE object.repo_id = ?
-        AND (mark.oid IS NOT NULL OR ${LOOSE_DELTA_BASE}) = (candidate.oid IS NOT NULL)
+      WHERE object.repo_id = ? AND object.oid > ?
+        AND CASE WHEN mark.oid IS NOT NULL OR ${LOOSE_DELTA_BASE}
+                 THEN candidate.oid IS NOT NULL
+                 ELSE candidate.oid IS NULL OR candidate.unreachable_since_ms <= ? END
       ORDER BY object.oid COLLATE BINARY LIMIT ?`,
     run.runId,
     repoId,
-    pageRows + 1,
+    run.cursorText ?? "",
+    sweepCutoff(nowMs),
+    pageRows,
   )) {
     rows.push(readLooseRow(row, repoId));
   }
-  if (rows.length > pageRows + 1) throw new CorruptError("loose mismatch page exceeded sentinel");
   return rows;
 }
 
@@ -109,68 +117,6 @@ function insertLooseCandidates(
     nowMs,
     JSON.stringify(oids),
   );
-}
-
-export function classifyLoose(
-  db: SqlDatabase,
-  repoId: number,
-  run: RunState,
-  nowMs: number,
-  pageRows: number,
-): SliceResult {
-  const rows = readLooseMismatch(db, repoId, run, pageRows);
-  if (rows.length === 0) {
-    const updated = transitionPhase(db, repoId, run, "classify-packs", null);
-    return {
-      progress: progress(updated, updated.phase, "phase-complete"),
-      storageChanged: false,
-    };
-  }
-  const page = rows.slice(0, pageRows);
-  deleteLooseCandidates(
-    db,
-    repoId,
-    page.filter(retained).map((row) => row.oid),
-  );
-  insertLooseCandidates(
-    db,
-    repoId,
-    page.filter((row) => !retained(row)).map((row) => row.oid),
-    nowMs,
-  );
-  return { progress: progress(run, run.phase, "progress"), storageChanged: false };
-}
-
-function readLooseSweepActions(
-  db: SqlDatabase,
-  repoId: number,
-  run: RunState,
-  nowMs: number,
-  pageRows: number,
-): LooseRow[] {
-  const rows: LooseRow[] = [];
-  for (const row of db.iterate(
-    `SELECT /* maintenance-sweep-loose */ ${LOOSE_COLUMNS}
-       FROM git_loose_gc_candidates candidate
-       JOIN git_objects object
-         ON object.repo_id = candidate.repo_id AND object.oid = candidate.oid
-       LEFT JOIN git_maintenance_objects mark
-         ON mark.repo_id = candidate.repo_id AND mark.run_id = ? AND mark.oid = candidate.oid
-      WHERE candidate.repo_id = ?
-        AND (mark.oid IS NOT NULL OR ${LOOSE_DELTA_BASE}
-          OR candidate.unreachable_since_ms <= ?)
-      ORDER BY candidate.oid COLLATE BINARY LIMIT ?`,
-    run.runId,
-    repoId,
-    sweepCutoff(nowMs),
-    pageRows + 1,
-  )) {
-    const checked = readLooseRow(row, repoId);
-    if (checked.candidateSince === null) throw new CorruptError("loose sweep lost candidate age");
-    rows.push(checked);
-  }
-  if (rows.length > pageRows + 1) throw new CorruptError("loose sweep page exceeded sentinel");
-  return rows;
 }
 
 function deleteLooseObjects(db: SqlDatabase, repoId: number, oids: readonly string[]): void {
@@ -211,59 +157,56 @@ function deleteLooseObjects(db: SqlDatabase, repoId: number, oids: readonly stri
   bumpRepositorySourceGeneration(db, repoId);
 }
 
-function nextLooseEligibility(db: SqlDatabase, repoId: number, run: RunState): number | null {
-  const row = db.one<Record<string, unknown>>(
-    `SELECT min(candidate.unreachable_since_ms) AS since,
-            EXISTS(
-              SELECT 1 FROM git_loose_gc_candidates candidate
-              JOIN git_maintenance_objects mark
-                ON mark.repo_id = candidate.repo_id AND mark.run_id = ? AND mark.oid = candidate.oid
-              WHERE candidate.repo_id = ?
-            ) AS marked
-       FROM git_loose_gc_candidates candidate WHERE candidate.repo_id = ?`,
-    run.runId,
-    repoId,
+function nextLooseEligibility(db: SqlDatabase, repoId: number): number | null {
+  const since = db.scalar<unknown>(
+    "SELECT min(unreachable_since_ms) FROM git_loose_gc_candidates WHERE repo_id = ?",
     repoId,
   );
-  if (row === undefined || row.marked !== 0) {
-    throw new CorruptError("loose sweep completion retained an actionable candidate");
-  }
-  return row.since === null
+  return since === null
     ? null
-    : eligibilityTime(
-        expectSafeInteger(row.since, 0, Number.MAX_SAFE_INTEGER, "loose candidate age"),
-      );
+    : eligibilityTime(expectSafeInteger(since, 0, Number.MAX_SAFE_INTEGER, "loose candidate age"));
 }
 
-export function sweepLoose(
+export function advanceLoose(
   db: SqlDatabase,
   repoId: number,
   run: RunState,
   nowMs: number,
   pageRows: number,
 ): SliceResult {
-  const rows = readLooseSweepActions(db, repoId, run, nowMs, pageRows);
-  if (rows.length === 0) {
-    const eligible = nextLooseEligibility(db, repoId, run);
-    const updated = transitionPhase(db, repoId, run, "sweep-packs", eligible);
+  const page = readLooseActions(db, repoId, run, nowMs, pageRows);
+  if (page.length === 0) {
+    const updated = transitionPhase(db, repoId, run, "packs", nextLooseEligibility(db, repoId));
     return {
       progress: progress(updated, updated.phase, "phase-complete"),
       storageChanged: false,
     };
   }
-  const page = rows.slice(0, pageRows);
   deleteLooseCandidates(
     db,
     repoId,
     page.filter(retained).map((row) => row.oid),
   );
-  const doomed = page.filter((row) => !retained(row));
+  insertLooseCandidates(
+    db,
+    repoId,
+    page.filter((row) => !retained(row) && row.candidateSince === null).map((row) => row.oid),
+    nowMs,
+  );
+  const doomed = page.filter((row) => !retained(row) && row.candidateSince !== null);
   let bytes = 0;
   for (const row of doomed) {
     bytes += row.storedBytes;
     if (!Number.isSafeInteger(bytes)) throw new GitError("E2BIG", "loose byte count overflow");
   }
-  let updated = run;
+  const last = page.at(-1)?.oid ?? null;
+  db.run(
+    "UPDATE git_maintenance_runs SET cursor_text = ? WHERE repo_id = ? AND run_id = ?",
+    last,
+    repoId,
+    run.runId,
+  );
+  let updated: RunState = { ...run, cursorText: last };
   if (doomed.length > 0) {
     requireStableEpoch(db, repoId, run);
     deleteLooseObjects(
@@ -271,7 +214,7 @@ export function sweepLoose(
       repoId,
       doomed.map((row) => row.oid),
     );
-    updated = updateReclamationCounters(db, repoId, run, doomed.length, 0, bytes);
+    updated = updateReclamationCounters(db, repoId, updated, doomed.length, 0, bytes);
   }
   return {
     progress: progress(updated, updated.phase, "progress"),

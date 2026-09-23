@@ -8,11 +8,11 @@ import {
   type MaintenanceSweepProgress,
   type SliceResult,
 } from "./sweep-contracts.js";
-import { classifyLoose, sweepLoose } from "./sweep-loose.js";
-import { classifyPacks, sweepPacks } from "./sweep-packs.js";
+import { advanceLoose } from "./sweep-loose.js";
+import { advancePacks } from "./sweep-packs.js";
 import { progress, readRun } from "./sweep-shared.js";
 
-/** Advance one durable WU6 classification, sweep, or phase-transition boundary. */
+/** Advance one durable loose or pack page, or one phase transition. */
 export function advanceMaintenanceSweep(
   store: SharedRepoStore,
   options: AdvanceMaintenanceSweepOptions,
@@ -34,13 +34,9 @@ export function advanceMaintenanceSweep(
       return { progress: progress(run, run.phase, "complete"), storageChanged: false };
     }
     const slice =
-      run.phase === "classify-loose"
-        ? classifyLoose(store.db, store.repoId, run, nowMs, pageRows)
-        : run.phase === "classify-packs"
-          ? classifyPacks(store.db, store.repoId, run, nowMs)
-          : run.phase === "sweep-loose"
-            ? sweepLoose(store.db, store.repoId, run, nowMs, pageRows)
-            : sweepPacks(store, run, nowMs, pageRows);
+      run.phase === "loose"
+        ? advanceLoose(store.db, store.repoId, run, nowMs, pageRows)
+        : advancePacks(store, run, nowMs, pageRows);
     // A slice that reclaimed storage bumped the generation itself; adopting it
     // as the transaction's last statement keeps the run from restarting itself.
     if (slice.storageChanged) {
