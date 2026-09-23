@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { utf8Decoder } from "../packages/git/src/common/bytes.js";
+import { serializeCommit } from "../packages/git/src/common/objects.js";
 import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
 import type { GitContext } from "../packages/git/src/ops/core/context.js";
+import { MAX_JOURNAL_MESSAGE_BYTES } from "../packages/git/src/ops/core/journal-input.js";
 import {
   cherryPick,
   cherryPickAbort,
@@ -451,6 +453,61 @@ describe("cherry-pick lifecycle", () => {
     expect(head).toMatchObject({ oldOid: current, newOid: result.oid, reason: "cherry-pick" });
     if (named === undefined || head === undefined) throw new Error("cherry-pick reflog is missing");
     expect(head.ordinal).toBe(named.ordinal + 1);
+  });
+
+  it("refuses a NUL in a cherry-pick message as caller input, not corruption", async () => {
+    const source = fixture();
+    source.write("conflict.txt", "base\n");
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("conflict.txt", "incoming\n");
+    const picked = source.commit("topic subject");
+    source.git("checkout", "-q", "main");
+    source.write("conflict.txt", "current\n");
+    const current = source.commit("main");
+    const workspace = await imported(source);
+
+    expect(() =>
+      cherryPick(workspace.context, workspace.repo, workspace.worktree, {
+        source: picked,
+        message: "picked\0subject\n",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(workspace.repo.head().oid).toBe(current);
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
+    expect(textAt(workspace, "conflict.txt")).toBe("current\n");
+  });
+
+  it("commits a clean pick whose unjournaled source message is large or holds NUL", async () => {
+    const messages = [`${"x".repeat(MAX_JOURNAL_MESSAGE_BYTES)}\n`, "source\0subject\n"];
+    for (const message of messages) {
+      const source = fixture();
+      source.write("base.txt", "base\n");
+      const base = source.commit("base");
+      source.git("checkout", "-q", "-b", "topic");
+      source.write("topic.txt", "topic\n");
+      const topic = source.commit("topic");
+      source.git("checkout", "-q", "main");
+      source.write("main.txt", "main\n");
+      const current = source.commit("main");
+      const workspace = await imported(source);
+      const tree = workspace.repo.readCommit(topic).tree;
+      const author = workspace.repo.readCommit(topic).author;
+      const picked = workspace.repo.store.write(
+        "commit",
+        serializeCommit({ tree, parent: [base], author, committer: author, message }),
+      );
+
+      const result = cherryPick(workspace.context, workspace.repo, workspace.worktree, {
+        source: picked,
+      });
+
+      expect(result.outcome).toBe("committed");
+      if (result.outcome !== "committed") throw new Error("clean pick did not commit");
+      expect(workspace.repo.readCommit(result.oid).parent).toEqual([current]);
+      expect(textAt(workspace, "topic.txt")).toBe("topic\n");
+      expect(workspace.repo.checkout.readOperationState()).toBeNull();
+    }
   });
 
   it("continues a distinct regular-symlink conflict from its cold journal", async () => {

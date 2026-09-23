@@ -6,23 +6,19 @@ import {
 // Shared orchestration for one bounded cherry-pick or revert operation.
 
 import { GitError } from "../../common/errors.js";
-import { hashObject, type Person } from "../../common/objects.js";
-import { joinSorted } from "../../common/streams.js";
-import {
-  type IntegrationWorkspace,
-  withIntegrationWorkspaceOwned,
-} from "../../store/operations/integration-workspace/workspace.js";
+import { type Commit, hashObject, type Person } from "../../common/objects.js";
+import { withIntegrationWorkspaceOwned } from "../../store/operations/integration-workspace/workspace.js";
 import {
   iterateOperationTouchedOwned,
   readOperationHeaderOwned,
 } from "../../store/operations/operation-journal.js";
 import type { OperationTouchedSource } from "../../store/operations/operation-journal-types.js";
 import type { GitContext, GitIdentity } from "../core/context.js";
+import { requireJournalIdentity, requireJournalMessage } from "../core/journal-input.js";
 import type { ReplayEmptyReason, ReplayResult } from "../core/kinds.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import {
   type CherryPickJournal,
-  type OperationJournal,
   operationKindMismatch,
   operationNotActive,
   operationStepsForState,
@@ -31,10 +27,8 @@ import {
   type RevertJournal,
 } from "../core/operation-state.js";
 import { applyIntegrationOwned } from "../integration/integration-apply-owned.js";
-import { projectIntegrationWithCollisionsOwned } from "../integration/integration-collisions-owned.js";
 import { restoreIntegrationOwned } from "../integration/integration-restore-owned.js";
 import { projectIntegrationStepOwned } from "../integration/integration-step.js";
-import { integrationTouched } from "../integration/integration-touched.js";
 import {
   integrationIndexMatchesTree,
   requireBoundedIntegrationIndex,
@@ -43,7 +37,6 @@ import {
 } from "../integration/integration-worktree.js";
 import { type CommitIdentities, commitIndex } from "../repository/commit.js";
 import type { Repository, ResolvedHead } from "../repository/repository.js";
-import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { planReplayOwned } from "./replay-planning.js";
 import type { ReplayIncomingLabelStyle, ReplayPlan } from "./replay-types.js";
@@ -74,7 +67,7 @@ export interface ReplayPolicy {
   resolveIdentities(
     context: GitContext,
     repo: Repository,
-    plan: ReplayPlan,
+    source: Commit,
     input: ReplayContinueOptions,
   ): CommitIdentities;
 }
@@ -180,113 +173,9 @@ function conflicts(entries: ReplayPlan["integration"]["entries"]): boolean {
   return false;
 }
 
-function planForState(
-  workspace: IntegrationWorkspace,
-  repo: Repository,
-  state: ReplayStateMetadata,
-  incomingLabelStyle: ReplayIncomingLabelStyle,
-): ReplayPlan {
-  const plan = planReplayOwned(workspace, repo, {
-    kind: state.kind,
-    source: state.sourceOid,
-    currentOid: state.originalHeadOid,
-    mainline: state.mainline ?? undefined,
-    incomingLabelStyle,
-  });
-  if (
-    plan.sourceOid !== state.sourceOid ||
-    plan.selectedParentOid !== state.selectedParentOid ||
-    plan.mainline !== state.mainline ||
-    plan.labels.current !== state.currentLabel ||
-    plan.labels.incoming !== state.incomingLabel
-  ) {
-    throw new GitError("ECORRUPT", `${state.kind} journal differs from its replay plan`);
-  }
-  return plan;
-}
-
-function requireOriginalSnapshots(
-  repo: Repository,
-  journal: OperationJournal<OperationTouchedSource>,
-): void {
-  const originalTree = repo.readCommit(journal.state.originalHeadOid).tree;
-  for (const row of joinSorted(treeStream(repo, originalTree), journal.touched, {
-    left: (entry) => entry.path,
-    right: (entry) => entry.path,
-  })) {
-    const saved = row.right;
-    if (saved === undefined) continue;
-    const expected = row.left;
-    if (expected === undefined) {
-      if (saved.index !== null) {
-        throw new GitError("ECORRUPT", `replay snapshot differs at ${saved.path}`);
-      }
-      continue;
-    }
-    if (
-      saved.index === null ||
-      saved.index.oid !== expected.oid ||
-      saved.index.mode !== Number.parseInt(expected.mode, 8)
-    ) {
-      throw new GitError("ECORRUPT", `replay snapshot differs at ${saved.path}`);
-    }
-    const worktree = saved.worktree;
-    if (worktree.kind === "absent") continue;
-    if (worktree.kind !== "file" && worktree.kind !== "symlink") {
-      throw new GitError("ECORRUPT", `replay worktree snapshot differs at ${saved.path}`);
-    }
-    const mode =
-      worktree.kind === "symlink" ? "120000" : (worktree.mode & 0o111) === 0 ? "100644" : "100755";
-    if (worktree.oid !== expected.oid || mode !== expected.mode) {
-      throw new GitError("ECORRUPT", `replay worktree snapshot differs at ${saved.path}`);
-    }
-  }
-}
-
-function requireOwnership(
-  workspace: IntegrationWorkspace,
-  repo: Repository,
-  worktree: Worktree,
-  journal: CherryPickJournal<OperationTouchedSource> | RevertJournal<OperationTouchedSource>,
-  incomingLabelStyle: ReplayIncomingLabelStyle,
-): ReplayPlan {
-  requireOriginalSnapshots(repo, journal);
-  const plan = planForState(workspace, repo, journal.state, incomingLabelStyle);
-  const omitted = workspace.touched(plan.integration);
-  omitted.reserve(journal.touched);
-  const projected = projectIntegrationWithCollisionsOwned(
-    workspace,
-    repo,
-    worktree,
-    plan.baseTreeOid,
-    plan.incomingTreeOid,
-    plan.integration,
-    plan.labels.current,
-    plan.labels.incoming,
-    omitted,
-    plan.kind,
-  );
-  const expected = integrationTouched(workspace, projected);
-  if (expected.length !== journal.touched.length) {
-    throw new GitError("ECORRUPT", "replay journal path ownership is incomplete");
-  }
-  for (const row of joinSorted(expected.shapes(), journal.touched, {
-    left: (entry) => entry.path,
-    right: (entry) => entry.path,
-  })) {
-    const wanted = row.left;
-    const saved = row.right;
-    if (
-      wanted === undefined ||
-      saved === undefined ||
-      wanted.path !== saved.path ||
-      wanted.logicalPath !== saved.logicalPath ||
-      wanted.purpose !== saved.purpose
-    ) {
-      throw new GitError("ECORRUPT", "replay journal path ownership differs from its plan");
-    }
-  }
-  return plan;
+function requireReplayIdentities(kind: ReplayKind, input: ReplayContinueOptions): void {
+  requireJournalIdentity(input.author, "author", kind);
+  requireJournalIdentity(input.committer, "committer", kind);
 }
 
 export function startReplay(
@@ -297,6 +186,7 @@ export function startReplay(
   policy: ReplayPolicy,
 ): ReplayResult {
   requireSharedMutationScope(repo.store.db, worktree);
+  requireReplayIdentities(policy.kind, input);
   return withIntegrationWorkspaceOwned(repo.store, (workspace) => {
     repo.checkout.requireNoOperationState();
     const head = requireReplayHead(repo, policy.kind);
@@ -314,6 +204,7 @@ export function startReplay(
     if (plan.integration.entryCount === 0) {
       const reason = emptyReason(plan);
       if (policy.suspendEmpty) {
+        requireJournalMessage(message, policy.kind);
         const state = replayState(policy, plan, head, "empty", reason, message, input);
         const steps = operationStepsForState(state);
         writeOperationJournalOwned(repo.checkout, state, steps, []);
@@ -333,12 +224,13 @@ export function startReplay(
     if (current.ref !== head.ref || current.oid !== head.oid) {
       throw new GitError("ESTALEHEAD", `HEAD changed while ${policy.kind} was being prepared`);
     }
+    if (conflicted) requireJournalMessage(message, policy.kind);
     const state = conflicted
       ? replayState(policy, plan, head, "conflicted", null, message, input)
       : null;
     applyIntegrationOwned(workspace, repo, worktree, integration, state);
     if (conflicted) return { outcome: "conflicted" };
-    const identities = policy.resolveIdentities(context, repo, plan, input);
+    const identities = policy.resolveIdentities(context, repo, plan.sourceCommit, input);
     const result = commitIndex(
       repo,
       {
@@ -360,16 +252,10 @@ export function continueReplay(
   input: ReplayContinueOptions,
   policy: ReplayPolicy,
 ): ReplayResult {
-  return withIntegrationWorkspaceOwned(repo.store, (workspace) => {
+  requireReplayIdentities(policy.kind, input);
+  return repo.store.db.transactionSync(() => {
     const journal = requireReplayJournal(repo, policy.kind);
     const head = requireOriginalHead(repo, journal.state);
-    const plan = requireOwnership(
-      workspace,
-      repo,
-      context.worktree,
-      journal,
-      policy.incomingLabelStyle,
-    );
     if (journal.state.phase === "empty") {
       const reason = journal.state.emptyReason;
       if (reason === null) throw new GitError("ECORRUPT", "empty replay lost its reason");
@@ -382,7 +268,7 @@ export function continueReplay(
       );
     }
     requireBoundedIntegrationIndex(repo);
-    if (integrationIndexMatchesTree(repo, plan.currentTreeOid)) {
+    if (integrationIndexMatchesTree(repo, repo.readCommit(journal.state.originalHeadOid).tree)) {
       const reason: ReplayEmptyReason = "result";
       if (policy.suspendEmpty) {
         markReplayEmptyOwned(repo.checkout, policy.kind, reason);
@@ -391,7 +277,8 @@ export function continueReplay(
       }
       return { outcome: "empty", reason };
     }
-    const identities = policy.resolveIdentities(context, repo, plan, {
+    const source = repo.readCommit(journal.state.sourceOid);
+    const identities = policy.resolveIdentities(context, repo, source, {
       message: input.message,
       author: input.author ?? journal.state.author ?? undefined,
       committer: input.committer ?? journal.state.committer ?? undefined,
@@ -418,13 +305,8 @@ export function cancelReplay(repo: Repository, worktree: Worktree, kind: ReplayK
   withIntegrationWorkspaceOwned(repo.store, (workspace) => {
     const journal = requireReplayJournal(repo, kind);
     requireOriginalHead(repo, journal.state);
-    if (journal.state.phase !== "empty") {
-      const incomingLabelStyle: ReplayIncomingLabelStyle =
-        kind === "cherry-pick" ? "source-subject" : "parent-of-source-subject";
-      requireOwnership(workspace, repo, worktree, journal, incomingLabelStyle);
-      if (journal.touched.length > 0) {
-        restoreIntegrationOwned(workspace, repo, worktree, journal.touched);
-      }
+    if (journal.state.phase !== "empty" && journal.touched.length > 0) {
+      restoreIntegrationOwned(workspace, repo, worktree, journal.touched);
     }
     checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
   });

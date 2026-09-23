@@ -22,7 +22,6 @@ import type {
   RebaseJournal,
   RevertJournal,
 } from "../operations/operations.js";
-import { type SharedRepoStore, sharedRepoStoreMutations } from "../repository/shared.js";
 
 export class CheckoutOperationStore {
   readonly #table: OperationJournalTable;
@@ -30,17 +29,11 @@ export class CheckoutOperationStore {
 
   constructor(
     database: SqlDatabase,
-    shared: SharedRepoStore,
     repoId: number,
     checkoutId: number,
     requireActive: () => void,
   ) {
-    this.#table = new OperationJournalTable(
-      database,
-      repoId,
-      checkoutId,
-      sharedRepoStoreMutations(shared).objectTableOwned(),
-    );
+    this.#table = new OperationJournalTable(database, repoId, checkoutId);
     this.#requireActive = requireActive;
   }
 

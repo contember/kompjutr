@@ -9,11 +9,7 @@ import {
 import { advanceRebaseOwned } from "../../store/operations/operation-journal.js";
 import { checkoutTreeExcluding } from "../checkout/checkout.js";
 import type { GitIdentity } from "../core/context.js";
-import {
-  type OperationStepMetadata,
-  operationNotActive,
-  type RebaseStateMetadata,
-} from "../core/operation-state.js";
+import { operationNotActive, type RebaseStateMetadata } from "../core/operation-state.js";
 import {
   integrationIndexMatchesTree,
   requireBoundedIntegrationIndex,
@@ -114,14 +110,6 @@ export function requireOriginalHead(repo: Repository, state: RebaseStateMetadata
   if (head.ref !== state.originalHeadRef || head.oid !== state.originalHeadOid) {
     throw new GitError("ESTALEHEAD", "HEAD changed during the rebase operation");
   }
-}
-
-export function sameQueueStep(left: OperationStepMetadata, right: OperationStepMetadata): boolean {
-  return (
-    left.sourceOid === right.sourceOid &&
-    left.selectedParentOid === right.selectedParentOid &&
-    left.mainline === right.mainline
-  );
 }
 
 export function requireCurrentBaseline(

@@ -1,6 +1,7 @@
 // One-commit cherry-pick over the shared replay lifecycle.
 
 import type { GitContext, GitIdentity } from "../core/context.js";
+import { requireJournalIdentity } from "../core/journal-input.js";
 import type { ReplayResult } from "../core/kinds.js";
 import { resolveIdentity } from "../repository/commit.js";
 import type { Repository } from "../repository/repository.js";
@@ -33,13 +34,16 @@ const POLICY: ReplayPolicy = {
   incomingLabelStyle: "source-subject",
   suspendEmpty: true,
   defaultMessage: (plan) => plan.sourceCommit.message,
-  resolveIdentities: (context, repo, plan, input) =>
-    resolveIdentity(
+  resolveIdentities: (context, repo, source, input) => {
+    const identities = resolveIdentity(
       context,
       repo,
       { committer: input.committer, env: input.env },
-      plan.sourceCommit,
-    ),
+      source,
+    );
+    requireJournalIdentity(identities.committer, "committer", "cherry-pick");
+    return identities;
+  },
 };
 
 function startInput(options: CherryPickOptions): ReplayStartOptions {

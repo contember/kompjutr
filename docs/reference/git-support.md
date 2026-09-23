@@ -764,8 +764,19 @@ after lease comparison is still rejected by the server-side request CAS.
 
 All four commands below use the same bounded three-way engine and durable
 operation journal, so each survives a Durable Object restart mid-way. The
-validated operation plan and its anchors are immutable after creation. Ordinary
-reads use plain projections. A replay or one-shot operation transition may
+operation plan and its anchors are immutable after creation. Continue, skip, and
+abort trust the stored journal. Each checks the original HEAD and the journal
+kind; rebase continue and skip also check the phase, and continuing a conflicted
+operation refuses unmerged index entries. None of them re-plans the integration.
+Caller input is checked before it is written. A merge, cherry-pick, or revert
+`author` or `committer` option, and the resolved committer (plus the merge or
+revert author) of every commit these commands and rebase write, fails with
+`EINVAL` when it is empty, contains NUL, LF, CR, `<` or `>`, or is not canonical
+UTF-16, and with `E2BIG` above 1,024 UTF-8 bytes. A rebase `committer` option
+that is invalid is dropped from the reflog actor; only a step
+commit refuses it. A merge `message`, and any message a journal stores, fails
+with `EINVAL` on NUL or non-canonical UTF-16 and with `E2BIG` above 1 MiB.
+Ordinary reads use plain projections. A replay or one-shot operation transition may
 change only `phase`, `empty_reason`, the `current_step` cursor,
 `current_parent_oid`, `replayed_count` and `skipped_count`, `committer_name`
 and `committer_email`, the current step's `outcome` and `result_oid`, and the
@@ -778,8 +789,8 @@ When the two sides put a regular or executable file and a symlink at the same
 path, the symlink stays at the logical path and the regular side is materialised
 at a collision-checked `~<label>` relocation, matching Git. Index stages are
 split by mode class; when a merge base exists, its stage follows the primary or
-relocated path with the same mode class. Continue and abort revalidate both
-physical paths after a reopen. A distinct-type conflict involving a gitlink
+relocated path with the same mode class. Both physical paths are journaled, so
+continue and abort find them after a reopen. A distinct-type conflict involving a gitlink
 cannot be materialised and fails atomically with `EUNSUPPORTED`.
 
 ### `git merge` — `merge()`, `mergeContinue()`, `mergeAbort()`

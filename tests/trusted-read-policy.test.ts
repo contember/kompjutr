@@ -41,11 +41,15 @@ const FORBIDDEN_JOURNAL_AUTHENTICATION: readonly [name: string, pattern: RegExp]
   ["detached journal identity", /\b(?:integrity_oid|operationJournalIntegrityOid)\b/u],
   [
     "whole-journal object authentication",
-    /(?:#validateOperationObjects|#validateOperationCommitBodies|objects\.(?:objectInfo|readObjects))\s*\(/u,
+    /(?:#validateOperationObjects|#validateOperationCommitBodies|validateObjects|(?:objects|store)\.(?:objectInfo|readObjects))\s*\(/u,
   ],
   [
     "whole-journal topology authentication",
-    /(?:#validateReplayTopology|validateOperationJournal)\s*\(/u,
+    /(?:#validateReplayTopology|validateOperationJournal|validateResultCommit)\s*\(/u,
+  ],
+  [
+    "continuation re-plan",
+    /\b(?:requireJournalOwnership|requireConflictOwnership|requireOwnership|planForState|planCurrentStep|planReplayOwned|planIntegrationOwned)\s*\(/u,
   ],
 ];
 
@@ -267,17 +271,36 @@ describe("trusted ordinary read policy", () => {
     }
   });
 
-  it("keeps complete journal readers free of detached and whole-plan authentication", () => {
-    const path = "packages/git/src/store/operations/operation-journal-read.ts";
-    const readers = [scopedSource(path, "export function readOperationState(")];
-    for (const reader of readers) expect(journalReaderViolations(reader)).toEqual([]);
+  it("keeps journal readers, writers, continuations, and aborts free of re-authentication", () => {
+    const reads = "packages/git/src/store/operations/operation-journal-read.ts";
+    const replay = "packages/git/src/ops/replay/replay-lifecycle.ts";
+    const rebase = "packages/git/src/ops/rebase/rebase.ts";
+    const merge = "packages/git/src/ops/merge/merge.ts";
+    const scopes = [
+      scopedSource(reads, "export function readOperationState("),
+      scopedSource("packages/git/src/store/operations/operation-journal-write.ts", "import"),
+      scopedSource(merge, "export function mergeContinue("),
+      scopedSource(replay, "export function continueReplay("),
+      scopedSource(rebase, "export function rebaseContinue("),
+      scopedSource(
+        "packages/git/src/ops/integration/integration-restore-owned.ts",
+        "export function restoreIntegrationOwned(",
+      ),
+    ];
+    for (const scope of scopes) expect(journalReaderViolations(scope)).toEqual([]);
 
     const regressions = [
       "const integrity = operationJournalIntegrityOid(state, touched, steps);",
       "this.#validateOperationObjects(journal);",
       "this.#validateReplayTopology(journal, sizes);",
       "validateOperationJournal(state, touched, steps);",
+      "validateResultCommit(context, resultOid, previousParent);",
       "this.objects.objectInfo(expected);",
+      "validateObjects(repo, roots, touched);",
+      "for (const info of repo.store.objectInfo([...expected.keys()])) {",
+      "requireJournalOwnership(repo, context.worktree, journal);",
+      "const plan = requireConflictOwnership(workspace, repo, worktree, journal);",
+      "const plan = planForState(workspace, repo, journal.state, incomingLabelStyle);",
     ];
     for (const regression of regressions) {
       expect(journalReaderViolations(regression), regression).not.toEqual([]);

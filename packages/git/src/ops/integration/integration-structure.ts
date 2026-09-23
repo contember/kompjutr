@@ -1,10 +1,7 @@
 // Pure structural planning for a three-way integration. Blob content is left
 // to the bounded content phase; this layer only compares tree identities.
 
-import { isOid } from "../../common/bytes.js";
-import { CorruptError } from "../../common/errors.js";
 import { MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../../common/objects.js";
-import { comparePaths } from "../../common/streams.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
 import type {
   ClassifiedRow,
@@ -126,42 +123,4 @@ export function classifyRow(
     },
     occupiesPath: true,
   };
-}
-
-function validatePath(path: string, source: string): void {
-  if (
-    path.length === 0 ||
-    path.startsWith("/") ||
-    path.endsWith("/") ||
-    path.includes("//") ||
-    path.includes("\0")
-  ) {
-    throw new CorruptError(`${source} tree yielded invalid path '${path}'`);
-  }
-}
-
-function validateEntry(entry: TargetEntry, source: string): void {
-  validatePath(entry.path, source);
-  if (
-    entry.mode !== MODE_FILE &&
-    entry.mode !== MODE_EXECUTABLE &&
-    entry.mode !== MODE_SYMLINK &&
-    entry.mode !== MODE_COMMIT
-  ) {
-    throw new CorruptError(`${source} tree yielded invalid mode '${entry.mode}'`);
-  }
-  if (!isOid(entry.oid))
-    throw new CorruptError(`${source} tree yielded invalid oid '${entry.oid}'`);
-}
-
-export function* validated(entries: Iterable<TargetEntry>, source: string): Generator<TargetEntry> {
-  let previous: string | null = null;
-  for (const entry of entries) {
-    validateEntry(entry, source);
-    if (previous !== null && comparePaths(previous, entry.path) >= 0) {
-      throw new CorruptError(`${source} tree paths are not strictly ordered`);
-    }
-    previous = entry.path;
-    yield entry;
-  }
 }

@@ -4,7 +4,7 @@ import { joinSorted3 } from "../../common/streams.js";
 import type { StructuralIntegrationEntry } from "../../store/operations/integration-workspace/descriptors.js";
 import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
 import type { IntegrationWorkspace } from "../../store/operations/integration-workspace/workspace.js";
-import { classifyRow, validated } from "./integration-structure.js";
+import { classifyRow } from "./integration-structure.js";
 import type { IntegrationStages, ResolvedLimits } from "./integration-structure-types.js";
 import type { IntegrationInput } from "./integration-types.js";
 
@@ -48,9 +48,9 @@ export function classifyIntegrationStructureOwned(
     // active prefix candidates can exist across the three input streams.
     const prefixes: Prefix[] = [];
     for (const row of joinSorted3(
-      validated(stream(input.baseTreeOid), "base"),
-      validated(stream(input.currentTreeOid), "current"),
-      validated(stream(input.incomingTreeOid), "incoming"),
+      stream(input.baseTreeOid),
+      stream(input.currentTreeOid),
+      stream(input.incomingTreeOid),
       { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
     )) {
       if (sourceRows >= limits.maxRows)

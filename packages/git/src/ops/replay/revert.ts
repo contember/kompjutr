@@ -2,6 +2,7 @@
 
 import { GitError } from "../../common/errors.js";
 import type { GitContext, GitIdentity } from "../core/context.js";
+import { requireJournalIdentity } from "../core/journal-input.js";
 import type { ReplayResult } from "../core/kinds.js";
 import { resolveIdentity } from "../repository/commit.js";
 import type { Repository } from "../repository/repository.js";
@@ -56,12 +57,16 @@ const POLICY: ReplayPolicy = {
   incomingLabelStyle: "parent-of-source-subject",
   suspendEmpty: false,
   defaultMessage,
-  resolveIdentities: (context, repo, _plan, input) =>
-    resolveIdentity(context, repo, {
+  resolveIdentities: (context, repo, _source, input) => {
+    const identities = resolveIdentity(context, repo, {
       author: input.author,
       committer: input.committer,
       env: input.env,
-    }),
+    });
+    requireJournalIdentity(identities.author, "author", "revert");
+    requireJournalIdentity(identities.committer, "committer", "revert");
+    return identities;
+  },
 };
 
 function startInput(options: RevertOptions): ReplayStartOptions {

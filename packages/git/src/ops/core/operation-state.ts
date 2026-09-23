@@ -17,5 +17,4 @@ export {
   type ReplayKind,
   type ReplayStateMetadata,
   type RevertJournal,
-  validateOperationStepMetadata,
 } from "../../store/operations/operations.js";

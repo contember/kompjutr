@@ -441,7 +441,7 @@ describe("rebase lifecycle", () => {
     );
   });
 
-  it("keeps a cold distinct-type rebase journal until structural abort blockers clear", async () => {
+  it("aborts a cold distinct-type rebase around untracked content at a relocation path", async () => {
     const source = fixture();
     source.write("target.txt", "target\n");
     const base = source.commit("base");
@@ -473,17 +473,10 @@ describe("rebase lifecycle", () => {
     workspace.worktree.removeFiles(["/lnk~HEAD"]);
     writeWorkFile(workspace, "/lnk~HEAD/outside.txt", "outside\n");
 
-    expectCode(() => rebaseAbort(cold, workspace.worktree, []), "ECHECKOUTFAIL");
-    expect(textAt(workspace, "lnk~HEAD/outside.txt")).toBe("outside\n");
-    expect(cold.checkout.readOperationState()).not.toBeNull();
-    expect(cold.head().oid).toBe(original);
-
-    workspace.worktree.removeFiles(["/lnk~HEAD/outside.txt"]);
-    workspace.worktree.rmdir("/lnk~HEAD");
     rebaseAbort(cold, workspace.worktree, []);
+    expect(textAt(workspace, "lnk~HEAD/outside.txt")).toBe("outside\n");
     expect(cold.head().oid).toBe(original);
     expect(workspace.worktree.readlink("/lnk")).toBe("target.txt");
-    expect(workspace.worktree.stat("/lnk~HEAD")).toBeNull();
     expect(cold.checkout.readOperationState()).toBeNull();
   });
 
@@ -515,6 +508,50 @@ describe("rebase lifecycle", () => {
       },
     );
     expect(textAt(workspace, "later.txt")).toBe("later\n");
+  });
+
+  it("refuses an invalid resolved committer before a step commit", async () => {
+    const source = fixture();
+    source.write("shared.txt", "base\n");
+    const base = source.commit("base");
+    source.git("checkout", "-q", "-b", "upstream", base);
+    source.write("shared.txt", "upstream\n");
+    const upstream = source.commit("upstream");
+    source.git("checkout", "-q", "-b", "current", base);
+    source.write("shared.txt", "current\n");
+    const original = source.commit("conflicting change");
+    const workspace = await imported(source);
+
+    expect(
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream }).outcome,
+    ).toBe("conflicted");
+    writeWorkFile(workspace, "/shared.txt", "resolved\n");
+    add(workspace.repo, workspace.worktree, { paths: ["shared.txt"] });
+    expectCode(
+      () =>
+        rebaseContinue(workspace.context, workspace.repo, workspace.worktree, [], {
+          committer: { name: "Rebase <Committer>", email: "committer@example.com" },
+        }),
+      "EINVAL",
+    );
+    expectCode(
+      () =>
+        rebaseContinue(workspace.context, workspace.repo, workspace.worktree, [], {
+          env: {
+            GIT_COMMITTER_NAME: "x".repeat(1_025),
+            GIT_COMMITTER_EMAIL: "committer@example.com",
+          },
+        }),
+      "E2BIG",
+    );
+    expect(workspace.repo.checkout.requireOperationState("rebase").state).toMatchObject({
+      phase: "conflicted",
+      currentStep: 0,
+    });
+    expect(workspace.repo.head().oid).toBe(original);
+    expect(rebaseContinue(workspace.context, workspace.repo, workspace.worktree, []).outcome).toBe(
+      "completed",
+    );
   });
 
   it("drops a conflicted step when its resolution equals the current parent", async () => {
@@ -764,7 +801,7 @@ describe("rebase lifecycle", () => {
     expect(cold.checkout.readOperationState()).toBeNull();
   });
 
-  it("authenticates only absent or directory snapshots for baseline-absent relocations", async () => {
+  it("journals absent and directory snapshots for baseline-absent relocations", async () => {
     const source = fixture();
     source.write("base.txt", "base\n");
     const base = source.commit("base");
@@ -776,9 +813,6 @@ describe("rebase lifecycle", () => {
     source.commit("current directory");
 
     const absent = await imported(source);
-    const upstreamTree = absent.repo.readCommit(upstream).tree;
-    const upstreamFile = absent.repo.readTree(upstreamTree).find((entry) => entry.name === "x");
-    if (upstreamFile === undefined) throw new Error("upstream file is missing");
     expect(rebase(absent.context, absent.repo, absent.worktree, [], { upstream }).outcome).toBe(
       "conflicted",
     );
@@ -786,15 +820,6 @@ describe("rebase lifecycle", () => {
       .requireOperationState("rebase")
       .touched.find((entry) => entry.path === "x~HEAD");
     expect(relocation).toMatchObject({ index: null, worktree: { kind: "absent" } });
-    absent.repo.store.db.run(
-      `UPDATE git_operation_touched
-       SET worktree_kind = 'file', worktree_mode = ?, worktree_oid = ?, worktree_revision = 0
-       WHERE checkout_id = ? AND path = 'x~HEAD'`,
-      Number.parseInt(upstreamFile.mode, 8),
-      upstreamFile.oid,
-      absent.repo.checkout.checkoutId,
-    );
-    expectCode(() => rebaseSkip(absent.context, absent.repo, absent.worktree, []), "ECORRUPT");
 
     const directory = await imported(source);
     directory.worktree.writeFiles([{ path: "/x~HEAD", mode: 0o755 }]);

@@ -1,7 +1,7 @@
 import type { WriteEntry } from "@kompjutr/drive";
-import { CorruptError, GitError, hasErrorCode } from "../../common/errors.js";
+import { GitError } from "../../common/errors.js";
 import { isNestedPath, joinPath } from "../../common/paths.js";
-import { comparePaths, joinSorted } from "../../common/streams.js";
+import { joinSorted } from "../../common/streams.js";
 import type { ProjectedMergeEntry } from "../../store/operations/integration-workspace/descriptors.js";
 import { integrationPages } from "../../store/operations/integration-workspace/storage.js";
 import type { IntegrationWorkspace } from "../../store/operations/integration-workspace/workspace.js";
@@ -14,56 +14,13 @@ import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import { collectBlobSizes, restoreWorktreeFiles } from "./apply/apply-blobs.js";
 import { restoreIndex } from "./apply/apply-index.js";
 
-function validateObjects(
-  repo: Repository,
-  roots: readonly string[],
-  touched: OperationTouchedSource,
-): void {
-  function* expectedObjects(): Generator<{ oid: string; type: "blob" | "commit" }> {
-    for (const oid of roots) yield { oid, type: "commit" };
-    let previous: string | null = null;
-    for (const entry of touched) {
-      if (previous !== null && comparePaths(previous, entry.path) >= 0)
-        throw new CorruptError("operation journal paths are not in strict Git path order");
-      previous = entry.path;
-      if (entry.index !== null)
-        yield { oid: entry.index.oid, type: entry.index.mode === 0o160000 ? "commit" : "blob" };
-      if (entry.worktree.kind === "file" || entry.worktree.kind === "symlink")
-        yield { oid: entry.worktree.oid, type: "blob" };
-    }
-  }
-  for (const page of integrationPages(expectedObjects())) {
-    const expected = new Map<string, "blob" | "commit">();
-    for (const entry of page) {
-      const previous = expected.get(entry.oid);
-      if (previous !== undefined && previous !== entry.type)
-        throw new CorruptError(
-          `operation journal object ${entry.oid} has conflicting expected types`,
-        );
-      expected.set(entry.oid, entry.type);
-    }
-    try {
-      for (const info of repo.store.objectInfo([...expected.keys()])) {
-        if (expected.get(info.oid) !== info.type)
-          throw new CorruptError(`operation journal object ${info.oid} has an unexpected type`);
-      }
-    } catch (error) {
-      if (hasErrorCode(error, "ENOTFOUND"))
-        throw new CorruptError("operation journal references a missing object", { cause: error });
-      throw error;
-    }
-  }
-}
-
 export function restoreIntegrationOwned(
   workspace: IntegrationWorkspace,
   repo: Repository,
   worktree: Worktree,
   touched: OperationTouchedSource,
-  roots: readonly string[] = [],
 ): void {
   requireSharedMutationScope(repo.store.db, worktree);
-  validateObjects(repo, roots, touched);
   const removals = workspace.projectedPlan();
   const absent = workspace.reservations(removals, "occupied");
   function* absentPaths() {

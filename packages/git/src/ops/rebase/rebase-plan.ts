@@ -2,11 +2,7 @@
 
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
-import {
-  MAX_OPERATION_STEPS,
-  type OperationStepMetadata,
-  validateOperationStepMetadata,
-} from "../core/operation-state.js";
+import { MAX_OPERATION_STEPS, type OperationStepMetadata } from "../core/operation-state.js";
 import {
   MAX_MERGE_BASE_COMMITS,
   type MergeBaseLimits,
@@ -126,7 +122,6 @@ function selectSteps(
       outcome: "pending",
       resultOid: null,
     };
-    validateOperationStepMetadata(step);
     newestFirst.push(step);
     oid = selectedParentOid;
   }

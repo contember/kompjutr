@@ -1,8 +1,4 @@
 export {
-  MAX_MERGE_IDENTITY_BYTES,
-  MAX_MERGE_LABEL_BYTES,
-  MAX_MERGE_MESSAGE_BYTES,
-  MAX_MERGE_REF_BYTES,
   type MergeIndexSnapshot,
   type MergeJournal,
   type MergeOrigin,
@@ -21,6 +17,4 @@ export {
   requireMergePurpose,
   requireMergeText,
   validateMergePath,
-  validateMergeStateMetadata,
-  validateMergeTouchedPath,
 } from "../../store/operations/operations.js";

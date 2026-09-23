@@ -3,7 +3,6 @@
 
 import { GitError } from "../../common/errors.js";
 import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
-import { withIntegrationWorkspaceOwned } from "../../store/operations/integration-workspace/workspace.js";
 import { writeOperationJournalOwned } from "../../store/operations/operation-journal.js";
 import type { GitContext } from "../core/context.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
@@ -32,7 +31,7 @@ import {
   requireRebaseIndex,
 } from "./rebase-lifecycle-baseline.js";
 import { driveRebase } from "./rebase-lifecycle-drive.js";
-import { requireConflictOwnership, stepIdentities } from "./rebase-lifecycle-step.js";
+import { requirePendingStep, stepIdentities } from "./rebase-lifecycle-step.js";
 import type {
   RebaseContinueOptions,
   RebaseLifecycleResult,
@@ -130,28 +129,27 @@ export function rebaseContinue(
       requireCurrentBaseline(repo, worktree, journal.state, exclusions);
       return;
     }
-    withIntegrationWorkspaceOwned(repo.store, (workspace) => {
-      const plan = requireConflictOwnership(workspace, repo, worktree, journal);
-      if (repo.checkout.hasConflicts()) {
-        throw new GitError("EUNMERGED", "cannot continue rebase: the index has unmerged paths");
-      }
-      requireRebaseIndex(repo);
-      requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
-      const currentTree = repo.readCommit(journal.state.currentParentOid).tree;
-      if (integrationIndexMatchesTree(repo, currentTree)) {
-        preflightBaselineTree(repo, currentTree);
-        hardMaterializeTree(repo, worktree, currentTree, currentTree, exclusions);
-        advance(repo, journal, "skipped", null);
-        return;
-      }
-      const identities = stepIdentities(context, repo, plan, options);
-      const result = writeUnpublishedCommit(repo, {
-        message: plan.sourceCommit.message,
-        parent: [journal.state.currentParentOid],
-        identities,
-      });
-      advance(repo, journal, "applied", result.oid, identities.committer);
+    const step = requirePendingStep(journal);
+    if (repo.checkout.hasConflicts()) {
+      throw new GitError("EUNMERGED", "cannot continue rebase: the index has unmerged paths");
+    }
+    requireRebaseIndex(repo);
+    requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
+    const currentTree = repo.readCommit(journal.state.currentParentOid).tree;
+    if (integrationIndexMatchesTree(repo, currentTree)) {
+      preflightBaselineTree(repo, currentTree);
+      hardMaterializeTree(repo, worktree, currentTree, currentTree, exclusions);
+      advance(repo, journal, "skipped", null);
+      return;
+    }
+    const source = repo.readCommit(step.sourceOid);
+    const identities = stepIdentities(context, repo, source, options);
+    const result = writeUnpublishedCommit(repo, {
+      message: source.message,
+      parent: [journal.state.currentParentOid],
+      identities,
     });
+    advance(repo, journal, "applied", result.oid, identities.committer);
   });
   return driveRebase(context, repo, worktree, options, exclusions);
 }
@@ -165,13 +163,12 @@ export function rebaseSkip(
 ): RebaseLifecycleResult {
   const exclusions = rebaseExclusions(repo, excludeRoots);
   requireSharedMutationScope(repo.store.db, worktree);
-  withIntegrationWorkspaceOwned(repo.store, (workspace) => {
+  repo.store.db.transactionSync(() => {
     const journal = requireRebaseCursor(repo);
     requireOriginalHead(repo, journal.state);
     if (journal.state.phase !== "conflicted") {
       throw new GitError("EOPMISMATCH", "rebase skip requires a conflicted step");
     }
-    requireConflictOwnership(workspace, repo, worktree, journal);
     const currentTree = repo.readCommit(journal.state.currentParentOid).tree;
     preflightBaselineTree(repo, currentTree);
     hardMaterializeTree(repo, worktree, currentTree, currentTree, exclusions);
@@ -190,11 +187,6 @@ export function rebaseAbort(
   repo.store.db.transactionSync(() => {
     const journal = requireRebaseCursor(repo);
     requireOriginalHead(repo, journal.state);
-    if (journal.state.phase === "conflicted") {
-      withIntegrationWorkspaceOwned(repo.store, (workspace) => {
-        requireConflictOwnership(workspace, repo, worktree, journal);
-      });
-    }
     const originalTree = repo.readCommit(journal.state.originalHeadOid).tree;
     const baselineTree = repo.readCommit(journal.state.currentParentOid).tree;
     preflightBaselineTree(repo, originalTree);

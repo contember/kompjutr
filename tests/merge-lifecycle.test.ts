@@ -12,6 +12,7 @@ import {
 } from "../packages/git/src/common/objects.js";
 import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
 import type { GitContext } from "../packages/git/src/ops/core/context.js";
+import { MAX_JOURNAL_MESSAGE_BYTES } from "../packages/git/src/ops/core/journal-input.js";
 import { operationRefLogMetadata } from "../packages/git/src/ops/core/ref-log.js";
 import { merge, mergeAbort, mergeContinue } from "../packages/git/src/ops/merge/merge.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
@@ -1034,59 +1035,44 @@ describe("merge lifecycle", () => {
     expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
-  it("rejects a journal path retarget before abort can delete unrelated content", async () => {
+  it("refuses a NUL in a merge message as caller input, not corruption", async () => {
     const history = conflictingDivergence();
     const workspace = await clonedFrom(history.fixture);
-    writeWorkFile(workspace, "/sentinel.txt", "unrelated\n");
+    const head = workspace.repo.head();
+
+    expect(() =>
+      merge(workspace.context, workspace.repo, workspace.worktree, {
+        theirs: "topic",
+        message: "merge\0topic\n",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
+    expect(workspace.repo.head()).toEqual(head);
+
+    expect(() =>
+      merge(workspace.context, workspace.repo, workspace.worktree, {
+        theirs: "topic",
+        author: { name: "Merge <Author>", email: "author@example.com" },
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(() =>
+      merge(workspace.context, workspace.repo, workspace.worktree, {
+        theirs: "topic",
+        message: "x".repeat(MAX_JOURNAL_MESSAGE_BYTES + 1),
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
 
     expect(
       merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
     ).toEqual({ conflicted: true, pendingCommit: true });
-    workspace.database.db.run(
-      `UPDATE git_operation_touched
-          SET path = 'sentinel.txt', logical_path = 'sentinel.txt'
-        WHERE checkout_id = ? AND path = 'conflict.txt'`,
-      workspace.repo.store.repoId,
-    );
-
-    expect(() => mergeAbort(workspace.repo, workspace.worktree)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(textAt(workspace, "sentinel.txt")).toBe("unrelated\n");
-    expect(
-      workspace.database.db.scalar<number>(
-        "SELECT COUNT(*) FROM git_operation_state WHERE checkout_id = ?",
-        workspace.repo.store.repoId,
-      ),
-    ).toBe(1);
-  });
-
-  it("rejects a type-valid snapshot retarget before abort restores it", async () => {
-    const history = conflictingDivergence();
-    const workspace = await clonedFrom(history.fixture);
-
-    expect(
-      merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
-    ).toEqual({ conflicted: true, pendingCommit: true });
-    const incoming = workspace.repo.checkout.indexGet("conflict.txt", 3);
-    if (incoming === null) throw new Error("expected incoming conflict stage");
-    workspace.database.db.run(
-      `UPDATE git_operation_touched
-          SET worktree_oid = ?
-        WHERE checkout_id = ? AND path = 'conflict.txt'`,
-      incoming.oid,
-      workspace.repo.store.repoId,
-    );
-
-    expect(() => mergeAbort(workspace.repo, workspace.worktree)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-    expect(
-      workspace.database.db.scalar<number>(
-        "SELECT COUNT(*) FROM git_operation_state WHERE checkout_id = ?",
-        workspace.repo.store.repoId,
-      ),
-    ).toBe(1);
+    writeWorkFile(workspace, "/conflict.txt", "resolved\n");
+    add(workspace.repo, workspace.worktree, { paths: ["conflict.txt"] });
+    expect(() =>
+      mergeContinue(workspace.context, workspace.repo, { message: "resolved\0merge\n" }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(workspace.repo.checkout.readMergeState()).not.toBeNull();
+    expect(workspace.repo.head()).toEqual(head);
   });
 
   it("keeps the captured incoming parent exact across conflict continuation", async () => {

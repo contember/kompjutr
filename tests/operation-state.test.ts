@@ -50,14 +50,6 @@ const SECOND_BYTES = serializeCommit({
   message: "second root\n",
 });
 const SECOND = hashObject("commit", SECOND_BYTES);
-const MERGE_BYTES = serializeCommit({
-  tree: TREE,
-  parent: [ORIGINAL, SECOND],
-  author: PERSON,
-  committer: PERSON,
-  message: "merge\n",
-});
-const MERGE = hashObject("commit", MERGE_BYTES);
 const THIRD_BYTES = serializeCommit({
   tree: TREE,
   parent: [SOURCE],
@@ -81,14 +73,6 @@ const RESULT_TWO_BYTES = serializeCommit({
   committer: PERSON,
   message: "rewritten third\n",
 });
-const WRONG_RESULT_BYTES = serializeCommit({
-  tree: TREE,
-  parent: [ORIGINAL],
-  author: PERSON,
-  committer: PERSON,
-  message: "wrong parent\n",
-});
-const WRONG_RESULT = hashObject("commit", WRONG_RESULT_BYTES);
 const FILE_BYTES = utf8.encode("before\n");
 const FILE = hashObject("blob", FILE_BYTES);
 
@@ -173,11 +157,9 @@ function open() {
   store.write("commit", ORIGINAL_BYTES);
   store.write("commit", SOURCE_BYTES);
   store.write("commit", SECOND_BYTES);
-  store.write("commit", MERGE_BYTES);
   store.write("commit", THIRD_BYTES);
   store.write("commit", RESULT_ONE_BYTES);
   store.write("commit", RESULT_TWO_BYTES);
-  store.write("commit", WRONG_RESULT_BYTES);
   store.write("blob", FILE_BYTES);
   return { db, database, repository, store };
 }
@@ -323,55 +305,6 @@ describe("durable operation journal", () => {
     ).toThrowError(expect.objectContaining({ code: "EOPMISMATCH" }));
   });
 
-  it("rejects cursor/outcome mismatches, invalid touched ownership, and bad topology", () => {
-    const structural: readonly {
-      state: RebaseStateMetadata;
-      steps: readonly OperationStepMetadata[];
-      paths: readonly MergeTouchedPath[];
-    }[] = [
-      { state: rebase({ currentStep: 1 }), steps: rebaseSteps(), paths: [] },
-      {
-        state: rebase(),
-        steps: [{ ...rebaseSteps()[0]!, outcome: "skipped" }, rebaseSteps()[1]!],
-        paths: [],
-      },
-      { state: rebase({ currentParentOid: RESULT_ONE }), steps: rebaseSteps(), paths: [] },
-      { state: rebase({ phase: "conflicted" }), steps: rebaseSteps(), paths: [] },
-      { state: rebase(), steps: rebaseSteps(), paths: touched() },
-    ];
-    for (const witness of structural) {
-      const { store } = open();
-      expect(() =>
-        store.writeOperationJournal(witness.state, witness.steps, witness.paths),
-      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    }
-
-    const swapped = [...rebaseSteps()].reverse();
-    expect(() => open().store.writeOperationJournal(rebase(), swapped, [])).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-
-    const wrongResultSteps: readonly OperationStepMetadata[] = [
-      { ...rebaseSteps()[0]!, outcome: "applied", resultOid: WRONG_RESULT },
-      rebaseSteps()[1]!,
-    ];
-    expect(() =>
-      open().store.writeOperationJournal(
-        rebase({ currentStep: 1, currentParentOid: WRONG_RESULT }),
-        wrongResultSteps,
-        [],
-      ),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-
-    expect(() =>
-      open().store.writeOperationJournal(rebase({ upstreamOid: FILE }), rebaseSteps(), []),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-
-    expect(() =>
-      open().store.writeOperationJournal(rebase({ originalHeadOid: SOURCE }), rebaseSteps(), []),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-  });
-
   it("keeps structural limits while large conflict snapshots round-trip", () => {
     const step = rebaseSteps()[0]!;
     const tooManySteps = Array.from({ length: MAX_OPERATION_STEPS + 1 }, () => step);
@@ -398,7 +331,7 @@ describe("durable operation journal", () => {
     expect(readOperationStateOwned(cold)).toMatchObject({ touched: largeTouched });
   });
 
-  it("pages exact-limit validation while cumulative commit bodies exceed 32 MiB", () => {
+  it("writes a full-length rebase journal without reading its commit objects", () => {
     const { db, store } = open();
     const steps: OperationStepMetadata[] = [];
     let parentOid = ORIGINAL;
@@ -409,7 +342,7 @@ describe("durable operation journal", () => {
           parent: [parentOid],
           author: PERSON,
           committer: PERSON,
-          message: `${"x".repeat(8_192)} step ${ordinal}\n`,
+          message: `step ${ordinal}\n`,
         });
         const sourceOid = batch.write("commit", data);
         steps.push({
@@ -428,109 +361,15 @@ describe("durable operation journal", () => {
 
     store.writeOperationJournal(state, steps, []);
 
-    expect(
-      db.scalar<number>("SELECT sum(size) FROM git_objects WHERE repo_id = 1 AND type = 'commit'"),
-    ).toBeGreaterThan(32 * 1024 * 1024);
-    // Pages stay bounded by the batch cap (E2BIG above it); >= 2 proves paging ran.
-    const metadataPages = [...histogram].reduce(
-      (total, [query, count]) =>
-        total + (query.startsWith("WITH wanted(ordinal, oid) AS MATERIALIZED") ? count : 0),
-      0,
+    const objectReads = [...histogram].filter(
+      ([query]) => query.includes("git_objects") || query.includes("git_pack_objects"),
     );
-    expect(metadataPages).toBeGreaterThanOrEqual(2);
-    expect(store.requireOperationState("rebase").steps).toHaveLength(MAX_OPERATION_STEPS);
-
+    expect(objectReads).toEqual([]);
     const coldDatabase = new SqliteGitDatabase(db);
     const coldRow = coldDatabase.checkoutAt("/repo");
     if (coldRow === null) throw new Error("cold checkout disappeared");
     const cold = coldDatabase.openCheckout(coldRow);
     expect(cold.requireOperationState("rebase").steps).toHaveLength(MAX_OPERATION_STEPS);
-  });
-
-  it("rejects authenticated replay selections that differ from source parents", () => {
-    const cases: readonly {
-      name: string;
-      valid: ReplayStateMetadata;
-      invalid: ReplayStateMetadata;
-    }[] = [
-      {
-        name: "root with parent",
-        valid: replay("cherry-pick", {
-          sourceOid: ORIGINAL,
-          selectedParentOid: null,
-          mainline: null,
-        }),
-        invalid: replay("cherry-pick", {
-          sourceOid: ORIGINAL,
-          selectedParentOid: SOURCE,
-          mainline: null,
-        }),
-      },
-      {
-        name: "single parent missing",
-        valid: replay(),
-        invalid: replay("cherry-pick", { selectedParentOid: null }),
-      },
-      {
-        name: "single parent wrong",
-        valid: replay(),
-        invalid: replay("cherry-pick", { selectedParentOid: SECOND }),
-      },
-      {
-        name: "merge mainline missing",
-        valid: replay("revert", {
-          sourceOid: MERGE,
-          selectedParentOid: ORIGINAL,
-          mainline: 1,
-        }),
-        invalid: replay("revert", {
-          sourceOid: MERGE,
-          selectedParentOid: ORIGINAL,
-          mainline: null,
-        }),
-      },
-      {
-        name: "merge parent wrong",
-        valid: replay("revert", {
-          sourceOid: MERGE,
-          selectedParentOid: ORIGINAL,
-          mainline: 1,
-        }),
-        invalid: replay("revert", {
-          sourceOid: MERGE,
-          selectedParentOid: ORIGINAL,
-          mainline: 2,
-        }),
-      },
-    ];
-    for (const witness of cases) {
-      const { store } = open();
-      expect(
-        () => store.writeOperationState(witness.invalid, []),
-        `${witness.name} write`,
-      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-      store.writeOperationState(witness.valid, []);
-      expect(store.readOperationState()).toMatchObject({
-        state: witness.valid,
-        steps: operationStepsForState(witness.valid),
-      });
-    }
-  });
-
-  it("rejects impossible replay metadata before writing rows", () => {
-    const cases: readonly ReplayStateMetadata[] = [
-      replay("cherry-pick", { phase: "conflicted", emptyReason: "source" }),
-      replay("cherry-pick", { phase: "empty", emptyReason: null }),
-      replay("revert", { selectedParentOid: null, mainline: 1 }),
-      replay("revert", { currentLabel: "" }),
-    ];
-    for (const state of cases) {
-      const { db, store } = open();
-      expect(() => store.writeOperationState(state, [])).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-      expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
-    }
   });
 });
 

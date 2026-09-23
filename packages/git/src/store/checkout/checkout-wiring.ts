@@ -79,13 +79,7 @@ export function createCheckoutStoreState(wiring: CheckoutStoreWiring): CheckoutS
     return withGitMutationGuard(activeDatabase(), body);
   };
   const index = new CheckoutIndexStore(database, repoId, checkoutId, requireActive);
-  const operations = new CheckoutOperationStore(
-    database,
-    shared,
-    repoId,
-    checkoutId,
-    requireActive,
-  );
+  const operations = new CheckoutOperationStore(database, repoId, checkoutId, requireActive);
   const refs = new CheckoutRefStore({
     database,
     shared,

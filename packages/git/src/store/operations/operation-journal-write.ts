@@ -1,12 +1,9 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../common/errors.js";
-import { comparePaths } from "../../common/paths.js";
 import { jsonPages } from "../core/json-pages.js";
 import { bumpMaintenanceRootEpoch } from "../maintenance/control.js";
-import type { ObjectTable } from "../objects/objects.js";
 import { integrationJsonPages } from "./integration-workspace/storage.js";
 import {
-  operationJournal,
   persistedOperationStep,
   persistedOperationTouched,
   requireOperationKind,
@@ -17,25 +14,20 @@ import type {
   PersistedOperationTouched,
 } from "./operation-journal-types.js";
 import {
-  type OperationJournalValidationContext,
-  validateOperationObjects,
-  validateResultCommit,
-} from "./operation-journal-validation.js";
-import {
+  MAX_OPERATION_STEPS,
   type MergeSavedIdentity,
   type OperationStateMetadata,
   type OperationStepMetadata,
   operationAlreadyActive,
   operationStepsForState,
-  requireMergeInteger,
-  requireMergeOid,
-  validateOperationJournal,
 } from "./operations.js";
 
-export interface OperationJournalWriteContext extends OperationJournalValidationContext {
+// The ops layer validates caller input before it reaches these writers, and the
+// schema CHECKs guard row shape; the journal is trusted from here on (ADR-0004).
+export interface OperationJournalWriteContext {
   db: SqlDatabase;
+  repoId: number;
   checkoutId: number;
-  objects: ObjectTable;
 }
 
 export function writeOperationState(
@@ -55,7 +47,9 @@ export function writeOperationJournal(
   steps: readonly OperationStepMetadata[],
   touched: OperationTouchedSource,
 ): void {
-  validateOperationJournal(state, touched, steps);
+  if (steps.length > MAX_OPERATION_STEPS) {
+    throw new GitError("E2BIG", `operation journal exceeds ${MAX_OPERATION_STEPS} steps`);
+  }
   let replayed = 0;
   let skipped = 0;
   if (state.kind === "rebase") {
@@ -72,8 +66,6 @@ export function writeOperationJournal(
       context.checkoutId,
     );
     if (active !== undefined) throw operationAlreadyActive(requireOperationKind(active.kind));
-    const journal = operationJournal(state, steps, touched, replayed, skipped);
-    validateOperationObjects(context, journal);
     insertOperationHeader(context, state, steps.length, touched.length, replayed, skipped);
     insertOperationSteps(context, steps);
     replaceTouched(context, touched);
@@ -153,13 +145,6 @@ function replaceTouched(
   context: OperationJournalWriteContext,
   touched: OperationTouchedSource,
 ): void {
-  let previousPath: string | null = null;
-  for (const entry of touched) {
-    if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
-      throw new CorruptError("operation touched paths are not in strict Git path order");
-    }
-    previousPath = entry.path;
-  }
   context.db.run("DELETE FROM git_operation_touched WHERE checkout_id = ?", context.checkoutId);
   function* rows(): Generator<PersistedOperationTouched> {
     let ordinal = 0;
@@ -261,32 +246,6 @@ export function advanceRebase(
     throw new CorruptError("rebase result does not match its outcome");
   }
   context.db.transactionSync(() => {
-    const current = context.db.one<{
-      phase: unknown;
-      current_step: unknown;
-      current_parent_oid: unknown;
-    }>(
-      `SELECT phase, current_step, current_parent_oid
-         FROM git_operation_state WHERE checkout_id = ? AND kind = 'rebase'`,
-      context.checkoutId,
-    );
-    if (
-      current === undefined ||
-      current.phase !== phase ||
-      requireMergeInteger(current.current_step, "current step") !== currentStep
-    ) {
-      throw new GitError("EOPMISMATCH", "rebase operation changed before advancement");
-    }
-    const previousParent = requireMergeOid(current.current_parent_oid, "current parent");
-    if (outcome === "applied") {
-      if (resultOid === null) throw new CorruptError("applied rebase step lost its result");
-      if (currentParentOid !== resultOid) {
-        throw new CorruptError("applied rebase parent differs from its result");
-      }
-      validateResultCommit(context, resultOid, previousParent);
-    } else if (currentParentOid !== previousParent) {
-      throw new CorruptError("skipped rebase step changed the current parent");
-    }
     const changed = context.db.one<{ checkout_id: unknown }>(
       `UPDATE git_operation_state
           SET phase = 'running', current_step = current_step + 1, current_parent_oid = ?,

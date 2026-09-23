@@ -322,7 +322,8 @@ Architecture rules are executable checks:
 - `tests/trusted-read-policy.test.ts` exhaustively classifies the changed
   ordinary-read scopes. It rejects storage-class, authentication-shaped BLOB
   casts, `length`/`hex` witnesses, metadata preflights, detached journal
-  identity, and whole-journal topology/object authentication without banning
+  identity, whole-journal topology/object authentication, and re-planning in
+  journal continuations without banning
   schema, write, ingest, stale-handle, JSON-ordinal, or exact algorithmic
   boundaries.
 - The source-file ceiling witness rejects any `packages/*/src/**/*.ts` file at or above 500

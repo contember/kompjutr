@@ -6,6 +6,7 @@ import { GitError } from "../../common/errors.js";
 import type { ProjectedMergeEntry } from "../../store/operations/integration-workspace/descriptors.js";
 import { withIntegrationWorkspaceOwned } from "../../store/operations/integration-workspace/workspace.js";
 import type { GitContext, GitIdentity } from "../core/context.js";
+import { requireJournalIdentity, requireJournalMessage } from "../core/journal-input.js";
 import type { MergeResult } from "../core/kinds.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata, type RefLogReason } from "../core/ref-log.js";
@@ -18,16 +19,12 @@ import {
   requireBoundedIntegrationTree,
   requireCleanIntegrationIndex,
 } from "../integration/integration-worktree.js";
-import { type CommitIdentities, commitIndex, resolveIdentity } from "../repository/commit.js";
+import { commitIndex, resolveIdentity } from "../repository/commit.js";
 import type { Repository, ResolvedHead } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { selectMergeBases } from "./merge-base.js";
-import { requireJournalOwnership, requireMergeJournalOwned } from "./merge-journal.js";
-import {
-  type MergeOrigin,
-  type MergeStateMetadata,
-  validateMergeStateMetadata,
-} from "./merge-state.js";
+import { requireMergeJournalOwned } from "./merge-journal.js";
+import type { MergeOrigin, MergeStateMetadata } from "./merge-state.js";
 import { commitTree, selectedBaseTreeOwned, type VirtualState } from "./merge-virtual-base.js";
 
 const HEADS = "refs/heads/";
@@ -167,17 +164,9 @@ function messageWithConflicts(
   return `${body}\n# Conflicts:\n${conflicts}`;
 }
 
-function validateMergeCommitInput(
-  state: MergeStateMetadata,
-  message: string,
-  identities: CommitIdentities,
-): void {
-  validateMergeStateMetadata({
-    ...state,
-    message,
-    author: { name: identities.author.name, email: identities.author.email },
-    committer: { name: identities.committer.name, email: identities.committer.email },
-  });
+function requireMergeIdentities(options: Pick<MergeContinueOptions, "author" | "committer">): void {
+  requireJournalIdentity(options.author, "author", "merge");
+  requireJournalIdentity(options.committer, "committer", "merge");
 }
 
 /** Start and either finish or durably suspend one local two-head merge. */
@@ -204,6 +193,8 @@ function mergeInTransaction(
   const theirs = requireMergeRevision(options.theirs, "incoming");
   const ours =
     options.ours === undefined ? undefined : requireMergeRevision(options.ours, "current");
+  if (options.message !== undefined) requireJournalMessage(options.message, "merge");
+  requireMergeIdentities(options);
   repo.checkout.requireNoMergeState();
   const rawHead = requireCurrentHead(repo, ours);
   if (rawHead.ref === null || rawHead.oid === null) throw new GitError("ECORRUPT", "invalid HEAD");
@@ -287,7 +278,7 @@ function mergeInTransaction(
     );
     const outcome =
       conflictCount > 0 ? "conflicted" : mergeMetadata.mode === "no-commit" ? "ready" : "clean";
-    if (outcome === "clean") validateMergeStateMetadata({ ...mergeMetadata, phase: "conflicted" });
+    if (outcome !== "clean") requireJournalMessage(mergeMetadata.message, "merge");
     applyIntegrationOwned(
       workspace,
       repo,
@@ -322,11 +313,7 @@ function mergeInTransaction(
     if (outcome === "ready") return { pendingCommit: true };
 
     const identities = resolveIdentity(context, repo, options);
-    validateMergeCommitInput(
-      { ...mergeMetadata, phase: "conflicted" },
-      mergeMetadata.message,
-      identities,
-    );
+    requireMergeIdentities(identities);
     return commitIndex(
       repo,
       {
@@ -355,10 +342,11 @@ export function mergeContinue(
   repo: Repository,
   options: MergeContinueOptions = {},
 ): MergeResult {
+  if (options.message !== undefined) requireJournalMessage(options.message, "merge");
+  requireMergeIdentities(options);
   return repo.store.db.transactionSync(() => {
     const journal = requireMergeJournalOwned(repo);
     const head = requireOriginalHead(repo, journal.state);
-    requireJournalOwnership(repo, context.worktree, journal);
     if (repo.checkout.hasConflicts()) {
       throw new GitError("EUNMERGED", "cannot continue: the index has unmerged paths");
     }
@@ -368,12 +356,11 @@ export function mergeContinue(
       committer: options.committer ?? journal.state.committer ?? undefined,
       env: options.env,
     });
-    const message = options.message ?? journal.state.message;
-    validateMergeCommitInput(journal.state, message, identities);
+    requireMergeIdentities(identities);
     const result = commitIndex(
       repo,
       {
-        message,
+        message: options.message ?? journal.state.message,
         parent: [journal.state.currentParentOid, journal.state.incomingParentOid],
         identities,
         expectedHead: head,
@@ -392,13 +379,8 @@ export function mergeAbort(repo: Repository, worktree: Worktree): void {
   repo.store.db.transactionSync(() => {
     const journal = requireMergeJournalOwned(repo);
     requireOriginalHead(repo, journal.state);
-    requireJournalOwnership(repo, worktree, journal);
     withIntegrationWorkspaceOwned(repo.store, (workspace) => {
-      restoreIntegrationOwned(workspace, repo, worktree, journal.touched, [
-        journal.state.originalHeadOid,
-        journal.state.currentParentOid,
-        journal.state.incomingParentOid,
-      ]);
+      restoreIntegrationOwned(workspace, repo, worktree, journal.touched);
       checkoutStoreMutations(repo.checkout).clearMergeStateOwned();
     });
   });

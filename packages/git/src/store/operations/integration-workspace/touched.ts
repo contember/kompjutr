@@ -9,7 +9,7 @@ import {
 import { JSON_BATCH_BYTES, utf8ByteLength } from "../../core/json-pages.js";
 import { operationTouchedFromRow, persistedOperationTouched } from "../operation-journal-rows.js";
 import type { OperationTouchedRow, PersistedOperationTouched } from "../operation-journal-types.js";
-import { type MergeTouchedPath, validateMergeTouchedPath } from "../operations.js";
+import type { MergeTouchedPath } from "../operations.js";
 import type { MergePathPurpose } from "./descriptors.js";
 import {
   decodeDescriptor,
@@ -118,7 +118,6 @@ export class IntegrationTouched implements Iterable<MergeTouchedPath> {
   private *snapshots(entries: Iterable<MergeTouchedPath>): Generator<PersistedOperationTouched> {
     for (const entry of entries) {
       this.owner.requireActive();
-      validateMergeTouchedPath(entry);
       yield persistedOperationTouched(entry, this.#nextOrdinal++);
     }
   }

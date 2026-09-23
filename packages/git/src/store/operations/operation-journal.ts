@@ -1,7 +1,6 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import type { CheckoutStore } from "../checkout/checkout.js";
 import { checkoutStoreMutations } from "../core/checkout-mutations-registry.js";
-import type { ObjectTable } from "../objects/objects.js";
 import {
   iterateOperationTouched,
   readOperationHeader,
@@ -147,7 +146,6 @@ export class OperationJournalTable {
     private readonly db: SqlDatabase,
     private readonly repoId: number,
     private readonly checkoutId: number,
-    private readonly objects: ObjectTable,
   ) {}
 
   readOperationState(): OperationJournal | null {
@@ -262,7 +260,6 @@ export class OperationJournalTable {
       db: this.db,
       repoId: this.repoId,
       checkoutId: this.checkoutId,
-      objects: this.objects,
     };
   }
 }

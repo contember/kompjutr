@@ -1,8 +1,4 @@
 export {
-  MAX_MERGE_IDENTITY_BYTES,
-  MAX_MERGE_LABEL_BYTES,
-  MAX_MERGE_MESSAGE_BYTES,
-  MAX_MERGE_REF_BYTES,
   type MergeIndexSnapshot,
   type MergeJournal,
   type MergeOrigin,
@@ -21,8 +17,6 @@ export {
   requireMergePurpose,
   requireMergeText,
   validateMergePath,
-  validateMergeStateMetadata,
-  validateMergeTouchedPath,
 } from "./operations-merge.js";
 export {
   type CherryPickJournal,
@@ -44,6 +38,4 @@ export {
   type ReplayKind,
   type ReplayStateMetadata,
   type RevertJournal,
-  validateOperationJournal,
-  validateOperationStepMetadata,
 } from "./operations-replay.js";
