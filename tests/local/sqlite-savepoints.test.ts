@@ -3,8 +3,6 @@ import { DatabaseSync } from "node:sqlite";
 
 import { NodeSqliteDatabase } from "@kompjutr/local";
 import { afterEach, describe, expect, it } from "vitest";
-import { SqliteGitDatabase } from "../../packages/git/src/store/index.js";
-import { withPackReadScope } from "../../packages/git/src/store/pack/read/read-scope.js";
 import { type LocalFixture, localFixture } from "./helpers.js";
 
 const fixtures: LocalFixture[] = [];
@@ -14,22 +12,6 @@ function database(): NodeSqliteDatabase {
   const fixture = localFixture();
   fixtures.push(fixture);
   return new NodeSqliteDatabase(join(fixture.base, "scopes.sqlite"));
-}
-
-/** A real Git store on disk, so a read scope can open over local cursors. */
-function gitDatabase(): { db: NodeSqliteDatabase; repoId: number } {
-  const fixture = localFixture();
-  fixtures.push(fixture);
-  const db = new NodeSqliteDatabase(join(fixture.base, "scopes-git.sqlite"));
-  databases.push(db);
-  const checkout = new SqliteGitDatabase(db).createRepository("/repo", "ref: refs/heads/main");
-  return { db, repoId: checkout.repoId };
-}
-
-function counted(db: NodeSqliteDatabase): Iterator<Record<string, unknown>> {
-  return db
-    .iterate("SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4")
-    [Symbol.iterator]();
 }
 
 afterEach(() => {
@@ -166,6 +148,36 @@ describe("local SQL savepoints", () => {
     expect(cursor.next().done).toBe(true);
   });
 
+  it("invalidates an enclosing read cursor advanced inside a failed nested scope", () => {
+    using db = database();
+    db.transactionSync(() => {
+      const outer = db.iterate("SELECT 1 AS n UNION ALL SELECT 2 AS n")[Symbol.iterator]();
+      expect(outer.next().value).toEqual({ n: 1 });
+      expect(() =>
+        db.transactionSync(() => {
+          expect(outer.next().value).toEqual({ n: 2 });
+          throw new Error("nested failure");
+        }),
+      ).toThrow("nested failure");
+      expect(() => outer.next()).toThrowError(expect.objectContaining({ code: "ESTALE" }));
+    });
+  });
+
+  it("preserves an enclosing read cursor advanced inside a successful nested scope", () => {
+    using db = database();
+    db.transactionSync(() => {
+      const outer = db
+        .iterate("SELECT 1 AS n UNION ALL SELECT 2 AS n UNION ALL SELECT 3 AS n")
+        [Symbol.iterator]();
+      expect(outer.next().value).toEqual({ n: 1 });
+      db.transactionSync(() => {
+        expect(outer.next().value).toEqual({ n: 2 });
+      });
+      expect(outer.next().value).toEqual({ n: 3 });
+      expect(outer.next().done).toBe(true);
+    });
+  });
+
   it("invalidates pending writers when the outer transaction rolls back", () => {
     using db = database();
     db.run("CREATE TABLE sample (value TEXT)");
@@ -252,69 +264,5 @@ describe("local SQL savepoints", () => {
     expect(db.scalar("SELECT COUNT(*) FROM sample")).toBe(0);
     db.transactionSync(() => db.run("INSERT INTO sample VALUES ('after')"));
     expect(db.all("SELECT value FROM sample")).toEqual([{ value: "after" }]);
-  });
-});
-
-describe("local paged read scope cursors", () => {
-  it("invalidates a cursor created inside a failed read scope", () => {
-    const { db, repoId } = gitDatabase();
-    let cursor: Iterator<Record<string, unknown>> | undefined;
-
-    expect(() =>
-      withPackReadScope(db, repoId, null, (scope) => {
-        db.run(
-          `INSERT INTO git_pack_read_pages (repo_id, read_id, step, entry_limit)
-           VALUES (?, ?, 0, 1)`,
-          repoId,
-          scope.readId,
-        );
-        cursor = db
-          .iterate("SELECT step FROM git_pack_read_pages WHERE repo_id = ?", repoId)
-          [Symbol.iterator]();
-        expect(cursor.next().done).toBe(false);
-        throw new Error("scope failure");
-      }),
-    ).toThrow("scope failure");
-
-    expect(() => cursor?.next()).toThrowError(expect.objectContaining({ code: "ESTALE" }));
-    expect(db.scalar("SELECT COUNT(*) FROM git_pack_read_pages")).toBe(0);
-  });
-
-  /**
-   * `scopedSqliteRows.next()` re-attaches a cursor to the *current* scope on
-   * every step, so an enclosing cursor advanced inside a failed read scope dies
-   * with it. A consumer must not resume an outer cursor after a nested read
-   * scope threw.
-   */
-  it("invalidates an enclosing cursor advanced inside a failed read scope", () => {
-    const { db, repoId } = gitDatabase();
-    db.transactionSync(() => {
-      const outer = counted(db);
-      expect(outer.next().done).toBe(false);
-
-      expect(() =>
-        withPackReadScope(db, repoId, null, () => {
-          expect(outer.next().done).toBe(false);
-          throw new Error("scope failure");
-        }),
-      ).toThrow("scope failure");
-
-      expect(() => outer.next()).toThrowError(expect.objectContaining({ code: "ESTALE" }));
-    });
-  });
-
-  it("preserves an enclosing cursor across a successful read scope", () => {
-    const { db, repoId } = gitDatabase();
-    db.transactionSync(() => {
-      const outer = counted(db);
-      expect(outer.next().value).toEqual({ n: 1 });
-
-      withPackReadScope(db, repoId, null, () => {
-        expect(outer.next().value).toEqual({ n: 2 });
-      });
-
-      expect(outer.next().value).toEqual({ n: 3 });
-      outer.return?.();
-    });
   });
 });

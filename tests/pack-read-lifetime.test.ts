@@ -4,13 +4,12 @@ import type { SqlDatabase } from "../packages/do/src/db/db.js";
 import { concat } from "../packages/git/src/common/bytes.js";
 import { hashObject } from "../packages/git/src/common/objects.js";
 import { withGitMutationGuard } from "../packages/git/src/store/core/mutation-guard.js";
-import { SqliteGitDatabase, type StoreOptions } from "../packages/git/src/store/index.js";
+import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { withIntegrationWorkspaceOwned } from "../packages/git/src/store/operations/integration-workspace/workspace.js";
 import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import { PackDataReader } from "../packages/git/src/store/pack/read/read-data.js";
-import { withPackReadScope } from "../packages/git/src/store/pack/read/read-scope.js";
+import { MAX_DELTA_DEPTH } from "../packages/git/src/store/pack/shared.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
-import { scratchTransactionsFor } from "../packages/git/src/store/repository/shared-support.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 
@@ -119,39 +118,36 @@ describe("packed read payload lifetime", () => {
     }
   });
 
-  it.each([4, 4096])(
-    "resolves a cold chain and multiple outputs with page size %i",
-    async (graphPageEntries) => {
-      const db = new TestDatabase();
-      const native = new GitFixture().init();
-      try {
-        const outputs = Array.from({ length: 17 }, (_, index) => target(index));
-        const oids = outputs.map((bytes) => hashObject("blob", bytes));
-        const bytes = pack(outputs.length, (writer) => {
-          writer.object("blob", outputs[0]!);
-          for (let index = 1; index < outputs.length; index++) {
-            writer.refDelta(oids[index - 1]!, literal(8, outputs[index]!));
-          }
-        });
-        nativeIngest(native, bytes);
-        const options = { objectCacheBytes: 0, graphPageEntries };
-        const database = new SqliteGitDatabase(db, options);
-        const checkout = database.createRepository("/repo", "ref: refs/heads/main");
-        await database.openCheckout(checkout).packs.ingest(slices(bytes, 4096));
-        const cold = new SqliteGitDatabase(db, options).openCheckout(checkout);
-        const inflate = vi.spyOn(PackDataReader.prototype, "inflateCompressed");
-        expect(cold.packs.read(oids[16]!)?.data).toEqual(native.catFile(oids[16]!));
-        expect(inflate).toHaveBeenCalledTimes(17);
-        const wanted = [oids[8]!, oids[16]!, oids[4]!];
-        const result = cold.packs.readObjects(wanted);
-        expect([...result.keys()]).toEqual(wanted);
-        for (const oid of wanted) expect(result.get(oid)?.data).toEqual(native.catFile(oid));
-      } finally {
-        native.dispose();
-        db.storage.db.close();
-      }
-    },
-  );
+  it("resolves a cold chain and multiple outputs", async () => {
+    const db = new TestDatabase();
+    const native = new GitFixture().init();
+    try {
+      const outputs = Array.from({ length: 17 }, (_, index) => target(index));
+      const oids = outputs.map((bytes) => hashObject("blob", bytes));
+      const bytes = pack(outputs.length, (writer) => {
+        writer.object("blob", outputs[0]!);
+        for (let index = 1; index < outputs.length; index++) {
+          writer.refDelta(oids[index - 1]!, literal(8, outputs[index]!));
+        }
+      });
+      nativeIngest(native, bytes);
+      const options = { objectCacheBytes: 0 };
+      const database = new SqliteGitDatabase(db, options);
+      const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+      await database.openCheckout(checkout).packs.ingest(slices(bytes, 4096));
+      const cold = new SqliteGitDatabase(db, options).openCheckout(checkout);
+      const inflate = vi.spyOn(PackDataReader.prototype, "inflateCompressed");
+      expect(cold.packs.read(oids[16]!)?.data).toEqual(native.catFile(oids[16]!));
+      expect(inflate).toHaveBeenCalledTimes(17);
+      const wanted = [oids[8]!, oids[16]!, oids[4]!];
+      const result = cold.packs.readObjects(wanted);
+      expect([...result.keys()]).toEqual(wanted);
+      for (const oid of wanted) expect(result.get(oid)?.data).toEqual(native.catFile(oid));
+    } finally {
+      native.dispose();
+      db.storage.db.close();
+    }
+  });
 
   it("reloads a discovery-time cache hit evicted before use", async () => {
     const db = new TestDatabase();
@@ -190,12 +186,8 @@ describe("packed read payload lifetime", () => {
 });
 
 class ObservingDatabase implements SqlDatabase {
-  readonly queries: { query: string; bindings: unknown[] }[] = [];
-  readonly pageRows: number[] = [];
+  readonly queries: string[] = [];
   transactions = 0;
-  openScratchCursors = 0;
-  /** Runs before the wrapped statement, so a seam can mutate sources mid-scope. */
-  onQuery: ((query: string) => void) | null = null;
 
   constructor(readonly inner: TestDatabase) {}
 
@@ -205,74 +197,36 @@ class ObservingDatabase implements SqlDatabase {
 
   reset(): void {
     this.queries.length = 0;
-    this.pageRows.length = 0;
     this.transactions = 0;
   }
 
-  matching(pattern: RegExp): { query: string; bindings: unknown[] }[] {
-    return this.queries.filter((entry) => pattern.test(entry.query));
-  }
-
-  #record(query: string, bindings: unknown[]): void {
-    this.queries.push({ query, bindings });
-    const hook = this.onQuery;
-    if (hook !== null) hook(query);
+  matching(pattern: RegExp): string[] {
+    return this.queries.filter((query) => pattern.test(query));
   }
 
   run(query: string, ...bindings: unknown[]): void {
-    this.#record(query, bindings);
+    this.queries.push(query);
     this.inner.run(query, ...bindings);
   }
 
   all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
-    this.#record(query, bindings);
+    this.queries.push(query);
     return this.inner.all<Row>(query, ...bindings);
   }
 
   one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
-    this.#record(query, bindings);
+    this.queries.push(query);
     return this.inner.one<Row>(query, ...bindings);
   }
 
   scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
-    this.#record(query, bindings);
+    this.queries.push(query);
     return this.inner.scalar<T>(query, ...bindings);
   }
 
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
-    this.#record(query, bindings);
-    const rows = this.inner.iterate(query, ...bindings);
-    const page = query.includes("/* pack-graph-page */");
-    if (!page && !query.includes("git_pack_read_")) return rows;
-    const owner = this;
-    if (page) owner.pageRows.push(0);
-    return {
-      [Symbol.iterator](): IterableIterator<Record<string, unknown>> {
-        const iterator = rows[Symbol.iterator]();
-        let open = true;
-        owner.openScratchCursors++;
-        const close = (): void => {
-          if (!open) return;
-          open = false;
-          owner.openScratchCursors--;
-        };
-        const wrapped: IterableIterator<Record<string, unknown>> = {
-          [Symbol.iterator]: () => wrapped,
-          next(): IteratorResult<Record<string, unknown>> {
-            const step = iterator.next();
-            if (step.done === true) close();
-            else if (page) owner.pageRows[owner.pageRows.length - 1]!++;
-            return step;
-          },
-          return(): IteratorResult<Record<string, unknown>> {
-            close();
-            iterator.return?.();
-            return { done: true, value: undefined };
-          },
-        };
-        return wrapped;
-      },
-    };
+    this.queries.push(query);
+    return this.inner.iterate(query, ...bindings);
   }
 
   transactionSync<T>(closure: () => T): T {
@@ -281,41 +235,28 @@ class ObservingDatabase implements SqlDatabase {
   }
 }
 
-function scratchCounts(db: TestDatabase): { scopes: number; pages: number; frontier: number } {
-  const count = (table: string): number => db.scalar<number>(`SELECT count(*) FROM ${table}`) ?? -1;
-  return {
-    scopes: count("git_pack_read_scopes"),
-    pages: count("git_pack_read_pages"),
-    frontier: count("git_pack_read_frontier"),
-  };
-}
+const GRAPH_QUERY = /\/\* pack-graph \*\//;
 
-function chainPack(length: number): { bytes: Uint8Array; outputs: Uint8Array[]; oids: string[] } {
-  const outputs = Array.from({ length }, (_, index) => target(index));
-  const oids = outputs.map((bytes) => hashObject("blob", bytes));
-  const bytes = pack(length, (writer) => {
-    writer.object("blob", outputs[0]!);
-    for (let index = 1; index < length; index++) {
-      writer.refDelta(oids[index - 1]!, literal(8, outputs[index]!));
-    }
-  });
-  return { bytes, outputs, oids };
-}
-
-/** `count` independent delta chains, so every origin walks its own bases. */
-function independentChains(count: number, length: number): { bytes: Uint8Array; tips: string[] } {
+/** `count` independent delta chains of `length` entries, so every tip walks its own bases. */
+function independentChains(
+  count: number,
+  length: number,
+): { bytes: Uint8Array; tips: string[]; outputs: Uint8Array[] } {
   const tips: string[] = [];
+  const outputs: Uint8Array[] = [];
   const plan: { base: string | null; output: Uint8Array }[] = [];
   let value = 0;
   for (let chain = 0; chain < count; chain++) {
     let previous: string | null = null;
+    let output: Uint8Array | null = null;
     for (let index = 0; index < length; index++) {
-      const output = target(value++);
+      output = target(value++);
       plan.push({ base: previous, output });
       previous = hashObject("blob", output);
     }
-    if (previous === null) throw new Error("a chain needs at least one object");
+    if (previous === null || output === null) throw new Error("a chain needs at least one object");
     tips.push(previous);
+    outputs.push(output);
   }
   const bytes = pack(plan.length, (writer) => {
     for (const entry of plan) {
@@ -323,45 +264,18 @@ function independentChains(count: number, length: number): { bytes: Uint8Array; 
       else writer.refDelta(entry.base, literal(8, entry.output));
     }
   });
-  return { bytes, tips };
+  return { bytes, tips, outputs };
 }
 
-/** Scratch statements and discovery pages one paged read over `origins` costs. */
-async function frontierCost(origins: number): Promise<{ statements: number; pages: number }> {
-  const inner = new TestDatabase();
-  const observed = new ObservingDatabase(inner);
-  const database = new SqliteGitDatabase(observed, {
-    objectCacheBytes: 0,
-    chunkBytes: 0,
-    graphPageEntries: 4,
-  });
+async function chainStore(db: SqlDatabase, length: number) {
+  const database = new SqliteGitDatabase(db, { objectCacheBytes: 0, chunkBytes: 0 });
   const checkout = database.createRepository("/repo", "ref: refs/heads/main");
   const store = database.openCheckout(checkout);
-  const chains = independentChains(origins, 6);
-  await store.packs.ingest(slices(chains.bytes, 4096));
-  observed.reset();
-
-  expect([...store.packs.readObjects(chains.tips).keys()]).toEqual(chains.tips);
-
-  expect(scratchCounts(inner)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
-  return {
-    statements: observed.matching(/git_pack_read_/).length,
-    pages: observed.pageRows.length,
-  };
-}
-
-async function pagedChain(db: SqlDatabase, options: StoreOptions = {}, length = 17) {
-  const database = new SqliteGitDatabase(db, {
-    objectCacheBytes: 0,
-    chunkBytes: 0,
-    graphPageEntries: 4,
-    ...options,
-  });
-  const checkout = database.createRepository("/repo", "ref: refs/heads/main");
-  const store = database.openCheckout(checkout);
-  const chain = chainPack(length);
-  const packed = await store.packs.ingest(slices(chain.bytes, 4096));
-  return { store, checkout, packId: packed.packId, ...chain };
+  const chain = independentChains(1, length);
+  await store.packs.ingest(slices(chain.bytes, 64 * 1024));
+  const tip = chain.tips[0]!;
+  const output = chain.outputs[0]!;
+  return { store, tip, output };
 }
 
 /**
@@ -380,143 +294,73 @@ function deferredChainPack(length: number): { bytes: Uint8Array; oids: string[] 
   return { bytes, oids };
 }
 
-function pendingStore(db: SqlDatabase) {
-  const database = new SqliteGitDatabase(db, {
-    objectCacheBytes: 0,
-    chunkBytes: 0,
-    graphPageEntries: 4,
-  });
-  const checkout = database.createRepository("/repo", "ref: refs/heads/main");
-  return { checkout, store: database.openCheckout(checkout) };
-}
-
-describe("paged packed read scope", () => {
-  it("opens no transaction and touches no scratch on a non-paged read", async () => {
+describe("non-paged packed reads", () => {
+  it("opens no transaction and writes nothing", async () => {
     const inner = new TestDatabase();
     const observed = new ObservingDatabase(inner);
-    const { store, oids, outputs } = await pagedChain(observed, { graphPageEntries: 4096 });
+    const { store, tip, output } = await chainStore(observed, 17);
     observed.reset();
 
-    expect(store.packs.read(oids[16]!)?.data).toEqual(outputs[16]);
+    expect(store.packs.read(tip)?.data).toEqual(output);
 
     expect(observed.transactions).toBe(0);
-    expect(observed.matching(/git_pack_read_|git_repositories/)).toEqual([]);
+    expect(observed.matching(GRAPH_QUERY)).toHaveLength(1);
+    expect(observed.matching(/^\s*(INSERT|UPDATE|DELETE|REPLACE)\b/)).toEqual([]);
   });
 
-  it("opens exactly one transaction and one owner row on a paged read", async () => {
+  it("reads one object at the maximum depth from a single graph query", async () => {
     const inner = new TestDatabase();
     const observed = new ObservingDatabase(inner);
-    const { store, oids, outputs } = await pagedChain(observed);
+    const { store, tip, output } = await chainStore(observed, MAX_DELTA_DEPTH + 1);
     observed.reset();
 
-    expect(store.packs.read(oids[16]!)?.data).toEqual(outputs[16]);
+    expect(store.packs.read(tip)?.data).toEqual(output);
 
-    expect(observed.transactions).toBe(1);
-    expect(observed.matching(/INSERT INTO git_pack_read_scopes/)).toHaveLength(1);
-    expect(observed.matching(/SELECT source_generation FROM git_repositories/)).toHaveLength(2);
-    expect(scratchCounts(inner)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
+    expect(observed.matching(GRAPH_QUERY)).toHaveLength(1);
   });
 
-  it("allocates a distinct owner for a nested read scope and leaves no scratch", async () => {
+  it("splits 4,096 wanted depth-3 chains whose union graph exceeds one graph", async () => {
     const inner = new TestDatabase();
     const observed = new ObservingDatabase(inner);
-    const { store, oids, outputs } = await pagedChain(observed);
+    const database = new SqliteGitDatabase(observed, { objectCacheBytes: 0, chunkBytes: 0 });
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const chains = independentChains(4096, 4);
+    await store.packs.ingest(slices(chains.bytes, 64 * 1024));
     observed.reset();
 
-    const outerId = withPackReadScope(observed, store.sharedRepoId, null, (outer) => {
-      expect(store.packs.read(oids[16]!)?.data).toEqual(outputs[16]);
-      return outer.readId;
+    const result = store.packs.readObjects(chains.tips, "blob");
+
+    expect([...result.keys()]).toEqual(chains.tips);
+    chains.tips.forEach((oid, index) => {
+      expect(result.get(oid)?.data).toEqual(chains.outputs[index]);
     });
-
-    const owners = observed
-      .matching(/INSERT INTO git_pack_read_scopes/)
-      .map((entry) => entry.bindings[1]);
-    expect(owners).toHaveLength(2);
-    expect(new Set(owners).size).toBe(2);
-    expect(owners[0]).toBe(outerId);
-    // Only the outermost scope snapshots the sources; the nested one inherits.
-    expect(observed.matching(/SELECT source_generation FROM git_repositories/)).toHaveLength(2);
-    expect(scratchCounts(inner)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
-  });
-
-  it("resolves a paged read inside a guarded write transaction", async () => {
-    const db = new TestDatabase();
-    const { store, oids, outputs } = await pagedChain(db);
-
-    const result = withGitMutationGuard(db, () =>
-      db.transactionSync(() => store.packs.read(oids[16]!)),
-    );
-
-    expect(result?.data).toEqual(outputs[16]);
-    expect(scratchCounts(db)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
-  });
-
-  it("fails ECORRUPT and rolls its scratch back when sources change inside the scope", async () => {
-    const inner = new TestDatabase();
-    const observed = new ObservingDatabase(inner);
-    const { store, oids, checkout } = await pagedChain(observed);
-    observed.reset();
-    observed.onQuery = (query) => {
-      if (!query.includes("/* pack-graph-page */")) return;
-      observed.onQuery = null;
-      inner.run(
-        "UPDATE git_repositories SET source_generation = source_generation + 1 WHERE id = ?",
-        checkout.repoId,
-      );
-    };
-
-    expect(() => store.packs.read(oids[16]!)).toThrowError(
-      expect.objectContaining({
-        code: "ECORRUPT",
-        message: "packed read observed a source change",
-      }),
-    );
-
-    expect(scratchCounts(inner)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
-    expect(() => scratchTransactionsFor(observed).requireHealthy()).not.toThrow();
+    expect(observed.matching(GRAPH_QUERY).length).toBeGreaterThan(1);
+    expect(observed.transactions).toBe(0);
   });
 
   it("resolves pending-visible bases through a deferred ingest", async () => {
     const db = new TestDatabase();
-    const { store } = pendingStore(db);
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0, chunkBytes: 0 });
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const chain = deferredChainPack(17);
 
     await store.packs.ingest(slices(chain.bytes, 4096));
 
     for (const oid of chain.oids) expect(store.packs.read(oid)).not.toBeNull();
-    expect(scratchCounts(db)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
   });
 
-  it("re-asserts the pending pack state a scope snapshotted", async () => {
+  it("resolves a read inside a guarded write transaction", async () => {
     const db = new TestDatabase();
-    const { store, checkout } = pendingStore(db);
-    const chain = deferredChainPack(4);
-    const packed = await store.packs.ingest(slices(chain.bytes, 4096));
+    const { store, tip, output } = await chainStore(db, 17);
 
-    expect(() =>
-      withPackReadScope(db, checkout.repoId, packed.packId, () => {
-        db.run(
-          "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = ? AND pack_id = ?",
-          checkout.repoId,
-          packed.packId,
-        );
-      }),
-    ).toThrowError(
-      expect.objectContaining({
-        code: "ECORRUPT",
-        message: "packed read observed a source change",
-      }),
-    );
-    expect(scratchCounts(db)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
-    expect(
-      db.scalar<string>("SELECT state FROM git_pack_meta WHERE pack_id = ?", packed.packId),
-    ).toBe("complete");
+    const result = withGitMutationGuard(db, () => db.transactionSync(() => store.packs.read(tip)));
+
+    expect(result?.data).toEqual(output);
   });
 
   it("leaves an enclosing integration workspace committable after a read failure", async () => {
-    const inner = new TestDatabase();
-    const observed = new ObservingDatabase(inner);
-    const { store, oids, checkout } = await pagedChain(observed);
+    const db = new TestDatabase();
+    const { store, tip, output } = await chainStore(db, 17);
     const tooMany = Array.from({ length: 4097 }, (_, index) =>
       index.toString(16).padStart(40, "0"),
     );
@@ -525,102 +369,10 @@ describe("paged packed read scope", () => {
       expect(() => store.packs.readObjects(tooMany)).toThrowError(
         expect.objectContaining({ code: "E2BIG" }),
       );
-      observed.onQuery = (query) => {
-        if (!query.includes("/* pack-graph-page */")) return;
-        observed.onQuery = null;
-        inner.run(
-          "UPDATE git_repositories SET source_generation = source_generation + 1 WHERE id = ?",
-          checkout.repoId,
-        );
-      };
-      expect(() => store.packs.read(oids[16]!)).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
+      expect(store.packs.read(tip)?.data).toEqual(output);
       return "committed";
     });
 
     expect(committed).toBe("committed");
-    expect(scratchCounts(inner)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
-  });
-
-  it("returns a paged read in request order, identically to the non-paged read", async () => {
-    const pagedDb = new TestDatabase();
-    const paged = await pagedChain(pagedDb);
-    const wholeDb = new TestDatabase();
-    const whole = await pagedChain(wholeDb, { graphPageEntries: 4096 });
-    const wanted = [paged.oids[8]!, paged.oids[16]!, paged.oids[4]!];
-
-    const pagedResult = paged.store.packs.readObjects(wanted);
-    const wholeResult = whole.store.packs.readObjects(wanted);
-
-    expect([...pagedResult.keys()]).toEqual(wanted);
-    expect([...wholeResult.keys()]).toEqual(wanted);
-    for (const oid of wanted) expect(pagedResult.get(oid)).toEqual(wholeResult.get(oid));
-    // The logical read rebuilds its own result in request order as well.
-    expect([...paged.store.readObjects(wanted).objects.keys()]).toEqual(wanted);
-  });
-
-  it("drains every scratch cursor before releasing the owner row", async () => {
-    const inner = new TestDatabase();
-    const observed = new ObservingDatabase(inner);
-    const { store, oids } = await pagedChain(observed);
-    observed.reset();
-    let openAtRelease = -1;
-    observed.onQuery = (query) => {
-      if (query.includes("DELETE FROM git_pack_read_scopes")) {
-        openAtRelease = observed.openScratchCursors;
-      }
-    };
-
-    expect(store.packs.read(oids[16]!)).not.toBeNull();
-
-    expect(openAtRelease).toBe(0);
-  });
-
-  it("keeps every page inside its entry limit and its scratch inside the declared bound", async () => {
-    const inner = new TestDatabase();
-    const observed = new ObservingDatabase(inner);
-    const { store, oids } = await pagedChain(observed, { graphPageEntries: 4 }, 64);
-    observed.reset();
-    let peakFrontier = 0;
-    let peakPages = 0;
-    observed.onQuery = (query) => {
-      if (!query.includes("/* pack-graph-page */")) return;
-      peakFrontier = Math.max(peakFrontier, scratchCounts(inner).frontier);
-      peakPages = Math.max(peakPages, scratchCounts(inner).pages);
-    };
-
-    const wanted = [oids[63]!, oids[47]!, oids[31]!, oids[15]!];
-    expect([...store.packs.readObjects(wanted).keys()]).toEqual(wanted);
-
-    expect(observed.pageRows.length).toBeGreaterThan(4);
-    for (const rows of observed.pageRows) expect(rows).toBeLessThanOrEqual(4);
-    // origins x (depth + 1) is the declared frontier bound; pages are one per step.
-    expect(peakFrontier).toBeLessThanOrEqual(wanted.length * observed.pageRows.length);
-    expect(peakPages).toBeLessThanOrEqual(observed.pageRows.length);
-    expect(scratchCounts(inner)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
-  });
-
-  it("costs scratch statements per page, never per origin", async () => {
-    const small = await frontierCost(16);
-    const large = await frontierCost(32);
-
-    expect(small.pages).toBeGreaterThan(1);
-    expect(large.pages).toBe(small.pages);
-    // Independent chains of equal length page identically at both widths, so
-    // doubling the origins must not cost a single extra statement.
-    expect(large.statements).toBe(small.statements);
-    // Discovery spends four per page - frontier read, page row, union graph,
-    // move batch - and resolution two; the scope itself seeds, owns, releases.
-    expect(large.statements).toBeLessThanOrEqual(6 * large.pages + 4);
-  });
-
-  it("pages a union graph that crosses the 4,096-entry discovery limit", async () => {
-    const db = new TestDatabase();
-    const { store, oids, outputs } = await pagedChain(db, { graphPageEntries: undefined }, 4_200);
-
-    expect(store.packs.read(oids[4_199]!)?.data).toEqual(outputs[4_199]);
-
-    expect(scratchCounts(db)).toEqual({ scopes: 0, pages: 0, frontier: 0 });
   });
 });

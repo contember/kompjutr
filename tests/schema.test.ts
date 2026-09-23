@@ -58,9 +58,6 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_pack_entries", "shared"],
   ["git_pack_objects", "shared"],
   ["git_pack_pending", "shared"],
-  ["git_pack_read_scopes", "shared"],
-  ["git_pack_read_pages", "shared"],
-  ["git_pack_read_frontier", "shared"],
   ["git_tree_sources", "shared"],
   ["git_tree_entries", "shared"],
   ["git_tree_effective", "shared"],
@@ -127,9 +124,6 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_pack_objects" },
   { type: "index", name: "git_pack_objects_loc" },
   { type: "table", name: "git_pack_pending" },
-  { type: "table", name: "git_pack_read_frontier" },
-  { type: "table", name: "git_pack_read_pages" },
-  { type: "table", name: "git_pack_read_scopes" },
   { type: "table", name: "git_promised_blobs" },
   { type: "trigger", name: "git_promised_blobs_loose_present" },
   { type: "table", name: "git_promisor_remotes" },
@@ -423,9 +417,6 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
       "worktree_revision",
     ],
   ],
-  ["git_pack_read_scopes", ["repo_id", "read_id"]],
-  ["git_pack_read_pages", ["repo_id", "read_id", "step", "entry_limit"]],
-  ["git_pack_read_frontier", ["repo_id", "read_id", "step", "oid", "origin_id", "depth"]],
   [
     "git_pack_objects",
     ["repo_id", "oid", "pack_id", "offset", "data_off", "data_len", "type", "size", "entry_size"],
@@ -598,24 +589,6 @@ describe("git schema", () => {
     expect(primaryKeyOf(db, "git_pack_ingest_control")).toEqual(["repo_id"]);
     expect(primaryKeyOf(db, "git_pack_entries")).toEqual(["repo_id", "pack_id", "offset"]);
     expect(primaryKeyOf(db, "git_pack_commit_staging")).toEqual(["repo_id", "pack_id", "oid"]);
-    expect(primaryKeyOf(db, "git_pack_read_scopes")).toEqual(["repo_id", "read_id"]);
-    expect(cascadeForeignKeysOf(db, "git_pack_read_scopes")).toEqual([
-      { table: "git_repositories", from: "repo_id", to: "id" },
-    ]);
-    expect(primaryKeyOf(db, "git_pack_read_pages")).toEqual(["repo_id", "read_id", "step"]);
-    expect(primaryKeyOf(db, "git_pack_read_frontier")).toEqual([
-      "repo_id",
-      "read_id",
-      "step",
-      "oid",
-      "origin_id",
-    ]);
-    for (const table of ["git_pack_read_pages", "git_pack_read_frontier"]) {
-      expect(cascadeForeignKeysOf(db, table), table).toEqual([
-        { table: "git_pack_read_scopes", from: "repo_id", to: "repo_id" },
-        { table: "git_pack_read_scopes", from: "read_id", to: "read_id" },
-      ]);
-    }
     expect(cascadeForeignKeysOf(db, "git_pack_commit_staging")).toEqual([
       { table: "git_pack_meta", from: "repo_id", to: "repo_id" },
       { table: "git_pack_meta", from: "pack_id", to: "pack_id" },

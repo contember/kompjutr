@@ -12,23 +12,16 @@ import {
   type CompressedEntry,
   checkDeltaInflateBudget,
   checkedPackBytes,
-  isPackGraphLimit,
   MAX_PACK_BLOB_GRAPH_ENTRIES,
   MAX_PACK_BLOB_INPUTS,
   MAX_PACK_DELTA_WORKING_BYTES,
   PACK_BLOB_BATCH_TARGET_BYTES,
   PACK_CHUNK,
-  PACK_GRAPH_LIMIT_MESSAGE,
   type PackedEntry,
   validateDeltaWorkingSet,
 } from "../shared.js";
 import type { PackDataReader } from "./read-data.js";
-import { PackGraphPager } from "./read-graph.js";
-import {
-  PACK_GRAPH_BASE_STEP,
-  PACK_GRAPH_ENTRY_SELECT,
-  packGraphStartsSql,
-} from "./read-graph-sql.js";
+import { packGraphSql } from "./read-graph-sql.js";
 
 const INVALID_ENTRY = "packed blob index contains invalid metadata";
 const INVALID_CHUNK = "pack chunk query returned invalid coordinates";
@@ -44,15 +37,13 @@ const PACKED_ENTRY_ROW = new RowShape(
     size: int(0, Number.MAX_SAFE_INTEGER, INVALID_ENTRY),
     entry_size: int(0, MAX_PACK_DELTA_WORKING_BYTES, INVALID_ENTRY),
     base_offset: nullable(int(0, Number.MAX_SAFE_INTEGER, INVALID_ENTRY)),
-    base_oid: nullable(text(INVALID_ENTRY).where(isOid, INVALID_ENTRY)),
     start: int(0, 1, INVALID_ENTRY),
   },
   INVALID_ENTRY,
 );
 
-/** A graph entry carries its in-pack base's OID so a seeded base ends the walk. */
+/** A graph entry marks whether a requested chain starts there. */
 interface GraphEntry extends PackedEntry {
-  baseOid: string | null;
   start: boolean;
 }
 
@@ -84,61 +75,32 @@ function decodePackedEntry(row: Record<string, unknown>): GraphEntry {
     size: decoded.size,
     entrySize: decoded.entry_size,
     baseOffset: decoded.base_offset,
-    baseOid: decoded.base_oid,
     start: decoded.start === 1,
   };
 }
 
 export class PackObjectResolver {
-  readonly #pager: PackGraphPager;
-
   constructor(
     private readonly db: SqlDatabase,
     private readonly repoId: number,
     private readonly objects: ByteLru<string, RawObject>,
     private readonly data: PackDataReader,
     private readonly maxDeltaDepth: number,
-    private readonly graphPageEntries: number,
-  ) {
-    this.#pager = new PackGraphPager(
-      db,
-      repoId,
-      maxDeltaDepth,
-      graphPageEntries,
-      (oids, pendingPackId, expectedType, allowMissing, seeds, bypassCache, graphEntryLimit) =>
-        this.#readObjects(
-          oids,
-          pendingPackId,
-          expectedType,
-          allowMissing,
-          seeds,
-          bypassCache,
-          graphEntryLimit,
-        ),
-    );
-  }
+  ) {}
 
   readObjectsBounded(
     oids: readonly string[],
     pendingPackId: number | null,
     expectedType: ObjectType | null,
     allowMissing: boolean,
-    seeds: ReadonlyMap<string, RawObject>,
     bypassCache: boolean,
   ): Map<string, RawObject> {
-    try {
-      return this.#readObjects(oids, pendingPackId, expectedType, allowMissing, seeds, bypassCache);
-    } catch (error) {
-      if (!isPackGraphLimit(error)) throw error;
+    const wanted = [...new Set(oids)];
+    if (wanted.length === 0) return new Map();
+    if (wanted.length > MAX_PACK_BLOB_INPUTS) {
+      throw new GitError("E2BIG", `blob batch exceeds ${MAX_PACK_BLOB_INPUTS} packed inputs`);
     }
-    return this.#pager.readObjectsPaged(
-      oids,
-      pendingPackId,
-      expectedType,
-      allowMissing,
-      seeds,
-      bypassCache,
-    );
+    return this.#readBatch(wanted, pendingPackId, expectedType, allowMissing, bypassCache);
   }
 
   #deltaDepthExceeded(oid: string): CorruptError {
@@ -146,30 +108,53 @@ export class PackObjectResolver {
   }
 
   /**
-   * Discover the bounded delta closure of `wanted`: each chain start, then its
-   * in-pack bases by offset. Keys are physical, since one OID can sit in
-   * several packs of the closure.
+   * Resolve `wanted` from one bounded graph, halving the batch while its union
+   * graph exceeds the entry limit. Ingest caps every chain at `MAX_DELTA_DEPTH`
+   * edges, so a single OID always fits one graph.
+   */
+  #readBatch(
+    wanted: readonly string[],
+    pendingPackId: number | null,
+    expectedType: ObjectType | null,
+    allowMissing: boolean,
+    bypassCache: boolean,
+  ): Map<string, RawObject> {
+    const entries = this.#readGraph(wanted, pendingPackId);
+    if (entries !== null) {
+      return this.#readObjects(wanted, entries, expectedType, allowMissing, bypassCache);
+    }
+    if (wanted.length === 1) throw this.#deltaDepthExceeded(wanted[0]!);
+    const middle = Math.ceil(wanted.length / 2);
+    const result = this.#readBatch(
+      wanted.slice(0, middle),
+      pendingPackId,
+      expectedType,
+      allowMissing,
+      bypassCache,
+    );
+    const rest = this.#readBatch(
+      wanted.slice(middle),
+      pendingPackId,
+      expectedType,
+      allowMissing,
+      bypassCache,
+    );
+    for (const [oid, object] of rest) result.set(oid, object);
+    return result;
+  }
+
+  /**
+   * Discover the delta closure of `wanted`, or null when it exceeds the graph
+   * entry limit. Keys are physical, since one OID can sit in several packs of
+   * the closure.
    */
   #readGraph(
     wanted: readonly string[],
-    seeds: ReadonlyMap<string, RawObject>,
     pendingPackId: number | null,
-    graphEntryLimit: number,
-  ): Map<string, GraphEntry> {
+  ): Map<string, GraphEntry> | null {
     const rows = this.db.iterate(
-      `WITH RECURSIVE
-         roots(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
-         seeds(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
-         ${packGraphStartsSql("roots")},
-         reachable(pack_id, offset) AS (
-           SELECT pack_id, offset FROM starts
-           UNION
-           ${PACK_GRAPH_BASE_STEP}
-            LIMIT ${graphEntryLimit + 1}
-         )
-       ${PACK_GRAPH_ENTRY_SELECT}`,
+      packGraphSql(MAX_PACK_BLOB_GRAPH_ENTRIES),
       JSON.stringify(wanted),
-      JSON.stringify([...seeds.keys()]),
       this.repoId,
       pendingPackId ?? -1,
       this.repoId,
@@ -179,40 +164,22 @@ export class PackObjectResolver {
     );
 
     const entries = new Map<string, GraphEntry>();
-    let rowCount = 0;
     for (const row of rows) {
-      rowCount++;
-      if (rowCount > graphEntryLimit) throw new GitError("E2BIG", PACK_GRAPH_LIMIT_MESSAGE);
+      if (entries.size === MAX_PACK_BLOB_GRAPH_ENTRIES) return null;
       const entry = decodePackedEntry(row);
       entries.set(entryKey(entry.packId, entry.offset), entry);
     }
     return entries;
   }
 
-  /** Resolve requested objects in one bounded graph and physical pack cursor. */
+  /** Resolve requested objects from their discovered graph and one physical pack cursor. */
   #readObjects(
-    oids: readonly string[],
-    pendingPackId: number | null,
+    wanted: readonly string[],
+    entries: ReadonlyMap<string, GraphEntry>,
     expectedType: ObjectType | null,
     allowMissing: boolean,
-    seeds: ReadonlyMap<string, RawObject> = new Map(),
-    bypassCache = false,
-    graphEntryLimit = this.graphPageEntries,
+    bypassCache: boolean,
   ): Map<string, RawObject> {
-    if (
-      !Number.isSafeInteger(graphEntryLimit) ||
-      graphEntryLimit < 1 ||
-      graphEntryLimit > MAX_PACK_BLOB_GRAPH_ENTRIES
-    ) {
-      throw new CorruptError("packed blob graph entry limit is invalid");
-    }
-    const wanted = [...new Set(oids)];
-    if (wanted.length === 0) return new Map();
-    if (wanted.length > MAX_PACK_BLOB_INPUTS) {
-      throw new GitError("E2BIG", `blob batch exceeds ${MAX_PACK_BLOB_INPUTS} packed inputs`);
-    }
-
-    const entries = this.#readGraph(wanted, seeds, pendingPackId, graphEntryLimit);
     const cachedObject = (entry: PackedEntry): RawObject | undefined =>
       bypassCache ? undefined : this.objects.get(this.data.objectCacheKey(entry.packId, entry.oid));
 
@@ -382,8 +349,6 @@ export class PackObjectResolver {
         chain.push(current);
         const next = baseOf(current);
         if (next === undefined) {
-          object = current.baseOid === null ? undefined : seeds.get(current.baseOid);
-          if (object !== undefined) break;
           throw new CorruptError(
             `missing delta base at pack ${current.packId} offset ${current.baseOffset} for ${current.oid}`,
           );

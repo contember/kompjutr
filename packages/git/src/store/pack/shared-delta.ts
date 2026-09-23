@@ -17,11 +17,6 @@ export interface CompressedEntry {
   filled: number;
 }
 
-export interface PackGraphExit {
-  readonly oid: string | null;
-  readonly distance: number;
-}
-
 export interface PackRangeRequest {
   ordinal: number;
   offset: number;

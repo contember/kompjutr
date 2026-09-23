@@ -113,7 +113,7 @@ decisions → reference → archive.
 - [0021 — Recover local worktree mutations with an undo journal](decisions/0021-recover-local-worktree-mutations-with-an-undo-journal.md)
 - [0022 — Stage pack commit projections until publication](decisions/0022-stage-pack-commit-projections-until-publication.md)
 - [0024 — Own integration output in a scoped SQL workspace](decisions/0024-own-integration-output-in-a-scoped-sql-workspace.md)
-- [0025 — Scope paged read metadata and linearize maintenance expansion](decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md)
+- [0025 — Bound packed reads by chain depth and restart maintenance on source drift](decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md)
 
 The set was renumbered on 2026-09-04; [`decisions/README.md`](decisions/README.md#renumbered-on-2026-09-04)
 decodes an old number found in `archive/` or `specs/`.

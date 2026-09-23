@@ -22,7 +22,6 @@ export {
   type IngestBase,
   MAX_PACK_DELTA_WORKING_BYTES,
   type PackBaseMetadata,
-  type PackGraphExit,
   type PackIngestMemory,
   type PackRangeRequest,
   validateDeltaWorkingSet,
@@ -36,15 +35,16 @@ export const MAX_PACK_INGEST_OBJECTS = 128 * 1024;
 export const PACK_MEMBERSHIP_DIGEST_BYTES = 20;
 
 /**
- * Git's default pack depth is 50, but a pack from another implementation can
- * legitimately chain deeper. Ingest rejects a longer in-pack chain, so every
- * stored chain is bounded; the iterative base walk never guards stack depth.
+ * Git's `pack-objects` refuses a depth above 4,095, so no Git-produced pack
+ * chains deeper. Ingest rejects a longer in-pack chain, so every stored chain
+ * fits one read graph; the iterative base walk never guards stack depth.
  */
-export const MAX_DELTA_DEPTH = 50_000;
+export const MAX_DELTA_DEPTH = 4_095;
 
 /** Non-refusing target for buffered object, compressed, and base batches. */
 export const PACK_BLOB_BATCH_TARGET_BYTES = 4 * 1024 * 1024;
-export const MAX_PACK_BLOB_GRAPH_ENTRIES = 4096;
+/** One graph holds a whole maximal chain; a larger batch graph is split. */
+export const MAX_PACK_BLOB_GRAPH_ENTRIES = MAX_DELTA_DEPTH + 1;
 export const MAX_PACK_BLOB_INPUTS = 4096;
 
 /** Recent (offset -> oid) pairs kept in memory for immediate ofs-delta bases. */
@@ -59,8 +59,6 @@ export interface PackCacheOptions {
   cacheEntryLimit?: number;
   /** Test seam; production uses `MAX_DELTA_DEPTH`. */
   maxDeltaDepth?: number;
-  /** Test seam; production discovers 4,096 union-graph rows per page. */
-  graphPageEntries?: number;
   /** Test seam for durable ingest lease expiry. */
   now?: () => number;
 }
@@ -89,18 +87,6 @@ export function checkedPackBytes(left: number, right: number, label: string): nu
     throw new GitError("E2BIG", `packed object ${label} byte count overflow`);
   }
   return left + right;
-}
-
-/** Paged recovery recognises the graph limit by text; thrower and matcher share this literal. */
-export const PACK_GRAPH_LIMIT_MESSAGE =
-  "packed blob dependency graph exceeds the bounded entry limit";
-
-export function isPackGraphLimit(error: unknown): error is GitError {
-  return (
-    error instanceof GitError &&
-    error.code === "E2BIG" &&
-    error.message === PACK_GRAPH_LIMIT_MESSAGE
-  );
 }
 
 export function pushExactInflate(stream: InflateInto, input: Uint8Array, label: string): number {

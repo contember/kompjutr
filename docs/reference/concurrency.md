@@ -30,15 +30,10 @@ including the `EREENTRANT` rejection above, leaves the outer transaction
 committable. A failed drive operation can also mark the transaction abort-only
 before recording an effect.
 
-A **paged** packed read opens its own `transactionSync()` to own its scratch
-frontier, so at top level on `@kompjutr/local` it takes SQLite's writer
-reservation and produces WAL traffic for what the caller issued as a read. A
-second local writer is already excluded by the lifetime process lock, so this
-adds no cross-process contention, but a read-only caller can no longer assume a
-paged read takes no write lock. An ordinary non-paged packed read opens no
-transaction at all. The scope never reacquires the public mutation guard, and it
-refuses to open inside a poisoned scratch transaction without ever poisoning one
-itself. See [ADR-0025](../decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md).
+A packed read opens no transaction and writes nothing. It discovers a batch's
+delta closure in one bounded graph query and halves the batch while the closure
+is larger, so on `@kompjutr/local` a read-only caller never takes the writer
+reservation.
 
 Local cursors created or advanced in a rolled-back scope are closed before SQL
 rollback; advancing them again fails with `ESTALE`. This includes unstarted
@@ -46,7 +41,7 @@ cursors, so a failed scope cannot defer a write until after rollback. Successful
 scopes preserve their read cursors. Because `scopedSqliteRows.next()` re-attaches
 a cursor to the *current* scope on every step, an **enclosing** cursor advanced
 inside a failed nested scope is invalidated with it: a consumer must not resume
-an outer cursor after a nested read scope threw. SQLite requires pending write statements to
+an outer cursor after a nested scope threw. SQLite requires pending write statements to
 finish before a savepoint can be released or the outer transaction committed.
 See [ADR-0021](../decisions/0021-recover-local-worktree-mutations-with-an-undo-journal.md).
 
@@ -218,7 +213,8 @@ Packs are self-contained: every delta names its base by offset inside its own
 pack. Fetch never requests `thin-pack`. Ingest stores a REF delta with the offset
 of the in-pack entry that carries its base OID and rejects a base outside the pack
 with `ECORRUPT`. It carries each entry's chain depth while deferred deltas drain
-and rejects a chain longer than 50,000 edges with `ECORRUPT`. A read takes the
+and rejects a chain longer than 4,095 edges, Git's `pack-objects` limit, with
+`ECORRUPT`. A read takes the
 canonical row's pack and follows base offsets within it, so an older canonical
 owner never redirects a chain into another pack. Publication compares the exact
 ordered rows with the digest made while parsing and requires every entry's

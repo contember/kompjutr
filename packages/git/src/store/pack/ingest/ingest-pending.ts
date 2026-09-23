@@ -359,10 +359,10 @@ export class PackPendingResolver {
       }
     }
     if (result.size === 0) {
-      return this.read.readObjectsBounded(uncached, packId, null, true, new Map(), false);
+      return this.read.readObjectsBounded(uncached, packId, null, true, false);
     }
     if (uncached.length === 0) return result;
-    const parts = this.read.readObjectsBounded(uncached, packId, null, true, new Map(), false);
+    const parts = this.read.readObjectsBounded(uncached, packId, null, true, false);
     for (const [oid, object] of parts) result.set(oid, object);
     return result;
   }

@@ -18,7 +18,6 @@ import {
   DEFAULT_CACHE_ENTRY_LIMIT,
   DEFAULT_MAX_BUFFERED_ENTRY,
   MAX_DELTA_DEPTH,
-  MAX_PACK_BLOB_GRAPH_ENTRIES,
   type PackCacheOptions,
   type PackedEntry,
   type PackIngestOptions,
@@ -76,15 +75,6 @@ export class PackStore {
       throw new RangeError("maxDeltaDepth must be a finite non-negative integer");
     }
     const boundedMaxDeltaDepth = Math.min(maxDeltaDepth, MAX_DELTA_DEPTH);
-    const graphPageEntries = options.graphPageEntries ?? MAX_PACK_BLOB_GRAPH_ENTRIES;
-    if (
-      !Number.isFinite(graphPageEntries) ||
-      !Number.isInteger(graphPageEntries) ||
-      graphPageEntries < 1
-    ) {
-      throw new RangeError("graphPageEntries must be a finite positive integer");
-    }
-    const boundedGraphPageEntries = Math.min(graphPageEntries, MAX_PACK_BLOB_GRAPH_ENTRIES);
     const sharedState: PackSharedState = {
       cacheGeneration: 0,
       activePending: new Set<number>(),
@@ -98,7 +88,6 @@ export class PackStore {
       sharedState,
       cacheEntryLimit,
       boundedMaxDeltaDepth,
-      boundedGraphPageEntries,
     );
     this.#lifecycle = new PackLifecycle(db, repoId, sharedState);
     this.#ingest = new PackIngestEngine(

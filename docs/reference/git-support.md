@@ -665,7 +665,7 @@ is held unless a depth request must renegotiate the boundary. A remote
 whatever its destination. Fetch never requests `thin-pack`, so an incremental
 fetch may transfer more than Git's; a depth-limited fetch receives the whole
 snapshot of its new boundary. A server that sends a thin pack anyway, or a
-delta chain deeper than 50,000 edges, fails with `ECORRUPT` and moves no ref. One
+delta chain deeper than 4,095 edges (Git's `pack-objects` limit), fails with `ECORRUPT` and moves no ref. One
 complete validated pack precedes atomic publication of selected destinations.
 Interrupted ingest, a stale candidate, or one invalid destination moves no ref.
 Every selected ref is authenticated against the received objects before

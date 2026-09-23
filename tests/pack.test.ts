@@ -211,7 +211,7 @@ class ClosingIteratorDatabase implements SqlDatabase {
 
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
     const rows = this.inner.iterate(query, ...bindings);
-    if (query.includes("/* pack-graph-page */")) {
+    if (query.includes("/* pack-graph */")) {
       const iterator = rows[Symbol.iterator]();
       let rowIndex = 0;
       const wrapped: IterableIterator<Record<string, unknown>> = {
@@ -404,11 +404,10 @@ function deltaPack(depth: number): { bytes: Uint8Array; target: Uint8Array; targ
   return { bytes: concat(chunks), target, targetOid };
 }
 
-async function pagedUnionFixture(db: SqlDatabase = new TestDatabase(), options: StoreOptions = {}) {
+async function unionFixture(db: SqlDatabase = new TestDatabase(), options: StoreOptions = {}) {
   const database = new SqliteGitDatabase(db, {
     chunkBytes: 0,
     objectCacheBytes: 0,
-    graphPageEntries: 8,
     ...options,
   });
   const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
@@ -1933,17 +1932,15 @@ describe("pack deferred resolution", () => {
     expect(store.read(objects[999]!.oid)?.data).toEqual(objects[999]!.data);
   });
 
-  it("drives graph pages from the frontier with canonical oid seeks", async () => {
+  it("drives the delta graph with canonical oid seeks", async () => {
     const inner = new TestDatabase();
     try {
       const recorder = new RecordingDatabase(inner);
-      const { store, targets } = await pagedUnionFixture(recorder);
+      const { store, targets } = await unionFixture(recorder);
       recorder.queries.length = 0;
       expect(store.packs.read(targets[0]!.oid)?.data).toEqual(targets[0]!.data);
-      const issued = recorder.queries.find((entry) =>
-        entry.query.includes("/* pack-graph-page */"),
-      );
-      if (issued === undefined) throw new Error("the graph pager was never issued");
+      const issued = recorder.queries.find((entry) => entry.query.includes("/* pack-graph */"));
+      if (issued === undefined) throw new Error("the delta graph was never issued");
       const plan = inner
         .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
         .map((row) => row.detail);
@@ -1967,28 +1964,14 @@ describe("pack deferred resolution", () => {
       expect(recursiveStep).toBeGreaterThanOrEqual(0);
       expect(reachableScan).toBeGreaterThan(recursiveStep);
       expect(childSeek).toBeGreaterThan(reachableScan);
-      // The page roots now come from the owner-scoped frontier rows, which the
-      // primary key already orders: an ordered prefix seek, ahead of every
-      // canonical OID seek, and with no temporary b-tree for the DISTINCT.
-      const frontierSeek = plan.findIndex((detail) =>
-        detail.startsWith("SEARCH git_pack_read_frontier "),
-      );
-      expect(plan[frontierSeek]).toMatch(
-        /SEARCH git_pack_read_frontier USING PRIMARY KEY \(repo_id=\? AND read_id=\? AND step=\?\)/,
-      );
-      expect(plan.join("\n")).not.toContain("TEMP B-TREE");
-      expect(frontierSeek).toBeLessThan(
-        plan.findIndex((detail) => detail.startsWith("SEARCH object ")),
-      );
-      expect(frontierSeek).toBeLessThan(recursiveStep);
     } finally {
       inner.storage.db.close();
     }
   });
 
-  it("pages one shared union graph across every public packed read path", async () => {
-    const { db, targets, store } = await pagedUnionFixture();
-    if (!(db instanceof TestDatabase)) throw new Error("expected pager test database");
+  it("resolves one union graph across every public packed read path", async () => {
+    const { db, targets, store } = await unionFixture();
+    if (!(db instanceof TestDatabase)) throw new Error("expected graph test database");
     const targetOids = targets.map((target) => target.oid);
     const statements: number[] = [];
     db.storage.histogram = new Map();
@@ -1998,9 +1981,9 @@ describe("pack deferred resolution", () => {
     statements.push(db.storage.statementCount);
     expect(
       [...db.storage.histogram]
-        .filter(([query]) => query.includes("/* pack-graph-page */"))
+        .filter(([query]) => query.includes("/* pack-graph */"))
         .reduce((calls, [, count]) => calls + count, 0),
-    ).toBe(4);
+    ).toBe(1);
 
     const first = targets[0]!;
     db.storage.resetCounters();
@@ -2019,8 +2002,8 @@ describe("pack deferred resolution", () => {
     expect(statements.every((count) => count < 1_000)).toBe(true);
   });
 
-  it("reports missing bases, cycles, and depth excess across graph pages without leaking", async () => {
-    const typed = await pagedUnionFixture();
+  it("reports missing bases, cycles, and depth excess in the delta graph", async () => {
+    const typed = await unionFixture();
     expect(() =>
       typed.store.packs.readObjects(
         typed.targets.map((target) => target.oid),
@@ -2028,7 +2011,7 @@ describe("pack deferred resolution", () => {
       ),
     ).toThrow(/is a blob, not a tree/);
 
-    const entryOffset = (fixture: Awaited<ReturnType<typeof pagedUnionFixture>>, oid: string) => {
+    const entryOffset = (fixture: Awaited<ReturnType<typeof unionFixture>>, oid: string) => {
       const offset = fixture.db.scalar<number>(
         "SELECT offset FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND oid = ?",
         fixture.store.sharedRepoId,
@@ -2038,7 +2021,7 @@ describe("pack deferred resolution", () => {
       if (offset === undefined) throw new Error(`pack entry ${oid} disappeared`);
       return offset;
     };
-    const missing = await pagedUnionFixture();
+    const missing = await unionFixture();
     const missingOffset = entryOffset(missing, missing.chain[3]!.oid);
     const missingChild = missing.chain[4]!;
     missing.db.run(
@@ -2051,7 +2034,7 @@ describe("pack deferred resolution", () => {
       `missing delta base at pack ${missing.packId} offset ${missingOffset} for ${missingChild.oid}`,
     );
 
-    const cyclic = await pagedUnionFixture();
+    const cyclic = await unionFixture();
     cyclic.db.run(
       "UPDATE git_pack_entries SET base_offset = ? WHERE repo_id = ? AND pack_id = ? AND oid = ?",
       entryOffset(cyclic, cyclic.chain[cyclic.chain.length - 1]!.oid),
@@ -2066,25 +2049,24 @@ describe("pack deferred resolution", () => {
     } catch (error) {
       pairVerdict = error instanceof Error ? error.message : String(error);
     }
-    // Both origins re-enter an exit they already recorded, so every move in one
-    // batched advance conflicts; the verdict still names an object on the cycle.
+    // Both origins share the cycle; the verdict names an object on it.
     expect(cyclic.chain.map((entry) => `cyclic delta chain at ${entry.oid}`)).toContain(
       pairVerdict,
     );
 
-    await expect(pagedUnionFixture(new TestDatabase(), { maxDeltaDepth: 12 })).rejects.toThrow(
+    await expect(unionFixture(new TestDatabase(), { maxDeltaDepth: 12 })).rejects.toThrow(
       /delta chain deeper than 12/,
     );
   });
 
-  it("closes the graph-page cursor when row validation fails", async () => {
+  it("closes the graph cursor when row validation fails", async () => {
     const inner = new TestDatabase();
     const db = new ClosingIteratorDatabase(inner);
-    const { store, targets } = await pagedUnionFixture(db);
+    const { store, targets } = await unionFixture(db);
     db.corruptNextGraphTraversal = true;
 
     expect(() => store.packs.read(targets[0]!.oid)).toThrow(
-      /paged pack graph contains invalid metadata/,
+      /packed blob index contains invalid metadata/,
     );
     expect(db.graphIteratorReturns).toBe(1);
   });
@@ -2440,7 +2422,7 @@ describe("pack deferred resolution", () => {
   });
 
   it("keeps the production delta limit and enforces its exact boundary", async () => {
-    expect(MAX_DELTA_DEPTH).toBe(50_000);
+    expect(MAX_DELTA_DEPTH).toBe(4_095);
     const ingestAt = async (depth: number, limit: number) => {
       const db = new TestDatabase();
       const database = new SqliteGitDatabase(db, { maxDeltaDepth: limit });

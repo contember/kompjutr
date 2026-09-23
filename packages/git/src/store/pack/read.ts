@@ -30,7 +30,6 @@ export class PackReadEngine {
     sharedState: PackSharedState,
     cacheEntryLimit: number,
     maxDeltaDepth: number,
-    graphPageEntries: number,
   ) {
     this.#db = db;
     this.#repoId = repoId;
@@ -43,14 +42,7 @@ export class PackReadEngine {
       sharedState,
       cacheEntryLimit,
     );
-    this.#resolver = new PackObjectResolver(
-      db,
-      repoId,
-      objects,
-      this.#data,
-      maxDeltaDepth,
-      graphPageEntries,
-    );
+    this.#resolver = new PackObjectResolver(db, repoId, objects, this.#data, maxDeltaDepth);
   }
 
   /** Bytes the chunk cache currently holds. */
@@ -151,13 +143,13 @@ export class PackReadEngine {
 
   read(oid: string): RawObject | null {
     validatePackReadInputs([oid], null);
-    return this.readObjectsBounded([oid], null, null, true, new Map(), false).get(oid) ?? null;
+    return this.readObjectsBounded([oid], null, null, true, false).get(oid) ?? null;
   }
 
-  /** Resolve packed blobs with one graph query and one physical chunk cursor. */
+  /** Resolve packed blobs with bounded graph queries and physical chunk cursors. */
   readBlobs(oids: readonly string[]): Map<string, Uint8Array> {
     validatePackReadInputs(oids, "blob");
-    const objects = this.readObjectsBounded(oids, null, "blob", false, new Map(), false);
+    const objects = this.readObjectsBounded(oids, null, "blob", false, false);
     const blobs = new Map<string, Uint8Array>();
     for (const [oid, object] of objects) {
       if (object.type !== "blob") {
@@ -173,15 +165,13 @@ export class PackReadEngine {
     expectedType: ObjectType | null = null,
   ): Map<string, RawObject> {
     validatePackReadInputs(oids, expectedType);
-    return this.readObjectsBounded(oids, null, expectedType, false, new Map(), false);
+    return this.readObjectsBounded(oids, null, expectedType, false, false);
   }
 
   /** Cold-read and hash one canonical object from a complete pack. */
   readAuthenticatedObject(oid: string, expectedType: ObjectType): RawObject | null {
     validatePackReadInputs([oid], expectedType);
-    const object = this.readObjectsBounded([oid], null, expectedType, true, new Map(), true).get(
-      oid,
-    );
+    const object = this.readObjectsBounded([oid], null, expectedType, true, true).get(oid);
     if (object === undefined) return null;
     if (hashObject(object.type, object.data) !== oid) {
       throw new CorruptError(`packed ${expectedType} ${oid} does not match its bytes`);
@@ -194,7 +184,6 @@ export class PackReadEngine {
     pendingPackId: number | null,
     expectedType: ObjectType | null,
     allowMissing: boolean,
-    seeds: ReadonlyMap<string, RawObject>,
     bypassCache: boolean,
   ): Map<string, RawObject> {
     return this.#resolver.readObjectsBounded(
@@ -202,7 +191,6 @@ export class PackReadEngine {
       pendingPackId,
       expectedType,
       allowMissing,
-      seeds,
       bypassCache,
     );
   }

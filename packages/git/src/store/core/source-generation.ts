@@ -5,8 +5,8 @@ export const SOURCE_GENERATION_EXHAUSTED = "repository source generation is exha
 
 /**
  * Identity of the source set an ordinary complete read sees: for every OID,
- * which loose row or which complete pack serves it and which canonical delta
- * edge it carries. Pending sources are covered by ingest ownership instead.
+ * which loose row or which complete pack serves it. Pending sources are
+ * covered by ingest ownership instead.
  */
 function requireRepositoryId(repoId: number): void {
   if (!Number.isSafeInteger(repoId) || repoId < 1) {
