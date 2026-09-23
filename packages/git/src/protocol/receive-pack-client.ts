@@ -12,7 +12,7 @@ import type {
   ReceivePackRequest,
   ReceivePackStatus,
 } from "./receive-pack-types.js";
-import { baseHeaders, normalizeRemoteUrl } from "./remote-base.js";
+import { baseHeaders, currentProtocolLimits, normalizeRemoteUrl } from "./remote-base.js";
 import { throwIfAborted } from "./stream.js";
 import {
   fetchHttpClient,
@@ -94,7 +94,7 @@ export async function receivePack(
   request: ReceivePackRequest,
   options: ReceivePackOptions = {},
 ): Promise<ReceivePackStatus> {
-  const limits = resolvedStatusLimits(options.protocolLimits);
+  const limits = resolvedStatusLimits(currentProtocolLimits());
   const prepared = prepareRequest(request);
   const base = normalizeRemoteUrl(request.url);
   const certainty: PostCertainty = { invoked: false, safeAbort: false };

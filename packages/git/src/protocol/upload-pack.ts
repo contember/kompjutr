@@ -4,6 +4,7 @@ import { FLUSH, pkt } from "./pktline.js";
 import {
   AGENT,
   baseHeaders,
+  currentProtocolLimits,
   NegotiationBudget,
   normalizeRemoteUrl,
   ownedPktText,
@@ -58,7 +59,7 @@ export async function uploadPack(
   request: UploadPackRequest,
   options: ProtocolRequestOptions = {},
 ): Promise<UploadPackResult> {
-  const entryLimit = resolvedProtocolEntryLimit(options.protocolLimits?.entries);
+  const entryLimit = resolvedProtocolEntryLimit(currentProtocolLimits().entries);
   const base = normalizeRemoteUrl(request.url);
   const filter = uploadPackFilter(request.filter);
   if (filter !== undefined && !request.advertised.has("filter")) {

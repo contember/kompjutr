@@ -143,6 +143,11 @@ function nfaStep(
   return work + epsilon(states, next, maxWork - work);
 }
 
+/** One bit per NFA state plus the accepting state; the matcher budget bounds the steps. */
+function nfaMask(states: readonly NfaState[]): Uint32Array {
+  return new Uint32Array(Math.ceil((states.length + 1) / 32));
+}
+
 function equalBytes(
   left: Uint8Array,
   leftStart: number,
@@ -237,8 +242,8 @@ export function finalMatch(compiled: Compiled, path: EncodedPath): boolean {
   }
   const prefix = prefixMatch(compiled.literalPrefix, path.bytes, 0);
   if (!prefix.matched) return false;
-  let current = new Uint32Array(2);
-  let next = new Uint32Array(2);
+  let current = nfaMask(compiled.states);
+  let next = nfaMask(compiled.states);
   maskSet(current, 0);
   epsilon(compiled.states, current);
   for (const byte of path.bytes) {
@@ -338,8 +343,8 @@ export function matchPatternDepths(
   const prefix = prefixMatch(compiled.literalPrefix, path.bytes, start, maxWork);
   work += prefix.work;
   if (!prefix.matched || work > maxWork) return work;
-  let current = new Uint32Array(2);
-  let next = new Uint32Array(2);
+  let current = nfaMask(compiled.states);
+  let next = nfaMask(compiled.states);
   maskSet(current, 0);
   work += epsilon(compiled.states, current, maxWork - work);
   if (work > maxWork) return work;

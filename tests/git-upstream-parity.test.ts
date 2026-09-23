@@ -6,6 +6,10 @@ import {
   UPSTREAM_GIT_REVISION,
 } from "./helpers/git-parity.js";
 
+const LONG_NAME = `${"generated-segment-".repeat(6)}artifact.log`;
+const DEEP_DIRECTORY = Array.from({ length: 12 }, (_, depth) => `level${depth}`).join("/");
+const MANY_RULES = Array.from({ length: 600 }, (_, rule) => `*.ext${rule}\n`).join("");
+
 const scenarios: GitParityScenario[] = [
   {
     source: { file: "t/t3700-add.sh", test: ".gitignore is honored" },
@@ -69,6 +73,27 @@ const scenarios: GitParityScenario[] = [
       { op: "write", path: "foo/b/bb/1", content: "" },
       { op: "write", path: "foo/b/bb/2", content: "" },
       { op: "clean", directories: true },
+    ],
+  },
+  {
+    source: { file: "t/t0008-ignores.sh", test: "long anchored globstar rule (adapted)" },
+    steps: [
+      { op: "write", path: ".gitignore", content: `a/**/${LONG_NAME}\n` },
+      { op: "write", path: `a/${LONG_NAME}`, content: "" },
+      { op: "write", path: `a/x/y/${LONG_NAME}`, content: "" },
+      { op: "write", path: `b/x/${LONG_NAME}`, content: "" },
+      { op: "write", path: "a/x/other.log", content: "" },
+      { op: "add", paths: ["."] },
+    ],
+  },
+  {
+    source: { file: "t/t0008-ignores.sh", test: "many rules against a deep path (adapted)" },
+    steps: [
+      { op: "write", path: ".gitignore", content: MANY_RULES },
+      { op: "write", path: `${DEEP_DIRECTORY}/ignored.ext599`, content: "" },
+      { op: "write", path: `${DEEP_DIRECTORY}/ignored.ext0`, content: "" },
+      { op: "write", path: `${DEEP_DIRECTORY}/kept.txt`, content: "" },
+      { op: "add", paths: ["."] },
     ],
   },
 ];

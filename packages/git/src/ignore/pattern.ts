@@ -6,7 +6,6 @@ export {
   compilePattern,
   compilePatternBytes,
   encodePath,
-  patternLimits,
   patternLiteral,
   patternMatchesNever,
 } from "./pattern-compile.js";

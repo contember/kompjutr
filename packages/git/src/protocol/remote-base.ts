@@ -12,15 +12,28 @@ export const MAX_PROTOCOL_NEGOTIATION_ENTRIES = 16_384;
 const ERROR_PREFIX_BYTES = 800;
 const ERROR_PREFIX_CHARACTERS = 200;
 export interface ProtocolMemoryLimits {
-  /** Receive-pack test seams for structural input and result limits. */
   retainedBytes?: number;
   inputBytes?: number;
   entries?: number;
   lineBytes?: number;
 }
 
+let protocolLimits: ProtocolMemoryLimits = {};
+
+export function currentProtocolLimits(): ProtocolMemoryLimits {
+  return protocolLimits;
+}
+
+/** Test seam: replaces the limits until restore; readers clamp them to production ceilings. */
+export function setProtocolLimitsForTest(limits: ProtocolMemoryLimits): () => void {
+  const previous = protocolLimits;
+  protocolLimits = limits;
+  return () => {
+    protocolLimits = previous;
+  };
+}
+
 export interface ProtocolRequestOptions extends RemoteRequestOptions {
-  protocolLimits?: ProtocolMemoryLimits;
   authSession?: RemoteAuthSession;
 }
 

@@ -231,25 +231,6 @@ export function targetSegments(tokens: readonly Token[]): number {
   return segments;
 }
 
-export function wildcardSegments(bytes: Uint8Array): number {
-  let count = 0;
-  let wildcard = false;
-  for (let index = 0; index <= bytes.length; index++) {
-    const byte = bytes[index];
-    if (index === bytes.length || (byte === SLASH && !escaped(bytes, index))) {
-      if (wildcard) count++;
-      wildcard = false;
-      continue;
-    }
-    if (byte === BACKSLASH) {
-      index++;
-      continue;
-    }
-    if (byte === STAR || byte === QUESTION || byte === OPEN_CLASS) wildcard = true;
-  }
-  return count;
-}
-
 export function hasGlobstar(bytes: Uint8Array): boolean {
   let segmentStart = 0;
   for (let index = 0; index <= bytes.length; index++) {

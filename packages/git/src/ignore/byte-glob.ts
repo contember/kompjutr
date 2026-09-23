@@ -30,8 +30,6 @@ export function compileByteGlob(
     tokens: parsed.tokens,
     literalPrefix,
     literalSuffix: literalEdge(parsed.tokens, false),
-    wildcardSegments: 0,
-    nfaStates: 0,
     hasStar: parsed.hasStar,
     targetSegments: 1,
   };

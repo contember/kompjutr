@@ -14,12 +14,28 @@ import {
 } from "../packages/git/src/protocol/receive-pack.js";
 import { discover } from "../packages/git/src/protocol/remote.js";
 import {
+  type ProtocolMemoryLimits,
+  setProtocolLimitsForTest,
+} from "../packages/git/src/protocol/remote-base.js";
+import {
   fetchHttpClient,
   type GitHttpClient,
   type GitHttpResponse,
 } from "../packages/git/src/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServer, startGitServer } from "./helpers/http-backend.js";
+
+async function withProtocolLimits<T>(
+  limits: ProtocolMemoryLimits,
+  run: () => Promise<T>,
+): Promise<T> {
+  const restore = setProtocolLimitsForTest(limits);
+  try {
+    return await run();
+  } finally {
+    restore();
+  }
+}
 
 async function* once(...chunks: Uint8Array[]): AsyncGenerator<Uint8Array> {
   for (const chunk of chunks) yield chunk;
@@ -817,23 +833,22 @@ describe("receive-pack status validation and bounds", () => {
   it("preserves caller-lowered status packet, input and result bounds", async () => {
     const body = report([first]);
     await expect(
-      receivePack(baseRequest([first]), {
-        http: async () => response(body),
-        protocolLimits: { entries: 2, inputBytes: body.length - FLUSH.length, retainedBytes: 426 },
-      }),
+      withProtocolLimits(
+        { entries: 2, inputBytes: body.length - FLUSH.length, retainedBytes: 426 },
+        () => receivePack(baseRequest([first]), { http: async () => response(body) }),
+      ),
     ).resolves.toMatchObject({ unpack: "ok" });
 
-    const limits = [
+    const limits: ProtocolMemoryLimits[] = [
       { entries: 1 },
       { inputBytes: body.length - FLUSH.length - 1 },
       { retainedBytes: 425 },
     ];
-    for (const protocolLimits of limits) {
+    for (const lowered of limits) {
       await expect(
-        receivePack(baseRequest([first]), {
-          http: async () => response(body),
-          protocolLimits,
-        }),
+        withProtocolLimits(lowered, () =>
+          receivePack(baseRequest([first]), { http: async () => response(body) }),
+        ),
       ).rejects.toMatchObject({ code: "EPUSHUNCERTAIN", cause: { code: "E2BIG" } });
     }
   });

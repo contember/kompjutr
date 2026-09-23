@@ -551,7 +551,7 @@ describe("gitignore", () => {
     expect(matcher.ignores("d0008/x", false)).toBe(true);
   });
 
-  it("caps one file, aggregate bytes, physical lines and compiled patterns", () => {
+  it("caps one file and aggregate bytes", () => {
     const oversized = makeRepo("/");
     writeWorkFile(oversized, "/.gitignore", "#".repeat(IGNORE_LIMITS.fileBytes + 1));
     expectLimit(() => loadIgnoreMatcher(oversized.worktree, "/"), "fileBytes");
@@ -562,28 +562,6 @@ describe("gitignore", () => {
       writeWorkFile(aggregate, `/d${index}/.gitignore`, part);
     }
     expectLimit(() => loadIgnoreMatcher(aggregate.worktree, "/"), "rawBytes");
-
-    const longLine = makeRepo("/");
-    writeWorkFile(longLine, "/.gitignore", "x".repeat(IGNORE_LIMITS.patternBytes + 1));
-    expectLimit(() => loadIgnoreMatcher(longLine.worktree, "/"), "patternBytes");
-
-    const patterns = makeRepo("/");
-    writeWorkFile(patterns, "/.gitignore", "x\n".repeat(IGNORE_LIMITS.patterns + 1));
-    expectLimit(() => loadIgnoreMatcher(patterns.worktree, "/"), "patterns");
-
-    const compiledBytes = makeRepo("/");
-    const compiledLine = `${"x".repeat(4_000)}\n`;
-    writeWorkFile(compiledBytes, "/.gitignore", compiledLine.repeat(32));
-    writeWorkFile(compiledBytes, "/nested/.gitignore", compiledLine.repeat(33));
-    expectLimit(() => loadIgnoreMatcher(compiledBytes.worktree, "/"), "compiledBytes");
-
-    const wildcardSegments = makeRepo("/");
-    writeWorkFile(
-      wildcardSegments,
-      "/.gitignore",
-      "*?\n".repeat(IGNORE_LIMITS.wildcardSegments + 1),
-    );
-    expectLimit(() => loadIgnoreMatcher(wildcardSegments.worktree, "/"), "wildcardSegments");
   });
 
   it("charges extra patterns to the same fail-closed byte budget", () => {
@@ -702,66 +680,20 @@ describe("gitignore", () => {
 });
 
 describe("bounded ignore pattern matcher", () => {
-  it("accepts every exact matcher boundary and rejects the next unit", () => {
+  it("accepts every exact loader boundary and rejects the next unit", () => {
     const empty = loadIgnoreMatcher(makeRepo("/").worktree, "/");
     expect(empty.ignores("x".repeat(IGNORE_LIMITS.queryBytes), false)).toBe(false);
     expectLimit(() => empty.ignores("x".repeat(IGNORE_LIMITS.queryBytes + 1), false), "queryBytes");
-    expect(
-      empty.ignores(
-        Array.from({ length: IGNORE_LIMITS.querySegments }, () => "x").join("/"),
-        false,
-      ),
-    ).toBe(false);
-    expectLimit(
-      () =>
-        empty.ignores(
-          Array.from({ length: IGNORE_LIMITS.querySegments + 1 }, () => "x").join("/"),
-          false,
-        ),
-      "querySegments",
-    );
-
-    const wildcard = makeRepo("/");
-    const runtimeWildcards = Array.from(
-      { length: 32 },
-      (_, index) => `*a[${"y".repeat(index + 1)}]`,
-    );
-    writeWorkFile(wildcard, "/.gitignore", `${runtimeWildcards.join("\n")}\n`);
-    const wildcardMatcher = loadIgnoreMatcher(wildcard.worktree, "/");
-    expect(wildcardMatcher.ignores(`${"x".repeat(125)}ay`, false)).toBe(true);
-    const workError = expectLimit(
-      () => wildcardMatcher.ignores(`${"x".repeat(126)}ay`, false),
-      "matcherWork",
-    );
-    expect(workError.observed).toBe(IGNORE_LIMITS.matcherWork + 1);
 
     const patternCount = makeRepo("/");
     writeWorkFile(patternCount, "/.gitignore", "literal\n".repeat(IGNORE_LIMITS.patterns));
     loadIgnoreMatcher(patternCount.worktree, "/");
     writeWorkFile(patternCount, "/.gitignore", "literal\n".repeat(IGNORE_LIMITS.patterns + 1));
-    expectLimit(() => loadIgnoreMatcher(patternCount.worktree, "/"), "patterns");
-
-    const compiled = makeRepo("/");
-    const exactCompiled = Array.from(
-      { length: 64 },
-      (_, index) => `${String(index).padStart(2, "0")}${"x".repeat(3_998)}`,
+    const patternError = expectLimit(
+      () => loadIgnoreMatcher(patternCount.worktree, "/"),
+      "patterns",
     );
-    writeWorkFile(compiled, "/.gitignore", `${exactCompiled.slice(0, 32).join("\n")}\n`);
-    writeWorkFile(compiled, "/nested/.gitignore", `${exactCompiled.slice(32).join("\n")}\n`);
-    loadIgnoreMatcher(compiled.worktree, "/");
-    exactCompiled[63] = `${exactCompiled[63]}x`;
-    writeWorkFile(compiled, "/nested/.gitignore", `${exactCompiled.slice(32).join("\n")}\n`);
-    const compiledError = expectLimit(
-      () => loadIgnoreMatcher(compiled.worktree, "/"),
-      "compiledBytes",
-    );
-    expect(compiledError.observed).toBe(IGNORE_LIMITS.compiledBytes + 1);
-
-    const patternBytes = makeRepo("/");
-    writeWorkFile(patternBytes, "/.gitignore", "x".repeat(IGNORE_LIMITS.patternBytes));
-    loadIgnoreMatcher(patternBytes.worktree, "/");
-    writeWorkFile(patternBytes, "/.gitignore", "x".repeat(IGNORE_LIMITS.patternBytes + 1));
-    expectLimit(() => loadIgnoreMatcher(patternBytes.worktree, "/"), "patternBytes");
+    expect(patternError.observed).toBe(IGNORE_LIMITS.patterns + 1);
 
     const fileBytes = makeRepo("/");
     writeWorkFile(fileBytes, "/.gitignore", commentsOfSize(IGNORE_LIMITS.fileBytes));
@@ -776,14 +708,6 @@ describe("bounded ignore pattern matcher", () => {
     loadIgnoreMatcher(rawBytes.worktree, "/");
     writeWorkFile(rawBytes, "/r4/.gitignore", commentsOfSize(200_001));
     expectLimit(() => loadIgnoreMatcher(rawBytes.worktree, "/"), "rawBytes");
-
-    const nfa = makeRepo("/");
-    const atLimit = Array.from({ length: 512 }, () => "abc/**/*");
-    writeWorkFile(nfa, "/.gitignore", `${atLimit.join("\n")}\n`);
-    loadIgnoreMatcher(nfa.worktree, "/");
-    writeWorkFile(nfa, "/.gitignore", `${[...atLimit, "abc/**/*"].join("\n")}\n`);
-    const nfaError = expectLimit(() => loadIgnoreMatcher(nfa.worktree, "/"), "totalNfaStates");
-    expect(nfaError.observed).toBe(IGNORE_LIMITS.totalNfaStates + 8);
 
     const exactNfa = makeRepo("/");
     const exactRule = `a/**/${"b".repeat(59)}`;
@@ -807,19 +731,46 @@ describe("bounded ignore pattern matcher", () => {
     fixtures.push(git);
     expect(() => git.git("check-ignore", "-q", "--no-index", oversizedPath)).not.toThrow();
     writeWorkFile(oversizedNfa, "/.gitignore", `${oversizedRule}\n`);
-    const oversizedNfaError = expectLimit(
-      () => loadIgnoreMatcher(oversizedNfa.worktree, "/"),
-      "nfaStates",
-    );
-    expect(oversizedNfaError.observed).toBeGreaterThan(IGNORE_LIMITS.nfaStates);
+    expect(loadIgnoreMatcher(oversizedNfa.worktree, "/").ignores(oversizedPath, false)).toBe(true);
+  });
+
+  it("admits matcher work up to the request CPU budget", () => {
+    // Each `*q` rule spends two steps rejecting its literal suffix on every segment.
+    const rules = 5_000;
+    const segments = IGNORE_LIMITS.requestCpuWork / (2 * rules);
+    const extra = Array.from({ length: rules }, () => "*q").join("\n");
+    const matcher = loadIgnoreMatcher(makeRepo("/").worktree, "/", { extra: [extra] });
+    const path = (count: number): string => Array.from({ length: count }, () => "x").join("/");
+
+    const start = performance.now();
+    expect(matcher.ignores(path(segments), false)).toBe(false);
+    const duration = performance.now() - start;
+    const error = expectLimit(() => matcher.ignores(path(segments + 1), false), "requestCpuWork");
+
+    expect(error.observed).toBe(IGNORE_LIMITS.requestCpuWork + 1);
+    console.log(`requestCpuWork at limit: ${duration.toFixed(1)} ms`);
+  });
+
+  it("evaluates every rule kind against a path deeper than 128 segments", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/.gitignore", "*.log\nd/**/deep.txt\nexact\n/d/d/anchored\n");
+    const matcher = loadIgnoreMatcher(workspace.worktree, "/");
+    const deep = Array.from({ length: 200 }, () => "d").join("/");
+
+    expect(matcher.ignores(`${deep}/x.log`, false)).toBe(true);
+    expect(matcher.ignores(`${deep}/deep.txt`, false)).toBe(true);
+    expect(matcher.ignores(`${deep}/exact`, false)).toBe(true);
+    expect(matcher.ignores(`${deep}/anchored`, false)).toBe(false);
+    expect(matcher.ignores(`${deep}/kept.txt`, false)).toBe(false);
   });
 
   it("handles maximum-length wildcard input without recursion", () => {
-    const pattern = compilePattern("?".repeat(IGNORE_LIMITS.patternBytes));
+    const length = 16_384;
+    const pattern = compilePattern("?".repeat(length));
     if (pattern === null) throw new Error("pattern did not compile");
 
-    expect(pattern.test("x".repeat(IGNORE_LIMITS.patternBytes))).toBe(true);
-    expect(pattern.test("x".repeat(IGNORE_LIMITS.patternBytes - 1))).toBe(false);
+    expect(pattern.test("x".repeat(length))).toBe(true);
+    expect(pattern.test("x".repeat(length - 1))).toBe(false);
   });
 
   it("keeps globstars, ranges, escapes and unclosed classes bounded", () => {
@@ -893,18 +844,7 @@ describe("bounded ignore pattern matcher", () => {
     expect(matcher.ignores("beta/only-alpha", false)).toBe(false);
   });
 
-  it("charges every duplicate literal candidate before comparing it", () => {
-    const workspace = makeRepo("/");
-    const literal = "x".repeat(31);
-    writeWorkFile(workspace, "/.gitignore", `${literal}\n`.repeat(7_812));
-    const matcher = loadIgnoreMatcher(workspace.worktree, "/");
-
-    const error = expectLimit(() => matcher.ignores(literal, false), "matcherWork");
-
-    expect(error.observed).toBe(IGNORE_LIMITS.matcherWork + 1);
-  });
-
-  it("charges both sides of an adversarial literal hash collision", () => {
+  it("verifies both sides of an adversarial literal hash collision", () => {
     const workspace = makeRepo("/");
     const control = makeRepo("/");
     const left = "c-026r5wh-dsd";
@@ -926,18 +866,17 @@ describe("bounded ignore pattern matcher", () => {
     const matcher = loadIgnoreMatcher(workspace.worktree, "/");
     const controlMatcher = loadIgnoreMatcher(control.worktree, "/");
 
-    const error = expectLimit(() => matcher.ignores(right, false), "matcherWork");
-
-    expect(error.observed).toBe(IGNORE_LIMITS.matcherWork + 1);
+    expect(matcher.ignores(left, false)).toBe(true);
+    expect(matcher.ignores(right, false)).toBe(true);
+    expect(matcher.ignores("c-unrelated", false)).toBe(false);
     expect(controlMatcher.ignores(right, false)).toBe(true);
+    expect(controlMatcher.ignores(left, false)).toBe(false);
   });
 
-  it("charges full source bytes for one-boundary hash collisions and fails closed", () => {
-    const { matcher, queryDirectory, sourceLength } = maximumCollisionMatcher();
-    const path = `${queryDirectory}/file`;
+  it("verifies exact source bytes for one-boundary hash collisions", () => {
+    const { matcher, queryDirectory } = maximumCollisionMatcher();
 
-    const error = expectLimit(() => matcher.ignores(path, false), "matcherWork");
-    expect(error.observed).toBe(new TextEncoder().encode(path).byteLength + sourceLength);
+    expect(matcher.ignores(`${queryDirectory}/never`, false)).toBe(false);
   });
 
   it("evaluates 63 maximum-length anchored deterministic rules without hidden token work", () => {
@@ -948,14 +887,6 @@ describe("bounded ignore pattern matcher", () => {
 
     expect(new TextEncoder().encode(rule)).toHaveLength(4_001);
     expect(matcher.ignores("z", false)).toBe(false);
-    const error = expectLimit(
-      () =>
-        loadIgnoreMatcher(workspace.worktree, "/", {
-          extra: [[...rules, rule].join("\n")],
-        }),
-      "compiledBytes",
-    );
-    expect(error.observed).toBe(256_064);
   });
 
   it("admits 8,192 compiled-never rules without runtime dispatch", () => {
@@ -964,17 +895,9 @@ describe("bounded ignore pattern matcher", () => {
     const matcher = loadIgnoreMatcher(workspace.worktree, "/", { extra: [rules.join("\n")] });
 
     expect(matcher.ignores("never", false)).toBe(false);
-    const error = expectLimit(
-      () =>
-        loadIgnoreMatcher(workspace.worktree, "/", {
-          extra: [[...rules, "never\\"].join("\n")],
-        }),
-      "patterns",
-    );
-    expect(error.observed).toBe(IGNORE_LIMITS.patterns + 1);
   });
 
-  timingIt("loads and evaluates 100 and 1,000 unrelated paths at the work ceiling", () => {
+  timingIt("loads and evaluates 100 and 1,000 unrelated wildcard paths", () => {
     const workspace = makeRepo("/");
     const runtimeWildcards = Array.from(
       { length: 32 },
@@ -1061,12 +984,12 @@ describe("bounded ignore pattern matcher", () => {
     expect(large / small).toBeLessThanOrEqual(12);
   });
 
-  timingIt("fails one maximum-length source collision within bounded time", () => {
+  timingIt("evaluates one maximum-length source collision within bounded time", () => {
     const { matcher, queryDirectory } = maximumCollisionMatcher();
-    const path = `${queryDirectory}/file`;
+    const path = `${queryDirectory}/never`;
 
     const start = performance.now();
-    expectLimit(() => matcher.ignores(path, false), "matcherWork");
+    expect(matcher.ignores(path, false)).toBe(false);
     const duration = performance.now() - start;
 
     expect(duration).toBeLessThan(100);

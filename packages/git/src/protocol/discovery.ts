@@ -3,6 +3,7 @@ import { CorruptError, GitError } from "../common/errors.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../common/ref-name.js";
 import {
   baseHeaders,
+  currentProtocolLimits,
   drain,
   NegotiationBudget,
   normalizeRemoteUrl,
@@ -38,7 +39,7 @@ export async function discover(
   service: Service,
   options: DiscoveryRequestOptions = {},
 ): Promise<Advertisement> {
-  const budget = new NegotiationBudget(resolvedProtocolEntryLimit(options.protocolLimits?.entries));
+  const budget = new NegotiationBudget(resolvedProtocolEntryLimit(currentProtocolLimits().entries));
   const base = normalizeRemoteUrl(url);
   const response = await requestWithAuth(
     {

@@ -16,6 +16,10 @@ import {
   normalizeRemoteUrl,
   uploadPack,
 } from "../packages/git/src/protocol/remote.js";
+import {
+  type ProtocolMemoryLimits,
+  setProtocolLimitsForTest,
+} from "../packages/git/src/protocol/remote-base.js";
 import { ByteReader, pktText } from "../packages/git/src/protocol/stream.js";
 import {
   fetchHttpClient,
@@ -32,6 +36,18 @@ import {
 } from "./helpers/network-integrity.js";
 import { TIMING_GATE } from "./helpers/timing.js";
 import { makeRepo } from "./helpers/workspace.js";
+
+async function withProtocolLimits<T>(
+  limits: ProtocolMemoryLimits,
+  run: () => Promise<T>,
+): Promise<T> {
+  const restore = setProtocolLimitsForTest(limits);
+  try {
+    return await run();
+  } finally {
+    restore();
+  }
+}
 
 describe("sideband termination parity", () => {
   const endings: FrameEnding[] = ["empty", "unknown", "eof", "flush", "progress"];
@@ -548,20 +564,18 @@ describe("discovery", () => {
     const response = () =>
       respond(advertisementBody([line]), "application/x-git-upload-pack-advertisement");
     await expect(
-      discover("http://host/repo", "git-upload-pack", {
-        http: canned(response),
-        protocolLimits: { entries: 4 },
-      }),
+      withProtocolLimits({ entries: 4 }, () =>
+        discover("http://host/repo", "git-upload-pack", { http: canned(response) }),
+      ),
     ).resolves.toMatchObject({
       capabilities: new Set(["thin-pack", symref]),
       headRef,
       refs: [{ name: headRef, oid: OID }],
     });
     await expect(
-      discover("http://host/repo", "git-upload-pack", {
-        http: canned(response),
-        protocolLimits: { entries: 3 },
-      }),
+      withProtocolLimits({ entries: 3 }, () =>
+        discover("http://host/repo", "git-upload-pack", { http: canned(response) }),
+      ),
     ).rejects.toMatchObject({ code: "E2BIG" });
   });
 
@@ -895,10 +909,10 @@ describe("upload-pack", () => {
     };
 
     await expect(
-      uploadPack(request, { http: response(2), protocolLimits: { entries: 2 } }),
+      withProtocolLimits({ entries: 2 }, () => uploadPack(request, { http: response(2) })),
     ).resolves.toMatchObject({ shallow: [OID, OID] });
     await expect(
-      uploadPack(request, { http: response(3), protocolLimits: { entries: 2 } }),
+      withProtocolLimits({ entries: 2 }, () => uploadPack(request, { http: response(3) })),
     ).rejects.toMatchObject({ code: "E2BIG" });
   });
 
@@ -1147,13 +1161,12 @@ describe("upload-pack", () => {
     expect(calls).toBe(1);
     expect(sentBytes).toBeGreaterThan(0);
     await expect(
-      uploadPack(request, { http, protocolLimits: { entries: 2 } }),
+      withProtocolLimits({ entries: 2 }, () => uploadPack(request, { http })),
     ).resolves.toBeDefined();
     expect(calls).toBe(2);
     await expect(
-      uploadPack(
-        { ...request, wants: [OID, "3".repeat(40)] },
-        { http, protocolLimits: { entries: 2 } },
+      withProtocolLimits({ entries: 2 }, () =>
+        uploadPack({ ...request, wants: [OID, "3".repeat(40)] }, { http }),
       ),
     ).rejects.toMatchObject({ code: "E2BIG" });
     expect(calls).toBe(2);

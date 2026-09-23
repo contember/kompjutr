@@ -214,16 +214,13 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
     if (queryBytes > IGNORE_LIMITS.queryBytes) {
       throw new IgnoreLimitError("queryBytes", IGNORE_LIMITS.queryBytes, queryBytes);
     }
-    const encoded = encodePath(path, IGNORE_LIMITS.querySegments);
-    if (encoded.segments > IGNORE_LIMITS.querySegments) {
-      throw new IgnoreLimitError("querySegments", IGNORE_LIMITS.querySegments, encoded.segments);
-    }
+    const encoded = encodePath(path);
 
     let work = 0;
     const addWork = (amount: number): void => {
       const observed = work + amount;
-      if (observed > IGNORE_LIMITS.matcherWork) {
-        throw new IgnoreLimitError("matcherWork", IGNORE_LIMITS.matcherWork, observed);
+      if (observed > IGNORE_LIMITS.requestCpuWork) {
+        throw new IgnoreLimitError("requestCpuWork", IGNORE_LIMITS.requestCpuWork, observed);
       }
       work = observed;
     };
@@ -251,8 +248,8 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
     }
 
     const decisions = new Uint8Array(encoded.segments);
-    const sourceRanks = new Uint16Array(encoded.segments);
-    const lineRanks = new Uint16Array(encoded.segments);
+    const sourceRanks = new Uint32Array(encoded.segments);
+    const lineRanks = new Uint32Array(encoded.segments);
     const decide = (rule: IndexedRule, depth: number, sourceRank: number): void => {
       if (rule.pattern.directoryOnly && depth === encoded.segments && !isDirectory) return;
       const lineRank = rule.line + 1;
@@ -275,7 +272,7 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
           (depth) => {
             decide(rule, depth, sourceRank);
           },
-          IGNORE_LIMITS.matcherWork - work,
+          IGNORE_LIMITS.requestCpuWork - work,
         );
         addWork(patternWork);
       }
@@ -291,7 +288,7 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
               start,
               end,
               rule.literal,
-              IGNORE_LIMITS.matcherWork - work,
+              IGNORE_LIMITS.requestCpuWork - work,
             );
             addWork(compared.work);
             if (compared.matched) decide(rule, depth, sourceRank);
@@ -316,7 +313,7 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
               start,
               end,
               rule.literal,
-              IGNORE_LIMITS.matcherWork - work,
+              IGNORE_LIMITS.requestCpuWork - work,
             );
             addWork(compared.work);
             if (compared.matched) decide(rule, depth, sourceRank);

@@ -29,16 +29,14 @@ export interface NfaState {
 }
 
 export type Compiled =
-  | { kind: "literalBasename"; literal: Uint8Array; wildcardSegments: number; nfaStates: 0 }
-  | { kind: "literalPath"; literal: Uint8Array; wildcardSegments: number; nfaStates: 0 }
+  | { kind: "literalBasename"; literal: Uint8Array }
+  | { kind: "literalPath"; literal: Uint8Array }
   | {
       kind: "deterministic";
       anchored: boolean;
       tokens: readonly Token[];
       literalPrefix: Uint8Array;
       literalSuffix: Uint8Array;
-      wildcardSegments: number;
-      nfaStates: 0;
       hasStar: boolean;
       targetSegments: number;
     }
@@ -46,10 +44,8 @@ export type Compiled =
       kind: "nfa";
       states: readonly NfaState[];
       literalPrefix: Uint8Array;
-      wildcardSegments: number;
-      nfaStates: number;
     }
-  | { kind: "never"; wildcardSegments: number; nfaStates: number };
+  | { kind: "never" };
 
 export interface IgnorePattern {
   negated: boolean;
@@ -60,8 +56,8 @@ export interface IgnorePattern {
 
 export interface EncodedPath {
   bytes: Uint8Array;
-  starts: Uint16Array;
-  ends: Uint16Array;
+  starts: Uint32Array;
+  ends: Uint32Array;
   segments: number;
 }
 

@@ -55,10 +55,9 @@ function compileSource(contents: Uint8Array, budget: IgnoreBudget, path?: string
       lineStart += 3;
     }
     if (lineEnd > lineStart && contents[lineEnd - 1] === 0x0d) lineEnd--;
-    const lineBytes = budget.checkLine(lineEnd - lineStart, path);
     const compiled = compilePatternBytes(contents.subarray(lineStart, lineEnd));
     if (compiled !== null) {
-      budget.addPattern(compiled, lineBytes, path);
+      budget.addPattern(path);
       patterns.push(compiled);
     }
     start = end + 1;
@@ -134,7 +133,7 @@ function compileExtra(extra: readonly string[], budget: IgnoreBudget): IgnorePat
     if (index > 0) budget.addRaw(1, "options.extra");
     budget.addRaw(boundedUtf8Bytes(source, IGNORE_LIMITS.rawBytes), "options.extra");
     const bytes = ENCODER.encode(source);
-    patterns.push(...compileSource(bytes, budget, "options.extra"));
+    for (const pattern of compileSource(bytes, budget, "options.extra")) patterns.push(pattern);
   }
   return patterns;
 }

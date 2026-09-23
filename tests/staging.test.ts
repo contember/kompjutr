@@ -403,7 +403,7 @@ describe("add", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/tracked.txt", "one\n");
     add(workspace.repo, workspace.worktree, { paths: ["tracked.txt"], force: true });
-    writeWorkFile(workspace, "/.gitignore", "*?\n".repeat(IGNORE_LIMITS.wildcardSegments + 1));
+    writeWorkFile(workspace, "/.gitignore", "#".repeat(IGNORE_LIMITS.fileBytes + 1));
     writeWorkFile(workspace, "/tracked.txt", "two\n");
 
     add(workspace.repo, workspace.worktree, { paths: ["tracked.txt"] });
@@ -413,7 +413,7 @@ describe("add", () => {
     );
     writeWorkFile(workspace, "/new.txt", "new\n");
     expect(() => add(workspace.repo, workspace.worktree, { paths: ["new.txt"] })).toThrow(
-      /wildcardSegments/,
+      /fileBytes/,
     );
   });
 
