@@ -9,7 +9,10 @@ import type { GitContext } from "../core/context.js";
 import { requireJournalIdentity } from "../core/journal-input.js";
 import { applyIntegrationOwned } from "../integration/integration-apply-owned.js";
 import { projectIntegrationStepOwned } from "../integration/integration-step.js";
-import { integrationIndexMatchesTree } from "../integration/integration-worktree.js";
+import {
+  integrationIndexMatchesTree,
+  requireBoundedIntegrationTree,
+} from "../integration/integration-worktree.js";
 import { planFixedReplayStepOwned } from "../replay/replay-planning.js";
 import type { ReplayPlan } from "../replay/replay-types.js";
 import { resolveIdentity, writeUnpublishedCommit } from "../repository/commit.js";
@@ -21,8 +24,6 @@ import {
   requireOriginalHead,
   requirePathsOutsideExclusions,
   requireRebaseCursor,
-  requireRebaseIndex,
-  requireRebaseTree,
 } from "./rebase-lifecycle-baseline.js";
 import type { RebaseContinueOptions, RebaseExclusions } from "./rebase-lifecycle-types.js";
 
@@ -85,7 +86,6 @@ export function applyOneStep(
     if (journal.state.phase !== "running") return "conflicted";
     const currentTree = requireCurrentBaseline(repo, worktree, journal.state, exclusions);
     const plan = planCurrentStep(workspace, repo, journal);
-    requireRebaseIndex(repo);
     if (sourceIsEmpty(plan)) {
       const identities = stepIdentities(context, repo, plan.sourceCommit, options);
       const result = writeUnpublishedCommit(repo, {
@@ -112,7 +112,7 @@ export function applyOneStep(
           requirePathsOutsideExclusions([entry.path, entry.logicalPath], exclusions);
         }
       },
-      requireResultTree: (entries) => requireRebaseTree(repo, entries),
+      requireResultTree: (entries) => requireBoundedIntegrationTree(repo, entries),
     });
     let conflicted = false;
     for (const entry of plan.integration.entries)

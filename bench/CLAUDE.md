@@ -17,7 +17,8 @@ npm run bench:workerd:nextjs # clone inside a real SQLite Durable Object
 
 Scenarios: `synthetic.ts` isolates one variable at a time; `macro` replays the
 reference experiment against real repositories; `shell` measures the command
-surface; `nextjs-workflow.ts` runs clone through a 100-file commit and push;
+surface; `nextjs-workflow.ts` runs clone through a 100-file commit and push,
+then rebases that commit onto a new `main` commit;
 `clone-storage.ts` sizes the database a clone leaves behind, against real git.
 `statements.ts` checks correctness and frozen SQL/row baselines for operations
 whose runtime query barriers were removed, and for the sparse fast paths

@@ -16,7 +16,8 @@ import {
   requireBoundedIntegrationTree,
   requireCleanIntegrationWorktree,
 } from "../integration/integration-worktree.js";
-import { type CheckoutBlockerLimits, checkoutBlockers } from "../refs/refs.js";
+import { checkoutBlockers } from "../refs/refs.js";
+import { describeBlockers } from "../refs/refs-checkout-guard.js";
 import { preflightReplayCommitObjects } from "../replay/replay-revision.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
@@ -24,7 +25,7 @@ import type { Worktree } from "../worktree/worktree.js";
 import type { RebaseExclusions } from "./rebase-lifecycle-types.js";
 import type { RebasePlan } from "./rebase-plan.js";
 
-const REBASE_BASELINE_MAX_ENTRIES = 4_096;
+const BASELINE_OBJECT_PAGE = 1_000;
 const REBASE_EXCLUDE_ROOTS = 64;
 export function preflightRebaseReplayObjects(repo: Repository, plan: RebasePlan): void {
   if (plan.relation !== "replay") return;
@@ -76,25 +77,6 @@ export function requirePathsOutsideExclusions(
   }
 }
 
-export function requireRebaseIndex(repo: Repository) {
-  const stats = requireBoundedIntegrationIndex(repo);
-  if (stats.leafEntries > REBASE_BASELINE_MAX_ENTRIES) {
-    throw new GitError("E2BIG", `rebase index exceeds ${REBASE_BASELINE_MAX_ENTRIES} entries`);
-  }
-  return stats;
-}
-
-export function requireRebaseTree(
-  repo: Repository,
-  entries: Parameters<typeof requireBoundedIntegrationTree>[1],
-) {
-  const stats = requireBoundedIntegrationTree(repo, entries);
-  if (stats.leafEntries > REBASE_BASELINE_MAX_ENTRIES) {
-    throw new GitError("E2BIG", `rebase result exceeds ${REBASE_BASELINE_MAX_ENTRIES} entries`);
-  }
-  return stats;
-}
-
 export function requireHead(repo: Repository): { ref: string; oid: string } {
   const head = repo.head();
   if (head.ref === null) throw new GitError("EDETACHED", "cannot rebase with a detached HEAD");
@@ -119,7 +101,7 @@ export function requireCurrentBaseline(
   exclusions: RebaseExclusions,
 ): string {
   const tree = repo.readCommit(state.currentParentOid).tree;
-  requireRebaseIndex(repo);
+  requireBoundedIntegrationIndex(repo);
   if (!integrationIndexMatchesTree(repo, tree)) {
     throw new GitError("ECHECKOUTFAIL", "rebase index differs from its current replay parent");
   }
@@ -138,35 +120,24 @@ export function materializeTree(
     baselineTree,
     tree: targetTree,
     prune: true,
-    limits: checkoutGuardLimits(),
     excludeRoots: exclusions.absolute,
     mode: "checkout",
   });
   if (blockers.tracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",
-      `local changes to ${blockers.tracked.join(", ")} would be overwritten by rebase`,
+      `local changes to ${describeBlockers(blockers.tracked, blockers.trackedOmitted)} would be overwritten by rebase`,
     );
   }
   if (blockers.untracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",
-      `untracked working tree files would be overwritten by rebase: ${blockers.untracked.join(", ")}`,
+      `untracked working tree files would be overwritten by rebase: ${describeBlockers(blockers.untracked, blockers.untrackedOmitted)}`,
     );
   }
   checkoutTreeExcluding(repo, worktree, targetTree, exclusions.absolute, {
     preserveMatchingIndex: true,
-    maxWorktreeRowsPerPass: 50_000,
   });
-}
-
-function checkoutGuardLimits(): CheckoutBlockerLimits {
-  return {
-    maxRows: 50_000,
-    rows: 0,
-    maxHashCandidates: REBASE_BASELINE_MAX_ENTRIES,
-    hashCandidates: 0,
-  };
 }
 
 export function hardMaterializeTree(
@@ -180,38 +151,48 @@ export function hardMaterializeTree(
     baselineTree,
     tree: targetTree,
     prune: true,
-    limits: checkoutGuardLimits(),
     excludeRoots: exclusions.absolute,
     mode: "hard-reset",
   });
   if (blockers.untracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",
-      `untracked working tree files would be overwritten by rebase: ${blockers.untracked.join(", ")}`,
+      `untracked working tree files would be overwritten by rebase: ${describeBlockers(blockers.untracked, blockers.untrackedOmitted)}`,
     );
   }
   checkoutTreeExcluding(repo, worktree, targetTree, exclusions.absolute, {
     preserveMatchingIndex: false,
     restoreStructure: true,
     discardUnmerged: true,
-    maxWorktreeRowsPerPass: 50_000,
   });
 }
 
+/**
+ * One pass over the tree refuses gitlinks, measures each tree object, and
+ * checks blob types a page at a time, so memory is independent of tree size.
+ */
 export function preflightBaselineTree(repo: Repository, treeOid: string): void {
-  const oids: string[] = [];
+  let page = new Set<string>();
+  const flush = (): void => {
+    const oids = [...page];
+    page = new Set<string>();
+    const types = new Map<string, string>();
+    for (const object of repo.store.objectInfo(oids)) types.set(object.oid, object.type);
+    for (const oid of oids) {
+      const type = types.get(oid);
+      if (type === undefined) {
+        throw new CorruptError(`rebase baseline object ${oid} is missing`);
+      }
+      if (type !== "blob") throw new CorruptError(`rebase baseline object ${oid} is not a blob`);
+    }
+  };
   const entries = function* (): Generator<IndexEntry> {
     for (const entry of treeStream(repo, treeOid)) {
       if (entry.mode === "160000") {
         throw new GitError("EUNSUPPORTED", `rebase cannot materialize gitlink ${entry.path}`);
       }
-      if (oids.length >= REBASE_BASELINE_MAX_ENTRIES) {
-        throw new GitError(
-          "E2BIG",
-          `rebase baseline exceeds ${REBASE_BASELINE_MAX_ENTRIES} entries`,
-        );
-      }
-      oids.push(entry.oid);
+      page.add(entry.oid);
+      if (page.size >= BASELINE_OBJECT_PAGE) flush();
       yield {
         path: entry.path,
         stage: 0,
@@ -223,23 +204,9 @@ export function preflightBaselineTree(repo: Repository, treeOid: string): void {
         rev: null,
       };
     }
+    flush();
   };
-  requireRebaseTree(repo, entries());
-  const unique = [...new Set(oids)];
-  const info = repo.store.objectInfo(unique);
-  if (info.length !== unique.length) {
-    throw new CorruptError("rebase baseline object metadata is incomplete");
-  }
-  for (let ordinal = 0; ordinal < info.length; ordinal++) {
-    const object = info[ordinal];
-    const oid = unique[ordinal];
-    if (object === undefined || oid === undefined || object.oid !== oid) {
-      throw new CorruptError("rebase baseline object metadata is out of order");
-    }
-    if (object.type !== "blob") {
-      throw new CorruptError(`rebase baseline object ${object.oid} is not a blob`);
-    }
-  }
+  requireBoundedIntegrationTree(repo, entries());
 }
 
 export function initialState(

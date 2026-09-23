@@ -17,6 +17,7 @@ const CHANGE_COUNT = 100;
 const MAX_SAMPLE_BYTES = 64 * 1024;
 const TEXT_FILE = /\.(?:c|css|go|h|html|js|jsx|md|mjs|rs|sh|toml|ts|tsx|txt|yaml|yml)$/i;
 const MARKER_PREFIX = "/* nextjs workflow benchmark change ";
+const UPSTREAM_FILE = "nextjs-workflow-upstream.txt";
 
 interface Sample {
   path: string;
@@ -267,6 +268,34 @@ export const NEXTJS_WORKFLOW: Scenario = {
       name: "git.status (clean work)",
       async run({ harness }) {
         expectClean(await harness.git.status({ dir: REPO }), "work branch status");
+      },
+    },
+    {
+      name: "git.rebase (100 onto main)",
+      async before({ harness }) {
+        await harness.git.checkout({ dir: REPO, ref: ORIGIN_BRANCH });
+        await harness.workspace.fs.writeFiles([
+          {
+            path: `${REPO}/${UPSTREAM_FILE}`,
+            content: new TextEncoder().encode("upstream\n"),
+            mode: 0o644,
+          },
+        ]);
+        await harness.git.add({ dir: REPO, paths: [UPSTREAM_FILE] });
+        await harness.git.commit({ dir: REPO, message: "Benchmark upstream change" });
+        await harness.git.checkout({ dir: REPO, ref: "bench-work" });
+      },
+      async run({ harness }) {
+        const result = await harness.git.rebase({ dir: REPO, upstream: ORIGIN_BRANCH });
+        if (result.outcome !== "completed" || result.replayed !== 1) {
+          throw new Error(`rebase ended ${result.outcome}, expected one replayed commit`);
+        }
+      },
+    },
+    {
+      name: "git.status (clean rebase)",
+      async run({ harness }) {
+        expectClean(await harness.git.status({ dir: REPO }), "rebased branch status");
       },
     },
   ],

@@ -733,6 +733,37 @@ describe("rebase lifecycle", () => {
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
   });
 
+  it("names the first 100 untracked blockers and counts the rest", async () => {
+    const source = fixture();
+    source.write("base.txt", "base\n");
+    const base = source.commit("base");
+    source.git("checkout", "-q", "-b", "upstream", base);
+    const blocked = Array.from(
+      { length: 150 },
+      (_, index) => `u${index.toString().padStart(3, "0")}`,
+    );
+    for (const path of blocked) source.write(path, "upstream\n");
+    const upstream = source.commit("upstream");
+    source.git("checkout", "-q", "-b", "current", base);
+    source.write("current.txt", "current\n");
+    const original = source.commit("current");
+    const workspace = await imported(source);
+    for (const path of blocked) writeWorkFile(workspace, `/${path}`, "untracked\n");
+
+    let message = "";
+    try {
+      rebase(workspace.context, workspace.repo, workspace.worktree, [], { upstream });
+    } catch (error) {
+      expect(hasErrorCode(error, "ECHECKOUTFAIL")).toBe(true);
+      message = error instanceof Error ? error.message : "";
+    }
+    expect(message).toBe(
+      `untracked working tree files would be overwritten by rebase: ${blocked.slice(0, 100).join(", ")}, and 50 more`,
+    );
+    expect(workspace.repo.head().oid).toBe(original);
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
+  });
+
   it("rejects unsupported source message bytes and encoding headers before mutation", async () => {
     for (const variant of ["invalid-utf8", "encoding-header"]) {
       const source = fixture();

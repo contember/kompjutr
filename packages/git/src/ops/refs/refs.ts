@@ -10,7 +10,7 @@ import { treeOf } from "../repository/reads.js";
 import { expandRefOwned, type Repository, resolveHeadOwned } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { branch } from "./refs-branches.js";
-import { checkoutBlockers } from "./refs-checkout-guard.js";
+import { checkoutBlockers, describeBlockers } from "./refs-checkout-guard.js";
 
 // Branches, tags and HEAD movement, plus the working-tree reconciliation
 // that goes with moving HEAD. Refs are rows; HEAD is a column on the
@@ -179,13 +179,13 @@ function requireCheckoutAllowed(
   if (blocked.tracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",
-      `local changes to ${blocked.tracked.join(", ")} would be overwritten by checkout`,
+      `local changes to ${describeBlockers(blocked.tracked, blocked.trackedOmitted)} would be overwritten by checkout`,
     );
   }
   if (blocked.untracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",
-      `untracked working tree files would be overwritten by checkout: ${blocked.untracked.join(", ")}`,
+      `untracked working tree files would be overwritten by checkout: ${describeBlockers(blocked.untracked, blocked.untrackedOmitted)}`,
     );
   }
 }

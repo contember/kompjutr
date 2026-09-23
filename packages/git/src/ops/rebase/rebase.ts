@@ -9,6 +9,7 @@ import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata } from "../core/ref-log.js";
 import {
   integrationIndexMatchesTree,
+  requireBoundedIntegrationIndex,
   requireCleanIntegrationIndex,
   requireCleanIntegrationWorktree,
 } from "../integration/integration-worktree.js";
@@ -28,7 +29,6 @@ import {
   requireHead,
   requireOriginalHead,
   requireRebaseCursor,
-  requireRebaseIndex,
 } from "./rebase-lifecycle-baseline.js";
 import { driveRebase } from "./rebase-lifecycle-drive.js";
 import { requirePendingStep, stepIdentities } from "./rebase-lifecycle-step.js";
@@ -59,7 +59,7 @@ export function rebase(
     repo.checkout.requireNoOperationState();
     const head = requireHead(repo);
     const originalTree = repo.readCommit(head.oid).tree;
-    requireRebaseIndex(repo);
+    requireBoundedIntegrationIndex(repo);
     requireCleanIntegrationIndex(repo, originalTree, "rebase");
     requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
     const plan = planRebase(repo, { upstream: options.upstream, currentOid: head.oid });
@@ -133,7 +133,7 @@ export function rebaseContinue(
     if (repo.checkout.hasConflicts()) {
       throw new GitError("EUNMERGED", "cannot continue rebase: the index has unmerged paths");
     }
-    requireRebaseIndex(repo);
+    requireBoundedIntegrationIndex(repo);
     requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
     const currentTree = repo.readCommit(journal.state.currentParentOid).tree;
     if (integrationIndexMatchesTree(repo, currentTree)) {

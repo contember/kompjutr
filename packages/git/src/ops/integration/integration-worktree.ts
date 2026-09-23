@@ -11,6 +11,7 @@ import type { IntegrationPlanHandle } from "../../store/operations/integration-w
 import type { IntegrationTouched } from "../../store/operations/integration-workspace/touched.js";
 import type { ProjectedMergeEntry } from "../merge/merge-projection.js";
 import { type CheckoutPathSelection, checkoutBlockers } from "../refs/refs.js";
+import { describeBlockers } from "../refs/refs-checkout-guard.js";
 import type { Repository } from "../repository/repository.js";
 import {
   MAX_TREE_BUILD_LEAF_ENTRIES,
@@ -19,21 +20,9 @@ import {
 } from "../tree/tree-build-full.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { type DirtyPathLimits, dirtyPathStream } from "../worktree/worktree-io.js";
+import { dirtyPathStream } from "../worktree/worktree-io.js";
 
 export const MAX_INTEGRATION_INDEX_ENTRIES = MAX_TREE_BUILD_LEAF_ENTRIES;
-const MAX_REPOSITORY_ROWS = 50_000;
-
-function dirtyPathLimits(): DirtyPathLimits {
-  return {
-    maxIndexRows: MAX_INTEGRATION_INDEX_ENTRIES,
-    indexRows: 0,
-    maxWorktreeRows: MAX_REPOSITORY_ROWS,
-    worktreeRows: 0,
-    maxHashCandidates: MAX_INTEGRATION_INDEX_ENTRIES,
-    hashCandidates: 0,
-  };
-}
 
 export type IntegrationOperation = "merge" | "cherry-pick" | "revert" | "rebase";
 
@@ -126,13 +115,14 @@ export function integrationIndexMatchesTree(repo: Repository, treeOid: string): 
   return true;
 }
 
+/** Streams in fixed hash batches, so the tree size does not bound the check. */
 export function requireCleanIntegrationWorktree(
   repo: Repository,
   worktree: Worktree,
   operation: IntegrationOperation,
   excludeRoots: string[] = [],
 ): void {
-  const iterator = dirtyPathStream(repo, worktree, undefined, dirtyPathLimits(), excludeRoots);
+  const iterator = dirtyPathStream(repo, worktree, undefined, undefined, excludeRoots);
   try {
     const dirty = iterator.next();
     if (dirty.done !== true) {
@@ -153,32 +143,24 @@ function requireSafeIntegrationSelection(
   paths: string[] | CheckoutPathSelection,
   operation: IntegrationOperation,
   baselineTree: string | null | undefined,
-  maxHashCandidates: number,
 ): void {
-  const limits = {
-    maxRows: MAX_REPOSITORY_ROWS,
-    rows: 0,
-    maxHashCandidates,
-    hashCandidates: 0,
-  };
   const blockers = checkoutBlockers(repo, worktree, {
     baselineTree,
     tree: incomingTree,
     paths,
     prune: true,
-    limits,
     mode: "checkout",
   });
   if (blockers.tracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",
-      `local changes to ${blockers.tracked.join(", ")} would be overwritten by ${operation}`,
+      `local changes to ${describeBlockers(blockers.tracked, blockers.trackedOmitted)} would be overwritten by ${operation}`,
     );
   }
   if (blockers.untracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",
-      `untracked working tree files would be overwritten by ${operation}: ${blockers.untracked.join(", ")}`,
+      `untracked working tree files would be overwritten by ${operation}: ${describeBlockers(blockers.untracked, blockers.untrackedOmitted)}`,
     );
   }
 }
@@ -208,15 +190,7 @@ export function requireSafeIntegrationWorktreeOwned(
     },
   };
   try {
-    requireSafeIntegrationSelection(
-      repo,
-      worktree,
-      incomingTree,
-      paths,
-      operation,
-      baselineTree,
-      MAX_REPOSITORY_ROWS,
-    );
+    requireSafeIntegrationSelection(repo, worktree, incomingTree, paths, operation, baselineTree);
   } finally {
     iterator.return(undefined);
   }

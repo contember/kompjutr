@@ -869,8 +869,13 @@ Restrictions, each a stable error rather than a fallback:
 - at most 4,096 replayed commits (`E2BIG`);
 - HEAD must be an existing checked-out symbolic local branch, with a clean index
   and worktree;
-- a materialized baseline or result tree is limited to 4,096 entries and 32 MiB
-  of blob content; gitlinks cannot be materialized;
+- one materialized tree object holds at most 10,000 entries, a replay step
+  joins at most 200,000 paths across its three trees, and checkout keeps at
+  most 16 MiB of pending removal paths (`E2BIG`); the repository size is
+  otherwise not capped, because the baseline preflight, the clean-worktree
+  check, and the overwrite guard stream and hash in fixed batches; a refusal
+  names the first 100 blocking paths of each kind and counts the rest; gitlinks
+  cannot be materialized;
 - source messages must be valid UTF-8 without an `encoding` header.
 
 `RebaseResult` is `up-to-date`, `completed` (with `replayed`, `skipped`,

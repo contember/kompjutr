@@ -15,7 +15,6 @@ import {
   walkWorktreeEntriesStream,
 } from "./worktree-io-walk.js";
 
-const DIRTY_EXCLUDED_SCAN_ROWS = 100_000;
 const HASH_BATCH = 1000;
 
 /**
@@ -235,7 +234,6 @@ function* scanDirtyWorktreeEntries(
   for (const entry of walkWorktreeEntriesStream(worktree, lexicalRoot, {
     excludeRoots,
     includeIgnored: true,
-    maxScanRows: DIRTY_EXCLUDED_SCAN_ROWS,
   })) {
     if (entry.stat.type === "dir") continue;
     if (limits !== undefined) {

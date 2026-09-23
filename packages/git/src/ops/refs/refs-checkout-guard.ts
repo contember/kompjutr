@@ -15,12 +15,24 @@ import {
 } from "../worktree/worktree-io.js";
 
 const CHECKOUT_GUARD_BATCH = 1_000;
+/** A refusal names this many paths of each kind; the rest are counted. */
+const MAX_REPORTED_BLOCKERS = 100;
 
 export interface CheckoutBlockers {
-  /** Tracked paths carrying uncommitted work the checkout would discard. */
+  /** The first tracked paths, in path order, carrying uncommitted work the checkout would discard. */
   tracked: string[];
-  /** Untracked files the target tree would write over. */
+  /** The first untracked files, in path order, the target tree would write over. */
   untracked: string[];
+  /** Tracked blockers beyond `tracked`; absent when none were left out. */
+  trackedOmitted?: number;
+  /** Untracked blockers beyond `untracked`; absent when none were left out. */
+  untrackedOmitted?: number;
+}
+
+/** A refusal's path list, visibly truncated when blockers were left out. */
+export function describeBlockers(paths: readonly string[], omitted: number | undefined): string {
+  const listed = paths.join(", ");
+  return omitted === undefined ? listed : `${listed}, and ${omitted} more`;
 }
 
 export interface CheckoutBlockerLimits {
@@ -64,8 +76,8 @@ export function checkoutBlockers(
   const { tree, paths, prune, limits } = guard;
   const excludeRoots = guard.excludeRoots ?? [];
   const discardTrackedChanges = guard.mode === "hard-reset";
-  const tracked: string[] = [];
-  const untracked: string[] = [];
+  const tracked = new BlockerList();
+  const untracked = new BlockerList();
   const dirtyCandidates: GuardCandidate[] = [];
   const pendingTargets: PendingTarget[] = [];
   const pendingTrackedPaths: PendingTarget[] = [];
@@ -164,9 +176,36 @@ export function checkoutBlockers(
     }
   }
   flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, limits, hashCursor);
-  tracked.sort(comparePaths);
-  untracked.sort(comparePaths);
-  return { tracked, untracked };
+  const blockers: CheckoutBlockers = { tracked: tracked.first(), untracked: untracked.first() };
+  if (tracked.omitted() > 0) blockers.trackedOmitted = tracked.omitted();
+  if (untracked.omitted() > 0) blockers.untrackedOmitted = untracked.omitted();
+  return blockers;
+}
+
+/** Keeps the first blockers in path order and counts the rest, so a refusal stays bounded. */
+class BlockerList {
+  #paths: string[] = [];
+  #total = 0;
+
+  add(path: string): void {
+    this.#total++;
+    this.#paths.push(path);
+    if (this.#paths.length >= 2 * MAX_REPORTED_BLOCKERS) this.#trim();
+  }
+
+  first(): string[] {
+    this.#trim();
+    return this.#paths;
+  }
+
+  omitted(): number {
+    return this.#total - Math.min(this.#total, MAX_REPORTED_BLOCKERS);
+  }
+
+  #trim(): void {
+    this.#paths.sort(comparePaths);
+    if (this.#paths.length > MAX_REPORTED_BLOCKERS) this.#paths.length = MAX_REPORTED_BLOCKERS;
+  }
 }
 
 interface CheckoutGuardRow {
@@ -221,8 +260,8 @@ interface PendingTarget {
   upper: string;
 }
 
-function retainBlocker(paths: string[], path: string): void {
-  paths.push(path);
+function retainBlocker(paths: BlockerList, path: string): void {
+  paths.add(path);
 }
 
 function retainRange(ranges: PendingTarget[], path: string): void {
@@ -246,7 +285,7 @@ function findAncestor(ranges: PendingTarget[], path: string): PendingTarget | un
 function convertRangeToBlocker(
   ranges: PendingTarget[],
   range: PendingTarget,
-  blockers: string[],
+  blockers: BlockerList,
 ): void {
   ranges.splice(ranges.indexOf(range), 1);
   retainBlocker(blockers, range.path);
@@ -256,7 +295,7 @@ function flushGuardCandidates(
   repo: Repository,
   worktree: Worktree,
   candidates: GuardCandidate[],
-  tracked: string[],
+  tracked: BlockerList,
   limits: CheckoutBlockerLimits | undefined,
   hashCursor: WorktreeHashCursor,
 ): void {
