@@ -7,7 +7,8 @@ inside a cgroup with a hard memory limit, and writes to `bench/results/`.
 npm run bench          # every scenario
 npm run bench:macro    # macro-packed, macro-loose
 npm run bench:nextjs   # the Next.js workflow
-npm run bench:statements -- --check  # deterministic SQL/row regression gate
+npm run bench:statements -- --check  # SQL/row regression gate with tolerance
+npm run bench:statements -- --check --nextjs <path>  # also gate a Next.js result
 npm run bench:clone-storage  # SQLite bytes a clone costs, and where they go
 npm run bench:memory         # cgroup-backed bounded-memory evidence under cpu-lease
 npm run bench:memory -- --runtime-check  # focused lease/cgroup wiring witness
@@ -19,10 +20,14 @@ reference experiment against real repositories; `shell` measures the command
 surface; `nextjs-workflow.ts` runs clone through a 100-file commit and push;
 `clone-storage.ts` sizes the database a clone leaves behind, against real git.
 `statements.ts` checks correctness and frozen SQL/row baselines for operations
-whose runtime query barriers were removed. It reports whether each row meets the
-at-most-1,000-statement target. A target miss alone does not fail `--check` and
-never licenses a runtime refusal; missing rows, invalid end states, and frozen-
-baseline regressions do fail.
+whose runtime query barriers were removed, and for the sparse fast paths
+(`status.sparse-*`, `staging.add-selected`, `worktree.list`). It reports whether
+each row meets the at-most-1,000-statement target. A target miss alone does not
+fail `--check` and never licenses a runtime refusal. Missing rows, invalid end
+states, non-linear scaling rows, any statement rise, and rows read above
+`baseline × 1.10 + 16` fail. A drop passes and prints a "rebaseline available"
+note. The thresholds live in `statement-gate.ts`.
+Next.js references are report-only unless `--nextjs <path>` names a result.
 `memory.ts` exercises streamed operations above retired cumulative byte limits.
 Its SQL target is report-only; semantic, CPU-lease, and cgroup
 validation failures are hard failures. The runner reserves its own CPU lease.

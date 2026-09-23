@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
 import { createFilesystem } from "../packages/do/src/fs/filesystem.js";
 import { CHUNK_SIZE } from "../packages/do/src/fs/schema.js";
 import { createInitialWorktreeWriter } from "../packages/do/src/fs/store/initial-write.js";
@@ -49,6 +50,7 @@ import { startGitServer } from "../tests/helpers/http-backend.js";
 import { importFixture } from "../tests/helpers/import.js";
 import { SqliteTestStorage } from "../tests/helpers/storage.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "../tests/helpers/workspace.js";
+import { type GatedRow, type GateOutcome, gateRows } from "./statement-gate.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RESULTS = join(HERE, "results");
@@ -158,6 +160,10 @@ type RequiredRow =
   | "staging.add"
   | "staging.rm"
   | "status.full"
+  | "status.sparse-clean"
+  | "status.sparse-dirty"
+  | "staging.add-selected"
+  | "worktree.list"
   | "checkout.initial"
   | "commit.sparse"
   | "diff.index-worktree"
@@ -198,6 +204,10 @@ const REQUIRED_ROWS: readonly RequiredRow[] = [
   "staging.add",
   "staging.rm",
   "status.full",
+  "status.sparse-clean",
+  "status.sparse-dirty",
+  "staging.add-selected",
+  "worktree.list",
   "checkout.initial",
   "commit.sparse",
   "diff.index-worktree",
@@ -259,7 +269,8 @@ interface History {
   incoming: string;
 }
 
-// Frozen at the pre-sprint implementation. A target miss is reported separately.
+// Frozen at the pre-sprint implementation; the status.sparse, staging.add-selected
+// and worktree.list rows at fc25987. A target miss is reported separately.
 const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "schema.init": 97,
   "fs.redirect.stream": 32,
@@ -272,6 +283,10 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "staging.add": 18,
   "staging.rm": 27,
   "status.full": 28,
+  "status.sparse-clean": 7,
+  "status.sparse-dirty": 24,
+  "staging.add-selected": 25,
+  "worktree.list": 4,
   "checkout.initial": 24,
   "commit.sparse": 37,
   "diff.index-worktree": 35,
@@ -313,6 +328,10 @@ const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
   "staging.add": 26,
   "staging.rm": 31,
   "status.full": 31,
+  "status.sparse-clean": 5,
+  "status.sparse-dirty": 23,
+  "staging.add-selected": 33,
+  "worktree.list": 8,
   "checkout.initial": 21,
   "commit.sparse": 28,
   "diff.index-worktree": 35,
@@ -341,6 +360,13 @@ const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
   "transport.fetch": 64,
   "transport.push": 59,
 };
+
+const FULL_INDEX_SCAN_SQL =
+  "SELECT entry.path, entry.stage, entry.mode, entry.oid, entry.size, entry.mtime, entry.ino, entry.rev FROM git_index entr";
+const TRACKER_DIRTY_SQL = "SELECT path, flags FROM git_index_dirty WHERE checkout_id = ?";
+const SPARSE_HYDRATE_WORKTREE_SQL = "WITH wanted(ordinal, relative) AS MATERIALIZED";
+const SELECTED_EXACT_INDEX_SQL =
+  "WITH wanted(path) AS MATERIALIZED ( SELECT json_extract(value, '$.p') FROM json_each(?) ) SELECT candidate.path";
 
 const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
   {
@@ -371,6 +397,20 @@ const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
     source: "2026-09-07 pre-split HEAD baseline",
   },
 ];
+
+async function withQueries<T>(
+  storage: SqliteTestStorage,
+  run: () => T | Promise<T>,
+): Promise<{ value: T; queries: string }> {
+  const histogram = new Map<string, number>();
+  storage.histogram = histogram;
+  try {
+    const value = await run();
+    return { value, queries: [...histogram.keys()].join("\n") };
+  } finally {
+    storage.histogram = null;
+  }
+}
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -1007,6 +1047,193 @@ async function statusFullRow(rows: ResultRow[]): Promise<void> {
           dirty[1]?.path === "z-untracked.txt" &&
           dirty[1].flags === WORKTREE_DIRTY,
         "full status changed tracker seed",
+      );
+    },
+  );
+}
+
+async function statusSparseRows(rows: ResultRow[]): Promise<void> {
+  const workspace = makeRepo("/");
+  workspace.repo.store.configSet("user.name", IDENTITY.name);
+  workspace.repo.store.configSet("user.email", IDENTITY.email);
+  writeWorkFile(workspace, "/a.txt", "before\n");
+  writeWorkFile(workspace, "/stable.txt", "stable\n");
+  add(workspace.repo, workspace.worktree, { paths: [], all: true });
+  const base = commit(workspace.context, workspace.repo, { message: "status base" }).oid;
+  const baseTree = workspace.repo.readCommit(base).tree;
+  const baseBlob = hashObject("blob", utf8.encode("before\n"));
+  const sparseWorkspace = workspace.context.sparseWorkspace;
+  assert(sparseWorkspace !== undefined, "sparse status fixture has no sparse source");
+  let reseals = 0;
+  const statusContext = {
+    sparseWorkspace,
+    indexTracker: {
+      reseal: (
+        checkoutId: number,
+        baselineTreeOid: string | null,
+        entries: Iterable<{
+          path: string;
+          flags: number;
+        }>,
+      ) => {
+        reseals++;
+        return resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries);
+      },
+    },
+  };
+  assert(
+    resealIndexTracker(workspace.database.db, workspace.repo.checkout.checkoutId, baseTree, []),
+    "sparse status fixture did not seal its tracker",
+  );
+  const assertSparsePath = (queries: string, label: string): void => {
+    assert(queries.includes(TRACKER_DIRTY_SQL), `${label} did not read tracker dirty paths`);
+    assert(!queries.includes(FULL_INDEX_SCAN_SQL), `${label} fell back to a full index scan`);
+  };
+
+  await measure(
+    rows,
+    workspace.storage,
+    "status.sparse-clean",
+    () =>
+      withQueries(workspace.storage, () =>
+        eagerStatus(workspace.repo, workspace.worktree, {}, statusContext),
+      ),
+    ({ value: statusRows, queries }) => {
+      assert(statusRows.length === 0, "clean sparse status reported rows");
+      assertSparsePath(queries, "clean sparse status");
+      assert(reseals === 0, "clean sparse status resealed its tracker");
+    },
+  );
+
+  writeWorkFile(workspace, "/a.txt", "after\n");
+  writeWorkFile(workspace, "/z-untracked.txt", "untracked\n");
+  await measure(
+    rows,
+    workspace.storage,
+    "status.sparse-dirty",
+    () =>
+      withQueries(workspace.storage, () =>
+        eagerStatus(workspace.repo, workspace.worktree, {}, statusContext),
+      ),
+    ({ value: statusRows, queries }) => {
+      assertSparsePath(queries, "dirty sparse status");
+      assert(
+        queries.includes(SPARSE_HYDRATE_WORKTREE_SQL),
+        "dirty sparse status did not hydrate its candidates",
+      );
+      assert(reseals === 1, "dirty sparse status did not reseal its tracker");
+      assert(statusRows.length === 2, "dirty sparse status changed row count");
+      const tracked = statusRows[0];
+      const untracked = statusRows[1];
+      assert(
+        tracked !== undefined &&
+          tracked.path === "a.txt" &&
+          tracked.index === " " &&
+          tracked.worktree === "M" &&
+          "headOid" in tracked &&
+          tracked.headOid === baseBlob &&
+          tracked.indexOid === baseBlob,
+        "dirty sparse status changed tracked row",
+      );
+      assert(
+        untracked !== undefined &&
+          untracked.path === "z-untracked.txt" &&
+          untracked.index === " " &&
+          untracked.worktree === "?",
+        "dirty sparse status changed untracked row",
+      );
+      assert(workspace.repo.head().oid === base, "sparse status moved HEAD");
+      assert(workspace.repo.headTree() === baseTree, "sparse status moved HEAD tree");
+    },
+  );
+}
+
+async function stagingAddSelectedRow(rows: ResultRow[]): Promise<void> {
+  const storage = new SqliteTestStorage();
+  const workspace = new Workspace({
+    storage,
+    git: createGit(),
+    now: () => 1_600_000_000_000,
+    defaultGitIdentity: IDENTITY,
+  });
+  const git = workspace.git;
+  await git.init({ dir: "/repo" });
+  for (const path of ["a.txt", "dir/b.txt", "dir/c.txt", "z.txt"]) {
+    workspace.filesystem.writeFiles([
+      { path: `/repo/${path}`, bytes: utf8.encode(`${path}\n`), mode: 0o644 },
+    ]);
+  }
+  await git.add({ dir: "/repo", paths: [], all: true });
+  const base = (await git.commit({ dir: "/repo", message: "selected base" })).oid;
+  workspace.filesystem.writeFiles([
+    { path: "/repo/dir/b.txt", bytes: utf8.encode("changed\n"), mode: 0o644 },
+    { path: "/repo/new.txt", bytes: utf8.encode("new\n"), mode: 0o644 },
+    { path: "/repo/z.txt", bytes: utf8.encode("unstaged\n"), mode: 0o644 },
+  ]);
+  await measure(
+    rows,
+    storage,
+    "staging.add-selected",
+    () => withQueries(storage, () => git.add({ dir: "/repo", paths: ["dir/b.txt", "new.txt"] })),
+    async ({ queries }) => {
+      assert(
+        queries.includes(SELECTED_EXACT_INDEX_SQL),
+        "selected add skipped the selected source",
+      );
+      assert(!queries.includes(FULL_INDEX_SCAN_SQL), "selected add fell back to a full index scan");
+      assert(
+        (await git.revParse({ dir: "/repo", ref: "HEAD" })) === base,
+        "selected add moved HEAD",
+      );
+      const entries = await git.status({ dir: "/repo" });
+      sameStrings(
+        entries.map((entry) => `${entry.index}${entry.worktree} ${entry.path}`),
+        ["M  dir/b.txt", "A  new.txt", " M z.txt"],
+        "selected add status",
+      );
+    },
+  );
+}
+
+async function worktreeListRow(rows: ResultRow[]): Promise<void> {
+  const storage = new SqliteTestStorage();
+  const workspace = new Workspace({
+    storage,
+    git: createGit(),
+    now: () => 1_600_000_000_000,
+    defaultGitIdentity: IDENTITY,
+  });
+  const git = workspace.git;
+  await git.init({ dir: "/repo" });
+  workspace.filesystem.writeFiles([
+    { path: "/repo/file.txt", bytes: utf8.encode("file\n"), mode: 0o644 },
+  ]);
+  await git.add({ dir: "/repo", paths: ["file.txt"] });
+  const base = (await git.commit({ dir: "/repo", message: "worktree base" })).oid;
+  await git.worktreeAdd({
+    dir: "/repo",
+    root: "/left",
+    target: { kind: "new-branch", name: "left" },
+  });
+  await git.worktreeAdd({
+    dir: "/repo",
+    root: "/right",
+    target: { kind: "detached", startPoint: base },
+  });
+  await measure(
+    rows,
+    storage,
+    "worktree.list",
+    () => git.worktreeList({ dir: "/repo" }),
+    (worktrees) => {
+      sameStrings(
+        worktrees.map((entry) => `${entry.root} ${entry.head} ${entry.isPrimary} ${entry.state}`),
+        [
+          "/left ref: refs/heads/left false present",
+          "/repo ref: refs/heads/main true present",
+          `/right ${base} false present`,
+        ],
+        "worktree list",
       );
     },
   );
@@ -2231,6 +2458,7 @@ async function transportRows(rows: ResultRow[]): Promise<void> {
 function nextjsRow(
   value: unknown,
   operation: NextjsReference["operation"],
+  source: string,
 ): NextjsReference | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   if (Reflect.get(value, "operation") !== operation) return null;
@@ -2241,12 +2469,7 @@ function nextjsRow(
     return null;
   }
   if (!Number.isSafeInteger(rowsRead) || typeof rowsRead !== "number" || rowsRead < 0) return null;
-  return {
-    operation,
-    statements,
-    rowsRead,
-    source: "bench/results/nextjs-workflow.json",
-  };
+  return { operation, statements, rowsRead, source };
 }
 
 function requiredNextjsOperation(value: unknown): NextjsReference["operation"] | null {
@@ -2257,14 +2480,14 @@ function requiredNextjsOperation(value: unknown): NextjsReference["operation"] |
   return null;
 }
 
-function parseNextjsReferences(value: unknown): NextjsReference[] {
+function parseNextjsReferences(value: unknown, source: string): NextjsReference[] {
   if (!Array.isArray(value)) throw new Error("Next.js benchmark result is not an array");
   const found: NextjsReference[] = [];
   for (const candidate of value) {
     if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) continue;
     const operation = requiredNextjsOperation(Reflect.get(candidate, "operation"));
     if (operation === null) continue;
-    const row = nextjsRow(candidate, operation);
+    const row = nextjsRow(candidate, operation, source);
     if (row === null) throw new Error(`Next.js benchmark has malformed ${operation}`);
     if (found.some((existing) => existing.operation === operation)) {
       throw new Error(`Next.js benchmark duplicates ${operation}`);
@@ -2292,13 +2515,14 @@ function checkNextjsReferenceParser(): void {
     "Next.js parser fixture is empty",
   );
   assert(
-    parseNextjsReferences([...valid, { operation: "git.status", status: "error" }]).length === 3,
+    parseNextjsReferences([...valid, { operation: "git.status", status: "error" }], "self-test")
+      .length === 3,
     "Next.js parser rejected unrelated phases",
   );
   const expectFailure = (input: unknown, label: string): void => {
     let failed = false;
     try {
-      parseNextjsReferences(input);
+      parseNextjsReferences(input, "self-test");
     } catch {
       failed = true;
     }
@@ -2318,101 +2542,99 @@ function checkNextjsReferenceParser(): void {
     ],
     "a malformed required row before a valid duplicate",
   );
-  for (const reference of FROZEN_NEXTJS_REFERENCES) {
-    let rejectedZeroRows = false;
-    try {
-      checkNextjsReference({ ...reference, rowsRead: 0 });
-    } catch {
-      rejectedZeroRows = true;
-    }
-    assert(
-      rejectedZeroRows,
-      `Next.js row baseline accepted zero rows read for ${reference.operation}`,
-    );
-  }
 }
 
-function loadNextjsReferences(): NextjsReference[] {
-  const path = join(RESULTS, "nextjs-workflow.json");
-  let parsed: unknown;
+interface NextjsInput {
+  references: NextjsReference[];
+  /** Only an explicitly named result gates; the default result is report-only. */
+  gated: boolean;
+}
+
+function readNextjsReferences(path: string, source: string): NextjsReference[] {
+  return parseNextjsReferences(JSON.parse(readFileSync(path, "utf8")), source);
+}
+
+function loadNextjsReferences(explicitPath: string | undefined): NextjsInput {
+  if (explicitPath !== undefined) {
+    return { references: readNextjsReferences(explicitPath, explicitPath), gated: true };
+  }
   try {
-    parsed = JSON.parse(readFileSync(path, "utf8"));
+    return {
+      references: readNextjsReferences(
+        join(RESULTS, "nextjs-workflow.json"),
+        "bench/results/nextjs-workflow.json",
+      ),
+      gated: false,
+    };
   } catch (error) {
     if (typeof error === "object" && error !== null && Reflect.get(error, "code") === "ENOENT") {
-      return FROZEN_NEXTJS_REFERENCES.map((row) => ({ ...row }));
+      return { references: FROZEN_NEXTJS_REFERENCES.map((row) => ({ ...row })), gated: false };
     }
     throw error;
   }
-  return parseNextjsReferences(parsed);
 }
 
-function roundedThreeSignificantRows(rowsRead: number): number {
-  if (rowsRead < 1_000) return rowsRead;
-  const factor = 10 ** (Math.floor(Math.log10(rowsRead)) - 2);
-  return Math.round(rowsRead / factor) * factor;
-}
-
-function checkNextjsReference(reference: NextjsReference): void {
-  const baseline = FROZEN_NEXTJS_REFERENCES.find(
-    (candidate) => candidate.operation === reference.operation,
-  );
-  if (baseline === undefined) throw new Error(`unexpected Next.js row: ${reference.operation}`);
-  if (reference.statements > baseline.statements) {
-    throw new Error(
-      `${reference.operation}: ${reference.statements} statements regress frozen Next.js baseline ${baseline.statements}`,
+function nextjsGateRows(references: readonly NextjsReference[]): GatedRow[] {
+  return references.map((reference) => {
+    const baseline = FROZEN_NEXTJS_REFERENCES.find(
+      (candidate) => candidate.operation === reference.operation,
     );
-  }
-  if (
-    roundedThreeSignificantRows(reference.rowsRead) !==
-    roundedThreeSignificantRows(baseline.rowsRead)
-  ) {
-    throw new Error(
-      `${reference.operation}: ${reference.rowsRead} rows differ from three-significant-figure Next.js baseline ${baseline.rowsRead}`,
-    );
-  }
+    if (baseline === undefined) throw new Error(`unexpected Next.js row: ${reference.operation}`);
+    return {
+      operation: `nextjs:${reference.operation}`,
+      statements: reference.statements,
+      rowsRead: reference.rowsRead,
+      baselineStatements: baseline.statements,
+      baselineRowsRead: baseline.rowsRead,
+    };
+  });
 }
 
-function checkReport(report: StatementReport): void {
+function structuralFailures(rows: readonly ResultRow[]): string[] {
+  const failures: string[] = [];
   const seen = new Set<string>();
-  for (const row of report.rows) {
-    if (seen.has(row.operation)) throw new Error(`duplicate statement row: ${row.operation}`);
+  for (const row of rows) {
+    if (seen.has(row.operation)) failures.push(`duplicate statement row: ${row.operation}`);
     seen.add(row.operation);
-    if (row.baselineStatements !== null && row.statements > row.baselineStatements) {
-      throw new Error(
-        `${row.operation}: ${row.statements} statements regress frozen baseline ${row.baselineStatements}`,
-      );
-    }
-    if (row.baselineRowsRead !== null && row.rowsRead !== row.baselineRowsRead) {
-      throw new Error(
-        `${row.operation}: ${row.rowsRead} rows differ from frozen baseline ${row.baselineRowsRead}`,
-      );
-    }
-  }
-  const n = report.rows.find((row) => row.operation === "rebase.transition-n");
-  const twoN = report.rows.find((row) => row.operation === "rebase.transition-2n");
-  if (n === undefined || twoN === undefined) {
-    throw new Error("rebase transition scaling rows are missing");
-  }
-  if (twoN.statements > n.statements * 2 || twoN.rowsRead > n.rowsRead * 2) {
-    throw new Error(
-      `rebase transition growth is not linear: N=${n.statements}/${n.rowsRead}, 2N=${twoN.statements}/${twoN.rowsRead}`,
-    );
-  }
-  const markN = report.rows.find((row) => row.operation === "maintenance.mark-depth-n");
-  const mark2N = report.rows.find((row) => row.operation === "maintenance.mark-depth-2n");
-  if (markN === undefined || mark2N === undefined) {
-    throw new Error("maintenance mark scaling rows are missing");
-  }
-  if (mark2N.statements > markN.statements * 2.5 || mark2N.rowsRead > markN.rowsRead * 2.5) {
-    throw new Error(
-      `maintenance mark growth is not linear: N=${markN.statements}/${markN.rowsRead}, ` +
-        `2N=${mark2N.statements}/${mark2N.rowsRead}`,
-    );
   }
   for (const required of REQUIRED_ROWS) {
-    if (!seen.has(required)) throw new Error(`missing statement row: ${required}`);
+    if (!seen.has(required)) failures.push(`missing statement row: ${required}`);
   }
-  for (const reference of report.nextjsReferences) checkNextjsReference(reference);
+  const n = rows.find((row) => row.operation === "rebase.transition-n");
+  const twoN = rows.find((row) => row.operation === "rebase.transition-2n");
+  if (n !== undefined && twoN !== undefined) {
+    if (twoN.statements > n.statements * 2 || twoN.rowsRead > n.rowsRead * 2) {
+      failures.push(
+        `rebase transition growth is not linear: N=${n.statements}/${n.rowsRead}, 2N=${twoN.statements}/${twoN.rowsRead}`,
+      );
+    }
+  }
+  const markN = rows.find((row) => row.operation === "maintenance.mark-depth-n");
+  const mark2N = rows.find((row) => row.operation === "maintenance.mark-depth-2n");
+  if (markN !== undefined && mark2N !== undefined) {
+    if (mark2N.statements > markN.statements * 2.5 || mark2N.rowsRead > markN.rowsRead * 2.5) {
+      failures.push(
+        `maintenance mark growth is not linear: N=${markN.statements}/${markN.rowsRead}, ` +
+          `2N=${mark2N.statements}/${mark2N.rowsRead}`,
+      );
+    }
+  }
+  return failures;
+}
+
+function checkReport(report: StatementReport, nextjsGated: boolean): GateOutcome {
+  const outcome = gateRows(report.rows);
+  outcome.failures.push(...structuralFailures(report.rows));
+  const nextjs = gateRows(nextjsGateRows(report.nextjsReferences));
+  outcome.notes.push(...nextjs.notes);
+  if (nextjsGated) {
+    outcome.failures.push(...nextjs.failures);
+  } else {
+    for (const failure of nextjs.failures) {
+      outcome.notes.push(`${failure} (report-only; pass --nextjs <path> to gate)`);
+    }
+  }
+  return outcome;
 }
 
 function printTable(report: StatementReport): void {
@@ -2430,6 +2652,11 @@ function printTable(report: StatementReport): void {
   }
 }
 
+const { values: options } = parseArgs({
+  options: { check: { type: "boolean", default: false }, nextjs: { type: "string" } },
+});
+const nextjs = loadNextjsReferences(options.nextjs);
+
 const rows: ResultRow[] = [];
 await basicRows(rows);
 await ignoreLoadRow(rows);
@@ -2439,6 +2666,9 @@ await worktreeGuardRow(rows);
 await stagingAddRow(rows);
 await stagingRmRow(rows);
 await statusFullRow(rows);
+await statusSparseRows(rows);
+await stagingAddSelectedRow(rows);
+await worktreeListRow(rows);
 await checkoutInitialRow(rows);
 await commitSparseRow(rows);
 await diffIndexWorktreeRow(rows);
@@ -2457,12 +2687,15 @@ const report: StatementReport = {
   version: 1,
   targetStatements: TARGET_STATEMENTS,
   rows,
-  nextjsReferences: loadNextjsReferences(),
+  nextjsReferences: nextjs.references,
 };
-if (process.argv.includes("--check")) {
-  checkNextjsReferenceParser();
-  checkReport(report);
-}
 mkdirSync(RESULTS, { recursive: true });
 writeFileSync(join(RESULTS, "statements.json"), `${JSON.stringify(report, null, 2)}\n`);
 printTable(report);
+if (options.check) {
+  checkNextjsReferenceParser();
+  const outcome = checkReport(report, nextjs.gated);
+  for (const note of outcome.notes) process.stdout.write(`note: ${note}\n`);
+  for (const failure of outcome.failures) process.stderr.write(`FAIL: ${failure}\n`);
+  if (outcome.failures.length > 0) process.exitCode = 1;
+}
