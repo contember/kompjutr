@@ -16,10 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-09-23-statement-targets-and-harnesses.md`](sprints/sprint-2026-09-23-statement-targets-and-harnesses.md)
-  — every statement row under the 1,000 target, broken bench harnesses
-  restored, porcelain v2 unmerged order. Paused 2026-09-23: WU2/WU3 and
-  `clone-storage` landed; reachability retirement and clone cuts remain.
+None.
 
 ## Specs
 
@@ -41,6 +38,9 @@ decisions → reference → archive.
   shipped: cold-readable pack admission, hidden provisional projections, bounded
   packed reads, and integration output lifetime. It consumed backlog 74 and 63
   and ARCH-9/ARCH-8 from 65, and left backlog 83–90 with measured numbers.
+- [Statement targets and harnesses](archive/sprint-2026-09-23-statement-targets-and-harnesses.md)
+  closed early: harnesses restored, 83/85/88/89 shipped; statement misses 87
+  and 90 wait for the simplification program.
 - [Lifecycle and network integrity](archive/sprint-2026-09-08-lifecycle-and-network-integrity.md)
   is complete: promise-aware maintenance, pack dependency preservation, and final
   fetch connectivity checks. Default clone meets 990 SQL and the approved

@@ -20,5 +20,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [Statement targets and harnesses](sprint-2026-09-23-statement-targets-and-harnesses.md)
-  — backlog 83, 85, 87–90; paused 2026-09-23 with WU1 reachability and WU5 open.
+None.

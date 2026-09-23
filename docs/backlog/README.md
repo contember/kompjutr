@@ -91,10 +91,10 @@ The first architecture-review correction sprint shipped independently because
 its defects were already reproduced. The
 [production correctness and memory sprint](../archive/sprint-2026-09-10-production-correctness-and-memory.md)
 shipped all of 74 and 63 plus ARCH-9/ARCH-8 from 65, so those items are gone.
-Other findings in 65 remain unscheduled. Backlog 83, 85 and 87–90 are
-scheduled in the
-[statement targets and harnesses sprint](../sprints/sprint-2026-09-23-statement-targets-and-harnesses.md);
-84 and 86 remain for a later memory-and-transfer sprint. This bounded tranche precedes the broader scale/audit sequence below;
+Other findings in 65 remain unscheduled. The
+[statement targets and harnesses sprint](../archive/sprint-2026-09-23-statement-targets-and-harnesses.md)
+shipped 83, 85, 88 and 89 and closed early; 87 and 90 are re-measured after the
+simplification program. 84 and 86 remain for a later memory-and-transfer sprint. This bounded tranche precedes the broader scale/audit sequence below;
 it does not replace the external integration gate. Remaining parity work stays unscheduled
 until the external consumer integration gate provides new evidence.
 
@@ -162,10 +162,6 @@ does not schedule these issues into a sprint.
 - [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
 - [81 — Copy object bytes only when a cache actually retains them](81-copy-object-bytes-only-when-retained.md)
 - [84 — Read integration worktree inputs once](84-read-integration-worktree-inputs-once.md)
-- [85 — Restore the remaining broken benchmark harnesses](85-restore-broken-benchmark-harnesses.md)
 - [86 — Bound the sparse-selected-add and workerd clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
 - [87 — Bring an eight-step rebase under the statement target](87-bring-rebase-transition-under-the-statement-target.md)
-- [88 — Elide the operation journal keyset probe](88-elide-the-operation-journal-keyset-probe.md)
-- [89 — Trust staged commit promotion instead of counting it](89-trust-staged-commit-promotion.md)
-- [83 — Order unmerged status rows after changed rows](83-order-unmerged-status-rows-after-changed-rows.md)
 - [90 — Bring the Next.js clone under the statement target](90-bring-the-nextjs-clone-under-the-statement-target.md)

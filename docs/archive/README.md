@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Statement targets and harnesses](sprint-2026-09-23-statement-targets-and-harnesses.md)
+  — restored benchmark harnesses, porcelain v2 unmerged order, journal probe and
+  promotion recount removed; closed early before the statement targets.
 - [Production correctness and memory](sprint-2026-09-10-production-correctness-and-memory.md)
   — cold-readable pack admission, hidden provisional projections, bounded packed
   reads, and integration output owned by a scoped SQL workspace.
