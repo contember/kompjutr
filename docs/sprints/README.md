@@ -20,4 +20,6 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None.
+- [Simplification](sprint-2026-09-23-simplification.md) — remove machinery the
+  workload does not need while keeping every supported command; rebase on large
+  repositories.

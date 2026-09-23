@@ -16,7 +16,9 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprints/sprint-2026-09-23-simplification.md`](sprints/sprint-2026-09-23-simplification.md)
+  — remove excess machinery (thin-pack graph admission, paged reads, repack,
+  journal re-validation, byte ledgers, dead code) with functionality kept.
 
 ## Specs
 
