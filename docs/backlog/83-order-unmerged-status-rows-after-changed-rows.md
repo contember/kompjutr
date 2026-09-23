@@ -11,11 +11,12 @@ kompjutr's porcelain v2 row order differs from real Git's. No test pins it.
 
 ## Problem
 
-`buildStatusRows` groups rows as ordinary(0) / untracked(1) / ignored(2) and
-orders by path inside each group
-(`packages/git/src/ops/status/status-core.ts:26-36`), so an unmerged path sorts
-among the ordinary ones. Real Git (2.54.0) prints every changed (`1`/`2`) row
-before every unmerged (`u`) row, whatever the paths are.
+`formatPorcelainV2` (`packages/git/src/ops/status/status-format.ts:73-104`)
+emits `u` rows in the same pass as `1`/`2` rows, in the path order that
+`sortStatusDetails` (`status-core.ts:26-36`) produces. Real Git (2.54.0) prints
+every changed (`1`/`2`) row before every unmerged (`u`) row in porcelain v2,
+whatever the paths are. Porcelain v1 stays in path order in Git, so the shared
+sort is correct and must not change.
 
 Reproduced two ways while authoring the WU7 journey:
 
@@ -31,15 +32,14 @@ rather than asserting the wrong order; nothing else covers it.
 
 ## Approach / acceptance
 
-Order rows by class first — changed before unmerged before untracked before
-ignored — then by path inside each class, confirming the exact class order
-against the `git` binary rather than from this note. Witness a merge that leaves
+In the v2 formatter only, emit changed rows, then unmerged, then untracked,
+then ignored, each in path order. Witness a merge that leaves
 one conflicted and one cleanly merged path, compared against real Git through
 the existing parity harness, and let the WU7 journey use the natural shape.
 
 ## Touch points
 
-`packages/git/src/ops/status/status-core.ts`, `tests/status.test.ts`,
+`packages/git/src/ops/status/status-format.ts`, `tests/status-format.test.ts`,
 `tests/e2e/production-cold-workflow.test.ts`.
 
 <!-- Origin: sprint-2026-09-10 WU7 authoring, 2026-09-22. -->

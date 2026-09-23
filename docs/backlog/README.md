@@ -91,7 +91,10 @@ The first architecture-review correction sprint shipped independently because
 its defects were already reproduced. The
 [production correctness and memory sprint](../archive/sprint-2026-09-10-production-correctness-and-memory.md)
 shipped all of 74 and 63 plus ARCH-9/ARCH-8 from 65, so those items are gone.
-Other findings in 65 remain unscheduled. This bounded tranche precedes the broader scale/audit sequence below;
+Other findings in 65 remain unscheduled. Backlog 83, 85 and 87–90 are
+scheduled in the
+[statement targets and harnesses sprint](../sprints/sprint-2026-09-23-statement-targets-and-harnesses.md);
+84 and 86 remain for a later memory-and-transfer sprint. This bounded tranche precedes the broader scale/audit sequence below;
 it does not replace the external integration gate. Remaining parity work stays unscheduled
 until the external consumer integration gate provides new evidence.
 

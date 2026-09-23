@@ -20,5 +20,5 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None. The last sprint shipped on 2026-09-23 and is in
-[`../archive/`](../archive/sprint-2026-09-10-production-correctness-and-memory.md).
+- [Statement targets and harnesses](sprint-2026-09-23-statement-targets-and-harnesses.md)
+  — backlog 83, 85, 87–90; plan review pending.
