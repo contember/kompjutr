@@ -1,54 +1,65 @@
 ---
 id: 86
-title: Bound the sparse-selected-add and workerd clone memory peaks
+title: Bound the sparse-selected-add and Next.js clone memory peaks
 blocked-by: []
 ---
 
-# 86 — Bound the sparse-selected-add and workerd clone memory peaks
+# 86 — Bound the sparse-selected-add and Next.js clone memory peaks
 
 **Summary.** Two memory gates were already missed before the 2026-09-10 sprint
-started and are still missed. Both are now measured, so the numbers are real
-rather than assumed.
+started and are still missed at `62ffbf0`. The Next.js clone peak also grew in
+Node, where it had met its approved gate.
 
 ## Problem
 
-**`core.sparse-selected-add`** adds 154.17 MiB of process peak against the
-harness's 100 MiB target, and hard-fails the protocol. At `acf7289`, the
-sprint's starting commit, it was 154.11 MiB — the sprint moved it by 61,440
-bytes, 0.04%.
+**`core.sparse-selected-add`** adds 128.2, 149.0 and 158.5 MiB of process peak
+in three runs at `62ffbf0` (2026-09-24) against the harness's 100 MiB target,
+and hard-fails the protocol. It was 154.17 MiB at the 2026-09-10 closure and
+154.11 MiB at `acf7289`. The spread across runs is wider than any change since.
 
-**The workerd Next.js clone** adds 398.00 MiB of process RSS against the
-harness's 100 MiB gate. At `acf7289` it was 391.08 MiB. Note that local
-workerd has no isolate memory limiter, so this RSS is a regression signal and
-not evidence about the production 128 MB isolate limit; it also includes the
-SQLite page cache of a 233 MB database.
+**The workerd Next.js clone** adds 377.4, 453.1 and 445.0 MiB of process RSS in
+three runs at `62ffbf0` against the harness's 100 MiB gate. The clone itself is
+correct: 1,012 statements, 145,777 rows, 24,252 verified files. Earlier single
+runs recorded 391.08 MiB at `acf7289`, 398.00 MiB at the 2026-09-10 closure,
+and 412.8 and 420.6 MiB during the simplification sprint (`9ed0659` and WU21).
+Local workerd has no isolate memory limiter, so this RSS is a regression signal
+and not evidence about the production 128 MB isolate limit; it also includes
+the SQLite page cache of a 218 MiB database.
 
-The same clone also crossed the statement target during the sprint. That is
-now attributed per commit and tracked separately as
-[backlog 90](90-bring-the-nextjs-clone-under-the-statement-target.md); the
-memory peaks above are the part that remains open here.
+**The same clone in Node** adds 237.2 MiB in the workflow benchmark and
+235.9–250.2 MiB in the network benchmark at `62ffbf0`. On 2026-09-10 it added
+126.06 and 140.23 MiB, under the approved <160 MiB added-peak gate recorded in
+the archived lifecycle sprint. The rise predates the simplification sprint:
+its start commit `62edc57` already adds 222.6 MiB (1,026 statements), and the
+sprint moved it by +3 to +15 MiB, within run-to-run noise. In the workflow run the clone's V8 heap grew 49.7 MiB and its
+external memory 63.3 MiB over the phase.
 
-Measurements and attribution logs: ignored
-`bench/results/wu8-memory-2026-09-22-notes/` and
-`bench/results/wu8-workerd-2026-09-22/`.
+The clone's statement-target miss is tracked separately as
+[backlog 90](90-bring-the-nextjs-clone-under-the-statement-target.md).
+
+Measurements: [`benchmark-current`](../reference/benchmark-current.md) and
+ignored `bench/results/nextjs-workflow.json`, `nextjs-network-*.json`,
+`wu8-memory-2026-09-22-notes/` and `wu8-workerd-2026-09-22/`.
 
 ## Approach / acceptance
 
-Attribute each peak to its retained structures before changing code — neither
-number has been decomposed, and the harness cannot separate V8 heap from
-SQLite page cache and fragmentation. Start from the sparse selection and
-initial-write paths for the first, and from the clone's checkout and index
-population for the second.
+Attribute each peak to its retained structures before changing code — none of
+the three numbers has been decomposed, and the harnesses cannot separate V8
+heap from SQLite page cache and fragmentation. Start from the sparse selection
+and initial-write paths for the first, and from the clone's pack ingest,
+checkout and index population for the clone. Bisect the Node clone rise between
+the 2026-09-10 closure and `62edc57` first; it may name the retained structure.
 
-Witness: both scenarios meet their declared gate with unchanged semantics and
-native oracles, measured under an enforcing lease. If a gate turns out to be
-wrong rather than the code, say so with evidence and change the gate
-deliberately — do not widen it to pass.
+Witness: all three scenarios meet their declared gate with unchanged semantics
+and native oracles, measured under an enforcing lease over at least three runs.
+If a gate turns out to be wrong rather than the code, say so with evidence and
+change the gate deliberately — do not widen it to pass.
 
 ## Touch points
 
 `packages/git/src/do-fs/sparse/`, `packages/git/src/ops/staging/`,
 `packages/do/src/fs/store/initial-write.ts`, `packages/git/src/ops/checkout/`,
-`bench/memory.ts`, `bench/workerd/`.
+`packages/git/src/store/pack/ingest/`, `bench/memory.ts`, `bench/workerd/`,
+`bench/nextjs-run.ts`.
 
-<!-- Origin: sprint-2026-09-10 WU8 measurement, 2026-09-22 run-log entry. -->
+<!-- Origin: sprint-2026-09-10 WU8 measurement, 2026-09-22 run-log entry; remeasured at the 2026-09-23 simplification closure. -->

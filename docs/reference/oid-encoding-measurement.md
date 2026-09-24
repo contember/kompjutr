@@ -86,10 +86,22 @@ tables; parsed trees include `name`, `name_bytes`, `raw_entry`, and
 `cumulative_base`; commits include identities, timestamps, message, size, and
 cache accounting.
 
-> **Note (2026-09-24).** Production `git_commits` has since dropped
-> `cache_bytes` and stores `message` and `gpgsig` as NULL when the row would
-> exceed the platform row ceiling. The prototype's `git_commits` in
-> `bench/oid-encoding.ts` keeps the schema this measurement used.
+> **Note (2026-09-24).** The production schema has since drifted from the
+> prototype in `bench/oid-encoding.ts`, which keeps the schema this measurement
+> used:
+>
+> - `git_commits` dropped `cache_bytes` and stores `message` and `gpgsig` as
+>   NULL when the row would exceed the platform row ceiling.
+> - `git_tree_entries` dropped `raw_entry`.
+> - `git_pack_objects` dropped `base_oid`. A delta now names its base by
+>   `base_offset` in `git_pack_entries`, inside the same pack; packs are
+>   self-contained and thin packs are rejected at ingest.
+> - Maintenance no longer repacks loose objects, and every loose object is
+>   stored deflated. The loose-shaped workload's 64-byte proxy chunk does not
+>   model that compression.
+> - Git tables are declared `STRICT`.
+>
+> None of these changes the OID key columns this measurement compares.
 
 `git_commits.parents` is not treated as one scalar OID. TEXT stores an ordered,
 space-separated OID list. BLOB stores the ordered concatenation of 20-byte OIDs;

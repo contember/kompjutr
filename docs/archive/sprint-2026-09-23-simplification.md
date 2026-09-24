@@ -6,6 +6,32 @@ On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
 > <ids deleted/rescoped>. Deferred: <honest notes>.
 -->
 
+> **OUTCOME — shipped 2026-09-24.** All 23 WUs landed with functionality kept.
+> The Git engine fell from 77,078 to 66,293 source lines (−14 %), `git_*` tables
+> from 61 to 46, and ADRs from 25 to 24 (0023 deleted; 0004, 0005, 0009, 0012,
+> 0013, 0017, 0022, 0024, 0025 rewritten to the code). Every stored pack is
+> self-contained (no thin packs, delta depth ≤ 4,095), reads use one bounded
+> graph query, repack is gone, integration output and every commit row are
+> ordinary store rows, tables are `STRICT`, and rebase works at any size
+> (Next.js: 942 statements). Six user decisions and four lead decisions are in
+> the Decisions section and Run log. Commit map: WU0 → `42a4aab`, WU1 →
+> `3171de6`, WU2 → `4c4a742`, WU3 → `b60594c` `80fb1ac`, WU4 → `c0a955f`,
+> WU5 → `a4b6431`, WU6 → `7259cbb`, WU7 → `fe9484e`, WU8 → `8ba5909`, WU9 →
+> `0f53a7f`, WU10 → `fa5fe4d`, WU11 → `e4489b8`, WU12 → `7c75ca6`, WU13 →
+> `5b5e1a7`, WU14 → `73752ad`, WU15 → `9ed0659`, WU16 → `9219de0`, WU17 →
+> `aea6cab`, WU18 → `2090149` + `2ec772e` (shell sinks, a regression WU18's
+> verify missed), WU19 → `26d3642`, WU20 → `b612eff`, WU21 → `9394c2c`, WU22
+> → `9992b42`, rebaseline → `62ffbf0`. Verification: `test:full` green at
+> `9394c2c` (3,101 tests; the one 50,500-file rebase timeout got an explicit
+> 180 s limit in `62ffbf0`); `bench:statements -- --check` passes with 33 rows
+> dropped and none risen (maintenance mark 783 → 10, rebase.transition-2n
+> 1,279 → 1,132, Next.js clone 1,029 → 1,012 / 164,285 → 145,777 rows).
+> Backlog closed: none consumed whole; 66, 84, 86, 87, 90 updated; 91–97 filed
+> from the run log (93 is tier S: abort overwrites unstaged edits). Deferred:
+> 87 and 90 still miss the 1,000-statement target; the Node Next.js clone adds
+> ~237 MiB (a rise that predates the sprint, 222.6 MiB at `62edc57`) and the
+> workerd clone 377–453 MiB (backlog 86).
+
 # Sprint — Simplification (2026-09-23)
 
 **Goal.** Remove machinery that the reference workload and real platform limits
@@ -93,7 +119,7 @@ Resolved with the user on 2026-09-23:
   Supersedes [ADR-0023](../decisions/0023-validate-canonical-pack-dependencies-at-source-changes.md)
   and the read half of [ADR-0025](../decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md).
 - **CLI mutations commit and truncate** oversized output with `truncated: true`,
-  one policy for every command. Supersedes
+  one policy for every mutating command; reads keep failing with `E2BIG`. Supersedes
   [ADR-0017](../decisions/0017-preflight-mutating-cli-output-inside-the-transaction.md).
 - **Push tracking refs come from `report-status`**, like Git; no second
   discovery. `"deferred"` leaves `PushTrackingResult`.
@@ -433,9 +459,9 @@ stated. Every WU commits on its own.
 - **Scope.** Commit, then apply `boundedPublishedGitCliResult`; delete
   `SummaryRetainedBudget`, phase tracking, diagnostic pre-counting, and
   `gitCliUtf8ByteLengthRange`. Rewrite ADR-0017.
-- **Acceptance / witness.** Rewritten `git-cli-write.test.ts:803,840,846,1301,1344,1390`,
-  `git-cli-network.test.ts:369`, `integration-bounded-output.test.ts:241`: the
-  mutation persists across reopen and the result has `truncated: true`.
+- **Acceptance / witness.** Rewritten `git-cli-write.test.ts:1301,1344,1390`
+  and `git-cli-network.test.ts:369`: the mutation persists across reopen and
+  the result has `truncated: true`; a failing success formatter rolls back.
 - **Touch points.** `cli/write/`, `cli/result.ts`, `git-support.md:112-113,160-170,950`.
 
 #### WU19 — Remove ignore caps without a real failure (effort M)
@@ -561,3 +587,111 @@ are shared by most store WUs, so store WUs run in series.
   12. Dirty tree → already committed in `c0d8759`; 88 and 89 already closed.
 
 ## Run log
+
+- 2026-09-23 WU0 `42a4aab`: tolerance gate plus rows `status.sparse-clean` 7/5,
+  `status.sparse-dirty` 24/23, `staging.add-selected` 25/33, `worktree.list` 4/8.
+  The `commit.sparse` full-scan detector matches `FROM git_index WHERE
+  checkout_id`, which the fallback paths do not emit; re-check when WU7 lands.
+- 2026-09-23 WU5 `a4b6431`: status now calls the shared `isExcluded`, which
+  normalizes per root; extra CPU only when nested excluded roots exist.
+- 2026-09-23 WU3 `b60594c`, `80fb1ac`: `docs/reference/benchmark-current.md`
+  tree-schema numbers and `oid-encoding-measurement.md:82-86` predate the
+  `raw_entry` drop; rerun `bench:tree-schema` at closure.
+- 2026-09-23 WU1 review: `validated()`/`validateEntry()` in
+  `ops/integration/integration-structure.ts` re-check stored tree rows and lost
+  their only test with the stream API → added to WU6 scope. Merge refuses to
+  overwrite an ignored untracked file where Git overwrites it → parity gap to
+  file as backlog at closure.
+- 2026-09-23 WU10 verify-first: repack saved 22 % data bytes only because loose
+  objects ≤ 4 KiB were stored raw; pack reads cost +18 % statements. User chose:
+  delete repack and deflate small loose objects at write time.
+- 2026-09-23 WU18: after a CLI commit, `repo.reflog("HEAD")` on the same live
+  `Repository` returned `[]` until reopen — possible stale reflog cache; verify
+  and file at closure. `diffSummaryBounded` `maxRetainedBytes` is still a
+  modeled byte charge (backlog 66).
+- 2026-09-23 WU18 review: a commit changing > 50,000 files still fails with
+  `E2BIG` in the CLI summary (`write-summary.ts:93`) while the typed API accepts
+  it; Git skips rename detection past `renameLimit` → file as backlog at closure.
+- 2026-09-23 WU17: `worktree.list` costs 2 statements per checkout (a DO stat
+  is a resolve plus a read), 4 → 9 on the 3-root fixture; accepted by the lead
+  within the approved N-per-checkout change and rebaselined.
+- 2026-09-23 WU6: a rebase `committer` option is not validated at the entry
+  point (an existing test expects an invalid one to be dropped from the reflog
+  actor); a step commit refuses it, leaving a running journal that continue or
+  abort recovers. Pre-existing gap outside WU6: merge/cherry-pick abort overwrite
+  unstaged edits on cleanly merged touched paths where Git's `reset --merge`
+  refuses → file as backlog at closure.
+- 2026-09-23 WU22: the Next.js rebase step (951 statements, 1.06M rows read,
+  ~10 s) adds ~102 MiB peak RSS in Node; a 30k-file probe passes with
+  `--max-old-space-size=56`, so it is heap garbage, not retention. The rows come
+  from existing passes (backlog 84). The 50,500-file test takes ~36 s and can
+  trip vitest's `onTaskUpdate` RPC timeout under load; tests still pass.
+- 2026-09-24 WU12: a pending pack reads its bases from its own entries at
+  `(pack_id, offset)`. When a concurrent deletion removes a base's canonical
+  owner during a `yieldNow`, publication fails with retryable `ESTALE` (the
+  membership audit) and the retry succeeds. The Next.js clone is still
+  1,004 statements (report-only miss, backlog 90); maintenance mark 398/783 → 10.
+- 2026-09-24 WU13: `source_generation` kept — maintenance restarts discovery on
+  source drift. Next.js clone 1,004 / 145,778, peak RSS within noise of HEAD.
+  Review (pre-existing, not a regression): resolving every entry of one
+  4,096-long chain tip-first with the object cache off costs ~8M delta applies
+  (`read-resolver.ts` has no memo for intermediate entries) → file as backlog
+  at closure.
+- 2026-09-24 WU14: Next.js clone peak RSS is ~436–459 MiB absolute on HEAD and
+  on WU14 alike (≈ 227–250 MiB added over the ~209 MiB process baseline); the
+  frozen 209 MiB figure is the baseline, not the peak. No regression.
+- 2026-09-24 WU14 review: a failed ingest could commit tree projections before
+  their `git_pack_entries` rows, leaving orphans reclaim cannot find; the tree
+  index now flushes the object batch first. Next.js clone 1,004 → 1,014
+  statements (report-only row, backlog 90), accepted by the lead as the cost
+  of the fix. A pending pack's tree projections are visible (content-addressed);
+  its objects are not.
+- 2026-09-24 WU15 verify-first: loose commits were already indexed on write;
+  packed commits at ingest. The lazy/uncached walk existed only for commits whose
+  projection exceeds `COMMIT_CACHE_FLUSH_BYTES` (a message above the ~2 MB DO
+  row ceiling). User chose: always write the row, keep an oversized message out
+  of it (flag + read from the object), then delete the lazy fill,
+  `walkUncachedOwned` and `ECACHEMISS`.
+- 2026-09-24 WU16: integration output is ordinary loose objects; a successful
+  operation (conflict markers, virtual bases, replay planning) may leave
+  unreferenced loose objects for maintenance. Memory: binary-150 ~80 MiB (= HEAD),
+  paths-1001 34 → 24 MiB; paths-1001 statements 13,369 → 7,307.
+- 2026-09-24 WU16 review (pre-existing, unchanged by WU16): operation journals
+  are not GC roots; rebase step commits referenced only by a paused journal can
+  be swept after the 14-day grace → file as backlog at closure.
+- 2026-09-24 WU16 verify: `rebase-large` 50,500-file case timed out at 60 s in a
+  4-worker run; alone it takes 47.7 s on WU16 and 60.3 s on HEAD. The test sits
+  at its timeout under load → set a timeout that names the load at closure.
+- 2026-09-24 lead: WU18 (`2090149`) left 4 `tests/shell/bounds.test.ts`
+  "git destination preflight" cases failing (25/25 at `2090149^`); the WU18
+  verify did not run `tests/shell/`. A follow-up fix aligns the DO shell with
+  commit-then-truncate. From here every unit verify also runs the full smoke
+  and any slice whose package the unit touches.
+- 2026-09-24 WU18 follow-up, user decision: a mutating Git command whose
+  output overflows truncates only at terminal sinks (stdout/stderr,
+  `truncated: true`, Git's status). Pipe and redirect bytes are semantic input:
+  the shell's retained limit fails the run with exit 2, the redirect target
+  stays unchanged, and the mutation persists.
+- 2026-09-24 WU21 verify-first: STRICT + WITHOUT ROWID and AUTOINCREMENT
+  work on real workerd (1.20260820.1) and node:sqlite 3.50.2. Lead decisions:
+  `clone_generation` is dropped and provisional owners fence on the never-reused
+  AUTOINCREMENT repo id; id exhaustion at `MAX_SAFE_INTEGER` fails on the range
+  CHECK instead of `E2BIG` (unreachable in practice; the test asserts failure
+  and no row).
+- 2026-09-24 WU21: `bench:workerd:nextjs` fails its 100 MiB RSS gate on HEAD
+  too (412.8 MiB added at `9ed0659`, 420.6 MiB with WU21); the clone itself is
+  correct on real workerd (1,012 statements, 145,777 rows). Pre-existing:
+  backlog 86 recorded 398.00 MiB; the sprint moved it +4–6 % → update 86 with
+  the closure measurement.
+- 2026-09-24 WU21 review: two CHECKs lost NULL rejection when `typeof` went
+  (`git_tree_sources` complete counts, reflog raw endpoints); fixed with
+  `IS NOT NULL` and witnesses. Tests that planted a wrong storage class
+  (now unstorable under STRICT) were rewritten to violate a CHECK, or deleted
+  where the guard only caught the type (oversized ref target, malformed chunk
+  `seq`).
+- 2026-09-24 closure: two run-log suspicions did not hold at HEAD. The WU18
+  reflog `[]` was a test clock mismatch (entries written at 2020, 90-day
+  retention read at `Date.now()`), not a stale cache. Operation journals are
+  already GC roots (`operation-journal-roots.ts`, `maintenance-roots.test.ts`).
+  Neither was filed. The Node Next.js clone adds ~237 MiB against the 2026-09-10
+  126–140 MiB; the sprint start `62edc57` already added 222.6 MiB → backlog 86.

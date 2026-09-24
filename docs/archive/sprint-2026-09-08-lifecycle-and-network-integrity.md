@@ -26,7 +26,7 @@
 | WU4 checksum, ingest targets, complete-input inflation | `8f66785`, `7b1cfd8`, `1f63421` |
 
 Curated results and measurement limits are in
-[the benchmark snapshot](../reference/benchmark-current.md#default-network-clone-and-fetch--2026-09-10).
+[the benchmark snapshot](benchmarks/benchmark-snapshots-2026-09-10.md#default-network-clone-and-fetch--2026-09-10).
 The run log below retains rejected experiments, superseded criteria, and failed
 verification attempts as historical evidence; the outcome above governs closure.
 

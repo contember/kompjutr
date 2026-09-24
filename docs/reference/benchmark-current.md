@@ -1,105 +1,125 @@
 # Current benchmark snapshot
 
-## Default network clone and fetch — 2026-09-10
+Unless a section says otherwise, measurements ran on 2026-09-24 at commit
+`62ffbf0fb491731365d9a563437fc6b1d5540d3a` with Node v24.4.0, SQLite 3.50.2,
+git 2.54.0, Linux 6.17.0-41-generic x64, and an AMD Ryzen 7 PRO 8840HS. The
+Next.js fixture is `vercel/next.js` v15.5.2 at
+`381a9c8089ed7a244dcfa374fbb27d37032e208a`, rebuilt as one shallow-cloneable
+commit with 24,252 tracked files. The local Smart HTTP origin is prepared
+outside measurement. SQLite uses a temporary file. Each phase resets SQLite
+counters and the process RSS high-water mark; "added peak RSS" is reset `VmHWM`
+minus the same-phase baseline.
 
-The lifecycle/network closure witness uses `BENCH_NETWORK_MODE=legacy` and
-`BENCH_NETWORK_MODE=mapped` with `npm run bench:nextjs`. Each run held two
-leased vCPUs with a verified 1 GiB cgroup limit and zero swap. Node v24.4.0
-used default GC and heap settings. The fixture is Next.js v15.5.2, rebuilt at
-`381a9c8089ed7a244dcfa374fbb27d37032e208a` (24,252 files), with one-file child
-`7bb95e82c56785e1024728697c811557087b5f9c`. Default OFS_DELTA transport and
-cache settings are preserved. Both modes call the same clone operation;
-the mode selects subsequent fetch behavior, not a different clone path.
+This is `node:sqlite` unless the section names workerd. Statement counts
+transfer to the Durable Object cost model. Local wall time and process RSS are
+regression signals, not proof of a production isolate limit.
 
-| Operation | Wall, ms | SQL | Returned rows | Added peak RSS, MiB |
-| --- | ---: | ---: | ---: | ---: |
-| Clone, first run | 11,221.77 | 990 | 145,773 | 126.06 |
-| Legacy fetch, unchanged | 767.80 | 47 | 67,232 | 1.68 |
-| Legacy fetch, one changed file | 1,531.25 | 112 | 134,396 | 0.74 |
-| Clone, second run | 11,874.82 | 990 | 145,773 | 140.23 |
-| Mapped fetch, unchanged | 6,559.87 | 297 | 68,434 | 2.45 |
-| Mapped fetch, one changed file | 7,498.87 | 324 | 135,580 | 12.34 |
+## Next.js workflow — 2026-09-24
 
-All phases passed semantic verification. Clone baseline/reset-peak bytes were
-177,078,272 / 309,260,288 and 170,094,592 / 317,136,896. These are single runs,
-not medians or fixed savings estimates. Returned rows are not rows scanned.
-The approved regression gates for this witness are at most 1,000 SQL statements
-and less than 160 MiB reset process peak above the same-run baseline. The
-original 100 MiB criterion was not met. This local RSS gate does not prove a
-production isolate limit; forced-GC and heap-tuned diagnostics are excluded.
-
-## Scoped-package workflow comparison — 2026-09-08
-
-Measured in seven order-balanced runs on 2026-09-08 from the scoped-package
-working tree against baseline commit `d0c059ce251f15ca771c2c346f99fca67d0f385e`.
-The host used Node v24.4.0, SQLite 3.50.2, git 2.54.0, Linux
-6.17.0-41-generic x64, and an AMD Ryzen 7 PRO 8840HS:
+One run:
 
 ```bash
-cpu-lease run -n 2 --no-smt -- npm run bench:nextjs
+cpu-lease run -n 2 -- npm run bench:nextjs
 ```
 
-The harness held two vCPUs with SMT siblings excluded. Runs used the order
-`B,C,C,B,B,C,C,B,B,C,C,B,B,C` under one lease. The fixture is `vercel/next.js`
-at revision `381a9c8089ed7a244dcfa374fbb27d37032e208a`, rebuilt as one
-shallow-cloneable commit with 24,252 tracked files. SQLite uses a temporary
-file. The local Smart HTTP origin is prepared outside measurement. Each phase
-resets SQLite counters and the process RSS high-water mark. Wall values below
-are the median of seven runs. The table reports the scoped-package candidate
-medians.
+The lease held two vCPUs; SMT siblings were not excluded. Wall values are one
+sample each, not medians.
 
-This is `node:sqlite`, not Durable Object SQL. Statement counts transfer to the
-platform cost model. Local wall time and process RSS are regression signals, not
-proof of a production isolate limit.
+| Operation | Wall, ms | SQL | Rows | Added peak RSS, MiB |
+| --- | ---: | ---: | ---: | ---: |
+| `git.clone` | 10,211.9 | 1,012 | 145,777 | 237.2 |
+| `git.status` — clean clone | 4.0 | 14 | 12 | 0.0 |
+| `git.branch` | 4.3 | 30 | 19 | 0.0 |
+| `fs.writeFiles` — 100 | 26.0 | 6 | 288 | 0.0 |
+| `git.status` — 100 modified | 27.7 | 30 | 1,031 | 0.3 |
+| `git.diffSummary` — 100 | 66.2 | 30 | 1,575 | 0.0 |
+| `git.diff` — 100 | 37.3 | 29 | 1,573 | 0.4 |
+| `git.add` — 100 | 160.4 | 22 | 1,754 | 0.2 |
+| `git.status` — 100 staged | 17.5 | 27 | 685 | 0.1 |
+| `git.commit` — 100 | 140.6 | 51 | 725 | 0.1 |
+| `git.push` — 100 | 342.2 | 47 | 615 | 0.6 |
+| `git.status` — clean commit | 10.1 | 25 | 685 | 0.0 |
+| `git.checkout main` | 478.2 | 101 | 25,089 | 0.9 |
+| `git.checkout main --force` | 462.4 | 102 | 25,189 | 0.9 |
+| `git.status` — clean main | 1.0 | 11 | 8 | 0.0 |
+| `git.checkout bench-work` | 492.8 | 94 | 25,188 | 9.8 |
+| `git.checkout bench-work --force` | 457.4 | 94 | 25,188 | 5.4 |
+| `git.status` — clean work | 0.7 | 10 | 8 | 0.0 |
+| `git.rebase` — 100 onto `main` | 10,809.6 | 942 | 1,061,270 | 96.6 |
+| `git.status` — clean rebase | 23.8 | 27 | 891 | 0.0 |
 
-### Workflow results
+Every phase passed its verification. Rows are rows returned, not rows scanned.
+Every phase except clone meets the at-most-1,000-statement target. Clone misses
+it by 12 statements
+([backlog 90](../backlog/90-bring-the-nextjs-clone-under-the-statement-target.md)).
+Target status is performance evidence, not a runtime admission rule.
 
-| Operation | Median wall | SQL | Rows |
-| --- | ---: | ---: | ---: |
-| `git.clone` | 12,585.320 ms | 2,381 | 79,273 |
-| `git.status` — clean clone | 5.003 ms | 14 | 12 |
-| `git.branch` | 5.815 ms | 30 | 19 |
-| `fs.writeFiles` — 100 | 33.281 ms | 6 | 288 |
-| `git.status` — 100 modified | 34.136 ms | 30 | 1,031 |
-| `git.diffSummary` — 100 | 74.598 ms | 30 | 1,575 |
-| `git.diff` — 100 | 60.270 ms | 29 | 1,573 |
-| `git.add` — 100 | 190.854 ms | 21 | 1,753 |
-| `git.status` — 100 staged | 17.267 ms | 27 | 685 |
-| `git.commit` — 100 | 159.746 ms | 51 | 724 |
-| `git.push` — 100 | 460.439 ms | 50 | 618 |
-| `git.status` — clean commit | 13.652 ms | 25 | 685 |
-| `git.checkout main` | 515.181 ms | 101 | 25,089 |
-| `git.checkout main --force` | 497.214 ms | 102 | 25,189 |
-| `git.status` — clean main | 1.076 ms | 11 | 8 |
-| `git.checkout bench-work` | 509.917 ms | 94 | 25,188 |
-| `git.checkout bench-work --force` | 517.952 ms | 94 | 25,188 |
-| `git.status` — clean work | 0.858 ms | 10 | 8 |
+Clone adds 237.2 MiB over a 207.3 MiB process baseline. The rebase step replays
+one 100-file commit onto a new `main` commit and adds 96.6 MiB
+([backlog 95](../backlog/95-reduce-the-nextjs-rebase-step-peak.md)).
+`git.diffSummary` measured a peak 0.3 MiB below its baseline; the table
+reports 0.0.
 
-Every operation and status assertion passed. Candidate and baseline statement
-and returned-row counts matched for every phase. Every phase stayed below the
-1,000-statement target except clone, whose work is structurally bounded by pack
-and materialization batches. Target status is performance evidence, not a
-runtime admission rule.
+## Next.js clone on workerd — 2026-09-24
 
-Wall time is gated on the sum of corresponding operation medians so reduced
-allocation cannot fail merely by moving a V8 collection between adjacent
-phases. Individual phase medians remain diagnostic. The baseline total was
-16,580.647 ms; the candidate total was 15,682.580 ms, 5.416% lower and below the
-17,409.679 ms limit. Six candidate phase medians exceeded the former per-phase
-noise envelope, while heap drops and overlapping sample ranges showed that
-collection placement, not additional SQL work, caused the movement.
+Three runs of the clone inside a real SQLite Durable Object:
 
-### Historical workflow clone statement profile
+```bash
+cpu-lease run -n 2 -- npm run bench:workerd:nextjs
+```
 
-That workflow comparison had two accepted deterministic progress profiles: 2,381 statements over
-79,273 rows, or exactly two additional statements and one additional row. Both
-baseline and candidate produced the primary profile in six runs and the
-alternate profile once. The statement gate accepts no other clone deviation.
+The runtime was `workerd` 1.20260820.1 with compatibility date 2026-08-15.
 
-The harness writes detailed generated output to `bench/results/`, which is
-gitignored. Update this curated snapshot only from a CPU-leased run. Historical
-pre-standalone comparisons remain in
-[`../archive/benchmarks/`](../archive/benchmarks/README.md).
+| Run | SQL | Rows | Database bytes | Baseline RSS, MiB | Added peak RSS, MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1,012 | 145,777 | 228,356,096 | 65.0 | 377.4 |
+| 2 | 1,012 | 145,777 | 228,356,096 | 65.3 | 453.1 |
+| 3 | 1,012 | 145,777 | 228,356,096 | 65.1 | 445.0 |
+
+Every run verified HEAD, 24,252 index entries, and 24,252 worktree files with no
+invalid file. Statements and rows match the `node:sqlite` clone exactly. The
+harness's 100 MiB added-RSS gate fails in every run
+([backlog 86](../backlog/86-bound-sparse-selected-add-and-workerd-clone-peaks.md)).
+Runs 2 and 3 overlapped another leased benchmark on separate cores. Local
+workerd has no isolate memory limiter, and its RSS includes the SQLite page
+cache of a 218 MiB database. Wall time from inside a Worker is not a duration
+and is not reported.
+
+## Network clone and fetch — 2026-09-24
+
+One run per mode:
+
+```bash
+BENCH_NETWORK_MODE=legacy cpu-lease run -n 2 -- npm run bench:nextjs
+BENCH_NETWORK_MODE=mapped cpu-lease run -n 2 -- npm run bench:nextjs
+```
+
+Each run clones, fetches with nothing new, then fetches a one-file child commit
+`7bb95e82c56785e1024728697c811557087b5f9c`. The `legacy` mode passes
+`singleBranch: false, tags: false`; the `mapped` mode passes one forced
+`refs/heads/main:refs/remotes/origin/main` refspec. Both go through the same
+fetch engine, which lowers the legacy options to forced refspecs, so both
+modes do the same SQL work. Default OFS_DELTA transport and cache settings are
+preserved. No cgroup memory limit was applied.
+
+| Operation | Wall, ms | SQL | Rows | Added peak RSS, MiB |
+| --- | ---: | ---: | ---: | ---: |
+| Clone, `legacy` run | 9,427.8 | 1,006 | 145,772 | 250.2 |
+| Fetch, unchanged, `legacy` options | 696.1 | 47 | 67,231 | 7.6 |
+| Fetch, one changed file, `legacy` options | 1,332.8 | 105 | 130,791 | 0.0 |
+| Clone, `mapped` run | 11,390.4 | 1,006 | 145,772 | 235.9 |
+| Fetch, unchanged, `mapped` refspec | 693.3 | 47 | 67,231 | 19.8 |
+| Fetch, one changed file, `mapped` refspec | 1,336.9 | 105 | 130,791 | 0.5 |
+
+All phases passed semantic verification: the published tracking ref, the
+fetched commit count, and every fetched tree entry. Clone process baselines were
+167.8 MiB and 170.1 MiB. This clone passes `depth: 0` and `noTags: true`; the
+workflow clone passes `ref` and `depth: 1` and runs 1,012 statements. The clone misses
+the 1,000-statement target by 6 statements and the former <160 MiB added-peak
+gate by 76–90 MiB
+([backlog 86](../backlog/86-bound-sparse-selected-add-and-workerd-clone-peaks.md),
+[backlog 90](../backlog/90-bring-the-nextjs-clone-under-the-statement-target.md)).
+A phase whose peak stayed below its baseline is reported as 0.0.
 
 ## Local runtime qualification
 
@@ -132,7 +152,9 @@ npm run bench:tree-schema
 ```
 
 The harness re-executes measurement through `cpu-lease run -n 2 --no-smt` and
-verified `Cpus_allowed_list=10`, one logical CPU. A correctness-only run uses
+verified `Cpus_allowed_list=10`, one logical CPU. A rerun at `62ffbf0` on
+2026-09-24 (`Cpus_allowed_list=12`) reproduced every page count, byte count, row count,
+and checksum below. A correctness-only run uses
 `npm run bench:tree-schema -- --check` without a lease. Both layouts contain the
 same parsed data from Next.js v15.5.2 at revision
 `381a9c8089ed7a244dcfa374fbb27d37032e208a`: 24,252 tracked paths, 11,070 trees
@@ -165,19 +187,17 @@ This measurement isolates SQLite layout size and logical query profiles. It is
 `node:sqlite`, not Durable Object SQL, and makes no wall-time or production
 runtime claim.
 
-
 ## Clone storage
 
-Measured in three clean runs on 2026-08-27 at commit
-`d03aa708af926d3590fc4903bc6946b38698be7e` with Node v24.4.0, SQLite 3.50.2,
-git 2.54.0, Linux 6.17.0-41-generic x64, and an AMD Ryzen 7 PRO 8840HS:
+Measured in one clean run on 2026-09-24 at commit
+`62ffbf0fb491731365d9a563437fc6b1d5540d3a`:
 
 ```bash
 npm run bench:clone-storage
 ```
 
 The harness re-executes measurement through `cpu-lease run -n 4 --no-smt` and
-verified `Cpus_allowed_list=8,10`, two logical CPUs — one for the client, one
+verified `Cpus_allowed_list=12,14`, two logical CPUs — one for the client, one
 for the Smart HTTP origin that runs in the same process. A correctness-only run
 uses `npm run bench:clone-storage -- --check` without a lease. Sizes are
 `page_count * page_size`, the quantity `SqlStorage.databaseSize` reports on the
@@ -186,61 +206,68 @@ counted as apparent bytes per entry. Every run proves its own end state: HEAD,
 index entries and worktree files must match the fixture before a size is
 reported.
 
-| Fixture | Files | SQLite | git total | SQLite / git | `git.clone` median | Checkout median | Clone SQL |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `express` | 218 | 1.46 MiB | 917.2 KiB | 1.63× | 167.272 ms | 30.614 ms | 85 |
-| `tailwind` | 541 | 7.47 MiB | 6.41 MiB | 1.16× | 253.542 ms | 104.934 ms | 97 |
-| `vue` | 1,075 | 14.18 MiB | 12.25 MiB | 1.16× | 509.732 ms | 250.671 ms | 114 |
-| `eslint` | 2,358 | 32.73 MiB | 29.08 MiB | 1.13× | 1,503.573 ms | 583.589 ms | 161 |
-| `prettier` | 9,329 | 43.95 MiB | 30.92 MiB | 1.42× | 3,286.099 ms | 1,417.923 ms | 273 |
-| `nextjs` | 24,252 | 218.07 MiB | 179.89 MiB | 1.21× | 9,151.759 ms | 5,339.358 ms | 824 |
+| Fixture | Files | SQLite | git total | SQLite / git | `git.clone` | Checkout | Clone SQL | Clone rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `express` | 218 | 1.62 MiB | 917.2 KiB | 1.81× | 199 ms | 34.2 ms | 137 | 1,276 |
+| `tailwind` | 541 | 7.64 MiB | 6.41 MiB | 1.19× | 273 ms | 95.4 ms | 150 | 3,024 |
+| `vue` | 1,075 | 14.36 MiB | 12.25 MiB | 1.17× | 465 ms | 224.2 ms | 170 | 6,323 |
+| `eslint` | 2,358 | 32.91 MiB | 29.08 MiB | 1.13× | 1,912 ms | 995.5 ms | 222 | 13,960 |
+| `prettier` | 9,329 | 44.00 MiB | 30.92 MiB | 1.42× | 2,533 ms | 1,206.9 ms | 365 | 50,716 |
+| `nextjs` | 24,252 | 217.78 MiB | 179.89 MiB | 1.21× | 9,890 ms | 4,037.1 ms | 1,012 | 145,777 |
 
-All three runs passed provenance, end-state, storage, and SQL assertions. Sizes,
-facts, and statement counts were identical. Wall time is a regression signal,
-not a constant.
+The run passed provenance, end-state, storage, and SQL assertions. Checkout is
+the standalone checkout phase of the decomposition below. Wall times are single
+samples and a regression signal, not a constant. Small fixtures carry a fixed
+schema and repository cost of about 288 KiB, which dominates the `express`
+ratio.
 
-Next.js is the row that carries. Its 218.07 MiB is 1.21× what git writes for the
+Next.js is the row that carries. Its 217.78 MiB is 1.21× what git writes for the
 same shallow clone, and the shape of that overhead is the whole story:
 
 | Group | Allocated | Payload | Share |
 | --- | ---: | ---: | ---: |
-| Working tree (`fs_*`) | 153.55 MiB | 146.79 MiB | 70.4% |
-| Pack (`git_pack_*`) | 45.85 MiB | 45.19 MiB | 21.0% |
-| Tree projection (`git_tree_*`) | 11.45 MiB | 6.50 MiB | 5.3% |
-| Index (`git_index`, `git_blob_ids`) | 7.01 MiB | 6.14 MiB | 3.2% |
-| Loose objects | 20.0 KiB | 170 B | <0.1% |
-| Repository | 100.0 KiB | 1.4 KiB | <0.1% |
-| Schema | 96.0 KiB | 76.7 KiB | <0.1% |
-| **Total** | **218.07 MiB** | **204.70 MiB** | **100.0%** |
+| Working tree (`fs_*`) | 153.55 MiB | 146.79 MiB | 70.5% |
+| Pack (`git_pack_*`) | 49.72 MiB | 48.42 MiB | 22.8% |
+| Tree projection (`git_tree_*`) | 7.13 MiB | 4.00 MiB | 3.3% |
+| Index (`git_index`, `git_blob_ids`) | 7.02 MiB | 6.14 MiB | 3.2% |
+| Loose objects | 24.0 KiB | 0.2 KiB | <0.1% |
+| Integration scratch | 24.0 KiB | 0 B | <0.1% |
+| Maintenance | 24.0 KiB | 0 B | <0.1% |
+| Repository | 116.0 KiB | 1.4 KiB | 0.1% |
+| Schema | 172.0 KiB | 130.9 KiB | 0.1% |
+| **Total** | **217.78 MiB** | **205.48 MiB** | **100.0%** |
 
 The working tree holds the checkout uncompressed, so `fs_chunks` carries
 134.25 MiB of payload against the 134.08 MiB git writes to disk — a filesystem
-is a filesystem either way. The live received pack remains authoritative next
-to it; maintenance removes only wholly unreachable packs and does not compact
-mixed packs. Derived rows — tree projections, the index and the blob-id cache —
-cost 18.46 MiB, 8.5% of the database, and are the only part a plain `.git` does
-not have an equivalent for. B-tree overhead over the whole database is 6.1%;
-`VACUUM` would reclaim a further 2.9%, and Durable Object SQL exposes no
+is a filesystem either way. The received pack remains authoritative next to it;
+maintenance removes only wholly unreachable packs and does not compact mixed
+packs. Derived rows — tree projections, the index and the blob-id cache — cost
+14.15 MiB, 6.5% of the database, and are the only part a plain `.git` does not
+have an equivalent for. B-tree overhead over the whole database is 5.6%;
+`VACUUM` would reclaim a further 2.3%, and Durable Object SQL exposes no
 `VACUUM`, so treat that as a diagnostic rather than a plan.
 
 Decomposing the same work — `init`, `fetch`, `updateRef`, `checkout`, each into
 its own database — attributes bytes and statements to the two halves:
 
-| Phase | Median wall | SQL | Rows | DB after |
+| Phase | Wall | SQL | Rows | DB after |
 | --- | ---: | ---: | ---: | ---: |
-| `git.init` + `remoteAdd` | 3.907 ms | 16 | 6 | 336.0 KiB |
-| `git.fetch` | 4,100.493 ms | 208 | 1,202 | 57.57 MiB |
-| `git.updateRef` | 2.278 ms | 23 | 8 | 57.57 MiB |
-| `git.checkout` | 5,339.358 ms | 608 | 77,340 | 218.07 MiB |
+| `git.init` + `remoteAdd` | 3.7 ms | 25 | 13 | 500.0 KiB |
+| `git.fetch` | 6,165.8 ms | 330 | 68,430 | 57.27 MiB |
+| `git.updateRef` | 4.3 ms | 28 | 12 | 57.27 MiB |
+| `git.checkout` | 4,037.1 ms | 690 | 101,608 | 217.78 MiB |
 
 This is a decomposition, not the clone path. Both paths use the shared
 create-only initial materializer, but the standalone sequence also performs the
-separate initialization, fetch, and ref publication phases. Clone uses 824
-statements; the standalone checkout itself uses 608. Both materialize exactly
-24,252 index entries and worktree leaves at the expected HEAD. Each final state
-has the same 228,667,392-byte allocated database size. Both stay below the
-at-most-1,000-statement benchmark target; a future miss would be optimization
-evidence rather than a runtime refusal.
+separate initialization, fetch, and ref publication phases. Clone uses 1,012
+statements; the standalone checkout itself uses 690. Both materialize exactly
+24,252 index entries and worktree leaves at the expected HEAD and end at the
+same 217.78 MiB database size. Each phase meets the at-most-1,000-statement
+target; the clone misses it
+([backlog 90](../backlog/90-bring-the-nextjs-clone-under-the-statement-target.md)).
+A miss is optimization evidence, not a runtime refusal.
 
 Generated output goes to `bench/results/clone-storage.{json,md}`, which is
 gitignored. Update this curated snapshot only from a CPU-leased run.
+Superseded snapshots are in
+[`../archive/benchmarks/`](../archive/benchmarks/README.md).

@@ -16,9 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-09-23-simplification.md`](sprints/sprint-2026-09-23-simplification.md)
-  — remove excess machinery (thin-pack graph admission, paged reads, repack,
-  journal re-validation, byte ledgers, dead code) with functionality kept.
+None.
 
 ## Specs
 
@@ -36,22 +34,28 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
       If everything is "hot", nothing is. -->
+- [Simplification](archive/sprint-2026-09-23-simplification.md) shipped: −14 %
+  Git source, 61 → 46 tables, self-contained packs, `STRICT` schema, rebase at
+  any size. Next: [93](backlog/93-refuse-abort-over-unstaged-edits.md) (tier S
+  data loss), then the 86/87/90 cost misses.
 - [Production correctness and memory](archive/sprint-2026-09-10-production-correctness-and-memory.md)
   shipped: cold-readable pack admission, hidden provisional projections, bounded
   packed reads, and integration output lifetime. It consumed backlog 74 and 63
   and ARCH-9/ARCH-8 from 65, and left backlog 83–90 with measured numbers.
 - [Statement targets and harnesses](archive/sprint-2026-09-23-statement-targets-and-harnesses.md)
-  closed early: harnesses restored, 83/85/88/89 shipped; statement misses 87
-  and 90 wait for the simplification program.
+  closed early: harnesses restored, 83/85/88/89 shipped. At the simplification
+  closure 87 (1,132 statements) and 90 (1,012) still miss the target.
 - [Lifecycle and network integrity](archive/sprint-2026-09-08-lifecycle-and-network-integrity.md)
   is complete: promise-aware maintenance, pack dependency preservation, and final
-  fetch connectivity checks. Default clone meets 990 SQL and the approved
-  <160 MiB added-peak RSS gate; the original <100 MiB gate was not met.
+  fetch connectivity checks. At that closure the default clone met 990 SQL and
+  the approved <160 MiB added-peak RSS gate; on 2026-09-24 it runs 1,006 SQL
+  and adds 236–250 MiB ([backlog 86](backlog/86-bound-sparse-selected-add-and-workerd-clone-peaks.md),
+  [90](backlog/90-bring-the-nextjs-clone-under-the-statement-target.md)).
 - Five lockstep `@kompjutr/*` packages now separate shared contracts, generic
   Git, the Durable Object runtime, and a crash-recoverable Unix local runtime.
   The final package-split comparison preserved every operation's SQL/row profile
-  and reduced total workflow median time by 5.416%; see
-  [`benchmark-current`](reference/benchmark-current.md).
+  and reduced total workflow median time by 5.416%; see the
+  [superseded snapshots](archive/benchmarks/benchmark-snapshots-2026-09-10.md).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0015).
 - The 2026-09-08 architecture-review follow-up is filed in
@@ -214,4 +218,4 @@ decodes an old number found in `archive/` or `specs/`.
 - [`archive/sprint-2026-08-24-three-way-integration-engine.md`](archive/sprint-2026-08-24-three-way-integration-engine.md)
   — bounded pure three-tree integration engine.
 - [`archive/plans/`](archive/plans/README.md) — completed and superseded implementation plans.
-- [`archive/benchmarks/`](archive/benchmarks/README.md) — pre-standalone benchmark evidence.
+- [`archive/benchmarks/`](archive/benchmarks/README.md) — pre-standalone benchmark evidence and superseded native snapshots.

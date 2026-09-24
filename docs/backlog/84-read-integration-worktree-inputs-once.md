@@ -12,18 +12,24 @@ operation's wall time.
 
 ## Problem
 
-Measuring WU6 at `fe4e4e2` attributed 1,200 MiB of worktree reads to a merge
-whose conflicted inputs total 150 MiB — eight passes over the same bytes,
-delivered as 2,400 `fs_chunks` rows of `CHUNK_SIZE` 512 KiB with one row live
-at a time. The same ratio holds at 75 files (600 MiB against 75 MiB).
+Remeasured at `62ffbf0` (2026-09-24), after the simplification sprint's
+forwarding-layer removal (WU4) and large-rebase streaming (WU22). Neither
+changed the pass count. The instrumented pass for the 150-file binary merge
+still attributes 1,200 MiB of worktree reads to conflicted inputs that total
+150 MiB: one query shape,
+`SELECT c.idx, substr(c.bytes, 1, ?) FROM fs_chunks c WHERE c.inode = ? …`,
+runs 2,400 times and returns 2,400 rows of `CHUNK_SIZE` 512 KiB, one row live at
+a time. It was the same 2,400 rows and 1,200 MiB at `fe4e4e2`.
 
-This is not a memory defect: WU6's bound holds, and the case meets the
-<100 MiB added-peak target. It is the dominant term in that case's ~10 s, and
-it is why binary-150 reaches the 512 MiB cgroup cap through page cache and
-records several hundred `memory.max` reclaim events.
+This is not a memory defect. The case adds 92.4–96.2 MiB of process peak over
+three runs, under the <100 MiB target, in 8,040 statements. The reads are the
+dominant term in its 7.8–10.3 s, and they are why binary-150 reaches the
+512 MiB cgroup cap through page cache: 667–809 `memory.max` reclaim events per
+run, no OOM.
 
-Evidence and the per-table-family ledger are in ignored
-`bench/results/integration-after-2026-09-22/`.
+Evidence and the per-table-family ledger: ignored
+`bench/results/integration-after-2026-09-22/` (baseline) and a HEAD copy of that
+harness, rebuilt from the same frozen packs.
 
 ## Approach / acceptance
 
@@ -40,7 +46,8 @@ in the artifact directory so the before and after are like for like.
 
 ## Touch points
 
-`packages/git/src/ops/integration/`, `packages/git/src/ops/merge/`,
-`packages/git/src/ops/worktree/`, `bench/` fixtures.
+`packages/git/src/ops/integration/` (including `apply/`),
+`packages/git/src/ops/merge/`, `packages/git/src/ops/worktree/`, `bench/`
+fixtures.
 
-<!-- Origin: sprint-2026-09-10 WU6 measurement, 2026-09-22 run-log entry. -->
+<!-- Origin: sprint-2026-09-10 WU6 measurement, 2026-09-22 run-log entry; remeasured at the 2026-09-23 simplification closure. -->

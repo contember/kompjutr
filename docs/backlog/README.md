@@ -19,13 +19,16 @@ Ranking of the gaps recorded in
 not effort: a wrong answer outranks a missing one.
 
 - **S — silent divergence.** kompjutr returns a plausible result where Git
-  returns a different one or refuses. Nothing warns the caller. No current item.
+  returns a different one or refuses. Nothing warns the caller.
+  [93](93-refuse-abort-over-unstaged-edits.md)
 - **A — blocks a common workflow, loudly.** The call fails or the capability is
   absent; no data is at risk.
   [39](39-plumbing-read-surface.md) ·
   [06](06-stash-operations.md) ·
   [18](18-branch-and-remote-management.md)
 - **B — real gap, narrower audience or a workaround exists.**
+  [91](91-overwrite-ignored-untracked-files.md) ·
+  [92](92-summarize-cli-commits-past-the-row-cap.md) ·
   [36](36-glob-pathspecs.md) ·
   [25](25-rebase-targets-and-roots.md) ·
   [26](26-interactive-rebase.md) ·
@@ -93,8 +96,10 @@ its defects were already reproduced. The
 shipped all of 74 and 63 plus ARCH-9/ARCH-8 from 65, so those items are gone.
 Other findings in 65 remain unscheduled. The
 [statement targets and harnesses sprint](../archive/sprint-2026-09-23-statement-targets-and-harnesses.md)
-shipped 83, 85, 88 and 89 and closed early; 87 and 90 are re-measured after the
-simplification program. 84 and 86 remain for a later memory-and-transfer sprint. This bounded tranche precedes the broader scale/audit sequence below;
+shipped 83, 85, 88 and 89 and closed early. The simplification sprint
+re-measured 84, 86, 87 and 90 at its closure; all four remain open with current
+numbers, and it filed 91–97. 84, 86 and 95 fit a later memory-and-transfer
+sprint. This bounded tranche precedes the broader scale/audit sequence below;
 it does not replace the external integration gate. Remaining parity work stays unscheduled
 until the external consumer integration gate provides new evidence.
 
@@ -162,6 +167,13 @@ does not schedule these issues into a sprint.
 - [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
 - [81 — Copy object bytes only when a cache actually retains them](81-copy-object-bytes-only-when-retained.md)
 - [84 — Read integration worktree inputs once](84-read-integration-worktree-inputs-once.md)
-- [86 — Bound the sparse-selected-add and workerd clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
+- [86 — Bound the sparse-selected-add and Next.js clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
 - [87 — Bring an eight-step rebase under the statement target](87-bring-rebase-transition-under-the-statement-target.md)
 - [90 — Bring the Next.js clone under the statement target](90-bring-the-nextjs-clone-under-the-statement-target.md)
+- [91 — Overwrite ignored untracked files on checkout, merge and rebase](91-overwrite-ignored-untracked-files.md)
+- [92 — Summarize a CLI commit that changes more than 50,000 files](92-summarize-cli-commits-past-the-row-cap.md)
+- [93 — Refuse merge and replay abort over unstaged edits](93-refuse-abort-over-unstaged-edits.md)
+- [94 — Validate the rebase committer option at the entry point](94-validate-the-rebase-committer-at-entry.md)
+- [95 — Reduce the Next.js rebase step's full-tree passes and peak](95-reduce-the-nextjs-rebase-step-peak.md)
+- [96 — Memoize intermediate delta-chain entries during one packed read](96-memoize-intermediate-delta-chain-entries.md)
+- [97 — Bound Git output for pipe and redirect sinks by the shell's retained budget](97-bound-git-output-before-pipe-and-redirect-sinks.md)

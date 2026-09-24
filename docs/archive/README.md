@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Simplification](sprint-2026-09-23-simplification.md) — self-contained packs,
+  non-paged reads, no repack, per-OID tree projections, integration output and
+  commit rows as ordinary store rows, `STRICT` schema, rebase at any size.
 - [Statement targets and harnesses](sprint-2026-09-23-statement-targets-and-harnesses.md)
   — restored benchmark harnesses, porcelain v2 unmerged order, journal probe and
   promotion recount removed; closed early before the statement targets.
