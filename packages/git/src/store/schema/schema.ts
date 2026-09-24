@@ -225,11 +225,6 @@ export function initializeGitSchema(db: SqlDatabase): void {
 
     for (const statement of STATEMENTS) db.run(statement);
     db.run(
-      `INSERT OR IGNORE INTO git_identity_control
-         (singleton, last_repo_id, last_checkout_id, last_clone_generation)
-       VALUES (1, 0, 0, 0)`,
-    );
-    db.run(
       "INSERT INTO git_meta (key, value) VALUES ('schema_version', ?)",
       String(SCHEMA_VERSION),
     );

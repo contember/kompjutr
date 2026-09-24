@@ -308,7 +308,6 @@ describe("checkout lifecycle storage", () => {
       primary.repoId,
       OID,
     );
-    db.run("UPDATE git_identity_control SET last_checkout_id = 1023 WHERE singleton = 1");
 
     const accepted = database.createCheckout(primary.repoId, "/session-1024", OTHER_OID);
     expect(accepted.id).toBe(1_024);
@@ -341,11 +340,6 @@ describe("checkout lifecycle storage", () => {
               printf('ref: refs/tags/%0*d', 1009, id),
               CASE id WHEN 1 THEN 1 ELSE 0 END
          FROM sequence`,
-    );
-    db.run(
-      `UPDATE git_identity_control
-          SET last_repo_id = 1, last_checkout_id = 1024
-        WHERE singleton = 1`,
     );
 
     db.storage.resetCounters();
@@ -565,7 +559,6 @@ describe("checkout lifecycle storage", () => {
       primary.repoId,
       OID,
     );
-    db.run("UPDATE git_identity_control SET last_checkout_id = 1024 WHERE singleton = 1");
     const ids = Array.from({ length: 1_023 }, (_, index) => index + 2);
 
     db.storage.resetCounters();

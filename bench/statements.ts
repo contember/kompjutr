@@ -70,7 +70,6 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "table:git_commits",
   "table:git_config",
   "table:git_fetch_namespaces",
-  "table:git_identity_control",
   "table:git_index",
   "table:git_index_dirty",
   "table:git_index_state",

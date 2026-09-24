@@ -764,19 +764,19 @@ describe("branch", () => {
     const main = ws.repo.store.getRef("refs/heads/main");
     if (main === null) throw new Error("main is missing");
     ws.repo.store.configSet("branch.main.remote", "origin");
-    ws.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
+    ws.repo.store.db.run(
+      `CREATE TEMP TRIGGER branch_rename_publication_fault
+       BEFORE INSERT ON git_checkout_reflog_entries
+       WHEN NEW.new_raw = 'ref: refs/heads/primary'
+       BEGIN SELECT RAISE(ABORT, 'branch rename publication fault'); END`,
+    );
     try {
-      ws.repo.store.db.run(
-        "INSERT INTO git_refs (repo_id, name, target) VALUES (?, 'refs/tags/corrupt', zeroblob(40))",
-        ws.repo.store.repoId,
+      expect(() => branchRename(ws.context, ws.repo, { newName: "primary" })).toThrow(
+        /branch rename publication fault/,
       );
     } finally {
-      ws.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");
+      ws.repo.store.db.run("DROP TRIGGER branch_rename_publication_fault");
     }
-
-    expect(() => branchRename(ws.context, ws.repo, { newName: "primary" })).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
     expect(ws.repo.checkout.head()).toBe("ref: refs/heads/main");
     expect(ws.repo.store.getRef("refs/heads/main")).toBe(main);
     expect(ws.repo.store.getRef("refs/heads/primary")).toBeNull();

@@ -40,30 +40,14 @@ export class DatabaseCheckoutMutations {
         }
         throw new GitError("EALREADYINIT", `repository already exists at ${normalized}`);
       }
-      const identity = this.identities.allocateIdentities(true, true, false);
-      const repoId = identity.repoId;
-      const checkoutId = identity.checkoutId;
-      try {
-        this.state.db.run("INSERT INTO git_repositories (id) VALUES (?)", repoId);
-      } catch (error) {
-        throw new CorruptError("repository identity control precedes stored repositories", {
-          cause: error,
-        });
-      }
+      const repoId = this.identities.insertRepository("ready", null);
       this.state.db.run(
         `INSERT INTO git_pack_ingest_control
            (repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms)
          VALUES (?, 0, 0, NULL, NULL)`,
         repoId,
       );
-      this.state.db.run(
-        `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
-         VALUES (?, ?, ?, ?, 1)`,
-        checkoutId,
-        repoId,
-        normalized,
-        checkedHead,
-      );
+      const checkoutId = this.identities.insertCheckout(repoId, normalized, checkedHead, true);
       advanceCheckoutRevision(this.state.db, repoId);
       this.state.db.run(
         "INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (?, 0)",
@@ -161,16 +145,9 @@ export class DatabaseCheckoutMutations {
           }
         }
 
-        const checkoutId = this.identities.allocateIdentities(false, true, false).checkoutId;
+        let checkoutId: number;
         try {
-          this.state.db.run(
-            `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
-           VALUES (?, ?, ?, ?, 0)`,
-            checkoutId,
-            repoId,
-            normalized,
-            checkedHead,
-          );
+          checkoutId = this.identities.insertCheckout(repoId, normalized, checkedHead, false);
         } catch (error) {
           if (isCheckoutRootUniqueConstraint(error)) {
             throw new GitError(

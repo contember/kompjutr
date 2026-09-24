@@ -19,7 +19,6 @@ interface SchemaDefinition extends SchemaObject {
 
 const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_meta", "global"],
-  ["git_identity_control", "global"],
   ["git_repositories", "shared"],
   ["git_refs", "shared"],
   ["git_tracking_ref_revisions", "shared"],
@@ -86,7 +85,6 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_commits" },
   { type: "table", name: "git_config" },
   { type: "table", name: "git_fetch_namespaces" },
-  { type: "table", name: "git_identity_control" },
   { type: "table", name: "git_index" },
   { type: "table", name: "git_index_dirty" },
   { type: "table", name: "git_index_state" },
@@ -140,15 +138,10 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
 const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] = [
   ["git_meta", ["key", "value"]],
   [
-    "git_identity_control",
-    ["singleton", "last_repo_id", "last_checkout_id", "last_clone_generation"],
-  ],
-  [
     "git_repositories",
     [
       "id",
       "lifecycle",
-      "clone_generation",
       "clone_expires_ms",
       "fetch_generation",
       "shallow_revision",
@@ -536,7 +529,6 @@ describe("git schema", () => {
       }
     }
     expect(primaryKeyOf(db, "git_repositories")).toEqual(["id"]);
-    expect(primaryKeyOf(db, "git_identity_control")).toEqual(["singleton"]);
     expect(primaryKeyOf(db, "git_checkouts")).toEqual(["id"]);
     expect(primaryKeyOf(db, "git_fetch_namespaces")).toEqual(["repo_id", "tracking_prefix"]);
     expect(primaryKeyOf(db, "git_tracking_ref_revisions")).toEqual(["repo_id", "ref_name"]);
@@ -735,30 +727,35 @@ describe("git schema", () => {
       oid,
     );
 
-    const invalidUpdates = [
+    const invalidValues = [
       "UPDATE git_refs SET name = ''",
-      "UPDATE git_refs SET name = zeroblob(1)",
       "UPDATE git_refs SET target = 'broken'",
       "UPDATE git_refs SET target = 'ref: HEAD'",
-      "UPDATE git_refs SET target = zeroblob(40)",
       "UPDATE git_shallow SET oid = 'broken'",
-      "UPDATE git_shallow SET oid = zeroblob(40)",
       "UPDATE git_config SET seq = -1",
-      "UPDATE git_config SET seq = 0.5",
-      "UPDATE git_config SET value = zeroblob(1)",
       "UPDATE git_index SET stage = 4",
-      "UPDATE git_index SET stage = 0.5",
       "UPDATE git_index SET mode = 0",
       "UPDATE git_index SET oid = 'broken'",
-      "UPDATE git_index SET oid = zeroblob(40)",
       "UPDATE git_index SET size = -1",
       "UPDATE git_index SET mtime = -1",
       "UPDATE git_index SET ino = -1",
       "UPDATE git_index SET rev = -1",
+    ];
+    for (const update of invalidValues) {
+      expect(() => db.run(update), update).toThrow(/CHECK constraint failed/);
+    }
+    const invalidTypes = [
+      "UPDATE git_refs SET name = zeroblob(1)",
+      "UPDATE git_refs SET target = zeroblob(40)",
+      "UPDATE git_shallow SET oid = zeroblob(40)",
+      "UPDATE git_config SET seq = 0.5",
+      "UPDATE git_config SET value = zeroblob(1)",
+      "UPDATE git_index SET stage = 0.5",
+      "UPDATE git_index SET oid = zeroblob(40)",
       "UPDATE git_index SET size = 0.5",
     ];
-    for (const update of invalidUpdates) {
-      expect(() => db.run(update), update).toThrow(/CHECK/);
+    for (const update of invalidTypes) {
+      expect(() => db.run(update), update).toThrow(/cannot store (BLOB|REAL) value/);
     }
   });
 
@@ -777,7 +774,7 @@ describe("git schema", () => {
     ).toThrow(/CHECK/);
     expect(() =>
       db.run("INSERT INTO git_repositories (id, checkout_revision) VALUES (3, zeroblob(1))"),
-    ).toThrow(/CHECK/);
+    ).toThrow(/cannot store BLOB value in INTEGER column/);
   });
 
   it("enforces current reflog lifecycle foreign keys", () => {
@@ -814,6 +811,62 @@ describe("git schema", () => {
     ).toThrow(/FOREIGN KEY/);
   });
 
+  it("rejects a NULL reflog endpoint whose OID is set", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
+    const oldOid = "1".repeat(40);
+    const newOid = "2".repeat(40);
+    const endpoints = [
+      { name: "old", values: [null, newOid, oldOid, newOid] },
+      { name: "new", values: [oldOid, null, oldOid, newOid] },
+    ];
+    const tables = [
+      {
+        name: "git_reflog_entries",
+        insert: `INSERT INTO git_reflog_entries
+           (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+            actor_name, actor_email, timestamp, timezone, reason)
+         VALUES (?, 'refs/tags/x', ?, ?, ?, ?, ?, NULL, NULL, 0, 0, 'witness')`,
+        owner: [repository.repoId],
+      },
+      {
+        name: "git_checkout_reflog_entries",
+        insert: `INSERT INTO git_checkout_reflog_entries
+           (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
+            actor_name, actor_email, timestamp, timezone, reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, 'witness')`,
+        owner: [repository.id, repository.repoId],
+      },
+    ];
+    let ordinal = 1;
+    for (const table of tables) {
+      db.run(table.insert, ...table.owner, ordinal++, oldOid, newOid, oldOid, newOid);
+      for (const endpoint of endpoints) {
+        expect(
+          () => db.run(table.insert, ...table.owner, ordinal++, ...endpoint.values),
+          `${table.name} ${endpoint.name}`,
+        ).toThrow(/CHECK constraint failed/);
+      }
+    }
+  });
+
+  it("requires complete tree projections to record their counts", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
+    const insert = `INSERT INTO git_tree_sources
+       (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
+     VALUES (?, ?, 1, 1, ?, ?)`;
+    db.run(insert, repository.repoId, "a".repeat(40), 1, 1);
+    expect(() => db.run(insert, repository.repoId, "b".repeat(40), null, 1)).toThrow(
+      /CHECK constraint failed/,
+    );
+    expect(() => db.run(insert, repository.repoId, "c".repeat(40), 1, null)).toThrow(
+      /CHECK constraint failed/,
+    );
+  });
+
   it("enforces authenticated merge-origin operation constraints", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
@@ -848,7 +901,7 @@ describe("git schema", () => {
     partial.run(`CREATE TABLE git_meta (
      key TEXT PRIMARY KEY,
      value TEXT NOT NULL
-   )`);
+   ) STRICT`);
     partial.run("INSERT INTO git_meta (key, value) VALUES ('schema_version', '1')");
     expect(() => initializeGitSchema(partial)).toThrow(/missing required/);
     expect(schemaObjects(partial)).toEqual([{ type: "table", name: "git_meta" }]);
@@ -938,7 +991,7 @@ describe("git schema", () => {
     missingVersion.run(`CREATE TABLE git_meta (
      key TEXT PRIMARY KEY,
      value TEXT NOT NULL
-   )`);
+   ) STRICT`);
     expect(() => initializeGitSchema(missingVersion)).toThrow(/version is missing/);
 
     for (const version of ["", " ", "1.0", "01", "0", "-1", "9007199254740993"]) {

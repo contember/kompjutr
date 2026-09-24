@@ -44,30 +44,28 @@ export class DatabaseProvisionalClones {
     const checkedHead = requireRawRefTarget(head, "initial HEAD target", "input");
     const nowMs = requireMilliseconds(now, "clone lease clock", "input");
     const expiresMs = provisionalCloneExpiry(nowMs);
-    let cleanupGeneration: number | null = null;
+    let cleanupRepoId: number | null = null;
     let created: {
       checkout: CheckoutRow;
-      generation: number;
-      evictedGeneration: number | null;
+      evictedRepoId: number | null;
     };
     try {
       created = this.state.db.transactionSync(() => {
         const existing = this.identities.repositoryAtRoot(normalized);
-        let evictedGeneration: number | null = null;
+        let evictedRepoId: number | null = null;
         if (existing !== null) {
           if (existing.lifecycle === "ready") {
             throw new GitError("EALREADYINIT", `repository already exists at ${normalized}`);
           }
-          const oldGeneration = existing.cloneGeneration;
           const oldExpiry = existing.cloneExpiresMs;
-          if (oldGeneration === null || oldExpiry === null) {
+          if (oldExpiry === null) {
             throw new CorruptError("provisional clone owner is incomplete");
           }
           if (nowMs < oldExpiry) {
             throw new GitError("EBUSY", `clone at ${normalized} is still in progress`);
           }
-          cleanupGeneration = oldGeneration;
-          const oldStore = this.provisionalStore(existing.checkout, oldGeneration).store;
+          cleanupRepoId = existing.repoId;
+          const oldStore = this.provisionalStore(existing.checkout).store;
           const result = withLifecycleCheckoutMutations(oldStore, () => cleanup(oldStore));
           if (isThenableResult(result)) {
             void Promise.resolve(result).catch(() => {});
@@ -76,10 +74,9 @@ export class DatabaseProvisionalClones {
           const deleted = this.state.db.one<Record<string, unknown>>(
             `DELETE FROM git_repositories
             WHERE id = ? AND lifecycle = 'provisional'
-              AND clone_generation = ? AND clone_expires_ms = ? AND clone_expires_ms <= ?
+              AND clone_expires_ms = ? AND clone_expires_ms <= ?
           RETURNING id AS repo_id`,
             existing.repoId,
-            oldGeneration,
             oldExpiry,
             nowMs,
           );
@@ -89,68 +86,49 @@ export class DatabaseProvisionalClones {
           ) {
             throw new GitError("ESTALE", "provisional clone ownership changed during takeover");
           }
-          evictedGeneration = oldGeneration;
+          evictedRepoId = existing.repoId;
         }
 
-        const identity = this.identities.allocateIdentities(true, true, true);
-        this.state.db.run(
-          `INSERT INTO git_repositories
-             (id, lifecycle, clone_generation, clone_expires_ms)
-           VALUES (?, 'provisional', ?, ?)`,
-          identity.repoId,
-          identity.cloneGeneration,
-          expiresMs,
-        );
+        const repoId = this.identities.insertRepository("provisional", expiresMs);
         this.state.db.run(
           `INSERT INTO git_pack_ingest_control
              (repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms)
            VALUES (?, 0, 0, NULL, NULL)`,
-          identity.repoId,
+          repoId,
         );
-        this.state.db.run(
-          `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
-           VALUES (?, ?, ?, ?, 1)`,
-          identity.checkoutId,
-          identity.repoId,
-          normalized,
-          checkedHead,
-        );
-        advanceCheckoutRevision(this.state.db, identity.repoId);
+        const checkoutId = this.identities.insertCheckout(repoId, normalized, checkedHead, true);
+        advanceCheckoutRevision(this.state.db, repoId);
         this.state.db.run(
           "INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (?, 0)",
-          identity.repoId,
+          repoId,
         );
         this.state.db.run(
           `INSERT OR IGNORE INTO git_index_state
                (checkout_id, baseline_tree_oid, format, complete) VALUES (?, NULL, 1, 0)`,
-          identity.checkoutId,
+          checkoutId,
         );
         const checkout: CheckoutRow = {
-          id: identity.checkoutId,
-          repoId: identity.repoId,
+          id: checkoutId,
+          repoId,
           root: normalized,
           head: checkedHead,
           isPrimary: true,
         };
-        return { checkout, generation: identity.cloneGeneration, evictedGeneration };
+        return { checkout, evictedRepoId };
       });
     } catch (error) {
-      if (cleanupGeneration !== null) {
-        this.evictProvisional(cleanupGeneration);
+      if (cleanupRepoId !== null) {
+        this.evictProvisional(cleanupRepoId);
       }
       throw error;
     }
 
-    if (created.evictedGeneration !== null) {
-      this.evictProvisional(created.evictedGeneration);
+    if (created.evictedRepoId !== null) {
+      this.evictProvisional(created.evictedRepoId);
     }
     const checkout = Object.freeze(created.checkout);
-    const record = this.provisionalStore(checkout, created.generation);
-    const owner = Object.freeze({
-      checkout,
-      generation: created.generation,
-      store: record.store,
-    });
+    const record = this.provisionalStore(checkout);
+    const owner = Object.freeze({ checkout, store: record.store });
     this.state.issuedProvisionalOwners.add(owner);
     return owner;
   }
@@ -167,11 +145,10 @@ export class DatabaseProvisionalClones {
         const updated = this.state.db.one<Record<string, unknown>>(
           `UPDATE git_repositories SET clone_expires_ms = ?
             WHERE id = ? AND lifecycle = 'provisional'
-              AND clone_generation = ? AND clone_expires_ms = ? AND clone_expires_ms > ?
+              AND clone_expires_ms = ? AND clone_expires_ms > ?
           RETURNING clone_expires_ms`,
           nextExpiry,
           stored.repoId,
-          owner.generation,
           currentExpiry,
           nowMs,
         );
@@ -223,12 +200,11 @@ export class DatabaseProvisionalClones {
         }
         const updated = this.state.db.one<Record<string, unknown>>(
           `UPDATE git_repositories
-              SET lifecycle = 'ready', clone_generation = NULL, clone_expires_ms = NULL
+              SET lifecycle = 'ready', clone_expires_ms = NULL
             WHERE id = ? AND lifecycle = 'provisional'
-              AND clone_generation = ? AND clone_expires_ms = ? AND clone_expires_ms > ?
-          RETURNING id AS repo_id, lifecycle, clone_generation, clone_expires_ms`,
+              AND clone_expires_ms = ? AND clone_expires_ms > ?
+          RETURNING id AS repo_id, lifecycle, clone_expires_ms`,
           stored.repoId,
-          owner.generation,
           expiry,
           nowMs,
         );
@@ -266,12 +242,11 @@ export class DatabaseProvisionalClones {
     try {
       this.state.db.transactionSync(() => {
         const stored = this.storedProvisionalOwner(owner);
-        const generation = owner.generation;
-        const existing = this.state.provisionalStores.get(generation);
+        const existing = this.state.provisionalStores.get(stored.repoId);
         if (existing !== undefined && existing.store !== owner.store) {
           throw new GitError("ESTALE", "provisional clone facade belongs to another owner");
         }
-        cleanupRecord = existing ?? this.provisionalStore(stored.checkout, generation);
+        cleanupRecord = existing ?? this.provisionalStore(stored.checkout);
         const cleanupStore = cleanupRecord.store;
         const result = withLifecycleCheckoutMutations(cleanupStore, () => cleanup(cleanupStore));
         if (isThenableResult(result)) {
@@ -281,10 +256,8 @@ export class DatabaseProvisionalClones {
         const deleted = this.state.db.one<Record<string, unknown>>(
           `DELETE FROM git_repositories
             WHERE id = ? AND lifecycle = 'provisional'
-              AND clone_generation = ?
           RETURNING id AS repo_id`,
           stored.repoId,
-          generation,
         );
         if (
           deleted === undefined ||
@@ -311,12 +284,11 @@ export class DatabaseProvisionalClones {
     }
     const repoId = requireSafeId(owner.checkout.repoId, "provisional repository id");
     const checkoutId = requireSafeId(owner.checkout.id, "provisional checkout id");
-    const generation = requireSafeId(owner.generation, "provisional clone generation");
     const row = this.state.db.one<Record<string, unknown>>(
       `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
                 checkout.head,
                 checkout.is_primary, repository.lifecycle,
-                repository.clone_generation, repository.clone_expires_ms,
+                repository.clone_expires_ms,
                 ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
            FROM git_repositories repository
            JOIN git_checkouts checkout ON checkout.repo_id = repository.id
@@ -328,7 +300,6 @@ export class DatabaseProvisionalClones {
     const stored = requireStoredCheckoutLifecycle(row);
     if (
       stored.lifecycle !== "provisional" ||
-      stored.cloneGeneration !== generation ||
       stored.checkout.root !== owner.checkout.root ||
       stored.checkout.repoId !== repoId ||
       stored.checkout.id !== checkoutId
@@ -344,11 +315,10 @@ export class DatabaseProvisionalClones {
     nowMs: number,
   ): StoredCheckoutLifecycle {
     const stored = this.storedProvisionalOwner(owner);
-    const generation = owner.generation;
     const expiry = stored.cloneExpiresMs;
     if (expiry === null) throw new CorruptError("provisional clone lease is missing");
     if (nowMs >= expiry) throw new GitError("ESTALE", "provisional clone lease has expired");
-    const record = this.state.provisionalStores.get(generation);
+    const record = this.state.provisionalStores.get(stored.repoId);
     if (record === undefined || record.store !== owner.store) {
       throw new GitError("ESTALE", "provisional clone facade is no longer active");
     }
@@ -358,11 +328,11 @@ export class DatabaseProvisionalClones {
     return stored;
   }
 
-  private provisionalStore(checkout: CheckoutRow, generation: number): ProvisionalStoreRecord {
-    const existing = this.state.provisionalStores.get(generation);
+  private provisionalStore(checkout: CheckoutRow): ProvisionalStoreRecord {
+    const existing = this.state.provisionalStores.get(checkout.repoId);
     if (existing !== undefined) {
-      if (existing.repoId !== checkout.repoId || existing.checkoutId !== checkout.id) {
-        throw new CorruptError("provisional clone generation belongs to another repository");
+      if (existing.checkoutId !== checkout.id) {
+        throw new CorruptError("provisional clone facade belongs to another checkout");
       }
       return existing;
     }
@@ -390,34 +360,32 @@ export class DatabaseProvisionalClones {
       isLifecycleMutationCheckout,
     );
     const record: ProvisionalStoreRecord = {
-      generation,
       repoId: checkout.repoId,
       checkoutId: checkout.id,
       shared,
       store,
       lifetime,
     };
-    this.state.provisionalStores.set(generation, record);
+    this.state.provisionalStores.set(checkout.repoId, record);
     return record;
   }
 
-  private evictProvisional(generation: number): void {
-    const record = this.state.provisionalStores.get(generation);
+  private evictProvisional(repoId: number): void {
+    const record = this.state.provisionalStores.get(repoId);
     if (record === undefined) return;
     this.evictProvisionalRecord(record);
   }
 
   private evictProvisionalRecord(record: ProvisionalStoreRecord): void {
-    if (this.state.provisionalStores.get(record.generation) !== record) return;
+    if (this.state.provisionalStores.get(record.repoId) !== record) return;
     record.lifetime.revoke();
     record.shared.clearCaches();
-    this.state.provisionalStores.delete(record.generation);
+    this.state.provisionalStores.delete(record.repoId);
   }
 
   private provisionalRecordForOwner(owner: ProvisionalCloneOwner): ProvisionalStoreRecord | null {
     if (!this.state.issuedProvisionalOwners.has(owner)) return null;
-    if (!Number.isSafeInteger(owner.generation) || owner.generation < 1) return null;
-    const record = this.state.provisionalStores.get(owner.generation);
+    const record = this.state.provisionalStores.get(owner.checkout.repoId);
     return record !== undefined && record.store === owner.store ? record : null;
   }
 

@@ -134,7 +134,7 @@ describe("operation reflog metadata", () => {
         "UPDATE git_config SET value = x'00' WHERE repo_id = ? AND path = 'user.name'",
         workspace.repo.store.repoId,
       ),
-    ).toThrow(/CHECK/);
+    ).toThrow(/cannot store BLOB value in TEXT column/);
     expect(workspace.repo.store.configGet("user.name")).toBe("Valid");
   });
 });

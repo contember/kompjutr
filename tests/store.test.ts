@@ -96,7 +96,6 @@ describe("repository registry", () => {
       "git_commits",
       "git_config",
       "git_fetch_namespaces",
-      "git_identity_control",
       "git_index",
       "git_index_dirty",
       "git_index_state",
@@ -136,6 +135,7 @@ describe("repository registry", () => {
       "git_tracking_ref_revisions",
       "git_tree_entries",
       "git_tree_sources",
+      "sqlite_sequence",
     ]);
   });
 
@@ -243,7 +243,7 @@ describe("repository registry", () => {
 
     const corrupt = open();
     corrupt.db.run("PRAGMA ignore_check_constraints = ON");
-    corrupt.db.run("UPDATE git_repositories SET checkout_revision = zeroblob(1) WHERE id = 1");
+    corrupt.db.run("UPDATE git_repositories SET checkout_revision = -1 WHERE id = 1");
     corrupt.db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() =>
       corrupt.store.beginFetchPublication("refs/remotes/origin/", ["refs/heads/next"]),
@@ -2035,9 +2035,7 @@ describe("refs, config and index", () => {
   it("fails closed on corrupt or exhausted fetch generations and revisions", () => {
     const corruptGeneration = open();
     corruptGeneration.db.run("PRAGMA ignore_check_constraints = ON");
-    corruptGeneration.db.run(
-      "UPDATE git_repositories SET fetch_generation = zeroblob(1) WHERE id = 1",
-    );
+    corruptGeneration.db.run("UPDATE git_repositories SET fetch_generation = -1 WHERE id = 1");
     corruptGeneration.db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() =>
       corruptGeneration.store.beginFetchPublication("refs/remotes/origin/"),
@@ -2073,9 +2071,7 @@ describe("refs, config and index", () => {
     const corruptToken = corruptRevision.store.beginFetchPublication("refs/remotes/origin/");
     try {
       corruptRevision.db.run("PRAGMA ignore_check_constraints = ON");
-      corruptRevision.db.run(
-        "UPDATE git_fetch_namespaces SET revision = zeroblob(1) WHERE repo_id = 1",
-      );
+      corruptRevision.db.run("UPDATE git_fetch_namespaces SET revision = -1 WHERE repo_id = 1");
       corruptRevision.db.run("PRAGMA ignore_check_constraints = OFF");
       expect(() =>
         corruptRevision.store.publishFetchRefs(corruptToken, {}, fetchMetadata),
@@ -2107,7 +2103,7 @@ describe("refs, config and index", () => {
     try {
       corruptTrackingRevision.db.run("PRAGMA ignore_check_constraints = ON");
       corruptTrackingRevision.db.run(
-        "UPDATE git_tracking_ref_revisions SET revision = zeroblob(1) WHERE repo_id = 1",
+        "UPDATE git_tracking_ref_revisions SET revision = -1 WHERE repo_id = 1",
       );
       corruptTrackingRevision.db.run("PRAGMA ignore_check_constraints = OFF");
       expect(() =>
@@ -2141,9 +2137,7 @@ describe("refs, config and index", () => {
 
     const corruptShallowRevision = open();
     corruptShallowRevision.db.run("PRAGMA ignore_check_constraints = ON");
-    corruptShallowRevision.db.run(
-      "UPDATE git_repositories SET shallow_revision = zeroblob(1) WHERE id = 1",
-    );
+    corruptShallowRevision.db.run("UPDATE git_repositories SET shallow_revision = -1 WHERE id = 1");
     corruptShallowRevision.db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() =>
       corruptShallowRevision.store.beginFetchPublication("refs/remotes/origin/"),

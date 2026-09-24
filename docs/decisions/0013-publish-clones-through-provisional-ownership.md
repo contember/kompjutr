@@ -20,13 +20,13 @@ unrelated repositories and untracked files.
 
 ## Decision
 
-Clones are created as provisional repositories with an exact monotonic owner
-generation and a five-minute renewable lease. A provisional root remains a
-routing barrier but is hidden from ordinary repository lookup and from public
-store opens. An active same-root claimant receives `EBUSY`. A claimant that
-observes exact expiry removes the abandoned owner's tracked index and worktree
-state and its repository rows before allocating new, never-reused repository,
-checkout, and clone identities.
+Clones are created as provisional repositories with a five-minute renewable
+lease. The owner is fenced by its repository id, which `AUTOINCREMENT` never
+reuses once committed. A provisional root remains a routing barrier but is
+hidden from ordinary repository lookup and from public store opens. An active
+same-root claimant receives `EBUSY`. A claimant that observes exact expiry
+removes the abandoned owner's tracked index and worktree state and its
+repository rows before allocating a new repository and checkout id.
 
 The clone renews ownership at its real asynchronous checkpoints. A stale owner
 receives `ESTALE` and can neither publish nor delete its replacement. The

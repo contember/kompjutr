@@ -187,7 +187,7 @@ export class DatabaseRegistry {
       `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
                 checkout.head,
                 checkout.is_primary, repository.lifecycle,
-                repository.clone_generation, repository.clone_expires_ms,
+                repository.clone_expires_ms,
                 ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
            FROM git_checkouts checkout
            JOIN git_repositories repository ON repository.id = checkout.repo_id

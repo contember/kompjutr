@@ -132,19 +132,6 @@ describe("loose object payload streaming", () => {
     expect(recording.objectChunkQueries[0]).toContain("loose-object-payload");
   });
 
-  it("rejects a malformed payload row shape", () => {
-    const { db, store } = open();
-    const data = deterministicBytes(96 * 1024);
-    const oid = store.write("blob", data);
-    expect(rechunk(db, oid, 997)).toBeGreaterThan(2);
-    db.run(
-      "UPDATE git_object_chunks SET seq = 'invalid' WHERE repo_id = 1 AND oid = ? AND seq = 1",
-      oid,
-    );
-
-    expect(() => store.read(oid)).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-  });
-
   it("rejects gaps in an otherwise ordered chunk sequence", () => {
     const { db, store } = open();
     const data = deterministicBytes(96 * 1024);

@@ -27,7 +27,6 @@ export interface CheckoutRow {
 
 export interface ProvisionalCloneOwner {
   readonly checkout: CheckoutRow;
-  readonly generation: number;
   readonly store: CheckoutStore;
 }
 

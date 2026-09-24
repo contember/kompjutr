@@ -9,63 +9,58 @@ export const WORKTREE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS git_index (
      checkout_id INTEGER NOT NULL,
      path TEXT NOT NULL CHECK (
-       typeof(path) = 'text'
-       AND length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
+       length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
      ),
-     stage INTEGER NOT NULL CHECK (typeof(stage) = 'integer' AND stage BETWEEN 0 AND 3),
+     stage INTEGER NOT NULL CHECK (stage BETWEEN 0 AND 3),
      mode INTEGER NOT NULL CHECK (
-       typeof(mode) = 'integer' AND mode IN (33188, 33261, 40960, 57344)
+       mode IN (33188, 33261, 40960, 57344)
      ),
      oid TEXT NOT NULL CHECK (
-       typeof(oid) = 'text'
-       AND length(CAST(oid AS BLOB)) = 40
+       length(CAST(oid AS BLOB)) = 40
        AND oid NOT GLOB '*[^0-9a-f]*'
      ),
-     size INTEGER CHECK (size IS NULL OR (typeof(size) = 'integer' AND size >= 0)),
-     mtime INTEGER CHECK (mtime IS NULL OR (typeof(mtime) = 'integer' AND mtime >= 0)),
-     ino INTEGER CHECK (ino IS NULL OR (typeof(ino) = 'integer' AND ino >= 0)),
-     rev INTEGER CHECK (rev IS NULL OR (typeof(rev) = 'integer' AND rev >= 0)),
+     size INTEGER CHECK (size IS NULL OR size >= 0),
+     mtime INTEGER CHECK (mtime IS NULL OR mtime >= 0),
+     ino INTEGER CHECK (ino IS NULL OR ino >= 0),
+     rev INTEGER CHECK (rev IS NULL OR rev >= 0),
      PRIMARY KEY (checkout_id, path, stage),
      FOREIGN KEY (checkout_id) REFERENCES git_checkouts (id) ON DELETE CASCADE
-   )`,
+   ) STRICT`,
 
   `CREATE TABLE IF NOT EXISTS git_scratch_indexes (
      repo_id INTEGER NOT NULL CHECK (
-       typeof(repo_id) = 'integer' AND repo_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+       repo_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
      ),
      name TEXT NOT NULL CHECK (
-       typeof(name) = 'text'
-       AND length(CAST(name AS BLOB)) BETWEEN 1 AND ${MAX_SCRATCH_INDEX_NAME_BYTES}
+       length(CAST(name AS BLOB)) BETWEEN 1 AND ${MAX_SCRATCH_INDEX_NAME_BYTES}
        AND instr(name, char(0)) = 0
      ),
      PRIMARY KEY (repo_id, name),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
-   ) WITHOUT ROWID`,
+   ) STRICT, WITHOUT ROWID`,
 
   `CREATE TABLE IF NOT EXISTS git_scratch_index_entries (
      repo_id INTEGER NOT NULL,
      name TEXT NOT NULL,
      path TEXT NOT NULL CHECK (
-       typeof(path) = 'text'
-       AND length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
+       length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
      ),
-     stage INTEGER NOT NULL CHECK (typeof(stage) = 'integer' AND stage BETWEEN 0 AND 3),
+     stage INTEGER NOT NULL CHECK (stage BETWEEN 0 AND 3),
      mode INTEGER NOT NULL CHECK (
-       typeof(mode) = 'integer' AND mode IN (33188, 33261, 40960, 57344)
+       mode IN (33188, 33261, 40960, 57344)
      ),
      oid TEXT NOT NULL CHECK (
-       typeof(oid) = 'text'
-       AND length(CAST(oid AS BLOB)) = 40
+       length(CAST(oid AS BLOB)) = 40
        AND oid NOT GLOB '*[^0-9a-f]*'
      ),
-     size INTEGER CHECK (size IS NULL OR (typeof(size) = 'integer' AND size >= 0)),
-     mtime INTEGER CHECK (mtime IS NULL OR (typeof(mtime) = 'integer' AND mtime >= 0)),
-     ino INTEGER CHECK (ino IS NULL OR (typeof(ino) = 'integer' AND ino >= 0)),
-     rev INTEGER CHECK (rev IS NULL OR (typeof(rev) = 'integer' AND rev >= 0)),
+     size INTEGER CHECK (size IS NULL OR size >= 0),
+     mtime INTEGER CHECK (mtime IS NULL OR mtime >= 0),
+     ino INTEGER CHECK (ino IS NULL OR ino >= 0),
+     rev INTEGER CHECK (rev IS NULL OR rev >= 0),
      PRIMARY KEY (repo_id, name, path, stage),
      FOREIGN KEY (repo_id, name) REFERENCES git_scratch_indexes (repo_id, name)
        ON DELETE CASCADE
-   ) WITHOUT ROWID`,
+   ) STRICT, WITHOUT ROWID`,
 
   `CREATE TABLE IF NOT EXISTS git_index_state (
      checkout_id INTEGER PRIMARY KEY,
@@ -73,15 +68,15 @@ export const WORKTREE_SCHEMA_STATEMENTS = [
      format INTEGER NOT NULL CHECK (format = 1),
      complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
      FOREIGN KEY (checkout_id) REFERENCES git_checkouts (id) ON DELETE CASCADE
-   )`,
+   ) STRICT`,
 
   `CREATE TABLE IF NOT EXISTS git_index_dirty (
      checkout_id INTEGER NOT NULL,
      path TEXT NOT NULL,
-     flags INTEGER NOT NULL CHECK (typeof(flags) = 'integer' AND flags IN (1, 2, 3)),
+     flags INTEGER NOT NULL CHECK (flags IN (1, 2, 3)),
      PRIMARY KEY (checkout_id, path),
      FOREIGN KEY (checkout_id) REFERENCES git_checkouts (id) ON DELETE CASCADE
-   ) WITHOUT ROWID`,
+   ) STRICT, WITHOUT ROWID`,
 
   // One durable incomplete operation header; ordered replay state lives in
   // `git_operation_steps` and touched rows belong only to a suspended step.
@@ -94,19 +89,19 @@ export const WORKTREE_SCHEMA_STATEMENTS = [
   // The id is whatever the filesystem chose to record. Nothing here computes
   // one, and a missing row means "read the file", never "the file differs".
   `CREATE TABLE IF NOT EXISTS git_blob_ids (
-     repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
-     content_id BLOB NOT NULL CHECK (typeof(content_id) = 'blob'),
-     oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
-     generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation >= 1),
+     repo_id INTEGER NOT NULL CHECK (repo_id >= 1),
+     content_id BLOB NOT NULL,
+     oid TEXT NOT NULL CHECK (length(CAST(oid AS BLOB)) = 40),
+     generation INTEGER NOT NULL CHECK (generation >= 1),
      PRIMARY KEY (repo_id, content_id),
      FOREIGN KEY (repo_id) REFERENCES git_blob_id_state (repo_id) ON DELETE CASCADE
-   ) WITHOUT ROWID`,
+   ) STRICT, WITHOUT ROWID`,
 
   `CREATE TABLE IF NOT EXISTS git_blob_id_state (
-     repo_id INTEGER PRIMARY KEY CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
-     generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation >= 0),
+     repo_id INTEGER PRIMARY KEY CHECK (repo_id >= 1),
+     generation INTEGER NOT NULL CHECK (generation >= 0),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
-   )`,
+   ) STRICT`,
 
   `CREATE INDEX IF NOT EXISTS git_blob_ids_by_generation
      ON git_blob_ids (repo_id, generation)`,
@@ -179,11 +174,10 @@ export const WORKTREE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS git_shallow (
      repo_id INTEGER NOT NULL,
      oid TEXT NOT NULL CHECK (
-       typeof(oid) = 'text'
-       AND length(CAST(oid AS BLOB)) = 40
+       length(CAST(oid AS BLOB)) = 40
        AND oid NOT GLOB '*[^0-9a-f]*'
      ),
      PRIMARY KEY (repo_id, oid),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
-   )`,
+   ) STRICT`,
 ] as const;

@@ -1112,11 +1112,6 @@ function checkoutListScenario(): Scenario {
                 CASE id WHEN 1 THEN 1 ELSE 0 END
            FROM sequence`,
       );
-      setup.db.run(
-        `UPDATE git_identity_control
-            SET last_repo_id = 1, last_checkout_id = ${CHECKOUT_COUNT}
-          WHERE singleton = 1`,
-      );
       database = new SqliteGitDatabase(harness.workspace.db);
     },
     phases: [

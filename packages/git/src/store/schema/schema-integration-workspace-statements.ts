@@ -1,56 +1,56 @@
-const OWNER = `repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
-  workspace_id TEXT NOT NULL CHECK (typeof(workspace_id) = 'text' AND length(workspace_id) > 0)`;
+const OWNER = `repo_id INTEGER NOT NULL CHECK (repo_id >= 1),
+  workspace_id TEXT NOT NULL CHECK (length(workspace_id) > 0)`;
 const OWNER_FOREIGN_KEY = `FOREIGN KEY (repo_id, workspace_id)
   REFERENCES git_integration_workspaces (repo_id, workspace_id) ON DELETE CASCADE`;
 const PLAN_ID = `plan_id INTEGER NOT NULL CHECK (
-  typeof(plan_id) = 'integer' AND plan_id BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+  plan_id BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
 )`;
 const PLAN_FOREIGN_KEY = `FOREIGN KEY (repo_id, workspace_id, plan_id)
   REFERENCES git_integration_plans (repo_id, workspace_id, plan_id) ON DELETE CASCADE`;
 const PATH = `path TEXT NOT NULL COLLATE BINARY CHECK (
-  typeof(path) = 'text' AND length(CAST(path AS BLOB)) > 0
+  length(CAST(path AS BLOB)) > 0
 )`;
 
 export const INTEGRATION_WORKSPACE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS git_integration_workspaces (
      ${OWNER}, PRIMARY KEY (repo_id, workspace_id),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
-   ) WITHOUT ROWID`,
+   ) STRICT, WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS git_integration_plans (
      ${OWNER}, ${PLAN_ID},
      kind TEXT NOT NULL CHECK (kind IN ('structural', 'resolved', 'projected')),
      source_rows INTEGER NOT NULL CHECK (
-       typeof(source_rows) = 'integer' AND source_rows BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+       source_rows BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
      ),
      entry_count INTEGER NOT NULL CHECK (
-       typeof(entry_count) = 'integer' AND entry_count BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+       entry_count BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
      ),
      PRIMARY KEY (repo_id, workspace_id, plan_id), ${OWNER_FOREIGN_KEY}
-   ) WITHOUT ROWID`,
+   ) STRICT, WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS git_integration_plan_entries (
      ${OWNER}, ${PLAN_ID}, ${PATH},
      descriptor TEXT NOT NULL CHECK (
-       typeof(descriptor) = 'text' AND json_valid(descriptor) AND json_type(descriptor) = 'object'
+       json_valid(descriptor) AND json_type(descriptor) = 'object'
      ),
      PRIMARY KEY (repo_id, workspace_id, plan_id, path), ${PLAN_FOREIGN_KEY}
-   ) WITHOUT ROWID`,
+   ) STRICT, WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS git_integration_reservations (
      ${OWNER}, ${PLAN_ID},
-     family TEXT NOT NULL CHECK (typeof(family) = 'text' AND length(family) > 0),
+     family TEXT NOT NULL CHECK (length(family) > 0),
      ${PATH},
      descriptor TEXT NOT NULL CHECK (
-       typeof(descriptor) = 'text' AND json_valid(descriptor) AND json_type(descriptor) = 'object'
+       json_valid(descriptor) AND json_type(descriptor) = 'object'
      ),
      PRIMARY KEY (repo_id, workspace_id, plan_id, family, path), ${PLAN_FOREIGN_KEY}
-   ) WITHOUT ROWID`,
+   ) STRICT, WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS git_integration_touched (
      ${OWNER}, ${PLAN_ID},
      ordinal INTEGER NOT NULL CHECK (
-       typeof(ordinal) = 'integer' AND ordinal BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+       ordinal BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
      ),
      ${PATH},
      logical_path TEXT NOT NULL COLLATE BINARY CHECK (
-       typeof(logical_path) = 'text' AND length(CAST(logical_path AS BLOB)) > 0
+       length(CAST(logical_path AS BLOB)) > 0
      ),
      purpose TEXT NOT NULL CHECK (
        purpose IN ('primary', 'current-relocation', 'incoming-relocation')
@@ -84,5 +84,5 @@ export const INTEGRATION_WORKSPACE_SCHEMA_STATEMENTS = [
           AND worktree_oid IS NULL AND worktree_revision IS NOT NULL)
      ),
      ${PLAN_FOREIGN_KEY}
-   ) WITHOUT ROWID`,
+   ) STRICT, WITHOUT ROWID`,
 ];

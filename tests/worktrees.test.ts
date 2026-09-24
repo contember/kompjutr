@@ -80,10 +80,6 @@ function insertMissingCheckoutWitnesses(workspace: TestRepository, count = 64): 
     "1".repeat(40),
     JSON.stringify(roots),
   );
-  workspace.database.db.run(
-    "UPDATE git_identity_control SET last_checkout_id = ? WHERE singleton = 1",
-    count + 1,
-  );
 }
 
 function bindGit(workspace: TestWorkspace, database = workspace.database): Git {
@@ -666,9 +662,6 @@ describe("worktree prune", () => {
        SELECT id, ?, '/missing-' || printf('%04d', id), ?, 0 FROM sequence`,
       workspace.repo.store.repoId,
       "1".repeat(40),
-    );
-    workspace.database.db.run(
-      "UPDATE git_identity_control SET last_checkout_id = 1024 WHERE singleton = 1",
     );
     // A DO stat is a resolve plus a node read; the listing itself is one statement.
     const rootStatStatements = 2 * 1_024 + 1;

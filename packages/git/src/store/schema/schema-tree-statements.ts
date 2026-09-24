@@ -3,42 +3,42 @@ export const TREE_SCHEMA_STATEMENTS = [
   // bytes, so every loose or packed copy of the OID shares it.
   `CREATE TABLE IF NOT EXISTS git_tree_sources (
      source_key INTEGER PRIMARY KEY,
-     repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
+     repo_id INTEGER NOT NULL CHECK (repo_id >= 1),
      tree_oid TEXT NOT NULL CHECK (
-       typeof(tree_oid) = 'text' AND length(CAST(tree_oid AS BLOB)) = 40
+       length(CAST(tree_oid AS BLOB)) = 40
      ),
-     complete INTEGER NOT NULL CHECK (typeof(complete) = 'integer' AND complete IN (0, 1)),
-     object_size INTEGER NOT NULL CHECK (typeof(object_size) = 'integer' AND object_size >= 0),
+     complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+     object_size INTEGER NOT NULL CHECK (object_size >= 0),
      entry_count INTEGER CHECK (
        (complete = 0 AND entry_count IS NULL) OR
-       (complete = 1 AND typeof(entry_count) = 'integer' AND entry_count >= 0)
+       (complete = 1 AND entry_count IS NOT NULL AND entry_count >= 0)
      ),
      base_cost INTEGER CHECK (
        (complete = 0 AND base_cost IS NULL) OR
-       (complete = 1 AND typeof(base_cost) = 'integer' AND base_cost >= 0)
+       (complete = 1 AND base_cost IS NOT NULL AND base_cost >= 0)
      ),
      UNIQUE (repo_id, tree_oid),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
-   )`,
+   ) STRICT`,
 
   `CREATE TABLE IF NOT EXISTS git_tree_entries (
-     source_key INTEGER NOT NULL CHECK (typeof(source_key) = 'integer' AND source_key >= 1),
-     ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+     source_key INTEGER NOT NULL CHECK (source_key >= 1),
+     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
      mode TEXT NOT NULL CHECK (
-       typeof(mode) = 'text' AND mode IN ('40000','040000','100644','100755','120000','160000')
+       mode IN ('40000','040000','100644','100755','120000','160000')
      ),
      name_bytes BLOB NOT NULL CHECK (
-       typeof(name_bytes) = 'blob' AND length(name_bytes) >= 1
+       length(name_bytes) >= 1
      ),
-     oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
+     oid TEXT NOT NULL CHECK (length(CAST(oid AS BLOB)) = 40),
      cumulative_base INTEGER NOT NULL CHECK (
-       typeof(cumulative_base) = 'integer' AND cumulative_base >= 0
+       cumulative_base >= 0
      ),
      PRIMARY KEY (source_key, ordinal),
      FOREIGN KEY (source_key)
        REFERENCES git_tree_sources (source_key)
        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
-   ) WITHOUT ROWID`,
+   ) STRICT, WITHOUT ROWID`,
 
   `CREATE INDEX IF NOT EXISTS git_tree_entries_by_name_bytes
      ON git_tree_entries (source_key, name_bytes)`,

@@ -1,6 +1,6 @@
 export const OPERATION_STATE_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_state (
   checkout_id INTEGER PRIMARY KEY CHECK (
-    typeof(checkout_id) = 'integer' AND checkout_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+    checkout_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
   ),
   kind TEXT NOT NULL CHECK (kind IN ('merge', 'cherry-pick', 'revert', 'rebase')),
   original_head_ref TEXT NOT NULL,
@@ -45,27 +45,27 @@ export const OPERATION_STATE_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_s
        AND current_parent_oid IS NOT NULL AND incoming_parent_oid IS NULL
        AND upstream_oid IS NOT NULL AND base_oid IS NOT NULL AND mode IS NULL
        AND merge_origin IS NULL
-       AND typeof(current_step) = 'integer' AND current_step >= 0
-       AND typeof(step_count) = 'integer' AND step_count >= 1
+       AND current_step >= 0
+       AND step_count >= 1
        AND current_step <= step_count
-       AND typeof(replayed_count) = 'integer' AND replayed_count >= 0
-       AND typeof(skipped_count) = 'integer' AND skipped_count >= 0
+       AND replayed_count >= 0
+       AND skipped_count >= 0
        AND replayed_count + skipped_count = current_step
        AND (phase != 'conflicted' OR current_step < step_count))
   ),
   CHECK ((author_name IS NULL) = (author_email IS NULL)),
   CHECK ((committer_name IS NULL) = (committer_email IS NULL)),
   FOREIGN KEY (checkout_id) REFERENCES git_checkouts (id) ON DELETE CASCADE
-)`;
+) STRICT`;
 
 const OPERATION_STEPS_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_steps (
   checkout_id INTEGER NOT NULL CHECK (
-    typeof(checkout_id) = 'integer' AND checkout_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+    checkout_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
   ),
-  ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
   source_oid TEXT NOT NULL,
   selected_parent_oid TEXT,
-  mainline INTEGER CHECK (mainline IS NULL OR (typeof(mainline) = 'integer' AND mainline >= 1)),
+  mainline INTEGER CHECK (mainline IS NULL OR mainline >= 1),
   outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'applied', 'skipped')),
   result_oid TEXT,
   PRIMARY KEY (checkout_id, ordinal),
@@ -73,7 +73,7 @@ const OPERATION_STEPS_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_steps (
       OR (outcome IN ('pending', 'skipped') AND result_oid IS NULL)),
   CHECK (mainline IS NULL OR selected_parent_oid IS NOT NULL),
   FOREIGN KEY (checkout_id) REFERENCES git_operation_state (checkout_id) ON DELETE CASCADE
-) WITHOUT ROWID`;
+) STRICT, WITHOUT ROWID`;
 
 const OPERATION_TOUCHED_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_touched (
   checkout_id INTEGER NOT NULL,
@@ -113,7 +113,7 @@ const OPERATION_TOUCHED_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_touche
        AND worktree_oid IS NULL AND worktree_revision IS NOT NULL)
   ),
   FOREIGN KEY (checkout_id) REFERENCES git_operation_state (checkout_id) ON DELETE CASCADE
-) WITHOUT ROWID`;
+) STRICT, WITHOUT ROWID`;
 
 export const OPERATION_SCHEMA_STATEMENTS = [
   OPERATION_STATE_TABLE,

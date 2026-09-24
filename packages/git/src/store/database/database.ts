@@ -96,7 +96,6 @@ export class SqliteGitDatabase {
     enforceForeignKeys(db);
     initializeGitSchema(db);
     this.#identities = new DatabaseIdentities(this.#state);
-    this.#identities.readIdentityControl();
     this.#registry = new DatabaseRegistry(this.#state, this.#identities, (repoId) =>
       this.destroyRepositoryOwned(repoId),
     );

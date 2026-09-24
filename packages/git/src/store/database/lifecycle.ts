@@ -132,24 +132,6 @@ export function requireSafeId(value: unknown, label: string): number {
   return value;
 }
 
-export function requireIdentityCounter(value: unknown, label: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new CorruptError(`${label} is not a safe nonnegative integer`);
-  }
-  return value;
-}
-
-export function requireStoredIdentityMaximum(value: unknown, label: string): number {
-  return value === null ? 0 : requireSafeId(value, label);
-}
-
-export function nextIdentity(value: number, label: string): number {
-  if (value >= Number.MAX_SAFE_INTEGER) {
-    throw new GitError("E2BIG", `${label} space is exhausted`);
-  }
-  return value + 1;
-}
-
 export function requireMilliseconds(
   value: unknown,
   label: string,
@@ -172,7 +154,6 @@ export function provisionalCloneExpiry(nowMs: number): number {
 export interface StoredRepositoryLifecycle {
   repoId: number;
   lifecycle: RepositoryLifecycle;
-  cloneGeneration: number | null;
   cloneExpiresMs: number | null;
 }
 
@@ -184,19 +165,17 @@ export function requireStoredRepositoryLifecycle(
   if (lifecycle !== "ready" && lifecycle !== "provisional") {
     throw new CorruptError("repository lifecycle is invalid");
   }
-  const cloneGeneration =
-    row.clone_generation === null ? null : requireSafeId(row.clone_generation, "clone generation");
   const cloneExpiresMs =
     row.clone_expires_ms === null
       ? null
       : requireMilliseconds(row.clone_expires_ms, "clone lease expiry", "stored");
   if (
-    (lifecycle === "ready" && (cloneGeneration !== null || cloneExpiresMs !== null)) ||
-    (lifecycle === "provisional" && (cloneGeneration === null || cloneExpiresMs === null))
+    (lifecycle === "ready" && cloneExpiresMs !== null) ||
+    (lifecycle === "provisional" && cloneExpiresMs === null)
   ) {
     throw new CorruptError("repository lifecycle fields are inconsistent");
   }
-  return { repoId, lifecycle, cloneGeneration, cloneExpiresMs };
+  return { repoId, lifecycle, cloneExpiresMs };
 }
 
 export interface StoredCheckoutLifecycle extends StoredRepositoryLifecycle {

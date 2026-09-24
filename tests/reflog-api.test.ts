@@ -821,7 +821,7 @@ describe("reflog recovery", () => {
 
     workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
     workspace.repo.store.db.run(
-      "UPDATE git_reflog_entries SET reason = zeroblob(1) WHERE repo_id = ?",
+      "UPDATE git_reflog_entries SET timezone = 100000 WHERE repo_id = ?",
       workspace.repo.store.repoId,
     );
     workspace.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");

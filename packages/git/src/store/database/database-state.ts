@@ -25,7 +25,6 @@ export function withLifecycleCheckoutMutations<T>(store: CheckoutStore, body: ()
 }
 
 export interface ProvisionalStoreRecord {
-  generation: number;
   repoId: number;
   checkoutId: number;
   shared: SharedRepoStore;

@@ -95,24 +95,16 @@ function injectProvisionalSecondary(
   repoId: number,
   root: string,
 ): number {
-  const lastCheckoutId = workspace.database.db.scalar<number>(
-    "SELECT last_checkout_id FROM git_identity_control WHERE singleton = 1",
-  );
-  if (lastCheckoutId === undefined) throw new Error("identity control is missing");
-  const checkoutId = lastCheckoutId + 1;
   const bytes = utf8.encode("orphan checkout\n");
   const oid = store.write("blob", bytes);
-  workspace.database.db.run(
-    "UPDATE git_identity_control SET last_checkout_id = ? WHERE singleton = 1",
-    checkoutId,
-  );
-  workspace.database.db.run(
-    `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
-     VALUES (?, ?, ?, 'ref: refs/heads/injected', 0)`,
-    checkoutId,
+  const checkoutId = workspace.database.db.scalar<number>(
+    `INSERT INTO git_checkouts (repo_id, root, head, is_primary)
+     VALUES (?, ?, 'ref: refs/heads/injected', 0)
+     RETURNING id`,
     repoId,
     root,
   );
+  if (checkoutId === undefined) throw new Error("injected checkout returned no id");
   workspace.database.db.run(
     `INSERT INTO git_index (checkout_id, path, stage, mode, oid, size)
      VALUES (?, 'orphan.txt', 0, 33188, ?, ?)`,
@@ -193,13 +185,12 @@ describe("provisional clone publication", () => {
       await awaitBarrierEntry(reservation, cloning);
       expect(
         runtime.db.one(
-          `SELECT lifecycle, clone_generation, clone_expires_ms
+          `SELECT lifecycle, clone_expires_ms
              FROM git_repositories WHERE id = ?`,
           repoId,
         ),
       ).toEqual({
         lifecycle: "provisional",
-        clone_generation: 1,
         clone_expires_ms: clock + PROVISIONAL_CLONE_LEASE_MS,
       });
       await expect(runtime.git.status({ dir: "/repo" })).rejects.toMatchObject({
@@ -269,11 +260,10 @@ describe("provisional clone publication", () => {
       const replacement = cold.db.one<{
         repo_id: number;
         lifecycle: string;
-        clone_generation: number | null;
         clone_expires_ms: number | null;
       }>(
         `SELECT repository.id AS repo_id, repository.lifecycle,
-                repository.clone_generation, repository.clone_expires_ms
+                repository.clone_expires_ms
            FROM git_repositories repository
            JOIN git_checkouts checkout ON checkout.repo_id = repository.id
           WHERE checkout.root = '/repo'`,
@@ -281,7 +271,6 @@ describe("provisional clone publication", () => {
       expect(replacement).toEqual({
         repo_id: expect.any(Number),
         lifecycle: "ready",
-        clone_generation: null,
         clone_expires_ms: null,
       });
       expect(replacement?.repo_id).toBeGreaterThan(repoId ?? 0);
@@ -543,7 +532,6 @@ describe("provisional clone publication", () => {
 
     expect(replacement.checkout.repoId).toBeGreaterThan(old.checkout.repoId);
     expect(replacement.checkout.id).toBeGreaterThan(old.checkout.id);
-    expect(replacement.generation).toBeGreaterThan(old.generation);
     expect(workspace.worktree.stat("/repo/obsolete.txt")).toBeNull();
     expect(workspace.worktree.readFile("/repo/untracked.txt")).toEqual(
       utf8.encode("caller content\n"),
@@ -600,8 +588,8 @@ describe("provisional clone publication", () => {
     ).toThrow(injected);
     expect(
       workspace.database.db.scalar<number>(
-        "SELECT id FROM git_repositories WHERE clone_generation = ?",
-        owner.generation,
+        "SELECT id FROM git_repositories WHERE id = ? AND lifecycle = 'provisional'",
+        owner.checkout.repoId,
       ),
     ).toBe(owner.checkout.repoId);
     expect(
@@ -622,7 +610,7 @@ describe("provisional clone publication", () => {
       secondCold.context.now(),
       secondCleanup,
     );
-    expect(replacement.generation).toBeGreaterThan(owner.generation);
+    expect(replacement.checkout.repoId).toBeGreaterThan(owner.checkout.repoId);
     expect(secondCold.worktree.stat("/repo/rollback.txt")).toBeNull();
     secondCold.database.discardProvisionalClone(
       replacement,
@@ -783,7 +771,6 @@ describe("provisional clone publication", () => {
     materializeFile(owner.store, workspace, "expired.txt", "expired clone\n");
     const copiedOwner = Object.freeze({
       checkout: owner.checkout,
-      generation: owner.generation,
       store: owner.store,
     });
     expect(() =>
@@ -842,10 +829,10 @@ describe("provisional clone publication", () => {
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
     expect(
       publishWorkspace.database.db.one(
-        "SELECT lifecycle, clone_generation FROM git_repositories WHERE id = ?",
+        "SELECT lifecycle FROM git_repositories WHERE id = ?",
         publishOwner.checkout.repoId,
       ),
-    ).toEqual({ lifecycle: "provisional", clone_generation: publishOwner.generation });
+    ).toEqual({ lifecycle: "provisional" });
     expect(
       publishWorkspace.database.db.scalar<number>(
         "SELECT COUNT(*) FROM git_checkouts WHERE id = ?",
@@ -880,10 +867,10 @@ describe("provisional clone publication", () => {
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
     expect(
       takeoverWorkspace.database.db.one(
-        "SELECT lifecycle, clone_generation FROM git_repositories WHERE id = ?",
+        "SELECT lifecycle FROM git_repositories WHERE id = ?",
         takeoverOwner.checkout.repoId,
       ),
-    ).toEqual({ lifecycle: "provisional", clone_generation: takeoverOwner.generation });
+    ).toEqual({ lifecycle: "provisional" });
     expect(
       takeoverWorkspace.database.db.scalar<number>(
         "SELECT COUNT(*) FROM git_checkouts WHERE id = ?",
@@ -912,7 +899,6 @@ describe("provisional clone publication", () => {
     );
     expect(second.checkout.repoId).toBeGreaterThan(first.checkout.repoId);
     expect(second.checkout.id).toBeGreaterThan(first.checkout.id);
-    expect(second.generation).toBeGreaterThan(first.generation);
     workspace.database.discardProvisionalClone(second, workspace.context.now(), noCleanup);
 
     const ready = workspace.database.createRepository("/ready", "ref: refs/heads/main");
@@ -922,29 +908,7 @@ describe("provisional clone publication", () => {
     expect(replacement.id).toBeGreaterThan(ready.id);
   });
 
-  it("fails closed on trailing controls, malformed lifecycle rows, and exhausted counters", () => {
-    const identityCounters: Array<"last_repo_id" | "last_checkout_id"> = [
-      "last_repo_id",
-      "last_checkout_id",
-    ];
-    for (const counter of identityCounters) {
-      const db = new TestDatabase();
-      const database = new SqliteGitDatabase(db);
-      database.createRepository("/repo", "ref: refs/heads/main");
-      db.run(`UPDATE git_identity_control SET ${counter} = 0 WHERE singleton = 1`);
-      expect(() => new SqliteGitDatabase(db)).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-    }
-
-    const cloneDb = new TestDatabase();
-    const cloneDatabase = new SqliteGitDatabase(cloneDb);
-    cloneDatabase.beginProvisionalClone("/repo", "ref: refs/heads/main", 60_000, noCleanup);
-    cloneDb.run("UPDATE git_identity_control SET last_clone_generation = 0 WHERE singleton = 1");
-    expect(() => new SqliteGitDatabase(cloneDb)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-
+  it("fails closed on malformed lifecycle rows and exhausted identities", () => {
     const lifecycleDb = new TestDatabase();
     const lifecycleDatabase = new SqliteGitDatabase(lifecycleDb);
     lifecycleDatabase.createRepository("/repo", "ref: refs/heads/main");
@@ -954,31 +918,26 @@ describe("provisional clone publication", () => {
       expect.objectContaining({ code: "ECORRUPT" }),
     );
 
-    const exhaustedDb = new TestDatabase();
-    const exhausted = new SqliteGitDatabase(exhaustedDb);
-    exhaustedDb.run(
-      `UPDATE git_identity_control
-          SET last_repo_id = ?, last_checkout_id = ?, last_clone_generation = ?
-        WHERE singleton = 1`,
-      Number.MAX_SAFE_INTEGER,
-      Number.MAX_SAFE_INTEGER,
-      Number.MAX_SAFE_INTEGER,
-    );
-    expect(() => exhausted.createRepository("/repo", "ref: refs/heads/main")).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(() =>
-      exhausted.beginProvisionalClone("/clone", "ref: refs/heads/main", 70_000, noCleanup),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-
-    const cloneExhaustedDb = new TestDatabase();
-    const cloneExhausted = new SqliteGitDatabase(cloneExhaustedDb);
-    cloneExhaustedDb.run(
-      `UPDATE git_identity_control SET last_clone_generation = ? WHERE singleton = 1`,
-      Number.MAX_SAFE_INTEGER,
-    );
-    expect(() =>
-      cloneExhausted.beginProvisionalClone("/clone", "ref: refs/heads/main", 80_000, noCleanup),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    const identityTables: Array<"git_repositories" | "git_checkouts"> = [
+      "git_repositories",
+      "git_checkouts",
+    ];
+    for (const table of identityTables) {
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db);
+      db.run(
+        "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+        table,
+        Number.MAX_SAFE_INTEGER,
+      );
+      expect(() => database.createRepository("/repo", "ref: refs/heads/main")).toThrow(
+        /CHECK constraint failed/,
+      );
+      expect(() =>
+        database.beginProvisionalClone("/clone", "ref: refs/heads/main", 70_000, noCleanup),
+      ).toThrow(/CHECK constraint failed/);
+      expect(db.scalar<number>("SELECT COUNT(*) FROM git_repositories")).toBe(0);
+      expect(db.scalar<number>("SELECT COUNT(*) FROM git_checkouts")).toBe(0);
+    }
   });
 });

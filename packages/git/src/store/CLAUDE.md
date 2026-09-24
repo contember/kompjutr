@@ -48,7 +48,11 @@ ADR-0003.
 ## Trust and cost rules
 
 - Validate caller input before storage and untrusted network bytes at ingest.
-  Schema `CHECK`s and write-path validation establish the stored-row premise.
+  `STRICT` tables, schema `CHECK`s, and write-path validation establish the
+  stored-row premise. `STRICT` owns storage classes; `CHECK`s carry only
+  grammar, ranges, and enums, never a `typeof` prefix.
+- Repository and checkout ids are `AUTOINCREMENT`, never reused once
+  committed. Live facades and provisional clone owners are keyed by them.
 - Reads trust rows. Decode driver values through `common/rows.ts`; a shape
   mismatch is `CorruptError`. Do not add SQL `typeof` witnesses, two-phase
   metadata preflights, or read-time re-authentication. Out-of-band mutation is

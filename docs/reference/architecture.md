@@ -304,7 +304,8 @@ and repeats its authoritative durable checks. Fetch generations and namespaces,
 pack-stream checkpoints, and other async ownership use their own transactions,
 epochs, CAS, or leases rather than the local mutation guard.
 
-- Clone hides partial state behind a renewable provisional owner generation.
+- Clone hides partial state behind a renewable provisional owner, fenced by its
+  repository id, never reused once committed.
 - Ordinary pack ingest uses one renewable five-minute generation lease per
   repository. A live competitor gets `EBUSY`; an expired owner is fenced with
   `ESTALE`.

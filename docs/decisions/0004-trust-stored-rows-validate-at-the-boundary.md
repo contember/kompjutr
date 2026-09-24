@@ -88,13 +88,17 @@ contract as `git fsck` and `PRAGMA integrity_check`.
 - A write-path bug now surfaces later — at use, or in the opt-in audit — instead
   of at the next read. Write-time `CHECK`s, the parity harnesses, and the suite
   are the compensating controls.
-- `git_refs`, `git_shallow`, `git_config`, and `git_index` carry `CHECK`
-  constraints for their stored grammar, types, and ranges. These anchor the
-  write-time premise for the row families the trusted-read change affects most.
+- Every `git_*` table is `STRICT`, so SQLite rejects a value of the wrong
+  storage class at write. `CHECK` constraints carry only grammar, ranges, and
+  enums. `git_refs`, `git_shallow`, `git_config`, and `git_index` carry them for
+  their stored grammar; these anchor the write-time premise for the row families
+  the trusted-read change affects most.
 - An application that corrupts its own rows gets undefined results, not
   `CorruptError`. That is the documented contract.
 - Corruption-injection tests survive only where they witness a boundary: ingest,
   schema open, and write `CHECK`s.
+- Repository and checkout ids are `AUTOINCREMENT` and never reused once
+  committed. No counter table or open-time cross-check guards them.
 
 ## Alternatives considered
 
@@ -104,5 +108,6 @@ contract as `git fsck` and `PRAGMA integrity_check`.
   maintain, and the untested one rots. An explicit audit operation serves the
   same need without forking every read.
 - **SQLite `STRICT` tables instead of `CHECK`s.** Insufficient alone — no ranges
-  and no enums — and unavailable as a complete replacement on the platform
-  baseline. `CHECK`s already cover the write side.
+  and no enums. Adopted beside the `CHECK`s instead: `STRICT` owns storage
+  classes (it opens with `WITHOUT ROWID` on workerd 1.20260820.1 and
+  `node:sqlite`), and the `CHECK`s keep ranges and enums.
