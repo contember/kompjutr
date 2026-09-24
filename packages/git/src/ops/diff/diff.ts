@@ -5,7 +5,9 @@
 // phase-specific sidecars; this module preserves the public entry point.
 
 import type { SparseWorkspaceSource } from "../../store/core/contracts.js";
+import type { DiffSummaryEntry } from "../core/kinds.js";
 import type { Repository } from "../repository/repository.js";
+import type { ExactRename } from "../status/rename-detection.js";
 import type { Worktree } from "../worktree/worktree.js";
 import {
   classifyDiffRenames,
@@ -15,16 +17,13 @@ import {
 } from "./diff-collect.js";
 import { renderPatch } from "./diff-format.js";
 import type { DiffOptions, PendingChange } from "./diff-internal.js";
+import { summarizeChanges } from "./diff-summary.js";
 import type { DiffFormatOptions, TreeDiffOptions } from "./diff-types.js";
 
 export { DIFF_COMBINED_MAX_LINES, DIFF_COMBINED_MAX_MEMORY_BYTES } from "./diff-combined.js";
 export type { DiffOptions } from "./diff-internal.js";
 export { diffHeaderPath } from "./diff-path-format.js";
-export {
-  diffSummary,
-  diffSummaryBounded,
-  diffSummaryEntryRetainedBytes,
-} from "./diff-summary.js";
+export { diffSummary } from "./diff-summary.js";
 export type { DiffFormatOptions, TreeDiffOptions } from "./diff-types.js";
 export { DIFF_MAX_OUTPUT_BYTES } from "./diff-types.js";
 
@@ -62,4 +61,25 @@ export function diffTrees(
     options,
     formatOptions,
   );
+}
+
+export interface TreeSummary {
+  renames: readonly ExactRename[];
+  entries: Generator<DiffSummaryEntry>;
+}
+
+/** Stream a tree pair's summary rows after one bounded exact-rename prepass. */
+export function diffTreeSummary(
+  repo: Repository,
+  beforeTree: string | null,
+  afterTree: string | null,
+  options: TreeDiffOptions = {},
+): TreeSummary {
+  const changes = (): Generator<PendingChange> =>
+    treePendingChanges(repo, beforeTree, afterTree, options);
+  const classification = classifyDiffRenames(repo, options, changes());
+  return {
+    renames: classification?.renames ?? [],
+    entries: summarizeChanges(collectPendingChanges(repo, undefined, changes(), classification)),
+  };
 }

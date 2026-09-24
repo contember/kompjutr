@@ -11,10 +11,6 @@ import { hashObject } from "../packages/git/src/common/objects.js";
 import { joinPath as gitJoinPath } from "../packages/git/src/common/paths.js";
 import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
 import { type GitContext, openRepository } from "../packages/git/src/ops/core/context.js";
-import {
-  diffSummaryBounded,
-  diffSummaryEntryRetainedBytes,
-} from "../packages/git/src/ops/diff/diff.js";
 import { merge } from "../packages/git/src/ops/merge/merge.js";
 import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
@@ -75,11 +71,45 @@ function gitResult(
     cwd,
     env: { ...REAL_GIT_ENV, ...env },
     encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.error !== undefined) throw result.error;
   if (result.status === null) throw new Error(`git terminated by signal ${result.signal}`);
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+interface FixtureFile {
+  path: string;
+  content: string;
+}
+async function importedPair(
+  source: GitFixture,
+  files: readonly FixtureFile[],
+): Promise<TestRepository> {
+  for (const file of files) source.write(file.path, file.content);
+  source.commit("base");
+  const workspace = nativeRepository();
+  await importFixture(source, workspace.repo.checkout);
+  checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+  return workspace;
+}
+function writeBoth(
+  source: GitFixture,
+  workspace: TestRepository,
+  files: readonly FixtureFile[],
+): void {
+  for (const file of files) source.write(file.path, file.content);
+  workspace.worktree.writeFiles(
+    files.map((file) => ({ path: `/repo/${file.path}`, bytes: utf8.encode(file.content) })),
+  );
+}
+function removeBoth(
+  source: GitFixture,
+  workspace: TestRepository,
+  files: readonly FixtureFile[],
+): void {
+  for (const file of files) source.remove(file.path);
+  workspace.worktree.removeFiles(files.map((file) => `/repo/${file.path}`));
 }
 function nativeRepository(root = "/repo"): TestRepository {
   const workspace = makeRepo(root, { startTime: FIXED_TIME });
@@ -767,50 +797,67 @@ describe("mutating git CLI handlers", () => {
       await native.runCli({ argv: ["commit", "-m", "mode"], cwd: "/repo", env: IDENTITY_ENV }),
     ).toEqual(cliResult(gitResult(source, ["commit", "-m", "mode"])));
   });
-  it("bounds commit-summary rows and retained bytes before materializing them", async () => {
-    const workspace = nativeRepository();
+  it("matches Git's commit summary for exact renames past Git's default rename limit", async () => {
+    // 1,001 dissimilar deletions and additions exceed Git's 1,000 x 1,000 inexact
+    // limit; Git still pairs the exact rename and warns nothing from commit.
+    const source = fixture();
+    const deleted = Array.from({ length: 1_001 }, (_, index) => ({
+      path: `old/f${index}.txt`,
+      content: `old ${index}\n`,
+    }));
+    const moved = { path: "old/moved.txt", content: "moved\n" };
+    const workspace = await importedPair(source, [...deleted, moved]);
+    removeBoth(source, workspace, [...deleted, moved]);
+    writeBoth(source, workspace, [
+      ...deleted.map((_, index) => ({ path: `new/g${index}.txt`, content: `new ${index}\n` })),
+      { path: "new/moved.txt", content: moved.content },
+    ]);
     const native = runner(workspace.context);
-    writeWorkFile(workspace, "/repo/file.txt", "one\n");
-    await native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
-    await native.runCli({ argv: ["commit", "-m", "base"], cwd: "/repo", env: IDENTITY_ENV });
-    const parent = workspace.repo.head().oid;
-    if (parent === null) throw new Error("base commit is missing");
-    writeWorkFile(workspace, "/repo/file.txt", "two\n");
-    await native.runCli({ argv: ["add", "file.txt"], cwd: "/repo" });
-    await native.runCli({ argv: ["commit", "-m", "change"], cwd: "/repo", env: IDENTITY_ENV });
-    const current = workspace.repo.head().oid;
-    if (current === null) throw new Error("changed commit is missing");
-    const options = { ref: parent, to: current, renames: false };
-    const [summaryRow] = diffSummaryBounded(
-      workspace.repo,
-      workspace.worktree,
-      options,
-      undefined,
-      {
-        maxRows: 1,
-        maxRetainedBytes: 8 * 1024 * 1024,
-      },
+    expect(await native.runCli({ argv: ["add", "-A"], cwd: "/repo" })).toEqual(
+      cliResult(gitResult(source, ["add", "-A"])),
     );
-    if (summaryRow === undefined) throw new Error("diff summary row is missing");
-    const exactBytes = diffSummaryEntryRetainedBytes(summaryRow);
+    const expected = gitResult(source, ["commit", "-m", "move"]);
+    expect(expected.stdout).toContain(" rename {old => new}/moved.txt (100%)\n");
     expect(
-      diffSummaryBounded(workspace.repo, workspace.worktree, options, undefined, {
-        maxRows: 1,
-        maxRetainedBytes: exactBytes,
-      }),
-    ).toHaveLength(1);
-    expect(() =>
-      diffSummaryBounded(workspace.repo, workspace.worktree, options, undefined, {
-        maxRows: 0,
-        maxRetainedBytes: exactBytes,
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(() =>
-      diffSummaryBounded(workspace.repo, workspace.worktree, options, undefined, {
-        maxRows: 1,
-        maxRetainedBytes: exactBytes - 1,
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      await native.runCli({ argv: ["commit", "-m", "move"], cwd: "/repo", env: IDENTITY_ENV }),
+    ).toEqual(cliResult(expected));
+  });
+  it("streams a commit summary past 50,000 changed files as Git does", async () => {
+    const source = fixture();
+    const base = { path: "base.txt", content: "base\n" };
+    const workspace = await importedPair(source, [base]);
+    // No deletion: Git would pair it inexactly with an addition, which kompjutr does not do.
+    writeBoth(source, workspace, [
+      { path: base.path, content: "changed\n" },
+      ...Array.from({ length: 50_000 }, (_, index) => ({
+        path: `d${Math.floor(index / 500)}/f${index % 500}.txt`,
+        content: `file ${index}\n`,
+      })),
+    ]);
+    const native = runner(workspace.context);
+    // Staging in halves stays under add's own worktree scan cap; the commit is the subject.
+    const directories = Array.from({ length: 100 }, (_, index) => `d${index}`);
+    for (const operands of [directories.slice(0, 50), [...directories.slice(50), base.path]]) {
+      expect(await native.runCli({ argv: ["add", ...operands], cwd: "/repo" })).toMatchObject({
+        exitCode: 0,
+        stderr: "",
+      });
+    }
+    expect(gitResult(source, ["add", "-A"]).status).toBe(0);
+    expect(indexLines(workspace.repo)).toEqual(
+      lines(gitResult(source, ["ls-files", "--stage"]).stdout.trimEnd()),
+    );
+
+    const expected = gitResult(source, ["commit", "-m", "wide"]);
+    const actual = await native.runCli({
+      argv: ["commit", "-m", "wide"],
+      cwd: "/repo",
+      env: IDENTITY_ENV,
+    });
+
+    expect(lines(expected.stdout)[1]).toMatch(/^ 50001 files changed,/);
+    expect(actual).toEqual(cliResult(expected));
+    expect(workspace.repo.head().oid).toBe(source.git("rev-parse", "HEAD"));
   });
   it("keeps the typed dirty-path file-row ceiling independent of directory rows", async () => {
     const workspace = nativeRepository();

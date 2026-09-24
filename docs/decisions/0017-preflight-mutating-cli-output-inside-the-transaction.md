@@ -42,8 +42,9 @@ A local mutating handler uses one shared synchronous wrapper
 
 Formatters write into per-stream truncating buffers
 (`packages/git/src/cli/write/write-output.ts`), so retained output never
-exceeds the stream ceiling. Memory for a commit summary is bounded by the diff
-summary row cap and by those buffers, not by a byte model.
+exceeds the stream ceiling. A commit summary streams the tree diff; its memory
+is bounded by the exact-rename candidate cap and by those buffers, not by a row
+cap or a byte model.
 
 Before a command that can mutate the worktree enters the wrapper, it proves
 transaction affinity through opaque scope identity. A missing or different

@@ -80,7 +80,7 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
             );
             return { before, result };
           },
-          (mutation) => formatRebaseContinue(repo, context.worktree, mutation, options),
+          (mutation) => formatRebaseContinue(repo, mutation, options),
           (error) => mapRebaseContinueFailure(repo, error, options),
         );
       });
@@ -112,7 +112,7 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
           },
           (mutation) => {
             const stdout = stdoutOutput(options);
-            formatCommitSummary(repo, context.worktree, mutation, stdout);
+            formatCommitSummary(repo, mutation, stdout);
             return truncatedResult(stdout, undefined, 0);
           },
           (error) => mapMergeFailure(error, outputContext(options)),

@@ -2,10 +2,7 @@ import { utf8Decoder } from "../../common/bytes.js";
 import { GitError } from "../../common/errors.js";
 import { diffText } from "../../diff/index.js";
 import { isBinary } from "../../diff/lines.js";
-import type { GitContext } from "../../ops/core/context.js";
-import type { DiffSummaryEntry } from "../../ops/core/kinds.js";
-import { diffHeaderPath, diffSummaryBounded } from "../../ops/diff/diff.js";
-import { DIFF_REPOSITORY_BYTES } from "../../ops/diff/diff-types.js";
+import { diffHeaderPath, diffTreeSummary } from "../../ops/diff/diff.js";
 import type { Repository } from "../../ops/repository/repository.js";
 import { statusFormatOptions } from "../../ops/status/status-format.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES, type WalkTreeDiffEntry } from "../../store/index.js";
@@ -13,7 +10,6 @@ import { TruncatingOutput } from "./write-output.js";
 
 const HEADS = "refs/heads/";
 const SUMMARY_WINDOW_ROWS = 1_000;
-const SUMMARY_MAX_ROWS = 50_000;
 
 export interface CommitMutation {
   oid: string;
@@ -36,23 +32,14 @@ interface RootSummaryRow {
 
 export function formatCommitSummary(
   repo: Repository,
-  worktree: GitContext["worktree"],
   mutation: CommitMutation,
   out: TruncatingOutput,
 ): void {
-  formatCommit(
-    repo,
-    worktree,
-    mutation.oid,
-    branchLabel(mutation.previousHead.ref),
-    out,
-    mutation.amended,
-  );
+  formatCommit(repo, mutation.oid, branchLabel(mutation.previousHead.ref), out, mutation.amended);
 }
 
 export function formatCommit(
   repo: Repository,
-  worktree: GitContext["worktree"],
   oid: string,
   label: string,
   out: TruncatingOutput,
@@ -60,14 +47,7 @@ export function formatCommit(
 ): void {
   const commit = repo.readCommit(oid);
   const quoteNonAscii = statusFormatOptions(repo).quotePath ?? true;
-  const summary = summarizeCommit(
-    repo,
-    worktree,
-    commit.tree,
-    commit.parent[0],
-    quoteNonAscii,
-    out.maximum,
-  );
+  const summary = summarizeCommit(repo, commit.tree, commit.parent[0], quoteNonAscii, out.maximum);
   const root = commit.parent.length === 0 ? " (root-commit)" : "";
   out.append(`[${label}${root} ${abbreviate(repo, oid)}] ${subject(commit.message)}\n`);
   if (amended) out.append(` Date: ${mediumDate(commit.author)}\n`);
@@ -77,7 +57,6 @@ export function formatCommit(
 
 function summarizeCommit(
   repo: Repository,
-  worktree: GitContext["worktree"],
   tree: string,
   parentOid: string | undefined,
   quoteNonAscii: boolean,
@@ -85,68 +64,39 @@ function summarizeCommit(
 ): CommitSummary {
   if (parentOid === undefined) return summarizeRoot(repo, tree, quoteNonAscii, maximum);
   const parentTree = repo.readCommit(parentOid).tree;
-  const rows = diffSummaryBounded(
-    repo,
-    worktree,
-    { ref: parentTree, to: tree, renames: true },
-    undefined,
-    { maxRows: SUMMARY_MAX_ROWS, maxRetainedBytes: DIFF_REPOSITORY_BYTES },
-  );
-  return summaryFromDiffRows(repo, parentTree, tree, rows, quoteNonAscii, maximum);
-}
-
-// Only rename endpoints are retained; every other changed path streams into bounded output.
-function summaryFromDiffRows(
-  repo: Repository,
-  beforeTree: string,
-  afterTree: string,
-  rows: readonly DiffSummaryEntry[],
-  quoteNonAscii: boolean,
-  maximum: number,
-): CommitSummary {
-  const renamed = new Set<string>();
-  for (const row of rows) {
-    if (row.originalPath !== undefined) {
-      renamed.add(row.originalPath);
-      renamed.add(row.path);
-    }
-  }
-  const renamedModes = new Map<string, WalkTreeDiffEntry>();
-  const modeDetails = new TruncatingOutput(maximum);
-  for (const row of repo.walkTreeDiff(beforeTree, afterTree)) {
-    if (renamed.has(row.path)) {
-      renamedModes.set(row.path, row);
+  // Git's commit summary ignores diff.renameLimit, which only gates inexact
+  // detection, and never warns. Exact pairing past the classifier's candidate
+  // cap falls back to plain additions and deletions.
+  const summary = diffTreeSummary(repo, parentTree, tree, { renames: true });
+  const sources = new Set(summary.renames.map((rename) => rename.source.path));
+  const renames = new Map(summary.renames.map((rename) => [rename.destination.path, rename]));
+  const details = new TruncatingOutput(maximum);
+  // Git lists a rename at its destination's position in path order.
+  for (const row of repo.walkTreeDiff(parentTree, tree)) {
+    const rename = renames.get(row.path);
+    if (rename !== undefined) {
+      const { source, destination, similarity } = rename;
+      details.append(
+        ` rename ${summaryRenamePath(source.path, destination.path, quoteNonAscii)} (${similarity}%)\n`,
+      );
+      if (source.mode !== destination.mode) {
+        details.append(` mode change ${source.mode} => ${destination.mode}\n`);
+      }
       continue;
     }
+    if (sources.has(row.path)) continue;
     const detail = modeDetail(row, quoteNonAscii);
-    if (detail !== undefined) modeDetails.append(` ${detail}\n`);
+    if (detail !== undefined) details.append(` ${detail}\n`);
   }
-  const details = new TruncatingOutput(maximum);
-  for (const row of rows) {
-    if (row.originalPath !== undefined && row.similarity !== undefined) {
-      const source = renamedModes.get(row.originalPath);
-      const destination = renamedModes.get(row.path);
-      details.append(
-        ` rename ${summaryRenamePath(row.originalPath, row.path, quoteNonAscii)} (${row.similarity}%)\n`,
-      );
-      if (
-        source !== undefined &&
-        destination !== undefined &&
-        source.beforeMode !== null &&
-        destination.afterMode !== null &&
-        source.beforeMode !== destination.afterMode
-      ) {
-        details.append(` mode change ${source.beforeMode} => ${destination.afterMode}\n`);
-      }
-    }
+  let files = 0;
+  let insertions = 0;
+  let deletions = 0;
+  for (const entry of summary.entries) {
+    files++;
+    insertions += entry.insertions;
+    deletions += entry.deletions;
   }
-  details.appendOutput(modeDetails);
-  return {
-    files: rows.length,
-    insertions: rows.reduce((total, row) => total + row.insertions, 0),
-    deletions: rows.reduce((total, row) => total + row.deletions, 0),
-    details,
-  };
+  return { files, insertions, deletions, details };
 }
 
 function summarizeRoot(

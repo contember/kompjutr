@@ -1,4 +1,3 @@
-import type { GitContext } from "../../ops/core/context.js";
 import type { RebaseResult } from "../../ops/core/kinds.js";
 import { requireRebaseCursor } from "../../ops/rebase/rebase-lifecycle-baseline.js";
 import type { Repository } from "../../ops/repository/repository.js";
@@ -21,7 +20,6 @@ interface RebaseMutation {
 
 export function formatRebaseContinue(
   repo: Repository,
-  worktree: GitContext["worktree"],
   mutation: RebaseMutation,
   options: ResolvedGitCliRunOptions,
 ): GitCliResult {
@@ -43,7 +41,7 @@ export function formatRebaseContinue(
   }
   const stdout = stdoutOutput(options);
   const commitOid = continuedCommitOid(repo, mutation);
-  if (commitOid !== undefined) formatCommit(repo, worktree, commitOid, "detached HEAD", stdout);
+  if (commitOid !== undefined) formatCommit(repo, commitOid, "detached HEAD", stdout);
   return truncatedResult(stdout, stderr, mutation.result.outcome === "completed" ? 0 : 1);
 }
 
