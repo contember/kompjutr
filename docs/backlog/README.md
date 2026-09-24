@@ -22,8 +22,7 @@ not effort: a wrong answer outranks a missing one.
   returns a different one or refuses. Nothing warns the caller. None filed.
 - **A — blocks a common workflow, loudly.** None filed.
 - **B — real gap, narrower audience or a workaround exists.**
-  [91](91-overwrite-ignored-untracked-files.md) ·
-  [92](92-summarize-cli-commits-past-the-row-cap.md)
+  [91](91-overwrite-ignored-untracked-files.md)
 - **No caller yet.** Stash, plumbing reads, branch and remote management, glob
   pathspecs, rebase extensions, interactive rebase, rebase merges, gitlink
   conflicts, outbound delta compression and byte-preserving paths live in
@@ -89,7 +88,7 @@ cost, or a removal.
 | Order | Items | Why |
 |---|---|---|
 | 1 | [91](91-overwrite-ignored-untracked-files.md) | Reproduced parity defect. |
-| 2 | [66](66-retire-modeled-retained-byte-charges.md), [92](92-summarize-cli-commits-past-the-row-cap.md), [65](65-git-sqlite-architecture-review.md) | Removals: modeled byte ledgers, the CLI summary cap, duplicate tables, twins and validators. |
+| 2 | [66](66-retire-modeled-retained-byte-charges.md), [65](65-git-sqlite-architecture-review.md) | Removals: the remaining modeled byte charges, twins and validators. |
 | 3 | [84](84-read-integration-worktree-inputs-once.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md) | Measured repeated passes and memory peaks. |
 | — | [64](64-speed-up-full-test-suite.md), [80](80-restore-import-graph-domain-guarantees.md) | Tooling. |
 
@@ -97,10 +96,9 @@ cost, or a removal.
 
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
 - [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
-- [66 — Retire modeled retained-byte charges](66-retire-modeled-retained-byte-charges.md)
+- [66 — Retire the status and rm modeled byte charges](66-retire-modeled-retained-byte-charges.md)
 - [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
 - [84 — Read integration worktree inputs once](84-read-integration-worktree-inputs-once.md)
 - [86 — Bound the sparse-selected-add and workerd clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
 - [91 — Overwrite ignored untracked files on checkout, merge and rebase](91-overwrite-ignored-untracked-files.md)
-- [92 — Summarize a CLI commit that changes more than 50,000 files](92-summarize-cli-commits-past-the-row-cap.md)
 - [95 — Reduce the Next.js rebase step's full-tree passes and peak](95-reduce-the-nextjs-rebase-step-peak.md)
