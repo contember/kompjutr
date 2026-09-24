@@ -4,10 +4,11 @@ import { createGitCommand } from "../../packages/do/src/git-shell.js";
 import { Workspace } from "../../packages/do/src/runtime/workspace.js";
 import { type Command, result } from "../../packages/do/src/shell/exec/context.js";
 import { createShell, type Shell } from "../../packages/do/src/shell/index.js";
-import type {
-  GitCliInput,
-  GitCliRunner,
-  GitCliRunOptions,
+import {
+  GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
+  type GitCliInput,
+  type GitCliRunner,
+  type GitCliRunOptions,
 } from "../../packages/git/src/cli/types.js";
 import { createGit } from "../../packages/git/src/client.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
@@ -258,17 +259,17 @@ describe("git command shell seam", () => {
     expect(calls[1]).toEqual({
       input: { argv: ["log"], cwd: "/repo" },
       options: {
-        maxStdoutBytes: 97,
+        maxStdoutBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
         maxStderrBytes: 20,
-        maxCombinedOutputBytes: 117,
+        maxCombinedOutputBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
         discardStderr: false,
         logLimitHint: 3,
       },
     });
     expect(calls[2]?.options).toEqual({
-      maxStdoutBytes: 96,
+      maxStdoutBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
       maxStderrBytes: 20,
-      maxCombinedOutputBytes: 116,
+      maxCombinedOutputBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
       discardStderr: false,
     });
     expect(calls[3]?.options).toEqual({

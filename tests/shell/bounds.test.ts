@@ -404,8 +404,10 @@ describe("retained-memory bounds", () => {
     expect(new TextDecoder().decode(fs.readFile("/repo/target"))).toBe("old");
   });
 });
-describe("git destination preflight", () => {
-  it("rolls a commit back before direct terminal output overflows", async () => {
+describe("git output at a bounded sink", () => {
+  // A mutation commits before its output is sized. Only a terminal sink
+  // truncates; pipe and redirect bytes hit the retained limit and fail the run.
+  it("commits and truncates direct terminal output to the sink", async () => {
     const subject = await stagedGit();
     const bounded = gitShell(subject.workspace, {
       maxOutputBytes: 1,
@@ -414,10 +416,10 @@ describe("git destination preflight", () => {
       maxRetainedBytes: 1000,
     });
     const run = await bounded.run("git commit -m overflow");
-    expect(run).toMatchObject({ stdout: "", exitCode: 2 });
-    await expectUnchanged(subject);
+    expect(run).toMatchObject({ stdout: "[", stderr: "", exitCode: 0, truncated: true });
+    await expectCommitted(subject);
   });
-  it("rolls a commit back before an upstream pipeline output overflows", async () => {
+  it("commits and fails the run when upstream pipeline output exceeds retained memory", async () => {
     const subject = await stagedGit();
     const bounded = gitShell(subject.workspace, {
       maxOutputBytes: 1000,
@@ -427,12 +429,13 @@ describe("git destination preflight", () => {
     });
     const run = await bounded.run("git commit -m overflow | head -1");
     expect(run).toMatchObject({ stdout: "", exitCode: 2 });
-    await expectUnchanged(subject);
+    expect(run.stderr).toMatch(/^kompjutr: git stdout exceeds the 64-byte retained-memory limit/);
+    expect(run.peakRetainedBytes).toBeLessThanOrEqual(64);
+    await expectCommitted(subject);
   });
-  it("rolls a commit and redirect back before redirected output overflows", async () => {
+  it("commits and leaves the redirect target unchanged when output exceeds retained memory", async () => {
     const subject = await stagedGit();
     subject.workspace.filesystem.writeFile("/repo/result", ENCODER.encode("old"));
-    const expectedStatus = await subject.workspace.git.status({ dir: "/repo" });
     const bounded = gitShell(subject.workspace, {
       maxOutputBytes: 1000,
       maxOperations: 100,
@@ -441,14 +444,22 @@ describe("git destination preflight", () => {
     });
     const run = await bounded.run("git commit -m overflow > result");
     expect(run).toMatchObject({ stdout: "", exitCode: 2 });
+    expect(run.stderr).toMatch(/^kompjutr: git stdout exceeds the 64-byte retained-memory limit/);
     expect(new TextDecoder().decode(subject.workspace.filesystem.readFile("/repo/result"))).toBe(
       "old",
     );
-    expect(await subject.workspace.git.log({ dir: "/repo" })).toEqual(subject.log);
-    expect(await subject.workspace.git.status({ dir: "/repo" })).toEqual(expectedStatus);
+    await expectCommitted(subject, ["result"]);
   });
-  it("publishes no partial Git refusal when direct stderr exceeds the sink", async () => {
+  it("keeps Git's status and truncates direct stderr to the sink", async () => {
     const subject = await stagedGit();
+    const full = await gitShell(subject.workspace, {
+      maxOutputBytes: 1000,
+      maxOperations: 100,
+      readBudget: 100,
+      maxRetainedBytes: 1000,
+    }).run("git push");
+    expect(full).toMatchObject({ stdout: "", exitCode: 128, truncated: false });
+    expect(ENCODER.encode(full.stderr).length).toBeGreaterThan(12);
     const bounded = gitShell(subject.workspace, {
       maxOutputBytes: 12,
       maxOperations: 100,
@@ -456,8 +467,8 @@ describe("git destination preflight", () => {
       maxRetainedBytes: 1000,
     });
     const run = await bounded.run("git push");
-    expect(run).toMatchObject({ stdout: "", exitCode: 2, truncated: true });
-    expect(run.stderr).not.toContain("No configured push destination");
+    expect(run).toMatchObject({ stdout: "", exitCode: 128, truncated: true });
+    expect(run.stderr).toBe(new TextDecoder().decode(ENCODER.encode(full.stderr).subarray(0, 12)));
     await expectUnchanged(subject);
   });
   it("does not charge dropped Git stderr to a zero-byte sink", async () => {
@@ -513,6 +524,17 @@ function gitShell(
     commands: new Map([["git", createGitCommand(workspace.git)]]),
     limits,
   });
+}
+async function expectCommitted(
+  subject: StagedGit,
+  untracked: readonly string[] = [],
+): Promise<void> {
+  const log = await subject.workspace.git.log({ dir: "/repo" });
+  expect(log).toHaveLength(subject.log.length + 1);
+  expect(log[0]?.message).toBe("overflow\n");
+  expect(await subject.workspace.git.status({ dir: "/repo" })).toEqual(
+    untracked.map((path) => ({ index: " ", path, worktree: "?" })),
+  );
 }
 async function expectUnchanged(subject: StagedGit): Promise<void> {
   expect(await subject.workspace.git.log({ dir: "/repo" })).toEqual(subject.log);

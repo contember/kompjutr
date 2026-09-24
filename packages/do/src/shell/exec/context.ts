@@ -304,7 +304,6 @@ export interface CommandContext {
 }
 
 export interface CommandOutput {
-  readonly destination: "terminal" | "pipeline" | "redirect";
   readonly maxStdoutBytes: number;
   readonly maxStderrBytes: number;
   readonly maxCombinedOutputBytes: number;

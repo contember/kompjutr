@@ -67,14 +67,6 @@ function commandOutput(
   lastStage: boolean,
   env: PipelineEnvironment,
 ): CommandContext["output"] {
-  const destination =
-    redirections.stdout.kind === "output"
-      ? lastStage
-        ? "terminal"
-        : "pipeline"
-      : redirections.stdout.kind === "diagnostic"
-        ? "terminal"
-        : "redirect";
   const maxStdoutBytes = destinationLimit(redirections.stdout, lastStage, env);
   const maxStderrBytes = destinationLimit(redirections.stderr, lastStage, env);
   const discardStderr = redirections.stderr.kind === "drop";
@@ -83,7 +75,6 @@ function commandOutput(
       ? Math.max(maxStdoutBytes, maxStderrBytes)
       : safeSum(maxStdoutBytes, maxStderrBytes);
   return {
-    destination,
     maxStdoutBytes,
     maxStderrBytes,
     maxCombinedOutputBytes,
@@ -91,19 +82,21 @@ function commandOutput(
   };
 }
 
+// Only a terminal sink truncates. Pipe and redirect bytes are semantic input,
+// so the retained budget fails the run instead of shortening them.
 function destinationLimit(
   destination: OutputDestination,
   lastStage: boolean,
   env: PipelineEnvironment,
 ): number {
   if (destination.kind === "drop") return 0;
-  const available =
-    destination.kind === "diagnostic"
-      ? env.errors.remaining
-      : destination.kind === "output" && lastStage
-        ? env.out.remaining
-        : Number.MAX_SAFE_INTEGER;
-  return Math.min(available, env.fs.retained.available);
+  if (destination.kind === "diagnostic") {
+    return Math.min(env.errors.remaining, env.fs.retained.available);
+  }
+  if (destination.kind === "output" && lastStage) {
+    return Math.min(env.out.remaining, env.fs.retained.available);
+  }
+  return Number.MAX_SAFE_INTEGER;
 }
 
 function safeSum(left: number, right: number): number {

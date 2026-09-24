@@ -177,20 +177,21 @@ work through its runner, so that SQL is deliberately excluded from
 `RunResult.operations`.
 
 Before Git runs, the adapter derives output ceilings from the planned
-destination. Terminal output gets the bytes remaining in the public sink; a
-redirect gets the atomic redirect ceiling; an upstream pipeline gets Git's
-intrinsic ceiling and any trailing-`head` demand hint. Direct stderr gets the
-remaining stderr sink, merged stderr shares the stage-output budget, and dropped
-stderr retains and charges nothing. The Git runner then applies its intrinsic
-16 MiB stdout, 1 MiB stderr, and 16 MiB combined maxima. A read-only Git
-command that exceeds its ceiling fails with an output limit.
+destination. Terminal stdout gets the bytes remaining in the public sink and
+direct stderr the remaining stderr sink, each capped by the available retained
+memory. An upstream pipeline or a redirect gets Git's intrinsic ceiling and any
+trailing-`head` demand hint; merged stderr follows its stdout destination, and
+dropped stderr retains and charges nothing. The Git runner then applies its
+intrinsic 16 MiB stdout, 1 MiB stderr, and 16 MiB combined maxima. A read-only
+Git command that exceeds its ceiling fails with an output limit.
 
 Every admitted mutating Git argv command, local or network, commits its outcome
-first and then returns the prefix that fits the ceiling, contributing
-`truncated: true` to the shell result when bytes are lost. A terminal, pipeline,
-merged, or redirect overflow therefore never undoes an index, worktree, ref, or
-operation-state change. Redirect publication remains atomic as for every other
-command. The policy is documented in
+before its output is sized. Only a terminal sink truncates: direct stdout or
+stderr returns the prefix that fits, keeps Git's exit status, and contributes
+`truncated: true` to the shell result. Pipe and redirect bytes are semantic
+input, so when they exceed `maxRetainedBytes` the mutation persists; the shell's
+retained limit fails the run with exit 2, and a redirect target stays
+unchanged. The Git-side policy is documented in
 [Git support](git-support.md#strict-argv-runner).
 
 Clone, fetch, pull, ls-remote, and push remain transport operations owned by the
