@@ -98,7 +98,7 @@ cost, or a removal.
 - [66 — Retire modeled retained-byte charges](66-retire-modeled-retained-byte-charges.md)
 - [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
 - [84 — Read integration worktree inputs once](84-read-integration-worktree-inputs-once.md)
-- [86 — Bound the sparse-selected-add and Next.js clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
+- [86 — Bound the sparse-selected-add and workerd clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
 - [91 — Overwrite ignored untracked files on checkout, merge and rebase](91-overwrite-ignored-untracked-files.md)
 - [92 — Summarize a CLI commit that changes more than 50,000 files](92-summarize-cli-commits-past-the-row-cap.md)
 - [95 — Reduce the Next.js rebase step's full-tree passes and peak](95-reduce-the-nextjs-rebase-step-peak.md)

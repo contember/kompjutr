@@ -62,11 +62,15 @@ legacy comparisons are under `docs/archive/benchmarks/`.
    object layouts and call the difference a result.
 6. A `vitest-pool-workers` run needs a `compatibility_date` the bundled
    `workerd` supports. A date set to "today" makes the benchmark unrunnable.
-7. Local workerd has no isolate memory limiter. Its process RSS is a regression
+7. **A memory peak depends on the cgroup `memory.max`.** The same Next.js clone
+   adds about 125–155 MiB under a 1 GiB cap and about 245 MiB without one.
+   Record the cap with every memory number, and compare only numbers taken under
+   the same cap.
+8. Local workerd has no isolate memory limiter. Its process RSS is a regression
    signal, not proof that the production 128 MB isolate limit is satisfied.
-8. The Next.js push phase must create a fresh remote branch. Setup and teardown
+9. The Next.js push phase must create a fresh remote branch. Setup and teardown
    delete `bench-work`, so a no-op push cannot masquerade as a measurement.
-9. The Smart HTTP origin is an `http` server in the benchmark process. A child
+10. The Smart HTTP origin is an `http` server in the benchmark process. A child
    spawned with `execFileSync` — real `git`, for a baseline — blocks the event
    loop and deadlocks against it. Spawn asynchronously and await the exit.
 

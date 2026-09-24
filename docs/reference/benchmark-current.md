@@ -114,9 +114,12 @@ All phases passed semantic verification: the published tracking ref, the
 fetched commit count, and every fetched tree entry. Clone process baselines were
 167.8 MiB and 170.1 MiB. This clone passes `depth: 0` and `noTags: true`; the
 workflow clone passes `ref` and `depth: 1` and runs 1,012 statements. The clone misses
-the 1,000-statement target by 6 statements and the former <160 MiB added-peak
-gate by 76–90 MiB
-([backlog 86](../backlog/86-bound-sparse-selected-add-and-workerd-clone-peaks.md)).
+the 1,000-statement target by 6 statements. These peaks were measured without a
+cgroup memory cap. The <160 MiB added-peak gate was approved under a 1 GiB,
+no-swap cap, and under that cap the same clone at `866843e` added 140.3 and
+111.2 MiB on 2026-09-24. Under the same cap, the 2026-09-10 closure `acf7289`
+added 154.2 and 124.4 MiB. Without the cap, `acf7289` added 243.7 MiB.
+Each run used a two-vCPU lease.
 A phase whose peak stayed below its baseline is reported as 0.0.
 
 ## Local runtime qualification

@@ -50,8 +50,9 @@ None.
 - [Lifecycle and network integrity](archive/sprint-2026-09-08-lifecycle-and-network-integrity.md)
   is complete: promise-aware maintenance, pack dependency preservation, and final
   fetch connectivity checks. At that closure the default clone met 990 SQL and
-  the approved <160 MiB added-peak RSS gate; on 2026-09-24 it runs 1,006 SQL
-  and adds 236–250 MiB ([backlog 86](backlog/86-bound-sparse-selected-add-and-workerd-clone-peaks.md)).
+  the approved <160 MiB added-peak RSS gate under a 1 GiB cgroup cap; on
+  2026-09-24 it runs 1,006 SQL and still meets the gate under the same cap
+  ([benchmark-current](reference/benchmark-current.md)).
 - Five lockstep `@kompjutr/*` packages now separate shared contracts, generic
   Git, the Durable Object runtime, and a crash-recoverable Unix local runtime.
   The final package-split comparison preserved every operation's SQL/row profile

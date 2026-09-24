@@ -1,14 +1,13 @@
 ---
 id: 86
-title: Bound the sparse-selected-add and Next.js clone memory peaks
+title: Bound the sparse-selected-add and workerd clone memory peaks
 blocked-by: []
 ---
 
-# 86 — Bound the sparse-selected-add and Next.js clone memory peaks
+# 86 — Bound the sparse-selected-add and workerd clone memory peaks
 
 **Summary.** Two memory gates were already missed before the 2026-09-10 sprint
-started and are still missed at `62ffbf0`. The Next.js clone peak also grew in
-Node, where it had met its approved gate.
+started and are still missed at `62ffbf0`.
 
 ## Problem
 
@@ -26,13 +25,12 @@ Local workerd has no isolate memory limiter, so this RSS is a regression signal
 and not evidence about the production 128 MB isolate limit; it also includes
 the SQLite page cache of a 218 MiB database.
 
-**The same clone in Node** adds 237.2 MiB in the workflow benchmark and
-235.9–250.2 MiB in the network benchmark at `62ffbf0`. On 2026-09-10 it added
-126.06 and 140.23 MiB, under the approved <160 MiB added-peak gate recorded in
-the archived lifecycle sprint. The rise predates the simplification sprint:
-its start commit `62edc57` already adds 222.6 MiB (1,026 statements), and the
-sprint moved it by +3 to +15 MiB, within run-to-run noise. In the workflow run the clone's V8 heap grew 49.7 MiB and its
-external memory 63.3 MiB over the phase.
+**The same clone in Node** is not a regression. The 2026-09-10 figures
+(126.06 and 140.23 MiB) were taken under a 1 GiB, no-swap cgroup cap; later
+figures (222–250 MiB) were not. On 2026-09-24, in the network scenario and
+under the same cap, `acf7289` added 154.2 and 124.4 MiB and `866843e` added
+140.3 and 111.2 MiB. Without the cap, they added 243.7 and 249.0 MiB. The
+approved <160 MiB gate holds under the conditions it was approved for.
 
 The clone's 1,012 statements miss the ADR-0005 target by 12; `bench:statements
 --check` reports it, and it has no dedicated item.
@@ -43,14 +41,15 @@ ignored `bench/results/nextjs-workflow.json`, `nextjs-network-*.json`,
 
 ## Approach / acceptance
 
-Attribute each peak to its retained structures before changing code — none of
-the three numbers has been decomposed, and the harnesses cannot separate V8
+Attribute each peak to its retained structures before changing code — neither
+number has been decomposed, and the harnesses cannot separate V8
 heap from SQLite page cache and fragmentation. Start from the sparse selection
 and initial-write paths for the first, and from the clone's pack ingest,
-checkout and index population for the clone. Bisect the Node clone rise between
-the 2026-09-10 closure and `62edc57` first; it may name the retained structure.
+checkout and index population for the workerd clone. Record the cgroup `memory.max`
+with every memory number; a peak taken without a cap is not comparable with one
+taken under it.
 
-Witness: all three scenarios meet their declared gate with unchanged semantics
+Witness: both scenarios meet their declared gate with unchanged semantics
 and native oracles, measured under an enforcing lease over at least three runs.
 If a gate turns out to be wrong rather than the code, say so with evidence and
 change the gate deliberately — do not widen it to pass.
