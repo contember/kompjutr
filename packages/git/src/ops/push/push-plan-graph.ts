@@ -5,18 +5,11 @@ import type { PushPlanningUpdate } from "../refs/refspec.js";
 import { type Repository, walkIndexedOwned } from "../repository/repository.js";
 import { resolveRoots } from "./push-plan-roots.js";
 import {
-  ARRAY_SLOT_BYTES,
-  COMMIT_ENTRY_BYTES,
-  COMMIT_PARENT_BYTES,
-  CONTAINER_BASE_BYTES,
   type NormalizedPushPlanOptions,
   OBJECT_PAGE,
   type PlannedCommit,
-  PUSH_PLAN_OBJECT_BYTES,
   type PushObject,
-  type PushRetainedTracker,
   type ResolvedRoot,
-  SET_ENTRY_BYTES,
 } from "./push-plan-types.js";
 import { validatePushPlanBounds } from "./push-plan-validation.js";
 
@@ -24,7 +17,6 @@ export function addObject(
   objects: Map<string, ObjectType>,
   oid: string,
   type: ObjectType,
-  tracker: PushRetainedTracker,
   limits: NormalizedPushPlanOptions,
 ): void {
   const prior = objects.get(oid);
@@ -32,27 +24,19 @@ export function addObject(
     throw new CorruptError(`object ${oid} is indexed as both ${prior} and ${type}`);
   }
   if (prior !== undefined) return;
-  const count = objects.size + 1;
-  validatePushPlanBounds(count, 0, limits);
-  tracker.set("object-map", CONTAINER_BASE_BYTES + count * PUSH_PLAN_OBJECT_BYTES);
+  validatePushPlanBounds(objects.size + 1, 0, limits);
   objects.set(oid, type);
 }
 
 export function excludedCommits(
   commits: ReadonlyMap<string, PlannedCommit>,
   remoteOids: Iterable<string>,
-  tracker: PushRetainedTracker,
 ): Set<string> {
-  tracker.set("excluded", CONTAINER_BASE_BYTES);
-  tracker.set("exclude-pending", CONTAINER_BASE_BYTES);
-  tracker.set("exclude-queued", CONTAINER_BASE_BYTES);
   const excluded = new Set<string>();
   const pending: string[] = [];
   const queued = new Set<string>();
   const enqueue = (oid: string): void => {
     if (oid === ZERO_OID || !commits.has(oid) || excluded.has(oid) || queued.has(oid)) return;
-    tracker.set("exclude-pending", CONTAINER_BASE_BYTES + (pending.length + 1) * ARRAY_SLOT_BYTES);
-    tracker.set("exclude-queued", CONTAINER_BASE_BYTES + (queued.size + 1) * SET_ENTRY_BYTES);
     pending.push(oid);
     queued.add(oid);
   };
@@ -60,36 +44,21 @@ export function excludedCommits(
   while (pending.length > 0) {
     const oid = pending.pop();
     if (oid === undefined) continue;
-    tracker.set("exclude-pending", CONTAINER_BASE_BYTES + pending.length * ARRAY_SLOT_BYTES);
     queued.delete(oid);
-    tracker.set("exclude-queued", CONTAINER_BASE_BYTES + queued.size * SET_ENTRY_BYTES);
     if (excluded.has(oid)) continue;
-    tracker.set("excluded", CONTAINER_BASE_BYTES + (excluded.size + 1) * SET_ENTRY_BYTES);
     excluded.add(oid);
     const commit = commits.get(oid);
     if (commit === undefined) continue;
     for (const parent of commit.parents) enqueue(parent);
   }
-  tracker.clear("exclude-pending");
-  tracker.clear("exclude-queued");
   return excluded;
 }
 
-export function hydrateObjects(
-  repo: Repository,
-  objects: Map<string, ObjectType>,
-  tracker: PushRetainedTracker,
-): PushObject[] {
-  tracker.set("hydrated-plan", CONTAINER_BASE_BYTES);
+export function hydrateObjects(repo: Repository, objects: Map<string, ObjectType>): PushObject[] {
   const planned: PushObject[] = [];
-  tracker.set("hydration-page", CONTAINER_BASE_BYTES);
   let page: ([string, ObjectType] | undefined)[] = [];
   const flush = (): void => {
     if (page.length === 0) return;
-    tracker.set(
-      "hydration-info",
-      2 * CONTAINER_BASE_BYTES + page.length * (PUSH_PLAN_OBJECT_BYTES + ARRAY_SLOT_BYTES),
-    );
     const oids: string[] = [];
     for (const entry of page) {
       if (entry === undefined) throw new CorruptError("push hydration page lost an entry");
@@ -108,25 +77,17 @@ export function hydrateObjects(
       if (found.oid !== oid || found.type !== type) {
         throw new CorruptError(`push metadata for ${oid} does not match its planned type`);
       }
-      const nextPlanBytes = CONTAINER_BASE_BYTES + (planned.length + 1) * PUSH_PLAN_OBJECT_BYTES;
-      tracker.transfer("hydration-page", PUSH_PLAN_OBJECT_BYTES, "hydrated-plan", nextPlanBytes);
       planned.push(found);
       page[index] = undefined;
     }
-    tracker.clear("hydration-info");
     page = [];
-    tracker.set("hydration-page", CONTAINER_BASE_BYTES);
   };
   for (const entry of objects) {
-    const nextPageBytes = CONTAINER_BASE_BYTES + (page.length + 1) * PUSH_PLAN_OBJECT_BYTES;
-    tracker.transfer("object-map", PUSH_PLAN_OBJECT_BYTES, "hydration-page", nextPageBytes);
     page.push(entry);
     objects.delete(entry[0]);
     if (page.length === OBJECT_PAGE) flush();
   }
   flush();
-  tracker.clear("object-map");
-  tracker.clear("hydration-page");
   return planned;
 }
 
@@ -141,19 +102,10 @@ function sameCommit(left: PlannedCommit, tree: string, parents: readonly string[
 export function collectCommitGraphs(
   repo: Repository,
   roots: Iterable<string>,
-  tracker: PushRetainedTracker,
 ): Map<string, PlannedCommit> {
-  tracker.set("commit-map", CONTAINER_BASE_BYTES);
   const commits = new Map<string, PlannedCommit>();
-  let retainedBytes = CONTAINER_BASE_BYTES;
   for (const root of roots) {
-    const graphBytes = tracker.remainingBytes;
-    if (graphBytes < 1) {
-      throw new GitError("E2BIG", "push commit graph has no operation memory capacity");
-    }
-    for (const { oid, commit } of walkIndexedOwned(repo, root, {
-      maxBytes: graphBytes,
-    })) {
+    for (const { oid, commit } of walkIndexedOwned(repo, root)) {
       const prior = commits.get(oid);
       if (prior !== undefined) {
         if (!sameCommit(prior, commit.tree, commit.parent)) {
@@ -161,10 +113,7 @@ export function collectCommitGraphs(
         }
         continue;
       }
-      retainedBytes += COMMIT_ENTRY_BYTES + commit.parent.length * COMMIT_PARENT_BYTES;
-      tracker.set("commit-map", retainedBytes);
-      const planned = { oid, tree: commit.tree, parents: commit.parent };
-      commits.set(oid, planned);
+      commits.set(oid, { oid, tree: commit.tree, parents: commit.parent });
     }
   }
   return commits;
@@ -174,18 +123,15 @@ function customBoundary(
   repo: Repository,
   oldOid: string,
   commits: ReadonlyMap<string, PlannedCommit>,
-  tracker: PushRetainedTracker,
 ): string | null {
   if (commits.has(oldOid)) return oldOid;
   try {
-    const old = resolveRoots(repo, [oldOid], tracker, "remote-root").get(oldOid);
+    const old = resolveRoots(repo, [oldOid]).get(oldOid);
     if (old?.finalType !== "commit" || !commits.has(old.finalOid)) return null;
     return old.finalOid;
   } catch (error) {
     if (hasErrorCode(error, "E2BIG")) throw error;
     return null;
-  } finally {
-    tracker.clear("remote-root");
   }
 }
 
@@ -230,15 +176,8 @@ export function requireNamespaceRules(
   updates: readonly PushPlanningUpdate[],
   roots: ReadonlyMap<string, ResolvedRoot>,
   commits: ReadonlyMap<string, PlannedCommit>,
-  tracker: PushRetainedTracker,
 ): Set<string> {
-  tracker.set("boundaries", CONTAINER_BASE_BYTES);
   const boundaries = new Set<string>();
-  const addBoundary = (oid: string): void => {
-    if (boundaries.has(oid)) return;
-    tracker.set("boundaries", CONTAINER_BASE_BYTES + (boundaries.size + 1) * SET_ENTRY_BYTES);
-    boundaries.add(oid);
-  };
   for (const update of updates) {
     const oid = update.oid;
     if (oid === null) continue;
@@ -249,7 +188,7 @@ export function requireNamespaceRules(
     }
     if (update.oldOid === oid) {
       if (root.finalType === "commit" && commits.has(root.finalOid)) {
-        addBoundary(root.finalOid);
+        boundaries.add(root.finalOid);
       }
       continue;
     }
@@ -261,9 +200,9 @@ export function requireNamespaceRules(
             `${update.destination} is not an ancestor of its local source`,
           );
         }
-        addBoundary(update.oldOid);
+        boundaries.add(update.oldOid);
       } else if (commits.has(update.oldOid)) {
-        addBoundary(update.oldOid);
+        boundaries.add(update.oldOid);
       }
       continue;
     }
@@ -281,16 +220,16 @@ export function requireNamespaceRules(
           `${update.destination} requires force for a non-commit replacement`,
         );
       }
-      const boundary = customBoundary(repo, update.oldOid, commits, tracker);
+      const boundary = customBoundary(repo, update.oldOid, commits);
       if (boundary === null) {
         throw new GitError(
           "ENONFASTFORWARD",
           `${update.destination} is not an ancestor of its local source`,
         );
       }
-      addBoundary(boundary);
+      boundaries.add(boundary);
     } else if (commits.has(update.oldOid)) {
-      addBoundary(update.oldOid);
+      boundaries.add(update.oldOid);
     }
   }
   return boundaries;
