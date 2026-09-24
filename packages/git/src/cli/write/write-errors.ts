@@ -125,6 +125,24 @@ export function mapRebaseFailure(error: unknown): GitCliResult | undefined {
   return undefined;
 }
 
+/** `merge --abort` is Git's `reset --merge`, which prefixes its refusal with the reset failure. */
+export function mapMergeAbortFailure(
+  error: unknown,
+  output: GitCliOutputContext,
+): GitCliResult | undefined {
+  const message = errorMessage(error);
+  if (hasErrorCode(error, "ECHECKOUTFAIL") && message !== undefined) {
+    return gitCliDiagnosticResult(
+      "error: ",
+      message,
+      "\nfatal: Could not reset index file to revision 'HEAD'.\n",
+      128,
+      output,
+    );
+  }
+  return mapMergeFailure(error, output);
+}
+
 export function mapMergeFailure(
   error: unknown,
   output: GitCliOutputContext,

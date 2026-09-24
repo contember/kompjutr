@@ -15,6 +15,7 @@ import {
   diffSummaryBounded,
   diffSummaryEntryRetainedBytes,
 } from "../packages/git/src/ops/diff/diff.js";
+import { merge } from "../packages/git/src/ops/merge/merge.js";
 import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
 import { initRepository } from "../packages/git/src/ops/repository/init.js";
@@ -1186,6 +1187,40 @@ describe("mutating git CLI handlers", () => {
     expect(reopened.repo.head().oid).toBe(beforeHead);
     expect(reopened.repo.checkout.readOperationState()).toBeNull();
     expect([...reopened.repo.checkout.indexScan()].some((entry) => entry.stage > 0)).toBe(false);
+  });
+  it.each([
+    ["an unstaged edit", "c.txt"],
+    ["an untracked file where the merge deleted one", "d.txt"],
+  ])("matches Git when merge --abort refuses over %s", async (_, path) => {
+    const source = fixture();
+    source.write("s.txt", "base\n").write("c.txt", "c\n").write("d.txt", "d\n");
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("s.txt", "topic\n").write("c.txt", "c topic\n").remove("d.txt");
+    source.commit("topic");
+    source.git("checkout", "-q", "main");
+    source.write("s.txt", "main\n");
+    source.commit("main");
+    const workspace = nativeRepository("/");
+    await importFixture(source, workspace.repo.checkout);
+    checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+    expect(gitResult(source, ["merge", "topic"]).status).toBe(1);
+    expect(
+      merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
+    ).toMatchObject({
+      conflicted: true,
+    });
+    source.write(path, "edit\n");
+    writeWorkFile(workspace, `/${path}`, "edit\n");
+    const before = repositoryState(workspace.context, workspace.repo);
+
+    const expected = gitResult(source, ["merge", "--abort"]);
+    expect(expected.status).toBe(128);
+    expect(await runner(workspace.context).runCli({ argv: ["merge", "--abort"] })).toEqual(
+      cliResult(expected),
+    );
+    expect(repositoryState(workspace.context, workspace.repo)).toEqual(before);
+    expect(workspace.repo.checkout.readOperationState()).not.toBeNull();
   });
   it("preserves foreign nested checkouts during rebase continue and abort", async () => {
     const continued = await conflictedNative(true, true);

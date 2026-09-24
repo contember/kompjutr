@@ -8,6 +8,7 @@ import type { GitCliHandlers } from "../types.js";
 import {
   environmentRecord,
   mapLocalMutationFailure,
+  mapMergeAbortFailure,
   mapMergeFailure,
   mapRebaseContinueFailure,
   mapRebaseFailure,
@@ -94,7 +95,7 @@ export function createGitCliReplayWriteHandlers(context: GitContext): ReplayHand
             options,
             () => mergeAbort(repo, context.worktree),
             () => gitCliResult("", "", 0),
-            (error) => mapMergeFailure(error, outputContext(options)),
+            (error) => mapMergeAbortFailure(error, outputContext(options)),
           );
         }
         return runMutation(

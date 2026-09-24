@@ -36,8 +36,7 @@ None.
       If everything is "hot", nothing is. -->
 - [Simplification](archive/sprint-2026-09-23-simplification.md) shipped: −14 %
   Git source, 61 → 46 tables, self-contained packs, `STRICT` schema, rebase at
-  any size. Next: [93](backlog/93-refuse-abort-over-unstaged-edits.md) (tier S
-  data loss), then the removals in the [backlog plan](backlog/README.md#sprint-plan).
+  any size. Next: the removals in the [backlog plan](backlog/README.md#sprint-plan).
 - The 2026-09-24 backlog review deleted items that would re-add excess machinery
   (17, 75, 76, 77, 78, 81, 87, 90, 96, 97) and moved no-caller parity features
   to [`ideas/`](ideas/README.md).

@@ -781,13 +781,12 @@ operation plan and its anchors are immutable after creation. Continue, skip, and
 abort trust the stored journal. Each checks the original HEAD and the journal
 kind; rebase continue and skip also check the phase, and continuing a conflicted
 operation refuses unmerged index entries. None of them re-plans the integration.
-Caller input is checked before it is written. A merge, cherry-pick, or revert
-`author` or `committer` option, and the resolved committer (plus the merge or
-revert author) of every commit these commands and rebase write, fails with
+Caller input is checked before it is written. A merge, cherry-pick, revert, or
+rebase `author` or `committer` option, and the resolved committer (plus the
+merge or revert author) of every commit these commands write, fails with
 `EINVAL` when it is empty, contains NUL, LF, CR, `<` or `>`, or is not canonical
-UTF-16, and with `E2BIG` above 1,024 UTF-8 bytes. A rebase `committer` option
-that is invalid is dropped from the reflog actor; only a step
-commit refuses it. A merge `message`, and any message a journal stores, fails
+UTF-16, and with `E2BIG` above 1,024 UTF-8 bytes. An invalid option fails before
+the operation starts. A merge `message`, and any message a journal stores, fails
 with `EINVAL` on NUL or non-canonical UTF-16 and with `E2BIG` above 1 MiB.
 Ordinary reads use plain projections. A replay or one-shot operation transition may
 change only `phase`, `empty_reason`, the `current_step` cursor,
@@ -797,6 +796,16 @@ bounded conflict snapshot. Its outer synchronous SQLite transaction owns the
 authoritative reread, index/worktree changes, conditional journal transition,
 and maintenance-root epoch bump.
 Supported public mutation re-entry fails with `EREENTRANT`.
+
+Merge abort and cherry-pick or revert skip and abort follow Git's
+`reset --merge`. They fail with `ECHECKOUTFAIL` and change nothing when a
+restored path that is present in the worktree differs from its stage-0 index
+entry (`Entry '<path>' not uptodate`), or when an untracked file stands where
+the restore writes one (`Untracked working tree file '<path>' would be
+overwritten`). Conflicted paths are reset regardless, and a path the user
+removed is restored. One narrow divergence: Git keeps an unstaged edit to a
+touched path whose staged entry the user set back to the pre-operation entry;
+kompjutr refuses. Rebase abort restores unconditionally, as Git's does.
 
 When the two sides put a regular or executable file and a symlink at the same
 path, the symlink stays at the logical path and the regular side is materialised
@@ -817,7 +826,7 @@ cannot be materialised and fails atomically with `EUNSUPPORTED`.
 | `-m <msg>` | `message` | ✔ |
 | `--no-commit` | `commit: false` | ✔ leaves a resumable pending merge |
 | `--continue` | `mergeContinue()` or plain `commit()` | ✔ |
-| `--abort` | `mergeAbort()` | ✔ restores only merge-owned paths; a structural blocker fails closed |
+| `--abort` | `mergeAbort()` | ✔ restores only merge-owned paths; refuses over unstaged edits as Git does |
 | `--squash` | — | ✘ |
 | `-s <strategy>`, `-X ours\|theirs\|patience`, `--conflict-style` | — | ✘ one built-in three-way strategy, default markers |
 | octopus (3+ heads) | — | ✘ |

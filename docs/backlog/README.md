@@ -19,8 +19,7 @@ Ranking of the gaps recorded in
 not effort: a wrong answer outranks a missing one.
 
 - **S — silent divergence.** kompjutr returns a plausible result where Git
-  returns a different one or refuses. Nothing warns the caller.
-  [93](93-refuse-abort-over-unstaged-edits.md)
+  returns a different one or refuses. Nothing warns the caller. None filed.
 - **A — blocks a common workflow, loudly.** None filed.
 - **B — real gap, narrower audience or a workaround exists.**
   [91](91-overwrite-ignored-untracked-files.md) ·
@@ -87,7 +86,7 @@ cost, or a removal.
 
 | Order | Items | Why |
 |---|---|---|
-| 1 | [93](93-refuse-abort-over-unstaged-edits.md), [91](91-overwrite-ignored-untracked-files.md) | Reproduced correctness and parity defects; 93 loses user edits. |
+| 1 | [91](91-overwrite-ignored-untracked-files.md) | Reproduced parity defect. |
 | 2 | [66](66-retire-modeled-retained-byte-charges.md), [92](92-summarize-cli-commits-past-the-row-cap.md), [65](65-git-sqlite-architecture-review.md), [79](79-bound-materialized-status-and-config-reads.md) | Removals: modeled byte ledgers, the CLI summary cap, duplicate tables, twins and validators. |
 | 3 | [84](84-read-integration-worktree-inputs-once.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md) | Measured repeated passes and memory peaks. |
 | — | [64](64-speed-up-full-test-suite.md), [80](80-restore-import-graph-domain-guarantees.md) | Tooling. |
@@ -103,5 +102,4 @@ cost, or a removal.
 - [86 — Bound the sparse-selected-add and Next.js clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
 - [91 — Overwrite ignored untracked files on checkout, merge and rebase](91-overwrite-ignored-untracked-files.md)
 - [92 — Summarize a CLI commit that changes more than 50,000 files](92-summarize-cli-commits-past-the-row-cap.md)
-- [93 — Refuse merge and replay abort over unstaged edits](93-refuse-abort-over-unstaged-edits.md)
 - [95 — Reduce the Next.js rebase step's full-tree passes and peak](95-reduce-the-nextjs-rebase-step-peak.md)

@@ -1038,14 +1038,12 @@ function currentBranchOf(fixture: GitFixture): string {
  * unmerged index entries behind it is a conflict; anything else is a
  * failure, and is rethrown so the codes stay comparable.
  */
+/** Git stops on a conflict with status 1; 128 is a refusal that may leave an earlier conflict behind. */
 function integrationOutcome(fixture: GitFixture, args: string[]): Outcome {
-  try {
-    fixture.git(...args);
-    return CLEAN;
-  } catch (error) {
-    if (fixture.git("ls-files", "-u") !== "") return CONFLICTED;
-    throw error;
-  }
+  const result = fixture.gitResult(...args);
+  if (result.status === 0) return CLEAN;
+  if (result.status !== 128 && fixture.git("ls-files", "-u") !== "") return CONFLICTED;
+  throw new Error(`git ${args.join(" ")} failed with ${result.status}: ${result.stderr}`);
 }
 
 // -- snapshots ---------------------------------------------------------
