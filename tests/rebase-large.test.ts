@@ -156,4 +156,6 @@ it.each([
       utf8.encode(finish === "abort" ? "0\n" : "upstream\n"),
     );
   },
+  // The 50,500-file case takes ~50 s alone and exceeds the 60 s default under a loaded suite.
+  180_000,
 );

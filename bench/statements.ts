@@ -240,7 +240,7 @@ interface History {
 // Frozen at the pre-sprint implementation; the status.sparse, staging.add-selected
 // and worktree.list rows at fc25987. A target miss is reported separately.
 const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
-  "schema.init": 97,
+  "schema.init": 72,
   "fs.redirect.stream": 32,
   "ls-files.cached": 1,
   "ls-files.combined": 6,
@@ -248,42 +248,42 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "sparse.prune": 126,
   "checkout.remove": 39,
   "worktree.guard": 7,
-  "staging.add": 18,
+  "staging.add": 17,
   "staging.rm": 27,
   "status.full": 28,
   "status.sparse-clean": 7,
   "status.sparse-dirty": 24,
-  "staging.add-selected": 25,
+  "staging.add-selected": 24,
   "worktree.list": 9,
   "checkout.initial": 24,
-  "commit.sparse": 37,
+  "commit.sparse": 36,
   "diff.index-worktree": 35,
   "fetch.publication": 22,
   "merge-base.select": 9,
-  "merge.virtual-base": 204,
-  "merge.apply": 147,
-  "merge.recovery": 101,
-  "merge.restore": 90,
+  "merge.virtual-base": 176,
+  "merge.apply": 133,
+  "merge.recovery": 37,
+  "merge.restore": 30,
   "replay.preflight": 5,
-  "replay.plan": 37,
-  "replay.recovery": 115,
+  "replay.plan": 32,
+  "replay.recovery": 45,
   "rebase.plan": 18,
-  "rebase.transition": 404,
-  "rebase.transition-n": 699,
-  "rebase.transition-2n": 1279,
+  "rebase.transition": 365,
+  "rebase.transition-n": 624,
+  "rebase.transition-2n": 1132,
   "pack.uncached-read": 3,
-  "pack.fallback-audit": 20,
+  "pack.fallback-audit": 12,
   "index-tracker.dirty": 2,
   "index-tracker.reseal": 8,
-  "maintenance.mark-depth-n": 398,
-  "maintenance.mark-depth-2n": 783,
+  "maintenance.mark-depth-n": 10,
+  "maintenance.mark-depth-2n": 10,
   "transport.discovery": 2,
-  "transport.fetch": 82,
+  "transport.fetch": 77,
   "transport.push": 50,
 };
 
 const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
-  "schema.init": 92,
+  "schema.init": 68,
   "fs.redirect.stream": 4,
   "ls-files.cached": 2,
   "ls-files.combined": 13,
@@ -302,27 +302,27 @@ const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
   "commit.sparse": 28,
   "diff.index-worktree": 35,
   "fetch.publication": 12,
-  "merge-base.select": 10,
-  "merge.virtual-base": 159,
-  "merge.apply": 116,
-  "merge.recovery": 73,
-  "merge.restore": 70,
+  "merge-base.select": 8,
+  "merge.virtual-base": 134,
+  "merge.apply": 109,
+  "merge.recovery": 28,
+  "merge.restore": 21,
   "replay.preflight": 10,
-  "replay.plan": 24,
-  "replay.recovery": 77,
-  "rebase.plan": 19,
-  "rebase.transition": 413,
-  "rebase.transition-n": 689,
-  "rebase.transition-2n": 1273,
+  "replay.plan": 22,
+  "replay.recovery": 35,
+  "rebase.plan": 16,
+  "rebase.transition": 381,
+  "rebase.transition-n": 629,
+  "rebase.transition-2n": 1157,
   "pack.uncached-read": 2,
   "pack.fallback-audit": 4,
   "index-tracker.dirty": 1_025,
   "index-tracker.reseal": 3,
-  "maintenance.mark-depth-n": 332,
-  "maintenance.mark-depth-2n": 653,
+  "maintenance.mark-depth-n": 8,
+  "maintenance.mark-depth-2n": 8,
   "transport.discovery": 2,
-  "transport.fetch": 64,
-  "transport.push": 57,
+  "transport.fetch": 63,
+  "transport.push": 56,
 };
 
 const FULL_INDEX_SCAN_SQL =
@@ -335,10 +335,11 @@ const SELECTED_EXACT_INDEX_SQL =
 const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
   {
     operation: "git.clone",
-    statements: 1_029,
-    rowsRead: 164_285,
+    statements: 1_012,
+    rowsRead: 145_777,
     source:
-      "2026-09-23 HEAD: commit promotion stopped recounting staged rows (-2 statements, " +
+      "2026-09-24 simplification sprint: self-contained packs and one tree projection per OID " +
+      "(-17 statements, -18,508 rows). 2026-09-23 HEAD: commit promotion stopped recounting staged rows (-2 statements, " +
       "-2 rows). 2026-09-22 HEAD, rebaselined with per-commit attribution. Statements fell from the " +
       "2026-09-07 pre-split 2,381 at bc9bd3f (lease-guard pairs) and e7d31b0 (admission page " +
       "256 -> 4,096). Rows rose from 79,273 through two correctness validations: 3fc7965 " +
@@ -347,10 +348,10 @@ const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
   },
   {
     operation: "git.commit (100)",
-    statements: 52,
+    statements: 51,
     rowsRead: 725,
     source:
-      "2026-09-22 HEAD. 51/724 held from the 2026-09-07 pre-split baseline until 924fb06, " +
+      "2026-09-24 simplification sprint (-1 statement). 2026-09-22 HEAD. 51/724 held from the 2026-09-07 pre-split baseline until 924fb06, " +
       "whose source-generation bump adds one UPDATE and its RETURNING row per batch flush " +
       "(ADR-0025, accepted consequence). Measured against its direct parent 2e1d48e.",
   },
