@@ -1,14 +1,13 @@
 export {
-  COMMIT_CACHE_FLUSH_BYTES,
+  COMMIT_ROW_MAX_BYTES,
   type CommitCacheEntry,
   type CommitCacheSource,
   type CommitCacheWriteResult,
-  commitCacheBytes,
-  indexCommitSource,
+  type CommitHeaders,
   insertCommitCaches,
   MAX_LOG_COMMITS,
+  parseAuthenticatedCommit,
   prepareCommitCache,
-  prepareCommitCacheOwned,
   readCommitCache,
 } from "./commits-cache.js";
 export {

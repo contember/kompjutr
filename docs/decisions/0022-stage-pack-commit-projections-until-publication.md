@@ -22,7 +22,7 @@ in [ADR-0005](0005-bound-real-failures-and-measure-cost.md).
 
 ## Decision
 
-Persist eligible pending projections in `git_pack_commit_staging`, keyed by
+Persist every pending commit's projection in `git_pack_commit_staging`, keyed by
 repository, pack, and OID. The exact pack owns them through a cascading foreign
 key. Admission checks validated projection input against that pack's physical
 commit membership; canonical OID ownership can belong to another complete pack.
@@ -36,7 +36,8 @@ transaction with the publication callback and ingest lease release.
 
 Promotion uses SQL over stored rows rather than reconstructing the pack's commit
 payloads in JavaScript. Ordinary commit and graph reads continue to read only
-published `git_commits` rows. Existing cache eligibility rules remain unchanged.
+published `git_commits` rows. Every packed commit gets a row; one whose message
+would exceed the platform row ceiling stores message and signature as NULL.
 
 ## Consequences
 

@@ -33,7 +33,6 @@ import {
 } from "../packages/git/src/store/index.js";
 import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
-import { commitCacheBytes } from "../packages/git/src/store/trees/commits.js";
 import {
   TREE_WALK_PATH_BYTES,
   TREE_WALK_STATE_BYTES,
@@ -488,21 +487,6 @@ describe("bounded commit graph reads", () => {
     expect(() => log(repo, { ref: "missing" })).toThrow(/unknown revision/);
   });
 
-  it("fills 256 cold point misses in bounded batches and reuses them warm", () => {
-    const { db, repo } = logFixture(256);
-    db.run("DELETE FROM git_commits WHERE repo_id = ?", 1);
-    db.storage.resetCounters();
-
-    expect(log(repo, { depth: 256 })).toHaveLength(256);
-    const cold = db.storage.statementCount;
-    expect(cold).toBeLessThan(1_500);
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits WHERE repo_id = ?", 1)).toBe(256);
-
-    db.storage.resetCounters();
-    expect(log(repo, { depth: 256 })).toHaveLength(256);
-    expect(db.storage.statementCount).toBeLessThan(1_000);
-  });
-
   it("uses one graph cursor for depth 257 and preserves every projected field", () => {
     const { db, repo } = logFixture(257);
     db.storage.histogram = new Map();
@@ -532,33 +516,14 @@ describe("bounded commit graph reads", () => {
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("authenticates an unavailable deep cache through the uncached path", () => {
-    const { db, repo, oids } = logFixture(257);
-    db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oids[0]);
-    db.storage.histogram = new Map();
-    db.storage.resetCounters();
-
-    expect(log(repo, { depth: 257 })).toHaveLength(257);
-    expect(
-      db.storage.histogram.get(
-        "WITH /* loose-object-payload */ wanted(ordinal, oid) AS ( SELECT CAST(key AS INTEGER), value FROM json_each(?) ) SELECT ",
-      ),
-    ).toBe(257);
-  });
-
   it("rejects a coordinated cached cycle on point and indexed log paths", () => {
     const { repo, oids } = logFixture(2);
     const parent = oids[0];
     const root = oids[1];
     if (parent === undefined || root === undefined) throw new Error("cycle fixture is incomplete");
-    const cached = repo.store.cachedCommit(parent);
-    if (cached === null) throw new Error("cycle fixture cache is missing");
-    const parents = [root];
-    const changed: Commit = { ...cached.commit, parent: parents };
     repo.store.db.run(
-      "UPDATE git_commits SET parents = ?, cache_bytes = ? WHERE repo_id = ? AND oid = ?",
-      JSON.stringify(parents),
-      commitCacheBytes(changed),
+      "UPDATE git_commits SET parents = ? WHERE repo_id = ? AND oid = ?",
+      JSON.stringify([root]),
       1,
       parent,
     );

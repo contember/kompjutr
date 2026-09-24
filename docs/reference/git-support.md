@@ -1002,6 +1002,13 @@ refuse the same size; pack ingest rejects a pack holding a larger entry; and
 fetching a repository that contains a larger object fails instead of producing a
 checkout that cannot be materialised.
 
+Every commit gets one parsed `git_commits` row, which a Durable Object stores
+only below about 2 MB. A commit whose message and signature would push the row
+past 2,000,000 bytes keeps them in the object instead, so such commits are
+accepted. A commit whose remaining headers alone exceed that size (an author or
+committer of about 2 MB, or roughly 44,000 parents) fails with `E2BIG` at loose
+write and at pack ingest, so cloning a repository that contains one fails.
+
 Two limits bite most often in ordinary use: the 2,200-byte cap on an emitted
 Git path, and the 4,096-step cap on a rebase or replay journal. Revision input is
 limited to 1,024 code units and 32 total `^`/`~` traversals. Divergence retains at

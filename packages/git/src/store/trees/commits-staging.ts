@@ -1,10 +1,10 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
-import { type CommitCacheEntry, writeCommitCachePages } from "./commits-cache.js";
-
-const COLUMNS = `repo_id, oid, parents, tree,
-  author_name, author_email, author_time, author_timezone,
-  committer_name, committer_email, committer_time, committer_timezone,
-  message, gpgsig, object_size, cache_bytes`;
+import {
+  COMMIT_ROW_COLUMNS,
+  COMMIT_ROW_JSON_COLUMNS,
+  type CommitCacheEntry,
+  writeCommitCachePages,
+} from "./commits-cache.js";
 
 export function stageCommitCaches(
   db: SqlDatabase,
@@ -16,19 +16,8 @@ export function stageCommitCaches(
     let admitted = 0;
     // Updating the same key still returns each admitted physical occurrence.
     for (const _row of db.iterate(
-      `INSERT INTO git_pack_commit_staging (${COLUMNS}, pack_id)
-       SELECT json_extract(j.value, '$.r'), json_extract(j.value, '$.o'),
-              json_extract(j.value, '$.p'), json_extract(j.value, '$.t'),
-              CAST(json_extract(j.value, '$.an') AS BLOB),
-              CAST(json_extract(j.value, '$.ae') AS BLOB),
-              json_extract(j.value, '$.at'), json_extract(j.value, '$.az'),
-              CAST(json_extract(j.value, '$.cn') AS BLOB),
-              CAST(json_extract(j.value, '$.ce') AS BLOB),
-              json_extract(j.value, '$.ct'), json_extract(j.value, '$.cz'),
-              CAST(json_extract(j.value, '$.m') AS BLOB),
-              CASE WHEN json_type(j.value, '$.g') = 'null' THEN NULL
-                   ELSE CAST(json_extract(j.value, '$.g') AS BLOB) END,
-              json_extract(j.value, '$.s'), json_extract(j.value, '$.b'), ?
+      `INSERT INTO git_pack_commit_staging (${COMMIT_ROW_COLUMNS}, pack_id)
+       SELECT ${COMMIT_ROW_JSON_COLUMNS}, ?
          FROM json_each(?) j
         WHERE json_extract(j.value, '$.r') = ? AND EXISTS (
            SELECT 1 FROM git_pack_entries e INDEXED BY git_pack_entries_by_oid
@@ -53,8 +42,8 @@ export function promoteCommitCaches(db: SqlDatabase, repoId: number, packId: num
   // Staging shares `git_commits`' columns and checks, and DO NOTHING absorbs only
   // the key conflict, so every staged key is inserted, already present, or aborts.
   db.run(
-    `INSERT INTO git_commits (${COLUMNS})
-     SELECT ${COLUMNS} FROM git_pack_commit_staging WHERE repo_id = ? AND pack_id = ?
+    `INSERT INTO git_commits (${COMMIT_ROW_COLUMNS})
+     SELECT ${COMMIT_ROW_COLUMNS} FROM git_pack_commit_staging WHERE repo_id = ? AND pack_id = ?
      ON CONFLICT(repo_id, oid) DO NOTHING`,
     repoId,
     packId,

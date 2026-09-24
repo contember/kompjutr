@@ -907,11 +907,10 @@ describe("maintenance reachability", () => {
     const decoyParent = store.write("commit", commit(decoyTree, [], "decoy parent\n"));
     db.run(
       `UPDATE git_commits
-          SET tree = ?, parents = json_array(?), cache_bytes = ?
+          SET tree = ?, parents = json_array(?)
         WHERE repo_id = ? AND oid = ?`,
       decoyTree,
       decoyParent,
-      101 * 1024 * 1024,
       checkout.repoId,
       root,
     );

@@ -17,11 +17,7 @@ import { readRefLog } from "../refs/reflog.js";
 import type { HeadOwner } from "../refs/refs.js";
 import {
   type CommitCacheEntry,
-  type CommitCacheWriteResult,
   type CommitGraphLimits,
-  indexCommitSource,
-  insertCommitCaches,
-  prepareCommitCache,
   readCommitCache,
   readCommitGraph,
 } from "../trees/commits.js";
@@ -220,26 +216,6 @@ export abstract class SharedRepoRefStore extends SharedRepoObjectStore {
 
   cachedCommit(oid: string): CommitCacheEntry | null {
     return readCommitCache(this.db, this.repoId, oid);
-  }
-
-  prepareCommit(oid: string, data: Uint8Array): CommitCacheEntry {
-    return prepareCommitCache({ repoId: this.repoId, oid, data });
-  }
-
-  cacheCommit(oid: string, data: Uint8Array): CommitCacheEntry | null {
-    return withGitMutationGuard(this.db, () => this.cacheCommitOwned(oid, data));
-  }
-
-  protected cacheCommitOwned(oid: string, data: Uint8Array): CommitCacheEntry | null {
-    return indexCommitSource(this.db, { repoId: this.repoId, oid, data });
-  }
-
-  cacheCommits(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
-    return withGitMutationGuard(this.db, () => this.cacheCommitsOwned(entries));
-  }
-
-  protected cacheCommitsOwned(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
-    return insertCommitCaches(this.db, entries);
   }
 
   commitGraph(rootOid: string, limits: CommitGraphLimits = {}): Iterable<CommitCacheEntry> {

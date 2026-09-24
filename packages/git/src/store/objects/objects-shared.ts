@@ -28,8 +28,8 @@ export const OID_PROBE_PAGE = 4096;
 
 export const MAX_BLOB_BATCH_OIDS = 4096;
 
-/** Parsed commits staged beside encoded object bytes before a batch flush. */
-export const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
+/** Commit source bytes staged beside encoded object bytes before a batch flush. */
+export const COMMIT_STAGE_SOURCE_BYTES = 8 * 1024 * 1024;
 
 /** One object staged in a batch, already hashed and encoded for storage. */
 export interface StagedObject {
@@ -88,7 +88,7 @@ export function requireStorableObjectSize(type: ObjectType, size: number): void 
 }
 
 export function requireCommitCacheWrites(result: CommitCacheWriteResult, expected: number): void {
-  if (result.written !== result.eligible || result.eligible + result.skipped !== expected) {
+  if (result.written !== expected) {
     throw new CorruptError(`commit cache wrote ${result.written} of ${expected} required rows`);
   }
 }

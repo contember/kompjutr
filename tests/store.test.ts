@@ -897,7 +897,7 @@ describe("loose objects", () => {
     expect(store.read(oid)?.data.length).toBe(data.length);
   });
 
-  it("keeps large scalar, batch, and streamed commits authoritative when cache-ineligible", () => {
+  it("indexes large scalar, batch, and streamed commits with a message-less row", () => {
     const person = {
       name: "Large Commit",
       email: "large@example.test",
@@ -916,12 +916,16 @@ describe("loose objects", () => {
     const scalar = open();
     expect(scalar.store.write("commit", data)).toBe(expectedOid);
     expect(scalar.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
-    expect(scalar.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
+    expect(
+      scalar.db.all("SELECT message IS NULL AS omitted, object_size FROM git_commits"),
+    ).toEqual([{ omitted: 1, object_size: data.length }]);
 
     const batch = open();
     expect(batch.store.writeObjects((writer) => writer.write("commit", data))).toBe(expectedOid);
     expect(batch.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
-    expect(batch.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
+    expect(batch.db.all("SELECT message IS NULL AS omitted, object_size FROM git_commits")).toEqual(
+      [{ omitted: 1, object_size: data.length }],
+    );
 
     const streamed = open();
     expect(
@@ -932,7 +936,9 @@ describe("loose objects", () => {
       }),
     ).toBe(expectedOid);
     expect(streamed.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
-    expect(streamed.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
+    expect(
+      streamed.db.all("SELECT message IS NULL AS omitted, object_size FROM git_commits"),
+    ).toEqual([{ omitted: 1, object_size: data.length }]);
   });
 
   it("resolves unambiguous prefixes only", () => {

@@ -62,7 +62,7 @@ caches, queues, and caps tied to real failures; there is no runtime byte ledger.
 - Push preflights both pack passes before POST. Reopen only for a 401 retry;
   never replay a network-failed POST. Move tracking refs only after complete
   `report-status`.
-- A new commit must publish a valid cache projection atomically with object
+- A new commit must publish its `git_commits` row atomically with object
   visibility.
 - Do not add an arbitrary Git-path component ceiling. A path cap survives only
   when it names a real format, platform, memory, or structural failure.

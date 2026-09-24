@@ -26,7 +26,6 @@ import type {
   OperationStepMetadata,
 } from "../operations/operations.js";
 import { type SharedRepoStore, sharedRepoStoreMutations } from "../repository/shared.js";
-import type { CommitCacheEntry, CommitCacheWriteResult } from "../trees/commits.js";
 import type { CheckoutIndexStore } from "./checkout-index.js";
 import type { CheckoutOperationStore } from "./checkout-operation.js";
 import type { CheckoutRefStore } from "./checkout-refs.js";
@@ -86,8 +85,6 @@ export interface CheckoutStoreMutations {
   indexClearOwned(): void;
   indexApplyOwned<T>(body: (sink: IndexSink) => T, options?: IndexApplyOptions): T;
   indexReplaceOwned(entries: Iterable<IndexEntry>, options?: IndexApplyOptions): void;
-  cacheCommitOwned(oid: string, data: Uint8Array): CommitCacheEntry | null;
-  cacheCommitsOwned(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult;
   setShallowOwned(add: Iterable<string>, remove?: Iterable<string>): void;
   destroyOwned(): void;
 }
@@ -161,8 +158,6 @@ export function createCheckoutStoreMutations(
     indexClearOwned: () => dependencies.index.indexClearOwned(),
     indexApplyOwned: (body, options) => dependencies.index.indexApplyOwned(body, options),
     indexReplaceOwned: (entries, options) => dependencies.index.indexReplaceOwned(entries, options),
-    cacheCommitOwned: (oid, data) => dependencies.index.cacheCommitOwned(oid, data),
-    cacheCommitsOwned: (entries) => dependencies.index.cacheCommitsOwned(entries),
     setShallowOwned: (add, remove) => sharedMutations().setShallowOwned(add, remove),
     destroyOwned: () => dependencies.destroyOwned(),
   };

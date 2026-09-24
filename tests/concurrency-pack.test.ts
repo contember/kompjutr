@@ -261,13 +261,14 @@ describe("concurrent pack ownership", () => {
     },
   );
 
-  it("counts repeated eligible and skipped physical commits while preserving published duplicates", async () => {
+  it("counts repeated small and oversized physical commits while preserving published duplicates", async () => {
     const opened = createStore();
     const fixture = new GitFixture().init();
     const header = `tree ${"0".repeat(40)}\nauthor Fixture <fixture@example.com> 1577836800 +0000\ncommitter Fixture <fixture@example.com> 1577836800 +0000\n\n`;
     const eligible = utf8.encode(`${header}eligible\n`);
     const loose = utf8.encode(`${header}loose\n`);
-    const skipped = utf8.encode(`${header}${"x".repeat(4 * 1024 * 1024)}\n`);
+    const oversized = utf8.encode(`${header}${"x".repeat(4 * 1024 * 1024)}\n`);
+    const oversizedOid = hashObject("commit", oversized);
     const eligibleOid = hashObject("commit", eligible);
     const looseOid = opened.store.write("commit", loose);
     await opened.store.packs.ingest(
@@ -278,8 +279,8 @@ describe("concurrent pack ownership", () => {
       for (let i = 0; i < 3073; i++) writer.object("commit", eligible);
       writer.object("commit", loose);
       writer.object("commit", loose);
-      writer.object("commit", skipped);
-      writer.object("commit", skipped);
+      writer.object("commit", oversized);
+      writer.object("commit", oversized);
     }, 3077);
     try {
       fixture.write("duplicates.pack", bytes);
@@ -308,14 +309,18 @@ describe("concurrent pack ownership", () => {
       ).toBe(3077);
       expect(opened.db.scalar<number>("SELECT count(*) FROM git_pack_commit_staging")).toBe(0);
       const cold = reopenStore(opened.storage);
-      expect(
-        cold.db.all<Record<string, unknown>>("SELECT * FROM git_commits ORDER BY oid"),
-      ).toEqual(before);
-      const object = cold.store.read(hashObject("commit", skipped));
+      const after = cold.db.all<Record<string, unknown>>("SELECT * FROM git_commits ORDER BY oid");
+      expect(after.filter((row) => row.oid !== oversizedOid)).toEqual(before);
+      expect(after.find((row) => row.oid === oversizedOid)).toMatchObject({
+        message: null,
+        gpgsig: null,
+        object_size: oversized.length,
+      });
+      const object = cold.store.read(oversizedOid);
       expect(object?.type).toBe("commit");
       if (object === null) throw new Error("published oversized commit is missing");
-      expect(Buffer.from(object.data).equals(skipped)).toBe(true);
-      expect(cold.store.cachedCommit(hashObject("commit", skipped))).toBeNull();
+      expect(Buffer.from(object.data).equals(oversized)).toBe(true);
+      expect(cold.store.cachedCommit(oversizedOid)).toMatchObject({ messageStored: false });
     } finally {
       fixture.dispose();
     }

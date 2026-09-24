@@ -447,18 +447,6 @@ export class CheckoutStore implements Api.IndexStore {
     return this.#state.index.cachedCommit(oid);
   }
 
-  prepareCommit(oid: string, data: Uint8Array): Api.CommitCacheEntry {
-    return this.#state.index.prepareCommit(oid, data);
-  }
-
-  cacheCommit(oid: string, data: Uint8Array): Api.CommitCacheEntry | null {
-    return this.#mutate(() => this.#state.mutations.cacheCommitOwned(oid, data));
-  }
-
-  cacheCommits(entries: Iterable<Api.CommitCacheEntry>): Api.CommitCacheWriteResult {
-    return this.#mutate(() => this.#state.mutations.cacheCommitsOwned(entries));
-  }
-
   commitGraph(rootOid: string, limits: Api.CommitGraphLimits = {}): Iterable<Api.CommitCacheEntry> {
     return this.#state.index.commitGraph(rootOid, limits);
   }

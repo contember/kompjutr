@@ -1,27 +1,27 @@
-import { CorruptError, GitError, hasErrorCode, ObjectNotFoundError } from "../../common/errors.js";
-import type { Commit } from "../../common/objects.js";
+import { CorruptError, GitError, ObjectNotFoundError } from "../../common/errors.js";
+import { type Commit, parseCommit } from "../../common/objects.js";
 import type { SharedRepoStore } from "../../store/index.js";
 import { readShallowOwned } from "../../store/index.js";
-import { sharedRepoStoreMutations } from "../../store/repository/shared.js";
 import {
-  COMMIT_CACHE_FLUSH_BYTES,
   type CommitCacheEntry,
   type CommitGraphLimits,
   MAX_LOG_COMMITS,
-  prepareCommitCacheOwned,
+  parseAuthenticatedCommit,
   readCommitGraphOwned,
 } from "../../store/trees/commits.js";
 
+type CommitGraphFields = Pick<Commit, "tree" | "parent" | "author" | "committer">;
+
 interface WalkNode {
   oid: string;
-  commit: Commit;
+  entry: CommitCacheEntry;
   sequence: number;
 }
 
 function before(left: WalkNode, right: WalkNode): boolean {
-  if (left.commit.committer.timestamp !== right.commit.committer.timestamp) {
-    return left.commit.committer.timestamp > right.commit.committer.timestamp;
-  }
+  const leftTime = left.entry.commit.committer.timestamp;
+  const rightTime = right.entry.commit.committer.timestamp;
+  if (leftTime !== rightTime) return leftTime > rightTime;
   return left.sequence < right.sequence;
 }
 
@@ -66,32 +66,6 @@ class CommitHeap {
   }
 }
 
-class CommitFillBuffer {
-  readonly #pending: CommitCacheEntry[] = [];
-  #bytes = 0;
-
-  constructor(private readonly store: SharedRepoStore) {}
-
-  add(entry: CommitCacheEntry): void {
-    if (
-      entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES ||
-      (this.#pending.length > 0 && this.#bytes + entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES)
-    ) {
-      this.flush();
-    }
-    if (entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES) return;
-    this.#pending.push(entry);
-    this.#bytes += entry.cacheBytes;
-    if (this.#bytes >= COMMIT_CACHE_FLUSH_BYTES) this.flush();
-  }
-
-  flush(): void {
-    sharedRepoStoreMutations(this.store).cacheCommitsOwned(this.#pending);
-    this.#pending.length = 0;
-    this.#bytes = 0;
-  }
-}
-
 interface WalkRepository {
   readonly store: SharedRepoStore;
   peel(oid: string): string;
@@ -104,13 +78,8 @@ export interface PrunedCommitWalkDecision {
   parents: readonly string[];
 }
 
-/** Read, hash, and parse a commit from its authoritative physical source. */
-export function readAuthenticatedCommitOwned(store: SharedRepoStore, oid: string): Commit {
-  return readAuthenticatedCommitEntryOwned(store, oid).commit;
-}
-
 export function readCommitOwned(store: SharedRepoStore, oid: string): Commit {
-  return readCommitEntryOwned(store, oid).commit;
+  return completeCommit(store, readCommitEntryOwned(store, oid));
 }
 
 export function authenticateCommitGraphThroughBoundary(
@@ -152,7 +121,8 @@ export function authenticateCommitGraphThroughBoundary(
   return visited;
 }
 
-function readAuthenticatedCommitEntryOwned(store: SharedRepoStore, oid: string): CommitCacheEntry {
+/** Read, hash, and parse a commit from its authoritative physical source. */
+export function readAuthenticatedCommitOwned(store: SharedRepoStore, oid: string): Commit {
   const metadata = store.typeAndSize(oid);
   if (metadata === null) throw new ObjectNotFoundError(oid);
   if (metadata.type !== "commit") {
@@ -163,25 +133,28 @@ function readAuthenticatedCommitEntryOwned(store: SharedRepoStore, oid: string):
   if (object.data.length !== metadata.size) {
     throw new CorruptError(`commit ${oid} does not match its authoritative size`);
   }
-  return prepareCommitCacheOwned({ repoId: store.repoId, oid, data: object.data });
+  return parseAuthenticatedCommit({ repoId: store.repoId, oid, data: object.data });
 }
 
-function readCommitEntryOwned(
-  store: SharedRepoStore,
-  oid: string,
-  fill?: CommitFillBuffer,
-): CommitCacheEntry {
-  const cached = store.cachedCommit(oid);
-  if (cached !== null) return cached;
-  const prepared = readAuthenticatedCommitEntryOwned(store, oid);
-  if (fill === undefined) {
-    if (prepared.cacheBytes <= COMMIT_CACHE_FLUSH_BYTES) {
-      sharedRepoStoreMutations(store).cacheCommitsOwned([prepared]);
-    }
-  } else {
-    fill.add(prepared);
+/** Every stored commit has a row; a commit object without one is corruption. */
+function readCommitEntryOwned(store: SharedRepoStore, oid: string): CommitCacheEntry {
+  const row = store.cachedCommit(oid);
+  if (row !== null) return row;
+  const metadata = store.typeAndSize(oid);
+  if (metadata === null) throw new ObjectNotFoundError(oid);
+  if (metadata.type !== "commit") {
+    throw new CorruptError(`${oid} is a ${metadata.type}, not a commit`);
   }
-  return prepared;
+  throw new CorruptError(`commit ${oid} has no parsed row`);
+}
+
+/** A row without its message reads message and signature from the trusted object. */
+function completeCommit(store: SharedRepoStore, entry: CommitCacheEntry): Commit {
+  if (entry.messageStored) return entry.commit;
+  const object = store.read(entry.oid);
+  if (object === null) throw new ObjectNotFoundError(entry.oid);
+  const { message, gpgsig } = parseCommit(object.data);
+  return { ...entry.commit, message, ...(gpgsig === undefined ? {} : { gpgsig }) };
 }
 
 /** Commits reachable from `oid`, first-parent-first, in commit-date order. */
@@ -189,32 +162,11 @@ export function* walkOwned(
   repo: WalkRepository,
   oid: string,
 ): Generator<{ oid: string; commit: Commit }> {
-  const fill = new CommitFillBuffer(repo.store);
-  try {
-    const seen = new Set<string>();
-    const queue = new CommitHeap();
-    let sequence = 0;
-    const push = (candidate: string): void => {
-      if (seen.has(candidate)) return;
-      if (seen.size >= MAX_LOG_COMMITS) {
-        throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
-      }
-      const entry = readCommitEntryOwned(repo.store, candidate, fill);
-      seen.add(candidate);
-      queue.push({ oid: candidate, commit: entry.commit, sequence: sequence++ });
-    };
-
-    push(repo.peel(oid));
-    const boundary = readShallowOwned(repo.store);
-    while (queue.size > 0) {
-      const next = queue.pop();
-      if (next === undefined) throw new CorruptError("commit graph heap lost its next row");
-      yield { oid: next.oid, commit: next.commit };
-      if (boundary.has(next.oid)) continue;
-      for (const parent of next.commit.parent) push(parent);
-    }
-  } finally {
-    fill.flush();
+  for (const entry of walkPrunedOwned(repo, oid, ({ commit }) => ({
+    include: true,
+    parents: commit.parent,
+  }))) {
+    yield { oid: entry.oid, commit: entry.commit };
   }
 }
 
@@ -223,38 +175,34 @@ export function* walkPrunedOwned(
   oid: string,
   select: (entry: { oid: string; commit: Commit }) => PrunedCommitWalkDecision,
 ): Generator<{ oid: string; commit: Commit; include: boolean }> {
-  const fill = new CommitFillBuffer(repo.store);
-  try {
-    const seen = new Set<string>();
-    const queue = new CommitHeap();
-    let sequence = 0;
-    const push = (candidate: string): void => {
-      if (seen.has(candidate)) return;
-      if (seen.size >= MAX_LOG_COMMITS) {
-        throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
-      }
-      const entry = readCommitEntryOwned(repo.store, candidate, fill);
-      seen.add(candidate);
-      queue.push({ oid: candidate, commit: entry.commit, sequence: sequence++ });
-    };
-
-    push(repo.peel(oid));
-    const boundary = readShallowOwned(repo.store);
-    while (queue.size > 0) {
-      const next = queue.pop();
-      if (next === undefined) throw new CorruptError("commit graph heap lost its next row");
-      const decision = select({ oid: next.oid, commit: next.commit });
-      yield { oid: next.oid, commit: next.commit, include: decision.include };
-      if (boundary.has(next.oid)) continue;
-      for (const parent of decision.parents) {
-        if (!next.commit.parent.includes(parent)) {
-          throw new CorruptError("pruned commit walk selected a non-parent oid");
-        }
-        push(parent);
-      }
+  const seen = new Set<string>();
+  const queue = new CommitHeap();
+  let sequence = 0;
+  const push = (candidate: string): void => {
+    if (seen.has(candidate)) return;
+    if (seen.size >= MAX_LOG_COMMITS) {
+      throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
     }
-  } finally {
-    fill.flush();
+    const entry = readCommitEntryOwned(repo.store, candidate);
+    seen.add(candidate);
+    queue.push({ oid: candidate, entry, sequence: sequence++ });
+  };
+
+  push(repo.peel(oid));
+  const boundary = readShallowOwned(repo.store);
+  while (queue.size > 0) {
+    const next = queue.pop();
+    if (next === undefined) throw new CorruptError("commit graph heap lost its next row");
+    const commit = completeCommit(repo.store, next.entry);
+    const decision = select({ oid: next.oid, commit });
+    yield { oid: next.oid, commit, include: decision.include };
+    if (boundary.has(next.oid)) continue;
+    for (const parent of decision.parents) {
+      if (!commit.parent.includes(parent)) {
+        throw new CorruptError("pruned commit walk selected a non-parent oid");
+      }
+      push(parent);
+    }
   }
 }
 
@@ -269,56 +217,25 @@ export function* walkIndexedOwned(
   const entries = new Map<string, CommitCacheEntry>();
   const maxCommits = Math.min(limits.maxCommits ?? MAX_LOG_COMMITS, MAX_LOG_COMMITS);
   try {
-    try {
-      for (const entry of readCommitGraphOwned(repo.store.db, repo.store.repoId, root, limits)) {
-        if (entries.has(entry.oid)) {
-          throw new CorruptError("commit graph yielded a duplicate oid");
-        }
-        if (entries.size >= maxCommits) {
-          throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
-        }
-        entries.set(entry.oid, entry);
+    for (const entry of readCommitGraphOwned(repo.store.db, repo.store.repoId, root, limits)) {
+      if (entries.has(entry.oid)) {
+        throw new CorruptError("commit graph yielded a duplicate oid");
       }
-    } catch (error) {
-      if (!hasErrorCode(error, "ECACHEMISS")) throw error;
-      yield* walkUncachedOwned(repo.store, root, boundary, limits);
-      return;
+      if (entries.size >= maxCommits) {
+        throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
+      }
+      entries.set(entry.oid, entry);
     }
-    if (!entries.has(root)) throw new CorruptError("commit graph omitted its cached root");
+    if (!entries.has(root)) throw new CorruptError("commit graph omitted its root");
     validateCommitGraph(root, entries, boundary, true);
-    yield* orderedCommitGraph(root, entries, boundary);
+    yield* orderedCommitGraph(repo.store, root, entries, boundary);
   } finally {
     entries.clear();
   }
 }
 
-function* walkUncachedOwned(
-  store: SharedRepoStore,
-  root: string,
-  boundary: ReadonlySet<string>,
-  limits: CommitGraphLimits,
-): Generator<{ oid: string; commit: Commit }> {
-  const entries = new Map<string, CommitCacheEntry>();
-  const pending = [root];
-  const maxCommits = Math.min(limits.maxCommits ?? MAX_LOG_COMMITS, MAX_LOG_COMMITS);
-  while (pending.length > 0) {
-    const candidate = pending.pop();
-    if (candidate === undefined || entries.has(candidate)) continue;
-    if (entries.size >= maxCommits) {
-      throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
-    }
-    const entry = readAuthenticatedCommitEntryOwned(store, candidate);
-    entries.set(candidate, entry);
-    if (!boundary.has(candidate)) {
-      for (const parent of entry.commit.parent) pending.push(parent);
-    }
-  }
-  if (!entries.has(root)) throw new CorruptError("commit graph omitted its root");
-  validateCommitGraph(root, entries, boundary, true);
-  yield* orderedCommitGraph(root, entries, boundary);
-}
-
 function* orderedCommitGraph(
+  store: SharedRepoStore,
   root: string,
   entries: ReadonlyMap<string, CommitCacheEntry>,
   boundary: ReadonlySet<string>,
@@ -331,15 +248,15 @@ function* orderedCommitGraph(
     const entry = entries.get(candidate);
     if (entry === undefined) throw new CorruptError("commit graph is missing a parent row");
     seen.add(candidate);
-    queue.push({ oid: candidate, commit: entry.commit, sequence: sequence++ });
+    queue.push({ oid: candidate, entry, sequence: sequence++ });
   };
   push(root);
   while (queue.size > 0) {
     const next = queue.pop();
     if (next === undefined) throw new CorruptError("commit graph heap lost its next row");
-    yield { oid: next.oid, commit: next.commit };
+    yield { oid: next.oid, commit: completeCommit(store, next.entry) };
     if (boundary.has(next.oid)) continue;
-    for (const parent of next.commit.parent) push(parent);
+    for (const parent of next.entry.commit.parent) push(parent);
   }
 }
 
@@ -348,7 +265,7 @@ export function validateCommitWalk(
   repo: WalkRepository,
   entries: readonly { oid: string; commit: Commit }[],
 ): void {
-  const indexed = new Map<string, { commit: Commit }>();
+  const indexed = new Map<string, { commit: CommitGraphFields }>();
   for (const entry of entries) {
     if (indexed.has(entry.oid)) throw new CorruptError("commit walk yielded a duplicate oid");
     indexed.set(entry.oid, { commit: entry.commit });
@@ -360,7 +277,7 @@ export function validateCommitWalk(
 
 function validateCommitGraph(
   root: string,
-  entries: ReadonlyMap<string, { commit: Commit }>,
+  entries: ReadonlyMap<string, { commit: CommitGraphFields }>,
   boundary: ReadonlySet<string>,
   requireComplete: boolean,
 ): void {

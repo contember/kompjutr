@@ -8,7 +8,6 @@ import { planRebase } from "../packages/git/src/ops/rebase/rebase-plan.js";
 import { MAX_REPLAY_REVISION_CODE_UNITS } from "../packages/git/src/ops/replay/replay-revision.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../packages/git/src/store/index.js";
-import { commitCacheBytes } from "../packages/git/src/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 
@@ -388,13 +387,9 @@ describe("bounded rebase planner", () => {
         message: "current\n",
       }),
     );
-    const cachedBase = store.cachedCommit(base);
-    if (cachedBase === null) throw new Error("base commit cache row is missing");
-    const cyclicBase = { ...cachedBase.commit, parent: [current] };
     db.run(
-      "UPDATE git_commits SET parents = ?, cache_bytes = ? WHERE repo_id = ? AND oid = ?",
-      JSON.stringify(cyclicBase.parent),
-      commitCacheBytes(cyclicBase),
+      "UPDATE git_commits SET parents = ? WHERE repo_id = ? AND oid = ?",
+      JSON.stringify([current]),
       1,
       base,
     );

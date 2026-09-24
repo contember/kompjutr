@@ -1163,7 +1163,6 @@ describe("restricted log ranges", () => {
     unrelated.write("other.txt", "other\n").commit("other");
     const otherOid = unrelated.git("rev-parse", "HEAD");
     workspace.repo.store.write("commit", unrelated.catFile(otherOid));
-    workspace.repo.store.cacheCommit(otherOid, unrelated.catFile(otherOid));
     expect(await nativeRun(workspace, ["log", `${otherOid}..main-tip`])).toEqual(failure);
     const shallowBoundary = fixture.git("rev-parse", "main-tip");
     workspace.repo.store.setShallow([shallowBoundary]);

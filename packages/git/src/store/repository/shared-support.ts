@@ -16,7 +16,6 @@ import type {
 } from "../core/contracts.js";
 import type { ObjectTable } from "../objects/objects.js";
 import type { HeadOwner } from "../refs/refs.js";
-import type { CommitCacheEntry, CommitCacheWriteResult } from "../trees/commits.js";
 
 export interface ScratchStorageCache {
   revalidateStorageCaches(): void;
@@ -59,8 +58,6 @@ export interface SharedRepoStoreMutations {
   configAddOwned(path: string, value: string): void;
   configUnsetOwned(path: string): void;
   configMoveSectionOwned(sourcePrefix: string, destinationPrefix: string): void;
-  cacheCommitOwned(oid: string, data: Uint8Array): CommitCacheEntry | null;
-  cacheCommitsOwned(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult;
   setShallowOwned(add: Iterable<string>, remove?: Iterable<string>): void;
   destroyOwned(): void;
 }

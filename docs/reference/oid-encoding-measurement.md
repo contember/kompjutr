@@ -86,6 +86,11 @@ tables; parsed trees include `name`, `name_bytes`, `raw_entry`, and
 `cumulative_base`; commits include identities, timestamps, message, size, and
 cache accounting.
 
+> **Note (2026-09-24).** Production `git_commits` has since dropped
+> `cache_bytes` and stores `message` and `gpgsig` as NULL when the row would
+> exceed the platform row ceiling. The prototype's `git_commits` in
+> `bench/oid-encoding.ts` keeps the schema this measurement used.
+
 `git_commits.parents` is not treated as one scalar OID. TEXT stores an ordered,
 space-separated OID list. BLOB stores the ordered concatenation of 20-byte OIDs;
 zero parents is a zero-length BLOB. The loose workload includes zero-, one-, and

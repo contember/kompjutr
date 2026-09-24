@@ -15,10 +15,9 @@ const COMMIT_COLUMNS = `
   committer_email BLOB NOT NULL CHECK (typeof(committer_email) = 'blob'),
   committer_time INTEGER NOT NULL CHECK (typeof(committer_time) = 'integer'),
   committer_timezone INTEGER NOT NULL CHECK (typeof(committer_timezone) = 'integer'),
-  message BLOB NOT NULL CHECK (typeof(message) = 'blob'),
-  gpgsig BLOB CHECK (gpgsig IS NULL OR typeof(gpgsig) = 'blob'),
-  object_size INTEGER NOT NULL CHECK (typeof(object_size) = 'integer' AND object_size >= 0),
-  cache_bytes INTEGER NOT NULL CHECK (typeof(cache_bytes) = 'integer' AND cache_bytes >= 0)`;
+  message BLOB CHECK (message IS NULL OR typeof(message) = 'blob'),
+  gpgsig BLOB CHECK (gpgsig IS NULL OR (typeof(gpgsig) = 'blob' AND message IS NOT NULL)),
+  object_size INTEGER NOT NULL CHECK (typeof(object_size) = 'integer' AND object_size >= 0)`;
 
 const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
   ${COMMIT_COLUMNS},
@@ -46,8 +45,9 @@ export const OBJECT_SCHEMA_STATEMENTS = [
       WHERE repo_id = NEW.repo_id AND oid = NEW.oid;
    END`,
 
-  // Full parsed commits for graph walks and reads. This remains a derived
-  // cache: source metadata is validated before a row can be returned.
+  // One parsed row per stored commit, written with the object. A NULL message
+  // marks a row that would exceed the platform row ceiling: message and gpgsig
+  // are then read from the object.
   COMMIT_TABLE,
 
   `CREATE TABLE IF NOT EXISTS git_pack_commit_staging (

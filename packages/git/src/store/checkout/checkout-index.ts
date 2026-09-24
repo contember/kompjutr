@@ -10,11 +10,7 @@ import type {
 import { IndexTable } from "../indexes/index-table.js";
 import {
   type CommitCacheEntry,
-  type CommitCacheWriteResult,
   type CommitGraphLimits,
-  indexCommitSource,
-  insertCommitCaches,
-  prepareCommitCache,
   readCommitCache,
   readCommitGraph,
 } from "../trees/commits.js";
@@ -88,18 +84,6 @@ export class CheckoutIndexStore {
 
   cachedCommit(oid: string): CommitCacheEntry | null {
     return readCommitCache(this.#db(), this.#repoId, oid);
-  }
-
-  prepareCommit(oid: string, data: Uint8Array): CommitCacheEntry {
-    return prepareCommitCache({ repoId: this.#repoId, oid, data });
-  }
-
-  cacheCommitOwned(oid: string, data: Uint8Array): CommitCacheEntry | null {
-    return indexCommitSource(this.#db(), { repoId: this.#repoId, oid, data });
-  }
-
-  cacheCommitsOwned(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
-    return insertCommitCaches(this.#db(), entries);
   }
 
   commitGraph(rootOid: string, limits: CommitGraphLimits = {}): Iterable<CommitCacheEntry> {

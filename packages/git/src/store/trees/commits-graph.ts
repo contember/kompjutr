@@ -3,15 +3,17 @@ import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { expectText } from "../../common/rows.js";
 import {
-  COMMIT_FIXED_CACHE_BYTES,
   COMMIT_GRAPH_WALK_BYTES,
-  COMMIT_PARENT_CACHE_BYTES,
-  COMMIT_SQL_ROW_FIXED_BYTES,
+  COMMIT_ROW_MAX_BYTES,
   type CommitCacheEntry,
   type CommitCacheRow,
   decodeCommitCacheRow,
   MAX_LOG_COMMITS,
 } from "./commits-cache.js";
+
+/** Parsed-commit wrapper, map, heap, and result slots, charged per commit and per parent. */
+const COMMIT_FIXED_GRAPH_BYTES = 512;
+const COMMIT_PARENT_GRAPH_BYTES = 64;
 
 interface CommitGraphRow extends CommitCacheRow {
   kind: unknown;
@@ -31,12 +33,16 @@ const COMMIT_GRAPH_COLUMNS = `NULL AS parents, NULL AS tree,
   NULL AS author_name, NULL AS author_email, NULL AS author_time, NULL AS author_timezone,
   NULL AS committer_name, NULL AS committer_email,
   NULL AS committer_time, NULL AS committer_timezone,
-  NULL AS message, NULL AS gpgsig, NULL AS object_size, NULL AS cache_bytes`;
+  NULL AS message, NULL AS gpgsig, NULL AS object_size`;
 
-/** One recursive graph cursor. Payload columns are projected only after every bound passes. */
+/**
+ * One recursive graph cursor. Every commit has a row, so a reachable oid without one is
+ * corruption. Retained state is charged from `object_size`, capped at the row ceiling a
+ * message-less row stays under, since parsed strings take at most two bytes per source byte;
+ * payload columns are projected only after every bound passes.
+ */
 export const WALK_COMMIT_GRAPH_SQL = `WITH RECURSIVE
-  params(repo_id, root_oid, count_cap, byte_cap, fixed_bytes, parent_bytes, shallow_json)
-    AS (VALUES (?, ?, ?, ?, ?, ?, ?)),
+  params(repo_id, root_oid, count_cap, byte_cap, shallow_json) AS (VALUES (?, ?, ?, ?, ?)),
   boundaries(oid) AS MATERIALIZED (
     SELECT value FROM params p, json_each(p.shallow_json)
     UNION ALL
@@ -56,95 +62,41 @@ export const WALK_COMMIT_GRAPH_SQL = `WITH RECURSIVE
      )
      LIMIT (SELECT count_cap + 1 FROM params)
   ),
-  metadata AS MATERIALIZED (
-    SELECT r.oid,
-           c.oid IS NOT NULL AS cached,
-           EXISTS (
-             SELECT 1 FROM git_objects o
-              WHERE o.repo_id = p.repo_id AND o.oid = r.oid AND o.type = 'commit'
-             UNION ALL
-             SELECT 1 FROM git_pack_objects o
-               JOIN git_pack_meta m ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id
-              WHERE o.repo_id = p.repo_id AND o.oid = r.oid AND o.type = 'commit'
-                AND m.state = 'complete'
-           ) AS commit_source,
-           CASE WHEN c.oid IS NULL THEN p.byte_cap + 1
-                ELSE
-             min(
-               p.byte_cap + 1,
-               p.fixed_bytes
-               + 2 * (length(CAST(c.tree AS BLOB)) + length(CAST(c.parents AS BLOB))
-                 + length(c.author_name) + length(c.author_email)
-                 + length(c.committer_name) + length(c.committer_email)
-                 + length(c.message) + COALESCE(length(c.gpgsig), 0))
-               + p.parent_bytes * COALESCE(json_array_length(c.parents), 0)
-             )
-           END AS actual_bytes,
-           CASE WHEN c.oid IS NULL THEN p.byte_cap + 1
-                ELSE
-             min(
-               p.byte_cap + 1,
-               ${COMMIT_SQL_ROW_FIXED_BYTES}
-               + 2 * (length(CAST(c.tree AS BLOB)) + length(CAST(c.parents AS BLOB)))
-               + length(c.author_name) + length(c.author_email)
-               + length(c.committer_name) + length(c.committer_email)
-               + length(c.message) + COALESCE(length(c.gpgsig), 0)
-             )
-           END AS payload_bytes
+  summary AS (
+    SELECT count(*) AS rows,
+           COALESCE(sum(c.oid IS NULL), 0) AS missing,
+           COALESCE(sum(
+             ${COMMIT_FIXED_GRAPH_BYTES} + 2 * min(c.object_size, ${COMMIT_ROW_MAX_BYTES})
+             + ${COMMIT_PARENT_GRAPH_BYTES} * json_array_length(c.parents)
+           ), 0) AS bytes
       FROM reachable r
       CROSS JOIN params p
       LEFT JOIN git_commits c ON c.repo_id = p.repo_id AND c.oid = r.oid
-  ),
-  summary AS (
-    SELECT count(*) AS rows,
-           COALESCE(sum(actual_bytes), 0) AS bytes,
-           min(
-             p.byte_cap + 1,
-             COALESCE(sum(actual_bytes), 0) + COALESCE(max(payload_bytes), 0)
-           ) AS admission_bytes,
-           COALESCE(sum(CASE WHEN cached = 0 AND commit_source != 0 THEN 1 ELSE 0 END), 0)
-             AS incomplete,
-           COALESCE(sum(CASE WHEN cached = 0 AND commit_source = 0 THEN 1 ELSE 0 END), 0)
-             AS missing
-      FROM metadata CROSS JOIN params p
   ),
   verdict AS (
     SELECT CASE
       WHEN rows > p.count_cap THEN 'E2BIG'
       WHEN missing > 0 THEN 'ECORRUPT'
-      WHEN incomplete > 0 THEN 'ECACHEMISS'
-      WHEN admission_bytes > p.byte_cap THEN 'E2BIG'
+      WHEN bytes > p.byte_cap THEN 'E2BIG'
       ELSE NULL
     END AS error_code,
     CASE
       WHEN rows > p.count_cap THEN 'commit graph exceeds the 50000 commit limit'
-      WHEN missing > 0 THEN 'commit graph references a missing commit source'
-      WHEN incomplete > 0 THEN 'commit graph cache is unavailable'
-      WHEN admission_bytes > p.byte_cap THEN 'commit graph exceeds its fixed state capacity'
+      WHEN missing > 0 THEN 'commit graph references a commit without a row'
+      WHEN bytes > p.byte_cap THEN 'commit graph exceeds its fixed state capacity'
       ELSE NULL
-    END AS error,
-    summary.bytes AS graph_bytes,
-    summary.admission_bytes AS admission_bytes
+    END AS error
     FROM summary CROSS JOIN params p
   )
 SELECT 'error' AS kind, verdict.error_code, verdict.error, NULL AS oid,
        ${COMMIT_GRAPH_COLUMNS}
   FROM verdict WHERE verdict.error_code IS NOT NULL
 UNION ALL
-SELECT 'admission' AS kind, NULL AS error_code, NULL AS error, NULL AS oid,
-       NULL AS parents, NULL AS tree,
-       NULL AS author_name, NULL AS author_email, NULL AS author_time, NULL AS author_timezone,
-       NULL AS committer_name, NULL AS committer_email,
-       NULL AS committer_time, NULL AS committer_timezone,
-       NULL AS message, NULL AS gpgsig,
-       verdict.graph_bytes AS object_size, verdict.admission_bytes AS cache_bytes
-  FROM verdict WHERE verdict.error_code IS NULL
-UNION ALL
 SELECT 'commit' AS kind, NULL AS error_code, NULL AS error, c.oid,
        c.parents, c.tree,
        c.author_name, c.author_email, c.author_time, c.author_timezone,
        c.committer_name, c.committer_email, c.committer_time, c.committer_timezone,
-       c.message, c.gpgsig, c.object_size, c.cache_bytes
+       c.message, c.gpgsig, c.object_size
   FROM verdict
   CROSS JOIN params p
   CROSS JOIN reachable r
@@ -201,8 +153,6 @@ export function* readCommitGraphOwned(
     rootOid,
     maxCommits,
     maxBytes,
-    COMMIT_FIXED_CACHE_BYTES,
-    COMMIT_PARENT_CACHE_BYTES,
     shallow === undefined ? null : JSON.stringify(shallow),
   )) {
     const row: CommitGraphRow = {
@@ -223,7 +173,6 @@ export function* readCommitGraphOwned(
       message: value.message,
       gpgsig: value.gpgsig,
       object_size: value.object_size,
-      cache_bytes: value.cache_bytes,
     };
     const kind = expectText(row.kind, "commit graph row kind");
     if (kind === "error") {
@@ -232,7 +181,6 @@ export function* readCommitGraphOwned(
         expectText(row.error, "commit graph error message"),
       );
     }
-    if (kind === "admission") continue;
     if (kind !== "commit") {
       throw new CorruptError("commit graph yielded an invalid commit row");
     }

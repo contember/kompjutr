@@ -1,12 +1,11 @@
 import { ownedBytes, type SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
-import { hashObject, type ObjectType, parseCommit } from "../../common/objects.js";
+import type { ObjectType } from "../../common/objects.js";
 import {
-  COMMIT_CACHE_FLUSH_BYTES,
   type CommitCacheEntry,
   type CommitCacheSource,
-  prepareCommitCacheOwned,
+  prepareCommitCache,
 } from "../trees/commits.js";
 import { promoteCommitCaches, stageCommitCaches } from "../trees/commits-staging.js";
 import { indexPackTreeSources, type TreeSourceInput } from "../trees/tree-index.js";
@@ -18,30 +17,11 @@ const PACK_TREE_SOURCE_BYTES = 256;
 export const PACK_TREE_CHUNK_BYTES = 64;
 const PACK_TREE_CHUNK_ARRAY_BYTES = 64;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
+const PACK_COMMIT_BATCH_SOURCE_BYTES = 2 * 1024 * 1024;
 export const PACK_COMMIT_PAYLOAD_BYTES = 256;
 const PACK_INDEX_BATCH_BYTES = 1024 * 1024;
 const PACK_INDEX_BATCH_ROWS = 2048;
 export const PACK_PENDING_PAGE_ROWS = 4096;
-
-function validateLargeCommit(source: CommitCacheSource): void {
-  if (!Number.isSafeInteger(source.repoId) || source.repoId < 1 || !isOid(source.oid)) {
-    throw new CorruptError("commit cache source identity is invalid");
-  }
-  if (hashObject("commit", source.data) !== source.oid) {
-    throw new CorruptError(`commit cache source ${source.oid} does not match its bytes`);
-  }
-  const commit = parseCommit(source.data);
-  for (const value of [
-    commit.author.timestamp,
-    commit.author.timezoneOffset,
-    commit.committer.timestamp,
-    commit.committer.timezoneOffset,
-  ]) {
-    if (!Number.isSafeInteger(value)) {
-      throw new GitError("E2BIG", "commit has an unrepresentable identity number");
-    }
-  }
-}
 
 export type PackObjectInput = [
   oid: string,
@@ -323,8 +303,6 @@ export class PackCommitIndex {
   readonly #entries: CommitCacheEntry[] = [];
   #bytes = 0;
   #expected = 0;
-  #eligible = 0;
-  #skipped = 0;
   #written = 0;
 
   constructor(
@@ -335,39 +313,25 @@ export class PackCommitIndex {
   ) {}
 
   add(source: CommitCacheSource): void {
-    this.#add(source);
-  }
-
-  #add(source: CommitCacheSource): void {
-    if (source.data.length > COMMIT_CACHE_FLUSH_BYTES) {
-      validateLargeCommit(source);
-      this.#expected++;
-      this.#skipped++;
-      return;
-    }
-    const entry = prepareCommitCacheOwned(source);
+    const entry = prepareCommitCache(source);
     this.#expected++;
-    if (entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES) {
-      this.#skipped++;
-      return;
-    }
     if (
       this.#entries.length > 0 &&
       (this.#entries.length >= PACK_COMMIT_BATCH_SOURCES ||
-        this.#bytes + entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES)
+        this.#bytes + entry.objectSize > PACK_COMMIT_BATCH_SOURCE_BYTES)
     ) {
       this.#stage();
     }
     this.#entries.push(entry);
-    this.#bytes += entry.cacheBytes;
+    this.#bytes += entry.objectSize;
   }
 
   /** Promote only after the caller audits complete pack membership. */
   finish(): void {
     if (this.#entries.length !== 0) throw new CorruptError("packed commits were not checkpointed");
-    if (this.#written !== this.#eligible || this.#eligible + this.#skipped !== this.#expected) {
+    if (this.#written !== this.#expected) {
       throw new CorruptError(
-        `packed commit cache wrote ${this.#written} of ${this.#eligible} eligible rows and skipped ${this.#skipped} of ${this.#expected}`,
+        `packed commit cache wrote ${this.#written} of ${this.#expected} rows`,
       );
     }
     promoteCommitCaches(this.db, this.repoId, this.packId);
@@ -390,16 +354,11 @@ export class PackCommitIndex {
   #insert(): void {
     if (this.#entries.length === 0) return;
     const result = stageCommitCaches(this.db, this.repoId, this.packId, this.#entries);
-    if (
-      result.written !== result.eligible ||
-      result.eligible + result.skipped !== this.#entries.length
-    ) {
+    if (result.written !== this.#entries.length) {
       throw new CorruptError(
-        `packed commit cache wrote ${result.written} of ${result.eligible} eligible rows and skipped ${result.skipped} of ${this.#entries.length}`,
+        `packed commit cache wrote ${result.written} of ${this.#entries.length} rows`,
       );
     }
-    this.#eligible += result.eligible;
-    this.#skipped += result.skipped;
     this.#written += result.written;
   }
 

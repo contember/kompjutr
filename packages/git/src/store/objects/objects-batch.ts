@@ -11,7 +11,7 @@ import { indexSeededTreeSources } from "../trees/tree-index.js";
 import { fulfillLoosePromises } from "./objects-promises.js";
 import {
   type ChunkPayload,
-  COMMIT_STAGE_CACHE_BYTES,
+  COMMIT_STAGE_SOURCE_BYTES,
   DEFAULT_OBJECT_FLUSH,
   OBJECT_CHUNK,
   OBJECT_PAYLOAD,
@@ -66,7 +66,7 @@ export function createObjectWriteBatch(
           object.commitEntry = commitEntry;
         }
         const nextBytes = bytes + storedData.length + (object.treeData?.length ?? 0);
-        const nextCommitBytes = commitBytes + (object.commitEntry?.cacheBytes ?? 0);
+        const nextCommitBytes = commitBytes + (object.commitEntry?.objectSize ?? 0);
         staged.set(oid, object);
         bytes = nextBytes;
         commitBytes = nextCommitBytes;
@@ -74,7 +74,7 @@ export function createObjectWriteBatch(
         // row have to land in the same flush, whatever its size.
         if (
           bytes >= payloadBytes ||
-          commitBytes >= COMMIT_STAGE_CACHE_BYTES ||
+          commitBytes >= COMMIT_STAGE_SOURCE_BYTES ||
           staged.size >= flushEvery
         ) {
           flush();

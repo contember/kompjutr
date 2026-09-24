@@ -35,8 +35,11 @@ fetch state, direct-ref reflogs, projections, blob IDs, and maintenance.
 journals, and `HEAD` reflog. `git_tree_sources` holds one projection per tree
 OID, shared by every loose and packed copy and deleted with the last copy;
 `git_tree_entries` is owned through its source surrogate. `git_scratch_index*`
-rows are transaction-local and never become maintenance roots. `git_integration_*` rows are owned by one live
-`(repo_id, workspace_id)` inside a single transaction and are invisible to every
+rows are transaction-local and never become maintenance roots. `git_commits`
+holds one row per stored commit, written in the object's transaction (a packed
+one's at pack publication) and deleted with the last copy; a NULL message marks a
+row above the platform row ceiling, whose message and signature stay in the
+object. `git_integration_*` rows are owned by one live `(repo_id, workspace_id)` inside a single transaction and are invisible to every
 ordinary object, projection, promise and maintenance query. Integration output
 is ordinary loose objects written in that same transaction; a fault rolls them
 back, and unpublished ones are left for maintenance (ADR-0024). This boundary is

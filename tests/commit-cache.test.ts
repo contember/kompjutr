@@ -1,4 +1,3 @@
-import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../packages/do/src/db/db.js";
 import { utf8 } from "../packages/git/src/common/bytes.js";
@@ -8,20 +7,21 @@ import {
   hashObject,
   parseCommit,
   serializeCommit,
+  serializeTree,
 } from "../packages/git/src/common/objects.js";
+import { commit as commitIndexOp } from "../packages/git/src/ops/repository/commit.js";
+import { log, show } from "../packages/git/src/ops/repository/reads.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import {
-  COMMIT_CACHE_FLUSH_BYTES,
-  commitCacheBytes,
-  indexCommitSource,
+  COMMIT_ROW_MAX_BYTES,
+  insertCommitCaches,
   MAX_LOG_COMMITS,
   prepareCommitCache,
   WALK_COMMIT_GRAPH_SQL,
 } from "../packages/git/src/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
-
-const FORMER_INDEXED_COMMIT_BYTES = 1024 * 1024;
+import { makeRepo } from "./helpers/workspace.js";
 
 class MeasuredDatabase implements SqlDatabase {
   widestStringBytes = 0;
@@ -122,6 +122,10 @@ function chunks(data: Uint8Array, width: number): () => Iterable<Uint8Array> {
   };
 }
 
+function insertSource(db: SqlDatabase, oid: string, data: Uint8Array): number {
+  return insertCommitCaches(db, [prepareCommitCache({ repoId: 1, oid, data })]).written;
+}
+
 function commitChain(store: ReturnType<typeof open>, count: number): string[] {
   return store.writeObjects((batch) => {
     const oids: string[] = [];
@@ -133,31 +137,6 @@ function commitChain(store: ReturnType<typeof open>, count: number): string[] {
     }
     return oids;
   });
-}
-
-function insertAuthoritativeCommit(db: SqlDatabase, data: Uint8Array): string {
-  const oid = hashObject("commit", data);
-  db.run(
-    "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, 'commit', ?)",
-    1,
-    oid,
-    data.length,
-  );
-  const compressed = deflateSync(data);
-  for (
-    let offset = 0, sequence = 0;
-    offset < compressed.length;
-    offset += 1024 * 1024, sequence++
-  ) {
-    db.run(
-      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-      1,
-      oid,
-      sequence,
-      compressed.subarray(offset, offset + 1024 * 1024),
-    );
-  }
-  return oid;
 }
 
 describe("parsed commit cache", () => {
@@ -204,39 +183,118 @@ describe("parsed commit cache", () => {
         oid,
         commit,
         objectSize: data.length,
-        cacheBytes: commitCacheBytes(commit),
+        messageStored: true,
       });
     }
   });
 
-  it("caches a large accepted commit below the fixed flush target", () => {
+  it("indexes a commit written by commit before any log", () => {
+    const workspace = makeRepo("/");
+    workspace.repo.store.configSet("user.name", "Fixture");
+    workspace.repo.store.configSet("user.email", "fixture@example.com");
+    const { oid } = commitIndexOp(workspace.context, workspace.repo, {
+      message: "first\n",
+      allowEmpty: true,
+    });
+
+    expect(
+      workspace.repo.store.db.one(
+        "SELECT message FROM git_commits WHERE repo_id = ? AND oid = ?",
+        workspace.repo.store.repoId,
+        oid,
+      ),
+    ).toEqual({ message: utf8.encode("first\n") });
+  });
+
+  it("keeps the message of a large commit whose row fits the platform ceiling", () => {
     const commit = fixture("m".repeat(600 * 1024));
     const data = serializeCommit(commit);
     const oid = hashObject("commit", data);
     const entry = prepareCommitCache({ repoId: 1, oid, data });
 
-    expect(data.length).toBeLessThan(FORMER_INDEXED_COMMIT_BYTES);
-    expect(entry.cacheBytes).toBeGreaterThan(1_200_000);
-    expect(entry.cacheBytes).toBeLessThan(1_300_000);
-    expect(entry.cacheBytes).toBeLessThanOrEqual(COMMIT_CACHE_FLUSH_BYTES);
+    expect(entry.messageStored).toBe(true);
+    expect(entry.commit).toEqual(commit);
   });
 
-  it("reads and traverses an authoritative commit above the former cache threshold uncached", () => {
-    const db = new TestDatabase();
-    const store = open(db);
-    const commit = fixture(`${"m".repeat(2_100_000)}\n`);
+  it("keeps an oversized message out of the row and reads it from the object", () => {
+    const workspace = makeRepo("/");
+    const store = workspace.repo.store;
+    const commit = fixture(`${"m".repeat(COMMIT_ROW_MAX_BYTES)}\n`);
     commit.parent = [];
+    commit.tree = store.write("tree", serializeTree([]));
+    const oid = store.write("commit", serializeCommit(commit));
+
+    expect(
+      store.db.one(
+        `SELECT message IS NULL AS message, gpgsig IS NULL AS gpgsig
+           FROM git_commits WHERE repo_id = ? AND oid = ?`,
+        store.repoId,
+        oid,
+      ),
+    ).toEqual({ message: 1, gpgsig: 1 });
+    const graph = [...store.commitGraph(oid)];
+    expect(graph).toHaveLength(1);
+    expect(graph[0]).toMatchObject({ oid, messageStored: false });
+    expect(graph[0]?.commit.message).toBeUndefined();
+    expect(log(workspace.repo, { ref: oid }).map((view) => view.message)).toEqual([commit.message]);
+    expect(log(workspace.repo, { ref: oid, depth: 1 }).map((view) => view.message)).toEqual([
+      commit.message,
+    ]);
+    expect(show(workspace.repo, { ref: oid }).commit.message).toBe(commit.message);
+    expect([...workspace.repo.walkIndexed(oid)]).toEqual([{ oid, commit }]);
+  });
+
+  it("logs a history whose 40 MiB commit charges the graph only its row", () => {
+    const workspace = makeRepo("/");
+    const store = workspace.repo.store;
+    const tree = store.write("tree", serializeTree([]));
+    const large = fixture(`${"m".repeat(40 * 1024 * 1024)}\n`);
+    large.tree = tree;
+    large.parent = [];
+    const parent = store.write("commit", serializeCommit(large));
+    const child = fixture("child\n");
+    child.tree = tree;
+    child.parent = [parent];
+    const oid = store.write("commit", serializeCommit(child));
+
+    expect(log(workspace.repo, { ref: oid }).map((view) => view.oid)).toEqual([oid, parent]);
+    expect(log(workspace.repo, { ref: oid, depth: 2 }).map((view) => view.oid)).toEqual([
+      oid,
+      parent,
+    ]);
+  }, 30_000);
+
+  it("rejects commit headers above the row ceiling without storing them", () => {
+    const store = open();
+    const commit = fixture();
+    commit.author.name = "a".repeat(COMMIT_ROW_MAX_BYTES);
     const data = serializeCommit(commit);
-    const oid = insertAuthoritativeCommit(db, data);
-    store.shared.markLoose();
+
+    let error: unknown;
+    try {
+      store.write("commit", data);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(hasErrorCode(error, "E2BIG")).toBe(true);
+    expect(store.objectCount()).toBe(0);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
+  });
+
+  it("reports a point read of a commit without a row as corruption", () => {
+    const store = open();
+    const [parent, root] = commitChain(store, 2);
+    store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, parent);
     const repo = new Repository(store);
 
-    expect(data.length).toBeGreaterThan(FORMER_INDEXED_COMMIT_BYTES);
-    expect(store.cachedCommit(oid)).toBeNull();
-    expect(repo.readCommit(oid).message).toBe(commit.message);
-    expect(store.cachedCommit(oid)).toBeNull();
-    expect([...repo.walkIndexed(oid)].map((entry) => entry.oid)).toEqual([oid]);
-    expect(store.cachedCommit(oid)).toBeNull();
+    for (const read of [() => repo.readCommit(parent!), () => [...repo.walk(root!)]]) {
+      expect(read).toThrow(
+        expect.objectContaining({
+          code: "ECORRUPT",
+          message: expect.stringMatching(/has no parsed row/),
+        }),
+      );
+    }
   });
 
   it("round-trips NUL in every arbitrary text projection field", () => {
@@ -275,7 +333,7 @@ describe("parsed commit cache", () => {
     });
   });
 
-  it("lazily inserts once and checks source witnesses only while writing", () => {
+  it("inserts one row per key and checks source witnesses only while writing", () => {
     const store = open();
     const commit = fixture();
     const data = serializeCommit(commit);
@@ -283,8 +341,9 @@ describe("parsed commit cache", () => {
     store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oid);
 
     expect(store.cachedCommit(oid)).toBeNull();
-    expect(store.cacheCommit(oid, data)?.commit).toEqual(commit);
-    expect(store.cacheCommit(oid, data)?.commit).toEqual(commit);
+    expect(insertSource(store.db, oid, data)).toBe(1);
+    expect(insertSource(store.db, oid, data)).toBe(1);
+    expect(store.cachedCommit(oid)?.commit).toEqual(commit);
     expect(
       store.db.scalar<number>(
         "SELECT COUNT(*) FROM git_commits WHERE repo_id = ? AND oid = ?",
@@ -305,17 +364,17 @@ describe("parsed commit cache", () => {
 
     store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oid);
     store.db.run("UPDATE git_objects SET size = size + 1 WHERE repo_id = ? AND oid = ?", 1, oid);
-    expect(indexCommitSource(store.db, { repoId: 1, oid, data })).toBeNull();
+    expect(insertSource(store.db, oid, data)).toBe(0);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
     store.db.run("UPDATE git_objects SET size = size - 1 WHERE repo_id = ? AND oid = ?", 1, oid);
-    expect(indexCommitSource(store.db, { repoId: 1, oid, data })?.commit).toEqual(commit);
+    expect(insertSource(store.db, oid, data)).toBe(1);
     store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oid);
     store.db.run("DELETE FROM git_objects WHERE repo_id = ? AND oid = ?", 1, oid);
-    expect(indexCommitSource(store.db, { repoId: 1, oid, data })).toBeNull();
+    expect(insertSource(store.db, oid, data)).toBe(0);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
   });
 
-  it("batch-inserts prepared point misses through the shared-store seam", () => {
+  it("batch-inserts prepared rows", () => {
     const store = open();
     const sources = [fixture("first\n"), fixture("second\n")].map((commit) => {
       const data = serializeCommit(commit);
@@ -328,13 +387,8 @@ describe("parsed commit cache", () => {
       return entry;
     });
 
-    const result = store.cacheCommits(entries);
-    expect(result).toEqual({
-      eligible: 2,
-      skipped: 0,
-      written: 2,
-      statements: expect.any(Number),
-    });
+    const result = insertCommitCaches(store.db, entries);
+    expect(result).toEqual({ written: 2, statements: expect.any(Number) });
     expect(result.statements).toBeLessThan(1_000);
     expect(sources.map(({ oid }) => store.cachedCommit(oid)?.commit.message)).toEqual([
       "first\n",
@@ -355,7 +409,7 @@ describe("parsed commit cache", () => {
     );
     store.db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() => store.cachedCommit(oid)).toThrow(/invalid parents/);
-    expect(store.cacheCommit(oid, data)?.commit).toEqual(fixture());
+    expect(insertSource(store.db, oid, data)).toBe(1);
     expect(store.cachedCommit(oid)?.commit).toEqual(fixture());
     store.db.run(
       "UPDATE git_commits SET message = ? WHERE repo_id = ? AND oid = ?",
@@ -364,18 +418,18 @@ describe("parsed commit cache", () => {
       oid,
     );
     expect(store.cachedCommit(oid)?.commit.message).toBe("x".repeat(fixture().message.length));
-    expect(store.cacheCommit(oid, data)?.commit).toEqual(fixture());
+    expect(insertSource(store.db, oid, data)).toBe(1);
     expect(store.cachedCommit(oid)?.commit).toEqual(fixture());
   });
 
-  it("rejects lazy cache bytes whose oid names different content", () => {
+  it("rejects row bytes whose oid names different content", () => {
     const store = open();
     const data = serializeCommit(fixture("source\n"));
     const oid = store.write("commit", data);
     const wrong = serializeCommit(fixture("changed\n"));
 
     expect(() => prepareCommitCache({ repoId: 1, oid, data: wrong })).toThrow(/does not match/);
-    expect(() => store.cacheCommit(oid, wrong)).toThrow(/does not match/);
+    expect(() => insertSource(store.db, oid, wrong)).toThrow(/does not match/);
     expect(store.cachedCommit(oid)?.commit.message).toBe("source\n");
   });
 
@@ -416,13 +470,13 @@ describe("parsed commit cache", () => {
     }
   });
 
-  it("ignores a lazy row without a matching raw source", () => {
+  it("ignores a row without a matching raw source", () => {
     const db = new TestDatabase();
     const store = open(db);
     const data = serializeCommit(fixture());
     const oid = hashObject("commit", data);
 
-    expect(indexCommitSource(db, { repoId: 1, oid, data })).toBeNull();
+    expect(insertSource(db, oid, data)).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
     expect(store.cachedCommit(oid)).toBeNull();
   });
@@ -457,15 +511,15 @@ describe("parsed commit cache", () => {
       data.length,
     );
 
-    indexCommitSource(db, { repoId: 1, oid, data });
+    expect(insertSource(db, oid, data)).toBe(1);
     expect(store.cachedCommit(oid)?.commit).toEqual(commit);
     db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oid);
     db.run("UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = ? AND pack_id = ?", 1, 7);
-    expect(indexCommitSource(db, { repoId: 1, oid, data })).toBeNull();
+    expect(insertSource(db, oid, data)).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
     db.run("UPDATE git_pack_meta SET state = 'complete' WHERE repo_id = ? AND pack_id = ?", 1, 7);
     db.run("UPDATE git_pack_objects SET size = size + 1 WHERE repo_id = ? AND oid = ?", 1, oid);
-    expect(indexCommitSource(db, { repoId: 1, oid, data })).toBeNull();
+    expect(insertSource(db, oid, data)).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
   });
 
@@ -491,7 +545,7 @@ describe("parsed commit cache", () => {
       widestStringBytes: db.widestStringBytes,
       widestCommitRows: db.widestCommitRows,
     }).toEqual({
-      widestStringBytes: 908_203,
+      widestStringBytes: 889_771,
       widestCommitRows: 2_048,
     });
     expect(db.commitStatements).toBeLessThan(1_000);
@@ -536,21 +590,21 @@ describe("parsed commit cache", () => {
     expect([...store.commitGraph(oids[3]!, { maxCommits: 4 })]).toHaveLength(4);
   });
 
-  it("rejects understated oversized payload metadata without returning its BLOB", () => {
+  it("charges graph state from object sizes before returning a BLOB", () => {
     const inner = new TestDatabase();
     const db = new MeasuredDatabase(inner);
     const store = open(db);
-    const oid = commitChain(store, 1)[0]!;
-    store.db.run(
-      "UPDATE git_commits SET message = zeroblob(?) WHERE repo_id = ? AND oid = ?",
-      40 * 1024 * 1024,
-      1,
-      oid,
-    );
+    const oids = commitChain(store, 2);
+    const sizes = store.db.scalar<number>("SELECT sum(object_size) FROM git_commits");
+    if (sizes === undefined) throw new Error("graph fixture has no rows");
+    const charged = 2 * 512 + 2 * sizes + 64;
     db.widestResultBlob = 0;
 
-    expect(() => [...store.commitGraph(oid)]).toThrow(/fixed state capacity/);
+    expect(() => [...store.commitGraph(oids[1]!, { maxBytes: charged - 1 })]).toThrow(
+      /fixed state capacity/,
+    );
     expect(db.widestResultBlob).toBe(0);
+    expect([...store.commitGraph(oids[1]!, { maxBytes: charged })]).toHaveLength(2);
   });
 
   it("stops at shallow commits before requiring their parents", () => {
@@ -563,13 +617,18 @@ describe("parsed commit cache", () => {
     expect([...store.commitGraph(root!)]).toHaveLength(1);
   });
 
-  it("reports an unavailable cache before returning a graph row", () => {
+  it("reports a reachable commit without a row as corruption before returning a graph row", () => {
     const store = open();
     const [parent, root] = commitChain(store, 2);
     store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, parent);
     const walk = store.commitGraph(root!)[Symbol.iterator]();
 
-    expect(() => walk.next()).toThrow(/cache is unavailable/);
+    expect(() => walk.next()).toThrow(
+      expect.objectContaining({
+        code: "ECORRUPT",
+        message: expect.stringMatching(/without a row/),
+      }),
+    );
   });
 
   it("releases graph iterators on early return", () => {
@@ -584,13 +643,9 @@ describe("parsed commit cache", () => {
   it("leaves graph cycles to fail-closed Repository validation", () => {
     const store = open();
     const [parent, root] = commitChain(store, 2);
-    const changed = fixture("commit 0\n");
-    changed.parent = [root!];
-    changed.committer.timestamp = 0;
     store.db.run(
-      "UPDATE git_commits SET parents = ?, cache_bytes = ? WHERE repo_id = ? AND oid = ?",
-      JSON.stringify(changed.parent),
-      commitCacheBytes(changed),
+      "UPDATE git_commits SET parents = ? WHERE repo_id = ? AND oid = ?",
+      JSON.stringify([root!]),
       1,
       parent,
     );
@@ -608,8 +663,7 @@ describe("parsed commit cache", () => {
         oid,
         50_000,
         32 * 1024 * 1024,
-        512,
-        64,
+        null,
       )
       .map((row) => row.detail)
       .join("\n");

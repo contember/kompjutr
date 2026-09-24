@@ -16,6 +16,8 @@ import {
   serializeCommit,
   serializeTree,
 } from "../packages/git/src/common/objects.js";
+import { log, show } from "../packages/git/src/ops/repository/reads.js";
+import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { SqliteGitDatabase, type StoreOptions } from "../packages/git/src/store/index.js";
 import { applyDelta, encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import {
@@ -29,7 +31,7 @@ import {
   PACK_CHUNK,
 } from "../packages/git/src/store/pack/packs.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
-import { COMMIT_CACHE_FLUSH_BYTES } from "../packages/git/src/store/trees/commits.js";
+import { COMMIT_ROW_MAX_BYTES } from "../packages/git/src/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { completePackMatches, type PackMember, reclaimPending } from "./helpers/pack-store.js";
@@ -319,10 +321,12 @@ function syntheticCommit(index: number, message = `commit ${index}\n`): Uint8Arr
   });
 }
 
+const DENSE_HEADER_SOURCE_BYTES = 1024 * 1024;
+
 function denseIgnoredHeaderCommit(): Uint8Array {
   const malformedTree = utf8.encode("tree malformed\n");
   const ignored = utf8.encode("x y\n");
-  const sourceBytes = COMMIT_CACHE_FLUSH_BYTES / 4;
+  const sourceBytes = DENSE_HEADER_SOURCE_BYTES;
   const count = Math.floor((sourceBytes - malformedTree.length - 1) / ignored.length);
   const data = new Uint8Array(malformedTree.length + ignored.length * count + 1);
   data.set(malformedTree);
@@ -1171,12 +1175,13 @@ describe("synthetic pack ingest", () => {
     }
   });
 
-  it("publishes a valid commit that is too large for the commit-cache flush target", async () => {
+  it("publishes a commit whose message exceeds the row ceiling with a message-less row", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { maxBufferedEntry: 64 * 1024 });
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const data = syntheticCommit(1, "a".repeat(COMMIT_CACHE_FLUSH_BYTES + 64 * 1024));
-    expect(data.length).toBeGreaterThan(COMMIT_CACHE_FLUSH_BYTES);
+    const message = "a".repeat(COMMIT_ROW_MAX_BYTES + 64 * 1024);
+    const data = syntheticCommit(0, message);
+    expect(data.length).toBeGreaterThan(COMMIT_ROW_MAX_BYTES);
     const oid = hashObject("commit", data);
     const chunks: Uint8Array[] = [];
     const writer = new PackWriter((chunk) => chunks.push(chunk));
@@ -1198,13 +1203,23 @@ describe("synthetic pack ingest", () => {
     const cold = reopened.openCheckout(checkout);
     expect(cold.typeAndSize(oid)).toEqual({ type: "commit", size: data.length });
     expect(cold.read(oid)?.data).toEqual(data);
-    expect(cold.cachedCommit(oid)).toBeNull();
+    expect(
+      cold.db.one(
+        "SELECT message IS NULL AS message, object_size FROM git_commits WHERE oid = ?",
+        oid,
+      ),
+    ).toEqual({ message: 1, object_size: data.length });
+    expect(cold.cachedCommit(oid)).toMatchObject({ oid, messageStored: false });
+    const repo = new Repository(cold);
+    expect(log(repo, { ref: oid }).map((view) => view.message)).toEqual([message]);
+    expect(show(repo, { ref: oid }).commit.message).toBe(message);
+    expect([...repo.walkIndexed(oid)].map((entry) => entry.commit)).toEqual([parseCommit(data)]);
   }, 30_000);
 
-  it("rejects a malformed commit above the cache target without publishing it", async () => {
+  it("rejects a malformed commit above the row ceiling without publishing it", async () => {
     const store = open();
-    const data = utf8.encode(`tree malformed\n\n${"m".repeat(COMMIT_CACHE_FLUSH_BYTES)}`);
-    expect(data.length).toBeGreaterThan(COMMIT_CACHE_FLUSH_BYTES);
+    const data = utf8.encode(`tree malformed\n\n${"m".repeat(COMMIT_ROW_MAX_BYTES)}`);
+    expect(data.length).toBeGreaterThan(COMMIT_ROW_MAX_BYTES);
 
     await expect(
       store.packs.ingest(slices(singleObjectPack("commit", data), 64 * 1024)),
@@ -1215,15 +1230,41 @@ describe("synthetic pack ingest", () => {
     expect(await reclaimPending(store)).toBe(1);
   });
 
+  it("rejects commit headers above the row ceiling and leaves a reclaimable pack", async () => {
+    const store = open();
+    const data = serializeCommit({
+      tree: "1".repeat(40),
+      parent: [],
+      author: {
+        name: "a".repeat(COMMIT_ROW_MAX_BYTES),
+        email: "author@example.com",
+        timestamp: 1,
+        timezoneOffset: 0,
+      },
+      committer: { name: "C", email: "c@example.com", timestamp: 1, timezoneOffset: 0 },
+      message: "headers\n",
+    });
+
+    await expect(
+      store.packs.ingest(slices(singleObjectPack("commit", data), 64 * 1024)),
+    ).rejects.toMatchObject({ code: "E2BIG" });
+    expect(
+      store.db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'complete'"),
+    ).toBe(0);
+    expect(store.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
+    expect(await reclaimPending(store)).toBe(1);
+  });
+
   it("matches loose caching for a commit above the SQL page byte limit", async () => {
-    const data = syntheticCommit(9, "p".repeat(600_096));
+    const data = syntheticCommit(9, "p".repeat(1_100_096));
     const oid = hashObject("commit", data);
 
     const loose = open();
     expect(loose.write("commit", data)).toBe(oid);
     const looseCache = loose.cachedCommit(oid);
     expect(looseCache).not.toBeNull();
-    expect(looseCache?.cacheBytes).toBeGreaterThan(1024 * 1024);
+    expect(looseCache?.objectSize).toBeGreaterThan(1024 * 1024);
+    expect(looseCache?.messageStored).toBe(true);
 
     const packed = open();
     const chunks: Uint8Array[] = [];
@@ -1242,7 +1283,7 @@ describe("synthetic pack ingest", () => {
   it("reports dense malformed commit headers as corruption", async () => {
     const store = open();
     const data = denseIgnoredHeaderCommit();
-    expect(data.length).toBeLessThanOrEqual(COMMIT_CACHE_FLUSH_BYTES / 4);
+    expect(data.length).toBeLessThanOrEqual(DENSE_HEADER_SOURCE_BYTES);
     const chunks: Uint8Array[] = [];
     const writer = new PackWriter((chunk) => chunks.push(chunk));
     writer.header(1);

@@ -265,7 +265,12 @@ objects for reads.
 Tree objects are parsed into edge rows once per tree OID, when the first copy
 is stored; a later loose or packed copy writes no entries. Tree walks use one
 recursive SQLite cursor and read no object BLOBs.
-Commit projections are written atomically with new commit visibility. Hot
+Every commit, loose or packed, has one `git_commits` row, written atomically
+with the commit's visibility (a packed commit's at pack publication). A row that
+would exceed the Durable Object ~2 MB row ceiling stores message and signature
+as NULL; readers that need them parse the object. A reachable commit without a
+row is `ECORRUPT`, and the graph walk charges its retained state from
+`object_size`. Hot
 status, diff, checkout, add, reset, and commit paths merge ordered streams and
 batch unresolved content reads and writes. The successful eager tracker-backed
 sparse status path hydrates only the bounded dirty and baseline-to-HEAD

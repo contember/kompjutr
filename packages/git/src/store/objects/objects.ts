@@ -46,7 +46,7 @@ export type {
   StagedObject,
 } from "./objects-shared.js";
 export {
-  COMMIT_STAGE_CACHE_BYTES,
+  COMMIT_STAGE_SOURCE_BYTES,
   DEFAULT_OBJECT_FLUSH,
   INFLATE_FEED,
   isObjectType,
