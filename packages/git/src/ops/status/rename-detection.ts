@@ -6,8 +6,6 @@ import { comparePaths } from "../../common/streams.js";
 import type { Repository } from "../repository/repository.js";
 
 export const MAX_EXACT_RENAME_CANDIDATES = 10_000;
-export const MAX_EXACT_RENAME_RETAINED_BYTES = 16 * 1024 * 1024;
-const RENAME_CANDIDATE_FIXED_BYTES = 256;
 const RENAME_CONFIG_BYTES = 16;
 const TRUE_CONFIG_VALUES = new Set(["1", "true", "yes", "on"]);
 const FALSE_CONFIG_VALUES = new Set(["", "0", "false", "no", "off"]);
@@ -26,7 +24,6 @@ export interface ExactRename {
 
 export interface ExactRenameLimits {
   maxCandidates?: number;
-  maxRetainedBytes?: number;
 }
 
 export type ExactRenameClassification =
@@ -51,11 +48,6 @@ interface BasenameBucket {
   ordinal: number;
 }
 
-interface ResolvedRenameLimits {
-  maxCandidates: number;
-  maxRetainedBytes: number;
-}
-
 /** Resolve explicit option > command config > Git's enabled-by-default policy. */
 export function renameDetectionEnabled(
   repo: Repository,
@@ -74,14 +66,13 @@ export function renameDetectionEnabled(
 
 /** Incremental form for one bounded identity prepass. */
 export class ExactRenameClassifier {
-  readonly #limits: ResolvedRenameLimits;
+  readonly #maxCandidates: number;
   readonly #buckets = new Map<string, RenameBucket>();
   #candidateCount = 0;
-  #retainedBytes = 0;
   #fallback = false;
 
   constructor(limits?: ExactRenameLimits) {
-    this.#limits = resolveLimits(limits);
+    this.#maxCandidates = boundedCandidateLimit(limits?.maxCandidates);
   }
 
   addSource(candidate: ExactRenameCandidate): boolean {
@@ -112,16 +103,12 @@ export class ExactRenameClassifier {
 
   #retain(candidate: ExactRenameCandidate, side: "source" | "destination"): boolean {
     if (this.#fallback) return false;
-    const bytes = exactRenameCandidateRetainedBytes(candidate);
+    validateCandidate(candidate);
     this.#candidateCount++;
-    if (
-      this.#candidateCount > this.#limits.maxCandidates ||
-      bytes > this.#limits.maxRetainedBytes - this.#retainedBytes
-    ) {
+    if (this.#candidateCount > this.#maxCandidates) {
       this.#fallback = true;
       return false;
     }
-    this.#retainedBytes += bytes;
     const key = `${candidate.oid}:${modeClass(candidate.mode)}`;
     let bucket = this.#buckets.get(key);
     if (bucket === undefined) {
@@ -148,12 +135,6 @@ export function classifyExactRenames(
     if (!classifier.addDestination(candidate)) return classifier.finish();
   }
   return classifier.finish();
-}
-
-/** Retained charge reserves the candidate plus its future basename index. */
-export function exactRenameCandidateRetainedBytes(candidate: ExactRenameCandidate): number {
-  const pathBytes = validateCandidate(candidate);
-  return RENAME_CANDIDATE_FIXED_BYTES + pathBytes * 2;
 }
 
 function pairBucket(bucket: RenameBucket, output: ExactRename[]): void {
@@ -191,18 +172,16 @@ function pairBucket(bucket: RenameBucket, output: ExactRename[]): void {
   }
 }
 
-function validateCandidate(candidate: ExactRenameCandidate): number {
+function validateCandidate(candidate: ExactRenameCandidate): void {
   if (typeof candidate.path !== "string") {
     throw new CorruptError("rename candidate path is invalid");
   }
-  const pathBytes = validatePathAndCountUtf8(candidate.path);
+  validatePath(candidate.path);
   modeClass(candidate.mode);
   if (!isOid(candidate.oid)) throw new CorruptError("rename candidate object id is invalid");
-  return pathBytes;
 }
 
-function validatePathAndCountUtf8(path: string): number {
-  let bytes = 0;
+function validatePath(path: string): void {
   let segmentStart = 0;
   for (let index = 0; index <= path.length; index++) {
     if (index === path.length || path.charCodeAt(index) === 0x2f) {
@@ -216,25 +195,11 @@ function validatePathAndCountUtf8(path: string): number {
       ) {
         throw new CorruptError("rename candidate path is invalid");
       }
-      if (index < path.length) bytes++;
       segmentStart = index + 1;
       continue;
     }
-    const unit = path.charCodeAt(index);
-    if (unit === 0) throw new CorruptError("rename candidate path is invalid");
-    if (unit < 0x80) bytes++;
-    else if (unit < 0x800) bytes += 2;
-    else if (unit >= 0xd800 && unit <= 0xdbff) {
-      const low = path.charCodeAt(index + 1);
-      if (low >= 0xdc00 && low <= 0xdfff) {
-        bytes += 4;
-        index++;
-      } else {
-        bytes += 3;
-      }
-    } else bytes += 3;
+    if (path.charCodeAt(index) === 0) throw new CorruptError("rename candidate path is invalid");
   }
-  return bytes;
 }
 
 function modeClass(mode: string): "regular" | "symlink" {
@@ -247,21 +212,10 @@ function basenameOf(path: string): string {
   return path.slice(path.lastIndexOf("/") + 1);
 }
 
-function resolveLimits(limits: ExactRenameLimits | undefined): ResolvedRenameLimits {
-  return {
-    maxCandidates: boundedLimit(limits?.maxCandidates, MAX_EXACT_RENAME_CANDIDATES, "candidate"),
-    maxRetainedBytes: boundedLimit(
-      limits?.maxRetainedBytes,
-      MAX_EXACT_RENAME_RETAINED_BYTES,
-      "retained byte",
-    ),
-  };
-}
-
-function boundedLimit(value: number | undefined, ceiling: number, label: string): number {
-  if (value === undefined) return ceiling;
-  if (!Number.isSafeInteger(value) || value < 1 || value > ceiling) {
-    throw new RangeError(`invalid exact-rename ${label} limit`);
+function boundedCandidateLimit(value: number | undefined): number {
+  if (value === undefined) return MAX_EXACT_RENAME_CANDIDATES;
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_EXACT_RENAME_CANDIDATES) {
+    throw new RangeError("invalid exact-rename candidate limit");
   }
   return value;
 }

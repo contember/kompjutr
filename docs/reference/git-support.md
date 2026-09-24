@@ -401,8 +401,8 @@ Output is a `diff --git` patch with correct `new file` / `deleted file` /
 `old mode` / `new mode` / `index` headers. Exact moves use `similarity index
 100%`, `rename from`, and `rename to` headers. Explicit `renames` overrides
 `diff.renames`; the default is enabled. Detection retains at most 10,000
-candidates and 16 MiB. Exceeding either cap disables all pairing for that
-operation and returns the complete add/delete output.
+candidates. Exceeding the cap disables all pairing for that operation and
+returns the complete add/delete output.
 
 ## Commits and history
 

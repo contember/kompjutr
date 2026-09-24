@@ -1,10 +1,9 @@
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 import {
   classifyExactRenames,
   type ExactRenameCandidate,
   type ExactRenameClassification,
-  exactRenameCandidateRetainedBytes,
   MAX_EXACT_RENAME_CANDIDATES,
   renameDetectionEnabled,
 } from "../packages/git/src/ops/status/rename-detection.js";
@@ -137,16 +136,13 @@ describe("bounded exact rename classification", () => {
     expect(classifyExactRenames([], [candidate("new/a")]).renames).toEqual([]);
   });
 
-  it("classifies at exact count and byte limits and falls back all at once above them", () => {
+  it("classifies at the exact count limit and falls back all at once above it", () => {
     const source = candidate("old/a");
     const destination = candidate("new/a");
-    const retainedBytes =
-      exactRenameCandidateRetainedBytes(source) + exactRenameCandidateRetainedBytes(destination);
 
     expect(
       classifyExactRenames([source], [destination], {
         maxCandidates: 2,
-        maxRetainedBytes: retainedBytes,
       }),
     ).toMatchObject({ kind: "classified", candidateCount: 2 });
     expect(
@@ -154,30 +150,6 @@ describe("bounded exact rename classification", () => {
         maxCandidates: 2,
       }),
     ).toMatchObject({ kind: "fallback", renames: [], candidateCount: 3 });
-    expect(
-      classifyExactRenames([source], [destination], {
-        maxRetainedBytes: retainedBytes - 1,
-      }),
-    ).toMatchObject({ kind: "fallback", renames: [], candidateCount: 2 });
-  });
-
-  it("scans path grammar and UTF-8 length before the aggregate byte boundary", () => {
-    const source = candidate(`old/${"é".repeat(128 * 1024)}`);
-    const destination = candidate(`new/${"😀".repeat(64 * 1024)}`);
-    const encode = vi.spyOn(TextEncoder.prototype, "encode");
-    try {
-      const retainedBytes =
-        exactRenameCandidateRetainedBytes(source) + exactRenameCandidateRetainedBytes(destination);
-      expect(
-        classifyExactRenames([source], [destination], { maxRetainedBytes: retainedBytes }),
-      ).toMatchObject({ kind: "classified", candidateCount: 2 });
-      expect(
-        classifyExactRenames([source], [destination], { maxRetainedBytes: retainedBytes - 1 }),
-      ).toMatchObject({ kind: "fallback", candidateCount: 2 });
-      expect(encode).not.toHaveBeenCalled();
-    } finally {
-      encode.mockRestore();
-    }
   });
 
   it("rejects corrupt identities and attempts to raise hard limits", () => {
