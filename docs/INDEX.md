@@ -75,11 +75,11 @@ None.
 - The completed POSIX shell sprint admitted bounded `printf`, `exit`, `1>&2`,
   and named parameter expansion with Bash parity as the standing gate
   (ADR-0019).
-- The external consumer integration gate remains outside this public repository;
-  its provider still lacks the bulk worktree scan needed for an efficient
-  implementation without crossing private storage boundaries. The hardening
-  sprint addresses known defects; broader production scope is re-planned from
-  that real workflow rather than package-local assumptions.
+- The external consumer integration gate runs outside this public repository.
+  On 2026-09-24 its adapter was moved to the scoped `@kompjutr/do` imports with
+  no API change, and its workflow, conformance and shell suites passed
+  in-process under Bun; it has not run on workerd. Broader production scope is
+  re-planned from that real workflow rather than package-local assumptions.
 
 ## Key reference
 

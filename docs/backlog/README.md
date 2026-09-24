@@ -74,8 +74,10 @@ The default sequencing at the current HEAD, not scheduling state — a sprint
 exists once its file lands in [`../sprints/`](../sprints/). Every scheduled item
 belongs to exactly one sprint.
 
-**Phase 1** package work is complete. The real adapter now reruns its workflow as
-the integration gate; everything after it is re-planned from that result.
+**Phase 1** package work is complete. The real adapter reruns its workflow as the
+integration gate; everything after it is re-planned from that result. On
+2026-09-24 it passed in-process against the scoped packages and found no
+kompjutr defect or missing API.
 
 The 2026-09-24 backlog review removed items that would re-add the machinery the
 [simplification sprint](../archive/sprint-2026-09-23-simplification.md)
