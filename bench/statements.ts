@@ -82,7 +82,6 @@ const EXPECTED_SCHEMA_OBJECTS: readonly string[] = [
   "table:git_maintenance_control",
   "table:git_maintenance_objects",
   "table:git_maintenance_runs",
-  "table:git_maintenance_shallow",
   "table:git_meta",
   "table:git_object_chunks",
   "table:git_objects",

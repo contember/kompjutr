@@ -96,17 +96,6 @@ export const MAINTENANCE_SCHEMA_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS git_maintenance_objects_queue
      ON git_maintenance_objects (repo_id, run_id, expanded, oid)`,
 
-  `CREATE TABLE IF NOT EXISTS git_maintenance_shallow (
-     repo_id INTEGER NOT NULL CHECK (repo_id >= 1),
-     run_id INTEGER NOT NULL CHECK (
-       run_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
-     ),
-     oid TEXT NOT NULL CHECK (length(CAST(oid AS BLOB)) = 40),
-     PRIMARY KEY (repo_id, run_id, oid),
-     FOREIGN KEY (repo_id, run_id)
-       REFERENCES git_maintenance_runs (repo_id, run_id) ON DELETE CASCADE
-   ) STRICT, WITHOUT ROWID`,
-
   `CREATE TABLE IF NOT EXISTS git_loose_gc_candidates (
      repo_id INTEGER NOT NULL CHECK (repo_id >= 1),
      oid TEXT NOT NULL CHECK (length(CAST(oid AS BLOB)) = 40),

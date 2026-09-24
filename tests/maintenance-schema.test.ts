@@ -48,11 +48,6 @@ describe("maintenance schema", () => {
       oid,
     );
     db.run(
-      "INSERT INTO git_maintenance_shallow (repo_id, run_id, oid) VALUES (?, 1, ?)",
-      checkout.repoId,
-      oid,
-    );
-    db.run(
       "INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms) VALUES (?, ?, ?)",
       checkout.repoId,
       oid,
@@ -67,9 +62,7 @@ describe("maintenance schema", () => {
 
     db.run("DELETE FROM git_maintenance_runs WHERE repo_id = ?", checkout.repoId);
 
-    for (const table of ["git_maintenance_objects", "git_maintenance_shallow"]) {
-      expect(db.scalar<number>(`SELECT COUNT(*) FROM ${table}`), table).toBe(0);
-    }
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_maintenance_objects")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_loose_gc_candidates")).toBe(1);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_gc_candidates")).toBe(1);
 

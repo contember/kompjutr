@@ -214,7 +214,6 @@ describe("public maintenance lifecycle", () => {
     });
     expect(db.scalar<number>("SELECT count(*) FROM git_loose_gc_candidates")).toBe(1);
     expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_objects")).toBe(0);
-    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_shallow")).toBe(0);
   });
 
   it("rolls a future finished run immediately after root drift", async () => {
@@ -357,7 +356,6 @@ describe("public maintenance lifecycle", () => {
       reclaimedBytes: 99,
     });
     expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_objects")).toBe(0);
-    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_shallow")).toBe(0);
     expect(db.scalar<number>("SELECT count(*) FROM git_loose_gc_candidates")).toBe(1);
     expect(
       db.one<{

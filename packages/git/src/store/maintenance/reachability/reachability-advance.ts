@@ -54,12 +54,7 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
   let rows = 0;
   for (const row of db.iterate(
     `SELECT object.repo_id, object.run_id, object.oid, object.source_mask,
-            object.expanded, object.shallow_boundary, object.edge_cursor,
-            EXISTS (
-              SELECT 1 FROM git_maintenance_shallow shallow
-               WHERE shallow.repo_id = object.repo_id AND shallow.run_id = object.run_id
-                 AND shallow.oid = object.oid
-            ) AS stored_shallow
+            object.expanded, object.shallow_boundary, object.edge_cursor
        FROM git_maintenance_objects object
       WHERE object.repo_id = ? AND object.run_id = ? AND object.expanded = 0
       ORDER BY object.oid COLLATE BINARY LIMIT 2`,
@@ -73,8 +68,7 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
     const oid = oidField(row.oid, "maintenance queued OID");
     const expanded = booleanInteger(row.expanded, "maintenance expanded marker");
     const shallowBoundary = booleanInteger(row.shallow_boundary, "maintenance shallow marker");
-    const storedShallow = booleanInteger(row.stored_shallow, "maintenance shallow membership");
-    if (expanded || shallowBoundary !== storedShallow) {
+    if (expanded) {
       throw new CorruptError("maintenance queued object has inconsistent state");
     }
     const edgeCursor = expectSafeInteger(

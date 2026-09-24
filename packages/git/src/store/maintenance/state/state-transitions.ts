@@ -27,7 +27,6 @@ export function adoptMaintenanceSourceGeneration(
 
 function clearRunOwnedReachability(db: SqlDatabase, repoId: number, runId: number): void {
   db.run("DELETE FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?", repoId, runId);
-  db.run("DELETE FROM git_maintenance_shallow WHERE repo_id = ? AND run_id = ?", repoId, runId);
 }
 
 /** Reset one drifted run to root discovery. */
@@ -211,11 +210,7 @@ export function rolloverFinishedMaintenanceRun(
     const retained = db.scalar<unknown>(
       `SELECT EXISTS(
          SELECT 1 FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?
-         UNION ALL
-         SELECT 1 FROM git_maintenance_shallow WHERE repo_id = ? AND run_id = ?
        )`,
-      repoId,
-      expectedRunId,
       repoId,
       expectedRunId,
     );

@@ -299,7 +299,6 @@ function publishCompletedMark(
   const rootPayload = JSON.stringify(directRootOids);
   db.transactionSync(() => {
     db.run("DELETE FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?", repoId, runId);
-    db.run("DELETE FROM git_maintenance_shallow WHERE repo_id = ? AND run_id = ?", repoId, runId);
     db.run(
       `INSERT INTO git_maintenance_objects
        (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, edge_cursor)

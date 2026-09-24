@@ -20,7 +20,7 @@ this entire item as one undifferentiated change.
 Completed findings are removed when their response ships. The tables below
 contain only open work.
 
-ARCH-10 shipped with the 2026-09-10 sprint. ARCH-19 (the duplicate reflog-root
+ARCH-10 shipped with the 2026-09-10 sprint; ARCH-21 (the duplicate maintenance shallow table) was removed on 2026-09-24. ARCH-19 (the duplicate reflog-root
 scan) and the rebase no-op admission cap went with the 2026-09-23 simplification
 sprint. ARCH-47 is the [outbound delta compression idea](../ideas/outbound-delta-compression.md).
 ARCH-17 is owned by [66](66-retire-modeled-retained-byte-charges.md).
@@ -45,12 +45,6 @@ suite. Preserve these distinctions when planning acceptance:
 | Existing finding | Qualified evidence and required witness |
 |---|---|
 | ARCH-27 | Public `updateRef` accepted a trailing unpaired high surrogate; stored text changed and original-name lookup failed. Runtime-reproduced caller-input validation defect, not failure with valid ref names. Fix the shared text boundary and test symbolic targets/config/reflog siblings as applicable. |
-
-## Store and maintenance work
-
-| IDs | Problem | Acceptance | Touch points |
-|---|---|---|---|
-| ARCH-21 | `git_maintenance_shallow` duplicates `git_maintenance_objects.shallow_boundary`; its functional lookup is always false. | The duplicate table and cross-check are removed without changing shallow traversal or restart behavior. | `packages/git/src/store/schema/schema.ts`, `packages/git/src/store/maintenance/` |
 
 ## Layering and operation work
 

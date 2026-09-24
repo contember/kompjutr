@@ -128,17 +128,11 @@ function publishExpansionOwned(
     for (const _row of db.iterate(
       `INSERT INTO git_maintenance_objects
          (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, edge_cursor)
-       SELECT ?, ?, input.value, 0, 0,
-              EXISTS (
-                SELECT 1 FROM git_maintenance_shallow shallow
-                 WHERE shallow.repo_id = ? AND shallow.run_id = ? AND shallow.oid = input.value
-              ), 0
+       SELECT ?, ?, input.value, 0, 0, 0, 0
          FROM json_each(?) input
         WHERE true
        ON CONFLICT(repo_id, run_id, oid) DO NOTHING
        RETURNING oid`,
-      store.repoId,
-      run.runId,
       store.repoId,
       run.runId,
       JSON.stringify(oids),

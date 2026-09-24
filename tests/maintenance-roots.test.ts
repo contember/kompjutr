@@ -380,7 +380,8 @@ describe("maintenance roots", () => {
     expect(rootMask(db, checkout.repoId, missingGitlink)).toBeUndefined();
     expect(
       db.all<{ oid: string }>(
-        "SELECT oid FROM git_maintenance_shallow WHERE repo_id = ? ORDER BY oid",
+        `SELECT oid FROM git_maintenance_objects
+          WHERE repo_id = ? AND shallow_boundary = 1 ORDER BY oid`,
         checkout.repoId,
       ),
     ).toEqual([{ oid: shallow }]);

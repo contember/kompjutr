@@ -93,11 +93,6 @@ function restartRun(db: SqlDatabase, run: RunState, rootEpoch: number): RunState
     run.repoId,
     run.runId,
   );
-  db.run(
-    "DELETE FROM git_maintenance_shallow WHERE repo_id = ? AND run_id = ?",
-    run.repoId,
-    run.runId,
-  );
   const row = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_runs
         SET observed_root_epoch = ?, observed_source_generation = ?,
@@ -240,15 +235,6 @@ function insertRoots(
     shallow ? 1 : 0,
     payload,
   );
-  if (shallow) {
-    db.run(
-      `INSERT OR IGNORE INTO git_maintenance_shallow (repo_id, run_id, oid)
-       SELECT ?, ?, value FROM json_each(?)`,
-      repoId,
-      runId,
-      payload,
-    );
-  }
 }
 
 function nextSource(source: MaintenanceRootSource): MaintenanceRootSource {

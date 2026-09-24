@@ -135,10 +135,6 @@ function maintenanceState(database: SqliteGitDatabase, repoId: number) {
       "SELECT * FROM git_maintenance_objects WHERE repo_id = ? ORDER BY run_id, oid",
       repoId,
     ),
-    shallow: db.all<Record<string, unknown>>(
-      "SELECT * FROM git_maintenance_shallow WHERE repo_id = ? ORDER BY run_id, oid",
-      repoId,
-    ),
     looseCandidates: db.all<Record<string, unknown>>(
       "SELECT * FROM git_loose_gc_candidates WHERE repo_id = ? ORDER BY oid",
       repoId,

@@ -108,7 +108,6 @@ describe("repository registry", () => {
       "git_maintenance_control",
       "git_maintenance_objects",
       "git_maintenance_runs",
-      "git_maintenance_shallow",
       "git_meta",
       "git_object_chunks",
       "git_objects",

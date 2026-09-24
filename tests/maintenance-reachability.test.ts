@@ -169,14 +169,6 @@ function seedMark(
       root.oid,
       root.shallow === true ? 1 : 0,
     );
-    if (root.shallow === true) {
-      db.run(
-        `INSERT INTO git_maintenance_shallow (repo_id, run_id, oid)
-         VALUES (?, 1, ?)`,
-        repoId,
-        root.oid,
-      );
-    }
   }
 }
 

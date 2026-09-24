@@ -42,7 +42,6 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_maintenance_control", "shared"],
   ["git_maintenance_runs", "shared"],
   ["git_maintenance_objects", "shared"],
-  ["git_maintenance_shallow", "shared"],
   ["git_loose_gc_candidates", "shared"],
   ["git_pack_gc_candidates", "shared"],
   ["git_pack_ingest_control", "shared"],
@@ -98,7 +97,6 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_maintenance_objects" },
   { type: "index", name: "git_maintenance_objects_queue" },
   { type: "table", name: "git_maintenance_runs" },
-  { type: "table", name: "git_maintenance_shallow" },
   { type: "table", name: "git_meta" },
   { type: "table", name: "git_object_chunks" },
   { type: "table", name: "git_objects" },
@@ -311,7 +309,6 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
     "git_maintenance_objects",
     ["repo_id", "run_id", "oid", "source_mask", "expanded", "shallow_boundary", "edge_cursor"],
   ],
-  ["git_maintenance_shallow", ["repo_id", "run_id", "oid"]],
   ["git_loose_gc_candidates", ["repo_id", "oid", "unreachable_since_ms"]],
   [
     "git_commits",
