@@ -24,7 +24,6 @@ export interface InflatedPackEntry {
   consumed: number;
   streamedOid: string | null;
   deltaTargetSize: number | null;
-  compressedDigest: string;
 }
 
 export class PackIngestInflater {
@@ -180,17 +179,10 @@ export class PackIngestInflater {
     dataOff: number,
     entrySize: number,
     type: ObjectType | null,
-  ): {
-    data: Uint8Array | null;
-    consumed: number;
-    streamedOid: string | null;
-    deltaTargetSize: number | null;
-    compressedDigest: string;
-  } {
+  ): InflatedPackEntry {
     const buffered =
       entrySize <= this.maxBufferedEntry && (type !== "blob" || entrySize <= this.cacheEntryLimit);
     const deltaHeader = type === null ? new DeltaHeaderProbe() : null;
-    const compressedSha = new Sha1();
     reader.seek(dataOff);
     if (buffered) {
       const window = reader.window();
@@ -211,14 +203,12 @@ export class PackIngestInflater {
           throw new CorruptError(`pack entry size mismatch at ${dataOff}`);
         }
         deltaHeader?.update(exact.data);
-        compressedSha.update(window.subarray(0, exact.consumed));
         reader.seek(dataOff + exact.consumed);
         return {
           data: exact.data,
           consumed: exact.consumed,
           streamedOid: null,
           deltaTargetSize: deltaHeader?.finish().targetSize ?? null,
-          compressedDigest: toHex(compressedSha.digest()),
         };
       }
     }
@@ -253,7 +243,6 @@ export class PackIngestInflater {
       if (!stream.ended && used !== window.length) {
         throw new CorruptError(`pack entry inflater stopped before the stream ended at ${dataOff}`);
       }
-      compressedSha.update(window.subarray(0, used));
       reader.seek(reader.position + (stream.ended ? used : window.length));
     }
     if (stream.inflated !== entrySize) {
@@ -266,7 +255,6 @@ export class PackIngestInflater {
       consumed,
       streamedOid: buffered || sha === null ? null : toHex(sha.digest()),
       deltaTargetSize: deltaHeader?.finish().targetSize ?? null,
-      compressedDigest: toHex(compressedSha.digest()),
     };
   }
 }

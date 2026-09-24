@@ -32,7 +32,6 @@ export const PACK_CHUNK = 1024 * 1024;
 export const MAX_PACK_DELETE_BATCH = 48;
 export const PACK_INGEST_LEASE_MS = 5 * 60 * 1_000;
 export const MAX_PACK_INGEST_OBJECTS = 128 * 1024;
-export const PACK_MEMBERSHIP_DIGEST_BYTES = 20;
 
 /**
  * Git's `pack-objects` refuses a depth above 4,095, so no Git-produced pack
@@ -226,48 +225,20 @@ export interface PackIngestLease {
   expiresMs: number;
 }
 
-const PACK_MEMBERSHIP_ENCODER = new TextEncoder();
-
-export function packMembershipDigest(row: PackObjectInput): Uint8Array {
-  return new Sha1().update(PACK_MEMBERSHIP_ENCODER.encode(JSON.stringify(row))).digest();
-}
-
 export function validatePackMembershipCount(count: number): void {
   if (!Number.isSafeInteger(count) || count < 0 || count > MAX_PACK_INGEST_OBJECTS) {
     throw new GitError("E2BIG", `pack exceeds ${MAX_PACK_INGEST_OBJECTS} objects`);
   }
 }
 
-export interface PackByteMembership {
-  offset: number;
-  dataOff: number;
-  dataLen: number;
-  entrySize: number;
-  kind: "ofs" | "ref" | null;
-  baseDelta: number | null;
-  baseOid: string | null;
-  type: ObjectType | null;
-  size: number;
-  oid: string | null;
-  compressedDigest: string;
-}
-
-export function packByteMembershipDigest(row: PackByteMembership): Uint8Array {
-  return new Sha1().update(PACK_MEMBERSHIP_ENCODER.encode(JSON.stringify(row))).digest();
-}
-
 export class ExpectedPackMembership {
   readonly #offsets: Float64Array;
-  readonly #digests: Uint8Array;
-  readonly #byteDigests: Uint8Array;
   readonly #completed: Uint8Array;
   #offsetCount = 0;
 
   constructor(readonly count: number) {
     validatePackMembershipCount(count);
     this.#offsets = new Float64Array(count);
-    this.#digests = new Uint8Array(count * PACK_MEMBERSHIP_DIGEST_BYTES);
-    this.#byteDigests = new Uint8Array(count * PACK_MEMBERSHIP_DIGEST_BYTES);
     this.#completed = new Uint8Array(count);
   }
 
@@ -292,7 +263,6 @@ export class ExpectedPackMembership {
     if (this.#completed[ordinal] !== 0) {
       throw new CorruptError(`pack entry at ${offset} was indexed more than once`);
     }
-    this.#digests.set(packMembershipDigest(row), ordinal * PACK_MEMBERSHIP_DIGEST_BYTES);
     this.#completed[ordinal] = 1;
   }
 
@@ -307,13 +277,6 @@ export class ExpectedPackMembership {
       else return middle;
     }
     throw new CorruptError(`pack entry at ${offset} has no physical ordinal`);
-  }
-
-  recordBytes(ordinal: number, row: PackByteMembership): void {
-    if (ordinal < 0 || ordinal >= this.count || row.offset !== this.#offsets[ordinal]) {
-      throw new CorruptError("pack byte membership order disagrees");
-    }
-    this.#byteDigests.set(packByteMembershipDigest(row), ordinal * PACK_MEMBERSHIP_DIGEST_BYTES);
   }
 
   assertComplete(): void {

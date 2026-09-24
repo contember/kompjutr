@@ -20,7 +20,7 @@ this entire item as one undifferentiated change.
 Completed findings are removed when their response ships. The tables below
 contain only open work.
 
-ARCH-10 shipped with the 2026-09-10 sprint; ARCH-21 (the duplicate maintenance shallow table) was removed on 2026-09-24. ARCH-19 (the duplicate reflog-root
+ARCH-10 shipped with the 2026-09-10 sprint; ARCH-21 (the duplicate maintenance shallow table) and the unused pack membership digests were removed on 2026-09-24. ARCH-19 (the duplicate reflog-root
 scan) and the rebase no-op admission cap went with the 2026-09-23 simplification
 sprint. ARCH-47 is the [outbound delta compression idea](../ideas/outbound-delta-compression.md).
 ARCH-17 is owned by [66](66-retire-modeled-retained-byte-charges.md).
@@ -62,7 +62,6 @@ suite. Preserve these distinctions when planning acceptance:
 | ARCH-34 | `store/operations/operations.ts` duplicates existing ref and path validators. | The reviewed equivalent implementations collapse to shared validators with no behavior change. | `packages/git/src/store/operations/operations.ts`, `packages/git/src/store/refs/ref-validation.ts`, `packages/git/src/common/` |
 | ARCH-36 | Direct-ref and checkout-HEAD reflog writers duplicate append and retention logic. | Shared infrastructure preserves separate ownership and FKs, including valid endpoint-equal HEAD entries. | `packages/git/src/store/refs/reflog.ts`, `packages/git/src/store/checkout/checkout.ts`, `packages/git/src/store/refs/refs.ts` |
 | ARCH-40 | Ref expansion and one ref probe issue raw `git_refs` SQL from ops. | Ref queries live behind the store ref seam; ops does not name store tables. | `packages/git/src/ops/repository/repository.ts`, `packages/git/src/ops/refs/refs.ts`, `packages/git/src/store/refs/refs.ts` |
-| Unused membership digests | Pack ingest computes and stores digest arrays that publication never consumes; the arrays alone reach 5 MiB at the admitted entry count. | Remove unused hashing/storage and reconcile the documented membership guarantee, or explicitly establish a needed comparison without ordinary read-time reauthentication. This is dead work/documentation drift, not protection against out-of-band writes. | `packages/git/src/store/pack/shared.ts`, `packages/git/src/store/pack/lifecycle/lifecycle-ingest.ts`, store and concurrency docs |
 
 ## Cross-cutting acceptance
 

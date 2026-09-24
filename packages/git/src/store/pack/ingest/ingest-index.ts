@@ -113,19 +113,6 @@ export class PackIndexer {
           : entry.data === null
             ? entry.streamedOid
             : hashObject(entryType, entry.data);
-      membership.recordBytes(i, {
-        offset: header.offset,
-        dataOff: header.dataOff,
-        dataLen: entry.consumed,
-        entrySize: header.entrySize,
-        kind: header.kind,
-        baseDelta: header.baseDelta,
-        baseOid: header.baseOid,
-        type: entryType,
-        size: entryType === null ? (entry.deltaTargetSize ?? -1) : header.entrySize,
-        oid: fullOid,
-        compressedDigest: entry.compressedDigest,
-      });
 
       if (header.kind === null) {
         const type = entryType!;

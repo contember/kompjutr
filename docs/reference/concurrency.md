@@ -225,12 +225,12 @@ with `ECORRUPT`. It carries each entry's chain depth while deferred deltas drain
 and rejects a chain longer than 4,095 edges, Git's `pack-objects` limit, with
 `ECORRUPT`. A read takes the
 canonical row's pack and follows base offsets within it, so an older canonical
-owner never redirects a chain into another pack. Publication compares the exact
-ordered rows with the digest made while parsing and requires every entry's
-canonical owner to be complete. Deleting that owner promotes one complete
-fallback entry atomically before the old rows disappear. No surviving chain can
-lose its base to a deletion, so deletion checks no dependency. Publication trusts
-the parse-time membership digests; deletion does not re-hash stored objects.
+owner never redirects a chain into another pack. Parsing requires every entry to be indexed exactly once at a strictly ordered
+offset, and publication requires the published entry count to match the parsed
+count and every entry's canonical owner to be complete. Deleting that owner
+promotes one complete fallback entry atomically before the old rows disappear.
+No surviving chain can lose its base to a deletion, so deletion checks no
+dependency. Neither publication nor deletion re-hashes stored objects.
 Page and read sizes shape the work, but accumulated pages or projected reads do
 not reject it.
 Ingest and cold reads share the 48 MiB logical base/instructions/target limit;
