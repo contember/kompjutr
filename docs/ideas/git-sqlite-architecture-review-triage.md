@@ -18,13 +18,11 @@ The report's explicitly dismissed claims are not retained here.
 
 The 2026-09-08 follow-up graduated the ref-limit correctness consequence and
 unused membership digests into [65](../backlog/65-git-sqlite-architecture-review.md),
-journal-root paging into
-[78](../backlog/78-make-sql-cursors-seek-and-deliver-incrementally.md), and the
+journal-root paging into a cursor item the 2026-09-24 backlog review dropped for
+lack of a measured cost, and the
 qualified malformed-sideband finding into
 [the completed lifecycle/network sprint](../archive/sprint-2026-09-08-lifecycle-and-network-integrity.md).
-Their evidence and acceptance live in those records. The
-[review intake](../backlog/README.md#2026-09-08-review-intake) distinguishes valid
-API failures from malformed-input checks and store-level reproductions.
+Their evidence and acceptance live in those records.
 
 ## Subsumed claims
 

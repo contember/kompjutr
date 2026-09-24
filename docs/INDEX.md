@@ -37,7 +37,10 @@ None.
 - [Simplification](archive/sprint-2026-09-23-simplification.md) shipped: −14 %
   Git source, 61 → 46 tables, self-contained packs, `STRICT` schema, rebase at
   any size. Next: [93](backlog/93-refuse-abort-over-unstaged-edits.md) (tier S
-  data loss), then the 86/87/90 cost misses.
+  data loss), then the removals in the [backlog plan](backlog/README.md#sprint-plan).
+- The 2026-09-24 backlog review deleted items that would re-add excess machinery
+  (17, 75, 76, 77, 78, 81, 87, 90, 96, 97) and moved no-caller parity features
+  to [`ideas/`](ideas/README.md).
 - [Production correctness and memory](archive/sprint-2026-09-10-production-correctness-and-memory.md)
   shipped: cold-readable pack admission, hidden provisional projections, bounded
   packed reads, and integration output lifetime. It consumed backlog 74 and 63
@@ -49,8 +52,7 @@ None.
   is complete: promise-aware maintenance, pack dependency preservation, and final
   fetch connectivity checks. At that closure the default clone met 990 SQL and
   the approved <160 MiB added-peak RSS gate; on 2026-09-24 it runs 1,006 SQL
-  and adds 236–250 MiB ([backlog 86](backlog/86-bound-sparse-selected-add-and-workerd-clone-peaks.md),
-  [90](backlog/90-bring-the-nextjs-clone-under-the-statement-target.md)).
+  and adds 236–250 MiB ([backlog 86](backlog/86-bound-sparse-selected-add-and-workerd-clone-peaks.md)).
 - Five lockstep `@kompjutr/*` packages now separate shared contracts, generic
   Git, the Durable Object runtime, and a crash-recoverable Unix local runtime.
   The final package-split comparison preserved every operation's SQL/row profile
@@ -58,11 +60,9 @@ None.
   [superseded snapshots](archive/benchmarks/benchmark-snapshots-2026-09-10.md).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0015).
-- The 2026-09-08 architecture-review follow-up is filed in
-  [`backlog/74–81`](backlog/README.md#2026-09-08-review-intake), with explicit
-  separation of valid public API failures, malformed-input validation, store-only
-  reproductions, and unmeasured scaling findings. Existing findings were refined
-  in [`65`](backlog/65-git-sqlite-architecture-review.md).
+- The 2026-09-08 architecture-review follow-up refined the existing findings in
+  [`65`](backlog/65-git-sqlite-architecture-review.md); of its new items only 79
+  and 80 survive the 2026-09-24 review.
 - Three tranches from the 2026-09-02 Git-in-SQLite architecture review are
   complete: storage/publication safety, Git result and scale correctness, then
   transaction-owned local mutations with trusted ordinary reads. Remaining

@@ -1,10 +1,4 @@
----
-id: 27
-title: Replay merge topology during rebase
-blocked-by: []
----
-
-# 27 — Replay merge topology during rebase
+# Replay merge topology during rebase
 
 **Summary.** Extend rebase from one linear chain to a bounded authenticated
 topology equivalent to Git's `--rebase-merges` mode.

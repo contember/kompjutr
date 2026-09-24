@@ -1,10 +1,4 @@
----
-id: 39
-title: Complete the remaining plumbing reads
-blocked-by: []
----
-
-# 39 — Complete the remaining plumbing reads
+# Complete the remaining plumbing reads
 
 **Summary.** Tier A. The checkpoint-critical subset has shipped. Four common
 read shapes remain absent, but no current consumer issues them.

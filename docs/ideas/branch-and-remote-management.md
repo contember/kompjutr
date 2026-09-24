@@ -1,10 +1,4 @@
----
-id: 18
-title: Complete remaining branch and remote management
-blocked-by: []
----
-
-# 18 — Complete remaining branch and remote management
+# Complete remaining branch and remote management
 
 **Summary.** Add the typed upstream and remote lifecycle operations that have no
 current consumer. Branch rename and single fetch-URL get/set are already served.

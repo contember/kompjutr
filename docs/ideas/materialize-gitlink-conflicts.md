@@ -1,10 +1,4 @@
----
-id: 58
-title: Materialize gitlink distinct-type conflicts
-blocked-by: []
----
-
-# 58 — Materialize gitlink distinct-type conflicts
+# Materialize gitlink distinct-type conflicts
 
 **Summary.** Design and implement Git-compatible worktree materialisation for
 gitlink conflicts instead of rejecting them. Effort L.

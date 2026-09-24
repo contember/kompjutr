@@ -1,10 +1,4 @@
----
-id: 29
-title: Update dependent refs after rebase
-blocked-by: []
----
-
-# 29 — Update dependent refs after rebase
+# Update dependent refs after rebase
 
 **Summary.** Add a bounded `--update-refs` mode that moves eligible refs to
 their rewritten commits with atomic validation and recovery records.

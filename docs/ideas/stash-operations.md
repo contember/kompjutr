@@ -1,10 +1,4 @@
----
-id: 06
-title: Implement stash operations
-blocked-by: []
----
-
-# 06 — Implement stash operations
+# Implement stash operations
 
 **Summary.** Replace the `stashPush`, `stashList`, and `stashPop` stubs with
 native, recoverable snapshots of index and worktree changes.

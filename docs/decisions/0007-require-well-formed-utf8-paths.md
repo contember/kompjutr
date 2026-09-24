@@ -59,4 +59,4 @@ Public paths remain JavaScript strings.
 - Add parallel string and byte paths to status only. This leaves the
   filesystem, index, checkout, and merge boundaries inconsistent.
 - Redesign every path boundary now. That is a separate architectural project,
-  tracked in [backlog 59](../backlog/59-byte-preserving-git-paths.md).
+  described in the [byte-preserving paths idea](../ideas/byte-preserving-git-paths.md).

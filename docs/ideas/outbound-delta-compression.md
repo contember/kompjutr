@@ -1,10 +1,4 @@
----
-id: 09
-title: Add outbound delta compression
-blocked-by: []
----
-
-# 09 — Add outbound delta compression
+# Add outbound delta compression
 
 **Summary.** Reduce push bandwidth and memory pressure by emitting bounded delta
 objects when the savings justify their construction.

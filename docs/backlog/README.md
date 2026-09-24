@@ -21,29 +21,20 @@ not effort: a wrong answer outranks a missing one.
 - **S — silent divergence.** kompjutr returns a plausible result where Git
   returns a different one or refuses. Nothing warns the caller.
   [93](93-refuse-abort-over-unstaged-edits.md)
-- **A — blocks a common workflow, loudly.** The call fails or the capability is
-  absent; no data is at risk.
-  [39](39-plumbing-read-surface.md) ·
-  [06](06-stash-operations.md) ·
-  [18](18-branch-and-remote-management.md)
+- **A — blocks a common workflow, loudly.** None filed.
 - **B — real gap, narrower audience or a workaround exists.**
   [91](91-overwrite-ignored-untracked-files.md) ·
-  [92](92-summarize-cli-commits-past-the-row-cap.md) ·
-  [36](36-glob-pathspecs.md) ·
-  [25](25-rebase-targets-and-roots.md) ·
-  [26](26-interactive-rebase.md) ·
-  [27](27-rebase-merges.md) ·
-  [29](29-rebase-update-refs.md)
+  [92](92-summarize-cli-commits-past-the-row-cap.md)
+- **No caller yet.** Stash, plumbing reads, branch and remote management, glob
+  pathspecs, rebase extensions, interactive rebase, rebase merges, gitlink
+  conflicts, outbound delta compression and byte-preserving paths live in
+  [`../ideas/`](../ideas/README.md). One graduates here when a consumer issues it.
 - **C — deliberately out of scope.** Not filed: `bisect`, `blame`, `describe`,
   `shortlog`, `grep`, `archive`, `bundle`, `am`/`format-patch`, submodules,
   notes, hooks, signing, credential helpers, LFS, `.gitattributes` filters,
   config scopes, `clean -x`, SSH transport. Reopen a case for one only with a
   concrete workload behind it. Textual `apply` is not filed because local
   snapshot replay serves the current workload.
-  retains packed-graph and read-memory scaling; [65](65-git-sqlite-architecture-review.md)
-  collects verified architecture-review remediation; [64](64-speed-up-full-test-suite.md)
-  tracks exhaustive-suite wall time; [66](66-retire-modeled-retained-byte-charges.md)
-  finishes the ledger removal ADR-0005 only partly completed.
 
 ## Consumer demand
 
@@ -69,8 +60,8 @@ Coverage of the calls that decide whether Phase 1 is usable:
 | Call | Issued by | Item |
 |---|---|---|
 | a full-history clone that later runs `merge-base`, `rebase`, `rev-list --count` | both | Served: optionless clone is complete, while explicit shallow clones can deepen and unshallow later |
-| `branch -m`, `remote set-url` | both | Served by typed native operations; [18](18-branch-and-remote-management.md) now retains only no-caller management |
-| `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'` | builder | Served by native cached/untracked selection and repository `.gitignore` filtering; [36](36-glob-pathspecs.md) now retains mutating globs only |
+| `branch -m`, `remote set-url` | both | Served by typed native operations; the rest is the [branch and remote management idea](../ideas/branch-and-remote-management.md) |
+| `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'` | builder | Served by native cached/untracked selection and repository `.gitignore` filtering; mutating globs are the [glob pathspecs idea](../ideas/glob-pathspecs.md) |
 | `clone --filter=blob:none` | both | Served by native filtered clone/fetch, durable promises, and bounded lazy backfill (ADR-0015) |
 | `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | Served by the strict awaitable runner, bounded per-run stdin/env, and the explicit `@kompjutr/do/git-shell` adapter |
 
@@ -82,98 +73,36 @@ spelling listed under
 
 The default sequencing at the current HEAD, not scheduling state — a sprint
 exists once its file lands in [`../sprints/`](../sprints/). Every scheduled item
-belongs to exactly one sprint. A sprint is *normal* (roughly four to six work
-units) or *long* (roughly seven to ten); an item whose acceptance scope exceeds
-one work unit is split at the WU level inside its own sprint, never across two.
-A blocked item must not move ahead of its blocker.
+belongs to exactly one sprint.
 
 **Phase 1** package work is complete. The real adapter now reruns its workflow as
-the integration gate. Everything below the gate is re-planned from that result.
-**Phase 2** is production scale; partial clone shipped directly outside a sprint.
-The first architecture-review correction sprint shipped independently because
-its defects were already reproduced. The
-[production correctness and memory sprint](../archive/sprint-2026-09-10-production-correctness-and-memory.md)
-shipped all of 74 and 63 plus ARCH-9/ARCH-8 from 65, so those items are gone.
-Other findings in 65 remain unscheduled. The
-[statement targets and harnesses sprint](../archive/sprint-2026-09-23-statement-targets-and-harnesses.md)
-shipped 83, 85, 88 and 89 and closed early. The simplification sprint
-re-measured 84, 86, 87 and 90 at its closure; all four remain open with current
-numbers, and it filed 91–97. 84, 86 and 95 fit a later memory-and-transfer
-sprint. This bounded tranche precedes the broader scale/audit sequence below;
-it does not replace the external integration gate. Remaining parity work stays unscheduled
-until the external consumer integration gate provides new evidence.
+the integration gate; everything after it is re-planned from that result.
 
-| # | Sprint | Items | Length | Why here |
-|---|---|---|---|---|
-| **Phase 1 — a consumer can run** | | | | |
-| — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
-| **Phase 2 — production scale** | | | | |
-| 1 | Architecture review conformance, remainder | [65](65-git-sqlite-architecture-review.md), excluding ARCH-9/ARCH-8 | long | Re-plan remaining findings after the active tranche and consumer gate. |
-| 3 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Audit the settled physical, shallow, promisor, and packed storage shapes. |
-| **Remaining parity without a caller (unscheduled)** | | | | |
-| — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
-| — | Plumbing reads | [39](39-plumbing-read-surface.md) | normal | Type/size probes, tree/blob filters, ref enumeration, and general commit enumeration have no current caller. |
-| — | Mutating glob pathspecs | [36](36-glob-pathspecs.md) | normal | Read selection is served; no consumer currently issues glob-shaped add/rm/reset/checkout/clean/diff/status mutations. |
-| — | Rebase extensions | [25](25-rebase-targets-and-roots.md), [29](29-rebase-update-refs.md) | long | Both consumers issue `rebase <upstream>` and nothing else. |
-| — | Interactive rebase | [26](26-interactive-rebase.md) | long | |
-| — | Rebase merge topology | [27](27-rebase-merges.md) | long | |
-| — | Branch and remote management, rest | [18](18-branch-and-remote-management.md) (rest) | normal | Upstream set/unset, remote rename, separate push URLs. |
-| — | Gitlink conflicts, delta compression, byte paths | [58](58-materialize-gitlink-conflicts.md), [09](09-outbound-delta-compression.md), [59](59-byte-preserving-git-paths.md) | — | Fail closed today; widen only with a concrete workload. |
+The 2026-09-24 backlog review removed items that would re-add the machinery the
+[simplification sprint](../archive/sprint-2026-09-23-simplification.md)
+deleted: defences against unmeasured inputs, guards against API misuse, and
+dedicated work toward the ADR-0005 statement *target*, which `bench:statements
+--check` keeps reporting. An item here needs a reproduced defect, a measured
+cost, or a removal.
 
-Do not merge 26 and 27 into one sprint. They are two independent extra-large
-units over the same files, and a long sprint does not make that safe.
-
-## 2026-09-08 review intake
-
-These issues preserve the review's distinction between ordinary valid API use,
-invalid external input, and store-level reproduction. Each item states its
-trigger, actual evidence, and missing public witness. Static allocation/work
-proofs are not measured OOM or latency results. Arbitrary `git_*` mutation is not
-an accepted correctness witness under ADR-0004.
-
-| Work | Items | Evidence boundary |
+| Order | Items | Why |
 |---|---|---|
-| Public API correctness | shipped — [`archive/sprint-2026-09-08-public-api-correctness.md`](../archive/sprint-2026-09-08-public-api-correctness.md) | Buffer aliasing, nested rollback, repeated mutations, and regular-file discovery. Item 70's scan-ordering claim was refuted, not fixed. |
-| Valid-input resource scaling | [75](75-bound-network-authentication-payloads.md), [76](76-bound-full-tree-construction.md), [77](77-remove-repeated-local-traversal-work.md), [78](78-make-sql-cursors-seek-and-deliver-incrementally.md), [79](79-bound-materialized-status-and-config-reads.md) | Static live-state/work analysis and specified query-plan observations; target-runtime measurements remain acceptance work. |
-| Architectural test guarantee | [80](80-restore-import-graph-domain-guarantees.md) | Lost enforcement verified; current inspected source edges are clean. |
-
-Existing aggregate integration, ref-limit, sweep, and related
-findings remain in [65](65-git-sqlite-architecture-review.md); packed-read memory
-Callback misuse and design experiments are explicitly labeled there. The intake
-does not schedule these issues into a sprint.
+| 1 | [93](93-refuse-abort-over-unstaged-edits.md), [94](94-validate-the-rebase-committer-at-entry.md), [91](91-overwrite-ignored-untracked-files.md) | Reproduced correctness and parity defects; 93 loses user edits. |
+| 2 | [66](66-retire-modeled-retained-byte-charges.md), [92](92-summarize-cli-commits-past-the-row-cap.md), [65](65-git-sqlite-architecture-review.md), [79](79-bound-materialized-status-and-config-reads.md) | Removals: modeled byte ledgers, the CLI summary cap, duplicate tables, twins and validators. |
+| 3 | [84](84-read-integration-worktree-inputs-once.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md) | Measured repeated passes and memory peaks. |
+| — | [64](64-speed-up-full-test-suite.md), [80](80-restore-import-graph-domain-guarantees.md) | Tooling. |
 
 ## Items
 
-- [06 — Implement stash operations](06-stash-operations.md)
-- [09 — Add outbound delta compression](09-outbound-delta-compression.md)
-- [17 — Add repository integrity audit and snapshots](17-integrity-audit-and-snapshots.md)
-- [18 — Complete remaining branch and remote management](18-branch-and-remote-management.md)
-- [25 — Add explicit rebase targets and roots](25-rebase-targets-and-roots.md)
-- [26 — Add programmable interactive rebase](26-interactive-rebase.md)
-- [27 — Replay merge topology during rebase](27-rebase-merges.md)
-- [29 — Update dependent refs after rebase](29-rebase-update-refs.md)
-- [36 — Add mutating glob pathspecs](36-glob-pathspecs.md)
-- [39 — Complete the remaining plumbing reads](39-plumbing-read-surface.md)
-- [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
-- [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
 - [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
 - [66 — Retire modeled retained-byte charges](66-retire-modeled-retained-byte-charges.md)
-- [75 — Bound payload lifetime during shallow-history validation](75-bound-network-authentication-payloads.md)
-- [76 — Bound full-tree construction before serialization allocation](76-bound-full-tree-construction.md)
-- [77 — Remove repeated local traversal and recovery work](77-remove-repeated-local-traversal-work.md)
-- [78 — Make SQL cursors seek and deliver incrementally](78-make-sql-cursors-seek-and-deliver-incrementally.md)
-- [79 — Bound materialized status and avoid scalar config overreads](79-bound-materialized-status-and-config-reads.md)
+- [79 — Read scalar config values with one row](79-bound-materialized-status-and-config-reads.md)
 - [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
-- [81 — Copy object bytes only when a cache actually retains them](81-copy-object-bytes-only-when-retained.md)
 - [84 — Read integration worktree inputs once](84-read-integration-worktree-inputs-once.md)
 - [86 — Bound the sparse-selected-add and Next.js clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
-- [87 — Bring an eight-step rebase under the statement target](87-bring-rebase-transition-under-the-statement-target.md)
-- [90 — Bring the Next.js clone under the statement target](90-bring-the-nextjs-clone-under-the-statement-target.md)
 - [91 — Overwrite ignored untracked files on checkout, merge and rebase](91-overwrite-ignored-untracked-files.md)
 - [92 — Summarize a CLI commit that changes more than 50,000 files](92-summarize-cli-commits-past-the-row-cap.md)
 - [93 — Refuse merge and replay abort over unstaged edits](93-refuse-abort-over-unstaged-edits.md)
 - [94 — Validate the rebase committer option at the entry point](94-validate-the-rebase-committer-at-entry.md)
 - [95 — Reduce the Next.js rebase step's full-tree passes and peak](95-reduce-the-nextjs-rebase-step-peak.md)
-- [96 — Memoize intermediate delta-chain entries during one packed read](96-memoize-intermediate-delta-chain-entries.md)
-- [97 — Bound Git output for pipe and redirect sinks by the shell's retained budget](97-bound-git-output-before-pipe-and-redirect-sinks.md)

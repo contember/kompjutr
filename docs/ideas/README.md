@@ -24,3 +24,16 @@ decided work or status.
 - [`resolve-filesystem-paths-incrementally.md`](resolve-filesystem-paths-incrementally.md)
   — the filesystem path planner rebuilds every ancestor prefix, so one resolve
   costs `O(components²)`; a 1,000-component merge abort spends 8.6 s of 10 s there.
+- Git parity without a caller — each graduates to `../backlog/` when a consumer
+  issues it:
+  [`stash-operations.md`](stash-operations.md) ·
+  [`plumbing-read-surface.md`](plumbing-read-surface.md) ·
+  [`branch-and-remote-management.md`](branch-and-remote-management.md) ·
+  [`glob-pathspecs.md`](glob-pathspecs.md) ·
+  [`rebase-targets-and-roots.md`](rebase-targets-and-roots.md) ·
+  [`rebase-update-refs.md`](rebase-update-refs.md) ·
+  [`interactive-rebase.md`](interactive-rebase.md) ·
+  [`rebase-merges.md`](rebase-merges.md) ·
+  [`materialize-gitlink-conflicts.md`](materialize-gitlink-conflicts.md) ·
+  [`outbound-delta-compression.md`](outbound-delta-compression.md) ·
+  [`byte-preserving-git-paths.md`](byte-preserving-git-paths.md).

@@ -1,10 +1,4 @@
----
-id: 26
-title: Add programmable interactive rebase
-blocked-by: []
----
-
-# 26 — Add programmable interactive rebase
+# Add programmable interactive rebase
 
 **Summary.** Add a durable typed rebase todo surface for reorder, edit, reword,
 squash, fixup, drop, and autosquash workflows.

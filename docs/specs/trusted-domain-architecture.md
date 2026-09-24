@@ -83,8 +83,7 @@ current `@kompjutr/*` surface.
 | JS re-validation of SQL `ORDER BY` output | delete |
 | Corruption-injection tests for deleted checks | delete or convert to write-`CHECK`/boundary witnesses |
 
-Out-of-band mutation of the database is undefined behavior. The opt-in
-integrity audit is [backlog 17](../backlog/17-integrity-audit-and-snapshots.md).
+Out-of-band mutation of the database is undefined behavior.
 
 ## Design style
 

@@ -1,10 +1,4 @@
----
-id: 59
-title: Add byte-preserving Git paths
-blocked-by: []
----
-
-# 59 — Add byte-preserving Git paths
+# Add byte-preserving Git paths
 
 **Summary.** Replace the UTF-8-only string envelope with a lossless byte-path
 model for repositories that contain non-UTF-8 tree names. Effort XL.

@@ -75,7 +75,7 @@ knobs matter and neither is a hard wall:
   property of the storage. Serving needs its own budget, derived from what a
   clone actually costs to stream, and probably a different shape: a clone reads
   a lot and writes nothing.
-- **No outbound delta compression** (see [`backlog/09`](../backlog/09-outbound-delta-compression.md)).
+- **No outbound delta compression** (see the [outbound delta compression idea](outbound-delta-compression.md)).
   Every object goes out full. That is correct but fat, and it is the difference
   between a clone that is merely large and one that is embarrassing. This is the
   first thing to fix if serving becomes real.

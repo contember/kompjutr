@@ -74,10 +74,8 @@ check on pack deletion, and the structural bounds of
 kit replaces hand-rolled multi-operand conditionals; a new five-operand `typeof`
 chain is the anti-pattern.
 
-**Out-of-band mutation of the database is undefined behavior.** Corruption
-detection is an explicit, opt-in audit
-([backlog 17](../backlog/17-integrity-audit-and-snapshots.md)), the same
-contract as `git fsck` and `PRAGMA integrity_check`.
+**Out-of-band mutation of the database is undefined behavior.** The store does
+not detect it; `PRAGMA integrity_check` covers SQLite-level damage.
 
 ## Consequences
 

@@ -34,8 +34,8 @@ its start commit `62edc57` already adds 222.6 MiB (1,026 statements), and the
 sprint moved it by +3 to +15 MiB, within run-to-run noise. In the workflow run the clone's V8 heap grew 49.7 MiB and its
 external memory 63.3 MiB over the phase.
 
-The clone's statement-target miss is tracked separately as
-[backlog 90](90-bring-the-nextjs-clone-under-the-statement-target.md).
+The clone's 1,012 statements miss the ADR-0005 target by 12; `bench:statements
+--check` reports it, and it has no dedicated item.
 
 Measurements: [`benchmark-current`](../reference/benchmark-current.md) and
 ignored `bench/results/nextjs-workflow.json`, `nextjs-network-*.json`,

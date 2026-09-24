@@ -1,10 +1,4 @@
----
-id: 36
-title: Add mutating glob pathspecs
-blocked-by: []
----
-
-# 36 — Add mutating glob pathspecs
+# Add mutating glob pathspecs
 
 **Summary.** Tier B. Read-only `lsFiles()` selection is complete for the current
 builder workload. Mutating commands still accept only exact paths and directory

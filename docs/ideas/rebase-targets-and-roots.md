@@ -1,10 +1,4 @@
----
-id: 25
-title: Add explicit rebase targets and roots
-blocked-by: []
----
-
-# 25 — Add explicit rebase targets and roots
+# Add explicit rebase targets and roots
 
 **Summary.** Extend the native sequencer with `--onto`, explicit branch, and
 root-rebase selection without weakening bounded planning or atomic publication.

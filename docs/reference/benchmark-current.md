@@ -50,8 +50,7 @@ sample each, not medians.
 
 Every phase passed its verification. Rows are rows returned, not rows scanned.
 Every phase except clone meets the at-most-1,000-statement target. Clone misses
-it by 12 statements
-([backlog 90](../backlog/90-bring-the-nextjs-clone-under-the-statement-target.md)).
+it by 12 statements.
 Target status is performance evidence, not a runtime admission rule.
 
 Clone adds 237.2 MiB over a 207.3 MiB process baseline. The rebase step replays
@@ -117,8 +116,7 @@ fetched commit count, and every fetched tree entry. Clone process baselines were
 workflow clone passes `ref` and `depth: 1` and runs 1,012 statements. The clone misses
 the 1,000-statement target by 6 statements and the former <160 MiB added-peak
 gate by 76–90 MiB
-([backlog 86](../backlog/86-bound-sparse-selected-add-and-workerd-clone-peaks.md),
-[backlog 90](../backlog/90-bring-the-nextjs-clone-under-the-statement-target.md)).
+([backlog 86](../backlog/86-bound-sparse-selected-add-and-workerd-clone-peaks.md)).
 A phase whose peak stayed below its baseline is reported as 0.0.
 
 ## Local runtime qualification
@@ -263,8 +261,7 @@ separate initialization, fetch, and ref publication phases. Clone uses 1,012
 statements; the standalone checkout itself uses 690. Both materialize exactly
 24,252 index entries and worktree leaves at the expected HEAD and end at the
 same 217.78 MiB database size. Each phase meets the at-most-1,000-statement
-target; the clone misses it
-([backlog 90](../backlog/90-bring-the-nextjs-clone-under-the-statement-target.md)).
+target; the clone misses it.
 A miss is optimization evidence, not a runtime refusal.
 
 Generated output goes to `bench/results/clone-storage.{json,md}`, which is
