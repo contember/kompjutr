@@ -487,7 +487,7 @@ reads, and promisor hydration. Tree/blob display remains ✘.
 | `git merge-base --all <current> <incoming>` | `mergeBase()` | ★ ~ returns every bounded best base plus `already-merged`, `fast-forward`, `divergent`, `unrelated`, or `shallow` classification |
 | `git read-tree`, `git write-tree`, `git commit-tree` | `readTree()`, `writeTree()`, `commitTree()` | ★ ✔ ordinary calls target the checkout index; `commitTree()` writes one detached authenticated commit and moves no ref |
 | `GIT_INDEX_FILE=<throwaway>` around those commands | `withScratchIndex({ name }, callback)` | ★ ~ the synchronous callback receives `readTree`, `add`, `writeTree`, `commitTree`, and `replaySnapshot`; all scratch rows are transaction-scoped and no index file or persistent alternate index exists |
-| `git diff --binary --full-index <snap>^ <snap>` then `git apply --3way --cached` | `scratch.replaySnapshot({ snapshot, onto })` | ★ ~ index-only replay while all objects share one store; clean results return a tree, conflicts return physical stage rows and write nothing. ✘ textual patch interchange |
+| `git diff --binary --full-index <snap>^ <snap>` then `git apply --3way --cached` | `scratch.replaySnapshot({ snapshot, onto })` | ★ ~ index-only replay while all objects share one store; clean results return a tree, conflicts return physical stage rows and change no index or ref; generated conflict bytes may remain as unreferenced loose objects for maintenance. ✘ textual patch interchange |
 | general `git rev-list`, ref enumeration through `git for-each-ref` | — | ✘ the bounded reads above do not expose general enumeration |
 
 Loose-object reads join object metadata and ordered chunk payload in one cursor.

@@ -101,7 +101,7 @@ describe("integration workspace ownership", () => {
     });
   });
 
-  it("adopts a virtual stage-1 blob but leaves worktree-only markers provisional", () => {
+  it("publishes a virtual stage-1 blob and worktree-only markers as ordinary objects", () => {
     const { repo, worktree } = makeRepo();
     const current = repo.store.write("blob", new TextEncoder().encode("current\n"));
     const incoming = repo.store.write("blob", new TextEncoder().encode("incoming\n"));
@@ -164,7 +164,7 @@ describe("integration workspace ownership", () => {
     expect(repo.store.read(result.base)?.data).toEqual(
       new TextEncoder().encode("virtual ancestor\n"),
     );
-    expect(repo.store.has(result.content)).toBe(false);
+    expect(repo.store.read(result.content)?.data).toEqual(result.markers);
     expect(worktree.readFile("/file")).toEqual(result.markers);
     expect(repo.checkout.requireMergeState().touched).toHaveLength(1);
   });
@@ -246,7 +246,7 @@ describe("integration workspace ownership", () => {
     }
   });
 
-  it("matches native generated conflict bytes without publishing them during validation", () => {
+  it("matches native generated conflict bytes and writes them as one ordinary object", () => {
     const { db, store } = setup();
     const native = new GitFixture().init();
     try {
@@ -280,7 +280,7 @@ describe("integration workspace ownership", () => {
         ).status,
       ).toBe(1);
       const expected = new Uint8Array(readFileSync(join(native.dir, "current")));
-      const ordinary = db.scalar("SELECT count(*) FROM git_objects");
+      const ordinary = db.scalar<number>("SELECT count(*) FROM git_objects") ?? 0;
       withIntegrationWorkspaceOwned(store, (workspace) => {
         const plan = planIntegrationOwned(workspace, input);
         const entry = plan.entries.get("file");
@@ -290,21 +290,20 @@ describe("integration workspace ownership", () => {
         expect(
           workspace.source.readBlobs([entry.content.oid]).blobs.get(entry.content.oid),
         ).toEqual(expected);
-        expect(store.has(entry.content.oid)).toBe(false);
+        expect(store.read(entry.content.oid)?.data).toEqual(expected);
         expect(plan.entries.get("file")).toEqual(entry);
       });
-      expect(db.scalar("SELECT count(*) FROM git_objects")).toBe(ordinary);
-      expect(db.scalar("SELECT count(*) FROM git_integration_objects")).toBe(0);
+      expect(db.scalar("SELECT count(*) FROM git_objects")).toBe(ordinary + 1);
     } finally {
       native.dispose();
     }
   });
 
-  it("keeps generated output private and revokes handles and suspended traversal", () => {
+  it("writes generated output to the ordinary store and revokes handles and suspended traversal", () => {
     const { db, store } = setup();
     const retained = withIntegrationWorkspaceOwned(store, (workspace) => {
       const oid = workspace.source.write("blob", new TextEncoder().encode("private output"));
-      expect(store.has(oid)).toBe(false);
+      expect(store.has(oid)).toBe(true);
       const plan = workspace.resolvedPlan();
       plan.entries.write([
         {
@@ -322,7 +321,7 @@ describe("integration workspace ownership", () => {
       expect([...plan.entries].map((entry) => entry.path)).toEqual(["a", "b"]);
       return { workspace, plan, cursor, oid };
     });
-    expect(store.has(retained.oid)).toBe(false);
+    expect(store.has(retained.oid)).toBe(true);
     expect(() => retained.cursor.next()).toThrowError(expect.objectContaining({ code: "ESTALE" }));
     expect(() => retained.plan.entryCount).toThrowError(
       expect.objectContaining({ code: "ESTALE" }),
@@ -331,17 +330,15 @@ describe("integration workspace ownership", () => {
       expect.objectContaining({ code: "ESTALE" }),
     );
     expect(db.scalar("SELECT count(*) FROM git_integration_workspaces")).toBe(0);
-    expect(db.scalar("SELECT count(*) FROM git_integration_objects")).toBe(0);
   });
 
-  it("poisons an outer scope after a caught nested failure and invalidates adopted-object caches", () => {
+  it("poisons an outer scope after a caught nested failure and invalidates written-object caches", () => {
     const { db, store } = setup();
-    let adopted = "";
+    let written = "";
     expect(() =>
       withIntegrationWorkspaceOwned(store, (workspace) => {
-        adopted = workspace.source.write("blob", new TextEncoder().encode("rolled back"));
-        workspace.source.adopt(adopted);
-        expect(store.read(adopted)?.data).toEqual(new TextEncoder().encode("rolled back"));
+        written = workspace.source.write("blob", new TextEncoder().encode("rolled back"));
+        expect(store.read(written)?.data).toEqual(new TextEncoder().encode("rolled back"));
         try {
           withIntegrationWorkspaceOwned(store, () => {
             throw new Error("nested failure");
@@ -351,13 +348,13 @@ describe("integration workspace ownership", () => {
         }
       }),
     ).toThrow("nested failure");
-    expect(store.has(adopted)).toBe(false);
-    expect(store.read(adopted)).toBeNull();
+    expect(store.has(written)).toBe(false);
+    expect(store.read(written)).toBeNull();
     expect(db.scalar("SELECT count(*) FROM git_integration_workspaces")).toBe(0);
   });
 
-  it("adopts reachable tree dependencies without publishing unrelated temporary blobs", () => {
-    const { db, store } = setup();
+  it("publishes written trees, their dependencies and unreferenced temporary blobs", () => {
+    const { store } = setup();
     const result = withIntegrationWorkspaceOwned(store, (workspace) => {
       const blob = workspace.source.write("blob", new TextEncoder().encode("retained"));
       const unused = workspace.source.write("blob", new TextEncoder().encode("discarded"));
@@ -368,27 +365,27 @@ describe("integration workspace ownership", () => {
       expect([...workspace.source.walkTree(tree)]).toEqual([
         { path: "file", mode: "100644", oid: blob },
       ]);
-      workspace.source.adopt(tree);
       return { tree, blob, unused };
     });
     expect(store.has(result.tree)).toBe(true);
     expect(store.read(result.blob)?.data).toEqual(new TextEncoder().encode("retained"));
-    expect(store.has(result.unused)).toBe(false);
+    expect(store.read(result.unused)?.data).toEqual(new TextEncoder().encode("discarded"));
     expect([...store.walkTree(result.tree)]).toEqual([
       { path: "file", mode: "100644", oid: result.blob },
     ]);
-    expect(db.scalar("SELECT count(*) FROM git_integration_objects")).toBe(0);
   });
 
-  it("rejects asynchronous callbacks and cleans their provisional output", () => {
+  it("rejects asynchronous callbacks and rolls back their output", () => {
     const { db, store } = setup();
+    let written = "";
     expect(() =>
       withIntegrationWorkspaceOwned(store, async (workspace) => {
-        workspace.source.write("blob", new Uint8Array([1]));
+        written = workspace.source.write("blob", new Uint8Array([1]));
       }),
     ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
     expect(db.scalar("SELECT count(*) FROM git_integration_workspaces")).toBe(0);
-    expect(db.scalar("SELECT count(*) FROM git_integration_object_chunks")).toBe(0);
+    expect(written).toHaveLength(40);
+    expect(store.has(written)).toBe(false);
   });
 });
 

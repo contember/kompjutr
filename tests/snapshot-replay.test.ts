@@ -205,7 +205,7 @@ describe("scratch snapshot replay", () => {
     expect(scratchRows(workspace)).toEqual([]);
   });
 
-  it("returns Git stage data for conflicts without changing the selected index or objects", async () => {
+  it("returns Git stage data for conflicts without changing the selected index or refs", async () => {
     const source = fixture();
     source.write("conflict.txt", "base\n").write("stable.txt", "stable\n");
     const base = source.commit("base");
@@ -246,7 +246,8 @@ describe("scratch snapshot replay", () => {
       expect(scratch.writeTree()).toBe(beforeTree);
     });
 
-    expect(objectCount(workspace)).toBe(beforeObjects);
+    // Only the generated conflict-marker blob is left behind, unreferenced.
+    expect(objectCount(workspace)).toBe(beforeObjects + 1);
     expect(controlState(workspace)).toEqual(before);
     await expect(git.readRef({ ref: publishRef })).resolves.toEqual({
       kind: "direct",

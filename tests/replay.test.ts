@@ -83,7 +83,7 @@ function expectCode(action: () => unknown, code: string): void {
 }
 
 describe("one-commit replay planner", () => {
-  it("maps cherry-pick and revert to opposite three-tree integrations without mutation", () => {
+  it("maps cherry-pick and revert to opposite three-tree integrations without moving refs or the index", () => {
     const { store, repo } = harness();
     const base = tree(store, "base\n");
     const sourceTree = tree(store, "source\n");
@@ -164,11 +164,12 @@ describe("one-commit replay planner", () => {
         },
       }),
     ]);
+    // Each direction writes its conflict-marker blob as an ordinary loose object.
     expect({
       objects: store.objectCount(),
       refs: store.listRefs(),
       index: store.indexEntries(),
-    }).toEqual(before);
+    }).toEqual({ ...before, objects: before.objects + 2 });
   });
 
   it("generates command-specific source subject labels", () => {

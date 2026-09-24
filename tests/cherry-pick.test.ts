@@ -138,7 +138,7 @@ describe("cherry-pick lifecycle", () => {
       if (fault === "object") {
         workspace.repo.store.db.run(
           `CREATE TRIGGER fault_replay_object
-           BEFORE INSERT ON git_integration_objects
+           BEFORE INSERT ON git_objects
            WHEN NEW.repo_id = ${workspace.repo.store.repoId} AND NEW.type = 'blob'
            BEGIN
              SELECT RAISE(ABORT, 'fault object');
@@ -179,7 +179,7 @@ describe("cherry-pick lifecycle", () => {
     }
   });
 
-  it("rolls back an ordinary object write that fails during replay adoption", async () => {
+  it("rolls back a generated object write that fails during a clean replay", async () => {
     const body = (top: string, bottom: string): string =>
       [top, "one", "two", "three", "four", "five", "six", bottom, ""].join("\n");
     const source = fixture();
@@ -193,24 +193,19 @@ describe("cherry-pick lifecycle", () => {
     source.commit("main");
     const workspace = await imported(source);
     const before = durableSnapshot(workspace);
-    // Adoption is the one point that copies generated integration output into
-    // ordinary objects, so the fault is scoped to an OID the live workspace owns.
+    // The only blob this replay writes is the cleanly merged content.
     workspace.repo.store.db.run(
-      `CREATE TRIGGER fault_replay_adoption
+      `CREATE TRIGGER fault_replay_merged_blob
        BEFORE INSERT ON git_objects
-       WHEN NEW.repo_id = ${workspace.repo.store.repoId}
-        AND EXISTS (
-          SELECT 1 FROM git_integration_objects o
-           WHERE o.repo_id = NEW.repo_id AND o.oid = NEW.oid
-        )
+       WHEN NEW.repo_id = ${workspace.repo.store.repoId} AND NEW.type = 'blob'
        BEGIN
-         SELECT RAISE(ABORT, 'fault adoption');
+         SELECT RAISE(ABORT, 'fault merged blob');
        END`,
     );
 
     expect(() =>
       cherryPick(workspace.context, workspace.repo, workspace.worktree, { source: picked }),
-    ).toThrow("fault adoption");
+    ).toThrow("fault merged blob");
     expect(durableSnapshot(workspace)).toEqual(before);
   });
 

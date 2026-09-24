@@ -208,7 +208,7 @@ describe("bounded three-way integration plan", () => {
     expect(iterators.active()).toBe(0);
   });
 
-  it("merges mixed loose and packed blobs without mutation", async () => {
+  it("merges mixed loose and packed blobs, writing only the generated blobs", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
@@ -319,7 +319,9 @@ describe("bounded three-way integration plan", () => {
       objects: coldStore.objectCount(),
       refs: coldStore.listRefs(),
       index: coldStore.indexEntries(),
-    }).toEqual(before);
+    }).toEqual({ ...before, objects: before.objects + 2 });
+    for (const content of [clean.content, conflict.content])
+      expect(coldStore.read(hashObject("blob", content))?.data).toEqual(content);
   });
 
   it("batches content reads and returns clean, text, binary, and structural results", () => {
@@ -415,7 +417,9 @@ describe("bounded three-way integration plan", () => {
       objects: store.objectCount(),
       refs: store.listRefs(),
       index: store.indexEntries(),
-    }).toEqual(before);
+    }).toEqual({ ...before, objects: before.objects + 2 });
+    for (const content of [clean.content, conflict.content])
+      expect(store.read(hashObject("blob", content))?.data).toEqual(content);
   });
 
   it("plans one valid binary blob above the batching target as a singleton", () => {
@@ -438,7 +442,7 @@ describe("bounded three-way integration plan", () => {
     expect(entry.content).toEqual(large);
   });
 
-  it("finishes after more than sixteen progressing blob reads without mutating state", () => {
+  it("finishes after more than sixteen progressing blob reads without moving refs or the index", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const baseFiles: Record<string, FileValue> = {};
@@ -506,7 +510,7 @@ describe("bounded three-way integration plan", () => {
       objects: store.objectCount(),
       refs: store.listRefs(),
       index: store.indexEntries(),
-    }).toEqual(before);
+    }).toEqual({ ...before, objects: before.objects + 17 });
   });
 
   it("fails closed on missing and wrong-type candidate objects", () => {

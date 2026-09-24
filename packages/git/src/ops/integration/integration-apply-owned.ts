@@ -150,25 +150,6 @@ function materialize(
   }
 }
 
-export function adoptProjectedIndex(
-  workspace: IntegrationWorkspace,
-  plan: IntegrationPlanHandle<ProjectedMergeEntry>,
-): void {
-  function* oids(): Generator<string> {
-    for (const entry of plan.entries) {
-      for (const identity of [
-        entry.stageZero,
-        entry.stages?.base,
-        entry.stages?.current,
-        entry.stages?.incoming,
-      ]) {
-        if (identity !== null && identity !== undefined) yield identity.oid;
-      }
-    }
-  }
-  workspace.source.adoptMany(oids());
-}
-
 export function applyIntegrationOwned(
   workspace: IntegrationWorkspace,
   repo: Repository,
@@ -229,7 +210,6 @@ export function applyIntegrationOwned(
   }
   removals.entries.write(removalEntries());
   removals.finish(0, removalCount);
-  adoptProjectedIndex(workspace, plan);
   for (const page of integrationPages(removals.entries))
     worktree.removeFiles(
       page.map((entry) => joinPath(repo.root, entry.path)),

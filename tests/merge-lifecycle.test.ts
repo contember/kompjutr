@@ -1196,7 +1196,9 @@ describe("merge lifecycle", () => {
       expect.objectContaining({ oid: stageOne.oid, source: "loose", type: "blob" }),
     ]);
     const markerOid = hashObject("blob", utf8.encode(expectedWorktree));
-    expect(workspace.repo.store.has(markerOid)).toBe(false);
+    expect(workspace.repo.store.objectInfo([markerOid])).toEqual([
+      expect.objectContaining({ oid: markerOid, source: "loose", type: "blob" }),
+    ]);
     const git = nativeGit(workspace);
     let maintenance = await git.maintenance();
     for (let calls = 0; calls < 100 && maintenance.phase !== "loose"; calls++) {

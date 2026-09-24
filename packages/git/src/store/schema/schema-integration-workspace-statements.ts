@@ -1,5 +1,3 @@
-import { MAX_OBJECT_BYTES } from "../../common/objects.js";
-
 const OWNER = `repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
   workspace_id TEXT NOT NULL CHECK (typeof(workspace_id) = 'text' AND length(workspace_id) > 0)`;
 const OWNER_FOREIGN_KEY = `FOREIGN KEY (repo_id, workspace_id)
@@ -17,46 +15,6 @@ export const INTEGRATION_WORKSPACE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS git_integration_workspaces (
      ${OWNER}, PRIMARY KEY (repo_id, workspace_id),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
-   ) WITHOUT ROWID`,
-  `CREATE TABLE IF NOT EXISTS git_integration_objects (
-     ${OWNER},
-     oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
-     type TEXT NOT NULL CHECK (typeof(type) = 'text' AND type IN ('blob', 'tree')),
-     size INTEGER NOT NULL CHECK (
-       typeof(size) = 'integer' AND size BETWEEN 0 AND ${MAX_OBJECT_BYTES}
-     ),
-     PRIMARY KEY (repo_id, workspace_id, oid), ${OWNER_FOREIGN_KEY}
-   ) WITHOUT ROWID`,
-  `CREATE TABLE IF NOT EXISTS git_integration_object_chunks (
-     ${OWNER},
-     oid TEXT NOT NULL,
-     seq INTEGER NOT NULL CHECK (
-       typeof(seq) = 'integer' AND seq BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-     ),
-     data BLOB NOT NULL CHECK (typeof(data) = 'blob'),
-     PRIMARY KEY (repo_id, workspace_id, oid, seq),
-     FOREIGN KEY (repo_id, workspace_id, oid)
-       REFERENCES git_integration_objects (repo_id, workspace_id, oid) ON DELETE CASCADE
-   ) WITHOUT ROWID`,
-  `CREATE TABLE IF NOT EXISTS git_integration_tree_entries (
-     ${OWNER},
-     tree_oid TEXT NOT NULL,
-     ordinal INTEGER NOT NULL CHECK (
-       typeof(ordinal) = 'integer' AND ordinal BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-     ),
-     name TEXT NOT NULL COLLATE BINARY CHECK (
-       typeof(name) = 'text' AND length(CAST(name AS BLOB)) > 0
-     ),
-     mode TEXT NOT NULL CHECK (
-       typeof(mode) = 'text' AND mode IN ('40000', '040000', '100644', '100755', '120000', '160000')
-     ),
-     child_oid TEXT NOT NULL CHECK (
-       typeof(child_oid) = 'text' AND length(CAST(child_oid AS BLOB)) = 40
-     ),
-     PRIMARY KEY (repo_id, workspace_id, tree_oid, ordinal),
-     UNIQUE (repo_id, workspace_id, tree_oid, name),
-     FOREIGN KEY (repo_id, workspace_id, tree_oid)
-       REFERENCES git_integration_objects (repo_id, workspace_id, oid) ON DELETE CASCADE
    ) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS git_integration_plans (
      ${OWNER}, ${PLAN_ID},

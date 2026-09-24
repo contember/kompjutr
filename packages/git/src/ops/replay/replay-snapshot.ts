@@ -20,7 +20,6 @@ import {
 import { indexFromTree } from "../checkout/checkout.js";
 import { applyIndex } from "../integration/apply/apply-index.js";
 import { validateProjectedIndexEntries } from "../integration/apply/apply-validation.js";
-import { adoptProjectedIndex } from "../integration/integration-apply-owned.js";
 import type { IntegrationStages } from "../integration/integration-structure.js";
 import { integrationTouched } from "../integration/integration-touched.js";
 import { MAX_INTEGRATION_SOURCE_ROWS } from "../integration/integration-types.js";
@@ -263,7 +262,6 @@ function replayInWorkspace(
       } else {
         index.indexReplace(indexFromTree(repo, plan.currentTreeOid));
       }
-      adoptProjectedIndex(workspace, projected);
       applyIndex(index, projected.entries, touched.shapes());
       return { outcome: "clean", tree: writeTreeOwned(repo, index) };
     }),

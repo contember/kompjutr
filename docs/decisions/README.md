@@ -40,7 +40,7 @@ so the two cannot drift.
 - [0008 — Enforce SQLite foreign keys at the store boundary](0008-enforce-sqlite-foreign-keys-at-the-store-boundary.md) — accepted (2026-08-25)
 - [0009 — Choose the persisted Git storage formats](0009-persisted-git-storage-formats.md) — accepted (2026-08-26)
 - [0022 — Stage pack commit projections until publication](0022-stage-pack-commit-projections-until-publication.md) — accepted (2026-09-11)
-- [0024 — Own integration output in a scoped SQL workspace](0024-own-integration-output-in-a-scoped-sql-workspace.md) — accepted (2026-09-22)
+- [0024 — Hold integration plans in a scoped SQL workspace and write output as ordinary objects](0024-own-integration-output-in-a-scoped-sql-workspace.md) — accepted (2026-09-24)
 - [0025 — Bound packed reads by chain depth and restart maintenance on source drift](0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md) — accepted (2026-09-24)
 
 **Git domain**

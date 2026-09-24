@@ -17,7 +17,8 @@ refs/          refs, reflogs, configuration, and shallow boundaries
 fetch/         promisor metadata and atomic fetch publication
 indexes/       checkout/scratch indexes and filesystem change tracker
 operations/    restartable merge, replay, and rebase state; the scoped
-               integration workspace that owns provisional integration output
+               integration workspace that owns plans, reservations, and touched
+               snapshots
 schema/        editable schema version 1; no migrations
 trees/         tree/commit projections and streaming walks
 pack/          pack read, ingest, publication, deletion, and delta workspace
@@ -35,10 +36,11 @@ journals, and `HEAD` reflog. `git_tree_sources` holds one projection per tree
 OID, shared by every loose and packed copy and deleted with the last copy;
 `git_tree_entries` is owned through its source surrogate. `git_scratch_index*`
 rows are transaction-local and never become maintenance roots. `git_integration_*` rows are owned by one live
-`(repo_id, workspace_id)` inside a single transaction, are invisible to every
-ordinary object, projection, promise and maintenance query, and reach the
-ordinary store only through explicit adoption at a consumer's publication
-point (ADR-0024). This boundary is ADR-0003.
+`(repo_id, workspace_id)` inside a single transaction and are invisible to every
+ordinary object, projection, promise and maintenance query. Integration output
+is ordinary loose objects written in that same transaction; a fault rolls them
+back, and unpublished ones are left for maintenance (ADR-0024). This boundary is
+ADR-0003.
 
 ## Trust and cost rules
 
