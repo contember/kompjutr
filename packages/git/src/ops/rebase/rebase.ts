@@ -5,6 +5,7 @@ import { GitError } from "../../common/errors.js";
 import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { writeOperationJournalOwned } from "../../store/operations/operation-journal.js";
 import type { GitContext } from "../core/context.js";
+import { requireJournalIdentity } from "../core/journal-input.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata } from "../core/ref-log.js";
 import {
@@ -53,6 +54,7 @@ export function rebase(
   excludeRoots: readonly string[],
   options: RebaseStartOptions,
 ): RebaseLifecycleResult {
+  requireJournalIdentity(options.committer, "committer", "rebase");
   const exclusions = rebaseExclusions(repo, excludeRoots);
   requireSharedMutationScope(repo.store.db, worktree);
   const started = repo.store.db.transactionSync(() => {

@@ -143,6 +143,35 @@ function expectCode(action: () => unknown, code: string): void {
   throw new Error(`expected ${code}`);
 }
 
+/** Both callers start on `current` at `original`. */
+function expectInvalidCommitterRefused(
+  workspace: TestRepository,
+  original: string,
+  upstream: string,
+  paths: readonly string[],
+): void {
+  const { repo } = workspace;
+  const branchReflog = repo.store.reflog("refs/heads/current");
+  const headReflog = repo.checkout.reflog("HEAD");
+  const files = paths.map((path) => textAt(workspace, path));
+
+  expectCode(
+    () =>
+      rebase(workspace.context, repo, workspace.worktree, [], {
+        upstream,
+        committer: { name: "Invalid <Actor", email: "actor@example.com" },
+      }),
+    "EINVAL",
+  );
+
+  expect(repo.head()).toEqual({ ref: "refs/heads/current", oid: original });
+  expect(repo.store.reflog("refs/heads/current")).toEqual(branchReflog);
+  expect(repo.checkout.reflog("HEAD")).toEqual(headReflog);
+  expect(repo.checkout.readOperationState()).toBeNull();
+  expect(integrationIndexMatchesTree(repo, repo.readCommit(original).tree)).toBe(true);
+  expect(paths.map((path) => textAt(workspace, path))).toEqual(files);
+}
+
 function divergent(
   source: GitFixture,
   conflict = false,
@@ -372,20 +401,15 @@ describe("rebase lifecycle", () => {
     redundantSource.write("same.txt", "same\n");
     const redundantOriginal = redundantSource.commit("current adds same change");
     const redundantWorkspace = await imported(redundantSource);
-    redundantWorkspace.repo.store.configUnset("user.name");
-    redundantWorkspace.repo.store.configUnset("user.email");
 
-    const redundantResult = rebase(
-      redundantWorkspace.context,
-      redundantWorkspace.repo,
-      redundantWorkspace.worktree,
-      [],
-      {
+    expectInvalidCommitterRefused(redundantWorkspace, redundantOriginal, redundantUpstream, [
+      "same.txt",
+    ]);
+    expect(
+      rebase(redundantWorkspace.context, redundantWorkspace.repo, redundantWorkspace.worktree, [], {
         upstream: redundantUpstream,
-        committer: { name: "Invalid <Actor", email: "invalid>actor@example.com" },
-      },
-    );
-    expect(redundantResult).toEqual({
+      }),
+    ).toEqual({
       outcome: "completed",
       oid: redundantUpstream,
       replayed: 0,
@@ -395,11 +419,20 @@ describe("rebase lifecycle", () => {
     expect(redundantWorkspace.repo.store.reflog("refs/heads/current")[0]).toMatchObject({
       oldOid: redundantOriginal,
       newOid: redundantUpstream,
-      actor: null,
-      timestamp: 1_577_836_800,
-      timezoneOffset: 0,
       reason: "rebase: replay",
     });
+  });
+
+  it("refuses an invalid committer before a replaying rebase starts", async () => {
+    const source = fixture();
+    const { upstream, original } = divergent(source);
+    const workspace = await imported(source);
+
+    expectInvalidCommitterRefused(workspace, original, upstream, [
+      "one.txt",
+      "two.txt",
+      "upstream.txt",
+    ]);
   });
 
   it("continues a conflict with the resolved index", async () => {
