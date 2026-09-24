@@ -1790,6 +1790,21 @@ describe("config", () => {
     expect(runGit("config", "--get", "user.email").ok).toBe(false);
   });
 
+  it("reads the last of many appended values as one row, including after reopen", () => {
+    for (let index = 0; index < 1_000; index++) {
+      configSet(ws.repo, { path: "kompjutr.item", value: `value ${index}`, append: true });
+    }
+    const checkout = ws.database.findCheckout("/");
+    if (checkout === null) throw new Error("checkout disappeared before reopen");
+    const reopened = new Repository(ws.database.openCheckout(checkout));
+
+    for (const repo of [ws.repo, reopened]) {
+      ws.storage.resetCounters();
+      expect(configGet(repo, { path: "kompjutr.item" })).toBe("value 999");
+      expect(ws.storage.rowCount).toBe(1);
+    }
+  });
+
   it("reports a missing key as undefined", () => {
     expect(configGet(ws.repo, { path: "nothing.here" })).toBeUndefined();
     expect(configGet(ws.repo, { path: "nothing.here", all: true })).toEqual([]);

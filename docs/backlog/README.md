@@ -87,7 +87,7 @@ cost, or a removal.
 | Order | Items | Why |
 |---|---|---|
 | 1 | [91](91-overwrite-ignored-untracked-files.md) | Reproduced parity defect. |
-| 2 | [66](66-retire-modeled-retained-byte-charges.md), [92](92-summarize-cli-commits-past-the-row-cap.md), [65](65-git-sqlite-architecture-review.md), [79](79-bound-materialized-status-and-config-reads.md) | Removals: modeled byte ledgers, the CLI summary cap, duplicate tables, twins and validators. |
+| 2 | [66](66-retire-modeled-retained-byte-charges.md), [92](92-summarize-cli-commits-past-the-row-cap.md), [65](65-git-sqlite-architecture-review.md) | Removals: modeled byte ledgers, the CLI summary cap, duplicate tables, twins and validators. |
 | 3 | [84](84-read-integration-worktree-inputs-once.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md) | Measured repeated passes and memory peaks. |
 | — | [64](64-speed-up-full-test-suite.md), [80](80-restore-import-graph-domain-guarantees.md) | Tooling. |
 
@@ -96,7 +96,6 @@ cost, or a removal.
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
 - [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
 - [66 — Retire modeled retained-byte charges](66-retire-modeled-retained-byte-charges.md)
-- [79 — Read scalar config values with one row](79-bound-materialized-status-and-config-reads.md)
 - [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
 - [84 — Read integration worktree inputs once](84-read-integration-worktree-inputs-once.md)
 - [86 — Bound the sparse-selected-add and Next.js clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)

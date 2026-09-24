@@ -48,10 +48,9 @@ export class ConfigTable {
       .map((row) => expectText(row.value, `config ${path}`));
   }
 
+  /** Git's `--get` reports the last value of a multi-valued key. */
   get(path: string): string | undefined {
-    // git's `--get` reports the last value for a multi-valued key.
-    const values = this.getAll(path);
-    return values.length === 0 ? undefined : values[values.length - 1];
+    return this.getBounded(path);
   }
 
   getOwned(path: string): string | undefined {
