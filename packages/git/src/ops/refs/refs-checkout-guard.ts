@@ -1,5 +1,6 @@
 import { GitError } from "../../common/errors.js";
 import { comparePaths, joinSorted } from "../../common/streams.js";
+import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { contentIdKey, type IndexEntry, indexScanOwned } from "../../store/index.js";
 import { matchesPaths, stageZero, type TargetEntry } from "../checkout/checkout.js";
 import type { Repository } from "../repository/repository.js";
@@ -83,6 +84,14 @@ export function checkoutBlockers(
   const pendingTrackedPaths: PendingTarget[] = [];
   const untrackedAncestors: PendingTarget[] = [];
   const hashCursor = createWorktreeHashCursor(excludeRoots);
+  let ignores: IgnoreMatcher | undefined;
+  const isIgnored = (path: string): boolean => {
+    ignores ??= loadIgnoreMatcher(worktree, repo.root, { excludeRoots });
+    return ignores.ignores(path, false);
+  };
+  const retainUntracked = (path: string): void => {
+    if (!isIgnored(path)) retainBlocker(untracked, path);
+  };
 
   for (const row of checkoutGuardRows(repo, worktree, baselineTree, tree, excludeRoots)) {
     if (limits !== undefined) {
@@ -102,15 +111,19 @@ export function checkoutBlockers(
       for (let index = pendingTargets.length - 1; index >= 0; index--) {
         const pending = pendingTargets[index]!;
         if (!row.path.startsWith(`${pending.path}/`)) continue;
-        pendingTargets.splice(index, 1);
-        retainBlocker(untracked, pending.path);
+        if (!isIgnored(row.path)) {
+          pendingTargets.splice(index, 1);
+          retainBlocker(untracked, pending.path);
+        }
         break;
       }
       for (let index = pendingTrackedPaths.length - 1; index >= 0; index--) {
         const pending = pendingTrackedPaths[index]!;
         if (!row.path.startsWith(`${pending.path}/`)) continue;
-        pendingTrackedPaths.splice(index, 1);
-        retainBlocker(untracked, pending.path);
+        if (!isIgnored(row.path)) {
+          pendingTrackedPaths.splice(index, 1);
+          retainBlocker(untracked, pending.path);
+        }
         break;
       }
       if (row.target === undefined) retainRange(untrackedAncestors, row.path);
@@ -134,9 +147,10 @@ export function checkoutBlockers(
       }
       const ancestor = findAncestor(untrackedAncestors, row.path);
       if (ancestor !== undefined) {
-        convertRangeToBlocker(untrackedAncestors, ancestor, untracked);
+        untrackedAncestors.splice(untrackedAncestors.indexOf(ancestor), 1);
+        retainUntracked(ancestor.path);
       } else if (row.worktree !== undefined) {
-        retainBlocker(untracked, row.path);
+        retainUntracked(row.path);
       } else {
         retainRange(pendingTargets, row.path);
       }
@@ -151,7 +165,8 @@ export function checkoutBlockers(
     const ancestor = changesIndex ? findAncestor(untrackedAncestors, row.path) : undefined;
     if (ancestor !== undefined) {
       untrackedAncestors.splice(untrackedAncestors.indexOf(ancestor), 1);
-      retainBlocker(discardTrackedChanges ? untracked : tracked, row.path);
+      if (discardTrackedChanges) retainUntracked(ancestor.path);
+      else retainBlocker(tracked, row.path);
       continue;
     }
     if (discardTrackedChanges) {
@@ -280,15 +295,6 @@ function findAncestor(ranges: PendingTarget[], path: string): PendingTarget | un
     if (path.startsWith(`${range.path}/`)) return range;
   }
   return undefined;
-}
-
-function convertRangeToBlocker(
-  ranges: PendingTarget[],
-  range: PendingTarget,
-  blockers: BlockerList,
-): void {
-  ranges.splice(ranges.indexOf(range), 1);
-  retainBlocker(blockers, range.path);
 }
 
 function flushGuardCandidates(

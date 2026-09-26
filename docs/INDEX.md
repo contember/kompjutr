@@ -37,6 +37,8 @@ None.
 - [Simplification](archive/sprint-2026-09-23-simplification.md) shipped: −14 %
   Git source, 61 → 46 tables, self-contained packs, `STRICT` schema, rebase at
   any size. Next: the removals in the [backlog plan](backlog/README.md#sprint-plan).
+- The ignored-untracked overwrite parity gap is fixed for checkout, merge,
+  cherry-pick, and rebase, including directory-to-file replacements.
 - The 2026-09-24 backlog review deleted items that would re-add excess machinery
   (17, 75, 76, 77, 78, 81, 87, 90, 96, 97) and moved no-caller parity features
   to [`ideas/`](ideas/README.md).

@@ -369,6 +369,9 @@ All worktree-changing forms preserve registered nested repository roots. The
 argv runner resolves literal paths from `cwd`; path checkout updates index and
 worktree, while restore is worktree-only. An explicit restore source removes a
 selected tracked worktree path that is absent from that source.
+Checkout, merge, cherry-pick, and rebase replace ignored untracked files and
+directories when writing tracked paths, as Git does. Non-ignored untracked
+content and tracked changes that would be overwritten still block the operation.
 
 ### `git clean` — `clean()`
 

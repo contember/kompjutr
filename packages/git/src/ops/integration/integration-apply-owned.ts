@@ -4,6 +4,7 @@ import { CorruptError, GitError } from "../../common/errors.js";
 import { MODE_COMMIT, MODE_SYMLINK } from "../../common/objects.js";
 import { isNestedPath, joinPath } from "../../common/paths.js";
 import { comparePaths, joinSorted, joinSorted3, peekable } from "../../common/streams.js";
+import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { indexScanOwned, PACK_BLOB_BATCH_TARGET_BYTES } from "../../store/index.js";
 import type { ProjectedMergeEntry } from "../../store/operations/integration-workspace/descriptors.js";
 import {
@@ -37,6 +38,7 @@ function* snapshotDrafts(
   const projected = plan.entries[Symbol.iterator]();
   let next = projected.next();
   let destructive: string | null = null;
+  let ignores: IgnoreMatcher | undefined;
   try {
     for (const row of joinSorted3(
       touched.shapes(),
@@ -63,6 +65,10 @@ function* snapshotDrafts(
         row.path !== destructive &&
         row.a === undefined
       ) {
+        if (row.b === undefined) {
+          ignores ??= loadIgnoreMatcher(worktree, repo.root);
+          if (ignores.ignores(row.path, false)) continue;
+        }
         throw new GitError(
           "ECHECKOUTFAIL",
           `working tree path blocks merge restoration: ${row.path}`,

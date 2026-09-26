@@ -154,7 +154,7 @@ function checkoutLegacy(
   );
   checkoutTreeExcluding(repo, worktree, tree, excludeRoots, {
     preserveMatchingIndex: options.force !== true,
-    restoreStructure: options.force === true,
+    restoreStructure: true,
   });
   moveHead(context, repo, options.ref, commit);
 }

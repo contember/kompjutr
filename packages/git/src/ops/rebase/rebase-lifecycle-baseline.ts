@@ -137,6 +137,7 @@ export function materializeTree(
   }
   checkoutTreeExcluding(repo, worktree, targetTree, exclusions.absolute, {
     preserveMatchingIndex: true,
+    restoreStructure: true,
   });
 }
 
