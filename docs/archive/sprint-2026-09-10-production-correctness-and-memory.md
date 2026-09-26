@@ -42,7 +42,7 @@ and [63](../backlog/63-bound-packed-dependency-graph-traversal.md), plus only
 ARCH-9 and ARCH-8 from [65](../backlog/65-git-sqlite-architecture-review.md).
 The remainder of 65 stays unscheduled. On closure delete 74/63 only if every
 acceptance is met; remove just the completed findings from 65 and reconcile its
-overlapping integration ledger entry with [66](../backlog/66-retire-modeled-retained-byte-charges.md).
+overlapping integration ledger entry with [66](sprint-2026-09-26-retire-modeled-charges-and-twins.md).
 
 ## Refs re-verified at HEAD (2026-09-10)
 

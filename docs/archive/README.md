@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Retire modeled charges and pure forwarding twins](sprint-2026-09-26-retire-modeled-charges-and-twins.md)
+  — bounded status/clean collections, streamed rm planning, and split architecture
+  review follow-ups.
 - [Simplification](sprint-2026-09-23-simplification.md) — self-contained packs,
   non-paged reads, no repack, per-OID tree projections, integration output and
   commit rows as ordinary store rows, `STRICT` schema, rebase at any size.

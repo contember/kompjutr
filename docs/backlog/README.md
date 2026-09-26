@@ -86,7 +86,7 @@ cost, or a removal.
 
 | Order | Items | Why |
 |---|---|---|
-| 1 | [66](66-retire-modeled-retained-byte-charges.md), [65](65-git-sqlite-architecture-review.md) | Removals: the remaining modeled byte charges, twins and validators. |
+| 1 | [98](98-remove-forwarding-owner-wrappers.md), [102](102-consolidate-equivalent-store-validators.md), [96](96-validate-git-caller-utf8-at-boundaries.md) | Small duplicate-removal slices; review the input-changing UTF-8 fix separately. |
 | 2 | [84](84-read-integration-worktree-inputs-once.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md) | Measured repeated passes and memory peaks. |
 | — | [64](64-speed-up-full-test-suite.md), [80](80-restore-import-graph-domain-guarantees.md) | Tooling. |
 
@@ -94,8 +94,17 @@ cost, or a removal.
 
 - [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
 - [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
-- [66 — Retire the status and rm modeled byte charges](66-retire-modeled-retained-byte-charges.md)
 - [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
 - [84 — Read integration worktree inputs once](84-read-integration-worktree-inputs-once.md)
 - [86 — Bound the sparse-selected-add and workerd clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
 - [95 — Reduce the Next.js rebase step's full-tree passes and peak](95-reduce-the-nextjs-rebase-step-peak.md)
+- [96 — Reject noncanonical UTF-16 in Git caller text](96-validate-git-caller-utf8-at-boundaries.md)
+- [97 — Audit checkout modeled byte charges](97-audit-checkout-modeled-byte-charges.md)
+- [98 — Remove forwarding owner wrappers](98-remove-forwarding-owner-wrappers.md)
+- [99 — Simplify redundant checkout store reads](99-simplify-checkout-store-reads.md)
+- [100 — Consolidate equivalent Git path and OID helpers](100-consolidate-equivalent-git-helpers.md)
+- [101 — Use tracked prefixes in status pruning](101-use-tracked-prefixes-in-status-pruning.md)
+- [102 — Consolidate equivalent store validators](102-consolidate-equivalent-store-validators.md)
+- [103 — Share reflog append and retention plumbing](103-share-reflog-append-plumbing.md)
+- [104 — Move ref probes behind the store seam](104-move-ref-probes-behind-store-seam.md)
+- [105 — Measure eager status result memory and decide its boundary](105-measure-eager-status-result-memory.md)

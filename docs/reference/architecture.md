@@ -207,17 +207,18 @@ through signatures. Work is bounded by construction:
 - caches and queues have fixed capacities;
 - a single-value or enumeration cap survives only when it names a real format,
   platform, memory, or structural failure;
-- caller-unbounded materialized results fail instead of truncating.
+- materialized results with explicit caps fail instead of truncating.
 
 A byte budget is legitimate only when it charges bytes an operation actually
-retains: the shell's intermediate pipeline buffers. Four Git operations — push
-planning, full status, rename detection, and selected-path staging — still charge a
-hand-computed estimate of a JavaScript object's footprint on top of a structural
-count cap that already bounds the same structure — except full status and
-`clean`, where the byte charge is currently the only bound on the tracked-path
-set. They are known exceptions tracked in [backlog 66](../backlog/66-retire-modeled-retained-byte-charges.md),
-and no new one may be added
-([ADR-0005](../decisions/0005-bound-real-failures-and-measure-cost.md)).
+retains, such as the shell's intermediate pipeline buffers. Status retains at
+most 30,000 tracked paths and 30,000 tracked directories; clean bounds its
+materialized path collections and requires untracked names to fit the 8 KiB
+stored-index path limit. `rm` scans at most 50,000 rows per source, retains at
+most 10,000 pathspecs and 10,000 derived directories, and measures the actual
+JSON payload of filesystem removal batches. None of these uses an estimated
+JavaScript object size ([ADR-0005](../decisions/0005-bound-real-failures-and-measure-cost.md)).
+Eager status still materializes its returned rows without a result count cap;
+that result is distinct from the bounded tracked-path snapshot.
 
 At most 1,000 SQL statements and less than 100 MiB of process-transient memory
 per representative operation are benchmark targets. A target miss is

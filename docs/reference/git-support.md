@@ -282,6 +282,14 @@ rows before untracked rows and ignored rows in eager `status()` and
 ordering inside each group. The staged deletion thus precedes the same path's
 untracked row; `statusStream()` remains path/window ordered.
 
+Full status retains at most 30,000 tracked paths and 30,000 tracked directory
+prefixes. Visible untracked worktree paths and reported HEAD paths above the
+8 KiB index-path limit fail with `E2BIG`; hidden untracked paths do not prevent
+ordinary status reporting.
+
+The eager `status()` result is an array and can contain more than 30,000 rows
+in `all` and `no` modes; the 30,000 limit applies to the internal snapshot.
+
 Native status, staging, checkout, and commit-tree snapshot fast paths come
 from one sparse capability that `createSqliteSparseCapability` builds over the
 Git store's SQLite `Database`; `createGit` refuses a capability built over any
@@ -297,6 +305,9 @@ request and retained index rows. Commit-tree
 snapshot instead shares one global 1,000-item counter across its materialized
 dirty, index, directory, and tree-entry results. Overflow makes the fast path
 unavailable and falls back without truncating caller-visible results.
+An unavailable tracker can reseal from a full status pass; its optional seed
+holds at most 50,000 paths. An oversized path or an excess seed entry disables
+resealing for that pass without changing the status result.
 
 ### `git add` — `add()`
 
@@ -337,6 +348,11 @@ index updates are atomic. Empty parent directories are pruned, but untracked
 contents are retained. Symlinks are removed without following their targets.
 The native client never removes index entries or working-tree paths beneath a
 registered nested repository root.
+
+`rm` accepts at most 10,000 pathspecs, each at most 8 KiB after normalization.
+Each HEAD, index and worktree stream is capped at 50,000 rows, and directory
+pruning retains at most 10,000 prefixes. Exceeding a cap fails with `E2BIG`
+before removal.
 
 ### `git reset` — `reset()`
 
@@ -382,6 +398,11 @@ content and tracked changes that would be overwritten still block the operation.
 | `-- <paths>` | `paths` | ✔ exact or directory prefix |
 | `-f` | — | ★ ~ implicit: without `dryRun`, `clean()` removes |
 | `-x`, `-X` | — | ✘ ignored files are always preserved |
+
+`clean` caps its retained index and worktree path collections at 30,000 entries
+and its directory collections at 30,000 entries. Visible paths considered for
+removal that exceed 8 KiB fail with `E2BIG` before removal, including in dry-run
+mode.
 
 ### `git diff` — `diff()`, `diffSummary()`
 

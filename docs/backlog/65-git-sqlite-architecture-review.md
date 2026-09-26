@@ -7,8 +7,7 @@ blocked-by: []
 # 65 - Resolve verified Git SQLite architecture review findings
 
 **Summary.** Resolve the verified open findings from the 2026-09-02
-Git-in-SQLite architecture review, ordered by correctness risk and cost-model
-impact.
+Git-in-SQLite architecture review as independent, small changes.
 
 ## Scope
 
@@ -23,7 +22,9 @@ contain only open work.
 ARCH-10 shipped with the 2026-09-10 sprint; ARCH-21 (the duplicate maintenance shallow table) and the unused pack membership digests were removed on 2026-09-24. ARCH-19 (the duplicate reflog-root
 scan) and the rebase no-op admission cap went with the 2026-09-23 simplification
 sprint. ARCH-47 is the [outbound delta compression idea](../ideas/outbound-delta-compression.md).
-ARCH-17 is owned by [66](66-retire-modeled-retained-byte-charges.md).
+The status/rm slice of ARCH-17 shipped in the
+[modeled-charge sprint](../archive/sprint-2026-09-26-retire-modeled-charges-and-twins.md);
+checkout's remaining charges are tracked in [97](97-audit-checkout-modeled-byte-charges.md).
 
 The 2026-09-24 backlog review dropped findings that would add machinery without
 a measured cost or a reproduced defect: ARCH-16 (durable sweep cursors), ARCH-18
@@ -44,24 +45,20 @@ suite. Preserve these distinctions when planning acceptance:
 
 | Existing finding | Qualified evidence and required witness |
 |---|---|
-| ARCH-27 | Public `updateRef` accepted a trailing unpaired high surrogate; stored text changed and original-name lookup failed. Runtime-reproduced caller-input validation defect, not failure with valid ref names. Fix the shared text boundary and test symbolic targets/config/reflog siblings as applicable. |
+| ARCH-27 | Public `updateRef` accepted a trailing unpaired high surrogate; stored text changed and original-name lookup failed. The input-changing fix and its witness are [96](96-validate-git-caller-utf8-at-boundaries.md). |
 
-## Layering and operation work
+## Independent follow-ups
 
-| IDs | Problem | Acceptance | Touch points |
-|---|---|---|---|
-| ARCH-24 / ARCH-25 | Most `*Owned` wrappers, identical twins, and WeakMap dispatch survive from the removed ownership system. | Every remaining owner abstraction has a concrete layering or behavior role; no pure forwarding twin remains. | `packages/git/src/ops/repository/repository.ts`, `packages/git/src/store/` |
-| ARCH-26 | `CheckoutStore` duplicates some synchronous shared-repository reads, while other wrappers enforce delayed lifetime and mutation behavior. | Simplify only redundant reads first; preserve checks at iterator start/batch flush and authorized internal mutation composition. | `packages/git/src/store/checkout/checkout.ts`, `packages/git/src/store/repository/shared.ts` |
-| ARCH-27 | Path, UTF-8, basename/depth, and OID helpers are duplicated across ops and already disagree on lone surrogates. | Shared path and byte kits become the single implementation while callers retain their error taxonomy. | `packages/git/src/common/paths.ts`, `packages/git/src/common/bytes.ts`, `packages/git/src/ops/` |
-| ARCH-29 | Status scans every tracked path for each ignored directory although tracked directory prefixes are already available. | Directory pruning uses constant-time tracked path/prefix lookup, including paths retained during the stream. | `packages/git/src/ops/status/status.ts` |
-
-## Lower-severity cleanup
-
-| IDs | Problem | Acceptance | Touch points |
-|---|---|---|---|
-| ARCH-34 | `store/operations/operations.ts` duplicates existing ref and path validators. | The reviewed equivalent implementations collapse to shared validators with no behavior change. | `packages/git/src/store/operations/operations.ts`, `packages/git/src/store/refs/ref-validation.ts`, `packages/git/src/common/` |
-| ARCH-36 | Direct-ref and checkout-HEAD reflog writers duplicate append and retention logic. | Shared infrastructure preserves separate ownership and FKs, including valid endpoint-equal HEAD entries. | `packages/git/src/store/refs/reflog.ts`, `packages/git/src/store/checkout/checkout.ts`, `packages/git/src/store/refs/refs.ts` |
-| ARCH-40 | Ref expansion and one ref probe issue raw `git_refs` SQL from ops. | Ref queries live behind the store ref seam; ops does not name store tables. | `packages/git/src/ops/repository/repository.ts`, `packages/git/src/ops/refs/refs.ts`, `packages/git/src/store/refs/refs.ts` |
+| Finding | Small change |
+|---|---|
+| ARCH-24/25 | [98 — Remove forwarding owner wrappers](98-remove-forwarding-owner-wrappers.md) |
+| ARCH-26 | [99 — Simplify redundant checkout store reads](99-simplify-checkout-store-reads.md) |
+| ARCH-27, equivalent helpers | [100 — Consolidate Git path and OID helpers](100-consolidate-equivalent-git-helpers.md) |
+| ARCH-27, input acceptance | [96 — Reject noncanonical UTF-16 in caller text](96-validate-git-caller-utf8-at-boundaries.md) |
+| ARCH-29 | [101 — Use tracked prefixes in status pruning](101-use-tracked-prefixes-in-status-pruning.md) |
+| ARCH-34 | [102 — Consolidate equivalent store validators](102-consolidate-equivalent-store-validators.md) |
+| ARCH-36 | [103 — Share reflog append plumbing](103-share-reflog-append-plumbing.md) |
+| ARCH-40 | [104 — Move ref probes behind the store seam](104-move-ref-probes-behind-store-seam.md) |
 
 ## Cross-cutting acceptance
 

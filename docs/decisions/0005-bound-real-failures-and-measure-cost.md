@@ -22,11 +22,9 @@ and repeatedly failed its own reviews with allocation-before-admission gaps. The
 actual protection against Durable Object OOM came from streaming discipline and
 fixed caps, not from the ledger.
 
-The statement ceiling was removed completely. The ledger was not: the
-cross-cutting coordinator and its reservation scopes went, but several
-operations kept a private budget, and five of those still charge hand-computed
-JavaScript object sizes. This decision therefore has to draw the line the
-original removal did not.
+The statement ceiling and several modeled retained-byte charges were removed.
+The rule below distinguishes a real payload ceiling from an estimated object
+footprint; checkout still has private charges to review.
 
 ## Decision
 
@@ -61,17 +59,15 @@ buffer leaves scope. It is a documented shell limit
 ([ADR-0018](0018-compile-shell-commands-to-bounded-queries.md),
 [ADR-0019](0019-admit-a-bounded-posix-shell-surface.md)).
 
-Two sites still charge modeled object sizes and are debt, not contract:
-`packages/git/src/ops/status/status-full.ts` and the `rm` planner in
-`packages/git/src/ops/staging/staging-rm*.ts`. The push, rename-detection and
-diff-summary charges sat on top of count caps that already bounded the same
-structures and were deleted. Status is different: `STATUS_RETAINED_BYTES` is
-currently the only bound on its tracked-path set, so retiring that charge means
-introducing a real cap rather than deleting one.
+Status retains at most 30,000 tracked paths and 30,000 tracked directories;
+`clean` caps its materialized collections and rejects a visible untracked path
+above the stored index's 8 KiB path limit. `rm` caps 10,000 pathspecs, 50,000 rows
+per stream and 10,000 derived directories. The filesystem removal binding
+still measures its actual JSON payload.
 
-Removing them is
-[backlog 66](../backlog/66-retire-modeled-retained-byte-charges.md); until then
-they are known exceptions, and no new one may be added.
+Checkout removal, prune and tracker-seed paths still include modeled object
+charges. They are debt, not exceptions to this rule; see
+[backlog 97](../backlog/97-audit-checkout-modeled-byte-charges.md).
 
 **Benchmarks own the evidence.** Representative operations have deterministic
 statement and row rows, and memory scenarios run under a leased cgroup that
@@ -104,9 +100,8 @@ semantic query shape.
 - **Keep the byte ledger everywhere.** Rejected: it is precision theater —
   hand-computed constants standing in for real allocation — with a high plumbing
   and review cost, and it never was the thing preventing OOM.
-- **Declare the five survivors compliant.** Rejected: that would bless a charge
-  nobody can verify, layered on a count cap that already bounds the same
-  structure. Recording them as debt keeps the rule sharp and the record honest.
+- **Declare the modeled charges compliant.** Rejected: their object-footprint
+  estimates cannot be verified and do not provide a reliable memory bound.
 - **Remove every limit.** Rejected: structural caps on binding sizes, wire
   formats, queues, caches, and unbounded enumerations prevent real failures and
   cost nothing to keep.

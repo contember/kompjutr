@@ -40,7 +40,7 @@ None.
 - The ignored-untracked overwrite parity gap is fixed for checkout, merge,
   cherry-pick, and rebase, including directory-to-file replacements.
 - The 2026-09-24 backlog review deleted items that would re-add excess machinery
-  (17, 75, 76, 77, 78, 81, 87, 90, 96, 97) and moved no-caller parity features
+  and moved no-caller parity features
   to [`ideas/`](ideas/README.md).
 - [Production correctness and memory](archive/sprint-2026-09-10-production-correctness-and-memory.md)
   shipped: cold-readable pack admission, hidden provisional projections, bounded
@@ -69,8 +69,14 @@ None.
   complete: storage/publication safety, Git result and scale correctness, then
   transaction-owned local mutations with trusted ordinary reads. Remaining
   verified work is in
-  [`backlog/65`](backlog/65-git-sqlite-architecture-review.md); unverified
+  [`backlog/65`](backlog/65-git-sqlite-architecture-review.md), split into small
+  follow-ups. The input-changing UTF-8 fix is
+  [`backlog/96`](backlog/96-validate-git-caller-utf8-at-boundaries.md); unverified
   claims remain in [`ideas`](ideas/git-sqlite-architecture-review-triage.md).
+- Checkout's remaining modeled retained-byte charges are tracked in
+  [`backlog/97`](backlog/97-audit-checkout-modeled-byte-charges.md).
+- Eager status result memory needs a separate measurement and boundary decision
+  in [`backlog/105`](backlog/105-measure-eager-status-result-memory.md).
 - The completed everyday Git shell sprint made command execution asynchronous,
   added staged diff and history reads, exposed exact local/network operations,
   and composed pull with the restart-safe rebase lifecycle.
