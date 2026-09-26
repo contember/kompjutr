@@ -6,12 +6,12 @@
 export { clean } from "./status-clean.js";
 export { eagerStatus, status, statusBranch, statusReport, statusStream } from "./status-core.js";
 export { formatPorcelainV1, formatPorcelainV2, formatShort } from "./status-format.js";
-export { statusIndexRetainedBytes } from "./status-full.js";
 export { statusMatrix } from "./status-matrix.js";
 export type { StatusDetail, StatusOptions } from "./status-rows.js";
 export {
   type CleanOptions,
-  STATUS_RETAINED_BYTES,
+  STATUS_MAX_DIRECTORIES,
+  STATUS_MAX_PATHS,
   type StatusBranch,
   type StatusReport,
   type StatusReportOptions,

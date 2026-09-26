@@ -19,6 +19,7 @@ import {
   statusStream,
 } from "../packages/git/src/ops/status/status.js";
 import { sparseStatus } from "../packages/git/src/ops/status/status-sparse.js";
+import { FullStatusTrackerSeed } from "../packages/git/src/ops/status/status-sparse-tracker.js";
 import { hashWorktreePath, indexEntryFor } from "../packages/git/src/ops/worktree/worktree-io.js";
 import type { SparseWorkspaceSource } from "../packages/git/src/store/core/contracts.js";
 import type { IndexEntry } from "../packages/git/src/store/index.js";
@@ -840,6 +841,32 @@ describe("sparse eager status", () => {
     expect(recorded.reseals).toEqual([
       expect.objectContaining({ entries: [{ path, flags: WORKTREE_DIRTY }] }),
     ]);
+  });
+
+  it("returns hidden oversized untracked paths without retaining an invalid tracker seed", () => {
+    const workspace = makeRepo("/");
+    const directory = Array.from(
+      { length: 85 },
+      (_, index) => `d${index.toString().padStart(2, "0")}${"x".repeat(95)}`,
+    ).join("/");
+    workspace.worktree.writeFiles([{ path: `/${directory}/file`, bytes: new Uint8Array([1]) }]);
+    const recorded = recordingContext(workspace);
+
+    expect(
+      eagerStatus(workspace.repo, workspace.worktree, { untrackedFiles: "no" }, recorded.context),
+    ).toEqual([]);
+    expect(recorded.reseals).toEqual([]);
+  });
+
+  it("disables the optional tracker seed when untracked paths exceed its count cap", () => {
+    const seed = new FullStatusTrackerSeed();
+    for (let index = 0; index <= 50_000; index++) {
+      seed.observeUntracked(`f${index.toString().padStart(5, "0")}`);
+    }
+    seed.finish();
+
+    expect(seed.resealable).toBe(false);
+    expect([...seed.entries()]).toEqual([]);
   });
 
   it("uses the tree diff when HEAD changes after the tracker baseline", () => {

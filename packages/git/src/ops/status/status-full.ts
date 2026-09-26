@@ -1,8 +1,9 @@
+import { utf8 } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { isExcluded, relativeTo } from "../../common/paths.js";
 import { joinSorted, joinSorted3 } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
-import type { IndexEntry } from "../../store/index.js";
+import { MAX_INDEX_PATH_BYTES } from "../../store/schema/schema.js";
 import { matchesPaths } from "../checkout/checkout.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
@@ -32,19 +33,11 @@ import {
   untrackedRow,
 } from "./status-rows.js";
 import type { FullStatusTrackerSeed } from "./status-sparse-tracker.js";
-import {
-  DIRECTORY_FIXED_BYTES,
-  STATUS_RETAINED_BYTES,
-  STATUS_WINDOW_ROWS,
-  statusStringBytes,
-} from "./status-types.js";
-
-const SET_ENTRY_BYTES = 48;
+import { STATUS_MAX_DIRECTORIES, STATUS_MAX_PATHS, STATUS_WINDOW_ROWS } from "./status-types.js";
 
 interface StatusIndexSnapshot {
   trackedDirs: Set<string>;
   trackedPaths: Set<string>;
-  budget: RetainedStatusBudget;
   retainsTrackedPaths: boolean;
 }
 
@@ -52,19 +45,6 @@ export interface FullStatusPrepass {
   snapshot: StatusIndexSnapshot;
   excluded: ExcludedRoot[];
   renames: ExactRenameClassification | undefined;
-}
-
-class RetainedStatusBudget {
-  #bytes = 0;
-
-  constructor(private readonly limit: number) {}
-
-  add(bytes: number): void {
-    if (bytes > this.limit - this.#bytes) {
-      throw new GitError("E2BIG", `status retained state exceeds ${this.limit} bytes`);
-    }
-    this.#bytes += bytes;
-  }
 }
 
 export function fullStatusPrepass(
@@ -175,6 +155,7 @@ export function* statusStreamInternal(
     const ignored = ignores.ignores(candidate, false);
     if (isExcluded(candidate, excludedPaths) || (options.includeIgnored !== true && ignored))
       return;
+    requireStatusWorktreePath(candidate);
 
     let path = candidate;
     if (collapse) {
@@ -331,10 +312,9 @@ function snapshotStatusIndex(
 }
 
 function emptyStatusIndexSnapshot(retainsTrackedPaths: boolean): StatusIndexSnapshot {
-  const budget = new RetainedStatusBudget(STATUS_RETAINED_BYTES);
   const trackedDirs = new Set<string>();
   const trackedPaths = new Set<string>();
-  return { trackedDirs, trackedPaths, budget, retainsTrackedPaths };
+  return { trackedDirs, trackedPaths, retainsTrackedPaths };
 }
 
 function retainStatusIndexPath(
@@ -343,39 +323,32 @@ function retainStatusIndexPath(
   includeDirectories: boolean,
 ): void {
   if (snapshot.retainsTrackedPaths && !snapshot.trackedPaths.has(path)) {
-    snapshot.budget.add(trackedPathRetainedBytes(path));
+    requireStatusCapacity(snapshot.trackedPaths.size, STATUS_MAX_PATHS, "tracked paths");
     snapshot.trackedPaths.add(path);
   }
   if (!includeDirectories) return;
   for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
     const directory = path.slice(0, slash);
     if (snapshot.trackedDirs.has(directory)) continue;
-    snapshot.budget.add(DIRECTORY_FIXED_BYTES + statusStringBytes(directory));
+    requireStatusCapacity(snapshot.trackedDirs.size, STATUS_MAX_DIRECTORIES, "tracked directories");
     snapshot.trackedDirs.add(directory);
   }
 }
 
 function retainTrackedPath(snapshot: StatusIndexSnapshot, path: string): void {
   if (snapshot.trackedPaths.has(path)) return;
-  snapshot.budget.add(SET_ENTRY_BYTES + statusStringBytes(path));
+  requireStatusCapacity(snapshot.trackedPaths.size, STATUS_MAX_PATHS, "tracked paths");
   snapshot.trackedPaths.add(path);
 }
 
-/** @internal Charge when one path and all its directory prefixes are new. */
-export function statusIndexRetainedBytes(entry: IndexEntry): number {
-  let bytes = trackedPathRetainedBytes(entry.path);
-  for (
-    let slash = entry.path.indexOf("/");
-    slash !== -1;
-    slash = entry.path.indexOf("/", slash + 1)
-  ) {
-    bytes += DIRECTORY_FIXED_BYTES + statusStringBytes(entry.path.slice(0, slash));
-  }
-  return bytes;
+export function requireStatusCapacity(size: number, limit: number, label: string): void {
+  if (size >= limit) throw new GitError("E2BIG", `${label} exceed ${limit} entries`);
 }
 
-function trackedPathRetainedBytes(path: string): number {
-  return SET_ENTRY_BYTES + statusStringBytes(path);
+export function requireStatusWorktreePath(path: string): void {
+  if (path.length > MAX_INDEX_PATH_BYTES || utf8.encode(path).length > MAX_INDEX_PATH_BYTES) {
+    throw new GitError("E2BIG", `worktree path exceeds ${MAX_INDEX_PATH_BYTES} UTF-8 bytes`);
+  }
 }
 
 function shallowestUntrackedDirectory(file: string, tracked: Set<string>): string | null {

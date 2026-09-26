@@ -12,11 +12,14 @@ import type { StatusOptions } from "./status-rows.js";
 import { statusIndexGroups } from "./status-rows.js";
 
 /** O(tracked). Only `statusMatrix`, which is not on the client surface, still needs it. */
-export function stagedIndex(repo: Repository): Map<string, IndexEntry> {
+export function stagedIndex(repo: Repository, maxPaths?: number): Map<string, IndexEntry> {
   const index = new Map<string, IndexEntry>();
   for (const group of statusIndexGroups(repo.checkout.indexScan())) {
     if (group.kind === "unmerged") {
       throw new GitError("EUNMERGED", `status matrix cannot represent conflict at ${group.path}`);
+    }
+    if (maxPaths !== undefined && !index.has(group.path) && index.size >= maxPaths) {
+      throw new GitError("E2BIG", `clean index exceeds ${maxPaths} paths`);
     }
     index.set(group.path, group.entry);
   }

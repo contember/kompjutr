@@ -8,14 +8,14 @@ import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { walkWorktree } from "../worktree/worktree-io.js";
 import { statusStream } from "./status-core.js";
+import { requireStatusCapacity, requireStatusWorktreePath } from "./status-full.js";
 import { stagedIndex } from "./status-matrix.js";
 import type { StatusOptions } from "./status-rows.js";
 import {
   type CleanOptions,
-  DIRECTORY_FIXED_BYTES,
-  STATUS_RETAINED_BYTES,
+  STATUS_MAX_DIRECTORIES,
+  STATUS_MAX_PATHS,
   STATUS_WINDOW_ROWS,
-  statusStringBytes,
 } from "./status-types.js";
 
 /**
@@ -27,7 +27,7 @@ import {
  * what `git clean -d` does.
  */
 export function clean(repo: Repository, worktree: Worktree, options: CleanOptions = {}): string[] {
-  const index = stagedIndex(repo);
+  const index = stagedIndex(repo, STATUS_MAX_PATHS);
   const ignores =
     options.ignores ??
     loadIgnoreMatcher(worktree, repo.root, { excludeRoots: options.excludeRoots });
@@ -63,7 +63,10 @@ export function clean(repo: Repository, worktree: Worktree, options: CleanOption
 function untrackedEntries(repo: Repository, worktree: Worktree, options: StatusOptions): string[] {
   const out: string[] = [];
   for (const row of statusStream(repo, worktree, options)) {
-    if (row.worktree === "?") out.push(row.path);
+    if (row.worktree === "?") {
+      requireStatusCapacity(out.length, STATUS_MAX_PATHS, "clean untracked paths");
+      out.push(row.path);
+    }
   }
   return out.sort(comparePaths);
 }
@@ -105,13 +108,18 @@ function snapshotCleanWorktree(
   const directories: string[] = [];
   const excludedPaths = relativeExcludeRoots(repo.root, options.excludeRoots);
   const protectedDirectories = [...excludedPaths];
-  let retainedBytes = 0;
+  let retainedPaths = 0;
   const retain = (path: string): void => {
-    retainedBytes += DIRECTORY_FIXED_BYTES + statusStringBytes(path);
-    if (retainedBytes > STATUS_RETAINED_BYTES) {
-      throw new GitError("E2BIG", `clean retained state exceeds ${STATUS_RETAINED_BYTES} bytes`);
-    }
+    requireStatusWorktreePath(path);
+    requireStatusCapacity(retainedPaths, STATUS_MAX_PATHS, "clean snapshot paths");
+    retainedPaths++;
   };
+  if (protectedDirectories.length > STATUS_MAX_DIRECTORIES) {
+    throw new GitError(
+      "E2BIG",
+      `clean protected directories exceed ${STATUS_MAX_DIRECTORIES} entries`,
+    );
+  }
   for (const path of protectedDirectories) retain(path);
 
   const root = worktree.realpath(repo.root);
@@ -128,6 +136,11 @@ function snapshotCleanWorktree(
       if (entry.type === "dir") {
         if (ignoredRoot !== null) continue;
         if (ignores.ignores(path, true)) {
+          requireStatusCapacity(
+            protectedDirectories.length,
+            STATUS_MAX_DIRECTORIES,
+            "clean protected directories",
+          );
           retain(path);
           ignored.push(path);
           protectedDirectories.push(path);
@@ -135,6 +148,7 @@ function snapshotCleanWorktree(
           continue;
         }
         if (!matchesPaths(path, options.paths)) continue;
+        requireStatusCapacity(directories.length, STATUS_MAX_DIRECTORIES, "clean directories");
         retain(path);
         directories.push(path);
         continue;
@@ -154,22 +168,23 @@ function snapshotCleanWorktree(
 /** Include empty directories that status cannot report because Git tracks no directories. */
 function cleanableDirectories(directories: string[], protectedPaths: string[]): string[] {
   const protectedDirectories = new Set<string>();
-  let retainedBytes = 0;
   const protect = (path: string): void => {
     for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
       const directory = path.slice(0, slash);
       if (protectedDirectories.has(directory)) continue;
-      retainedBytes += DIRECTORY_FIXED_BYTES + statusStringBytes(directory);
-      if (retainedBytes > STATUS_RETAINED_BYTES) {
-        throw new GitError("E2BIG", `clean retained state exceeds ${STATUS_RETAINED_BYTES} bytes`);
-      }
+      requireStatusCapacity(
+        protectedDirectories.size,
+        STATUS_MAX_DIRECTORIES,
+        "clean protected directories",
+      );
       protectedDirectories.add(directory);
     }
     if (!protectedDirectories.has(path)) {
-      retainedBytes += DIRECTORY_FIXED_BYTES + statusStringBytes(path);
-      if (retainedBytes > STATUS_RETAINED_BYTES) {
-        throw new GitError("E2BIG", `clean retained state exceeds ${STATUS_RETAINED_BYTES} bytes`);
-      }
+      requireStatusCapacity(
+        protectedDirectories.size,
+        STATUS_MAX_DIRECTORIES,
+        "clean protected directories",
+      );
       protectedDirectories.add(path);
     }
   };
@@ -185,6 +200,7 @@ function minimalCleanEntries(entries: string[]): string[] {
     if (directory !== null && entry.startsWith(directory)) continue;
     const previous = out[out.length - 1];
     if (entry === previous) continue;
+    requireStatusCapacity(out.length, STATUS_MAX_PATHS, "clean results");
     out.push(entry);
     directory = entry.endsWith("/") ? entry : null;
   }

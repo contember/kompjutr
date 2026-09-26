@@ -1,4 +1,6 @@
+import { utf8 } from "../../common/bytes.js";
 import type { IndexEntry } from "../../store/index.js";
+import { MAX_INDEX_PATH_BYTES } from "../../store/schema/schema.js";
 import type { SparseTrackerSeedEntry } from "../../store/sparse/capability.js";
 import type { TargetEntry } from "../checkout/checkout.js";
 import type { WorktreePath } from "../worktree/worktree-io.js";
@@ -6,6 +8,7 @@ import { type BufferedStatusRow, octalMode } from "./status-rows.js";
 
 const SPARSE_INDEX_DIRTY = 1;
 const SPARSE_WORKTREE_DIRTY = 2;
+const MAX_TRACKER_SEED_PATHS = 50_000;
 
 /** Bounded dirty-leaf snapshot collected only by the eager repair pass. */
 export class FullStatusTrackerSeed {
@@ -72,7 +75,12 @@ export class FullStatusTrackerSeed {
       this.#entries.set(path, previous | flags);
       return;
     }
-    if (!trackerPathRepresentable(path)) {
+    if (
+      this.#entries.size >= MAX_TRACKER_SEED_PATHS ||
+      !trackerPathRepresentable(path) ||
+      path.length > MAX_INDEX_PATH_BYTES ||
+      utf8.encode(path).length > MAX_INDEX_PATH_BYTES
+    ) {
       this.#disable();
       return;
     }

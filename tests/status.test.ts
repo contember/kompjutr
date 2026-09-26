@@ -10,10 +10,9 @@ import {
   formatPorcelainV1,
   formatPorcelainV2,
   formatShort,
-  STATUS_RETAINED_BYTES,
+  STATUS_MAX_PATHS,
   type StatusOptions,
   status,
-  statusIndexRetainedBytes,
   statusMatrix,
   statusReport,
   statusStream,
@@ -1070,12 +1069,7 @@ describe("status cost", () => {
     const worktree = new BulkOnlyWorktree(workspace.worktree);
     workspace.storage.histogram = new Map();
     // The former full-row snapshot rejects this exact index before the merge.
-    const materializedIndexBytes = entries.reduce(
-      (bytes, entry) =>
-        bytes + 256 + (48 + entry.path.length * 2) + (48 + entry.oid.length * 2) + 48,
-      0,
-    );
-    expect(materializedIndexBytes).toBeGreaterThan(STATUS_RETAINED_BYTES);
+    expect(entries.length).toBeLessThan(STATUS_MAX_PATHS);
 
     workspace.storage.resetCounters();
     expect(status(workspace.repo, worktree)).toEqual([]);
@@ -1233,11 +1227,10 @@ describe("status cost", () => {
     expect(included.pages).toBe(3);
   });
 
-  it("fails before one retained tracked path and directory crosses the memory cap", () => {
+  it("bounds the retained tracked-path set before inserting the first excess path", () => {
     const workspace = makeRepo("/");
-    const suffix = "x".repeat(2_030);
     const entry = (index: number): IndexEntry => ({
-      path: `${index.toString().padStart(7, "0")}${suffix}/f`,
+      path: `d/f${index.toString().padStart(5, "0")}`,
       stage: 0,
       mode: 0o100644,
       oid: "ab".repeat(20),
@@ -1245,14 +1238,13 @@ describe("status cost", () => {
       mtime: null,
       ino: null,
     });
-    const retainedPerEntry = statusIndexRetainedBytes(entry(0));
-    const accepted = Math.floor(STATUS_RETAINED_BYTES / retainedPerEntry);
     workspace.repo.checkout.indexReplace(
-      Array.from({ length: accepted }, (_, index) => entry(index)),
+      Array.from({ length: STATUS_MAX_PATHS }, (_, index) => entry(index)),
     );
-
-    expect(status(workspace.repo, workspace.worktree)).toHaveLength(accepted);
-    workspace.repo.checkout.indexPut(entry(accepted));
+    expect(status(workspace.repo, workspace.worktree, { untrackedFiles: "no" })).toHaveLength(
+      STATUS_MAX_PATHS,
+    );
+    workspace.repo.checkout.indexPut(entry(STATUS_MAX_PATHS));
     expect(() => status(workspace.repo, workspace.worktree)).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
@@ -1260,6 +1252,46 @@ describe("status cost", () => {
 });
 
 describe("clean", () => {
+  it("bounds paths in a collapsed directory before removing any of them", () => {
+    const workspace = makeRepo("/");
+    const bytes = utf8.encode("contents\n");
+    const paths = Array.from(
+      { length: STATUS_MAX_PATHS + 1 },
+      (_, index) => `/untracked/f${index.toString().padStart(5, "0")}`,
+    );
+    workspace.worktree.writeFiles(paths.map((path) => ({ path, bytes })));
+
+    expect(status(workspace.repo, workspace.worktree).map((row) => row.path)).toEqual([
+      "untracked/",
+    ]);
+    for (const dryRun of [true, false]) {
+      expect(() =>
+        clean(workspace.repo, workspace.worktree, { directories: true, dryRun }),
+      ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+    }
+    expect(workspace.worktree.stat(paths[0] ?? "")).not.toBeNull();
+    expect(workspace.worktree.stat(paths[paths.length - 1] ?? "")).not.toBeNull();
+  });
+
+  it("rejects an untracked worktree path beyond the index path limit", () => {
+    const workspace = makeRepo("/");
+    const directory = Array.from(
+      { length: 85 },
+      (_, index) => `d${index.toString().padStart(2, "0")}${"x".repeat(95)}`,
+    ).join("/");
+    const path = `/${directory}/file`;
+    workspace.worktree.writeFiles([{ path, bytes: utf8.encode("x") }]);
+
+    expect(() => status(workspace.repo, workspace.worktree)).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(status(workspace.repo, workspace.worktree, { untrackedFiles: "no" })).toEqual([]);
+    expect(() => clean(workspace.repo, workspace.worktree, { directories: true })).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(workspace.worktree.stat(path)).not.toBeNull();
+  });
+
   /** The paths `git clean` says it would remove, in git's own order. */
   function wouldRemove(fixture: GitFixture, ...flags: string[]): string[] {
     const stdout = fixture.gitBinary("clean", "-n", ...flags).toString("utf8");

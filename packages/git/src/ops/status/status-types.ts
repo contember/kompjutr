@@ -31,11 +31,6 @@ export interface CleanOptions {
   dryRun?: boolean;
 }
 
-/** Retained index, directory and tracked-path state for one status call. */
-export const STATUS_RETAINED_BYTES = 16 * 1024 * 1024;
+export const STATUS_MAX_PATHS = 30_000;
+export const STATUS_MAX_DIRECTORIES = 30_000;
 export const STATUS_WINDOW_ROWS = 1000;
-export const DIRECTORY_FIXED_BYTES = 96;
-
-export function statusStringBytes(value: string): number {
-  return 48 + value.length * 2;
-}
