@@ -5,14 +5,6 @@ import { expectText } from "../../common/rows.js";
 import { jsonPages } from "../core/json-pages.js";
 import { bumpMaintenanceRootEpoch } from "../maintenance/control.js";
 
-export interface ShallowTableOwner {
-  readShallowOwned(): Set<string>;
-}
-
-export function readShallowOwned(store: ShallowTableOwner): Set<string> {
-  return store.readShallowOwned();
-}
-
 function requireShallowGeneration(value: unknown, label: string, minimum: number): number {
   if (
     typeof value !== "number" ||

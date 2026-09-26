@@ -25,7 +25,6 @@ describe("sqlite store module exports", () => {
       "TrackingRefPublicationToken",
       "WALK_TREE_SQL",
       "ancestors",
-      "configGetOwned",
       "contentIdKey",
       "indexScanOwned",
       "listCheckoutsOwned",
@@ -33,7 +32,6 @@ describe("sqlite store module exports", () => {
       "readAuthenticatedObjectOwned",
       "readOperationStateOwned",
       "readRebaseCursorOwned",
-      "readShallowOwned",
       "withIntegrationWorkspaceOwned",
     ]);
     expect(store.CheckoutStore).toBe(CheckoutStore);

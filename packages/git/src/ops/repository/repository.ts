@@ -30,7 +30,6 @@ import type {
   WalkTreeDiffEntry,
   WalkTreeDiffObject,
 } from "../../store/index.js";
-import { readShallowOwned } from "../../store/index.js";
 import { sharedRepoStoreMutations } from "../../store/repository/shared.js";
 import type { CommitGraphLimits } from "../../store/trees/commits.js";
 import {
@@ -162,7 +161,7 @@ export class Repository {
 
   /** Commits whose parents this repository deliberately does not have. */
   shallow(): Set<string> {
-    return readShallowOwned(this.store);
+    return this.store.readShallowOwned();
   }
 
   invalidateShallow(): void {

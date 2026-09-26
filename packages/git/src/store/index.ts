@@ -61,10 +61,8 @@ export {
 export { PACK_BLOB_BATCH_TARGET_BYTES } from "./pack/packs.js";
 export {
   CONFIG_SECTION_MOVE_UPDATE_SQL,
-  configGetOwned,
   MAX_CONFIG_SECTION_MOVE_ROWS,
 } from "./refs/config.js";
-export { readShallowOwned } from "./refs/shallow.js";
 export { SharedRepoStore } from "./repository/shared.js";
 export { MAX_LOG_COMMITS } from "./trees/commits.js";
 export type { WalkTreeDiffEntry, WalkTreeDiffObject, WalkTreeEntry } from "./trees/tree-walk.js";

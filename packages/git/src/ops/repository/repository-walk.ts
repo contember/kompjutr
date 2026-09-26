@@ -1,7 +1,6 @@
 import { CorruptError, GitError, ObjectNotFoundError } from "../../common/errors.js";
 import { type Commit, parseCommit } from "../../common/objects.js";
 import type { SharedRepoStore } from "../../store/index.js";
-import { readShallowOwned } from "../../store/index.js";
 import {
   type CommitCacheEntry,
   type CommitGraphLimits,
@@ -189,7 +188,7 @@ export function* walkPrunedOwned(
   };
 
   push(repo.peel(oid));
-  const boundary = readShallowOwned(repo.store);
+  const boundary = repo.store.readShallowOwned();
   while (queue.size > 0) {
     const next = queue.pop();
     if (next === undefined) throw new CorruptError("commit graph heap lost its next row");
@@ -213,7 +212,7 @@ export function* walkIndexedOwned(
   limits: CommitGraphLimits = {},
 ): Generator<{ oid: string; commit: Commit }> {
   const root = repo.peel(oid);
-  const boundary = readShallowOwned(repo.store);
+  const boundary = repo.store.readShallowOwned();
   const entries = new Map<string, CommitCacheEntry>();
   const maxCommits = Math.min(limits.maxCommits ?? MAX_LOG_COMMITS, MAX_LOG_COMMITS);
   try {

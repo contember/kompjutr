@@ -21,16 +21,7 @@ export interface ConfigSectionCandidateMetadata {
   readonly seq: number;
 }
 
-export interface ConfigTableOwner {
-  configGetOwned(path: string): string | undefined;
-}
-
 const CONFIG_SECTION_ROW = new RowShape({ path: text(), seq: int(0) });
-
-/** Internal last-value config read through the shared repository seam. */
-export function configGetOwned(store: ConfigTableOwner, path: string): string | undefined {
-  return store.configGetOwned(path);
-}
 
 export class ConfigTable {
   constructor(

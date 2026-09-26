@@ -2,6 +2,7 @@
 
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
+import { expectText } from "../../common/rows.js";
 
 export const MAX_MERGE_PATH_BYTES = 2_200;
 
@@ -110,8 +111,7 @@ export function validateMergePath(path: string, label: string): number {
 }
 
 export function requireMergeText(value: unknown, label: string): string {
-  if (typeof value !== "string") throw new CorruptError(`merge ${label} is not text`);
-  return value;
+  return expectText(value, `merge ${label}`);
 }
 
 export function requireMergeOid(value: unknown, label: string): string {

@@ -3,7 +3,6 @@
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import type { Commit } from "../../common/objects.js";
-import { readShallowOwned } from "../../store/index.js";
 import { MAX_LOG_COMMITS } from "../../store/trees/commits.js";
 import { type Repository, walkIndexedOwned } from "../repository/repository.js";
 
@@ -224,7 +223,7 @@ function reachableGraphOwned(repo: Repository, input: MergeBaseInput): GraphStat
   }
   const state: GraphState = {
     nodes: new Map(),
-    shallow: readShallowOwned(repo.store),
+    shallow: repo.store.readShallowOwned(),
   };
   addReachable(repo, input.currentOid, CURRENT, limits, state);
   addReachable(repo, input.incomingOid, INCOMING, limits, state);
