@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import type { OrderedScanOptions, RealPath, ScanEntry } from "../packages/do/src/fs/types.js";
 import { fromHex, utf8 } from "../packages/git/src/common/bytes.js";
+import { serializeCommit, serializeTree } from "../packages/git/src/common/objects.js";
 import { comparePaths } from "../packages/git/src/common/streams.js";
 import type { IgnoreMatcher } from "../packages/git/src/ignore/index.js";
 import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
@@ -1248,6 +1249,49 @@ describe("status cost", () => {
     expect(() => status(workspace.repo, workspace.worktree)).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
+  });
+
+  it("rejects a HEAD path longer than the index can retain", () => {
+    const workspace = makeRepo("/");
+    let oid = workspace.repo.store.write("blob", utf8.encode("x"));
+    for (let depth = 84; depth >= 0; depth--) {
+      oid = workspace.repo.store.write(
+        "tree",
+        serializeTree([
+          {
+            mode: depth === 84 ? "100644" : "40000",
+            name: `d${depth.toString().padStart(2, "0")}${"x".repeat(95)}`,
+            oid,
+          },
+        ]),
+      );
+    }
+    const person = {
+      name: "Fixture",
+      email: "fixture@example.com",
+      timestamp: 1_577_836_800,
+      timezoneOffset: 0,
+    };
+    const commitOid = workspace.repo.store.write(
+      "commit",
+      serializeCommit({
+        tree: oid,
+        parent: [],
+        author: person,
+        committer: person,
+        message: "long\n",
+      }),
+    );
+    workspace.repo.checkout.setHead(commitOid);
+
+    const modes: StatusOptions["untrackedFiles"][] = ["normal", "all", "no"];
+    for (const untrackedFiles of modes) {
+      for (const renames of [false, true]) {
+        expect(() =>
+          status(workspace.repo, workspace.worktree, { untrackedFiles, renames }),
+        ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+      }
+    }
   });
 });
 

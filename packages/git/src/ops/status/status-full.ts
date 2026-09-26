@@ -82,6 +82,7 @@ export function fullStatusPrepass(
     const index = row.right?.entry;
     let retained = true;
     if (head !== undefined && index === undefined && isRenameMode(head.mode)) {
+      requireStatusWorktreePath(row.path);
       retained = classifier.addSource({ path: row.path, mode: head.mode, oid: head.oid });
     } else if (head === undefined && index !== undefined && index.mode !== 0o160000) {
       retained = classifier.addDestination({
@@ -194,6 +195,7 @@ export function* statusStreamInternal(
       if (snapshot.retainsTrackedPaths) retainTrackedPath(snapshot, row.path);
       const matches = matchesPaths(row.path, options.paths);
       if (matches || seed !== undefined) {
+        if (matches && row.a !== undefined) requireStatusWorktreePath(row.path);
         const detail: BufferedStatusRow | null =
           row.b?.kind === "unmerged"
             ? { kind: "ready", detail: unmergedRow(row.b, row.c) }
@@ -337,6 +339,7 @@ function retainStatusIndexPath(
 
 function retainTrackedPath(snapshot: StatusIndexSnapshot, path: string): void {
   if (snapshot.trackedPaths.has(path)) return;
+  requireStatusWorktreePath(path);
   requireStatusCapacity(snapshot.trackedPaths.size, STATUS_MAX_PATHS, "tracked paths");
   snapshot.trackedPaths.add(path);
 }
