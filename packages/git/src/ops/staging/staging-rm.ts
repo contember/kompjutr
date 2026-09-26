@@ -1,30 +1,26 @@
+import { utf8 } from "../../common/bytes.js";
 import { GitError, PathspecNotFoundError } from "../../common/errors.js";
 import { isExcluded, relativeExcludeRoots } from "../../common/paths.js";
 import { joinSorted3 } from "../../common/streams.js";
 import { applyIndexOwned } from "../../store/checkout/checkout.js";
 import { type IndexEntry, indexScanOwned } from "../../store/index.js";
+import { MAX_INDEX_PATH_BYTES } from "../../store/schema/schema.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
-import { structuralStringBytes } from "./staging-add-stage.js";
 import {
   absoluteRmPaths,
   boundedRmRows,
   identifyRmWorktree,
   physicalRmPaths,
   planRmDirectoryPrune,
-  RM_ARRAY_ENTRY_BYTES,
   type RmCandidate,
   removeRmWorktreePaths,
-  requireRmRetained,
 } from "./staging-rm-worktree.js";
 
 const RM_MAX_PATHSPECS = 10_000;
-const RM_CANDIDATE_FIXED_BYTES = 320;
-const RM_SPEC_FIXED_BYTES = 192;
-const RM_EXECUTION_HEADROOM_BYTES = 4 * 1024 * 1024;
 
 export interface RmOptions {
   /** Repo-relative pathspecs. Empty is a no-op. */
@@ -68,43 +64,10 @@ export function rm(repo: Repository, worktree: Worktree, options: RmOptions): vo
   const force = options.force === true;
   const recursive = options.recursive === true;
   const excluded = relativeExcludeRoots(repo.root, options.excludeRoots);
-  const candidates: RmCandidate[] = [];
-  const removed = new Set<string>();
-  let retained = normalized.retained;
-
-  for (const row of joinSorted3(
-    boundedRmRows(treeStream(repo, repo.headTree()), "HEAD"),
-    rmIndexPaths(repo, normalized.index, excluded),
-    boundedRmRows(
-      walkWorktreeEntriesStream(worktree, repo.root, {
-        excludeRoots: options.excludeRoots,
-        includeIgnored: true,
-        includeDirectories: true,
-      }),
-      "worktree",
-    ),
-    { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
-  )) {
+  for (const row of rmRows(repo, worktree, normalized.index, excluded, options.excludeRoots)) {
     const selected = row.b;
     if (selected === undefined) continue;
     noteRmMatches(normalized.index, selected.path, row.c?.stat.type === "dir");
-    retained +=
-      RM_CANDIDATE_FIXED_BYTES +
-      structuralStringBytes(selected.path) +
-      structuralStringBytes(selected.entry?.oid ?? "") +
-      structuralStringBytes(row.a?.oid ?? "") +
-      structuralStringBytes(row.c?.stat.target ?? "") +
-      (row.c?.stat.contentId?.byteLength ?? 0);
-    requireRmRetained(retained);
-    removed.add(selected.path);
-    candidates.push({
-      path: selected.path,
-      head: row.a,
-      index: selected.entry,
-      worktree: row.c,
-      conflicted: selected.conflicted,
-      worktreeMatchesIndex: false,
-    });
   }
 
   // Git resolves structural and unmatched errors in caller pathspec order.
@@ -118,15 +81,82 @@ export function rm(repo: Repository, worktree: Worktree, options: RmOptions): vo
     if (!spec.matched) throw new PathspecNotFoundError(displayRmSpec(spec));
     if (!recursive && spec.directoryMatch) throw rmDirectoryError(spec);
   }
-  if (candidates.length === 0) return;
-
   if (!force) {
-    identifyRmWorktree(repo, worktree, candidates);
-    for (const candidate of candidates) {
+    preflightRmSafety(repo, worktree, normalized.index, excluded, options.excludeRoots, cached);
+  }
+
+  const selectedPaths = (): Generator<string> => rmSelectedPaths(repo, normalized.index, excluded);
+  const pruned = cached
+    ? []
+    : planRmDirectoryPrune(repo, worktree, selectedPaths, options.excludeRoots);
+
+  if (!cached) requireSharedMutationScope(repo.store.db, worktree);
+
+  repo.store.db.transactionSync(() => {
+    if (!cached) {
+      removeRmWorktreePaths(
+        worktree,
+        physicalRmPaths(
+          repo,
+          worktree,
+          rmSelectedPages(repo, normalized.index, excluded),
+          options.excludeRoots,
+        ),
+        false,
+      );
+      removeRmWorktreePaths(worktree, absoluteRmPaths(repo, pruned), true);
+    }
+    applyIndexOwned(repo.checkout, (sink) => {
+      for (const page of rmSelectedPages(repo, normalized.index, excluded)) {
+        for (const path of page) sink.remove(path);
+      }
+    });
+  });
+}
+
+function* rmRows(
+  repo: Repository,
+  worktree: Worktree,
+  specs: RmSpecIndex,
+  excluded: readonly string[],
+  excludeRoots: readonly string[] | undefined,
+) {
+  yield* joinSorted3(
+    boundedRmRows(treeStream(repo, repo.headTree()), "HEAD"),
+    rmIndexPaths(repo, specs, excluded),
+    boundedRmRows(
+      walkWorktreeEntriesStream(worktree, repo.root, {
+        excludeRoots: excludeRoots === undefined ? undefined : [...excludeRoots],
+        includeIgnored: true,
+        includeDirectories: true,
+      }),
+      "worktree",
+    ),
+    { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
+  );
+}
+
+function preflightRmSafety(
+  repo: Repository,
+  worktree: Worktree,
+  specs: RmSpecIndex,
+  excluded: readonly string[],
+  excludeRoots: readonly string[] | undefined,
+  cached: boolean,
+): void {
+  const batch: RmCandidate[] = [];
+  let firstUnsafe: GitError | undefined;
+  const flush = (): void => {
+    identifyRmWorktree(repo, worktree, batch);
+    for (const candidate of batch) {
       if (candidate.conflicted) continue;
       const entry = candidate.index;
       if (entry === undefined) {
-        throw new GitError("EUNSAFEREMOVE", `cannot prove index state for '${candidate.path}'`);
+        firstUnsafe ??= new GitError(
+          "EUNSAFEREMOVE",
+          `cannot prove index state for '${candidate.path}'`,
+        );
+        continue;
       }
       const headMatches =
         candidate.head !== undefined &&
@@ -137,40 +167,68 @@ export function rm(repo: Repository, worktree: Worktree, options: RmOptions): vo
         ? headMatches || candidate.worktreeMatchesIndex
         : missingWorktree || (headMatches && candidate.worktreeMatchesIndex);
       if (!safe) {
-        throw new GitError(
+        firstUnsafe ??= new GitError(
           "EUNSAFEREMOVE",
           `path '${candidate.path}' has staged or working-tree changes`,
         );
       }
     }
-  }
+    batch.length = 0;
+  };
 
-  let pruned: string[] = [];
-  if (!cached) {
-    const planned = planRmDirectoryPrune(
-      repo,
-      worktree,
-      candidates,
-      removed,
-      options.excludeRoots,
-      retained,
-    );
-    pruned = planned.directories;
-    retained = planned.retained;
-  }
-  requireRmRetained(retained);
-
-  if (!cached) requireSharedMutationScope(repo.store.db, worktree);
-
-  repo.store.db.transactionSync(() => {
-    if (!cached) {
-      removeRmWorktreePaths(worktree, physicalRmPaths(repo, candidates), false);
-      removeRmWorktreePaths(worktree, absoluteRmPaths(repo, pruned), true);
-    }
-    applyIndexOwned(repo.checkout, (sink) => {
-      for (const candidate of candidates) sink.remove(candidate.path);
+  for (const row of rmRows(repo, worktree, specs, excluded, excludeRoots)) {
+    const selected = row.b;
+    if (selected === undefined) continue;
+    batch.push({
+      path: selected.path,
+      head: row.a,
+      index: selected.entry,
+      worktree: row.c,
+      conflicted: selected.conflicted,
+      worktreeMatchesIndex: false,
     });
-  });
+    if (batch.length === 1_000) flush();
+  }
+  if (batch.length > 0) flush();
+  if (firstUnsafe !== undefined) throw firstUnsafe;
+}
+
+function* rmSelectedPaths(
+  repo: Repository,
+  specs: RmSpecIndex,
+  excluded: readonly string[],
+): Generator<string> {
+  for (const entry of rmIndexPaths(repo, specs, excluded)) yield entry.path;
+}
+
+function* rmSelectedPages(
+  repo: Repository,
+  specs: RmSpecIndex,
+  excluded: readonly string[],
+): Generator<string[]> {
+  let after: { path: string; stage: number } | undefined;
+  let previousPath: string | undefined;
+  for (;;) {
+    const page: IndexEntry[] = [];
+    for (const entry of indexScanOwned(repo.checkout, { after, pageSize: 1_000 })) {
+      page.push(entry);
+      if (page.length === 1_000) break;
+    }
+    if (page.length === 0) return;
+    const last = page[page.length - 1];
+    if (last === undefined) return;
+    after = { path: last.path, stage: last.stage };
+    const selected: string[] = [];
+    for (const entry of page) {
+      if (entry.path === previousPath) continue;
+      previousPath = entry.path;
+      if (matchesRmSpecs(specs, entry.path) && !isExcluded(entry.path, excluded)) {
+        selected.push(entry.path);
+      }
+    }
+    if (selected.length > 0) yield selected;
+    if (page.length < 1_000) return;
+  }
 }
 
 function* rmIndexPaths(
@@ -199,7 +257,6 @@ function* rmIndexPaths(
 function normalizeRmSpecs(paths: readonly string[]): {
   specs: RmSpec[];
   index: RmSpecIndex;
-  retained: number;
 } {
   if (paths.length > RM_MAX_PATHSPECS) {
     throw new GitError("E2BIG", `rm pathspec count exceeds ${RM_MAX_PATHSPECS}`);
@@ -207,7 +264,6 @@ function normalizeRmSpecs(paths: readonly string[]): {
   const specs: RmSpec[] = [];
   const files = new Map<string, RmSpec>();
   const directories = new Map<string, RmSpec>();
-  let retained = RM_EXECUTION_HEADROOM_BYTES;
   for (const raw of paths) {
     let path: string;
     let directoryOnly: boolean;
@@ -219,11 +275,11 @@ function normalizeRmSpecs(paths: readonly string[]): {
       path = "";
       directoryOnly = true;
     }
+    if (path.length > MAX_INDEX_PATH_BYTES || utf8.encode(path).length > MAX_INDEX_PATH_BYTES) {
+      throw new GitError("E2BIG", `rm pathspec exceeds ${MAX_INDEX_PATH_BYTES} UTF-8 bytes`);
+    }
     const seen = directoryOnly ? directories : files;
     if (seen.has(path)) continue;
-    const additional = RM_SPEC_FIXED_BYTES + RM_ARRAY_ENTRY_BYTES + structuralStringBytes(path);
-    requireRmRetained(retained + additional);
-    retained += additional;
     const spec: RmSpec = {
       path,
       directoryOnly,
@@ -237,7 +293,6 @@ function normalizeRmSpecs(paths: readonly string[]): {
   return {
     specs,
     index: { files, directories },
-    retained,
   };
 }
 

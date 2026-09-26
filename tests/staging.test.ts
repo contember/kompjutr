@@ -955,6 +955,45 @@ describe("rm", () => {
     expect(utf8Decoder.decode(workspace.worktree.readFile("/target.txt"))).toBe("target\n");
   });
 
+  it("hashes long symlink targets in bounded rm windows after pathspec checks", () => {
+    const workspace = makeRepo("/");
+    const target = "x".repeat(17_000);
+    const paths = Array.from(
+      { length: 1_001 },
+      (_, index) => `link${index.toString().padStart(4, "0")}`,
+    );
+    workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, target })));
+    workspace.repo.checkout.indexReplace(
+      paths.map((path) => ({
+        path,
+        stage: 0,
+        mode: 0o120000,
+        oid: hashObject("blob", utf8.encode(target)),
+        size: null,
+        mtime: null,
+        ino: null,
+      })),
+    );
+    workspace.worktree.writeFiles([{ path: "/link0000", target: "different" }]);
+
+    expect(() =>
+      rm(workspace.repo, workspace.worktree, {
+        paths: [".", "missing"],
+        recursive: true,
+        cached: true,
+      }),
+    ).toThrow(expect.objectContaining({ code: "EPATHSPEC" }));
+    expect(() =>
+      rm(workspace.repo, workspace.worktree, { paths: ["."], recursive: true, cached: true }),
+    ).toThrow(expect.objectContaining({ code: "EUNSAFEREMOVE" }));
+    expect(workspace.repo.checkout.indexEntries()).toHaveLength(paths.length);
+
+    workspace.worktree.writeFiles([{ path: "/link0000", target }]);
+    rm(workspace.repo, workspace.worktree, { paths: ["."], recursive: true, cached: true });
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
+    expect(workspace.worktree.readlink("/link0000")).toBe(target);
+  });
+
   it("removes unmerged stages as a conflict resolution", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/conflict.txt", "conflict\n");
@@ -1013,7 +1052,7 @@ describe("rm", () => {
     );
   });
 
-  it("bounds pathspec count and retained state without a component byte ceiling", () => {
+  it("bounds pathspec count and path length without a component byte ceiling", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/file.txt", "content\n");
     add(workspace.repo, workspace.worktree, { paths: ["file.txt"] });
@@ -1025,6 +1064,12 @@ describe("rm", () => {
     expect(() =>
       rm(workspace.repo, workspace.worktree, {
         paths: Array.from({ length: 10_001 }, () => "file.txt"),
+        force: true,
+      }),
+    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+    expect(() =>
+      rm(workspace.repo, workspace.worktree, {
+        paths: [`unmatchable-${"z".repeat(8_192)}`],
         force: true,
       }),
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
@@ -1054,8 +1099,69 @@ describe("rm", () => {
         ),
         force: true,
       }),
-    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+    ).toThrow(expect.objectContaining({ code: "EPATHSPEC" }));
     assertUnchanged();
+  });
+
+  it("bounds derived rm directories before changing the index", () => {
+    const workspace = makeRepo("/");
+    const oid = workspace.repo.store.write("blob", utf8.encode("content\n"));
+    const entries = Array.from({ length: 101 }, (_, group) => ({
+      path: `${group.toString().padStart(3, "0")}/${Array.from(
+        { length: 100 },
+        (_, depth) => `d${depth}`,
+      ).join("/")}/file`,
+      stage: 0,
+      mode: 0o100644,
+      oid,
+      size: null,
+      mtime: null,
+      ino: null,
+    }));
+    workspace.repo.checkout.indexReplace(entries);
+
+    expect(() =>
+      rm(workspace.repo, workspace.worktree, {
+        paths: ["."],
+        recursive: true,
+        force: true,
+      }),
+    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+    expect(workspace.repo.checkout.indexEntries()).toHaveLength(entries.length);
+  });
+
+  it("removes a conflict split across selected index pages", () => {
+    const workspace = makeRepo("/");
+    const oid = workspace.repo.store.write("blob", utf8.encode("content\n"));
+    const entries = Array.from({ length: 999 }, (_, index) => ({
+      path: `f${index.toString().padStart(4, "0")}`,
+      stage: 0,
+      mode: 0o100644,
+      oid,
+      size: null,
+      mtime: null,
+      ino: null,
+    }));
+    workspace.repo.checkout.indexReplace([
+      ...entries,
+      ...[1, 2, 3].map((stage) => ({
+        path: "z-conflict",
+        stage,
+        mode: 0o100644,
+        oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      })),
+    ]);
+
+    rm(workspace.repo, workspace.worktree, {
+      paths: ["."],
+      cached: true,
+      force: true,
+      recursive: true,
+    });
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
   });
 });
 
@@ -1503,7 +1609,7 @@ describe("cost", () => {
     expect(workspace.repo.checkout.indexEntries().map((entry) => entry.path)).toEqual(paths);
   });
 
-  it("fails rm before mutation when retained state exceeds 16 MiB", () => {
+  it("removes paths whose modeled footprint exceeded the former 16 MiB ceiling", () => {
     const workspace = makeRepo("/");
     const oid = workspace.repo.store.write("blob", utf8.encode("x\n"));
     const suffix = "x".repeat(2_000);
@@ -1518,15 +1624,13 @@ describe("cost", () => {
     }));
     workspace.repo.checkout.indexReplace(entries);
 
-    expect(() =>
-      rm(workspace.repo, workspace.worktree, {
-        paths: ["."],
-        cached: true,
-        force: true,
-        recursive: true,
-      }),
-    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+    rm(workspace.repo, workspace.worktree, {
+      paths: ["."],
+      cached: true,
+      force: true,
+      recursive: true,
+    });
 
-    expect(workspace.repo.checkout.indexEntries()).toHaveLength(entries.length);
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
   });
 });

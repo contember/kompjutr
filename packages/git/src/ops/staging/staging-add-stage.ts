@@ -14,11 +14,6 @@ import {
 } from "../worktree/worktree-io.js";
 
 const ADD_MAX_ROWS_PER_STREAM = 50_000;
-export const ADD_RETAINED_BYTES = 16 * 1024 * 1024;
-
-export function structuralStringBytes(value: string): number {
-  return 48 + value.length * 2;
-}
 
 export interface AddIndexPath {
   path: string;

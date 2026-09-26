@@ -1,5 +1,6 @@
 import { GitError } from "../../common/errors.js";
 import { comparePaths, joinPath, relativeExcludeRoots } from "../../common/paths.js";
+import { joinSorted } from "../../common/streams.js";
 import type { IndexEntry } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
@@ -10,12 +11,10 @@ import {
   type WorktreePath,
   walkWorktreeEntriesStream,
 } from "../worktree/worktree-io.js";
-import { ADD_RETAINED_BYTES, structuralStringBytes } from "./staging-add-stage.js";
 
 const RM_MAX_ROWS_PER_STREAM = 50_000;
-export const RM_ARRAY_ENTRY_BYTES = 8;
+const RM_MAX_DIRECTORIES = 10_000;
 const RM_WINDOW_ROWS = 1_000;
-const RM_DIRECTORY_FIXED_BYTES = 96;
 const RM_REMOVE_BINDING_BYTES = 1_000_000;
 
 export interface RmCandidate {
@@ -35,12 +34,6 @@ export function* boundedRmRows<T>(rows: Iterable<T>, label: string): Generator<T
     }
     count++;
     yield row;
-  }
-}
-
-export function requireRmRetained(bytes: number): void {
-  if (bytes > ADD_RETAINED_BYTES) {
-    throw new GitError("E2BIG", `rm retained state exceeds ${ADD_RETAINED_BYTES} bytes`);
   }
 }
 
@@ -96,24 +89,22 @@ export function identifyRmWorktree(
 export function planRmDirectoryPrune(
   repo: Repository,
   worktree: Worktree,
-  candidates: readonly RmCandidate[],
-  removed: ReadonlySet<string>,
+  selectedPaths: () => Generator<string>,
   excludeRoots: readonly string[] | undefined,
-  initialRetained: number,
-): { directories: string[]; retained: number } {
+): string[] {
   const directories = new Set<string>();
-  let retained = initialRetained;
-  for (const { path } of candidates) {
+  for (const path of selectedPaths()) {
     const parts = path.split("/");
     for (let depth = parts.length - 1; depth > 0; depth--) {
       const directory = parts.slice(0, depth).join("/");
       if (directories.has(directory)) continue;
-      retained += RM_DIRECTORY_FIXED_BYTES + structuralStringBytes(directory);
-      requireRmRetained(retained);
+      if (directories.size >= RM_MAX_DIRECTORIES) {
+        throw new GitError("E2BIG", `rm directory prune exceeds ${RM_MAX_DIRECTORIES} directories`);
+      }
       directories.add(directory);
     }
   }
-  if (directories.size === 0) return { directories: [], retained };
+  if (directories.size === 0) return [];
 
   const blocked = new Set<string>();
   const block = (path: string, includeSelf: boolean): void => {
@@ -122,22 +113,26 @@ export function planRmDirectoryPrune(
     for (; depth > 0; depth--) {
       const directory = parts.slice(0, depth).join("/");
       if (!directories.has(directory) || blocked.has(directory)) continue;
-      retained += RM_DIRECTORY_FIXED_BYTES;
-      requireRmRetained(retained);
       blocked.add(directory);
     }
   };
 
   for (const root of relativeExcludeRoots(repo.root, excludeRoots)) block(root, true);
-  for (const entry of boundedRmRows(
-    walkWorktreeEntriesStream(worktree, repo.root, {
-      excludeRoots: excludeRoots === undefined ? undefined : [...excludeRoots],
-      includeIgnored: true,
-      includeDirectories: true,
-    }),
-    "directory-prune worktree",
+  for (const row of joinSorted(
+    selectedPaths(),
+    boundedRmRows(
+      walkWorktreeEntriesStream(worktree, repo.root, {
+        excludeRoots: excludeRoots === undefined ? undefined : [...excludeRoots],
+        includeIgnored: true,
+        includeDirectories: true,
+      }),
+      "directory-prune worktree",
+    ),
+    { left: (path) => path, right: (entry) => entry.path },
   )) {
-    if (removed.has(entry.path) && entry.stat.type !== "dir") continue;
+    const entry = row.right;
+    if (entry === undefined) continue;
+    if (row.left !== undefined && entry.stat.type !== "dir") continue;
     if (entry.stat.type === "dir" && directories.has(entry.path)) continue;
     block(entry.path, entry.stat.type === "dir");
   }
@@ -145,15 +140,13 @@ export function planRmDirectoryPrune(
   const pruned: string[] = [];
   for (const directory of directories) {
     if (blocked.has(directory)) continue;
-    retained += RM_ARRAY_ENTRY_BYTES;
-    requireRmRetained(retained);
     pruned.push(directory);
   }
   pruned.sort((left, right) => {
     const depth = pathDepth(right) - pathDepth(left);
     return depth === 0 ? comparePaths(left, right) : depth;
   });
-  return { directories: pruned, retained };
+  return pruned;
 }
 
 function pathDepth(path: string): number {
@@ -166,11 +159,30 @@ function pathDepth(path: string): number {
 
 export function* physicalRmPaths(
   repo: Repository,
-  candidates: readonly RmCandidate[],
+  worktree: Worktree,
+  selectedPages: Iterable<readonly string[]>,
+  excludeRoots: readonly string[] | undefined,
 ): Generator<string> {
-  for (const candidate of candidates) {
-    if (candidate.worktree === undefined) continue;
-    yield joinPath(repo.root, candidate.path);
+  const entries = boundedRmRows(
+    walkWorktreeEntriesStream(worktree, repo.root, {
+      excludeRoots: excludeRoots === undefined ? undefined : [...excludeRoots],
+      includeIgnored: true,
+      includeDirectories: true,
+    }),
+    "removal worktree",
+  )[Symbol.iterator]();
+  let current = entries.next();
+  try {
+    for (const page of selectedPages) {
+      for (const path of page) {
+        while (!current.done && comparePaths(current.value.path, path) < 0) {
+          current = entries.next();
+        }
+        if (!current.done && current.value.path === path) yield joinPath(repo.root, path);
+      }
+    }
+  } finally {
+    entries.return?.(undefined);
   }
 }
 
