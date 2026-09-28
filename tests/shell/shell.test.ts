@@ -91,8 +91,8 @@ describe("listing", () => {
   it("renders recursive groups including an empty directory", async () => {
     fs.mkdir("/repo/src/empty");
     expect((await shell.run("ls -R src")).stdout).toBe(
-      "/repo/src:\nalpha.ts\nbeta.ts\nempty\ngamma.js\nnested\n\n" +
-        "/repo/src/empty:\n\n/repo/src/nested:\ndelta.ts\n",
+      "src:\nalpha.ts\nbeta.ts\nempty\ngamma.js\nnested\n\n" +
+        "src/empty:\n\nsrc/nested:\ndelta.ts\n",
     );
   });
   it("prunes hidden recursive groups unless requested", async () => {

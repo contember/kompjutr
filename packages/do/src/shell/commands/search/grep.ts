@@ -6,7 +6,7 @@ import { type Command, fail } from "../../exec/context.js";
 import { resolve } from "../../exec/execute.js";
 import { count, parseFlags, UsageError } from "../flags.js";
 import { compilePatternSet, type Dialect, literalNeedle, PatternError } from "./regex.js";
-import { type SearchRequest, search } from "./search.js";
+import { type SearchRequest, type SearchRoot, search } from "./search.js";
 import { onlyMatchingFor, quietly } from "./search-output.js";
 import { searchStream } from "./search-stream.js";
 
@@ -176,6 +176,10 @@ export const grep: Command = (context) => {
       operands = rest;
     }
 
+    const roots: SearchRoot[] = operands.map((operand) => ({
+      path: resolve(context.cwd, operand),
+      operand,
+    }));
     const compiled = compilePatternSet(patterns, { dialect, ignoreCase, wholeWord, wholeLine });
     // The SQL content predicate only answers a case-sensitive, positive
     // substring search: `instr` has no case folding and cannot prove the
@@ -197,9 +201,12 @@ export const grep: Command = (context) => {
       onlyMatching: onlyMatching ? onlyMatchingFor(compiled, "grep") : null,
     };
 
-    // A pipe stage searches its input, not the filesystem — R3. No path is
-    // resolved and no query is issued.
-    if (operands.length === 0) {
+    // `-r` with no file searches the working directory, as GNU grep does even
+    // when stdin is a pipe. Otherwise a pipe stage searches its input, not the
+    // filesystem — R3. No path is resolved and no query is issued.
+    if (operands.length === 0 && recursive) {
+      roots.push({ path: context.cwd, operand: "" });
+    } else if (operands.length === 0) {
       if (context.stdin === null) {
         return fail(context, "no input; give a file or pipe something in", 2);
       }
@@ -220,7 +227,7 @@ export const grep: Command = (context) => {
       ...shared,
       pattern: compiled,
       literal,
-      roots: operands.map((operand) => resolve(context.cwd, operand)),
+      roots,
       recursive,
       include,
       exclude,

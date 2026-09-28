@@ -56,6 +56,10 @@ We admit this finite surface:
   expression. Each file test is one stat.
 - `echo` with Bash's `-n`, `-e`, and `-E` option words and its `-e` escapes.
 - `tail -n +N`, and `basename` and `dirname` with GNU options.
+- `find`'s expression language: several starting points, name, path, and
+  type tests, depth limits, `-prune`, `-print0`, and `!`, `-a`, `-o` with
+  parentheses. Pruned and too-deep subtrees are skipped by resuming the scan.
+- `grep` and `rg` `-o` and `-q`, each following its own binary around `-o`.
 
 Expansion stays unresolved through parse and plan, so planning stays pure.
 Generated fields and pathname matches share the 10,000-entry argv ceiling and the
@@ -70,8 +74,9 @@ this admission is the [baseline](../../tests/shell/parity-bash.test.ts),
 [ordered redirection](../../tests/shell/parity-bash-redirection.test.ts),
 [`printf`](../../tests/shell/parity-bash-printf.test.ts),
 [`exit`](../../tests/shell/parity-bash-exit.test.ts),
-[named expansion](../../tests/shell/parity-bash-expansion.test.ts), and
-[script](../../tests/shell/parity-bash-scripts.test.ts) suites.
+[named expansion](../../tests/shell/parity-bash-expansion.test.ts),
+[script](../../tests/shell/parity-bash-scripts.test.ts), and
+[path](../../tests/shell/parity-bash-paths.test.ts) suites.
 
 These forms remain rejected:
 

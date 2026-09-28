@@ -18,13 +18,14 @@
 import type { RealPath, RegularFileHandle } from "../../../fs/types.js";
 import { type ByteStream, decode, encode, firstNul, lines } from "../../exec/bytes.js";
 import type { BoundedFs } from "../../exec/context.js";
+import { displayUnder } from "../../exec/display.js";
 import { compileIncludeGlob, GLOB_PATTERN_MAX_BYTES } from "../../exec/glob.js";
 import { type LineLabel, type OnlyMatching, renderSelected } from "./search-output.js";
 
 export interface SearchRequest {
   readonly pattern: RegExp;
-  /** Absolute paths. A file is searched directly; a directory is walked. */
-  readonly roots: readonly string[];
+  /** A file is searched directly; a directory is walked. */
+  readonly roots: readonly SearchRoot[];
   readonly recursive: boolean;
   readonly include: readonly string[];
   readonly exclude: readonly string[];
@@ -70,6 +71,12 @@ export interface SearchRequest {
   readonly walkedBinaries: "report" | "skip";
 }
 
+export interface SearchRoot {
+  readonly path: string;
+  /** The operand as typed; results under it are printed relative to it. */
+  readonly operand: string;
+}
+
 export type SearchMode = "content" | "files" | "files-without-match" | "count";
 
 export interface SearchOutcome {
@@ -98,11 +105,11 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
     // recursive by default and would otherwise label every single-file run.
     const several = request.roots.length > 1;
 
-    for (const root of request.roots) {
+    for (const { path: root, operand } of request.roots) {
       const stat = fs.stat(root);
       if (stat === null) {
         failed = true;
-        request.warn(`${root}: No such file or directory`);
+        request.warn(`${operand}: No such file or directory`);
         continue;
       }
 
@@ -115,7 +122,7 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
           const bytes = fs.readFile(root);
           // Named on the command line: searched whatever it holds.
           for await (const chunk of emit(
-            root,
+            operand,
             bytes,
             request,
             request.withFilename ?? several,
@@ -133,7 +140,7 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
 
       if (!request.recursive) {
         failed = true;
-        request.warn(`${root}: Is a directory`);
+        request.warn(`${operand}: Is a directory`);
         continue;
       }
 
@@ -141,14 +148,17 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
       // `-l` over a literal pattern needs no content at all: the database
       // already decided, and reading the file would only confirm it.
       const needsBytes = request.mode !== "files" || request.literal === null;
-      for (const file of walk(fs, root, request, includeMatchers, excludeMatchers, needsBytes)) {
+      const realRoot = fs.realpath(root);
+      const walked = walk(fs, realRoot, request, includeMatchers, excludeMatchers, needsBytes);
+      for (const file of walked) {
+        const shown = displayUnder(operand, realRoot, file.path);
         if (file.bytes === null) {
           noteMatch();
-          yield encode(`${file.path}\n`);
+          yield encode(`${shown}\n`);
           continue;
         }
         for await (const chunk of emit(
-          file.path,
+          shown,
           file.bytes,
           request,
           request.withFilename ?? true,
@@ -186,13 +196,12 @@ interface FoundFile {
  */
 function* walk(
   fs: BoundedFs,
-  root: string,
+  realRoot: RealPath,
   request: SearchRequest,
   include: ReadonlyArray<{ test(path: string): boolean }>,
   exclude: ReadonlyArray<{ test(path: string): boolean }>,
   needsBytes: boolean,
 ): Generator<FoundFile, void, undefined> {
-  const realRoot = fs.realpath(root);
   const sqlPattern = narrowing(realRoot, request.include);
 
   // The predicate returns the files that match, so a mode whose output

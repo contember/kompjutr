@@ -254,7 +254,9 @@ export const rg: Command = (context) => {
 
     // rg with no path searches the working directory, recursively.
     const roots =
-      operands.length === 0 ? [context.cwd] : operands.map((o) => resolve(context.cwd, o));
+      operands.length === 0
+        ? [{ path: context.cwd, operand: "" }]
+        : operands.map((operand) => ({ path: resolve(context.cwd, operand), operand }));
 
     const outcome = search(context.fs, {
       ...shared,

@@ -1,6 +1,6 @@
 import type { SqlDatabase } from "../../../db/db.js";
 import { comparePaths, subtreeSuccessor } from "../../path.js";
-import type { OrderedScanOptions, RealPath, ScanEntry } from "../../types.js";
+import type { OrderedScanOptions, RealPath, ScanEntry, ScanOptions } from "../../types.js";
 import { scan } from "../scan.js";
 
 /** Rows per keyset statement. This is also the metadata memory bound. */
@@ -25,14 +25,25 @@ export function* scanStream(
   root: RealPath,
   options: OrderedScanOptions = {},
 ): Generator<ScanEntry> {
+  yield* orderedScan((pageOptions) => scan(db, root, pageOptions), options);
+}
+
+/**
+ * The pruning walk over any keyset page source with `scan`'s contract. The
+ * shell drives it through its operation-counted filesystem, one call per page.
+ */
+export function* orderedScan(
+  scanPage: (options: ScanOptions) => ScanEntry[],
+  options: OrderedScanOptions = {},
+): Generator<ScanEntry> {
   const pruned: PrunedRange[] = [];
   let after = options.after;
   let afterSubtree: string | undefined;
   while (true) {
     const page =
       afterSubtree === undefined
-        ? scan(db, root, { after, filesOnly: options.filesOnly, limit: SCAN_STREAM_PAGE })
-        : scan(db, root, { afterSubtree, filesOnly: options.filesOnly, limit: SCAN_STREAM_PAGE });
+        ? scanPage({ after, filesOnly: options.filesOnly, limit: SCAN_STREAM_PAGE })
+        : scanPage({ afterSubtree, filesOnly: options.filesOnly, limit: SCAN_STREAM_PAGE });
     afterSubtree = undefined;
     for (const entry of page) {
       after = entry.path;

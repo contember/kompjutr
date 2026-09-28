@@ -54,7 +54,7 @@ it("composes the complete bounded shell contract", async () => {
       "recovered\n" +
       "announce: warning\n" +
       "payload\n" +
-      "/repo/src:\n" +
+      "src:\n" +
       "a.txt\n" +
       "b.txt\n" +
       "c.md\n" +
@@ -67,10 +67,8 @@ it("composes the complete bounded shell contract", async () => {
   expect(run.operations).toBeLessThanOrEqual(16);
   expect(run.peakRetainedBytes).toBeGreaterThan(0);
   expect(run.peakRetainedBytes).toBeLessThanOrEqual(256);
-  expect(DECODER.decode(fs.readFile("/repo/found"))).toBe("/repo/src/a.txt\n/repo/src/b.txt\n");
-  expect(DECODER.decode(fs.readFile("/repo/summary"))).toBe(
-    "selected: /repo/src/a.txt /repo/src/b.txt\n",
-  );
+  expect(DECODER.decode(fs.readFile("/repo/found"))).toBe("src/a.txt\nsrc/b.txt\n");
+  expect(DECODER.decode(fs.readFile("/repo/summary"))).toBe("selected: src/a.txt src/b.txt\n");
   expect(DECODER.decode(fs.readFile("/repo/copy/nested/d.txt"))).toBe("beta\n");
   expect(fs.stat("/repo/copy")?.mtime).toBe(200);
   expect(fs.stat("/repo/copy/a.txt")).toMatchObject({ mtime: 200 });

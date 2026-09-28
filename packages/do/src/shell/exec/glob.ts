@@ -33,6 +33,48 @@ export function compileIncludeGlob(pattern: string): Matcher {
   return { test };
 }
 
+/**
+ * `fnmatch` without `FNM_PATHNAME` or `FNM_PERIOD`, as find's `-name` and
+ * `-path` use it: `*` and `?` cross `/`, a leading dot needs no literal
+ * match, and a backslash quotes the next character.
+ */
+export function compileFnmatch(pattern: string, ignoreCase: boolean): Matcher {
+  let source = "";
+  let index = 0;
+  while (index < pattern.length) {
+    const char = pattern.charAt(index);
+    if (char === "\\" && index + 1 < pattern.length) {
+      source += escapeLiteral(pattern.charAt(index + 1));
+      index += 2;
+      continue;
+    }
+    if (char === "*") {
+      source += ".*";
+      index++;
+      continue;
+    }
+    if (char === "?") {
+      source += ".";
+      index++;
+      continue;
+    }
+    if (char === "[") {
+      const close = pattern.indexOf("]", index + 2);
+      if (close !== -1) {
+        const body = pattern.slice(index + 1, close);
+        const negated = body.startsWith("!") || body.startsWith("^");
+        source += `[${negated ? "^" : ""}${escapeClass(negated ? body.slice(1) : body)}]`;
+        index = close + 1;
+        continue;
+      }
+    }
+    source += escapeLiteral(char);
+    index++;
+  }
+  const regexp = new RegExp(`^${source}$`, ignoreCase ? "isu" : "su");
+  return { test: (value: string) => regexp.test(value) };
+}
+
 function buildRegExp(
   pattern: string,
   recursiveStars: boolean,

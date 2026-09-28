@@ -1,13 +1,13 @@
-// `ls`, `find`, `stat`. Long/recursive listings and indexed find stream
-// keyset pages; bare `ls` keeps the cheaper direct-directory shape.
+// `ls` and `stat`. Long/recursive listings stream keyset pages; bare `ls`
+// keeps the cheaper direct-directory shape.
 
-import { basename, normalize } from "../../fs/path.js";
+import { basename, comparePaths, normalize } from "../../fs/path.js";
 import type { ListCursor, Stat } from "../../fs/types.js";
 import { type ByteStream, encode } from "../exec/bytes.js";
-import { type Command, type CommandContext, fail, result } from "../exec/context.js";
+import { type Command, type CommandContext, fail } from "../exec/context.js";
+import { displayUnder } from "../exec/display.js";
 import { resolve } from "../exec/execute.js";
-import { compileIncludeGlob, sqlGlobFor } from "../exec/glob.js";
-import { count, parseFlags, UsageError } from "./flags.js";
+import { parseFlags, UsageError } from "./flags.js";
 
 export const ls: Command = (context) => {
   try {
@@ -19,35 +19,40 @@ export const ls: Command = (context) => {
     const long = flags.has("-l");
     const all = flags.has("-a") || flags.has("-A");
     const recursive = flags.has("-R");
-    const targets = parsed.operands.length === 0 ? [context.cwd] : parsed.operands;
+    const operands = parsed.operands.length === 0 ? ["."] : parsed.operands;
 
     let status = 0;
     const stream = (function* (): ByteStream {
-      const many = targets.length > 1;
-      let first = true;
-      for (const operand of targets) {
+      // GNU ls reports missing operands, then lists files, then directories,
+      // each group in name order, every result under the operand as typed.
+      const files: Array<{ operand: string; stat: Stat }> = [];
+      const directories: Array<{ operand: string; path: string }> = [];
+      for (const operand of operands) {
         const path = resolve(context.cwd, operand);
         const stat = context.fs.stat(path);
         if (stat === null) {
           context.warn(`cannot access '${operand}': No such file or directory`);
           status = 2;
-          continue;
+        } else if (stat.type !== "dir" || flags.has("-d")) {
+          files.push({ operand, stat });
+        } else {
+          directories.push({ operand, path });
         }
-        if (stat.type !== "dir" || flags.has("-d")) {
-          yield row(basename(path), stat, long);
-          continue;
-        }
-        if (recursive) {
-          if (!first) yield encode("\n");
-          yield* listRecursive(context, path, { long, all });
-          first = false;
-          continue;
-        }
-        if (many) {
-          if (!first) yield encode("\n");
-          yield encode(`${path}:\n`);
-        }
+      }
+      files.sort((left, right) => comparePaths(left.operand, right.operand));
+      directories.sort((left, right) => comparePaths(left.operand, right.operand));
+
+      for (const file of files) yield row(file.operand, file.stat, long);
+      const headed = recursive || operands.length > 1;
+      let first = files.length === 0;
+      for (const { operand, path } of directories) {
+        if (!first) yield encode("\n");
         first = false;
+        if (recursive) {
+          yield* listRecursive(context, operand, path, { long, all });
+          continue;
+        }
+        if (headed) yield encode(`${operand}:\n`);
         if (long) yield* listLongDirectory(context, path, all);
         else yield* listBareDirectory(context, path, all);
       }
@@ -87,6 +92,7 @@ function* listLongDirectory(context: CommandContext, path: string, all: boolean)
 
 function* listRecursive(
   context: CommandContext,
+  operand: string,
   root: string,
   options: { long: boolean; all: boolean },
 ): ByteStream {
@@ -102,7 +108,7 @@ function* listRecursive(
       if (!options.all && hiddenBelow(root, item.directory)) continue;
       if (item.directory !== current) {
         if (current !== null) yield encode("\n");
-        yield encode(`${item.directory}:\n`);
+        yield encode(`${displayUnder(operand, root, item.directory)}:\n`);
         current = item.directory;
       }
       const entry = item.entry;
@@ -146,115 +152,6 @@ function permissions(mode: number): string {
   return out;
 }
 
-export const find: Command = (context) => {
-  try {
-    let root: string | null = null;
-    let namePattern: string | null = null;
-    let type: "f" | "d" | "l" | null = null;
-    let maxDepth: number | null = null;
-
-    for (let index = 0; index < context.argv.length; index++) {
-      const arg = context.argv[index];
-      if (arg === undefined) continue;
-      if (arg === "-name") {
-        namePattern = context.argv[index + 1] ?? null;
-        index++;
-        continue;
-      }
-      if (arg === "-type") {
-        const value = context.argv[index + 1];
-        if (value !== "f" && value !== "d" && value !== "l") {
-          throw new UsageError(`unknown -type '${value}'`);
-        }
-        type = value;
-        index++;
-        continue;
-      }
-      if (arg === "-maxdepth") {
-        maxDepth = count(context.argv[index + 1] ?? "", "-maxdepth");
-        index++;
-        continue;
-      }
-      if (arg.startsWith("-")) {
-        throw new UsageError(`${arg} is not supported; supported: -name, -type, -maxdepth`);
-      }
-      if (root !== null) throw new UsageError("only one starting point is supported");
-      root = arg;
-    }
-
-    const start = resolve(context.cwd, root ?? ".");
-    const stat = context.fs.stat(start);
-    if (stat === null) return fail(context, `'${root ?? "."}': No such file or directory`);
-
-    const matcher = namePattern === null ? null : compileIncludeGlob(namePattern);
-    const depthOf = (path: string): number =>
-      path === start ? 0 : path.slice(start.length).split("/").length - 1;
-
-    const stream = (function* (): ByteStream {
-      // The root itself is a result in find, before anything under it.
-      if (typeMatches(stat.type, type) && (matcher === null || matcher.test(start))) {
-        yield encode(`${start}\n`);
-      }
-
-      // `-name` with no type filter lowers straight to an indexed GLOB.
-      if (matcher !== null && type === null && maxDepth === null) {
-        const absolute = `${start === "/" ? "" : start}/*${trailingLiteral(namePattern ?? "")}`;
-        const sql = sqlGlobFor(absolute);
-        if (sql !== null) {
-          const pageSize = Math.min(1_000, Math.max(1, (context.limitHint ?? 500) * 2));
-          let after: string | undefined;
-          for (;;) {
-            const page = context.fs.globPage(
-              start,
-              sql,
-              after === undefined ? { limit: pageSize } : { after, limit: pageSize },
-            );
-            for (const path of page.paths) {
-              if (matcher.test(path)) yield encode(`${path}\n`);
-            }
-            if (page.next === null) return;
-            after = page.next;
-          }
-        }
-      }
-
-      let after: string | undefined;
-      for (;;) {
-        const page = context.fs.scan(
-          start,
-          after === undefined ? { limit: 1_000 } : { after, limit: 1_000 },
-        );
-        for (const entry of page) {
-          if (maxDepth !== null && depthOf(entry.path) > maxDepth) continue;
-          if (!typeMatches(entry.type, type)) continue;
-          if (matcher !== null && !matcher.test(entry.path)) continue;
-          yield encode(`${entry.path}\n`);
-        }
-        if (page.length < 1_000) return;
-        after = page[page.length - 1]?.path;
-        if (after === undefined) return;
-      }
-    })();
-
-    return result(stream);
-  } catch (error) {
-    if (error instanceof UsageError) return fail(context, error.message, 2);
-    throw error;
-  }
-};
-
-function typeMatches(actual: string, wanted: "f" | "d" | "l" | null): boolean {
-  if (wanted === null) return true;
-  if (wanted === "f") return actual === "file";
-  if (wanted === "d") return actual === "dir";
-  return actual === "symlink";
-}
-
-/** The longest trailing run with no glob metacharacter. */
-function trailingLiteral(pattern: string): string {
-  return /[^*?[\]]*$/.exec(pattern)?.[0] ?? "";
-}
-
 export const stat: Command = (context) => {
   if (context.argv.length === 0) return fail(context, "missing operand", 2);
   let status = 0;
@@ -279,6 +176,5 @@ export const stat: Command = (context) => {
 
 export const listCommands: ReadonlyMap<string, Command> = new Map([
   ["ls", ls],
-  ["find", find],
   ["stat", stat],
 ]);

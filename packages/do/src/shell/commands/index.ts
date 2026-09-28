@@ -10,6 +10,7 @@ import { type Command, type CommandResult, fail } from "../exec/context.js";
 import { exit } from "./control.js";
 import { echo } from "./echo.js";
 import { fileCommands } from "./files.js";
+import { find } from "./find.js";
 import { UsageError } from "./flags.js";
 import { listCommands } from "./list.js";
 import { basename, dirname } from "./names.js";
@@ -29,6 +30,7 @@ export function builtinCommands(): Map<string, Command> {
     ["printf", printf],
     ["exit", exit],
     ["echo", echo],
+    ["find", find],
     ["xargs", xargs],
     ["tail", tail],
     ["test", test],

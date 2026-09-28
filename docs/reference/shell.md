@@ -94,8 +94,8 @@ attached value, or `--long=value`.
 | `head` | `-N`, `-n`/`--lines`, `-c`/`--bytes`, `-q`, `-v`; files or stdin. |
 | `tail` | `-N`, `-n`/`--lines`, and `-n +N` to start at line N; one file or stdin/multiple-file stream. |
 | `wc` | `-l`/`--lines`, `-w`/`--words`, `-m`/`--chars`, `-c`/`--bytes`. |
-| `ls` | `-l`, `-a`, `-A`, `-1`, `-R`, `-d`. Output is one entry per line. |
-| `find` | One root; `-name`, `-type f\|d\|l`, `-maxdepth`. |
+| `ls` | `-l`, `-a`, `-A`, `-1`, `-R`, `-d`. Output is one entry per line. Missing operands are reported, then files, then directories, each group in name order. `-l` prints its own stable fields, not GNU's owner and date columns. `-R` groups follow path byte order. |
+| `find` | Several starting points (default `.`); `-name`, `-iname`, `-path`, `-ipath`, `-type f\|d\|l` with comma lists, `-maxdepth`, `-mindepth`, `-prune`, `-print`, `-print0`, `-true`, `-false`; `!`/`-not`, `-a`/`-and`, `-o`/`-or`, and parentheses. Without an action the expression prints. Malformed expressions exit 1 with GNU's diagnostics; `-exec`, `-delete`, `-size`, time and permission tests, and other predicates are refused with status 2. Results follow path byte order, where GNU follows readdir. |
 | `stat` | One or more paths; stable text fields for file, size, type, mode, and mtime. |
 | `cp` | Files and `-r`/`-R`/`--recursive` trees. Metadata and content identity are preserved. |
 | `mv` | One or more sources and one destination; no options. |
@@ -168,8 +168,17 @@ Existing built-ins keep using the prefixed `warn()` seam.
 
 All filesystem access passes through `BoundedFs`. Bare `ls` uses a direct
 directory read. Long and recursive listings use metadata-bearing keyset pages.
-`find -name` uses keyset-paged indexed globs. Literal recursive search pushes
-the content predicate into SQLite when its semantics permit it.
+`find` scans keyset pages and resumes past a pruned or too-deep subtree rather
+than reading it; an expression of only `-name`, `-path`, and actions uses
+keyset-paged indexed globs narrowed by the `-name` pattern. Literal recursive
+search pushes the content predicate into SQLite when its semantics permit it.
+
+`find`, `ls`, `grep -r`, and `rg` print a result under an operand as the
+operand typed plus the rest of the path, so `find .` prints `./a` and
+`grep -r x src/` prints `src/a`. `grep -r` and `rg` without a path search the
+working directory and print bare relative paths. The
+[path parity suite](../../tests/shell/parity-bash-paths.test.ts) compares these
+with the GNU tools.
 
 Recursive copy discovers bounded pages and copies content inside SQLite; file
 bodies do not enter the isolate. `touch` performs one preflighted metadata-only
