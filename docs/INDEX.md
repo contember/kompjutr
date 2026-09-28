@@ -127,6 +127,7 @@ None.
 - [0022 — Stage pack commit projections until publication](decisions/0022-stage-pack-commit-projections-until-publication.md)
 - [0024 — Hold integration plans in a scoped SQL workspace and write output as ordinary objects](decisions/0024-own-integration-output-in-a-scoped-sql-workspace.md)
 - [0025 — Bound packed reads by chain depth and restart maintenance on source drift](decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md)
+- [0026 — Gate the workerd clone on a V8 regression limit](decisions/0026-gate-the-workerd-clone-on-a-v8-regression-limit.md)
 
 The set was renumbered on 2026-09-04; [`decisions/README.md`](decisions/README.md#renumbered-on-2026-09-04)
 decodes an old number found in `archive/` or `specs/`.

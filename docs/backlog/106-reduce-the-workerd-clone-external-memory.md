@@ -41,9 +41,10 @@ measurement says whether the clone fits the production isolate.
 3. Decide whether a production Durable Object probe is needed to answer the
    128 MB question. Local workerd has no isolate limiter.
 
-Witness: peak V8 used + external falls over at least three leased
-`cpu-lease run -n 2 -- npm run bench:workerd:nextjs` runs, with the oracle
-unchanged, `memory.max` and the commit recorded. Lower
+Witness: the maximum peak V8 used + external of at least three leased
+`cpu-lease run -n 2 -- npm run bench:workerd:nextjs` runs is below 225 MiB,
+today's minimum. The oracle is unchanged, and `memory.max` and the commit are
+recorded. Lower
 `V8_USED_PLUS_EXTERNAL_LIMIT_BYTES` in `bench/workerd/run.ts` to the new level.
 
 ## Touch points

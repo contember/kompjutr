@@ -12,7 +12,7 @@ date: 2026-09-28
 `npm run bench:workerd:nextjs` clones the Next.js fixture (24,252 files, a
 42 MiB pack) inside a SQLite Durable Object on local workerd. Its gate failed
 when the clone added more than 100 MiB of process RSS. The gate failed in every
-run: the clone adds 339–494 MiB of RSS.
+run: in the five WU4 runs below, the clone added 367.6–468.0 MiB of RSS.
 
 Process RSS on local workerd does not measure the production 128 MB isolate
 limit. Local workerd has no isolate memory limiter. RSS also holds SQLite,
@@ -22,7 +22,7 @@ The isolate limit counts V8 heap and V8 external memory. External memory holds
 ArrayBuffer backing stores, so every `Uint8Array` that kompjutr allocates counts
 against the isolate.
 
-The sprint's WU3 split the clone's memory with V8's
+WU3 of sprint-2026-09-28-memory-and-cost split the clone's memory with V8's
 `--trace-gc --trace-gc-verbose` output. Forced GCs bracket the clone. Each V8 value
 is a sample at a GC event, so each V8 peak is a lower bound. Three leased runs
 (`cpu-lease run -n 2`) of the harness that landed as `2b2002c`, with cgroup
@@ -50,8 +50,8 @@ We gate the workerd clone on a **regression limit**, not on a production claim.
 
 - **The gated measure** is `clone.v8.peakUsedPlusExternalBytes`: the highest V8
   heap used before a GC plus the external counter after that GC, over every GC
-  of the clone isolate between the two forced GCs. GC only releases external
-  memory, so the sum is a lower bound on the true peak.
+  of the clone isolate between the two forced GCs. A GC can only lower the
+  external counter, so the sum is a lower bound on the true peak.
 - **The limit** is `V8_USED_PLUS_EXTERNAL_LIMIT_BYTES` in `bench/workerd/run.ts`:
   450 MiB. It is today's level with a margin. Five leased runs at `c3b670c`
   (898 statements, 145,777 rows, `memory.max` = `max`) measured 238.4, 241.2,
@@ -78,6 +78,9 @@ owns that question and the external memory.
   one measured 363 MiB, like the WU3 review run. A limit above the high runs
   lets a typical run grow by almost 2× before it fails, so the limit catches
   large regressions only.
+- A draft of the WU3 harness measured 399.9 MiB at `06de5e5`, 89% of the limit.
+  A failure near 450 MiB may be spread, not a regression; rerun before blaming
+  the change.
 - The production 128 MB question stays open until backlog 106 attributes and
   reduces the external memory, or a production probe answers it.
 

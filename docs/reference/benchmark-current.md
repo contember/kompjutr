@@ -76,7 +76,9 @@ The harness warms the Durable Object and forces a full GC before the baseline,
 resets `VmHWM`, and runs the checkout oracle after the measured region. V8
 values come from the GC trace between two forced GCs, so their peaks are lower
 bounds. The non-V8 residue is RSS after the closing forced GC minus V8 committed
-and external memory at that GC, minus the same value at the baseline.
+and external memory at that GC, minus the same value at the baseline. Each
+column is its own peak over the GC samples. V8 used + external is the peak of
+the sum at one GC, not the sum of the two peaks.
 
 | Run | V8 used, MiB | V8 external, MiB | V8 used + external, MiB | Added peak RSS, MiB | Non-V8 residue added, MiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
