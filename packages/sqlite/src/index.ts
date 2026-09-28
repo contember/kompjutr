@@ -141,6 +141,44 @@ export function readBlob(value: unknown): Uint8Array {
   throw new Error("expected a BLOB column");
 }
 
+/**
+ * Exact UTF-8 length of `JSON.stringify(value)` without building it, so a
+ * caller can size a JSON binding before joining it. JSON escapes an unpaired
+ * surrogate as `\uXXXX`, six bytes, where `TextEncoder` would write U+FFFD.
+ */
+export function jsonStringEncodedBytes(value: string): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (
+      unit === 0x22 ||
+      unit === 0x5c ||
+      unit === 0x08 ||
+      unit === 0x09 ||
+      unit === 0x0a ||
+      unit === 0x0c ||
+      unit === 0x0d
+    ) {
+      bytes += 2;
+    } else if (unit < 0x20) {
+      bytes += 6;
+    } else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else {
+        bytes += 6;
+      }
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      bytes += 6;
+    } else {
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+  }
+  return bytes;
+}
+
 export const MAX_ROUTING_CHECKOUTS = 8_192;
 export const MAX_ROUTING_CHECKOUTS_RETAINED_BYTES = 16 * 1024 * 1024;
 export const MAX_ROUTING_ROOTS_UTF8_BYTES = 6 * 1024 * 1024;
