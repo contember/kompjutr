@@ -7,9 +7,9 @@
 // status for several missing operands, which is not what this suite pins.
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -61,6 +61,54 @@ const B_CHANGE = `--- a/src/b.txt
 +BETA
  gamma
 `;
+
+const LINK_FILES: Readonly<Record<string, string>> = {
+  "w/in/t.txt": "x\n",
+  "w/in2/t.txt": "x\n",
+  "outside/t.txt": "x\n",
+};
+const LINKS: ReadonlyArray<readonly [string, string]> = [
+  ["w/out", "../outside"],
+  ["w/back", "../w/in"],
+  ["w/inl", "in"],
+  ["w/in/up", "../in2"],
+  ["w/leaf", "../outside/t.txt"],
+];
+
+/**
+ * The parity harness seeds regular files only and the shell has no `ln` yet,
+ * so this compares against GNU patch directly: both trees get the same files
+ * and relative symbolic links, then run the same script under `LC_ALL=C`.
+ */
+async function compareWithLinks(script: string): Promise<void> {
+  const directory = mkdtempSync(join(tmpdir(), "kompjutr-patch-links-"));
+  try {
+    const fs = createFilesystem(new TestDatabase(), { now: () => 0 });
+    fs.makeDirectories(["/repo/w/in", "/repo/w/in2", "/repo/outside"]);
+    for (const [path, text] of Object.entries(LINK_FILES)) {
+      mkdirSync(dirname(join(directory, path)), { recursive: true });
+      writeFileSync(join(directory, path), text);
+      fs.writeFiles([
+        { path: `/repo/${path}`, bytes: new TextEncoder().encode(text), mode: 0o644 },
+      ]);
+    }
+    for (const [path, target] of LINKS) {
+      symlinkSync(target, join(directory, path));
+      fs.symlink(target, `/repo/${path}`);
+    }
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC", IFS: " \t\n" };
+    const bash = spawnSync("bash", ["--noprofile", "--norc", "-c", script], {
+      cwd: directory,
+      env,
+    });
+    const ours = await createShell({ fs, cwd: "/repo" }).exec(script, { env });
+    expect(ours.stdout).toEqual(Uint8Array.from(bash.stdout));
+    expect(ours.stderr).toEqual(Uint8Array.from(bash.stderr));
+    expect(ours.exitCode).toBe(bash.status);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
 
 describe("the patch parity suite has something to compare against", () => {
   it("found GNU bash", () => {
@@ -258,6 +306,14 @@ index 1111111..0000000
     const diff = `${deleting}--- a/src/b.txt\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-alpha\n-beta\n-gamma\n${creating}--- /dev/null\n+++ b/src/b.txt\n@@ -0,0 +1 @@\n+reborn\n`;
     await compare("patch -p1", diff, "ls src; cat src/b.txt");
   });
+
+  it.each(["patch -p1", "patch -p1 --no-backup-if-mismatch"])(
+    "backs up a file deleted at an offset: %s",
+    async (command) => {
+      const diff = "--- a/src/b.txt\n+++ /dev/null\n@@ -2,3 +0,0 @@\n-alpha\n-beta\n-gamma\n";
+      await compare(command, diff, "ls src; cat src/b.txt.orig");
+    },
+  );
 
   it("applies a patch twice and refuses to recreate or re-delete", async () => {
     await compare(
@@ -489,6 +545,34 @@ new mode 100755
     await compare("patch -p1 -F3 -t", diff, inspect, tree);
   });
 
+  it.each([
+    ["patch -p1", "modify", "out/t.txt"],
+    ["patch -p1", "create", "out/new.txt"],
+    ["patch -p1", "create", "out/deeper/new.txt"],
+    ["patch -p1 --dry-run", "create", "out/new.txt"],
+    ["patch -p1", "modify", "back/t.txt"],
+    ["patch -p1", "create", "back/new.txt"],
+    ["patch -p1", "modify", "inl/t.txt"],
+    ["patch -p1", "create", "inl/new.txt"],
+    ["patch -p1", "modify", "in/up/t.txt"],
+    ["patch -p1", "create", "in/up/new.txt"],
+    ["patch -p1", "modify", "leaf"],
+    ["patch -p1", "fail", "out/t.txt"],
+    ["patch -p1 out/t.txt", "fail", "out/t.txt"],
+  ])("follows symbolic links only inside the tree: %s, %s %s", async (command, action, name) => {
+    const header = action === "create" ? "--- /dev/null\n" : `--- a/${name}\n`;
+    const body =
+      action === "create"
+        ? "@@ -0,0 +1 @@\n+y\n"
+        : action === "fail"
+          ? "@@ -1 +1 @@\n-q\n+y\n"
+          : "@@ -1 +1 @@\n-x\n+y\n";
+    const script = `cd w && ${command} <<'EOF'\n${header}+++ b/${name}\n${body}EOF\n`;
+    const inspect = "ls . in in2 ../outside; cat ../outside/t.txt in/t.txt in2/t.txt; echo end\n";
+    await compareWithLinks(script);
+    await compareWithLinks(`${script}${inspect}`);
+  });
+
   it("reports a git binary patch as GNU does", async () => {
     const binary = `diff --git a/bin.dat b/bin.dat\nindex 1..2 100644\nGIT binary patch\nliteral 3\nKcmZ?\n\nliteral 0\nHcmV?d00001\n\n${B_CHANGE}`;
     await compare("patch -p1", binary, "cat src/b.txt; ls", { ...TREE, "bin.dat": "abc" });
@@ -595,8 +679,11 @@ function seeded(seed: number): () => number {
 describe("patch refusals", () => {
   const encoder = new TextEncoder();
 
-  function shell(files: Readonly<Record<string, string>>, maxRetainedBytes?: number) {
-    const fs = createFilesystem(new TestDatabase(), { now: () => 0 });
+  function shell(
+    files: Readonly<Record<string, string>>,
+    maxRetainedBytes?: number,
+    fs = createFilesystem(new TestDatabase(), { now: () => 0 }),
+  ) {
     fs.writeFiles(
       Object.entries(files).map(([path, text]) => ({
         path: `/repo/${path}`,
@@ -650,6 +737,39 @@ describe("patch refusals", () => {
     const run = await shell({ "change.diff": diff }).run("patch -p1 < change.diff; ls");
     expect(run.stdout).toBe("change.diff\n");
     expect(run.stderr).toBe("patch: patches to symbolic links are not supported\n");
+  });
+
+  it("stages queued git outputs in the filesystem, not in retained memory", async () => {
+    const files: Record<string, string> = {};
+    let diff = "";
+    for (let index = 0; index < 20; index++) {
+      const name = `f${index}.txt`;
+      files[name] = `head\n${"x".repeat(4096)}\n`;
+      diff += `diff --git a/${name} b/${name}\nindex 1..2 100644\n--- a/${name}\n+++ b/${name}\n@@ -1 +1 @@\n-head\n+HEAD\n`;
+    }
+    // Each file fits the budget; twenty held together would not.
+    const run = await shell({ ...files, "change.diff": diff }, 24 * 1024).run(
+      "patch -p1 < change.diff >/dev/null; ls; head -c 5 f0.txt f19.txt",
+    );
+    expect(run.stderr).toBe("");
+    expect(run.stdout).toBe(
+      `change.diff\n${Array.from({ length: 20 }, (_, index) => `f${index}.txt`)
+        .sort()
+        .join("\n")}\n==> f0.txt <==\nHEAD\n\n==> f19.txt <==\nHEAD\n`,
+    );
+  });
+
+  it("removes staged outputs when the run fails", async () => {
+    const diff =
+      "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y\n" +
+      "diff --git a/g b/g\nindex 1..2 100644\n--- a/g\n+++ b/g\n@@ -1 +1 @@\n-x\n+y\n";
+    const fs = createFilesystem(new TestDatabase(), { now: () => 0 });
+    const files = { f: "x\n", g: `x\n${"z".repeat(300)}\n`, "change.diff": diff };
+    const run = await shell(files, 400, fs).run("patch -p1 < change.diff");
+    expect(run.stderr).toMatch(/^kompjutr: patch target .*retained-memory limit\n$/);
+    expect(run.exitCode).toBe(2);
+    expect(fs.readdir("/repo").map((entry) => entry.name)).toEqual(["change.diff", "f", "g"]);
+    expect(new TextDecoder().decode(fs.readFile("/repo/f"))).toBe("x\n");
   });
 
   it("fails loudly when the diff exceeds the retained budget", async () => {

@@ -4,7 +4,11 @@
 // diff; a second patch to the same file flushes the queue first. Deletions
 // wait until the whole input has been read, so a file deleted and recreated
 // survives, and a fatal error publishes the queue but deletes nothing. A
-// backup is made once per file per run, from the first version replaced.
+// backup is made once per file per run, from the first version replaced,
+// and copied before the file is replaced so the original is never missing.
+// A queued output waits in a staging file beside its target rather than in
+// memory, so a diff touching many large files stays within the retained
+// budget; `discard` removes staging files when the run fails.
 
 import { concat } from "../../exec/bytes.js";
 import type { BoundedFs } from "../../exec/context.js";
@@ -16,10 +20,9 @@ type Mark = "created" | "delete-later";
 
 interface Queued {
   readonly path: string;
-  readonly bytes: Uint8Array;
-  readonly mode: number;
+  /** The staging file holding the new content, already at its final mode. */
+  readonly staged: string;
   readonly backup: boolean;
-  readonly release: () => void;
 }
 
 interface Deletion {
@@ -71,17 +74,32 @@ export class Publisher {
       this.#move(path, bytes, mode, backup);
       return;
     }
-    const release = this.fs.retained.retain(bytes.length, "patch queued output");
-    this.#queue.push({ path, bytes, mode, backup, release });
+    const staged = this.#stagingPath(path);
+    this.fs.writeFiles([{ path: staged, bytes, mode }], { parents: true });
+    this.#queue.push({ path, staged, backup });
   }
 
   flush(): void {
-    for (let next = this.#queue.shift(); next !== undefined; next = this.#queue.shift()) {
-      try {
-        this.#move(next.path, next.bytes, next.mode, next.backup);
-      } finally {
-        next.release();
-      }
+    for (let next = this.#queue[0]; next !== undefined; next = this.#queue[0]) {
+      if (next.backup) this.#backup(next.path, this.fs.stat(next.path) !== null);
+      this.fs.rename(next.staged, next.path);
+      this.#queue.shift();
+      this.#marks.set(next.path, "created");
+    }
+  }
+
+  /** Remove the staging files of outputs that will not be published. */
+  discard(): void {
+    const staged = this.#queue.map((queued) => queued.staged);
+    this.#queue.length = 0;
+    if (staged.length > 0) this.fs.removeFiles(staged, { force: true });
+  }
+
+  #stagingPath(path: string): string {
+    for (let attempt = 0; ; attempt++) {
+      const candidate = `${path}.kompjutr-patch${attempt === 0 ? "" : `-${attempt}`}`;
+      const taken = this.#queue.some((queued) => queued.staged === candidate);
+      if (!taken && this.fs.stat(candidate) === null) return candidate;
     }
   }
 
@@ -93,17 +111,7 @@ export class Publisher {
   /** Keep a copy of the original when nothing else replaces it. */
   backupInPlace(name: string): void {
     const path = this.path(name);
-    const stat = this.fs.stat(path);
-    if (stat === null || this.#marks.get(path) === "created") return;
-    const release = this.fs.retained.retain(stat.size, "patch backup");
-    try {
-      const bytes = this.fs.readFile(path);
-      this.fs.writeFiles([{ path: `${path}.orig`, bytes, mode: stat.mode & 0o777 }], {
-        parents: true,
-      });
-    } finally {
-      release();
-    }
+    if (this.fs.stat(path) !== null) this.#backup(path, true);
   }
 
   /** A reject file: a new one replaces what is there; later rejects in this run append. */
@@ -129,7 +137,7 @@ export class Publisher {
     for (const deletion of this.#deletions) {
       const path = this.path(deletion.name);
       if (this.#marks.get(path) !== "delete-later") continue;
-      if (deletion.backup) this.#backup(path, false);
+      if (deletion.backup) this.#backup(path, this.fs.stat(path) !== null, true);
       else this.fs.removeFiles([path], { force: true });
       this.#removeEmptyParents(deletion.name);
     }
@@ -141,10 +149,12 @@ export class Publisher {
     this.#marks.set(path, "created");
   }
 
-  #backup(path: string, exists: boolean): void {
+  /** A deleted file's backup takes its place; a replaced file's is a copy. */
+  #backup(path: string, exists: boolean, removing = false): void {
     if (this.#marks.get(path) === "created") return;
     const backup = `${path}.orig`;
-    if (exists) this.fs.rename(path, backup);
+    if (exists && removing) this.fs.rename(path, backup);
+    else if (exists) this.fs.copyFiles([{ source: path, destination: backup }]);
     else
       this.fs.writeFiles([{ path: backup, bytes: new Uint8Array(0), mode: 0o644 }], {
         parents: true,

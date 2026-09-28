@@ -9,9 +9,11 @@ import type { Stat } from "../../../fs/types.js";
 import type { BoundedFs } from "../../exec/context.js";
 import type { Header } from "./intuit.js";
 import { quote } from "./names.js";
+import { reach } from "./safety.js";
 import type { Session } from "./session.js";
 
 const NONE = 3;
+const ENCODER = new TextEncoder();
 
 export function chooseFile(session: Session, header: Header, fs: BoundedFs): void {
   const names = header.names;
@@ -25,7 +27,11 @@ export function chooseFile(session: Session, header: Header, fs: BoundedFs): voi
     for (let index = 0; index < 3; index++) {
       const name = names[index];
       if (name === undefined || name === null) continue;
-      const stat = fs.stat(session.publisher.path(name));
+      // A name reached through a link out of the tree does not exist, for GNU.
+      const stat =
+        reach(fs, session.options.cwd, name) === "inside"
+          ? fs.stat(session.publisher.path(name))
+          : null;
       stats[index] = stat !== null && !session.publisher.deleteScheduled(name) ? stat : null;
       last = index;
     }
@@ -136,13 +142,14 @@ function bestName(
     counts[index] = count;
     if (fewest < count) continue;
     fewest = count;
-    const base = name.slice(name.lastIndexOf("/") + 1).length;
+    const base = byteLength(name.slice(name.lastIndexOf("/") + 1));
     basenames[index] = base;
     if (shortestBase < base) continue;
     shortestBase = base;
-    lengths[index] = name.length;
-    if (shortest < name.length) continue;
-    shortest = name.length;
+    const length = byteLength(name);
+    lengths[index] = length;
+    if (shortest < length) continue;
+    shortest = length;
   }
   for (let index = 0; index < 3; index++) {
     const name = names[index];
@@ -161,14 +168,20 @@ function bestName(
   return NONE;
 }
 
+/** GNU compares names by their length in bytes. */
+function byteLength(text: string): number {
+  return ENCODER.encode(text).length;
+}
+
 /** Directory components of a name; with a filesystem, only the leading ones that exist. */
 function components(name: string, fs: BoundedFs | null, session?: Session): number {
   let count = 0;
   for (let index = 1; index < name.length; index++) {
     if (name.charAt(index) !== "/" || name.charAt(index - 1) === "/") continue;
     if (fs !== null && session !== undefined) {
-      const stat = fs.stat(session.publisher.path(name.slice(0, index)));
-      if (stat?.type !== "dir") break;
+      const prefix = name.slice(0, index);
+      if (reach(fs, session.options.cwd, `${prefix}/-`) !== "inside") break;
+      if (fs.statTarget(session.publisher.path(prefix))?.type !== "dir") break;
     }
     count++;
   }

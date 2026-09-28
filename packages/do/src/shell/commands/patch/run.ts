@@ -10,6 +10,7 @@ import { type Header, intuit, touchesSymlink } from "./intuit.js";
 import { PatchFatal } from "./messages.js";
 import { isSpace, quote } from "./names.js";
 import { rejectHunk } from "./reject.js";
+import { reach } from "./safety.js";
 import { chooseFile } from "./select.js";
 import type { Session } from "./session.js";
 import type { PatchSource } from "./source.js";
@@ -143,6 +144,21 @@ function applyOne(
   if (inname !== null && inStat?.type === "file" && (inStat.mode & 0o200) === 0) {
     say(`File ${quote(inname)} is read-only; trying to patch anyway\n`);
   }
+  // GNU vets the output name where it creates its temporary file.
+  let skipRejects = false;
+  const reached =
+    outname === null || options.target !== null || options.dryRun
+      ? "inside"
+      : reach(context.fs, options.cwd, outname);
+  if (reached === "dangling") {
+    throw new PatchFatal(`Can't create temporary file ${outname} : No such file or directory`);
+  }
+  if (reached === "outside") {
+    say(`Invalid file name ${quote(outname ?? "")} -- skipping patch\n`);
+    session.skipRest = true;
+    skipRejects = true;
+    ok = false;
+  }
   if (!session.skipRest && header.kind === "binary") {
     say(`File ${quote(outname ?? "")}: git binary diffs are not supported.\n`);
     session.skipRest = true;
@@ -173,7 +189,7 @@ function applyOne(
     }
     if (outcome.failed > 0) {
       ok = false;
-      reportRejects(session, outname, outcome);
+      if (!skipRejects) reportRejects(session, outname, outcome);
     }
   } finally {
     input?.release();

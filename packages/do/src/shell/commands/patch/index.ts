@@ -53,6 +53,8 @@ const patch: Command = async (context) => {
     status = 2;
   } finally {
     input?.release();
+    // Empty after a completed run; after any other failure, staging files go.
+    publisher.discard();
   }
   return stdout(transcript, status);
 };
