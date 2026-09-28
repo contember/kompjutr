@@ -8,7 +8,8 @@ import {
 } from "../../store/index.js";
 import { advanceRebaseOwned } from "../../store/operations/operation-journal.js";
 import { checkoutTreeExcluding } from "../checkout/checkout.js";
-import type { GitIdentity } from "../core/context.js";
+import { trySparseCleanCheckout } from "../checkout/sparse-checkout-operation.js";
+import type { GitContext, GitIdentity } from "../core/context.js";
 import { operationNotActive, type RebaseStateMetadata } from "../core/operation-state.js";
 import {
   integrationIndexMatchesTree,
@@ -123,13 +124,25 @@ export function currentBaseline(
   return requireCurrentBaseline(repo, worktree, state, exclusions);
 }
 
+/**
+ * `baselineTree` is HEAD's tree. With a clean index tracker at HEAD, only paths
+ * in the tree diff can block or change, so a diff-bounded checkout replaces the
+ * whole-tree pass. Anything the fast path cannot prove declines to the full one.
+ */
 export function materializeTree(
+  context: GitContext,
   repo: Repository,
   worktree: Worktree,
   baselineTree: string,
   targetTree: string,
   exclusions: RebaseExclusions,
 ): void {
+  if (
+    exclusions.absolute.length === 0 &&
+    trySparseCleanCheckout(context, repo, worktree, targetTree)
+  ) {
+    return;
+  }
   const blockers = checkoutBlockers(repo, worktree, {
     baselineTree,
     tree: targetTree,
