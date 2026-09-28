@@ -2,7 +2,7 @@
 // options; the first other word starts the operands. `-e` interprets escapes
 // byte-for-byte, so `\x` and `\0` sequences may produce non-UTF-8 output.
 
-import { type ByteStream, concat, encode } from "../exec/bytes.js";
+import { concat, encode, one } from "../exec/bytes.js";
 import { type Command, fail, result } from "../exec/context.js";
 
 const SIMPLE_ESCAPES: ReadonlyMap<string, number> = new Map([
@@ -104,8 +104,4 @@ function interpretEscapes(text: string): { bytes: Uint8Array; stopped: boolean }
   }
   flush();
   return { bytes: concat(chunks), stopped: false };
-}
-
-function* one(bytes: Uint8Array): ByteStream {
-  if (bytes.length > 0) yield bytes;
 }

@@ -62,6 +62,8 @@ We admit this finite surface:
   type tests, depth limits, `-prune`, `-print0`, and `!`, `-a`, `-o` with
   parentheses. Pruned and too-deep subtrees are skipped by resuming the scan.
 - `grep` and `rg` `-o` and `-q`, each following its own binary around `-o`.
+- `tee`, which holds its file bytes against the retained budget and publishes
+  each file once, and `wc` in GNU's per-operand layout.
 
 Expansion stays unresolved through parse and plan, so planning stays pure.
 Generated fields and pathname matches share the 10,000-entry argv ceiling and the

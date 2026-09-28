@@ -5,7 +5,7 @@
 // Each file test is one stat.
 
 import type { Stat } from "../../fs/types.js";
-import type { ByteStream } from "../exec/bytes.js";
+import { empty } from "../exec/bytes.js";
 import {
   type Command,
   type CommandContext,
@@ -51,7 +51,7 @@ export const bracket: Command = (context) => {
 
 function evaluate(context: CommandContext, args: readonly string[]): CommandResult {
   try {
-    return result(nothing(), expression(context, args) ? 0 : 1);
+    return result(empty(), expression(context, args) ? 0 : 1);
   } catch (error) {
     if (error instanceof TestError) return fail(context, error.message, 2);
     throw error;
@@ -169,8 +169,4 @@ function integer(value: string): bigint {
   const trimmed = value.trim();
   if (!/^[+-]?[0-9]+$/.test(trimmed)) throw new TestError(`${value}: integer expression expected`);
   return BigInt(trimmed);
-}
-
-function* nothing(): ByteStream {
-  // A test answers with its status alone.
 }

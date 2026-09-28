@@ -5,7 +5,7 @@
 // GNU grep and rg disagree about `-o` around the match: rg keeps context
 // lines and prints whole selected lines under `-v`; GNU prints neither.
 
-import { type ByteStream, decode, encode, NEWLINE } from "../../exec/bytes.js";
+import { type ByteStream, decode, empty, encode, NEWLINE } from "../../exec/bytes.js";
 import { type CommandResult, type RetainedBudget, result } from "../../exec/context.js";
 
 export interface LineLabel {
@@ -91,11 +91,7 @@ export async function quietly(
   matched: () => boolean,
 ): Promise<CommandResult> {
   for await (const _first of stdout) break;
-  return result(nothing(), matched() ? 0 : status());
-}
-
-function* nothing(): ByteStream {
-  // `-q` writes nothing.
+  return result(empty(), matched() ? 0 : status());
 }
 
 function prefix(label: LineLabel, separator: string): string {

@@ -19,8 +19,10 @@ import { readCommands } from "./read.js";
 import { grep } from "./search/grep.js";
 import { rg } from "./search/rg.js";
 import { tail } from "./tail.js";
+import { tee } from "./tee.js";
 import { bracket, test } from "./test.js";
 import { registerKnownCommands, textCommands } from "./text.js";
+import { wc } from "./wc.js";
 import { xargs } from "./xargs.js";
 
 export function builtinCommands(): Map<string, Command> {
@@ -33,6 +35,8 @@ export function builtinCommands(): Map<string, Command> {
     ["find", find],
     ["xargs", xargs],
     ["tail", tail],
+    ["tee", tee],
+    ["wc", wc],
     ["test", test],
     ["[", bracket],
     ["basename", basename],

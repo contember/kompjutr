@@ -38,10 +38,10 @@ describe("reading", () => {
     expect((await shell.run("head -n 1 docs/guide.md")).stdout).toBe("line1\n");
   });
   it("counts", async () => {
-    expect((await shell.run("wc -l docs/guide.md")).stdout).toBe("5\n");
+    expect((await shell.run("wc -l docs/guide.md")).stdout).toBe("5 docs/guide.md\n");
     fs.writeFiles([file("/repo/unicode.txt", "é x\n")]);
-    expect((await shell.run("wc -m unicode.txt")).stdout.trim()).toBe("4");
-    expect((await shell.run("wc -cm unicode.txt")).stdout.trim().split(/\s+/)).toEqual(["4", "5"]);
+    expect((await shell.run("wc -m unicode.txt")).stdout).toBe("4 unicode.txt\n");
+    expect((await shell.run("wc -cm unicode.txt")).stdout).toBe("4 5 unicode.txt\n");
   });
   it("heads each file independently and controls headings", async () => {
     expect((await shell.run("head -1 README.md docs/guide.md")).stdout).toBe(

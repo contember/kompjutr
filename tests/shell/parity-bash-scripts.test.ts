@@ -152,6 +152,36 @@ describe.skipIf(!REAL_BASH)("scripts match Bash", () => {
   });
 
   it.each([
+    "echo hi | tee out.txt; cat out.txt",
+    "printf 'a\\nb\\n' | tee one two > /dev/null; cat one two",
+    "echo more | tee -a lines.txt; cat lines.txt",
+    "echo x | tee --append lines.txt > /dev/null; cat lines.txt",
+    "printf '1\\n2\\n3\\n' | tee full.txt | head -1; cat full.txt",
+    "tee empty.out < /dev/null; wc -c empty.out",
+  ])("copies input with tee: %j", async (source) => {
+    await compare(source);
+  });
+
+  it.each([
+    "wc -l lines.txt",
+    "wc lines.txt",
+    "wc -l lines.txt empty.txt",
+    "wc lines.txt sub/inner.txt",
+    "wc -cl lines.txt",
+    "wc -m lines.txt",
+    "printf 'a b\\n' | wc",
+    "printf 'a b\\n' | wc -l",
+    "printf 'a b\\n' | wc -lw",
+    "printf 'a b\\n' | wc -l - lines.txt",
+    "wc lines.txt missing",
+    "wc -l missing",
+    "wc sub",
+    "wc -c < /dev/null",
+  ])("counts in GNU wc's layout: %j", async (source) => {
+    await compare(source);
+  });
+
+  it.each([
     "basename /a/b/c.txt",
     "basename /a/b/c.txt .txt",
     "basename c.txt c.txt",
@@ -186,6 +216,15 @@ describe("script refusals and located diagnostics", () => {
     expect(run.exitCode).toBe(2);
     expect(run.stdout).toBe("");
     expect(run.stderr).toBe("kompjutr: here-document delimited by end of input (wanted 'EOF')\n");
+  });
+
+  // The host tee is uutils, which appends `(os error 2)` to the GNU text.
+  it("reports a tee target it cannot open and still writes the others", async () => {
+    const run = await shell.run("echo x | tee nodir/a out.txt; cat out.txt");
+    expect(run.stderr).toBe("tee: nodir/a: No such file or directory\n");
+    expect(run.stdout).toBe("x\nx\n");
+    expect(run.exitCode).toBe(0);
+    expect((await shell.run("echo x | tee nodir/a")).exitCode).toBe(1);
   });
 
   // Bash's result depends on the locale; the run has none.

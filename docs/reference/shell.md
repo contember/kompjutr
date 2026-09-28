@@ -24,7 +24,8 @@ The [baseline Bash parity suite](../../tests/shell/parity-bash.test.ts)
 pins existing `echo`, `cat`, `2>&1`, and `2>/dev/null` behavior. Each stage owns
 its redirections:
 
-- `< file`, `> file`, and `>> file` preserve atomic publication. Synchronous
+- `< file`, `> file`, and `>> file` preserve atomic publication. `< /dev/null`
+  is empty input. Synchronous
   output streams feed the filesystem transaction incrementally. Asynchronous
   output is pulled sequentially under `maxRetainedBytes` before the one
   synchronous filesystem publication; an upstream rejection publishes nothing.
@@ -94,7 +95,8 @@ attached value, or `--long=value`.
 | `cat` | Files or stdin. Multiple files stream in operand order. |
 | `head` | `-N`, `-n`/`--lines`, `-c`/`--bytes`, `-q`, `-v`; files or stdin. |
 | `tail` | `-N`, `-n`/`--lines`, and `-n +N` to start at line N; one file or stdin/multiple-file stream. |
-| `wc` | `-l`/`--lines`, `-w`/`--words`, `-m`/`--chars`, `-c`/`--bytes`. |
+| `wc` | `-l`/`--lines`, `-w`/`--words`, `-m`/`--chars`, `-c`/`--bytes`; `-` names stdin. GNU layout: operand names, a `total` row for several operands, and GNU's column width. |
+| `tee` | `-a`/`--append`. Files are created or truncated before input is read and published once when it ends; their bytes are held against `maxRetainedBytes`. A consumer that stops early does not shorten the files. |
 | `ls` | `-l`, `-a`, `-A`, `-1`, `-R`, `-d`. Output is one entry per line. Missing operands are reported, then files, then directories, each group in name order. `-l` prints its own stable fields, not GNU's owner and date columns. `-R` groups follow path byte order. |
 | `find` | Several starting points (default `.`); `-name`, `-iname`, `-path`, `-ipath`, `-type f\|d\|l` with comma lists, `-maxdepth`, `-mindepth`, `-prune`, `-print`, `-print0`, `-true`, `-false`; `!`/`-not`, `-a`/`-and`, `-o`/`-or`, and parentheses. Without an action the expression prints. Malformed expressions exit 1 with GNU's diagnostics; `-exec`, `-delete`, `-size`, time and permission tests, and other predicates are refused with status 2. Results follow path byte order, where GNU follows readdir. |
 | `stat` | One or more paths; stable text fields for file, size, type, mode, and mtime. |

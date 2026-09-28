@@ -1,7 +1,7 @@
 // `tail`. A file is read from the end in widening range probes; `-n +N`
 // streams from line N without buffering lines.
 
-import { type ByteStream, lines, NEWLINE, terminated } from "../exec/bytes.js";
+import { type ByteStream, empty, lines, NEWLINE, one, terminated } from "../exec/bytes.js";
 import { type Command, type CommandContext, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { count, UsageError } from "./flags.js";
@@ -143,12 +143,4 @@ function countNewlines(bytes: Uint8Array, includeFirst: boolean): number {
     if (bytes[index] === NEWLINE) found++;
   }
   return found;
-}
-
-function* one(bytes: Uint8Array): ByteStream {
-  if (bytes.length > 0) yield bytes;
-}
-
-function* empty(): ByteStream {
-  // Nothing.
 }

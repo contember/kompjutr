@@ -3,7 +3,7 @@
 // read. The ones that do name a file lower to `readRange`, so `head -20` of
 // a 40 MB file is one statement over a few kilobytes.
 
-import { type ByteStream, concat, encode, NEWLINE, restoreUnused } from "../exec/bytes.js";
+import { type ByteStream, concat, empty, encode, NEWLINE, restoreUnused } from "../exec/bytes.js";
 import { type Command, type CommandContext, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { count, parseFlags, UsageError } from "./flags.js";
@@ -162,50 +162,6 @@ async function* headed(name: string, source: ByteStream): ByteStream {
   for await (const chunk of source) yield chunk;
 }
 
-export const wc: Command = async (context) => {
-  const parsed = parseFlags(context.argv, {
-    boolean: new Set(["-l", "-c", "-w", "-m", "--lines", "--bytes", "--words", "--chars"]),
-    valued: new Set(),
-  });
-  const wants = new Set(parsed.flags.map((flag) => flag.name));
-
-  const source =
-    parsed.operands.length === 0 ? context.stdin : fileStream(context, parsed.operands);
-  if (source === null) return result(empty());
-
-  let lineCount = 0;
-  let wordCount = 0;
-  let byteCount = 0;
-  let characterCount = 0;
-  let inWord = false;
-  const decoder = new TextDecoder();
-  for await (const chunk of source) {
-    byteCount += chunk.length;
-    for (const _character of decoder.decode(chunk, { stream: true })) characterCount++;
-    for (let index = 0; index < chunk.length; index++) {
-      const byte = chunk[index];
-      if (byte === NEWLINE) lineCount++;
-      // A word is a run of anything that is not whitespace, counted as the
-      // run starts so the stream is never buffered.
-      const blank = byte === 0x20 || byte === 0x09 || byte === NEWLINE || byte === 0x0d;
-      if (blank) inWord = false;
-      else if (!inWord) {
-        inWord = true;
-        wordCount++;
-      }
-    }
-  }
-  for (const _character of decoder.decode()) characterCount++;
-
-  const requested = parsed.flags.length > 0;
-  const counts: number[] = [];
-  if (!requested || wants.has("-l") || wants.has("--lines")) counts.push(lineCount);
-  if (!requested || wants.has("-w") || wants.has("--words")) counts.push(wordCount);
-  if (wants.has("-m") || wants.has("--chars")) counts.push(characterCount);
-  if (!requested || wants.has("-c") || wants.has("--bytes")) counts.push(byteCount);
-  return result(one(encode(`${counts.join(" ")}\n`)));
-};
-
 /** Pull `-N` out of an argv, leaving the rest for the flag parser. */
 function takeCountShorthand(argv: readonly string[]): {
   argv: string[];
@@ -237,7 +193,7 @@ export function fileStream(context: CommandContext, operands: readonly string[])
   })();
 }
 
-function* streamFile(
+export function* streamFile(
   context: CommandContext,
   path: string,
   size: number,
@@ -335,18 +291,9 @@ function* headOfFile(
   }
 }
 
-function* one(bytes: Uint8Array): ByteStream {
-  if (bytes.length > 0) yield bytes;
-}
-
-function* empty(): ByteStream {
-  // Nothing.
-}
-
 export const readCommands: ReadonlyMap<string, Command> = new Map([
   ["cat", cat],
   ["head", head],
-  ["wc", wc],
 ]);
 
 export { concat };
