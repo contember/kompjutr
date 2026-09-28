@@ -129,7 +129,6 @@ describe("named parameter expansion boundaries", () => {
     { label: "argument parameter", parameter: "$@" },
     { label: "argument-list parameter", parameter: "$*" },
     { label: "argument-count parameter", parameter: "$#" },
-    { label: "status parameter", parameter: "$?" },
     { label: "background-process parameter", parameter: "$!" },
     { label: "option-flags parameter", parameter: "$-" },
     { label: "process parameter", parameter: "$$" },

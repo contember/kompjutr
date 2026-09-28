@@ -1,195 +1,138 @@
-import type { PlannedPipeline } from "../plan/types.js";
-import { expandArguments } from "./arguments.js";
-import { type ByteStream, close, isAsyncByteStream, line } from "./bytes.js";
-import { commandContext } from "./command-context.js";
-import type { CommandResult } from "./context.js";
-import type { PipelineEnvironment } from "./execution-types.js";
-import {
-  isFilesystemError,
-  openRedirectionFiles,
-  readText,
-  readWholeFile,
-  resolveRedirections,
-  routeStageOutput,
-  UpstreamError,
-} from "./redirections.js";
-import type { HeldChunk, OutputDestination, ResolvedRedirections } from "./routing-types.js";
-import {
-  diagnosticsFor,
-  releaseDiagnostics,
-  rethrowAfterCommandCleanup,
-  stageOutput,
-} from "./stage-output.js";
+// One pipeline. Each stage's output stream is built in order and the last one
+// is yielded to the consumer; nothing runs until something pulls.
+//
+// As in Bash, every stage of a multi-stage pipeline is its own shell: it runs
+// on a copy of the shell state, so `cd x | cat` changes nothing and an `exit`
+// or `break` there ends only that stage.
 
-export interface PipelineResult {
-  readonly exitCode: number;
-  readonly truncated: boolean;
-  readonly terminateRun: boolean;
-}
+import type { PlannedPipeline, PlannedStage } from "../plan/types.js";
+import { type ByteStream, close, line } from "./bytes.js";
+import {
+  EXIT,
+  type Flow,
+  type Frame,
+  type Outcome,
+  type Runtime,
+  type Segments,
+} from "./compound/frame.js";
+import { isFilesystemError, routeStageOutput, UpstreamError } from "./redirections.js";
+import { prepareStage, replaceInput, type StageSettlement, startStage } from "./stage.js";
+import { releaseDiagnostics } from "./stage-output.js";
 
-export async function runPipeline(
+export async function* runPipeline(
   pipeline: PlannedPipeline,
-  env: PipelineEnvironment,
-): Promise<PipelineResult> {
-  let stream: ByteStream | null = env.inputs?.borrow() ?? null;
-  const results: CommandResult[] = [];
+  frame: Frame,
+  runtime: Runtime,
+): Segments {
+  const stages = pipeline.commands;
+  const [only] = stages;
+  // An unrouted compound runs in place: its pipelines' output reaches the
+  // consumer one pipeline at a time, as the enclosing list's would.
+  if (stages.length === 1 && only !== undefined && only.kind !== "command") {
+    if (only.redirections.length === 0) return yield* runtime.compound(only, frame);
+  }
+
+  const multi = stages.length > 1;
+  const settlements: StageSettlement[] = [];
+  const copies: Frame[] = [];
+  const finish = (status: number, flow: Flow | null): Outcome => {
+    runtime.truncated ||= settlements.some((stage) => stage.truncated());
+    return { status, flow };
+  };
+  let stream: ByteStream | null = frame.io.stdin?.borrow() ?? null;
   let settled = false;
 
   try {
-    for (let index = 0; index < pipeline.commands.length; index++) {
-      const planned = pipeline.commands[index];
+    for (let index = 0; index < stages.length; index++) {
+      const planned = stages[index];
       if (planned === undefined) continue;
+      const stageFrame = multi ? stageCopy(frame, planned) : frame;
+      if (stageFrame !== frame) copies.push(stageFrame);
 
-      const command = env.commands.get(planned.name);
-      if (command === undefined) {
-        env.errors.writeBytes(line(`kompjutr: ${planned.name}: command not found`));
-        await close(stream);
-        settled = true;
-        return {
-          exitCode: 127,
-          truncated: results.some(commandResultTruncated),
-          terminateRun: false,
-        };
-      }
-
-      const expanded = expandArguments(planned.args, env.fs, env.cwd, env.inputs?.env);
-      const argv = expanded.argv;
-
-      let redirections: ResolvedRedirections;
-      try {
-        redirections = resolveRedirections(planned, env.fs, env.cwd, env.inputs?.env);
-        await openRedirectionFiles(redirections, env.fs);
-      } catch (error) {
-        expanded.release();
-        if (isFilesystemError(error)) {
-          env.errors.writeBytes(line(`${planned.name}: ${error.message}`));
-          return {
-            exitCode: 1,
-            truncated: results.some(commandResultTruncated),
-            terminateRun: false,
-          };
+      const prepared = await prepareStage(planned, stageFrame, runtime);
+      if (prepared.kind === "abort") return finish(prepared.status, null);
+      if (prepared.kind === "failed") {
+        if (!multi) {
+          await close(stream);
+          settled = true;
+          return finish(prepared.status, prepared.exit ? EXIT : null);
         }
-        throw error;
+        stream = await failStage(stream, prepared.status, settlements);
+        continue;
       }
 
-      if (redirections.stdin !== null) {
-        const priorInput = stream;
-        stream = null;
-        let priorClosed = false;
-        const closePrior = async (): Promise<void> => {
-          if (priorClosed) return;
-          priorClosed = true;
-          await close(priorInput);
-        };
-        try {
-          await closePrior();
-          stream =
-            redirections.stdin.kind === "file"
-              ? readWholeFile(env.fs, redirections.stdin.path)
-              : readText(env.fs, redirections.stdin.text);
-        } catch (error) {
-          try {
-            await closePrior();
-          } finally {
-            expanded.release();
-          }
-          throw error;
-        }
-      }
-
-      const routedDiagnostics = new Map<OutputDestination, HeldChunk[]>();
-      const stageInput = stream;
-      const context = commandContext(
-        planned,
-        redirections,
-        index === pipeline.commands.length - 1,
-        pipeline.commands.length === 1,
-        argv,
-        stageInput,
+      const stage = prepared.stage;
+      const input = stream;
+      stream = null;
+      stream = await replaceInput(input, stage, runtime.fs);
+      const started = await startStage(
+        stage,
+        stream,
+        { first: index === 0, last: index === stages.length - 1 },
         pipeline.limitHint,
-        env,
-        routedDiagnostics,
+        stageFrame,
+        runtime,
       );
-      let produced: CommandResult;
+      settlements.push(started.settlement);
       try {
-        produced = await command(context);
+        stream = await routeStageOutput(
+          started.output,
+          stage.redirections,
+          started.routed,
+          runtime.fs,
+          stageFrame.io.stderr,
+        );
       } catch (error) {
-        rethrowAfterCommandCleanup(error, expanded, routedDiagnostics);
-      }
-      const releaseStage = isAsyncByteStreamOrNull(stageInput)
-        ? async (): Promise<void> => {
-            try {
-              await close(stageInput);
-            } finally {
-              expanded.release();
-            }
-          }
-        : (): void => {
-            try {
-              stageInput?.return?.();
-            } finally {
-              expanded.release();
-            }
-          };
-      const output = stageOutput(
-        produced.stdout,
-        diagnosticsFor(routedDiagnostics, redirections.stdout),
-        releaseStage,
-        isAsyncByteStreamOrNull(stageInput),
-      );
-      results.push(produced);
-      try {
-        stream = await routeStageOutput(output, redirections, routedDiagnostics, env);
-      } catch (error) {
-        await close(output);
-        releaseDiagnostics(routedDiagnostics);
+        await close(started.output);
+        releaseDiagnostics(started.routed);
         if (error instanceof UpstreamError) throw error.original;
         if (isFilesystemError(error)) {
-          env.errors.writeBytes(line(`${planned.name}: ${error.message}`));
-          return {
-            exitCode: 1,
-            truncated: results.some(commandResultTruncated),
-            terminateRun: false,
-          };
+          stageFrame.io.stderr.writeBytes(line(`${stage.label.name}: ${error.message}`));
+          return finish(1, null);
         }
         throw error;
-      }
-      if (produced.control?.kind === "exit") {
-        await env.out.write(stream);
-        settled = true;
-        return {
-          exitCode: produced.status(),
-          truncated: results.some(commandResultTruncated),
-          terminateRun: produced.control.terminateRun,
-        };
       }
     }
 
     if (stream === null) {
       settled = true;
-      return { exitCode: 0, truncated: false, terminateRun: false };
+      return finish(0, null);
     }
-    await env.out.write(stream);
+    yield stream;
     settled = true;
-
-    // A pipeline's status is its last stage's, as in bash without pipefail.
-    const last = results[results.length - 1];
-    return {
-      exitCode: last === undefined ? 0 : last.status(),
-      truncated: results.some(commandResultTruncated),
-      terminateRun: false,
-    };
+    const status = pipelineStatus(settlements, frame.shell.options.pipefail);
+    return finish(status, multi ? null : (settlements[0]?.flow() ?? null));
   } finally {
-    if (!settled) await close(stream);
+    try {
+      if (!settled) await close(stream);
+    } finally {
+      for (const copy of copies) copy.shell.release();
+    }
   }
 }
 
-function commandResultTruncated(result: CommandResult): boolean {
-  return result.truncated?.() ?? false;
+/** A compound stage and its body get no enclosing loops, as in Bash. */
+function stageCopy(frame: Frame, planned: PlannedStage): Frame {
+  const compound = planned.kind !== "command";
+  return { ...frame, shell: frame.shell.clone(compound), loops: compound ? 0 : frame.loops };
 }
 
-function isAsyncByteStreamOrNull(
-  stream: ByteStream | null,
-): stream is AsyncIterableIterator<Uint8Array, void, undefined> {
-  return stream !== null && isAsyncByteStream(stream);
+/** A stage whose shell ended before its command ran: no output, a fixed status. */
+async function failStage(
+  input: ByteStream | null,
+  status: number,
+  settlements: StageSettlement[],
+): Promise<ByteStream> {
+  await close(input);
+  settlements.push({ status: () => status, truncated: () => false, flow: () => null });
+  return (function* (): ByteStream {})();
+}
+
+/** The last stage's status, or with `pipefail` the rightmost non-zero one. */
+function pipelineStatus(settlements: readonly StageSettlement[], pipefail: boolean): number {
+  for (let index = settlements.length - 1; index >= 0; index--) {
+    const status = settlements[index]?.status() ?? 0;
+    if (!pipefail || status !== 0) return status;
+  }
+  return 0;
 }

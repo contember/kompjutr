@@ -1,11 +1,8 @@
-// Exit matches Bash exactly except in multi-stage pipelines. Bash forks there;
-// this shell has no subshells and reports an explicit local usage error instead.
+// Exit matches Bash exactly, including in a multi-stage pipeline, where each
+// stage is its own shell and `exit` ends only that stage.
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
-import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
-import { createShell, type Shell } from "../../packages/do/src/shell/index.js";
-import { TestDatabase } from "../helpers/db.js";
 import { agreeWithBash, compareWithBash, REAL_BASH } from "../helpers/shell-parity.js";
 
 describe("the exit parity suite has something to compare against", () => {
@@ -35,22 +32,14 @@ describe.skipIf(!REAL_BASH)("exit matches Bash", () => {
       agreeWithBash(await compareWithBash(source));
     },
   );
-});
 
-describe("exit rejects multi-stage pipelines locally", () => {
-  let shell: Shell;
-
-  beforeEach(() => {
-    const fs = createFilesystem(new TestDatabase());
-    fs.mkdir("/repo");
-    shell = createShell({ fs, cwd: "/repo" });
-  });
-
-  it.each(["exit | cat", "true | exit"])("reports a usage error: %s", async (source) => {
-    expect(await shell.run(source)).toMatchObject({
-      stdout: "",
-      stderr: "exit: only supported as a single-stage pipeline\n",
-      exitCode: 2,
-    });
+  it.each([
+    "exit | cat; echo after",
+    "true | exit; echo after",
+    "echo a | exit 3; echo after",
+    "exit 5 | cat",
+    "echo x | exit foo; echo after",
+  ])("ends only its own stage in a pipeline: %s", async (source) => {
+    agreeWithBash(await compareWithBash(source));
   });
 });

@@ -1,8 +1,8 @@
-import type { PlannedCommand } from "../plan/types.js";
-import { quotedText, resolve, single } from "./arguments.js";
+import type { PlannedRedirection } from "../plan/types.js";
+import { type Parameters, quotedText, resolve, single } from "./arguments.js";
 import { type ByteStream, close, isAsyncByteStream } from "./bytes.js";
+import type { DiagnosticPort } from "./compound/frame.js";
 import type { BoundedFs } from "./context.js";
-import type { PipelineEnvironment } from "./execution-types.js";
 import type {
   FileDestination,
   HeldChunk,
@@ -40,10 +40,10 @@ function protectUpstream(stream: ByteStream): ByteStream {
 }
 
 export function resolveRedirections(
-  planned: PlannedCommand,
+  planned: { readonly redirections: readonly PlannedRedirection[] },
   fs: BoundedFs,
   cwd: string,
-  env: Readonly<Record<string, string>> | undefined,
+  parameters: Parameters,
 ): ResolvedRedirections {
   const output: OutputDestination = { kind: "output" };
   const diagnostic: OutputDestination = { kind: "diagnostic" };
@@ -54,12 +54,12 @@ export function resolveRedirections(
 
   for (const redirection of planned.redirections) {
     if (redirection.kind === "read") {
-      const path = resolve(cwd, single(redirection.path, fs, cwd, env));
+      const path = resolve(cwd, single(redirection.path, fs, cwd, parameters));
       stdin = path === "/dev/null" ? { kind: "text", text: "" } : { kind: "file", path };
       continue;
     }
     if (redirection.kind === "text") {
-      const text = quotedText(redirection.text, env);
+      const text = quotedText(redirection.text, parameters);
       stdin = { kind: "text", text: redirection.newline ? `${text}\n` : text };
       continue;
     }
@@ -69,7 +69,7 @@ export function resolveRedirections(
       else stderr = destination;
       continue;
     }
-    const path = resolve(cwd, single(redirection.path, fs, cwd, env));
+    const path = resolve(cwd, single(redirection.path, fs, cwd, parameters));
     const destination: OutputDestination =
       path === "/dev/null"
         ? { kind: "drop" }
@@ -106,21 +106,22 @@ export async function routeStageOutput(
   stdout: ByteStream,
   redirections: ResolvedRedirections,
   diagnostics: Map<OutputDestination, HeldChunk[]>,
-  env: PipelineEnvironment,
+  fs: BoundedFs,
+  stderr: DiagnosticPort,
 ): Promise<ByteStream> {
   if (redirections.stdout.kind === "output") {
     const sideFiles = activeSideFiles(redirections);
     if (sideFiles.length === 0) return stdout;
-    return outputWithSideFiles(stdout, sideFiles, diagnostics, env.fs);
+    return outputWithSideFiles(stdout, sideFiles, diagnostics, fs);
   }
 
   if (redirections.stdout.kind === "diagnostic") {
-    await env.errors.write(stdout);
+    await stderr.write(stdout);
   } else if (redirections.stdout.kind === "drop") {
     await drain(stdout);
   } else {
     await writeStream(
-      env.fs,
+      fs,
       redirections.stdout.path,
       redirections.stdout.append || redirections.stdout.opened,
       protectUpstream(stdout),
@@ -128,7 +129,7 @@ export async function routeStageOutput(
     redirections.stdout.opened = true;
   }
 
-  await flushSideFiles(activeSideFiles(redirections), diagnostics, env.fs);
+  await flushSideFiles(activeSideFiles(redirections), diagnostics, fs);
   const pipelineDiagnostics = diagnosticsFor(diagnostics, redirections.output);
   releaseDiagnostics(diagnostics, pipelineDiagnostics);
   return stageOutput(empty(), pipelineDiagnostics, () => {}, false);

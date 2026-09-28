@@ -3,9 +3,10 @@
 // 614 real agent command lines were parsed through a full bash grammar and
 // the node kinds it emitted were counted: of ~80 kinds, 11 covered 613 of
 // them. Those 11 are below, plus here-documents, which agents use to write
-// files, and word expansions (tilde, braces) that keep the grammar flat.
-// Everything else — arithmetic, `case`, process substitution, functions,
-// `[[ ]]` — is rejected by name in `lexer.ts` rather than half-implemented,
+// files, word expansions (tilde, braces), and the compound commands whose
+// execution is bounded: subshells, groups, `if`, and `for … in` (ADR-0027).
+// Everything else — arithmetic, `case`, `while`, process substitution,
+// functions, `[[ ]]` — is rejected by name rather than half-implemented,
 // because a construct that
 // parses and then means something slightly different is worse than one that
 // does not parse at all. See docs/archive/plans/shell.md §1.2.
@@ -74,9 +75,52 @@ export interface SimpleCommand {
   readonly line: number;
 }
 
+/** Redirections after the closing word apply to the whole body. */
+interface CompoundBase {
+  readonly redirections: readonly Redirection[];
+  /** The one-based source line of the opening word. */
+  readonly line: number;
+}
+
+/** `( list )`: the body runs on a copy of the shell state. */
+export interface Subshell extends CompoundBase {
+  readonly kind: "Subshell";
+  readonly body: readonly Statement[];
+}
+
+/** `{ list; }`: the body runs in the current shell. */
+export interface Group extends CompoundBase {
+  readonly kind: "Group";
+  readonly body: readonly Statement[];
+}
+
+export interface IfClause {
+  readonly condition: readonly Statement[];
+  readonly body: readonly Statement[];
+}
+
+/** `if … then …` followed by any `elif` clauses, in order. */
+export interface IfCommand extends CompoundBase {
+  readonly kind: "If";
+  readonly clauses: readonly IfClause[];
+  readonly otherwise: readonly Statement[] | null;
+}
+
+/** `for NAME in WORDS; do …; done`. */
+export interface ForCommand extends CompoundBase {
+  readonly kind: "For";
+  readonly name: string;
+  readonly words: readonly Word[];
+  readonly body: readonly Statement[];
+}
+
+export type CompoundCommand = Subshell | Group | IfCommand | ForCommand;
+
+export type Command = SimpleCommand | CompoundCommand;
+
 export interface Pipeline {
   readonly kind: "Pipeline";
-  readonly commands: readonly SimpleCommand[];
+  readonly commands: readonly Command[];
   /** `! pipeline` inverts the status. */
   readonly negated: boolean;
 }

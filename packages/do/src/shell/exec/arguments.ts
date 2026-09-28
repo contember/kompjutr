@@ -8,7 +8,41 @@ import { compileGlob, sqlGlobFor } from "./glob.js";
 import { utf8Bytes } from "./utf8.js";
 
 const ARGUMENT_COUNT_MAX = 10_000;
+// Nested loops multiply their word lists; one run-wide count keeps a run
+// inside the Worker's CPU-time limit, sized by the same ceiling as argv.
+const LOOP_ITERATION_MAX = ARGUMENT_COUNT_MAX;
 const PATH_PAGE_MAX = 1_000;
+
+/** The values `$NAME` and `$?` expand to. */
+export interface Parameters {
+  /** A set parameter's value, or undefined when it is unset. */
+  value(name: string): string | undefined;
+  /** `set -u`: expanding an unset parameter fails. */
+  readonly nounset: boolean;
+}
+
+/** `set -u` met an unset parameter; the executor reports it as Bash does. */
+export class UnboundVariable extends Error {
+  constructor(readonly parameter: string) {
+    super(`${parameter}: unbound variable`);
+    this.name = "UnboundVariable";
+  }
+}
+
+/** Counts loop iterations across a whole run, subshells and pipeline stages included. */
+export class LoopBudget {
+  #iterations = 0;
+
+  charge(): void {
+    this.#iterations++;
+    if (this.#iterations > LOOP_ITERATION_MAX) {
+      throw new ShellLimitError(
+        "arguments",
+        `for: exceeded the ${LOOP_ITERATION_MAX}-iteration loop iteration limit`,
+      );
+    }
+  }
+}
 
 export interface ExpandedArguments {
   readonly argv: readonly string[];
@@ -19,7 +53,7 @@ export function expandArguments(
   args: readonly Argument[],
   fs: BoundedFs,
   cwd: string,
-  env?: Readonly<Record<string, string>>,
+  parameters: Parameters,
 ): ExpandedArguments {
   const out: string[] = [];
   const releases: Array<() => void> = [];
@@ -31,8 +65,8 @@ export function expandArguments(
   };
 
   try {
-    for (const word of words(args, env)) {
-      for (const field of expandWord(word, env)) {
+    for (const word of words(args, parameters)) {
+      for (const field of expandWord(word, parameters)) {
         const value = fieldText(field);
         if (!fieldHasGlob(field)) {
           push(value);
@@ -58,13 +92,8 @@ export function expandArguments(
   };
 }
 
-export function single(
-  arg: Argument,
-  fs: BoundedFs,
-  cwd: string,
-  env: Readonly<Record<string, string>> | undefined,
-): string {
-  const expanded = expandArguments([arg], fs, cwd, env);
+export function single(arg: Argument, fs: BoundedFs, cwd: string, parameters: Parameters): string {
+  const expanded = expandArguments([arg], fs, cwd, parameters);
   try {
     const first = expanded.argv[0];
     if (expanded.argv.length !== 1 || first === undefined) {
@@ -77,20 +106,17 @@ export function single(
 }
 
 /** Here-text as one string: tilde and parameter expansion, no splitting or pathname expansion. */
-export function quotedText(
-  argument: Argument,
-  env: Readonly<Record<string, string>> | undefined,
-): string {
+export function quotedText(argument: Argument, parameters: Parameters): string {
   let text = "";
-  for (const part of expandTildes(flatParts(argument.parts), argument.kind, homeOf(env))) {
-    text += part.kind === "parameter" ? environmentValue(env, part.name) : part.value;
+  for (const part of expandTildes(flatParts(argument.parts), argument.kind, homeOf(parameters))) {
+    text += part.kind === "parameter" ? parameterValue(parameters, part.name) : part.value;
   }
   return text;
 }
 
-function homeOf(env: Readonly<Record<string, string>> | undefined): () => string {
+function homeOf(parameters: Parameters): () => string {
   return () => {
-    const value = env === undefined || !Object.hasOwn(env, "HOME") ? undefined : env.HOME;
+    const value = parameters.value("HOME");
     if (value === undefined) {
       // Bash would fall back to the passwd entry, which this runtime does not have.
       throw new ShellSyntaxError("tilde expansion", "tilde expansion needs HOME in the run env", 0);
@@ -111,20 +137,17 @@ function argumentLimit(): ShellLimitError {
  * words count against the argv ceiling as they arrive, so a generator that
  * yields only empty words is bounded too.
  */
-function* words(
-  args: readonly Argument[],
-  env: Readonly<Record<string, string>> | undefined,
-): Generator<readonly FlatPart[]> {
+function* words(args: readonly Argument[], parameters: Parameters): Generator<readonly FlatPart[]> {
   let generated = 0;
   for (const arg of args) {
     if (!hasBraces(arg.parts)) {
-      yield expandTildes(flatParts(arg.parts), arg.kind, homeOf(env));
+      yield expandTildes(flatParts(arg.parts), arg.kind, homeOf(parameters));
       continue;
     }
     for (const word of generateWords(arg.parts)) {
       generated++;
       if (generated > ARGUMENT_COUNT_MAX) throw argumentLimit();
-      yield expandTildes(word, "word", homeOf(env));
+      yield expandTildes(word, "word", homeOf(parameters));
     }
   }
 }
@@ -136,10 +159,7 @@ interface FieldPart {
 
 type ExpandedField = readonly FieldPart[];
 
-function* expandWord(
-  parts: readonly FlatPart[],
-  env: Readonly<Record<string, string>> | undefined,
-): Generator<ExpandedField> {
+function* expandWord(parts: readonly FlatPart[], parameters: Parameters): Generator<ExpandedField> {
   let field: FieldPart[] = [];
   let preserveEmpty = false;
 
@@ -154,7 +174,7 @@ function* expandWord(
       continue;
     }
 
-    const value = environmentValue(env, part.name);
+    const value = parameterValue(parameters, part.name);
     if (part.quoted) {
       if (value !== "") field.push({ value, globActive: false });
       preserveEmpty = true;
@@ -180,9 +200,11 @@ function* expandWord(
   if (field.length > 0 || preserveEmpty) yield field;
 }
 
-function environmentValue(env: Readonly<Record<string, string>> | undefined, name: string): string {
-  if (env === undefined || !Object.hasOwn(env, name)) return "";
-  return env[name] ?? "";
+function parameterValue(parameters: Parameters, name: string): string {
+  const value = parameters.value(name);
+  if (value !== undefined) return value;
+  if (parameters.nounset) throw new UnboundVariable(name);
+  return "";
 }
 
 function isIfsWhitespace(value: string): boolean {

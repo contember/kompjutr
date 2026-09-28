@@ -10,7 +10,8 @@
 // inode/owner identity, absolute paths, and the physical cwd are not comparable.
 // Named expansion is limited to controlled or case-explicit variables. Bash
 // intrinsic variables (`PWD`, `SHLVL`, `RANDOM`, `BASH_*`, etc.) and special
-// parameters (`$?`, `$$`, `$1`, etc.) are rejected rather than normalized.
+// parameters other than the status `$?` (`$$`, `$1`, etc.) are rejected rather
+// than normalized.
 // Stdout, stderr, and exit status are compared exactly, with output kept as bytes.
 // The printf-invalid helper only removes Bash's fixed `bash: line 1: ` location
 // prefix from the exact `%Z` diagnostic; the remaining diagnostic stays byte-exact.
@@ -207,6 +208,7 @@ function validateParameterExpansions(source: string, env: Readonly<Record<string
       }
       continue;
     }
+    if (/^(\?|\{\?\})/.test(rest)) continue;
     if (/^\{?[0-9@*#?$!_-]/.test(rest)) {
       throw new Error("Bash special parameters are outside shell parity");
     }

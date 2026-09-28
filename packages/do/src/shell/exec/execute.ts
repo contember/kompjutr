@@ -10,7 +10,11 @@ import { normalize } from "../../fs/path.js";
 import type { Filesystem } from "../../fs/types.js";
 import { ShellSyntaxError } from "../parse/ast.js";
 import type { Plan } from "../plan/types.js";
+import { LoopBudget } from "./arguments.js";
 import { line } from "./bytes.js";
+import type { Frame, Outcome, Runtime, Segments } from "./compound/frame.js";
+import { runCompound, runList } from "./compound/run.js";
+import { ShellState } from "./compound/state.js";
 import {
   BoundedFs,
   type Command,
@@ -19,7 +23,6 @@ import {
   ShellLimitError,
 } from "./context.js";
 import { prepareRunInput, type RunInputOwner } from "./input.js";
-import { runPipeline } from "./pipeline.js";
 import { Sink } from "./sink.js";
 
 export { resolve } from "./arguments.js";
@@ -54,41 +57,38 @@ export async function execute(plan: Plan, options: ExecOptions): Promise<ExecRes
   const fs = new BoundedFs(options.fs, limits);
   const out = new Sink(limits.maxOutputBytes);
   const errors = new Sink(limits.maxOutputBytes);
-  let cwd = normalize(options.cwd);
+  const runtime: Runtime = {
+    fs,
+    commands: options.commands,
+    loops: new LoopBudget(),
+    now: options.now ?? Date.now,
+    truncated: false,
+    compound: (stage, frame) => runCompound(stage, frame, runtime),
+  };
+  let shell: ShellState | null = null;
   let exitCode = 0;
-  let previousConnector: "&&" | "||" | ";" | null = null;
   let runInput: RunInputOwner | null = null;
-  let commandTruncated = false;
 
   try {
     try {
       runInput = prepareRunInput(options.stdin, options.env, fs);
-      for (const step of plan.steps) {
-        const selected =
-          previousConnector === null ||
-          previousConnector === ";" ||
-          (previousConnector === "&&" ? exitCode === 0 : exitCode !== 0);
-        if (selected) {
-          const outcome = await runPipeline(step.pipeline, {
-            fs,
-            cwd,
-            commands: options.commands,
-            out,
-            errors,
-            inputs: runInput,
-            currentStatus: exitCode,
-            now: options.now ?? Date.now,
-            chdir: (path: string) => {
-              cwd = path;
-            },
-          });
-          exitCode =
-            step.negated && !outcome.terminateRun ? negate(outcome.exitCode) : outcome.exitCode;
-          commandTruncated ||= outcome.truncated;
-          if (outcome.terminateRun) break;
-        }
-        previousConnector = step.connector;
-      }
+      shell = ShellState.initial(normalize(options.cwd), runInput?.env, fs.retained);
+      const frame: Frame = {
+        shell,
+        io: {
+          stdin: runInput,
+          stderr: {
+            writeBytes: (bytes) => errors.writeBytes(bytes),
+            write: (stream) => errors.write(stream),
+            limit: () => Math.min(errors.remaining, fs.retained.available),
+            discards: false,
+          },
+          stdoutLimit: () => Math.min(out.remaining, fs.retained.available),
+        },
+        loops: 0,
+        errexitIgnored: false,
+      };
+      exitCode = (await writeSegments(runList(plan, frame, runtime), out)).status;
     } catch (error) {
       if (error instanceof ShellLimitError || error instanceof ShellSyntaxError) {
         errors.writeBytes(line(`kompjutr: ${error.message}`));
@@ -102,16 +102,33 @@ export async function execute(plan: Plan, options: ExecOptions): Promise<ExecRes
       stdout: out.bytes(),
       stderr: errors.bytes(),
       exitCode,
-      cwd,
-      truncated: commandTruncated || out.truncated || errors.truncated,
+      cwd: shell?.cwd ?? normalize(options.cwd),
+      truncated: runtime.truncated || out.truncated || errors.truncated,
       operations: fs.operations,
       peakRetainedBytes: fs.retained.peak,
     };
   } finally {
-    runInput?.close();
+    try {
+      shell?.release();
+    } finally {
+      runInput?.close();
+    }
   }
 }
 
-function negate(status: number): number {
-  return status === 0 ? 1 : 0;
+/** Each pipeline's output reaches the sink in turn; a truncated sink stops only that pipeline. */
+async function writeSegments(segments: Segments, out: Sink): Promise<Outcome> {
+  let finished = false;
+  try {
+    for (;;) {
+      const next = await segments.next();
+      if (next.done === true) {
+        finished = true;
+        return next.value;
+      }
+      await out.write(next.value);
+    }
+  } finally {
+    if (!finished) await segments.return({ status: 2, flow: null });
+  }
 }

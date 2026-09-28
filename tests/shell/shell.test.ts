@@ -338,7 +338,7 @@ describe("writing", () => {
 describe("rejections", () => {
   it("names an unsupported construct", async () => {
     expect((await shell.run("echo $(date)")).stderr).toContain("command substitution");
-    expect((await shell.run("for f in a b; do echo x; done")).stderr).toContain("`for`");
+    expect((await shell.run("while true; do echo x; done")).stderr).toContain("`while`");
   });
   it("reports an unknown command", async () => {
     const run = await shell.run("bun run build");

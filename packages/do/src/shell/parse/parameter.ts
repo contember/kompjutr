@@ -1,5 +1,6 @@
-// `$NAME` and `${NAME}`, shared by words and unquoted here-document bodies.
-// Every other `$` form is rejected by name rather than read as literal text.
+// `$NAME`, `${NAME}`, and the status parameter `$?`/`${?}`, shared by words and
+// unquoted here-document bodies. Every other `$` form is rejected by name
+// rather than read as literal text.
 
 import { ShellSyntaxError, type WordPart } from "./ast.js";
 
@@ -21,7 +22,10 @@ export function readParameter(
       start,
     );
   }
-  if (next !== "" && "*@#?-$!".includes(next)) {
+  if (next === "?") {
+    return { part: { kind: "Parameter", name: "?", quoted }, end: start + 2 };
+  }
+  if (next !== "" && "*@#-$!".includes(next)) {
     throw new ShellSyntaxError(
       "parameter expansion",
       `parameter expansion for special parameter $${next} is not supported`,
@@ -49,6 +53,7 @@ function readBracedParameter(
     throw new ShellSyntaxError("parameter expansion", "unterminated parameter expansion", start);
   }
   const body = source.slice(start + 2, close);
+  if (body === "?") return { part: { kind: "Parameter", name: "?", quoted }, end: close + 1 };
   if (!IDENTIFIER_START.test(body.charAt(0))) {
     throw new ShellSyntaxError(
       "parameter expansion",

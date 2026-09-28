@@ -1,58 +1,70 @@
-import type { PlannedCommand } from "../plan/types.js";
 import { type ByteStream, line } from "./bytes.js";
+import type { Frame, Runtime } from "./compound/frame.js";
 import type { CommandContext, CommandResult, InvokeOptions } from "./context.js";
-import type { PipelineEnvironment } from "./execution-types.js";
 import type { HeldChunk, OutputDestination, ResolvedRedirections } from "./routing-types.js";
 import { diagnosticsFor } from "./stage-output.js";
 
+/** What a diagnostic names: a command, or a compound command's opening word. */
+export interface StageLabel {
+  readonly name: string;
+  readonly line: number;
+}
+
+/**
+ * Every pipeline stage is a shell of its own, so a direct `exit` may end it:
+ * the run, a subshell, or just that stage of a multi-stage pipeline.
+ */
 export function commandContext(
-  planned: PlannedCommand,
+  label: StageLabel,
   redirections: ResolvedRedirections,
   lastStage: boolean,
-  mayExitRun: boolean,
   argv: readonly string[],
   stdin: ByteStream | null,
   limitHint: number | null,
-  env: PipelineEnvironment,
+  frame: Frame,
+  runtime: Runtime,
   routedDiagnostics: Map<OutputDestination, HeldChunk[]>,
 ): CommandContext {
-  const output = commandOutput(redirections, lastStage, env);
+  const output = commandOutput(redirections, lastStage, frame);
   const diagnostic = (bytes: Uint8Array): void => {
     if (bytes.length === 0 || redirections.stderr.kind === "drop") return;
     if (redirections.stderr.kind === "diagnostic") {
-      env.errors.writeBytes(bytes);
+      frame.io.stderr.writeBytes(bytes);
     } else {
       diagnosticsFor(routedDiagnostics, redirections.stderr).push({
         bytes,
-        release: env.fs.retained.retain(bytes.length, "routed diagnostic"),
+        release: runtime.fs.retained.retain(bytes.length, "routed diagnostic"),
       });
     }
   };
+  const shell = frame.shell;
   const context: CommandContext = {
-    fs: env.fs,
-    cwd: env.cwd,
+    fs: runtime.fs,
+    cwd: shell.cwd,
     argv,
     stdin,
-    env: env.inputs?.env,
-    currentStatus: env.currentStatus,
-    now: env.now,
-    mayExitRun,
-    line: planned.line,
+    env: shell.variables.exported(),
+    currentStatus: shell.status,
+    now: runtime.now,
+    mayExitRun: true,
+    line: label.line,
     limitHint,
     output,
     diagnostic,
     warn: (message: string) => {
       if (redirections.stderr.kind === "drop") return;
-      const bytes = line(`${planned.name}: ${message}`);
+      const bytes = line(`${label.name}: ${message}`);
       diagnostic(bytes);
     },
-    chdir: env.chdir,
+    chdir: (path: string) => {
+      shell.cwd = path;
+    },
     invoke: async (
       name: string,
       subArgv: readonly string[],
       options?: InvokeOptions,
     ): Promise<CommandResult | null> => {
-      const command = env.commands.get(name);
+      const command = runtime.commands.get(name);
       if (command === undefined) return null;
       // No stdin and no demand hint: the sub-invocation's arguments already
       // carry everything it is meant to see.
@@ -72,11 +84,13 @@ export function commandContext(
 function commandOutput(
   redirections: ResolvedRedirections,
   lastStage: boolean,
-  env: PipelineEnvironment,
+  frame: Frame,
 ): CommandContext["output"] {
-  const maxStdoutBytes = destinationLimit(redirections.stdout, lastStage, env);
-  const maxStderrBytes = destinationLimit(redirections.stderr, lastStage, env);
-  const discardStderr = redirections.stderr.kind === "drop";
+  const maxStdoutBytes = destinationLimit(redirections.stdout, lastStage, frame);
+  const maxStderrBytes = destinationLimit(redirections.stderr, lastStage, frame);
+  const discardStderr =
+    redirections.stderr.kind === "drop" ||
+    (redirections.stderr.kind === "diagnostic" && frame.io.stderr.discards);
   const maxCombinedOutputBytes =
     redirections.stdout === redirections.stderr
       ? Math.max(maxStdoutBytes, maxStderrBytes)
@@ -91,18 +105,14 @@ function commandOutput(
 
 // Only a terminal sink truncates. Pipe and redirect bytes are semantic input,
 // so the retained budget fails the run instead of shortening them.
-function destinationLimit(
+export function destinationLimit(
   destination: OutputDestination,
   lastStage: boolean,
-  env: PipelineEnvironment,
+  frame: Frame,
 ): number {
   if (destination.kind === "drop") return 0;
-  if (destination.kind === "diagnostic") {
-    return Math.min(env.errors.remaining, env.fs.retained.available);
-  }
-  if (destination.kind === "output" && lastStage) {
-    return Math.min(env.out.remaining, env.fs.retained.available);
-  }
+  if (destination.kind === "diagnostic") return frame.io.stderr.limit();
+  if (destination.kind === "output" && lastStage) return frame.io.stdoutLimit();
   return Number.MAX_SAFE_INTEGER;
 }
 

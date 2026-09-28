@@ -161,8 +161,8 @@ describe("caller stdin", () => {
     ["exit 300", 44],
     ["exit -1", 255],
     ["exit nope", 2],
-    ["exit | cat", 2],
-    ["cat | exit", 2],
+    ["exit | cat", 0],
+    ["cat | exit", 0],
   ])("closes and releases every exit path exactly once: %s", async (source, exitCode) => {
     const subject = fixture();
     const close = vi.spyOn(RunInputOwner.prototype, "close");

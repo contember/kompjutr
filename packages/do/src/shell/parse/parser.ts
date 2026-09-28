@@ -1,76 +1,76 @@
-// Tokens to a Script. The grammar is flat on purpose — statements joined by
-// `&&`/`||`/`;` or a newline, each a pipeline of simple commands — because the
-// corpus has no nesting to represent: `&&` outside a leading `cd` appears twice
-// in 614 lines and control flow five times, and both are rejected.
+// Tokens to a Script: statements joined by `&&`, `||`, `;`, or a newline, each
+// a pipeline whose stages are simple commands or the admitted compound
+// commands — `( … )`, `{ …; }`, `if`, and `for … in` (ADR-0027).
+//
+// Reserved words are recognized only where Bash recognizes them: as the first
+// word of a command, and `in` after `for NAME`. Everywhere else they are
+// ordinary words, so `echo done }` prints both.
 
 import {
+  type Command,
+  type CompoundCommand,
+  type IfClause,
   type Pipeline,
   type Redirection,
   type Script,
   ShellSyntaxError,
-  type SimpleCommand,
   type Statement,
   type Word,
-  wordText,
 } from "./ast.js";
-import { type Operator, type Token, tokenize } from "./lexer.js";
+import { TokenCursor } from "./cursor.js";
+import { tokenize } from "./lexer.js";
+import { parseRedirection, parseSimpleCommand } from "./simple.js";
 
 export function parse(source: string): Script {
-  return new Parser(tokenize(source), source).script();
+  return new Parser(new TokenCursor(tokenize(source), source)).script();
 }
 
-/**
- * Words that would open a compound command, rejected in §2 of the plan.
- *
- * Checked here rather than in the lexer because they are reserved *in
- * command position only*: `echo done` and `xargs echo for` are ordinary
- * lines, and a lexer that rejected the word wherever it appeared broke both.
- */
-const RESERVED = new Set([
-  "if",
-  "then",
-  "else",
-  "elif",
-  "fi",
-  "for",
-  "while",
-  "until",
-  "do",
-  "done",
-  "case",
-  "esac",
-  "select",
-  "function",
-]);
+/** Words that close a list: a list stops before them in command position. */
+const CLOSERS = new Set(["then", "elif", "else", "fi", "do", "done", "}", "esac"]);
+
+/** Bash keywords whose commands have no bounded execution here (ADR-0027). */
+const REFUSED = new Set(["while", "until", "case", "select", "function", "time", "coproc"]);
+
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 class Parser {
-  #index = 0;
-  #newlines: number[] | null = null;
-
-  constructor(
-    private readonly tokens: readonly Token[],
-    private readonly source: string,
-  ) {}
+  constructor(private readonly cursor: TokenCursor) {}
 
   script(): Script {
+    const statements = this.#list();
+    if (!this.cursor.done) throw this.cursor.unexpected();
+    return { kind: "Script", statements };
+  }
+
+  /** Statements up to the end of input or a closing word or `)` in command position. */
+  #list(): Statement[] {
     const statements: Statement[] = [];
-    this.#skipNewlines();
-    while (this.#index < this.tokens.length) {
+    this.cursor.skipNewlines();
+    while (!this.cursor.done && !this.#atListEnd()) {
       const pipeline = this.#pipeline();
       const connector = this.#connector();
       statements.push({ kind: "Statement", pipeline, connector });
       if (connector === null) break;
     }
-    if (this.#index < this.tokens.length) {
-      const token = this.tokens[this.#index];
-      throw new ShellSyntaxError("statement", "unexpected token", token?.offset ?? 0);
-    }
-    return { kind: "Script", statements };
+    return statements;
+  }
+
+  /** A list that Bash requires to hold at least one command. */
+  #body(): Statement[] {
+    const statements = this.#list();
+    if (statements.length === 0) throw this.cursor.unexpected();
+    return statements;
+  }
+
+  #atListEnd(): boolean {
+    if (this.cursor.peekOperator() === ")") return true;
+    const keyword = this.cursor.peekKeyword();
+    return keyword !== null && CLOSERS.has(keyword);
   }
 
   /** A newline separates statements exactly as `;` does. */
   #connector(): "&&" | "||" | ";" | null {
-    const token = this.tokens[this.#index];
+    const token = this.cursor.peek();
     let connector: "&&" | "||" | ";";
     if (token?.type === "newline") {
       connector = ";";
@@ -82,9 +82,9 @@ class Parser {
     } else {
       return null;
     }
-    this.#index++;
-    this.#skipNewlines();
-    if (this.#index < this.tokens.length) return connector;
+    this.cursor.advance();
+    this.cursor.skipNewlines();
+    if (!this.cursor.done && !this.#atListEnd()) return connector;
     if (connector !== ";") {
       throw new ShellSyntaxError(
         "statement",
@@ -92,193 +92,142 @@ class Parser {
         token.offset,
       );
     }
-    // A trailing `;` or newline ends the script rather than promising another statement.
+    // A trailing `;` or newline ends the list rather than promising another statement.
     return null;
   }
 
   #pipeline(): Pipeline {
     let negated = false;
-    while (this.#peekBang()) {
+    while (this.cursor.peekKeyword() === "!") {
       negated = !negated;
-      this.#index++;
+      this.cursor.advance();
     }
-    const commands: SimpleCommand[] = [this.#command()];
-    while (this.#peekOperator() === "|") {
-      this.#index++;
-      this.#skipNewlines();
+    const commands: Command[] = [this.#command()];
+    while (this.cursor.peekOperator() === "|") {
+      this.cursor.advance();
+      this.cursor.skipNewlines();
       commands.push(this.#command());
     }
     return { kind: "Pipeline", commands, negated };
   }
 
-  /** Only a bare `!` word negates; `!x` is an ordinary word. */
-  #peekBang(): boolean {
-    const token = this.tokens[this.#index];
-    if (token?.type !== "word") return false;
-    const [part, ...rest] = token.word.parts;
-    return rest.length === 0 && part?.kind === "Literal" && part.value === "!";
-  }
-
-  #lineAt(offset: number): number {
-    if (this.#newlines === null) {
-      this.#newlines = [];
-      for (let index = this.source.indexOf("\n"); index !== -1; ) {
-        this.#newlines.push(index);
-        index = this.source.indexOf("\n", index + 1);
-      }
+  #command(): Command {
+    const start = this.cursor.offset();
+    const line = this.cursor.lineAt(start);
+    if (this.cursor.peekOperator() === "(") {
+      this.cursor.advance();
+      const body = this.#body();
+      this.#expectOperator(")");
+      return { kind: "Subshell", body, ...this.#trailing(line) };
     }
-    let low = 0;
-    let high = this.#newlines.length;
-    while (low < high) {
-      const middle = (low + high) >> 1;
-      if ((this.#newlines[middle] ?? offset) < offset) low = middle + 1;
-      else high = middle;
+
+    const keyword = this.cursor.peekKeyword();
+    if (keyword === "{") {
+      this.cursor.advance();
+      const body = this.#body();
+      this.#expectKeyword("}");
+      return { kind: "Group", body, ...this.#trailing(line) };
     }
-    return low + 1;
+    if (keyword === "if") return this.#if(line);
+    if (keyword === "for") return this.#for(line, start);
+    if (keyword !== null && CLOSERS.has(keyword)) throw this.cursor.unexpected();
+    if (keyword !== null && REFUSED.has(keyword)) {
+      throw new ShellSyntaxError(`\`${keyword}\``, `\`${keyword}\` is not supported`, start);
+    }
+    return parseSimpleCommand(this.cursor);
   }
 
-  #skipNewlines(): void {
-    while (this.tokens[this.#index]?.type === "newline") this.#index++;
-  }
-
-  #command(): SimpleCommand {
-    const words: Word[] = [];
-    const redirections: Redirection[] = [];
-    const start = this.tokens[this.#index]?.offset ?? 0;
-
+  #if(line: number): CompoundCommand {
+    this.cursor.advance();
+    const clauses: IfClause[] = [this.#clause()];
+    let otherwise: Statement[] | null = null;
     for (;;) {
-      const token = this.tokens[this.#index];
-      if (token === undefined) break;
-
-      if (token.type === "word") {
-        words.push(token.word);
-        this.#index++;
+      const keyword = this.cursor.peekKeyword();
+      if (keyword === "elif") {
+        this.cursor.advance();
+        clauses.push(this.#clause());
         continue;
       }
-
-      if (token.type === "fd") {
-        this.#index++;
-        redirections.push(...this.#redirection(token.value, token.offset));
-        continue;
+      if (keyword === "else") {
+        this.cursor.advance();
+        otherwise = this.#body();
       }
-
-      if (token.type === "op" && isRedirectionOperator(token.value)) {
-        // No explicit fd: the `<` family reads stdin, everything else writes stdout.
-        const fd = token.value.startsWith("<") ? 0 : 1;
-        redirections.push(...this.#redirection(fd, token.offset));
-        continue;
-      }
-
-      break; // `|`, `&&`, `||`, `;`, and a newline end the command.
+      this.#expectKeyword("fi");
+      return { kind: "If", clauses, otherwise, ...this.#trailing(line) };
     }
-
-    const name = words[0];
-    if (name === undefined) {
-      throw new ShellSyntaxError("command", "missing command name", start);
-    }
-    if (name.parts.every((part) => part.kind === "Literal")) {
-      const text = name.parts.map((part) => part.value).join("");
-      if (text === "{" || text === "}") {
-        throw new ShellSyntaxError("command group", "command group is not supported", start);
-      }
-      if (RESERVED.has(text)) {
-        throw new ShellSyntaxError(`\`${text}\``, `\`${text}\` is not supported`, start);
-      }
-    }
-    return { kind: "SimpleCommand", words, redirections, line: this.#lineAt(start) };
   }
 
-  /**
-   * One redirection, or two for `&>file`, `&>>file`, and `>&file` or `1>&file`, which Bash
-   * defines as `>file 2>&1` and `>>file 2>&1`.
-   */
-  #redirection(fd: number, offset: number): Redirection[] {
-    const operator = this.tokens[this.#index];
-    if (operator?.type !== "op") {
-      throw new ShellSyntaxError("redirection", "expected a redirection operator", offset);
-    }
-    this.#index++;
-
-    if (operator.value === "&>" || operator.value === "&>>") {
-      const target = this.#target(offset);
-      return [
-        { kind: "Redirection", fd: 1, op: operator.value === "&>" ? ">" : ">>", target },
-        { kind: "Redirection", fd: 2, op: ">&", targetFd: 1 },
-      ];
-    }
-
-    if (operator.value === ">&") {
-      const target = this.tokens[this.#index];
-      if (target?.type !== "word") {
-        throw new ShellSyntaxError("redirection", "expected a descriptor after >&", offset);
-      }
-      if (fd === 1 && !/^[0-9]+$/.test(wordText(target.word)) && isFileTarget(target.word)) {
-        this.#index++;
-        return [
-          { kind: "Redirection", fd: 1, op: ">", target: target.word },
-          { kind: "Redirection", fd: 2, op: ">&", targetFd: 1 },
-        ];
-      }
-      if (target.word.parts.some((part) => part.kind === "Parameter")) {
-        throw new ShellSyntaxError(
-          "parameter expansion",
-          "parameters in redirection targets are not supported",
-          target.offset,
-        );
-      }
-      const text = wordText(target.word);
-      if (!/^[0-9]+$/.test(text)) {
-        throw new ShellSyntaxError("redirection", `\`>&${text}\` is not a descriptor`, offset);
-      }
-      this.#index++;
-      return [{ kind: "Redirection", fd, op: ">&", targetFd: Number(text) }];
-    }
-
-    if (operator.value === "<<" || operator.value === "<<-") {
-      const body = this.tokens[this.#index];
-      if (body?.type !== "hereDocument") {
-        throw new ShellSyntaxError("here-document", "expected a here-document body", offset);
-      }
-      this.#index++;
-      return [{ kind: "Redirection", fd, op: "<<", body: body.body }];
-    }
-
-    if (operator.value === "<<<") {
-      const target = this.tokens[this.#index];
-      if (target?.type !== "word") {
-        throw new ShellSyntaxError("redirection", "expected a word after <<<", offset);
-      }
-      this.#index++;
-      return [{ kind: "Redirection", fd, op: "<<<", target: target.word }];
-    }
-
-    if (operator.value !== ">" && operator.value !== ">>" && operator.value !== "<") {
-      throw new ShellSyntaxError("redirection", "expected a redirection operator", offset);
-    }
-
-    return [{ kind: "Redirection", fd, op: operator.value, target: this.#target(offset) }];
+  #clause(): IfClause {
+    const condition = this.#body();
+    this.#expectKeyword("then");
+    return { condition, body: this.#body() };
   }
 
-  #target(offset: number): Word {
-    const target = this.tokens[this.#index];
-    if (target?.type !== "word") {
-      throw new ShellSyntaxError("redirection", "expected a target after the operator", offset);
+  #for(line: number, start: number): CompoundCommand {
+    this.cursor.advance();
+    const name = this.cursor.peekKeyword();
+    if (name === null || !IDENTIFIER.test(name)) {
+      if (this.cursor.peek()?.type !== "word") throw this.cursor.unexpected();
+      throw new ShellSyntaxError("`for`", "`for` needs a variable name", start);
     }
-    this.#index++;
-    return target.word;
+    this.cursor.advance();
+    this.cursor.skipNewlines();
+    if (this.cursor.peekKeyword() !== "in") {
+      throw new ShellSyntaxError(
+        "`for`",
+        "`for` without `in` (over positional parameters) is not supported",
+        start,
+      );
+    }
+    this.cursor.advance();
+
+    const words: Word[] = [];
+    for (let token = this.cursor.peek(); token?.type === "word"; token = this.cursor.peek()) {
+      words.push(token.word);
+      this.cursor.advance();
+    }
+    const separator = this.cursor.peek();
+    if (separator?.type !== "newline" && this.cursor.peekOperator() !== ";") {
+      throw this.cursor.unexpected();
+    }
+    this.cursor.advance();
+    this.cursor.skipNewlines();
+    this.#expectKeyword("do");
+    const body = this.#body();
+    this.#expectKeyword("done");
+    return { kind: "For", name, words, body, ...this.#trailing(line) };
   }
 
-  #peekOperator(): string | null {
-    const token = this.tokens[this.#index];
-    return token?.type === "op" ? token.value : null;
+  /** Redirections after a compound command; a further word is a syntax error. */
+  #trailing(line: number): { redirections: Redirection[]; line: number } {
+    const redirections: Redirection[] = [];
+    for (let next = parseRedirection(this.cursor); next !== null; ) {
+      redirections.push(...next);
+      next = parseRedirection(this.cursor);
+    }
+    const token = this.cursor.peek();
+    if (token?.type === "word" || this.cursor.peekOperator() === "(") {
+      throw this.cursor.unexpected();
+    }
+    return { redirections, line };
   }
-}
 
-/** `>&-` closes and `>&$FD` may name a descriptor; neither is a file. */
-function isFileTarget(word: Word): boolean {
-  return wordText(word) !== "-" && !word.parts.some((part) => part.kind === "Parameter");
-}
+  #expectKeyword(keyword: string): void {
+    if (this.cursor.peekKeyword() !== keyword) throw this.#missing(`\`${keyword}\``);
+    this.cursor.advance();
+  }
 
-function isRedirectionOperator(value: Operator): boolean {
-  return value !== "|" && value !== "||" && value !== "&&" && value !== ";";
+  #expectOperator(operator: ")"): void {
+    if (this.cursor.peekOperator() !== operator) throw this.#missing(`\`${operator}\``);
+    this.cursor.advance();
+  }
+
+  #missing(expected: string): ShellSyntaxError {
+    if (!this.cursor.done) return this.cursor.unexpected();
+    return new ShellSyntaxError(
+      "syntax",
+      `syntax error: unexpected end of input, expected ${expected}`,
+      this.cursor.offset(),
+    );
+  }
 }

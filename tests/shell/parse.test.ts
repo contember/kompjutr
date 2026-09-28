@@ -6,7 +6,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { hasGlob, ShellSyntaxError, wordText } from "../../packages/do/src/shell/parse/ast.js";
+import {
+  hasGlob,
+  ShellSyntaxError,
+  type SimpleCommand,
+  type Statement,
+  wordText,
+} from "../../packages/do/src/shell/parse/ast.js";
 import { parse } from "../../packages/do/src/shell/parse/parser.js";
 
 function commands(source: string): string[][] {
@@ -14,10 +20,17 @@ function commands(source: string): string[][] {
   const out: string[][] = [];
   for (const statement of script.statements) {
     for (const command of statement.pipeline.commands) {
-      out.push(command.words.map(wordText));
+      if (command.kind === "SimpleCommand") out.push(command.words.map(wordText));
     }
   }
   return out;
+}
+
+/** The statement's first command; these shapes parse as simple commands. */
+function firstSimple(statement: Statement | undefined): SimpleCommand {
+  const command = statement?.pipeline.commands[0];
+  if (command?.kind !== "SimpleCommand") throw new Error("expected a simple command");
+  return command;
 }
 
 function rejects(source: string): ShellSyntaxError {
@@ -61,30 +74,30 @@ describe("words and quoting", () => {
   });
 
   it("records an unquoted escape as its own part", () => {
-    const word = parse("grep a\\ b").statements[0]?.pipeline.commands[0]?.words[1];
+    const word = firstSimple(parse("grep a\\ b").statements[0]).words[1];
     expect(word?.parts.map((part) => part.kind)).toEqual(["Literal", "Escaped", "Literal"]);
     expect(wordText(word!)).toBe("a b");
   });
 
   it("marks unquoted globs and leaves quoted ones literal", () => {
-    const glob = parse("ls *.ts").statements[0]?.pipeline.commands[0]?.words[1];
+    const glob = firstSimple(parse("ls *.ts").statements[0]).words[1];
     expect(hasGlob(glob!)).toBe(true);
-    const quoted = parse('ls "*.ts"').statements[0]?.pipeline.commands[0]?.words[1];
+    const quoted = firstSimple(parse('ls "*.ts"').statements[0]).words[1];
     expect(hasGlob(quoted!)).toBe(false);
   });
 
   it("reads a character class as one glob part", () => {
-    const word = parse("ls file[0-9].txt").statements[0]?.pipeline.commands[0]?.words[1];
+    const word = firstSimple(parse("ls file[0-9].txt").statements[0]).words[1];
     expect(word?.parts.map((part) => (part.kind === "Parameter" ? part.name : part.value))).toEqual(
       ["file", "[0-9]", ".txt"],
     );
     // An unclosed `[` is an ordinary character, as in bash.
-    expect(hasGlob(parse("ls a[b").statements[0]!.pipeline.commands[0]!.words[1]!)).toBe(false);
+    expect(hasGlob(firstSimple(parse("ls a[b").statements[0]).words[1]!)).toBe(false);
   });
 
   it("preserves named parameters in order with quote context", () => {
-    const word = parse(`echo pre$ONE-"\${TWO}"-'$THREE'-\\$FOUR`).statements[0]?.pipeline
-      .commands[0]?.words[1];
+    const word = firstSimple(parse(`echo pre$ONE-"\${TWO}"-'$THREE'-\\$FOUR`).statements[0])
+      .words[1];
     expect(word?.parts).toEqual([
       { kind: "Literal", value: "pre" },
       { kind: "Parameter", name: "ONE", quoted: false },
@@ -131,8 +144,8 @@ describe("pipelines and connectors", () => {
 
 describe("redirections", () => {
   it("parses the corpus's second most common shape", () => {
-    const command = parse("grep -r x . 2>/dev/null").statements[0]?.pipeline.commands[0];
-    expect(command?.words.map(wordText)).toEqual(["grep", "-r", "x", "."]);
+    const command = firstSimple(parse("grep -r x . 2>/dev/null").statements[0]);
+    expect(command.words.map(wordText)).toEqual(["grep", "-r", "x", "."]);
     expect(command?.redirections).toHaveLength(1);
     const redirection = command?.redirections[0];
     expect(redirection?.fd).toBe(2);
@@ -178,7 +191,6 @@ describe("rejections name the construct", () => {
     ["echo $@", "parameter expansion"],
     ["echo $*", "parameter expansion"],
     ["echo $#", "parameter expansion"],
-    ["echo $?", "parameter expansion"],
     ["echo $!", "parameter expansion"],
     ["echo $-", "parameter expansion"],
     ["echo $$", "parameter expansion"],
@@ -189,12 +201,12 @@ describe("rejections name the construct", () => {
     [`echo \${HOME:-fallback}`, "parameter expansion operator"],
     ["diff <(ls a) <(ls b)", "process substitution"],
     ["[[ -f x ]]", "conditional expression"],
-    ["for f in a b; do echo x; done", "`for`"],
-    ["if true; then ls; fi", "`if`"],
+    ["for f; do echo x; done", "`for`"],
+    ["until true; do ls; done", "`until`"],
     ["while true; do ls; done", "`while`"],
     ["ls &", "background execution"],
-    ["(ls)", "subshell"],
-    ["{ ls; }", "command group"],
+    ["((1))", "arithmetic command"],
+    ["f() { ls; }", "function definition"],
   ];
 
   for (const [source, construct] of cases) {
@@ -308,6 +320,6 @@ describe("newlines", () => {
       op: "<<",
       body: { parts: [{ kind: "SingleQuoted", value: "two $X\n" }] },
     });
-    expect(third?.pipeline.commands[0]?.words.map(wordText)).toEqual(["ls"]);
+    expect(firstSimple(third).words.map(wordText)).toEqual(["ls"]);
   });
 });

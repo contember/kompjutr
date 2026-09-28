@@ -6,16 +6,30 @@ import { describe, expect, it } from "vitest";
 import { ShellSyntaxError } from "../../packages/do/src/shell/parse/ast.js";
 import { parse } from "../../packages/do/src/shell/parse/parser.js";
 import { planScript } from "../../packages/do/src/shell/plan/plan.js";
-import type { Argument, PlannedPipeline } from "../../packages/do/src/shell/plan/types.js";
+import type {
+  Argument,
+  PlannedCommand,
+  PlannedPipeline,
+} from "../../packages/do/src/shell/plan/types.js";
 
-function planOne(source: string): PlannedPipeline {
+/** A pipeline of simple commands, the only shape these cases plan. */
+interface SimplePipeline extends PlannedPipeline {
+  readonly commands: readonly PlannedCommand[];
+}
+
+function planOne(source: string): SimplePipeline {
   const plan = planScript(parse(source));
   const first = plan.steps[0];
   if (first === undefined) throw new Error("no steps");
-  return first.pipeline;
+  const commands: PlannedCommand[] = [];
+  for (const stage of first.pipeline.commands) {
+    if (stage.kind !== "command") throw new Error("expected simple commands");
+    commands.push(stage);
+  }
+  return { ...first.pipeline, commands };
 }
 
-function names(pipeline: PlannedPipeline): string[] {
+function names(pipeline: SimplePipeline): string[] {
   return pipeline.commands.map((command) => command.name);
 }
 

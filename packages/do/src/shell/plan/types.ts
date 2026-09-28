@@ -81,6 +81,7 @@ export type PlannedRedirection =
     };
 
 export interface PlannedCommand {
+  readonly kind: "command";
   readonly name: string;
   /** Arguments after the name. */
   readonly args: readonly Argument[];
@@ -89,8 +90,45 @@ export interface PlannedCommand {
   readonly line: number;
 }
 
+interface PlannedCompoundBase {
+  /** Bound once around the whole body, before it runs. */
+  readonly redirections: readonly PlannedRedirection[];
+  /** The one-based source line of the opening word. */
+  readonly line: number;
+}
+
+/** `( … )`: the body runs on a copy of the shell state. */
+export interface PlannedSubshell extends PlannedCompoundBase {
+  readonly kind: "subshell";
+  readonly body: Plan;
+}
+
+/** `{ …; }`: the body runs in the current shell. */
+export interface PlannedGroup extends PlannedCompoundBase {
+  readonly kind: "group";
+  readonly body: Plan;
+}
+
+export interface PlannedIf extends PlannedCompoundBase {
+  readonly kind: "if";
+  readonly clauses: readonly { readonly condition: Plan; readonly body: Plan }[];
+  readonly otherwise: Plan | null;
+}
+
+/** The loop structure only; the word list is expanded and bound during execution. */
+export interface PlannedFor extends PlannedCompoundBase {
+  readonly kind: "for";
+  readonly name: string;
+  readonly words: readonly Argument[];
+  readonly body: Plan;
+}
+
+export type PlannedCompound = PlannedSubshell | PlannedGroup | PlannedIf | PlannedFor;
+
+export type PlannedStage = PlannedCommand | PlannedCompound;
+
 export interface PlannedPipeline {
-  readonly commands: readonly PlannedCommand[];
+  readonly commands: readonly PlannedStage[];
   /**
    * Downstream demand, when a trailing `head -N` makes it statically known.
    *
@@ -101,7 +139,8 @@ export interface PlannedPipeline {
    * sources seed at `2 * limitHint`.
    *
    * Null when a blocking stage (`sort`, `wc`) sits between the source and
-   * the limiter and swallows the demand.
+   * the limiter and swallows the demand, and whenever a stage is compound:
+   * its body's pipelines carry their own hints.
    */
   readonly limitHint: number | null;
   /** Rewrites applied, in order. Surfaced by tests and by `explain()`. */

@@ -246,10 +246,9 @@ describe("word expansion refusals and bounds", () => {
   });
 
   it.each([
-    ["{", "command group"],
-    ["}", "command group"],
-    ["{ echo x; }", "command group"],
-    ["echo x; } ", "command group"],
+    ["{", "unexpected end of input"],
+    ["}", "unexpected token `}'"],
+    ["echo x; } ", "unexpected token `}'"],
     ["{echo,x}", "brace expansion in command names"],
     ["~/bin/tool", "tilde expansion in command names"],
     ["echo $HOME{a,b}", "brace expansion after an unbraced parameter"],

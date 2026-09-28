@@ -34,7 +34,9 @@ export type Operator =
   | "&>>"
   | "<<"
   | "<<-"
-  | "<<<";
+  | "<<<"
+  | "("
+  | ")";
 
 export type Token =
   | { readonly type: "word"; readonly word: Word; readonly offset: number }
@@ -56,6 +58,7 @@ const WORD_END = new Set([" ", "\t", "\r", "\n"]);
 const REJECTED: ReadonlyArray<{ prefix: string; construct: string }> = [
   { prefix: "$((", construct: "arithmetic expansion" },
   { prefix: "$(", construct: "command substitution" },
+  { prefix: "((", construct: "arithmetic command" },
   { prefix: "`", construct: "command substitution" },
   { prefix: "<(", construct: "process substitution" },
   { prefix: ">(", construct: "process substitution" },
@@ -78,6 +81,8 @@ const OPERATORS: ReadonlyArray<Operator | "&"> = [
   ">",
   "<",
   "&",
+  "(",
+  ")",
 ];
 
 const DIGIT = /[0-9]/;
@@ -122,9 +127,6 @@ export function tokenize(source: string): Token[] {
     for (const { prefix, construct } of REJECTED) {
       if (source.startsWith(prefix, index)) reject(construct, index);
     }
-
-    // `{` and `}` are words; the parser refuses them in command position.
-    if (char === "(" || char === ")") reject("subshell", index);
 
     const operator = readOperator(source, index);
     if (operator !== null) {
@@ -274,6 +276,12 @@ function readWord(source: string, start: number): WordScan {
     }
 
     if (char === "$") {
+      if (source.startsWith("$(", index)) {
+        reject(
+          source.startsWith("$((", index) ? "arithmetic expansion" : "command substitution",
+          index,
+        );
+      }
       const parameter = readParameter(source, index, false);
       if (parameter !== null) {
         if (source.charAt(index + 1) !== "{" && source.charAt(parameter.end) === "{") {
