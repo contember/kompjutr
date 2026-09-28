@@ -251,7 +251,7 @@ interface History {
 // Frozen at the pre-sprint implementation; the status.sparse, staging.add-selected
 // and worktree.list rows at fc25987. A target miss is reported separately.
 const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
-  "schema.init": 72,
+  "schema.init": 71,
   "fs.redirect.stream": 32,
   "ls-files.cached": 1,
   "ls-files.combined": 6,
@@ -298,13 +298,13 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
 };
 
 const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
-  "schema.init": 68,
+  "schema.init": 67,
   "fs.redirect.stream": 4,
   "ls-files.cached": 2,
   "ls-files.combined": 13,
   "ignore.load": 7,
   "sparse.prune": 247,
-  "checkout.remove": 32,
+  "checkout.remove": 30,
   "worktree.guard": 12,
   "staging.add": 26,
   "staging.rm": 31,
@@ -354,9 +354,10 @@ const SELECTED_EXACT_INDEX_SQL =
 const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
   {
     operation: "git.clone",
-    statements: 1_012,
+    statements: 898,
     rowsRead: 145_777,
     source:
+      "2026-09-28 memory and cost sprint: initial-write metadata flushes at 256 KiB (-114 statements). " +
       "2026-09-24 simplification sprint: self-contained packs and one tree projection per OID " +
       "(-17 statements, -18,508 rows). 2026-09-23 HEAD: commit promotion stopped recounting staged rows (-2 statements, " +
       "-2 rows). 2026-09-22 HEAD, rebaselined with per-commit attribution. Statements fell from the " +
