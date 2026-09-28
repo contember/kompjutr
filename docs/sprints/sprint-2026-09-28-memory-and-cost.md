@@ -568,3 +568,25 @@ worktree, and the leader cherry-picks every green unit at once.
     calibration spreads 32–96 MB from GC timing.
   - Pre-existing local defects found in review → backlog 108.
 - Backlog 95, part b → backlog 107.
+- WU6 peak witness: interleaved leased runs under a 1 GiB no-swap cap
+  (`memory.max=1073741824`), three at `9fe4645` and three at `7ea46be`.
+
+  | Commit | Statements | Rows | Added peak (MiB) | Wall (s) |
+  |---|---|---|---|---|
+  | `9fe4645` | 1,006 | 1,145,713 | 30.7 / 53.4 / 63.2 | 12.2–12.4 |
+  | `7ea46be` | 724 | 830,418 | 36.8 / 44.9 / 40.5 | 9.1–9.5 |
+
+  The maximum falls from 63.2 to 44.9 MiB and the mean from 49.1 to 40.7 MiB.
+- WU6 `b87f696`…`0b2a9c3`:
+  - P1: the baseline proof passes through `driveRebase`. P2: a clean tracker answers
+    the start checks; without one, one join runs the checks. P3: rebase start checks
+    out only the tree diff when the tracker is clean.
+  - Three independent reviews were clean. An induction probe over 670 rebase tests
+    found no stale proof. Fast-path and full-path worktree and index dumps were
+    identical across nine shapes.
+  - The P3 "checkout bug" needed a tracker sealed over existing untracked content, which
+    the ADR-0004 contract excludes. The invariant is stated in
+    `trySparseCleanCheckout`.
+  - The tracked gate rows fall to 241/64,824 and 271/125,324.
+  - A replaced leaf's parent directory loses a custom mode on both checkout paths
+    (Git keeps it). This behaviour predates the sprint → backlog 109.
