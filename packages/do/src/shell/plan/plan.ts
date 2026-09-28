@@ -88,6 +88,7 @@ function planCommand(command: SimpleCommand): PlannedCommand {
     name,
     args: argWords.map(toArgument),
     redirections: command.redirections.map(planRedirection),
+    line: command.line,
   };
 }
 
@@ -273,6 +274,7 @@ function fuseFindIntoSearch(
 
   const search: PlannedCommand = {
     name: inner.name,
+    line: xargs.line,
     args,
     redirections: xargs.redirections,
   };

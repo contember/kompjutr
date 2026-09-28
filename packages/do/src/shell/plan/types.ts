@@ -37,6 +37,8 @@ export interface PlannedCommand {
   /** Arguments after the name. */
   readonly args: readonly Argument[];
   readonly redirections: readonly PlannedRedirection[];
+  /** The one-based source line, for Bash-shaped builtin diagnostics. */
+  readonly line: number;
 }
 
 export interface PlannedPipeline {

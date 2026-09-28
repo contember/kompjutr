@@ -22,6 +22,9 @@ describe.skipIf(!REAL_BASH)("exit matches Bash", () => {
     "exit foo",
     "exit 1 2; echo reachable",
     "false; exit; echo unreachable",
+    "echo first\nexit foo",
+    "cat <<E\nbody\nE\nexit 1 2",
+    "echo a \\\n b; exit foo",
   ])("matches operand and current-status behavior: %s", async (source) => {
     agreeWithBash(await compareWithBash(source));
   });

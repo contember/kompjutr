@@ -279,6 +279,8 @@ export interface CommandContext {
   readonly currentStatus: number;
   /** True only for a direct command that may terminate this run. */
   readonly mayExitRun: boolean;
+  /** The command's one-based source line, which Bash's builtins name in diagnostics. */
+  readonly line: number;
   /** From a lifted `head -N`. Sizes the first discovery page. */
   readonly limitHint: number | null;
   /** Planned stream destinations and the bytes still available to this stage. */

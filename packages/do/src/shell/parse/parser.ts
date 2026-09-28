@@ -16,7 +16,7 @@ import {
 import { type Operator, type Token, tokenize } from "./lexer.js";
 
 export function parse(source: string): Script {
-  return new Parser(tokenize(source)).script();
+  return new Parser(tokenize(source), source).script();
 }
 
 /**
@@ -45,8 +45,12 @@ const RESERVED = new Set([
 
 class Parser {
   #index = 0;
+  #newlines: number[] | null = null;
 
-  constructor(private readonly tokens: readonly Token[]) {}
+  constructor(
+    private readonly tokens: readonly Token[],
+    private readonly source: string,
+  ) {}
 
   script(): Script {
     const statements: Statement[] = [];
@@ -115,6 +119,24 @@ class Parser {
     return rest.length === 0 && part?.kind === "Literal" && part.value === "!";
   }
 
+  #lineAt(offset: number): number {
+    if (this.#newlines === null) {
+      this.#newlines = [];
+      for (let index = this.source.indexOf("\n"); index !== -1; ) {
+        this.#newlines.push(index);
+        index = this.source.indexOf("\n", index + 1);
+      }
+    }
+    let low = 0;
+    let high = this.#newlines.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if ((this.#newlines[middle] ?? offset) < offset) low = middle + 1;
+      else high = middle;
+    }
+    return low + 1;
+  }
+
   #skipNewlines(): void {
     while (this.tokens[this.#index]?.type === "newline") this.#index++;
   }
@@ -159,7 +181,7 @@ class Parser {
         throw new ShellSyntaxError(`\`${text}\``, `\`${text}\` is not supported`, start);
       }
     }
-    return { kind: "SimpleCommand", words, redirections };
+    return { kind: "SimpleCommand", words, redirections, line: this.#lineAt(start) };
   }
 
   #redirection(fd: number, offset: number): Redirection {

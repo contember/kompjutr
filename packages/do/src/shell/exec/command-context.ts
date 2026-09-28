@@ -36,6 +36,7 @@ export function commandContext(
     env: env.inputs?.env,
     currentStatus: env.currentStatus,
     mayExitRun,
+    line: planned.line,
     limitHint,
     output,
     diagnostic,

@@ -246,8 +246,8 @@ conditionals and loops, functions, background jobs, and compound commands also
 remain rejected. There is no external-process fallback.
 
 `printf`, `echo`, and `test` deliberately reject the forms listed in their
-command rows. Diagnostics from `test` and `[` omit Bash's `bash: line N:` prefix
-because the shell does not track script lines. `exit` in a multi-stage pipeline
+command rows. `exit`, `test`, and `[` report errors as Bash's builtins do, as
+`bash: line N:` with the source line the command starts on. `exit` in a multi-stage pipeline
 is a local usage error because this shell has no subshell in which to run it.
 The [printf](../../tests/shell/parity-bash-printf.test.ts),
 [exit](../../tests/shell/parity-bash-exit.test.ts), and

@@ -16,11 +16,13 @@ export const exit: Command = (context) => {
   const operand = context.argv[0];
   if (operand === undefined) return controlResult(context.currentStatus, true);
   if (!/^[+-]?[0-9]+$/.test(operand)) {
-    context.diagnostic(encode(`bash: line 1: exit: ${operand}: numeric argument required\n`));
+    context.diagnostic(
+      encode(`bash: line ${context.line}: exit: ${operand}: numeric argument required\n`),
+    );
     return controlResult(2, true);
   }
   if (context.argv.length > 1) {
-    context.diagnostic(encode("bash: line 1: exit: too many arguments\n"));
+    context.diagnostic(encode(`bash: line ${context.line}: exit: too many arguments\n`));
     return controlResult(1, true);
   }
 

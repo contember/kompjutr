@@ -1,6 +1,5 @@
 // Multi-line scripts, here-documents, negation, and the small built-ins agents
-// chain with them, compared with Bash. Refusals and diagnostics whose Bash text
-// carries a script location are pinned locally.
+// chain with them, compared with Bash. Refusals are pinned locally.
 
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -139,6 +138,17 @@ describe.skipIf(!REAL_BASH)("scripts match Bash", () => {
   });
 
   it.each([
+    "test a -eq 1",
+    "[ a = a",
+    "test -f a b",
+    "test -q x",
+    "echo first\n\ntest 1 -eq b",
+    "cat <<E\nbody\nE\n[ x -lt y ]",
+  ])("reports test diagnostics at their script line: %j", async (source) => {
+    await compare(source);
+  });
+
+  it.each([
     "printf 'ab ab\\nx\\nAb\\n' | grep -oin ab",
     "printf 'ab\\nx\\n' | grep -q ab && echo found",
     "printf 'x\\n' | grep -q ab || echo absent",
@@ -234,18 +244,6 @@ describe("script refusals and located diagnostics", () => {
     expect(run.stderr).toBe("echo: the \\u escape is not supported\n");
   });
 
-  // Bash prefixes these with a script line number this shell does not track.
-  it.each([
-    ["test a -eq 1", "test: a: integer expression expected\n"],
-    ["[ a = a", "[: missing `]'\n"],
-    ["test -f a b", "test: a: binary operator expected\n"],
-    ["test -q x", "test: -q: unary operator expected\n"],
-  ])("fails %j with status 2", async (source, stderr) => {
-    const run = await shell.run(source);
-    expect(run.exitCode).toBe(2);
-    expect(run.stderr).toBe(stderr);
-  });
-
   it("reserves a here-document body against the retained limit", async () => {
     const fs = createFilesystem(new TestDatabase(), { now: () => 0 });
     const bounded = createShell({
@@ -263,9 +261,12 @@ describe("script refusals and located diagnostics", () => {
   });
 
   it.each([
-    ["test -p x", "test: -p is not supported\n"],
-    ["test a -nt b", "test: -nt is not supported\n"],
-    ["test a = a -a b = b", "test: expressions with more than four arguments are not supported\n"],
+    ["test -p x", "bash: line 1: test: -p is not supported\n"],
+    ["test a -nt b", "bash: line 1: test: -nt is not supported\n"],
+    [
+      "true\ntest a = a -a b = b",
+      "bash: line 2: test: expressions with more than four arguments are not supported\n",
+    ],
   ])("refuses %j by name", async (source, stderr) => {
     const run = await shell.run(source);
     expect(run.exitCode).toBe(2);

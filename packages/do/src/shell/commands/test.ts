@@ -5,14 +5,8 @@
 // Each file test is one stat.
 
 import type { Stat } from "../../fs/types.js";
-import { empty } from "../exec/bytes.js";
-import {
-  type Command,
-  type CommandContext,
-  type CommandResult,
-  fail,
-  result,
-} from "../exec/context.js";
+import { empty, encode } from "../exec/bytes.js";
+import { type Command, type CommandContext, type CommandResult, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { isFilesystemError } from "../exec/redirections.js";
 
@@ -41,21 +35,27 @@ const STRING_COMPARISONS = new Set(["=", "==", "!="]);
 const INTEGER_COMPARISONS = new Set(["-eq", "-ne", "-lt", "-le", "-gt", "-ge"]);
 const UNSUPPORTED_BINARY = new Set(["-nt", "-ot", "-ef", "<", ">"]);
 
-export const test: Command = (context) => evaluate(context, context.argv);
+export const test: Command = (context) => evaluate(context, "test", context.argv);
 
 export const bracket: Command = (context) => {
   const last = context.argv[context.argv.length - 1];
-  if (last !== "]") return fail(context, "missing `]'", 2);
-  return evaluate(context, context.argv.slice(0, -1));
+  if (last !== "]") return usage(context, "[", "missing `]'");
+  return evaluate(context, "[", context.argv.slice(0, -1));
 };
 
-function evaluate(context: CommandContext, args: readonly string[]): CommandResult {
+function evaluate(context: CommandContext, name: string, args: readonly string[]): CommandResult {
   try {
     return result(empty(), expression(context, args) ? 0 : 1);
   } catch (error) {
-    if (error instanceof TestError) return fail(context, error.message, 2);
+    if (error instanceof TestError) return usage(context, name, error.message);
     throw error;
   }
+}
+
+/** A Bash builtin's diagnostic, which names the script line. */
+function usage(context: CommandContext, name: string, message: string): CommandResult {
+  context.diagnostic(encode(`bash: line ${context.line}: ${name}: ${message}\n`));
+  return result(empty(), 2);
 }
 
 function expression(context: CommandContext, args: readonly string[]): boolean {

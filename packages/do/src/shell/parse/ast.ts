@@ -69,6 +69,8 @@ export interface SimpleCommand {
   /** Never empty: a command with no words is a syntax error. */
   readonly words: readonly Word[];
   readonly redirections: readonly Redirection[];
+  /** The one-based source line the command starts on. */
+  readonly line: number;
 }
 
 export interface Pipeline {

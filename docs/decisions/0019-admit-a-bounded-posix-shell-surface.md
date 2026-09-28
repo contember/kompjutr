@@ -98,8 +98,7 @@ These forms remain rejected:
 - `echo -e` `\u` and `\U` escapes, whose Bash output depends on the locale.
 - `test` with more than four arguments outside parentheses, `-a`/`-o`
   precedence, `-nt`, `-ot`, `-ef`, `<`, `>`, and file tests with no meaning
-  here (`-p`, `-S`, `-t`, and the like). Diagnostics from `test` and `[` omit
-  Bash's `bash: line N:` prefix because the shell does not track script lines.
+  here (`-p`, `-S`, `-t`, and the like).
 - `exit` in a multi-stage pipeline. Bash runs that command in a subshell; this
   shell has no subshell and rejects the form rather than silently changing its
   control effect.
