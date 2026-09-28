@@ -66,21 +66,21 @@ The accepted argv grammar is exact:
 
 | Command | Accepted argv |
 |---|---|
-| `status` | Optionless human status, or one of `--porcelain`, `--porcelain=v1`, `--porcelain=v2`, `--short`, `-s`; optional `-b|--branch` and literal paths |
+| `status` | Optionless human status, or one of `--porcelain`, `--porcelain=v1`, `--porcelain=v2`, `--short`, `-s`; optional `-b|--branch` and default pathspecs |
 | `rev-parse` | One revision, optionally preceded by `--verify` and `--quiet`, or exactly `--show-toplevel` |
 | `branch` | Optionless or `--list`; create as `<name> [<start>]`; delete as `-d|--delete <name>` or `-D <name>`; rename as `-m|--move [<old>] <new>`; exactly `--show-current` |
-| `ls-files` | Optional `--cached`, `--others`, and `--exclude-standard` selection plus bounded literal paths |
-| `diff` | Plain diff with zero, one, or two refs, optional joined `-U<n>`, and optional `-- <literal-paths>`; staged diff as `--cached|--staged [<ref>] [-- <literal-paths>]` |
+| `ls-files` | Optional `--cached`, `--others`, and `--exclude-standard` selection plus bounded default pathspecs |
+| `diff` | Plain diff with zero, one, or two refs, optional joined `-U<n>`, `--name-only`, `-z`, and optional `-- <default-pathspecs>`; staged diff as `--cached|--staged [<ref>] [-- <default-pathspecs>]` |
 | `log` | At most one of `-1`, `-n <count>`, `--max-count=<count>`; at most one of `--oneline`, `--format=<template>`; optional `--first-parent`; then at most one ref or admitted `<a>..<b>` range and optional `-- <literal-paths>...` |
 | `show` | `[--first-parent] [<ref>]`; a merge requires `--first-parent` rather than silently choosing a parent |
 | `rev-list` | Exactly `--count <a>..<b>` |
 | `symbolic-ref` | Exactly `--short <ref>` |
-| `add` | One or more literal paths, optionally with `-f|--force`; or repository-wide `-A|--all` or `-u|--update`, optionally with force; `--` ends option parsing |
+| `add` | One or more default pathspecs, optionally with `-f|--force`; or repository-wide `-A|--all` or `-u|--update`, optionally with force; `--` ends option parsing |
 | `commit` | Exactly one `-m|--message <message>` or `--message=<message>`, plus optional `-a|--all`, `--amend`, and `--allow-empty` |
-| `reset` | `[--mixed|--hard] [<ref>]`, or `[<ref>] -- <literal-paths>...` |
-| `checkout` | `[-f|--force] <ref>`, `-b <name> [<start>]`, or `<ref> -- <literal-paths>...` |
+| `reset` | `[--mixed|--hard] [<ref>]`, or `[<ref>] -- <default-pathspecs>...` |
+| `checkout` | `[-f|--force] <ref>`, `-b <name> [<start>]`, or `<ref> -- <default-pathspecs>...` |
 | `switch` | Exactly `<branch>` or `-c <name>` |
-| `restore` | `[--source=<ref>] [--] <literal-paths>...` |
+| `restore` | `[--source=<ref>] [--] <default-pathspecs>...` |
 | `rebase` | Exactly one upstream, `--continue`, `--skip`, or `--abort` |
 | `merge` | Exactly `--continue` or `--abort` |
 | `init` | `[--bare] [--initial-branch=<name>] [<directory>]` |
@@ -91,10 +91,11 @@ The accepted argv grammar is exact:
 | `pull` | `[--rebase\|--ff\|--no-ff\|--ff-only] [<remote> [<branch>]]`; rebase and fast-forward options are mutually exclusive |
 | `push` | `[--force] [--delete] [--atomic] [--force-with-lease=<ref>[:<expect>]] [--push-option=<text>] [<remote-or-http(s)-url> [<selector-or-full-refspec>...]]` |
 
-Status, ls-files, and log path operands are literals or directory prefixes; glob
-and pathspec-magic spellings are rejected by this argv surface. `--exclude-standard`
-requires `--others`. Add path operands are also literal or directory-prefix
-selections. Repository-wide add/update modes do not accept path operands, and
+Status and ls-files accept default `*`, `?`, bracket-class, and `**` glob
+pathspecs. Add, path reset, path checkout, restore, and diff accept the same
+default globs; pathspec magic remains unsupported. Log paths remain literals
+or directory prefixes. `--exclude-standard`
+requires `--others`. Repository-wide add/update modes do not accept path operands, and
 `-A|--all` is incompatible with `-u|--update`. `--quiet` is admitted only with
 `rev-parse --verify`.
 
@@ -238,7 +239,7 @@ checkout; another attachment fails with `EBRANCHINUSE` and has no force bypass.
 | `--short` | `formatShort(entries, options?)` | ★ ✔ |
 | `core.quotePath` | `statusFormatOptions(repo, overrides?)` | ✔ Git boolean syntax, default `true`; an explicit `quotePath` override wins |
 | `-z` (NUL-framed output) | `zeroTerminate: true` | ★ ✔ disables quoting, NUL-terminates every record and branch header, and emits a rename as destination NUL source NUL |
-| `-- <paths>` | `GitStatusOptions.paths` | ~ exact path or directory prefix, no globs |
+| `-- <paths>` | `GitStatusOptions.paths` | ~ exact path, directory prefix, or default globs; no pathspec magic |
 | `--ignored` | `GitStatusOptions.includeIgnored` | ✔ ignored entries use `!!` in v1/short and `!` in v2 |
 | `--untracked-files=no\|normal\|all` | `GitStatusOptions.untrackedFiles` | ✔ default `normal`; `no` suppresses untracked and ignored rows, `normal` collapses wholly untracked directories, and `all` lists their files |
 | `-b`, `--branch` header | `statusReport({ branch: true })` | ✔ `oid`, `head`, configured upstream, and bounded ahead/behind counts |
@@ -313,7 +314,7 @@ resealing for that pass without changing the status result.
 
 | Git | kompjutr | |
 |---|---|---|
-| `<pathspec>...` | `paths` | ★ ~ exact path or directory prefix; no globs, no `:(exclude)` magic |
+| `<pathspec>...` | `paths` | ★ ~ exact path, directory prefix, or default globs; no `:(exclude)` magic |
 | `-A`, `--all` | `all` | ★ ✔ |
 | `-u`, `--update` | `trackedOnly` (with `all`) | ✔ this is the `commit -a` shape |
 | `-f`, `--force` | `force` | ★ ✔ stage an ignored path |
@@ -328,7 +329,7 @@ stages it.
 
 | Git | kompjutr | |
 |---|---|---|
-| `<pathspec>...` | `paths` | ★ ~ exact path or directory prefix; no globs or pathspec magic |
+| `<pathspec>...` | `paths` | ★ ~ exact path, directory prefix, or default globs; no pathspec magic |
 | default | `cached: false` (default) | ✔ removes matching index entries and working-tree files |
 | `--cached` | `cached: true` | ✔ removes only matching index entries |
 | `-f` | `force: true` | ★ ✔ bypasses content safety, not structural, matching, or resource checks |
@@ -382,7 +383,7 @@ hard-reset worktree changes.
 | `--orphan`, `--track`, `--merge`, `--patch` | — | ✘ |
 
 All worktree-changing forms preserve registered nested repository roots. The
-argv runner resolves literal paths from `cwd`; path checkout updates index and
+argv runner resolves pathspecs from `cwd`; path checkout updates index and
 worktree, while restore is worktree-only. An explicit restore source removes a
 selected tracked worktree path that is absent from that source.
 Checkout, merge, cherry-pick, and rebase replace ignored untracked files and
@@ -395,7 +396,7 @@ content and tracked changes that would be overwritten still block the operation.
 |---|---|---|
 | `-n`, `--dry-run` | `dryRun` | ✔ |
 | `-d` | `directories` | ★ ✔ |
-| `-- <paths>` | `paths` | ✔ exact or directory prefix |
+| `-- <paths>` | `paths` | ✔ exact path, directory prefix, or default globs |
 | `-f` | — | ★ ~ implicit: without `dryRun`, `clean()` removes |
 | `-x`, `-X` | — | ✘ ignored files are always preserved |
 
@@ -414,8 +415,9 @@ mode.
 | `git diff --cached` / `--staged [<ref>]` | `{ staged: true, ref? }` | ✔ selected tree (HEAD by default) vs stage-0 index; refuses unmerged indexes |
 | `-U<n>` | `context` | ✔ |
 | `--abbrev=<n>` | `abbrev` (default 7) | ✔ |
-| `-- <paths>` | `paths` | ~ exact or directory prefix, no globs |
-| `--numstat`, `--name-status`, `--name-only` | `diffSummary()` | ★ ~ returns structured objects, never framed text; exact renames have `R`, source path, similarity 100, and zero line delta |
+| `-- <paths>` | `paths` | ~ exact path, directory prefix, or default globs; no pathspec magic |
+| `--name-only [-z]` | strict argv runner | ✔ newline- or NUL-framed changed paths; NUL output has no C quoting |
+| `--numstat`, `--name-status` | `diffSummary()` | ★ ~ returns structured objects, not CLI-framed text; exact renames have `R`, source path, similarity 100, and zero line delta |
 | `-M100%` (exact rename detection) | `renames` | ~ equal authoritative blob OIDs and compatible modes only; defaults on |
 | similarity-scored `-M<n>`, `-C` | — | ✘ move-plus-edit remains a complete add/delete pair |
 | `--binary`, `--full-index` | — | ★ ✘ no patch text an `apply` could consume; binary files emit `Binary files a/… and b/… differ` |
@@ -1070,9 +1072,10 @@ MiB. There is no global operation byte ledger.
 
 ## Path and ordering rules
 
-- Mutating pathspecs are **exact path or directory prefix**. Read-only
-  `lsFiles({ paths })` additionally supports its bounded default glob subset.
-  No operation accepts `:(exclude)`, `:(icase)`, or leading `:/` magic.
+- Pathspecs for add, rm, reset, checkout/restore, clean, status, diff, and
+  `lsFiles({ paths })` accept bounded default `*`, `?`, bracket-class, and `**`
+  globs. Wildcards cross `/`. No operation accepts `:(exclude)`, `:(icase)`,
+  or leading `:/` magic.
 - Paths order by UTF-8 bytes, matching Git and SQLite `BINARY` — never by
   JavaScript string comparison.
 
@@ -1088,12 +1091,12 @@ remote discovery, linked-checkout add / list / remove / prune, caller-selected
 divergence, offline raw-ref reads, and every local read the agent makes. The
 consumer adapter is outside this package.
 
-### Hard gaps — no route through the current surface
+### Remaining workload gaps
 
 | Missing | What issues it |
 |---|---|
+| `diff --name-status -z` | NUL-framed status and path fields, including rename pairs, read by the consumer; `diffSummary()` has the data but the strict argv runner does not frame it |
 | `worktree repair` / `unlock` | the broader Git-layout recovery and lock lifecycle; the SQLite-native admission path has no pointer or lock state to repair |
-| `diff -z` | NUL-framed diff path lists parsed by the orchestrator; status formatters already provide NUL framing |
 
 ### Adaptable — the capability exists under another shape
 

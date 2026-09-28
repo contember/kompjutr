@@ -562,6 +562,26 @@ describe("status", () => {
     expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2", "--", "src"));
   });
 
+  it("filters tracked and untracked nested files with Git default globs", async () => {
+    const { fixture, workspace } = await build({
+      name: "glob pathspec",
+      commits: [
+        [
+          { op: "write", path: "src/a.ts", content: "old\n" },
+          { op: "write", path: "src/a.txt", content: "old\n" },
+        ],
+      ],
+      mutate: [
+        { op: "write", path: "src/a.ts", content: "new\n" },
+        { op: "write", path: "src/nested/b.ts", content: "new\n" },
+      ],
+    });
+    const paths = ["src/*.ts"];
+    expect(formatPorcelainV2(status(workspace.repo, workspace.worktree, { paths }))).toBe(
+      gitStatus(fixture, "--porcelain=v2", "--", ...paths),
+    );
+  });
+
   it("sorts non-BMP paths in Git's UTF-8 byte order", async () => {
     const privateUse = "\uE000.txt";
     const nonBmp = "😀.txt";
@@ -1370,6 +1390,23 @@ describe("clean", () => {
     const { fixture, workspace } = await build(scenario);
     expect(clean(workspace.repo, workspace.worktree, { dryRun: true, directories: true })).toEqual(
       wouldRemove(fixture, "-d"),
+    );
+  });
+
+  it("selects clean candidates with a default glob without removing siblings", async () => {
+    const { fixture, workspace } = await build(scenario);
+    const options = { paths: ["*.txt"], directories: true };
+    expect(clean(workspace.repo, workspace.worktree, { ...options, dryRun: true })).toEqual(
+      wouldRemove(fixture, "-d", "--", "*.txt"),
+    );
+    clean(workspace.repo, workspace.worktree, options);
+    fixture.git("clean", "-fd", "--", "*.txt");
+    expect(status(workspace.repo, workspace.worktree).map((row) => row.path)).toEqual(
+      fixture
+        .git("status", "--porcelain")
+        .split("\n")
+        .filter(Boolean)
+        .map((row) => row.slice(3)),
     );
   });
 

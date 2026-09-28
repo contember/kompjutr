@@ -9,7 +9,12 @@ import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
+import {
+  type CompiledPathspecMatcher,
+  compilePathspecs,
+  hasGlobSyntax,
+  walkWorktreeEntriesStream,
+} from "../worktree/worktree-io.js";
 import {
   absoluteRmPaths,
   boundedRmRows,
@@ -43,6 +48,7 @@ interface RmIndexPath {
 
 interface RmSpec {
   path: string;
+  matcher?: CompiledPathspecMatcher;
   directoryOnly: boolean;
   matched: boolean;
   directoryMatch: boolean;
@@ -52,6 +58,7 @@ interface RmSpec {
 interface RmSpecIndex {
   files: Map<string, RmSpec>;
   directories: Map<string, RmSpec>;
+  globs: RmSpec[];
 }
 
 /** Remove tracked paths with Git's HEAD/index/worktree safety checks. */
@@ -264,6 +271,7 @@ function normalizeRmSpecs(paths: readonly string[]): {
   const specs: RmSpec[] = [];
   const files = new Map<string, RmSpec>();
   const directories = new Map<string, RmSpec>();
+  const globs: RmSpec[] = [];
   for (const raw of paths) {
     let path: string;
     let directoryOnly: boolean;
@@ -277,6 +285,20 @@ function normalizeRmSpecs(paths: readonly string[]): {
     }
     if (path.length > MAX_INDEX_PATH_BYTES || utf8.encode(path).length > MAX_INDEX_PATH_BYTES) {
       throw new GitError("E2BIG", `rm pathspec exceeds ${MAX_INDEX_PATH_BYTES} UTF-8 bytes`);
+    }
+    if (hasGlobSyntax(path)) {
+      if (globs.some((spec) => spec.path === path)) continue;
+      const spec: RmSpec = {
+        path,
+        matcher: compilePathspecs([path]),
+        directoryOnly: false,
+        matched: false,
+        directoryMatch: false,
+        worktreeDirectory: false,
+      };
+      globs.push(spec);
+      specs.push(spec);
+      continue;
     }
     const seen = directoryOnly ? directories : files;
     if (seen.has(path)) continue;
@@ -292,7 +314,7 @@ function normalizeRmSpecs(paths: readonly string[]): {
   }
   return {
     specs,
-    index: { files, directories },
+    index: { files, directories, globs },
   };
 }
 
@@ -303,8 +325,14 @@ function matchesRmSpecs(specs: RmSpecIndex, path: string): boolean {
 function noteRmMatches(specs: RmSpecIndex, path: string, worktreeDirectory: boolean): void {
   visitMatchingRmSpecs(specs, path, (spec) => {
     spec.matched = true;
-    if (spec.directoryOnly || path !== spec.path) spec.directoryMatch = true;
-    if (!spec.directoryOnly && path === spec.path && worktreeDirectory) {
+    if (spec.matcher === undefined && (spec.directoryOnly || path !== spec.path)) {
+      spec.directoryMatch = true;
+    }
+    if (
+      !spec.directoryOnly &&
+      worktreeDirectory &&
+      (spec.matcher !== undefined || path === spec.path)
+    ) {
       spec.worktreeDirectory = true;
     }
   });
@@ -324,6 +352,9 @@ function visitMatchingRmSpecs(
   found(specs.files.get(""));
   found(specs.directories.get(""));
   found(specs.files.get(path));
+  for (const spec of specs.globs) {
+    if (spec.matcher?.matches(path)) found(spec);
+  }
   for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
     const prefix = path.slice(0, slash);
     found(specs.files.get(prefix));

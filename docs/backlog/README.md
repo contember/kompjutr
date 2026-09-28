@@ -22,8 +22,8 @@ not effort: a wrong answer outranks a missing one.
   returns a different one or refuses. Nothing warns the caller. None filed.
 - **A — blocks a common workflow, loudly.** None filed.
 - **B — real gap, narrower audience or a workaround exists.** None filed.
-- **No caller yet.** Stash, plumbing reads, branch and remote management, glob
-  pathspecs, rebase extensions, interactive rebase, rebase merges, gitlink
+- **No caller yet.** Stash, plumbing reads, branch and remote management,
+  rebase extensions, interactive rebase, rebase merges, gitlink
   conflicts, outbound delta compression and byte-preserving paths live in
   [`../ideas/`](../ideas/README.md). One graduates here when a consumer issues it.
 - **C — deliberately out of scope.** Not filed: `bisect`, `blame`, `describe`,
@@ -58,7 +58,7 @@ Coverage of the calls that decide whether Phase 1 is usable:
 |---|---|---|
 | a full-history clone that later runs `merge-base`, `rebase`, `rev-list --count` | both | Served: optionless clone is complete, while explicit shallow clones can deepen and unshallow later |
 | `branch -m`, `remote set-url` | both | Served by typed native operations; the rest is the [branch and remote management idea](../ideas/branch-and-remote-management.md) |
-| `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'` | builder | Served by native cached/untracked selection and repository `.gitignore` filtering; mutating globs are the [glob pathspecs idea](../ideas/glob-pathspecs.md) |
+| `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'` | builder | Served by native cached/untracked selection and repository `.gitignore` filtering; default globs also select paths in add, rm, reset, checkout/restore, clean, status, and diff |
 | `clone --filter=blob:none` | both | Served by native filtered clone/fetch, durable promises, and bounded lazy backfill (ADR-0015) |
 | `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | Served by the strict awaitable runner, bounded per-run stdin/env, and the explicit `@kompjutr/do/git-shell` adapter |
 

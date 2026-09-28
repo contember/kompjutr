@@ -29,7 +29,6 @@ decided work or status.
   [`stash-operations.md`](stash-operations.md) ·
   [`plumbing-read-surface.md`](plumbing-read-surface.md) ·
   [`branch-and-remote-management.md`](branch-and-remote-management.md) ·
-  [`glob-pathspecs.md`](glob-pathspecs.md) ·
   [`rebase-targets-and-roots.md`](rebase-targets-and-roots.md) ·
   [`rebase-update-refs.md`](rebase-update-refs.md) ·
   [`interactive-rebase.md`](interactive-rebase.md) ·

@@ -4,7 +4,6 @@ import { isExcluded, relativeTo } from "../../common/paths.js";
 import { joinSorted, joinSorted3 } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { MAX_INDEX_PATH_BYTES } from "../../store/schema/schema.js";
-import { matchesPaths } from "../checkout/checkout.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
@@ -23,6 +22,7 @@ import {
   type BufferedStatusRow,
   flushStatusRows,
   ignoredRow,
+  matchesStatusPath,
   octalMode,
   renameRow,
   type StatusDetail,
@@ -75,7 +75,7 @@ export function fullStatusPrepass(
     },
   )) {
     if (row.right !== undefined) retainStatusIndexPath(snapshot, row.right.path, collapse);
-    if (!classifying || !matchesPaths(row.path, options.paths) || row.right?.kind === "unmerged") {
+    if (!classifying || !matchesStatusPath(row.path, options) || row.right?.kind === "unmerged") {
       continue;
     }
     const head = row.left;
@@ -169,14 +169,14 @@ export function* statusStreamInternal(
       const directory = ignored
         ? shallowestIgnoredDirectory(path, snapshot.trackedDirs, ignores)
         : shallowestUntrackedDirectory(path, snapshot.trackedDirs);
-      if (directory !== null && matchesPaths(directory, options.paths)) {
+      if (directory !== null && matchesStatusPath(directory, options)) {
         if (ignored) collapsedIgnored = directory;
         else collapsedUntracked = directory;
         path = `${directory}/`;
       }
     }
     if (
-      (matchesPaths(path, options.paths) || matchesPaths(candidate, options.paths)) &&
+      (matchesStatusPath(path, options) || matchesStatusPath(candidate, options)) &&
       // A tracked file replaced by a directory is a deletion, not a new directory.
       (!collapse || !path.endsWith("/") || !snapshot.trackedPaths.has(stripSlash(path)))
     ) {
@@ -193,7 +193,7 @@ export function* statusStreamInternal(
     sourceRows++;
     if (row.a !== undefined || row.b !== undefined) {
       if (snapshot.retainsTrackedPaths) retainTrackedPath(snapshot, row.path);
-      const matches = matchesPaths(row.path, options.paths);
+      const matches = matchesStatusPath(row.path, options);
       if (matches || seed !== undefined) {
         if (matches && row.a !== undefined) requireStatusWorktreePath(row.path);
         const detail: BufferedStatusRow | null =
@@ -237,7 +237,7 @@ function worktreeEntries(
 ): Generator<WorktreePath> {
   return walkWorktreeEntriesStream(worktree, repo.root, {
     excludeRoots,
-    paths: options.paths,
+    pathspec: options.pathspec,
     ignores,
     // Tracked paths remain visible even when a later ignore rule matches.
     includeIgnored: true,
@@ -282,13 +282,13 @@ function worktreeWalkOptions(
   options: StatusOptions,
 ): {
   excludeRoots: string[] | undefined;
-  paths: string[] | undefined;
+  pathspec: StatusOptions["pathspec"];
   ignores: IgnoreMatcher;
   includeIgnored: boolean | undefined;
 } {
   return {
     excludeRoots: options.excludeRoots,
-    paths: options.paths,
+    pathspec: options.pathspec,
     ignores:
       options.ignores ??
       loadIgnoreMatcher(worktree, repo.root, { excludeRoots: options.excludeRoots }),

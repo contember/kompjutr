@@ -6,6 +6,7 @@ import { countAheadBehind } from "../merge/merge-base.js";
 import { boundedBranchRef, directRefOid, resolveBranchUpstream } from "../refs/branch-upstream.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
+import { compilePathspecs } from "../worktree/worktree-io.js";
 import { applyStatusRenames, fullStatusPrepass, statusStreamInternal } from "./status-full.js";
 import type { StatusDetail, StatusOptions } from "./status-rows.js";
 import { sparseStatus } from "./status-sparse.js";
@@ -136,6 +137,7 @@ export function* statusStream(
   worktree: Worktree,
   options: StatusOptions = {},
 ): Generator<StatusDetail> {
+  options = { ...options, pathspec: compilePathspecs(options.paths) };
   const headTreeOid = repo.headTree();
   const prepass = fullStatusPrepass(repo, headTreeOid, options);
   yield* applyStatusRenames(

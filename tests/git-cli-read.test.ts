@@ -197,6 +197,12 @@ describe("read-only git argv handlers", () => {
     expect((await nativeRun(workspace, ["diff"])).stdout).toBe(
       fixture.gitBinary("diff").toString("utf8"),
     );
+    expect(await nativeRun(workspace, ["status", "--short", "--", "*.txt"], "/repo/src")).toEqual(
+      gitResultAt(fixture, ["status", "--short", "--", "*.txt"], "src"),
+    );
+    expect(
+      await nativeRun(workspace, ["diff", "--name-only", "-z", "--", "*.txt"], "/repo/src"),
+    ).toEqual(gitResultAt(fixture, ["diff", "--name-only", "-z", "--", "*.txt"], "src"));
   });
   it("matches default, oneline, template and admitted linear-range logs", async () => {
     for (const argv of [
@@ -386,6 +392,85 @@ describe("read-only git argv handlers", () => {
       ),
     ).toEqual([[expect.any(String), 1]]);
     expect(workspace.storage.statementCount).toBeLessThan(1000);
+  });
+});
+
+describe("git diff --name-only -z", () => {
+  it("lists a changed path whose content exceeds the patch hydration window", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("large.bin", "old\n");
+    fixture.commit("base");
+    const workspace = await importAt(fixture);
+    const content = "x".repeat(9 * 1024 * 1024);
+    fixture.write("large.bin", content);
+    writeWorkFile(workspace, "/repo/large.bin", content);
+
+    const argv = ["diff", "--name-only", "-z"];
+    expect(await nativeRun(workspace, argv)).toEqual(gitResultAt(fixture, argv));
+  });
+
+  it("matches Git for NUL-framed staged, working-tree, and commit-pair paths", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("src/one.ts", "first\n");
+    fixture.write("src/two\nname.ts", "first\n");
+    fixture.write("other.txt", "first\n");
+    fixture.commit("base");
+    const workspace = await importAt(fixture);
+
+    fixture.write("src/one.ts", "second\n");
+    fixture.write("src/two\nname.ts", "second\n");
+    fixture.write("other.txt", "second\n");
+    writeWorkFile(workspace, "/repo/src/one.ts", "second\n");
+    writeWorkFile(workspace, "/repo/src/two\nname.ts", "second\n");
+    writeWorkFile(workspace, "/repo/other.txt", "second\n");
+
+    for (const argv of [
+      ["diff", "--name-only", "-z"],
+      ["diff", "-z", "--name-only", "HEAD", "--", "src"],
+      ["diff", "HEAD", "--name-only", "-z"],
+      ["diff", "--name-only", "-z", "--", "src/*.ts"],
+      ["diff", "--name-only"],
+      ["diff", "-z"],
+    ]) {
+      expect(await nativeRun(workspace, argv)).toEqual(gitResultAt(fixture, argv));
+    }
+    const listed = gitResultAt(fixture, ["diff", "--name-only", "-z"]);
+    const limit = ENCODER.encode(listed.stdout).byteLength;
+    expect(
+      await runGitCli(
+        { argv: ["diff", "--name-only", "-z"], cwd: "/repo" },
+        createGitCliReadHandlers(workspace.context),
+        { maxStdoutBytes: limit },
+      ),
+    ).toEqual(listed);
+    await expect(
+      runGitCli(
+        { argv: ["diff", "--name-only", "-z"], cwd: "/repo" },
+        createGitCliReadHandlers(workspace.context),
+        { maxStdoutBytes: limit - 1 },
+      ),
+    ).rejects.toThrowError(expect.objectContaining({ code: "E2BIG" }));
+
+    fixture.git("add", "-A");
+    add(workspace.repo, workspace.worktree, { all: true, paths: [] });
+    const staged = ["diff", "--cached", "--name-only", "-z"];
+    expect(await nativeRun(workspace, staged)).toEqual(gitResultAt(fixture, staged));
+    fixture.commit("changed");
+    commit(workspace.context, workspace.repo, {
+      message: "changed",
+      author: { name: "Fixture", email: "fixture@example.com" },
+      committer: { name: "Fixture", email: "fixture@example.com" },
+    });
+    const pair = ["diff", "--name-only", "-z", "HEAD~1", "HEAD"];
+    expect(await nativeRun(workspace, pair)).toEqual(gitResultAt(fixture, pair));
+
+    fixture.git("mv", "src/one.ts", "src/moved.ts");
+    workspace.worktree.rename("/repo/src/one.ts", "/repo/src/moved.ts");
+    add(workspace.repo, workspace.worktree, { all: true, paths: [] });
+    const renamed = ["diff", "--cached", "--name-only", "-z"];
+    expect(await nativeRun(workspace, renamed)).toEqual(gitResultAt(fixture, renamed));
   });
 });
 describe("everyday read argv parity", () => {

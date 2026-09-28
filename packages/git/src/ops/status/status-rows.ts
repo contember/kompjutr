@@ -5,6 +5,7 @@ import type { IgnoreMatcher } from "../../ignore/index.js";
 import { contentIdKey, type IndexEntry } from "../../store/index.js";
 import { sharedRepoStoreMutations } from "../../store/repository/shared.js";
 import type { TargetEntry } from "../checkout/checkout.js";
+import { matchesPaths } from "../checkout/checkout.js";
 import type {
   IgnoredStatusCode,
   OrdinaryStatusEntry,
@@ -16,6 +17,7 @@ import { validateMergePath } from "../merge/merge-state.js";
 import type { Repository } from "../repository/repository.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
+  type CompiledPathspecMatcher,
   type HashedPath,
   hashExactWorktreePaths,
   hashWorktreePaths,
@@ -128,8 +130,9 @@ interface PendingStatusIndexGroup {
 }
 
 export interface StatusOptions {
-  /** Restrict to these repo-relative pathspecs: exact or directory prefix. */
+  /** Restrict to these repo-relative pathspecs. */
   paths?: string[];
+  pathspec?: CompiledPathspecMatcher;
   /** Roots of repositories nested inside this one; their files are theirs. */
   excludeRoots?: string[];
   /** Report ignored paths too. git's `--ignored`. */
@@ -144,6 +147,10 @@ export interface StatusOptions {
   untrackedFiles?: "no" | "normal" | "all";
   /** Detect staged exact renames. Explicit values override `status.renames`. */
   renames?: boolean;
+}
+
+export function matchesStatusPath(path: string, options: StatusOptions): boolean {
+  return options.pathspec?.matches(path) ?? matchesPaths(path, options.paths);
 }
 
 /** Group a validated `(path, stage)` index stream without retaining the index. */

@@ -342,6 +342,66 @@ async function expectPublicGitState(source: GitFixture, workspace: TestRepositor
   }
 }
 describe("mutating git CLI handlers", () => {
+  it("selects nested cwd-relative glob paths for add and reset", async () => {
+    const source = fixture();
+    source.write("src/a.ts", "old\n");
+    source.write("src/nested/b.ts", "old\n");
+    source.write("src/c.txt", "old\n");
+    source.commit("base");
+    const workspace = nativeRepository();
+    await importFixture(source, workspace.repo.checkout);
+    checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+    for (const path of ["src/a.ts", "src/nested/b.ts", "src/c.txt"]) {
+      source.write(path, "new\n");
+      writeWorkFile(workspace, `/repo/${path}`, "new\n");
+    }
+    const native = runner(workspace.context);
+    const cwd = join(source.dir, "src");
+
+    expect(await native.runCli({ argv: ["add", "*.ts"], cwd: "/repo/src" })).toEqual(
+      cliResult(gitResult(source, ["add", "*.ts"], cwd)),
+    );
+    expect(indexLines(workspace.repo)).toEqual(source.git("ls-files", "--stage").split("\n"));
+
+    expect(
+      (await native.runCli({ argv: ["reset", "--", "*.ts"], cwd: "/repo/src" })).exitCode,
+    ).toBe(gitResult(source, ["reset", "--", "*.ts"], cwd).status);
+    expect(indexLines(workspace.repo)).toEqual(source.git("ls-files", "--stage").split("\n"));
+  });
+  it("restores only glob-selected worktree paths", async () => {
+    const source = fixture();
+    for (const path of ["src/a.ts", "src/nested/b.ts", "src/c.txt"]) {
+      source.write(path, "old\n");
+    }
+    source.commit("base");
+    const workspace = nativeRepository();
+    await importFixture(source, workspace.repo.checkout);
+    checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+    const native = runner(workspace.context);
+    for (const path of ["src/a.ts", "src/nested/b.ts", "src/c.txt"]) {
+      source.write(path, "new\n");
+      writeWorkFile(workspace, `/repo/${path}`, "new\n");
+    }
+
+    expect(gitResult(source, ["restore", "--", "*.ts"], join(source.dir, "src")).status).toBe(0);
+    expect(
+      (await native.runCli({ argv: ["restore", "--", "*.ts"], cwd: "/repo/src" })).exitCode,
+    ).toBe(0);
+    await expectPublicGitState(source, workspace);
+
+    for (const path of ["src/a.ts", "src/nested/b.ts"]) {
+      source.write(path, "again\n");
+      writeWorkFile(workspace, `/repo/${path}`, "again\n");
+    }
+    expect(
+      gitResult(source, ["checkout", "HEAD", "--", "*.ts"], join(source.dir, "src")).status,
+    ).toBe(0);
+    expect(
+      (await native.runCli({ argv: ["checkout", "HEAD", "--", "*.ts"], cwd: "/repo/src" }))
+        .exitCode,
+    ).toBe(0);
+    await expectPublicGitState(source, workspace);
+  });
   it("matches Git for cwd-relative add and an ordinary initial commit", async () => {
     const source = fixture();
     source.write("nested/a.txt", "one\n");

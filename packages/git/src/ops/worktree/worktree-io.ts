@@ -18,6 +18,7 @@ export {
 export {
   type CompiledPathspecMatcher,
   compilePathspecs,
+  hasGlobSyntax,
   MAX_COMPILED_PATHS,
 } from "./worktree-io-pathspec.js";
 export {

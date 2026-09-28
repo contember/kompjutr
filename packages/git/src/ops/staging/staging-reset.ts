@@ -1,13 +1,14 @@
 import { joinSorted } from "../../common/streams.js";
 import { applyIndexOwned } from "../../store/checkout/checkout.js";
 import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
-import { checkoutTreeExcluding, indexFromTree, matchesPaths } from "../checkout/checkout.js";
+import { checkoutTreeExcluding, indexFromTree } from "../checkout/checkout.js";
 import type { GitContext } from "../core/context.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata } from "../core/ref-log.js";
 import type { Repository } from "../repository/repository.js";
 import { repositoryMutations } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
+import { compilePathspecs } from "../worktree/worktree-io.js";
 
 export interface ResetOptions {
   /** Unstage these paths back to `ref`, leaving the working tree alone. */
@@ -32,6 +33,7 @@ export function reset(
   }
 
   const specs = normalizeSpecs(options.paths ?? []);
+  const pathspec = compilePathspecs(specs);
   const tree = targetTree(repo, options.ref);
   if (specs.length === 0) {
     // This one genuinely replaces the whole index, so the big hammer fits.
@@ -45,7 +47,7 @@ export function reset(
       left: (entry) => entry.path,
       right: (entry) => entry.path,
     })) {
-      if (!matchesPaths(row.path, specs)) continue;
+      if (!pathspec.matches(row.path)) continue;
       // A conflicted path repeats across stages; clearing it once is enough,
       // and indexPut only ever overwrites stage 0.
       if (row.right !== undefined && row.right.stage !== 0) sink.remove(row.path);

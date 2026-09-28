@@ -104,6 +104,10 @@ export function hydrateEndpoint(
   return { mode: identity.mode, oid: identity.oid, bytes: bytes ?? null };
 }
 
+export function nameOnlyEndpoint(identity: EndpointIdentity | null): Endpoint | null {
+  return identity === null ? null : { mode: identity.mode, oid: identity.oid, bytes: null };
+}
+
 export function endpointBytes(endpoint: Endpoint): Uint8Array {
   if (endpoint.bytes === null) throw new CorruptError(`diff bytes missing for ${endpoint.oid}`);
   return endpoint.bytes;

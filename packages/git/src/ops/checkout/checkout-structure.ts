@@ -129,7 +129,7 @@ export function restoreStructuralConflicts(
       target === undefined &&
       row.b !== undefined &&
       options.prune !== false &&
-      matchesPaths(row.b.path, options.paths)
+      (options.pathspec?.matches(row.b.path) ?? matchesPaths(row.b.path, options.paths))
     ) {
       const replacedByDirectory = current?.type === "dir";
       let replacedUnderLeaf = false;
@@ -153,7 +153,7 @@ export function restoreStructuralConflicts(
     if (
       target === undefined ||
       target.mode === "160000" ||
-      !matchesPaths(target.path, options.paths)
+      !(options.pathspec?.matches(target.path) ?? matchesPaths(target.path, options.paths))
     ) {
       continue;
     }

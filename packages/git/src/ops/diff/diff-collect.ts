@@ -1,7 +1,7 @@
 import { CorruptError, GitError } from "../../common/errors.js";
 import { joinSorted, joinSorted3 } from "../../common/streams.js";
 import type { SparseWorkspaceSource } from "../../store/core/contracts.js";
-import { matchesPaths, stageZero } from "../checkout/checkout.js";
+import { stageZero } from "../checkout/checkout.js";
 import type { Repository } from "../repository/repository.js";
 import {
   type ExactRename,
@@ -13,20 +13,28 @@ import { statusIndexGroups } from "../status/status-rows.js";
 import { type TargetEntry, treeStream } from "../tree/tree-stream.js";
 import { sparseCommitPair, sparseWorkingCandidates } from "../worktree/sparse-diff.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { createWorktreeHashCursor, walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
+import {
+  compilePathspecs,
+  createWorktreeHashCursor,
+  hasGlobSyntax,
+  walkWorktreeEntriesStream,
+} from "../worktree/worktree-io.js";
 import { hydrateChanges } from "./diff-hydrate.js";
 import { indexWorktreePatchChanges } from "./diff-index-worktree.js";
 import {
   compareIdentities,
   type DiffOptions,
   type EndpointIdentity,
+  matchesDiffPath,
   type PendingChange,
+  type SelectedDiffOptions,
   treeIdentity,
   type WorkingCandidate,
 } from "./diff-internal.js";
 import {
   DIFF_WINDOW_ROWS,
   type FileChange,
+  nameOnlyEndpoint,
   type PatchChange,
   type TreeDiffOptions,
 } from "./diff-types.js";
@@ -38,51 +46,63 @@ export function* collect(
   options: DiffOptions,
   sparseWorkspace: SparseWorkspaceSource | undefined,
   indexBase = false,
+  namesOnly = false,
 ): Generator<PatchChange> {
+  const selected: SelectedDiffOptions = { ...options, pathspec: compilePathspecs(options.paths) };
   if (indexBase) {
     if (options.staged === true || options.ref !== undefined || options.to !== undefined) {
       throw new GitError("EINVAL", "index-worktree diff does not accept tree endpoints");
     }
-    yield* indexWorktreePatchChanges(repo, worktree, options);
+    yield* indexWorktreePatchChanges(repo, worktree, selected, namesOnly);
     return;
   }
   if (options.staged === true) {
     if (options.to !== undefined) {
       throw new GitError("EINVAL", "staged diff accepts only one tree endpoint");
     }
-    const classification = classifyDiffRenames(repo, options, stagedPendingChanges(repo, options));
+    const classification = classifyDiffRenames(
+      repo,
+      selected,
+      stagedPendingChanges(repo, selected),
+    );
     yield* collectPendingChanges(
       repo,
       worktree,
-      stagedPendingChanges(repo, options),
+      stagedPendingChanges(repo, selected),
       classification,
+      namesOnly,
     );
     return;
   }
-  const sparse = boundedSparsePendingChanges(repo, worktree, options, sparseWorkspace);
+  const sparse = boundedSparsePendingChanges(repo, worktree, selected, sparseWorkspace);
   if (sparse !== null) {
     yield* collectPendingChanges(
       repo,
       worktree,
       sparse,
-      classifyDiffRenames(repo, options, sparse),
+      classifyDiffRenames(repo, selected, sparse),
+      namesOnly,
     );
     return;
   }
   const classification = classifyDiffRenames(
     repo,
-    options,
-    pendingChanges(repo, worktree, options, true),
+    selected,
+    pendingChanges(repo, worktree, selected, true),
   );
   yield* collectPendingChanges(
     repo,
     worktree,
-    pendingChanges(repo, worktree, options, false),
+    pendingChanges(repo, worktree, selected, false),
     classification,
+    namesOnly,
   );
 }
 
-function* stagedPendingChanges(repo: Repository, options: DiffOptions): Generator<PendingChange> {
+function* stagedPendingChanges(
+  repo: Repository,
+  options: SelectedDiffOptions,
+): Generator<PendingChange> {
   const from = treeStream(repo, resolveFrom(repo, options));
   for (const row of joinSorted(from, statusIndexGroups(repo.checkout.indexScan()), {
     left: (entry) => entry.path,
@@ -92,7 +112,7 @@ function* stagedPendingChanges(repo: Repository, options: DiffOptions): Generato
     if (group?.kind === "unmerged") {
       throw new GitError("EUNMERGED", `cannot diff staged contents with conflict at ${row.path}`);
     }
-    if (!matchesPaths(row.path, options.paths)) continue;
+    if (!matchesDiffPath(row.path, options)) continue;
     const after = group === undefined ? null : treeIdentity(indexTarget(group.entry));
     const change = compareIdentities(row.path, treeIdentity(row.left), after);
     if (change !== null) yield change;
@@ -104,6 +124,7 @@ export function* collectPendingChanges(
   worktree: Worktree | undefined,
   changes: Iterable<PendingChange>,
   classification: ExactRenameClassification | undefined,
+  namesOnly = false,
 ): Generator<FileChange> {
   const sources =
     classification?.kind === "classified"
@@ -118,14 +139,34 @@ export function* collectPendingChanges(
     if (sources.has(change.path)) continue;
     const rename = destinations.get(change.path);
     if (rename !== undefined) {
-      yield* hydrateChanges(repo, worktree, pending);
+      yield* renderPendingChanges(repo, worktree, pending, namesOnly);
       yield exactRenameChange(rename, change);
       continue;
     }
     pending.push(change);
-    if (pending.length >= DIFF_WINDOW_ROWS) yield* hydrateChanges(repo, worktree, pending);
+    if (pending.length >= DIFF_WINDOW_ROWS)
+      yield* renderPendingChanges(repo, worktree, pending, namesOnly);
   }
-  yield* hydrateChanges(repo, worktree, pending);
+  yield* renderPendingChanges(repo, worktree, pending, namesOnly);
+}
+
+function* renderPendingChanges(
+  repo: Repository,
+  worktree: Worktree | undefined,
+  pending: PendingChange[],
+  namesOnly: boolean,
+): Generator<FileChange> {
+  if (!namesOnly) {
+    yield* hydrateChanges(repo, worktree, pending);
+    return;
+  }
+  for (const change of pending.splice(0)) {
+    yield {
+      path: change.path,
+      before: nameOnlyEndpoint(change.before),
+      after: nameOnlyEndpoint(change.after),
+    };
+  }
 }
 
 export function classifyDiffRenames(
@@ -161,8 +202,9 @@ export function* treePendingChanges(
   afterTree: string | null,
   options: TreeDiffOptions,
 ): Generator<PendingChange> {
+  const pathspec = compilePathspecs(options.paths);
   for (const row of repo.walkTreeDiff(beforeTree, afterTree)) {
-    if (!matchesPaths(row.path, options.paths)) continue;
+    if (!pathspec.matches(row.path)) continue;
     const before = treeDiffIdentity(row.beforeMode, row.beforeOid);
     const after = treeDiffIdentity(row.afterMode, row.afterOid);
     const change = compareIdentities(row.path, before, after);
@@ -178,9 +220,10 @@ function treeDiffIdentity(mode: string | null, oid: string | null): EndpointIden
 function boundedSparsePendingChanges(
   repo: Repository,
   worktree: Worktree,
-  options: DiffOptions,
+  options: SelectedDiffOptions,
   sparseWorkspace: SparseWorkspaceSource | undefined,
 ): PendingChange[] | null {
+  if (options.paths?.some(hasGlobSyntax)) return null;
   const fromTreeOid = resolveFrom(repo, options);
   if (options.to !== undefined) {
     return sparseCommitPair(repo, fromTreeOid, repo.resolveTreeRevision(options.to), options);
@@ -194,7 +237,7 @@ function boundedSparsePendingChanges(
 function* pendingChanges(
   repo: Repository,
   worktree: Worktree,
-  options: DiffOptions,
+  options: SelectedDiffOptions,
   renameCandidatesOnly = false,
 ): Generator<PendingChange> {
   const fromTreeOid = resolveFrom(repo, options);
@@ -205,7 +248,7 @@ function* pendingChanges(
     const from = treeStream(repo, fromTreeOid);
     const to = treeStream(repo, toTreeOid);
     for (const row of joinSorted(from, to, { ...byPath, right: (entry) => entry.path })) {
-      if (!matchesPaths(row.path, options.paths)) continue;
+      if (!matchesDiffPath(row.path, options)) continue;
       const change = compareIdentities(row.path, treeIdentity(row.left), treeIdentity(row.right));
       if (
         change !== null &&
@@ -231,7 +274,7 @@ function* pendingChanges(
       repo.root,
       options.paths === undefined || options.paths.length === 0
         ? { filesOnly: true }
-        : { paths: options.paths },
+        : { pathspec: options.pathspec },
     ),
     {
       a: (entry) => entry.path,
@@ -239,7 +282,7 @@ function* pendingChanges(
       c: (entry) => entry.path,
     },
   )) {
-    if (!matchesPaths(row.path, options.paths)) continue;
+    if (!matchesDiffPath(row.path, options)) continue;
     if (row.a === undefined && row.b === undefined) continue;
     const worktreePresent = row.c !== undefined && row.c.stat.type !== "dir";
     if (renameCandidatesOnly && (row.a === undefined) === !worktreePresent) continue;

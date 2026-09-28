@@ -37,12 +37,13 @@ interface GlobPathspec {
 
 type ReadPathspec = LiteralPathspec | GlobPathspec;
 
-/** A compiled read-only pathspec and the indexed prefixes that can cover it. */
+/** A compiled default pathspec and the indexed prefixes that can cover it. */
 export class CompiledReadPathspec {
   readonly scanPrefixes: readonly string[] | null;
   readonly #all: boolean;
   readonly #patterns: readonly ReadPathspec[];
   readonly #limits: ResolvedLimits;
+  #matchedWork = 0;
 
   constructor(
     all: boolean,
@@ -90,6 +91,24 @@ export class CompiledReadPathspec {
     }
     out.sort(comparePaths);
     return out;
+  }
+
+  /** Match one path while bounding cumulative work across a streaming operation. */
+  matches(path: string): boolean {
+    if (this.#all) return true;
+    const bytes = utf8.encode(path);
+    for (const pattern of this.#patterns) {
+      const result =
+        pattern.kind === "literal"
+          ? matchLiteral(pattern, bytes, this.#limits.maxMatcherWork - this.#matchedWork)
+          : pattern.pattern.match(bytes, this.#limits.maxMatcherWork - this.#matchedWork);
+      this.#matchedWork += result.work;
+      if (this.#matchedWork > this.#limits.maxMatcherWork) {
+        throw tooBig("matcher work", this.#limits.maxMatcherWork);
+      }
+      if (result.matched) return true;
+    }
+    return false;
   }
 }
 

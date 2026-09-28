@@ -17,8 +17,9 @@ import {
 } from "./diff-collect.js";
 import { renderPatch } from "./diff-format.js";
 import type { DiffOptions, PendingChange } from "./diff-internal.js";
+import { diffHeaderPath } from "./diff-path-format.js";
 import { summarizeChanges } from "./diff-summary.js";
-import type { DiffFormatOptions, TreeDiffOptions } from "./diff-types.js";
+import { type DiffFormatOptions, DiffOutput, type TreeDiffOptions } from "./diff-types.js";
 
 export { DIFF_COMBINED_MAX_LINES, DIFF_COMBINED_MAX_MEMORY_BYTES } from "./diff-combined.js";
 export type { DiffOptions } from "./diff-internal.js";
@@ -39,6 +40,29 @@ export function diff(
     options,
     formatOptions,
   );
+}
+
+export function diffNames(
+  repo: Repository,
+  worktree: Worktree,
+  options: DiffOptions = {},
+  sparseWorkspace?: SparseWorkspaceSource,
+  formatOptions: DiffFormatOptions = {},
+  zeroTerminate = false,
+): string {
+  const output = new DiffOutput(formatOptions.maxOutputBytes);
+  for (const change of collect(
+    repo,
+    worktree,
+    options,
+    sparseWorkspace,
+    formatOptions.indexBase === true,
+    true,
+  )) {
+    output.append(zeroTerminate ? change.path : diffHeaderPath(change.path, "", formatOptions));
+    output.append(zeroTerminate ? "\0" : "\n");
+  }
+  return output.finish();
 }
 
 /** Render a patch between two selected trees without consulting the worktree. */

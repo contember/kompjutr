@@ -2,11 +2,10 @@ import { GitError } from "../../common/errors.js";
 import { isExcluded, joinPath, relativeExcludeRoots, relativeTo } from "../../common/paths.js";
 import { comparePaths } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
-import { matchesPaths } from "../checkout/checkout.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { walkWorktree } from "../worktree/worktree-io.js";
+import { compilePathspecs, walkWorktree } from "../worktree/worktree-io.js";
 import { statusStream } from "./status-core.js";
 import { requireStatusCapacity, requireStatusWorktreePath } from "./status-full.js";
 import { stagedIndex } from "./status-matrix.js";
@@ -103,6 +102,7 @@ function snapshotCleanWorktree(
   options: CleanOptions,
   ignores: IgnoreMatcher,
 ): CleanWorktreeSnapshot {
+  const pathspec = compilePathspecs(options.paths);
   const visible: string[] = [];
   const ignored: string[] = [];
   const directories: string[] = [];
@@ -147,13 +147,13 @@ function snapshotCleanWorktree(
           ignoredRoot = path;
           continue;
         }
-        if (!matchesPaths(path, options.paths)) continue;
+        if (!pathspec.matches(path)) continue;
         requireStatusCapacity(directories.length, STATUS_MAX_DIRECTORIES, "clean directories");
         retain(path);
         directories.push(path);
         continue;
       }
-      if (ignoredRoot !== null || !matchesPaths(path, options.paths)) continue;
+      if (ignoredRoot !== null || !pathspec.matches(path)) continue;
       retain(path);
       if (ignores.ignores(path, false)) ignored.push(path);
       else visible.push(path);

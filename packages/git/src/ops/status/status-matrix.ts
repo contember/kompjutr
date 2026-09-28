@@ -2,14 +2,14 @@ import { GitError } from "../../common/errors.js";
 import { joinPath } from "../../common/paths.js";
 import { comparePaths } from "../../common/streams.js";
 import type { IndexEntry } from "../../store/index.js";
-import { matchesPaths, treeEntries } from "../checkout/checkout.js";
+import { treeEntries } from "../checkout/checkout.js";
 import type { StatusRow } from "../core/kinds.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { hashWorktreePath, indexMatchesStat } from "../worktree/worktree-io.js";
+import { compilePathspecs, hashWorktreePath, indexMatchesStat } from "../worktree/worktree-io.js";
 import { worktreeFiles } from "./status-full.js";
 import type { StatusOptions } from "./status-rows.js";
-import { statusIndexGroups } from "./status-rows.js";
+import { matchesStatusPath, statusIndexGroups } from "./status-rows.js";
 
 /** O(tracked). Only `statusMatrix`, which is not on the client surface, still needs it. */
 export function stagedIndex(repo: Repository, maxPaths?: number): Map<string, IndexEntry> {
@@ -36,6 +36,7 @@ export function statusMatrix(
   worktree: Worktree,
   options: StatusOptions = {},
 ): StatusRow[] {
+  options = { ...options, pathspec: compilePathspecs(options.paths) };
   const head = treeEntries(repo, repo.headTree());
   const index = stagedIndex(repo);
   const present = new Set<string>(worktreeFiles(repo, worktree, options));
@@ -43,7 +44,7 @@ export function statusMatrix(
   const paths = new Set<string>([...head.keys(), ...index.keys(), ...present]);
   const rows: StatusRow[] = [];
   for (const path of [...paths].sort(comparePaths)) {
-    if (!matchesPaths(path, options.paths)) continue;
+    if (!matchesStatusPath(path, options)) continue;
     const headOid = head.get(path)?.oid ?? null;
     const stageOid = index.get(path)?.oid ?? null;
     const workdirOid = worktreeOid(repo, worktree, path, index.get(path), present.has(path));

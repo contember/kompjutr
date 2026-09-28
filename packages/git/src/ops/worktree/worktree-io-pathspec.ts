@@ -1,7 +1,12 @@
 import { GitError } from "../../common/errors.js";
 import { comparePaths } from "../../common/streams.js";
+import { type CompiledReadPathspec, compileReadPathspec } from "./pathspec.js";
 
 export const MAX_COMPILED_PATHS = 32_768;
+
+export function hasGlobSyntax(path: string): boolean {
+  return /[*?[\\]/.test(path);
+}
 
 /** One immutable exact/prefix pathspec projection in Git byte order. */
 export interface CompiledPathspecMatcher {
@@ -19,8 +24,13 @@ class ByteOrderedPathspecMatcher implements CompiledPathspecMatcher {
   readonly #exact: string[];
   readonly #checkoutPrefixes: string[];
   readonly #walkPrefixes: string[];
+  readonly #glob: CompiledReadPathspec | undefined;
 
   constructor(paths: readonly string[] | undefined) {
+    this.#glob =
+      paths?.some(hasGlobSyntax) && !paths.includes("")
+        ? compileReadPathspec({ paths })
+        : undefined;
     this.#checkoutAll =
       paths === undefined || paths.length === 0 || paths.includes("") || paths.includes(".");
     this.#walkAll =
@@ -37,6 +47,7 @@ class ByteOrderedPathspecMatcher implements CompiledPathspecMatcher {
   }
 
   matches(path: string): boolean {
+    if (this.#glob !== undefined) return this.#glob.matches(path);
     return (
       this.#checkoutAll ||
       containsByteOrdered(this.#exact, path) ||
@@ -45,6 +56,7 @@ class ByteOrderedPathspecMatcher implements CompiledPathspecMatcher {
   }
 
   matchesEntry(path: string): boolean {
+    if (this.#glob !== undefined) return this.#glob.matches(path);
     return (
       this.#walkAll ||
       containsByteOrdered(this.#walkPrefixes, path) ||
@@ -53,6 +65,7 @@ class ByteOrderedPathspecMatcher implements CompiledPathspecMatcher {
   }
 
   includesDirectory(path: string): boolean {
+    if (this.#glob !== undefined) return true;
     if (this.#walkAll || this.matchesEntry(path)) return true;
     const prefix = `${path}/`;
     const at = lowerBound(this.#walkPrefixes, prefix);

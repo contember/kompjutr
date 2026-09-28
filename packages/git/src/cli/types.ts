@@ -79,6 +79,8 @@ export interface GitCliLsFilesCommand {
 
 export interface GitCliDiffCommand {
   readonly kind: "diff";
+  readonly nameOnly?: boolean;
+  readonly zeroTerminate?: boolean;
   readonly staged?: boolean;
   readonly ref?: string;
   readonly to?: string;

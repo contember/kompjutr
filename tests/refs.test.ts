@@ -1021,6 +1021,18 @@ describe("checkout", () => {
     );
   });
 
+  it("restores paths selected by a default glob without moving HEAD", () => {
+    checkout(ws.context, ws.repo, ws.worktree, { ref: "side" });
+    fixture.git("checkout", "-q", "side");
+
+    checkout(ws.context, ws.repo, ws.worktree, { ref: "main", paths: ["modif*.txt"] });
+    fixture.git("checkout", "main", "--", "modif*.txt");
+
+    expectSameTree();
+    expect(indexPaths()).toEqual(lines(fixture.git("ls-files")));
+    expect(currentBranch(ws.repo)).toBe(fixture.git("branch", "--show-current"));
+  });
+
   it("refuses to overwrite local changes without force", () => {
     checkout(ws.context, ws.repo, ws.worktree, { ref: "main" });
     writeWorkFile(ws, "/modified.txt", "locally changed content\n");

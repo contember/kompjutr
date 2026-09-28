@@ -1,3 +1,5 @@
+import type { CompiledPathspecMatcher } from "../worktree/worktree-io.js";
+
 export interface CheckoutOptions {
   /** Restrict the update to these repo-relative pathspecs. */
   paths?: string[];
@@ -20,4 +22,5 @@ export interface CheckoutOptions {
 export interface CheckoutInternalOptions extends CheckoutOptions {
   excludeRoots: string[];
   relativeExcludeRoots: string[];
+  pathspec?: CompiledPathspecMatcher;
 }

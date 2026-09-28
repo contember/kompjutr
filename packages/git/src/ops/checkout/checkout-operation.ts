@@ -7,7 +7,7 @@ import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
+import { compilePathspecs, walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import {
   type CheckoutPrunePlan,
   discardUnmergedPaths,
@@ -26,7 +26,6 @@ import {
   checkoutWriteBudget,
   flushCheckoutCandidates,
   intersectsExcluded,
-  matchesPaths,
   stageZero,
 } from "./checkout-support.js";
 import type { CheckoutInternalOptions } from "./checkout-types.js";
@@ -70,6 +69,8 @@ export function checkoutTreeInternal(
   options: CheckoutInternalOptions,
   index: IndexStore,
 ): void {
+  const pathspec = compilePathspecs(options.paths);
+  options = { ...options, pathspec };
   requireSharedMutationScope(repo.store.db, worktree);
   requireExcludedIndexIdentity(
     target,
@@ -113,7 +114,7 @@ export function checkoutTreeInternal(
       const existing = row.right;
       if (intersectsExcluded(row.path, options.relativeExcludeRoots)) continue;
       if (entry !== undefined || existing === undefined || options.prune === false) continue;
-      if (!matchesPaths(existing.path, options.paths)) continue;
+      if (!pathspec.matches(existing.path)) continue;
       retainedBytes += CHECKOUT_PATH_FIXED_BYTES + existing.path.length * 2;
       if (retainedBytes > CHECKOUT_REMOVAL_BYTES) {
         throw new GitError(
@@ -157,7 +158,7 @@ export function checkoutTreeInternal(
       { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
     )) {
       const entry = row.a;
-      if (entry === undefined || !matchesPaths(entry.path, options.paths)) continue;
+      if (entry === undefined || !pathspec.matches(entry.path)) continue;
       if (intersectsExcluded(entry.path, options.relativeExcludeRoots)) continue;
       if (entry.mode === "160000") continue; // submodules are out of scope
       if (

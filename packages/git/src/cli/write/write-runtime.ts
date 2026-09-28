@@ -1,12 +1,13 @@
 import { GitError, hasErrorCode } from "../../common/errors.js";
 import { joinPath, normalizePath, relativeTo } from "../../common/paths.js";
-import { matchesPaths, stageZero } from "../../ops/checkout/checkout.js";
+import { stageZero } from "../../ops/checkout/checkout.js";
 import { type GitContext, openRepository } from "../../ops/core/context.js";
 import { requireSharedMutationScope } from "../../ops/core/mutation-scope.js";
 import { operationRefLogMetadata } from "../../ops/core/ref-log.js";
 import type { Repository } from "../../ops/repository/repository.js";
 import { repositoryMutations } from "../../ops/repository/repository.js";
 import { treeStream } from "../../ops/tree/tree-stream.js";
+import { compilePathspecs } from "../../ops/worktree/worktree-io.js";
 import { withGitMutationGuardOwned } from "../../store/database/database.js";
 import { boundedPublishedGitCliResult, gitCliResult } from "../result.js";
 import type { GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
@@ -116,10 +117,10 @@ function requirePathsInSources(
   second: Iterable<{ path: string }>,
 ): void {
   const matched = paths.map(() => false);
+  const pathspecs = paths.map((requested) => compilePathspecs([requested.path]));
   const visit = (path: string): void => {
     for (let index = 0; index < paths.length; index++) {
-      const requested = paths[index];
-      if (requested !== undefined && matchesPaths(path, [requested.path])) matched[index] = true;
+      if (matched[index] !== true && pathspecs[index]?.matches(path)) matched[index] = true;
     }
   };
   for (const entry of first) visit(entry.path);

@@ -1,7 +1,7 @@
 import { GitError, hasErrorCode } from "../../common/errors.js";
 import { joinPath, normalizePath, relativePath, relativeTo } from "../../common/paths.js";
 import { type GitContext, nestedRoots, openRepository } from "../../ops/core/context.js";
-import { diff } from "../../ops/diff/diff.js";
+import { diff, diffNames } from "../../ops/diff/diff.js";
 import { divergence } from "../../ops/merge/merge-base.js";
 import { withPromisorHydration } from "../../ops/network/network.js";
 import { branchList, currentBranch } from "../../ops/refs/refs.js";
@@ -163,34 +163,34 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
         const command = invocation.command;
         const quotePath = statusFormatOptions(repo).quotePath ?? true;
         const paths = resolveDiffPaths(repo.root, invocation.cwd, command.paths);
-        return withPromisorHydration(context, repo, () =>
-          gitCliResult(
-            diff(
-              repo,
-              context.worktree,
-              {
-                staged: command.staged,
-                ref: command.ref,
-                to: command.to,
-                paths,
-                context: command.context,
-              },
-              context.sparseWorkspace,
-              {
-                quotePaths: true,
-                quoteNonAscii: quotePath,
-                indexBase:
-                  command.staged !== true && command.ref === undefined && command.to === undefined,
-                maxOutputBytes: Math.min(
-                  runOptions.maxStdoutBytes,
-                  runOptions.maxCombinedOutputBytes,
-                ),
-              },
-            ),
-            "",
-            0,
-          ),
-        );
+        const options = {
+          staged: command.staged,
+          ref: command.ref,
+          to: command.to,
+          paths,
+          context: command.context,
+        };
+        const format = {
+          quotePaths: true,
+          quoteNonAscii: quotePath,
+          indexBase:
+            command.staged !== true && command.ref === undefined && command.to === undefined,
+          maxOutputBytes: Math.min(runOptions.maxStdoutBytes, runOptions.maxCombinedOutputBytes),
+        };
+        return withPromisorHydration(context, repo, () => {
+          const stdout =
+            command.nameOnly === true
+              ? diffNames(
+                  repo,
+                  context.worktree,
+                  options,
+                  context.sparseWorkspace,
+                  format,
+                  command.zeroTerminate === true,
+                )
+              : diff(repo, context.worktree, options, context.sparseWorkspace, format);
+          return gitCliResult(stdout, "", 0);
+        });
       });
     },
     async log(invocation, runOptions) {

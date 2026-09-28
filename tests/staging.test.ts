@@ -399,6 +399,43 @@ describe("add", () => {
     expect(lsFiles(workspace.repo)).toEqual(["src/a.ts", "src/nested/b.ts"]);
   });
 
+  it("stages default glob pathspecs including nested paths, and refuses an unmatched glob", () => {
+    const fixture = newFixture();
+    const workspace = makeRepo("/");
+    writeBoth(workspace, fixture, "src/a.ts", "a\n");
+    writeBoth(workspace, fixture, "src/nested/b.ts", "b\n");
+    writeBoth(workspace, fixture, "src/c.txt", "c\n");
+
+    add(workspace.repo, workspace.worktree, { paths: ["src/*.ts"] });
+    fixture.git("add", "src/*.ts");
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+    expect(() => add(workspace.repo, workspace.worktree, { paths: ["src/*.rs"] })).toThrowError(
+      expect.objectContaining({ code: "EPATHSPEC" }),
+    );
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+  });
+
+  it("rejects excessive wildcard structure before changing the index", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/file.ts", "contents\n");
+    expect(() =>
+      add(workspace.repo, workspace.worktree, { paths: ["*".repeat(4_097)] }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(lsFiles(workspace.repo)).toEqual([]);
+  });
+
+  it("does not count glob matches inside excluded nested roots", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/nested/hidden.ts", "nested\n");
+    expect(() =>
+      add(workspace.repo, workspace.worktree, {
+        paths: ["nested/*.ts"],
+        excludeRoots: ["/nested"],
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EPATHSPEC" }));
+    expect(lsFiles(workspace.repo)).toEqual([]);
+  });
+
   it("does not load ignore rules when updating tracked paths", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/tracked.txt", "one\n");
@@ -617,6 +654,26 @@ describe("add", () => {
 });
 
 describe("rm", () => {
+  it("removes nested paths matched by a default glob without requiring recursive", async () => {
+    const fixture = newFixture();
+    fixture.write("src/a.ts", "a\n");
+    fixture.write("src/nested/b.ts", "b\n");
+    fixture.write("src/c.txt", "c\n");
+    fixture.commit("base");
+    const workspace = await clonedFrom(fixture);
+
+    rm(workspace.repo, workspace.worktree, { paths: ["src/*.ts"] });
+    fixture.git("rm", "-q", "src/*.ts");
+
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+    expect(workspace.worktree.stat("/src/a.ts")).toBeNull();
+    expect(workspace.worktree.stat("/src/nested/b.ts")).toBeNull();
+    expect(workspace.worktree.stat("/src/c.txt")).not.toBeNull();
+    expect(() => rm(workspace.repo, workspace.worktree, { paths: ["src/*.rs"] })).toThrowError(
+      expect.objectContaining({ code: "EPATHSPEC" }),
+    );
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+  });
   it("removes a clean tracked path from the index and working tree", async () => {
     const fixture = newFixture();
     fixture.write("a.txt", "a\n");
@@ -1166,6 +1223,23 @@ describe("rm", () => {
 });
 
 describe("reset", () => {
+  it("unstages only the paths selected by a default glob", async () => {
+    const fixture = newFixture();
+    fixture.write("src/a.ts", "old\n");
+    fixture.write("src/nested/b.ts", "old\n");
+    fixture.write("src/c.txt", "old\n");
+    fixture.commit("base");
+    const workspace = await clonedFrom(fixture);
+    for (const path of ["src/a.ts", "src/nested/b.ts", "src/c.txt"]) {
+      writeBoth(workspace, fixture, path, "new\n");
+    }
+    add(workspace.repo, workspace.worktree, { all: true, paths: [] });
+    fixture.git("add", "-A");
+
+    reset(workspace.context, workspace.repo, workspace.worktree, { paths: ["src/*.ts"] });
+    fixture.git("reset", "-q", "--", "src/*.ts");
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+  });
   it("resets listed paths back to HEAD and leaves the working tree alone", async () => {
     const fixture = newFixture();
     fixture.write("a.txt", "a\n");

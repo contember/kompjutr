@@ -1,6 +1,6 @@
 import type { IndexEntry } from "../../store/index.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
-import type { WorktreePath } from "../worktree/worktree-io.js";
+import type { CompiledPathspecMatcher, WorktreePath } from "../worktree/worktree-io.js";
 
 export interface DiffOptions {
   /** The "from" side. Defaults to HEAD. */
@@ -9,7 +9,7 @@ export interface DiffOptions {
   to?: string;
   /** Compare the selected ref to the stage-0 index. */
   staged?: boolean;
-  /** Exact-or-directory-prefix path filter. No globs. */
+  /** Default Git pathspecs without magic. */
   paths?: string[];
   /** Context lines around each hunk. */
   context?: number;
@@ -17,6 +17,14 @@ export interface DiffOptions {
   abbrev?: number;
   /** Detect exact renames. Explicit values override `diff.renames`. */
   renames?: boolean;
+}
+
+export interface SelectedDiffOptions extends DiffOptions {
+  pathspec: CompiledPathspecMatcher;
+}
+
+export function matchesDiffPath(path: string, options: SelectedDiffOptions): boolean {
+  return options.pathspec.matches(path);
 }
 
 export interface EndpointIdentity {

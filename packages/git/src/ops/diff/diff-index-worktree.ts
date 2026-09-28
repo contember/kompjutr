@@ -3,7 +3,6 @@ import { CorruptError } from "../../common/errors.js";
 import { joinPath } from "../../common/paths.js";
 import { joinSorted } from "../../common/streams.js";
 import type { IndexEntry } from "../../store/index.js";
-import { matchesPaths } from "../checkout/checkout.js";
 import type { Repository } from "../repository/repository.js";
 import { type StatusIndexGroup, statusIndexGroups } from "../status/status-rows.js";
 import type { Worktree } from "../worktree/worktree.js";
@@ -17,15 +16,17 @@ import {
 } from "./diff-hydrate.js";
 import {
   compareIdentities,
-  type DiffOptions,
   type EndpointIdentity,
+  matchesDiffPath,
   type PendingChange,
+  type SelectedDiffOptions,
   treeIdentity,
   type WorkingCandidate,
 } from "./diff-internal.js";
 import {
   DIFF_WINDOW_ROWS,
   hydrateEndpoint,
+  nameOnlyEndpoint,
   type PatchChange,
   type UnmergedPathChange,
 } from "./diff-types.js";
@@ -61,7 +62,8 @@ function isPendingUnmergedChange(change: PendingIndexPatchChange): change is Unm
 export function* indexWorktreePatchChanges(
   repo: Repository,
   worktree: Worktree,
-  options: DiffOptions,
+  options: SelectedDiffOptions,
+  namesOnly = false,
 ): Generator<PatchChange> {
   const candidates: IndexPatchCandidate[] = [];
   for (const row of joinSorted(
@@ -71,19 +73,19 @@ export function* indexWorktreePatchChanges(
       repo.root,
       options.paths === undefined || options.paths.length === 0
         ? { filesOnly: true }
-        : { paths: options.paths },
+        : { pathspec: options.pathspec },
     ),
     { left: (group) => group.path, right: (entry) => entry.path },
   )) {
     const group = row.left;
-    if (group === undefined || !matchesPaths(row.path, options.paths)) continue;
+    if (group === undefined || !matchesDiffPath(row.path, options)) continue;
     if (group.kind === "tracked" && group.entry.mode === 0o160000) continue;
     candidates.push(indexPatchCandidate(group, row.right));
     if (candidates.length >= DIFF_WINDOW_ROWS) {
-      yield* hydrateIndexPatchCandidates(repo, worktree, candidates);
+      yield* hydrateIndexPatchCandidates(repo, worktree, candidates, namesOnly);
     }
   }
-  yield* hydrateIndexPatchCandidates(repo, worktree, candidates);
+  yield* hydrateIndexPatchCandidates(repo, worktree, candidates, namesOnly);
 }
 
 function indexPatchCandidate(
@@ -118,6 +120,7 @@ function* hydrateIndexPatchCandidates(
   repo: Repository,
   worktree: Worktree,
   candidates: IndexPatchCandidate[],
+  namesOnly: boolean,
 ): Generator<PatchChange> {
   if (candidates.length === 0) return;
   const source = candidates.splice(0);
@@ -161,6 +164,30 @@ function* hydrateIndexPatchCandidates(
       ],
       after,
     });
+  }
+  if (namesOnly) {
+    for (const change of pending) {
+      if (isPendingUnmergedChange(change)) {
+        yield change;
+      } else if (isPendingCombinedChange(change)) {
+        yield {
+          kind: "combined",
+          path: change.path,
+          parents: [
+            { mode: change.parents[0].mode, oid: change.parents[0].oid, bytes: null },
+            { mode: change.parents[1].mode, oid: change.parents[1].oid, bytes: null },
+          ],
+          after: nameOnlyEndpoint(change.after),
+        };
+      } else {
+        yield {
+          path: change.path,
+          before: nameOnlyEndpoint(change.before),
+          after: nameOnlyEndpoint(change.after),
+        };
+      }
+    }
+    return;
   }
   yield* hydrateIndexPatchChanges(repo, worktree, pending);
 }

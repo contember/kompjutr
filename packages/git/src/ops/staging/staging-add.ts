@@ -12,6 +12,7 @@ import {
   type CompiledPathspecMatcher,
   compilePathspecs,
   createWorktreeHashCursor,
+  hasGlobSyntax,
   indexMatchesStat,
   type WorktreePath,
   walkWorktreeEntriesStream,
@@ -118,7 +119,10 @@ function runAdd(
   let pathspec: CompiledPathspecMatcher | undefined;
   pathspec = all ? undefined : compilePathspecs(specs);
   if (!all && pathspec !== undefined) {
-    const selected = index === repo.checkout ? selectAddPaths(repo, specs, context) : null;
+    const selected =
+      index === repo.checkout && !specs.some(hasGlobSyntax)
+        ? selectAddPaths(repo, specs, context)
+        : null;
     if (selected !== null) {
       assertSelectedPathspecsMatch(specs, selected);
       applyAdd(
@@ -136,7 +140,7 @@ function runAdd(
       );
       return;
     }
-    assertPathspecsMatch(repo, worktree, specs, index);
+    assertPathspecsMatch(repo, worktree, specs, index, options.excludeRoots);
   }
 
   const snapshot = addIndexSource(indexScanOwned(index), pathspec);
@@ -307,8 +311,48 @@ function assertPathspecsMatch(
   worktree: Worktree,
   specs: string[],
   index: IndexStore,
+  excludeRoots: readonly string[] | undefined,
 ): void {
+  const globSpecs = specs.filter(hasGlobSyntax);
+  const globMatches = new Map<string, boolean>();
+  if (globSpecs.length > 0) {
+    const matchers = globSpecs.map((spec) => compilePathspecs([spec]));
+    const matched = matchers.map(() => false);
+    const excluded = relativeExcludeRoots(repo.root, excludeRoots);
+    const check = (path: string): void => {
+      for (let index = 0; index < matchers.length; index++) {
+        if (matched[index]) continue;
+        if (matchers[index]?.matchesEntry(path)) matched[index] = true;
+      }
+    };
+    let indexRows = 0;
+    for (const entry of indexScanOwned(index)) {
+      if (indexRows++ >= ADD_MAX_ROWS_PER_STREAM) {
+        throw new GitError("E2BIG", `add index scan exceeds ${ADD_MAX_ROWS_PER_STREAM} rows`);
+      }
+      if (!isExcluded(entry.path, excluded)) check(entry.path);
+      if (matched.every(Boolean)) break;
+    }
+    if (!matched.every(Boolean)) {
+      for (const entry of walkWorktreeEntriesStream(worktree, repo.root, {
+        excludeRoots: excludeRoots === undefined ? undefined : [...excludeRoots],
+        includeIgnored: true,
+        maxScanRows: ADD_MAX_ROWS_PER_STREAM,
+      })) {
+        check(entry.path);
+        if (matched.every(Boolean)) break;
+      }
+    }
+    for (let index = 0; index < globSpecs.length; index++) {
+      const spec = globSpecs[index];
+      if (spec !== undefined) globMatches.set(spec, matched[index] === true);
+    }
+  }
   for (const spec of specs) {
+    if (hasGlobSyntax(spec)) {
+      if (!globMatches.get(spec)) throw new PathspecNotFoundError(spec);
+      continue;
+    }
     if (spec === "") continue;
     const absolute = joinPath(repo.root, spec);
     const stat = worktree.stat(absolute);

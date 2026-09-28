@@ -110,6 +110,10 @@ export function validLiteralPathspec(value: string): boolean {
   return value.length > 0 && !GLOB_PATHSPEC.test(value) && !value.startsWith(":");
 }
 
+export function validDefaultPathspec(value: string): boolean {
+  return value.length > 0 && !value.startsWith(":");
+}
+
 export function validNameOperand(value: string | undefined): value is string {
   return value !== undefined && value.length > 0 && !value.startsWith("-");
 }

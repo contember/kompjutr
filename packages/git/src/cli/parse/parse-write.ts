@@ -16,7 +16,7 @@ import {
   invalidInvocation,
   invocation,
   validateCommitMessage,
-  validLiteralPathspec,
+  validDefaultPathspec,
   validNameOperand,
   validRevisionOperand,
 } from "./parse-utils.js";
@@ -58,7 +58,7 @@ export function parseAdd(
         result: gitCliUnknownOptionFailure("add", argument, outputContext),
       };
     }
-    if (!validLiteralPathspec(argument)) {
+    if (!validDefaultPathspec(argument)) {
       return invalidInvocation("add", argv, outputContext);
     }
     paths.push(argument);
@@ -174,7 +174,7 @@ export function parseReset(argv: readonly string[]): ParsedGitCliCommand | undef
     if (
       before.length > 1 ||
       paths.length === 0 ||
-      paths.some((path) => !validLiteralPathspec(path))
+      paths.some((path) => !validDefaultPathspec(path))
     ) {
       return undefined;
     }
@@ -225,7 +225,7 @@ export function parseCheckout(argv: readonly string[]): GitCliCheckoutCommand | 
   }
   if (force || argv[offset + 1] !== "--") return undefined;
   const paths = argv.slice(offset + 2);
-  if (paths.length === 0 || paths.some((path) => !validLiteralPathspec(path))) return undefined;
+  if (paths.length === 0 || paths.some((path) => !validDefaultPathspec(path))) return undefined;
   return { kind: "checkout", action: "checkout", ref, paths };
 }
 
@@ -253,7 +253,7 @@ export function parseRestore(argv: readonly string[]): GitCliRestoreCommand | un
   const paths = argv.slice(offset);
   if (
     paths.length === 0 ||
-    paths.some((path) => !validLiteralPathspec(path) || (!separated && path.startsWith("-")))
+    paths.some((path) => !validDefaultPathspec(path) || (!separated && path.startsWith("-")))
   ) {
     return undefined;
   }

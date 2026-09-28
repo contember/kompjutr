@@ -9,6 +9,7 @@ import { operationRefLogMetadata } from "../core/ref-log.js";
 import { treeOf } from "../repository/reads.js";
 import { expandRefOwned, type Repository, resolveHeadOwned } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
+import { type CompiledPathspecMatcher, compilePathspecs } from "../worktree/worktree-io.js";
 import { branch } from "./refs-branches.js";
 import { checkoutBlockers, describeBlockers } from "./refs-checkout-guard.js";
 
@@ -90,7 +91,7 @@ function checkoutInternal(
       repo,
       worktree,
       tree,
-      paths,
+      compilePathspecs(paths),
       false,
       options.force === true,
       excludeRoots,
@@ -163,7 +164,7 @@ function requireCheckoutAllowed(
   repo: Repository,
   worktree: Worktree,
   tree: string | null,
-  paths: string[] | undefined,
+  paths: string[] | CompiledPathspecMatcher | undefined,
   prune: boolean,
   force: boolean,
   excludeRoots: readonly string[],
