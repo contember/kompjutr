@@ -192,10 +192,13 @@ function rmCandidateUnsafe(candidate: RmCandidate, cached: boolean): GitError | 
     candidate.head !== undefined &&
     candidate.head.oid === entry.oid &&
     Number.parseInt(candidate.head.mode, 8) === entry.mode;
+  // Git skips a path that already vanished from the worktree, with or without --cached.
   const missingWorktree = candidate.worktree === undefined;
-  const safe = cached
-    ? headMatches || candidate.worktreeMatchesIndex
-    : missingWorktree || (headMatches && candidate.worktreeMatchesIndex);
+  const safe =
+    missingWorktree ||
+    (cached
+      ? headMatches || candidate.worktreeMatchesIndex
+      : headMatches && candidate.worktreeMatchesIndex);
   if (safe) return undefined;
   return new GitError(
     "EUNSAFEREMOVE",

@@ -815,6 +815,13 @@ describe("rm", () => {
       { name: "cached staged", stage: "index\n", cached: true, succeeds: true },
       { name: "cached worktree", worktree: "worktree\n", cached: true, succeeds: true },
       {
+        name: "cached staged then missing",
+        stage: "index\n",
+        missing: true,
+        cached: true,
+        succeeds: true,
+      },
+      {
         name: "cached both",
         stage: "index\n",
         worktree: "worktree\n",
@@ -878,6 +885,17 @@ describe("rm", () => {
     rm(workspace.repo, workspace.worktree, { paths: ["new.txt"] });
     fixture.git("rm", "-q", "new.txt");
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+
+    const cachedFixture = newFixture();
+    const cached = makeRepo("/");
+    writeBoth(cached, cachedFixture, "new.txt", "new\n");
+    add(cached.repo, cached.worktree, { paths: ["new.txt"] });
+    cachedFixture.git("add", "new.txt");
+    removeBoth(cached, cachedFixture, "new.txt");
+
+    rm(cached.repo, cached.worktree, { paths: ["new.txt"], cached: true });
+    cachedFixture.git("rm", "--cached", "-q", "new.txt");
+    expect(indexLines(cached.repo)).toEqual(gitIndexLines(cachedFixture));
 
     const forcedFixture = newFixture();
     const forced = makeRepo("/");
