@@ -250,6 +250,9 @@ gate, and release sequence. Do not publish this package from a local checkout.
 The pack-native object store is based on ideas from dgit. Adapted files retain
 their source headers and license notices. Files ported from
 `@cloudflare/computer` are covered by `packages/do/LICENSES/cloudflare-computer.txt`.
+Parts of the shell's `jq` command are adapted from jq, and parts of its text
+commands from uutils coreutils; both are MIT licensed and covered by
+`packages/do/LICENSES/jq.txt` and `packages/do/LICENSES/uutils-coreutils.txt`.
 
 ## License
 

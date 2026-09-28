@@ -99,7 +99,7 @@ function validatePack(name, manifest, packed, expectedFilename) {
     name === "git"
       ? ["LICENSES/LGPL-2.1.txt", "src/diff/LICENSE"]
       : name === "do"
-        ? ["LICENSES/cloudflare-computer.txt"]
+        ? ["LICENSES/cloudflare-computer.txt", "LICENSES/jq.txt", "LICENSES/uutils-coreutils.txt"]
         : [];
   const actualNoticeFiles = files.filter(
     (path) => path.startsWith("LICENSES/") || path === "src/diff/LICENSE",
