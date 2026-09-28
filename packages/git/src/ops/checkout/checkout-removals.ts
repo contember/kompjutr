@@ -5,7 +5,6 @@
 // mid-stream relies on the caller's transaction to undo earlier windows.
 
 import { GitError } from "../../common/errors.js";
-import { joinPath } from "../../common/paths.js";
 import { comparePaths } from "../../common/streams.js";
 import type { IndexSink } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
@@ -110,7 +109,7 @@ export class CheckoutRemovalStream {
 
   #removeFiles(batch: string[] | undefined): void {
     if (batch === undefined) return;
-    this.#worktree.removeFiles(batch.map((path) => joinPath(this.#repo.root, path)));
+    this.#worktree.removeFiles(batch);
   }
 
   #flushIndex(): void {
@@ -121,15 +120,6 @@ export class CheckoutRemovalStream {
 }
 
 /** Drop the planned empty subtrees after tracked leaves are gone. */
-export function pruneEmptyDirectories(
-  repo: Repository,
-  worktree: Worktree,
-  plan: CheckoutPrunePlan,
-): void {
-  for (const batch of plan.batches) {
-    worktree.removeFiles(
-      batch.map((path) => joinPath(repo.root, path)),
-      { recursive: true },
-    );
-  }
+export function pruneEmptyDirectories(worktree: Worktree, plan: CheckoutPrunePlan): void {
+  for (const batch of plan.batches) worktree.removeFiles(batch, { recursive: true });
 }

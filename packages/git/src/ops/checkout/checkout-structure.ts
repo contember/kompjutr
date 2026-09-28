@@ -1,8 +1,8 @@
+import { jsonStringEncodedBytes } from "@kompjutr/sqlite";
 import { GitError } from "../../common/errors.js";
 import { gitParentPath, joinPath } from "../../common/paths.js";
 import { comparePaths, joinSorted, joinSorted3 } from "../../common/streams.js";
 import { applyIndexOwned } from "../../store/checkout/checkout.js";
-import { utf8ByteLength } from "../../store/core/json-pages.js";
 import type { IndexStore } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
@@ -60,7 +60,7 @@ export function discardUnmergedPaths(
     }
   }
   for (const batch of planWorktreeRemovalBatches(repo, physical)) {
-    worktree.removeFiles(batch.map((path) => joinPath(repo.root, path)));
+    worktree.removeFiles(batch);
   }
   applyIndexOwned(index, (sink) => {
     for (let offset = 0; offset < paths.length; offset += CHECKOUT_WINDOW_ROWS) {
@@ -182,10 +182,7 @@ export function restoreStructuralConflicts(
 
   const paths = [...removals].sort(comparePaths);
   for (const batch of planWorktreeRemovalBatches(repo, paths)) {
-    worktree.removeFiles(
-      batch.map((path) => joinPath(repo.root, path)),
-      { recursive: true },
-    );
+    worktree.removeFiles(batch, { recursive: true });
   }
   return replaced;
 }
@@ -213,6 +210,7 @@ export class ReplacedIndexPaths {
 
   has(path: string): boolean {
     if (this.#directories.has(path)) return true;
+    if (this.#leaves.size === 0) return false;
     for (let parent = gitParentPath(path); parent !== ""; parent = gitParentPath(parent)) {
       if (this.#leaves.has(parent)) return true;
     }
@@ -236,7 +234,10 @@ function* walkStructuralPaths(
   }
 }
 
-/** Split ordinary removals at the flush target; larger singletons still reach the worktree. */
+/**
+ * Split ordinary removals at the flush target; larger singletons still reach
+ * the worktree. Batches hold absolute paths, ready for `removeFiles`.
+ */
 export class WorktreeRemovalBatcher {
   readonly #root: string;
   #paths: string[] = [];
@@ -248,13 +249,14 @@ export class WorktreeRemovalBatcher {
 
   /** Queue `path`, returning the batch it closed when it would cross the flush target. */
   push(path: string): string[] | undefined {
-    const itemBytes = utf8ByteLength(JSON.stringify(joinPath(this.#root, path)));
+    const absolute = joinPath(this.#root, path);
+    const itemBytes = jsonStringEncodedBytes(absolute);
     const closed =
       this.#paths.length > 0 && this.#bytes + 1 + itemBytes > CHECKOUT_REMOVE_FLUSH_BYTES
         ? this.take()
         : undefined;
     this.#bytes += (this.#paths.length === 0 ? 0 : 1) + itemBytes;
-    this.#paths.push(path);
+    this.#paths.push(absolute);
     return closed;
   }
 

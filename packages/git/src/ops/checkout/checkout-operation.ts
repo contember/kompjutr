@@ -122,7 +122,7 @@ export function checkoutTreeInternal(
     }
     prunePlan = removals.finish();
   });
-  if (prunePlan !== undefined) pruneEmptyDirectories(repo, worktree, prunePlan);
+  if (prunePlan !== undefined) pruneEmptyDirectories(worktree, prunePlan);
 
   const written: TargetEntry[] = [];
   const candidates: CheckoutCandidate[] = [];
