@@ -18,7 +18,8 @@ external memory (ArrayBuffer backing stores and external strings) is far larger:
 | Measured at | Runs | Peak V8 external, MiB | Peak V8 used + external, MiB | Non-V8 residue added, MiB |
 | --- | ---: | --- | --- | --- |
 | `2b2002c` harness (WU3, 1,012 statements) | 3 + 1 review | 187.5–227.2; review run 325.0 | 219.1–279.2; review run 355.9 | 191.1–243.7; review run 245.7 |
-| `c3b670c` (WU4, 898 statements) | 5 | 195.1–315.2 | 225.6–363.3 | 203.0–272.7 |
+| `555ee0d` (WU4, 898 statements) | 5 | 195.1–315.2 | 225.6–363.3 | 203.0–272.7 |
+| `b7a5118` (closure, 898 statements) | 3 | 204.7–276.5 | 231.9–315.0 | 188.3–246.9 |
 
 All runs: `cpu-lease run -n 2`, cgroup `memory.max` = `max` (no limit),
 `workerd` 1.20260820.1. The V8 values come from V8's GC trace, so their peaks

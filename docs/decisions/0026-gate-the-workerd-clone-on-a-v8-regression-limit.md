@@ -44,6 +44,10 @@ the production limit can pass today. The local numbers suggest that the clone
 does not fit the production isolate, but nobody has measured how the production
 limiter counts and when it checks.
 
+The sprint plan required a stop and a re-gate with the user if the sum did not fit.
+At that escalation the user chose a V8 measurement with a regression limit at
+today's level, and a backlog item for the external memory.
+
 ## Decision
 
 We gate the workerd clone on a **regression limit**, not on a production claim.
@@ -53,7 +57,7 @@ We gate the workerd clone on a **regression limit**, not on a production claim.
   of the clone isolate between the two forced GCs. A GC can only lower the
   external counter, so the sum is a lower bound on the true peak.
 - **The limit** is `V8_USED_PLUS_EXTERNAL_LIMIT_BYTES` in `bench/workerd/run.ts`:
-  450 MiB. It is today's level with a margin. Five leased runs at `c3b670c`
+  450 MiB. It is today's level with a margin. Five leased runs at `555ee0d`
   (898 statements, 145,777 rows, `memory.max` = `max`) measured 238.4, 241.2,
   277.8, 363.3 and 225.6 MiB. The limit is the maximum × 1.2, rounded up to
   25 MiB.
@@ -69,7 +73,7 @@ owns that question and the external memory.
 
 ## Consequences
 
-- The workerd benchmark can pass, so a regression in V8 memory now fails it.
+- The workerd benchmark can pass, so a large regression in V8 memory now fails it.
 - A drop in external memory must lower the limit in the same change. Otherwise
   the limit drifts away from today's level.
 - The measure is a lower bound from GC samples. A short spike between two GCs
@@ -92,6 +96,9 @@ owns that question and the external memory.
   more than twice that. The gate would only fail until the external memory is
   reduced, which is backlog work, not a gate.
 - **Gate V8 used only, or run under `--max-old-space-size`.** Both ignore
-  external memory, the largest part of what the isolate counts.
+  external memory, the largest part of what the isolate counts. The plan's
+  `--max-semi-space-size=8` pin belonged to that old-space gate, so the harness
+  passes only the GC trace flags. Nobody measured whether the pin narrows the
+  run-to-run spread.
 - **Report only, with no limit.** Nothing would catch a regression while
   backlog 106 is open.

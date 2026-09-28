@@ -1,18 +1,22 @@
-> **OUTCOME — shipped 2026-09-28.** Sparse selected add meets its <100 MiB gate:
-> 81.4 MB capped at closure, down from 158 MB. The Next.js clone runs 898
-> statements, down from 1,012. The workerd clone gate is now a 450 MiB regression
-> limit on V8 used + external
-> ([ADR-0026](../decisions/0026-gate-the-workerd-clone-on-a-v8-regression-limit.md)):
-> V8 used + external is at least 219 MiB, and RSS is not what the isolate limit
-> counts. External memory moves to backlog 106. Checkout keeps only real payload
-> limits and count caps: removals stream, structural state keeps only replaced
-> roots (50,000-root cap), and the tracker seed has a 50,000-path cap and the 8 KiB
-> guard. Rebase carries its baseline proof through one drive call, answers the start
+> **OUTCOME — shipped 2026-09-28.** Sparse selected add cut its peak from 158 MB
+> to about 78 MB. The peak is bimodal, though: the closure review measured about
+> 110 MB in 4 of 9 runs, all in the uncapped stage, so the row does not reliably
+> meet its <100 MiB gate (backlog 110). The Next.js clone runs 898 statements,
+> down from 1,012. Success criterion 2 was not met. V8 used + external is at least
+> 219 MiB, so no gate at the production isolate limit can pass. At the WU4
+> escalation the user chose a 450 MiB regression limit on V8 used + external
+> instead ([ADR-0026](../decisions/0026-gate-the-workerd-clone-on-a-v8-regression-limit.md)).
+> RSS is not what the isolate limit counts. External memory moves to backlog 106.
+> Checkout keeps only real payload limits and count caps: removals stream,
+> structural state keeps only replaced roots (50,000-root cap), and the tracker
+> seed has a 50,000-path cap and the 8 KiB guard. Rebase carries its baseline proof through one drive call, answers the start
 > checks from a clean tracker, and checks out only the tree diff at start. The
 > Next.js rebase phase fell from 1,006 to 724 statements and from 1,145,713 to
-> 830,418 rows; the maximum added peak over three interleaved capped runs fell from
-> 63.2 to 44.9 MiB. The `staging.rm` regression is fixed: 42/64 → 27/31. The user
-> added WU7 (the rm regression) and WU8 (DOFS JSON sizing copies) mid-sprint.
+> 830,418 rows. The maximum added peak over three interleaved capped runs fell from
+> 63.2 to 44.9 MiB, but three closure-review runs measured 30.0–65.8 MiB, so the
+> peak drop is within run-to-run spread. The `staging.rm` regression is fixed:
+> 42/64 → 27/31. The user added WU7 (the rm regression) and WU8 (DOFS JSON sizing
+> copies) mid-sprint.
 >
 > **Commit map.**
 >
@@ -42,15 +46,42 @@
 >   145,777 rows, added peak 118.2 MiB (gate <160 MiB); rebase 724 statements,
 >   830,418 rows, added peak 39.4 MiB.
 >
+> **Closure review at `b7a5118`.** An independent review found no defect in the
+> sprint's code, but found the evidence gaps below. It reran the closure benchmarks from a clean worktree
+> (symlinked `node_modules` and fixtures only):
+>
+> - Three capped `bench:nextjs` runs (`memory.max` 1073741824, swap 0): clone
+>   898/145,777, added peak 126.7 / 116.8 / 121.5 MiB; rebase 724/830,418, added
+>   peak 65.8 / 57.9 / 30.0 MiB. The closure had run only one.
+> - Three `bench:workerd:nextjs` runs (`memory.max` = `max`): V8 used + external
+>   231.9 / 236.7 / 315.0 MiB, all under the 450 MiB limit, in the same range as
+>   the runs that set it before WU5 and WU8.
+> - Three `core.checkout.tree-swap` runs: all pass; transient 8.8, 8.8 and
+>   11.4 MB (capped stage).
+> - `core.sparse-selected-add`: 3 of 6 runs at `b7a5118` and 1 of 3 at `9fa0a7b`
+>   (end of WU2) fail the uncapped stage at 109–115 MB; passing runs peak at
+>   77–80 MB → backlog 110.
+> - Evidence the plan required and nobody recorded: the three per-run WU2 peaks
+>   with their commit; the failures before WU5 for the 20 × 8 KiB and
+>   80,000-path witnesses; the `E2BIG` refusal of `core.checkout.tree-swap`
+>   before WU5 (the scenario body arrived with WU5, so it never ran there); the
+>   `test:fs` and checkout-suite gate on `14fd12a`; the merge, cherry-pick,
+>   revert and integration suites for WU6 (the review ran them: 77 passed).
+> - The review's `rm --cached` finding (a path already gone from the worktree)
+>   predates the sprint and is fixed in `e215e46`.
+>
 > **Backlog.** Closed: 86, 95, 97. Filed: 106 (workerd external memory), 107
 > (shared integration step passes, formerly 95 part b), 108 (local `reset --hard`
 > `ENOENT` on missing paths; predates the sprint, tier A), 109 (directory mode
-> reset when its only child changes type; predates the sprint, tier S).
+> reset when its only child changes type; predates the sprint, tier S). The closure
+> review filed 110 (the bimodal sparse add peak).
 >
 > **Deferred.**
 >
-> - P4 of backlog 95: limit the baseline preflight object checks to diff blobs.
-> - Sharing the exclusion normalizer between checkout and `rebaseExclusions`.
+> - P4 of backlog 95: limit the baseline preflight object checks to diff blobs
+>   (recorded in backlog 107).
+> - Sharing the exclusion normalizer between checkout and `rebaseExclusions`
+>   (recorded in backlog 107).
 > - The 450 MiB workerd limit catches only large regressions.
 > - The uncapped tree-swap calibration varies from 32 to 96 MB with GC timing.
 > - node:sqlite keeps bound parameters on idle statements. The harness is unchanged.
@@ -577,7 +608,7 @@ worktree, and the leader cherry-picks every green unit at once.
 - WU1 `5c6378f`: `METADATA_JSON_FLUSH_BYTES` 128 → 256 KiB; the node and path flush was
   already one call. The Next.js clone runs 898 statements, down from 1,012, in Node and
   workerd; rows stay 145,777. The Node clone adds 99.0 MiB (one leased run,
-  `memory.max=1073741824`, swap 0, commit `06ba414`).
+  `memory.max=1073741824`, swap 0, commit `5c6378f`).
 - `bench:statements -- --check` already fails at `06de5e5` on `staging.rm`, `merge.restore`
   and `rebase.transition{,-n,-2n}`, before any sprint code. Triage is running.
 - Statement gate triage:
@@ -623,12 +654,12 @@ worktree, and the leader cherry-picks every green unit at once.
   - Local checkout defects found in review → backlog 108.
 - Backlog 95, part b → backlog 107.
 - WU6 peak witness: interleaved leased runs under a 1 GiB no-swap cap
-  (`memory.max=1073741824`), three at `9fe4645` and three at `7ea46be`.
+  (`memory.max=1073741824`), three at `9fe4645` and three at `0b2a9c3`.
 
   | Commit | Statements | Rows | Added peak (MiB) | Wall (s) |
   |---|---|---|---|---|
   | `9fe4645` | 1,006 | 1,145,713 | 30.7 / 53.4 / 63.2 | 12.2–12.4 |
-  | `7ea46be` | 724 | 830,418 | 36.8 / 44.9 / 40.5 | 9.1–9.5 |
+  | `0b2a9c3` | 724 | 830,418 | 36.8 / 44.9 / 40.5 | 9.1–9.5 |
 
   The maximum falls from 63.2 to 44.9 MiB and the mean from 49.1 to 40.7 MiB.
 - WU6 `b87f696`…`0b2a9c3`:

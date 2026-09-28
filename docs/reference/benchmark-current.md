@@ -16,52 +16,55 @@ regression signals, not proof of a production isolate limit.
 
 ## Next.js workflow — 2026-09-28
 
-One run at commit `c4eb082`, under a cgroup with `memory.max` 1073741824 and
-`memory.swap.max` 0:
+Three runs at commit `b7a5118`, each under a cgroup with `memory.max`
+1073741824 and `memory.swap.max` 0:
 
 ```bash
-cpu-lease run -n 2 -- npm run bench:nextjs
+cpu-lease run -n 2 -- systemd-run --user --scope --slice=leases.slice \
+  -p AllowedCPUs=<leased CPUs> -p MemoryMax=1073741824 -p MemorySwapMax=0 -- \
+  npm run bench:nextjs
 ```
 
-The lease held two vCPUs; SMT siblings were not excluded. Wall values are one
-sample each, not medians.
+The lease held two vCPUs; SMT siblings were not excluded. Wall is the median of
+the three runs. Statements and rows were identical in every run. The added peak
+lists the three runs in order.
 
 | Operation | Wall, ms | SQL | Rows | Added peak RSS, MiB |
 | --- | ---: | ---: | ---: | ---: |
-| `git.clone` | 9,908.2 | 898 | 145,777 | 118.2 |
-| `git.status` — clean clone | 4.1 | 14 | 12 | 0.0 |
-| `git.branch` | 5.8 | 30 | 19 | 0.0 |
-| `fs.writeFiles` — 100 | 35.8 | 6 | 288 | 0.0 |
-| `git.status` — 100 modified | 29.6 | 30 | 1,031 | 0.1 |
-| `git.diffSummary` — 100 | 39.4 | 30 | 1,575 | 0.3 |
-| `git.diff` — 100 | 40.3 | 29 | 1,573 | 0.8 |
-| `git.add` — 100 | 158.1 | 22 | 1,754 | 0.2 |
-| `git.status` — 100 staged | 14.3 | 27 | 685 | 0.0 |
-| `git.commit` — 100 | 141.2 | 51 | 725 | 0.0 |
-| `git.push` — 100 | 344.8 | 47 | 615 | 0.7 |
-| `git.status` — clean commit | 9.6 | 25 | 685 | 0.0 |
-| `git.checkout main` | 492.3 | 101 | 25,089 | 0.5 |
-| `git.checkout main --force` | 453.8 | 102 | 25,189 | 6.3 |
-| `git.status` — clean main | 0.8 | 11 | 8 | 0.0 |
-| `git.checkout bench-work` | 489.3 | 94 | 25,188 | 4.4 |
-| `git.checkout bench-work --force` | 467.1 | 94 | 25,188 | 0.0 |
-| `git.status` — clean work | 0.8 | 10 | 8 | 0.0 |
-| `git.rebase` — 100 onto `main` | 9,053.3 | 724 | 830,418 | 39.4 |
-| `git.status` — clean rebase | 22.9 | 27 | 891 | 0.0 |
+| `git.clone` | 10,109.6 | 898 | 145,777 | 126.7 / 116.8 / 121.5 |
+| `git.status` — clean clone | 4.1 | 14 | 12 | 0.0 / 0.0 / 0.0 |
+| `git.branch` | 5.2 | 30 | 19 | 0.0 / 0.0 / 0.1 |
+| `fs.writeFiles` — 100 | 29.9 | 6 | 288 | 0.1 / 0.1 / 0.0 |
+| `git.status` — 100 modified | 29.5 | 30 | 1,031 | 0.2 / 0.2 / 0.0 |
+| `git.diffSummary` — 100 | 62.9 | 30 | 1,575 | 1.3 / 1.9 / 0.2 |
+| `git.diff` — 100 | 42.0 | 29 | 1,573 | 0.3 / 0.4 / 0.5 |
+| `git.add` — 100 | 167.5 | 22 | 1,754 | 0.0 / 0.0 / 0.2 |
+| `git.status` — 100 staged | 14.6 | 27 | 685 | 0.1 / 0.0 / 0.0 |
+| `git.commit` — 100 | 155.0 | 51 | 725 | 0.1 / 0.1 / 0.0 |
+| `git.push` — 100 | 342.3 | 47 | 615 | 0.9 / 0.9 / 0.6 |
+| `git.status` — clean commit | 9.9 | 25 | 685 | 0.0 / 0.0 / 0.0 |
+| `git.checkout main` | 474.8 | 101 | 25,089 | 0.5 / 0.4 / 0.6 |
+| `git.checkout main --force` | 474.5 | 102 | 25,189 | 8.0 / 8.0 / 7.8 |
+| `git.status` — clean main | 0.8 | 11 | 8 | 0.0 / 0.0 / 0.0 |
+| `git.checkout bench-work` | 503.0 | 94 | 25,188 | 3.8 / 4.3 / 4.7 |
+| `git.checkout bench-work --force` | 471.6 | 94 | 25,188 | 0.0 / 0.1 / 0.2 |
+| `git.status` — clean work | 0.8 | 10 | 8 | 0.0 / 0.0 / 0.0 |
+| `git.rebase` — 100 onto `main` | 9,674.3 | 724 | 830,418 | 65.8 / 57.9 / 30.0 |
+| `git.status` — clean rebase | 24.2 | 27 | 891 | 0.0 / 0.0 / 0.0 |
 
 Every phase passed its verification. Rows are rows returned, not rows scanned.
 Every phase meets the at-most-1,000-statement target.
 Target status is performance evidence, not a runtime admission rule.
 
-Clone adds 118.2 MiB over a 191.8 MiB process baseline, under its <160 MiB
-gate. The rebase step replays one 100-file commit onto a new `main` commit and
-adds 39.4 MiB. `fs.writeFiles` and `git.commit` measured a peak below their
-baseline; the table reports 0.0.
+Clone adds 116.8–126.7 MiB over a process baseline of about 196 MiB, under its
+<160 MiB gate. The rebase step replays one 100-file commit onto a new `main`
+commit and adds 30.0–65.8 MiB; its peak has no gate and varies more than twofold
+between runs. A phase that measured a peak below its baseline reports 0.0.
 
 ## Next.js clone on workerd — 2026-09-28
 
 Five runs of the clone inside a real SQLite Durable Object, at commit
-`c3b670c`:
+`555ee0d`:
 
 ```bash
 cpu-lease run -n 2 -- npm run bench:workerd:nextjs
@@ -91,12 +94,18 @@ Baseline RSS was 74.0–74.9 MiB. Every run verified HEAD, 24,252 index entries,
 and 24,252 worktree files with no invalid file. Statements and rows match the
 `node:sqlite` clone.
 
+Three more runs at `b7a5118`, after the checkout and byte-sizing changes that
+landed after `555ee0d`, stay in the same range: V8 used + external 231.9, 236.7
+and 315.0 MiB; V8 external 209.4, 204.7 and 276.5 MiB; added peak RSS 363.7,
+383.1 and 453.5 MiB. The limit therefore still sits at today's level.
+
 The gate is a regression limit of 450 MiB on V8 used + external
 ([ADR-0026](../decisions/0026-gate-the-workerd-clone-on-a-v8-regression-limit.md)).
 It is not the production 128 MB isolate limit, and no local number shows that
 the clone fits it. Process RSS is report-only.
 
-External memory is most of what the isolate counts: 4.6–7.5× the 42 MiB pack
+External memory is most of what the isolate counts: 4.5–7.7× the 42 MiB pack
+over every run so far
 ([backlog 106](../backlog/106-reduce-the-workerd-clone-external-memory.md)).
 The SQLite page cache does not explain the RSS. File-backed memory stays near
 47 MiB, and workerd keeps SQLite's default cache of about 2 MiB. Wall time from

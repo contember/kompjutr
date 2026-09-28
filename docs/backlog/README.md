@@ -94,14 +94,16 @@ over different reflog tables. It moved 84 and 105 to
 [`../ideas/`](../ideas/README.md): neither has a failure behind it.
 
 The 2026-09-28 [memory and cost sprint](../archive/sprint-2026-09-28-memory-and-cost.md)
-closed 86, 95 and 97, and filed 106–109 from its findings.
+closed 86, 95 and 97, and filed 106–109 from its findings. Its closure review
+filed 110.
 
 | Order | Items | Why |
 |---|---|---|
 | 1 | [108](108-local-checkout-removes-missing-paths.md) | Tier A: local `reset --hard` fails with `ENOENT` when a tracked path is already gone. It blocks a common workflow. |
 | 2 | [109](109-keep-parent-directory-when-replacing-its-only-child.md) | Tier S, but narrow: only a directory's mode changes when its only child changes type. |
 | 3 | [107](107-bound-shared-integration-step-passes.md) | Cost: the shared integration step still makes full-tree passes for every rebase, merge, cherry-pick and revert step. |
-| 4 | [106](106-reduce-the-workerd-clone-external-memory.md) | Memory: the workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it first, then decide whether a production probe is needed. |
+| 4 | [110](110-stabilize-the-sparse-selected-add-peak.md) | Memory: the sparse selected add peak is bimodal and fails its <100 MiB gate in about one run in two. |
+| 5 | [106](106-reduce-the-workerd-clone-external-memory.md) | Memory: the workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it first, then decide whether a production probe is needed. |
 
 ## Items
 
@@ -109,3 +111,4 @@ closed 86, 95 and 97, and filed 106–109 from its findings.
 - [107 — Bound the shared integration step's full-tree passes](107-bound-shared-integration-step-passes.md)
 - [108 — Let local checkout remove paths that are already gone](108-local-checkout-removes-missing-paths.md)
 - [109 — Keep a directory whose only child changes type](109-keep-parent-directory-when-replacing-its-only-child.md)
+- [110 — Stabilize the sparse selected add peak under its gate](110-stabilize-the-sparse-selected-add-peak.md)

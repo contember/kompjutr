@@ -43,7 +43,8 @@ None.
   lookups (4× faster in the measured case). Next: the
   [backlog plan](backlog/README.md#sprint-plan).
 - [Memory and cost](archive/sprint-2026-09-28-memory-and-cost.md) shipped:
-  sparse selected add meets <100 MiB, the Next.js clone runs 898 statements, the
+  sparse selected add cut its peak but still misses <100 MiB in about one run in
+  two (backlog 110), the Next.js clone runs 898 statements, the
   rebase phase reads 830,418 rows instead of 1,145,713, and checkout keeps only
   real payload limits and count caps. The workerd clone has a V8 regression limit
   (ADR-0026). Next: the [backlog plan](backlog/README.md#sprint-plan), 108 first.
