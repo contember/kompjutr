@@ -8,6 +8,7 @@
 import { type ByteStream, isAsyncByteStream } from "../exec/bytes.js";
 import { type Command, type CommandResult, fail } from "../exec/context.js";
 import { exit } from "./control.js";
+import { diff } from "./diff/diff.js";
 import { echo } from "./echo.js";
 import { fileCommands } from "./files.js";
 import { find } from "./find.js";
@@ -33,6 +34,7 @@ export function builtinCommands(): Map<string, Command> {
     ["printf", printf],
     ["exit", exit],
     ["echo", echo],
+    ["diff", diff],
     ["find", find],
     ["xargs", xargs],
     ["sed", sed],

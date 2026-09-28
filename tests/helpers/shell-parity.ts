@@ -1,8 +1,9 @@
 // Differential harness for the Bash-shaped shell surface.
 //
-// Controlled dimensions: `LC_ALL=C`; POSIX-default `IFS`; an environment
-// allowlist of `PATH`, `LC_ALL`, `IFS`, and case-explicit variables; and cwd at
-// the seeded tree root (`<temp>` for Bash, `/repo` for kompjutr).
+// Controlled dimensions: `LC_ALL=C`; `TZ=UTC`, the only zone the shell has;
+// POSIX-default `IFS`; an environment allowlist of `PATH`, `LC_ALL`, `TZ`,
+// `IFS`, and case-explicit variables; and cwd at the seeded tree root (`<temp>`
+// for Bash, `/repo` for kompjutr).
 //
 // The seed supports regular files and their parent directories only. Both sides
 // receive mode 0644/0755 and the same fixed mtime. Symlinks, empty directories,
@@ -35,6 +36,7 @@ const ENCODER = new TextEncoder();
 const BASE_ENV = {
   PATH: process.env.PATH ?? "/usr/bin:/bin",
   LC_ALL: "C",
+  TZ: "UTC",
   IFS: " \t\n",
 };
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;

@@ -64,6 +64,7 @@ We admit this finite surface:
 - `grep` and `rg` `-o` and `-q`, each following its own binary around `-o`.
 - `tee`, which holds its file bytes against the retained budget and publishes
   each file once, and `wc` in GNU's per-operand layout.
+- `diff` in GNU's normal and unified formats over a minimal edit script.
 - A `sed` script language without hold space, branches, or file commands:
   `s`, `p`, `d`, `q`, `=`, `a`, `i`, `c`, and blocks over line, `$`, regex,
   and range addresses, with `-i` publishing each file once.
@@ -76,15 +77,21 @@ run's retained-byte budget.
 commands. Each admitted form must compare stdout bytes, stderr bytes, and exit
 status against GNU Bash under declared controlled dimensions. An intentional
 divergence must be an explicit refusal pinned by a local test; it must never be
-hidden by weakening or normalizing the differential comparison. The evidence for
+hidden by weakening or normalizing the differential comparison. One divergence
+is admitted rather than refused: where several minimal `diff` edit scripts
+exist, hunk placement follows this shell's own rule, because matching GNU's
+choice would mean reproducing its GPL heuristics. The diff suite compares the
+script's size on ambiguous input and its bytes on realistic edits, and pins
+one ambiguous placement locally. The evidence for
 this admission is the [baseline](../../tests/shell/parity-bash.test.ts),
 [ordered redirection](../../tests/shell/parity-bash-redirection.test.ts),
 [`printf`](../../tests/shell/parity-bash-printf.test.ts),
 [`exit`](../../tests/shell/parity-bash-exit.test.ts),
 [named expansion](../../tests/shell/parity-bash-expansion.test.ts),
 [script](../../tests/shell/parity-bash-scripts.test.ts),
-[path](../../tests/shell/parity-bash-paths.test.ts), and
-[sed](../../tests/shell/parity-bash-sed.test.ts) suites.
+[path](../../tests/shell/parity-bash-paths.test.ts),
+[sed](../../tests/shell/parity-bash-sed.test.ts), and
+[diff](../../tests/shell/parity-bash-diff.test.ts) suites.
 
 These forms remain rejected:
 
