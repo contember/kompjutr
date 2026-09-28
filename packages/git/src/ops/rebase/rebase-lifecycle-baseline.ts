@@ -128,6 +128,7 @@ export function currentBaseline(
  * `baselineTree` is HEAD's tree. With a clean index tracker at HEAD, only paths
  * in the tree diff can block or change, so a diff-bounded checkout replaces the
  * whole-tree pass. Anything the fast path cannot prove declines to the full one.
+ * `trackedClean` skips the attempt when the start checks already saw a dirty tracker.
  */
 export function materializeTree(
   context: GitContext,
@@ -136,8 +137,10 @@ export function materializeTree(
   baselineTree: string,
   targetTree: string,
   exclusions: RebaseExclusions,
+  trackedClean: boolean,
 ): void {
   if (
+    trackedClean &&
     exclusions.absolute.length === 0 &&
     trySparseCleanCheckout(context, repo, worktree, targetTree)
   ) {

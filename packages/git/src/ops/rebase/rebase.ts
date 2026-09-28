@@ -80,7 +80,7 @@ export function rebase(
     if (plan.relation === "replay") {
       preflightBaselineTree(repo, originalTree);
     }
-    materializeTree(context, repo, worktree, originalTree, upstreamTree, exclusions);
+    materializeTree(context, repo, worktree, originalTree, upstreamTree, exclusions, trackedClean);
     const observed = repo.head();
     if (observed.ref !== head.ref || observed.oid !== head.oid) {
       throw new GitError("ESTALEHEAD", "HEAD changed while rebase was being prepared");
