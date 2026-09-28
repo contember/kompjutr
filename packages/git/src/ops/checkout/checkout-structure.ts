@@ -1,8 +1,8 @@
-import { utf8 } from "../../common/bytes.js";
 import { GitError } from "../../common/errors.js";
 import { joinPath } from "../../common/paths.js";
 import { comparePaths, joinSorted, joinSorted3 } from "../../common/streams.js";
 import { applyIndexOwned } from "../../store/checkout/checkout.js";
+import { utf8ByteLength } from "../../store/core/json-pages.js";
 import type { IndexStore } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
@@ -11,9 +11,7 @@ import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import {
   boundedCheckoutSourceRows,
   boundedCheckoutWorktreeEntries,
-  CHECKOUT_PATH_FIXED_BYTES,
-  CHECKOUT_PRUNE_PATHS,
-  CHECKOUT_REMOVAL_BYTES,
+  CHECKOUT_STRUCTURAL_PATHS,
   CHECKOUT_UNMERGED_PATHS,
   CHECKOUT_WINDOW_ROWS,
   matchesPaths,
@@ -22,6 +20,7 @@ import {
 import type { CheckoutInternalOptions } from "./checkout-types.js";
 
 const CHECKOUT_REMOVE_FLUSH_BYTES = 1_000_000;
+const EMPTY_REMOVAL_BINDING_BYTES = 2;
 
 export function discardUnmergedPaths(
   repo: Repository,
@@ -85,9 +84,15 @@ export function restoreStructuralConflicts(
 ): Set<string> {
   const removals = new Set<string>();
   const preservedRemovals = new Set<string>();
-  let retainedBytes = 0;
-  let activeBytes = 0;
-  const activeLeaves: Array<{ path: string; upper: string; bytes: number }> = [];
+  const activeLeaves: Array<{ path: string; upper: string }> = [];
+  const requireStructuralCapacity = (): void => {
+    if (removals.size + preservedRemovals.size + activeLeaves.length >= CHECKOUT_STRUCTURAL_PATHS) {
+      throw new GitError(
+        "E2BIG",
+        `checkout structural state exceeds ${CHECKOUT_STRUCTURAL_PATHS} paths`,
+      );
+    }
+  };
   for (const row of joinSorted3(
     boundedCheckoutSourceRows(targetEntries(), options.maxSourceRowsPerPass, "tree"),
     stageZero(boundedCheckoutSourceRows(index.indexScan(), options.maxSourceRowsPerPass, "index")),
@@ -98,20 +103,12 @@ export function restoreStructuralConflicts(
       activeLeaves.length > 0 &&
       comparePaths(row.path, activeLeaves[activeLeaves.length - 1]!.upper) >= 0
     ) {
-      activeBytes -= activeLeaves.pop()!.bytes;
+      activeLeaves.pop();
     }
     const current = row.c;
     if (current !== undefined && current.type !== "dir" && row.a === undefined) {
-      const upper = `${current.path}0`;
-      const bytes = CHECKOUT_PATH_FIXED_BYTES + current.path.length * 2 + upper.length * 2;
-      if (retainedBytes + activeBytes + bytes > CHECKOUT_REMOVAL_BYTES) {
-        throw new GitError(
-          "E2BIG",
-          `checkout structural state exceeds ${CHECKOUT_REMOVAL_BYTES} bytes`,
-        );
-      }
-      activeLeaves.push({ path: current.path, upper, bytes });
-      activeBytes += bytes;
+      requireStructuralCapacity();
+      activeLeaves.push({ path: current.path, upper: `${current.path}0` });
     }
 
     const target = row.a;
@@ -130,13 +127,7 @@ export function restoreStructuralConflicts(
         }
       }
       if ((replacedByDirectory || replacedUnderLeaf) && !preservedRemovals.has(row.b.path)) {
-        retainedBytes += CHECKOUT_PATH_FIXED_BYTES + row.b.path.length * 2;
-        if (retainedBytes + activeBytes > CHECKOUT_REMOVAL_BYTES) {
-          throw new GitError(
-            "E2BIG",
-            `checkout structural state exceeds ${CHECKOUT_REMOVAL_BYTES} bytes`,
-          );
-        }
+        requireStructuralCapacity();
         preservedRemovals.add(row.b.path);
       }
     }
@@ -153,7 +144,7 @@ export function restoreStructuralConflicts(
       row.b.mode === Number.parseInt(target.mode, 8);
     if (options.preserveMatchingIndex === true && sameIndex) continue;
 
-    let activeLeaf: { path: string; upper: string; bytes: number } | undefined;
+    let activeLeaf: { path: string; upper: string } | undefined;
     for (let index = activeLeaves.length - 1; index >= 0; index--) {
       const leaf = activeLeaves[index]!;
       if (target.path.startsWith(`${leaf.path}/`)) {
@@ -166,16 +157,9 @@ export function restoreStructuralConflicts(
       current !== undefined && current.type !== targetType ? target.path : activeLeaf?.path;
     if (structural === undefined || removals.has(structural)) continue;
     if (activeLeaf?.path === structural) {
-      activeBytes -= activeLeaf.bytes;
       activeLeaves.splice(activeLeaves.indexOf(activeLeaf), 1);
     }
-    retainedBytes += CHECKOUT_PATH_FIXED_BYTES + structural.length * 2;
-    if (retainedBytes + activeBytes > CHECKOUT_REMOVAL_BYTES) {
-      throw new GitError(
-        "E2BIG",
-        `checkout structural state exceeds ${CHECKOUT_REMOVAL_BYTES} bytes`,
-      );
-    }
+    requireStructuralCapacity();
     removals.add(structural);
   }
 
@@ -205,112 +189,45 @@ function* walkStructuralPaths(
   }
 }
 
-export interface CheckoutPrunePlan {
-  batches: string[][];
-}
-
-/** Preflight the retained directory state before checkout starts removing paths. */
-export function planEmptyDirectories(
-  repo: Repository,
-  worktree: Worktree,
-  removed: readonly string[],
-  preserved: ReadonlySet<string>,
-  maxRows: number | undefined,
-  excludeRoots: string[],
-  relativeExcludeRoots: string[],
-): CheckoutPrunePlan {
-  const directories = new Map<string, boolean>();
-  const physicalRemovals = new Set<string>();
-  for (const path of removed) {
-    if (!preserved.has(path)) physicalRemovals.add(path);
-    let slash = path.lastIndexOf("/");
-    while (slash > 0) {
-      const directory = path.slice(0, slash);
-      if (!directories.has(directory)) {
-        if (directories.size >= CHECKOUT_PRUNE_PATHS) {
-          throw new GitError(
-            "E2BIG",
-            `checkout directory-prune state exceeds ${CHECKOUT_PRUNE_PATHS} paths`,
-          );
-        }
-        directories.set(directory, false);
-      }
-      slash = directory.lastIndexOf("/");
-    }
-  }
-  if (directories.size === 0) return { batches: [] };
-  for (const root of relativeExcludeRoots) {
-    let candidate = root;
-    while (candidate !== "") {
-      if (directories.has(candidate)) directories.set(candidate, true);
-      const slash = candidate.lastIndexOf("/");
-      candidate = slash < 0 ? "" : candidate.slice(0, slash);
-    }
-  }
-  for (const entry of walkWorktreeEntriesStream(worktree, repo.root, {
-    excludeRoots,
-    includeIgnored: true,
-    includeDirectories: true,
-    maxScanRows: maxRows,
-  })) {
-    if (physicalRemovals.has(entry.path)) continue;
-    if (entry.stat.type === "dir" && directories.has(entry.path)) continue;
-    let candidate = entry.path;
-    while (candidate !== "") {
-      if (directories.has(candidate)) directories.set(candidate, true);
-      const slash = candidate.lastIndexOf("/");
-      candidate = slash < 0 ? "" : candidate.slice(0, slash);
-    }
-  }
-
-  const roots: string[] = [];
-  for (const [directory, hasContents] of directories) {
-    if (hasContents) continue;
-    const slash = directory.lastIndexOf("/");
-    const parent = slash < 0 ? undefined : directory.slice(0, slash);
-    if (parent !== undefined && directories.get(parent) === false) continue;
-    roots.push(directory);
-  }
-  roots.sort(comparePaths);
-  return {
-    batches: planWorktreeRemovalBatches(repo, roots),
-  };
-}
-
-/** Drop preflighted empty candidate subtrees after tracked leaves are gone. */
-export function pruneEmptyDirectories(
-  repo: Repository,
-  worktree: Worktree,
-  plan: CheckoutPrunePlan,
-): void {
-  for (const batch of plan.batches) {
-    worktree.removeFiles(
-      batch.map((path) => joinPath(repo.root, path)),
-      { recursive: true },
-    );
-  }
-}
-
 /** Split ordinary removals at the flush target; larger singletons still reach the worktree. */
-export function planWorktreeRemovalBatches(repo: Repository, paths: readonly string[]): string[][] {
-  const batches: string[][] = [];
-  let batch: string[] = [];
-  let bytes = 2;
-  const flush = (): void => {
-    if (batch.length === 0) return;
-    batches.push(batch);
-    batch = [];
-    bytes = 2;
-  };
+export class WorktreeRemovalBatcher {
+  readonly #root: string;
+  #paths: string[] = [];
+  #bytes = EMPTY_REMOVAL_BINDING_BYTES;
 
-  for (const path of paths) {
-    const absolute = joinPath(repo.root, path);
-    const itemBytes = utf8.encode(JSON.stringify(absolute)).byteLength;
-    const separator = batch.length === 0 ? 0 : 1;
-    if (batch.length > 0 && bytes + separator + itemBytes > CHECKOUT_REMOVE_FLUSH_BYTES) flush();
-    batch.push(path);
-    bytes += (batch.length === 1 ? 0 : 1) + itemBytes;
+  constructor(root: string) {
+    this.#root = root;
   }
-  flush();
+
+  /** Queue `path`, returning the batch it closed when it would cross the flush target. */
+  push(path: string): string[] | undefined {
+    const itemBytes = utf8ByteLength(JSON.stringify(joinPath(this.#root, path)));
+    const closed =
+      this.#paths.length > 0 && this.#bytes + 1 + itemBytes > CHECKOUT_REMOVE_FLUSH_BYTES
+        ? this.take()
+        : undefined;
+    this.#bytes += (this.#paths.length === 0 ? 0 : 1) + itemBytes;
+    this.#paths.push(path);
+    return closed;
+  }
+
+  take(): string[] | undefined {
+    if (this.#paths.length === 0) return undefined;
+    const batch = this.#paths;
+    this.#paths = [];
+    this.#bytes = EMPTY_REMOVAL_BINDING_BYTES;
+    return batch;
+  }
+}
+
+export function planWorktreeRemovalBatches(repo: Repository, paths: readonly string[]): string[][] {
+  const batcher = new WorktreeRemovalBatcher(repo.root);
+  const batches: string[][] = [];
+  for (const path of paths) {
+    const closed = batcher.push(path);
+    if (closed !== undefined) batches.push(closed);
+  }
+  const last = batcher.take();
+  if (last !== undefined) batches.push(last);
   return batches;
 }

@@ -40,9 +40,8 @@ export function matchesPaths(path: string, paths: string[] | undefined): boolean
 }
 
 export const CHECKOUT_WINDOW_ROWS = 1_000;
-export const CHECKOUT_REMOVAL_BYTES = 16 * 1024 * 1024;
 export const CHECKOUT_PRUNE_PATHS = 50_000;
-export const CHECKOUT_PATH_FIXED_BYTES = 96;
+export const CHECKOUT_STRUCTURAL_PATHS = 50_000;
 export const CHECKOUT_UNMERGED_PATHS = 10_000;
 const CHECKOUT_EXCLUDE_ROOTS = 64;
 

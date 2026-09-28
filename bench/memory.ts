@@ -20,14 +20,18 @@ import { fromHex, utf8 } from "../packages/git/src/common/bytes.js";
 import {
   type Commit,
   hashObject,
+  MODE_FILE,
+  MODE_TREE,
   serializeCommit,
   serializeTree,
 } from "../packages/git/src/common/objects.js";
 import { createSqliteSelectedPathSource } from "../packages/git/src/do-fs/index.js";
 import { MAX_SPARSE_BINDING_BYTES } from "../packages/git/src/do-fs/sparse/shared.js";
+import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
 import type { GitContext } from "../packages/git/src/ops/core/context.js";
 import { requireCleanIntegrationWorktree } from "../packages/git/src/ops/integration/integration-worktree.js";
 import { type RebaseLifecycleResult, rebase } from "../packages/git/src/ops/rebase/rebase.js";
+import { checkout } from "../packages/git/src/ops/refs/refs.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { add } from "../packages/git/src/ops/staging/staging.js";
 import type {
@@ -47,6 +51,9 @@ import {
   CHECKOUT_COUNT,
   CHECKOUT_HEAD_BYTES,
   CHECKOUT_ROOT_BYTES,
+  CHECKOUT_SWAP_DIRECTORY_COUNT,
+  CHECKOUT_SWAP_PATH_BYTES,
+  CHECKOUT_SWAP_PATH_COUNT,
   FALLBACK_FORMER_LIMIT_BYTES,
   GRAPH_COMMIT_COUNT,
   GRAPH_MESSAGE_BYTES,
@@ -759,6 +766,131 @@ function sparseSelectedAddScenario(): Scenario {
   };
 }
 
+class RemovalCountingWorktree extends CountingWorktree {
+  removedPaths = 0;
+  removedPathBytes = 0;
+  readonly #removedDigest = createHash("sha256");
+
+  override removeFiles(paths: readonly string[], options?: RemoveOptions): void {
+    if (options?.recursive !== true) {
+      for (const path of paths) {
+        const relative = path.slice(1);
+        this.removedPaths++;
+        this.removedPathBytes += utf8.encode(relative).length;
+        this.#removedDigest.update(`${relative}\0`);
+      }
+    }
+    super.removeFiles(paths, options);
+  }
+
+  removedDigest(): string {
+    return this.#removedDigest.digest("hex");
+  }
+}
+
+function checkoutTreeSwapScenario(): Scenario {
+  const spec = memoryScenarioSpec("core.checkout.tree-swap");
+  const directories = Array.from(
+    { length: CHECKOUT_SWAP_DIRECTORY_COUNT },
+    (_, index) => `d${index.toString().padStart(3, "0")}`,
+  );
+  // Every directory shares one leaf tree; each path is `dNNN/` plus its name.
+  const names = Array.from(
+    { length: CHECKOUT_SWAP_PATH_COUNT / CHECKOUT_SWAP_DIRECTORY_COUNT },
+    (_, index) =>
+      `f${index.toString().padStart(2, "0")}-`.padEnd(
+        CHECKOUT_SWAP_PATH_BYTES - "d000/".length,
+        "p",
+      ),
+  );
+  const expectedDigest = createHash("sha256");
+  for (const parent of directories) {
+    for (const name of names) expectedDigest.update(`${parent}/${name}\0`);
+  }
+  const expected = expectedDigest.digest("hex");
+  let repo: Repository | null = null;
+  let worktree: RemovalCountingWorktree | null = null;
+  let verificationDigest: string | null = null;
+  return {
+    name: spec.scenario,
+    kind: "memory",
+    fileBacked: true,
+    async setup({ harness }) {
+      const created = createRepository(harness);
+      const store = created.repo.store;
+      const blob = store.write("blob", new Uint8Array([0x73]));
+      const leaves = store.write(
+        "tree",
+        serializeTree(names.map((name) => ({ mode: MODE_FILE, name, oid: blob }))),
+      );
+      const root = store.write(
+        "tree",
+        serializeTree(directories.map((name) => ({ mode: MODE_TREE, name, oid: leaves }))),
+      );
+      const commit = store.write(
+        "commit",
+        serializeCommit({
+          tree: root,
+          parent: [],
+          author: BENCH_PERSON,
+          committer: BENCH_PERSON,
+          message: "swap\n",
+        }),
+      );
+      const now = (): number => 1_577_836_800_000;
+      // The create-only initial writer materialises the fixture without a per-file index pass.
+      const context: GitContext = {
+        database: created.database,
+        worktree: harness.workspace.filesystem,
+        initialWorktree: createInitialWorktreeWriter(
+          harness.workspace.db,
+          now,
+          (database) => database === created.database,
+        ),
+        now,
+        timezoneOffset: () => 0,
+      };
+      checkout(context, created.repo, harness.workspace.filesystem, { ref: commit });
+      repo = reopenRepository(harness).repo;
+      let indexed = 0;
+      for (const entry of repo.checkout.indexScan()) if (entry.stage === 0) indexed++;
+      if (indexed !== CHECKOUT_SWAP_PATH_COUNT) {
+        throw new Error("tree-swap fixture did not materialise every path");
+      }
+      worktree = new RemovalCountingWorktree(harness.workspace.filesystem);
+    },
+    phases: [
+      {
+        name: spec.operation,
+        async run() {
+          if (repo === null || worktree === null) throw new Error("tree-swap fixture is missing");
+          const target = repo;
+          const counting = worktree;
+          target.store.db.transactionSync(() => checkoutTree(target, counting, null));
+        },
+        async verify({ harness }) {
+          if (repo === null || worktree === null) throw new Error("tree-swap fixture is missing");
+          if (
+            worktree.removedPaths !== spec.verifiedChunkCount ||
+            worktree.removedPathBytes !== spec.verifiedContentBytes ||
+            worktree.removedDigest() !== expected
+          ) {
+            throw new Error("tree swap did not remove exactly the generated paths");
+          }
+          if (!repo.checkout.indexScan().next().done) {
+            throw new Error("tree swap left index rows behind");
+          }
+          if (harness.workspace.filesystem.scan("/", { limit: 1 }).length !== 0) {
+            throw new Error("tree swap left worktree entries behind");
+          }
+          verificationDigest = expected;
+        },
+        memoryEvidence: () => ownedEvidence(spec, verificationDigest),
+      },
+    ],
+  };
+}
+
 function looseObjectStreamScenario(): Scenario {
   const spec = memoryScenarioSpec("core.loose-object-stream");
   let store: SharedRepoStore | null = null;
@@ -1155,6 +1287,7 @@ export const MEMORY: Scenario[] = [
   rebaseBaselineScenario(),
   stagingAddScenario(),
   sparseSelectedAddScenario(),
+  checkoutTreeSwapScenario(),
   looseObjectStreamScenario(),
   packFallbackAuditScenario(),
   retainedGraphScenario(),

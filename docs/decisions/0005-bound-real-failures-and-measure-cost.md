@@ -66,11 +66,17 @@ per stream and 10,000 derived directories. The filesystem removal binding
 still measures its actual JSON payload.
 
 Checkout caps 10,000 conflict paths, 50,000 prune directories and 64
-exclusion roots. The initial checkout drops its tracker reseal, never the
-checkout, past 50,000 gitlinks or at a gitlink path above 8 KiB. The checkout
-removal list and structural sets still include modeled object charges. They
-are debt, not exceptions to this rule; see
-[backlog 97](../backlog/97-audit-checkout-modeled-byte-charges.md).
+exclusion roots. It streams removals in windows bounded by the 1,000,000-byte
+removal binding and 1,000 index rows, so only the prune directory map outlives
+a window. A cap that fires after a window has flushed relies on the caller's
+transaction, which every checkout caller holds. The structural sets of
+`restoreStructure` share one 50,000-path cap. At the 8 KiB index path limit,
+that cap and the prune map each retain about 400 MiB of path strings in the
+worst case. These worst cases are new: the 16 MiB modeled charges they replace
+also bounded the prune map. The status cap is the precedent, at 30,000 paths
+of the same limit. The initial
+checkout drops its tracker reseal, never the checkout, past 50,000 gitlinks
+or at a gitlink path above 8 KiB.
 
 **Benchmarks own the evidence.** Representative operations have deterministic
 statement and row rows, and memory scenarios run under a leased cgroup that
