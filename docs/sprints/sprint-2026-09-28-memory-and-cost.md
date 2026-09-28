@@ -516,3 +516,10 @@ worktree, and the leader cherry-picks every green unit at once.
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). After graduating,
      trim to a one-line pointer ("→ ADR-0007"). -->
+
+- WU1 `5c6378f`: `METADATA_JSON_FLUSH_BYTES` 128 → 256 KiB; the node and path flush was
+  already one call. The Next.js clone runs 898 statements, down from 1,012, in Node and
+  workerd; rows stay 145,777. The Node clone adds 99.0 MiB (one leased run,
+  `memory.max=1073741824`, swap 0, commit `06ba414`).
+- `bench:statements -- --check` already fails at `06de5e5` on `staging.rm`, `merge.restore`
+  and `rebase.transition{,-n,-2n}`, before any sprint code. Triage is running.
