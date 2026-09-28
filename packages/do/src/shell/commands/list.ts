@@ -12,11 +12,12 @@ import { parseFlags, UsageError } from "./flags.js";
 export const ls: Command = (context) => {
   try {
     const parsed = parseFlags(context.argv, {
-      boolean: new Set(["-l", "-a", "-A", "-1", "-R", "-d"]),
+      boolean: new Set(["-l", "-a", "-A", "-1", "-R", "-d", "-h"]),
       valued: new Set(),
     });
     const flags = new Set(parsed.flags.map((flag) => flag.name));
-    const long = flags.has("-l");
+    // `-h` only changes how `-l` prints a size.
+    const long: Long = flags.has("-l") ? { human: flags.has("-h") } : null;
     const all = flags.has("-a") || flags.has("-A");
     const recursive = flags.has("-R");
     const operands = parsed.operands.length === 0 ? ["."] : parsed.operands;
@@ -53,7 +54,7 @@ export const ls: Command = (context) => {
           continue;
         }
         if (headed) yield encode(`${operand}:\n`);
-        if (long) yield* listLongDirectory(context, path, all);
+        if (long !== null) yield* listLongDirectory(context, path, all, long);
         else yield* listBareDirectory(context, path, all);
       }
     })();
@@ -65,15 +66,23 @@ export const ls: Command = (context) => {
   }
 };
 
+/** Null for a bare listing. */
+type Long = { readonly human: boolean } | null;
+
 function* listBareDirectory(context: CommandContext, path: string, all: boolean): ByteStream {
   const entries = context.fs.readdir(path);
   for (const entry of entries) {
     if (!all && entry.name.startsWith(".")) continue;
-    yield row(entry.name, null, false);
+    yield row(entry.name, null, null);
   }
 }
 
-function* listLongDirectory(context: CommandContext, path: string, all: boolean): ByteStream {
+function* listLongDirectory(
+  context: CommandContext,
+  path: string,
+  all: boolean,
+  long: NonNullable<Long>,
+): ByteStream {
   let after: ListCursor | undefined;
   const limit = listingPageSize(context);
   for (;;) {
@@ -83,7 +92,7 @@ function* listLongDirectory(context: CommandContext, path: string, all: boolean)
       if (entry === null) continue;
       const name = basename(entry.path);
       if (!all && name.startsWith(".")) continue;
-      yield row(name, entry, true);
+      yield row(name, entry, long);
     }
     if (page.next === null) return;
     after = page.next;
@@ -94,7 +103,7 @@ function* listRecursive(
   context: CommandContext,
   operand: string,
   root: string,
-  options: { long: boolean; all: boolean },
+  options: { long: Long; all: boolean },
 ): ByteStream {
   let after: ListCursor | undefined;
   let current: string | null = null;
@@ -131,14 +140,36 @@ function hiddenBelow(root: string, directory: string): boolean {
   return relative.split("/").some((segment) => segment.startsWith("."));
 }
 
-function row(name: string, stat: Stat | null, long: boolean): Uint8Array {
-  if (!long || stat === null) return encode(`${name}\n`);
+function row(name: string, stat: Stat | null, long: Long): Uint8Array {
+  if (long === null || stat === null) return encode(`${name}\n`);
   const kind = stat.type === "dir" ? "d" : stat.type === "symlink" ? "l" : "-";
   const mode = permissions(stat.mode);
-  const size = String(stat.size).padStart(8);
+  const size = (long.human ? humanSize(stat.size) : String(stat.size)).padStart(8);
   const when = new Date(stat.mtime).toISOString().slice(0, 16).replace("T", " ");
   const target = stat.type === "symlink" && stat.target !== null ? ` -> ${stat.target}` : "";
   return encode(`${kind}${mode} ${size} ${when} ${name}${target}\n`);
+}
+
+const UNITS = "KMGTPE";
+
+/**
+ * uutils `ls -h`: powers of 1024, rounded up, one decimal below 10 — so
+ * 1025 bytes is `1.1K` and 1048575 is `1024K`.
+ */
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return String(bytes);
+  let unit = 0;
+  let scaled = bytes / 1024;
+  while (scaled >= 1024 && unit < UNITS.length - 1) {
+    scaled /= 1024;
+    unit++;
+  }
+  const suffix = UNITS.charAt(unit);
+  if (scaled < 10) {
+    const tenths = Math.ceil(scaled * 10) / 10;
+    if (tenths < 10) return `${tenths.toFixed(1)}${suffix}`;
+  }
+  return `${Math.ceil(scaled)}${suffix}`;
 }
 
 function permissions(mode: number): string {

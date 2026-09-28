@@ -1,10 +1,16 @@
-// `pwd`, `cd`, `true`, `false`, `which`, `sort`, `uniq`.
+// `pwd`, `cd`, `true`, `false`, `which`, `type`, `command`, `sort`, `uniq`.
 
-import { comparePaths, normalize } from "../../fs/path.js";
-import { type ByteStream, decode, encode, lines, owned, terminated } from "../exec/bytes.js";
+import { normalize } from "../../fs/path.js";
+import { type ByteStream, decode, encode, lines } from "../exec/bytes.js";
 import { type Command, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { parseFlags } from "./flags.js";
+import { isKnown } from "./lookup/known.js";
+import { command, type } from "./lookup/type.js";
+import { sort } from "./sort/sort.js";
+
+export { registerKnownCommands } from "./lookup/known.js";
+export { sort };
 
 function* nothing(): ByteStream {
   // Nothing.
@@ -43,71 +49,12 @@ export const which: Command = (context) => {
   let status = 0;
   const stream = (function* (): ByteStream {
     for (const name of context.argv) {
-      if (KNOWN.has(name)) yield encode(`/usr/bin/${name}\n`);
+      if (isKnown(name)) yield encode(`/usr/bin/${name}\n`);
       else status = 1;
     }
   })();
   return { stdout: stream, status: () => status, truncated: () => false };
 };
-
-/** Names `which` will admit to. Filled in by the registry at load. */
-const KNOWN = new Set<string>();
-
-export function registerKnownCommands(names: Iterable<string>): void {
-  for (const name of names) KNOWN.add(name);
-}
-
-export const sort: Command = async (context) => {
-  const parsed = parseFlags(context.argv, {
-    boolean: new Set(["-r", "-n", "-u", "-f", "--reverse", "--numeric-sort", "--unique"]),
-    valued: new Set(),
-  });
-  const flags = new Set(parsed.flags.map((flag) => flag.name));
-  const reverse = flags.has("-r") || flags.has("--reverse");
-  const numeric = flags.has("-n") || flags.has("--numeric-sort");
-  const unique = flags.has("-u") || flags.has("--unique");
-  const fold = flags.has("-f");
-
-  const source = sourceFor(context, parsed.operands);
-  if (source === null) return result(nothing());
-
-  const releases: Array<() => void> = [];
-  const release = releaseAll(releases);
-  const collected: string[] = [];
-  try {
-    for await (const text of lines(source, context.fs.retained)) {
-      releases.push(context.fs.retained.retain(text.length * 2, "sort input"));
-      collected.push(decode(text));
-    }
-    collected.sort((left, right) => {
-      if (numeric) {
-        const difference = Number.parseFloat(left) - Number.parseFloat(right);
-        if (!Number.isNaN(difference) && difference !== 0) return difference;
-      }
-      const a = fold ? left.toLowerCase() : left;
-      const b = fold ? right.toLowerCase() : right;
-      return comparePaths(a, b);
-    });
-    if (reverse) collected.reverse();
-
-    const out = unique
-      ? collected.filter((value, index) => value !== collected[index - 1])
-      : collected;
-    return result(owned(terminated(out.map((value) => encode(value))), release));
-  } catch (error) {
-    release();
-    throw error;
-  }
-};
-
-function releaseAll(releases: ReadonlyArray<() => void>): () => void {
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    for (const release of releases) release();
-  };
-}
 
 export const uniq: Command = (context) => {
   const parsed = parseFlags(context.argv, {
@@ -192,6 +139,8 @@ export const textCommands: ReadonlyMap<string, Command> = new Map([
   ["true", yes],
   ["false", no],
   ["which", which],
+  ["type", type],
+  ["command", command],
   ["sort", sort],
   ["uniq", uniq],
 ]);

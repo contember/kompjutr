@@ -3,21 +3,91 @@
 // read. The ones that do name a file lower to `readRange`, so `head -20` of
 // a 40 MB file is one statement over a few kilobytes.
 
+import type { Stat } from "../../fs/types.js";
 import { type ByteStream, concat, empty, encode, NEWLINE, restoreUnused } from "../exec/bytes.js";
-import { type Command, type CommandContext, fail, result } from "../exec/context.js";
+import {
+  type Command,
+  type CommandContext,
+  type CommandResult,
+  fail,
+  result,
+} from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
+import { type CatArguments, parseCatArguments } from "./cat/options.js";
+import { CatRenderer } from "./cat/render.js";
 import { count, parseFlags, UsageError } from "./flags.js";
+import { ClapError } from "./uutils/arguments.js";
 
 /** Enough of a file to hold `count` lines, without reading all of it. */
 export const LINE_PROBE = 8 * 1024;
 
 export const cat: Command = (context) => {
-  if (context.argv.length === 0) {
+  let parsed: CatArguments;
+  try {
+    parsed = parseCatArguments(context.argv);
+  } catch (error) {
+    if (!(error instanceof ClapError)) throw error;
+    context.diagnostic(error.bytes);
+    return result(empty(), 1);
+  }
+  const { render, operands } = parsed;
+  if (render === null && !operands.includes("-")) return plainCat(context, operands);
+
+  let status = 0;
+  const renderer = render === null ? null : new CatRenderer(render);
+  const stream = (async function* (): ByteStream {
+    for (const operand of operands.length === 0 ? ["-"] : operands) {
+      for await (const chunk of catSource(context, operand, () => {
+        status = 1;
+      })) {
+        if (renderer === null) {
+          yield chunk;
+          continue;
+        }
+        yield* held(context, renderer.push(chunk));
+      }
+    }
+    if (renderer !== null) yield* held(context, renderer.finish());
+  })();
+  return { stdout: stream, status: () => status, truncated: () => false };
+};
+
+function catSource(context: CommandContext, operand: string, failed: () => void): ByteStream {
+  if (operand === "-") return context.stdin ?? empty();
+  const path = resolve(context.cwd, operand);
+  const stat = context.fs.statTarget(path);
+  if (stat === null || stat.type === "dir") {
+    context.warn(unreadable(operand, stat));
+    failed();
+    return empty();
+  }
+  return streamFile(context, path, stat.size, "cat file");
+}
+
+function* held(context: CommandContext, bytes: Uint8Array): ByteStream {
+  if (bytes.length === 0) return;
+  const release = context.fs.retained.retain(bytes.length, "cat rendered chunk");
+  try {
+    yield bytes;
+  } finally {
+    release();
+  }
+}
+
+/** uutils cat appends the Rust I/O error's errno to a missing file, not to a directory. */
+function unreadable(operand: string, stat: Stat | null): string {
+  return stat === null
+    ? `${operand}: No such file or directory (os error 2)`
+    : `${operand}: Is a directory`;
+}
+
+function plainCat(context: CommandContext, operands: readonly string[]): CommandResult {
+  if (operands.length === 0) {
     return result(context.stdin ?? empty());
   }
-  const paths = context.argv.map((operand) => resolve(context.cwd, operand));
+  const paths = operands.map((operand) => resolve(context.cwd, operand));
   // Diagnostics name the operand as typed, as GNU cat does.
-  const operandOf = new Map(paths.map((path, index) => [path, context.argv[index] ?? path]));
+  const operandOf = new Map(paths.map((path, index) => [path, operands[index] ?? path]));
 
   // `cat big.log | head -20` is the one place the planner's demand hint pays
   // for itself: without it `cat` reads the whole file and `head` throws the
@@ -26,7 +96,7 @@ export const cat: Command = (context) => {
     const only = paths[0] ?? "";
     const stat = context.fs.stat(only);
     if (stat === null) {
-      return fail(context, `${operandOf.get(only) ?? only}: No such file or directory`);
+      return fail(context, unreadable(operandOf.get(only) ?? only, null));
     }
     return result(headOfFile(context, only, stat.size, context.limitHint));
   }
@@ -48,8 +118,8 @@ export const cat: Command = (context) => {
         const path = pending[0];
         if (path === undefined) return;
         const stat = context.fs.statTarget(path);
-        if (stat === null) {
-          context.warn(`${operandOf.get(path) ?? path}: No such file or directory`);
+        if (stat === null || stat.type === "dir") {
+          context.warn(unreadable(operandOf.get(path) ?? path, stat));
           status = 1;
         } else {
           yield* streamFile(context, path, stat.size, "cat file");
@@ -67,7 +137,7 @@ export const cat: Command = (context) => {
           if (path === undefined) continue;
           const bytes = batch.files.get(path);
           if (bytes === undefined) {
-            context.warn(`${operandOf.get(path) ?? path}: No such file or directory`);
+            context.warn(unreadable(operandOf.get(path) ?? path, context.fs.statTarget(path)));
             status = 1;
           } else yield bytes;
         }
@@ -78,7 +148,7 @@ export const cat: Command = (context) => {
     }
   })();
   return { stdout: stream, status: () => status, truncated: () => false };
-};
+}
 
 export const head: Command = (context) => {
   try {

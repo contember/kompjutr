@@ -346,7 +346,6 @@ describe("rejections", () => {
     expect(run.stderr).toContain("command not found");
   });
   it.each([
-    "ls -h",
     "ls -t",
     "ls -r",
     "ls -S",
