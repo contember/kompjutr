@@ -1,185 +1,142 @@
-// `diff` between two files, or a file and stdin, in GNU's normal or unified
-// format. Both inputs are read whole and held against the retained budget
-// while the edit script is computed, in linear space. Exit status is 0 when
-// equal, 1 when different, and 2 on trouble. Directory comparison is refused.
+// `diff` between two files, a file and stdin, or two directories, in GNU's
+// normal or unified format. A file pair is read whole and held against the
+// retained budget while its edit script is computed, in linear space; a
+// directory pair streams one entry at a time (see tree.ts). Exit status is 0
+// when equal, 1 when different, and 2 on trouble.
 
 import { basename } from "../../../fs/path.js";
-import { concat, empty, encode, equals, firstNul, NEWLINE, one } from "../../exec/bytes.js";
+import { type ByteStream, concat, empty } from "../../exec/bytes.js";
 import {
   type Command,
   type CommandContext,
   type CommandResult,
+  deferred,
   result,
 } from "../../exec/context.js";
 import { resolve } from "../../exec/execute.js";
-import { parseFlags, UsageError } from "../flags.js";
-import { groups, type Line, normal, unified } from "./format.js";
-import { editScript } from "./myers.js";
-
-/** Options GNU diff has and this one does not: whitespace, recursion, other formats. */
-const REFUSED: ReadonlySet<string> = new Set([
-  "-r",
-  "-N",
-  "-w",
-  "-b",
-  "-B",
-  "-i",
-  "-c",
-  "-y",
-  "-e",
-  "-a",
-]);
-
-interface Input {
-  readonly name: string;
-  readonly bytes: Uint8Array;
-  readonly mtime: number;
-}
+import { UsageError } from "../flags.js";
+import { type DiffOptions, parseOptions } from "./options.js";
+import type { Comparison, Side } from "./pair.js";
+import { absent, childName, compareSides, present } from "./tree.js";
 
 export const diff: Command = async (context) => {
-  const parsed = parseFlags(context.argv, {
-    boolean: new Set(["-u", "-q", "--brief", "-s", "--report-identical-files", ...REFUSED]),
-    valued: new Set(["-U", "--unified"]),
-  });
-  const refused = parsed.flags.find((flag) => REFUSED.has(flag.name));
-  if (refused !== undefined) {
-    throw new UsageError(`${refused.name} is not supported; supported: -u, -U N, -q, -s`);
+  let options: DiffOptions | string;
+  try {
+    options = parseOptions(context.argv);
+  } catch (error) {
+    if (error instanceof UsageError) return trouble(context, [error.message]);
+    throw error;
   }
-  let contextLines: number | null = null;
-  let brief = false;
-  let reportIdentical = false;
-  for (const flag of parsed.flags) {
-    switch (flag.name) {
-      case "-u":
-        contextLines = 3;
-        break;
-      case "-U":
-      case "--unified": {
-        const value = flag.value ?? "";
-        if (!/^[0-9]+$/.test(value)) {
-          return usageTrouble(context, `invalid context length '${value}'`);
-        }
-        contextLines = Number(value);
-        break;
-      }
-      case "-q":
-      case "--brief":
-        brief = true;
-        break;
-      default:
-        reportIdentical = true;
-    }
-  }
-  const [left, right, extra] = parsed.operands;
+  if (typeof options === "string") return usageTrouble(context, options);
+  const [left, right, extra] = options.operands;
   if (left === undefined) return usageTrouble(context, "missing operand after 'diff'");
   if (right === undefined) return usageTrouble(context, `missing operand after '${left}'`);
   if (extra !== undefined) return usageTrouble(context, `extra operand '${extra}'`);
 
   const releases: Array<() => void> = [];
+  const release = (): void => {
+    for (const done of releases.splice(0)) done();
+  };
   try {
-    const a = await load(context, left, right, releases);
-    if (typeof a === "string") return trouble(context, a);
-    const b = await load(context, right, left, releases);
-    if (typeof b === "string") return trouble(context, b);
-
-    if (equals(a.bytes, b.bytes)) {
-      if (!reportIdentical) return result(empty(), 0);
-      return result(one(encode(`Files ${a.name} and ${b.name} are identical\n`)), 0);
+    const sides = await operands(context, options, left, right, releases);
+    if (!("a" in sides)) {
+      release();
+      return trouble(context, sides);
     }
-    if (brief) return result(one(encode(`Files ${a.name} and ${b.name} differ\n`)), 1);
-    if (firstNul(a.bytes) >= 0 || firstNul(b.bytes) >= 0) {
-      return result(one(encode(`Binary files ${a.name} and ${b.name} differ\n`)), 1);
-    }
-
-    const aLines = split(a.bytes);
-    const bLines = split(b.bytes);
-    const ids = new Map<string, number>();
-    const script = editScript(intern(aLines, ids), intern(bLines, ids));
-    const changes = groups(script);
-    const body =
-      contextLines === null
-        ? [...normal(changes, aLines, bLines)]
-        : [
-            encode(`--- ${a.name}\t${timestamp(a.mtime)}\n`),
-            encode(`+++ ${b.name}\t${timestamp(b.mtime)}\n`),
-            ...unified(changes, aLines, bLines, contextLines),
-          ];
-    return result(one(concat(body)), 1);
+    const comparison: Comparison = { context, options, status: 0 };
+    return deferred((setStatus) => stream(comparison, sides, release, setStatus));
   } catch (error) {
-    if (error instanceof UsageError) return trouble(context, error.message);
+    release();
     throw error;
-  } finally {
-    for (const release of releases) release();
   }
 };
 
+function* stream(
+  comparison: Comparison,
+  sides: { readonly a: Side; readonly b: Side },
+  release: () => void,
+  setStatus: (code: number) => void,
+): ByteStream {
+  try {
+    yield* compareSides(comparison, sides.a, sides.b, null);
+  } finally {
+    release();
+    setStatus(comparison.status);
+  }
+}
+
 /**
- * An operand's bytes, or the diagnostic for why there are none. A directory
- * against a file compares the file of the same name inside it, as GNU does.
+ * The two top-level sides, or the diagnostics for why there are none. A
+ * directory against a file compares the file of the same name inside it, as
+ * GNU does; under `-N` a missing operand is empty when the other exists.
  */
-async function load(
+async function operands(
   context: CommandContext,
-  operand: string,
-  other: string,
+  options: DiffOptions,
+  left: string,
+  right: string,
   releases: Array<() => void>,
-): Promise<Input | string> {
-  if (operand === "-") {
+): Promise<{ a: Side; b: Side } | string[]> {
+  let a = await operand(context, left, releases);
+  let b = await operand(context, right, releases);
+  if (a === null && b === null) {
+    return [`${left}: No such file or directory`, `${right}: No such file or directory`];
+  }
+  if (a === null) {
+    if (!options.newFile) return [`${left}: No such file or directory`];
+    a = absent(left, "");
+  }
+  if (b === null) {
+    if (!options.newFile) return [`${right}: No such file or directory`];
+    b = absent(right, "");
+  }
+  if (a.kind === "dir" && b.kind === "file") {
+    const found = inside(context, a, b);
+    if (typeof found === "string") return [found];
+    a = found;
+  } else if (b.kind === "dir" && a.kind === "file") {
+    const found = inside(context, b, a);
+    if (typeof found === "string") return [found];
+    b = found;
+  }
+  return { a, b };
+}
+
+async function operand(
+  context: CommandContext,
+  name: string,
+  releases: Array<() => void>,
+): Promise<Side | null> {
+  if (name === "-") {
     const chunks: Uint8Array[] = [];
     for await (const chunk of context.stdin ?? empty()) {
       releases.push(context.fs.retained.retain(chunk.length, "diff input"));
       chunks.push(chunk.slice());
     }
-    return { name: "-", bytes: concat(chunks), mtime: Date.now() };
+    const bytes = concat(chunks);
+    return {
+      name,
+      path: "",
+      kind: "file",
+      size: bytes.length,
+      mtime: context.now(),
+      ino: null,
+      contentId: null,
+      bytes,
+    };
   }
-  let name = operand;
-  let path = resolve(context.cwd, operand);
-  let stat = context.fs.stat(path);
-  if (stat?.type === "dir") {
-    if (other === "-" || context.fs.stat(resolve(context.cwd, other))?.type === "dir") {
-      throw new UsageError("comparing directories is not supported");
-    }
-    name = `${operand.replace(/\/+$/, "")}/${basename(resolve(context.cwd, other))}`;
-    path = resolve(context.cwd, name);
-    stat = context.fs.stat(path);
-  }
-  if (stat === null) return `${name}: No such file or directory`;
-  releases.push(context.fs.retained.retain(stat.size, "diff input"));
-  return { name, bytes: context.fs.readFile(path), mtime: stat.mtime };
+  const path = resolve(context.cwd, name);
+  const stat = context.fs.statTarget(path);
+  return stat === null ? null : present(name, path, stat);
 }
 
-function split(bytes: Uint8Array): Line[] {
-  const lines: Line[] = [];
-  let start = 0;
-  for (let index = 0; index < bytes.length; index++) {
-    if (bytes[index] !== NEWLINE) continue;
-    lines.push({ text: bytes.subarray(start, index), terminated: true });
-    start = index + 1;
-  }
-  if (start < bytes.length) lines.push({ text: bytes.subarray(start), terminated: false });
-  return lines;
-}
-
-/** Equal lines share an id. A final line without a newline differs from one with it. */
-function intern(lines: readonly Line[], ids: Map<string, number>): Int32Array {
-  const out = new Int32Array(lines.length);
-  for (const [index, line] of lines.entries()) {
-    let key = line.terminated ? "\n" : "";
-    for (const byte of line.text) key += String.fromCharCode(byte);
-    let id = ids.get(key);
-    if (id === undefined) {
-      id = ids.size;
-      ids.set(key, id);
-    }
-    out[index] = id;
-  }
-  return out;
-}
-
-/** GNU's `%Y-%m-%d %H:%M:%S.%N %z`, in UTC. */
-function timestamp(milliseconds: number): string {
-  const iso = new Date(milliseconds).toISOString();
-  const nanoseconds = `${iso.slice(20, 23)}000000`;
-  return `${iso.slice(0, 10)} ${iso.slice(11, 19)}.${nanoseconds} +0000`;
+/** The entry of `directory` named like `file`, or the diagnostic for why there is none. */
+function inside(context: CommandContext, directory: Side, file: Side): Side | string {
+  if (file.bytes !== null) return "cannot compare '-' to a directory";
+  const name = childName(directory.name, basename(file.path));
+  const path = resolve(context.cwd, name);
+  const stat = context.fs.statTarget(path);
+  return stat === null ? `${name}: No such file or directory` : present(name, path, stat);
 }
 
 function usageTrouble(context: CommandContext, message: string): CommandResult {
@@ -188,7 +145,7 @@ function usageTrouble(context: CommandContext, message: string): CommandResult {
   return result(empty(), 2);
 }
 
-function trouble(context: CommandContext, message: string): CommandResult {
-  context.warn(message);
+function trouble(context: CommandContext, messages: readonly string[]): CommandResult {
+  for (const message of messages) context.warn(message);
   return result(empty(), 2);
 }

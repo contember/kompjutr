@@ -77,11 +77,13 @@ describe.skipIf(!REAL_BASH)("diff matches GNU diff", () => {
     "diff a sub",
     "diff sub a",
     "cat a | diff - b",
+    "diff -N a missing",
+    "diff -uN missing b",
   ])("formats: %j", async (source) => {
     await compare(source);
   });
 
-  it.each(["diff a missing", "diff a", "diff a b c", "diff -U x a b"])(
+  it.each(["diff a missing", "diff missing gone", "diff a", "diff a b c", "diff -U x a b"])(
     "reports trouble: %j",
     async (source) => {
       await compare(source);
@@ -128,16 +130,12 @@ describe("diff refusals and the placement it owns", () => {
     return createShell({ fs, cwd: "/repo" });
   }
 
-  it.each(["-r", "-w", "-b", "-i", "-c", "-y"])("refuses %s by name", async (flag) => {
+  it.each(["-w", "-b", "-i", "-c", "-y"])("refuses %s by name", async (flag) => {
     const run = await shell({ a: "x\n", b: "y\n" }).run(`diff ${flag} a b`);
     expect(run.exitCode).toBe(2);
-    expect(run.stderr).toBe(`diff: ${flag} is not supported; supported: -u, -U N, -q, -s\n`);
-  });
-
-  it("refuses comparing two directories", async () => {
-    const run = await shell({ "one/a": "", "two/a": "" }).run("diff one two");
-    expect(run.exitCode).toBe(2);
-    expect(run.stderr).toBe("diff: comparing directories is not supported\n");
+    expect(run.stderr).toBe(
+      `diff: ${flag} is not supported; supported: -u, -U N, -q, -s, -r, -N\n`,
+    );
   });
 
   // GNU deletes lines 3-8 here; deleting 4-9 is equally minimal.
