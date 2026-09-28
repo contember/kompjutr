@@ -74,7 +74,31 @@ function expectUnstarted(start: Started): void {
   expect(start.workspace.repo.checkout.readOperationState()).toBeNull();
 }
 
+/** An up-to-date rebase runs only the start checks, so its queries show which path ran. */
+function upToDateWorktreeQueries(start: Started, context: GitContext): string[] {
+  const storage = start.workspace.storage;
+  const histogram = new Map<string, number>();
+  storage.histogram = histogram;
+  try {
+    const result = rebase(context, start.workspace.repo, start.workspace.worktree, [], {
+      upstream: start.base,
+    });
+    expect(result).toEqual({ outcome: "up-to-date", oid: start.original });
+  } finally {
+    storage.histogram = null;
+  }
+  return [...histogram.keys()].filter((query) => query.includes("fs_paths"));
+}
+
 describe("rebase start from the index tracker", () => {
+  it("answers the start checks without a worktree walk", async () => {
+    const start = await started();
+    start.seal(start.workspace.repo.readCommit(start.original).tree);
+
+    expect(upToDateWorktreeQueries(start, start.context)).toEqual([]);
+    expect(upToDateWorktreeQueries(start, start.workspace.context).length).toBeGreaterThan(0);
+  });
+
   it("starts from a clean tracker and matches real Git", async () => {
     const start = await started();
     start.seal(start.workspace.repo.readCommit(start.original).tree);
