@@ -1,31 +1,37 @@
-import { existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+
+import { GC_DONE_MARKER } from "./protocol.js";
 
 // Parses V8 `--trace-gc --trace-gc-verbose` output from workerd. A GC line gives
 // heap used and committed before and after the collection; the verbose block that
-// follows gives the post-GC external memory counter. V8 adds ArrayBuffer backing
-// stores to that counter too, so "Backing store memory" is a part of it, not an
-// addition. Every value is a sample at a GC event, so a peak is a lower bound.
+// follows gives the post-GC external memory counter. That counter already includes
+// ArrayBuffer backing stores (and external strings), so "Backing store memory" is
+// reported as a part of it, never added to it. Every value is a sample at a GC
+// event, so a peak is a lower bound.
 
 const MIB = 1024 * 1024;
 const KIB = 1024;
+const MAX_REPORTED_LINES = 5;
 
 export const GC_TRACE_V8_FLAGS = ["--trace-gc", "--trace-gc-verbose", "--expose-gc"];
 
-const LIBSTDBUF_CANDIDATES = [
-  "/usr/libexec/coreutils/libstdbuf.so",
-  "/usr/lib/coreutils/libstdbuf.so",
-  "/usr/lib/x86_64-linux-gnu/coreutils/libstdbuf.so",
-];
-
 // V8 prints the trace through a block-buffered stdout pipe, and Miniflare stops
-// workerd with SIGKILL, so an unflushed tail of the trace is lost. coreutils'
-// stdbuf preload makes workerd's stdout line-buffered.
+// workerd with SIGKILL, so an unflushed tail of the trace is lost. stdbuf's preload
+// makes workerd's stdout line-buffered; stdbuf itself would replace an inherited
+// LD_PRELOAD, so its values are read out and the library is appended.
 export function lineBufferedRuntimeEnv(): Record<string, string> {
-  const library = LIBSTDBUF_CANDIDATES.find((candidate) => existsSync(candidate));
-  if (library === undefined) {
-    throw new Error("coreutils libstdbuf.so is required to line-buffer the workerd GC trace");
+  const { LD_PRELOAD: inherited, ...environment } = process.env;
+  const [library, mode] = execFileSync("stdbuf", ["-oL", "printenv", "LD_PRELOAD", "_STDBUF_O"], {
+    env: environment,
+    encoding: "utf8",
+  })
+    .trim()
+    .split("\n");
+  if (library === undefined || library === "" || mode === undefined || mode === "") {
+    throw new Error("stdbuf did not report its preload library");
   }
-  return { LD_PRELOAD: library, _STDBUF_O: "L" };
+  const preload = inherited === undefined || inherited === "" ? library : `${inherited}:${library}`;
+  return { LD_PRELOAD: preload, _STDBUF_O: mode };
 }
 
 export interface GcEvent {
@@ -49,8 +55,11 @@ export interface V8HeapSnapshot {
 export interface V8CloneAttribution {
   isolate: string;
   gcEvents: number;
+  forcedEvents: number;
   samples: number;
   otherIsolateEvents: number;
+  unrecognizedTraceLines: number;
+  unrecognizedTraceSample: string[];
   baseline: V8HeapSnapshot;
   final: V8HeapSnapshot;
   peakUsedBytes: number;
@@ -61,11 +70,22 @@ export interface V8CloneAttribution {
   peakCommittedPlusExternalBytes: number;
 }
 
-const GC_LINE =
-  /^\[(\d+:0x[0-9a-f]+)\]\s+[\d.]+ ms: .+? ([\d.]+) \(([\d.]+)\) -> ([\d.]+) \(([\d.]+)\) MB, .*current mu = [\d.]+\) (.*)$/;
+const PREFIX = String.raw`\[(\d+:0x[0-9a-f]+)\]`;
+const GC_LINE = new RegExp(
+  String.raw`^${PREFIX}\s+[\d.]+ ms: .+? ([\d.]+) \(([\d.]+)\) -> ([\d.]+) \(([\d.]+)\) MB, .*current mu = [\d.]+\) (.*)$`,
+);
 const GC_LINE_SHAPE = /^\[\d+:0x[0-9a-f]+\]\s+[\d.]+ ms: .* MB, /;
-const EXTERNAL_LINE = /^\[(\d+:0x[0-9a-f]+)\] External memory reported:\s+(-?\d+) KB$/;
-const BACKING_STORE_LINE = /^\[(\d+:0x[0-9a-f]+)\] Backing store memory:\s+(\d+) KB$/;
+const EXTERNAL_LINE = new RegExp(`^${PREFIX} External memory reported:\\s+(-?\\d+) KB$`);
+const BACKING_STORE_LINE = new RegExp(`^${PREFIX} Backing store memory:\\s+(\\d+) KB$`);
+const V8_PREFIXED = /^\[\d+:0x[0-9a-f]+(?::\d+)?\]/;
+const KNOWN_VERBOSE_LINES = [
+  /^\[\d+:0x[0-9a-f]+\] [A-Za-z -]+,\s+used:/,
+  /^\[\d+:0x[0-9a-f]+\] Pool buffering /,
+  /^\[\d+:0x[0-9a-f]+\] External memory global:/,
+  /^\[\d+:0x[0-9a-f]+\] Total time spent in GC:/,
+  /^\[\d+:0x[0-9a-f]+\] \(\*\) Sweeping is still in progress/,
+  /^\[\d+:0x[0-9a-f]+:\d+\]\s+[\d.]+ ms: \[(?:Heap|GlobalMemory)Controller\]/,
+];
 
 function megabytes(value: string | undefined): number {
   const parsed = Number(value);
@@ -73,18 +93,25 @@ function megabytes(value: string | undefined): number {
   return Math.round(parsed * MIB);
 }
 
-function kilobytes(value: string | undefined): number {
+function kilobytes(value: string | undefined): number | null {
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed)) throw new Error(`invalid GC trace size ${value}`);
-  return Math.max(0, parsed) * KIB;
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed * KIB : null;
 }
 
 export class GcTrace {
   readonly events: GcEvent[] = [];
-  readonly unparsed: string[] = [];
+  readonly #markers: number[] = [];
+  readonly #rejected: string[] = [];
+  readonly #unrecognized: string[] = [];
+  #unrecognizedCount = 0;
   #waiters: { count: number; resolve: () => void }[] = [];
 
   accept(message: string): boolean {
+    if (message.trim() === GC_DONE_MARKER) {
+      this.#markers.push(this.events.length);
+      this.#settle();
+      return true;
+    }
     for (const line of message.split("\n")) {
       if (!this.#acceptLine(line.trimEnd())) return false;
     }
@@ -92,11 +119,11 @@ export class GcTrace {
   }
 
   // Trace text arrives over a pipe after the request that caused it has returned.
-  async waitForForced(count: number, timeoutMs: number): Promise<void> {
-    if (this.#forcedComplete(count)) return;
+  async waitForMarker(count: number, timeoutMs: number): Promise<void> {
+    if (this.#markers.length >= count) return;
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
-        reject(new Error(`forced GC ${count} did not reach the trace within ${timeoutMs} ms`));
+        reject(new Error(`GC marker ${count} did not reach the trace within ${timeoutMs} ms`));
       }, timeoutMs);
       this.#waiters.push({
         count,
@@ -108,17 +135,18 @@ export class GcTrace {
     });
   }
 
-  attributeBetweenForced(first: number, second: number): V8CloneAttribution {
-    if (this.unparsed.length > 0) throw new Error(`unparsed GC trace line: ${this.unparsed[0]}`);
-    const forced = this.events.filter((event) => event.forced);
-    const start = forced[first - 1];
-    const end = forced[second - 1];
+  attributeBetweenMarkers(first: number, second: number): V8CloneAttribution {
+    if (this.#rejected.length > 0) throw new Error(`invalid GC trace line: ${this.#rejected[0]}`);
+    const startIndex = this.#forcedBeforeMarker(first);
+    const endIndex = this.#forcedBeforeMarker(second);
+    const start = this.events[startIndex];
+    const end = this.events[endIndex];
     if (start === undefined || end === undefined) throw new Error("forced GC events are missing");
-    const startIndex = this.events.indexOf(start);
-    const endIndex = this.events.indexOf(end);
+    if (end.isolate !== start.isolate) throw new Error("forced GC events come from two isolates");
     const window = this.events.slice(startIndex + 1, endIndex + 1);
     const own = window.filter((event) => event.isolate === start.isolate);
-    if (end.isolate !== start.isolate) throw new Error("forced GC events come from two isolates");
+    const organic = own.filter((event) => !event.forced);
+    if (organic.length === 0) throw new Error("the measured region holds no unforced GC event");
     let peakUsedBytes = 0;
     let peakCommittedBytes = 0;
     let peakExternalBytes = 0;
@@ -145,9 +173,12 @@ export class GcTrace {
     }
     return {
       isolate: start.isolate,
-      gcEvents: own.length - 1,
+      gcEvents: organic.length,
+      forcedEvents: own.length - organic.length,
       samples: own.length,
       otherIsolateEvents: window.length - own.length,
+      unrecognizedTraceLines: this.#unrecognizedCount,
+      unrecognizedTraceSample: [...this.#unrecognized],
       baseline: afterSnapshot(start),
       final: afterSnapshot(end),
       peakUsedBytes,
@@ -159,12 +190,20 @@ export class GcTrace {
     };
   }
 
+  // One gc() call can log two forced collections (finishing incremental marking,
+  // then the full GC); the last one before the marker is the settled state.
+  #forcedBeforeMarker(marker: number): number {
+    const bound = this.#markers[marker - 1];
+    const lower = marker > 1 ? (this.#markers[marker - 2] ?? 0) : 0;
+    if (bound === undefined) throw new Error(`GC marker ${marker} is missing`);
+    for (let index = bound - 1; index >= lower; index--) {
+      if (this.events[index]?.forced === true) return index;
+    }
+    throw new Error(`no forced GC precedes GC marker ${marker} in the trace`);
+  }
+
   #acceptLine(line: string): boolean {
     const gc = GC_LINE.exec(line);
-    if (gc === null && GC_LINE_SHAPE.test(line)) {
-      this.unparsed.push(line);
-      return true;
-    }
     if (gc !== null) {
       // gc() collects with the "testing" reason; nothing else in the clone does.
       this.events.push({
@@ -179,40 +218,55 @@ export class GcTrace {
       });
       return true;
     }
+    if (GC_LINE_SHAPE.test(line)) {
+      this.#rejected.push(line);
+      return true;
+    }
     const external = EXTERNAL_LINE.exec(line);
     if (external !== null) {
-      const event = this.#lastEvent(external[1]);
-      if (event !== undefined) event.externalAfterBytes = kilobytes(external[2]);
+      this.#recordVerbose(line, external[1], kilobytes(external[2]), "externalAfterBytes");
       return true;
     }
     const backingStore = BACKING_STORE_LINE.exec(line);
     if (backingStore !== null) {
-      const event = this.#lastEvent(backingStore[1]);
-      if (event !== undefined) event.arrayBufferAfterBytes = kilobytes(backingStore[2]);
-      this.#settle();
+      this.#recordVerbose(
+        line,
+        backingStore[1],
+        kilobytes(backingStore[2]),
+        "arrayBufferAfterBytes",
+      );
       return true;
     }
-    return /^\[\d+:0x[0-9a-f]+(?::\d+)?\]/.test(line);
-  }
-
-  // A verbose block without a preceding GC line is left unattributed; the missing
-  // values then fail attribution instead of the log handler.
-  #lastEvent(isolate: string | undefined): GcEvent | undefined {
-    for (let index = this.events.length - 1; index >= 0; index--) {
-      const event = this.events[index];
-      if (event?.isolate === isolate) return event;
+    if (!V8_PREFIXED.test(line)) return false;
+    if (!KNOWN_VERBOSE_LINES.some((pattern) => pattern.test(line))) {
+      this.#unrecognizedCount++;
+      if (this.#unrecognized.length < MAX_REPORTED_LINES) this.#unrecognized.push(line);
     }
-    return undefined;
+    return true;
   }
 
-  #forcedComplete(count: number): boolean {
-    const event = this.events.filter((candidate) => candidate.forced)[count - 1];
-    return event !== undefined && event.arrayBufferAfterBytes !== null;
+  // A detail line that cannot be attached or holds a negative counter is rejected;
+  // attribution then fails instead of the log handler.
+  #recordVerbose(
+    line: string,
+    isolate: string | undefined,
+    bytes: number | null,
+    field: "externalAfterBytes" | "arrayBufferAfterBytes",
+  ): void {
+    let event: GcEvent | undefined;
+    for (let index = this.events.length - 1; index >= 0 && event === undefined; index--) {
+      if (this.events[index]?.isolate === isolate) event = this.events[index];
+    }
+    if (event === undefined || bytes === null) {
+      this.#rejected.push(line);
+      return;
+    }
+    event[field] = bytes;
   }
 
   #settle(): void {
     this.#waiters = this.#waiters.filter((waiter) => {
-      if (!this.#forcedComplete(waiter.count)) return true;
+      if (this.#markers.length < waiter.count) return true;
       waiter.resolve();
       return false;
     });

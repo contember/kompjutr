@@ -1,5 +1,5 @@
 import { readFileSync, readlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 
 export interface MemorySample {
   rssBytes: number;
@@ -19,6 +19,7 @@ export interface SampledPeaks {
 export interface WorkerdCgroup {
   path: string;
   memoryMaxBytes: number | null;
+  memoryMaxSource: string | null;
 }
 
 export function workerdPid(): number {
@@ -46,9 +47,16 @@ export function statusBytes(pid: number, field: "VmRSS" | "VmHWM"): number {
   return kilobyteField(readFileSync(`/proc/${pid}/status`, "utf8"), field, `workerd ${pid} status`);
 }
 
+const PAGE_BYTES = 4096;
+
 // Writing 5 to clear_refs resets VmHWM to the current RSS.
 export function resetPeakRss(pid: number): void {
   writeFileSync(`/proc/${pid}/clear_refs`, "5");
+  const peak = statusBytes(pid, "VmHWM");
+  const current = statusBytes(pid, "VmRSS");
+  if (Math.abs(peak - current) > PAGE_BYTES) {
+    throw new Error(`VmHWM ${peak} did not reset to VmRSS ${current} for workerd ${pid}`);
+  }
 }
 
 // The kernel's per-process counters. They cost microseconds to read, so they can
@@ -117,6 +125,7 @@ export class MemorySampler {
   }
 }
 
+// The effective limit is the lowest memory.max on the path to the root.
 export function workerdCgroup(pid: number): WorkerdCgroup {
   const unified = readFileSync(`/proc/${pid}/cgroup`, "utf8")
     .split("\n")
@@ -126,9 +135,20 @@ export function workerdCgroup(pid: number): WorkerdCgroup {
     throw new Error("unified cgroup path is unavailable");
   }
   const path = row.slice(3);
-  const value = readFileSync(join("/sys/fs/cgroup", path, "memory.max"), "utf8").trim();
-  if (value === "max") return { path, memoryMaxBytes: null };
-  const bytes = Number(value);
-  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error("memory.max is invalid");
-  return { path, memoryMaxBytes: bytes };
+  let limit: { memoryMaxBytes: number; memoryMaxSource: string } | null = null;
+  for (let current = path; current !== "/" && current !== ""; current = posix.dirname(current)) {
+    const value = readFileSync(join("/sys/fs/cgroup", current, "memory.max"), "utf8").trim();
+    if (value === "max") continue;
+    const bytes = Number(value);
+    if (!Number.isSafeInteger(bytes) || bytes < 0)
+      throw new Error(`memory.max is invalid in ${current}`);
+    if (limit === null || bytes < limit.memoryMaxBytes) {
+      limit = { memoryMaxBytes: bytes, memoryMaxSource: current };
+    }
+  }
+  return {
+    path,
+    memoryMaxBytes: limit?.memoryMaxBytes ?? null,
+    memoryMaxSource: limit?.memoryMaxSource ?? null,
+  };
 }

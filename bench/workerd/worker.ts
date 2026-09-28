@@ -5,6 +5,7 @@ import {
   type SQLStorageLike,
   Workspace,
 } from "../../packages/do/src/index.js";
+import { GC_DONE_MARKER } from "./protocol.js";
 
 interface DurableObjectContextLike {
   storage: DurableObjectStorageLike;
@@ -188,6 +189,7 @@ export class CloneBench {
           return Response.json({ warm: true });
         case "/gc":
           forceGc();
+          console.log(GC_DONE_MARKER);
           return Response.json({ collected: true });
         case "/clone":
           return Response.json(await this.#clone(cloneInput(await request.json())));

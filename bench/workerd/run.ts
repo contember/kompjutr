@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -110,18 +111,36 @@ function durableObjectPost(namespace: unknown): DurableObjectPost {
   };
 }
 
-function measuredRevision(root: string): { commit: string; dirty: boolean } {
+function measuredRevision(root: string): { commit: string; changes: string[] } {
   const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
-  const changes = execFileSync(
-    "git",
-    ["status", "--porcelain", "--untracked-files=no", "--", "packages", "bench"],
-    { cwd: root, encoding: "utf8" },
-  ).trim();
-  return { commit, dirty: changes.length > 0 };
+  const changes = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], {
+    cwd: root,
+    encoding: "utf8",
+  })
+    .split("\n")
+    .filter((line) => line.length > 0);
+  return { commit, changes };
+}
+
+function packageVersion(name: string): string {
+  const manifest: unknown = JSON.parse(
+    readFileSync(createRequire(import.meta.url).resolve(`${name}/package.json`), "utf8"),
+  );
+  const version =
+    typeof manifest === "object" && manifest !== null
+      ? Reflect.get(manifest, "version")
+      : undefined;
+  if (typeof version !== "string") throw new Error(`${name} has no package version`);
+  return version;
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
 const revision = measuredRevision(join(here, "..", ".."));
+const runtimeVersions = {
+  workerd: packageVersion("workerd"),
+  miniflare: packageVersion("miniflare"),
+};
+const runtimeEnv = lineBufferedRuntimeEnv();
 const temporary = mkdtempSync(join(tmpdir(), "kompjutr-workerd-nextjs-"));
 let origin: { url: string; close(): Promise<void> } | undefined;
 
@@ -161,7 +180,7 @@ try {
   const miniflare = new Miniflare({
     resourcePersistencePath: join(temporary, "state"),
     handleStructuredLogs: routeWorkerdLog,
-    unsafeRuntimeEnv: lineBufferedRuntimeEnv(),
+    unsafeRuntimeEnv: runtimeEnv,
     workers: [
       {
         config: {
@@ -196,9 +215,9 @@ try {
     // region holds the clone alone.
     await post("/warm", {});
     await post("/gc", {});
-    await trace.waitForForced(1, TRACE_TIMEOUT_MS);
-    const baselineRssBytes = statusBytes(runtimePid, "VmRSS");
+    await trace.waitForMarker(1, TRACE_TIMEOUT_MS);
     const baselineRollup = rollupSample(runtimePid);
+    const baselineRssBytes = statusBytes(runtimePid, "VmRSS");
     resetPeakRss(runtimePid);
     const sampler = new MemorySampler(runtimePid, SAMPLE_INTERVAL_MS);
     const started = performance.now();
@@ -212,20 +231,23 @@ try {
     const wallMs = performance.now() - started;
     const sampled = sampler.stop();
     const peakRssBytes = statusBytes(runtimePid, "VmHWM");
-    const afterCloneRollup = rollupSample(runtimePid);
 
     // The closing forced GC samples the heap the clone left and proves that the
     // trace reached the end of the clone.
     await post("/gc", {});
-    await trace.waitForForced(2, TRACE_TIMEOUT_MS);
-    const v8 = trace.attributeBetweenForced(1, 2);
+    await trace.waitForMarker(2, TRACE_TIMEOUT_MS);
+    const afterGcRollup = rollupSample(runtimePid);
+    const v8 = trace.attributeBetweenMarkers(1, 2);
 
     const checkout = checkoutResult(await post("/verify", { expectedHead, expectedFiles }));
 
     const addedPeakRssBytes = Math.max(0, peakRssBytes - baselineRssBytes);
-    const baselineV8Bytes = v8.baseline.committedBytes + v8.baseline.externalBytes;
-    const addedPeakV8Bytes = v8.peakCommittedPlusExternalBytes - baselineV8Bytes;
-    const retainedV8Bytes = v8.final.committedBytes + v8.final.externalBytes - baselineV8Bytes;
+    // Each residue pairs one smaps_rollup with the forced GC just before it, so
+    // both sides describe the same idle moment.
+    const baselineNonV8Bytes =
+      baselineRollup.rssBytes - v8.baseline.committedBytes - v8.baseline.externalBytes;
+    const afterCloneNonV8Bytes =
+      afterGcRollup.rssBytes - v8.final.committedBytes - v8.final.externalBytes;
     process.stdout.write(
       `${JSON.stringify(
         {
@@ -233,7 +255,9 @@ try {
           ...checkout,
           wallMs,
           measuredCommit: revision.commit,
-          measuredTreeDirty: revision.dirty,
+          measuredTreeDirty: revision.changes.length > 0,
+          measuredTreeChanges: revision.changes,
+          runtimeVersions,
           cgroup,
           workerdBaselineRssBytes: baselineRssBytes,
           workerdPeakRssBytes: peakRssBytes,
@@ -242,8 +266,11 @@ try {
             v8: {
               lowerBound: true,
               gcEvents: v8.gcEvents,
+              forcedGcEvents: v8.forcedEvents,
               samples: v8.samples,
               otherIsolateGcEvents: v8.otherIsolateEvents,
+              unrecognizedTraceLines: v8.unrecognizedTraceLines,
+              unrecognizedTraceSample: v8.unrecognizedTraceSample,
               baseline: v8.baseline,
               afterClone: v8.final,
               peakUsedBytes: v8.peakUsedBytes,
@@ -258,20 +285,22 @@ try {
               peakRssBytes,
               addedPeakRssBytes,
               baselineRollup,
-              afterCloneRollup,
-              peakAnonymousBytes: sampled.peakAnonymousBytes,
-              peakFileBytes: sampled.peakFileBytes,
-              atPeakRss: sampled.peakRss,
-              samples: sampled.samples,
-              sampleIntervalMs: sampled.intervalMs,
-              samplingMs: sampled.samplingMs,
+              afterClosingGcRollup: afterGcRollup,
+              sampled: {
+                resolution: `±${sampled.intervalMs} ms samples of /proc/<pid>/status`,
+                peakAnonymousBytes: sampled.peakAnonymousBytes,
+                peakFileBytes: sampled.peakFileBytes,
+                atPeakRss: sampled.peakRss,
+                samples: sampled.samples,
+                samplingMs: sampled.samplingMs,
+              },
             },
-            // Upper bounds: the V8 part they subtract is sampled only at GC events.
-            nonV8ResidueBytes: Math.max(0, addedPeakRssBytes - addedPeakV8Bytes),
-            retainedNonV8Bytes: Math.max(
-              0,
-              afterCloneRollup.rssBytes - baselineRssBytes - retainedV8Bytes,
-            ),
+            nonV8Residue: {
+              bound: "point value at an idle moment after a forced GC; not a bound on the peak",
+              baselineBytes: baselineNonV8Bytes,
+              afterCloneBytes: afterCloneNonV8Bytes,
+              addedBytes: afterCloneNonV8Bytes - baselineNonV8Bytes,
+            },
           },
           statementTarget: {
             atMost: STATEMENT_TARGET,
