@@ -553,3 +553,18 @@ worktree, and the leader cherry-picks every green unit at once.
   - Review verified atomicity on DO and on the local undo journal against the parent.
   - A read error during safety hashing now comes after pathspec errors, as in Git.
   - `bench:statements -- --check` is clean at `e540efa`. `schema.init` shows a drop of 1.
+- WU8 (added by the user) `b541508`, `7666b1d`, `1790db7`:
+  - `jsonStringEncodedBytes` moved to `@kompjutr/sqlite`.
+  - DOFS resolve, readFiles, writeNodes and discovery size their bindings without
+    `JSON.stringify`.
+  - Sparse-probe total allocation fell from 157 to 126 MiB. Statement rows are
+    unchanged.
+- WU5 `2f9565c`…`9fe4645`:
+  - Four byte charges were dropped. Removals stream in byte-bounded windows.
+  - Per the user's decision, structural state keeps only the replaced roots, capped at
+    50,000 roots, so the 60,000-row replaced-directory `reset --hard` passes.
+  - The tracker seed has a 50,000 cap and an 8 KiB guard.
+  - Checkout-owned tree-swap allocation fell from 119 to 25 MiB. The uncapped
+    calibration spreads 32–96 MB from GC timing.
+  - Pre-existing local defects found in review → backlog 108.
+- Backlog 95, part b → backlog 107.
