@@ -523,3 +523,20 @@ worktree, and the leader cherry-picks every green unit at once.
   `memory.max=1073741824`, swap 0, commit `06ba414`).
 - `bench:statements -- --check` already fails at `06de5e5` on `staging.rm`, `merge.restore`
   and `rebase.transition{,-n,-2n}`, before any sprint code. Triage is running.
+- Statement gate triage:
+  - `merge.restore` (+2) comes from the d2fe7b9 abort guard.
+  - `rebase.transition*` (+5) comes from the 11cd7a6 structural restore; without that pass,
+    `tests/e2e/ignored-overwrite.test.ts` fails.
+  - Both rows were rebaselined in `6c014f6`.
+  - `staging.rm` (27 → 42) is an avoidable regression from d0a50c1. The user added it to
+    this sprint as WU7.
+- WU2 `44326c3`…`9fa0a7b`: `core.sparse-selected-add` passes 3 of 3 runs. The highest
+  process transient is 84,267,008 B (capped stage, `memory.max` 536870912), against
+  157,962,240 B at `06de5e5`. The probe's total allocation fell from 252.7 to 148.5 MiB.
+  - Statement rows are unchanged. No harness change was needed.
+  - node:sqlite keeps a bound parameter on an idle statement; workerd clears it.
+  - Review verified equivalence by fuzzing `joinPath`, the byte counting and resolution
+    against the base. It moved the canonical-path helpers into `fs/path.ts`.
+- WU4 escalated. V8 used + external is at least 219–279 MiB on the workerd clone; external
+  memory alone is 188–227 MiB. The user chose a report-only V8 measurement with a
+  regression limit at today's level, plus a backlog item for external memory.
