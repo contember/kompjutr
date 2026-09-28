@@ -104,6 +104,8 @@ keep the peak at or below 75.4 MiB in ten runs at `25d07ea`.
 | 2 | [109](109-keep-parent-directory-when-replacing-its-only-child.md) | Tier S, but narrow: only a directory's mode changes when its only child changes type. |
 | 3 | [107](107-bound-shared-integration-step-passes.md) | Cost: the shared integration step still makes full-tree passes for every rebase, merge, cherry-pick and revert step. |
 | 4 | [106](106-reduce-the-workerd-clone-external-memory.md) | Memory: the workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it first, then decide whether a production probe is needed. |
+| 5 | [113](113-close-small-shell-parity-gaps.md), [111](111-bound-interpreter-cpu-and-regex-backtracking.md) | Shell: silent divergences first, then the CPU and regex bound, which needs a decision. |
+| 6 | [112](112-give-invoked-commands-stdin-and-their-own-name.md), [115](115-bulk-chmod-without-mtime.md), [114](114-share-one-uutils-argument-parser.md) | Shell: seam gaps, then cost, then deduplication. |
 
 ## Items
 
@@ -111,3 +113,8 @@ keep the peak at or below 75.4 MiB in ten runs at `25d07ea`.
 - [107 — Bound the shared integration step's full-tree passes](107-bound-shared-integration-step-passes.md)
 - [108 — Let local checkout remove paths that are already gone](108-local-checkout-removes-missing-paths.md)
 - [109 — Keep a directory whose only child changes type](109-keep-parent-directory-when-replacing-its-only-child.md)
+- [111 — Bound interpreter CPU and regex backtracking in the shell](111-bound-interpreter-cpu-and-regex-backtracking.md)
+- [112 — Give invoked commands stdin and their own diagnostic name](112-give-invoked-commands-stdin-and-their-own-name.md)
+- [113 — Close small shell parity gaps found in the 2026-09-28 sprint](113-close-small-shell-parity-gaps.md)
+- [114 — Share one uutils argument parser across shell commands](114-share-one-uutils-argument-parser.md)
+- [115 — Change modes in bulk without touching mtime](115-bulk-chmod-without-mtime.md)

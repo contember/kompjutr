@@ -27,6 +27,9 @@ decided work or status.
 - [`read-integration-worktree-inputs-once.md`](read-integration-worktree-inputs-once.md)
   — a conflicted three-way integration reads every worktree input eight times;
   it costs wall time in a 150-file binary merge, not memory.
+- [`shell-bounded-loops-and-arithmetic.md`](shell-bounded-loops-and-arithmetic.md)
+  — `while read`, arithmetic expansion, bounded awk C-style `for`, and larger
+  `jq` inputs, each waiting for a bound that names a real failure.
 - [`measure-eager-status-result-memory.md`](measure-eager-status-result-memory.md)
   — `status()` materializes its whole result; measure it before deciding on an
   API or count boundary.
