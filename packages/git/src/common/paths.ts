@@ -1,6 +1,8 @@
 /** Git-side path helpers. Everything here is POSIX-shaped, like the workspace. */
 
-export { comparePaths } from "./streams.js";
+import { comparePaths } from "./streams.js";
+
+export { comparePaths };
 
 export function normalizePath(path: string): string {
   const absolute = path.startsWith("/") ? path : `/${path}`;
@@ -95,6 +97,19 @@ export function relativeExcludeRoots(root: string, paths: readonly string[] | un
     relatives.push(relative);
   }
   return relatives;
+}
+
+/** First index in `comparePaths`-ordered `values` that does not sort before `wanted`. */
+export function lowerBoundPath(values: readonly string[], wanted: string): number {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    const value = values[middle];
+    if (value !== undefined && comparePaths(value, wanted) < 0) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 export function isExcluded(path: string, roots: readonly string[]): boolean {

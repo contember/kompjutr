@@ -1,5 +1,5 @@
 import { GitError } from "../../common/errors.js";
-import { comparePaths } from "../../common/streams.js";
+import { comparePaths, lowerBoundPath } from "../../common/paths.js";
 import { type CompiledReadPathspec, compileReadPathspec } from "./pathspec.js";
 
 export const MAX_COMPILED_PATHS = 32_768;
@@ -68,7 +68,7 @@ class ByteOrderedPathspecMatcher implements CompiledPathspecMatcher {
     if (this.#glob !== undefined) return true;
     if (this.#walkAll || this.matchesEntry(path)) return true;
     const prefix = `${path}/`;
-    const at = lowerBound(this.#walkPrefixes, prefix);
+    const at = lowerBoundPath(this.#walkPrefixes, prefix);
     return this.#walkPrefixes[at]?.startsWith(prefix) === true;
   }
 
@@ -108,18 +108,6 @@ function uniqueByteOrdered(values: readonly string[]): string[] {
   return unique;
 }
 
-function lowerBound(values: readonly string[], wanted: string): number {
-  let low = 0;
-  let high = values.length;
-  while (low < high) {
-    const middle = low + Math.floor((high - low) / 2);
-    const value = values[middle];
-    if (value !== undefined && comparePaths(value, wanted) < 0) low = middle + 1;
-    else high = middle;
-  }
-  return low;
-}
-
 function containsByteOrdered(values: readonly string[], wanted: string): boolean {
-  return values[lowerBound(values, wanted)] === wanted;
+  return values[lowerBoundPath(values, wanted)] === wanted;
 }

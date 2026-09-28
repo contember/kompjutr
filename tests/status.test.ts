@@ -1248,6 +1248,52 @@ describe("status cost", () => {
     expect(included.pages).toBe(3);
   });
 
+  const trackedBelowIgnored: ReadonlyArray<readonly [string, StatusOptions]> = [
+    ["an exclude root in all mode", { untrackedFiles: "all", excludeRoots: ["/excluded"] }],
+    ["rename detection in normal mode", { renames: true }],
+    [
+      "an exclude root and rename detection in all mode",
+      { untrackedFiles: "all", excludeRoots: ["/excluded"], renames: true },
+    ],
+  ];
+  it.each(trackedBelowIgnored)(
+    "keeps a tracked file below an ignored directory with %s",
+    (_case, options) => {
+      const workspace = makeRepo("/");
+      const bytes = utf8.encode("ignored\n");
+      workspace.worktree.writeFiles([
+        { path: "/ignored/a/tracked.txt", bytes },
+        { path: "/ignored/b/untracked.txt", bytes },
+      ]);
+      const hashed = hashWorktreePath(workspace.repo, workspace.worktree, "ignored/a/tracked.txt");
+      if (hashed === null) throw new Error("tracked ignored witness was not written");
+      workspace.repo.checkout.indexPut(indexEntryFor("ignored/a/tracked.txt", hashed));
+      const ignores: IgnoreMatcher = {
+        ignores: (path) => path === "ignored" || path.startsWith("ignored/"),
+      };
+
+      expect(status(workspace.repo, workspace.worktree, { ...options, ignores })).toEqual([
+        expect.objectContaining({ path: "ignored/a/tracked.txt", index: "A", worktree: " " }),
+      ]);
+    },
+  );
+
+  it("walks an exclude root that holds a tracked file in no mode", () => {
+    const workspace = makeRepo("/");
+    workspace.worktree.writeFiles([{ path: "/nested/tracked.txt", bytes: utf8.encode("one\n") }]);
+    const hashed = hashWorktreePath(workspace.repo, workspace.worktree, "nested/tracked.txt");
+    if (hashed === null) throw new Error("tracked excluded witness was not written");
+    workspace.repo.checkout.indexPut(indexEntryFor("nested/tracked.txt", hashed));
+    writeWorkFile(workspace, "/nested/tracked.txt", "two\n");
+
+    expect(
+      status(workspace.repo, workspace.worktree, {
+        untrackedFiles: "no",
+        excludeRoots: ["/nested"],
+      }),
+    ).toEqual([expect.objectContaining({ path: "nested/tracked.txt", index: "A", worktree: "M" })]);
+  });
+
   it("bounds the retained tracked-path set before inserting the first excess path", () => {
     const workspace = makeRepo("/");
     const entry = (index: number): IndexEntry => ({

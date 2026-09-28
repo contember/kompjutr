@@ -1,6 +1,6 @@
 import { utf8 } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
-import { isExcluded, relativeTo } from "../../common/paths.js";
+import { isExcluded, lowerBoundPath, relativeTo } from "../../common/paths.js";
 import { joinSorted, joinSorted3 } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { MAX_INDEX_PATH_BYTES } from "../../store/schema/schema.js";
@@ -38,6 +38,8 @@ import { STATUS_MAX_DIRECTORIES, STATUS_MAX_PATHS, STATUS_WINDOW_ROWS } from "./
 interface StatusIndexSnapshot {
   trackedDirs: Set<string>;
   trackedPaths: Set<string>;
+  /** Prepass index paths in scan order, kept only when `trackedDirs` is not. */
+  orderedIndexPaths: string[] | null;
   retainsTrackedPaths: boolean;
 }
 
@@ -63,7 +65,7 @@ export function fullStatusPrepass(
     };
   }
 
-  const snapshot = emptyStatusIndexSnapshot(includeTrackedPaths);
+  const snapshot = emptyStatusIndexSnapshot(includeTrackedPaths, collapse);
   const classifier = new ExactRenameClassifier();
   let classifying = true;
   for (const row of joinSorted(
@@ -143,7 +145,7 @@ export function* statusStreamInternal(
   const ignores =
     options.ignores ??
     loadIgnoreMatcher(worktree, repo.root, { excludeRoots: options.excludeRoots });
-  const prunable = prunableExcludeRoots(excluded, snapshot.trackedPaths);
+  const prunable = prunableExcludeRoots(excluded, snapshot);
   const excludedPaths = excluded.map((root) => root.relative);
   const buffered: BufferedStatusRow[] = [];
   const hashCursor = createWorktreeHashCursor(prunable);
@@ -243,7 +245,7 @@ function worktreeEntries(
     includeIgnored: true,
     pruneDirectory:
       allowIgnoredPrune && options.includeIgnored !== true && snapshot.retainsTrackedPaths
-        ? (path) => ignores.ignores(path, true) && !hasTrackedPath(path, snapshot.trackedPaths)
+        ? (path) => ignores.ignores(path, true) && !hasTrackedPath(path, snapshot)
         : undefined,
   });
 }
@@ -262,18 +264,21 @@ function excludedRoots(root: string, roots: string[] | undefined): ExcludedRoot[
 
 function prunableExcludeRoots(
   roots: readonly ExcludedRoot[],
-  trackedPaths: ReadonlySet<string>,
+  snapshot: StatusIndexSnapshot,
 ): string[] {
   return roots
-    .filter((root) => !hasTrackedPath(root.relative, trackedPaths))
+    .filter((root) => !hasTrackedPath(root.relative, snapshot))
     .map((root) => root.absolute);
 }
 
-function hasTrackedPath(root: string, trackedPaths: ReadonlySet<string>): boolean {
-  for (const path of trackedPaths) {
-    if (path === root || path.startsWith(`${root}/`)) return true;
-  }
-  return false;
+// A directory is pruned before the walk yields anything below it, so the
+// merge stream has added no path under `root` yet: the prepass index decides.
+function hasTrackedPath(root: string, snapshot: StatusIndexSnapshot): boolean {
+  if (snapshot.trackedPaths.has(root) || snapshot.trackedDirs.has(root)) return true;
+  const ordered = snapshot.orderedIndexPaths;
+  if (ordered === null) return false;
+  const prefix = `${root}/`;
+  return ordered[lowerBoundPath(ordered, prefix)]?.startsWith(prefix) === true;
 }
 
 function worktreeWalkOptions(
@@ -305,7 +310,7 @@ function snapshotStatusIndex(
   includeDirectories: boolean,
   includeTrackedPaths: boolean,
 ): StatusIndexSnapshot {
-  const snapshot = emptyStatusIndexSnapshot(includeTrackedPaths);
+  const snapshot = emptyStatusIndexSnapshot(includeTrackedPaths, includeDirectories);
   if (!includeDirectories && !includeTrackedPaths) return snapshot;
   for (const group of statusIndexGroups(repo.checkout.indexScan())) {
     retainStatusIndexPath(snapshot, group.path, includeDirectories);
@@ -313,10 +318,14 @@ function snapshotStatusIndex(
   return snapshot;
 }
 
-function emptyStatusIndexSnapshot(retainsTrackedPaths: boolean): StatusIndexSnapshot {
+function emptyStatusIndexSnapshot(
+  retainsTrackedPaths: boolean,
+  includesDirectories: boolean,
+): StatusIndexSnapshot {
   const trackedDirs = new Set<string>();
   const trackedPaths = new Set<string>();
-  return { trackedDirs, trackedPaths, retainsTrackedPaths };
+  const orderedIndexPaths = retainsTrackedPaths && !includesDirectories ? [] : null;
+  return { trackedDirs, trackedPaths, orderedIndexPaths, retainsTrackedPaths };
 }
 
 function retainStatusIndexPath(
@@ -327,6 +336,7 @@ function retainStatusIndexPath(
   if (snapshot.retainsTrackedPaths && !snapshot.trackedPaths.has(path)) {
     requireStatusCapacity(snapshot.trackedPaths.size, STATUS_MAX_PATHS, "tracked paths");
     snapshot.trackedPaths.add(path);
+    snapshot.orderedIndexPaths?.push(path);
   }
   if (!includeDirectories) return;
   for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
