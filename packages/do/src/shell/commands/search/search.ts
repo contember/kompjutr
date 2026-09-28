@@ -15,10 +15,11 @@
 // `readFileHandles` (one statement per byte budget). Either way the generator
 // is pulled lazily, so a consumer that stops — `| head -20` — stops it here.
 
-import type { RealPath, RegularFileHandle } from "../../fs/types.js";
-import { type ByteStream, decode, encode, firstNul, lines, NEWLINE } from "../exec/bytes.js";
-import type { BoundedFs } from "../exec/context.js";
-import { compileIncludeGlob, GLOB_PATTERN_MAX_BYTES } from "../exec/glob.js";
+import type { RealPath, RegularFileHandle } from "../../../fs/types.js";
+import { type ByteStream, decode, encode, firstNul, lines } from "../../exec/bytes.js";
+import type { BoundedFs } from "../../exec/context.js";
+import { compileIncludeGlob, GLOB_PATTERN_MAX_BYTES } from "../../exec/glob.js";
+import { type LineLabel, type OnlyMatching, renderSelected } from "./search-output.js";
 
 export interface SearchRequest {
   readonly pattern: RegExp;
@@ -36,6 +37,8 @@ export interface SearchRequest {
   readonly withFilename: boolean | null;
   readonly before: number;
   readonly after: number;
+  /** `-o`: matches replace whole lines. */
+  readonly onlyMatching: OnlyMatching | null;
   /**
    * The pattern as plain bytes, when it is a substring rather than an
    * expression. Null disables the SQL predicate — as `-i` and `-v` must,
@@ -71,8 +74,9 @@ export type SearchMode = "content" | "files" | "files-without-match" | "count";
 
 export interface SearchOutcome {
   readonly stream: ByteStream;
-  /** Valid once the stream is drained. 0 when something matched. */
+  /** Valid once the stream is drained: 2 after any failed path, else 0 on a match. */
   status(): number;
+  matched(): boolean;
 }
 
 const PAGE_MAX = 1_000;
@@ -158,7 +162,7 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
     }
   })();
 
-  return { stream, status: () => (matched ? 0 : failed ? 2 : 1) };
+  return { stream, status: () => (failed ? 2 : matched ? 0 : 1), matched: () => matched };
 }
 
 interface FoundFile {
@@ -406,6 +410,12 @@ async function* emit(
 
   const emitted = new Set<number>();
   let previous = -1;
+  const label = (number: number): LineLabel => ({
+    name: path,
+    number,
+    withFilename,
+    lineNumbers: request.lineNumbers,
+  });
   for (const index of hits) {
     const from = Math.max(0, index - request.before);
     const to = Math.min(all.length - 1, index + request.after);
@@ -417,34 +427,21 @@ async function* emit(
       emitted.add(at);
       const text = all[at];
       if (text === undefined) continue;
+      previous = at;
       // `:` marks a line that matches, whoever's context window emitted it.
       // Keying on the hit being iterated printed the second of two adjacent
-      // matches as a context line.
-      yield render(path, at + 1, text, hits.has(at), request, withFilename);
-      previous = at;
+      // matches as a context line. Under `-o`, a line GNU grep drops still
+      // counts toward where `--` falls.
+      yield* renderSelected(
+        label(at + 1),
+        text,
+        hits.has(at),
+        request.invert,
+        request.onlyMatching,
+        retained,
+      );
     }
   }
-}
-
-function render(
-  path: string,
-  number: number,
-  text: Uint8Array,
-  isMatch: boolean,
-  request: SearchRequest,
-  withFilename: boolean,
-): Uint8Array {
-  // Context lines use `-` where matches use `:`, as both greps do.
-  const separator = isMatch ? ":" : "-";
-  let prefix = "";
-  if (withFilename) prefix += `${path}${separator}`;
-  if (request.lineNumbers) prefix += `${number}${separator}`;
-  const head = encode(prefix);
-  const out = new Uint8Array(head.length + text.length + 1);
-  out.set(head, 0);
-  out.set(text, head.length);
-  out[head.length + text.length] = NEWLINE;
-  return out;
 }
 
 async function matchesAnywhere(

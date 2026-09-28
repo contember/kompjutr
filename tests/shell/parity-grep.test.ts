@@ -189,11 +189,53 @@ describe.skipIf(!REAL_GREP)("grep matches GNU grep", () => {
       agree(parity);
       expect(parity.ours.stderr).toBe(parity.real.stderr);
     });
+    it("a missing file fails the run even when another file matched", async () => {
+      agree(await compare("NEEDLE", "{root}/missing.ts", "{root}/a.ts"));
+      agree(await compare("-r", "NEEDLE", "{root}/sub", "{root}/missing"), { ordered: false });
+    });
     it("-s silences the diagnostic but not the status", async () => {
       const parity = await compare("-s", "NEEDLE", "{root}/missing.ts");
       agree(parity);
       expect(parity.ours.stderr).toBe("");
       expect(parity.ours.exitCode).toBe(2);
+    });
+  });
+  describe("only the matching part", () => {
+    it("-o prints each match on its own line", async () => {
+      agree(await compare("-o", "HIT", "{root}/adj.txt"));
+      agree(await compare("-on", "NEEDLE", "{root}/sub/c.ts"));
+      agree(await compare("-oi", "needle", "{root}/sub/c.ts"));
+      agree(await compare("-oE", "l[0-9]|HIT", "{root}/ctx.txt"));
+    });
+    it("-o skips empty matches", async () => {
+      agree(await compare("-on", "x*", "{root}/ctx.txt"));
+    });
+    it("-o over a walk labels every match", async () => {
+      agree(await compare("-ro", "NEEDLE", "{root}/sub"), { ordered: false });
+    });
+    it("-o drops context lines but keeps their separators", async () => {
+      agree(await compare("-o", "-C1", "HIT", "{root}/ctx.txt"));
+    });
+    it("-o with -v selects lines and prints nothing", async () => {
+      agree(await compare("-ov", "HIT", "{root}/ctx.txt"));
+    });
+    it("-o does not change -c", async () => {
+      agree(await compare("-oc", "NEEDLE", "{root}/sub/c.ts"));
+    });
+  });
+  describe("quiet", () => {
+    it("-q prints nothing and exits 0 on a match", async () => {
+      const parity = await compare("-q", "NEEDLE", "{root}/a.ts");
+      agree(parity);
+      expect(parity.ours.stdout).toBe("");
+    });
+    it("-q exits 1 without a match", async () => {
+      agree(await compare("-rq", "ABSENT", "{root}"));
+    });
+    it("-q exits 0 on a match despite an earlier missing file", async () => {
+      agree(await compare("-q", "NEEDLE", "{root}/missing.ts", "{root}/a.ts"));
+      agree(await compare("--quiet", "NEEDLE", "{root}/a.ts", "{root}/missing.ts"));
+      agree(await compare("--silent", "-v", "NEEDLE", "{root}/a.ts"));
     });
   });
   describe("the shell's own guarantee, which neither binary makes", () => {

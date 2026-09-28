@@ -20,8 +20,8 @@ plan/     AST → Plan. Pure: imports nothing from ../fs/. Globs and parameters
 exec/     Plan → result. Resolves parameters from the frozen run env and globs
           through BoundedFs. Pull-based, so a consumer that stops pulling stops
           the source.
-commands/ the registry: grep, rg, printf, echo, exit, test, tail, xargs,
-          basename/dirname, plus read/list/file/text families
+commands/ the registry: printf, echo, exit, test, tail, xargs, basename/dirname,
+          read/list/file/text families, and search/ (grep, rg, one engine)
 ```
 
 Keep `plan/` free of filesystem imports — that is what makes every rewrite

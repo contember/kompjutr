@@ -166,5 +166,32 @@ describe.skipIf(!REAL_RG)("rg matches ripgrep", () => {
       agree(parity);
       expect(parity.ours.exitCode).toBe(1);
     });
+    it("a missing path fails the run even when another path matched", async () => {
+      agree(await compare("NEEDLE", "{root}/missing.ts", "{root}/a.ts"));
+    });
+  });
+  describe("only the matching part", () => {
+    it("-o prints each match on its own line", async () => {
+      agree(await compare("-o", "HIT", "{root}/adj.txt"));
+      agree(await compare("-on", "NEEDLE", "{root}/sub/c.ts"));
+      agree(await compare("-o", "NEEDLE", "{root}/sub"));
+    });
+    it("-o keeps context lines, where grep drops them", async () => {
+      agree(await compare("-o", "-C1", "HIT", "{root}/ctx.txt"));
+    });
+    it("-o with -v prints the selected lines, where grep prints nothing", async () => {
+      agree(await compare("-ov", "HIT", "{root}/ctx.txt"));
+    });
+  });
+  describe("quiet", () => {
+    it("-q prints nothing and follows the match", async () => {
+      const parity = await compare("-q", "NEEDLE", "{root}/a.ts");
+      agree(parity);
+      expect(parity.ours.stdout).toBe("");
+      agree(await compare("--quiet", "ABSENT", "{root}/a.ts"));
+    });
+    it("-q exits 0 on a match despite a missing path", async () => {
+      agree(await compare("-q", "NEEDLE", "{root}/missing.ts", "{root}/a.ts"));
+    });
   });
 });

@@ -41,8 +41,8 @@ const GRANDFATHERED_SYMBOLS: ReadonlySet<string> = new Set([
   "git/diff/myers-search.ts::findSplit",
   // One flag-by-flag option surface each, compared byte-for-byte against the
   // real binaries in tests/shell/parity-{grep,rg}.test.ts.
-  "do/shell/commands/rg.ts::rg",
-  "do/shell/commands/grep.ts::grep",
+  "do/shell/commands/search/rg.ts::rg",
+  "do/shell/commands/search/grep.ts::grep",
 ]);
 
 type FunctionLike =

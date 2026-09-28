@@ -6,9 +6,10 @@
 // its input as its consumer asks for, so `… | grep x | head -5` still stops
 // the source behind it.
 
-import { type ByteStream, decode, encode, lines, NEWLINE } from "../exec/bytes.js";
-import type { CommandResult, RetainedBudget } from "../exec/context.js";
+import { type ByteStream, decode, encode, lines } from "../../exec/bytes.js";
+import type { CommandResult, RetainedBudget } from "../../exec/context.js";
 import type { SearchMode } from "./search.js";
+import { type OnlyMatching, renderSelected } from "./search-output.js";
 
 export interface StreamSearch {
   readonly pattern: RegExp;
@@ -20,13 +21,19 @@ export interface StreamSearch {
   readonly withFilename: boolean;
   /** The label to print when `withFilename`. `(standard input)` in grep. */
   readonly name: string | null;
+  /** `-o`: matches replace whole lines. */
+  readonly onlyMatching: OnlyMatching | null;
+}
+
+export interface StreamSearchResult extends CommandResult {
+  matched(): boolean;
 }
 
 export function searchStream(
   stdin: ByteStream,
   options: StreamSearch,
   retained: RetainedBudget,
-): CommandResult {
+): StreamSearchResult {
   let matched = false;
 
   const stream = (async function* (): ByteStream {
@@ -43,7 +50,13 @@ export function searchStream(
       // A gap between context groups is marked, as both greps do.
       if (context && emitted > 0 && at > emitted + 1) yield encode("--\n");
       emitted = at;
-      yield render(label, at, text, isMatch, options);
+      const line = {
+        name: label,
+        number: at,
+        withFilename: options.withFilename,
+        lineNumbers: options.lineNumbers,
+      };
+      yield* renderSelected(line, text, isMatch, options.invert, options.onlyMatching, retained);
     }
 
     try {
@@ -61,6 +74,8 @@ export function searchStream(
         if (hit) {
           matched = true;
           hits++;
+          // `-l` needs one selected line; the rest of the input is not read.
+          if (options.mode === "files") break;
           if (options.mode === "content") {
             // `-B n`: the lines held back, oldest first.
             for (let index = 0; index < history.length; index++) {
@@ -101,24 +116,10 @@ export function searchStream(
     if (options.mode === "files-without-match" && !matched) yield encode(`${label}\n`);
   })();
 
-  return { stdout: stream, status: () => (matched ? 0 : 1), truncated: () => false };
-}
-
-function render(
-  label: string,
-  number: number,
-  text: Uint8Array,
-  isMatch: boolean,
-  options: StreamSearch,
-): Uint8Array {
-  const separator = isMatch ? ":" : "-";
-  let prefix = "";
-  if (options.withFilename) prefix += `${label}${separator}`;
-  if (options.lineNumbers) prefix += `${number}${separator}`;
-  const head = encode(prefix);
-  const out = new Uint8Array(head.length + text.length + 1);
-  out.set(head, 0);
-  out.set(text, head.length);
-  out[head.length + text.length] = NEWLINE;
-  return out;
+  return {
+    stdout: stream,
+    status: () => (matched ? 0 : 1),
+    truncated: () => false,
+    matched: () => matched,
+  };
 }

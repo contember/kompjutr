@@ -2,15 +2,21 @@
 // searched, BRE unless `-E`. See docs/archive/plans/shell.md §5.1 for the six ways
 // this differs from `rg`, which shares the engine below it.
 
-import { type Command, fail } from "../exec/context.js";
-import { resolve } from "../exec/execute.js";
-import { count, parseFlags, UsageError } from "./flags.js";
+import { type Command, fail } from "../../exec/context.js";
+import { resolve } from "../../exec/execute.js";
+import { count, parseFlags, UsageError } from "../flags.js";
 import { compilePatternSet, type Dialect, literalNeedle, PatternError } from "./regex.js";
 import { type SearchRequest, search } from "./search.js";
+import { onlyMatchingFor, quietly } from "./search-output.js";
 import { searchStream } from "./search-stream.js";
 
 const SPEC = {
   boolean: new Set([
+    "-o",
+    "--only-matching",
+    "-q",
+    "--quiet",
+    "--silent",
     "-r",
     "-R",
     "-i",
@@ -56,6 +62,8 @@ export const grep: Command = (context) => {
     let wholeWord = false;
     let wholeLine = false;
     let withFilename: boolean | null = null;
+    let onlyMatching = false;
+    let quiet = false;
     /** `-s`: an unreadable path stops being a diagnostic, but still fails. */
     let suppressErrors = false;
     let before = 0;
@@ -122,6 +130,15 @@ export const grep: Command = (context) => {
         case "-s":
           suppressErrors = true;
           break;
+        case "-o":
+        case "--only-matching":
+          onlyMatching = true;
+          break;
+        case "-q":
+        case "--quiet":
+        case "--silent":
+          quiet = true;
+          break;
         case "-A":
           after = count(flag.value ?? "", "-A");
           break;
@@ -169,7 +186,16 @@ export const grep: Command = (context) => {
         ? null
         : literalNeedle(onlyPattern, dialect);
     const literal = needle === null ? null : new TextEncoder().encode(needle);
-    const shared = { invert, mode, lineNumbers, before, after };
+    // `-q` only needs to know that one line was selected.
+    const searchMode: SearchRequest["mode"] = quiet ? "files" : mode;
+    const shared = {
+      invert,
+      mode: searchMode,
+      lineNumbers,
+      before,
+      after,
+      onlyMatching: onlyMatching ? onlyMatchingFor(compiled, "grep") : null,
+    };
 
     // A pipe stage searches its input, not the filesystem — R3. No path is
     // resolved and no query is issued.
@@ -177,7 +203,7 @@ export const grep: Command = (context) => {
       if (context.stdin === null) {
         return fail(context, "no input; give a file or pipe something in", 2);
       }
-      return searchStream(
+      const piped = searchStream(
         context.stdin,
         {
           ...shared,
@@ -187,6 +213,7 @@ export const grep: Command = (context) => {
         },
         context.fs.retained,
       );
+      return quiet ? quietly(piped.stdout, piped.status, piped.matched) : piped;
     }
 
     const request: SearchRequest = {
@@ -214,6 +241,7 @@ export const grep: Command = (context) => {
     };
 
     const outcome = search(context.fs, request);
+    if (quiet) return quietly(outcome.stream, outcome.status, outcome.matched);
     return { stdout: outcome.stream, status: outcome.status, truncated: () => false };
   } catch (error) {
     if (error instanceof UsageError || error instanceof PatternError) {

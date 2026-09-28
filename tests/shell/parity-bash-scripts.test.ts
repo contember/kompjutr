@@ -139,6 +139,19 @@ describe.skipIf(!REAL_BASH)("scripts match Bash", () => {
   });
 
   it.each([
+    "printf 'ab ab\\nx\\nAb\\n' | grep -oin ab",
+    "printf 'ab\\nx\\n' | grep -q ab && echo found",
+    "printf 'x\\n' | grep -q ab || echo absent",
+    "printf 'ab\\nx\\n' | grep -l ab",
+    "printf 'l1\\nab\\nl3\\nl4\\nl5\\nab\\n' | grep -o -C1 ab",
+    "printf 'l1\\nab\\nl3\\n' | rg -o -C1 ab",
+    "printf 'ab ab\\nx\\n' | rg -ov ab",
+    "printf 'ab\\n' | rg -q ab && echo found",
+  ])("searches a pipe quietly or for the match alone: %j", async (source) => {
+    await compare(source);
+  });
+
+  it.each([
     "basename /a/b/c.txt",
     "basename /a/b/c.txt .txt",
     "basename c.txt c.txt",

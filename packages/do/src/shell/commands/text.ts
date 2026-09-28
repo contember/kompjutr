@@ -10,7 +10,7 @@ import { type ByteStream, decode, encode, lines, owned, terminated } from "../ex
 import { type Command, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { parseFlags, UsageError } from "./flags.js";
-import { compilePattern, PatternError } from "./regex.js";
+import { compilePattern, PatternError } from "./search/regex.js";
 
 function* nothing(): ByteStream {
   // Nothing.

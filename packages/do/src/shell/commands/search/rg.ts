@@ -13,12 +13,13 @@
 // tty-dependent defaults resolve to the piped form: no heading, and line
 // numbers only with `-n`. There is no terminal here.
 
-import { encode } from "../exec/bytes.js";
-import { type Command, fail } from "../exec/context.js";
-import { resolve } from "../exec/execute.js";
-import { count, parseFlags, UsageError } from "./flags.js";
+import { encode } from "../../exec/bytes.js";
+import { type Command, fail } from "../../exec/context.js";
+import { resolve } from "../../exec/execute.js";
+import { count, parseFlags, UsageError } from "../flags.js";
 import { compilePatternSet, literalNeedle, PatternError } from "./regex.js";
 import { type SearchRequest, search } from "./search.js";
+import { onlyMatchingFor, quietly } from "./search-output.js";
 import { searchStream } from "./search-stream.js";
 
 /** `-t ts` and friends. Lowered to the same glob `-g` produces. */
@@ -40,6 +41,10 @@ const TYPES: ReadonlyMap<string, readonly string[]> = new Map([
 
 const SPEC = {
   boolean: new Set([
+    "-o",
+    "--only-matching",
+    "-q",
+    "--quiet",
     "-i",
     "-S",
     "-s",
@@ -83,6 +88,8 @@ export const rg: Command = (context) => {
     let wholeWord = false;
     let wholeLine = false;
     let withFilename: boolean | null = null;
+    let onlyMatching = false;
+    let quiet = false;
     let skipHidden = true;
     let before = 0;
     let after = 0;
@@ -148,6 +155,14 @@ export const rg: Command = (context) => {
         case "--no-heading":
         case "--no-ignore":
           break; // Already the behaviour; accepted so scripts do not break.
+        case "-o":
+        case "--only-matching":
+          onlyMatching = true;
+          break;
+        case "-q":
+        case "--quiet":
+          quiet = true;
+          break;
         case "-A":
           after = count(flag.value ?? "", "-A");
           break;
@@ -212,10 +227,19 @@ export const rg: Command = (context) => {
         ? null
         : literalNeedle(onlyPattern, fixed ? "fixed" : "ere");
     const literal = needle === null ? null : new TextEncoder().encode(needle);
-    const shared = { invert, mode, lineNumbers, before, after };
+    // `-q` only needs to know that one line was selected.
+    const searchMode: SearchRequest["mode"] = quiet ? "files" : mode;
+    const shared = {
+      invert,
+      mode: searchMode,
+      lineNumbers,
+      before,
+      after,
+      onlyMatching: onlyMatching ? onlyMatchingFor(compiled, "rg") : null,
+    };
 
     if (operands.length === 0 && context.stdin !== null) {
-      return searchStream(
+      const piped = searchStream(
         context.stdin,
         {
           ...shared,
@@ -225,6 +249,7 @@ export const rg: Command = (context) => {
         },
         context.fs.retained,
       );
+      return quiet ? quietly(piped.stdout, piped.status, piped.matched) : piped;
     }
 
     // rg with no path searches the working directory, recursively.
@@ -257,6 +282,7 @@ export const rg: Command = (context) => {
           `${withName ? `${path}: ` : ""}binary file matches (found "\\0" byte around offset ${offset})\n`,
         ),
     });
+    if (quiet) return quietly(outcome.stream, outcome.status, outcome.matched);
     return { stdout: outcome.stream, status: outcome.status, truncated: () => false };
   } catch (error) {
     if (error instanceof UsageError || error instanceof PatternError) {

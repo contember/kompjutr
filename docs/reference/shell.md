@@ -117,12 +117,20 @@ attached value, or `--long=value`.
 
 `grep` uses GNU grep defaults: non-recursive, dotfiles included, and BRE unless
 `-E` is present. It supports `-r`/`-R`/`--recursive`, `-i`, `-n`, `-l`, `-L`,
-`-v`, `-E`, `-F`, `-c`, `-w`, `-x`, `-h`, `-H`, `-s`, `-A`, `-B`, `-C`,
-repeated `-e`/`--regexp`, and `--include`/`--exclude`. `-m` is rejected with an
-explicit instruction to use `head`.
+`-v`, `-E`, `-F`, `-c`, `-w`, `-x`, `-h`, `-H`, `-s`, `-o`, `-q`, `-A`, `-B`,
+`-C`, repeated `-e`/`--regexp`, and `--include`/`--exclude`. `-m` is rejected
+with an explicit instruction to use `head`.
+
+Both searches exit 2 when a path fails, even if another path matched; `-q`
+exits 0 on a match despite such a failure. `-q` stops at the first selected
+line and runs as `-l`, so a literal pattern is still answered by the database.
+`-o` prints each non-empty match on its own line. The two binaries differ
+around it, and each surface follows its own: GNU grep drops context lines but
+keeps their `--` separators and prints nothing under `-v`; rg keeps context
+lines and prints whole selected lines under `-v`.
 
 `rg` is recursive by default, skips hidden paths by default, and uses ERE. It
-supports `-i`, `-S`, `-s`, `-n`, `-N`, `-l`, `-v`, `-F`, `-c`, `-w`, `-x`,
+supports `-i`, `-S`, `-s`, `-n`, `-N`, `-l`, `-v`, `-F`, `-c`, `-w`, `-x`, `-o`, `-q`,
 `--hidden`, filename controls, `--no-heading`, `--no-ignore`, `-A`, `-B`, `-C`,
 repeated `-e`/`--regexp`, `-g`/`--glob`, and `-t`/`--type`. Known types are
 `ts`, `js`, `md`, `json`, `css`, `html`, `py`, `go`, `rust`, `sh`, `yaml`,
