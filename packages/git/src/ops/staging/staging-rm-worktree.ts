@@ -1,6 +1,5 @@
 import { GitError } from "../../common/errors.js";
 import { comparePaths, gitPathDepth, joinPath, relativeExcludeRoots } from "../../common/paths.js";
-import { joinSorted } from "../../common/streams.js";
 import type { IndexEntry } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
@@ -14,7 +13,7 @@ import {
 
 const RM_MAX_ROWS_PER_STREAM = 50_000;
 const RM_MAX_DIRECTORIES = 10_000;
-const RM_WINDOW_ROWS = 1_000;
+export const RM_WINDOW_ROWS = 1_000;
 const RM_REMOVE_BINDING_BYTES = 1_000_000;
 
 export interface RmCandidate {
@@ -86,75 +85,58 @@ export function identifyRmWorktree(
   }
 }
 
-export function planRmDirectoryPrune(
-  repo: Repository,
-  worktree: Worktree,
-  selectedPaths: () => Generator<string>,
-  excludeRoots: readonly string[] | undefined,
-): string[] {
-  const directories = new Set<string>();
-  for (const path of selectedPaths()) {
-    const parts = path.split("/");
-    for (let depth = parts.length - 1; depth > 0; depth--) {
-      const directory = parts.slice(0, depth).join("/");
-      if (directories.has(directory)) continue;
-      if (directories.size >= RM_MAX_DIRECTORIES) {
-        throw new GitError("E2BIG", `rm directory prune exceeds ${RM_MAX_DIRECTORIES} directories`);
-      }
-      directories.add(directory);
-    }
-  }
-  if (directories.size === 0) return [];
-
-  const blocked = new Set<string>();
-  const block = (path: string, includeSelf: boolean): void => {
-    const parts = path.split("/");
-    let depth = includeSelf ? parts.length : parts.length - 1;
-    for (; depth > 0; depth--) {
-      const directory = parts.slice(0, depth).join("/");
-      if (!directories.has(directory) || blocked.has(directory)) continue;
-      blocked.add(directory);
-    }
-  };
-
-  for (const root of relativeExcludeRoots(repo.root, excludeRoots)) block(root, true);
-  for (const row of joinSorted(
-    selectedPaths(),
-    boundedRmRows(
-      walkWorktreeEntriesStream(worktree, repo.root, {
-        excludeRoots: excludeRoots === undefined ? undefined : [...excludeRoots],
-        includeIgnored: true,
-        includeDirectories: true,
-      }),
-      "directory-prune worktree",
-    ),
-    { left: (path) => path, right: (entry) => entry.path },
-  )) {
-    const entry = row.right;
-    if (entry === undefined) continue;
-    if (row.left !== undefined && entry.stat.type !== "dir") continue;
-    if (entry.stat.type === "dir" && directories.has(entry.path)) continue;
-    block(entry.path, entry.stat.type === "dir");
-  }
-
-  const pruned: string[] = [];
-  for (const directory of directories) {
-    if (blocked.has(directory)) continue;
-    pruned.push(directory);
-  }
-  pruned.sort((left, right) => {
-    const depth = gitPathDepth(right) - gitPathDepth(left);
-    return depth === 0 ? comparePaths(left, right) : depth;
-  });
-  return pruned;
+/** Ancestors of selected paths, and those a surviving worktree entry keeps. */
+export interface RmPrunePlan {
+  directories: Set<string>;
+  blocked: Set<string>;
+  overflow: boolean;
 }
 
-export function* physicalRmPaths(
+export function newRmPrunePlan(): RmPrunePlan {
+  return { directories: new Set(), blocked: new Set(), overflow: false };
+}
+
+/** Git reports the overflow only after pathspec and safety errors, so it is recorded here. */
+export function noteRmPruneAncestors(plan: RmPrunePlan, path: string): void {
+  if (plan.overflow) return;
+  const parts = path.split("/");
+  for (let depth = parts.length - 1; depth > 0; depth--) {
+    const directory = parts.slice(0, depth).join("/");
+    if (plan.directories.has(directory)) continue;
+    if (plan.directories.size >= RM_MAX_DIRECTORIES) {
+      plan.overflow = true;
+      return;
+    }
+    plan.directories.add(directory);
+  }
+}
+
+export function requireRmPruneBounded(plan: RmPrunePlan): void {
+  if (plan.overflow) {
+    throw new GitError("E2BIG", `rm directory prune exceeds ${RM_MAX_DIRECTORIES} directories`);
+  }
+}
+
+/**
+ * Absolute worktree paths to remove for the sorted selected paths. The same
+ * walk blocks every candidate directory that keeps a surviving entry, so the
+ * prune plan is complete only once this generator is drained.
+ */
+export function* rmWorktreeRemovals(
   repo: Repository,
   worktree: Worktree,
-  selectedPages: Iterable<readonly string[]>,
+  selected: Iterable<string>,
+  plan: RmPrunePlan,
   excludeRoots: readonly string[] | undefined,
 ): Generator<string> {
+  for (const root of relativeExcludeRoots(repo.root, excludeRoots)) {
+    blockRmPrune(plan, root, true);
+  }
+  const observe = (entry: WorktreePath, removed: boolean): void => {
+    if (removed && entry.stat.type !== "dir") return;
+    if (entry.stat.type === "dir" && plan.directories.has(entry.path)) return;
+    blockRmPrune(plan, entry.path, entry.stat.type === "dir");
+  };
   const entries = boundedRmRows(
     walkWorktreeEntriesStream(worktree, repo.root, {
       excludeRoots: excludeRoots === undefined ? undefined : [...excludeRoots],
@@ -165,16 +147,45 @@ export function* physicalRmPaths(
   )[Symbol.iterator]();
   let current = entries.next();
   try {
-    for (const page of selectedPages) {
-      for (const path of page) {
-        while (!current.done && comparePaths(current.value.path, path) < 0) {
-          current = entries.next();
-        }
-        if (!current.done && current.value.path === path) yield joinPath(repo.root, path);
+    for (const path of selected) {
+      while (!current.done && comparePaths(current.value.path, path) < 0) {
+        observe(current.value, false);
+        current = entries.next();
+      }
+      if (!current.done && current.value.path === path) {
+        observe(current.value, true);
+        yield joinPath(repo.root, path);
+        current = entries.next();
       }
     }
+    if (plan.directories.size === 0) return;
+    for (; !current.done; current = entries.next()) observe(current.value, false);
   } finally {
     entries.return?.(undefined);
+  }
+}
+
+/** Unblocked candidate directories, deepest first. */
+export function prunedRmDirectories(plan: RmPrunePlan): string[] {
+  const pruned: string[] = [];
+  for (const directory of plan.directories) {
+    if (plan.blocked.has(directory)) continue;
+    pruned.push(directory);
+  }
+  pruned.sort((left, right) => {
+    const depth = gitPathDepth(right) - gitPathDepth(left);
+    return depth === 0 ? comparePaths(left, right) : depth;
+  });
+  return pruned;
+}
+
+function blockRmPrune(plan: RmPrunePlan, path: string, includeSelf: boolean): void {
+  const parts = path.split("/");
+  let depth = includeSelf ? parts.length : parts.length - 1;
+  for (; depth > 0; depth--) {
+    const directory = parts.slice(0, depth).join("/");
+    if (!plan.directories.has(directory) || plan.blocked.has(directory)) continue;
+    plan.blocked.add(directory);
   }
 }
 

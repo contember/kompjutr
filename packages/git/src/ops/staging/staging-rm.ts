@@ -3,7 +3,7 @@ import { GitError, PathspecNotFoundError } from "../../common/errors.js";
 import { isExcluded, relativeExcludeRoots } from "../../common/paths.js";
 import { joinSorted3 } from "../../common/streams.js";
 import { applyIndexOwned } from "../../store/checkout/checkout.js";
-import { type IndexEntry, indexScanOwned } from "../../store/index.js";
+import { type IndexEntry, type IndexSink, indexScanOwned } from "../../store/index.js";
 import { MAX_INDEX_PATH_BYTES } from "../../store/schema/schema.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import type { Repository } from "../repository/repository.js";
@@ -19,10 +19,15 @@ import {
   absoluteRmPaths,
   boundedRmRows,
   identifyRmWorktree,
-  physicalRmPaths,
-  planRmDirectoryPrune,
+  newRmPrunePlan,
+  noteRmPruneAncestors,
+  prunedRmDirectories,
+  RM_WINDOW_ROWS,
   type RmCandidate,
+  type RmPrunePlan,
   removeRmWorktreePaths,
+  requireRmPruneBounded,
+  rmWorktreeRemovals,
 } from "./staging-rm-worktree.js";
 
 const RM_MAX_PATHSPECS = 10_000;
@@ -71,11 +76,10 @@ export function rm(repo: Repository, worktree: Worktree, options: RmOptions): vo
   const force = options.force === true;
   const recursive = options.recursive === true;
   const excluded = relativeExcludeRoots(repo.root, options.excludeRoots);
-  for (const row of rmRows(repo, worktree, normalized.index, excluded, options.excludeRoots)) {
-    const selected = row.b;
-    if (selected === undefined) continue;
-    noteRmMatches(normalized.index, selected.path, row.c?.stat.type === "dir");
-  }
+  const scan = scanRmSelection(repo, worktree, normalized.index, excluded, options.excludeRoots, {
+    cached,
+    force,
+  });
 
   // Git resolves structural and unmatched errors in caller pathspec order.
   for (const spec of specs) {
@@ -88,37 +92,127 @@ export function rm(repo: Repository, worktree: Worktree, options: RmOptions): vo
     if (!spec.matched) throw new PathspecNotFoundError(displayRmSpec(spec));
     if (!recursive && spec.directoryMatch) throw rmDirectoryError(spec);
   }
-  if (!force) {
-    preflightRmSafety(repo, worktree, normalized.index, excluded, options.excludeRoots, cached);
-  }
-
-  const selectedPaths = (): Generator<string> => rmSelectedPaths(repo, normalized.index, excluded);
-  const pruned = cached
-    ? []
-    : planRmDirectoryPrune(repo, worktree, selectedPaths, options.excludeRoots);
+  if (scan.unsafe !== undefined) throw scan.unsafe;
+  requireRmPruneBounded(scan.prune);
 
   if (!cached) requireSharedMutationScope(repo.store.db, worktree);
 
   repo.store.db.transactionSync(() => {
-    if (!cached) {
+    applyIndexOwned(repo.checkout, (sink) => {
+      const selected = rmRemovalPaths(repo, normalized.index, excluded, scan.retained);
+      if (cached) {
+        for (const path of selected) sink.remove(path);
+        return;
+      }
       removeRmWorktreePaths(
         worktree,
-        physicalRmPaths(
+        rmWorktreeRemovals(
           repo,
           worktree,
-          rmSelectedPages(repo, normalized.index, excluded),
+          removedFromIndex(sink, selected),
+          scan.prune,
           options.excludeRoots,
         ),
         false,
       );
-      removeRmWorktreePaths(worktree, absoluteRmPaths(repo, pruned), true);
-    }
-    applyIndexOwned(repo.checkout, (sink) => {
-      for (const page of rmSelectedPages(repo, normalized.index, excluded)) {
-        for (const path of page) sink.remove(path);
-      }
+      removeRmWorktreePaths(worktree, absoluteRmPaths(repo, prunedRmDirectories(scan.prune)), true);
     });
   });
+}
+
+interface RmSelectionScan {
+  unsafe: GitError | undefined;
+  prune: RmPrunePlan;
+  /** Every selected path when they fit one window; otherwise removal rescans the index. */
+  retained: string[] | undefined;
+}
+
+/**
+ * One HEAD/index/worktree pass records pathspec matches, the first unsafe
+ * removal, and prune candidates. Errors are deferred because Git reports
+ * pathspec errors before safety errors.
+ */
+function scanRmSelection(
+  repo: Repository,
+  worktree: Worktree,
+  specs: RmSpecIndex,
+  excluded: readonly string[],
+  excludeRoots: readonly string[] | undefined,
+  mode: { cached: boolean; force: boolean },
+): RmSelectionScan {
+  const prune = newRmPrunePlan();
+  let retained: string[] | undefined = [];
+  const batch: RmCandidate[] = [];
+  let unsafe: GitError | undefined;
+  const flush = (): void => {
+    identifyRmWorktree(repo, worktree, batch);
+    for (const candidate of batch) unsafe ??= rmCandidateUnsafe(candidate, mode.cached);
+    batch.length = 0;
+  };
+
+  for (const row of rmRows(repo, worktree, specs, excluded, excludeRoots)) {
+    const selected = row.b;
+    if (selected === undefined) continue;
+    noteRmMatches(specs, selected.path, row.c?.stat.type === "dir");
+    if (!mode.cached) noteRmPruneAncestors(prune, selected.path);
+    if (retained !== undefined) {
+      if (retained.length === RM_WINDOW_ROWS) retained = undefined;
+      else retained.push(selected.path);
+    }
+    if (mode.force) continue;
+    batch.push({
+      path: selected.path,
+      head: row.a,
+      index: selected.entry,
+      worktree: row.c,
+      conflicted: selected.conflicted,
+      worktreeMatchesIndex: false,
+    });
+    if (batch.length === RM_WINDOW_ROWS) flush();
+  }
+  if (batch.length > 0) flush();
+  return { unsafe, prune, retained };
+}
+
+function rmCandidateUnsafe(candidate: RmCandidate, cached: boolean): GitError | undefined {
+  if (candidate.conflicted) return undefined;
+  const entry = candidate.index;
+  if (entry === undefined) {
+    return new GitError("EUNSAFEREMOVE", `cannot prove index state for '${candidate.path}'`);
+  }
+  const headMatches =
+    candidate.head !== undefined &&
+    candidate.head.oid === entry.oid &&
+    Number.parseInt(candidate.head.mode, 8) === entry.mode;
+  const missingWorktree = candidate.worktree === undefined;
+  const safe = cached
+    ? headMatches || candidate.worktreeMatchesIndex
+    : missingWorktree || (headMatches && candidate.worktreeMatchesIndex);
+  if (safe) return undefined;
+  return new GitError(
+    "EUNSAFEREMOVE",
+    `path '${candidate.path}' has staged or working-tree changes`,
+  );
+}
+
+function* removedFromIndex(sink: IndexSink, paths: Iterable<string>): Generator<string> {
+  for (const path of paths) {
+    sink.remove(path);
+    yield path;
+  }
+}
+
+function* rmRemovalPaths(
+  repo: Repository,
+  specs: RmSpecIndex,
+  excluded: readonly string[],
+  retained: readonly string[] | undefined,
+): Generator<string> {
+  if (retained !== undefined) {
+    yield* retained;
+    return;
+  }
+  for (const page of rmSelectedPages(repo, specs, excluded)) yield* page;
 }
 
 function* rmRows(
@@ -141,71 +235,6 @@ function* rmRows(
     ),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   );
-}
-
-function preflightRmSafety(
-  repo: Repository,
-  worktree: Worktree,
-  specs: RmSpecIndex,
-  excluded: readonly string[],
-  excludeRoots: readonly string[] | undefined,
-  cached: boolean,
-): void {
-  const batch: RmCandidate[] = [];
-  let firstUnsafe: GitError | undefined;
-  const flush = (): void => {
-    identifyRmWorktree(repo, worktree, batch);
-    for (const candidate of batch) {
-      if (candidate.conflicted) continue;
-      const entry = candidate.index;
-      if (entry === undefined) {
-        firstUnsafe ??= new GitError(
-          "EUNSAFEREMOVE",
-          `cannot prove index state for '${candidate.path}'`,
-        );
-        continue;
-      }
-      const headMatches =
-        candidate.head !== undefined &&
-        candidate.head.oid === entry.oid &&
-        Number.parseInt(candidate.head.mode, 8) === entry.mode;
-      const missingWorktree = candidate.worktree === undefined;
-      const safe = cached
-        ? headMatches || candidate.worktreeMatchesIndex
-        : missingWorktree || (headMatches && candidate.worktreeMatchesIndex);
-      if (!safe) {
-        firstUnsafe ??= new GitError(
-          "EUNSAFEREMOVE",
-          `path '${candidate.path}' has staged or working-tree changes`,
-        );
-      }
-    }
-    batch.length = 0;
-  };
-
-  for (const row of rmRows(repo, worktree, specs, excluded, excludeRoots)) {
-    const selected = row.b;
-    if (selected === undefined) continue;
-    batch.push({
-      path: selected.path,
-      head: row.a,
-      index: selected.entry,
-      worktree: row.c,
-      conflicted: selected.conflicted,
-      worktreeMatchesIndex: false,
-    });
-    if (batch.length === 1_000) flush();
-  }
-  if (batch.length > 0) flush();
-  if (firstUnsafe !== undefined) throw firstUnsafe;
-}
-
-function* rmSelectedPaths(
-  repo: Repository,
-  specs: RmSpecIndex,
-  excluded: readonly string[],
-): Generator<string> {
-  for (const entry of rmIndexPaths(repo, specs, excluded)) yield entry.path;
 }
 
 function* rmSelectedPages(

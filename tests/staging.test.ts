@@ -1185,6 +1185,29 @@ describe("rm", () => {
       }),
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
     expect(workspace.repo.checkout.indexEntries()).toHaveLength(entries.length);
+
+    // The cap is reported only after Git's own pathspec and safety errors.
+    expect(() =>
+      rm(workspace.repo, workspace.worktree, {
+        paths: [".", "missing"],
+        recursive: true,
+        force: true,
+      }),
+    ).toThrow(expect.objectContaining({ code: "EPATHSPEC" }));
+    writeWorkFile(workspace, "/zz-unsafe.txt", "changed\n");
+    workspace.repo.checkout.indexPut({
+      path: "zz-unsafe.txt",
+      stage: 0,
+      mode: 0o100644,
+      oid,
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    expect(() => rm(workspace.repo, workspace.worktree, { paths: ["."], recursive: true })).toThrow(
+      expect.objectContaining({ code: "EUNSAFEREMOVE" }),
+    );
+    expect(workspace.repo.checkout.indexEntries()).toHaveLength(entries.length + 1);
   });
 
   it("removes a conflict split across selected index pages", () => {
