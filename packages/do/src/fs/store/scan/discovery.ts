@@ -1,4 +1,8 @@
-import { MAX_ROUTING_CHECKOUTS, MAX_ROUTING_ROOTS_UTF8_BYTES } from "@kompjutr/sqlite";
+import {
+  jsonStringEncodedBytes,
+  MAX_ROUTING_CHECKOUTS,
+  MAX_ROUTING_ROOTS_UTF8_BYTES,
+} from "@kompjutr/sqlite";
 import type { SqlDatabase } from "../../../db/db.js";
 import { comparePaths, normalize } from "../../path.js";
 import { CHUNK_SIZE } from "../../schema.js";
@@ -68,43 +72,6 @@ function boundedUtf8Bytes(value: string, limit: number): number {
       }
     } else bytes += 3;
     if (bytes > limit) return limit + 1;
-  }
-  return bytes;
-}
-
-function jsonStringUtf8Bytes(value: string): number {
-  let bytes = 2;
-  for (let index = 0; index < value.length; index++) {
-    const code = value.charCodeAt(index);
-    if (
-      code === 0x22 ||
-      code === 0x5c ||
-      code === 0x08 ||
-      code === 0x09 ||
-      code === 0x0a ||
-      code === 0x0c ||
-      code === 0x0d
-    ) {
-      bytes += 2;
-    } else if (code < 0x20) {
-      bytes += 6;
-    } else if (code < 0x80) {
-      bytes++;
-    } else if (code < 0x800) {
-      bytes += 2;
-    } else if (code >= 0xd800 && code <= 0xdbff) {
-      const low = value.charCodeAt(index + 1);
-      if (low >= 0xdc00 && low <= 0xdfff) {
-        bytes += 4;
-        index++;
-      } else {
-        bytes += 6;
-      }
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      bytes += 6;
-    } else {
-      bytes += 3;
-    }
   }
   return bytes;
 }
@@ -241,7 +208,7 @@ export function discoveryExcludeRootsJsonSegments(
   let segment = "[";
   let segmentBytes = 1;
   for (const path of excludeRoots) {
-    const itemBytes = jsonStringUtf8Bytes(path);
+    const itemBytes = jsonStringEncodedBytes(path);
     if (itemBytes + 2 > DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES) {
       if (segmentBytes > 1) segments.push(`${segment}]`);
       const singleton = JSON.stringify([path]);

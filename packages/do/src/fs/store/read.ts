@@ -8,13 +8,13 @@
 // either reported in `remaining` or assembled from bounded pages — never
 // pulled across the wire in one result set.
 
+import { jsonStringEncodedBytes } from "@kompjutr/sqlite";
 import { readBlob, type SqlDatabase } from "../../db/db.js";
 import { normalize } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type { ReadBatch, ReadOptions } from "../types.js";
 import { DEFAULT_READ_BUDGET } from "./read/read-limits.js";
 import { realpath } from "./resolve.js";
-import { utf8Length } from "./write/write-batches.js";
 
 export { readFileHandles } from "./read/read-handles.js";
 export { DEFAULT_READ_BUDGET, MAX_HANDLE_MATERIALIZE_BYTES } from "./read/read-limits.js";
@@ -97,7 +97,7 @@ function lookupMany(db: SqlDatabase, paths: readonly string[]): Map<string, Node
   };
 
   for (const path of paths) {
-    const itemBytes = utf8Length(JSON.stringify(path));
+    const itemBytes = jsonStringEncodedBytes(path);
     if (batch.length > 0 && bytes + itemBytes + 1 > LOOKUP_BATCH_BYTES) flush();
     batch.push(path);
     bytes += itemBytes + 1;

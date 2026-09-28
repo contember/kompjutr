@@ -7,10 +7,10 @@
 // entering the store passes through here first, so this is also where a
 // caller path is rejected for not being well-formed UTF-8.
 
+import { jsonStringEncodedBytes } from "@kompjutr/sqlite";
 import type { SqlDatabase } from "../../db/db.js";
 import { assertWellFormedPath, isCanonicalPath, prefixesOf } from "../path.js";
 import type { RealPath } from "../types.js";
-import { utf8Length } from "./write/write-batches.js";
 
 /** POSIX's own guidance; dofs counts follows the same way. */
 const MAX_FOLLOWS = 40;
@@ -43,7 +43,7 @@ const NODES_ON_SQL = `SELECT j.key AS ordinal,
   JOIN fs_nodes n ON n.inode = p.inode`;
 
 function jsonItemBytes(path: string): number {
-  return utf8Length(JSON.stringify(path)) + 1;
+  return jsonStringEncodedBytes(path) + 1;
 }
 
 /**

@@ -1,6 +1,8 @@
+import { jsonStringEncodedBytes } from "@kompjutr/sqlite";
 import { blob, type SqlDatabase } from "../../../db/db.js";
 import type { EntryType } from "../../types.js";
 
+const JSON_NULL_BYTES = "null".length;
 const DEFAULT_PAYLOAD_BYTES = 1024 * 1024;
 const MAX_PAYLOAD_BYTES = 2_000_000;
 const MAX_JSON_BYTES = 1_500_000;
@@ -172,7 +174,8 @@ export function writeNodes(db: SqlDatabase, rows: readonly WriteNodeRow[], rev: 
   };
 
   for (const row of rows) {
-    const estimate = 96 + utf8Length(JSON.stringify(row.target));
+    const estimate =
+      96 + (row.target === null ? JSON_NULL_BYTES : jsonStringEncodedBytes(row.target));
     const idSize = row.contentId?.length ?? 0;
     if (
       group.length > 0 &&
