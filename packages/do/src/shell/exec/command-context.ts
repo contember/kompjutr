@@ -1,6 +1,6 @@
 import type { PlannedCommand } from "../plan/types.js";
 import { type ByteStream, line } from "./bytes.js";
-import type { CommandContext, CommandResult } from "./context.js";
+import type { CommandContext, CommandResult, InvokeOptions } from "./context.js";
 import type { PipelineEnvironment } from "./execution-types.js";
 import type { HeldChunk, OutputDestination, ResolvedRedirections } from "./routing-types.js";
 import { diagnosticsFor } from "./stage-output.js";
@@ -47,7 +47,11 @@ export function commandContext(
       diagnostic(bytes);
     },
     chdir: env.chdir,
-    invoke: async (name: string, subArgv: readonly string[]): Promise<CommandResult | null> => {
+    invoke: async (
+      name: string,
+      subArgv: readonly string[],
+      options?: InvokeOptions,
+    ): Promise<CommandResult | null> => {
       const command = env.commands.get(name);
       if (command === undefined) return null;
       // No stdin and no demand hint: the sub-invocation's arguments already
@@ -55,6 +59,7 @@ export function commandContext(
       return command({
         ...context,
         argv: subArgv,
+        env: options?.env ?? context.env,
         stdin: null,
         limitHint: null,
         mayExitRun: false,

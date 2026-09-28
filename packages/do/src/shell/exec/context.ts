@@ -319,7 +319,7 @@ export interface CommandContext {
   /** Change the session's working directory. Only `cd` uses it. */
   chdir(path: string): void;
   /**
-   * Run another registered command. Only `xargs` uses it, and it exists as
+   * Run another registered command. `xargs`, `find -exec`, and `env` use it; it exists as
    * a named seam rather than a registry handed to every command so that the
    * set of commands able to invoke others stays one grep away.
    *
@@ -329,7 +329,16 @@ export interface CommandContext {
    *
    * Returns null when no such command is registered.
    */
-  invoke(name: string, argv: readonly string[]): Promise<CommandResult | null>;
+  invoke(
+    name: string,
+    argv: readonly string[],
+    options?: InvokeOptions,
+  ): Promise<CommandResult | null>;
+}
+
+export interface InvokeOptions {
+  /** Replaces the environment the sub-invocation sees, as `env NAME=value cmd` does. */
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 export interface CommandOutput {
