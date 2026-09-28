@@ -84,6 +84,7 @@ const KNOWN_VERBOSE_LINES = [
   /^\[\d+:0x[0-9a-f]+\] External memory global:/,
   /^\[\d+:0x[0-9a-f]+\] Total time spent in GC:/,
   /^\[\d+:0x[0-9a-f]+\] \(\*\) Sweeping is still in progress/,
+  /^\[\d+:0x[0-9a-f]+\] Shrinking page /,
   /^\[\d+:0x[0-9a-f]+:\d+\]\s+[\d.]+ ms: \[(?:Heap|GlobalMemory)Controller\]/,
 ];
 

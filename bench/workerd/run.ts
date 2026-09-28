@@ -21,6 +21,8 @@ import {
 } from "./proc-memory.js";
 
 const STATEMENT_TARGET = 1_000;
+// A regression limit at today's level, not the production isolate limit (ADR-0026).
+const V8_USED_PLUS_EXTERNAL_LIMIT_BYTES = 300 * 1024 * 1024;
 const SAMPLE_INTERVAL_MS = 5;
 const TRACE_TIMEOUT_MS = 10_000;
 
@@ -306,17 +308,23 @@ try {
             atMost: STATEMENT_TARGET,
             status: statementTarget(counts.statements),
           },
+          v8RegressionLimit: {
+            measure: "clone.v8.peakUsedPlusExternalBytes",
+            limitBytes: V8_USED_PLUS_EXTERNAL_LIMIT_BYTES,
+            status:
+              v8.peakUsedPlusExternalBytes <= V8_USED_PLUS_EXTERNAL_LIMIT_BYTES ? "pass" : "fail",
+          },
         },
         null,
         2,
       )}\n`,
     );
-    const failures: string[] = [];
-    // Local workerd has no isolate limit; this is a process-level regression gate.
-    if (addedPeakRssBytes > 100 * 1024 * 1024) {
-      failures.push(`${addedPeakRssBytes} added workerd RSS bytes > 100 MiB`);
+    // Process RSS is report-only: local workerd RSS does not measure the isolate limit.
+    if (v8.peakUsedPlusExternalBytes > V8_USED_PLUS_EXTERNAL_LIMIT_BYTES) {
+      throw new Error(
+        `clone gate failed: ${v8.peakUsedPlusExternalBytes} V8 used + external bytes > ${V8_USED_PLUS_EXTERNAL_LIMIT_BYTES}`,
+      );
     }
-    if (failures.length > 0) throw new Error(`clone gate failed: ${failures.join(", ")}`);
   } finally {
     await miniflare.dispose();
   }
