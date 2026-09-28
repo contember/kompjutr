@@ -114,9 +114,10 @@ class SourceIndex {
   }
 
   applicable(bytes: Uint8Array, addWork: (amount: number) => void): RuleSource[] {
+    if (this.#buckets.size === 0) return [];
     const sources: RuleSource[] = [];
     const verified = new Set<RuleSource>();
-    if (this.#buckets.size > 0) addWork(bytes.byteLength);
+    addWork(bytes.byteLength);
     let hash = SOURCE_HASH_INITIAL;
     for (let index = 0; index < bytes.byteLength; index++) {
       hash = this.hashStep(hash, bytes[index] ?? 0) >>> 0;
@@ -165,6 +166,7 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
   readonly #rootSource: RuleSource | null;
   readonly #sourceIndex: SourceIndex;
   readonly #extraSource: RuleSource;
+  readonly #hasRules: boolean;
 
   constructor(
     rules: ReadonlyMap<string, IgnorePattern[]>,
@@ -202,6 +204,12 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
     }
     this.#rootSource = rootSource;
     this.#sourceIndex = new SourceIndex(sources, hashStep);
+    this.#hasRules =
+      rootSource !== null ||
+      sources.length > 0 ||
+      this.#extraSource.paths.size > 0 ||
+      this.#extraSource.basenames.size > 0 ||
+      this.#extraSource.dynamic.length > 0;
   }
 
   sourceIndexStats(): IgnoreSourceIndexStats {
@@ -214,6 +222,8 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
     if (queryBytes > IGNORE_LIMITS.queryBytes) {
       throw new IgnoreLimitError("queryBytes", IGNORE_LIMITS.queryBytes, queryBytes);
     }
+    // Encoding and hashing every byte of the query is the matcher's main cost.
+    if (!this.#hasRules) return false;
     const encoded = encodePath(path);
 
     let work = 0;
