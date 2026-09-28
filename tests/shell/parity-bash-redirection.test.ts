@@ -45,4 +45,19 @@ describe.skipIf(!REAL_BASH)("ordered descriptor bindings match Bash", () => {
   it("writes bytes when the file binding is last", async () => {
     await compare("echo out 1>&2 >file; cat file", { file: "stale bytes\n" });
   });
+
+  it.each([
+    "rm missing 2> err; cat err",
+    "rm missing 2>> log; rm other 2>> log; cat log",
+    "echo out 2> err; cat err | wc -c",
+    "printf 'out\\n'; rm missing 2> err > out; cat out err",
+    "rm missing > both 2>&1; cat both",
+    "rm missing 2> both 1>&2; cat both",
+    "rm missing 2>&1 > out | wc -l; cat out",
+    "rm missing 2> err | wc -l; cat err",
+    "rm missing 2> err 2> second; cat err; echo --; cat second",
+    "rm missing 2> sub/err || echo failed; cat sub/err",
+  ])("writes stderr to a file: %j", async (source) => {
+    await compare(source, { err: "stale bytes\n", "sub/keep": "" });
+  });
 });

@@ -135,18 +135,7 @@ function planRedirection(redirection: Redirection): PlannedRedirection {
   }
 
   const append = redirection.op === ">>";
-  if (redirection.fd === 2) {
-    // `2>/dev/null` is 145 of 614 corpus lines' worth of noise suppression.
-    // Recognising the sink means never allocating the buffer at all.
-    if (argumentLiteral(target) === "/dev/null") {
-      return { kind: "write", fd: 2, path: target, append };
-    }
-    throw new ShellSyntaxError(
-      "redirection",
-      "redirecting stderr to a file is not supported; use 2>/dev/null or 2>&1",
-      0,
-    );
-  }
+  if (redirection.fd === 2) return { kind: "write", fd: 2, path: target, append };
   if (redirection.fd !== 1) {
     throw new ShellSyntaxError("redirection", `descriptor ${redirection.fd} is not supported`, 0);
   }

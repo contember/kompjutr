@@ -216,8 +216,13 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
     ]);
   });
 
-  it("refuses a stderr redirection it cannot honour", () => {
-    expect(rejects("ls 2> errors.log").construct).toBe("redirection");
+  it("plans stderr to a file as an ordered write", () => {
+    expect(planOne("ls 2> errors.log").commands[0]?.redirections).toMatchObject([
+      { kind: "write", fd: 2, append: false },
+    ]);
+  });
+
+  it("refuses a descriptor redirection it cannot honour", () => {
     expect(rejects("ls 3> x").construct).toBe("redirection");
     expect(rejects("ls 1>&1").construct).toBe("redirection");
   });

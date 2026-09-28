@@ -16,6 +16,8 @@ export const cat: Command = (context) => {
     return result(context.stdin ?? empty());
   }
   const paths = context.argv.map((operand) => resolve(context.cwd, operand));
+  // Diagnostics name the operand as typed, as GNU cat does.
+  const operandOf = new Map(paths.map((path, index) => [path, context.argv[index] ?? path]));
 
   // `cat big.log | head -20` is the one place the planner's demand hint pays
   // for itself: without it `cat` reads the whole file and `head` throws the
@@ -23,7 +25,9 @@ export const cat: Command = (context) => {
   if (paths.length === 1 && context.limitHint !== null) {
     const only = paths[0] ?? "";
     const stat = context.fs.stat(only);
-    if (stat === null) return fail(context, `${only}: No such file or directory`);
+    if (stat === null) {
+      return fail(context, `${operandOf.get(only) ?? only}: No such file or directory`);
+    }
     return result(headOfFile(context, only, stat.size, context.limitHint));
   }
 
@@ -45,7 +49,7 @@ export const cat: Command = (context) => {
         if (path === undefined) return;
         const stat = context.fs.statTarget(path);
         if (stat === null) {
-          context.warn(`${path}: No such file or directory`);
+          context.warn(`${operandOf.get(path) ?? path}: No such file or directory`);
           status = 1;
         } else {
           yield* streamFile(context, path, stat.size, "cat file");
@@ -63,7 +67,7 @@ export const cat: Command = (context) => {
           if (path === undefined) continue;
           const bytes = batch.files.get(path);
           if (bytes === undefined) {
-            context.warn(`${path}: No such file or directory`);
+            context.warn(`${operandOf.get(path) ?? path}: No such file or directory`);
             status = 1;
           } else yield bytes;
         }
@@ -220,12 +224,12 @@ function takeCountShorthand(argv: readonly string[]): {
 }
 
 export function fileStream(context: CommandContext, operands: readonly string[]): ByteStream {
-  const paths = operands.map((operand) => resolve(context.cwd, operand));
   return (function* (): ByteStream {
-    for (const path of paths) {
+    for (const operand of operands) {
+      const path = resolve(context.cwd, operand);
       const stat = context.fs.stat(path);
       if (stat === null) {
-        context.warn(`${path}: No such file or directory`);
+        context.warn(`${operand}: No such file or directory`);
         continue;
       }
       yield* streamFile(context, path, stat.size, "file input");

@@ -40,8 +40,9 @@ its redirections:
   supplies the word and a newline. Neither splits fields nor expands paths.
   The body bytes are reserved against `maxRetainedBytes` while the stage reads
   them. A body without its delimiter line is rejected.
-- Redirecting stderr to a file and duplicating descriptors other than `1` and
-  `2` are rejected.
+- `2> file` and `2>> file` hold the stage's diagnostics against
+  `maxRetainedBytes` and publish them after the stage settles. Descriptors
+  other than `0`, `1`, and `2` are rejected.
 
 The [ordered-redirection Bash parity suite](../../tests/shell/parity-bash-redirection.test.ts)
 pins descriptor routing, pipeline behavior, left-to-right ordering, and file

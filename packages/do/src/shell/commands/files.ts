@@ -24,7 +24,8 @@ export const cp: Command = (context) => {
     const recursive = parsed.flags.some(
       (flag) => flag.name === "-r" || flag.name === "-R" || flag.name === "--recursive",
     );
-    const paths = parsed.operands.map((operand) => resolve(context.cwd, operand));
+    const operands = parsed.operands;
+    const paths = operands.map((operand) => resolve(context.cwd, operand));
     const destination = paths.pop();
     if (destination === undefined || paths.length === 0) {
       return fail(context, "usage: cp [-r] SOURCE... DEST", 2);
@@ -33,13 +34,13 @@ export const cp: Command = (context) => {
     const destinationStat = context.fs.stat(destination);
     const intoDirectory = destinationStat?.type === "dir";
     if (paths.length > 1 && !intoDirectory) {
-      return fail(context, `target '${destination}' is not a directory`, 2);
+      return fail(context, `target '${operands[paths.length] ?? ""}' is not a directory`, 2);
     }
 
-    for (const source of paths) {
+    for (const [index, source] of paths.entries()) {
       const stat = context.fs.stat(source);
       if (stat === null) {
-        return fail(context, `cannot stat '${source}': No such file or directory`);
+        return fail(context, `cannot stat '${operands[index] ?? ""}': No such file or directory`);
       }
       const target = intoDirectory ? join(destination, basename(source)) : destination;
 
@@ -93,18 +94,19 @@ function copySubtree(context: CommandContext, source: string, target: string): v
 }
 
 export const mv: Command = (context) => {
-  const paths = context.argv.map((operand) => resolve(context.cwd, operand));
+  const operands = context.argv;
+  const paths = operands.map((operand) => resolve(context.cwd, operand));
   const destination = paths.pop();
   if (destination === undefined || paths.length === 0) {
     return fail(context, "usage: mv SOURCE... DEST", 2);
   }
   const intoDirectory = context.fs.stat(destination)?.type === "dir";
   if (paths.length > 1 && !intoDirectory) {
-    return fail(context, `target '${destination}' is not a directory`, 2);
+    return fail(context, `target '${operands[paths.length] ?? ""}' is not a directory`, 2);
   }
-  for (const source of paths) {
+  for (const [index, source] of paths.entries()) {
     if (context.fs.stat(source) === null) {
-      return fail(context, `cannot stat '${source}': No such file or directory`);
+      return fail(context, `cannot stat '${operands[index] ?? ""}': No such file or directory`);
     }
     context.fs.rename(source, intoDirectory ? join(destination, basename(source)) : destination);
   }

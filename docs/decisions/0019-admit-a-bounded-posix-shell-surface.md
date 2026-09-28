@@ -31,8 +31,10 @@ subshell behaviour require execution models this runtime does not have.
 
 We admit this finite surface:
 
-- `1>&2` alongside `2>&1`, with descriptor bindings resolved left to right and
-  earlier file creation and truncation effects preserved.
+- `1>&2` alongside `2>&1`, and `2>`/`2>>` to a file, with descriptor bindings
+  resolved left to right and earlier file creation and truncation effects
+  preserved. File-bound diagnostics are held against the retained budget and
+  published when the stage settles.
 - `printf` with `%s`, `%%`, signed ASCII-decimal `%d`, the escapes `\n`, `\t`,
   `\r`, `\\`, and `\0`, Bash's missing-operand defaults, and format recycling.
 - `exit [N]` as a run-terminating single-stage command. No operand uses the
