@@ -21,10 +21,11 @@ export interface SparseCheckoutCandidate {
 type AvailableSparseWorkspaceResult = Extract<SparseWorkspaceResult, { available: true }>;
 
 /**
- * A clean tracker (baseline at HEAD, no dirty row) means no untracked path
- * exists, ignored ones included: every seal records what it saw, and every
- * later write is journaled. So only the tree diff can block, and no blocker
- * check runs. A seal over unrecorded content is undefined behavior.
+ * A clean tracker (baseline at HEAD, no dirty row) means no untracked file or
+ * symlink exists, ignored ones included: every seal records the files it saw,
+ * and every later write is journaled. Empty directories are replaceable, and
+ * hydrate reads each diff path's real type, so only the tree diff can block.
+ * A seal over unrecorded content is undefined behavior.
  */
 export function trySparseCleanCheckout(
   context: GitContext,
