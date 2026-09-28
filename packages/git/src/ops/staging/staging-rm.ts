@@ -92,6 +92,7 @@ export function rm(repo: Repository, worktree: Worktree, options: RmOptions): vo
     if (!spec.matched) throw new PathspecNotFoundError(displayRmSpec(spec));
     if (!recursive && spec.directoryMatch) throw rmDirectoryError(spec);
   }
+  if (scan.hashFailure !== undefined) throw scan.hashFailure.error;
   if (scan.unsafe !== undefined) throw scan.unsafe;
   requireRmPruneBounded(scan.prune);
 
@@ -121,6 +122,8 @@ export function rm(repo: Repository, worktree: Worktree, options: RmOptions): vo
 }
 
 interface RmSelectionScan {
+  /** A worktree read failure while hashing; hashing stops at the first one. */
+  hashFailure: { error: unknown } | undefined;
   unsafe: GitError | undefined;
   prune: RmPrunePlan;
   /** Every selected path when they fit one window; otherwise removal rescans the index. */
@@ -129,8 +132,8 @@ interface RmSelectionScan {
 
 /**
  * One HEAD/index/worktree pass records pathspec matches, the first unsafe
- * removal, and prune candidates. Errors are deferred because Git reports
- * pathspec errors before safety errors.
+ * removal, and prune candidates. Safety and read errors are deferred because
+ * Git reports pathspec errors before it reads any file.
  */
 function scanRmSelection(
   repo: Repository,
@@ -144,9 +147,14 @@ function scanRmSelection(
   let retained: string[] | undefined = [];
   const batch: RmCandidate[] = [];
   let unsafe: GitError | undefined;
+  let hashFailure: { error: unknown } | undefined;
   const flush = (): void => {
-    identifyRmWorktree(repo, worktree, batch);
-    for (const candidate of batch) unsafe ??= rmCandidateUnsafe(candidate, mode.cached);
+    try {
+      identifyRmWorktree(repo, worktree, batch);
+      for (const candidate of batch) unsafe ??= rmCandidateUnsafe(candidate, mode.cached);
+    } catch (error) {
+      hashFailure = { error };
+    }
     batch.length = 0;
   };
 
@@ -159,7 +167,7 @@ function scanRmSelection(
       if (retained.length === RM_WINDOW_ROWS) retained = undefined;
       else retained.push(selected.path);
     }
-    if (mode.force) continue;
+    if (mode.force || hashFailure !== undefined) continue;
     batch.push({
       path: selected.path,
       head: row.a,
@@ -171,7 +179,7 @@ function scanRmSelection(
     if (batch.length === RM_WINDOW_ROWS) flush();
   }
   if (batch.length > 0) flush();
-  return { unsafe, prune, retained };
+  return { hashFailure, unsafe, prune, retained };
 }
 
 function rmCandidateUnsafe(candidate: RmCandidate, cached: boolean): GitError | undefined {

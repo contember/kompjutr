@@ -1012,7 +1012,7 @@ describe("rm", () => {
     expect(utf8Decoder.decode(workspace.worktree.readFile("/target.txt"))).toBe("target\n");
   });
 
-  it("hashes long symlink targets in bounded rm windows after pathspec checks", () => {
+  it("hashes long symlink targets in bounded rm windows and reports pathspec errors first", () => {
     const workspace = makeRepo("/");
     const target = "x".repeat(17_000);
     const paths = Array.from(

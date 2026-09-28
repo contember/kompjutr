@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   closeSync,
   existsSync,
   mkdirSync,
@@ -128,6 +129,43 @@ describe("LocalWorkspace Git parity", () => {
       await expect(workspace.git.status()).resolves.toEqual([]);
     } finally {
       workspace.close();
+      fixture.dispose();
+    }
+  });
+
+  it("reports an unmatched rm pathspec before an unreadable modified file", async () => {
+    const fixture = localFixture();
+    const mirror = new GitFixture().init();
+    const workspace = fixture.workspace({
+      now: () => FIXED_TIME,
+      timezoneOffset: () => 0,
+      defaultGitIdentity: IDENTITY,
+    });
+    try {
+      await workspace.git.init();
+      writeBoth(workspace, mirror, "z.txt", "base\n");
+      await workspace.git.add({ paths: ["z.txt"] });
+      await workspace.git.commit({ message: "base" });
+      mirror.git("add", "--", "z.txt");
+      mirror.git("commit", "-q", "-m", "base");
+      writeBoth(workspace, mirror, "z.txt", "changed\n");
+      chmodSync(join(workspace.root, "z.txt"), 0o000);
+      chmodSync(join(mirror.dir, "z.txt"), 0o000);
+
+      expect(() => mirror.git("rm", "-q", "--", "z.txt", "missing")).toThrow(
+        /pathspec 'missing' did not match/,
+      );
+      await expect(workspace.git.rm({ paths: ["z.txt", "missing"] })).rejects.toMatchObject({
+        code: "EPATHSPEC",
+      });
+      chmodSync(join(workspace.root, "z.txt"), 0o644);
+      chmodSync(join(mirror.dir, "z.txt"), 0o644);
+      const status = await workspace.git.runCli({ argv: ["status", "--porcelain=v2"], cwd: "/" });
+      expect(status.stdout.trimEnd()).toBe(mirror.git("status", "--porcelain=v2"));
+      expect(readFileSync(join(workspace.root, "z.txt"), "utf8")).toBe("changed\n");
+    } finally {
+      workspace.close();
+      mirror.dispose();
       fixture.dispose();
     }
   });
