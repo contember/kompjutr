@@ -4,9 +4,15 @@ import {
   type DurableObjectStorageLike,
   type SqlDatabase,
 } from "../../packages/do/src/db/db.js";
+import { isCanonicalPath, prefixesOf } from "../../packages/do/src/fs/path.js";
 import { initializeFsSchema } from "../../packages/do/src/fs/schema.js";
 import { allocateInodes } from "../../packages/do/src/fs/store/meta.js";
-import { realpath, realpathNoFollow, realpaths } from "../../packages/do/src/fs/store/resolve.js";
+import {
+  realpath,
+  realpathNoFollow,
+  realpaths,
+  realpathsNoFollow,
+} from "../../packages/do/src/fs/store/resolve.js";
 import type { EntryType } from "../../packages/do/src/fs/types.js";
 import { TestDatabase } from "../helpers/db.js";
 
@@ -80,6 +86,33 @@ class RecordingDatabase implements SqlDatabase {
   }
 }
 
+describe("canonical path kit", () => {
+  it("accepts only absolute paths without empty, dot, or dot-dot components", () => {
+    expect(["/", "/a", "/a/b", "/a/.b", "/a/..b"].map(isCanonicalPath)).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+    ]);
+    expect(["//a", "/a/", "/a/.", "/a/..", "/./a", "a", ""].map(isCanonicalPath)).toEqual([
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+    ]);
+  });
+
+  it("lists the root, every ancestor, and the path", () => {
+    expect(prefixesOf("/")).toEqual(["/"]);
+    expect(prefixesOf("/a")).toEqual(["/", "/a"]);
+    expect(prefixesOf("/a/b/c")).toEqual(["/", "/a", "/a/b", "/a/b/c"]);
+  });
+});
+
 describe("ordered path resolution", () => {
   it.each(["/file/child", "/file/", "/file//", "/file/../target"])(
     "checks a file before consuming the remainder of %s",
@@ -88,6 +121,27 @@ describe("ordered path resolution", () => {
       expect(() => realpath(db, path)).toThrowError(expect.objectContaining({ code: "ENOTDIR" }));
     },
   );
+
+  it("resolves canonical batches to the same paths as the component walk", () => {
+    const db = setup([
+      { path: "/dir", type: "dir" },
+      { path: "/dir/file" },
+      { path: "/real", type: "dir" },
+      { path: "/real/file" },
+      { path: "/alias", type: "symlink", target: "/real" },
+    ]);
+    expect(
+      realpaths(db, ["/dir/file", "/dir/missing/descendant", "/alias", "/alias/file"]),
+    ).toEqual(["/dir/file", "/dir/missing/descendant", "/real", "/real/file"]);
+    expect(realpathsNoFollow(db, ["/alias", "/alias/file", "/dir/missing"])).toEqual([
+      "/alias",
+      "/real/file",
+      "/dir/missing",
+    ]);
+    expect(() => realpaths(db, ["/dir", "/dir/file/child"])).toThrowError(
+      expect.objectContaining({ code: "ENOTDIR" }),
+    );
+  });
 
   it("expands a nested symlink before applying a following parent segment", () => {
     const db = setup([

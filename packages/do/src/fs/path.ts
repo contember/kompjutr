@@ -48,6 +48,41 @@ export function basename(path: string): string {
   return normalized.slice(normalized.lastIndexOf("/") + 1);
 }
 
+/** Absolute with no empty, `.`, or `..` component; `/` itself is canonical. */
+export function isCanonicalPath(path: string): boolean {
+  if (path === "/") return true;
+  if (path.charCodeAt(0) !== 0x2f) return false;
+  let start = 1;
+  for (let index = 1; index <= path.length; index++) {
+    if (index < path.length && path.charCodeAt(index) !== 0x2f) continue;
+    const length = index - start;
+    if (
+      length === 0 ||
+      (length === 1 && path.charCodeAt(start) === 0x2e) ||
+      (length === 2 && path.charCodeAt(start) === 0x2e && path.charCodeAt(start + 1) === 0x2e)
+    ) {
+      return false;
+    }
+    start = index + 1;
+  }
+  return true;
+}
+
+/**
+ * `/`, every ancestor, then the path itself, for a canonical path. Each
+ * prefix is a slice, so the engine shares the path's storage instead of
+ * copying it.
+ */
+export function prefixesOf(path: string): string[] {
+  const prefixes = ["/"];
+  if (path === "/") return prefixes;
+  for (let index = path.indexOf("/", 1); index !== -1; index = path.indexOf("/", index + 1)) {
+    prefixes.push(path.slice(0, index));
+  }
+  prefixes.push(path);
+  return prefixes;
+}
+
 /** The segments of an absolute path, root excluded. `/` gives `[]`. */
 export function segments(path: string): string[] {
   const normalized = normalize(path);

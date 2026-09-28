@@ -326,6 +326,18 @@ describe("readFiles", () => {
     expect(batch.remaining).toEqual([]);
   });
 
+  it("delivers a duplicated path under every caller spelling from one lookup row", () => {
+    const fixture = new Fixture();
+    const a = pseudoRandom(100, 3);
+    fixture.transaction(() => fixture.file("/repo/a.bin", a));
+
+    const batch = readFiles(fixture.db, ["/repo/a.bin", "/repo//a.bin", "/repo/a.bin"]);
+    expect([...batch.files.keys()]).toEqual(["/repo/a.bin", "/repo//a.bin"]);
+    expectBytes(batch.files.get("/repo/a.bin"), a);
+    expectBytes(batch.files.get("/repo//a.bin"), a);
+    expect(batch.remaining).toEqual([]);
+  });
+
   it("costs one lookup plus one statement per byte budget, and never overruns it", () => {
     const fixture = new Fixture();
     // 9,329 files of 2,560 bytes = 23,882,240 bytes (~23.9 MB). Uniform so

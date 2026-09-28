@@ -8,7 +8,7 @@
 // caller path is rejected for not being well-formed UTF-8.
 
 import type { SqlDatabase } from "../../db/db.js";
-import { assertWellFormedPath } from "../path.js";
+import { assertWellFormedPath, isCanonicalPath, prefixesOf } from "../path.js";
 import type { RealPath } from "../types.js";
 import { utf8Length } from "./write/write-batches.js";
 
@@ -82,37 +82,6 @@ function nodesOn(db: SqlDatabase, paths: readonly string[]): Map<string, NodeRow
   }
   flush();
   return out;
-}
-
-/** No empty, `.`, or `..` component: every prefix is then a slice, not a new string. */
-function isCanonical(path: string): boolean {
-  if (path === "/") return true;
-  if (path.charCodeAt(0) !== 0x2f) return false;
-  let start = 1;
-  for (let index = 1; index <= path.length; index++) {
-    if (index < path.length && path.charCodeAt(index) !== 0x2f) continue;
-    const length = index - start;
-    if (
-      length === 0 ||
-      (length === 1 && path.charCodeAt(start) === 0x2e) ||
-      (length === 2 && path.charCodeAt(start) === 0x2e && path.charCodeAt(start + 1) === 0x2e)
-    ) {
-      return false;
-    }
-    start = index + 1;
-  }
-  return true;
-}
-
-/** `/`, then every ancestor of a canonical path, then the path itself. */
-function canonicalPrefixes(path: string): string[] {
-  const prefixes = ["/"];
-  if (path === "/") return prefixes;
-  for (let index = path.indexOf("/", 1); index !== -1; index = path.indexOf("/", index + 1)) {
-    prefixes.push(path.slice(0, index));
-  }
-  prefixes.push(path);
-  return prefixes;
 }
 
 /** Whether the ordered walk of a canonical path must expand a symlink. */
@@ -201,8 +170,8 @@ function resolve(
   assertWellFormedPath(path);
   let nodes = initialNodes;
   let real: string | null = null;
-  if (isCanonical(path)) {
-    const prefixes = canonicalPrefixes(path);
+  if (isCanonicalPath(path)) {
+    const prefixes = prefixesOf(path);
     nodes ??= nodesOn(db, prefixes);
     if (!followsSymlink(path, prefixes, followFinal, nodes)) real = path;
   }
@@ -282,8 +251,8 @@ function resolveMany(db: SqlDatabase, paths: readonly string[], followFinal: boo
   for (const path of paths) {
     // Ahead of the planning binding, so a malformed path never reaches SQL.
     assertWellFormedPath(path);
-    const candidates = isCanonical(path)
-      ? canonicalPrefixes(path)
+    const candidates = isCanonicalPath(path)
+      ? prefixesOf(path)
       : plannedPaths([], componentsOf(path));
     const candidateBytes = candidates.map(jsonItemBytes);
     let addedBytes = 0;
