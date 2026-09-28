@@ -32,6 +32,10 @@ const TREE: ShellTree = {
   "nul.bin": "b\u0000a\nx\u0000c\u0000",
   "fields.txt": "x:3:b:9\ny:1:a\nz:2:c:1\nw:1:b:7\n",
   "dir/f.txt": "q\np\n",
+  "ver2.txt":
+    "1.10\n1.9\n1.09\n1.010\n1.0\n1\n1.\na~b\na~\na\nab\na~~\na.b\na-b\na+b\na_b\n.hidden\n.hidden2\n.a~\n..b\n...\n\nfoo.tar.gz\nfoo.tar\nfoo\nfoo-1.2.tar.gz\nfoo-1.10.tar.gz\nfoo-1.2.tgz\nfoo.1.tar.gz~\nfoo.gz.1\nfoo.~\n007\n7\n0\n00\n-1\n-\n--\n1-a\n1a\n1-\nA1\na1\nZ\n1.2.3-rc1\n1.2.3-rc10\n1.2.3~rc2\n1.2.3\n~\n~~\n",
+  "keys.txt":
+    "  ab  cdef  gh\nx\n\n a\nab:cdef:gh\na::bc:d\na  b c\n:\n::\nb\tq w\nab cd\nab cc\n  zz yy\n",
 };
 
 describe("the sort options parity suite has something to compare against", () => {
@@ -75,6 +79,23 @@ describe.skipIf(!REAL_BASH)("sort options match uutils sort", () => {
     "sort -k2n ws.txt",
     "sort -k1 ws.txt",
     "sort -b ws.txt",
+    "sort -k2.3,2.5 keys.txt",
+    "sort -k2.3,2.5 -k1 keys.txt",
+    "sort -k2,2b keys.txt",
+    "sort -k2b,2 keys.txt",
+    "sort -k2.2b,2.3 keys.txt",
+    "sort -k2.2,2.3b keys.txt",
+    "sort -k2.9 keys.txt",
+    "sort -k2,2.9 keys.txt",
+    "sort -k1,1.5 keys.txt",
+    "sort -k1.3,2 keys.txt",
+    "sort -k1.9,1.20 keys.txt",
+    "sort -k5 keys.txt",
+    "sort -k2,5 keys.txt",
+    "sort -k3,3.2 -s keys.txt",
+    "sort -b -k2 keys.txt",
+    "sort -b -k2.2,2.2 keys.txt",
+    "sort -k2,2 -r keys.txt",
   ])("orders by key: %j", async (source) => {
     await compare(source);
   });
@@ -94,6 +115,26 @@ describe.skipIf(!REAL_BASH)("sort options match uutils sort", () => {
     "sort --field-separator=: -k2 fields.txt",
     "sort -t: -t, -k2n csv.txt",
     "sort -t ' ' -k2n s.txt",
+    "sort -t: -k3 keys.txt",
+    "sort -t: -k3 -s keys.txt",
+    "sort -t: -k2,2 -k4.5 keys.txt",
+    "sort -t: -k1.3,2 keys.txt",
+    "sort -t: -k1,1.5 keys.txt",
+    "sort -t: -k2.2,2.9 keys.txt",
+    "sort -t: -k1.9,1.20 keys.txt",
+    "sort -t: -k2b keys.txt",
+    "sort -t: -k2.2b keys.txt",
+    "sort -t: -k2,2.1b -s keys.txt",
+    "sort -t: -k5 keys.txt",
+    "sort -t: -k2,5 keys.txt",
+    "sort -t ' ' -k2b keys.txt",
+    "sort -t ' ' -k2,2b keys.txt",
+    "sort -t ' ' -k2.2b,2.2b keys.txt",
+    "sort -t ' ' -k3.1b,3.1 keys.txt",
+    "sort -b -t ' ' -k2 keys.txt",
+    "sort -b -t: -k2 keys.txt",
+    "sort -t: -k2,2 -s fields.txt csv.txt keys.txt",
+    "printf 'a::c\\na:b:c\\na:::\\n::\\n' | sort -t: -k2,2 -k3r",
   ])("splits on a separator: %j", async (source) => {
     await compare(source);
   });
@@ -119,6 +160,18 @@ describe.skipIf(!REAL_BASH)("sort options match uutils sort", () => {
     "sort -k1V ver.txt",
     "sort --version-sort ver.txt",
     "sort --human-numeric-sort human.txt",
+    "sort -V ver2.txt",
+    "sort -Vr ver2.txt",
+    "sort -V -s ver2.txt",
+    "sort -Vu ver2.txt",
+    "sort -k1V -s ver2.txt",
+    "printf '1.10\\n1.9\\n1.9.0\\n1.09\\n' | sort -V -s",
+    "printf 'a~b\\na\\na~\\nab\\n~a\\n' | sort -V",
+    "printf '.hidden\\nhidden\\n.\\n..\\n\\n.h1\\n' | sort -V",
+    "printf 'x.tar.gz\\nx.tar\\nx.1.gz\\nx.gz\\nx-1.tar.gz\\n' | sort -V -s",
+    "printf '0010\\n010\\n10\\n9\\n0\\n000\\n' | sort -V -s",
+    "printf 'a-1\\na1\\naa1\\na.1\\n-a\\nA-1\\n' | sort -V",
+    "printf 'k 1.10\\nk 1.9\\nj 1.10\\n' | sort -k2V -k1",
   ])("orders numbers and versions: %j", async (source) => {
     await compare(source);
   });

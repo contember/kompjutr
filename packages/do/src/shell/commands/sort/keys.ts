@@ -1,7 +1,7 @@
 // `sort -k KEYDEF` parsing and field extraction.
 //
 // Parsing follows uutils sort 0.2.2, whose diagnostics the parity suite pins.
-// Extraction follows POSIX as GNU implements it (`begfield`/`limfield`):
+// Extraction follows POSIX `sort -k`:
 // without `-t` a field starts at the blanks before it, and with `-t` the
 // separator belongs to neither neighbour.
 
@@ -187,7 +187,11 @@ export function isBlank(byte: number | undefined): boolean {
   return byte === 0x20 || (byte !== undefined && byte >= 0x09 && byte <= 0x0d);
 }
 
-/** Where `key` starts in `line[start, end)`. */
+/**
+ * Where `key` starts in `line[start, end)`: the start field's first byte,
+ * past its leading blanks under `b`, plus the character offset. An offset
+ * is not held inside its field; only the line end bounds it.
+ */
 export function keyStart(
   line: Uint8Array,
   start: number,
@@ -195,21 +199,16 @@ export function keyStart(
   key: SortKey,
   separator: number | null,
 ): number {
-  let at = start;
-  for (let field = key.startField; at < end && field > 0; field--) {
-    if (separator !== null) {
-      while (at < end && line[at] !== separator) at++;
-      if (at < end) at++;
-    } else {
-      while (at < end && isBlank(line[at])) at++;
-      while (at < end && !isBlank(line[at])) at++;
-    }
-  }
-  if (key.options.blanksAtStart) while (at < end && isBlank(line[at])) at++;
-  return Math.min(end, at + key.startChar);
+  const field = fieldStart(line, start, end, key.startField, separator);
+  const counted = key.options.blanksAtStart ? skipBlanks(line, field, end) : field;
+  return Math.min(counted + key.startChar, end);
 }
 
-/** Where `key` ends in `line[start, end)`. */
+/**
+ * Where `key` ends: the line end without an end field, the end of the end
+ * field when its character is 0, and otherwise the field's first byte (past
+ * blanks under `b`) plus the one-based character, bounded by the line end.
+ */
 export function keyEnd(
   line: Uint8Array,
   start: number,
@@ -218,21 +217,46 @@ export function keyEnd(
   separator: number | null,
 ): number {
   if (key.endField === null) return end;
+  const field = fieldStart(line, start, end, key.endField, separator);
+  if (key.endChar === 0) return fieldEnd(line, field, end, separator);
+  const counted = key.options.blanksAtEnd ? skipBlanks(line, field, end) : field;
+  return Math.min(counted + key.endChar, end);
+}
+
+/**
+ * First byte of the zero-based `field`, or `end` when the line has fewer
+ * fields. With a separator, a field begins after the previous separator.
+ * Without one, a field begins at the blanks that precede its non-blanks.
+ */
+function fieldStart(
+  line: Uint8Array,
+  start: number,
+  end: number,
+  field: number,
+  separator: number | null,
+): number {
   let at = start;
-  let fields = key.endChar === 0 ? key.endField + 1 : key.endField;
-  while (at < end && fields > 0) {
-    fields--;
-    if (separator !== null) {
-      while (at < end && line[at] !== separator) at++;
-      if (at < end && (fields > 0 || key.endChar !== 0)) at++;
-    } else {
-      while (at < end && isBlank(line[at])) at++;
-      while (at < end && !isBlank(line[at])) at++;
-    }
-  }
-  if (key.endChar !== 0) {
-    if (key.options.blanksAtEnd) while (at < end && isBlank(line[at])) at++;
-    at = Math.min(end, at + key.endChar);
+  for (let skipped = 0; skipped < field && at < end; skipped++) {
+    at = fieldEnd(line, at, end, separator);
+    if (separator !== null && at < end) at++;
   }
   return at;
+}
+
+/** The byte after the field that begins at `at`. */
+function fieldEnd(line: Uint8Array, at: number, end: number, separator: number | null): number {
+  let cursor = at;
+  if (separator !== null) {
+    while (cursor < end && line[cursor] !== separator) cursor++;
+    return cursor;
+  }
+  cursor = skipBlanks(line, cursor, end);
+  while (cursor < end && !isBlank(line[cursor])) cursor++;
+  return cursor;
+}
+
+function skipBlanks(line: Uint8Array, at: number, end: number): number {
+  let cursor = at;
+  while (cursor < end && isBlank(line[cursor])) cursor++;
+  return cursor;
 }

@@ -2,7 +2,7 @@
 //
 // Numbers compare as exact decimals, never through floating point, so
 // `sort -n` agrees with the reference on values past 2^53. Version order is
-// gnulib's `filevercmp`, which uutils `-V` matches.
+// the coreutils manual's version sort, which uutils `-V` matches.
 
 import { isBlank, type KeyOptions } from "./keys.js";
 
@@ -188,88 +188,135 @@ function unitOrder(number: Decimal): number {
   return number.negative ? -order : order;
 }
 
+/**
+ * Follows uutils coreutils (MIT) `uucore::version_cmp`, the host `sort -V`.
+ * Equal bytes are equal. Otherwise the empty string, `.`, `..`, and then
+ * any other dot-name sort first, in that order; two dot-names drop their dot.
+ * A file suffix is ignored unless the two names differ only there. The rest
+ * alternates a non-digit run, compared by `compareVersionText`, with a digit
+ * run, compared by value.
+ */
 export function compareVersions(left: Span, right: Span): number {
-  const a = left.bytes.subarray(left.start, left.end);
-  const b = right.bytes.subarray(right.start, right.end);
-  if (a.length === 0) return b.length === 0 ? 0 : -1;
-  if (b.length === 0) return 1;
-  if (a[0] === 0x2e) {
-    if (b[0] !== 0x2e) return -1;
-    const aDot = a.length === 1;
-    const bDot = b.length === 1;
-    if (aDot) return bDot ? 0 : -1;
-    if (bDot) return 1;
-    const aDotDot = a[1] === 0x2e && a.length === 2;
-    const bDotDot = b[1] === 0x2e && b.length === 2;
-    if (aDotDot) return bDotDot ? 0 : -1;
-    if (bDotDot) return 1;
-  } else if (b[0] === 0x2e) {
-    return 1;
+  if (compareBytes(left, right) === 0) return 0;
+  for (const special of SPECIAL_NAMES) {
+    const difference = Number(!equalsText(left, special)) - Number(!equalsText(right, special));
+    if (difference !== 0) return difference;
   }
-  const aPrefix = suffixStart(a);
-  const bPrefix = suffixStart(b);
-  const result = versionOrder(a, aPrefix, b, bPrefix);
-  if (result !== 0 || (aPrefix === a.length && bPrefix === b.length)) return result;
-  return versionOrder(a, a.length, b, b.length);
-}
-
-/** Length of the name before a suffix like `.tar.gz`: `(\.[A-Za-z~][A-Za-z0-9~]*)*$`. */
-function suffixStart(bytes: Uint8Array): number {
-  let prefix = 0;
-  let index = 0;
-  while (index < bytes.length) {
-    index++;
-    prefix = index;
-    while (
-      index + 1 < bytes.length &&
-      bytes[index] === 0x2e &&
-      (isAlpha(bytes[index + 1]) || bytes[index + 1] === 0x7e)
-    ) {
-      for (
-        index += 2;
-        index < bytes.length && (isAlphanumeric(bytes[index] ?? 0) || bytes[index] === 0x7e);
-        index++
-      ) {
-        // Skip the suffix word.
-      }
-    }
+  let a = left;
+  let b = right;
+  const leftDot = startsWithDot(left);
+  const rightDot = startsWithDot(right);
+  if (leftDot !== rightDot) return leftDot ? -1 : 1;
+  if (leftDot) {
+    a = { bytes: a.bytes, start: a.start + 1, end: a.end };
+    b = { bytes: b.bytes, start: b.start + 1, end: b.end };
   }
-  return prefix;
-}
+  const aStem = withoutSuffix(a);
+  const bStem = withoutSuffix(b);
+  if (compareBytes(aStem, bStem) !== 0) {
+    a = aStem;
+    b = bStem;
+  }
 
-function characterOrder(bytes: Uint8Array, at: number, length: number): number {
-  if (at === length) return -1;
-  const byte = bytes[at] ?? 0;
-  if (isDigit(byte)) return 0;
-  if (isAlpha(byte)) return byte;
-  if (byte === 0x7e) return -2;
-  return byte + 256;
-}
-
-function versionOrder(a: Uint8Array, aLength: number, b: Uint8Array, bLength: number): number {
-  let ai = 0;
-  let bi = 0;
-  while (ai < aLength || bi < bLength) {
-    let firstDifference = 0;
-    while ((ai < aLength && !isDigit(a[ai])) || (bi < bLength && !isDigit(b[bi]))) {
-      const ac = characterOrder(a, ai, aLength);
-      const bc = characterOrder(b, bi, bLength);
-      if (ac !== bc) return ac - bc;
-      ai++;
-      bi++;
-    }
-    while (ai < aLength && a[ai] === 0x30) ai++;
-    while (bi < bLength && b[bi] === 0x30) bi++;
-    while (ai < aLength && bi < bLength && isDigit(a[ai]) && isDigit(b[bi])) {
-      if (firstDifference === 0) firstDifference = (a[ai] ?? 0) - (b[bi] ?? 0);
-      ai++;
-      bi++;
-    }
-    if (ai < aLength && isDigit(a[ai])) return 1;
-    if (bi < bLength && isDigit(b[bi])) return -1;
-    if (firstDifference !== 0) return firstDifference;
+  let x = a.start;
+  let y = b.start;
+  while (x < a.end || y < b.end) {
+    const xDigits = findByte(a.bytes, x, a.end, isDigit);
+    const yDigits = findByte(b.bytes, y, b.end, isDigit);
+    const text = compareVersionText(a.bytes, x, xDigits, b.bytes, y, yDigits);
+    if (text !== 0) return text;
+    x = xDigits;
+    y = yDigits;
+    const xEnd = findByte(a.bytes, x, a.end, (byte) => !isDigit(byte));
+    const yEnd = findByte(b.bytes, y, b.end, (byte) => !isDigit(byte));
+    const xSignificant = findByte(a.bytes, x, xEnd, (byte) => byte !== 0x30);
+    const ySignificant = findByte(b.bytes, y, yEnd, (byte) => byte !== 0x30);
+    const digits = xEnd - xSignificant - (yEnd - ySignificant);
+    if (digits !== 0) return digits;
+    const number = compareBytes(
+      { bytes: a.bytes, start: xSignificant, end: xEnd },
+      { bytes: b.bytes, start: ySignificant, end: yEnd },
+    );
+    if (number !== 0) return number;
+    x = xEnd;
+    y = yEnd;
   }
   return 0;
+}
+
+const SPECIAL_NAMES: readonly string[] = ["", ".", ".."];
+
+function equalsText(span: Span, text: string): boolean {
+  if (span.end - span.start !== text.length) return false;
+  for (let index = 0; index < text.length; index++) {
+    if (span.bytes[span.start + index] !== text.charCodeAt(index)) return false;
+  }
+  return true;
+}
+
+function startsWithDot(span: Span): boolean {
+  return span.start < span.end && span.bytes[span.start] === 0x2e;
+}
+
+function findByte(
+  bytes: Uint8Array,
+  from: number,
+  end: number,
+  found: (byte: number) => boolean,
+): number {
+  let at = from;
+  while (at < end && !found(bytes[at] ?? 0)) at++;
+  return at;
+}
+
+/**
+ * Two non-digit runs: `~` sorts before everything, the end of a run
+ * included; then letters sort before other bytes; then plain byte order.
+ */
+function compareVersionText(
+  left: Uint8Array,
+  leftStart: number,
+  leftEnd: number,
+  right: Uint8Array,
+  rightStart: number,
+  rightEnd: number,
+): number {
+  let x = leftStart;
+  let y = rightStart;
+  for (; x < leftEnd || y < rightEnd; x++, y++) {
+    const a = x < leftEnd ? left[x] : undefined;
+    const b = y < rightEnd ? right[y] : undefined;
+    if (a === b) continue;
+    if (b === TILDE) return 1;
+    if (a === TILDE) return -1;
+    if (a === undefined) return -1;
+    if (b === undefined) return 1;
+    if (isAlpha(a) !== isAlpha(b)) return isAlpha(a) ? -1 : 1;
+    return a - b;
+  }
+  return 0;
+}
+
+const TILDE = 0x7e;
+
+/** The span without the file suffix uutils matches as `(\.[A-Za-z~][A-Za-z0-9~]*)*$`. */
+function withoutSuffix(span: Span): Span {
+  let suffixStart: number | null = null;
+  let afterDot = false;
+  for (let at = span.start; at < span.end; at++) {
+    const byte = span.bytes[at] ?? 0;
+    if (byte === 0x2e) {
+      if (suffixStart === null || afterDot) suffixStart = at;
+      afterDot = true;
+    } else if (afterDot) {
+      afterDot = false;
+      if (!isAlpha(byte) && byte !== TILDE) suffixStart = null;
+    } else if (!isAlphanumeric(byte) && byte !== TILDE) {
+      suffixStart = null;
+    }
+  }
+  if (afterDot || suffixStart === null) return span;
+  return { bytes: span.bytes, start: span.start, end: suffixStart };
 }
 
 function isDigit(byte: number | undefined): boolean {
