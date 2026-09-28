@@ -335,24 +335,6 @@ describe("writing", () => {
     expect((await touchShell.run("touch -h file")).exitCode).toBe(2);
   });
 });
-describe("sed ships two forms", () => {
-  it("substitutes", async () => {
-    expect((await shell.run("cat README.md | sed 's/widgets/gadgets/'")).stdout).toContain(
-      "gadgets",
-    );
-  });
-  it("prints a line range", async () => {
-    expect((await shell.run("sed -n 2,3p docs/guide.md")).stdout).toBe("line2\nline3\n");
-    expect((await shell.run("sed 2p docs/guide.md")).stdout).toBe(
-      "line1\nline2\nline2\nline3\nline4\nline5\n",
-    );
-  });
-  it("names the supported forms for anything else", async () => {
-    const run = await shell.run("cat README.md | sed '/widgets/d'");
-    expect(run.exitCode).toBe(2);
-    expect(run.stderr).toContain("only s/// and line-print scripts are supported");
-  });
-});
 describe("rejections", () => {
   it("names an unsupported construct", async () => {
     expect((await shell.run("echo $(date)")).stderr).toContain("command substitution");

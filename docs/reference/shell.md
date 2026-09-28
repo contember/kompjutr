@@ -115,7 +115,7 @@ attached value, or `--long=value`.
 | `which` | Reports built-in and injected command names as `/usr/bin/<name>`. |
 | `sort` | `-r`/`--reverse`, `-n`/`--numeric-sort`, `-u`/`--unique`, `-f`; UTF-8 byte order. |
 | `uniq` | `-c`/`--count`, `-d`, `-u`. |
-| `sed` | `s<d>pattern<d>replacement<d>[gi]` and `[from[,to]]p`, with optional `-n`. |
+| `sed` | Scripts from the operand or repeated `-e`, commands separated by `;` or newlines: `s` with `g`, `p`, `i`/`I`, and a numeric occurrence, `\1`–`\9` and `&` in the replacement; `p`, `d`, `q [status]`, `=`, one-line `a`, `i`, `c`, and `{ }` blocks. Addresses are line numbers, `$`, `/re/[I]`, `addr,addr`, `addr,+N`, `0,/re/`, and `!`. `-n`, `-E`/`-r`, and `-i` (in place, published once per file). Hold space, branches, labels, and file commands are refused by name. Script errors use GNU's `-e expression #N, char M:` diagnostics. |
 | `xargs` | `-n`/`--max-args`, `-I`/`--replace`, `-d`/`--delimiter`, `-0`/`--null`, `-r`/`--no-run-if-empty`. |
 
 `grep` uses GNU grep defaults: non-recursive, dotfiles included, and BRE unless

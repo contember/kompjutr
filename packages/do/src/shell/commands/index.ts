@@ -18,6 +18,7 @@ import { printf } from "./printf.js";
 import { readCommands } from "./read.js";
 import { grep } from "./search/grep.js";
 import { rg } from "./search/rg.js";
+import { sed } from "./sed/sed.js";
 import { tail } from "./tail.js";
 import { tee } from "./tee.js";
 import { bracket, test } from "./test.js";
@@ -34,6 +35,7 @@ export function builtinCommands(): Map<string, Command> {
     ["echo", echo],
     ["find", find],
     ["xargs", xargs],
+    ["sed", sed],
     ["tail", tail],
     ["tee", tee],
     ["wc", wc],

@@ -1,16 +1,10 @@
-// `pwd`, `cd`, `true`, `false`, `which`, `sort`, `uniq`, `sed`.
-//
-// `sed` ships two forms and nothing else: `s/a/b/[gi]` and `-n Np`. The
-// corpus has seven `sed` invocations and they are all one of those. Growing
-// a script parser here is how a shell turns into a bash port, so anything
-// else is a named error. See §2 of the plan.
+// `pwd`, `cd`, `true`, `false`, `which`, `sort`, `uniq`.
 
 import { comparePaths, normalize } from "../../fs/path.js";
 import { type ByteStream, decode, encode, lines, owned, terminated } from "../exec/bytes.js";
 import { type Command, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
-import { parseFlags, UsageError } from "./flags.js";
-import { compilePattern, PatternError } from "./search/regex.js";
+import { parseFlags } from "./flags.js";
 
 function* nothing(): ByteStream {
   // Nothing.
@@ -161,135 +155,6 @@ export const uniq: Command = (context) => {
   return result(stream);
 };
 
-/** `s/a/b/[gi]` or `-n Np`, and a named error for anything else. */
-export const sed: Command = (context) => {
-  try {
-    const quiet = context.argv[0] === "-n";
-    const rest = quiet ? context.argv.slice(1) : context.argv;
-    const script = rest[0];
-    if (script === undefined) return fail(context, "missing script", 2);
-
-    const source = sourceFor(context, rest.slice(1));
-    if (source === null) return result(nothing());
-
-    const print = /^([0-9]+)(?:,([0-9]+))?p$/.exec(script);
-    if (print !== null) {
-      const from = Number(print[1]);
-      const to = print[2] === undefined ? from : Number(print[2]);
-      return result(printRange(source, from, to, quiet, context.fs.retained));
-    }
-
-    const substitute = parseSubstitution(script);
-    if (substitute === null) {
-      return fail(context, `only s/// and line-print scripts are supported, not '${script}'`, 2);
-    }
-    return result(applySubstitution(source, substitute, quiet, context.fs.retained));
-  } catch (error) {
-    if (error instanceof UsageError || error instanceof PatternError) {
-      return fail(context, error.message, 2);
-    }
-    throw error;
-  }
-};
-
-interface Substitution {
-  readonly pattern: RegExp;
-  readonly replacement: string;
-  readonly global: boolean;
-}
-
-function parseSubstitution(script: string): Substitution | null {
-  if (!script.startsWith("s") || script.length < 4) return null;
-  const delimiter = script.charAt(1);
-  if (/[A-Za-z0-9\\\n]/.test(delimiter)) return null;
-
-  const parts: string[] = [];
-  let current = "";
-  let index = 2;
-  while (index < script.length && parts.length < 2) {
-    const char = script.charAt(index);
-    if (char === "\\" && script.charAt(index + 1) === delimiter) {
-      current += delimiter;
-      index += 2;
-      continue;
-    }
-    if (char === delimiter) {
-      parts.push(current);
-      current = "";
-      index++;
-      continue;
-    }
-    current += char;
-    index++;
-  }
-  if (parts.length < 2) return null;
-
-  const flags = script.slice(index);
-  if (!/^[gi]*$/.test(flags)) return null;
-  const find = parts[0];
-  const replace = parts[1];
-  if (find === undefined || replace === undefined) return null;
-
-  return {
-    pattern: compilePattern(find, {
-      dialect: "bre",
-      ignoreCase: flags.includes("i"),
-      wholeWord: false,
-      wholeLine: false,
-    }),
-    // sed's `&` is the whole match; JS spells that `$&`.
-    replacement: replace.replace(/\$/g, "$$$$").replace(/(^|[^\\])&/g, "$1$$&"),
-    global: flags.includes("g"),
-  };
-}
-
-async function* applySubstitution(
-  source: ByteStream,
-  substitution: Substitution,
-  quiet: boolean,
-  retained: Parameters<Command>[0]["fs"]["retained"],
-): ByteStream {
-  const flags = substitution.global
-    ? substitution.pattern.flags
-    : substitution.pattern.flags.replace("g", "");
-  const pattern = new RegExp(substitution.pattern.source, flags);
-  for await (const text of lines(source, retained)) {
-    const release = retained.retain(text.length * 2, "sed decoded line");
-    try {
-      const value = decode(text);
-      const replaced = value.replace(pattern, substitution.replacement);
-      if (quiet && replaced === value) continue;
-      yield encode(`${replaced}\n`);
-    } finally {
-      release();
-    }
-  }
-}
-
-async function* printRange(
-  source: ByteStream,
-  from: number,
-  to: number,
-  quiet: boolean,
-  retained: Parameters<Command>[0]["fs"]["retained"],
-): ByteStream {
-  let number = 0;
-  for await (const text of lines(source, retained)) {
-    number++;
-    const inRange = number >= from && number <= to;
-    const release = retained.retain(text.length * 2, "sed decoded line");
-    try {
-      const output = encode(`${decode(text)}\n`);
-      // Without `-n`, sed prints every line and duplicates the selected range.
-      if (!quiet) yield output;
-      if (inRange) yield output;
-      if (number > to && quiet) return;
-    } finally {
-      release();
-    }
-  }
-}
-
 function sourceFor(
   context: Parameters<Command>[0],
   operands: readonly string[],
@@ -329,5 +194,4 @@ export const textCommands: ReadonlyMap<string, Command> = new Map([
   ["which", which],
   ["sort", sort],
   ["uniq", uniq],
-  ["sed", sed],
 ]);

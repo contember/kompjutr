@@ -64,6 +64,9 @@ We admit this finite surface:
 - `grep` and `rg` `-o` and `-q`, each following its own binary around `-o`.
 - `tee`, which holds its file bytes against the retained budget and publishes
   each file once, and `wc` in GNU's per-operand layout.
+- A `sed` script language without hold space, branches, or file commands:
+  `s`, `p`, `d`, `q`, `=`, `a`, `i`, `c`, and blocks over line, `$`, regex,
+  and range addresses, with `-i` publishing each file once.
 
 Expansion stays unresolved through parse and plan, so planning stays pure.
 Generated fields and pathname matches share the 10,000-entry argv ceiling and the
@@ -79,8 +82,9 @@ this admission is the [baseline](../../tests/shell/parity-bash.test.ts),
 [`printf`](../../tests/shell/parity-bash-printf.test.ts),
 [`exit`](../../tests/shell/parity-bash-exit.test.ts),
 [named expansion](../../tests/shell/parity-bash-expansion.test.ts),
-[script](../../tests/shell/parity-bash-scripts.test.ts), and
-[path](../../tests/shell/parity-bash-paths.test.ts) suites.
+[script](../../tests/shell/parity-bash-scripts.test.ts),
+[path](../../tests/shell/parity-bash-paths.test.ts), and
+[sed](../../tests/shell/parity-bash-sed.test.ts) suites.
 
 These forms remain rejected:
 
