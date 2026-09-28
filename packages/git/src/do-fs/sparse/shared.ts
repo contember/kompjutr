@@ -6,6 +6,7 @@ import type {
   SparseTreeLeaf,
   SparseWorkspaceRequest,
 } from "../../store/core/contracts.js";
+import { jsonStringEncodedBytes } from "../../store/core/json-pages.js";
 
 export const MAX_PATHS = 1_000;
 export const MAX_SPARSE_BINDING_BYTES = 8 * 1024 * 1024;
@@ -14,7 +15,6 @@ export const MAX_DEPTH = 64;
 export const MAX_EDGE_STEPS = 32_768;
 export const MAX_INDEX_ANCESTORS = MAX_PATHS;
 export const MAX_SELECTED_EXACT_ANCESTORS = 32_768;
-export const encoder: { encode(input?: string): Uint8Array } = new TextEncoder();
 
 export interface TreeCursor {
   ordinal: number;
@@ -148,7 +148,6 @@ export function validateRequest(request: SparseWorkspaceRequest): ValidatedReque
   if (request.paths.length > MAX_PATHS) {
     throw tooLarge(`sparse workspace request exceeds ${MAX_PATHS} paths`);
   }
-  const parts: string[] = [];
   const segments: string[][] = [];
   let jsonBytes = 2;
   let previous: string | null = null;
@@ -159,17 +158,15 @@ export function validateRequest(request: SparseWorkspaceRequest): ValidatedReque
     }
     if (parsed.segments.length > MAX_DEPTH)
       throw tooLarge(`sparse workspace path exceeds ${MAX_DEPTH} segments`);
-    const part = JSON.stringify(path);
-    jsonBytes += encoder.encode(part).length + (previous === null ? 0 : 1);
+    jsonBytes += jsonStringEncodedBytes(path) + (previous === null ? 0 : 1);
     if (!Number.isSafeInteger(jsonBytes))
       throw tooLarge("sparse workspace request JSON size overflows");
     if (jsonBytes > MAX_SPARSE_BINDING_BYTES)
       throw tooLarge("sparse workspace request JSON is too large");
-    parts.push(part);
     segments.push(parsed.segments);
     previous = path;
   }
-  return { json: `[${parts.join(",")}]`, segments };
+  return { json: JSON.stringify(request.paths), segments };
 }
 
 export function validateIndexAncestorRequest(input: unknown): {
@@ -189,7 +186,6 @@ export function validateIndexAncestorRequest(input: unknown): {
     throw tooLarge(`sparse index ancestor request exceeds ${MAX_INDEX_ANCESTORS} paths`);
   }
   const ancestors: string[] = [];
-  const parts: string[] = [];
   let jsonBytes = 2;
   let previous: string | null = null;
   for (let index = 0; index < ancestorsInput.length; index++) {
@@ -204,18 +200,16 @@ export function validateIndexAncestorRequest(input: unknown): {
     if (previous !== null && comparePaths(previous, path) >= 0) {
       throw inputError("sparse index ancestor paths are not in strict Git order");
     }
-    const part = JSON.stringify(path);
-    jsonBytes += encoder.encode(part).length + (previous === null ? 0 : 1);
+    jsonBytes += jsonStringEncodedBytes(path) + (previous === null ? 0 : 1);
     if (!Number.isSafeInteger(jsonBytes))
       throw tooLarge("sparse index ancestor request JSON size overflows");
     if (jsonBytes > MAX_SPARSE_BINDING_BYTES)
       throw tooLarge("sparse index ancestor request JSON is too large");
     ancestors.push(path);
-    parts.push(part);
     previous = path;
   }
   return {
     request: { checkoutId, ancestors },
-    json: `[${parts.join(",")}]`,
+    json: JSON.stringify(ancestors),
   };
 }

@@ -9,10 +9,10 @@ import type {
   SelectedPathSpec,
   SelectedWorktreeFact,
 } from "../../store/core/contracts.js";
+import { jsonStringEncodedBytes, utf8ByteLength } from "../../store/core/json-pages.js";
 import type { IndexEntry } from "../../store/index.js";
 import { decodeSparseWorktreeRow, validatedSparseIndexEntry } from "./index-rows.js";
 import {
-  encoder,
   inputError,
   MAX_PATHS,
   MAX_SELECTED_EXACT_ANCESTORS,
@@ -23,6 +23,9 @@ import {
 } from "./shared.js";
 
 const MAX_SELECTED_INDEX_ROWS = MAX_PATHS * 4;
+/** The `{"p":…,"r":0}` frame around each spec's JSON path string. */
+const SPEC_FRAME_JSON_BYTES =
+  utf8ByteLength(JSON.stringify({ p: "", r: 0 })) - jsonStringEncodedBytes("");
 
 export interface ValidatedSelectedPathRequest {
   request: SelectedPathRequest;
@@ -41,7 +44,7 @@ function selectedExactAncestors(
   const add = (path: string): boolean => {
     if (unique.has(path)) return true;
     if (unique.size === MAX_SELECTED_EXACT_ANCESTORS) return false;
-    const encoded = encoder.encode(JSON.stringify(path)).length;
+    const encoded = jsonStringEncodedBytes(path);
     if (jsonBytes > MAX_SPARSE_BINDING_BYTES - encoded - (unique.size === 0 ? 0 : 1)) {
       return false;
     }
@@ -85,7 +88,6 @@ export function validateSelectedPathRequest(input: unknown): ValidatedSelectedPa
     throw tooLarge(`selected path request exceeds ${MAX_PATHS} specs`);
   }
   const specs: SelectedPathSpec[] = [];
-  const parts: string[] = [];
   let jsonBytes = 2;
   let previous: string | null = null;
   for (let ordinal = 0; ordinal < specsInput.length; ordinal++) {
@@ -103,18 +105,16 @@ export function validateSelectedPathRequest(input: unknown): ValidatedSelectedPa
     if (previous !== null && comparePaths(previous, path) >= 0) {
       throw inputError("selected path specs are not in strict Git order");
     }
-    const part = JSON.stringify({ p: path, r: recursive ? 1 : 0 });
-    jsonBytes += encoder.encode(part).length + (previous === null ? 0 : 1);
+    jsonBytes += SPEC_FRAME_JSON_BYTES + jsonStringEncodedBytes(path) + (previous === null ? 0 : 1);
     if (!Number.isSafeInteger(jsonBytes))
       throw tooLarge("selected path request JSON size overflows");
     if (jsonBytes > MAX_SPARSE_BINDING_BYTES) return null;
-    parts.push(part);
     specs.push({ path, recursive });
     previous = path;
   }
   return {
     request: { repoId, checkoutId, root, specs },
-    json: `[${parts.join(",")}]`,
+    json: JSON.stringify(specs.map((spec) => ({ p: spec.path, r: spec.recursive ? 1 : 0 }))),
   };
 }
 

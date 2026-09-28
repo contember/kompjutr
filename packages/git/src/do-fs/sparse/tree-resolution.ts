@@ -3,8 +3,8 @@ import { isOid } from "../../common/bytes.js";
 import { CorruptError } from "../../common/errors.js";
 import { int, nullable, oneOf, RowShape, text } from "../../common/rows.js";
 import type { SparseTreeLeaf, SparseWorkspaceRequest } from "../../store/core/contracts.js";
+import { utf8ByteLength } from "../../store/core/json-pages.js";
 import {
-  encoder,
   MAX_DEPTH,
   MAX_EDGE_STEPS,
   MAX_PATHS,
@@ -65,7 +65,7 @@ export function treeDepth(
       n: cursor.segment,
       f: cursor.final ? 1 : 0,
     });
-    const partBytes = encoder.encode(part).length + (parts.length === 0 ? 0 : 1);
+    const partBytes = utf8ByteLength(part) + (parts.length === 0 ? 0 : 1);
     if (jsonBytes > MAX_SPARSE_BINDING_BYTES - partBytes) {
       return { available: false, resolutions };
     }
