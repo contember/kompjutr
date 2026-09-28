@@ -128,9 +128,9 @@ export class Runtime implements Formats {
     this.arrays = input.program.globals.map((global) => (global.array ? new AwkArray() : null));
     this.fields = new FieldState(
       (text) => splitText(text, this.splitter),
-      (values) =>
-        values.map((value) => toText(value, this)).join(toText(this.special("OFS"), this)),
       (value) => toText(value, this),
+      () => toText(this.special("OFS"), this),
+      (delta) => this.memory.adjust(delta),
     );
     const argv = this.globalArray("ARGV");
     input.argv.forEach((value, index) => {

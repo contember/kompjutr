@@ -1,7 +1,9 @@
-// awk programs and statements, and the checks mawk makes after parsing:
-// every called function defined, arguments typed against parameters, and —
-// ours alone — no recursion. With loops limited to `for (k in a)` and a
-// non-recursive call graph, every program's work is bounded by its input.
+// awk programs and statements, and the checks made after parsing: every
+// called function defined, arguments typed against parameters, and — ours
+// alone — no recursion and no call chain deeper than MAX_CALL_DEPTH. With
+// loops limited to `for (k in a)` and an acyclic call graph, every program
+// terminates, but CPU is not budgeted: a function calling the previous one
+// twice doubles its work per level, and nested loops over one array multiply.
 
 import { AwkSyntaxError } from "../errors.js";
 import type { Expr, FunctionDefinition, Program, Rule, Slot, Statement } from "./ast.js";
@@ -9,6 +11,9 @@ import { scan } from "./lexer.js";
 import type { SymbolEntry } from "./parse-base.js";
 import { CallParser, GETLINE_REFUSAL } from "./parse-calls.js";
 import type { Token } from "./tokens.js";
+
+/** The deepest chain of nested calls a program may contain. */
+const MAX_CALL_DEPTH = 100;
 
 const LOOP_REFUSAL = "has no structural bound: only `for (key in array)' loops are supported";
 
@@ -133,6 +138,10 @@ class ProgramParser extends CallParser {
   }
 
   private statement(): Statement {
+    return this.nested(() => this.unnestedStatement());
+  }
+
+  private unnestedStatement(): Statement {
     const token = this.token;
     switch (token.kind) {
       case "{":
@@ -220,14 +229,17 @@ class ProgramParser extends CallParser {
   }
 
   private ifStatement(): Statement {
-    this.advance();
-    this.expect("(");
-    const test = this.expression();
-    this.expect(")");
-    const then = this.statement();
-    if (!this.isKeyword("else")) return { kind: "if", test, then, otherwise: null };
-    this.advance();
-    return { kind: "if", test, then, otherwise: this.statement() };
+    const branches: Array<{ test: Expr; body: Statement }> = [];
+    for (;;) {
+      this.advance();
+      this.expect("(");
+      const test = this.expression();
+      this.expect(")");
+      branches.push({ test, body: this.statement() });
+      if (!this.isKeyword("else")) return { kind: "if", branches, otherwise: null };
+      this.advance();
+      if (!this.isKeyword("if")) return { kind: "if", branches, otherwise: this.statement() };
+    }
   }
 
   private forStatement(): Statement {
@@ -308,7 +320,7 @@ class ProgramParser extends CallParser {
         throw this.error(`too many arguments in call to ${call.name}`, call.token);
       }
     }
-    this.refuseRecursion();
+    this.checkCallGraph();
     this.typeArguments();
     for (const state of this.functions.values()) {
       state.definition.params.forEach((param, index) => {
@@ -317,7 +329,12 @@ class ProgramParser extends CallParser {
     }
   }
 
-  private refuseRecursion(): void {
+  /**
+   * Refuse a cycle in the call graph, and a chain of calls deeper than
+   * MAX_CALL_DEPTH, which bounds how deeply calls can nest at run time.
+   * Iterative: a long chain of functions must not exhaust the parser's stack.
+   */
+  private checkCallGraph(): void {
     const edges = new Map<string, PendingCallEdge[]>();
     for (const call of this.calls) {
       if (call.caller === null) continue;
@@ -325,26 +342,45 @@ class ProgramParser extends CallParser {
       list.push({ callee: call.name, token: call.token });
       edges.set(call.caller, list);
     }
-    const done = new Set<string>();
-    const path: string[] = [];
-    const visit = (name: string): void => {
-      if (done.has(name)) return;
-      path.push(name);
-      for (const edge of edges.get(name) ?? []) {
-        const cycleStart = path.indexOf(edge.callee);
-        if (cycleStart !== -1) {
-          const cycle = [...path.slice(cycleStart), edge.callee].join(" -> ");
+    const depth = new Map<string, number>();
+    const onPath = new Set<string>();
+    for (const root of this.functions.keys()) {
+      if (depth.has(root)) continue;
+      const stack: Array<{ name: string; next: number }> = [{ name: root, next: 0 }];
+      onPath.add(root);
+      while (stack.length > 0) {
+        const top = stack[stack.length - 1];
+        if (top === undefined) break;
+        const out = edges.get(top.name) ?? [];
+        const edge = out[top.next];
+        if (edge !== undefined) {
+          top.next++;
+          if (onPath.has(edge.callee)) {
+            const path = stack.map((entry) => entry.name);
+            const cycle = [...path.slice(path.indexOf(edge.callee)), edge.callee].join(" -> ");
+            throw this.refuse(
+              `recursive function calls are not supported: ${cycle} has no structural bound`,
+              edge.token,
+            );
+          }
+          if (!depth.has(edge.callee)) {
+            onPath.add(edge.callee);
+            stack.push({ name: edge.callee, next: 0 });
+          }
+          continue;
+        }
+        stack.pop();
+        onPath.delete(top.name);
+        const below = Math.max(0, ...out.map((call) => depth.get(call.callee) ?? 0));
+        depth.set(top.name, below + 1);
+        if (below + 1 > MAX_CALL_DEPTH) {
           throw this.refuse(
-            `recursive function calls are not supported: ${cycle} has no structural bound`,
-            edge.token,
+            `function calls nested more than ${MAX_CALL_DEPTH} deep are not supported: a chain from ${top.name} is ${below + 1} calls long`,
+            out[0]?.token ?? this.token,
           );
         }
-        visit(edge.callee);
       }
-      path.pop();
-      done.add(name);
-    };
-    for (const name of this.functions.keys()) visit(name);
+    }
   }
 
   /** Propagate array-ness through bare-name arguments until nothing changes. */

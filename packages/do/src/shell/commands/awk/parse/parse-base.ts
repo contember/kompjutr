@@ -28,8 +28,17 @@ function isSpecial(name: string): name is SpecialName {
 /** The global arrays mawk defines before the program runs. */
 export const PREDEFINED_ARRAYS = ["ENVIRON", "ARGV"] as const;
 
+/**
+ * Nested constructs parse recursively, so their depth is capped to keep the
+ * parser and evaluator well inside a Worker's stack. mawk's own parser stack
+ * overflows at about 200 levels with the same diagnostic; this cap is lower.
+ * Chains of binary operators and concatenation are iterative and uncapped.
+ */
+export const MAX_NESTING = 100;
+
 export class ParserBase {
   position = 0;
+  #depth = 0;
   scope: Scope = "main";
   loopDepth = 0;
   readonly globals = new Map<string, SymbolEntry>();
@@ -43,6 +52,17 @@ export class ParserBase {
     for (const name of PREDEFINED_ARRAYS) this.global(name).kind = "array";
     for (const name of scalars) {
       if (!isSpecial(name)) this.global(name).kind = "scalar";
+    }
+  }
+
+  /** Parse one nesting level; past the cap it is a syntax error at the current token. */
+  nested<T>(parse: () => T): T {
+    if (this.#depth >= MAX_NESTING) throw this.syntaxError();
+    this.#depth++;
+    try {
+      return parse();
+    } finally {
+      this.#depth--;
     }
   }
 

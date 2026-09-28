@@ -81,20 +81,35 @@ function positiveMatch(
   return null;
 }
 
+/** Bytes charged per field beyond its text: the slot and its cached value. */
+const FIELD_OVERHEAD = 16;
+
+/**
+ * Field and NF assignments only mark `$0` stale, with the OFS in force then;
+ * it is joined when read, so assigning n fields costs O(n), not O(n^2).
+ * Every growth is charged before it is allocated.
+ */
 export class FieldState {
   #record = "";
   #recordValue: Value | undefined;
   #texts: string[] = [];
   /** Assigned values; `undefined` means the field still holds its input text. */
   #values: Array<Value | undefined> = [];
+  #textBytes = 0;
+  /** The OFS to rebuild `$0` with, or null when `$0` is current. */
+  #staleWith: string | null = null;
+  #charged = 0;
 
   constructor(
     private readonly split: (text: string) => string[],
-    private readonly join: (values: readonly Value[]) => string,
     private readonly toText: (value: Value) => string,
+    private readonly separator: () => string,
+    /** Charges (or, negative, credits) retained bytes; throws at the limit. */
+    private readonly charge: (delta: number) => void,
   ) {}
 
   get record(): string {
+    this.#sync();
     return this.#record;
   }
 
@@ -102,20 +117,20 @@ export class FieldState {
     return this.#texts.length;
   }
 
-  /** Approximate bytes held by the record and its fields. */
-  get bytes(): number {
-    return this.#record.length * 2 + this.#texts.length * 16;
-  }
-
   setRecord(text: string, value?: Value): void {
+    this.#reserve(text.length * 2);
     this.#record = text;
     this.#recordValue = value;
+    this.#staleWith = null;
     this.#texts = this.split(text);
     this.#values = [];
+    this.#textBytes = text.length;
+    this.#account();
   }
 
   get(index: number): Value {
     if (index === 0) {
+      this.#sync();
       this.#recordValue ??= maybeNumber(this.#record);
       return this.#recordValue;
     }
@@ -132,37 +147,65 @@ export class FieldState {
       this.setRecord(this.toText(value), value);
       return;
     }
-    while (this.#texts.length < index) {
-      this.#texts.push("");
-      this.#values[this.#texts.length - 1] = "";
-    }
-    this.#texts[index - 1] = this.toText(value);
+    const text = this.toText(value);
+    this.#extend(index);
+    this.#reserve(text.length);
+    this.#textBytes += text.length - (this.#texts[index - 1] ?? "").length;
+    this.#texts[index - 1] = text;
     this.#values[index - 1] = value;
-    this.#rebuild();
+    this.#staleWith = this.separator();
+    this.#account();
   }
 
   setCount(count: number): void {
     if (count < this.#texts.length) {
+      for (let index = count; index < this.#texts.length; index++) {
+        this.#textBytes -= (this.#texts[index] ?? "").length;
+      }
       this.#texts.length = count;
       this.#values.length = Math.min(this.#values.length, count);
     }
+    this.#extend(count);
+    this.#staleWith = this.separator();
+    this.#account();
+  }
+
+  #extend(count: number): void {
+    if (count <= this.#texts.length) return;
+    this.#reserve((count - this.#texts.length) * FIELD_OVERHEAD);
     while (this.#texts.length < count) {
       this.#texts.push("");
       this.#values[this.#texts.length - 1] = "";
     }
-    this.#rebuild();
   }
 
   /** A lone field becomes `$0` with its type; several join to a plain string. */
-  #rebuild(): void {
-    if (this.#texts.length === 1) {
+  #sync(): void {
+    const separator = this.#staleWith;
+    if (separator === null) return;
+    this.#staleWith = null;
+    const count = this.#texts.length;
+    if (count === 1) {
       this.#recordValue = this.get(1);
       this.#record = this.#texts[0] ?? "";
-      return;
+    } else {
+      this.#reserve((this.#textBytes + Math.max(0, count - 1) * separator.length) * 2);
+      this.#record = this.#texts.join(separator);
+      this.#recordValue = this.#record;
     }
-    const values: Value[] = [];
-    for (let index = 1; index <= this.#texts.length; index++) values.push(this.get(index));
-    this.#record = this.join(values);
-    this.#recordValue = this.#record;
+    this.#account();
+  }
+
+  #reserve(bytes: number): void {
+    this.charge(bytes);
+    this.#charged += bytes;
+  }
+
+  /** Settle the charge to the current estimate once an operation has finished. */
+  #account(): void {
+    const record = this.#staleWith === null ? this.#record.length * 2 : 0;
+    const estimate = record + this.#textBytes + this.#texts.length * FIELD_OVERHEAD;
+    this.charge(estimate - this.#charged);
+    this.#charged = estimate;
   }
 }

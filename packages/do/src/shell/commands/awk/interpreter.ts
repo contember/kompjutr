@@ -1,17 +1,16 @@
 // Statement execution. Each statement is a generator that yields after it
 // writes output, so the driver can flush between statements and a consumer
-// that stops reading (`awk … | head`) stops the program. Function bodies run
-// to completion synchronously; their output waits in the reserved buffer.
+// that stops reading (`awk … | head`) stops the program — inside function
+// bodies too, since calls run through `steps.ts`.
 
 import { formatted } from "./builtins.js";
-import { Evaluator, type Flow } from "./evaluate.js";
-import type { Rule, Statement } from "./parse/ast.js";
+import type { Flow, Step } from "./evaluate.js";
+import type { Expr, Rule, Statement } from "./parse/ast.js";
 import { ELEMENT_OVERHEAD, type Runtime } from "./runtime.js";
+import { SteppingEvaluator } from "./steps.js";
 import { byteLength, toNumber, toOutputText, toText, truthy, type Value } from "./values.js";
 
-export type Step = Generator<undefined, Flow, undefined>;
-
-export class Interpreter extends Evaluator {
+export class Interpreter extends SteppingEvaluator {
   exitStatus = 0;
   readonly #ranges: boolean[];
 
@@ -20,37 +19,40 @@ export class Interpreter extends Evaluator {
     this.#ranges = runtime.program.rules.map(() => false);
   }
 
-  runBody(body: Statement): Flow {
-    const step = this.execute(body);
-    for (;;) {
-      const next = step.next();
-      if (next.done === true) return next.value;
-    }
+  /** An expression's value; only one that calls a function pays for a generator. */
+  private *value(expr: Expr): Step<Value> {
+    return this.callFree(expr) ? this.evaluate(expr) : yield* this.steps(expr);
   }
 
-  *execute(statement: Statement): Step {
+  private *values(exprs: readonly Expr[]): Step<Value[]> {
+    const values: Value[] = [];
+    for (const expr of exprs) {
+      values.push(this.callFree(expr) ? this.evaluate(expr) : yield* this.steps(expr));
+    }
+    return values;
+  }
+
+  *execute(statement: Statement): Step<Flow> {
     switch (statement.kind) {
       case "expr":
-        this.evaluate(statement.expr);
+        if (this.callFree(statement.expr)) this.evaluate(statement.expr);
+        else yield* this.steps(statement.expr);
         return "normal";
       case "print":
-        this.print(statement.args.map((arg) => this.evaluate(arg)));
+        this.print(yield* this.values(statement.args));
         yield;
         return "normal";
       case "printf":
         this.runtime.output.write(
-          formatted(
-            this.runtime,
-            "printf",
-            statement.args.map((arg) => this.evaluate(arg)),
-          ),
+          formatted(this.runtime, "printf", yield* this.values(statement.args)),
         );
         yield;
         return "normal";
-      case "if": {
-        const branch = truthy(this.evaluate(statement.test)) ? statement.then : statement.otherwise;
-        return branch === null ? "normal" : yield* this.execute(branch);
-      }
+      case "if":
+        for (const branch of statement.branches) {
+          if (truthy(yield* this.value(branch.test))) return yield* this.execute(branch.body);
+        }
+        return statement.otherwise === null ? "normal" : yield* this.execute(statement.otherwise);
       case "block":
         for (const inner of statement.body) {
           const flow = yield* this.execute(inner);
@@ -76,27 +78,28 @@ export class Interpreter extends Evaluator {
       case "empty":
         return "normal";
       case "exit":
-        if (statement.value !== null)
-          this.exitStatus = exitCode(toNumber(this.evaluate(statement.value)));
+        if (statement.value !== null) {
+          this.exitStatus = exitCode(toNumber(yield* this.value(statement.value)));
+        }
         return "exit";
       case "return": {
-        const value = statement.value === null ? null : this.evaluate(statement.value);
+        const value = statement.value === null ? null : yield* this.value(statement.value);
         if (this.frame !== null) this.frame.returned = value;
         return "return";
       }
       case "delete":
-        this.delete(statement);
+        yield* this.delete(statement);
         return "normal";
     }
   }
 
-  private delete(statement: Extract<Statement, { kind: "delete" }>): void {
+  private *delete(statement: Extract<Statement, { kind: "delete" }>): Step<void> {
     const array = this.array(statement.array);
     if (statement.subscripts === null) {
       this.runtime.clearArray(array);
       return;
     }
-    const subscript = this.subscriptOf(statement.subscripts);
+    const subscript = this.subscriptFrom(yield* this.values(statement.subscripts));
     const entry = array.find(subscript, false);
     if (entry === null) return;
     const keyBytes = subscript.kind === "string" ? subscript.value.length : 8;
@@ -113,11 +116,11 @@ export class Interpreter extends Evaluator {
   }
 
   /** The main rules against the current record. */
-  *rules(): Step {
+  *rules(): Step<Flow> {
     const rules = this.runtime.program.rules;
     for (let index = 0; index < rules.length; index++) {
       const rule = rules[index];
-      if (rule === undefined || !this.#selects(rule, index)) continue;
+      if (rule === undefined || !(yield* this.#selects(rule, index))) continue;
       if (rule.action === null) {
         this.print([]);
         yield;
@@ -129,15 +132,15 @@ export class Interpreter extends Evaluator {
     return "normal";
   }
 
-  #selects(rule: Rule, index: number): boolean {
+  *#selects(rule: Rule, index: number): Step<boolean> {
     const pattern = rule.pattern;
     if (pattern === null) return true;
-    if (pattern.kind === "expr") return truthy(this.evaluate(pattern.expr));
+    if (pattern.kind === "expr") return truthy(yield* this.value(pattern.expr));
     if (this.#ranges[index] !== true) {
-      if (!truthy(this.evaluate(pattern.from))) return false;
+      if (!truthy(yield* this.value(pattern.from))) return false;
       this.#ranges[index] = true;
     }
-    if (truthy(this.evaluate(pattern.to))) this.#ranges[index] = false;
+    if (truthy(yield* this.value(pattern.to))) this.#ranges[index] = false;
     return true;
   }
 }

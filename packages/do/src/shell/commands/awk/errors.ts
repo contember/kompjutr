@@ -26,3 +26,12 @@ export class AwkFatalError extends Error {
     this.name = "AwkFatalError";
   }
 }
+
+/**
+ * A JS stack overflow. The parser and evaluator cap nesting well inside a
+ * Worker's stack; this backstop turns anything that still overflows into an
+ * awk failure with exit status 2 instead of an exception out of the shell.
+ */
+export function isStackOverflow(error: unknown): boolean {
+  return error instanceof RangeError && /call stack/i.test(error.message);
+}

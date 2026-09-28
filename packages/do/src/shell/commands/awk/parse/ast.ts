@@ -116,10 +116,10 @@ export type Statement =
   | { readonly kind: "expr"; readonly expr: Expr }
   | { readonly kind: "print"; readonly args: readonly Expr[] }
   | { readonly kind: "printf"; readonly args: readonly Expr[] }
+  /** `if … else if … else …`, flat, so a long chain nests nothing. */
   | {
       readonly kind: "if";
-      readonly test: Expr;
-      readonly then: Statement;
+      readonly branches: readonly { readonly test: Expr; readonly body: Statement }[];
       readonly otherwise: Statement | null;
     }
   | {

@@ -196,3 +196,83 @@ describe("awk streams and bounds what it keeps", () => {
     expect(run.stdout).toBe("42\n");
   });
 });
+
+describe("awk bounds nesting and stops fanned-out calls", () => {
+  const chain = (count: number): string =>
+    Array.from({ length: count }, (_, index) =>
+      index === 0
+        ? "function f0(x) { return x + 1 }"
+        : `function f${index}(x) { return f${index - 1}(x) }`,
+    ).join("\n");
+
+  // mawk's parser stack overflows near 200 levels with this same diagnostic,
+  // naming the operator; the shell caps nesting at 100 and names the operand.
+  it.each([
+    ["x=", `BEGIN{${"x=".repeat(1000)}1; print x}`, "x"],
+    ["if(1)", `BEGIN{${"if(1)".repeat(1000)}print 1}`, "1"],
+    ["^", `BEGIN{print 2${"^1".repeat(1000)}}`, "1"],
+    ["?:", `BEGIN{print ${"1?".repeat(1000)}1${":0".repeat(1000)}}`, "1"],
+  ])("refuses 1000 nested %s as a syntax error", async (_label, program, near) => {
+    const run = await shellWith({}).run(`awk '${program}'`);
+    expect(run.stderr).toBe(`awk: line 1: syntax error at or near ${near}\n`);
+    expect(run.exitCode).toBe(2);
+  });
+
+  it("runs a long else-if chain, which does not nest (mawk's parser overflows on it)", async () => {
+    const branches = Array.from(
+      { length: 300 },
+      (_, index) => `if (x == ${index}) print ${index};`,
+    );
+    const run = await shellWith({}).run(`awk 'BEGIN{x = 299; ${branches.join(" else ")}}'`);
+    expect(run.stdout).toBe("299\n");
+  });
+
+  it("refuses a chain of calls deeper than 100", async () => {
+    const run = await shellWith({}).run(`awk '${chain(1000)}\nBEGIN{print f999(1)}'`);
+    expect(run.stderr).toBe(
+      "awk: line 101: function calls nested more than 100 deep are not supported: a chain from f100 is 101 calls long\n",
+    );
+    expect(run.exitCode).toBe(2);
+  });
+
+  it("reports a regular expression nested past the stack as too large", async () => {
+    const pattern = `${"(".repeat(200_000)}a${")".repeat(200_000)}`;
+    const run = await shellWith({}).run("awk '{ print ($0 ~ $0) }'", { stdin: `${pattern}\n` });
+    expect(run.stderr).toMatch(
+      /^awk: run time error: regular expression compile failed \(resource exhaustion -- regular expression too large\)\n/,
+    );
+    expect(run.exitCode).toBe(2);
+  });
+
+  it("stops a call tree that fans out when the consumer stops", async () => {
+    const functions = Array.from({ length: 26 }, (_, index) =>
+      index === 0
+        ? 'function g0() { print "x" }'
+        : `function g${index}() { g${index - 1}(); g${index - 1}() }`,
+    ).join("\n");
+    const run = await shellWith({}).run(`awk '${functions}\nBEGIN { g25() }' | head -1`);
+    expect(run.stdout).toBe("x\n");
+    expect(run.exitCode).toBe(0);
+  });
+});
+
+describe("awk charges field growth before allocating it", () => {
+  it.each(['BEGIN { $50000000 = "x" }', "BEGIN { NF = 50000000; print NF }"])(
+    "%j fails with the retained-memory limit",
+    async (program) => {
+      const run = await shellWith({}, 1024 * 1024).run(`awk '${program}'`);
+      expect(run.stderr).toBe(
+        "kompjutr: awk variables exceeds the 1048576-byte retained-memory limit\n",
+      );
+      expect(run.exitCode).toBe(2);
+      expect(run.peakRetainedBytes).toBeLessThanOrEqual(1024 * 1024);
+    },
+  );
+
+  it("assigns many fields without rebuilding $0 each time", async () => {
+    const run = await shellWith({}).run(
+      'awk \'BEGIN { n = split(sprintf("%100000s", ""), a, ""); for (k in a) $k = "x"; print length($0), NF }\'',
+    );
+    expect(run.stdout).toBe("199999 100000\n");
+  });
+});

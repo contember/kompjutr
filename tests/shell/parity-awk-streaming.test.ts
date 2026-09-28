@@ -33,7 +33,8 @@ function corpus(): string {
 }
 
 describe.skipIf(!MAWK)("awk splits records across chunk boundaries as mawk does", () => {
-  const text = corpus();
+  // Short records, plus records far longer than a chunk, which the search resumes over.
+  const text = `${corpus()}${"L".repeat(20_000)};;${"M".repeat(20_000)}\n\n\n${"N".repeat(5000)}`;
 
   it.each([
     '{ print NR ":" NF ":" $0 }',

@@ -367,6 +367,28 @@ describe.skipIf(!REAL_BASH)("awk matches mawk", () => {
     await compare(source);
   });
 
+  const chain = (count: number): string =>
+    Array.from({ length: count }, (_, index) =>
+      index === 0
+        ? "function f0(x) { return x + 1 }"
+        : `function f${index}(x) { return f${index - 1}(x) }`,
+    ).join("\n");
+
+  it.each([
+    ["a 6000-term sum", `awk 'BEGIN{print 1${"+1".repeat(6000)}}'`],
+    ["a 20000-term concatenation", `awk 'BEGIN{x = 1${" 1".repeat(20000)}; print length(x)}'`],
+    ["a 5000-term ||", `awk 'BEGIN{print 0${" || 0".repeat(5000)}}'`],
+    ["90 nested parentheses", `awk 'BEGIN{print ${"(".repeat(90)}1${")".repeat(90)}}'`],
+    ["1000 nested parentheses", `awk 'BEGIN{print ${"(".repeat(1000)}1${")".repeat(1000)}}'`],
+    ["1000 nested !", `awk 'BEGIN{print ${"!".repeat(1000)}1}'`],
+    ["1000 nested blocks", `awk 'BEGIN${"{".repeat(1000)}print 1${"}".repeat(1000)}'`],
+    ["1000 nested subscripts", `awk 'BEGIN{${"a[".repeat(1000)}1${"]".repeat(1000)}=1}'`],
+    ["1000 nested $", `awk 'BEGIN{print ${"$".repeat(1000)}0}'`],
+    ["a chain of 60 functions", `awk '${chain(60)}\nBEGIN{print f59(1)}'`],
+  ])("handles long and deeply nested programs: %s", async (_label, source) => {
+    await compare(source);
+  });
+
   it.each([
     "awk 'BEGIN{x = 1 & 2}'",
     "awk 'BEGIN{x = \"abc'",

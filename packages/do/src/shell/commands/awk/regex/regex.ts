@@ -27,6 +27,8 @@ export interface SearchResult {
   readonly match: Match | null;
   /** The text ended while the match could still change: more input is needed. */
   readonly hitEnd: boolean;
+  /** With `hitEnd`: no match can start before this position, whatever input follows. */
+  readonly resume: number;
 }
 
 class Builder {
@@ -151,6 +153,7 @@ export class Regex {
   readonly #next: ThreadList;
   #best: Match | null = null;
   #hitEnd = false;
+  #resume = 0;
 
   /** `guard` sees the program's size in bytes before it is built. */
   constructor(
@@ -188,10 +191,12 @@ export class Regex {
       return {
         match: at === -1 ? null : { start: at, end: at + this.#literal.length },
         hitEnd: false,
+        resume: text.length,
       };
     }
     this.#best = null;
     this.#hitEnd = false;
+    this.#resume = text.length;
     let current = this.#current;
     let next = this.#next;
     let position = from;
@@ -206,7 +211,14 @@ export class Regex {
         continue;
       }
       if (position >= text.length) {
-        if (!final) this.#hitEnd = true;
+        if (!final) {
+          this.#hitEnd = true;
+          const bestStart = this.#bestStart();
+          for (let index = 0; index < current.size; index++) {
+            const start = current.starts[index] ?? 0;
+            if (start <= bestStart) this.#resume = Math.min(this.#resume, start);
+          }
+        }
         break;
       }
       const code = text.charCodeAt(position);
@@ -230,7 +242,8 @@ export class Regex {
       position++;
     }
     if (!final && this.#best === null) this.#hitEnd = true;
-    return { match: this.#best, hitEnd: this.#hitEnd };
+    const resume = Math.min(this.#resume, this.#bestStart());
+    return { match: this.#best, hitEnd: this.#hitEnd, resume };
   }
 
   /** Read through a method: `#add` updates the best match behind the type checker's back. */
@@ -272,7 +285,10 @@ export class Regex {
         case EOL:
           if (position === text.length) {
             if (final) stack.push(pc + 1);
-            else this.#hitEnd = true;
+            else {
+              this.#hitEnd = true;
+              this.#resume = Math.min(this.#resume, start);
+            }
           }
           break;
         case MATCH: {

@@ -3,10 +3,10 @@
 // POSIX requires; a run time error flushes what was printed and exits 2.
 
 import type { ByteStream } from "../../exec/bytes.js";
-import { AwkFatalError, AwkRuntimeError } from "./errors.js";
-import { ExitSignal, type Flow } from "./evaluate.js";
+import { AwkFatalError, AwkRuntimeError, isStackOverflow } from "./errors.js";
+import { ExitSignal, type Flow, type Step } from "./evaluate.js";
 import { type InputSources, MainInput } from "./input.js";
-import { Interpreter, type Step } from "./interpreter.js";
+import { Interpreter } from "./interpreter.js";
 import type { Runtime } from "./runtime.js";
 import { toNumber, toText } from "./values.js";
 
@@ -30,7 +30,7 @@ export function runProgram(
   let records = 0;
   let fileRecords = 0;
 
-  async function* phase(step: Step): AsyncGenerator<Uint8Array, Flow, undefined> {
+  async function* phase(step: Step<Flow>): AsyncGenerator<Uint8Array, Flow, undefined> {
     try {
       for (;;) {
         const next = step.next();
@@ -67,9 +67,7 @@ export function runProgram(
           fileRecords++;
           runtime.setSpecial("NR", toNumber(runtime.special("NR")) + 1);
           runtime.setSpecial("FNR", toNumber(runtime.special("FNR")) + 1);
-          const before = runtime.fields.bytes;
           runtime.fields.setRecord(record);
-          runtime.memory.adjust(runtime.fields.bytes - before);
           const flow = yield* phase(interpreter.rules());
           if (flow === "exit") break;
           if (flow === "nextfile") await input.skipFile();
@@ -89,7 +87,10 @@ export function runProgram(
     try {
       try {
         yield* main();
-      } catch (error) {
+      } catch (thrown) {
+        const error = isStackOverflow(thrown)
+          ? new AwkRuntimeError("expressions or calls nested too deeply for the stack")
+          : thrown;
         if (error instanceof AwkRuntimeError) {
           if (runtime.output.size > 0) yield runtime.output.take();
           const file = toText(runtime.special("FILENAME"), runtime);

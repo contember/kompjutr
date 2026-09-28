@@ -43,15 +43,18 @@ class RecordSource {
       this.#started = true;
       if (separator.kind === "regex" && separator.paragraph) await this.#skipLeadingNewlines();
     }
+    // Where the separator search resumes: text before it was searched and
+    // cannot hold the start of a separator, however the record continues.
+    let from = this.#offset;
     for (;;) {
-      const found = this.#find(separator);
-      if (found !== null) {
+      const found = this.#find(separator, from);
+      if ("start" in found) {
         const record = this.#buffer.slice(this.#offset, found.start);
         this.#offset = found.end;
         return record;
       }
       if (!this.#ended) {
-        await this.#fill();
+        from = found.resume - (await this.#fill());
         continue;
       }
       if (this.#offset >= this.#buffer.length) return null;
@@ -81,33 +84,37 @@ class RecordSource {
     }
   }
 
-  #find(separator: Separator): { start: number; end: number } | null {
+  #find(separator: Separator, from: number): { start: number; end: number } | { resume: number } {
+    const buffer = this.#buffer;
     if (separator.kind === "char") {
-      const at = this.#buffer.indexOf(separator.char, this.#offset);
-      return at === -1 ? null : { start: at, end: at + 1 };
+      const at = buffer.indexOf(separator.char, from);
+      return at === -1 ? { resume: buffer.length } : { start: at, end: at + 1 };
     }
-    let position = this.#offset;
-    while (position < this.#buffer.length) {
+    let position = from;
+    while (position < buffer.length) {
       const atStart = this.#consumed === 0 && position === 0;
-      const { match, hitEnd } = separator.regex.search(
-        this.#buffer,
+      const { match, hitEnd, resume } = separator.regex.search(
+        buffer,
         position,
         atStart,
         this.#ended,
       );
-      if (hitEnd || match === null) return null;
+      if (hitEnd) return { resume };
+      if (match === null) return { resume: buffer.length };
       if (match.end > match.start) return match;
       position = match.start + 1;
     }
-    return null;
+    return { resume: buffer.length };
   }
 
-  async #fill(): Promise<void> {
+  /** Pull a chunk; returns how far the buffer's positions shifted left. */
+  async #fill(): Promise<number> {
     const next = await this.stream.next();
     if (next.done === true) {
       this.#ended = true;
-      return;
+      return 0;
     }
+    const shift = this.#offset;
     const kept = this.#buffer.slice(this.#offset);
     this.#consumed += this.#offset;
     this.#release();
@@ -116,6 +123,7 @@ class RecordSource {
     this.#buffer = kept + bytesToText(next.value);
     this.#offset = 0;
     this.#release = release;
+    return shift;
   }
 }
 

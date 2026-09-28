@@ -1,10 +1,9 @@
 // Builtin functions, with the argument conversions and edge cases mawk shows.
 
+import type { AwkArray } from "./array.js";
 import { AwkRuntimeError } from "./errors.js";
-import type { Evaluator } from "./evaluate.js";
-import { splitText } from "./fields.js";
+import { type Splitter, splitText } from "./fields.js";
 import { type Converter, FormatError, sprintf } from "./format/format.js";
-import type { Expr, LValue, Slot } from "./parse/ast.js";
 import type { Regex } from "./regex/regex.js";
 import { ELEMENT_OVERHEAD, type Runtime } from "./runtime.js";
 import { byteLength, maybeNumber, toNumber, toText, type Value } from "./values.js";
@@ -70,9 +69,13 @@ function substr(text: string, startValue: number, lengthValue: number | null): s
   return count <= 0 ? "" : text.slice(start, start + count);
 }
 
-export function callBuiltin(evaluator: Evaluator, name: string, argExprs: readonly Expr[]): Value {
-  const runtime = evaluator.runtime;
-  const args = argExprs.map((arg) => evaluator.evaluate(arg));
+/** An lvalue resolved once: its subscripts or field index are already evaluated. */
+export interface Place {
+  get(): Value;
+  set(value: Value): void;
+}
+
+export function callBuiltin(runtime: Runtime, name: string, args: readonly Value[]): Value {
   const text = (index: number): string => toText(args[index] ?? null, runtime);
   const number = (index: number): number => toNumber(args[index] ?? null);
   switch (name) {
@@ -114,10 +117,8 @@ export function callBuiltin(evaluator: Evaluator, name: string, argExprs: readon
   }
 }
 
-export function matchFunction(evaluator: Evaluator, subjectExpr: Expr, patternExpr: Expr): Value {
-  const runtime = evaluator.runtime;
-  const subject = toText(evaluator.evaluate(subjectExpr), runtime);
-  const regex = evaluator.regexOf(patternExpr);
+export function matchFunction(runtime: Runtime, subjectValue: Value, regex: Regex): Value {
+  const subject = toText(subjectValue, runtime);
   const { match } = regex.search(subject, 0, true, true);
   const start = match === null ? 0 : match.start + 1;
   runtime.setSpecial("RSTART", start);
@@ -125,20 +126,8 @@ export function matchFunction(evaluator: Evaluator, subjectExpr: Expr, patternEx
   return start;
 }
 
-export function split(
-  evaluator: Evaluator,
-  sourceExpr: Expr,
-  slot: Slot,
-  separator: Expr | null,
-): Value {
-  const runtime = evaluator.runtime;
-  const source = toText(evaluator.evaluate(sourceExpr), runtime);
-  const array = evaluator.array(slot);
-  let pieces: string[];
-  if (separator === null) pieces = splitText(source, runtime.splitter);
-  else if (separator.kind === "regex") {
-    pieces = splitText(source, { kind: "regex", regex: runtime.regex(separator.source) });
-  } else pieces = splitText(source, runtime.splitterFor(evaluator.evaluate(separator)));
+export function split(runtime: Runtime, source: Value, array: AwkArray, splitter: Splitter): Value {
+  const pieces = splitText(toText(source, runtime), splitter);
   runtime.clearArray(array);
   const values = pieces.map((piece) => maybeNumber(piece));
   let bytes = 0;
@@ -201,16 +190,13 @@ function expand(parts: readonly ReplacementPart[], matched: string): string {
 }
 
 export function substitute(
-  evaluator: Evaluator,
+  runtime: Runtime,
   global: boolean,
-  patternExpr: Expr,
-  replacementExpr: Expr,
-  target: LValue,
+  regex: Regex,
+  replacement: Value,
+  place: Place,
 ): Value {
-  const runtime = evaluator.runtime;
-  const regex = evaluator.regexOf(patternExpr);
-  const parts = replacementParts(toText(evaluator.evaluate(replacementExpr), runtime));
-  const place = evaluator.locate(target);
+  const parts = replacementParts(toText(replacement, runtime));
   const input = toText(place.get(), runtime);
   if (!global) {
     const { match } = regex.search(input, 0, true, true);

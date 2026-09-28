@@ -48,16 +48,16 @@ export abstract class ExpressionParser extends ParserBase {
   protected abstract keywordExpression(token: Token): Expr;
 
   expression(): Expr {
-    return this.ternary();
+    return this.nested(() => this.ternary());
   }
 
   private ternary(): Expr {
     const test = this.binary(0);
     if (!this.is("?")) return test;
     this.advance();
-    const then = this.ternary();
+    const then = this.nested(() => this.ternary());
     this.expect(":");
-    const otherwise = this.ternary();
+    const otherwise = this.nested(() => this.ternary());
     return { kind: "conditional", test, then, otherwise };
   }
 
@@ -158,7 +158,7 @@ export abstract class ExpressionParser extends ParserBase {
     const token = this.token;
     if (token.kind === "!" || token.kind === "-" || token.kind === "+") {
       this.advance();
-      const operand = this.unary();
+      const operand = this.nested(() => this.unary());
       const kind = token.kind === "!" ? "not" : token.kind === "-" ? "negate" : "plus";
       return { kind, operand };
     }
@@ -169,7 +169,7 @@ export abstract class ExpressionParser extends ParserBase {
     const base = this.postfix();
     if (!this.is("^")) return base;
     this.advance();
-    const exponent = this.powerOperand();
+    const exponent = this.nested(() => this.powerOperand());
     return { kind: "arithmetic", op: "^", left: base, right: exponent };
   }
 
@@ -178,7 +178,7 @@ export abstract class ExpressionParser extends ParserBase {
     const token = this.token;
     if (token.kind === "!" || token.kind === "-" || token.kind === "+") {
       this.advance();
-      const operand = this.powerOperand();
+      const operand = this.nested(() => this.powerOperand());
       const kind = token.kind === "!" ? "not" : token.kind === "-" ? "negate" : "plus";
       return { kind, operand };
     }
@@ -239,7 +239,7 @@ export abstract class ExpressionParser extends ParserBase {
       if (this.is("[")) return { kind: "field", index: this.element(next) };
       return { kind: "field", index: { kind: "variable", ref: this.useScalar(next.value, next) } };
     }
-    return { kind: "field", index: this.dollarOperand() };
+    return { kind: "field", index: this.nested(() => this.dollarOperand()) };
   }
 
   /** The operand of `$`, which binds tighter than everything but grouping. */

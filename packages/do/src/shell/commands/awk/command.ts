@@ -8,7 +8,7 @@ import { type Command, type CommandContext, result } from "../../exec/context.js
 import { resolve } from "../../exec/execute.js";
 import { streamFile } from "../read.js";
 import { bytesToText, fromUnicode, toUnicode } from "./bytes.js";
-import { AwkFatalError, AwkRuntimeError, AwkSyntaxError } from "./errors.js";
+import { AwkFatalError, AwkRuntimeError, AwkSyntaxError, isStackOverflow } from "./errors.js";
 import { assignFromCommandLine, isAssignment } from "./input.js";
 import { parseProgram } from "./parse/parser.js";
 import { processEscapes } from "./parse/tokens.js";
@@ -143,6 +143,10 @@ export function awkCommand(name: string): Command {
         context.warn(
           error.line === null ? error.message : `${prefix}line ${error.line}: ${error.message}`,
         );
+        return result(empty(), 2);
+      }
+      if (isStackOverflow(error)) {
+        context.warn(`${prefix}program nested too deeply for the stack`);
         return result(empty(), 2);
       }
       throw error;
