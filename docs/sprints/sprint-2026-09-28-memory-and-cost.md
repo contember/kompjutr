@@ -209,6 +209,7 @@ scratchpad and are not committed.
   5. Record anonymous and file memory with a host-side `smaps_rollup` sampler. The residue
      after V8 used + external is SQLite, allocator and runtime memory.
   6. Record the cgroup `memory.max` and the measured commit hash with every number.
+  7. Report the number of GC events and samples across the clone.
 - **Acceptance / witness.**
   - Run `cpu-lease run -n 2 -- npm run bench:workerd:nextjs` three times. The output
     separates V8 used and committed, V8 external memory, the non-V8 residue, and process
@@ -227,9 +228,10 @@ scratchpad and are not committed.
   memory is material or the sum does not fit, stop and re-gate with the user.
 - **Scope.**
   1. Write an ADR that replaces the RSS gate. The clone must complete under
-     `MINIFLARE_WORKERD_V8_FLAGS` with `--max-old-space-size=100` and a pinned
-     `--max-semi-space-size`, and peak V8 used plus V8 external memory must stay below
-     100 MiB. Process RSS stays report-only as a regression signal.
+     `MINIFLARE_WORKERD_V8_FLAGS` with `--max-old-space-size=100` and
+     `--max-semi-space-size=8`, and peak V8 used plus V8 external memory must stay below
+     100 MiB. The ADR names the exact measurement behind the gate and says whether it is a
+     lower bound. Process RSS stays report-only as a regression signal.
   2. Implement the gate in the harness.
   3. Reduce kompjutr code only if the new gate fails, and only in the owners WU3 names.
      Such a change triggers a re-gate.
@@ -264,8 +266,8 @@ Two commits in this order.
 - **Witnesses.**
   - The 10,001st conflict path fails with `E2BIG` and leaves the state unchanged.
   - 10,000 conflicts with paths of about 1 KiB succeed.
-  - About 10 files whose paths are 8 KiB long with 128 segments, under distinct top
-    directories, check out to the empty tree. This fails today on the 16 MiB prune charge.
+  - At least 20 files whose paths are 8 KiB long with at most 127 segments, under distinct
+    top directories, check out to the empty tree. This fails today on the 16 MiB prune charge.
     Show that failure at HEAD first.
   - The 50,001st prune directory still fails, as a regression guard.
   - Rebase start and abort with 64 roots of 17,000 characters succeed.
@@ -285,9 +287,10 @@ Two commits in this order.
     with one combined count cap of 50,000.
     - First confirm that no current witness exceeds it.
     - If a cap would refuse work that passes today, stop and re-gate.
-    - The worst-case real retention is about 50,000 × 8 KiB, which is about 400 MiB. The prune
-      map already has this bound at HEAD, and the status precedent accepts 30,000 × 8 KiB.
-      Record this worst case in ADR-0005's checkout paragraph.
+    - The worst-case real retention is about 50,000 × 8 KiB, which is about 400 MiB. This is a
+      new bound: at HEAD the 16 MiB modeled charge also held the prune map. The status
+      precedent (30,000 × 8 KiB) justifies it. Record this worst case and its justification in
+      ADR-0005's checkout paragraph.
   - Keep the real payload limits:
     - `CHECKOUT_REMOVE_FLUSH_BYTES`
     - `CHECKOUT_BLOB_BYTES`
@@ -309,8 +312,12 @@ Two commits in this order.
     index are unchanged.
   - Measurement: add `core.checkout.tree-swap` to `bench/memory.ts`. The leader declares
     the row and its `MemorySource` in the wave-0 protocol seam.
-    - It generates a tree whose workload crosses the 16 MiB former removal limit: at least
-      80,000 paths of at least 64 bytes.
+    - `workloadBytes` is real UTF-8 path bytes. The seam freezes 80,000 paths of 224 bytes
+      each (about 17.9 MB) in 1,000 directories. This crosses the 16 MiB former removal limit
+      (`CHECKOUT_SWAP_*` in `bench/memory-protocol.ts`).
+    - Setup builds the tree through a streamed path, such as an initial checkout of a
+      generated tree, not a `git add` of 80,000 files. It must fit the 512 MiB cap and the
+      1,800 s lease timeout over six setups.
     - It calls `checkoutTree` against the empty tree and bypasses the sparse path.
     - At HEAD it refuses with `E2BIG`. Record that refusal.
     - After the change, run it three times with
@@ -341,7 +348,7 @@ Two commits in this order.
      - Each entry point that proves the baseline passes the token:
        - start: `materializeTree`
        - continue: the check at `rebase.ts:131`, or the one at `:139` plus the commit
-       - skip: `hardMaterializeTree`
+       - skip, and skip inside continue (`rebase.ts:141`): `hardMaterializeTree`
      - With the token, skip `requireCurrentBaseline` at step start and at publish.
      - A restart or any entry point without a proof runs the full check.
      - The per-path guard at `rebase-lifecycle-step.ts:103` stays. It matches Git's per-pick
@@ -403,6 +410,10 @@ Two commits in this order.
   working tree. Every WU that runs a benchmark therefore works in its own git worktree,
   based on the latest committed HEAD. Numbers cited in an ADR, the run log or closure come
   from a leader run on committed HEAD.
+- **Worktree setup.** Each worktree symlinks `node_modules` and `bench/.fixtures` from the
+  main tree, so no WU refetches the Next.js fixture. A gate that names another WU's new
+  tests runs the existing suites of that area instead. For example, WU2's `joinPath` commit
+  runs the current checkout suites listed in WU5, plus `npm run test:fs`.
 - **Sprint closure.** Run `cpu-lease run -n 4 -- npm run test:full` once, after final
   review. The last run took about 743 s.
 - **Failure loop.** Reproduce a failure with its exact file, and stabilize that file before
@@ -441,8 +452,8 @@ Two commits in this order.
   - Each committed step leaves index = T(N+1), and untouched paths stay clean from the last
     proof.
   - The per-path guard applies Git's own per-pick rule to touched paths.
-  - The whole-tree check runs once per entry point with a proof: start, continue and skip.
-    After a restart it runs in full.
+  - Each entry point passes a proof: start and continue run the whole-tree check, and skip
+    proves the baseline by hard reset. After a restart the check runs in full.
   - On the local adapter, a writer that ignores the lock is already outside the ADR-0021
     guarantee.
 
@@ -465,8 +476,9 @@ worktree, and the leader cherry-picks every green unit at once.
 ## Plan review
 
 - **Reviewer:** independent general agent, first pass against `8c82521`.
-- **Verdict:** blocked. All findings are resolved in this revision; the second pass is
-  pending.
+- **Verdict:** approved on the third pass. The first pass was blocked. The second pass,
+  against `b6681c6`, was blocked on one finding. The third pass confirmed the fix and the
+  wave-0 seam.
 - **Material findings:**
   - Blocking: an old-space flag and GC-time traces do not measure what the isolate limit
     counts. `Uint8Array` buffers are V8 external memory. The gate is now V8 used + external,
@@ -488,6 +500,15 @@ worktree, and the leader cherry-picks every green unit at once.
   - Citation fixes: `:97`, `ops/network/`, and `rebaseSkip` has no baseline check.
   - WU2 reports the maximum of three runs and the total allocation drop. `joinPath` lands
     as its own commit.
+  - Second pass, blocking: 80,000 × 64 bytes crosses 16 MiB only in the modeled currency.
+    The seam now freezes 80,000 × 224 real path bytes.
+  - Second pass, non-blocking:
+    - The prune witness needs at least 20 files.
+    - Worktrees symlink dependencies and fixtures.
+    - Skip is a proof by reset, and `:141` is a proving entry.
+    - The ADR names its measurement and whether it is a lower bound. The semi-space is
+      pinned at 8 MB, and WU3 reports GC and sample counts.
+    - The prune worst case is new and is justified by the status precedent.
 
 ## Run log
 
