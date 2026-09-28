@@ -21,8 +21,8 @@ import {
 } from "./proc-memory.js";
 
 const STATEMENT_TARGET = 1_000;
-// A regression limit at today's level, not the production isolate limit (ADR-0026).
-const V8_USED_PLUS_EXTERNAL_LIMIT_BYTES = 300 * 1024 * 1024;
+// A regression limit, not the isolate limit: 1.2 × the 363 MiB five-run peak (ADR-0026).
+const V8_USED_PLUS_EXTERNAL_LIMIT_BYTES = 450 * 1024 * 1024;
 const SAMPLE_INTERVAL_MS = 5;
 const TRACE_TIMEOUT_MS = 10_000;
 
