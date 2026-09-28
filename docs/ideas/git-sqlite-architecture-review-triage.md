@@ -29,7 +29,7 @@ acceptance witness of the listed verified finding.
 
 | Claims | Candidate owner | Verification needed |
 |---|---|---|
-| CORR-20 | [Backlog 97](../backlog/97-audit-checkout-modeled-byte-charges.md), ARCH-17 | Classify sparse accounting as mutable ledger, structural cap, or result cap under ADR-0005. |
+| CORR-20 | [Memory and cost sprint](../archive/sprint-2026-09-28-memory-and-cost.md) (backlog 97), ARCH-17 | Classify sparse accounting as mutable ledger, structural cap, or result cap under ADR-0005. |
 
 ## Correctness candidates
 

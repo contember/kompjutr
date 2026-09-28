@@ -14,9 +14,10 @@ This is `node:sqlite` unless the section names workerd. Statement counts
 transfer to the Durable Object cost model. Local wall time and process RSS are
 regression signals, not proof of a production isolate limit.
 
-## Next.js workflow — 2026-09-24
+## Next.js workflow — 2026-09-28
 
-One run:
+One run at commit `c4eb082`, under a cgroup with `memory.max` 1073741824 and
+`memory.swap.max` 0:
 
 ```bash
 cpu-lease run -n 2 -- npm run bench:nextjs
@@ -27,37 +28,35 @@ sample each, not medians.
 
 | Operation | Wall, ms | SQL | Rows | Added peak RSS, MiB |
 | --- | ---: | ---: | ---: | ---: |
-| `git.clone` | 10,211.9 | 1,012 | 145,777 | 237.2 |
-| `git.status` — clean clone | 4.0 | 14 | 12 | 0.0 |
-| `git.branch` | 4.3 | 30 | 19 | 0.0 |
-| `fs.writeFiles` — 100 | 26.0 | 6 | 288 | 0.0 |
-| `git.status` — 100 modified | 27.7 | 30 | 1,031 | 0.3 |
-| `git.diffSummary` — 100 | 66.2 | 30 | 1,575 | 0.0 |
-| `git.diff` — 100 | 37.3 | 29 | 1,573 | 0.4 |
-| `git.add` — 100 | 160.4 | 22 | 1,754 | 0.2 |
-| `git.status` — 100 staged | 17.5 | 27 | 685 | 0.1 |
-| `git.commit` — 100 | 140.6 | 51 | 725 | 0.1 |
-| `git.push` — 100 | 342.2 | 47 | 615 | 0.6 |
-| `git.status` — clean commit | 10.1 | 25 | 685 | 0.0 |
-| `git.checkout main` | 478.2 | 101 | 25,089 | 0.9 |
-| `git.checkout main --force` | 462.4 | 102 | 25,189 | 0.9 |
-| `git.status` — clean main | 1.0 | 11 | 8 | 0.0 |
-| `git.checkout bench-work` | 492.8 | 94 | 25,188 | 9.8 |
-| `git.checkout bench-work --force` | 457.4 | 94 | 25,188 | 5.4 |
-| `git.status` — clean work | 0.7 | 10 | 8 | 0.0 |
-| `git.rebase` — 100 onto `main` | 10,809.6 | 942 | 1,061,270 | 96.6 |
-| `git.status` — clean rebase | 23.8 | 27 | 891 | 0.0 |
+| `git.clone` | 9,908.2 | 898 | 145,777 | 118.2 |
+| `git.status` — clean clone | 4.1 | 14 | 12 | 0.0 |
+| `git.branch` | 5.8 | 30 | 19 | 0.0 |
+| `fs.writeFiles` — 100 | 35.8 | 6 | 288 | 0.0 |
+| `git.status` — 100 modified | 29.6 | 30 | 1,031 | 0.1 |
+| `git.diffSummary` — 100 | 39.4 | 30 | 1,575 | 0.3 |
+| `git.diff` — 100 | 40.3 | 29 | 1,573 | 0.8 |
+| `git.add` — 100 | 158.1 | 22 | 1,754 | 0.2 |
+| `git.status` — 100 staged | 14.3 | 27 | 685 | 0.0 |
+| `git.commit` — 100 | 141.2 | 51 | 725 | 0.0 |
+| `git.push` — 100 | 344.8 | 47 | 615 | 0.7 |
+| `git.status` — clean commit | 9.6 | 25 | 685 | 0.0 |
+| `git.checkout main` | 492.3 | 101 | 25,089 | 0.5 |
+| `git.checkout main --force` | 453.8 | 102 | 25,189 | 6.3 |
+| `git.status` — clean main | 0.8 | 11 | 8 | 0.0 |
+| `git.checkout bench-work` | 489.3 | 94 | 25,188 | 4.4 |
+| `git.checkout bench-work --force` | 467.1 | 94 | 25,188 | 0.0 |
+| `git.status` — clean work | 0.8 | 10 | 8 | 0.0 |
+| `git.rebase` — 100 onto `main` | 9,053.3 | 724 | 830,418 | 39.4 |
+| `git.status` — clean rebase | 22.9 | 27 | 891 | 0.0 |
 
 Every phase passed its verification. Rows are rows returned, not rows scanned.
-Every phase except clone meets the at-most-1,000-statement target. Clone misses
-it by 12 statements.
+Every phase meets the at-most-1,000-statement target.
 Target status is performance evidence, not a runtime admission rule.
 
-Clone adds 237.2 MiB over a 207.3 MiB process baseline. The rebase step replays
-one 100-file commit onto a new `main` commit and adds 96.6 MiB
-([backlog 95](../backlog/95-reduce-the-nextjs-rebase-step-peak.md)).
-`git.diffSummary` measured a peak 0.3 MiB below its baseline; the table
-reports 0.0.
+Clone adds 118.2 MiB over a 191.8 MiB process baseline, under its <160 MiB
+gate. The rebase step replays one 100-file commit onto a new `main` commit and
+adds 39.4 MiB. `fs.writeFiles` and `git.commit` measured a peak below their
+baseline; the table reports 0.0.
 
 ## Next.js clone on workerd — 2026-09-28
 
@@ -132,8 +131,8 @@ preserved. No cgroup memory limit was applied.
 All phases passed semantic verification: the published tracking ref, the
 fetched commit count, and every fetched tree entry. Clone process baselines were
 167.8 MiB and 170.1 MiB. This clone passes `depth: 0` and `noTags: true`; the
-workflow clone passes `ref` and `depth: 1` and runs 1,012 statements. The clone misses
-the 1,000-statement target by 6 statements. These peaks were measured without a
+workflow clone passes `ref` and `depth: 1`. This clone misses the
+1,000-statement target by 6 statements. These peaks were measured without a
 cgroup memory cap. The <160 MiB added-peak gate was approved under a 1 GiB,
 no-swap cap, and under that cap the same clone at `866843e` added 140.3 and
 111.2 MiB on 2026-09-24. Under the same cap, the 2026-09-10 closure `acf7289`
@@ -279,11 +278,12 @@ its own database — attributes bytes and statements to the two halves:
 
 This is a decomposition, not the clone path. Both paths use the shared
 create-only initial materializer, but the standalone sequence also performs the
-separate initialization, fetch, and ref publication phases. Clone uses 1,012
-statements; the standalone checkout itself uses 690. Both materialize exactly
-24,252 index entries and worktree leaves at the expected HEAD and end at the
-same 217.78 MiB database size. Each phase meets the at-most-1,000-statement
-target; the clone misses it.
+separate initialization, fetch, and ref publication phases. At `62ffbf0`, clone
+used 1,012 statements; the standalone checkout itself used 690. Both materialize
+exactly 24,252 index entries and worktree leaves at the expected HEAD and end at
+the same 217.78 MiB database size. Each phase met the at-most-1,000-statement
+target; the clone missed it. The workflow clone above runs 898 statements at
+`c4eb082`.
 A miss is optimization evidence, not a runtime refusal.
 
 Generated output goes to `bench/results/clone-storage.{json,md}`, which is

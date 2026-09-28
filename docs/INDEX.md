@@ -40,7 +40,13 @@ None.
 - [Correctness and layering](archive/sprint-2026-09-28-correctness-and-layering.md)
   shipped: ref text rejects a trailing lone surrogate, the import-graph witness
   enforces Git peer and DO domain rules again, and status pruning uses prefix
-  lookups (4× faster in the measured case). Next: memory and cost (86, 95, 97).
+  lookups (4× faster in the measured case). Next: the
+  [backlog plan](backlog/README.md#sprint-plan).
+- [Memory and cost](archive/sprint-2026-09-28-memory-and-cost.md) shipped:
+  sparse selected add meets <100 MiB, the Next.js clone runs 898 statements, the
+  rebase phase reads 830,418 rows instead of 1,145,713, and checkout keeps only
+  real payload limits and count caps. The workerd clone has a V8 regression limit
+  (ADR-0026). Next: the [backlog plan](backlog/README.md#sprint-plan), 108 first.
 - The 2026-09-28 backlog triage cut the backlog from 16 to 8 items and deleted
   stale and look-alike cleanup items; two with no failure behind them moved
   to [`ideas/`](ideas/README.md).
@@ -76,8 +82,6 @@ None.
   transaction-owned local mutations with trusted ordinary reads. Remaining
   verified review findings shipped with the correctness and layering sprint;
   unverified claims remain in [`ideas`](ideas/git-sqlite-architecture-review-triage.md).
-- Checkout's remaining modeled retained-byte charges are tracked in
-  [`backlog/97`](backlog/97-audit-checkout-modeled-byte-charges.md).
 - The completed everyday Git shell sprint made command execution asynchronous,
   added staged diff and history reads, exposed exact local/network operations,
   and composed pull with the restart-safe rebase lifecycle.

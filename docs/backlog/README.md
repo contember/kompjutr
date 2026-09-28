@@ -19,8 +19,10 @@ Ranking of the gaps recorded in
 not effort: a wrong answer outranks a missing one.
 
 - **S — silent divergence.** kompjutr returns a plausible result where Git
-  returns a different one or refuses. Nothing warns the caller. None filed.
-- **A — blocks a common workflow, loudly.** None filed.
+  returns a different one or refuses. Nothing warns the caller.
+  [109](109-keep-parent-directory-when-replacing-its-only-child.md).
+- **A — blocks a common workflow, loudly.**
+  [108](108-local-checkout-removes-missing-paths.md).
 - **B — real gap, narrower audience or a workaround exists.** None filed.
 - **No caller yet.** Stash, plumbing reads, branch and remote management,
   rebase extensions, interactive rebase, rebase merges, gitlink
@@ -91,14 +93,19 @@ the `IndexStore` interface implementation, a finished audit, and look-alike SQL
 over different reflog tables. It moved 84 and 105 to
 [`../ideas/`](../ideas/README.md): neither has a failure behind it.
 
+The 2026-09-28 [memory and cost sprint](../archive/sprint-2026-09-28-memory-and-cost.md)
+closed 86, 95 and 97, and filed 106–109 from its findings.
+
 | Order | Items | Why |
 |---|---|---|
-| 1 | [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [97](97-audit-checkout-modeled-byte-charges.md) | Memory and cost: missed memory gates, repeated full-tree passes, and checkout's remaining modeled byte charges. |
-| Unscheduled | [106](106-reduce-the-workerd-clone-external-memory.md) | The workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it, then decide whether a production probe is needed. |
+| 1 | [108](108-local-checkout-removes-missing-paths.md) | Tier A: local `reset --hard` fails with `ENOENT` when a tracked path is already gone. It blocks a common workflow. |
+| 2 | [109](109-keep-parent-directory-when-replacing-its-only-child.md) | Tier S, but narrow: only a directory's mode changes when its only child changes type. |
+| 3 | [107](107-bound-shared-integration-step-passes.md) | Cost: the shared integration step still makes full-tree passes for every rebase, merge, cherry-pick and revert step. |
+| 4 | [106](106-reduce-the-workerd-clone-external-memory.md) | Memory: the workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it first, then decide whether a production probe is needed. |
 
 ## Items
 
-- [86 — Bound the sparse-selected-add and workerd clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
-- [95 — Reduce the Next.js rebase step's full-tree passes and peak](95-reduce-the-nextjs-rebase-step-peak.md)
-- [97 — Audit checkout modeled byte charges](97-audit-checkout-modeled-byte-charges.md)
 - [106 — Reduce the workerd clone's external memory](106-reduce-the-workerd-clone-external-memory.md)
+- [107 — Bound the shared integration step's full-tree passes](107-bound-shared-integration-step-passes.md)
+- [108 — Let local checkout remove paths that are already gone](108-local-checkout-removes-missing-paths.md)
+- [109 — Keep a directory whose only child changes type](109-keep-parent-directory-when-replacing-its-only-child.md)

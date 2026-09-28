@@ -9,6 +9,10 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Memory and cost](sprint-2026-09-28-memory-and-cost.md) — sparse selected add
+  under its memory gate, an 898-statement clone, a V8 regression limit for the
+  workerd clone, checkout without modeled byte charges, and a rebase step without
+  repeated baseline passes.
 - [Correctness and layering](sprint-2026-09-28-correctness-and-layering.md)
   — trailing-surrogate ref text fix, restored import-graph peer and DO domain
   rules, prefix lookups in status pruning, ref probes behind the store seam.

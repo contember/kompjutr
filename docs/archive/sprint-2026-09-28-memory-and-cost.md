@@ -1,3 +1,60 @@
+> **OUTCOME — shipped 2026-09-28.** Sparse selected add meets its <100 MiB gate:
+> 81.4 MB capped at closure, down from 158 MB. The Next.js clone runs 898
+> statements, down from 1,012. The workerd clone gate is now a 450 MiB regression
+> limit on V8 used + external
+> ([ADR-0026](../decisions/0026-gate-the-workerd-clone-on-a-v8-regression-limit.md)):
+> V8 used + external is at least 219 MiB, and RSS is not what the isolate limit
+> counts. External memory moves to backlog 106. Checkout keeps only real payload
+> limits and count caps: removals stream, structural state keeps only replaced
+> roots (50,000-root cap), and the tracker seed has a 50,000-path cap and the 8 KiB
+> guard. Rebase carries its baseline proof through one drive call, answers the start
+> checks from a clean tracker, and checks out only the tree diff at start. The
+> Next.js rebase phase fell from 1,006 to 724 statements and from 1,145,713 to
+> 830,418 rows; the maximum added peak over three interleaved capped runs fell from
+> 63.2 to 44.9 MiB. The `staging.rm` regression is fixed: 42/64 → 27/31. The user
+> added WU7 (the rm regression) and WU8 (DOFS JSON sizing copies) mid-sprint.
+>
+> **Commit map.**
+>
+> - Protocol seam → `06de5e5`
+> - WU1 → `5c6378f`
+> - WU2 → `44326c3`, `75acf9d`, `14fd12a`, `8b08eaf`, `9fa0a7b`
+> - WU3 → `290bf52`, `2b2002c`
+> - WU4 → `555ee0d`, `e177161`, `c8ee599`, `ecfd96c`
+> - WU5 → `2f9565c`, `537d62b`, `4fcb09e`, `5a93810`, `9fe4645`
+> - WU6 → `b87f696`, `1e254a5`, `420984a`, `bd018bd`, `407c106`, `b60395b`,
+>   `b97d615`, `0b2a9c3`, `b3f7202`
+> - WU7 → `143764b`, `e540efa`
+> - WU8 → `b541508`, `7666b1d`, `1790db7`
+> - Rebaselines → `6c014f6` (`merge.restore` and `rebase.transition*`, for the
+>   earlier correctness fixes `d2fe7b9` and `11cd7a6`) and `9811cab`
+> - Documentation → this closing commit
+>
+> **Verification at `c4eb082`.**
+>
+> - `npm test`: 160 passed.
+> - `cpu-lease run -n 4 -- npm run test:full`: 17 slices, 4,100 passed, 0 failed,
+>   779.1 s wall with two lanes.
+> - `npm run bench:statements -- --check --nextjs`: exit 0.
+> - `npm run bench:memory`: all 13 scenarios pass both stages (calibration
+>   uncapped; capped `memory.max` 536870912).
+> - Capped `bench:nextjs` (`memory.max` 1073741824): clone 898 statements,
+>   145,777 rows, added peak 118.2 MiB (gate <160 MiB); rebase 724 statements,
+>   830,418 rows, added peak 39.4 MiB.
+>
+> **Backlog.** Closed: 86, 95, 97. Filed: 106 (workerd external memory), 107
+> (shared integration step passes, formerly 95 part b), 108 (local `reset --hard`
+> `ENOENT` on missing paths; predates the sprint, tier A), 109 (directory mode
+> reset when its only child changes type; predates the sprint, tier S).
+>
+> **Deferred.**
+>
+> - P4 of backlog 95: limit the baseline preflight object checks to diff blobs.
+> - Sharing the exclusion normalizer between checkout and `rebaseExclusions`.
+> - The 450 MiB workerd limit catches only large regressions.
+> - The uncapped tree-swap calibration varies from 32 to 96 MB with GC timing.
+> - node:sqlite keeps bound parameters on idle statements. The harness is unchanged.
+
 # Sprint — Memory and cost (2026-09-28)
 
 **Goal.** Meet the missed memory gates or replace a wrong gate with evidence. Remove the
@@ -537,17 +594,14 @@ worktree, and the leader cherry-picks every green unit at once.
   - node:sqlite keeps a bound parameter on an idle statement; workerd clears it.
   - Review verified equivalence by fuzzing `joinPath`, the byte counting and resolution
     against the base. It moved the canonical-path helpers into `fs/path.ts`.
-- WU4 escalated. V8 used + external is at least 219–279 MiB on the workerd clone; external
-  memory alone is 188–227 MiB. The user chose a report-only V8 measurement with a
-  regression limit at today's level, plus a backlog item for external memory.
+- WU4 escalated: V8 used + external exceeds 100 MiB → ADR-0026, backlog 106.
 - WU3 `290bf52`, `2b2002c`:
   - The old trace lost its tail to block-buffered stdout and SIGKILL. A stdbuf preload
     and gc-done markers now bracket the clone.
   - The non-V8 residue is measured at one instant.
   - `memory.max` is read from every ancestor cgroup.
   - Review found three defects. The second pass was clean.
-- WU4 `555ee0d`…`ecfd96c` → ADR-0026, backlog 106. The limit is 450 MiB on V8
-  used + external; the maximum of five runs was 363.3 MiB. RSS is report-only.
+- WU4 `555ee0d`…`ecfd96c` → ADR-0026, backlog 106.
 - WU7 `143764b`, `e540efa`: `staging.rm` is back to 27/31. rm plans in one
   HEAD/index/worktree pass and removes in one paged pass.
   - Review verified atomicity on DO and on the local undo journal against the parent.
@@ -566,7 +620,7 @@ worktree, and the leader cherry-picks every green unit at once.
   - The tracker seed has a 50,000 cap and an 8 KiB guard.
   - Checkout-owned tree-swap allocation fell from 119 to 25 MiB. The uncapped
     calibration spreads 32–96 MB from GC timing.
-  - Pre-existing local defects found in review → backlog 108.
+  - Local checkout defects found in review → backlog 108.
 - Backlog 95, part b → backlog 107.
 - WU6 peak witness: interleaved leased runs under a 1 GiB no-swap cap
   (`memory.max=1073741824`), three at `9fe4645` and three at `7ea46be`.
@@ -588,5 +642,4 @@ worktree, and the leader cherry-picks every green unit at once.
     the ADR-0004 contract excludes. The invariant is stated in
     `trySparseCleanCheckout`.
   - The tracked gate rows fall to 241/64,824 and 271/125,324.
-  - A replaced leaf's parent directory loses a custom mode on both checkout paths
-    (Git keeps it). This behaviour predates the sprint → backlog 109.
+  - Directory mode reset on a replaced only child → backlog 109.
