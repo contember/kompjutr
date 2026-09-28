@@ -1,4 +1,4 @@
-import type { SqlDatabase } from "@kompjutr/sqlite";
+import { jsonArrayText, type SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { comparePaths } from "../../common/streams.js";
 import type {
@@ -69,7 +69,7 @@ export class IndexTable implements IndexStore {
     this.#requireActive();
     const hasRemoves = pending.some((item) => item.kind === "r");
     const hasPuts = pending.some((item) => item.kind === "p");
-    const mutations = `[${pending.map((item) => item.json).join(",")}]`;
+    const mutations = jsonArrayText(pending.map((item) => item.json));
     if (hasRemoves) {
       if (this.source.kind === "checkout") {
         this.db.run(

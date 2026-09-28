@@ -179,6 +179,20 @@ export function jsonStringEncodedBytes(value: string): number {
   return bytes;
 }
 
+/**
+ * `[item,item,…]` built by one `join`. A template around `join` yields a rope
+ * that the driver flattens into a second full copy when it binds the text.
+ */
+export function jsonArrayText(items: readonly string[]): string {
+  const parts: string[] = ["["];
+  for (const item of items) {
+    if (parts.length > 1) parts.push(",");
+    parts.push(item);
+  }
+  parts.push("]");
+  return parts.join("");
+}
+
 export const MAX_ROUTING_CHECKOUTS = 8_192;
 export const MAX_ROUTING_CHECKOUTS_RETAINED_BYTES = 16 * 1024 * 1024;
 export const MAX_ROUTING_ROOTS_UTF8_BYTES = 6 * 1024 * 1024;

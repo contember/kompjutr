@@ -1,4 +1,4 @@
-import { jsonStringEncodedBytes } from "@kompjutr/sqlite";
+import { jsonArrayText, jsonStringEncodedBytes } from "@kompjutr/sqlite";
 import { expect, it } from "vitest";
 
 const encoder = new TextEncoder();
@@ -66,5 +66,13 @@ it("matches JSON.stringify over seeded random UTF-16 strings", () => {
     }
     const value = units(...codes);
     expect(jsonStringEncodedBytes(value), JSON.stringify(value)).toBe(stringifiedBytes(value));
+  }
+});
+
+it("frames JSON items as the array JSON.stringify writes", () => {
+  const cases: unknown[][] = [[], [1], [{ p: "a", r: 0 }, "b\n", null], [[1, 2], { q: [] }]];
+  for (const items of cases) {
+    const text = jsonArrayText(items.map((item) => JSON.stringify(item)));
+    expect(text).toBe(JSON.stringify(items));
   }
 });
