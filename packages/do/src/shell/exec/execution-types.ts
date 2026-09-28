@@ -10,5 +10,6 @@ export interface PipelineEnvironment {
   readonly errors: Sink;
   readonly inputs: RunInputOwner | null;
   readonly currentStatus: number;
+  now(): number;
   chdir(path: string): void;
 }

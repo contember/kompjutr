@@ -59,6 +59,7 @@ so the two cannot drift.
 - [0017 — Commit mutating CLI commands, then truncate their output](0017-preflight-mutating-cli-output-inside-the-transaction.md) — accepted (2026-09-23)
 - [0018 — Compile shell commands to bounded queries](0018-compile-shell-commands-to-bounded-queries.md) — accepted (2026-08-21)
 - [0019 — Admit a bounded POSIX shell surface](0019-admit-a-bounded-posix-shell-surface.md) — accepted (2026-09-01)
+- [0027 — Widen the shell to compound syntax and text tools](0027-widen-the-shell-to-compound-syntax-and-text-tools.md) — accepted (2026-09-28)
 
 ## Renumbered on 2026-09-04
 

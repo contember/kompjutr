@@ -32,6 +32,8 @@ export interface ExecOptions {
   readonly limits?: Limits;
   readonly stdin?: Uint8Array | string;
   readonly env?: Readonly<Record<string, string>>;
+  /** Milliseconds since the epoch. Defaults to `Date.now`. */
+  readonly now?: () => number;
 }
 
 export interface ExecResult {
@@ -75,6 +77,7 @@ export async function execute(plan: Plan, options: ExecOptions): Promise<ExecRes
             errors,
             inputs: runInput,
             currentStatus: exitCode,
+            now: options.now ?? Date.now,
             chdir: (path: string) => {
               cwd = path;
             },

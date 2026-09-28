@@ -26,6 +26,8 @@ export interface ShellOptions {
    */
   readonly commands?: ReadonlyMap<string, Command>;
   readonly limits?: Limits;
+  /** Milliseconds since the epoch, for `date` and friends. Defaults to `Date.now`. */
+  readonly now?: () => number;
 }
 
 export interface ShellRunOptions {
@@ -94,6 +96,7 @@ export function createShell(options: ShellOptions): Shell {
       limits: options.limits ?? DEFAULT_LIMITS,
       stdin: runOptions?.stdin,
       env: runOptions?.env,
+      now: options.now,
     });
     if (outcome.cwd !== before) session.setCwd(outcome.cwd);
     return outcome;

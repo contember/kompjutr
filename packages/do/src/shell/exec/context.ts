@@ -263,6 +263,31 @@ export class BoundedFs {
     this.#charge();
     this.fs.rename(oldPath, newPath);
   }
+
+  readlink(path: string): string {
+    this.#charge();
+    return this.fs.readlink(path);
+  }
+
+  symlink(target: string, path: string): void {
+    this.#charge();
+    this.fs.symlink(target, path);
+  }
+
+  link(existingPath: string, newPath: string): void {
+    this.#charge();
+    this.fs.link(existingPath, newPath);
+  }
+
+  chmod(path: string, mode: number): void {
+    this.#charge();
+    this.fs.chmod(path, mode);
+  }
+
+  rmdir(path: string): void {
+    this.#charge();
+    this.fs.rmdir(path);
+  }
 }
 
 export interface CommandContext {
@@ -281,6 +306,8 @@ export interface CommandContext {
   readonly mayExitRun: boolean;
   /** The command's one-based source line, which Bash's builtins name in diagnostics. */
   readonly line: number;
+  /** Milliseconds since the epoch, from `ShellOptions.now`. The shell's only clock. */
+  now(): number;
   /** From a lifted `head -N`. Sizes the first discovery page. */
   readonly limitHint: number | null;
   /** Planned stream destinations and the bytes still available to this stage. */

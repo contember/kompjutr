@@ -35,6 +35,7 @@ export function commandContext(
     stdin,
     env: env.inputs?.env,
     currentStatus: env.currentStatus,
+    now: env.now,
     mayExitRun,
     line: planned.line,
     limitHint,

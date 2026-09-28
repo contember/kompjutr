@@ -20,4 +20,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None.
+- [Shell surface expansion](sprint-2026-09-28-shell-surface-expansion.md)

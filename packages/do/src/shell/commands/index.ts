@@ -7,23 +7,30 @@
 
 import { type ByteStream, isAsyncByteStream } from "../exec/bytes.js";
 import { type Command, type CommandResult, fail } from "../exec/context.js";
+import { awkCommands } from "./awk/index.js";
+import { columnCommands } from "./columns/index.js";
 import { exit } from "./control.js";
 import { diff } from "./diff/diff.js";
 import { echo } from "./echo.js";
 import { fileCommands } from "./files.js";
 import { find } from "./find.js";
 import { UsageError } from "./flags.js";
+import { jqCommands } from "./jq/index.js";
+import { linkCommands } from "./links/index.js";
 import { listCommands } from "./list.js";
 import { basename, dirname } from "./names.js";
+import { patchCommands } from "./patch/index.js";
 import { printf } from "./printf.js";
 import { readCommands } from "./read.js";
 import { grep } from "./search/grep.js";
 import { rg } from "./search/rg.js";
 import { sed } from "./sed/sed.js";
+import { systemCommands } from "./system/index.js";
 import { tail } from "./tail.js";
 import { tee } from "./tee.js";
 import { bracket, test } from "./test.js";
 import { registerKnownCommands, textCommands } from "./text.js";
+import { treeCommands } from "./tree/index.js";
 import { wc } from "./wc.js";
 import { xargs } from "./xargs.js";
 
@@ -49,6 +56,13 @@ export function builtinCommands(): Map<string, Command> {
     ...listCommands,
     ...fileCommands,
     ...textCommands,
+    ...columnCommands,
+    ...linkCommands,
+    ...treeCommands,
+    ...systemCommands,
+    ...patchCommands,
+    ...jqCommands,
+    ...awkCommands,
   ]);
   const commands = new Map<string, Command>();
   for (const [name, command] of raw) commands.set(name, normalizeFailures(command));
