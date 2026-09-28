@@ -79,7 +79,8 @@ export async function execute(plan: Plan, options: ExecOptions): Promise<ExecRes
               cwd = path;
             },
           });
-          exitCode = outcome.exitCode;
+          exitCode =
+            step.negated && !outcome.terminateRun ? negate(outcome.exitCode) : outcome.exitCode;
           commandTruncated ||= outcome.truncated;
           if (outcome.terminateRun) break;
         }
@@ -106,4 +107,8 @@ export async function execute(plan: Plan, options: ExecOptions): Promise<ExecRes
   } finally {
     runInput?.close();
   }
+}
+
+function negate(status: number): number {
+  return status === 0 ? 1 : 0;
 }

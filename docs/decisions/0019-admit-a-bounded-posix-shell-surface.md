@@ -16,6 +16,11 @@ agent-authored command lines nevertheless use `printf`, `exit`, `1>&2`, and name
 environment parameters. Rejecting all four kept the implementation small but
 excluded ordinary scripts without protecting any specific runtime limit.
 
+Agents also send multi-line command lines, write files through
+here-documents, and guard steps with `test`/`[` and `!`. A newline read as a
+blank joined statements silently, so `rm -r build` followed by `ls` on the next
+line removed `ls` as well.
+
 Named parameter expansion was the consequential boundary change. Supporting it
 partially, or at parse time, would lose Bash's quote-sensitive field behaviour,
 and planning happens before the run's environment snapshot exists. General Bash
@@ -37,6 +42,20 @@ We admit this finite surface:
   execution. A quoted value remains one field; an unquoted value splits on fixed
   default-IFS whitespace and then undergoes pathname expansion; an unset name
   expands to empty.
+- Newlines as statement separators, `#` comments to the end of a line, and
+  backslash-newline line continuation outside single quotes.
+- Here-documents (`<<`, `<<-`) and here-strings (`<<<`) on descriptor 0. A
+  quoted delimiter keeps the body literal; an unquoted one admits the named
+  parameters above and Bash's `\$`, `` \` ``, `\\`, and backslash-newline
+  escapes. The body is one field: no splitting and no pathname expansion. Its
+  bytes are reserved against the retained budget while the stage reads them.
+- `! pipeline`, which inverts the pipeline status.
+- `test` and `[` with POSIX argument-count dispatch, the file tests `-e`, `-f`,
+  `-d`, `-s`, `-L`, `-h`, `-r`, `-w`, `-x`, the string tests `-n`, `-z`, `=`,
+  `==`, `!=`, the integer comparisons, `!`, and parentheses around a whole
+  expression. Each file test is one stat.
+- `echo` with Bash's `-n`, `-e`, and `-E` option words and its `-e` escapes.
+- `tail -n +N`, and `basename` and `dirname` with GNU options.
 
 Expansion stays unresolved through parse and plan, so planning stays pure.
 Generated fields and pathname matches share the 10,000-entry argv ceiling and the
@@ -50,20 +69,29 @@ hidden by weakening or normalizing the differential comparison. The evidence for
 this admission is the [baseline](../../tests/shell/parity-bash.test.ts),
 [ordered redirection](../../tests/shell/parity-bash-redirection.test.ts),
 [`printf`](../../tests/shell/parity-bash-printf.test.ts),
-[`exit`](../../tests/shell/parity-bash-exit.test.ts), and
-[named expansion](../../tests/shell/parity-bash-expansion.test.ts) suites.
+[`exit`](../../tests/shell/parity-bash-exit.test.ts),
+[named expansion](../../tests/shell/parity-bash-expansion.test.ts), and
+[script](../../tests/shell/parity-bash-scripts.test.ts) suites.
 
 These forms remain rejected:
 
-- Variable assignment, parameters in command names or redirection targets,
+- Variable assignment, parameters in command names or file redirection targets,
   `${...}` operators, positional parameters, and special parameters.
 - `printf` width and precision, `%b`, `%q`, `%c`, escapes outside the admitted
   set, and non-decimal numeric spellings.
+- A here-document without its delimiter line. Bash warns and uses the rest of
+  the input; this shell refuses rather than run a command with a body the
+  caller may not have meant.
+- `echo -e` `\u` and `\U` escapes, whose Bash output depends on the locale.
+- `test` with more than four arguments outside parentheses, `-a`/`-o`
+  precedence, `-nt`, `-ot`, `-ef`, `<`, `>`, and file tests with no meaning
+  here (`-p`, `-S`, `-t`, and the like). Diagnostics from `test` and `[` omit
+  Bash's `bash: line N:` prefix because the shell does not track script lines.
 - `exit` in a multi-stage pipeline. Bash runs that command in a subshell; this
   shell has no subshell and rejects the form rather than silently changing its
   control effect.
 - Command and process substitution, arithmetic, grouping and subshells, compound
-  control flow, functions, here-documents, and background jobs.
+  control flow, functions, and background jobs.
 
 Each remains rejected because its execution model or finite-cost semantics has
 not been admitted and witnessed — not because broad Bash incompatibility is a
@@ -71,8 +99,9 @@ goal.
 
 ## Consequences
 
-- Common agent-authored diagnostics, formatted output, explicit termination, and
-  environment-derived arguments work without an external process runtime.
+- Common agent-authored diagnostics, formatted output, explicit termination,
+  environment-derived arguments, multi-line scripts, here-document file writes,
+  and `test` guards work without an external process runtime.
 - Quote-sensitive expansion and ordered descriptor binding add executor state,
   but do not make planning environment- or filesystem-dependent.
 - The surface is still intentionally incomplete. A caller receives an explicit

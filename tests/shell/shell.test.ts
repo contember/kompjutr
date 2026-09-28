@@ -347,10 +347,10 @@ describe("sed ships two forms", () => {
       "line1\nline2\nline2\nline3\nline4\nline5\n",
     );
   });
-  it("points at the container for anything else", async () => {
+  it("names the supported forms for anything else", async () => {
     const run = await shell.run("cat README.md | sed '/widgets/d'");
     expect(run.exitCode).toBe(2);
-    expect(run.stderr).toContain("container");
+    expect(run.stderr).toContain("only s/// and line-print scripts are supported");
   });
 });
 describe("rejections", () => {

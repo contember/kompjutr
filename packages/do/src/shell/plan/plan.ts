@@ -26,6 +26,7 @@ import {
 } from "../parse/ast.js";
 import {
   type Argument,
+  type ArgumentPart,
   type Plan,
   type PlannedCommand,
   type PlannedPipeline,
@@ -37,7 +38,11 @@ import {
 export function planScript(script: Script): Plan {
   const steps: PlannedStep[] = [];
   for (const statement of script.statements) {
-    steps.push({ pipeline: planPipeline(statement.pipeline), connector: statement.connector });
+    steps.push({
+      pipeline: planPipeline(statement.pipeline),
+      negated: statement.pipeline.negated,
+      connector: statement.connector,
+    });
   }
   return { steps };
 }
@@ -106,6 +111,13 @@ function planRedirection(redirection: Redirection): PlannedRedirection {
     );
   }
 
+  if (redirection.op === "<<" || redirection.op === "<<<") {
+    if (redirection.fd !== 0) {
+      throw new ShellSyntaxError("redirection", `descriptor ${redirection.fd} is not supported`, 0);
+    }
+    return { kind: "text", fd: 0, text: hereText(redirection) };
+  }
+
   if (hasParameter(redirection.target)) {
     throw new ShellSyntaxError(
       "parameter expansion",
@@ -139,6 +151,16 @@ function planRedirection(redirection: Redirection): PlannedRedirection {
     throw new ShellSyntaxError("redirection", `descriptor ${redirection.fd} is not supported`, 0);
   }
   return { kind: "write", fd: 1, path: target, append };
+}
+
+function hereText(redirection: Extract<Redirection, { readonly op: "<<" | "<<<" }>): Argument {
+  const word = redirection.op === "<<" ? redirection.body : redirection.target;
+  const parts = word.parts.map((part): ArgumentPart => {
+    if (part.kind === "Parameter") return { kind: "parameter", name: part.name, quoted: true };
+    return { kind: "literal", value: part.value, quoted: true };
+  });
+  if (redirection.op === "<<<") parts.push({ kind: "literal", value: "\n", quoted: true });
+  return { kind: "word", parts };
 }
 
 /**
@@ -326,12 +348,15 @@ function literal(value: string): Argument {
 }
 
 function hasInputRedirection(command: PlannedCommand): boolean {
-  return command.redirections.some((redirection) => redirection.kind === "read");
+  return command.redirections.some(
+    (redirection) => redirection.kind === "read" || redirection.kind === "text",
+  );
 }
 
 function hasOutputRedirection(command: PlannedCommand): boolean {
   return command.redirections.some(
-    (redirection) => redirection.kind !== "read" && redirection.fd === 1,
+    (redirection) =>
+      (redirection.kind === "write" || redirection.kind === "duplicate") && redirection.fd === 1,
   );
 }
 

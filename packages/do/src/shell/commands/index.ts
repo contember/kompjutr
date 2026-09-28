@@ -8,13 +8,17 @@
 import { type ByteStream, isAsyncByteStream } from "../exec/bytes.js";
 import { type Command, type CommandResult, fail } from "../exec/context.js";
 import { exit } from "./control.js";
+import { echo } from "./echo.js";
 import { fileCommands } from "./files.js";
 import { UsageError } from "./flags.js";
 import { grep } from "./grep.js";
 import { listCommands } from "./list.js";
+import { basename, dirname } from "./names.js";
 import { printf } from "./printf.js";
 import { readCommands } from "./read.js";
 import { rg } from "./rg.js";
+import { tail } from "./tail.js";
+import { bracket, test } from "./test.js";
 import { registerKnownCommands, textCommands } from "./text.js";
 import { xargs } from "./xargs.js";
 
@@ -24,7 +28,13 @@ export function builtinCommands(): Map<string, Command> {
     ["rg", rg],
     ["printf", printf],
     ["exit", exit],
+    ["echo", echo],
     ["xargs", xargs],
+    ["tail", tail],
+    ["test", test],
+    ["[", bracket],
+    ["basename", basename],
+    ["dirname", dirname],
     ...readCommands,
     ...listCommands,
     ...fileCommands,

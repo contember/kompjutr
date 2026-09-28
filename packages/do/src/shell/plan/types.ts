@@ -28,7 +28,9 @@ export type PlannedRedirection =
       readonly path: Argument;
       readonly append: boolean;
     }
-  | { readonly kind: "duplicate"; readonly fd: 1 | 2; readonly targetFd: 1 | 2 };
+  | { readonly kind: "duplicate"; readonly fd: 1 | 2; readonly targetFd: 1 | 2 }
+  /** A here-document or here-string. Every part is quoted: no splitting, no globbing. */
+  | { readonly kind: "text"; readonly fd: 0; readonly text: Argument };
 
 export interface PlannedCommand {
   readonly name: string;
@@ -58,6 +60,7 @@ export interface PlannedPipeline {
 
 export interface PlannedStep {
   readonly pipeline: PlannedPipeline;
+  readonly negated: boolean;
   readonly connector: Connector | null;
 }
 

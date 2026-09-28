@@ -1,9 +1,9 @@
-// `echo`, `pwd`, `cd`, `true`, `false`, `which`, `sort`, `uniq`, `sed`.
+// `pwd`, `cd`, `true`, `false`, `which`, `sort`, `uniq`, `sed`.
 //
 // `sed` ships two forms and nothing else: `s/a/b/[gi]` and `-n Np`. The
 // corpus has seven `sed` invocations and they are all one of those. Growing
 // a script parser here is how a shell turns into a bash port, so anything
-// else is a named error pointing at the container. See §2 of the plan.
+// else is a named error. See §2 of the plan.
 
 import { comparePaths, normalize } from "../../fs/path.js";
 import { type ByteStream, decode, encode, lines, owned, terminated } from "../exec/bytes.js";
@@ -19,12 +19,6 @@ function* nothing(): ByteStream {
 function* one(bytes: Uint8Array): ByteStream {
   if (bytes.length > 0) yield bytes;
 }
-
-export const echo: Command = (context) => {
-  const noNewline = context.argv[0] === "-n";
-  const words = noNewline ? context.argv.slice(1) : context.argv;
-  return result(one(encode(`${words.join(" ")}${noNewline ? "" : "\n"}`)));
-};
 
 export const pwd: Command = (context) => result(one(encode(`${context.cwd}\n`)));
 
@@ -187,12 +181,7 @@ export const sed: Command = (context) => {
 
     const substitute = parseSubstitution(script);
     if (substitute === null) {
-      return fail(
-        context,
-        `only s/// and line-print scripts are supported, not '${script}'; ` +
-          "run the container backend for anything else",
-        2,
-      );
+      return fail(context, `only s/// and line-print scripts are supported, not '${script}'`, 2);
     }
     return result(applySubstitution(source, substitute, quiet, context.fs.retained));
   } catch (error) {
@@ -333,7 +322,6 @@ function sourceFor(
 }
 
 export const textCommands: ReadonlyMap<string, Command> = new Map([
-  ["echo", echo],
   ["pwd", pwd],
   ["cd", cd],
   ["true", yes],

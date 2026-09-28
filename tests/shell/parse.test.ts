@@ -188,7 +188,6 @@ describe("rejections name the construct", () => {
     ['echo "$-"', "parameter expansion"],
     [`echo \${HOME:-fallback}`, "parameter expansion operator"],
     ["diff <(ls a) <(ls b)", "process substitution"],
-    ["cat <<EOF", "here-document"],
     ["[[ -f x ]]", "conditional expression"],
     ["for f in a b; do echo x; done", "`for`"],
     ["if true; then ls; fi", "`if`"],
@@ -243,5 +242,70 @@ describe("malformed input", () => {
     expect(commands("ls -la # list them")).toEqual([["ls", "-la"]]);
     // A `#` inside a word is not a comment.
     expect(commands("grep a#b f")).toEqual([["grep", "a#b", "f"]]);
+  });
+
+  it("ends a comment at the end of its line", () => {
+    expect(commands("# setup\nls\npwd # here\necho a;#b")).toEqual([
+      ["ls"],
+      ["pwd"],
+      ["echo", "a"],
+    ]);
+  });
+
+  it("rejects a connector with nothing after it", () => {
+    expect(rejects("ls &&").construct).toBe("statement");
+    expect(rejects("ls ||\n").construct).toBe("statement");
+  });
+
+  it("rejects an unterminated here-document", () => {
+    const error = rejects("cat <<EOF\nbody");
+    expect(error.construct).toBe("here-document");
+    expect(error.message).toContain("wanted 'EOF'");
+  });
+
+  it("rejects expansion inside an unquoted here-document", () => {
+    expect(rejects("cat <<EOF\n$(date)\nEOF").construct).toBe("command substitution");
+    expect(rejects("cat <<EOF\n`date`\nEOF").construct).toBe("command substitution");
+    expect(rejects("cat <<EOF\n$((1))\nEOF").construct).toBe("arithmetic expansion");
+  });
+});
+
+describe("newlines", () => {
+  // Each newline ends a statement. Reading one as a blank once made
+  // `rm -r build\nls` remove `ls` as well.
+  it("separates statements", () => {
+    const script = parse("rm -r build\nls");
+    expect(script.statements.map((statement) => statement.connector)).toEqual([";", null]);
+    expect(commands("rm -r build\nls")).toEqual([["rm", "-r", "build"], ["ls"]]);
+  });
+
+  it("continues a statement after an operator", () => {
+    expect(commands("ls &&\n\npwd")).toEqual([["ls"], ["pwd"]]);
+    expect(commands("ls |\n wc -l")).toEqual([["ls"], ["wc", "-l"]]);
+  });
+
+  it("joins a line continuation outside single quotes", () => {
+    expect(commands("echo one \\\n two")).toEqual([["echo", "one", "two"]]);
+    expect(commands("echo a\\\nb \"c\\\nd\" 'e\\\nf'")).toEqual([["echo", "ab", "cd", "e\\\nf"]]);
+  });
+
+  it("reads a here-document body after its line", () => {
+    const script = parse("cat <<A > out; wc -l <<'B'\none $X\nA\ntwo $X\nB\nls");
+    const [first, second, third] = script.statements;
+    expect(first?.pipeline.commands[0]?.redirections[0]).toMatchObject({
+      op: "<<",
+      body: {
+        parts: [
+          { kind: "DoubleQuoted", value: "one " },
+          { kind: "Parameter", name: "X" },
+          { kind: "DoubleQuoted", value: "\n" },
+        ],
+      },
+    });
+    expect(second?.pipeline.commands[0]?.redirections[0]).toMatchObject({
+      op: "<<",
+      body: { parts: [{ kind: "SingleQuoted", value: "two $X\n" }] },
+    });
+    expect(third?.pipeline.commands[0]?.words.map(wordText)).toEqual(["ls"]);
   });
 });

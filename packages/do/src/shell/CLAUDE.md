@@ -13,13 +13,15 @@ measurements and rationale are in `../../../../docs/archive/plans/shell.md`; rea
 ## Pipeline
 
 ```
-parse/    source → quote-aware AST with literal, glob, and parameter word parts
+parse/    source → quote-aware AST with literal, glob, and parameter word parts.
+          A newline is a token; here-document bodies are read after their line.
 plan/     AST → Plan. Pure: imports nothing from ../fs/. Globs and parameters
           remain marked, never resolved here.
 exec/     Plan → result. Resolves parameters from the frozen run env and globs
           through BoundedFs. Pull-based, so a consumer that stops pulling stops
           the source.
-commands/ the registry: grep, rg, printf, exit, xargs, plus read/list/file/text families
+commands/ the registry: grep, rg, printf, echo, exit, test, tail, xargs,
+          basename/dirname, plus read/list/file/text families
 ```
 
 Keep `plan/` free of filesystem imports — that is what makes every rewrite

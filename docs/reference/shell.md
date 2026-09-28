@@ -13,9 +13,14 @@ stops pulling, an upstream scan, search, or listing stops issuing pages.
 consumers await each pull and close.
 
 The grammar supports simple commands, quotes and escapes, named parameters in
-arguments, unquoted path globs, pipelines, and flat left-associative `&&`, `||`,
-and `;` lists. Pipeline status is the last stage's status; there is no
-`pipefail`. The [baseline Bash parity suite](../../tests/shell/parity-bash.test.ts)
+arguments, unquoted path globs, pipelines, `!` negation, and flat
+left-associative `&&`, `||`, and `;` lists. A newline separates statements as
+`;` does, and a statement continues across newlines after `&&`, `||`, or `|`.
+`#` at the start of a word comments to the end of the line. Backslash-newline
+outside single quotes joins lines. Pipeline status is the last stage's status;
+there is no `pipefail`. The [script parity suite](../../tests/shell/parity-bash-scripts.test.ts)
+pins these forms together with here-documents and the small built-ins below.
+The [baseline Bash parity suite](../../tests/shell/parity-bash.test.ts)
 pins existing `echo`, `cat`, `2>&1`, and `2>/dev/null` behavior. Each stage owns
 its redirections:
 
@@ -28,6 +33,13 @@ its redirections:
   binding is still created or truncated even if a later binding replaces it.
   Stdout bound to stderr does not become pipeline input.
 - `2>/dev/null` drops diagnostics without allocating an intermediate buffer.
+- `<<DELIM` and `<<-DELIM` read a here-document body from the lines after the
+  command line, up to a line equal to `DELIM`; `<<-` strips leading tabs.
+  A quoted delimiter keeps the body literal. An unquoted one expands named
+  parameters and honours `\$`, `` \` ``, `\\`, and backslash-newline. `<<< word`
+  supplies the word and a newline. Neither splits fields nor expands paths.
+  The body bytes are reserved against `maxRetainedBytes` while the stage reads
+  them. A body without its delimiter line is rejected.
 - Redirecting stderr to a file and duplicating descriptors other than `1` and
   `2` are rejected.
 
@@ -80,7 +92,7 @@ attached value, or `--long=value`.
 |---|---|
 | `cat` | Files or stdin. Multiple files stream in operand order. |
 | `head` | `-N`, `-n`/`--lines`, `-c`/`--bytes`, `-q`, `-v`; files or stdin. |
-| `tail` | `-N`, `-n`/`--lines`; one file or stdin/multiple-file stream. |
+| `tail` | `-N`, `-n`/`--lines`, and `-n +N` to start at line N; one file or stdin/multiple-file stream. |
 | `wc` | `-l`/`--lines`, `-w`/`--words`, `-m`/`--chars`, `-c`/`--bytes`. |
 | `ls` | `-l`, `-a`, `-A`, `-1`, `-R`, `-d`. Output is one entry per line. |
 | `find` | One root; `-name`, `-type f\|d\|l`, `-maxdepth`. |
@@ -90,10 +102,12 @@ attached value, or `--long=value`.
 | `rm` | `-r`/`-R`/`--recursive`, `-f`/`--force`. |
 | `mkdir` | `-p`/`--parents`. |
 | `touch` | Files, directories, and final symlinks; creates missing files. No options. |
-| `echo` | `-n` when it is the first argument. |
+| `echo` | Bash's leading `-n`, `-e`, and `-E` option words. `-e` interprets `\a`, `\b`, `\c`, `\e`, `\f`, `\n`, `\r`, `\t`, `\v`, `\\`, `\0nnn`, and `\xHH`; `\u` and `\U` are rejected. |
 | `printf` | Required format; `%s`, `%%`, and `%d` with signed ASCII-decimal operands; `\n`, `\t`, `\r`, `\\`, and `\0`; format recycling and Bash's missing-operand defaults. Width, precision, `%b`, `%q`, `%c`, other escapes, and non-decimal numeric spellings are rejected. |
 | `exit` | `exit [N]`; no operand uses the current status, and numeric status is reduced modulo 256. It terminates the run and is accepted only as a single-stage pipeline. |
 | `pwd`, `true`, `false` | No options. |
+| `test`, `[` | POSIX argument-count dispatch with `!` and a parenthesised whole expression. File tests `-e`, `-f`, `-d`, `-s`, `-L`, `-h`, `-r`, `-w`, `-x` (one stat each); `-n`, `-z`, `=`, `==`, `!=`; `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`. Other operators and longer expressions are rejected with status 2. |
+| `basename`, `dirname` | GNU output; `basename -a`, `-s`, `-z` and `dirname -z`. No filesystem access. |
 | `cd` | Exactly one directory; the session retains the resulting cwd. |
 | `which` | Reports built-in and injected command names as `/usr/bin/<name>`. |
 | `sort` | `-r`/`--reverse`, `-n`/`--numeric-sort`, `-u`/`--unique`, `-f`; UTF-8 byte order. |
@@ -204,17 +218,20 @@ after the workspace is reopened.
 
 ## Deliberate boundaries
 
-Named expansion is restricted to command arguments. Variable assignment,
-parameters in command names or redirection targets, `${...}` operators,
-positional parameters, and special parameters such as `$@`, `$?`, and `$$` are
-rejected. Command and process substitution, arithmetic, grouping and subshells,
-conditionals and loops, functions, here-documents, background jobs, and compound
-commands also remain rejected. There is no external-process fallback.
+Named expansion is restricted to command arguments and here-document or
+here-string bodies. Variable assignment, parameters in command names or file
+redirection targets, `${...}` operators, positional parameters, and special
+parameters such as `$@`, `$?`, and `$$` are rejected. Command and process substitution, arithmetic, grouping and subshells,
+conditionals and loops, functions, background jobs, and compound commands also
+remain rejected. There is no external-process fallback.
 
-`printf` deliberately rejects the forms listed in its command row. `exit` in a
-multi-stage pipeline is a local usage error because this shell has no subshell
-in which to run it. The [printf parity suite](../../tests/shell/parity-bash-printf.test.ts)
-and [exit parity suite](../../tests/shell/parity-bash-exit.test.ts) compare the
+`printf`, `echo`, and `test` deliberately reject the forms listed in their
+command rows. Diagnostics from `test` and `[` omit Bash's `bash: line N:` prefix
+because the shell does not track script lines. `exit` in a multi-stage pipeline
+is a local usage error because this shell has no subshell in which to run it.
+The [printf](../../tests/shell/parity-bash-printf.test.ts),
+[exit](../../tests/shell/parity-bash-exit.test.ts), and
+[script](../../tests/shell/parity-bash-scripts.test.ts) parity suites compare the
 admitted forms with Bash and pin these intentional refusals locally. Bash parity
 is the standing admission gate for future shell syntax and commands; see
 [ADR-0019](../decisions/0019-admit-a-bounded-posix-shell-surface.md).

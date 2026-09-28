@@ -7,6 +7,7 @@ import type { PipelineEnvironment } from "./execution-types.js";
 import {
   isFilesystemError,
   openRedirectionFiles,
+  readText,
   readWholeFile,
   resolveRedirections,
   routeStageOutput,
@@ -56,7 +57,7 @@ export async function runPipeline(
 
       let redirections: ResolvedRedirections;
       try {
-        redirections = resolveRedirections(planned, env.fs, env.cwd);
+        redirections = resolveRedirections(planned, env.fs, env.cwd, env.inputs?.env);
         await openRedirectionFiles(redirections, env.fs);
       } catch (error) {
         expanded.release();
@@ -82,7 +83,10 @@ export async function runPipeline(
         };
         try {
           await closePrior();
-          stream = readWholeFile(env.fs, redirections.stdin);
+          stream =
+            redirections.stdin.kind === "file"
+              ? readWholeFile(env.fs, redirections.stdin.path)
+              : readText(env.fs, redirections.stdin.text);
         } catch (error) {
           try {
             await closePrior();

@@ -2,9 +2,10 @@
 //
 // 614 real agent command lines were parsed through a full bash grammar and
 // the node kinds it emitted were counted: of ~80 kinds, 11 covered 613 of
-// them. Those 11 are below. Everything else — arithmetic, `case`, here-docs,
-// process substitution, brace expansion, functions, `[[ ]]` — is rejected by
-// name in `lexer.ts` rather than half-implemented, because a construct that
+// them. Those 11 are below, plus here-documents, which agents use to write
+// files. Everything else — arithmetic, `case`, process substitution, brace
+// expansion, functions, `[[ ]]` — is rejected by name in `lexer.ts` rather
+// than half-implemented, because a construct that
 // parses and then means something slightly different is worse than one that
 // does not parse at all. See docs/archive/plans/shell.md §1.2.
 
@@ -47,6 +48,20 @@ export type Redirection =
       readonly op: ">&";
       /** `2>&1` — duplicate this descriptor onto `fd`. */
       readonly targetFd: number;
+    }
+  | {
+      readonly kind: "Redirection";
+      readonly fd: number;
+      /** A here-document; `<<-` tab stripping is already applied to the body. */
+      readonly op: "<<";
+      readonly body: Word;
+    }
+  | {
+      readonly kind: "Redirection";
+      readonly fd: number;
+      /** A here-string: the word plus a trailing newline. */
+      readonly op: "<<<";
+      readonly target: Word;
     };
 
 export interface SimpleCommand {
@@ -59,6 +74,8 @@ export interface SimpleCommand {
 export interface Pipeline {
   readonly kind: "Pipeline";
   readonly commands: readonly SimpleCommand[];
+  /** `! pipeline` inverts the status. */
+  readonly negated: boolean;
 }
 
 /** How a statement joins the one after it. `null` on the last. */

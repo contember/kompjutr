@@ -1,5 +1,5 @@
 import type { PlannedCommand } from "../plan/types.js";
-import { resolve, single } from "./arguments.js";
+import { quotedText, resolve, single } from "./arguments.js";
 import { type ByteStream, close, isAsyncByteStream } from "./bytes.js";
 import type { BoundedFs } from "./context.js";
 import type { PipelineEnvironment } from "./execution-types.js";
@@ -8,8 +8,11 @@ import type {
   HeldChunk,
   OutputDestination,
   ResolvedRedirections,
+  StdinSource,
 } from "./routing-types.js";
 import { diagnosticsFor, releaseDiagnostics, stageOutput } from "./stage-output.js";
+
+const ENCODER = new TextEncoder();
 
 export class UpstreamError extends Error {
   constructor(readonly original: unknown) {
@@ -40,17 +43,22 @@ export function resolveRedirections(
   planned: PlannedCommand,
   fs: BoundedFs,
   cwd: string,
+  env: Readonly<Record<string, string>> | undefined,
 ): ResolvedRedirections {
   const output: OutputDestination = { kind: "output" };
   const diagnostic: OutputDestination = { kind: "diagnostic" };
-  let stdin: string | null = null;
+  let stdin: StdinSource | null = null;
   let stdout: OutputDestination = output;
   let stderr: OutputDestination = diagnostic;
   const files: FileDestination[] = [];
 
   for (const redirection of planned.redirections) {
     if (redirection.kind === "read") {
-      stdin = resolve(cwd, single(redirection.path, fs, cwd));
+      stdin = { kind: "file", path: resolve(cwd, single(redirection.path, fs, cwd)) };
+      continue;
+    }
+    if (redirection.kind === "text") {
+      stdin = { kind: "text", text: quotedText(redirection.text, env) };
       continue;
     }
     if (redirection.kind === "duplicate") {
@@ -203,6 +211,17 @@ export function* readWholeFile(fs: BoundedFs, path: string): ByteStream {
       release();
     }
     offset += length;
+  }
+}
+
+/** A here-document or here-string body, reserved against the retained budget while live. */
+export function* readText(fs: BoundedFs, text: string): ByteStream {
+  const bytes = ENCODER.encode(text);
+  const release = fs.retained.retain(bytes.length, "here-document");
+  try {
+    if (bytes.length > 0) yield bytes;
+  } finally {
+    release();
   }
 }
 

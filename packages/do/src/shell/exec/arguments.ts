@@ -74,6 +74,18 @@ export function single(arg: Argument, fs: BoundedFs, cwd: string): string {
   }
 }
 
+/** An all-quoted argument as one string: no field splitting, no pathname expansion. */
+export function quotedText(
+  argument: Argument,
+  env: Readonly<Record<string, string>> | undefined,
+): string {
+  let text = "";
+  for (const part of argument.parts) {
+    text += part.kind === "parameter" ? environmentValue(env, part.name) : part.value;
+  }
+  return text;
+}
+
 interface FieldPart {
   readonly value: string;
   readonly globActive: boolean;

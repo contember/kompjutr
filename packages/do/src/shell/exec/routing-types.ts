@@ -11,8 +11,12 @@ export type OutputDestination =
   | { readonly kind: "drop" }
   | FileDestination;
 
+export type StdinSource =
+  | { readonly kind: "file"; readonly path: string }
+  | { readonly kind: "text"; readonly text: string };
+
 export interface ResolvedRedirections {
-  readonly stdin: string | null;
+  readonly stdin: StdinSource | null;
   readonly output: OutputDestination;
   readonly stdout: OutputDestination;
   readonly stderr: OutputDestination;

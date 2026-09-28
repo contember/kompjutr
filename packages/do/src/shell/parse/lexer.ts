@@ -4,23 +4,36 @@
 //
 // This is also where an unsupported construct is caught. It is caught here
 // rather than in the parser because the giveaway is lexical — `$(`, `<(`,
-// `<<` — and a lexer that swallowed them would hand the parser a word that
+// `[[` — and a lexer that swallowed them would hand the parser a word that
 // looks ordinary.
+//
+// A newline is a token, not whitespace: it ends a statement exactly as `;`
+// does, and a here-document body starts after it.
 //
 // Indexing goes through `charAt`, which returns "" past the end, so the
 // scanners need no bounds cast and no non-null assertion.
 
 import { ShellSyntaxError, type Word, type WordPart } from "./ast.js";
+import {
+  type PendingHereDocument,
+  readHereDocumentBodies,
+  unterminatedHereDocument,
+} from "./here-document.js";
+import { readParameter } from "./parameter.js";
 
-export type Operator = "|" | "||" | "&&" | ";" | ">" | ">>" | "<" | ">&";
+export type Operator = "|" | "||" | "&&" | ";" | ">" | ">>" | "<" | ">&" | "<<" | "<<-" | "<<<";
 
 export type Token =
   | { readonly type: "word"; readonly word: Word; readonly offset: number }
   | { readonly type: "op"; readonly value: Operator; readonly offset: number }
   /** A bare `2` immediately before `>` or `<`, never separated by space. */
-  | { readonly type: "fd"; readonly value: number; readonly offset: number };
+  | { readonly type: "fd"; readonly value: number; readonly offset: number }
+  | { readonly type: "newline"; readonly offset: number }
+  /** Follows its `<<` operator; the body is read after the line ends. */
+  | { readonly type: "hereDocument"; readonly body: Word; readonly offset: number };
 
-const WHITESPACE = new Set([" ", "\t", "\n", "\r"]);
+const BLANK = new Set([" ", "\t", "\r"]);
+const WORD_END = new Set([" ", "\t", "\r", "\n"]);
 
 /**
  * Lexical giveaways for constructs §2 of the plan rules out. Each maps to
@@ -33,15 +46,25 @@ const REJECTED: ReadonlyArray<{ prefix: string; construct: string }> = [
   { prefix: "`", construct: "command substitution" },
   { prefix: "<(", construct: "process substitution" },
   { prefix: ">(", construct: "process substitution" },
-  { prefix: "<<", construct: "here-document" },
   { prefix: "[[", construct: "conditional expression" },
 ];
 
 /** Longest first, so `>>` wins over `>` and `||` over `|`. */
-const OPERATORS: ReadonlyArray<Operator | "&"> = [">>", ">&", "&&", "||", "|", ";", ">", "<", "&"];
+const OPERATORS: ReadonlyArray<Operator | "&"> = [
+  "<<<",
+  "<<-",
+  "<<",
+  ">>",
+  ">&",
+  "&&",
+  "||",
+  "|",
+  ";",
+  ">",
+  "<",
+  "&",
+];
 
-const IDENTIFIER_START = /[A-Za-z_]/;
-const IDENTIFIER_CONTINUE = /[A-Za-z0-9_]/;
 const DIGIT = /[0-9]/;
 
 function reject(construct: string, at: number): never {
@@ -50,19 +73,35 @@ function reject(construct: string, at: number): never {
 
 export function tokenize(source: string): Token[] {
   const tokens: Token[] = [];
+  const pending: PendingHereDocument[] = [];
   let index = 0;
 
   while (index < source.length) {
     const char = source.charAt(index);
 
-    if (WHITESPACE.has(char)) {
+    if (BLANK.has(char)) {
       index++;
       continue;
     }
 
-    // A `#` only opens a comment at the start of a word, so `a#b` is a word.
-    if (char === "#" && (index === 0 || WHITESPACE.has(source.charAt(index - 1)))) {
-      break;
+    if (char === "\\" && source.charAt(index + 1) === "\n") {
+      index += 2;
+      continue;
+    }
+
+    if (char === "\n") {
+      tokens.push({ type: "newline", offset: index });
+      index = readHereDocumentBodies(source, index + 1, pending, tokens);
+      pending.length = 0;
+      continue;
+    }
+
+    // The scanner only stops here at the start of a word, which is exactly
+    // where `#` opens a comment; `a#b` is consumed whole by `readWord`.
+    if (char === "#") {
+      const newline = source.indexOf("\n", index);
+      index = newline === -1 ? source.length : newline;
+      continue;
     }
 
     for (const { prefix, construct } of REJECTED) {
@@ -77,6 +116,9 @@ export function tokenize(source: string): Token[] {
       if (operator.value === "&") reject("background execution", index);
       tokens.push({ type: "op", value: operator.value, offset: index });
       index = operator.end;
+      if (operator.value === "<<" || operator.value === "<<-") {
+        index = readHereDocumentDelimiter(source, index, operator.value === "<<-", pending, tokens);
+      }
       continue;
     }
 
@@ -95,7 +137,45 @@ export function tokenize(source: string): Token[] {
     index = word.end;
   }
 
+  const unterminated = pending[0];
+  if (unterminated !== undefined) throw unterminatedHereDocument(unterminated);
   return tokens;
+}
+
+/**
+ * Reads the delimiter word after `<<` and reserves the token slot the body
+ * fills once the line ends. Any quoting in the delimiter makes the body
+ * literal, as in Bash.
+ */
+function readHereDocumentDelimiter(
+  source: string,
+  start: number,
+  stripTabs: boolean,
+  pending: PendingHereDocument[],
+  tokens: Token[],
+): number {
+  let index = start;
+  while (BLANK.has(source.charAt(index))) index++;
+  const word = readWord(source, index);
+  if (word.parts.length === 0) {
+    throw new ShellSyntaxError("here-document", "expected a here-document delimiter", start);
+  }
+  let delimiter = "";
+  let quoted = false;
+  for (const part of word.parts) {
+    if (part.kind === "Parameter") {
+      throw new ShellSyntaxError(
+        "here-document",
+        "parameters in here-document delimiters are not supported",
+        index,
+      );
+    }
+    quoted ||= part.kind !== "Literal" && part.kind !== "Glob";
+    delimiter += part.value;
+  }
+  pending.push({ tokenIndex: tokens.length, delimiter, quoted, stripTabs, offset: index });
+  tokens.push({ type: "hereDocument", body: { kind: "Word", parts: [] }, offset: index });
+  return word.end;
 }
 
 function readOperator(
@@ -144,9 +224,13 @@ function readWord(source: string, start: number): WordScan {
   while (index < source.length) {
     const char = source.charAt(index);
 
-    if (WHITESPACE.has(char)) break;
+    if (WORD_END.has(char)) break;
     if (readOperator(source, index) !== null) break;
 
+    if (char === "\\" && source.charAt(index + 1) === "\n") {
+      index += 2;
+      continue;
+    }
     if (char === "\\") {
       if (index + 1 >= source.length) {
         throw new ShellSyntaxError("escape", "trailing backslash", index);
@@ -230,6 +314,10 @@ function readDoubleQuoted(source: string, start: number): WordScan {
     if (char === "\\") {
       if (index + 1 >= source.length) break;
       const escaped = source.charAt(index + 1);
+      if (escaped === "\n") {
+        index += 2;
+        continue;
+      }
       // Inside double quotes bash only honours these four; everything else
       // keeps its backslash, which is what `grep "a\.b"` depends on.
       value += '"\\$`'.includes(escaped) ? escaped : `\\${escaped}`;
@@ -252,69 +340,6 @@ function readDoubleQuoted(source: string, start: number): WordScan {
   throw new ShellSyntaxError("quote", "unterminated double quote", start);
 }
 
-function readParameter(
-  source: string,
-  start: number,
-  quoted: boolean,
-): { readonly part: WordPart; readonly end: number } | null {
-  const next = source.charAt(start + 1);
-  if (DIGIT.test(next)) {
-    throw new ShellSyntaxError(
-      "parameter expansion",
-      `parameter expansion for positional parameter $${next} is not supported`,
-      start,
-    );
-  }
-  if (next !== "" && "*@#?-$!".includes(next)) {
-    throw new ShellSyntaxError(
-      "parameter expansion",
-      `parameter expansion for special parameter $${next} is not supported`,
-      start,
-    );
-  }
-  if (next === "{") return readBracedParameter(source, start, quoted);
-  if (!IDENTIFIER_START.test(next)) return null;
-
-  let end = start + 2;
-  while (IDENTIFIER_CONTINUE.test(source.charAt(end))) end++;
-  return {
-    part: { kind: "Parameter", name: source.slice(start + 1, end), quoted },
-    end,
-  };
-}
-
-function readBracedParameter(
-  source: string,
-  start: number,
-  quoted: boolean,
-): { readonly part: WordPart; readonly end: number } {
-  const close = source.indexOf("}", start + 2);
-  if (close === -1) {
-    throw new ShellSyntaxError("parameter expansion", "unterminated parameter expansion", start);
-  }
-  const body = source.slice(start + 2, close);
-  if (!IDENTIFIER_START.test(body.charAt(0))) {
-    throw new ShellSyntaxError(
-      "parameter expansion",
-      `parameter \${${body}} is not supported`,
-      start,
-    );
-  }
-  let nameEnd = 1;
-  while (nameEnd < body.length && IDENTIFIER_CONTINUE.test(body.charAt(nameEnd))) nameEnd++;
-  if (nameEnd !== body.length) {
-    throw new ShellSyntaxError(
-      "parameter expansion operator",
-      `parameter expansion operator in \${${body}} is not supported`,
-      start,
-    );
-  }
-  return {
-    part: { kind: "Parameter", name: body, quoted },
-    end: close + 1,
-  };
-}
-
 /** The end of a `[...]` class, or -1 when it never closes. */
 function findClassEnd(source: string, open: number): number {
   let index = open + 1;
@@ -324,7 +349,7 @@ function findClassEnd(source: string, open: number): number {
     const char = source.charAt(index);
     if (char === "]") return index;
     // A class never spans a path separator or a word boundary.
-    if (char === "/" || WHITESPACE.has(char)) return -1;
+    if (char === "/" || WORD_END.has(char)) return -1;
     index++;
   }
   return -1;
