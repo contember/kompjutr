@@ -10,6 +10,7 @@
 import type { SqlDatabase } from "../../db/db.js";
 import { assertWellFormedPath } from "../path.js";
 import type { RealPath } from "../types.js";
+import { utf8Length } from "./write/write-batches.js";
 
 /** POSIX's own guidance; dofs counts follows the same way. */
 const MAX_FOLLOWS = 40;
@@ -17,12 +18,32 @@ const MAX_FOLLOWS = 40;
 /** Keeps every `json_each` binding below the platform BLOB/TEXT ceiling. */
 const PATH_BATCH_BYTES = 1_500_000;
 
-const ENCODER = new TextEncoder();
-
 interface NodeRow {
-  path: string;
-  type: string;
+  type: "dir" | "file" | "symlink";
   link_target: string | null;
+}
+
+interface NodeLookupRow {
+  ordinal: unknown;
+  type: unknown;
+  link_target: unknown;
+}
+
+// Rows name their path by binding ordinal, so no stored path is copied back.
+const NODES_ON_SQL = `SELECT j.key AS ordinal,
+       CASE
+         WHEN typeof(n.type) = 'text' AND n.type = 'dir' THEN 'dir'
+         WHEN typeof(n.type) = 'text' AND n.type = 'file' THEN 'file'
+         WHEN typeof(n.type) = 'text' AND n.type = 'symlink' THEN 'symlink'
+         ELSE ''
+       END AS type,
+       n.link_target AS link_target
+  FROM json_each(?) j
+  JOIN fs_paths p ON p.path = j.value
+  JOIN fs_nodes n ON n.inode = p.inode`;
+
+function jsonItemBytes(path: string): number {
+  return utf8Length(JSON.stringify(path)) + 1;
 }
 
 /**
@@ -32,47 +53,84 @@ interface NodeRow {
  */
 function nodesOn(db: SqlDatabase, paths: readonly string[]): Map<string, NodeRow> {
   const out = new Map<string, NodeRow>();
-  let items: string[] = [];
+  let batch: string[] = [];
   let bytes = 2;
   const flush = (): void => {
-    if (items.length === 0) return;
-    const binding = `[${items.join(",")}]`;
-    for (const row of db.all<NodeRow>(
-      `SELECT p.path AS path,
-              CASE
-                WHEN typeof(n.type) = 'text' AND n.type = 'dir' THEN 'dir'
-                WHEN typeof(n.type) = 'text' AND n.type = 'file' THEN 'file'
-                WHEN typeof(n.type) = 'text' AND n.type = 'symlink' THEN 'symlink'
-                ELSE ''
-              END AS type,
-              n.link_target AS link_target
-         FROM fs_paths p
-         JOIN fs_nodes n ON n.inode = p.inode
-        WHERE p.path IN (SELECT value FROM json_each(?))`,
-      binding,
-    )) {
+    if (batch.length === 0) return;
+    for (const row of db.all<NodeLookupRow>(NODES_ON_SQL, JSON.stringify(batch))) {
+      const path = typeof row.ordinal === "number" ? batch[row.ordinal] : undefined;
+      const type = row.type;
+      const target = row.link_target;
       if (
-        typeof row.path !== "string" ||
-        (row.type !== "dir" && row.type !== "file" && row.type !== "symlink") ||
-        (row.link_target !== null && typeof row.link_target !== "string")
+        path === undefined ||
+        (type !== "dir" && type !== "file" && type !== "symlink") ||
+        (target !== null && typeof target !== "string")
       ) {
         throw new Error("path resolution row is invalid");
       }
-      out.set(row.path, row);
+      out.set(path, { type, link_target: target });
     }
-    items = [];
+    batch = [];
     bytes = 2;
   };
 
   for (const path of paths) {
-    const item = JSON.stringify(path);
-    const itemBytes = ENCODER.encode(item).byteLength;
-    if (items.length > 0 && bytes + itemBytes + 1 > PATH_BATCH_BYTES) flush();
-    items.push(item);
-    bytes += itemBytes + 1;
+    const itemBytes = jsonItemBytes(path);
+    if (batch.length > 0 && bytes + itemBytes > PATH_BATCH_BYTES) flush();
+    batch.push(path);
+    bytes += itemBytes;
   }
   flush();
   return out;
+}
+
+/** No empty, `.`, or `..` component: every prefix is then a slice, not a new string. */
+function isCanonical(path: string): boolean {
+  if (path === "/") return true;
+  if (path.charCodeAt(0) !== 0x2f) return false;
+  let start = 1;
+  for (let index = 1; index <= path.length; index++) {
+    if (index < path.length && path.charCodeAt(index) !== 0x2f) continue;
+    const length = index - start;
+    if (
+      length === 0 ||
+      (length === 1 && path.charCodeAt(start) === 0x2e) ||
+      (length === 2 && path.charCodeAt(start) === 0x2e && path.charCodeAt(start + 1) === 0x2e)
+    ) {
+      return false;
+    }
+    start = index + 1;
+  }
+  return true;
+}
+
+/** `/`, then every ancestor of a canonical path, then the path itself. */
+function canonicalPrefixes(path: string): string[] {
+  const prefixes = ["/"];
+  if (path === "/") return prefixes;
+  for (let index = path.indexOf("/", 1); index !== -1; index = path.indexOf("/", index + 1)) {
+    prefixes.push(path.slice(0, index));
+  }
+  prefixes.push(path);
+  return prefixes;
+}
+
+/** Whether the ordered walk of a canonical path must expand a symlink. */
+function followsSymlink(
+  path: string,
+  prefixes: readonly string[],
+  followFinal: boolean,
+  nodes: ReadonlyMap<string, NodeRow>,
+): boolean {
+  for (let index = 1; index < prefixes.length; index++) {
+    const parent = prefixes[index - 1];
+    const candidate = prefixes[index];
+    if (parent === undefined || candidate === undefined) continue;
+    requireDirectory(nodes.get(parent), path);
+    const isFinal = index === prefixes.length - 1;
+    if (nodes.get(candidate)?.type === "symlink" && (followFinal || !isFinal)) return true;
+  }
+  return false;
 }
 
 /** Preserve separators and dot segments; their order carries type semantics. */
@@ -141,6 +199,22 @@ function resolve(
   initialNodes?: ReadonlyMap<string, NodeRow>,
 ): RealPath {
   assertWellFormedPath(path);
+  let nodes = initialNodes;
+  let real: string | null = null;
+  if (isCanonical(path)) {
+    const prefixes = canonicalPrefixes(path);
+    nodes ??= nodesOn(db, prefixes);
+    if (!followsSymlink(path, prefixes, followFinal, nodes)) real = path;
+  }
+  return (real ?? resolveComponents(db, path, followFinal, nodes)) as RealPath;
+}
+
+function resolveComponents(
+  db: SqlDatabase,
+  path: string,
+  followFinal: boolean,
+  initialNodes: ReadonlyMap<string, NodeRow> | undefined,
+): string {
   let resolved: string[] = [];
   let pending = componentsOf(path);
   let follows = 0;
@@ -185,7 +259,7 @@ function resolve(
       break;
     }
 
-    if (!expanded) return pathOf(resolved) as RealPath;
+    if (!expanded) return pathOf(resolved);
   }
 }
 
@@ -208,18 +282,24 @@ function resolveMany(db: SqlDatabase, paths: readonly string[], followFinal: boo
   for (const path of paths) {
     // Ahead of the planning binding, so a malformed path never reaches SQL.
     assertWellFormedPath(path);
-    const candidates = plannedPaths([], componentsOf(path));
+    const candidates = isCanonical(path)
+      ? canonicalPrefixes(path)
+      : plannedPaths([], componentsOf(path));
+    const candidateBytes = candidates.map(jsonItemBytes);
     let addedBytes = 0;
-    for (const candidate of candidates) {
-      if (!planned.has(candidate))
-        addedBytes += ENCODER.encode(JSON.stringify(candidate)).byteLength + 1;
+    for (let index = 0; index < candidates.length; index++) {
+      const candidate = candidates[index];
+      if (candidate !== undefined && !planned.has(candidate)) {
+        addedBytes += candidateBytes[index] ?? 0;
+      }
     }
     if (group.length > 0 && plannedBytes + addedBytes > PATH_BATCH_BYTES) flush();
     group.push(path);
-    for (const candidate of candidates) {
-      if (planned.has(candidate)) continue;
+    for (let index = 0; index < candidates.length; index++) {
+      const candidate = candidates[index];
+      if (candidate === undefined || planned.has(candidate)) continue;
       planned.add(candidate);
-      plannedBytes += ENCODER.encode(JSON.stringify(candidate)).byteLength + 1;
+      plannedBytes += candidateBytes[index] ?? 0;
     }
   }
   flush();

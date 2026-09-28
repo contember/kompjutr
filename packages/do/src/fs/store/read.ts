@@ -23,7 +23,6 @@ export { DEFAULT_READ_BUDGET, MAX_HANDLE_MATERIALIZE_BYTES } from "./read/read-l
 const LOOKUP_BATCH_BYTES = 1_500_000;
 
 interface NodeRow {
-  path: string;
   inode: number;
   type: string;
   size: number;
@@ -55,18 +54,23 @@ interface Planned extends Target {
   real: string;
 }
 
+interface LookupRow extends NodeRow {
+  ordinal: number;
+}
+
 // `json_each(?)` binds the whole path list as ONE parameter, so the
-// 100-parameter ceiling is never approached however long the list is.
-const LOOKUP_MANY_SQL = `SELECT p.path AS path, p.inode AS inode, n.type AS type, n.size AS size,
+// 100-parameter ceiling is never approached however long the list is. Rows
+// name their path by binding ordinal, so no stored path is copied back.
+const LOOKUP_MANY_SQL = `SELECT j.key AS ordinal, p.inode AS inode, n.type AS type, n.size AS size,
        count(c.idx) AS chunk_count, coalesce(sum(length(c.bytes)), 0) AS chunk_bytes,
        min(c.idx) AS first_idx, max(c.idx) AS last_idx
-     FROM fs_paths p
+     FROM json_each(?) j
+     JOIN fs_paths p ON p.path = j.value
      JOIN fs_nodes n ON n.inode = p.inode
      LEFT JOIN fs_chunks c ON c.inode = p.inode
-    WHERE p.path IN (SELECT value FROM json_each(?))
-    GROUP BY p.path, p.inode, n.type, n.size`;
+    GROUP BY j.key, p.inode, n.type, n.size`;
 
-const LOOKUP_ONE_SQL = `SELECT p.path AS path, p.inode AS inode, n.type AS type, n.size AS size,
+const LOOKUP_ONE_SQL = `SELECT p.inode AS inode, n.type AS type, n.size AS size,
        count(c.idx) AS chunk_count, coalesce(sum(length(c.bytes)), 0) AS chunk_bytes,
        min(c.idx) AS first_idx, max(c.idx) AS last_idx
      FROM fs_paths p
@@ -75,23 +79,27 @@ const LOOKUP_ONE_SQL = `SELECT p.path AS path, p.inode AS inode, n.type AS type,
     WHERE p.path = ?
     GROUP BY p.path, p.inode, n.type, n.size`;
 
-function lookupMany(db: SqlDatabase, paths: readonly string[]): NodeRow[] {
-  const out: NodeRow[] = [];
-  let items: string[] = [];
+/** Nodes by the caller's path string; absent paths have no entry. */
+function lookupMany(db: SqlDatabase, paths: readonly string[]): Map<string, NodeRow> {
+  const out = new Map<string, NodeRow>();
+  let batch: string[] = [];
   let bytes = 2;
 
   const flush = (): void => {
-    if (items.length === 0) return;
-    out.push(...db.all<NodeRow>(LOOKUP_MANY_SQL, `[${items.join(",")}]`));
-    items = [];
+    if (batch.length === 0) return;
+    for (const row of db.all<LookupRow>(LOOKUP_MANY_SQL, JSON.stringify(batch))) {
+      const path = batch[row.ordinal];
+      if (path === undefined) throw corrupt(row.inode, "path lookup returned an unknown ordinal");
+      out.set(path, row);
+    }
+    batch = [];
     bytes = 2;
   };
 
   for (const path of paths) {
-    const item = JSON.stringify(path);
-    const itemBytes = utf8Length(item);
-    if (items.length > 0 && bytes + itemBytes + 1 > LOOKUP_BATCH_BYTES) flush();
-    items.push(item);
+    const itemBytes = utf8Length(JSON.stringify(path));
+    if (batch.length > 0 && bytes + itemBytes + 1 > LOOKUP_BATCH_BYTES) flush();
+    batch.push(path);
     bytes += itemBytes + 1;
   }
   flush();
@@ -336,10 +344,7 @@ export function readFiles(
   const remaining: string[] = [];
   if (order.length === 0) return { files, remaining };
 
-  const found = new Map<string, NodeRow>();
-  for (const row of lookupMany(db, order)) {
-    found.set(row.path, row);
-  }
+  const found = lookupMany(db, order);
 
   const deliver = (planned: readonly Planned[], contents: Map<number, Uint8Array>): void => {
     for (const entry of planned) {
