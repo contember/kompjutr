@@ -41,6 +41,18 @@ describe("git path kit", () => {
     ]);
   });
 
+  it("joins exactly as normalizing the concatenation does", () => {
+    const roots = ["/", "/repo", "/repo/", "repo", "/a/./b", "/a/../b", "//repo"];
+    const relatives = ["x", "a/b", "./a", "a/../b", "a//b", "a/", "..", "\u{1F600}", "a\ud800"];
+    for (const root of roots) {
+      for (const relative of relatives) {
+        expect(joinPath(root, relative)).toBe(
+          normalizePath(`${root.replace(/\/+$/, "")}/${relative}`),
+        );
+      }
+    }
+  });
+
   it("checks canonical paths and component boundaries", () => {
     expect(isCanonicalAbsolutePath("/repo/nested")).toBe(true);
     expect(isCanonicalAbsolutePath("/repo/../nested")).toBe(false);

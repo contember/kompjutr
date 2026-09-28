@@ -20,6 +20,11 @@ export function normalizePath(path: string): string {
 
 export function joinPath(root: string, relative: string): string {
   if (relative === "" || relative === ".") return normalizePath(root);
+  // Canonical halves already form the normalized path; normalizing would copy it twice.
+  if (isCanonicalGitPath(relative)) {
+    if (root === "/") return `/${relative}`;
+    if (isCanonicalAbsolutePath(root)) return `${root}/${relative}`;
+  }
   return normalizePath(`${root.replace(/\/+$/, "")}/${relative}`);
 }
 
