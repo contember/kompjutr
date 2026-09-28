@@ -24,6 +24,12 @@ decided work or status.
 - [`resolve-filesystem-paths-incrementally.md`](resolve-filesystem-paths-incrementally.md)
   — the filesystem path planner rebuilds every ancestor prefix, so one resolve
   costs `O(components²)`; a 1,000-component merge abort spends 8.6 s of 10 s there.
+- [`read-integration-worktree-inputs-once.md`](read-integration-worktree-inputs-once.md)
+  — a conflicted three-way integration reads every worktree input eight times;
+  it costs wall time in a 150-file binary merge, not memory.
+- [`measure-eager-status-result-memory.md`](measure-eager-status-result-memory.md)
+  — `status()` materializes its whole result; measure it before deciding on an
+  API or count boundary.
 - Git parity without a caller — each graduates to `../backlog/` when a consumer
   issues it:
   [`stash-operations.md`](stash-operations.md) ·

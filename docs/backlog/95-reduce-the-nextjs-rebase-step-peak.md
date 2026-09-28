@@ -34,9 +34,9 @@ A 100-file change should not need about 34 full passes over the index, the
 trees and the worktree. Some are full by construction: the start of `rebase()`
 runs a clean-worktree check and two baseline-tree preflights
 (`packages/git/src/ops/rebase/rebase.ts:64,71,73`).
-[Backlog 84](84-read-integration-worktree-inputs-once.md) tracks the repeated
-worktree content reads in the same integration code; this item is the index,
-tree and path passes.
+The [integration worktree reads idea](../ideas/read-integration-worktree-inputs-once.md)
+covers the repeated worktree content reads in the same integration code; this
+item is the index, tree and path passes.
 
 ## Approach / acceptance
 

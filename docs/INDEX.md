@@ -36,7 +36,11 @@ None.
       If everything is "hot", nothing is. -->
 - [Simplification](archive/sprint-2026-09-23-simplification.md) shipped: −14 %
   Git source, 61 → 46 tables, self-contained packs, `STRICT` schema, rebase at
-  any size. Next: the removals in the [backlog plan](backlog/README.md#sprint-plan).
+  any size. Next: the [backlog plan](backlog/README.md#sprint-plan).
+- The 2026-09-28 backlog triage cut the backlog from 16 to 8 items in two
+  planned sprints: correctness and layering, then memory and cost. It deleted
+  stale and look-alike cleanup items and moved two with no failure behind them
+  to [`ideas/`](ideas/README.md).
 - The ignored-untracked overwrite parity gap is fixed for checkout, merge,
   cherry-pick, and rebase, including directory-to-file replacements.
 - The 2026-09-24 backlog review deleted items that would re-add excess machinery
@@ -62,21 +66,15 @@ None.
   [superseded snapshots](archive/benchmarks/benchmark-snapshots-2026-09-10.md).
 - Native `blob:none` clone/fetch, durable promises, bounded lazy blob hydration,
   promise-aware maintenance, and pre-push hydration are complete (ADR-0015).
-- The 2026-09-08 architecture-review follow-up refined the existing findings in
-  [`65`](backlog/65-git-sqlite-architecture-review.md); of its new items only 79
-  and 80 survive the 2026-09-24 review.
+- The 2026-09-08 architecture-review follow-up refined the existing findings;
+  of its new items only 79 and 80 survived the 2026-09-24 review.
 - Three tranches from the 2026-09-02 Git-in-SQLite architecture review are
   complete: storage/publication safety, Git result and scale correctness, then
   transaction-owned local mutations with trusted ordinary reads. Remaining
-  verified work is in
-  [`backlog/65`](backlog/65-git-sqlite-architecture-review.md), split into small
-  follow-ups. The input-changing UTF-8 fix is
-  [`backlog/96`](backlog/96-validate-git-caller-utf8-at-boundaries.md); unverified
+  verified work is in small backlog items (96, 100, 101, 104); unverified
   claims remain in [`ideas`](ideas/git-sqlite-architecture-review-triage.md).
 - Checkout's remaining modeled retained-byte charges are tracked in
   [`backlog/97`](backlog/97-audit-checkout-modeled-byte-charges.md).
-- Eager status result memory needs a separate measurement and boundary decision
-  in [`backlog/105`](backlog/105-measure-eager-status-result-memory.md).
 - The completed everyday Git shell sprint made command execution asynchronous,
   added staged diff and history reads, exposed exact local/network operations,
   and composed pull with the restart-safe rebase lifecycle.

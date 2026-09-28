@@ -84,27 +84,25 @@ dedicated work toward the ADR-0005 statement *target*, which `bench:statements
 --check` keeps reporting. An item here needs a reproduced defect, a measured
 cost, or a removal.
 
+The 2026-09-28 triage re-checked every item at `d8cf1f3`. It deleted 64 (the
+full-suite runner already runs slices concurrently and reports timings), the 65
+umbrella, and 98, 99, 102 and 103: what remained there were capability seams,
+the `IndexStore` interface implementation, a finished audit, and look-alike SQL
+over different reflog tables. It moved 84 and 105 to
+[`../ideas/`](../ideas/README.md): neither has a failure behind it.
+
 | Order | Items | Why |
 |---|---|---|
-| 1 | [98](98-remove-forwarding-owner-wrappers.md), [102](102-consolidate-equivalent-store-validators.md), [96](96-validate-git-caller-utf8-at-boundaries.md) | Small duplicate-removal slices; review the input-changing UTF-8 fix separately. |
-| 2 | [84](84-read-integration-worktree-inputs-once.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md) | Measured repeated passes and memory peaks. |
-| — | [64](64-speed-up-full-test-suite.md), [80](80-restore-import-graph-domain-guarantees.md) | Tooling. |
+| 1 | [96](96-validate-git-caller-utf8-at-boundaries.md), [80](80-restore-import-graph-domain-guarantees.md), [101](101-use-tracked-prefixes-in-status-pruning.md), [104](104-move-ref-probes-behind-store-seam.md), [100](100-consolidate-equivalent-git-helpers.md) | Correctness and layering: a reproduced defect, a weakened architecture witness, and small structural fixes. Review the input-changing UTF-8 fix separately. |
+| 2 | [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [97](97-audit-checkout-modeled-byte-charges.md) | Memory and cost: missed memory gates, repeated full-tree passes, and checkout's remaining modeled byte charges. |
 
 ## Items
 
-- [64 — Speed up the exhaustive test suite](64-speed-up-full-test-suite.md)
-- [65 — Resolve verified Git SQLite architecture review findings](65-git-sqlite-architecture-review.md)
 - [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
-- [84 — Read integration worktree inputs once](84-read-integration-worktree-inputs-once.md)
 - [86 — Bound the sparse-selected-add and workerd clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
 - [95 — Reduce the Next.js rebase step's full-tree passes and peak](95-reduce-the-nextjs-rebase-step-peak.md)
 - [96 — Reject noncanonical UTF-16 in Git caller text](96-validate-git-caller-utf8-at-boundaries.md)
 - [97 — Audit checkout modeled byte charges](97-audit-checkout-modeled-byte-charges.md)
-- [98 — Remove forwarding owner wrappers](98-remove-forwarding-owner-wrappers.md)
-- [99 — Simplify redundant checkout store reads](99-simplify-checkout-store-reads.md)
 - [100 — Consolidate equivalent Git path and OID helpers](100-consolidate-equivalent-git-helpers.md)
 - [101 — Use tracked prefixes in status pruning](101-use-tracked-prefixes-in-status-pruning.md)
-- [102 — Consolidate equivalent store validators](102-consolidate-equivalent-store-validators.md)
-- [103 — Share reflog append and retention plumbing](103-share-reflog-append-plumbing.md)
 - [104 — Move ref probes behind the store seam](104-move-ref-probes-behind-store-seam.md)
-- [105 — Measure eager status result memory and decide its boundary](105-measure-eager-status-result-memory.md)

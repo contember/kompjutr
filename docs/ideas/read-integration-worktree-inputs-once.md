@@ -1,10 +1,4 @@
----
-id: 84
-title: Read integration worktree inputs once
-blocked-by: []
----
-
-# 84 — Read integration worktree inputs once
+# Read integration worktree inputs once
 
 **Summary.** A conflicted three-way integration reads every worktree input
 eight times. Residency stays bounded, but the transfer volume dominates the
@@ -49,5 +43,10 @@ in the artifact directory so the before and after are like for like.
 `packages/git/src/ops/integration/` (including `apply/`),
 `packages/git/src/ops/merge/`, `packages/git/src/ops/worktree/`, `bench/`
 fixtures.
+
+## Graduation
+
+Graduates to the backlog when a consumer runs large conflicted binary merges,
+or when the extra reads cause a memory or time failure in a real workflow.
 
 <!-- Origin: sprint-2026-09-10 WU6 measurement, 2026-09-22 run-log entry; remeasured at the 2026-09-23 simplification closure. -->

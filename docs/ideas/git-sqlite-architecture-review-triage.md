@@ -12,14 +12,12 @@ contained nine claims and `CORR-31...41` contained more than eleven. This file
 keeps explicit IDs where the report assigned them and uses descriptive names for
 the remaining compact claims rather than inventing identifiers.
 
-Verified open work is canonical in
-[`../backlog/65-git-sqlite-architecture-review.md`](../backlog/65-git-sqlite-architecture-review.md).
+Verified open work lives in individual [backlog](../backlog/README.md) items.
 The report's explicitly dismissed claims are not retained here.
 
 The 2026-09-08 follow-up graduated the ref-limit correctness consequence and
-unused membership digests into [65](../backlog/65-git-sqlite-architecture-review.md),
-journal-root paging into a cursor item the 2026-09-24 backlog review dropped for
-lack of a measured cost, and the
+unused membership digests into the backlog, journal-root paging into a cursor
+item the 2026-09-24 backlog review dropped for lack of a measured cost, and the
 qualified malformed-sideband finding into
 [the completed lifecycle/network sprint](../archive/sprint-2026-09-08-lifecycle-and-network-integrity.md).
 Their evidence and acceptance live in those records.
@@ -31,12 +29,8 @@ acceptance witness of the listed verified finding.
 
 | Claims | Candidate owner | Verification needed |
 |---|---|---|
-| CORR-14 | Backlog 65, ARCH-32 | Reproduce malformed OID or path data through a supported scratch-index writer; do not revive the dismissed stronger trust-premise claim. |
-| CORR-19 / TEST-2 | Backlog 65, ARCH-6 | Define a narrow source witness for forbidden read-time authentication that does not flag schema checks or boundary validation. |
-| CORR-20 | Backlog 65, ARCH-17 | Classify sparse accounting as mutable ledger, structural cap, or result cap under ADR-0005. |
-| DOCS-2 / part of DOCS-3 / compact reflog-root cap claim | Backlog 65, ARCH-19 | Confirm which constants disappear with the duplicate root stream and which still bound public materialization. |
-| DOCS-6 and compact `*Owned` claims | Backlog 65, ARCH-24/ARCH-25 | Inventory remaining wrappers, WeakMaps, and callerless exports before mechanical removal. |
-| DOCS-7 and compact local-helper claims | Backlog 65, ARCH-27 | Attach exact helper call sites and divergent inputs to the shared-kit cleanup. |
+| CORR-20 | [Backlog 97](../backlog/97-audit-checkout-modeled-byte-charges.md), ARCH-17 | Classify sparse accounting as mutable ledger, structural cap, or result cap under ADR-0005. |
+| DOCS-7 and compact local-helper claims | [Backlog 100](../backlog/100-consolidate-equivalent-git-helpers.md), ARCH-27 | Attach exact helper call sites and divergent inputs to the shared-kit cleanup. |
 
 ## Correctness candidates
 

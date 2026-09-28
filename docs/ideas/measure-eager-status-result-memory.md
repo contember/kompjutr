@@ -1,10 +1,4 @@
----
-id: 105
-title: Measure eager status result memory and decide its boundary
-blocked-by: []
----
-
-# 105 — Measure eager status result memory and decide its boundary
+# Measure eager status result memory and decide its boundary
 
 **Summary.** `status()` and `eagerStatus()` materialize their entire returned
 row array. The 30,000-path cap bounds the internal tracked-path snapshot in
@@ -18,3 +12,6 @@ Then decide whether eager result materialization needs a separate API or count
 boundary, with explicit acceptance for the existing 32,001-row case and a
 failure witness if a new limit is approved. Preserve the lazy `statusStream()`
 contract and the optional sparse reseal behavior.
+
+Graduates to the backlog when a measurement or a consumer shows a real failure
+from an eager result; the lazy `statusStream()` already serves large results.
