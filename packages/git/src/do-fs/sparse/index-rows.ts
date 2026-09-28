@@ -30,8 +30,13 @@ export function decodeSparseWorktreeRow(
   root: string,
 ): { path: string; stat: SparseWorktreeLeaf } {
   const decoded = SPARSE_WORKTREE_ROW.decode(row);
-  const expected = root === "/" ? `/${decoded.relative}` : `${root}/${decoded.relative}`;
-  if (decoded.path !== expected || decoded.path_inode !== decoded.inode) {
+  // Compares `path` with root + "/" + relative in place; building that string copies every path.
+  const prefix = root === "/" ? "/" : `${root}/`;
+  const related =
+    decoded.path.length === prefix.length + decoded.relative.length &&
+    decoded.path.startsWith(prefix) &&
+    decoded.path.endsWith(decoded.relative);
+  if (!related || decoded.path_inode !== decoded.inode) {
     throw new CorruptError("sparse worktree lookup returned an unrelated row");
   }
   if (decoded.type === "dir") {
