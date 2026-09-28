@@ -1,5 +1,6 @@
 // Turning the index into a tree hierarchy with one bottom-up pass.
 
+import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { MODE_TREE, serializeTree, type TreeEntry } from "../../common/objects.js";
 import { comparePaths } from "../../common/streams.js";
@@ -13,7 +14,6 @@ import {
   serializedLeafModeBytes,
   utf8Length,
   validatePath,
-  validOid,
 } from "./tree-build-common.js";
 
 /** Maximum entries retained in one materialized tree object. */
@@ -114,7 +114,7 @@ export function preflightTreeBuild(
         throw new CorruptError("tree-build index contains a file below another file");
       }
     }
-    if (!validOid(entry.oid)) throw new CorruptError("tree-build index oid is invalid");
+    if (!isOid(entry.oid)) throw new CorruptError("tree-build index oid is invalid");
 
     const segments = validatePath(entry.path);
     const depth = segments.length - 1;
@@ -206,7 +206,7 @@ export function buildTreeInBatch(batch: ObjectBatch, entries: Iterable<IndexEntr
       throw new CorruptError("tree-build execution lost its leaf parent");
     }
     serializedLeafModeBytes(entry.mode);
-    if (!validOid(entry.oid)) throw new CorruptError("tree-build index oid is invalid");
+    if (!isOid(entry.oid)) throw new CorruptError("tree-build index oid is invalid");
     const mode = entry.mode.toString(8);
     parent.entries.push({
       mode,

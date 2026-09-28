@@ -2,7 +2,7 @@
 
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
-import { comparePaths } from "../../common/streams.js";
+import { comparePaths, gitBasename } from "../../common/paths.js";
 import type { Repository } from "../repository/repository.js";
 
 export const MAX_EXACT_RENAME_CANDIDATES = 10_000;
@@ -142,7 +142,7 @@ function pairBucket(bucket: RenameBucket, output: ExactRename[]): void {
   bucket.destinations.sort((left, right) => comparePaths(left.path, right.path));
   const byBasename = new Map<string, BasenameBucket>();
   for (const source of bucket.sources) {
-    const basename = basenameOf(source.path);
+    const basename = gitBasename(source.path);
     const matching = byBasename.get(basename);
     if (matching === undefined) byBasename.set(basename, { sources: [source], ordinal: 0 });
     else matching.sources.push(source);
@@ -152,7 +152,7 @@ function pairBucket(bucket: RenameBucket, output: ExactRename[]): void {
   let sourceOrdinal = 0;
   // Git does not reserve a source for a later destination's basename match.
   for (const destination of bucket.destinations) {
-    const basenameMatches = byBasename.get(basenameOf(destination.path));
+    const basenameMatches = byBasename.get(gitBasename(destination.path));
     let source: ExactRenameCandidate | undefined;
     while (
       basenameMatches !== undefined &&
@@ -206,10 +206,6 @@ function modeClass(mode: string): "regular" | "symlink" {
   if (mode === "100644" || mode === "100755") return "regular";
   if (mode === "120000") return "symlink";
   throw new CorruptError("rename candidate mode is invalid");
-}
-
-function basenameOf(path: string): string {
-  return path.slice(path.lastIndexOf("/") + 1);
 }
 
 function boundedCandidateLimit(value: number | undefined): number {

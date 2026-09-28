@@ -2,11 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
   ancestorsOf,
   comparePaths,
+  gitBasename,
+  gitParentPath,
+  gitPathDepth,
   isCanonicalAbsolutePath,
   isCanonicalGitPath,
   isNestedPath,
   isPathRoot,
   joinPath,
+  lowerBoundPath,
   normalizePath,
   relativePath,
   splitPath,
@@ -46,6 +50,21 @@ describe("git path kit", () => {
     expect(isPathRoot("/repo", "/repository/file")).toBe(false);
     expect(isNestedPath("/repo", "/repo/nested")).toBe(true);
     expect(isNestedPath("/repo", "/repo")).toBe(false);
+  });
+
+  it("walks relative Git paths from the root", () => {
+    expect(["", "top", "a/b/c.txt"].map(gitParentPath)).toEqual(["", "", "a/b"]);
+    expect(["", "top", "a/b/c.txt"].map(gitBasename)).toEqual(["", "top", "c.txt"]);
+    expect(["", "top", "a/b/c.txt"].map(gitPathDepth)).toEqual([0, 1, 3]);
+  });
+
+  it("finds the lower bound in Git byte order", () => {
+    const ordered = ["a", "a/b", "a\uffff", "a\u{1F600}", "b"];
+    expect([...ordered].sort(comparePaths)).toEqual(ordered);
+    expect(lowerBoundPath(ordered, "a/")).toBe(1);
+    expect(lowerBoundPath(ordered, "a\u{1F600}")).toBe(3);
+    expect(lowerBoundPath(ordered, "c")).toBe(5);
+    expect(lowerBoundPath([], "a")).toBe(0);
   });
 
   it("re-exports Git's UTF-8 byte ordering", () => {

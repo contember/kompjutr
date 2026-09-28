@@ -1,16 +1,9 @@
 import { CorruptError, hasErrorCode } from "../../common/errors.js";
 import { hashObject, MODE_TREE, serializeTree, type TreeEntry } from "../../common/objects.js";
-import { comparePaths } from "../../common/streams.js";
+import { comparePaths, gitBasename, gitParentPath, gitPathDepth } from "../../common/paths.js";
 import type { CommitTreeSnapshotResult } from "../../store/core/contracts.js";
 import type { IndexEntry, ObjectBatch } from "../../store/index.js";
-import {
-  basename,
-  checkedBytes,
-  parentPath,
-  pathDepth,
-  serializedEntryBytes,
-  utf8Length,
-} from "./tree-build-common.js";
+import { checkedBytes, serializedEntryBytes, utf8Length } from "./tree-build-common.js";
 
 const INDEX_DIRTY = 1;
 const MAX_SPARSE_TREE_PATHS = 1_000;
@@ -106,7 +99,7 @@ function planSparseTreeBuildOwned(
   const dirtyByParent = new Map<string, string[]>();
   const affectedDirectories = new Set<string>([""]);
   for (const path of dirtyIndexPaths) {
-    const parent = parentPath(path);
+    const parent = gitParentPath(path);
     const siblings = dirtyByParent.get(parent);
     if (siblings === undefined) {
       dirtyByParent.set(parent, [path]);
@@ -117,12 +110,12 @@ function planSparseTreeBuildOwned(
     for (;;) {
       affectedDirectories.add(ancestor);
       if (ancestor === "") break;
-      ancestor = parentPath(ancestor);
+      ancestor = gitParentPath(ancestor);
     }
   }
 
   const order = [...affectedDirectories].sort((left, right) => {
-    const depth = pathDepth(right) - pathDepth(left);
+    const depth = gitPathDepth(right) - gitPathDepth(left);
     return depth === 0 ? comparePaths(left, right) : depth;
   });
   const results = new Map<string, string | null>();
@@ -132,7 +125,7 @@ function planSparseTreeBuildOwned(
   const recordResult = (path: string, oid: string | null): void => {
     results.set(path, oid);
     if (path === "") return;
-    const parent = parentPath(path);
+    const parent = gitParentPath(path);
     const children = childrenByParent.get(parent);
     const result = { path, oid };
     if (children === undefined) {
@@ -149,7 +142,7 @@ function planSparseTreeBuildOwned(
     for (const entry of baseline.entries) entries.set(entry.name, entry);
 
     for (const dirtyPath of dirtyByParent.get(path) ?? []) {
-      const name = basename(dirtyPath);
+      const name = gitBasename(dirtyPath);
       entries.delete(name);
       const stageZero = indexByPath.get(dirtyPath)?.find((entry) => entry.stage === 0);
       if (stageZero !== undefined) {
@@ -160,7 +153,7 @@ function planSparseTreeBuildOwned(
     for (const child of childrenByParent.get(path) ?? []) {
       const childPath = child.path;
       const childOid = child.oid;
-      const name = basename(childPath);
+      const name = gitBasename(childPath);
       const exactStageZero = indexByPath.get(childPath)?.find((entry) => entry.stage === 0);
       if (exactStageZero !== undefined) {
         if (childOid !== null) {

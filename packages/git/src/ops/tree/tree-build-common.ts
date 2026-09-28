@@ -45,29 +45,6 @@ export function serializedLeafModeBytes(mode: number): number {
   return 6;
 }
 
-export function validOid(value: string): boolean {
-  return /^[0-9a-f]{40}$/.test(value);
-}
-
-export function parentPath(path: string): string {
-  const slash = path.lastIndexOf("/");
-  return slash < 0 ? "" : path.slice(0, slash);
-}
-
-export function basename(path: string): string {
-  const slash = path.lastIndexOf("/");
-  return slash < 0 ? path : path.slice(slash + 1);
-}
-
-export function pathDepth(path: string): number {
-  if (path === "") return 0;
-  let depth = 1;
-  for (let index = 0; index < path.length; index++) {
-    if (path.charCodeAt(index) === 0x2f) depth++;
-  }
-  return depth;
-}
-
 function validatePathShape(path: string): void {
   if (typeof path !== "string" || path.length === 0 || path.startsWith("/") || path.endsWith("/")) {
     throw new CorruptError("tree-build index path is invalid");

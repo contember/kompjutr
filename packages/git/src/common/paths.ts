@@ -66,6 +66,27 @@ export function basenameOf(path: string): string {
   return normalized.slice(normalized.lastIndexOf("/") + 1);
 }
 
+/** Parent of a relative Git path; the root is `""`. */
+export function gitParentPath(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? "" : path.slice(0, slash);
+}
+
+/** Last component of a relative Git path. */
+export function gitBasename(path: string): string {
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+
+/** Component count of a relative Git path; the root `""` has depth 0. */
+export function gitPathDepth(path: string): number {
+  if (path === "") return 0;
+  let depth = 1;
+  for (let index = 0; index < path.length; index++) {
+    if (path.charCodeAt(index) === 0x2f) depth++;
+  }
+  return depth;
+}
+
 export function ancestorsOf(path: string): string[] {
   const ancestors: string[] = [];
   let ancestor = dirnameOf(path);

@@ -1,5 +1,5 @@
 import { GitError } from "../../common/errors.js";
-import { comparePaths, joinPath, relativeExcludeRoots } from "../../common/paths.js";
+import { comparePaths, gitPathDepth, joinPath, relativeExcludeRoots } from "../../common/paths.js";
 import { joinSorted } from "../../common/streams.js";
 import type { IndexEntry } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
@@ -143,18 +143,10 @@ export function planRmDirectoryPrune(
     pruned.push(directory);
   }
   pruned.sort((left, right) => {
-    const depth = pathDepth(right) - pathDepth(left);
+    const depth = gitPathDepth(right) - gitPathDepth(left);
     return depth === 0 ? comparePaths(left, right) : depth;
   });
   return pruned;
-}
-
-function pathDepth(path: string): number {
-  let depth = 1;
-  for (let index = 0; index < path.length; index++) {
-    if (path.charCodeAt(index) === 0x2f) depth++;
-  }
-  return depth;
 }
 
 export function* physicalRmPaths(
