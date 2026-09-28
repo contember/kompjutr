@@ -11,8 +11,9 @@ import { operationRefLogMetadata } from "../core/ref-log.js";
 import {
   integrationIndexMatchesTree,
   requireBoundedIntegrationIndex,
-  requireCleanIntegrationIndex,
+  requireCleanIntegrationStart,
   requireCleanIntegrationWorktree,
+  trackerProvesCleanIntegrationStart,
 } from "../integration/integration-worktree.js";
 import { writeUnpublishedCommit } from "../repository/commit.js";
 import type { Repository } from "../repository/repository.js";
@@ -62,10 +63,13 @@ export function rebase(
     repo.checkout.requireNoOperationState();
     const head = requireHead(repo);
     const originalTree = repo.readCommit(head.oid).tree;
-    requireBoundedIntegrationIndex(repo);
-    requireCleanIntegrationIndex(repo, originalTree, "rebase");
-    requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
+    const trackedClean = trackerProvesCleanIntegrationStart(context, repo, originalTree);
+    if (!trackedClean) {
+      requireCleanIntegrationStart(repo, worktree, originalTree, "rebase", exclusions.absolute);
+    }
     const plan = planRebase(repo, { upstream: options.upstream, currentOid: head.oid });
+    // A tracked-clean index equals the original tree, which a replay preflights below.
+    if (trackedClean && plan.relation !== "replay") requireBoundedIntegrationIndex(repo);
     if (plan.relation === "up-to-date") {
       return { relation: plan.relation, oid: head.oid };
     }

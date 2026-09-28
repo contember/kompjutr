@@ -9,6 +9,7 @@ import type {
 } from "../../store/operations/integration-workspace/descriptors.js";
 import type { IntegrationPlanHandle } from "../../store/operations/integration-workspace/storage.js";
 import type { IntegrationTouched } from "../../store/operations/integration-workspace/touched.js";
+import type { GitContext } from "../core/context.js";
 import type { ProjectedMergeEntry } from "../merge/merge-projection.js";
 import { type CheckoutPathSelection, checkoutBlockers } from "../refs/refs.js";
 import { describeBlockers } from "../refs/refs-checkout-guard.js";
@@ -70,14 +71,20 @@ export function requireBoundedIntegrationIndex(repo: Repository): TreeBuildPrefl
   return requireBoundedIntegrationTree(repo, () => continuationIndexEntries(repo));
 }
 
+function unmergedIndexError(operation: IntegrationOperation): GitError {
+  return new GitError("EUNMERGED", `cannot ${operation} with unmerged index entries`);
+}
+
+function stagedChangesError(operation: IntegrationOperation): GitError {
+  return new GitError("ECHECKOUTFAIL", `cannot ${operation}: the index contains staged changes`);
+}
+
 export function requireCleanIntegrationIndex(
   repo: Repository,
   headTree: string,
   operation: IntegrationOperation,
 ): void {
-  if (repo.checkout.hasConflicts()) {
-    throw new GitError("EUNMERGED", `cannot ${operation} with unmerged index entries`);
-  }
+  if (repo.checkout.hasConflicts()) throw unmergedIndexError(operation);
   for (const row of joinSorted(treeStream(repo, headTree), repo.checkout.indexScan(), {
     left: (entry) => entry.path,
     right: (entry) => entry.path,
@@ -91,9 +98,65 @@ export function requireCleanIntegrationIndex(
       index.oid !== tree.oid ||
       index.mode !== Number.parseInt(tree.mode, 8)
     ) {
-      throw new GitError("ECHECKOUTFAIL", `cannot ${operation}: the index contains staged changes`);
+      throw stagedChangesError(operation);
     }
   }
+}
+
+/**
+ * The bounded-index, clean-index and clean-worktree start checks, with the
+ * first two answered by one tree/index join. Errors keep their former order:
+ * the index bound, unmerged entries, staged changes, then worktree changes.
+ */
+export function requireCleanIntegrationStart(
+  repo: Repository,
+  worktree: Worktree,
+  headTree: string,
+  operation: IntegrationOperation,
+  excludeRoots: string[],
+): void {
+  let staged = false;
+  const entries = function* (): Generator<IndexEntry> {
+    for (const row of joinSorted(treeStream(repo, headTree), continuationIndexEntries(repo), {
+      left: (entry) => entry.path,
+      right: (entry) => entry.path,
+    })) {
+      const tree = row.left;
+      const index = row.right;
+      if (
+        tree === undefined ||
+        index === undefined ||
+        index.oid !== tree.oid ||
+        index.mode !== Number.parseInt(tree.mode, 8)
+      ) {
+        staged = true;
+      }
+      if (index !== undefined) yield index;
+    }
+  };
+  requireBoundedIntegrationTree(repo, entries());
+  if (repo.checkout.hasConflicts()) throw unmergedIndexError(operation);
+  if (staged) throw stagedChangesError(operation);
+  requireCleanIntegrationWorktree(repo, worktree, operation, excludeRoots);
+}
+
+/**
+ * The sparse index tracker proves a clean start without a pass: its baseline
+ * is `headTree`, no path is dirty, and no conflict or gitlink row exists.
+ * Only a host that supplies the tracker writer keeps that baseline current.
+ */
+export function trackerProvesCleanIntegrationStart(
+  context: Pick<GitContext, "sparseWorkspace" | "indexTracker">,
+  repo: Repository,
+  headTree: string,
+): boolean {
+  const source = context.sparseWorkspace;
+  if (source === undefined || context.indexTracker === undefined) return false;
+  const checkoutId = repo.checkout.checkoutId;
+  const state = source.readState(checkoutId);
+  if (!state.available || state.baselineTreeOid !== headTree) return false;
+  for (const _dirty of source.dirtyPaths(checkoutId)) return false;
+  return !repo.checkout.hasCheckoutBlockingIndexEntries();
 }
 
 export function integrationIndexMatchesTree(repo: Repository, treeOid: string): boolean {
