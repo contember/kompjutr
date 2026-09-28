@@ -1,33 +1,27 @@
 // `find`. Each starting point is one stat plus keyset scan pages; `-prune`
 // and `-maxdepth` resume the scan past the skipped subtree instead of reading
-// it. An expression that is only `-name`, `-path`, and actions lowers to an
-// indexed GLOB narrowed by the `-name` pattern's literal tail. Results print
-// under the starting point as typed, as GNU find does.
+// it. An expression that is only `-name`, `-path`, `-print`, and `-exec`
+// lowers to an indexed GLOB narrowed by the `-name` pattern's literal tail.
+// Results print under the starting point as typed, as GNU find does. The
+// walks, `-exec`, and `-delete` live in `find/`.
 
-import { orderedScan } from "../../fs/store/scan/scan-stream.js";
-import type { EntryType } from "../../fs/types.js";
-import { type ByteStream, encode } from "../exec/bytes.js";
-import { type Command, type CommandContext, fail } from "../exec/context.js";
+import { type ByteStream, owned } from "../exec/bytes.js";
+import { type Command, fail } from "../exec/context.js";
 import { displayUnder } from "../exec/display.js";
 import { resolve } from "../exec/execute.js";
 import { sqlGlobFor } from "../exec/glob.js";
-import { type Expression, FindUsageError, parseFind } from "./find-expression.js";
+import { Deleter } from "./find/delete.js";
+import { type Evaluation, evaluate } from "./find/evaluate.js";
+import { ExecRunner } from "./find/exec.js";
+import { type Expression, type FindCommand, FindUsageError, nodes } from "./find/types.js";
+import { postOrder, preOrder, realPrefix, type Walk } from "./find/walk.js";
+import { parseFind } from "./find-expression.js";
 import { UsageError } from "./flags.js";
 
 const GLOB_PAGE = 1_000;
 
-interface Candidate {
-  readonly display: string;
-  readonly type: EntryType | null;
-}
-
-interface Visit {
-  readonly output: string[];
-  pruned: boolean;
-}
-
 export const find: Command = (context) => {
-  let command: ReturnType<typeof parseFind>;
+  let command: FindCommand;
   try {
     command = parseFind(context.argv);
   } catch (error) {
@@ -36,73 +30,86 @@ export const find: Command = (context) => {
     throw error;
   }
 
-  let status = 0;
-  const stream = (function* (): ByteStream {
+  const expressionNodes = [...nodes(command.expression)];
+  const newer = new Map<string, number>();
+  for (const node of expressionNodes) {
+    if (node.kind !== "newer" || newer.has(node.reference)) continue;
+    const reference = context.fs.stat(resolve(context.cwd, node.reference));
+    if (reference === null) {
+      return fail(context, `'${node.reference}': No such file or directory`, 1);
+    }
+    newer.set(node.reference, reference.mtime);
+  }
+
+  const live = expressionNodes.some((node) => node.kind === "exec");
+  const deleter = expressionNodes.some((node) => node.kind === "delete")
+    ? new Deleter(context, live)
+    : null;
+  const exec = new ExecRunner(
+    context,
+    expressionNodes.flatMap((node) => (node.kind === "exec" ? [node] : [])),
+    () => deleter?.flush(),
+  );
+  const evaluation: Evaluation = { now: context.now(), newer, exec };
+  const needsEmptiness = expressionNodes.some(
+    (node) => node.kind === "empty" || node.kind === "delete",
+  );
+
+  let missing = false;
+  const stream = (async function* (): ByteStream {
     for (const operand of command.startingPoints) {
       const start = resolve(context.cwd, operand);
-      const stat = context.fs.stat(start);
-      if (stat === null) {
+      const root = context.fs.stat(start);
+      if (root === null) {
         context.warn(`'${operand}': No such file or directory`);
-        status = 1;
+        missing = true;
         continue;
       }
-      const root = visit(command.expression, { display: operand, type: stat.type });
-      if (command.minDepth === 0) yield* emit(root.output);
-      const descend =
-        stat.type === "dir" && !root.pruned && (command.maxDepth === null || command.maxDepth > 0);
-      if (!descend) continue;
-
+      const walk: Walk = {
+        context,
+        command,
+        evaluation,
+        operand,
+        start,
+        root,
+        live,
+        needsEmptiness,
+      };
       const pattern = globNarrowing(command, start);
-      const results =
-        pattern === null
-          ? scanned(context, command, operand, start)
-          : globbed(context, command.expression, operand, start, pattern);
-      for (const output of results) yield* emit(output);
+      if (command.depthFirst) {
+        yield* postOrder(walk, deleter);
+      } else if (pattern === null || root.type !== "dir") {
+        yield* preOrder(walk);
+      } else {
+        yield* globbed(walk, pattern);
+      }
     }
+    deleter?.flush();
+    yield* exec.finish();
   })();
-  return { stdout: stream, status: () => status, truncated: () => false };
+  const failed = (): boolean => missing || exec.failed || (deleter?.failed ?? false);
+  return {
+    stdout: owned(stream, () => exec.release()),
+    status: () => (failed() ? 1 : 0),
+    truncated: () => exec.truncated,
+  };
 };
 
 /**
- * Every descendant in path order. A directory that `-prune` selected or that
- * sits at `-maxdepth` is skipped by the ordered scan, which resumes past its
- * subtree rather than reading it.
+ * The starting point, then descendants whose path matches a SQL GLOB superset,
+ * evaluated without metadata.
  */
-function* scanned(
-  context: CommandContext,
-  command: ReturnType<typeof parseFind>,
-  operand: string,
-  start: string,
-): Generator<string[], void, undefined> {
-  const real = realPrefix(context, start);
-  let skipLast = false;
-  const entries = orderedScan((options) => context.fs.scan(start, options), {
-    pruneDirectory: () => skipLast,
-  });
-  for (const entry of entries) {
-    const prefix = real(entry.path);
-    const depth = entry.path.slice(prefix === "/" ? 1 : prefix.length + 1).split("/").length;
-    let pruned = false;
-    if (depth >= command.minDepth) {
-      const result = visit(command.expression, {
-        display: displayUnder(operand, prefix, entry.path),
-        type: entry.type,
-      });
-      pruned = result.pruned;
-      yield result.output;
-    }
-    skipLast = pruned || (command.maxDepth !== null && depth >= command.maxDepth);
-  }
-}
+async function* globbed(walk: Walk, pattern: string): ByteStream {
+  const { context, command, evaluation, operand, start, root } = walk;
+  const rootCandidate = {
+    display: operand,
+    stat: root,
+    emptyDirectory: unreachable,
+    remove: unreachable,
+  };
+  const rootVisit = { pruned: false };
+  yield* evaluate(command.expression, rootCandidate, evaluation, rootVisit);
 
-/** Descendants whose path matches a SQL GLOB superset, evaluated without types. */
-function* globbed(
-  context: CommandContext,
-  expression: Expression,
-  operand: string,
-  start: string,
-  pattern: string,
-): Generator<string[], void, undefined> {
   const real = realPrefix(context, start);
   const pageSize = Math.min(GLOB_PAGE, Math.max(1, (context.limitHint ?? 500) * 2));
   let after: string | undefined;
@@ -113,34 +120,30 @@ function* globbed(
       after === undefined ? { limit: pageSize } : { after, limit: pageSize },
     );
     for (const path of page.paths) {
-      const display = displayUnder(operand, real(path), path);
-      yield visit(expression, { display, type: null }).output;
+      const candidate = {
+        display: displayUnder(operand, real(path), path),
+        stat: null,
+        emptyDirectory: unreachable,
+        remove: unreachable,
+      };
+      yield* evaluate(command.expression, candidate, evaluation, { pruned: false });
     }
     if (page.next === null) return;
     after = page.next;
   }
 }
 
-/**
- * Scan and glob results carry real paths. The resolved start usually is one,
- * so the realpath call is made only when a result shows otherwise.
- */
-function realPrefix(context: CommandContext, start: string): (path: string) => string {
-  let prefix: string | null = null;
-  return (path) => {
-    if (prefix === null) {
-      prefix = isUnder(path, start) ? start : context.fs.realpath(start);
-    }
-    return prefix;
-  };
+function unreachable(): boolean {
+  throw new Error("find: the indexed walk evaluates names only");
 }
 
 /**
- * The GLOB for an expression made only of `-name`, `-path`, and actions,
- * narrowed by a case-sensitive `-name`. Types, depths, and `-prune` need the
- * scan's entry metadata, and `-o` or `!` could admit paths a GLOB excludes.
+ * The GLOB for an expression made only of `-name`, `-path`, and actions that
+ * need no metadata, narrowed by a case-sensitive `-name`. Types, sizes, times,
+ * depths, and `-prune` need the scan's entry metadata, and `-o` or `!` could
+ * admit paths a GLOB excludes.
  */
-function globNarrowing(command: ReturnType<typeof parseFind>, start: string): string | null {
+function globNarrowing(command: FindCommand, start: string): string | null {
   if (command.maxDepth !== null || command.minDepth > 0) return null;
   let tail: string | null = null;
   const conjuncts: Expression[] = [command.expression];
@@ -149,7 +152,7 @@ function globNarrowing(command: ReturnType<typeof parseFind>, start: string): st
       conjuncts.push(next.left, next.right);
     } else if (next.kind === "name" || next.kind === "path") {
       if (next.kind === "name" && !next.ignoreCase) tail ??= literalTail(next.pattern);
-    } else if (next.kind !== "print") {
+    } else if (next.kind !== "print" && next.kind !== "exec") {
       return null;
     }
   }
@@ -160,53 +163,4 @@ function globNarrowing(command: ReturnType<typeof parseFind>, start: string): st
 /** The longest trailing run with no fnmatch metacharacter. */
 function literalTail(pattern: string): string {
   return /[^*?[\]\\]*$/.exec(pattern)?.[0] ?? "";
-}
-
-function visit(expression: Expression, candidate: Candidate): Visit {
-  const state: Visit = { output: [], pruned: false };
-  evaluate(expression, candidate, state);
-  return state;
-}
-
-function evaluate(expression: Expression, candidate: Candidate, state: Visit): boolean {
-  switch (expression.kind) {
-    case "and":
-      return (
-        evaluate(expression.left, candidate, state) && evaluate(expression.right, candidate, state)
-      );
-    case "or":
-      return (
-        evaluate(expression.left, candidate, state) || evaluate(expression.right, candidate, state)
-      );
-    case "not":
-      return !evaluate(expression.operand, candidate, state);
-    case "name":
-      return expression.test(baseName(candidate.display));
-    case "path":
-      return expression.test(candidate.display);
-    case "type":
-      return candidate.type !== null && expression.types.has(candidate.type);
-    case "constant":
-      return expression.value;
-    case "print":
-      state.output.push(`${candidate.display}${expression.terminator}`);
-      return true;
-    case "prune":
-      state.pruned = true;
-      return true;
-  }
-}
-
-/** GNU matches `-name` against the last component, ignoring trailing slashes. */
-function baseName(display: string): string {
-  const trimmed = display.length > 1 ? display.replace(/\/+$/, "") : display;
-  return trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed;
-}
-
-function isUnder(path: string, directory: string): boolean {
-  return path.startsWith(directory === "/" ? "/" : `${directory}/`);
-}
-
-function* emit(output: readonly string[]): ByteStream {
-  for (const line of output) yield encode(line);
 }

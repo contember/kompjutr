@@ -1,36 +1,15 @@
 // find's argument language: starting points, then an expression of tests,
 // actions, and operators with GNU precedence — `!` over implicit or explicit
-// `-a` over `-o`, with parentheses. Global options (`-maxdepth`, `-mindepth`)
-// may appear anywhere and evaluate as true. Predicates whose cost or meaning
-// has no counterpart here are refused by name.
+// `-a` over `-o`, with parentheses. Global options (`-maxdepth`, `-mindepth`,
+// `-depth`) may appear anywhere and evaluate as true. Predicates whose cost or
+// meaning has no counterpart here are refused by name: the filesystem keeps
+// no access or change time, and nothing here can prompt.
 
 import type { EntryType } from "../../fs/types.js";
 import { compileFnmatch } from "../exec/glob.js";
+import { parseAge, parseExec, parseSize } from "./find/arguments.js";
+import { type Expression, type FindCommand, FindUsageError, nodes } from "./find/types.js";
 import { UsageError } from "./flags.js";
-
-export type Expression =
-  | { readonly kind: "and" | "or"; readonly left: Expression; readonly right: Expression }
-  | { readonly kind: "not"; readonly operand: Expression }
-  | {
-      readonly kind: "name" | "path";
-      readonly pattern: string;
-      readonly ignoreCase: boolean;
-      test(value: string): boolean;
-    }
-  | { readonly kind: "type"; readonly types: ReadonlySet<EntryType> }
-  | { readonly kind: "constant"; readonly value: boolean }
-  | { readonly kind: "print"; readonly terminator: string }
-  | { readonly kind: "prune" };
-
-export interface FindCommand {
-  readonly startingPoints: readonly string[];
-  readonly expression: Expression;
-  readonly maxDepth: number | null;
-  readonly minDepth: number;
-}
-
-/** A GNU diagnostic: find exits 1 on a malformed expression. */
-export class FindUsageError extends Error {}
 
 const TYPES: ReadonlyMap<string, EntryType> = new Map([
   ["f", "file"],
@@ -39,20 +18,17 @@ const TYPES: ReadonlyMap<string, EntryType> = new Map([
 ]);
 
 const UNSUPPORTED = new Set([
-  "-exec",
   "-execdir",
   "-ok",
   "-okdir",
-  "-delete",
-  "-size",
-  "-empty",
-  "-newer",
-  "-mtime",
-  "-mmin",
   "-atime",
   "-amin",
   "-ctime",
   "-cmin",
+  "-anewer",
+  "-cnewer",
+  "-used",
+  "-daystart",
   "-perm",
   "-regex",
   "-iregex",
@@ -67,11 +43,12 @@ const UNSUPPORTED = new Set([
   "-follow",
   "-xdev",
   "-mount",
-  "-depth",
   "-L",
   "-H",
   "-P",
 ]);
+
+const PRINT: Expression = { kind: "print", terminator: "\n" };
 
 export function parseFind(argv: readonly string[]): FindCommand {
   let index = 0;
@@ -83,17 +60,26 @@ export function parseFind(argv: readonly string[]): FindCommand {
 
   const parser = new ExpressionParser(argv.slice(index));
   const parsed = parser.parse();
+  const parsedNodes = parsed === null ? [] : [...nodes(parsed)];
+  const deletes = parsedNodes.some((node) => node.kind === "delete");
+  if (deletes && !parser.depthFirst && parsedNodes.some((node) => node.kind === "prune")) {
+    throw new FindUsageError(
+      "The -delete action automatically turns on -depth, but -prune does nothing when -depth " +
+        "is in effect.  If you want to carry on anyway, just explicitly use the -depth option.",
+    );
+  }
   const expression: Expression =
     parsed === null
-      ? { kind: "print", terminator: "\n" }
-      : hasAction(parsed)
+      ? PRINT
+      : parsedNodes.some(isAction)
         ? parsed
-        : { kind: "and", left: parsed, right: { kind: "print", terminator: "\n" } };
+        : { kind: "and", left: parsed, right: PRINT };
   return {
     startingPoints: startingPoints.length === 0 ? ["."] : startingPoints,
     expression,
     maxDepth: parser.maxDepth,
     minDepth: parser.minDepth,
+    depthFirst: parser.depthFirst || deletes,
   };
 }
 
@@ -101,24 +87,16 @@ function startsExpression(arg: string): boolean {
   return (arg.startsWith("-") && arg !== "-") || arg === "!" || arg === "(" || arg === ")";
 }
 
-function hasAction(expression: Expression): boolean {
-  switch (expression.kind) {
-    case "and":
-    case "or":
-      return hasAction(expression.left) || hasAction(expression.right);
-    case "not":
-      return hasAction(expression.operand);
-    case "print":
-      return true;
-    default:
-      return false;
-  }
+/** An action suppresses the implicit `-print`. */
+function isAction(node: Expression): boolean {
+  return node.kind === "print" || node.kind === "exec" || node.kind === "delete";
 }
 
 class ExpressionParser {
   #index = 0;
   maxDepth: number | null = null;
   minDepth = 0;
+  depthFirst = false;
 
   constructor(private readonly args: readonly string[]) {}
 
@@ -213,11 +191,32 @@ class ExpressionParser {
         return { kind: "print", terminator: name === "-print0" ? "\0" : "\n" };
       case "-prune":
         return { kind: "prune" };
+      case "-depth":
+      case "-d":
+        this.depthFirst = true;
+        return { kind: "constant", value: true };
+      case "-empty":
+        return { kind: "empty" };
+      case "-size":
+        return parseSize(this.#value(name));
+      case "-mmin":
+      case "-mtime":
+        return parseAge(name, this.#value(name));
+      case "-newer":
+        return { kind: "newer", reference: this.#value(name) };
+      case "-delete":
+        return { kind: "delete" };
+      case "-exec": {
+        const { node, next } = parseExec(this.args, this.#index);
+        this.#index = next;
+        return node;
+      }
       default:
-        if (UNSUPPORTED.has(name)) {
+        if (UNSUPPORTED.has(name) || /^-newer[aBcmt][aBcmt]$/.test(name)) {
           throw new UsageError(
             `${name} is not supported; supported: -name, -iname, -path, -ipath, -type, ` +
-              "-maxdepth, -mindepth, -prune, -print, -print0, -true, -false, !, -a, -o, ( )",
+              "-size, -empty, -newer, -mmin, -mtime, -maxdepth, -mindepth, -depth, -prune, " +
+              "-print, -print0, -exec, -delete, -true, -false, !, -a, -o, ( )",
           );
         }
         if (!name.startsWith("-")) {

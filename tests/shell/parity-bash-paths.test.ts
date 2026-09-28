@@ -143,14 +143,11 @@ describe("find refusals and orders the shell owns", () => {
     return createShell({ fs, cwd: "/repo" });
   }
 
-  it.each(["-exec", "-delete", "-size", "-newer", "-regex", "-empty"])(
-    "refuses %s by name",
-    async (predicate) => {
-      const run = await shell().run(`find . ${predicate} x`);
-      expect(run.exitCode).toBe(2);
-      expect(run.stderr).toContain(`find: ${predicate} is not supported`);
-    },
-  );
+  it.each(["-execdir", "-ok", "-regex", "-amin"])("refuses %s by name", async (predicate) => {
+    const run = await shell().run(`find . ${predicate} x`);
+    expect(run.exitCode).toBe(2);
+    expect(run.stderr).toContain(`find: ${predicate} is not supported`);
+  });
 
   // GNU find follows readdir; this shell lists in path byte order.
   it("walks in path byte order", async () => {
