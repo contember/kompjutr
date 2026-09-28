@@ -32,9 +32,9 @@ changes except the rejection of noncanonical UTF-16.
   `tests/refs.test.ts:215`. The ops config check handles the trailing case
   correctly with its own loop — `ops/refs/config.ts:132-157`.
 - ✔ The import-graph witness merges `diff`, `ignore` and `protocol` into one
-  `algorithm` slice and skips same-slice edges — `tests/import-graph.test.ts:34-42,152,211`.
+  `algorithm` slice and skips same-slice edges — `tests/import-graph.test.ts:34-42,152,217`.
   `gitSlice` returns `null` outside Git, so no `@kompjutr/do` domain rule runs —
-  `tests/import-graph.test.ts:149,211`. The pre-extraction witness had those
+  `tests/import-graph.test.ts:149,217`. The pre-extraction witness had those
   rules — `git show 6fa72a5:tests/import-graph.test.ts` lines 8-9 and 154-178.
 - ✔ Current DO source respects the old domain rules: `db` imports only
   `@kompjutr/sqlite`; `fs` imports `db`, `drive`, `sqlite`; `shell` imports
@@ -42,12 +42,18 @@ changes except the rejection of noncanonical UTF-16.
 - ✔ `hasTrackedPath` scans every retained tracked path for each prune
   decision — `ops/status/status-full.ts:245-246,263-277`. In collapse mode, the
   index prepass also retains every tracked ancestor directory in `trackedDirs`,
-  capped at 30,000 — `status-full.ts:321-338`. Paths also enter `trackedPaths`
-  in the rename prepass and in the merge stream — `status-full.ts:195,340-345`.
+  capped at 30,000 — `status-full.ts:321-338`. In `all` or `no` mode with
+  exclude roots, `trackedDirs` stays empty. Both prepasses retain only index
+  paths, in index-scan (`comparePaths`) order — `status-full.ts:59-99,302-313`.
+  Merge-stream additions (`status-full.ts:195`) never reach a prune decision:
+  the walker prunes `d` before it yields anything below `d` —
+  `ops/worktree/worktree-io-walk.ts:128`.
 - ✔ Two ops queries name `git_refs`: `refExists` — `ops/refs/refs-branches.ts:307-316`
-  (two callers, lines 34 and 260); and `expandRefOwned` —
+  (two callers, lines 34 and 260), which does not validate the name; and
+  `expandRefOwned` —
   `ops/repository/repository-refs.ts:47-64`. The store ref family already reads
-  single refs — `store/refs/refs.ts:164-172`.
+  single refs, but validates the name first — `store/refs/refs.ts:164-172`.
+  `branchRef` and `tagRef` reject only `""` — `ops/refs/refs-branches.ts:296-304`.
 - ⚠ The common path helpers are not drop-in replacements. `dirnameOf` and
   `basenameOf` normalize to absolute paths — `common/paths.ts:5-17,56-65`. The
   duplicates work on relative Git paths: `parentPath`, `basename`, `pathDepth` —
@@ -55,7 +61,14 @@ changes except the rejection of noncanonical UTF-16.
   `ops/status/rename-detection.ts:211-213`; and a second `pathDepth` that returns
   1, not 0, for `""` — `ops/staging/staging-rm-worktree.ts:152-158`.
 - ✔ `validOid` repeats `isOid` exactly — `ops/tree/tree-build-common.ts:48-50`,
-  `common/bytes.ts:40-42`.
+  `common/bytes.ts:40-42`. It is called from `ops/tree/tree-build-full.ts:16,117,209`.
+- ✔ WU1 cannot fail a stored row. The only stored-row caller of the check is
+  `store/maintenance/roots/root-contracts.ts:127`, and SQLite TEXT cannot hold
+  a lone surrogate: binding replaces it with U+FFFD, which is the reproduced
+  symptom. `store/core/json-pages.ts:116` receives only `JSON.stringify` output,
+  which escapes lone surrogates, and `protocol/discovery.ts` receives decoded
+  network bytes. Every caller keeps its error code and message, because the
+  problem kind is unchanged.
 
 ## Work units
 
@@ -70,11 +83,13 @@ changes except the rejection of noncanonical UTF-16.
   Keep each caller's error code and message. Do not rewrite the separate
   loops in `ops/refs/config.ts` or `ops/core/journal-input.ts`; they already
   reject this input.
-- **Acceptance / witness.** Extend the table at `tests/refs.test.ts:215` with
-  a trailing high surrogate, a lone high surrogate before an ASCII unit, and a
-  valid supplementary scalar that must still succeed. Add public witnesses for
-  a symbolic ref target and reflog metadata (reason and actor). Each rejection
-  leaves the ref table and reflog unchanged. Run
+- **Acceptance / witness.** Extend the rejection table at `tests/refs.test.ts:215`
+  (it tests `expandRef`) with a trailing high surrogate and a lone high
+  surrogate before an ASCII unit. Add separate cases: `updateRef` rejects
+  `refs/heads/x\uD800`; a valid supplementary scalar in a ref name succeeds and
+  reads back; a symbolic ref target and reflog metadata (reason and actor) with
+  a trailing high surrogate are rejected. Each rejection leaves the ref table
+  and reflog unchanged. Run
   `npx vitest run tests/refs.test.ts tests/reflog-api.test.ts tests/refspec-contract.test.ts tests/client.test.ts`.
 - **Touch points.** `packages/git/src/common/ref-name.ts`, `tests/refs.test.ts`,
   `tests/reflog-api.test.ts`.
@@ -92,18 +107,21 @@ changes except the rejection of noncanonical UTF-16.
   1. Give `diff`, `ignore` and `protocol` distinct identities with equal rank.
      Reject an edge between two of them.
   2. Restore the DO domain rules. `db` imports no domain. `fs` imports `fs` or
-     `db`. `shell` imports `shell`, `fs` or `db`, and never `@kompjutr/git`.
-     `runtime` may import every DO domain, `@kompjutr/git` and
-     `@kompjutr/git/do-fs`. Top-level DO entry files may import any domain.
-  3. Check domain rules for relative imports and for `@kompjutr/*` package
-     specifiers, including type-only edges.
+     `db`. `shell` imports `shell`, `fs` or `db`. `runtime` may import every DO
+     domain. Top-level DO entry files may import any domain.
+  3. Apply the domain rules to relative imports and to `@kompjutr/do/*`
+     specifiers, mapped to their domain, including type-only edges.
+     `@kompjutr/sqlite` and `@kompjutr/drive` stay under the package rule only.
+     `@kompjutr/git` and `@kompjutr/git/do-fs` are allowed only from `runtime`
+     and the top-level DO files.
   4. Separate the rule function from the source scan so that fixture edges can
      exercise it directly.
 - **Acceptance / witness.** `npx vitest run tests/import-graph.test.ts` passes on
   the current source. New fixture cases prove allowed downward edges (for
   example `git/diff → git/common`, `do/fs → do/db`, `do/runtime → @kompjutr/git/do-fs`)
   and rejected edges (for example `git/diff → git/ignore`, `do/db → do/fs`,
-  `do/fs → do/shell`, `do/shell → @kompjutr/git`, and a type-only `do/fs → do/shell`).
+  `do/fs → do/shell`, `do/shell → @kompjutr/git`, `do/fs → @kompjutr/git`, and a
+  type-only `do/fs → do/shell`).
   Existing package, platform, `do-fs` and cycle checks stay unchanged.
 - **Touch points.** `tests/import-graph.test.ts`.
 
@@ -111,33 +129,48 @@ changes except the rejection of noncanonical UTF-16.
 
 - **Problem.** Each ignored or excluded directory scans every retained tracked
   path, so the cost is tracked paths × ignored directories.
-- **Verify first.** For each mode (collapse, `all` or `no` with exclude roots,
-  rename prepass), list which paths are in `trackedPaths` when a prune
-  decision runs, and whether their ancestors are in `trackedDirs` at that point.
-- **Scope.** Replace the linear scan with an exact path lookup plus a
-  tracked-ancestor lookup that has the same membership as today. Reuse
-  `trackedDirs` where it already holds every ancestor. Where it does not, keep
-  ancestor directories next to `trackedPaths` under the existing
-  `STATUS_MAX_DIRECTORIES` cap. Do not add a scalar SQL read per path.
+- **Verify first.** Confirm that both prepasses retain index paths in
+  `comparePaths` order and that no merge-stream addition precedes a prune
+  decision for an ancestor of that path.
+- **Scope.** Replace the linear scan in `hasTrackedPath` (used by the prune
+  callback and by `prunableExcludeRoots`) with lookups over the same
+  membership: the prepass index paths.
+  - Collapse mode: prune `d` only when `!trackedPaths.has(d) && !trackedDirs.has(d)`;
+    `trackedDirs` already holds every index ancestor.
+  - `all` or `no` mode with exclude roots: a `Set` cannot be binary-searched,
+    so add a sorted array that mirrors the prepass `trackedPaths`. Fill it in
+    `retainStatusIndexPath`; the existing `STATUS_MAX_PATHS` check bounds it.
+    Binary-search it with `comparePaths` for `d` and the `d/` prefix range.
+  - Add no directory set and no new cap: a tree with fewer than 30,000 files
+    can have more than 30,000 ancestor directories, and that status must keep
+    passing. Do not add a scalar SQL read per path.
 - **Acceptance / witness.** `npx vitest run tests/status.test.ts tests/status-sparse.test.ts`
   passes, including the prune cases at `tests/status.test.ts:1165` and `:1187`.
-  Add a witness in which a tracked file is a descendant of an ignored
-  directory: without an exclude root, with an exclude root in `all` mode, and
-  with rename detection on. The directory must not be pruned in any of them.
+  Regression guards: a tracked file below an ignored directory is not pruned
+  with an exclude root in `all` mode and with rename detection on. The
+  collapse case without an exclude root stays covered by `:1187`. Cost
+  evidence: time one status over about 20,000 tracked paths and 5,000 ignored
+  directories, `all` mode with an exclude root, before and after the fix under
+  `cpu-lease run -n 2 --no-smt`, and record both numbers in the run log. Add no
+  test-only counting hook to source.
 - **Touch points.** `packages/git/src/ops/status/status-full.ts`, `tests/status.test.ts`.
 
 ### WU4 — Move ref probes behind the store seam (S) — backlog 104
 
 - **Problem.** Two ops functions query `git_refs` directly.
-- **Verify first.** Confirm that `refExists` and `getRef(name) !== null` have
-  the same result and error behavior for every name the two callers pass.
-- **Scope.** Replace `refExists` with the store read. Move the six-candidate
+- **Verify first.** List the names the two `refExists` callers can pass after
+  `branchRef` and `tagRef`, and the error each invalid name produces today.
+- **Scope.** Replace `refExists` with the store read. This validates the name
+  earlier: an invalid branch or tag name fails with the store's `EINVAL`
+  message before any later check. Accept that change (see Decisions) and add
+  a witness for it. Move the six-candidate
   expansion query into the store ref family and expose it through the store
   interface the ops code already uses. Keep the candidate order, the
   `CorruptError` for an invalid stored value, and one statement per candidate
   at most.
 - **Acceptance / witness.** `npx vitest run tests/refs.test.ts tests/import-graph.test.ts tests/store-module-exports.test.ts`
-  and `npm run typecheck` pass. `git grep git_refs -- packages/git/src/ops` prints
+  and `npm run typecheck` pass. A new case shows `branch` and `tag` rejecting an
+  invalid name with `EINVAL` and without writing a ref. `git grep git_refs -- packages/git/src/ops` prints
   nothing.
 - **Touch points.** `packages/git/src/ops/refs/refs-branches.ts`,
   `packages/git/src/ops/repository/repository-refs.ts`,
@@ -147,11 +180,11 @@ changes except the rejection of noncanonical UTF-16.
 
 - **Problem.** Relative Git path helpers are repeated in three ops modules, and
   `validOid` repeats `isOid`.
-- **Verify first.** Confirm that the rm caller never passes `""` to its
-  `pathDepth`, or keep its current result for `""` explicitly.
+- **Verify first.** Confirm that the rm sort (`staging-rm-worktree.ts:146`)
+  receives only non-root directories, so the `""` difference cannot matter.
 - **Scope.** Put one relative parent, basename and depth helper in
   `common/paths.ts`, next to the absolute helpers, with names that say they
-  take relative Git paths. Replace the copies in `tree-build-common.ts`,
+  take relative Git paths and do not collide with `basenameOf`. Replace the copies in `tree-build-common.ts`,
   `rename-detection.ts` and `staging-rm-worktree.ts`. Replace `validOid` with
   `isOid`. Leave inline ancestor loops that do not declare a helper unchanged.
 - **Acceptance / witness.** `npx vitest run tests/paths.test.ts tests/tree-build-preflight.test.ts tests/checkout-sparse.test.ts tests/commit.test.ts tests/rename-detection.test.ts tests/staging.test.ts`
@@ -160,6 +193,7 @@ changes except the rejection of noncanonical UTF-16.
 - **Touch points.** `packages/git/src/common/paths.ts`,
   `packages/git/src/ops/tree/tree-build-common.ts`,
   `packages/git/src/ops/tree/tree-build-sparse.ts`,
+  `packages/git/src/ops/tree/tree-build-full.ts`,
   `packages/git/src/ops/status/rename-detection.ts`,
   `packages/git/src/ops/staging/staging-rm-worktree.ts`, `tests/paths.test.ts`.
 
@@ -171,7 +205,7 @@ changes except the rejection of noncanonical UTF-16.
 | WU1 | Changes public input acceptance in a check with about 20 callers | Focused witness; independent review of the caller list and of error codes; re-review after any substantive fix | A caller needs a different error code, or a stored row with a trailing high surrogate can already exist |
 | WU2 | Test-only, but it guards every future change | Focused witness; independent review that each documented rule has a positive and a negative fixture | The restored rules find a real forbidden edge in source: stop and ask before changing source |
 | WU3 | Changes a hot path in status; wrong membership hides or shows files | Focused witness; independent review of prune membership in each mode | The fix needs a new cap that rejects a case that passes today |
-| WU4 | Mechanical move behind an existing seam | Focused witness and typecheck; no independent review unless behavior changes | Result, error or statement count changes |
+| WU4 | Moves queries behind an existing seam and validates branch and tag names earlier | Focused witness and typecheck; independent review of the earlier validation and the moved expansion query | Result or statement count changes beyond the accepted earlier `EINVAL` |
 | WU5 | Mechanical consolidation | Focused witness and typecheck; no independent review unless a helper result changes | A caller depends on the old `""` result |
 
 ## Test cadence
@@ -202,27 +236,52 @@ changes except the rejection of noncanonical UTF-16.
 
 - WU1 fixes the shared check instead of adding new routing. Every input family
   that backlog 96 names already calls it.
+- WU4 accepts earlier validation of branch and tag names. The store read
+  validates at the boundary (root invariant 4). Keeping an unvalidated
+  existence probe in the store only to preserve a later error message is not
+  worth a second read path. The project has no compatibility requirement.
+- WU3 adds no directory set and no cap. The prune membership is the prepass
+  index paths. Collapse mode answers from `trackedDirs`; the other modes add
+  one sorted array bounded by the existing `STATUS_MAX_PATHS` check.
 - WU5 adds relative Git path helpers to `common/paths.ts` instead of reusing
   `dirnameOf` and `basenameOf`, because those normalize to absolute paths.
 
 ## Sequencing
 
-All five WUs have disjoint write territories and can run in parallel. WU2
-first gives the other WUs a stronger layer witness, so run it first when the
-work is sequential. Commit each WU separately.
+WU1 and WU4 both touch `expandRef` and `tests/refs.test.ts`, so WU4 runs after
+WU1. The other WUs have disjoint write territories. WU2 first gives the rest a
+stronger layer witness. Commit each WU separately.
 
 | Order | WU | Note |
 |---|---|---|
 | 1 | WU2 | Stronger witness for the rest |
 | 2 | WU1 | Independent review |
-| 3 | WU3 | Independent review |
-| 4 | WU4, WU5 | Mechanical |
+| 3 | WU3, WU5 | WU3 has independent review; disjoint from WU5 |
+| 4 | WU4 | After WU1; independent review |
 
 ## Plan review
 
-- **Reviewer:** pending
-- **Verdict:** pending
-- **Material findings:** pending
+- **Reviewer:** independent general agent, two passes against `298aca8`.
+- **Verdict:** first pass blocked; second pass approved with non-blocking
+  findings, both resolved in this revision.
+- **Material findings:**
+  - Blocking: WU3's proposed ancestor set under `STATUS_MAX_DIRECTORIES` could
+    reject a valid tree with fewer than 30,000 files but more ancestor
+    directories. Replaced by lookups over the prepass index paths, with no new
+    set or cap.
+  - WU3's regression witness passed before the fix; added a cost witness.
+  - WU4 validates branch and tag names earlier; recorded as a decision with a
+    witness and an independent review.
+  - WU1's table witness tests `expandRef` only; moved the success and
+    `updateRef` cases out of it and sequenced WU4 after WU1. Recorded why
+    stricter checking cannot fail a stored row.
+  - WU2 package-specifier wording would have rejected current
+    `@kompjutr/sqlite` and `@kompjutr/drive` imports; reworded.
+  - WU5 was missing `tree-build-full.ts`; added.
+  - Second pass: `all`/`no` mode needs a sorted array, not a lookup in an
+    existing structure; worded as a bounded array. The cost witness had no
+    observable counter; replaced by a leased before/after timing in the run
+    log.
 
 ## Run log
 

@@ -21,4 +21,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 ## Active
 
 - [Correctness and layering](sprint-2026-09-28-correctness-and-layering.md) —
-  backlog 96, 80, 101, 104 and 100; plan review pending.
+  backlog 96, 80, 101, 104 and 100.
