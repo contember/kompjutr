@@ -158,13 +158,14 @@ class Parser {
 
       if (token.type === "fd") {
         this.#index++;
-        redirections.push(this.#redirection(token.value, token.offset));
+        redirections.push(...this.#redirection(token.value, true, token.offset));
         continue;
       }
 
       if (token.type === "op" && isRedirectionOperator(token.value)) {
         // No explicit fd: the `<` family reads stdin, everything else writes stdout.
-        redirections.push(this.#redirection(token.value.startsWith("<") ? 0 : 1, token.offset));
+        const fd = token.value.startsWith("<") ? 0 : 1;
+        redirections.push(...this.#redirection(fd, false, token.offset));
         continue;
       }
 
@@ -177,6 +178,9 @@ class Parser {
     }
     if (name.parts.every((part) => part.kind === "Literal")) {
       const text = name.parts.map((part) => part.value).join("");
+      if (text === "{" || text === "}") {
+        throw new ShellSyntaxError("command group", "command group is not supported", start);
+      }
       if (RESERVED.has(text)) {
         throw new ShellSyntaxError(`\`${text}\``, `\`${text}\` is not supported`, start);
       }
@@ -184,17 +188,36 @@ class Parser {
     return { kind: "SimpleCommand", words, redirections, line: this.#lineAt(start) };
   }
 
-  #redirection(fd: number, offset: number): Redirection {
+  /**
+   * One redirection, or two for `&>file`, `&>>file`, and `>&file`, which Bash
+   * defines as `>file 2>&1` and `>>file 2>&1`.
+   */
+  #redirection(fd: number, explicitFd: boolean, offset: number): Redirection[] {
     const operator = this.tokens[this.#index];
     if (operator?.type !== "op") {
       throw new ShellSyntaxError("redirection", "expected a redirection operator", offset);
     }
     this.#index++;
 
+    if (operator.value === "&>" || operator.value === "&>>") {
+      const target = this.#target(offset);
+      return [
+        { kind: "Redirection", fd: 1, op: operator.value === "&>" ? ">" : ">>", target },
+        { kind: "Redirection", fd: 2, op: ">&", targetFd: 1 },
+      ];
+    }
+
     if (operator.value === ">&") {
       const target = this.tokens[this.#index];
       if (target?.type !== "word") {
         throw new ShellSyntaxError("redirection", "expected a descriptor after >&", offset);
+      }
+      if (!explicitFd && !/^[0-9]+$/.test(wordText(target.word)) && isFileTarget(target.word)) {
+        this.#index++;
+        return [
+          { kind: "Redirection", fd: 1, op: ">", target: target.word },
+          { kind: "Redirection", fd: 2, op: ">&", targetFd: 1 },
+        ];
       }
       if (target.word.parts.some((part) => part.kind === "Parameter")) {
         throw new ShellSyntaxError(
@@ -208,7 +231,7 @@ class Parser {
         throw new ShellSyntaxError("redirection", `\`>&${text}\` is not a descriptor`, offset);
       }
       this.#index++;
-      return { kind: "Redirection", fd, op: ">&", targetFd: Number(text) };
+      return [{ kind: "Redirection", fd, op: ">&", targetFd: Number(text) }];
     }
 
     if (operator.value === "<<" || operator.value === "<<-") {
@@ -217,7 +240,7 @@ class Parser {
         throw new ShellSyntaxError("here-document", "expected a here-document body", offset);
       }
       this.#index++;
-      return { kind: "Redirection", fd, op: "<<", body: body.body };
+      return [{ kind: "Redirection", fd, op: "<<", body: body.body }];
     }
 
     if (operator.value === "<<<") {
@@ -226,25 +249,34 @@ class Parser {
         throw new ShellSyntaxError("redirection", "expected a word after <<<", offset);
       }
       this.#index++;
-      return { kind: "Redirection", fd, op: "<<<", target: target.word };
+      return [{ kind: "Redirection", fd, op: "<<<", target: target.word }];
     }
 
     if (operator.value !== ">" && operator.value !== ">>" && operator.value !== "<") {
       throw new ShellSyntaxError("redirection", "expected a redirection operator", offset);
     }
 
+    return [{ kind: "Redirection", fd, op: operator.value, target: this.#target(offset) }];
+  }
+
+  #target(offset: number): Word {
     const target = this.tokens[this.#index];
     if (target?.type !== "word") {
       throw new ShellSyntaxError("redirection", "expected a target after the operator", offset);
     }
     this.#index++;
-    return { kind: "Redirection", fd, op: operator.value, target: target.word };
+    return target.word;
   }
 
   #peekOperator(): string | null {
     const token = this.tokens[this.#index];
     return token?.type === "op" ? token.value : null;
   }
+}
+
+/** `>&-` closes and `>&$FD` may name a descriptor; neither is a file. */
+function isFileTarget(word: Word): boolean {
+  return wordText(word) !== "-" && !word.parts.some((part) => part.kind === "Parameter");
 }
 
 function isRedirectionOperator(value: Operator): boolean {

@@ -24,6 +24,7 @@ import {
   type SimpleCommand,
   type Word,
 } from "../parse/ast.js";
+import { argumentPart, markBraces } from "./braces.js";
 import {
   type Argument,
   type ArgumentPart,
@@ -83,6 +84,20 @@ function planCommand(command: SimpleCommand): PlannedCommand {
     );
   }
   const name = literalText(nameWord);
+  if (markBraces(nameWord.parts) !== null) {
+    throw new ShellSyntaxError(
+      "brace expansion",
+      "brace expansion in command names is not supported",
+      0,
+    );
+  }
+  if (startsWithTilde(nameWord)) {
+    throw new ShellSyntaxError(
+      "tilde expansion",
+      "tilde expansion in command names is not supported",
+      0,
+    );
+  }
 
   return {
     name,
@@ -116,7 +131,12 @@ function planRedirection(redirection: Redirection): PlannedRedirection {
     if (redirection.fd !== 0) {
       throw new ShellSyntaxError("redirection", `descriptor ${redirection.fd} is not supported`, 0);
     }
-    return { kind: "text", fd: 0, text: hereText(redirection) };
+    return {
+      kind: "text",
+      fd: 0,
+      text: hereText(redirection),
+      newline: redirection.op === "<<<",
+    };
   }
 
   if (hasParameter(redirection.target)) {
@@ -143,13 +163,14 @@ function planRedirection(redirection: Redirection): PlannedRedirection {
   return { kind: "write", fd: 1, path: target, append };
 }
 
+/** A here-string admits tilde expansion but no brace or pathname expansion. */
 function hereText(redirection: Extract<Redirection, { readonly op: "<<" | "<<<" }>): Argument {
   const word = redirection.op === "<<" ? redirection.body : redirection.target;
   const parts = word.parts.map((part): ArgumentPart => {
     if (part.kind === "Parameter") return { kind: "parameter", name: part.name, quoted: true };
-    return { kind: "literal", value: part.value, quoted: true };
+    const quoted = redirection.op === "<<" || (part.kind !== "Literal" && part.kind !== "Glob");
+    return { kind: "literal", value: part.value, quoted };
   });
-  if (redirection.op === "<<<") parts.push({ kind: "literal", value: "\n", quoted: true });
   return { kind: "word", parts };
 }
 
@@ -352,20 +373,14 @@ function hasOutputRedirection(command: PlannedCommand): boolean {
 }
 
 function toArgument(word: Word): Argument {
-  return {
-    kind: "word",
-    parts: word.parts.map((part) => {
-      if (part.kind === "Parameter") {
-        return { kind: "parameter", name: part.name, quoted: part.quoted };
-      }
-      if (part.kind === "Glob") return { kind: "glob", value: part.value };
-      return {
-        kind: "literal",
-        value: part.value,
-        quoted: part.kind !== "Literal",
-      };
-    }),
-  };
+  const braces = markBraces(word.parts);
+  if (braces !== null) return { kind: "word", parts: braces };
+  return { kind: isAssignment(word) ? "assignment" : "word", parts: word.parts.map(argumentPart) };
+}
+
+function startsWithTilde(word: Word): boolean {
+  const first = word.parts[0];
+  return first?.kind === "Literal" && first.value.startsWith("~");
 }
 
 /** `[` is the only metacharacter a bracket-free escape has to hide. */
@@ -406,7 +421,9 @@ function argumentGlobPattern(argument: Argument): string | null {
   let pattern = "";
   let hasGlobPart = false;
   for (const part of argument.parts) {
-    if (part.kind === "parameter") return null;
+    if (part.kind === "parameter" || part.kind === "brace" || part.kind === "sequence") {
+      return null;
+    }
     if (part.kind === "glob") {
       hasGlobPart = true;
       pattern += part.value;

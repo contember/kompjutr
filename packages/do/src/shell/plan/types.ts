@@ -11,11 +11,46 @@ import type { Connector } from "../parse/ast.js";
 export type ArgumentPart =
   | { readonly kind: "literal"; readonly value: string; readonly quoted: boolean }
   | { readonly kind: "parameter"; readonly name: string; readonly quoted: boolean }
-  | { readonly kind: "glob"; readonly value: string };
+  | { readonly kind: "glob"; readonly value: string }
+  /**
+   * `{a,b}`: one generated word per alternative, before any other expansion.
+   * `value` is the unexpanded text, quote-removed; only the executor generates.
+   */
+  | {
+      readonly kind: "brace";
+      readonly value: string;
+      readonly alternatives: readonly (readonly ArgumentPart[])[];
+    }
+  /** `{1..9..2}` or `{a..e}`; `value` is the unexpanded text. */
+  | { readonly kind: "sequence"; readonly value: string; readonly sequence: BraceSequence };
 
-/** One argument retained as ordered parts until its run environment is known. */
+/**
+ * A validated sequence expression. `step` is a positive magnitude; the
+ * direction follows from `start` and `end`, as in Bash. Integers stay within
+ * Bash's `intmax_t`, and `width` is the zero-padded width or 0.
+ */
+export type BraceSequence =
+  | {
+      readonly kind: "integer";
+      readonly start: bigint;
+      readonly end: bigint;
+      readonly step: bigint;
+      readonly width: number;
+    }
+  | {
+      readonly kind: "character";
+      readonly start: number;
+      readonly end: number;
+      readonly step: bigint;
+    };
+
+/**
+ * One argument retained as ordered parts until its run environment is known.
+ * An `assignment` is an argument shaped like `NAME=value` with no brace
+ * expansion: Bash also expands a tilde after its `=` and after each `:`.
+ */
 export interface Argument {
-  readonly kind: "word";
+  readonly kind: "word" | "assignment";
   readonly parts: readonly ArgumentPart[];
 }
 
@@ -29,8 +64,17 @@ export type PlannedRedirection =
       readonly append: boolean;
     }
   | { readonly kind: "duplicate"; readonly fd: 1 | 2; readonly targetFd: 1 | 2 }
-  /** A here-document or here-string. Every part is quoted: no splitting, no globbing. */
-  | { readonly kind: "text"; readonly fd: 0; readonly text: Argument };
+  /**
+   * A here-document or here-string: no splitting, no globbing. A here-string
+   * keeps its unquoted literals unquoted, which only tilde expansion observes.
+   */
+  | {
+      readonly kind: "text";
+      readonly fd: 0;
+      readonly text: Argument;
+      /** A here-string appends a newline after expansion. */
+      readonly newline: boolean;
+    };
 
 export interface PlannedCommand {
   readonly name: string;

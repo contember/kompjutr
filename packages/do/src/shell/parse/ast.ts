@@ -3,9 +3,10 @@
 // 614 real agent command lines were parsed through a full bash grammar and
 // the node kinds it emitted were counted: of ~80 kinds, 11 covered 613 of
 // them. Those 11 are below, plus here-documents, which agents use to write
-// files. Everything else — arithmetic, `case`, process substitution, brace
-// expansion, functions, `[[ ]]` — is rejected by name in `lexer.ts` rather
-// than half-implemented, because a construct that
+// files, and word expansions (tilde, braces) that keep the grammar flat.
+// Everything else — arithmetic, `case`, process substitution, functions,
+// `[[ ]]` — is rejected by name in `lexer.ts` rather than half-implemented,
+// because a construct that
 // parses and then means something slightly different is worse than one that
 // does not parse at all. See docs/archive/plans/shell.md §1.2.
 

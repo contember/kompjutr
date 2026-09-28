@@ -54,12 +54,13 @@ export function resolveRedirections(
 
   for (const redirection of planned.redirections) {
     if (redirection.kind === "read") {
-      const path = resolve(cwd, single(redirection.path, fs, cwd));
+      const path = resolve(cwd, single(redirection.path, fs, cwd, env));
       stdin = path === "/dev/null" ? { kind: "text", text: "" } : { kind: "file", path };
       continue;
     }
     if (redirection.kind === "text") {
-      stdin = { kind: "text", text: quotedText(redirection.text, env) };
+      const text = quotedText(redirection.text, env);
+      stdin = { kind: "text", text: redirection.newline ? `${text}\n` : text };
       continue;
     }
     if (redirection.kind === "duplicate") {
@@ -68,7 +69,7 @@ export function resolveRedirections(
       else stderr = destination;
       continue;
     }
-    const path = resolve(cwd, single(redirection.path, fs, cwd));
+    const path = resolve(cwd, single(redirection.path, fs, cwd, env));
     const destination: OutputDestination =
       path === "/dev/null"
         ? { kind: "drop" }

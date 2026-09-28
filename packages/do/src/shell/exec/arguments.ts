@@ -1,8 +1,10 @@
 import { join, normalize } from "../../fs/path.js";
 import { ShellSyntaxError } from "../parse/ast.js";
 import type { Argument } from "../plan/types.js";
+import { type FlatPart, flatParts, generateWords, hasBraces } from "./braces.js";
 import { type BoundedFs, ShellLimitError } from "./context.js";
 import { compileGlob, sqlGlobFor } from "./glob.js";
+import { expandTildes } from "./tilde.js";
 import { utf8Bytes } from "./utf8.js";
 
 const ARGUMENT_COUNT_MAX = 10_000;
@@ -22,20 +24,15 @@ export function expandArguments(
   const out: string[] = [];
   const releases: Array<() => void> = [];
   const push = (value: string): void => {
-    if (out.length >= ARGUMENT_COUNT_MAX) {
-      throw new ShellLimitError(
-        "arguments",
-        `E2BIG: expanded argv exceeds ${ARGUMENT_COUNT_MAX} entries`,
-      );
-    }
+    if (out.length >= ARGUMENT_COUNT_MAX) throw argumentLimit();
     const valueBytes = utf8Bytes(value);
     releases.push(fs.retained.retain(valueBytes, "command arguments"));
     out.push(value);
   };
 
   try {
-    for (const arg of args) {
-      for (const field of expandWord(arg, env)) {
+    for (const word of words(args, env)) {
+      for (const field of expandWord(word, env)) {
         const value = fieldText(field);
         if (!fieldHasGlob(field)) {
           push(value);
@@ -61,8 +58,13 @@ export function expandArguments(
   };
 }
 
-export function single(arg: Argument, fs: BoundedFs, cwd: string): string {
-  const expanded = expandArguments([arg], fs, cwd);
+export function single(
+  arg: Argument,
+  fs: BoundedFs,
+  cwd: string,
+  env: Readonly<Record<string, string>> | undefined,
+): string {
+  const expanded = expandArguments([arg], fs, cwd, env);
   try {
     const first = expanded.argv[0];
     if (expanded.argv.length !== 1 || first === undefined) {
@@ -74,16 +76,46 @@ export function single(arg: Argument, fs: BoundedFs, cwd: string): string {
   }
 }
 
-/** An all-quoted argument as one string: no field splitting, no pathname expansion. */
+/** Here-text as one string: tilde and parameter expansion, no splitting or pathname expansion. */
 export function quotedText(
   argument: Argument,
   env: Readonly<Record<string, string>> | undefined,
 ): string {
   let text = "";
-  for (const part of argument.parts) {
+  for (const part of expandTildes(flatParts(argument.parts), false, env)) {
     text += part.kind === "parameter" ? environmentValue(env, part.name) : part.value;
   }
   return text;
+}
+
+function argumentLimit(): ShellLimitError {
+  return new ShellLimitError(
+    "arguments",
+    `E2BIG: expanded argv exceeds ${ARGUMENT_COUNT_MAX} entries`,
+  );
+}
+
+/**
+ * Each argument's words after brace and tilde expansion. Brace-generated
+ * words count against the argv ceiling as they arrive, so a generator that
+ * yields only empty words is bounded too.
+ */
+function* words(
+  args: readonly Argument[],
+  env: Readonly<Record<string, string>> | undefined,
+): Generator<readonly FlatPart[]> {
+  let generated = 0;
+  for (const arg of args) {
+    if (!hasBraces(arg.parts)) {
+      yield expandTildes(flatParts(arg.parts), arg.kind === "assignment", env);
+      continue;
+    }
+    for (const word of generateWords(arg.parts)) {
+      generated++;
+      if (generated > ARGUMENT_COUNT_MAX) throw argumentLimit();
+      yield expandTildes(word, false, env);
+    }
+  }
 }
 
 interface FieldPart {
@@ -94,13 +126,13 @@ interface FieldPart {
 type ExpandedField = readonly FieldPart[];
 
 function* expandWord(
-  argument: Argument,
+  parts: readonly FlatPart[],
   env: Readonly<Record<string, string>> | undefined,
 ): Generator<ExpandedField> {
   let field: FieldPart[] = [];
   let preserveEmpty = false;
 
-  for (const part of argument.parts) {
+  for (const part of parts) {
     if (part.kind === "literal") {
       if (part.value !== "") field.push({ value: part.value, globActive: false });
       preserveEmpty ||= part.quoted;

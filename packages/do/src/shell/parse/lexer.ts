@@ -21,7 +21,20 @@ import {
 } from "./here-document.js";
 import { readParameter } from "./parameter.js";
 
-export type Operator = "|" | "||" | "&&" | ";" | ">" | ">>" | "<" | ">&" | "<<" | "<<-" | "<<<";
+export type Operator =
+  | "|"
+  | "||"
+  | "&&"
+  | ";"
+  | ">"
+  | ">>"
+  | "<"
+  | ">&"
+  | "&>"
+  | "&>>"
+  | "<<"
+  | "<<-"
+  | "<<<";
 
 export type Token =
   | { readonly type: "word"; readonly word: Word; readonly offset: number }
@@ -53,9 +66,11 @@ const REJECTED: ReadonlyArray<{ prefix: string; construct: string }> = [
 const OPERATORS: ReadonlyArray<Operator | "&"> = [
   "<<<",
   "<<-",
+  "&>>",
   "<<",
   ">>",
   ">&",
+  "&>",
   "&&",
   "||",
   "|",
@@ -108,8 +123,8 @@ export function tokenize(source: string): Token[] {
       if (source.startsWith(prefix, index)) reject(construct, index);
     }
 
+    // `{` and `}` are words; the parser refuses them in command position.
     if (char === "(" || char === ")") reject("subshell", index);
-    if (char === "{" || char === "}") reject("command group", index);
 
     const operator = readOperator(source, index);
     if (operator !== null) {
@@ -261,6 +276,10 @@ function readWord(source: string, start: number): WordScan {
     if (char === "$") {
       const parameter = readParameter(source, index, false);
       if (parameter !== null) {
+        if (source.charAt(index + 1) !== "{" && source.charAt(parameter.end) === "{") {
+          // Bash expands braces first, so `$X{a,b}` names `$Xa` and `$Xb`.
+          reject("brace expansion after an unbraced parameter", parameter.end);
+        }
         flushLiteral();
         parts.push(parameter.part);
         index = parameter.end;
