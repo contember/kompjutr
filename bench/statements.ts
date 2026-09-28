@@ -9,7 +9,10 @@ import { Workspace } from "../packages/do/src/runtime/workspace.js";
 import { createGit } from "../packages/git/src/client.js";
 import { concat, utf8 } from "../packages/git/src/common/bytes.js";
 import { hashObject, MODE_FILE, serializeTree } from "../packages/git/src/common/objects.js";
-import { createSqliteCommitTreeSnapshotSource } from "../packages/git/src/do-fs/index.js";
+import {
+  createSqliteCommitTreeSnapshotSource,
+  createSqliteSparseCapability,
+} from "../packages/git/src/do-fs/index.js";
 import {
   advanceIndexTrackerBaseline,
   INDEX_DIRTY,
@@ -22,6 +25,7 @@ import { loadIgnoreMatcher } from "../packages/git/src/ignore/index.js";
 import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
 import { tryInitialCheckout } from "../packages/git/src/ops/checkout/initial-checkout.js";
 import { diff as diffIndexWorktree } from "../packages/git/src/ops/diff/diff.js";
+import { integrationIndexMatchesTree } from "../packages/git/src/ops/integration/integration-worktree.js";
 import { merge, mergeAbort, mergeContinue } from "../packages/git/src/ops/merge/merge.js";
 import { selectMergeBases } from "../packages/git/src/ops/merge/merge-base.js";
 import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
@@ -151,6 +155,10 @@ type RequiredRow =
   | "rebase.transition"
   | "rebase.transition-n"
   | "rebase.transition-2n"
+  | "rebase.large-n"
+  | "rebase.large-2n"
+  | "rebase.large-n-tracked"
+  | "rebase.large-2n-tracked"
   | "pack.uncached-read"
   | "pack.fallback-audit"
   | "index-tracker.dirty"
@@ -193,6 +201,10 @@ const REQUIRED_ROWS: readonly RequiredRow[] = [
   "rebase.transition",
   "rebase.transition-n",
   "rebase.transition-2n",
+  "rebase.large-n",
+  "rebase.large-2n",
+  "rebase.large-n-tracked",
+  "rebase.large-2n-tracked",
   "pack.uncached-read",
   "pack.fallback-audit",
   "index-tracker.dirty",
@@ -270,6 +282,10 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "rebase.transition": 370,
   "rebase.transition-n": 629,
   "rebase.transition-2n": 1137,
+  "rebase.large-n": 358,
+  "rebase.large-2n": 476,
+  "rebase.large-n-tracked": 361,
+  "rebase.large-2n-tracked": 479,
   "pack.uncached-read": 3,
   "pack.fallback-audit": 12,
   "index-tracker.dirty": 2,
@@ -313,6 +329,10 @@ const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
   "rebase.transition": 391,
   "rebase.transition-n": 637,
   "rebase.transition-2n": 1165,
+  "rebase.large-n": 185_173,
+  "rebase.large-2n": 366_303,
+  "rebase.large-n-tracked": 185_176,
+  "rebase.large-2n-tracked": 366_306,
   "pack.uncached-read": 2,
   "pack.fallback-audit": 4,
   "index-tracker.dirty": 1_025,
@@ -1979,6 +1999,109 @@ async function rebaseRows(rows: ResultRow[]): Promise<void> {
   await measureScale("rebase.transition-2n", 8);
 }
 
+const LARGE_REBASE_FANOUT = 20;
+const LARGE_REBASE_TOUCHED = 100;
+
+function largeRebasePath(ordinal: number): string {
+  const leaf = Math.floor(ordinal / LARGE_REBASE_FANOUT);
+  return `d${Math.floor(leaf / LARGE_REBASE_FANOUT)}/e${leaf}/f${ordinal}.txt`;
+}
+
+/** One upstream file and one pick that touches 100 files spread over the tree. */
+function largeRebaseHistory(files: number): History {
+  const fixture = new GitFixture().init();
+  for (let ordinal = 0; ordinal < files; ordinal++) {
+    fixture.write(largeRebasePath(ordinal), `${ordinal}\n`);
+  }
+  const base = fixture.commit("base");
+  fixture.git("checkout", "-q", "-b", "upstream", base);
+  fixture.write("upstream.txt", "upstream\n");
+  const incoming = fixture.commit("upstream");
+  fixture.git("checkout", "-q", "main");
+  for (let touched = 0; touched < LARGE_REBASE_TOUCHED; touched++) {
+    const ordinal = Math.floor((touched * files) / LARGE_REBASE_TOUCHED);
+    fixture.write(largeRebasePath(ordinal), `touched ${touched}\n`);
+  }
+  const current = fixture.commit("work");
+  return { fixture, base, current, incoming };
+}
+
+type LargeRebaseRow =
+  | "rebase.large-n"
+  | "rebase.large-2n"
+  | "rebase.large-n-tracked"
+  | "rebase.large-2n-tracked";
+
+async function measureLargeRebase(
+  rows: ResultRow[],
+  operation: LargeRebaseRow,
+  files: number,
+  tracked: boolean,
+): Promise<void> {
+  const history = largeRebaseHistory(files);
+  try {
+    const workspace = await imported(history.fixture);
+    const sparse = createSqliteSparseCapability(workspace.database.db);
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    const context = tracked
+      ? {
+          ...workspace.context,
+          indexTracker: sparse.tracker,
+          selectedPaths: sparse.selected,
+          commitTrees: sparse.commitTrees,
+        }
+      : workspace.context;
+    if (tracked) {
+      assert(
+        sparse.tracker.reseal(checkoutId, workspace.repo.headTree(), []),
+        `${operation} fixture did not seal its tracker`,
+      );
+    }
+    history.fixture.git("rebase", "-q", "upstream");
+    const expectedTree = history.fixture.git("rev-parse", "HEAD^{tree}");
+    await measure(
+      rows,
+      workspace.storage,
+      operation,
+      () => rebase(context, workspace.repo, workspace.worktree, [], { upstream: "upstream" }),
+      (value) => {
+        assert(value.outcome === "completed", `${operation} did not complete`);
+        assert(value.replayed === 1, `${operation} replayed another queue length`);
+        assert(value.skipped === 0 && value.fastForward === false, `${operation} changed`);
+        assert(workspace.repo.head().oid === value.oid, `${operation} did not publish HEAD`);
+        const result = workspace.repo.readCommit(value.oid);
+        sameStrings(result.parent, [history.incoming], `${operation} parents`);
+        assert(result.tree === expectedTree, `${operation} differs from real Git`);
+        assert(workspace.repo.checkout.readOperationState() === null, `${operation} survived`);
+        assert(
+          integrationIndexMatchesTree(workspace.repo, expectedTree),
+          `${operation} index differs from its result`,
+        );
+        assert(
+          dirtyPaths(workspace.repo, workspace.worktree).length === 0,
+          `${operation} left a dirty worktree`,
+        );
+        if (tracked) {
+          const state = readIndexTrackerState(workspace.database.db, checkoutId);
+          assert(
+            state.available && state.baselineTreeOid === expectedTree,
+            `${operation} did not advance its tracker baseline`,
+          );
+        }
+      },
+    );
+  } finally {
+    history.fixture.dispose();
+  }
+}
+
+async function rebaseLargeRows(rows: ResultRow[]): Promise<void> {
+  await measureLargeRebase(rows, "rebase.large-n", 4_000, false);
+  await measureLargeRebase(rows, "rebase.large-2n", 8_000, false);
+  await measureLargeRebase(rows, "rebase.large-n-tracked", 4_000, true);
+  await measureLargeRebase(rows, "rebase.large-2n-tracked", 8_000, true);
+}
+
 async function packUncachedReadRow(rows: ResultRow[]): Promise<void> {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db);
@@ -2462,6 +2585,18 @@ function structuralFailures(rows: readonly ResultRow[]): string[] {
       );
     }
   }
+  for (const suffix of ["", "-tracked"]) {
+    const largeN = rows.find((row) => row.operation === `rebase.large-n${suffix}`);
+    const large2N = rows.find((row) => row.operation === `rebase.large-2n${suffix}`);
+    if (largeN !== undefined && large2N !== undefined) {
+      if (large2N.statements > largeN.statements * 2 || large2N.rowsRead > largeN.rowsRead * 2) {
+        failures.push(
+          `large rebase${suffix} growth is not linear: N=${largeN.statements}/${largeN.rowsRead}, ` +
+            `2N=${large2N.statements}/${large2N.rowsRead}`,
+        );
+      }
+    }
+  }
   const markN = rows.find((row) => row.operation === "maintenance.mark-depth-n");
   const mark2N = rows.find((row) => row.operation === "maintenance.mark-depth-2n");
   if (markN !== undefined && mark2N !== undefined) {
@@ -2529,6 +2664,7 @@ await fetchPublicationRow(rows);
 await mergeRows(rows);
 await replayRows(rows);
 await rebaseRows(rows);
+await rebaseLargeRows(rows);
 await packUncachedReadRow(rows);
 await packFallbackAuditRow(rows);
 await indexTrackerDirtyRow(rows);
