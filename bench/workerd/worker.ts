@@ -12,6 +12,9 @@ interface DurableObjectContextLike {
 
 interface CloneInput {
   originUrl: string;
+}
+
+interface VerifyInput {
   expectedHead: string;
   expectedFiles: number;
 }
@@ -74,19 +77,33 @@ class CountingStorage implements DurableObjectStorageLike {
 function cloneInput(value: unknown): CloneInput {
   if (typeof value !== "object" || value === null) throw new Error("invalid clone input");
   const originUrl = Reflect.get(value, "originUrl");
+  if (typeof originUrl !== "string") throw new Error("invalid clone input");
+  return { originUrl };
+}
+
+function verifyInput(value: unknown): VerifyInput {
+  if (typeof value !== "object" || value === null) throw new Error("invalid verify input");
   const expectedHead = Reflect.get(value, "expectedHead");
   const expectedFiles = Reflect.get(value, "expectedFiles");
   if (
-    typeof originUrl !== "string" ||
     typeof expectedHead !== "string" ||
     !/^[0-9a-f]{40}$/.test(expectedHead) ||
     typeof expectedFiles !== "number" ||
     !Number.isSafeInteger(expectedFiles) ||
     expectedFiles < 0
   ) {
-    throw new Error("invalid clone input");
+    throw new Error("invalid verify input");
   }
-  return { originUrl, expectedHead, expectedFiles };
+  return { expectedHead, expectedFiles };
+}
+
+// The harness starts workerd with --expose-gc; the forced collections bracket the
+// clone in the GC trace.
+function forceGc(): void {
+  const gc = Reflect.get(globalThis, "gc");
+  if (typeof gc !== "function")
+    throw new Error("gc() is unavailable; start workerd with --expose-gc");
+  Reflect.apply(gc, globalThis, []);
 }
 
 function databaseBytes(storage: DurableObjectStorageLike): number {
@@ -166,43 +183,64 @@ export class CloneBench {
   async fetch(request: Request): Promise<Response> {
     if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
     try {
-      const input = cloneInput(await request.json());
-      this.#storage.sql.reset();
-      await this.#workspace.git.clone({
-        url: input.originUrl,
-        dir: "/repo",
-        ref: "main",
-        depth: 1,
-        singleBranch: true,
-      });
-      const statements = this.#storage.sql.statements;
-      const rows = this.#storage.sql.rows;
-      const head = await this.#workspace.git.revParse({ dir: "/repo", ref: "HEAD" });
-      const checkout = validateCheckout(this.#workspace);
-      const result = {
-        statements,
-        rows,
-        trackedFiles: checkout.trackedFiles,
-        worktreeFiles: checkout.worktreeFiles,
-        invalidFiles: checkout.invalidFiles,
-        head,
-        databaseBytes: databaseBytes(this.#platformStorage),
-      };
-      if (result.head !== input.expectedHead) throw new Error("clone HEAD does not match fixture");
-      if (result.trackedFiles !== input.expectedFiles) {
-        throw new Error(`clone has ${result.trackedFiles} tracked files`);
+      switch (new URL(request.url).pathname) {
+        case "/warm":
+          return Response.json({ warm: true });
+        case "/gc":
+          forceGc();
+          return Response.json({ collected: true });
+        case "/clone":
+          return Response.json(await this.#clone(cloneInput(await request.json())));
+        case "/verify":
+          return Response.json(await this.#verify(verifyInput(await request.json())));
+        default:
+          return new Response("not found", { status: 404 });
       }
-      if (result.worktreeFiles !== input.expectedFiles) {
-        throw new Error(`clone has ${result.worktreeFiles} worktree files`);
-      }
-      if (result.invalidFiles !== 0) {
-        throw new Error(`clone has ${result.invalidFiles} invalid worktree files`);
-      }
-      return Response.json(result);
     } catch (error) {
       const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
       return Response.json({ error: message }, { status: 500 });
     }
+  }
+
+  async #clone(input: CloneInput): Promise<{ statements: number; rows: number }> {
+    this.#storage.sql.reset();
+    await this.#workspace.git.clone({
+      url: input.originUrl,
+      dir: "/repo",
+      ref: "main",
+      depth: 1,
+      singleBranch: true,
+    });
+    return { statements: this.#storage.sql.statements, rows: this.#storage.sql.rows };
+  }
+
+  async #verify(input: VerifyInput): Promise<{
+    trackedFiles: number;
+    worktreeFiles: number;
+    invalidFiles: number;
+    head: string;
+    databaseBytes: number;
+  }> {
+    const head = await this.#workspace.git.revParse({ dir: "/repo", ref: "HEAD" });
+    const checkout = validateCheckout(this.#workspace);
+    const result = {
+      trackedFiles: checkout.trackedFiles,
+      worktreeFiles: checkout.worktreeFiles,
+      invalidFiles: checkout.invalidFiles,
+      head,
+      databaseBytes: databaseBytes(this.#platformStorage),
+    };
+    if (result.head !== input.expectedHead) throw new Error("clone HEAD does not match fixture");
+    if (result.trackedFiles !== input.expectedFiles) {
+      throw new Error(`clone has ${result.trackedFiles} tracked files`);
+    }
+    if (result.worktreeFiles !== input.expectedFiles) {
+      throw new Error(`clone has ${result.worktreeFiles} worktree files`);
+    }
+    if (result.invalidFiles !== 0) {
+      throw new Error(`clone has ${result.invalidFiles} invalid worktree files`);
+    }
+    return result;
   }
 }
 
