@@ -328,8 +328,12 @@ The complete outcome matrix is in [concurrency.md](concurrency.md).
 
 Architecture rules are executable checks:
 
-- `tests/import-graph.test.ts` parses every source import and enforces domain
-  and Git-layer direction, and keeps the value-import graph acyclic.
+- `tests/import-graph.test.ts` parses every source import, including
+  type-only ones, and enforces package, Git-layer and DO-domain direction:
+  `diff`, `ignore` and `protocol` may not import one another, and
+  `db` ← `fs` ← `shell` ← `runtime` inside `@kompjutr/do`, with Git reachable
+  only from `runtime` and the top-level DO entry files. Fixture edges prove
+  each rule. It also keeps the value-import graph acyclic.
 - `tests/public-exports.test.ts` keeps the root and Git entrypoint surfaces
   aligned through the restructure.
 - `tests/trusted-read-policy.test.ts` exhaustively classifies the changed

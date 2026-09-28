@@ -37,9 +37,12 @@ None.
 - [Simplification](archive/sprint-2026-09-23-simplification.md) shipped: −14 %
   Git source, 61 → 46 tables, self-contained packs, `STRICT` schema, rebase at
   any size. Next: the [backlog plan](backlog/README.md#sprint-plan).
-- The 2026-09-28 backlog triage cut the backlog from 16 to 8 items in two
-  planned sprints: correctness and layering, then memory and cost. It deleted
-  stale and look-alike cleanup items and moved two with no failure behind them
+- [Correctness and layering](archive/sprint-2026-09-28-correctness-and-layering.md)
+  shipped: ref text rejects a trailing lone surrogate, the import-graph witness
+  enforces Git peer and DO domain rules again, and status pruning uses prefix
+  lookups (4× faster in the measured case). Next: memory and cost (86, 95, 97).
+- The 2026-09-28 backlog triage cut the backlog from 16 to 8 items and deleted
+  stale and look-alike cleanup items; two with no failure behind them moved
   to [`ideas/`](ideas/README.md).
 - The ignored-untracked overwrite parity gap is fixed for checkout, merge,
   cherry-pick, and rebase, including directory-to-file replacements.
@@ -71,8 +74,8 @@ None.
 - Three tranches from the 2026-09-02 Git-in-SQLite architecture review are
   complete: storage/publication safety, Git result and scale correctness, then
   transaction-owned local mutations with trusted ordinary reads. Remaining
-  verified work is in small backlog items (96, 100, 101, 104); unverified
-  claims remain in [`ideas`](ideas/git-sqlite-architecture-review-triage.md).
+  verified review findings shipped with the correctness and layering sprint;
+  unverified claims remain in [`ideas`](ideas/git-sqlite-architecture-review-triage.md).
 - Checkout's remaining modeled retained-byte charges are tracked in
   [`backlog/97`](backlog/97-audit-checkout-modeled-byte-charges.md).
 - The completed everyday Git shell sprint made command execution asynchronous,

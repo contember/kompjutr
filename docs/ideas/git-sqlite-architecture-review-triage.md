@@ -30,7 +30,6 @@ acceptance witness of the listed verified finding.
 | Claims | Candidate owner | Verification needed |
 |---|---|---|
 | CORR-20 | [Backlog 97](../backlog/97-audit-checkout-modeled-byte-charges.md), ARCH-17 | Classify sparse accounting as mutable ledger, structural cap, or result cap under ADR-0005. |
-| DOCS-7 and compact local-helper claims | [Backlog 100](../backlog/100-consolidate-equivalent-git-helpers.md), ARCH-27 | Attach exact helper call sites and divergent inputs to the shared-kit cleanup. |
 
 ## Correctness candidates
 

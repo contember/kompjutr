@@ -93,16 +93,10 @@ over different reflog tables. It moved 84 and 105 to
 
 | Order | Items | Why |
 |---|---|---|
-| 1 | [96](96-validate-git-caller-utf8-at-boundaries.md), [80](80-restore-import-graph-domain-guarantees.md), [101](101-use-tracked-prefixes-in-status-pruning.md), [104](104-move-ref-probes-behind-store-seam.md), [100](100-consolidate-equivalent-git-helpers.md) | Correctness and layering: a reproduced defect, a weakened architecture witness, and small structural fixes. Review the input-changing UTF-8 fix separately. |
-| 2 | [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [97](97-audit-checkout-modeled-byte-charges.md) | Memory and cost: missed memory gates, repeated full-tree passes, and checkout's remaining modeled byte charges. |
+| 1 | [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [97](97-audit-checkout-modeled-byte-charges.md) | Memory and cost: missed memory gates, repeated full-tree passes, and checkout's remaining modeled byte charges. |
 
 ## Items
 
-- [80 — Restore peer and domain rules in the import-graph witness](80-restore-import-graph-domain-guarantees.md)
 - [86 — Bound the sparse-selected-add and workerd clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
 - [95 — Reduce the Next.js rebase step's full-tree passes and peak](95-reduce-the-nextjs-rebase-step-peak.md)
-- [96 — Reject noncanonical UTF-16 in Git caller text](96-validate-git-caller-utf8-at-boundaries.md)
 - [97 — Audit checkout modeled byte charges](97-audit-checkout-modeled-byte-charges.md)
-- [100 — Consolidate equivalent Git path and OID helpers](100-consolidate-equivalent-git-helpers.md)
-- [101 — Use tracked prefixes in status pruning](101-use-tracked-prefixes-in-status-pruning.md)
-- [104 — Move ref probes behind the store seam](104-move-ref-probes-behind-store-seam.md)

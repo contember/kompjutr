@@ -1,10 +1,15 @@
-<!--
-On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
-
-> **OUTCOME — shipped YYYY-MM-DD.** <one-paragraph result.> Commit map: WU1 → <sha>,
-> WU2 → <sha>, … Verification: <the gate command + numbers>. Backlog closed:
-> <ids deleted/rescoped>. Deferred: <honest notes>.
--->
+> **OUTCOME — shipped 2026-09-28.** Ref text rejects a trailing lone high
+> surrogate at its one shared check; the import-graph witness enforces Git
+> peer and DO domain rules again; status prunes directories through prefix
+> lookups; ops no longer query `git_refs`; relative Git path helpers and the OID
+> check live in the shared kits. Commit map: WU2 → `8878756`, WU1 → `75271fa`,
+> WU3 → `edfa1ab`, WU5 → `a8569ed`, WU4 → `9329dfc`; documentation → this
+> closing commit. Verification: `npm test` 160 passed; typecheck and Biome
+> clean; final `test:full` 3,721 passed in 17 slices, 742.9 s wall with two
+> lanes under a 4 vCPU lease. Backlog closed: 80, 96, 100, 101, 104.
+> Deferred: CLI `git branch` still prints the store's EINVAL message rather
+> than Git's wording for an invalid name; this predates the sprint and has no
+> caller asking for it.
 
 # Sprint — Correctness and layering (2026-09-28)
 
@@ -289,3 +294,22 @@ stronger layer witness. Commit each WU separately.
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). After graduating,
      trim to a one-line pointer ("→ ADR-0007"). -->
+
+- WU2: the restored rules found no forbidden edge in current source. Review
+  added a `@kompjutr/git/do-fs` rejection, a positive `@kompjutr/do/*` edge, a
+  type-only edge routed through the rule, and a check that every DO file sits
+  in a domain.
+- WU1: the new witnesses failed before the fix. Review confirmed every caller
+  keeps its code and message, and that SQLite stores a lone surrogate as
+  U+FFFD, so no stored row can fail the stricter check. The witness moved to
+  the guarded `Repository.mutateRefs`.
+- WU3: a temporary mutation that ignored `trackedDirs` failed the new and the
+  existing prune witnesses. Timing over 20,000 tracked paths and 5,000 ignored
+  directories (`all` mode, exclude root, `cpu-lease run -n 2 --no-smt`, three
+  samples after a warm-up): 1,875–2,564 ms before, 465–519 ms after. Review
+  added exclude-root cases with rename detection and in `no` mode.
+- WU4: review confirmed the expansion is unchanged; the store now rejects
+  `HEAD`, which ops answers first. The invalid-name witness moved to its own
+  block.
+- WU5: rm derives only non-empty directories, so the shared `gitPathDepth("")
+  = 0` changes no sort order.

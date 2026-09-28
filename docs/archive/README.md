@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Correctness and layering](sprint-2026-09-28-correctness-and-layering.md)
+  — trailing-surrogate ref text fix, restored import-graph peer and DO domain
+  rules, prefix lookups in status pruning, ref probes behind the store seam.
 - [Retire modeled charges and pure forwarding twins](sprint-2026-09-26-retire-modeled-charges-and-twins.md)
   — bounded status/clean collections, streamed rm planning, and split architecture
   review follow-ups.
