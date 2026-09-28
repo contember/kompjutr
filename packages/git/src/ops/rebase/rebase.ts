@@ -69,7 +69,8 @@ export function rebase(
     }
     const plan = planRebase(repo, { upstream: options.upstream, currentOid: head.oid });
     // A tracked-clean index equals the original tree, which a replay preflights below.
-    // An over-bound HEAD tree then fails after planning errors, not before them.
+    // An over-bound HEAD tree then fails after planning and, for a replay, after the
+    // replay-object and upstream-tree preflights, whose errors now come first.
     if (trackedClean && plan.relation !== "replay") requireBoundedIntegrationIndex(repo);
     if (plan.relation === "up-to-date") {
       return { relation: plan.relation, oid: head.oid };

@@ -93,7 +93,8 @@ export function driveRebase(
   entryProof: RebaseBaselineProof | null,
 ): RebaseLifecycleResult {
   // The loop is synchronous, so nothing can change the index or worktree
-  // between one step's transaction and the next.
+  // between one step's transaction and the next. A local writer that ignores the
+  // lock is outside the ADR-0021 guarantee.
   let proof = entryProof;
   for (;;) {
     const state = readRebaseDriveState(repo);

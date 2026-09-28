@@ -19,9 +19,11 @@ export interface RebaseExclusions {
 }
 
 /**
- * The replay parent whose tree the index and tracked worktree match. A whole-tree
- * check or a hard reset proves it; each step then keeps it true for its result.
- * It is valid only inside the synchronous call that proved it.
+ * The replay parent whose tree the index and tracked worktree match. It is proved
+ * by a whole-tree check, a hard reset, a clean tracker or start check followed by
+ * the start checkout, or a conflicted continue that commits the checked index.
+ * Each step keeps it true for its result. It is valid only inside the
+ * synchronous call that proved it.
  */
 export interface RebaseBaselineProof {
   readonly parentOid: string;

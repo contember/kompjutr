@@ -3,8 +3,10 @@ import { hasErrorCode } from "../packages/git/src/common/errors.js";
 import { createSqliteSparseCapability } from "../packages/git/src/do-fs/index.js";
 import { checkoutTree } from "../packages/git/src/ops/checkout/checkout.js";
 import type { GitContext } from "../packages/git/src/ops/core/context.js";
+import { merge } from "../packages/git/src/ops/merge/merge.js";
 import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
 import { add } from "../packages/git/src/ops/staging/staging.js";
+import { checkoutStoreMutations } from "../packages/git/src/store/core/checkout-mutations-registry.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
@@ -36,6 +38,9 @@ async function started(): Promise<Started> {
   source.git("checkout", "-q", "-b", "upstream", base);
   source.write("upstream.txt", "upstream\n");
   source.commit("upstream");
+  source.git("checkout", "-q", "-b", "conflict", base);
+  source.write("shared.txt", "conflict\n");
+  source.commit("conflict");
   source.git("checkout", "-q", "-b", "current", base);
   source.write("shared.txt", "current\n");
   const original = source.commit("current");
@@ -176,4 +181,59 @@ describe("rebase start without a tracker", () => {
     );
     expectUnstarted(start);
   });
+
+  it("reports unmerged entries before staged changes", async () => {
+    const start = await started();
+    leaveUnmergedIndex(start);
+    writeWorkFile(start.workspace, "/other.txt", "staged\n");
+    add(start.workspace.repo, start.workspace.worktree, { paths: ["other.txt"] });
+
+    expectCode(
+      () =>
+        rebase(start.workspace.context, start.workspace.repo, start.workspace.worktree, [], {
+          upstream: "upstream",
+        }),
+      "EUNMERGED",
+    );
+    expectUnstarted(start);
+  });
 });
+
+describe("rebase start with a tracker sealed over a conflicted index", () => {
+  it("falls back to the full checks", async () => {
+    const start = await started();
+    leaveUnmergedIndex(start);
+    start.seal(start.workspace.repo.readCommit(start.original).tree);
+
+    expectCode(
+      () =>
+        rebase(start.context, start.workspace.repo, start.workspace.worktree, [], {
+          upstream: "upstream",
+        }),
+      "EUNMERGED",
+    );
+    expectUnstarted(start);
+  });
+});
+
+/** Conflict stages with no operation journal, the state a cleared merge leaves. */
+function leaveUnmergedIndex(start: Started): void {
+  const { repo, worktree } = start.workspace;
+  expect(merge(start.workspace.context, repo, worktree, { theirs: "conflict" })).toMatchObject({
+    conflicted: true,
+  });
+  repo.store.db.transactionSync(() => {
+    checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
+  });
+  expect(repo.checkout.hasConflicts()).toBe(true);
+}
+
+function expectCode(action: () => unknown, code: string): void {
+  let caught: unknown = null;
+  try {
+    action();
+  } catch (error) {
+    caught = error;
+  }
+  expect(hasErrorCode(caught, code)).toBe(true);
+}
