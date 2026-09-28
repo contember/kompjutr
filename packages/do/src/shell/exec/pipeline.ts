@@ -11,11 +11,16 @@ import {
   EXIT,
   type Flow,
   type Frame,
-  type Outcome,
+  type PipelineOutcome,
   type Runtime,
   type Segments,
 } from "./compound/frame.js";
-import { isFilesystemError, routeStageOutput, UpstreamError } from "./redirections.js";
+import {
+  isFilesystemError,
+  redirectionDiagnostic,
+  routeStageOutput,
+  UpstreamError,
+} from "./redirections.js";
 import { prepareStage, replaceInput, type StageSettlement, startStage } from "./stage.js";
 import { releaseDiagnostics } from "./stage-output.js";
 
@@ -23,21 +28,23 @@ export async function* runPipeline(
   pipeline: PlannedPipeline,
   frame: Frame,
   runtime: Runtime,
-): Segments {
+): Segments<PipelineOutcome> {
   const stages = pipeline.commands;
   const [only] = stages;
   // An unrouted compound runs in place: its pipelines' output reaches the
   // consumer one pipeline at a time, as the enclosing list's would.
   if (stages.length === 1 && only !== undefined && only.kind !== "command") {
-    if (only.redirections.length === 0) return yield* runtime.compound(only, frame);
+    if (only.redirections.length === 0) {
+      return { ...(yield* runtime.compound(only, frame)), compoundRan: true };
+    }
   }
 
   const multi = stages.length > 1;
   const settlements: StageSettlement[] = [];
   const copies: Frame[] = [];
-  const finish = (status: number, flow: Flow | null): Outcome => {
+  const finish = (status: number, flow: Flow | null, compoundRan = false): PipelineOutcome => {
     runtime.truncated ||= settlements.some((stage) => stage.truncated());
-    return { status, flow };
+    return { status, flow, compoundRan };
   };
   let stream: ByteStream | null = frame.io.stdin?.borrow() ?? null;
   let settled = false;
@@ -87,7 +94,7 @@ export async function* runPipeline(
         releaseDiagnostics(started.routed);
         if (error instanceof UpstreamError) throw error.original;
         if (isFilesystemError(error)) {
-          stageFrame.io.stderr.writeBytes(line(`${stage.label.name}: ${error.message}`));
+          stageFrame.io.stderr.writeBytes(line(redirectionDiagnostic(error, stage.label)));
           return finish(1, null);
         }
         throw error;
@@ -101,7 +108,9 @@ export async function* runPipeline(
     yield stream;
     settled = true;
     const status = pipelineStatus(settlements, frame.shell.options.pipefail);
-    return finish(status, multi ? null : (settlements[0]?.flow() ?? null));
+    const single = multi ? undefined : settlements[0];
+    const compoundRan = only?.kind !== "command" && single?.ran() === true;
+    return finish(status, single?.flow() ?? null, compoundRan);
   } finally {
     try {
       if (!settled) await close(stream);
@@ -124,7 +133,12 @@ async function failStage(
   settlements: StageSettlement[],
 ): Promise<ByteStream> {
   await close(input);
-  settlements.push({ status: () => status, truncated: () => false, flow: () => null });
+  settlements.push({
+    status: () => status,
+    truncated: () => false,
+    flow: () => null,
+    ran: () => false,
+  });
   return (function* (): ByteStream {})();
 }
 

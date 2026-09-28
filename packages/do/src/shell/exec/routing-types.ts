@@ -1,6 +1,8 @@
 export interface FileDestination {
   readonly kind: "file";
   readonly path: string;
+  /** The target as the command line spelled it, which Bash's diagnostic names. */
+  readonly operand: string;
   readonly append: boolean;
   opened: boolean;
 }

@@ -107,6 +107,10 @@ const KEYWORDS = new Set([
   "while",
 ]);
 
+// Builtins the executor runs itself (exec/compound/builtins.ts); they are
+// never registry entries, so the registry cannot report them.
+const EXECUTOR_BUILTINS = new Set(["set", "break", "continue"]);
+
 export type Resolution =
   | { readonly kind: "keyword" }
   | { readonly kind: "builtin" }
@@ -115,6 +119,7 @@ export type Resolution =
 /** Keyword, then builtin, then file — Bash's order. `forcePath` looks for a file only. */
 export function resolveName(name: string, forcePath: boolean): Resolution | null {
   if (!forcePath && KEYWORDS.has(name)) return { kind: "keyword" };
+  if (EXECUTOR_BUILTINS.has(name)) return forcePath ? null : { kind: "builtin" };
   if (!KNOWN.has(name)) return null;
   const builtin = BASH_BUILTINS.has(name);
   if (!forcePath && builtin) return { kind: "builtin" };

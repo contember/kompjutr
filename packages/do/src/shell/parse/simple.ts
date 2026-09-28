@@ -30,7 +30,9 @@ export function parseSimpleCommand(cursor: TokenCursor): SimpleCommand {
   }
 
   if (words[0] === undefined) {
-    throw new ShellSyntaxError("command", "missing command name", start);
+    // Bash names the token that stands where the command should be.
+    const unexpected = cursor.unexpected();
+    throw new ShellSyntaxError("command", unexpected.message, unexpected.offset);
   }
   if (cursor.peekOperator() === "(") {
     if (words.length === 1) {

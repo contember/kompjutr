@@ -5,7 +5,7 @@
 
 import type { PlannedCompound, PlannedStage } from "../plan/types.js";
 import { type ExpandedArguments, expandArguments, UnboundVariable } from "./arguments.js";
-import { type ByteStream, close, isAsyncByteStream, line } from "./bytes.js";
+import { type ByteStream, close, empty, encode, isAsyncByteStream, line } from "./bytes.js";
 import { commandContext, destinationLimit, type StageLabel } from "./command-context.js";
 import { type BuiltinOutcome, SHELL_BUILTINS } from "./compound/builtins.js";
 import {
@@ -19,12 +19,13 @@ import {
 } from "./compound/frame.js";
 import { runRoutedCompound } from "./compound/routed.js";
 import { StreamCursor } from "./compound/stdin.js";
-import type { BoundedFs, CommandContext, CommandResult } from "./context.js";
+import { type BoundedFs, type CommandContext, type CommandResult, result } from "./context.js";
 import {
   isFilesystemError,
   openRedirectionFiles,
   readText,
   readWholeFile,
+  redirectionDiagnostic,
   resolveRedirections,
 } from "./redirections.js";
 import type { HeldChunk, OutputDestination, ResolvedRedirections } from "./routing-types.js";
@@ -40,6 +41,8 @@ export interface StageSettlement {
   status(): number;
   truncated(): boolean;
   flow(): Flow | null;
+  /** False for a compound whose body was closed before it finished. */
+  ran(): boolean;
 }
 
 export interface PreparedStage {
@@ -81,12 +84,7 @@ export async function prepareStage(
     target = { kind: "compound", stage: planned };
   } else {
     label = { name: planned.name, line: planned.line };
-    const runner = runnerFor(planned.name, runtime);
-    if (runner === null) {
-      frame.io.stderr.writeBytes(line(`kompjutr: ${planned.name}: command not found`));
-      return { kind: "abort", status: 127 };
-    }
-    target = { kind: "command", runner };
+    target = { kind: "command", runner: runnerFor(planned.name, runtime) };
     try {
       expanded = expandArguments(planned.args, runtime.fs, shell.cwd, parameters);
     } catch (error) {
@@ -109,7 +107,7 @@ export async function prepareStage(
       return { kind: "failed", status: fatalStatus(frame), exit: false };
     }
     if (isFilesystemError(error)) {
-      frame.io.stderr.writeBytes(line(`${label.name}: ${error.message}`));
+      frame.io.stderr.writeBytes(line(redirectionDiagnostic(error, label)));
       return { kind: "abort", status: 1 };
     }
     throw error;
@@ -155,6 +153,7 @@ export async function startStage(
   const routed = new Map<OutputDestination, HeldChunk[]>();
   let produced: CommandResult;
   let flow: () => Flow | null;
+  let ran: () => boolean = () => true;
   let release: () => void | Promise<void>;
   let asyncRelease: boolean;
 
@@ -210,6 +209,7 @@ export async function startStage(
     const run = runRoutedCompound(target.stage, context, limits, frame, cursor, runtime);
     produced = run.result;
     flow = () => run.outcome()?.flow ?? null;
+    ran = () => run.outcome() !== null;
     release = async () => {
       await owned?.close();
     };
@@ -229,20 +229,29 @@ export async function startStage(
       status: () => produced.status(),
       truncated: () => produced.truncated?.() ?? false,
       flow,
+      ran,
     },
   };
 }
 
 /** Registry commands report `exit` through `control`; executor builtins through a flow. */
-function runnerFor(name: string, runtime: Runtime): Runner | null {
+function runnerFor(name: string, runtime: Runtime): Runner {
   const builtin = SHELL_BUILTINS.get(name);
   if (builtin !== undefined) return builtin;
   const command = runtime.commands.get(name);
-  if (command === undefined) return null;
+  if (command === undefined) return notFound(name);
   return async (context) => {
-    const result = await command(context);
-    const exits = result.control?.kind === "exit" && result.control.terminateRun;
-    return { result, flow: exits ? EXIT : null };
+    const produced = await command(context);
+    const exits = produced.control?.kind === "exit" && produced.control.terminateRun;
+    return { result: produced, flow: exits ? EXIT : null };
+  };
+}
+
+/** Bash reports a missing command after binding the stage's redirections. */
+function notFound(name: string): Runner {
+  return (context) => {
+    context.diagnostic(encode(`bash: line ${context.line}: ${name}: command not found\n`));
+    return { result: result(empty(), 127), flow: null };
   };
 }
 

@@ -1,4 +1,4 @@
-// `pwd`, `cd`, `true`, `false`, `which`, `type`, `command`, `sort`, `uniq`.
+// `pwd`, `cd`, `true`, `:`, `false`, `which`, `type`, `command`, `sort`, `uniq`.
 
 import { normalize } from "../../fs/path.js";
 import { type ByteStream, decode, encode, lines } from "../exec/bytes.js";
@@ -137,6 +137,7 @@ export const textCommands: ReadonlyMap<string, Command> = new Map([
   ["pwd", pwd],
   ["cd", cd],
   ["true", yes],
+  [":", yes],
   ["false", no],
   ["which", which],
   ["type", type],

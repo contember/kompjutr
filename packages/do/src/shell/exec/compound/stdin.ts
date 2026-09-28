@@ -4,7 +4,9 @@
 // pipeline borrows the cursor in turn. Over a file, a consumer that stops
 // inside a chunk (`head`) returns the unused suffix for the next borrower, as
 // `head` seeks back on a regular file. Over a pipe or a here-document there
-// is nothing to seek, so a chunk once read is consumed, as in Bash.
+// is nothing to seek, so a chunk once read is consumed: Bash agrees for
+// `head -n`, which reads ahead, but not for `head -c`, which reads exactly
+// N bytes (a divergence pinned in compound.test.ts).
 
 import { type ByteStream, close, withUnusedRestorer } from "../bytes.js";
 import type { RetainedBudget } from "../context.js";

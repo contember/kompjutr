@@ -3,6 +3,7 @@ import { type Parameters, quotedText, resolve, single } from "./arguments.js";
 import { type ByteStream, close, isAsyncByteStream } from "./bytes.js";
 import type { DiagnosticPort } from "./compound/frame.js";
 import type { BoundedFs } from "./context.js";
+import { strerror } from "./errno.js";
 import type {
   FileDestination,
   HeldChunk,
@@ -13,6 +14,30 @@ import type {
 import { diagnosticsFor, releaseDiagnostics, stageOutput } from "./stage-output.js";
 
 const ENCODER = new TextEncoder();
+
+/** A redirection target the filesystem refused; keeps the error's `code`. */
+export class RedirectionFailure extends Error {
+  readonly code: string;
+
+  constructor(
+    readonly operand: string,
+    failure: Error & { readonly code: string },
+  ) {
+    super(failure.message);
+    this.code = failure.code;
+  }
+}
+
+/** Bash names a refused target as typed; other failures keep the command's prefix. */
+export function redirectionDiagnostic(
+  error: Error & { readonly code: string },
+  label: { readonly name: string; readonly line: number },
+): string {
+  if (error instanceof RedirectionFailure) {
+    return `bash: line ${label.line}: ${error.operand}: ${strerror(error)}`;
+  }
+  return `${label.name}: ${error.message}`;
+}
 
 export class UpstreamError extends Error {
   constructor(readonly original: unknown) {
@@ -69,13 +94,15 @@ export function resolveRedirections(
       else stderr = destination;
       continue;
     }
-    const path = resolve(cwd, single(redirection.path, fs, cwd, parameters));
+    const operand = single(redirection.path, fs, cwd, parameters);
+    const path = resolve(cwd, operand);
     const destination: OutputDestination =
       path === "/dev/null"
         ? { kind: "drop" }
         : {
             kind: "file",
             path,
+            operand,
             append: redirection.append,
             opened: false,
           };
@@ -97,7 +124,7 @@ export async function openRedirectionFiles(
       : undefined;
   for (const file of redirections.files) {
     if (file === deferred) continue;
-    await writeStream(fs, file.path, file.append, empty());
+    await writeFile(fs, file, file.append, empty());
     file.opened = true;
   }
 }
@@ -120,9 +147,9 @@ export async function routeStageOutput(
   } else if (redirections.stdout.kind === "drop") {
     await drain(stdout);
   } else {
-    await writeStream(
+    await writeFile(
       fs,
-      redirections.stdout.path,
+      redirections.stdout,
       redirections.stdout.append || redirections.stdout.opened,
       protectUpstream(stdout),
     );
@@ -168,9 +195,9 @@ async function flushSideFiles(
   for (const file of files) {
     const chunks = diagnosticsFor(diagnostics, file);
     if (chunks.length === 0) continue;
-    await writeStream(
+    await writeFile(
       fs,
-      file.path,
+      file,
       true,
       stageOutput(empty(), chunks, () => {}, false),
     );
@@ -225,6 +252,20 @@ export function* readText(fs: BoundedFs, text: string): ByteStream {
     if (bytes.length > 0) yield bytes;
   } finally {
     release();
+  }
+}
+
+async function writeFile(
+  fs: BoundedFs,
+  file: FileDestination,
+  append: boolean,
+  stream: ByteStream,
+): Promise<void> {
+  try {
+    await writeStream(fs, file.path, append, stream);
+  } catch (error) {
+    if (isFilesystemError(error)) throw new RedirectionFailure(file.operand, error);
+    throw error;
   }
 }
 

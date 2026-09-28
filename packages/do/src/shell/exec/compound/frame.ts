@@ -70,7 +70,16 @@ export interface Outcome {
   readonly flow: Flow | null;
 }
 
-export type Segments = AsyncGenerator<ByteStream, Outcome, undefined>;
+export type Segments<Result extends Outcome = Outcome> = AsyncGenerator<
+  ByteStream,
+  Result,
+  undefined
+>;
+
+export interface PipelineOutcome extends Outcome {
+  /** The pipeline is one compound command whose body ran, not one whose redirection failed. */
+  readonly compoundRan: boolean;
+}
 
 /** Bash exits a shell that fails fatally, such as on `set -u`, with this status. */
 export function fatalStatus(frame: Frame): number {

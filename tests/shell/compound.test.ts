@@ -83,6 +83,9 @@ describe("compound refusals", () => {
     ["done", "syntax error near unexpected token `done'"],
     ["echo a; fi", "syntax error near unexpected token `fi'"],
     ["echo a | then", "syntax error near unexpected token `then'"],
+    ["for i in 1; do; echo a; done", "syntax error near unexpected token `;'"],
+    ["echo a; ; echo b", "syntax error near unexpected token `;'"],
+    ["ls | | wc", "syntax error near unexpected token `|'"],
   ])("refuses the syntax error in %j", async (source, message) => {
     const run = await fixture().run(source);
     expect(run).toMatchObject({ stdout: "", exitCode: 2, operations: 0 });
@@ -245,6 +248,18 @@ describe("compound execution", () => {
     expect((await shell.run("cat lines.txt | { head -1; cat; }")).stdout).toBe("l1\n");
     expect((await shell.run("{ head -1; cat; }", { stdin: "caller\nrest\n" })).stdout).toBe(
       "caller\nrest\n",
+    );
+  });
+
+  // `head -c N` reads exactly N bytes from a pipe, so Bash leaves the rest for
+  // the next reader (`abc\n`, `a\nb\n`). The cursor cannot tell a byte count
+  // from a read-ahead `head -n`, whose chunk a pipe consumes, so the chunk is
+  // consumed here too.
+  it("consumes the chunk a partial reader took from a pipe", async () => {
+    const shell = fixture();
+    expect((await shell.run("echo abc | { head -c1; cat; }")).stdout).toBe("a");
+    expect((await shell.run("echo abc | for i in 1 2; do head -c1; echo; done")).stdout).toBe(
+      "a\n\n",
     );
   });
 

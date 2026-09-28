@@ -47,7 +47,7 @@ export async function* runList(plan: Plan, frame: Frame, runtime: Runtime): Segm
       !ignored &&
       frame.shell.options.errexit &&
       status !== 0 &&
-      !failsOnlyIgnored(step.pipeline)
+      !(outcome.compoundRan && failsOnlyIgnored(step.pipeline))
     ) {
       return { status, flow: EXIT };
     }
@@ -129,9 +129,9 @@ async function* runFor(stage: PlannedFor, frame: Frame, runtime: Runtime): Segme
 }
 
 /**
- * A group, `if`, or `for` returns non-zero under `set -e` only when the
- * failure inside it was ignored; Bash does not exit for that. A subshell
- * and a multi-stage pipeline do exit.
+ * A group, `if`, or `for` whose body ran returns non-zero under `set -e`
+ * only when the failure inside it was ignored; Bash does not exit for that.
+ * A failed redirection on it, a subshell, and a multi-stage pipeline do exit.
  */
 function failsOnlyIgnored(pipeline: PlannedPipeline): boolean {
   const [only, ...rest] = pipeline.commands;

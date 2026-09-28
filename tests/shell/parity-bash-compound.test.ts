@@ -239,4 +239,59 @@ describe.skipIf(!REAL_BASH)("compound commands match Bash", () => {
   ])("reports builtin diagnostics at their line: %j", async (source) => {
     await compare(source);
   });
+
+  it.each([
+    "set -e; for i in 1; do true; done > nodir/x; echo no",
+    "set -e; { true; } > nodir/x; echo no",
+    "set -e; if true; then true; fi > nodir/x; echo no",
+    "set -e; (true) > nodir/x; echo no",
+    "{ echo a; } > nodir/x; echo $?",
+    "echo a > nodir/x; echo $?",
+    "echo a 2> nodir/e; echo $?",
+    "echo a > lines.txt/x; echo $?",
+    "for x in 1; do echo x; done > nodir/x || echo failed",
+    "cat lines.txt | { cat; } > nodir/y; echo $?",
+    "set -e; { false && true; } > out.txt; echo reached",
+  ])("exits on a failed compound redirection under set -e: %j", async (source) => {
+    await compare(source);
+  });
+
+  it.each([
+    "if true; then :; fi; echo $?",
+    ": a b > made.txt; ls made.txt; echo $?",
+    "for i in 1 2; do :; done; echo $?",
+    "set -e; :; echo ok",
+    "false; :; echo $?",
+    ": | cat; echo $?",
+    "type :",
+    "command -v :",
+    "type set break continue",
+    "type -t : set",
+  ])("runs the null command: %j", async (source) => {
+    await compare(source);
+  });
+
+  it.each([
+    "nosuch; echo $?",
+    "nosuch 2>/dev/null; echo $?",
+    "{ nosuch; } 2>/dev/null; echo $?",
+    "nosuch | cat; echo $?",
+    "nosuch 2>&1 | cat",
+    "echo x | nosuch; echo $?",
+    "nosuch > out.txt; cat out.txt; echo $?",
+    "set -e; nosuch; echo no",
+    "set -o pipefail; nosuch | cat; echo $?",
+    "echo a\nnosuch arg\necho b",
+    "for i in 1; do nosuch; done 2> err.txt; cat err.txt",
+  ])("reports a missing command as Bash does: %j", async (source) => {
+    await compare(source);
+  });
+
+  it.each([
+    "printf 'l1\\nl2\\nl3\\n' | { head -1; head -1; }",
+    "cat lines.txt | for x in 1 2; do head -1; done",
+    "cat lines.txt | { cat > copy.txt; }; cat copy.txt",
+  ])("shares a pipe among a body's readers: %j", async (source) => {
+    await compare(source);
+  });
 });
