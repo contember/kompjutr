@@ -256,7 +256,7 @@ function readBackquote(
     if (char === "`") {
       const body = nest.enter(start).backquoted(text);
       return {
-        part: { kind: "CommandSubstitution", body, quoted: context !== "unquoted" },
+        part: { kind: "CommandSubstitution", body, quoted: context !== "unquoted", offset: start },
         end: index + 1,
       };
     }
@@ -287,7 +287,7 @@ export function readDollar(
   if (next === "(") {
     if (source.charAt(start + 2) === "(") reject("arithmetic expansion", start);
     const { body, end } = nest.enter(start).substitution(source, start + 2);
-    return { part: { kind: "CommandSubstitution", body, quoted }, end };
+    return { part: { kind: "CommandSubstitution", body, quoted, offset: start }, end };
   }
   if (!quoted && next === "'") reject("ANSI-C quoting ($'…')", start);
   if (!quoted && next === '"') reject('locale translation ($"…")', start);
@@ -352,7 +352,7 @@ function readBraced(
     throw new ShellSyntaxError("parameter expansion", "unterminated parameter expansion", start);
   }
   return {
-    part: { kind: "ParameterOperation", name, operator, word: scan.parts, quoted },
+    part: { kind: "ParameterOperation", name, operator, word: scan.parts, quoted, offset: start },
     end: scan.end + 1,
   };
 }

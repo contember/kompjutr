@@ -30,6 +30,7 @@ export async function runSubstitution(
     releases.length = 0;
   };
   try {
+    for (const [name, value] of io.exports ?? []) shell.variables.export(name, value);
     const outcome = await capture(
       runBody(body, frame, shell, io, runtime),
       chunks,

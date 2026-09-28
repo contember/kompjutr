@@ -35,9 +35,17 @@ export type WordPart =
       readonly operator: ParameterOperator;
       readonly word: readonly WordPart[];
       readonly quoted: boolean;
+      /** Where `$` stands in the text the word was read from. */
+      readonly offset: number;
     }
   /** `$( … )` or a backquoted command, parsed when the word is read. */
-  | { readonly kind: "CommandSubstitution"; readonly body: Script; readonly quoted: boolean }
+  | {
+      readonly kind: "CommandSubstitution";
+      readonly body: Script;
+      readonly quoted: boolean;
+      /** Where `$(` or the backquote stands in the text the word was read from. */
+      readonly offset: number;
+    }
   /** An unquoted `*`, `?` or `[...]`. Quoted ones are `Literal`. */
   | { readonly kind: "Glob"; readonly value: string };
 

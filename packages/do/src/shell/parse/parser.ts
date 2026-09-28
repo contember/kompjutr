@@ -153,7 +153,8 @@ class Parser {
 
   #command(): Command {
     const start = this.cursor.offset();
-    if (this.#depth >= NESTING_MAX) throw tooDeep(start);
+    // A top-level command is level 0; each enclosing construct adds one.
+    if (this.#depth > NESTING_MAX) throw tooDeep(start);
     this.#depth++;
     try {
       return this.#nestedCommand(start);

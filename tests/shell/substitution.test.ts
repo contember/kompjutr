@@ -11,6 +11,7 @@ import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
 import type { ByteStream } from "../../packages/do/src/shell/exec/bytes.js";
 import { type Command, result } from "../../packages/do/src/shell/exec/context.js";
 import { createShell, DEFAULT_LIMITS, type Shell } from "../../packages/do/src/shell/index.js";
+import { ShellSyntaxError } from "../../packages/do/src/shell/parse/ast.js";
 import { parse } from "../../packages/do/src/shell/parse/parser.js";
 import { planScript } from "../../packages/do/src/shell/plan/plan.js";
 import { TestDatabase } from "../helpers/db.js";
@@ -134,6 +135,29 @@ describe("nesting is bounded before anything runs", () => {
   const deep = (open: string, close: string, levels: number): string =>
     `echo before; ${open.repeat(levels)}echo x${close.repeat(levels)}`;
 
+  it.each([
+    ["subshells", "( ", " )"],
+    ["groups", "{ ", "; }"],
+    ["command substitutions", "echo $(", ")"],
+    ["parameter words", `echo \${u:-`, "}"],
+  ])("admits exactly 64 levels of %s and refuses 65", (_label, open, close) => {
+    expect(() => parse(deep(open, close, 64))).not.toThrow();
+    expect(() => parse(deep(open, close, 65))).toThrow(
+      "nested deeper than 64 levels are not supported",
+    );
+  });
+
+  it("points a refusal found after parsing at the outermost expansion", () => {
+    const source = deep("( echo $( ", ") )", 40);
+    let offset: number | null = null;
+    try {
+      parse(source);
+    } catch (error) {
+      if (error instanceof ShellSyntaxError) offset = error.offset;
+    }
+    expect(offset).toBe(source.indexOf("$("));
+  });
+
   it("admits ordinary nesting", async () => {
     const run = await fixture().run(`echo ${"$(echo ".repeat(20)}x${")".repeat(20)}`);
     expect(run).toMatchObject({ stdout: "x\n", exitCode: 0 });
@@ -174,9 +198,9 @@ describe("a substitution shares its run's budgets", () => {
   });
 
   it("charges an assigned value for as long as the variable holds it", async () => {
-    // Each value holds 4,001 bytes. A substitution's subshell copies the variables
-    // set so far, and capturing briefly holds the file's bytes twice more.
-    const shell = fixture({ maxRetainedBytes: 20_000 });
+    // Each value holds 4,001 bytes; capturing one briefly holds the file's bytes
+    // twice more. A substitution's subshell shares the variables, uncharged.
+    const shell = fixture({ maxRetainedBytes: 14_000 });
     expect(await shell.run("x=$(cat big.txt); y=$(cat big.txt); echo ok")).toMatchObject({
       stdout: "ok\n",
       exitCode: 0,
@@ -184,6 +208,35 @@ describe("a substitution shares its run's budgets", () => {
     const over = await shell.run("x=$(cat big.txt); y=$(cat big.txt); z=$(cat big.txt); echo no");
     expect(over.exitCode).toBe(2);
     expect(over.stderr).toContain("retained-memory limit");
+  });
+
+  it("charges a value once however many subshells and stages share it", async () => {
+    const shell = fixture();
+    const size = 4_788_894;
+    const piped = await shell.run(`x=$(seq 1 700000); echo a | cat | cat; echo \${#x}`);
+    expect(piped).toMatchObject({ stdout: `a\n${size}\n`, stderr: "", exitCode: 0 });
+    expect(piped.peakRetainedBytes).toBeLessThan(size + 1_000);
+    const looped = await shell.run(
+      `x=$(seq 1 400000); for i in $(seq 1 1000); do y=$(echo $i); done; echo $y \${#x}`,
+    );
+    expect(looped).toMatchObject({ stdout: "1000 2688894\n", stderr: "", exitCode: 0 });
+    expect(looped.peakRetainedBytes).toBeLessThan(2_688_894 + 10_000);
+  });
+
+  it("frees the old value before reserving a reassigned one", async () => {
+    const value = "v".repeat(6_000);
+    const run = await fixture({ maxRetainedBytes: 10_000 }).run(
+      `x=${value}; x+=a; echo \${#x}; x=\${x}b; echo \${#x}`,
+    );
+    expect(run).toMatchObject({ stdout: "6001\n6002\n", stderr: "", exitCode: 0 });
+  });
+
+  it("keeps the old value when a reassignment does not fit", async () => {
+    const run = await fixture({ maxRetainedBytes: 10_000 }).run(
+      `x=${"v".repeat(3_000)}; y=${"w".repeat(3_000)}; (x+=$y$y; echo no); echo \${#x}`,
+    );
+    expect(run.exitCode).toBe(2);
+    expect(run.stderr).toContain("shell variable exceeds the 10000-byte retained-memory limit");
   });
 
   it("counts filesystem calls inside a substitution against the run", async () => {

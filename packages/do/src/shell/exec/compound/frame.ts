@@ -54,6 +54,8 @@ export interface SubstitutionIO {
   readonly stderr: DiagnosticPort;
   /** The expanding command's line, which Bash names in diagnostics from inside. */
   readonly line: number;
+  /** Prefix assignments made so far, exported into the substitution's shell. */
+  readonly exports?: ReadonlyMap<string, string>;
 }
 
 export interface Substituted extends Captured {

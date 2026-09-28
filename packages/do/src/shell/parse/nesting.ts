@@ -39,14 +39,18 @@ type Node =
 
 /** Refuses a script whose compound commands and expansions nest past the limit. */
 export function checkNesting(script: Script): void {
-  const stack: Array<{ readonly node: Node; readonly depth: number }> = [
-    { node: { kind: "script", script }, depth: 0 },
-  ];
+  // `offset` is where the outermost expansion on the path starts; only the
+  // script's own words have offsets into its source. Null outside expansions.
+  const stack: Array<{
+    readonly node: Node;
+    readonly depth: number;
+    readonly offset: number | null;
+  }> = [{ node: { kind: "script", script }, depth: 0, offset: null }];
   for (let entry = stack.pop(); entry !== undefined; entry = stack.pop()) {
-    const { node, depth } = entry;
-    if (depth > NESTING_MAX) throw tooDeep(0);
-    const push = (next: Node, deeper: boolean): void => {
-      stack.push({ node: next, depth: deeper ? depth + 1 : depth });
+    const { node, depth, offset } = entry;
+    if (depth > NESTING_MAX) throw tooDeep(offset ?? 0);
+    const push = (next: Node, deeper: boolean, at = offset): void => {
+      stack.push({ node: next, depth: deeper ? depth + 1 : depth, offset: at });
     };
     const pushWords = (words: readonly Word[], deeper: boolean): void => {
       for (const word of words) push({ kind: "parts", parts: word.parts }, deeper);
@@ -61,9 +65,11 @@ export function checkNesting(script: Script): void {
     }
     if (node.kind === "parts") {
       for (const part of node.parts) {
-        if (part.kind === "CommandSubstitution") push({ kind: "script", script: part.body }, true);
-        else if (part.kind === "ParameterOperation")
-          push({ kind: "parts", parts: part.word }, true);
+        if (part.kind === "CommandSubstitution") {
+          push({ kind: "script", script: part.body }, true, offset ?? part.offset);
+        } else if (part.kind === "ParameterOperation") {
+          push({ kind: "parts", parts: part.word }, true, offset ?? part.offset);
+        }
       }
       continue;
     }

@@ -4,7 +4,7 @@
 // command that turns out to have no name.
 
 import type { Plan } from "../../plan/types.js";
-import type { DiagnosticPort, Frame, Runtime, StdinCursor } from "../compound/frame.js";
+import type { DiagnosticPort, Frame, Runtime, SubstitutionIO } from "../compound/frame.js";
 import type { BoundedFs } from "../context.js";
 import type { Captured, Expansion, Parameters } from "./segments.js";
 
@@ -19,11 +19,7 @@ export class ShellExpansion implements Expansion {
   constructor(
     private readonly frame: Frame,
     private readonly runtime: Runtime,
-    private readonly io: {
-      readonly stdin: StdinCursor | null;
-      readonly stderr: DiagnosticPort;
-      readonly line: number;
-    },
+    private readonly io: SubstitutionIO,
     readonly status: SubstitutionStatus,
     readonly parameters: Parameters = frame.shell.parameters(),
   ) {
@@ -52,9 +48,27 @@ export class ShellExpansion implements Expansion {
     );
   }
 
-  /** The same command, reading parameters through `parameters`. */
-  reading(parameters: Parameters): ShellExpansion {
-    return new ShellExpansion(this.frame, this.runtime, this.io, this.status, parameters);
+  /**
+   * The same command while its prefix assignments expand: each value sees the
+   * ones before it, and a substitution sees them exported, as in Bash.
+   * `values` grows as the assignments are made.
+   */
+  exporting(values: ReadonlyMap<string, string>): ShellExpansion {
+    const shell = this.parameters;
+    const parameters: Parameters = {
+      value: (name) => values.get(name) ?? shell.value(name),
+      assign: (name, value) => shell.assign(name, value),
+      get nounset() {
+        return shell.nounset;
+      },
+    };
+    return new ShellExpansion(
+      this.frame,
+      this.runtime,
+      { ...this.io, exports: values },
+      this.status,
+      parameters,
+    );
   }
 }
 

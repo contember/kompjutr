@@ -16,11 +16,42 @@ export interface ShellOptions {
   pipefail: boolean;
 }
 
-interface Binding {
-  /** Undefined for a name that is unset: a tombstone over the snapshot, or exported with no value. */
-  readonly value: string | undefined;
-  readonly exported: boolean;
-  readonly release: () => void;
+/**
+ * A bound value and its reservation, measured once when bound. Copies of a
+ * shell share it until one of them rebinds the name: the retained budget
+ * counts distinct values, not copies of the same immutable string.
+ */
+class Binding {
+  #holders = 1;
+
+  constructor(
+    /** Undefined for a name that is unset: a tombstone over the snapshot, or exported with no value. */
+    readonly value: string | undefined,
+    readonly exported: boolean,
+    readonly bytes: number,
+    private readonly release: () => void,
+  ) {}
+
+  /** No other copy holds it, so dropping it frees its bytes. */
+  get sole(): boolean {
+    return this.#holders === 1;
+  }
+
+  hold(): void {
+    this.#holders++;
+  }
+
+  drop(): void {
+    this.#holders--;
+    if (this.#holders === 0) this.release();
+  }
+}
+
+/** An overlay shared by copies of a shell until one of them writes. */
+interface Overlay {
+  readonly bindings: Map<string, Binding>;
+  owners: number;
+  exported: Readonly<Record<string, string>> | undefined | null;
 }
 
 /**
@@ -28,19 +59,23 @@ interface Binding {
  * snapshot entry starts exported; a variable the run sets stays a shell
  * variable unless its name is exported, as in Bash. `unset` leaves a
  * tombstone over the snapshot, and the snapshot object is never mutated.
- * Bindings the run makes are reserved against the retained budget.
+ * A copy shares its overlay and copies it on its first write, so a subshell
+ * or pipeline stage costs nothing until it assigns.
  */
 export class Variables {
-  readonly #overlay = new Map<string, Binding>();
-  #exported: Readonly<Record<string, string>> | undefined | null = null;
+  #overlay: Overlay;
+  #released = false;
 
   constructor(
     private readonly base: Readonly<Record<string, string>> | undefined,
     private readonly retained: RetainedBudget,
-  ) {}
+    overlay?: Overlay,
+  ) {
+    this.#overlay = overlay ?? { bindings: new Map(), owners: 1, exported: null };
+  }
 
   get(name: string): string | undefined {
-    const bound = this.#overlay.get(name);
+    const bound = this.#overlay.bindings.get(name);
     if (bound !== undefined) return bound.value;
     return this.#base(name);
   }
@@ -72,69 +107,95 @@ export class Variables {
   }
 
   #isExported(name: string): boolean {
-    return this.#overlay.get(name)?.exported ?? this.#base(name) !== undefined;
+    return this.#overlay.bindings.get(name)?.exported ?? this.#base(name) !== undefined;
+  }
+
+  /** This copy's own overlay, copied from the shared one on the first write. */
+  #writable(): Map<string, Binding> {
+    const shared = this.#overlay;
+    if (shared.owners > 1) {
+      for (const binding of shared.bindings.values()) binding.hold();
+      shared.owners--;
+      this.#overlay = { bindings: new Map(shared.bindings), owners: 1, exported: null };
+    }
+    this.#overlay.exported = null;
+    return this.#overlay.bindings;
   }
 
   #bind(name: string, value: string | undefined, exported: boolean): void {
     const bytes = utf8Bytes(name) + (value === undefined ? 0 : utf8Bytes(value));
-    const release = this.retained.retain(bytes, "shell variable");
-    const previous = this.#overlay.get(name);
-    previous?.release();
-    this.#overlay.set(name, { value, exported, release });
-    this.#exported = null;
+    const bindings = this.#writable();
+    const previous = bindings.get(name);
+    // Free the old value first: a reassignment that fits once it is gone must succeed.
+    const freed = previous?.sole === true;
+    bindings.delete(name);
+    previous?.drop();
+    try {
+      bindings.set(name, this.#reserve(value, exported, bytes));
+    } catch (error) {
+      if (previous !== undefined) {
+        if (freed) {
+          bindings.set(name, this.#reserve(previous.value, previous.exported, previous.bytes));
+        } else {
+          previous.hold();
+          bindings.set(name, previous);
+        }
+      }
+      throw error;
+    }
+  }
+
+  #reserve(value: string | undefined, exported: boolean, bytes: number): Binding {
+    return new Binding(value, exported, bytes, this.retained.retain(bytes, "shell variable"));
   }
 
   /** What commands see as `CommandContext.env`: the exported variables that have values. */
   exported(): Readonly<Record<string, string>> | undefined {
-    if (this.#exported !== null) return this.#exported;
+    const overlay = this.#overlay;
+    if (overlay.exported !== null) return overlay.exported;
     let changed = false;
-    for (const [name, binding] of this.#overlay) {
+    for (const [name, binding] of overlay.bindings) {
       changed ||= binding.exported || this.#base(name) !== undefined;
     }
     if (!changed) {
-      this.#exported = this.base;
+      overlay.exported = this.base;
       return this.base;
     }
     // Snapshot names keep their place, as uutils `env` prints a reassigned name.
     const entries: Array<readonly [string, string]> = [];
     for (const name in this.base) {
       if (!Object.hasOwn(this.base, name)) continue;
-      const value = this.#overlay.has(name) ? this.#exportedValue(name) : this.base[name];
+      const value = overlay.bindings.has(name) ? this.#exportedValue(name) : this.base[name];
       if (value !== undefined) entries.push([name, value]);
     }
-    for (const name of this.#overlay.keys()) {
+    for (const name of overlay.bindings.keys()) {
       if (this.#base(name) !== undefined) continue;
       const value = this.#exportedValue(name);
       if (value !== undefined) entries.push([name, value]);
     }
-    this.#exported = Object.freeze(Object.fromEntries(entries));
-    return this.#exported;
+    overlay.exported = Object.freeze(Object.fromEntries(entries));
+    return overlay.exported;
   }
 
   #exportedValue(name: string): string | undefined {
-    const binding = this.#overlay.get(name);
+    const binding = this.#overlay.bindings.get(name);
     return binding?.exported === true ? binding.value : undefined;
   }
 
+  /** A copy for a subshell or pipeline stage: O(1), sharing every binding. */
   clone(): Variables {
-    const copy = new Variables(this.base, this.retained);
-    try {
-      for (const [name, binding] of this.#overlay) {
-        const bytes =
-          utf8Bytes(name) + (binding.value === undefined ? 0 : utf8Bytes(binding.value));
-        const release = this.retained.retain(bytes, "shell variable");
-        copy.#overlay.set(name, { ...binding, release });
-      }
-    } catch (error) {
-      copy.release();
-      throw error;
-    }
-    return copy;
+    this.#overlay.owners++;
+    return new Variables(this.base, this.retained, this.#overlay);
   }
 
   release(): void {
-    for (const binding of this.#overlay.values()) binding.release();
-    this.#overlay.clear();
+    if (this.#released) return;
+    this.#released = true;
+    const overlay = this.#overlay;
+    overlay.owners--;
+    if (overlay.owners > 0) return;
+    for (const binding of overlay.bindings.values()) binding.drop();
+    overlay.bindings.clear();
   }
 }
 

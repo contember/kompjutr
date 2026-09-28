@@ -6,7 +6,7 @@
 
 import { DECLARATIONS } from "../plan/plan.js";
 import type { PlannedAssignment, PlannedCommand } from "../plan/types.js";
-import { expandArguments, expandText, type Parameters } from "./arguments.js";
+import { expandArguments, expandText } from "./arguments.js";
 import { empty, encode } from "./bytes.js";
 import { type BuiltinOutcome, SHELL_BUILTINS } from "./compound/builtins.js";
 import { EXIT, type Frame, type Runtime } from "./compound/frame.js";
@@ -105,15 +105,8 @@ async function temporaryAssignments(
     for (const each of releases) each();
   };
   if (assignments.length === 0) return { values, release };
-  const shell = expansion.parameters;
-  const parameters: Parameters = {
-    value: (name) => values.get(name) ?? shell.value(name),
-    assign: (name, value) => shell.assign(name, value),
-    get nounset() {
-      return shell.nounset;
-    },
-  };
-  const layered = expansion.reading(parameters);
+  const layered = expansion.exporting(values);
+  const parameters = layered.parameters;
   try {
     for (const assignment of assignments) {
       const expanded = await assignmentValue(assignment, layered);
