@@ -1,19 +1,18 @@
 // Tilde expansion, after brace generation and before parameter expansion.
 // Pure, so the planner refuses a static named prefix before anything runs and
-// the executor substitutes `HOME` from the frozen run env.
+// the executor substitutes `HOME` from the run's variables.
 //
 // A tilde prefix starts at an unquoted `~` at the start of a word. In a
 // `NAME=value` argument it also starts right after the `=` or an unquoted
 // `:`; in a here-string, after an unquoted `:`. It runs to the next unquoted
-// `/`, or `/` or `:` outside a plain word. This is Bash's
-// `bash_tilde_find_word`: a quoted character before the terminator keeps the
-// whole prefix literal. A bare prefix becomes `HOME` as a quoted value: Bash
-// neither splits nor globs it. Any other prefix (`~user`, `~+`, `~-`, `~:x`)
-// is refused: this runtime has no passwd database or directory stack, and
-// Bash's readline fallback is not modelled.
+// `/`, or `/` or `:` outside a plain word. As in Bash, a quoted character
+// before the terminator keeps the whole prefix literal. A bare prefix becomes
+// `HOME` as a quoted value: Bash neither splits nor globs it. Any other prefix
+// (`~user`, `~+`, `~-`, `~:x`) is refused: this runtime has no passwd
+// database or directory stack.
 
 import { ShellSyntaxError } from "../parse/ast.js";
-import type { Argument, FlatPart } from "./types.js";
+import { type Argument, type FlatPart, partSpelling } from "./types.js";
 
 /** Which positions start a prefix; an argument's kind names its rules. */
 export type TildeMode = Argument["kind"];
@@ -37,7 +36,7 @@ export function expandTildes(
   const leading = first?.kind === "literal" && !first.quoted && first.value.startsWith("~");
   if (mode === "word" && !leading) return [...parts];
 
-  const assignment = mode === "assignment";
+  const assignment = mode === "assignment" || mode === "declaration";
   const colons = mode !== "word";
   const out: FlatPart[] = [];
   let eligible = !assignment;
@@ -95,7 +94,7 @@ function scanPrefix(
     if (part === undefined) continue;
     if (part.kind === "literal" && part.quoted) return { kind: "literal" };
     if (part.kind !== "literal") {
-      text += part.kind === "parameter" ? `$${part.name}` : part.value;
+      text += partSpelling(part);
       continue;
     }
     let partEnd = 0;

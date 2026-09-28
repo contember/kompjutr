@@ -8,7 +8,8 @@
 // The seed supports regular files and their parent directories only. Both sides
 // receive mode 0644/0755 and the same fixed mtime. Symlinks, empty directories,
 // inode/owner identity, absolute paths, and the physical cwd are not comparable.
-// Named expansion is limited to controlled or case-explicit variables. Bash
+// Named expansion, `${#NAME}` included, is limited to controlled or
+// case-explicit variables. Bash
 // intrinsic variables (`PWD`, `SHLVL`, `RANDOM`, `BASH_*`, etc.) and special
 // parameters other than the status `$?` (`$$`, `$1`, etc.) are rejected rather
 // than normalized.
@@ -201,7 +202,7 @@ function validateParameterExpansions(source: string, env: Readonly<Record<string
     if (char !== "$" || singleQuoted) continue;
 
     const rest = source.slice(index + 1);
-    const named = /^\{?([A-Za-z_][A-Za-z0-9_]*)/.exec(rest)?.[1];
+    const named = /^(?:\{#?)?([A-Za-z_][A-Za-z0-9_]*)/.exec(rest)?.[1];
     if (named !== undefined) {
       if (!Object.hasOwn(env, named)) {
         throw new Error(`parameter ${named} must be explicit in the shell parity environment`);

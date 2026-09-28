@@ -13,13 +13,17 @@ measurements and rationale are in `../../../../docs/archive/plans/shell.md`; rea
 ## Pipeline
 
 ```
-parse/    source → quote-aware AST with literal, glob, and parameter word parts.
+parse/    source → quote-aware AST: literal, glob, parameter, `${…}` operator,
+          and command-substitution word parts. A substitution's list is parsed
+          while its word is read; `nesting.ts` bounds how deep source nests.
           A newline is a token; here-document bodies are read after their line.
-plan/     AST → Plan. Pure: imports nothing from ../fs/. Globs and parameters
-          remain marked, never resolved here.
-exec/     Plan → result. Resolves parameters from the frozen run env and globs
-          through BoundedFs. Pull-based, so a consumer that stops pulling stops
-          the source.
+plan/     AST → Plan. Pure: imports nothing from ../fs/. Braces are marked,
+          static tildes and other static refusals are checked, and a
+          substitution's list is planned, so nothing runs before a refusal.
+          Globs, parameters, and substitutions stay marked.
+exec/     Plan → result. Expands words (`arguments.ts`, `expansion/`) in Bash's
+          order, runs substitutions as subshells, and globs through BoundedFs.
+          Pull-based, so a consumer that stops pulling stops the source.
 commands/ the registry: printf, echo, exit, test, tail, xargs, basename/dirname,
           read/list/file/text families, and search/ (grep, rg, one engine)
 ```
@@ -42,9 +46,18 @@ plan and performed by the executor.
   ceiling and its UTF-8 bytes use the retained budget. Reserve before retaining
   and release when ownership ends; semantic input fails rather than truncates.
 - **Parameter expansion is an execution concern.** Preserve ordered word parts
-  and quote context through parse and plan. Only command arguments admit named
-  parameters; unquoted values use fixed default-IFS splitting and pathname
-  expansion. Do not make planning depend on env or the filesystem.
+  and quote context through parse and plan. Unquoted values use fixed
+  default-IFS splitting and pathname expansion, so a script may not change
+  `IFS`. Do not make planning depend on env or the filesystem.
+- **Shell variables layer over the frozen env snapshot.** `exec/compound/state.ts`
+  holds one run's variables; only exported names reach `CommandContext.env`,
+  a subshell or pipeline stage works on a copy, and the caller's snapshot is
+  never mutated. Every binding is reserved against the retained budget.
+- **A command substitution is a subshell sharing the run's budgets.** Its
+  stdout is captured under `maxRetainedBytes` (overflow fails, never
+  truncates), its stderr follows the expanding command's current binding, and
+  each one sets `$?`. `$?` of a command that expands to no name is its last
+  substitution's status.
 - **`operations` in `RunResult` is the metric that matters.** A change that
   makes output prettier and raises the operation count is a regression.
 - **A trailing `head -N` publishes a demand hint and remains a stage.** Paged

@@ -2,6 +2,7 @@
 // may carry.
 
 import {
+  hasExpansion,
   type Redirection,
   ShellSyntaxError,
   type SimpleCommand,
@@ -77,9 +78,9 @@ function redirectionAfterDescriptor(
   cursor.advance();
 
   if (operator.value === "&>" || operator.value === "&>>") {
-    const target = redirectionTarget(cursor, offset);
+    const { target, spelling } = redirectionTarget(cursor, offset);
     return [
-      { kind: "Redirection", fd: 1, op: operator.value === "&>" ? ">" : ">>", target },
+      { kind: "Redirection", fd: 1, op: operator.value === "&>" ? ">" : ">>", target, spelling },
       { kind: "Redirection", fd: 2, op: ">&", targetFd: 1 },
     ];
   }
@@ -92,14 +93,21 @@ function redirectionAfterDescriptor(
     if (fd === 1 && !/^[0-9]+$/.test(wordText(target.word)) && isFileTarget(target.word)) {
       cursor.advance();
       return [
-        { kind: "Redirection", fd: 1, op: ">", target: target.word },
+        {
+          kind: "Redirection",
+          fd: 1,
+          op: ">",
+          target: target.word,
+          spelling: cursor.spelling(target),
+        },
         { kind: "Redirection", fd: 2, op: ">&", targetFd: 1 },
       ];
     }
-    if (target.word.parts.some((part) => part.kind === "Parameter")) {
+    if (hasExpansion(target.word)) {
+      // The expansion would decide between a descriptor and a file.
       throw new ShellSyntaxError(
         "parameter expansion",
-        "parameters in redirection targets are not supported",
+        "parameters in redirection targets of `>&` are not supported",
         target.offset,
       );
     }
@@ -133,23 +141,25 @@ function redirectionAfterDescriptor(
     throw new ShellSyntaxError("redirection", "expected a redirection operator", offset);
   }
 
-  return [
-    { kind: "Redirection", fd, op: operator.value, target: redirectionTarget(cursor, offset) },
-  ];
+  const { target, spelling } = redirectionTarget(cursor, offset);
+  return [{ kind: "Redirection", fd, op: operator.value, target, spelling }];
 }
 
-function redirectionTarget(cursor: TokenCursor, offset: number): Word {
+function redirectionTarget(
+  cursor: TokenCursor,
+  offset: number,
+): { readonly target: Word; readonly spelling: string } {
   const target = cursor.peek();
   if (target?.type !== "word") {
     throw new ShellSyntaxError("redirection", "expected a target after the operator", offset);
   }
   cursor.advance();
-  return target.word;
+  return { target: target.word, spelling: cursor.spelling(target) };
 }
 
 /** `>&-` closes and `>&$FD` may name a descriptor; neither is a file. */
 function isFileTarget(word: Word): boolean {
-  return wordText(word) !== "-" && !word.parts.some((part) => part.kind === "Parameter");
+  return wordText(word) !== "-" && !hasExpansion(word);
 }
 
 function isRedirectionOperator(value: Operator): boolean {

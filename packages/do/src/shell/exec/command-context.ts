@@ -24,6 +24,7 @@ export function commandContext(
   frame: Frame,
   runtime: Runtime,
   routedDiagnostics: Map<OutputDestination, HeldChunk[]>,
+  env: Readonly<Record<string, string>> | undefined,
 ): CommandContext {
   const output = commandOutput(redirections, lastStage, frame);
   const diagnostic = (bytes: Uint8Array): void => {
@@ -43,7 +44,7 @@ export function commandContext(
     cwd: shell.cwd,
     argv,
     stdin,
-    env: shell.variables.exported(),
+    env,
     currentStatus: shell.status,
     now: runtime.now,
     mayExitRun: true,

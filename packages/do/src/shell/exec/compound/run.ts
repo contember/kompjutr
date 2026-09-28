@@ -14,7 +14,8 @@ import type {
   PlannedIf,
   PlannedPipeline,
 } from "../../plan/types.js";
-import { expandArguments, UnboundVariable } from "../arguments.js";
+import { type ExpandedArguments, ExpansionFailure, expandArguments } from "../arguments.js";
+import { ShellExpansion } from "../expansion/shell-expansion.js";
 import { runPipeline } from "../pipeline.js";
 import {
   EXIT,
@@ -22,6 +23,7 @@ import {
   fatalStatus,
   type Outcome,
   type Runtime,
+  reportedLine,
   reportUnbound,
   type Segments,
 } from "./frame.js";
@@ -99,11 +101,17 @@ async function* runIf(stage: PlannedIf, frame: Frame, runtime: Runtime): Segment
 }
 
 async function* runFor(stage: PlannedFor, frame: Frame, runtime: Runtime): Segments {
-  let values: ReturnType<typeof expandArguments>;
+  let values: ExpandedArguments;
+  const expansion = new ShellExpansion(
+    frame,
+    runtime,
+    { stdin: frame.io.stdin, stderr: frame.io.stderr, line: reportedLine(frame, stage.line) },
+    { last: null },
+  );
   try {
-    values = expandArguments(stage.words, runtime.fs, frame.shell.cwd, frame.shell.parameters());
+    values = await expandArguments(stage.words, expansion);
   } catch (error) {
-    if (!(error instanceof UnboundVariable)) throw error;
+    if (!(error instanceof ExpansionFailure)) throw error;
     reportUnbound(frame, stage.line, error);
     return { status: fatalStatus(frame), flow: EXIT };
   }

@@ -29,7 +29,7 @@ function planOne(source: string): SimplePipeline {
   return { ...first.pipeline, commands };
 }
 
-function names(pipeline: SimplePipeline): string[] {
+function names(pipeline: SimplePipeline): (string | null)[] {
   return pipeline.commands.map((command) => command.name);
 }
 
@@ -46,9 +46,11 @@ function text(args: readonly Argument[]): string[] {
         glob = true;
         literal += part.value;
         pattern += part.value;
-      } else {
+      } else if (part.kind === "literal" || part.kind === "brace" || part.kind === "sequence") {
         literal += part.value;
         pattern += globEscape(part.value);
+      } else {
+        throw new Error(`unexpected ${part.kind} part`);
       }
     }
     return glob ? `glob:${pattern}` : literal;
@@ -177,6 +179,7 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
         fd: 2,
         path: word("/dev/null"),
         append: false,
+        spelling: "/dev/null",
       },
     ]);
   });
@@ -197,6 +200,7 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
         fd: 1,
         path: word("out.txt"),
         append: false,
+        spelling: "out.txt",
       },
     ]);
     expect(planOne("echo hi >> out.txt").commands[0]?.redirections).toEqual([
@@ -205,6 +209,7 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
         fd: 1,
         path: word("out.txt"),
         append: true,
+        spelling: "out.txt",
       },
     ]);
   });
@@ -217,6 +222,7 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
         fd: 2,
         path: word("/dev/null"),
         append: false,
+        spelling: "/dev/null",
       },
     ]);
     expect(planOne("echo out 2>/dev/null 1>&2").commands[0]?.redirections).toEqual([
@@ -225,6 +231,7 @@ describe("R4 — redirections remain ordered descriptor bindings", () => {
         fd: 2,
         path: word("/dev/null"),
         append: false,
+        spelling: "/dev/null",
       },
       { kind: "duplicate", fd: 1, targetFd: 2 },
     ]);
@@ -268,11 +275,7 @@ describe("arguments", () => {
   });
 
   it("rejects parameters at static-only boundaries", () => {
-    expect(rejects("$COMMAND arg").message).toContain("command names");
-    expect(rejects("echo out > $TARGET").message).toContain("redirection targets");
     expect(rejects("echo out 1>&$TARGET").message).toContain("redirection targets");
-    expect(rejects("NAME=value echo out").construct).toBe("assignment");
-    expect(rejects("NAME=$VALUE echo out").construct).toBe("assignment");
   });
 });
 

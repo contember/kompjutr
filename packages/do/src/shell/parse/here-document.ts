@@ -1,11 +1,13 @@
 // Here-document bodies. A body starts on the line after its `<<` operator and
 // runs to a line equal to the delimiter; several on one line are read in
-// order. An unquoted delimiter admits `$NAME`, `${NAME}`, and the backslash
-// escapes Bash honours there; a quoted one keeps the body byte-for-byte.
+// order. An unquoted delimiter admits parameters, command substitutions, and
+// the backslash escapes Bash honours there; a quoted one keeps the body
+// byte-for-byte.
 
-import { ShellSyntaxError, type WordPart } from "./ast.js";
+import { ShellSyntaxError } from "./ast.js";
 import type { Token } from "./lexer.js";
-import { readParameter } from "./parameter.js";
+import type { Nest } from "./nesting.js";
+import { readQuoted } from "./word.js";
 
 export interface PendingHereDocument {
   readonly tokenIndex: number;
@@ -21,6 +23,7 @@ export function readHereDocumentBodies(
   start: number,
   pending: readonly PendingHereDocument[],
   tokens: Token[],
+  nest: Nest,
 ): number {
   let index = start;
   for (const document of pending) {
@@ -31,7 +34,7 @@ export function readHereDocumentBodies(
         kind: "Word",
         parts: document.quoted
           ? [{ kind: "SingleQuoted", value: body.text }]
-          : expandableParts(body.text, body.start),
+          : readQuoted(body.text, 0, nest, "heredoc").parts,
       },
       offset: document.offset,
     };
@@ -66,50 +69,4 @@ export function unterminatedHereDocument(document: PendingHereDocument): ShellSy
     `here-document delimited by end of input (wanted '${document.delimiter}')`,
     document.offset,
   );
-}
-
-function expandableParts(body: string, offset: number): WordPart[] {
-  const parts: WordPart[] = [];
-  let literal = "";
-  const flush = (): void => {
-    if (literal === "") return;
-    parts.push({ kind: "DoubleQuoted", value: literal });
-    literal = "";
-  };
-
-  let index = 0;
-  while (index < body.length) {
-    const char = body.charAt(index);
-    if (char === "\\") {
-      const escaped = body.charAt(index + 1);
-      if (escaped === "\n") {
-        index += 2;
-        continue;
-      }
-      if (escaped !== "" && "$`\\".includes(escaped)) {
-        literal += escaped;
-        index += 2;
-        continue;
-      }
-    }
-    if (char === "`" || body.startsWith("$(", index)) {
-      const construct = body.startsWith("$((", index)
-        ? "arithmetic expansion"
-        : "command substitution";
-      throw new ShellSyntaxError(construct, `${construct} is not supported`, offset + index);
-    }
-    if (char === "$") {
-      const parameter = readParameter(body, index, true);
-      if (parameter !== null) {
-        flush();
-        parts.push(parameter.part);
-        index = parameter.end;
-        continue;
-      }
-    }
-    literal += char;
-    index++;
-  }
-  flush();
-  return parts;
 }

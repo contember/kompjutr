@@ -44,6 +44,11 @@ export class TokenCursor {
     while (this.peek()?.type === "newline") this.#index++;
   }
 
+  /** A word token as it was typed. */
+  spelling(token: Extract<Token, { readonly type: "word" }>): string {
+    return this.source.slice(token.offset, token.end);
+  }
+
   /** The offset of the current token, or the end of the source. */
   offset(): number {
     return this.peek()?.offset ?? this.source.length;

@@ -115,6 +115,8 @@ export function fuseFindIntoSearch(
   const xargs = commands[1];
   if (find === undefined || xargs === undefined) return null;
   if (find.name !== "find" || xargs.name !== "xargs") return null;
+  // A prefix assignment changes what the stage's command sees; keep the stages.
+  if (find.assignments.length > 0 || xargs.assignments.length > 0) return null;
   if (hasOutputRedirection(find) || hasOutputRedirection(xargs) || hasInputRedirection(xargs))
     return null;
 
@@ -141,8 +143,10 @@ export function fuseFindIntoSearch(
   const search: PlannedCommand = {
     kind: "command",
     name: inner.name,
+    nameWord: null,
     line: xargs.line,
     args,
+    assignments: [],
     redirections: xargs.redirections,
   };
 
@@ -248,14 +252,13 @@ function argumentGlobPattern(argument: Argument): string | null {
   let pattern = "";
   let hasGlobPart = false;
   for (const part of argument.parts) {
-    if (part.kind === "parameter" || part.kind === "brace" || part.kind === "sequence") {
-      return null;
-    }
     if (part.kind === "glob") {
       hasGlobPart = true;
       pattern += part.value;
-    } else {
+    } else if (part.kind === "literal") {
       pattern += escapeGlob(part.value);
+    } else {
+      return null;
     }
   }
   return hasGlobPart ? pattern : null;

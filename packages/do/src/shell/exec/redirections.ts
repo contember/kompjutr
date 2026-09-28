@@ -1,9 +1,10 @@
 import type { PlannedRedirection } from "../plan/types.js";
-import { type Parameters, quotedText, resolve, single } from "./arguments.js";
+import { ExpansionFailure, expandTarget, expandText, resolve } from "./arguments.js";
 import { type ByteStream, close, isAsyncByteStream } from "./bytes.js";
 import type { DiagnosticPort } from "./compound/frame.js";
 import type { BoundedFs } from "./context.js";
 import { strerror } from "./errno.js";
+import { DROPPED, type ShellExpansion } from "./expansion/shell-expansion.js";
 import type {
   FileDestination,
   HeldChunk,
@@ -64,38 +65,78 @@ function protectUpstream(stream: ByteStream): ByteStream {
   })();
 }
 
-export function resolveRedirections(
+/**
+ * An unquoted target expanded to no field or several; Bash names it as typed,
+ * on the stderr bound so far: the shell's own, or dropped by `2>/dev/null`.
+ */
+export class AmbiguousRedirect extends Error {
+  constructor(
+    readonly spelling: string,
+    readonly dropped: boolean,
+  ) {
+    super(`${spelling}: ambiguous redirect`);
+  }
+}
+
+/**
+ * A target that could not expand. Bash ends the shell for an output target
+ * but only fails the command for an input target or here-text.
+ */
+export class TargetExpansionFailure extends Error {
+  constructor(
+    readonly failure: ExpansionFailure,
+    readonly fatal: boolean,
+  ) {
+    super(failure.message);
+  }
+}
+
+/**
+ * Binds descriptors left to right. A substitution in a target, and an
+ * ambiguous target, report to the stderr bound at that point; the planner
+ * admits only the shell's own stderr or `2>/dev/null` there.
+ */
+export async function resolveRedirections(
   planned: { readonly redirections: readonly PlannedRedirection[] },
-  fs: BoundedFs,
-  cwd: string,
-  parameters: Parameters,
-): ResolvedRedirections {
+  expansion: ShellExpansion,
+): Promise<ResolvedRedirections> {
   const output: OutputDestination = { kind: "output" };
   const diagnostic: OutputDestination = { kind: "diagnostic" };
   let stdin: StdinSource | null = null;
   let stdout: OutputDestination = output;
   let stderr: OutputDestination = diagnostic;
   const files: FileDestination[] = [];
+  const cwd = expansion.cwd;
 
   for (const redirection of planned.redirections) {
-    if (redirection.kind === "read") {
-      const path = resolve(cwd, single(redirection.path, fs, cwd, parameters));
-      stdin = path === "/dev/null" ? { kind: "text", text: "" } : { kind: "file", path };
-      continue;
-    }
-    if (redirection.kind === "text") {
-      const text = quotedText(redirection.text, parameters);
-      stdin = { kind: "text", text: redirection.newline ? `${text}\n` : text };
-      continue;
-    }
     if (redirection.kind === "duplicate") {
       const destination: OutputDestination = redirection.targetFd === 1 ? stdout : stderr;
       if (redirection.fd === 1) stdout = destination;
       else stderr = destination;
       continue;
     }
-    const operand = single(redirection.path, fs, cwd, parameters);
+    const bound: ShellExpansion = stderr.kind === "drop" ? expansion.reporting(DROPPED) : expansion;
+    if (redirection.kind === "text") {
+      const text = await expandOrFail(expandText(redirection.text, bound), false);
+      stdin = { kind: "text", text: redirection.newline ? `${text}\n` : text };
+      continue;
+    }
+    const operand: string | null = await expandOrFail(
+      expandTarget(redirection.path, bound),
+      redirection.kind === "write",
+    );
+    if (operand === null) throw new AmbiguousRedirect(redirection.spelling, stderr.kind === "drop");
+    if (operand === "") {
+      throw new RedirectionFailure(
+        operand,
+        Object.assign(new Error("no such file or directory"), { code: "ENOENT" }),
+      );
+    }
     const path = resolve(cwd, operand);
+    if (redirection.kind === "read") {
+      stdin = path === "/dev/null" ? { kind: "text", text: "" } : { kind: "file", path };
+      continue;
+    }
     const destination: OutputDestination =
       path === "/dev/null"
         ? { kind: "drop" }
@@ -112,6 +153,15 @@ export function resolveRedirections(
   }
 
   return { stdin, output, stdout, stderr, files };
+}
+
+async function expandOrFail<T>(expanded: Promise<T>, fatal: boolean): Promise<T> {
+  try {
+    return await expanded;
+  } catch (error) {
+    if (error instanceof ExpansionFailure) throw new TargetExpansionFailure(error, fatal);
+    throw error;
+  }
 }
 
 export async function openRedirectionFiles(

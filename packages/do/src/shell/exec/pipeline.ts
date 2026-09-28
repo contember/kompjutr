@@ -15,6 +15,7 @@ import {
   type Runtime,
   type Segments,
 } from "./compound/frame.js";
+import { PipeInput } from "./compound/stdin.js";
 import {
   isFilesystemError,
   redirectionDiagnostic,
@@ -46,7 +47,7 @@ export async function* runPipeline(
     runtime.truncated ||= settlements.some((stage) => stage.truncated());
     return { status, flow, compoundRan };
   };
-  let stream: ByteStream | null = frame.io.stdin?.borrow() ?? null;
+  let stream: ByteStream | null = null;
   let settled = false;
 
   try {
@@ -56,7 +57,10 @@ export async function* runPipeline(
       const stageFrame = multi ? stageCopy(frame, planned) : frame;
       if (stageFrame !== frame) copies.push(stageFrame);
 
-      const prepared = await prepareStage(planned, stageFrame, runtime);
+      // The shell's input is borrowed only after the first stage's substitutions have read theirs.
+      const pipe = index === 0 ? null : new PipeInput(stream, runtime.fs.retained);
+      const prepared = await prepareStage(planned, stageFrame, runtime, pipe ?? frame.io.stdin);
+      stream = pipe === null ? (frame.io.stdin?.borrow() ?? null) : pipe.take();
       if (prepared.kind === "abort") return finish(prepared.status, null);
       if (prepared.kind === "failed") {
         if (!multi) {

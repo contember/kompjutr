@@ -6,11 +6,23 @@
 // filesystem — expanding a glob, resolving a path — is *marked* here and
 // performed by the executor.
 
-import type { Connector } from "../parse/ast.js";
+import type { Connector, ParameterOperator } from "../parse/ast.js";
 
 export type ArgumentPart =
   | { readonly kind: "literal"; readonly value: string; readonly quoted: boolean }
   | { readonly kind: "parameter"; readonly name: string; readonly quoted: boolean }
+  /** `${#NAME}`. */
+  | { readonly kind: "length"; readonly name: string; readonly quoted: boolean }
+  /** `${NAME:-word}` and its siblings; `word` expands only when the operator selects it. */
+  | {
+      readonly kind: "conditional";
+      readonly name: string;
+      readonly operator: ParameterOperator;
+      readonly word: readonly FlatPart[];
+      readonly quoted: boolean;
+    }
+  /** `$( … )` or backquotes: the planned list, run by the executor in a subshell. */
+  | { readonly kind: "substitution"; readonly body: Plan; readonly quoted: boolean }
   | { readonly kind: "glob"; readonly value: string }
   /**
    * `{a,b}`: one generated word per alternative, before any other expansion.
@@ -26,6 +38,22 @@ export type ArgumentPart =
 
 /** A part of a word with no brace expression left: typed, or generated. */
 export type FlatPart = Exclude<ArgumentPart, { readonly kind: "brace" | "sequence" }>;
+
+/** A part as source-shaped text, for diagnostics; expansions stay unexpanded. */
+export function partSpelling(part: ArgumentPart): string {
+  switch (part.kind) {
+    case "parameter":
+      return `$${part.name}`;
+    case "length":
+      return `\${#${part.name}}`;
+    case "conditional":
+      return `\${${part.name}${part.operator}${part.word.map(partSpelling).join("")}}`;
+    case "substitution":
+      return "$(…)";
+    default:
+      return part.value;
+  }
+}
 
 /**
  * A validated sequence expression. `step` is a positive magnitude; the
@@ -51,21 +79,38 @@ export type BraceSequence =
  * One argument retained as ordered parts until its run environment is known.
  * The kind selects where a tilde prefix may start: an `assignment` is shaped
  * like `NAME=value` with no brace expansion and also expands after its `=`
- * and each `:`; a `here-string` also expands after each `:`.
+ * and each `:`; a `here-string` also expands after each `:`. A `declaration`
+ * is an `export NAME=value` operand: tilde rules of an assignment, and one
+ * field with no splitting or pathname expansion.
  */
 export interface Argument {
-  readonly kind: "word" | "assignment" | "here-string";
+  readonly kind: "word" | "assignment" | "declaration" | "here-string";
   readonly parts: readonly ArgumentPart[];
+}
+
+/** `NAME=value` or `NAME+=value` before a command, or standing alone. */
+export interface PlannedAssignment {
+  readonly name: string;
+  readonly append: boolean;
+  /** The whole word, `NAME=` included, as an `assignment` argument. */
+  readonly word: Argument;
 }
 
 /** One descriptor binding, retained in source order for left-to-right resolution. */
 export type PlannedRedirection =
-  | { readonly kind: "read"; readonly fd: 0; readonly path: Argument }
+  | {
+      readonly kind: "read";
+      readonly fd: 0;
+      readonly path: Argument;
+      /** The target as typed, for Bash's ambiguous-redirect diagnostic. */
+      readonly spelling: string;
+    }
   | {
       readonly kind: "write";
       readonly fd: 1 | 2;
       readonly path: Argument;
       readonly append: boolean;
+      readonly spelling: string;
     }
   | { readonly kind: "duplicate"; readonly fd: 1 | 2; readonly targetFd: 1 | 2 }
   /**
@@ -82,9 +127,17 @@ export type PlannedRedirection =
 
 export interface PlannedCommand {
   readonly kind: "command";
-  readonly name: string;
+  /**
+   * The literal command name. Null when the name word expands at run time
+   * (`nameWord`) or when the command is only assignments and redirections.
+   */
+  readonly name: string | null;
+  /** A name word with expansions; its first expanded field names the command. */
+  readonly nameWord: Argument | null;
   /** Arguments after the name. */
   readonly args: readonly Argument[];
+  /** Applied to the shell when there is no command, else to its environment only. */
+  readonly assignments: readonly PlannedAssignment[];
   readonly redirections: readonly PlannedRedirection[];
   /** The one-based source line, for Bash-shaped builtin diagnostics. */
   readonly line: number;
@@ -200,8 +253,8 @@ const TRAITS: ReadonlyMap<string, CommandTraits> = new Map([
   ["cd", DEFAULT_TRAITS],
 ]);
 
-export function traitsFor(name: string): CommandTraits {
-  return TRAITS.get(name) ?? DEFAULT_TRAITS;
+export function traitsFor(name: string | null): CommandTraits {
+  return (name === null ? undefined : TRAITS.get(name)) ?? DEFAULT_TRAITS;
 }
 
 export function isKnownCommand(name: string): boolean {

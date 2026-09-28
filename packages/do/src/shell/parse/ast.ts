@@ -3,8 +3,9 @@
 // 614 real agent command lines were parsed through a full bash grammar and
 // the node kinds it emitted were counted: of ~80 kinds, 11 covered 613 of
 // them. Those 11 are below, plus here-documents, which agents use to write
-// files, word expansions (tilde, braces), and the compound commands whose
-// execution is bounded: subshells, groups, `if`, and `for … in` (ADR-0027).
+// files, word expansions (tilde, braces, command substitution, the `${…}`
+// default operators), and the compound commands whose execution is bounded:
+// subshells, groups, `if`, and `for … in` (ADR-0027).
 // Everything else — arithmetic, `case`, `while`, process substitution,
 // functions, `[[ ]]` — is rejected by name rather than half-implemented,
 // because a construct that
@@ -22,8 +23,26 @@ export type WordPart =
   | { readonly kind: "DoubleQuoted"; readonly value: string }
   | { readonly kind: "Escaped"; readonly value: string }
   | { readonly kind: "Parameter"; readonly name: string; readonly quoted: boolean }
+  /** `${#NAME}`. */
+  | { readonly kind: "ParameterLength"; readonly name: string; readonly quoted: boolean }
+  /**
+   * `${NAME:-word}` and its siblings. `word` is read in the quote context of
+   * the expansion: inside double quotes every part of it is quoted.
+   */
+  | {
+      readonly kind: "ParameterOperation";
+      readonly name: string;
+      readonly operator: ParameterOperator;
+      readonly word: readonly WordPart[];
+      readonly quoted: boolean;
+    }
+  /** `$( … )` or a backquoted command, parsed when the word is read. */
+  | { readonly kind: "CommandSubstitution"; readonly body: Script; readonly quoted: boolean }
   /** An unquoted `*`, `?` or `[...]`. Quoted ones are `Literal`. */
   | { readonly kind: "Glob"; readonly value: string };
+
+/** A leading `:` also treats an empty value as unset. */
+export type ParameterOperator = "-" | ":-" | "+" | ":+" | "=" | ":=" | "?" | ":?";
 
 export interface Word {
   readonly kind: "Word";
@@ -43,6 +62,8 @@ export type Redirection =
       readonly fd: number;
       readonly op: RedirectionOp;
       readonly target: Word;
+      /** The target as typed, which Bash names in an ambiguous-redirect diagnostic. */
+      readonly spelling: string;
     }
   | {
       readonly kind: "Redirection";
@@ -160,10 +181,38 @@ export class ShellSyntaxError extends Error {
 /** Flatten a word to text. Only valid once globs are resolved or ignored. */
 export function wordText(word: Word): string {
   let text = "";
-  for (const part of word.parts) {
-    text += part.kind === "Parameter" ? `$${part.name}` : part.value;
-  }
+  for (const part of word.parts) text += partText(part);
   return text;
+}
+
+/** A part as text; an expansion is shown in its source shape, not expanded. */
+export function partText(part: WordPart): string {
+  switch (part.kind) {
+    case "Parameter":
+      return `$${part.name}`;
+    case "ParameterLength":
+      return `\${#${part.name}}`;
+    case "ParameterOperation":
+      return `\${${part.name}${part.operator}${part.word.map(partText).join("")}}`;
+    case "CommandSubstitution":
+      return "$(…)";
+    default:
+      return part.value;
+  }
+}
+
+/** True when any part expands a parameter or runs a command. */
+export function hasExpansion(word: Word): boolean {
+  return word.parts.some(isExpansion);
+}
+
+export function isExpansion(part: WordPart): boolean {
+  return (
+    part.kind === "Parameter" ||
+    part.kind === "ParameterLength" ||
+    part.kind === "ParameterOperation" ||
+    part.kind === "CommandSubstitution"
+  );
 }
 
 /** True when any part can match more than one path. */

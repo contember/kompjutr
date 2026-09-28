@@ -1,7 +1,7 @@
-// `set`, `break`, and `continue` change the shell that runs them, so they
-// are executor builtins rather than registry commands. Diagnostics follow
-// Bash's wording and exit statuses; options this shell does not implement
-// are refused by name.
+// `set`, `break`, `continue`, `export`, and `unset` change the shell that
+// runs them, so they are executor builtins rather than registry commands.
+// Diagnostics follow Bash's wording and exit statuses; options this shell does
+// not implement are refused by name.
 
 import { type ByteStream, encode } from "../bytes.js";
 import { type CommandContext, type CommandResult, result } from "../context.js";
@@ -141,8 +141,111 @@ function loopControl(kind: "break" | "continue"): ShellBuiltin {
   };
 }
 
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Leading option words; `--` ends them, and `-` alone is an operand. */
+function options(
+  context: CommandContext,
+  command: string,
+  usage: string,
+  accept: (letter: string) => "ok" | "refuse" | "invalid",
+):
+  | { readonly letters: ReadonlySet<string>; readonly operands: readonly string[] }
+  | BuiltinOutcome {
+  const letters = new Set<string>();
+  const argv = context.argv;
+  let index = 0;
+  for (; index < argv.length; index++) {
+    const arg = argv[index] ?? "";
+    if (arg === "--") {
+      index++;
+      break;
+    }
+    if (arg.length < 2 || !arg.startsWith("-")) break;
+    for (const letter of arg.slice(1)) {
+      const verdict = accept(letter);
+      if (verdict === "refuse") return refuse(context, `-${letter} is not supported`);
+      if (verdict === "invalid") {
+        located(context, `${command}: -${letter}: invalid option`);
+        context.diagnostic(encode(`${command}: usage: ${usage}\n`));
+        return done(2);
+      }
+      letters.add(letter);
+    }
+  }
+  return { letters, operands: argv.slice(index) };
+}
+
+/** Splitting uses a fixed default IFS, so a script may not change it. */
+function changesIfs(operands: readonly string[]): boolean {
+  return operands.some((operand) => /^IFS(\+?=|$)/.test(operand));
+}
+
+const exportBuiltin: ShellBuiltin = (context, frame) => {
+  const parsed = options(
+    context,
+    "export",
+    "export [-fn] [name[=value] ...] or export -p",
+    (letter) => (letter === "n" ? "ok" : letter === "p" || letter === "f" ? "refuse" : "invalid"),
+  );
+  if ("result" in parsed) return parsed;
+  if (parsed.operands.length === 0) {
+    return refuse(context, "listing exported variables is not supported");
+  }
+  if (changesIfs(parsed.operands)) return refuse(context, "changing IFS is not supported");
+  const unexport = parsed.letters.has("n");
+  const variables = frame.shell.variables;
+  let status = 0;
+  for (const operand of parsed.operands) {
+    const equals = operand.indexOf("=");
+    const target = equals === -1 ? operand : operand.slice(0, equals);
+    const append = equals !== -1 && target.endsWith("+");
+    const name = append ? target.slice(0, -1) : target;
+    if (!IDENTIFIER.test(name)) {
+      located(context, `export: \`${operand}': not a valid identifier`);
+      status = 1;
+      continue;
+    }
+    if (equals === -1) {
+      if (unexport) variables.unexport(name);
+      else variables.export(name);
+      continue;
+    }
+    const value = (append ? (variables.get(name) ?? "") : "") + operand.slice(equals + 1);
+    if (!unexport) {
+      variables.export(name, value);
+      continue;
+    }
+    variables.set(name, value);
+    variables.unexport(name);
+  }
+  return done(status);
+};
+
+const unsetBuiltin: ShellBuiltin = (context, frame) => {
+  const parsed = options(context, "unset", "unset [-f] [-v] [-n] [name ...]", (letter) =>
+    letter === "v" ? "ok" : letter === "f" || letter === "n" ? "refuse" : "invalid",
+  );
+  if ("result" in parsed) return parsed;
+  if (parsed.operands.length === 0) return refuse(context, "unset without names is not supported");
+  if (changesIfs(parsed.operands)) return refuse(context, "changing IFS is not supported");
+  let status = 0;
+  for (const name of parsed.operands) {
+    if (IDENTIFIER.test(name)) {
+      frame.shell.variables.unset(name);
+    } else if (parsed.letters.has("v")) {
+      located(context, `unset: \`${name}': not a valid identifier`);
+      status = 1;
+    }
+    // Without `-v`, Bash looks for a function of that name; there are none.
+  }
+  return done(status);
+};
+
 export const SHELL_BUILTINS: ReadonlyMap<string, ShellBuiltin> = new Map([
   ["set", set],
   ["break", loopControl("break")],
   ["continue", loopControl("continue")],
+  ["export", exportBuiltin],
+  ["unset", unsetBuiltin],
 ]);

@@ -18,11 +18,43 @@ import {
   type Word,
 } from "./ast.js";
 import { TokenCursor } from "./cursor.js";
-import { tokenize } from "./lexer.js";
+import { tokenize, tokenizeSubstitution } from "./lexer.js";
+import { checkNesting, NESTING_MAX, type Nest, tooDeep } from "./nesting.js";
 import { parseRedirection, parseSimpleCommand } from "./simple.js";
 
 export function parse(source: string): Script {
-  return new Parser(new TokenCursor(tokenize(source), source)).script();
+  const script = parseList(source, 0);
+  checkNesting(script);
+  return script;
+}
+
+function parseList(source: string, depth: number): Script {
+  return new Parser(new TokenCursor(tokenize(source, nestAt(depth)), source), depth).script();
+}
+
+/** Substitutions are parsed as their words are read, one level deeper each. */
+function nestAt(depth: number): Nest {
+  return {
+    depth,
+    enter: (offset) => {
+      if (depth >= NESTING_MAX) throw tooDeep(offset);
+      return nestAt(depth + 1);
+    },
+    substitution: (source, start) => {
+      const { tokens, end } = tokenizeSubstitution(source, start, nestAt(depth));
+      const first = tokens[0];
+      if (first?.type === "op" && first.value === "<") {
+        // Bash reads the file for `$(< file)`; a bare redirection here would print nothing.
+        throw new ShellSyntaxError(
+          "command substitution",
+          "`$(< file)` is not supported; use `$(cat file)`",
+          first.offset,
+        );
+      }
+      return { body: new Parser(new TokenCursor(tokens, source), depth).script(), end };
+    },
+    backquoted: (text) => parseList(text, depth),
+  };
 }
 
 /** Words that close a list: a list stops before them in command position. */
@@ -34,7 +66,15 @@ const REFUSED = new Set(["while", "until", "case", "select", "function", "time",
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 class Parser {
-  constructor(private readonly cursor: TokenCursor) {}
+  /** Enclosing compound commands and substitutions, for the stack bound. */
+  #depth: number;
+
+  constructor(
+    private readonly cursor: TokenCursor,
+    depth: number,
+  ) {
+    this.#depth = depth;
+  }
 
   script(): Script {
     const statements = this.#list();
@@ -113,6 +153,16 @@ class Parser {
 
   #command(): Command {
     const start = this.cursor.offset();
+    if (this.#depth >= NESTING_MAX) throw tooDeep(start);
+    this.#depth++;
+    try {
+      return this.#nestedCommand(start);
+    } finally {
+      this.#depth--;
+    }
+  }
+
+  #nestedCommand(start: number): Command {
     const line = this.cursor.lineAt(start);
     if (this.cursor.peekOperator() === "(") {
       this.cursor.advance();

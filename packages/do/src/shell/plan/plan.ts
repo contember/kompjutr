@@ -1,6 +1,7 @@
-// AST to plan. Planning is pure: globs, parameters, and loop words stay
-// marked here and are resolved by the executor. The query rewrites live in
-// `fusions.ts`.
+// AST to plan. Planning is pure: globs, parameters, substitutions, and loop
+// words stay marked here and are resolved by the executor; a substitution's
+// list is planned with the rest, so a refusal anywhere fails before anything
+// runs. The query rewrites live in `fusions.ts`.
 
 import type {
   Command,
@@ -11,21 +12,28 @@ import type {
   SimpleCommand,
   Statement,
   Word,
+  WordPart,
 } from "../parse/ast.js";
-import { ShellSyntaxError } from "../parse/ast.js";
-import { argumentPart, markBraces } from "./braces.js";
+import { hasExpansion, ShellSyntaxError } from "../parse/ast.js";
+import { markBraces } from "./braces.js";
 import { fuseFindIntoSearch, liftTrailingLimit } from "./fusions.js";
-import { refuseNamedTildes } from "./tilde.js";
 import type {
   Argument,
-  FlatPart,
   Plan,
+  PlannedAssignment,
   PlannedCommand,
   PlannedCompound,
   PlannedPipeline,
   PlannedRedirection,
   PlannedStage,
 } from "./types.js";
+import {
+  argumentPart,
+  assignmentArgument,
+  hereText,
+  isAssignmentShaped,
+  toArgument,
+} from "./words.js";
 
 export function planScript(script: Script): Plan {
   return planList(script.statements);
@@ -80,7 +88,7 @@ function planStage(command: Command): PlannedStage {
 }
 
 function planCompound(command: CompoundCommand): PlannedCompound {
-  const redirections = command.redirections.map(planRedirection);
+  const redirections = planRedirections(command.redirections);
   const line = command.line;
   switch (command.kind) {
     case "Subshell":
@@ -99,10 +107,11 @@ function planCompound(command: CompoundCommand): PlannedCompound {
         line,
       };
     case "For":
+      refuseIfs(command.name);
       return {
         kind: "for",
         name: command.name,
-        words: command.words.map(toArgument),
+        words: command.words.map((word) => toArgument(word, planScript)),
         body: planList(command.body),
         redirections,
         line,
@@ -111,22 +120,32 @@ function planCompound(command: CompoundCommand): PlannedCompound {
 }
 
 function planCommand(command: SimpleCommand): PlannedCommand {
-  const [nameWord, ...argWords] = command.words;
+  const assignments: PlannedAssignment[] = [];
+  let index = 0;
+  for (; index < command.words.length; index++) {
+    const word = command.words[index];
+    if (word === undefined || !isAssignmentShaped(word)) {
+      if (word !== undefined && index === assignments.length) refuseArrayAssignment(word);
+      break;
+    }
+    assignments.push(planAssignment(word));
+  }
+  const [nameWord, ...argWords] = command.words.slice(index);
+  const redirections = planRedirections(command.redirections);
+  const line = command.line;
   if (nameWord === undefined) {
-    throw new ShellSyntaxError("command", "missing command name", 0);
+    return {
+      kind: "command",
+      name: null,
+      nameWord: null,
+      args: [],
+      assignments,
+      redirections,
+      line,
+    };
   }
-  if (isAssignment(nameWord)) {
-    throw new ShellSyntaxError("assignment", "variable assignment is not supported", 0);
-  }
-  if (hasParameter(nameWord)) {
-    throw new ShellSyntaxError(
-      "parameter expansion",
-      "parameters in command names are not supported",
-      0,
-    );
-  }
-  const name = literalText(nameWord);
-  if (markBraces(nameWord.parts) !== null) {
+
+  if (markBraces(nameWord.parts, (part) => argumentPart(part, planScript)) !== null) {
     throw new ShellSyntaxError(
       "brace expansion",
       "brace expansion in command names is not supported",
@@ -140,14 +159,134 @@ function planCommand(command: SimpleCommand): PlannedCommand {
       0,
     );
   }
+  if (hasExpansion(nameWord)) {
+    return {
+      kind: "command",
+      name: null,
+      nameWord: toArgument(nameWord, planScript),
+      args: argWords.map((word) => toArgument(word, planScript)),
+      assignments,
+      redirections,
+      line,
+    };
+  }
 
+  const name = literalText(nameWord);
+  if (DECLARATIONS.has(name)) {
+    throw new ShellSyntaxError(`\`${name}\``, `\`${name}\` is not supported`, 0);
+  }
+  if (assignments.length > 0 && (name === "export" || name === "unset")) {
+    // Bash keeps some of these assignments and drops others, depending on the names.
+    throw new ShellSyntaxError("assignment", `assignments before \`${name}\` are not supported`, 0);
+  }
   return {
     kind: "command",
     name,
-    args: argWords.map(toArgument),
-    redirections: command.redirections.map(planRedirection),
-    line: command.line,
+    nameWord: null,
+    args: argWords.map((word) => toArgument(word, planScript, name === "export")),
+    assignments,
+    redirections,
+    line,
   };
+}
+
+/** Declaration builtins with attributes or scopes this shell does not model. */
+export const DECLARATIONS: ReadonlySet<string> = new Set([
+  "readonly",
+  "local",
+  "declare",
+  "typeset",
+]);
+
+function planAssignment(word: Word): PlannedAssignment {
+  const first = word.parts[0];
+  const match =
+    first?.kind === "Literal" ? /^([A-Za-z_][A-Za-z0-9_]*)(\+?)=/.exec(first.value) : null;
+  const name = match?.[1];
+  if (match === null || name === undefined) {
+    throw new ShellSyntaxError("assignment", "malformed assignment", 0);
+  }
+  refuseIfs(name);
+  return { name, append: match[2] === "+", word: assignmentArgument(word, planScript) };
+}
+
+/** `NAME[…]=value` assigns an array element in Bash; there are no arrays here. */
+function refuseArrayAssignment(word: Word): void {
+  const [first, second] = word.parts;
+  if (
+    first?.kind === "Literal" &&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(first.value) &&
+    second?.kind === "Glob" &&
+    second.value.startsWith("[")
+  ) {
+    const third = word.parts[2];
+    if (third?.kind === "Literal" && /^\+?=/.test(third.value)) {
+      throw new ShellSyntaxError("assignment", "array assignment is not supported", 0);
+    }
+  }
+}
+
+/** Splitting uses a fixed default IFS, so a script may not change it. */
+export function refuseIfs(name: string): void {
+  if (name === "IFS") {
+    throw new ShellSyntaxError("assignment", "changing IFS is not supported", 0);
+  }
+}
+
+/**
+ * Descriptor bindings in source order. A command substitution in a target
+ * runs while the redirections before it are bound, and Bash reports an
+ * ambiguous target there too, so both follow the stderr bound so far; only
+ * an unredirected stderr or `2>/dev/null` is modelled at that point.
+ */
+function planRedirections(redirections: readonly Redirection[]): PlannedRedirection[] {
+  const planned: PlannedRedirection[] = [];
+  let stderrRedirected = false;
+  for (const redirection of redirections) {
+    const target =
+      redirection.op === "<<"
+        ? redirection.body
+        : redirection.op === ">&"
+          ? null
+          : redirection.target;
+    const reports =
+      target !== null &&
+      (target.parts.some(isSubstitution) ||
+        (redirection.op !== "<<" && redirection.op !== "<<<" && target.parts.some(mayBeAmbiguous)));
+    if (stderrRedirected && reports) {
+      throw new ShellSyntaxError(
+        "redirection",
+        "a command substitution or unquoted expansion in a redirection target after a stderr redirection other than 2>/dev/null is not supported",
+        0,
+      );
+    }
+    const next = planRedirection(redirection);
+    planned.push(next);
+    if (next.kind === "duplicate" && next.fd === 2) stderrRedirected = true;
+    if (next.kind === "write" && next.fd === 2 && !isDevNull(next.path)) stderrRedirected = true;
+  }
+  return planned;
+}
+
+/** An unquoted expansion may yield no field or several. */
+function mayBeAmbiguous(part: WordPart): boolean {
+  return (
+    (part.kind === "Parameter" ||
+      part.kind === "ParameterLength" ||
+      part.kind === "ParameterOperation" ||
+      part.kind === "CommandSubstitution") &&
+    !part.quoted
+  );
+}
+
+function isSubstitution(part: WordPart): boolean {
+  if (part.kind === "CommandSubstitution") return true;
+  return part.kind === "ParameterOperation" && part.word.some(isSubstitution);
+}
+
+function isDevNull(path: Argument): boolean {
+  const [only, ...rest] = path.parts;
+  return rest.length === 0 && only?.kind === "literal" && only.value === "/dev/null";
 }
 
 function planRedirection(redirection: Redirection): PlannedRedirection {
@@ -174,58 +313,31 @@ function planRedirection(redirection: Redirection): PlannedRedirection {
     if (redirection.fd !== 0) {
       throw new ShellSyntaxError("redirection", `descriptor ${redirection.fd} is not supported`, 0);
     }
+    const word = redirection.op === "<<" ? redirection.body : redirection.target;
     return {
       kind: "text",
       fd: 0,
-      text: hereText(redirection),
+      text: hereText(word, redirection.op === "<<<", planScript),
       newline: redirection.op === "<<<",
     };
   }
 
-  if (hasParameter(redirection.target)) {
-    throw new ShellSyntaxError(
-      "parameter expansion",
-      "parameters in redirection targets are not supported",
-      0,
-    );
-  }
-  const target = toArgument(redirection.target);
+  const path = toArgument(redirection.target, planScript);
+  const spelling = redirection.spelling;
 
   if (redirection.op === "<") {
     if (redirection.fd !== 0) {
       throw new ShellSyntaxError("redirection", `descriptor ${redirection.fd} is not supported`, 0);
     }
-    return { kind: "read", fd: 0, path: target };
+    return { kind: "read", fd: 0, path, spelling };
   }
 
   const append = redirection.op === ">>";
-  if (redirection.fd === 2) return { kind: "write", fd: 2, path: target, append };
+  if (redirection.fd === 2) return { kind: "write", fd: 2, path, append, spelling };
   if (redirection.fd !== 1) {
     throw new ShellSyntaxError("redirection", `descriptor ${redirection.fd} is not supported`, 0);
   }
-  return { kind: "write", fd: 1, path: target, append };
-}
-
-/** A here-string admits tilde expansion but no brace or pathname expansion. */
-function hereText(redirection: Extract<Redirection, { readonly op: "<<" | "<<<" }>): Argument {
-  const word = redirection.op === "<<" ? redirection.body : redirection.target;
-  const parts = word.parts.map((part): FlatPart => {
-    if (part.kind === "Parameter") return { kind: "parameter", name: part.name, quoted: true };
-    const quoted = redirection.op === "<<" || (part.kind !== "Literal" && part.kind !== "Glob");
-    return { kind: "literal", value: part.value, quoted };
-  });
-  if (redirection.op === "<<") return { kind: "word", parts };
-  refuseNamedTildes(parts, "here-string");
-  return { kind: "here-string", parts };
-}
-
-function toArgument(word: Word): Argument {
-  const braces = markBraces(word.parts);
-  if (braces !== null) return { kind: "word", parts: braces };
-  const kind = isAssignment(word) ? "assignment" : "word";
-  const parts = word.parts.map(argumentPart);
-  refuseNamedTildes(parts, kind);
-  return { kind, parts };
+  return { kind: "write", fd: 1, path, append, spelling };
 }
 
 function startsWithTilde(word: Word): boolean {
@@ -236,19 +348,15 @@ function startsWithTilde(word: Word): boolean {
 function literalText(word: Word): string {
   let text = "";
   for (const part of word.parts) {
-    if (part.kind === "Parameter") {
+    if (
+      part.kind === "Parameter" ||
+      part.kind === "ParameterLength" ||
+      part.kind === "ParameterOperation" ||
+      part.kind === "CommandSubstitution"
+    ) {
       throw new ShellSyntaxError("parameter expansion", "parameter is not literal text", 0);
     }
     text += part.value;
   }
   return text;
-}
-
-function hasParameter(word: Word): boolean {
-  return word.parts.some((part) => part.kind === "Parameter");
-}
-
-function isAssignment(word: Word): boolean {
-  const first = word.parts[0];
-  return first?.kind === "Literal" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(first.value);
 }

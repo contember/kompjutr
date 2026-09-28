@@ -6,8 +6,8 @@
 // compound stage flattens them into its own lazily produced stdout, so a
 // downstream `head` that stops pulling stops the body as well.
 
-import type { PlannedCompound } from "../../plan/types.js";
-import type { LoopBudget, UnboundVariable } from "../arguments.js";
+import type { Plan, PlannedCompound } from "../../plan/types.js";
+import type { Captured, ExpansionFailure, LoopBudget } from "../arguments.js";
 import { type ByteStream, encode } from "../bytes.js";
 import type { BoundedFs, Command } from "../context.js";
 import type { ShellState } from "./state.js";
@@ -44,6 +44,20 @@ export interface Runtime {
   truncated: boolean;
   /** Runs a compound command's body; injected so the pipeline need not import the interpreter. */
   compound(stage: PlannedCompound, frame: Frame): Segments;
+  /** Runs a command substitution; injected for the same reason. */
+  substitute(body: Plan, frame: Frame, io: SubstitutionIO): Promise<Substituted>;
+}
+
+/** Where a command substitution reads and reports, bound by the command that expands it. */
+export interface SubstitutionIO {
+  readonly stdin: StdinCursor | null;
+  readonly stderr: DiagnosticPort;
+  /** The expanding command's line, which Bash names in diagnostics from inside. */
+  readonly line: number;
+}
+
+export interface Substituted extends Captured {
+  readonly status: number;
 }
 
 export interface Frame {
@@ -56,6 +70,11 @@ export interface Frame {
    * in everything such a command contains: `set -e` does not exit there.
    */
   readonly errexitIgnored: boolean;
+  /**
+   * Inside a command substitution, the line of the command that expanded it:
+   * Bash names that line in every diagnostic from inside.
+   */
+  readonly substitutionLine?: number;
 }
 
 /** A request to leave enclosing constructs, carried up to the one that consumes it. */
@@ -87,6 +106,11 @@ export function fatalStatus(frame: Frame): number {
 }
 
 /** Word expansion fails before redirections apply, so the shell's own stderr hears it. */
-export function reportUnbound(frame: Frame, line: number, error: UnboundVariable): void {
-  frame.io.stderr.writeBytes(encode(`bash: line ${line}: ${error.message}\n`));
+export function reportUnbound(frame: Frame, line: number, error: ExpansionFailure): void {
+  frame.io.stderr.writeBytes(encode(`bash: line ${reportedLine(frame, line)}: ${error.message}\n`));
+}
+
+/** The line a diagnostic names: the command's own, or the expanding command's. */
+export function reportedLine(frame: Frame, line: number): number {
+  return frame.substitutionLine ?? line;
 }

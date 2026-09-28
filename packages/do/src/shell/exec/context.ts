@@ -298,7 +298,10 @@ export interface CommandContext {
   readonly argv: readonly string[];
   /** The previous stage, or null when this command is first. */
   readonly stdin: ByteStream | null;
-  /** A frozen snapshot supplied for this run; built-ins do not expand it. */
+  /**
+   * The exported variables, frozen: the caller's snapshot as the script has
+   * exported, changed, or unset it, plus this command's prefix assignments.
+   */
   readonly env?: Readonly<Record<string, string>>;
   /** Status of the most recently selected pipeline in the current list. */
   readonly currentStatus: number;

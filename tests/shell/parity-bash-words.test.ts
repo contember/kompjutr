@@ -268,10 +268,6 @@ describe("word expansion refusals and bounds", () => {
     expect(nested.exitCode).toBe(0);
   });
 
-  it("refuses an ambiguous brace-expanded redirection target", async () => {
-    await refused("echo x > {c,d}", "ambiguous redirect");
-  });
-
   it("stops a huge sequence at the argv ceiling without materialising it", async () => {
     const started = Date.now();
     const run = await shell.run("true {1..100000000}");

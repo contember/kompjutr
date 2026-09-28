@@ -85,7 +85,7 @@ function* sequence(sequence: BraceSequence): Generator<FlatPart[]> {
   }
 }
 
-/** `printf("%0*jd", width, value)`: the sign counts toward the width. */
+/** Zero-padded to `width`, with the sign counting toward the width. */
 function padded(value: bigint, width: number): string {
   if (value < 0n) return `-${(-value).toString().padStart(width - 1, "0")}`;
   return value.toString().padStart(width, "0");

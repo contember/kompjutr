@@ -15,6 +15,7 @@ import { line } from "./bytes.js";
 import type { Frame, Outcome, Runtime, Segments } from "./compound/frame.js";
 import { runCompound, runList } from "./compound/run.js";
 import { ShellState } from "./compound/state.js";
+import { runSubstitution } from "./compound/substitution.js";
 import {
   BoundedFs,
   type Command,
@@ -64,6 +65,7 @@ export async function execute(plan: Plan, options: ExecOptions): Promise<ExecRes
     now: options.now ?? Date.now,
     truncated: false,
     compound: (stage, frame) => runCompound(stage, frame, runtime),
+    substitute: (body, frame, io) => runSubstitution(body, frame, io, runtime),
   };
   let shell: ShellState | null = null;
   let exitCode = 0;

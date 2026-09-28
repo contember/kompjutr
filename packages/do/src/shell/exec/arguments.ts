@@ -1,9 +1,21 @@
+// Word expansion for command arguments, redirection targets, assignment
+// values, and here-text: braces and tildes (sync), then parameters and
+// substitutions (async, `expansion/segments.ts`), then field splitting and
+// pathname expansion.
+
 import { join, normalize } from "../../fs/path.js";
-import { ShellSyntaxError } from "../parse/ast.js";
 import { expandTildes } from "../plan/tilde.js";
 import type { Argument, FlatPart } from "../plan/types.js";
 import { flatParts, generateWords, hasBraces } from "./braces.js";
 import { type BoundedFs, ShellLimitError } from "./context.js";
+import { fieldHasGlob, fieldPattern, fieldText, splitFields } from "./expansion/fields.js";
+import {
+  type Expansion,
+  homeOf,
+  joinSegments,
+  type Parameters,
+  resolveParts,
+} from "./expansion/segments.js";
 import { compileGlob, sqlGlobFor } from "./glob.js";
 import { utf8Bytes } from "./utf8.js";
 
@@ -13,21 +25,8 @@ const ARGUMENT_COUNT_MAX = 10_000;
 const LOOP_ITERATION_MAX = ARGUMENT_COUNT_MAX;
 const PATH_PAGE_MAX = 1_000;
 
-/** The values `$NAME` and `$?` expand to. */
-export interface Parameters {
-  /** A set parameter's value, or undefined when it is unset. */
-  value(name: string): string | undefined;
-  /** `set -u`: expanding an unset parameter fails. */
-  readonly nounset: boolean;
-}
-
-/** `set -u` met an unset parameter; the executor reports it as Bash does. */
-export class UnboundVariable extends Error {
-  constructor(readonly parameter: string) {
-    super(`${parameter}: unbound variable`);
-    this.name = "UnboundVariable";
-  }
-}
+export type { Captured, Expansion, Parameters } from "./expansion/segments.js";
+export { ExpansionFailure } from "./expansion/segments.js";
 
 /** Counts loop iterations across a whole run, subshells and pipeline stages included. */
 export class LoopBudget {
@@ -49,12 +48,11 @@ export interface ExpandedArguments {
   release(): void;
 }
 
-export function expandArguments(
+export async function expandArguments(
   args: readonly Argument[],
-  fs: BoundedFs,
-  cwd: string,
-  parameters: Parameters,
-): ExpandedArguments {
+  expansion: Expansion,
+): Promise<ExpandedArguments> {
+  const { fs, cwd } = expansion;
   const out: string[] = [];
   const releases: Array<() => void> = [];
   const push = (value: string): void => {
@@ -65,19 +63,29 @@ export function expandArguments(
   };
 
   try {
-    for (const word of words(args, parameters)) {
-      for (const field of expandWord(word, parameters)) {
-        const value = fieldText(field);
-        if (!fieldHasGlob(field)) {
-          push(value);
+    for (const word of words(args, expansion.parameters)) {
+      const held: Array<() => void> = [];
+      try {
+        const segments = await resolveParts(word.parts, expansion, held);
+        if (word.kind === "declaration") {
+          push(joinSegments(segments));
           continue;
         }
-        let matched = false;
-        for (const match of expandGlob(fieldPattern(field), fs, cwd)) {
-          push(match);
-          matched = true;
+        for (const field of splitFields(segments)) {
+          const value = fieldText(field);
+          if (!fieldHasGlob(field)) {
+            push(value);
+            continue;
+          }
+          let matched = false;
+          for (const match of expandGlob(fieldPattern(field), fs, cwd)) {
+            push(match);
+            matched = true;
+          }
+          if (!matched) push(value);
         }
-        if (!matched) push(value);
+      } finally {
+        for (const release of held) release();
       }
     }
   } catch (error) {
@@ -92,37 +100,33 @@ export function expandArguments(
   };
 }
 
-export function single(arg: Argument, fs: BoundedFs, cwd: string, parameters: Parameters): string {
-  const expanded = expandArguments([arg], fs, cwd, parameters);
+/** A redirection target's one field, or null when it expands to none or several. */
+export async function expandTarget(arg: Argument, expansion: Expansion): Promise<string | null> {
+  const expanded = await expandArguments([arg], expansion);
   try {
     const first = expanded.argv[0];
-    if (expanded.argv.length !== 1 || first === undefined) {
-      throw new ShellSyntaxError("redirection", "ambiguous redirect", 0);
-    }
-    return first;
+    return expanded.argv.length === 1 && first !== undefined ? first : null;
   } finally {
     expanded.release();
   }
 }
 
-/** Here-text as one string: tilde and parameter expansion, no splitting or pathname expansion. */
-export function quotedText(argument: Argument, parameters: Parameters): string {
-  let text = "";
-  for (const part of expandTildes(flatParts(argument.parts), argument.kind, homeOf(parameters))) {
-    text += part.kind === "parameter" ? parameterValue(parameters, part.name) : part.value;
+/**
+ * One string, as an assignment value or here-text expands: tilde, parameter,
+ * and command substitution, with no splitting or pathname expansion.
+ */
+export async function expandText(argument: Argument, expansion: Expansion): Promise<string> {
+  const parts = expandTildes(
+    flatParts(argument.parts),
+    argument.kind,
+    homeOf(expansion.parameters),
+  );
+  const held: Array<() => void> = [];
+  try {
+    return joinSegments(await resolveParts(parts, expansion, held));
+  } finally {
+    for (const release of held) release();
   }
-  return text;
-}
-
-function homeOf(parameters: Parameters): () => string {
-  return () => {
-    const value = parameters.value("HOME");
-    if (value === undefined) {
-      // Bash would fall back to the passwd entry, which this runtime does not have.
-      throw new ShellSyntaxError("tilde expansion", "tilde expansion needs HOME in the run env", 0);
-    }
-    return value;
-  };
 }
 
 function argumentLimit(): ShellLimitError {
@@ -137,100 +141,25 @@ function argumentLimit(): ShellLimitError {
  * words count against the argv ceiling as they arrive, so a generator that
  * yields only empty words is bounded too.
  */
-function* words(args: readonly Argument[], parameters: Parameters): Generator<readonly FlatPart[]> {
+function* words(
+  args: readonly Argument[],
+  parameters: Parameters,
+): Generator<{ readonly kind: Argument["kind"]; readonly parts: readonly FlatPart[] }> {
   let generated = 0;
   for (const arg of args) {
     if (!hasBraces(arg.parts)) {
-      yield expandTildes(flatParts(arg.parts), arg.kind, homeOf(parameters));
+      yield {
+        kind: arg.kind,
+        parts: expandTildes(flatParts(arg.parts), arg.kind, homeOf(parameters)),
+      };
       continue;
     }
     for (const word of generateWords(arg.parts)) {
       generated++;
       if (generated > ARGUMENT_COUNT_MAX) throw argumentLimit();
-      yield expandTildes(word, "word", homeOf(parameters));
+      yield { kind: "word", parts: expandTildes(word, "word", homeOf(parameters)) };
     }
   }
-}
-
-interface FieldPart {
-  readonly value: string;
-  readonly globActive: boolean;
-}
-
-type ExpandedField = readonly FieldPart[];
-
-function* expandWord(parts: readonly FlatPart[], parameters: Parameters): Generator<ExpandedField> {
-  let field: FieldPart[] = [];
-  let preserveEmpty = false;
-
-  for (const part of parts) {
-    if (part.kind === "literal") {
-      if (part.value !== "") field.push({ value: part.value, globActive: false });
-      preserveEmpty ||= part.quoted;
-      continue;
-    }
-    if (part.kind === "glob") {
-      field.push({ value: part.value, globActive: true });
-      continue;
-    }
-
-    const value = parameterValue(parameters, part.name);
-    if (part.quoted) {
-      if (value !== "") field.push({ value, globActive: false });
-      preserveEmpty = true;
-      continue;
-    }
-
-    let start = 0;
-    for (let index = 0; index <= value.length; index++) {
-      if (index < value.length && !isIfsWhitespace(value.charAt(index))) continue;
-      if (index > start) {
-        field.push({ value: value.slice(start, index), globActive: true });
-      }
-      if (index < value.length) {
-        if (field.length > 0 || preserveEmpty) yield field;
-        field = [];
-        preserveEmpty = false;
-        while (isIfsWhitespace(value.charAt(index + 1))) index++;
-      }
-      start = index + 1;
-    }
-  }
-
-  if (field.length > 0 || preserveEmpty) yield field;
-}
-
-function parameterValue(parameters: Parameters, name: string): string {
-  const value = parameters.value(name);
-  if (value !== undefined) return value;
-  if (parameters.nounset) throw new UnboundVariable(name);
-  return "";
-}
-
-function isIfsWhitespace(value: string): boolean {
-  return value === " " || value === "\t" || value === "\n";
-}
-
-function fieldText(field: ExpandedField): string {
-  let value = "";
-  for (const part of field) value += part.value;
-  return value;
-}
-
-function fieldPattern(field: ExpandedField): string {
-  let pattern = "";
-  for (const part of field) {
-    pattern += part.globActive ? part.value : escapeGlob(part.value);
-  }
-  return pattern;
-}
-
-function fieldHasGlob(field: ExpandedField): boolean {
-  return field.some((part) => part.globActive && /[*?[]/.test(part.value));
-}
-
-function escapeGlob(value: string): string {
-  return value.replace(/[*?[]/g, (match) => `[${match}]`);
 }
 
 /**

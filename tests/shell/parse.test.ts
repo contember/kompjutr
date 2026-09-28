@@ -88,9 +88,11 @@ describe("words and quoting", () => {
 
   it("reads a character class as one glob part", () => {
     const word = firstSimple(parse("ls file[0-9].txt").statements[0]).words[1];
-    expect(word?.parts.map((part) => (part.kind === "Parameter" ? part.name : part.value))).toEqual(
-      ["file", "[0-9]", ".txt"],
-    );
+    expect(word?.parts.map((part) => ("value" in part ? part.value : part.kind))).toEqual([
+      "file",
+      "[0-9]",
+      ".txt",
+    ]);
     // An unclosed `[` is an ordinary character, as in bash.
     expect(hasGlob(firstSimple(parse("ls a[b").statements[0]).words[1]!)).toBe(false);
   });
@@ -184,8 +186,6 @@ describe("redirections", () => {
 
 describe("rejections name the construct", () => {
   const cases: ReadonlyArray<[string, string]> = [
-    ["echo $(date)", "command substitution"],
-    ["echo `date`", "command substitution"],
     ["echo $((1+1))", "arithmetic expansion"],
     ["echo $1", "parameter expansion"],
     ["echo $@", "parameter expansion"],
@@ -198,7 +198,7 @@ describe("rejections name the construct", () => {
     ['echo "$#"', "parameter expansion"],
     ['echo "$!"', "parameter expansion"],
     ['echo "$-"', "parameter expansion"],
-    [`echo \${HOME:-fallback}`, "parameter expansion operator"],
+    [`echo \${HOME%fallback}`, "parameter expansion operator"],
     ["diff <(ls a) <(ls b)", "process substitution"],
     ["[[ -f x ]]", "conditional expression"],
     ["for f; do echo x; done", "`for`"],
@@ -277,9 +277,7 @@ describe("malformed input", () => {
     expect(error.message).toContain("wanted 'EOF'");
   });
 
-  it("rejects expansion inside an unquoted here-document", () => {
-    expect(rejects("cat <<EOF\n$(date)\nEOF").construct).toBe("command substitution");
-    expect(rejects("cat <<EOF\n`date`\nEOF").construct).toBe("command substitution");
+  it("rejects arithmetic inside an unquoted here-document", () => {
     expect(rejects("cat <<EOF\n$((1))\nEOF").construct).toBe("arithmetic expansion");
   });
 });

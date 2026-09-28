@@ -1,7 +1,8 @@
 // Brace expansion, marked. The structure is read here and generation is the
 // executor's job, where the argv ceiling bounds it.
 //
-// This follows Bash's `braces.c`, quirks included. A `{` closes at the first
+// This matches Bash's observable behavior, quirks included, each pinned by
+// parity-bash-words.test.ts. A `{` closes at the first
 // `}` reached at its own nesting level after a `,` or `..` at that level; a
 // `}` before that is literal and does not unwind the level. A matched body
 // with a comma anywhere, even quoted or nested, is split at its top-level
@@ -12,13 +13,13 @@
 // can form brace syntax, quoted parts and parameters cannot.
 
 import { ShellSyntaxError, type WordPart } from "../parse/ast.js";
-import type { ArgumentPart, BraceSequence, FlatPart } from "./types.js";
+import { type ArgumentPart, type BraceSequence, type FlatPart, partSpelling } from "./types.js";
 
 type Atom =
   | { readonly kind: "char"; readonly value: string; readonly glob: boolean }
   /**
-   * `quotedComma`: a quoted, not escaped, `,`, which Bash's body check still
-   * sees. `escapedBlank`: `\ `, whose raw character Bash reads as a blank.
+   * `quotedComma`: a quoted, not escaped, `,`, which still makes a body a
+   * comma list in Bash. `escapedBlank`: `\ `, which acts as a blank before `{`.
    */
   | {
       readonly kind: "part";
@@ -35,18 +36,16 @@ const SEQUENCE_CHARACTER = /^[0-9A-Za-z+.-]$/;
 const INTMAX = (1n << 63n) - 1n;
 const INTMIN = -(1n << 63n);
 
-export function argumentPart(part: WordPart): FlatPart {
-  if (part.kind === "Parameter") {
-    return { kind: "parameter", name: part.name, quoted: part.quoted };
-  }
-  if (part.kind === "Glob") return { kind: "glob", value: part.value };
-  return { kind: "literal", value: part.value, quoted: part.kind !== "Literal" };
-}
-
-/** The parts with brace expressions marked, or null when the word has none. */
-export function markBraces(parts: readonly WordPart[]): ArgumentPart[] | null {
+/**
+ * The parts with brace expressions marked, or null when the word has none.
+ * `convert` plans a part that cannot form brace syntax.
+ */
+export function markBraces(
+  parts: readonly WordPart[],
+  convert: (part: WordPart) => FlatPart,
+): ArgumentPart[] | null {
   if (!parts.some(mayOpenBrace)) return null;
-  const word = new BraceWord(toAtoms(parts));
+  const word = new BraceWord(toAtoms(parts, convert));
   const marked = word.mark(0, word.atoms.length, 0);
   if (!marked.some(isBraceNode)) return null;
   return marked;
@@ -60,7 +59,7 @@ function isBraceNode(part: ArgumentPart): boolean {
   return part.kind === "brace" || part.kind === "sequence";
 }
 
-function toAtoms(parts: readonly WordPart[]): Atom[] {
+function toAtoms(parts: readonly WordPart[], convert: (part: WordPart) => FlatPart): Atom[] {
   const atoms: Atom[] = [];
   for (const part of parts) {
     if (part.kind === "Literal" || part.kind === "Glob") {
@@ -71,7 +70,7 @@ function toAtoms(parts: readonly WordPart[]): Atom[] {
       const quotedComma =
         (part.kind === "SingleQuoted" || part.kind === "DoubleQuoted") && part.value.includes(",");
       const escapedBlank = part.kind === "Escaped" && BLANK.has(part.value);
-      atoms.push({ kind: "part", part: argumentPart(part), quotedComma, escapedBlank });
+      atoms.push({ kind: "part", part: convert(part), quotedComma, escapedBlank });
     }
   }
   return atoms;
@@ -82,10 +81,10 @@ function isChar(atom: Atom | undefined, value: string): boolean {
 }
 
 /**
- * Bash scans from each `{` with a floored level counter, which is quadratic
- * when repeated. Its walk is the same from any start, so the level-0
- * positions of every scan are chains of one "next position at or below this
- * level" forest, and each `{`'s close is two lookups along its chain.
+ * Scanning forward from each `{` for its close is quadratic when repeated.
+ * The scan visits the same level-0 positions from any start, so they form
+ * chains of one "next position at or below this level" forest, and each
+ * `{`'s close is two lookups along its chain.
  */
 class BraceWord {
   /** Next level-0 position of a scan through this one; `length` ends the chain. */
@@ -151,8 +150,9 @@ class BraceWord {
   }
 
   /**
-   * `textStart` is where Bash's current recursive call begins: a postamble,
-   * or the text after a matched `{` whose body did not expand.
+   * `textStart` is where the current run of text begins: the start, the text
+   * after an expanded brace, or the text after a matched `{` whose body did
+   * not expand.
    */
   mark(start: number, end: number, depth: number): ArgumentPart[] {
     const parts: ArgumentPart[] = [];
@@ -220,9 +220,7 @@ function textOf(atoms: readonly Atom[], start: number, end: number): string {
   for (let index = start; index < end; index++) {
     const atom = atoms[index];
     if (atom === undefined) continue;
-    if (atom.kind === "char") text += atom.value;
-    else if (atom.part.kind === "parameter") text += `$${atom.part.name}`;
-    else text += atom.part.value;
+    text += atom.kind === "char" ? atom.value : partSpelling(atom.part);
   }
   return text;
 }
@@ -298,7 +296,7 @@ function parseSequence(atoms: readonly Atom[], start: number, end: number): Brac
   return { kind: "character", start: first.charCodeAt(0), end: last.charCodeAt(0), step };
 }
 
-/** A decimal within `intmax_t`, as Bash's `legal_number` reads it. Out of range is not a sequence. */
+/** A decimal within a signed 64-bit range, as Bash accepts in a sequence. Out of range is not a sequence. */
 function parseInteger(text: string): bigint | null {
   if (!/^[+-]?[0-9]+$/.test(text)) return null;
   const value = BigInt(text);

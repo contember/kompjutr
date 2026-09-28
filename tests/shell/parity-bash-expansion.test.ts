@@ -147,12 +147,8 @@ describe("named parameter expansion boundaries", () => {
   });
 
   it.each([
-    ["$COMMAND arg", "command names"],
-    ["echo out > $TARGET", "redirection targets"],
     ["echo out 1>&$TARGET", "redirection targets"],
-    ["NAME=value echo out", "assignment"],
-    ["NAME=$VALUE echo out", "assignment"],
-    [`echo ${"$"}{NAME:-fallback}`, "operator"],
+    [`echo ${"$"}{NAME%fallback}`, "operator"],
   ])("rejects %s", async (source, message) => {
     const run = await shell.run(source, {
       env: { COMMAND: "echo", TARGET: "out", NAME: "set", VALUE: "value" },

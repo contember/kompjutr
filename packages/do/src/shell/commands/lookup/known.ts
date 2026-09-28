@@ -109,7 +109,7 @@ const KEYWORDS = new Set([
 
 // Builtins the executor runs itself (exec/compound/builtins.ts); they are
 // never registry entries, so the registry cannot report them.
-const EXECUTOR_BUILTINS = new Set(["set", "break", "continue"]);
+const EXECUTOR_BUILTINS = new Set(["set", "break", "continue", "export", "unset"]);
 
 export type Resolution =
   | { readonly kind: "keyword" }

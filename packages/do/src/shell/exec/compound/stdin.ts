@@ -70,3 +70,36 @@ export class StreamCursor implements StdinCursor {
     await close(this.source);
   }
 }
+
+/**
+ * The pipe into a later pipeline stage. A command substitution in the stage
+ * reads it first, as a Bash stage's substitution inherits the stage's stdin;
+ * the command gets the rest. Unread, the pipe passes through untouched.
+ */
+export class PipeInput implements StdinCursor {
+  #cursor: StreamCursor | null = null;
+
+  constructor(
+    private readonly stream: ByteStream | null,
+    private readonly retained: RetainedBudget,
+  ) {}
+
+  borrow(): ByteStream | null {
+    if (this.stream === null) return null;
+    this.#cursor ??= new StreamCursor(this.stream, this.retained, false);
+    return this.#cursor.borrow();
+  }
+
+  /** What the stage's command reads. */
+  take(): ByteStream | null {
+    const cursor = this.#cursor;
+    if (cursor === null) return this.stream;
+    return (async function* (): AsyncGenerator<Uint8Array, void, undefined> {
+      try {
+        yield* cursor.borrow();
+      } finally {
+        await cursor.close();
+      }
+    })();
+  }
+}

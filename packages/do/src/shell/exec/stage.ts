@@ -4,37 +4,42 @@
 // routing.
 
 import type { PlannedCompound, PlannedStage } from "../plan/types.js";
-import { type ExpandedArguments, expandArguments, UnboundVariable } from "./arguments.js";
-import { type ByteStream, close, empty, encode, isAsyncByteStream, line } from "./bytes.js";
+import { type ExpandedArguments, ExpansionFailure } from "./arguments.js";
+import { type ByteStream, close, isAsyncByteStream, line } from "./bytes.js";
 import { commandContext, destinationLimit, type StageLabel } from "./command-context.js";
-import { type BuiltinOutcome, SHELL_BUILTINS } from "./compound/builtins.js";
 import {
-  EXIT,
   type Flow,
   type Frame,
   fatalStatus,
   type Runtime,
+  reportedLine,
   reportUnbound,
   type StdinCursor,
 } from "./compound/frame.js";
 import { runRoutedCompound } from "./compound/routed.js";
 import { StreamCursor } from "./compound/stdin.js";
-import { type BoundedFs, type CommandContext, type CommandResult, result } from "./context.js";
+import type { BoundedFs, CommandResult } from "./context.js";
+import { ShellExpansion } from "./expansion/shell-expansion.js";
 import {
+  AmbiguousRedirect,
   isFilesystemError,
   openRedirectionFiles,
   readText,
   readWholeFile,
   redirectionDiagnostic,
   resolveRedirections,
+  TargetExpansionFailure,
 } from "./redirections.js";
 import type { HeldChunk, OutputDestination, ResolvedRedirections } from "./routing-types.js";
+import { commandTarget, expandCommandWords, type Runner } from "./simple.js";
 import { diagnosticsFor, rethrowAfterCommandCleanup, stageOutput } from "./stage-output.js";
 
-type Runner = (context: CommandContext, frame: Frame) => BuiltinOutcome | Promise<BuiltinOutcome>;
-
 type StageTarget =
-  | { readonly kind: "command"; readonly runner: Runner }
+  | {
+      readonly kind: "command";
+      readonly runner: Runner;
+      readonly env: Readonly<Record<string, string>> | undefined;
+    }
   | { readonly kind: "compound"; readonly stage: PlannedCompound };
 
 export interface StageSettlement {
@@ -69,48 +74,98 @@ const OPENING_WORDS = { subshell: "(", group: "{", if: "if", for: "for" } as con
 
 const NO_ARGUMENTS: ExpandedArguments = { argv: [], release: () => {} };
 
+/**
+ * Expands the stage's words, binds its redirections, and expands its
+ * assignments, in that order. `stdin` is what a command substitution in the
+ * stage reads: the shell's input for a first stage, else the pipe.
+ */
 export async function prepareStage(
   planned: PlannedStage,
   frame: Frame,
   runtime: Runtime,
+  stdin: StdinCursor | null,
 ): Promise<Preparation> {
-  const shell = frame.shell;
-  const parameters = shell.parameters();
-  let label: StageLabel;
-  let target: StageTarget;
+  const lineNumber = reportedLine(frame, planned.line);
+  const expansion = new ShellExpansion(
+    frame,
+    runtime,
+    { stdin, stderr: frame.io.stderr, line: lineNumber },
+    { last: null },
+  );
+  const failed = (error: ExpansionFailure, exit: boolean): Preparation => {
+    // An unexpandable word ends the stage's shell; Bash reports it on the shell's stderr.
+    reportUnbound(frame, planned.line, error);
+    return { kind: "failed", status: fatalStatus(frame), exit };
+  };
+
+  let name: string | null = null;
   let expanded = NO_ARGUMENTS;
-  if (planned.kind !== "command") {
-    label = { name: OPENING_WORDS[planned.kind], line: planned.line };
-    target = { kind: "compound", stage: planned };
-  } else {
-    label = { name: planned.name, line: planned.line };
-    target = { kind: "command", runner: runnerFor(planned.name, runtime) };
+  if (planned.kind === "command") {
     try {
-      expanded = expandArguments(planned.args, runtime.fs, shell.cwd, parameters);
+      const words = await expandCommandWords(planned, expansion);
+      name = words.name;
+      expanded = words;
     } catch (error) {
-      if (!(error instanceof UnboundVariable)) throw error;
-      // An unexpandable word ends the stage's shell.
-      reportUnbound(frame, planned.line, error);
-      return { kind: "failed", status: fatalStatus(frame), exit: true };
+      if (!(error instanceof ExpansionFailure)) throw error;
+      return failed(error, true);
     }
   }
+  const label: StageLabel = {
+    name: planned.kind === "command" ? (name ?? "") : OPENING_WORDS[planned.kind],
+    line: lineNumber,
+  };
 
+  let redirections: ResolvedRedirections;
   try {
-    const redirections = resolveRedirections(planned, runtime.fs, shell.cwd, parameters);
+    redirections = await resolveRedirections(planned, expansion);
     await openRedirectionFiles(redirections, runtime.fs);
-    return { kind: "ready", stage: { label, target, expanded, redirections } };
   } catch (error) {
     expanded.release();
-    if (error instanceof UnboundVariable) {
-      // A here-document that cannot expand fails its command, not the shell.
-      reportUnbound(frame, planned.line, error);
-      return { kind: "failed", status: fatalStatus(frame), exit: false };
+    if (error instanceof TargetExpansionFailure) return failed(error.failure, error.fatal);
+    if (error instanceof AmbiguousRedirect) {
+      if (!error.dropped)
+        frame.io.stderr.writeBytes(line(`bash: line ${lineNumber}: ${error.message}`));
+      return { kind: "abort", status: 1 };
     }
     if (isFilesystemError(error)) {
       frame.io.stderr.writeBytes(line(redirectionDiagnostic(error, label)));
       return { kind: "abort", status: 1 };
     }
     throw error;
+  }
+
+  if (planned.kind !== "command") {
+    return {
+      kind: "ready",
+      stage: { label, target: { kind: "compound", stage: planned }, expanded, redirections },
+    };
+  }
+  try {
+    const target = await commandTarget(planned, name, expansion, frame, runtime);
+    const words = expanded;
+    const owned: ExpandedArguments = {
+      argv: words.argv,
+      release: () => {
+        try {
+          target.release();
+        } finally {
+          words.release();
+        }
+      },
+    };
+    return {
+      kind: "ready",
+      stage: {
+        label,
+        target: { kind: "command", runner: target.runner, env: target.env },
+        expanded: owned,
+        redirections,
+      },
+    };
+  } catch (error) {
+    expanded.release();
+    if (!(error instanceof ExpansionFailure)) throw error;
+    return failed(error, true);
   }
 }
 
@@ -168,8 +223,9 @@ export async function startStage(
       frame,
       runtime,
       routed,
+      target.env,
     );
-    let outcome: BuiltinOutcome;
+    let outcome: Awaited<ReturnType<Runner>>;
     try {
       outcome = await target.runner(context, frame);
     } catch (error) {
@@ -191,6 +247,7 @@ export async function startStage(
       frame,
       runtime,
       routed,
+      frame.shell.variables.exported(),
     );
     let cursor: StdinCursor | null = null;
     let owned: StreamCursor | null = null;
@@ -231,27 +288,6 @@ export async function startStage(
       flow,
       ran,
     },
-  };
-}
-
-/** Registry commands report `exit` through `control`; executor builtins through a flow. */
-function runnerFor(name: string, runtime: Runtime): Runner {
-  const builtin = SHELL_BUILTINS.get(name);
-  if (builtin !== undefined) return builtin;
-  const command = runtime.commands.get(name);
-  if (command === undefined) return notFound(name);
-  return async (context) => {
-    const produced = await command(context);
-    const exits = produced.control?.kind === "exit" && produced.control.terminateRun;
-    return { result: produced, flow: exits ? EXIT : null };
-  };
-}
-
-/** Bash reports a missing command after binding the stage's redirections. */
-function notFound(name: string): Runner {
-  return (context) => {
-    context.diagnostic(encode(`bash: line ${context.line}: ${name}: command not found\n`));
-    return { result: result(empty(), 127), flow: null };
   };
 }
 
