@@ -13,6 +13,7 @@ import type {
 } from "../core/contracts.js";
 import { withGitMutationGuard } from "../core/mutation-guard.js";
 import { requireConfigPath, requireConfigSectionMove } from "../refs/config.js";
+import { expandRefName } from "../refs/ref-expansion.js";
 import { readRefLog } from "../refs/reflog.js";
 import type { HeadOwner } from "../refs/refs.js";
 import {
@@ -28,6 +29,11 @@ export abstract class SharedRepoRefStore extends SharedRepoObjectStore {
   getRef(name: string): string | null {
     if (name === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
     return this.refTable().getRef(name);
+  }
+
+  /** Full name of the stored ref a short name names, in git's lookup order. */
+  expandRefName(name: string): string | null {
+    return expandRefName(this.db, this.repoId, name);
   }
 
   setRef(name: string, target: string): void {

@@ -927,6 +927,21 @@ describe("currentBranch", () => {
   });
 });
 
+describe("branch and tag names", () => {
+  it("rejects an invalid branch or tag name before resolving its start point", () => {
+    const before = ws.repo.store.db.scalar<number>("SELECT count(*) FROM git_refs");
+    const invalid = expect.objectContaining({ code: "EINVAL", message: "ref name is invalid" });
+
+    expect(() =>
+      branch(ws.context, ws.repo, { name: "bad..name", startPoint: "missing" }),
+    ).toThrowError(invalid);
+    expect(() => tag(ws.context, ws.repo, { name: "bad..name", object: "missing" })).toThrowError(
+      invalid,
+    );
+    expect(ws.repo.store.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(before);
+  });
+});
+
 describe("tag", () => {
   it("creates, lists and deletes lightweight tags", () => {
     tag(ws.context, ws.repo, { name: "v2" });

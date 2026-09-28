@@ -31,7 +31,7 @@ export function branch(context: GitContext, repo: Repository, options: BranchOpt
 
 function branchOwned(context: GitContext, repo: Repository, options: BranchOptions): void {
   const full = branchRef(options.name);
-  const exists = refExists(repo, full);
+  const exists = repo.store.getRef(full) !== null;
   if (options.force !== true && exists) {
     throw new GitError("EBRANCHFAIL", `a branch named '${options.name}' already exists`);
   }
@@ -257,7 +257,7 @@ export function tag(context: GitContext, repo: Repository, options: TagOptions):
 
 function tagOwned(context: GitContext, repo: Repository, options: TagOptions): void {
   const full = tagRef(options.name);
-  const exists = refExists(repo, full);
+  const exists = repo.store.getRef(full) !== null;
   if (options.force !== true && exists) {
     throw new GitError("ETAGFAIL", `tag '${options.name}' already exists`);
   }
@@ -302,17 +302,6 @@ function branchRef(name: string): string {
 function tagRef(name: string): string {
   if (name === "") throw new GitError("ETAGFAIL", "a tag name is required");
   return `${TAGS}${name}`;
-}
-
-function refExists(repo: Repository, name: string): boolean {
-  const present = repo.store.db.scalar<unknown>(
-    "SELECT 1 FROM git_refs WHERE repo_id = ? AND name = ? LIMIT 1",
-    repo.store.repoId,
-    name,
-  );
-  if (present === undefined) return false;
-  if (present !== 1) throw new CorruptError("ref existence query returned invalid state");
-  return true;
 }
 
 function symbolicRef(ref: string): string {
