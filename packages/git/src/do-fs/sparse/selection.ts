@@ -1,4 +1,4 @@
-import type { SqlDatabase } from "@kompjutr/sqlite";
+import { jsonStringEncodedBytes, type SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../common/errors.js";
 import { int, RowShape, text } from "../../common/rows.js";
 import { comparePaths } from "../../common/streams.js";
@@ -9,7 +9,7 @@ import type {
   SelectedPathSpec,
   SelectedWorktreeFact,
 } from "../../store/core/contracts.js";
-import { jsonStringEncodedBytes, utf8ByteLength } from "../../store/core/json-pages.js";
+import { utf8ByteLength } from "../../store/core/json-pages.js";
 import type { IndexEntry } from "../../store/index.js";
 import { decodeSparseWorktreeRow, validatedSparseIndexEntry } from "./index-rows.js";
 import {

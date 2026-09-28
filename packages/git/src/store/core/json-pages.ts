@@ -2,8 +2,6 @@ import { CorruptError } from "../../common/errors.js";
 import { refTextBytes } from "../refs/ref-validation.js";
 import type { RefRow } from "./contracts.js";
 
-export { jsonStringEncodedBytes } from "@kompjutr/sqlite";
-
 export const JSON_ENCODER: { encode(input?: string): Uint8Array } = new TextEncoder();
 export const JSON_BATCH_ROWS = 2_048;
 export const JSON_BATCH_BYTES = 1_500_000;

@@ -1,3 +1,4 @@
+import { jsonStringEncodedBytes } from "@kompjutr/sqlite";
 import { isOid } from "../../common/bytes.js";
 import { GitError } from "../../common/errors.js";
 import { comparePaths } from "../../common/streams.js";
@@ -6,7 +7,6 @@ import type {
   SparseTreeLeaf,
   SparseWorkspaceRequest,
 } from "../../store/core/contracts.js";
-import { jsonStringEncodedBytes } from "../../store/core/json-pages.js";
 
 export const MAX_PATHS = 1_000;
 export const MAX_SPARSE_BINDING_BYTES = 8 * 1024 * 1024;
