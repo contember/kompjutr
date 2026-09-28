@@ -65,8 +65,11 @@ above the stored index's 8 KiB path limit. `rm` caps 10,000 pathspecs, 50,000 ro
 per stream and 10,000 derived directories. The filesystem removal binding
 still measures its actual JSON payload.
 
-Checkout removal, prune and tracker-seed paths still include modeled object
-charges. They are debt, not exceptions to this rule; see
+Checkout caps 10,000 conflict paths, 50,000 prune directories and 64
+exclusion roots. The initial checkout drops its tracker reseal, never the
+checkout, past 50,000 gitlinks or at a gitlink path above 8 KiB. The checkout
+removal list and structural sets still include modeled object charges. They
+are debt, not exceptions to this rule; see
 [backlog 97](../backlog/97-audit-checkout-modeled-byte-charges.md).
 
 **Benchmarks own the evidence.** Representative operations have deterministic

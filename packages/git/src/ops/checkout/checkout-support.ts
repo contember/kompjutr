@@ -1,4 +1,4 @@
-import { fromHex, utf8 } from "../../common/bytes.js";
+import { fromHex } from "../../common/bytes.js";
 import { GitError } from "../../common/errors.js";
 import { isTreeMode, type TreeEntry } from "../../common/objects.js";
 import { joinPath, relativeTo } from "../../common/paths.js";
@@ -41,13 +41,10 @@ export function matchesPaths(path: string, paths: string[] | undefined): boolean
 
 export const CHECKOUT_WINDOW_ROWS = 1_000;
 export const CHECKOUT_REMOVAL_BYTES = 16 * 1024 * 1024;
-export const CHECKOUT_PRUNE_BYTES = 16 * 1024 * 1024;
 export const CHECKOUT_PRUNE_PATHS = 50_000;
 export const CHECKOUT_PATH_FIXED_BYTES = 96;
 export const CHECKOUT_UNMERGED_PATHS = 10_000;
-export const CHECKOUT_UNMERGED_BYTES = 4 * 1024 * 1024;
 const CHECKOUT_EXCLUDE_ROOTS = 64;
-const CHECKOUT_EXCLUDE_BYTES = 1024 * 1024;
 
 export function checkoutInternalOptions(
   repo: Repository,
@@ -59,15 +56,10 @@ export function checkoutInternalOptions(
   }
   const absolute: string[] = [];
   const relative: string[] = [];
-  let retainedBytes = 0;
   for (const root of excludeRoots) {
     const path = relativeTo(repo.root, root);
     if (path === null || path === "") {
       throw new GitError("EINVAL", `checkout exclusion ${root} is not nested under ${repo.root}`);
-    }
-    retainedBytes += utf8.encode(root).byteLength + utf8.encode(path).byteLength;
-    if (retainedBytes > CHECKOUT_EXCLUDE_BYTES) {
-      throw new GitError("E2BIG", `checkout exclusions exceed ${CHECKOUT_EXCLUDE_BYTES} bytes`);
     }
     if (relative.includes(path)) continue;
     absolute.push(root);

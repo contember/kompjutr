@@ -12,10 +12,8 @@ import {
   boundedCheckoutSourceRows,
   boundedCheckoutWorktreeEntries,
   CHECKOUT_PATH_FIXED_BYTES,
-  CHECKOUT_PRUNE_BYTES,
   CHECKOUT_PRUNE_PATHS,
   CHECKOUT_REMOVAL_BYTES,
-  CHECKOUT_UNMERGED_BYTES,
   CHECKOUT_UNMERGED_PATHS,
   CHECKOUT_WINDOW_ROWS,
   matchesPaths,
@@ -35,19 +33,11 @@ export function discardUnmergedPaths(
 ): void {
   const paths: string[] = [];
   let previousUnmerged: string | null = null;
-  let retainedBytes = 0;
   for (const entry of boundedCheckoutSourceRows(index.indexScan(), maxSourceRows, "index")) {
     if (entry.stage === 0 || entry.path === previousUnmerged) continue;
     previousUnmerged = entry.path;
     if (paths.length >= CHECKOUT_UNMERGED_PATHS) {
       throw new GitError("E2BIG", `checkout conflicts exceed ${CHECKOUT_UNMERGED_PATHS} paths`);
-    }
-    retainedBytes += CHECKOUT_PATH_FIXED_BYTES + entry.path.length * 2;
-    if (retainedBytes > CHECKOUT_UNMERGED_BYTES) {
-      throw new GitError(
-        "E2BIG",
-        `checkout conflict paths exceed ${CHECKOUT_UNMERGED_BYTES} bytes`,
-      );
     }
     paths.push(entry.path);
   }
@@ -231,7 +221,6 @@ export function planEmptyDirectories(
 ): CheckoutPrunePlan {
   const directories = new Map<string, boolean>();
   const physicalRemovals = new Set<string>();
-  let retainedBytes = 0;
   for (const path of removed) {
     if (!preserved.has(path)) physicalRemovals.add(path);
     let slash = path.lastIndexOf("/");
@@ -242,13 +231,6 @@ export function planEmptyDirectories(
           throw new GitError(
             "E2BIG",
             `checkout directory-prune state exceeds ${CHECKOUT_PRUNE_PATHS} paths`,
-          );
-        }
-        retainedBytes += CHECKOUT_PATH_FIXED_BYTES + directory.length * 2;
-        if (retainedBytes > CHECKOUT_PRUNE_BYTES) {
-          throw new GitError(
-            "E2BIG",
-            `checkout directory-prune state exceeds ${CHECKOUT_PRUNE_BYTES} bytes`,
           );
         }
         directories.set(directory, false);

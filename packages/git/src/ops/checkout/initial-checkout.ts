@@ -1,10 +1,11 @@
 // Bounded create-only materialisation shared by clone and an eligible first
 // standalone checkout. Publication stays with the caller.
 
-import { fromHex } from "../../common/bytes.js";
+import { fromHex, utf8 } from "../../common/bytes.js";
 import { CorruptError } from "../../common/errors.js";
 import { checkoutStoreMutations } from "../../store/core/checkout-mutations-registry.js";
 import { type InitialStateSession, PACK_BLOB_BATCH_TARGET_BYTES } from "../../store/index.js";
+import { MAX_INDEX_PATH_BYTES } from "../../store/schema/schema.js";
 import type { SparseTrackerSeedEntry } from "../../store/sparse/capability.js";
 import type { GitContext, InitialWorktreeSession } from "../core/context.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
@@ -15,9 +16,8 @@ import { fileModeFor } from "../worktree/worktree.js";
 const INITIAL_WINDOW_ROWS = 1_000;
 const INITIAL_BLOB_BYTES = PACK_BLOB_BATCH_TARGET_BYTES;
 const INITIAL_SMALL_FILE_BYTES = 1024 * 1024;
-const INITIAL_TRACKER_BYTES = 4 * 1024 * 1024;
-const INITIAL_TRACKER_FIXED_BYTES = 64 * 1024;
-const INITIAL_TRACKER_ROW_BYTES = 128;
+// Overflow only drops the reseal; the checkout itself never refuses.
+const INITIAL_TRACKER_SEED_PATHS = 50_000;
 const INITIAL_INDEX_DIRTY = 1;
 const INITIAL_CHECKOUT_FALLBACK = Symbol("initial checkout requires ordinary materialisation");
 const initialTextDecoder = new TextDecoder();
@@ -108,16 +108,17 @@ function writeInitialCheckout(
 ): SparseTrackerSeedEntry[] | null {
   const window: TargetEntry[] = [];
   let trackerSeed: SparseTrackerSeedEntry[] | null = [];
-  let trackerSeedBytes = INITIAL_TRACKER_FIXED_BYTES;
   for (const entry of treeStream(repo, treeOid)) {
     if (entry.mode === "160000") {
       if (trackerSeed !== null) {
-        const retainedBytes = INITIAL_TRACKER_ROW_BYTES + entry.path.length * 2;
-        if (trackerSeedBytes > INITIAL_TRACKER_BYTES - retainedBytes) {
+        if (
+          trackerSeed.length >= INITIAL_TRACKER_SEED_PATHS ||
+          entry.path.length > MAX_INDEX_PATH_BYTES ||
+          utf8.encode(entry.path).length > MAX_INDEX_PATH_BYTES
+        ) {
           trackerSeed = null;
         } else {
           trackerSeed.push({ path: entry.path, flags: INITIAL_INDEX_DIRTY });
-          trackerSeedBytes += retainedBytes;
         }
       }
       continue;

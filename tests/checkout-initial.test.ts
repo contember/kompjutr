@@ -7,6 +7,12 @@ import type { Filesystem } from "../packages/do/src/fs/types.js";
 import { equalBytes, fromHex, utf8Decoder } from "../packages/git/src/common/bytes.js";
 import { GitError } from "../packages/git/src/common/errors.js";
 import {
+  MODE_COMMIT,
+  MODE_FILE,
+  serializeCommit,
+  serializeTree,
+} from "../packages/git/src/common/objects.js";
+import {
   INDEX_DIRTY,
   initializeIndexTracker,
   iterateIndexTrackerDirty,
@@ -216,6 +222,57 @@ describe("initial standalone checkout", () => {
     } finally {
       fixture.dispose();
     }
+  });
+
+  it("reseals up to 50,000 gitlinks and skips the reseal past the seed cap", () => {
+    const person = { name: "Seed", email: "seed@example.com", timestamp: 1, timezoneOffset: 0 };
+    const commitWithGitlinks = (runtime: InitialRepository, names: readonly string[]) => {
+      const readme = runtime.repo.store.write("blob", new TextEncoder().encode("readme\n"));
+      const tree = runtime.repo.store.write(
+        "tree",
+        serializeTree([
+          { mode: MODE_FILE, name: "README", oid: readme },
+          ...names.map((name) => ({ mode: MODE_COMMIT, name, oid: "1".repeat(40) })),
+        ]),
+      );
+      const commit = runtime.repo.store.write(
+        "commit",
+        serializeCommit({ tree, parent: [], author: person, committer: person, message: "g\n" }),
+      );
+      return { tree, commit };
+    };
+    const gitlinks = (count: number) =>
+      Array.from({ length: count }, (_, index) => `g${index.toString().padStart(5, "0")}`);
+
+    const atCap = makeInitialRepository();
+    const capped = commitWithGitlinks(atCap, gitlinks(50_000));
+    checkout(atCap.context, atCap.repo, atCap.worktree, { ref: capped.commit });
+    expect(atCap.repo.head().oid).toBe(capped.commit);
+    expect(readIndexTrackerState(atCap.db, atCap.repo.checkout.checkoutId)).toEqual({
+      available: true,
+      baselineTreeOid: capped.tree,
+    });
+    expect([...iterateIndexTrackerDirty(atCap.db, atCap.repo.checkout.checkoutId)]).toHaveLength(
+      50_000,
+    );
+
+    const overCap = makeInitialRepository();
+    const over = commitWithGitlinks(overCap, gitlinks(50_001));
+    checkout(overCap.context, overCap.repo, overCap.worktree, { ref: over.commit });
+    expect(overCap.repo.head().oid).toBe(over.commit);
+    expect(utf8Decoder.decode(overCap.worktree.readFile("/repo/README"))).toBe("readme\n");
+    expect(readIndexTrackerState(overCap.db, overCap.repo.checkout.checkoutId)).toEqual({
+      available: false,
+    });
+
+    const longPath = makeInitialRepository();
+    const long = commitWithGitlinks(longPath, ["g".repeat(8_193)]);
+    checkout(longPath.context, longPath.repo, longPath.worktree, { ref: long.commit });
+    expect(longPath.repo.head().oid).toBe(long.commit);
+    expect(utf8Decoder.decode(longPath.worktree.readFile("/repo/README"))).toBe("readme\n");
+    expect(readIndexTrackerState(longPath.db, longPath.repo.checkout.checkoutId)).toEqual({
+      available: false,
+    });
   });
 
   it("commits through the initial path when the existing repository root is empty", async () => {

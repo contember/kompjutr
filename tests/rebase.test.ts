@@ -474,6 +474,25 @@ describe("rebase lifecycle", () => {
     );
   });
 
+  it("starts and aborts with exclusions beyond the former checkout one-megabyte refusal", async () => {
+    const source = fixture();
+    const { upstream, original } = divergent(source, true);
+    const workspace = await imported(source);
+    const roots = Array.from(
+      { length: 64 },
+      (_, ordinal) => `/foreign-${ordinal}-${"x".repeat(17_000)}`,
+    );
+
+    expect(
+      rebase(workspace.context, workspace.repo, workspace.worktree, roots, { upstream }).outcome,
+    ).toBe("conflicted");
+    rebaseAbort(workspace.repo, workspace.worktree, roots);
+
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
+    expect(workspace.repo.head().oid).toBe(original);
+    expect(textAt(workspace, "shared.txt")).toBe("current\n");
+  });
+
   it("aborts a cold distinct-type rebase around untracked content at a relocation path", async () => {
     const source = fixture();
     source.write("target.txt", "target\n");
