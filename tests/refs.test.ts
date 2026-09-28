@@ -213,10 +213,66 @@ describe("branch", () => {
   it.each([
     ["invalid character", "topic\nother", "ref name contains an invalid character"],
     ["noncanonical UTF-16", "topic\udc00", "ref name is not canonical UTF-16"],
+    ["trailing high surrogate", "topic\ud800", "ref name is not canonical UTF-16"],
+    ["high surrogate before ASCII", "top\ud800ic", "ref name is not canonical UTF-16"],
   ])("validates an expand-ref %s before probing", (_case, name, message) => {
     expect(() => ws.repo.expandRef(name)).toThrowError(
       expect.objectContaining({ code: "EINVAL", message }),
     );
+  });
+
+  it("rejects a trailing high surrogate in ref text before writing", () => {
+    const main = ws.repo.resolveRef("refs/heads/main");
+    if (main === null) throw new Error("surrogate fixture is missing main");
+    const counts = () => [
+      ws.repo.store.db.scalar<number>("SELECT count(*) FROM git_refs"),
+      ws.repo.store.db.scalar<number>("SELECT count(*) FROM git_reflog_entries"),
+    ];
+    const before = counts();
+    const metadata = { actor: null, reason: "surrogate", timestamp: 1, timezoneOffset: 0 };
+
+    expect(() =>
+      updateRef(ws.context, ws.repo, { ref: "refs/heads/x\ud800", value: main }),
+    ).toThrowError(
+      expect.objectContaining({ code: "EINVAL", message: "ref name is not canonical UTF-16" }),
+    );
+    expect(() =>
+      ws.repo.mutateRefs(
+        { puts: [{ name: "refs/heads/y", target: "ref: refs/heads/x\ud800" }] },
+        metadata,
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "EINVAL",
+        message: "updated ref target is not canonical UTF-16",
+      }),
+    );
+    expect(() =>
+      ws.repo.mutateRefs(
+        { puts: [{ name: "refs/heads/y", target: main }] },
+        { ...metadata, reason: "reason\ud800" },
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: "EINVAL", message: "reflog reason is not canonical UTF-16" }),
+    );
+    expect(() =>
+      ws.repo.mutateRefs(
+        { puts: [{ name: "refs/heads/y", target: main }] },
+        { ...metadata, actor: { name: "name\ud800", email: "e@example.test" } },
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "EINVAL",
+        message: "reflog actor name is not canonical UTF-16",
+      }),
+    );
+    expect(counts()).toEqual(before);
+  });
+
+  it("accepts a supplementary scalar in a ref name", () => {
+    const main = ws.repo.resolveRef("refs/heads/main");
+    updateRef(ws.context, ws.repo, { ref: "refs/heads/\u{1F600}", value: "main" });
+    expect(ws.repo.resolveRef("refs/heads/\u{1F600}")).toBe(main);
   });
 
   it("reads a long raw HEAD and symbolic slice", () => {

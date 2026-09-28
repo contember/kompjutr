@@ -16,8 +16,9 @@ export function checkRefText(value: string, limit?: number): RefTextCheck {
       return { bytes, problem: "invalid-character" };
     }
     if (unit >= 0xd800 && unit <= 0xdbff) {
+      // Past the end, charCodeAt returns NaN, which fails no range comparison.
       const low = value.charCodeAt(index + 1);
-      if (low < 0xdc00 || low > 0xdfff) {
+      if (!(low >= 0xdc00 && low <= 0xdfff)) {
         return { bytes, problem: "noncanonical-utf16" };
       }
       index++;
