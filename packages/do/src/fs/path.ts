@@ -19,6 +19,7 @@ export function assertWellFormedPath(path: string, what = "path"): void {
 
 /** Lexical normalisation. Does NOT resolve symlinks — see `realpath`. */
 export function normalize(path: string): string {
+  if (isCanonicalPath(path)) return path;
   const absolute = path.startsWith("/") ? path : `/${path}`;
   const parts: string[] = [];
   for (const segment of absolute.split("/")) {
