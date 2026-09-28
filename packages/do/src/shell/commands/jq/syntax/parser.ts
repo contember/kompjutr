@@ -210,7 +210,8 @@ class Parser extends Structures {
         this.next();
         return { kind: "variable", name: token.text.slice(1), start: token.start, end: token.end };
       case "loc":
-        throw new JqRefusal("$__loc__ is not supported");
+        this.next();
+        return this.location(token);
       case "ident":
         return this.call();
       case "keyword":

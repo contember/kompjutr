@@ -213,7 +213,7 @@ export function indexStep(target: Frame, key: JqValue, optional: boolean): Frame
     if (optional && error instanceof JqError) return null;
     throw error;
   }
-  return { value, path: target.path === null ? null : [...target.path, key], at: value };
+  return { value, path: target.path === null ? null : target.path.append(key), at: value };
 }
 
 function* slice(
@@ -250,11 +250,11 @@ export function* iterate(target: Frame, optional: boolean): Results {
   if (isArray(container)) {
     for (let index = 0; index < container.length; index++) {
       const value = container[index] ?? null;
-      yield { value, path: tracked === null ? null : [...tracked, index], at: value };
+      yield { value, path: tracked === null ? null : tracked.append(index), at: value };
     }
   } else if (isObject(container)) {
     for (const [key, value] of container) {
-      yield { value, path: tracked === null ? null : [...tracked, key], at: value };
+      yield { value, path: tracked === null ? null : tracked.append(key), at: value };
     }
   } else if (!optional) {
     throw new JqError(`Cannot iterate over ${kindOf(container)} (${truncatedDump(container)})`);

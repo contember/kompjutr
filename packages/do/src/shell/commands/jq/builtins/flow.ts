@@ -31,7 +31,7 @@ export function registerFlow(natives: Natives): void {
     if (f === undefined) return;
     for (const path of paths(runtime, f, input.value)) {
       runtime.charge(arrayBytes(path.length));
-      yield valueFrame(input, [...path]);
+      yield valueFrame(input, path);
     }
   });
   natives.set("getpath/1", getpath);
@@ -107,7 +107,9 @@ const getpath: Native = function* (runtime, input, [path]) {
   for (const wanted of values(runtime, input, path)) {
     const value = getPath(input.value, wanted);
     if (input.path !== null && isArray(wanted) && identical(input.value, input.at)) {
-      yield { value, path: [...input.path, ...wanted], at: value };
+      let path = input.path;
+      for (const key of wanted) path = path.append(key);
+      yield { value, path, at: value };
     } else yield valueFrame(input, value);
   }
 };
@@ -193,9 +195,11 @@ function* steppedRange(
 }
 
 /**
- * recurse, recurse(f), recurse(f; cond). The resolver admits f only when it
- * is a chain of index and iterate steps, so every child is part of its
- * parent; the one way around that is a null reached again from null.
+ * recurse, recurse(f), recurse(f; cond), pre-order on an explicit stack of
+ * child iterators, so a 10,000-deep input costs no JavaScript stack. The
+ * resolver admits f only when it is a chain of index and iterate steps, so
+ * every child is part of its parent; the one way around that is a null
+ * reached again from null.
  */
 function* descend(
   runtime: Runtime,
@@ -203,24 +207,38 @@ function* descend(
   f: Closure | null,
   condition: Closure | null,
 ): Results {
-  yield input;
-  if (f === null) {
-    if (input.path !== null && !identical(input.value, input.at)) {
+  const children = (frame: Frame): Iterator<Frame> => {
+    if (f !== null) return runtime.evaluate(runtime, f.node, frame, f.env);
+    if (frame.path !== null && !identical(frame.value, frame.at)) {
       throw new JqError(
-        `Invalid path expression near attempt to iterate through ${truncatedDump(input.value, 30)}`,
+        `Invalid path expression near attempt to iterate through ${truncatedDump(frame.value, 30)}`,
       );
     }
-    for (const child of iterate(input, true)) yield* descend(runtime, child, null, null);
-    return;
-  }
-  for (const child of evaluate(runtime, f.node, input, f.env)) {
-    if (condition !== null && !admits(runtime, condition, child)) continue;
-    if (child.value === null && input.value === null) {
-      throw new JqRefusal(
-        "recurse(f) that maps null to null never terminates and is not supported",
-      );
+    return iterate(frame, true);
+  };
+  yield input;
+  const stack: Array<{ parent: Frame; children: Iterator<Frame> }> = [
+    { parent: input, children: children(input) },
+  ];
+  try {
+    for (let top = stack[0]; top !== undefined; top = stack[stack.length - 1]) {
+      const step = top.children.next();
+      if (step.done === true) {
+        stack.pop();
+        continue;
+      }
+      const child = step.value;
+      if (condition !== null && !admits(runtime, condition, child)) continue;
+      if (f !== null && child.value === null && top.parent.value === null) {
+        throw new JqRefusal(
+          "recurse(f) that maps null to null never terminates and is not supported",
+        );
+      }
+      yield child;
+      stack.push({ parent: child, children: children(child) });
     }
-    yield* descend(runtime, child, f, condition);
+  } finally {
+    for (const entry of stack) entry.children.return?.();
   }
 }
 

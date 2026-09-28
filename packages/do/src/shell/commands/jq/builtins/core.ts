@@ -171,6 +171,11 @@ const MATH: ReadonlyArray<readonly [string, (value: number) => number]> = [
   ["fabs", Math.abs],
   ["sqrt", Math.sqrt],
   ["log", Math.log],
+  ["log2", Math.log2],
+  ["log10", Math.log10],
+  ["exp", Math.exp],
+  ["exp10", (value) => 10 ** value],
+  ["trunc", Math.trunc],
 ];
 
 function charged(text: string, charge: Charge): string {
@@ -300,14 +305,25 @@ function flatten(value: JqValue, depth: JqValue, charge: Charge): JqValue {
   return out;
 }
 
+/** jq's `_flatten`, on an explicit stack so 10,000-deep arrays do not overflow. */
 function flattenInto(out: JqValue[], value: JqValue, depth: JqValue): void {
   const items = isArray(value) ? value : isObject(value) ? [...value.values()] : null;
-  if (items === null)
+  if (items === null) {
     throw new JqError(`Cannot iterate over ${kindOf(value)} (${truncatedDump(value)})`);
-  for (const item of items) {
-    if (isArray(item) && !equalValues(depth, 0)) {
-      if (!isNumber(depth)) throw typeError2(depth, 1, "cannot be subtracted");
-      flattenInto(out, item, numberValue(depth) - 1);
+  }
+  const stack: Array<{ items: readonly JqValue[]; index: number; depth: JqValue }> = [
+    { items, index: 0, depth },
+  ];
+  for (let top = stack[0]; top !== undefined; top = stack[stack.length - 1]) {
+    if (top.index >= top.items.length) {
+      stack.pop();
+      continue;
+    }
+    const item = top.items[top.index] ?? null;
+    top.index++;
+    if (isArray(item) && !equalValues(top.depth, 0)) {
+      if (!isNumber(top.depth)) throw typeError2(top.depth, 1, "cannot be subtracted");
+      stack.push({ items: item, index: 0, depth: numberValue(top.depth) - 1 });
     } else out.push(item);
   }
 }

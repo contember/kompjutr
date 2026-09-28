@@ -4,6 +4,7 @@
 
 import { comparePaths } from "../../../fs/path.js";
 import { sortedKeys } from "./dump.js";
+import { type Recursion, trampoline } from "./recursion.js";
 import {
   compareLiterals,
   isArray,
@@ -23,19 +24,23 @@ export function compareNumbers(a: JqNumber, b: JqNumber): number {
 }
 
 export function compareValues(a: JqValue, b: JqValue): number {
+  return trampoline(compareWalk(a, b));
+}
+
+function* compareWalk(a: JqValue, b: JqValue): Recursion<number> {
   const rankA = kindRank(a);
   const rankB = kindRank(b);
   if (rankA !== rankB) return rankA < rankB ? -1 : 1;
   if (isNumber(a) && isNumber(b)) {
-    if (Number.isNaN(numberValue(a))) return compareValues(null, b);
-    if (Number.isNaN(numberValue(b))) return compareValues(a, null);
+    if (Number.isNaN(numberValue(a))) return yield compareWalk(null, b);
+    if (Number.isNaN(numberValue(b))) return yield compareWalk(a, null);
     return compareNumbers(a, b);
   }
   if (typeof a === "string" && typeof b === "string") return Math.sign(comparePaths(a, b));
   if (isArray(a) && isArray(b)) {
     const shared = Math.min(a.length, b.length);
     for (let index = 0; index < shared; index++) {
-      const order = compareValues(a[index] ?? null, b[index] ?? null);
+      const order = yield compareWalk(a[index] ?? null, b[index] ?? null);
       if (order !== 0) return order;
     }
     return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
@@ -43,10 +48,10 @@ export function compareValues(a: JqValue, b: JqValue): number {
   if (a instanceof Map && b instanceof Map) {
     const keysA = sortedKeys(a);
     const keysB = sortedKeys(b);
-    const order = compareValues(keysA, keysB);
+    const order = yield compareWalk(keysA, keysB);
     if (order !== 0) return order;
     for (const key of keysA) {
-      const next = compareValues(a.get(key) ?? null, b.get(key) ?? null);
+      const next = yield compareWalk(a.get(key) ?? null, b.get(key) ?? null);
       if (next !== 0) return next;
     }
   }
@@ -54,20 +59,24 @@ export function compareValues(a: JqValue, b: JqValue): number {
 }
 
 export function equalValues(a: JqValue, b: JqValue): boolean {
+  return trampoline(equalWalk(a, b));
+}
+
+function* equalWalk(a: JqValue, b: JqValue): Recursion<boolean> {
   if (a === b) return true;
   if (kindRank(a) !== kindRank(b)) return false;
   if (isNumber(a) && isNumber(b)) return compareNumbers(a, b) === 0;
   if (isArray(a) && isArray(b)) {
     if (a.length !== b.length) return false;
     for (let index = 0; index < a.length; index++) {
-      if (!equalValues(a[index] ?? null, b[index] ?? null)) return false;
+      if (!(yield equalWalk(a[index] ?? null, b[index] ?? null))) return false;
     }
     return true;
   }
   if (a instanceof Map && b instanceof Map) {
     if (a.size !== b.size) return false;
     for (const [key, value] of a) {
-      if (!b.has(key) || !equalValues(value, b.get(key) ?? null)) return false;
+      if (!b.has(key) || !(yield equalWalk(value, b.get(key) ?? null))) return false;
     }
     return true;
   }
@@ -80,15 +89,29 @@ export function sameKind(a: JqValue, b: JqValue): boolean {
 }
 
 export function containsValue(a: JqValue, b: JqValue): boolean {
+  return trampoline(containsWalk(a, b));
+}
+
+function* containsWalk(a: JqValue, b: JqValue): Recursion<boolean> {
   if (!sameKind(a, b)) return false;
   if (a instanceof Map && b instanceof Map) {
     for (const [key, value] of b) {
-      if (!a.has(key) || !containsValue(a.get(key) ?? null, value)) return false;
+      if (!a.has(key) || !(yield containsWalk(a.get(key) ?? null, value))) return false;
     }
     return true;
   }
   if (isArray(a) && isArray(b)) {
-    return b.every((wanted) => a.some((item) => containsValue(item, wanted)));
+    for (const wanted of b) {
+      let found = false;
+      for (const item of a) {
+        if (yield containsWalk(item, wanted)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) return false;
+    }
+    return true;
   }
   if (typeof a === "string" && typeof b === "string") return a.includes(b);
   return equalValues(a, b);

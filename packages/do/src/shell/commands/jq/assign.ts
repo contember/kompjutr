@@ -12,6 +12,7 @@ import {
   type Env,
   type Frame,
   type JqPath,
+  PathStep,
   plain,
   type Results,
   type Runtime,
@@ -30,13 +31,13 @@ export function* paths(
   for (const frame of runtime.evaluate(
     runtime,
     closure.node,
-    { value, path: [], at: value },
+    { value, path: PathStep.EMPTY, at: value },
     closure.env,
   )) {
     if (!identical(frame.value, frame.at)) {
       throw new JqError(`Invalid path expression with result ${truncatedDump(frame.value, 30)}`);
     }
-    yield frame.path ?? [];
+    yield frame.path?.toArray() ?? [];
   }
 }
 

@@ -4,14 +4,44 @@
 // is how jq detects `path(sort | .[0])`.
 
 import type { RetainedBudget } from "../../exec/context.js";
+import { type Recursion, trampoline } from "./recursion.js";
 import type { Definition, Node } from "./syntax/ast.js";
 import { isArray, type JqArray, JqLiteral, type JqObject, type JqValue } from "./value.js";
 
 export type JqPath = readonly JqValue[];
 
+/**
+ * A tracked path as a chain of steps, so one step costs O(1) and a frame deep
+ * in a 10,000-level value does not copy the whole path.
+ */
+export class PathStep {
+  constructor(
+    readonly parent: PathStep | null,
+    readonly key: JqValue,
+  ) {}
+
+  static readonly EMPTY = new PathStep(null, null);
+
+  append(key: JqValue): PathStep {
+    return new PathStep(this, key);
+  }
+
+  toArray(): JqValue[] {
+    const keys: JqValue[] = [];
+    for (
+      let step: PathStep | null = this;
+      step !== null && step !== PathStep.EMPTY;
+      step = step.parent
+    ) {
+      keys.push(step.key);
+    }
+    return keys.reverse();
+  }
+}
+
 export interface Frame {
   readonly value: JqValue;
-  readonly path: JqPath | null;
+  readonly path: PathStep | null;
   readonly at: JqValue;
 }
 
@@ -144,18 +174,36 @@ export function forgetSize(value: object): void {
 
 /** An estimate of the memory a value holds, cached per container. */
 export function deepSize(value: JqValue): number {
+  const scalar = scalarSize(value);
+  return scalar ?? trampoline(sizeWalk(value));
+}
+
+function scalarSize(value: JqValue): number | null {
   if (value === null || typeof value === "boolean" || typeof value === "number") return 8;
   if (typeof value === "string") return 16 + 2 * value.length;
   if (value instanceof JqLiteral) return 32 + value.digits.length;
-  const cached = SIZES.get(value);
-  if (cached !== undefined) return cached;
+  return SIZES.get(value) ?? null;
+}
+
+function* sizeWalk(value: JqValue): Recursion<number> {
+  const scalar = scalarSize(value);
+  if (
+    scalar !== null ||
+    value === null ||
+    typeof value !== "object" ||
+    value instanceof JqLiteral
+  ) {
+    return scalar ?? 0;
+  }
   let size: number;
   if (isArray(value)) {
     size = 16;
-    for (const item of value) size += 8 + deepSize(item);
+    for (const item of value) size += 8 + (scalarSize(item) ?? (yield sizeWalk(item)));
   } else {
     size = 32;
-    for (const [key, item] of value) size += 48 + 2 * key.length + deepSize(item);
+    for (const [key, item] of value) {
+      size += 48 + 2 * key.length + (scalarSize(item) ?? (yield sizeWalk(item)));
+    }
   }
   SIZES.set(value, size);
   return size;

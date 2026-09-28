@@ -22,6 +22,8 @@ export interface Options {
   readonly files: readonly string[];
   readonly rawOutput: boolean;
   readonly join: boolean;
+  /** `--raw-output0`: a NUL after each output instead of a newline. */
+  readonly nul: boolean;
   readonly nullInput: boolean;
   readonly slurp: boolean;
   readonly rawInput: boolean;
@@ -57,7 +59,6 @@ const REFUSED = new Set([
   "binary",
   "help",
   "version",
-  "raw-output0",
   "unbuffered",
   "seq",
   "stream",
@@ -139,6 +140,7 @@ export function parseOptions(argv: readonly string[]): Options {
           index += 2;
           break;
         }
+        case "raw-output0":
         case "slurp":
         case "raw-output":
         case "join-output":
@@ -159,8 +161,9 @@ export function parseOptions(argv: readonly string[]): Options {
   return {
     program: program ?? ".",
     files,
-    rawOutput: flags.has("raw-output") || flags.has("join-output"),
-    join: flags.has("join-output"),
+    rawOutput: flags.has("raw-output") || flags.has("join-output") || flags.has("raw-output0"),
+    join: flags.has("join-output") || flags.has("raw-output0"),
+    nul: flags.has("raw-output0"),
     nullInput: flags.has("null-input"),
     slurp: flags.has("slurp"),
     rawInput: flags.has("raw-input"),

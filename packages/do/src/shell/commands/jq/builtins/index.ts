@@ -10,6 +10,7 @@ import type { Natives } from "./native.js";
 import { PRELUDE, REFUSED_BUILTINS } from "./prelude.js";
 import { registerRegex } from "./regex.js";
 import { registerStrings } from "./strings.js";
+import { registerStructure } from "./structure.js";
 
 let table: ReadonlyMap<string, Native | Definition> | null = null;
 
@@ -21,6 +22,7 @@ export function globals(): ReadonlyMap<string, Native | Definition> {
   registerStrings(natives);
   registerRegex(natives);
   registerDates(natives);
+  registerStructure(natives);
   const built = new Map<string, Native | Definition>(natives);
   for (const definition of parseDefinitions(PRELUDE)) {
     built.set(`${definition.name}/${definition.params.length}`, definition);

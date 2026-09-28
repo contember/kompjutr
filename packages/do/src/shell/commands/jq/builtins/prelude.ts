@@ -113,19 +113,29 @@ def ascii_downcase:
 def ascii_upcase:
   explode | map( if 97 <= . and . <= 122 then . - 32  else . end) | implode;
 def debug(msgs): (msgs | debug | empty), .;
+def halt_error: halt_error(5);
+def IN(s): any(s == .; .);
+def IN(src; s): any(src == s; .);
+def INDEX(stream; idx_expr):
+  reduce stream as $row ({}; .[$row|idx_expr|tostring] = $row);
+def INDEX(idx_expr): INDEX(.[]; idx_expr);
+def transpose: [range(0; map(length)|max // 0) as $i | [.[][$i]]];
+def pick(pathexps):
+  . as $in
+  | reduce path(pathexps) as $a (null;
+      setpath($a; $in|getpath($a)) );
 `;
 
 /** jq 1.8.1 builtins this shell declines, by name/arity. */
 export const REFUSED_BUILTINS = [
-  "IN/1 IN/2 INDEX/1 INDEX/2 JOIN/2 JOIN/3 JOIN/4 acos/0 acosh/0 asin/0 asinh/0 atan/0 atan2/2",
-  "atanh/0 bsearch/1 builtins/0 cbrt/0 combinations/0 combinations/1 copysign/2 cos/0 cosh/0",
-  "drem/2 erf/0 erfc/0 exp/0 exp10/0 exp2/0 expm1/0 fdim/2 finites/0 fma/3 fmax/2 fmin/2 fmod/2",
-  "format/1 frexp/0 fromstream/1 gamma/0 get_jq_origin/0 get_prog_origin/0 get_search_list/0",
-  "halt/0 halt_error/0 halt_error/1 hypot/2 input_line_number/0 isfinite/0 isnormal/0",
-  "j0/0 j1/0 jn/2 ldexp/2 lgamma/0 lgamma_r/0 localtime/0 log10/0 log1p/0 log2/0 logb/0",
-  "modf/0 modulemeta/0 nearbyint/0 nextafter/2 nexttoward/2 normals/0 pick/1 remainder/2 repeat/1",
-  "rint/0 scalb/2 scalbln/2 significand/0 sin/0 sinh/0 strflocaltime/1 tan/0 tanh/0 tgamma/0",
-  "toboolean/0 tostream/0 transpose/0 trunc/0 truncate_stream/1 until/2 walk/1 while/2 y0/0",
+  "JOIN/2 JOIN/3 JOIN/4 acos/0 acosh/0 asin/0 asinh/0 atan/0 atan2/2 atanh/0 bsearch/1",
+  "builtins/0 cbrt/0 combinations/0 combinations/1 copysign/2 cos/0 cosh/0 drem/2 erf/0",
+  "erfc/0 exp2/0 expm1/0 fdim/2 finites/0 fma/3 fmax/2 fmin/2 fmod/2 format/1 frexp/0",
+  "fromstream/1 gamma/0 get_jq_origin/0 get_prog_origin/0 get_search_list/0 hypot/2",
+  "input_line_number/0 isfinite/0 isnormal/0 j0/0 j1/0 jn/2 ldexp/2 lgamma/0 lgamma_r/0",
+  "localtime/0 log1p/0 logb/0 modf/0 modulemeta/0 nearbyint/0 nextafter/2 nexttoward/2",
+  "normals/0 remainder/2 repeat/1 rint/0 scalb/2 scalbln/2 significand/0 sin/0 sinh/0",
+  "strflocaltime/1 tan/0 tanh/0 tgamma/0 toboolean/0 truncate_stream/1 until/2 while/2 y0/0",
   "y1/0 yn/2",
 ]
   .join(" ")

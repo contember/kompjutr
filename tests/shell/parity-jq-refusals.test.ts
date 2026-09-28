@@ -62,10 +62,7 @@ describe("jq refusals", () => {
     ["jq -f prog.jq", "jq: option --from-file is not supported"],
     ["jq --slurpfile x a.json .", "jq: option --slurpfile is not supported"],
     ["jq --rawfile x a.json .", "jq: option --rawfile is not supported"],
-    ["jq --raw-output0 .", "jq: option --raw-output0 is not supported"],
     ["jq --unbuffered .", "jq: option --unbuffered is not supported"],
-    ["jq -n '$__loc__'", "jq: $__loc__ is not supported"],
-    ["jq -n '{$__loc__}'", "jq: $__loc__ is not supported"],
     ["jq -n 'import \"a\" as a; .'", "jq: modules (import, include, module) are not supported"],
     ["jq -n 'include \"a\"; .'", "jq: modules (import, include, module) are not supported"],
     ["jq -n '. as [$a] ?// $a | $a'", "jq: destructuring alternatives (?//) are not supported"],
@@ -73,11 +70,7 @@ describe("jq refusals", () => {
     ["jq -n 'until(. > 3; . + 1)'", "jq: until/2 is not supported"],
     ["jq -n '[limit(3; repeat(1))]'", "jq: repeat/1 is not supported"],
     ["jq -n 'input_line_number'", "jq: input_line_number/0 is not supported"],
-    ["jq -n '[1] | walk(.)'", "jq: walk/1 is not supported"],
-    ["jq -n '2 | IN(1, 2)'", "jq: IN/1 is not supported"],
-    ["jq -n '{} | tostream'", "jq: tostream/0 is not supported"],
     ["jq -n '[[1],[2]] | combinations'", "jq: combinations/0 is not supported"],
-    ["jq -n 'halt_error'", "jq: halt_error/0 is not supported"],
     ["jq -n '1 | significand'", "jq: significand/0 is not supported"],
     ["jq -n 'def f: f; f'", "jq: recursive function f/0 is not supported"],
     ["jq -n 'def f: def g: f; g; f'", "jq: recursive function f/0 is not supported"],
@@ -99,12 +92,15 @@ describe("jq refusals", () => {
     ["jq -n '[limit(3; range(infinite))]'", `jq: range ${UNREACHABLE}`],
     ["jq -n 'range(0; infinite; 1)'", `jq: range/3 ${UNREACHABLE}`],
     ['jq -n \'range("a"; "b"; "c")\'', "jq: range/3 over non-numbers is not supported"],
-    ["jq -n '@base32 \"\\(1)\"'", "jq: @base32 is not supported"],
-    ["jq -n '\"a\" | @urid'", "jq: @urid is not supported"],
     ['jq -n \'"a" | test("a++")\'', "jq: possessive regex quantifiers are not supported"],
-    ['jq -n \'"a" | test("a**")\'', "jq: repeated regex quantifiers are not supported"],
     ['jq -n \'"a" | test("(?>a)")\'', "jq: regex group (?> is not supported"],
-    ['jq -n \'"a" | test("(?i)A")\'', "jq: regex group (?i is not supported"],
+    ['jq -n \'"a" | test("x(?i)a")\'', "jq: regex group (?i is not supported"],
+    ['jq -n \'"a" | test("(?i:a)")\'', "jq: regex group (?i is not supported"],
+    ['jq -n \'"a" | test("(?m)a")\'', "jq: regex group (?m is not supported"],
+    ['jq -n \'"abc" | test("(?=b)")\'', "jq: regex lookaround is not supported"],
+    ['jq -n \'"abc" | test("(?<!b)c")\'', "jq: regex lookaround is not supported"],
+    ['jq -n \'"aa" | test("(a)\\\\1")\'', "jq: regex backreferences are not supported"],
+    ['jq -n \'"aa" | test("(?<x>a)\\\\k<x>")\'', "jq: regex backreferences are not supported"],
     ['jq -n \'"a" | test("\\\\h")\'', "jq: regex escape \\h is not supported"],
     ['jq -n \'"a" | test("a\\\\K")\'', "jq: regex escape \\K is not supported"],
     ['jq -n \'"a" | test("[a[b]]")\'', "jq: nested regex character classes are not supported"],
@@ -118,10 +114,6 @@ describe("jq refusals", () => {
       "jq: whitespace inside a regex character class with the x flag is not supported",
     ],
     ['jq -n \'"a" | test("a"; "l")\'', "jq: the l (longest match) regex flag is not supported"],
-    [
-      'jq -n \'"aaa" | [match("a*?"; "gn")]\'',
-      "jq: the n regex flag with a lazy quantifier or an alternation is not supported",
-    ],
     [
       'jq -n \'"ß" | test("SS"; "i")\'',
       "jq: case-insensitive matching of characters with multi-character case folds is not supported",
@@ -188,6 +180,86 @@ describe("jq bounds", () => {
       "jq -n 'reduce range(200000) as $i ([]; . + [$i]) | length, (reduce range(50000) as $i ({}; .[\"k\\($i)\"] = $i) | length)'",
     );
     expect(result).toEqual({ stdout: "200000\n50000\n", stderr: "", exitCode: 0 });
+  });
+});
+
+describe("jq regex matching is linear", () => {
+  // Oniguruma backtracks and gives up after its retry limit with
+  // "Regex failure: retry-limit-in-match over" (exit 5). JavaScript's RegExp
+  // has no limit, so these patterns would never finish. The Pike VM here
+  // returns the actual result instead: a documented divergence, since whether
+  // Oniguruma hits its limit depends on the input, not on the pattern.
+  it.each([
+    [`jq -n '"${"a".repeat(34)}" | test("(a*)*b")'`, "false\n"],
+    [`jq -n '"-" * 3000 | sub("(-+)+x"; "") | length'`, "3000\n"],
+    [`jq -n '"${"a".repeat(80)}!" | test("^(a|aa)+$")'`, "false\n"],
+    [`jq -n '"a" * 100000 | test("(a|aa)+b"), ([match("(a*)*"; "g")] | length)'`, "false\n2\n"],
+    [`jq -n '"x" * 20000 | [match("(x+x+)+y|(.*.*.*)z?"; "g")] | length'`, "2\n"],
+  ])("%s", async (source, stdout) => {
+    expect(await run(source)).toEqual({ stdout, stderr: "", exitCode: 0 });
+  });
+
+  it("charges the compiled program against the retained-memory limit", async () => {
+    const result = await run(`jq -n '"a" | test("(a{1000}){1000}")'`);
+    expect(result.stderr).toMatch(
+      /^kompjutr: jq value exceeds the 16777216-byte retained-memory limit\n$/,
+    );
+    expect(result.exitCode).toBe(2);
+  });
+});
+
+describe("jq deep nesting", () => {
+  // Input values and walks over them use explicit stacks (parity cases in
+  // parity-jq-structure.test.ts). What still recurses — the program parser —
+  // maps V8's stack overflow to a refusal instead of escaping shell.exec.
+  const LIMIT =
+    "jq: the program or value exceeds a JavaScript engine limit (Maximum call stack size exceeded)\n";
+  it.each([
+    `jq -n '${"(".repeat(20000)}1${")".repeat(20000)}'`,
+    `jq -n '${"[".repeat(20000)}${"]".repeat(20000)}'`,
+  ])("refuses a program nested 20,000 levels deep", async (source) => {
+    expect(await run(source)).toEqual({ stdout: "", stderr: LIMIT, exitCode: 2 });
+  });
+
+  it("walks 9,999-deep input without the JavaScript stack", async () => {
+    const deep = `${"[".repeat(9999)}${"]".repeat(9999)}\n`;
+    const result = await run(
+      "jq -c '([..] | length), (flatten | length), (. == .), contains(.), (walk(.) | length)' deep.json",
+      { "deep.json": deep },
+    );
+    expect(result).toEqual({ stdout: "9999\n0\ntrue\ntrue\n1\n", stderr: "", exitCode: 0 });
+  });
+
+  it("charges tostream's paths, which grow with the square of the depth", async () => {
+    const deep = `${"[".repeat(9999)}${"]".repeat(9999)}\n`;
+    const result = await run("jq -c '[tostream] | length' deep.json", { "deep.json": deep });
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toMatch(/retained-memory limit/);
+    expect(result.exitCode).toBe(2);
+  });
+});
+
+describe("jq input accounting", () => {
+  it("parses a 5 MB package-lock.json under the default budget", async () => {
+    const packages: Record<string, unknown> = {};
+    for (let index = 0; index < 10_500; index++) {
+      packages[`node_modules/@scope/package-name-${index}`] = {
+        version: `1.${index % 50}.${index % 7}`,
+        resolved: `https://registry.npmjs.org/@scope/package-name-${index}/-/package-name-${index}-1.0.0.tgz`,
+        integrity: `sha512-${"x".repeat(86)}==`,
+        dev: index % 3 === 0,
+        license: "MIT",
+        dependencies: { [`dep-${index % 100}`]: "^2.0.0", [`dep-${(index + 1) % 100}`]: "~1.2.3" },
+        engines: { node: ">=14" },
+      };
+    }
+    const text = JSON.stringify({ name: "app", lockfileVersion: 3, packages }, null, 2);
+    expect(text.length).toBeGreaterThan(5_000_000);
+    const result = await run(
+      "jq '.packages | length, ([.[] | select(.dev)] | length)' package-lock.json",
+      { "package-lock.json": `${text}\n` },
+    );
+    expect(result).toEqual({ stdout: "10500\n3500\n", stderr: "", exitCode: 0 });
   });
 });
 

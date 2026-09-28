@@ -8,7 +8,7 @@ import { type Command, type CommandContext, fail } from "../../exec/context.js";
 import { EMPTY_ENV, withVariable } from "./bindings.js";
 import { globals, REFUSED } from "./builtins/index.js";
 import { dumpInto, dumpString, quote, Writer } from "./dump.js";
-import { CompileError, JqError, JqRefusal } from "./errors.js";
+import { CompileError, JqError, JqHalt, JqRefusal } from "./errors.js";
 import { evaluate } from "./evaluate.js";
 import { InputReader } from "./input.js";
 import { OptionError, type Options, parseOptions, USAGE_HINT } from "./options.js";
@@ -62,7 +62,12 @@ function failure(context: CommandContext, error: unknown): ReturnType<Command> {
     return exited(3);
   }
   if (error instanceof JqRefusal) return fail(context, error.message, 2);
+  if (error instanceof RangeError) return fail(context, engineLimit(error), 2);
   throw error;
+}
+
+function engineLimit(error: RangeError): string {
+  return `the program or value exceeds a JavaScript engine limit (${error.message})`;
 }
 
 function exited(status: number): ReturnType<Command> {
@@ -143,6 +148,18 @@ async function* run(
       }
     }
   } catch (error) {
+    if (error instanceof JqHalt) {
+      halt(context, error);
+      setStatus(options.exitStatus ? Math.abs(error.status) : Math.max(error.status, 0));
+      return;
+    }
+    // V8's own limits (call stack, string or array length) are a real failure
+    // of this runtime rather than of the program; they must not escape the shell.
+    if (error instanceof RangeError) {
+      context.warn(engineLimit(error));
+      setStatus(2);
+      return;
+    }
     if (!(error instanceof JqRefusal)) throw error;
     context.warn(error.message);
     setStatus(2);
@@ -150,6 +167,13 @@ async function* run(
   }
   if (reader.failures > 0) result = SYSTEM;
   setStatus(exitStatus(options.exitStatus, result, last));
+}
+
+/** halt_error's report goes to stderr as is: a string raw, anything else as JSON. */
+function halt(context: CommandContext, error: JqHalt): void {
+  const report = error.report;
+  if (report === undefined || report === null) return;
+  context.diagnostic(utf8(typeof report === "string" ? report : `${dumpString(report)}\n`));
 }
 
 function exitStatus(exitStatusOption: boolean, result: number, last: number): number {
@@ -188,6 +212,14 @@ async function* process(
       if (step.done === true) return result;
       const value = step.value.value;
       if (options.rawOutput && typeof value === "string") {
+        if (!options.dump.ascii && options.nul && value.includes("\0")) {
+          context.diagnostic(
+            utf8(
+              `jq: error (at ${reader.position}): Cannot dump a string containing NUL with --raw-output0 option\n`,
+            ),
+          );
+          return ERROR;
+        }
         yield utf8(options.dump.ascii ? quote(value, true) : value);
         result = OK;
       } else {
@@ -195,6 +227,7 @@ async function* process(
         yield* serialize(value, options);
       }
       if (!options.join) yield utf8("\n");
+      if (options.nul) yield utf8("\0");
     }
   } finally {
     results.return();

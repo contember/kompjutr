@@ -4,6 +4,7 @@
 
 import { compareValues, equalValues } from "./compare.js";
 import { JqError } from "./errors.js";
+import { type Recursion, trampoline } from "./recursion.js";
 import {
   codePointLength,
   isArray,
@@ -157,20 +158,22 @@ export function getPath(root: JqValue, path: JqValue): JqValue {
 
 export function setPath(root: JqValue, path: JqValue, value: JqValue, charge: Charge): JqValue {
   if (!isArray(path)) throw new JqError("Path must be specified as an array");
-  return setFrom(root, path, 0, value, charge);
+  return setFrom(root, path, value, charge);
 }
 
-function setFrom(
-  root: JqValue,
-  path: JqArray,
-  at: number,
-  value: JqValue,
-  charge: Charge,
-): JqValue {
-  if (at === path.length) return value;
-  const key = path[at] ?? null;
-  const child = jvGet(root, key);
-  return jvSet(root, key, setFrom(child, path, at + 1, value, charge), charge);
+/** Reads down the path, then rebuilds each level bottom-up; no recursion over depth. */
+function setFrom(root: JqValue, path: JqArray, value: JqValue, charge: Charge): JqValue {
+  const levels: JqValue[] = [root];
+  let current = root;
+  for (const key of path) {
+    current = jvGet(current, key);
+    levels.push(current);
+  }
+  let result = value;
+  for (let at = path.length - 1; at >= 0; at--) {
+    result = jvSet(levels[at] ?? null, path[at] ?? null, result, charge);
+  }
+  return result;
 }
 
 export function deletePaths(root: JqValue, paths: JqValue, charge: Charge): JqValue {
@@ -183,15 +186,15 @@ export function deletePaths(root: JqValue, paths: JqValue, charge: Charge): JqVa
   }
   if (checked.length === 0) return root;
   if (checked[0]?.length === 0) return null;
-  return deleteSorted(root, checked, 0, charge);
+  return trampoline(deleteSorted(root, checked, 0, charge));
 }
 
-function deleteSorted(
+function* deleteSorted(
   root: JqValue,
   paths: readonly JqArray[],
   at: number,
   charge: Charge,
-): JqValue {
+): Recursion<JqValue> {
   let object = root;
   const keys: JqValue[] = [];
   for (let first = 0; first < paths.length; ) {
@@ -205,7 +208,7 @@ function deleteSorted(
         object = jvSet(
           object,
           key,
-          deleteSorted(child, paths.slice(first, last), at + 1, charge),
+          yield deleteSorted(child, paths.slice(first, last), at + 1, charge),
           charge,
         );
       }

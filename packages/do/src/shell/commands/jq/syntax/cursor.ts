@@ -2,6 +2,8 @@
 // bison's token names, jq's located error format, and the compile-error tally.
 
 import { CompileError } from "../errors.js";
+import type { JqValue } from "../value.js";
+import type { Node } from "./ast.js";
 import type { Token } from "./lexer.js";
 
 export class SyntaxFailure extends Error {
@@ -115,6 +117,21 @@ export class Cursor {
   keyword(text: string): boolean {
     const token = this.peek();
     return token.type === "keyword" && token.text === text;
+  }
+
+  /** `$__loc__`: the file and one-based line of the token. */
+  location(token: Token): Node {
+    let line = 1;
+    for (let index = 0; index < token.start; index++) {
+      if (this.source.charCodeAt(index) === 0x0a) line++;
+    }
+    return {
+      kind: "literal",
+      value: new Map<string, JqValue>([
+        ["file", "<top-level>"],
+        ["line", line],
+      ]),
+    };
   }
 
   expect(type: Token["type"], expecting: string | null = null): Token {

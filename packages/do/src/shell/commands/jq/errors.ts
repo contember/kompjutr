@@ -13,6 +13,17 @@ export class JqError extends Error {
   }
 }
 
+/** `halt` and `halt_error`: stop the whole run with a status; `try` does not catch it. */
+export class JqHalt extends Error {
+  constructor(
+    readonly status: number,
+    readonly report: JqValue | undefined,
+  ) {
+    super("halt");
+    this.name = "JqHalt";
+  }
+}
+
 export class JqRefusal extends Error {
   constructor(message: string) {
     super(message);

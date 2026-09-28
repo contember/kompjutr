@@ -9,6 +9,7 @@ import type { CommandContext } from "../../exec/context.js";
 import { resolve } from "../../exec/execute.js";
 import { streamFile } from "../read.js";
 import { JsonParser } from "./json-parse.js";
+import { deepSize } from "./runtime.js";
 import type { JqValue } from "./value.js";
 
 const CHUNK = 4095;
@@ -100,8 +101,7 @@ export class InputReader {
       if (step.kind === "error") return step;
       if (step.kind === "end") return this.#finish();
       if (step.kind === "value") {
-        if (this.#slurped === null)
-          return { kind: "value", value: step.value, release: this.#handOver() };
+        if (this.#slurped === null) return this.#value(step.value);
         this.#slurped.push(step.value);
       }
     }
@@ -119,23 +119,21 @@ export class InputReader {
     };
   }
 
+  /** Hands a parsed value over, reserving an estimate of its parsed size instead of its bytes. */
+  #value(value: JqValue): InputStep {
+    this.#handOver()();
+    const release = this.context.fs.retained.retain(deepSize(value), "jq input value");
+    return { kind: "value", value, release };
+  }
+
   #finish(): InputStep {
     this.#finished = true;
-    if (this.#slurped !== null)
-      return { kind: "value", value: this.#slurped, release: this.#handOver() };
+    if (this.#slurped !== null) return this.#value(this.#slurped);
     if (this.#rawSlurp !== null) {
-      return {
-        kind: "value",
-        value: DECODER.decode(join(this.#rawSlurp)),
-        release: this.#handOver(),
-      };
+      return this.#value(DECODER.decode(join(this.#rawSlurp)));
     }
     if (this.#rawLine !== null) {
-      return {
-        kind: "value",
-        value: DECODER.decode(join(this.#rawLine)),
-        release: this.#handOver(),
-      };
+      return this.#value(DECODER.decode(join(this.#rawLine)));
     }
     this.#handOver()();
     return { kind: "end" };
@@ -156,7 +154,7 @@ export class InputReader {
     }
     parts.push(bytes.subarray(0, bytes.length - 1));
     this.#rawLine = null;
-    return { kind: "value", value: DECODER.decode(join(parts)), release: this.#handOver() };
+    return this.#value(DECODER.decode(join(parts)));
   }
 
   /** jq_util_input_read_more: one fgets chunk, moving to the next file at EOF. */

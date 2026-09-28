@@ -4,6 +4,7 @@
 import { compareValues, equalValues } from "./compare.js";
 import { JqError, typeError2 } from "./errors.js";
 import { arrayBytes, type Charge, objectBytes, stringBytes } from "./paths.js";
+import { type Recursion, trampoline } from "./recursion.js";
 import { knownSize } from "./runtime.js";
 import type { BinaryOperator } from "./syntax/ast.js";
 import { isArray, isNumber, isObject, type JqObject, type JqValue, numberValue } from "./value.js";
@@ -78,7 +79,7 @@ function multiply(left: JqValue, right: JqValue, charge: Charge): JqValue {
   if (isNumber(left) && isNumber(right)) return numberValue(left) * numberValue(right);
   if (typeof left === "string" && isNumber(right)) return repeat(left, numberValue(right), charge);
   if (isNumber(left) && typeof right === "string") return repeat(right, numberValue(left), charge);
-  if (isObject(left) && isObject(right)) return deepMerge(left, right, charge);
+  if (isObject(left) && isObject(right)) return trampoline(deepMerge(left, right, charge));
   throw typeError2(left, right, "cannot be multiplied");
 }
 
@@ -92,12 +93,12 @@ function repeat(text: string, times: number, charge: Charge): JqValue {
   return text.repeat(count);
 }
 
-function deepMerge(left: JqObject, right: JqObject, charge: Charge): JqObject {
+function* deepMerge(left: JqObject, right: JqObject, charge: Charge): Recursion<JqObject> {
   const out = new Map(left);
   for (const [key, value] of right) {
     const existing = out.get(key);
     if (existing !== undefined && isObject(existing) && isObject(value)) {
-      out.set(key, deepMerge(existing, value, charge));
+      out.set(key, yield deepMerge(existing, value, charge));
     } else out.set(key, value);
   }
   charge(objectBytes(out.size));

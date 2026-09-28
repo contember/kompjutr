@@ -2,11 +2,9 @@
 // to `\0`, whichever table a format adds on top.
 
 import { dumpString } from "./dump.js";
-import { JqError, JqRefusal, typeError } from "./errors.js";
+import { JqError, typeError } from "./errors.js";
 import { type Charge, stringBytes } from "./paths.js";
 import { formatNumber, isArray, isNumber, type JqValue, numberValue } from "./value.js";
-
-const REFUSED = new Set(["base32", "base32d", "urid"]);
 
 export function formatValue(name: string, value: JqValue, charge: Charge): string {
   const text = format(name, value);
@@ -28,6 +26,8 @@ function format(name: string, value: JqValue): string {
       return escapeText(toText(value), HTML);
     case "uri":
       return uri(toText(value));
+    case "urid":
+      return uriDecode(toText(value));
     case "sh":
       return shell(value);
     case "base64":
@@ -35,7 +35,6 @@ function format(name: string, value: JqValue): string {
     case "base64d":
       return base64Decode(toText(value));
     default:
-      if (REFUSED.has(name)) throw new JqRefusal(`@${name} is not supported`);
       throw new JqError(`${name} is not a valid format`);
   }
 }
@@ -97,6 +96,44 @@ function uri(text: string): string {
         : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
   }
   return out;
+}
+
+/** jq's @urid: each %XX run forms one UTF-8 character, validated as a whole. */
+function uriDecode(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  const out: number[] = [];
+  const invalid = (): never => {
+    throw typeError(text, "is not a valid uri encoding");
+  };
+  const hex = (at: number): number => {
+    const digits = String.fromCharCode(bytes[at] ?? 0, bytes[at + 1] ?? 0);
+    if (!/^[0-9A-Fa-f]{2}$/.test(digits)) invalid();
+    return Number.parseInt(digits, 16);
+  };
+  for (let at = 0; at < bytes.length && bytes[at] !== 0; ) {
+    if (bytes[at] !== 0x25) {
+      out.push(bytes[at] ?? 0);
+      at++;
+      continue;
+    }
+    const sequence: number[] = [];
+    for (let count = 0; ; count++) {
+      const lead = sequence[0] ?? 0;
+      const more = count === 0 || (count < 4 && (lead >> 7) & 1 && (lead >> (7 - count)) & 1);
+      if (!more) break;
+      if (bytes[at] !== 0x25) invalid();
+      sequence.push(hex(at + 1));
+      at += 3;
+    }
+    const decoded = new TextDecoder("utf-8", { fatal: true });
+    try {
+      decoded.decode(Uint8Array.from(sequence));
+    } catch {
+      invalid();
+    }
+    out.push(...sequence);
+  }
+  return new TextDecoder().decode(Uint8Array.from(out));
 }
 
 function shell(value: JqValue): string {

@@ -80,7 +80,10 @@ export abstract class Structures extends Cursor {
       if (this.punct(":")) return { key: variable, value: this.dictValue() };
       return { key: { kind: "literal", value: token.text.slice(1) }, value: variable };
     }
-    if (token.type === "loc") throw new JqRefusal("$__loc__ is not supported");
+    if (token.type === "loc") {
+      this.next();
+      return { key: { kind: "literal", value: "__loc__" }, value: this.location(token) };
+    }
     if (token.type === "string-start" || token.type === "format") {
       const key = this.string();
       return {
