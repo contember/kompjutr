@@ -34,6 +34,7 @@ import {
 import { driveRebase } from "./rebase-lifecycle-drive.js";
 import { requirePendingStep, stepIdentities } from "./rebase-lifecycle-step.js";
 import type {
+  RebaseBaselineProof,
   RebaseContinueOptions,
   RebaseLifecycleResult,
   RebaseStartOptions,
@@ -100,7 +101,8 @@ export function rebase(
     }).actor;
     const state = initialState(head, plan.upstreamOid, plan.baseOid, actor);
     writeOperationJournalOwned(repo.checkout, state, plan.steps, []);
-    return { relation: plan.relation, oid: plan.upstreamOid };
+    const proof: RebaseBaselineProof = { parentOid: plan.upstreamOid };
+    return { relation: plan.relation, oid: plan.upstreamOid, proof };
   });
   if (started.relation === "up-to-date") return { outcome: "up-to-date", oid: started.oid };
   if (started.relation === "fast-forward") {
@@ -112,7 +114,7 @@ export function rebase(
       fastForward: true,
     };
   }
-  return driveRebase(context, repo, worktree, options, exclusions);
+  return driveRebase(context, repo, worktree, options, exclusions, started.proof);
 }
 
 export function rebaseContinue(
@@ -124,12 +126,12 @@ export function rebaseContinue(
 ): RebaseLifecycleResult {
   const exclusions = rebaseExclusions(repo, excludeRoots);
   requireSharedMutationScope(repo.store.db, worktree);
-  repo.store.db.transactionSync(() => {
+  const proof = repo.store.db.transactionSync((): RebaseBaselineProof => {
     const journal = requireRebaseCursor(repo);
     requireOriginalHead(repo, journal.state);
     if (journal.state.phase === "running") {
       requireCurrentBaseline(repo, worktree, journal.state, exclusions);
-      return;
+      return { parentOid: journal.state.currentParentOid };
     }
     const step = requirePendingStep(journal);
     if (repo.checkout.hasConflicts()) {
@@ -142,7 +144,7 @@ export function rebaseContinue(
       preflightBaselineTree(repo, currentTree);
       hardMaterializeTree(repo, worktree, currentTree, currentTree, exclusions);
       advance(repo, journal, "skipped", null);
-      return;
+      return { parentOid: journal.state.currentParentOid };
     }
     const source = repo.readCommit(step.sourceOid);
     const identities = stepIdentities(context, repo, source, options);
@@ -152,8 +154,9 @@ export function rebaseContinue(
       identities,
     });
     advance(repo, journal, "applied", result.oid, identities.committer);
+    return { parentOid: result.oid };
   });
-  return driveRebase(context, repo, worktree, options, exclusions);
+  return driveRebase(context, repo, worktree, options, exclusions, proof);
 }
 
 export function rebaseSkip(
@@ -165,7 +168,7 @@ export function rebaseSkip(
 ): RebaseLifecycleResult {
   const exclusions = rebaseExclusions(repo, excludeRoots);
   requireSharedMutationScope(repo.store.db, worktree);
-  repo.store.db.transactionSync(() => {
+  const proof = repo.store.db.transactionSync((): RebaseBaselineProof => {
     const journal = requireRebaseCursor(repo);
     requireOriginalHead(repo, journal.state);
     if (journal.state.phase !== "conflicted") {
@@ -175,8 +178,9 @@ export function rebaseSkip(
     preflightBaselineTree(repo, currentTree);
     hardMaterializeTree(repo, worktree, currentTree, currentTree, exclusions);
     advance(repo, journal, "skipped", null);
+    return { parentOid: journal.state.currentParentOid };
   });
-  return driveRebase(context, repo, worktree, options, exclusions);
+  return driveRebase(context, repo, worktree, options, exclusions, proof);
 }
 
 export function rebaseAbort(

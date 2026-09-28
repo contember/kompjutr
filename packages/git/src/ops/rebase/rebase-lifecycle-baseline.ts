@@ -22,7 +22,7 @@ import { preflightReplayCommitObjects } from "../replay/replay-revision.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
-import type { RebaseExclusions } from "./rebase-lifecycle-types.js";
+import type { RebaseBaselineProof, RebaseExclusions } from "./rebase-lifecycle-types.js";
 import type { RebasePlan } from "./rebase-plan.js";
 
 const BASELINE_OBJECT_PAGE = 1_000;
@@ -107,6 +107,20 @@ export function requireCurrentBaseline(
   }
   requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
   return tree;
+}
+
+/** Skips the whole-tree check only when `proof` names the current replay parent. */
+export function currentBaseline(
+  repo: Repository,
+  worktree: Worktree,
+  state: RebaseStateMetadata,
+  exclusions: RebaseExclusions,
+  proof: RebaseBaselineProof | null,
+): string {
+  if (proof?.parentOid === state.currentParentOid) {
+    return repo.readCommit(state.currentParentOid).tree;
+  }
+  return requireCurrentBaseline(repo, worktree, state, exclusions);
 }
 
 export function materializeTree(

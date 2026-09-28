@@ -20,12 +20,16 @@ import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import {
   advance,
-  requireCurrentBaseline,
+  currentBaseline,
   requireOriginalHead,
   requirePathsOutsideExclusions,
   requireRebaseCursor,
 } from "./rebase-lifecycle-baseline.js";
-import type { RebaseContinueOptions, RebaseExclusions } from "./rebase-lifecycle-types.js";
+import type {
+  RebaseBaselineProof,
+  RebaseContinueOptions,
+  RebaseExclusions,
+} from "./rebase-lifecycle-types.js";
 
 /** The pending step the cursor points at; a completed cursor has none. */
 export function requirePendingStep(journal: RebaseJournalCursor) {
@@ -76,15 +80,16 @@ export function applyOneStep(
   expectedStep: number,
   options: RebaseContinueOptions,
   exclusions: RebaseExclusions,
-): "advanced" | "conflicted" {
+  proof: RebaseBaselineProof | null,
+): RebaseBaselineProof | null {
   return withIntegrationWorkspaceOwned(repo.store, (workspace) => {
     const journal = requireRebaseCursor(repo);
     if (journal.state.currentStep !== expectedStep) {
       throw new GitError("EOPMISMATCH", "rebase operation changed before replay");
     }
     requireOriginalHead(repo, journal.state);
-    if (journal.state.phase !== "running") return "conflicted";
-    const currentTree = requireCurrentBaseline(repo, worktree, journal.state, exclusions);
+    if (journal.state.phase !== "running") return null;
+    const currentTree = currentBaseline(repo, worktree, journal.state, exclusions, proof);
     const plan = planCurrentStep(workspace, repo, journal);
     if (sourceIsEmpty(plan)) {
       const identities = stepIdentities(context, repo, plan.sourceCommit, options);
@@ -94,11 +99,11 @@ export function applyOneStep(
         identities,
       });
       advance(repo, journal, "applied", result.oid, identities.committer);
-      return "advanced";
+      return { parentOid: result.oid };
     }
     if (plan.integration.entryCount === 0) {
       advance(repo, journal, "skipped", null);
-      return "advanced";
+      return { parentOid: journal.state.currentParentOid };
     }
     const integration = projectIntegrationStepOwned(workspace, repo, worktree, {
       operation: "rebase",
@@ -124,10 +129,10 @@ export function applyOneStep(
       currentStep: journal.state.currentStep,
       conflictState: conflicted ? { ...journal.state, phase: "conflicted" } : null,
     });
-    if (conflicted) return "conflicted";
+    if (conflicted) return null;
     if (integrationIndexMatchesTree(repo, currentTree)) {
       advance(repo, journal, "skipped", null);
-      return "advanced";
+      return { parentOid: journal.state.currentParentOid };
     }
     const identities = stepIdentities(context, repo, plan.sourceCommit, options);
     const result = writeUnpublishedCommit(repo, {
@@ -136,6 +141,6 @@ export function applyOneStep(
       identities,
     });
     advance(repo, journal, "applied", result.oid, identities.committer);
-    return "advanced";
+    return { parentOid: result.oid };
   });
 }

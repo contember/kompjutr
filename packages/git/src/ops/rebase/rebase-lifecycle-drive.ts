@@ -7,12 +7,13 @@ import type { Repository } from "../repository/repository.js";
 import { repositoryMutations } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import {
-  requireCurrentBaseline,
+  currentBaseline,
   requireOriginalHead,
   requireRebaseCursor,
 } from "./rebase-lifecycle-baseline.js";
 import { applyOneStep } from "./rebase-lifecycle-step.js";
 import type {
+  RebaseBaselineProof,
   RebaseContinueOptions,
   RebaseExclusions,
   RebaseLifecycleResult,
@@ -23,6 +24,7 @@ function publishCompleted(
   repo: Repository,
   worktree: Worktree,
   exclusions: RebaseExclusions,
+  proof: RebaseBaselineProof | null,
 ): RebaseLifecycleResult {
   return repo.store.db.transactionSync(() => {
     const journal = requireRebaseCursor(repo);
@@ -30,7 +32,7 @@ function publishCompleted(
     if (journal.state.phase !== "running" || journal.state.currentStep !== journal.stepCount) {
       throw new CorruptError("rebase publication started before replay completion");
     }
-    const tree = requireCurrentBaseline(repo, worktree, journal.state, exclusions);
+    const tree = currentBaseline(repo, worktree, journal.state, exclusions, proof);
     if (repo.readCommit(journal.state.currentParentOid).tree !== tree) {
       throw new CorruptError("completed rebase baseline changed before publication");
     }
@@ -88,15 +90,19 @@ export function driveRebase(
   worktree: Worktree,
   options: RebaseContinueOptions,
   exclusions: RebaseExclusions,
+  entryProof: RebaseBaselineProof | null,
 ): RebaseLifecycleResult {
+  // The loop is synchronous, so nothing can change the index or worktree
+  // between one step's transaction and the next.
+  let proof = entryProof;
   for (;;) {
     const state = readRebaseDriveState(repo);
     if (state.phase === "conflicted") {
       return { outcome: "conflicted", replayed: state.replayed, skipped: state.skipped };
     }
     if (state.currentStep === state.stepCount) {
-      return publishCompleted(context, repo, worktree, exclusions);
+      return publishCompleted(context, repo, worktree, exclusions, proof);
     }
-    applyOneStep(context, repo, worktree, state.currentStep, options, exclusions);
+    proof = applyOneStep(context, repo, worktree, state.currentStep, options, exclusions, proof);
   }
 }

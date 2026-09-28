@@ -17,3 +17,12 @@ export interface RebaseExclusions {
   absolute: string[];
   relative: string[];
 }
+
+/**
+ * The replay parent whose tree the index and tracked worktree match. A whole-tree
+ * check or a hard reset proves it; each step then keeps it true for its result.
+ * It is valid only inside the synchronous call that proved it.
+ */
+export interface RebaseBaselineProof {
+  readonly parentOid: string;
+}
