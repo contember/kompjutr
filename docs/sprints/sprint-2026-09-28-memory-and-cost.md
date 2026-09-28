@@ -540,3 +540,16 @@ worktree, and the leader cherry-picks every green unit at once.
 - WU4 escalated. V8 used + external is at least 219–279 MiB on the workerd clone; external
   memory alone is 188–227 MiB. The user chose a report-only V8 measurement with a
   regression limit at today's level, plus a backlog item for external memory.
+- WU3 `290bf52`, `2b2002c`:
+  - The old trace lost its tail to block-buffered stdout and SIGKILL. A stdbuf preload
+    and gc-done markers now bracket the clone.
+  - The non-V8 residue is measured at one instant.
+  - `memory.max` is read from every ancestor cgroup.
+  - Review found three defects. The second pass was clean.
+- WU4 `555ee0d`…`ecfd96c` → ADR-0026, backlog 106. The limit is 450 MiB on V8
+  used + external; the maximum of five runs was 363.3 MiB. RSS is report-only.
+- WU7 `143764b`, `e540efa`: `staging.rm` is back to 27/31. rm plans in one
+  HEAD/index/worktree pass and removes in one paged pass.
+  - Review verified atomicity on DO and on the local undo journal against the parent.
+  - A read error during safety hashing now comes after pathspec errors, as in Git.
+  - `bench:statements -- --check` is clean at `e540efa`. `schema.init` shows a drop of 1.
