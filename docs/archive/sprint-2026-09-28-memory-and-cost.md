@@ -60,7 +60,8 @@
 >   11.4 MB (capped stage).
 > - `core.sparse-selected-add`: 3 of 6 runs at `b7a5118` and 1 of 3 at `9fa0a7b`
 >   (end of WU2) fail the uncapped stage at 109–115 MB; passing runs peak at
->   77–80 MB → backlog 110.
+>   77–80 MB → backlog 110, closed by `f434ad7`…`25d07ea`: ten runs at `25d07ea`
+  pass both stages, at most 79,044,608 B.
 > - Evidence the plan required and nobody recorded: the three per-run WU2 peaks
 >   with their commit; the failures before WU5 for the 20 × 8 KiB and
 >   80,000-path witnesses; the `E2BIG` refusal of `core.checkout.tree-swap`
