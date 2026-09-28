@@ -41,7 +41,7 @@ export function matchesPaths(path: string, paths: string[] | undefined): boolean
 
 export const CHECKOUT_WINDOW_ROWS = 1_000;
 export const CHECKOUT_PRUNE_PATHS = 50_000;
-export const CHECKOUT_STRUCTURAL_PATHS = 50_000;
+export const CHECKOUT_STRUCTURAL_ROOTS = 50_000;
 export const CHECKOUT_UNMERGED_PATHS = 10_000;
 const CHECKOUT_EXCLUDE_ROOTS = 64;
 

@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -55,6 +55,38 @@ function nestedTree(workspace: TestRepository, paths: readonly string[], blob: s
     return { mode, name, oid };
   });
   return store.write("tree", serializeTree(top));
+}
+
+function keepCommit(repository: Repository): { oid: string; blob: string } {
+  const blob = repository.store.write("blob", utf8.encode("keep\n"));
+  const tree = repository.store.write(
+    "tree",
+    serializeTree([{ mode: MODE_FILE, name: "keep.txt", oid: blob }]),
+  );
+  const oid = repository.store.write(
+    "commit",
+    serializeCommit({ tree, parent: [], author: PERSON, committer: PERSON, message: "keep\n" }),
+  );
+  return { oid, blob };
+}
+
+/** A conflicted path plus tracked `children` whose worktree `leaves` are files. */
+function hardResetFixture(
+  workspace: TestRepository,
+  children: readonly string[],
+  leaves: readonly string[],
+): { workspace: TestRepository; commit: string } {
+  const commit = keepCommit(workspace.repo);
+  workspace.repo.checkout.indexReplace([
+    indexed("conflict.txt", commit.blob, 2),
+    indexed("conflict.txt", commit.blob, 3),
+    ...children.map((path) => indexed(path, commit.blob)),
+  ]);
+  workspace.worktree.writeFiles([
+    { path: "/conflict.txt", bytes: utf8.encode("ours\n") },
+    ...leaves.map((leaf) => ({ path: `/${leaf}`, bytes: utf8.encode("leaf\n") })),
+  ]);
+  return { workspace, commit: commit.oid };
 }
 
 describe("checkout count caps", () => {
@@ -265,42 +297,32 @@ describe("streamed checkout removals", () => {
     expect(workspace.worktree.scan("/", { limit: 1 })).toEqual([]);
   });
 
-  it("caps hard-reset structural state at 50,000 paths and rolls back the conflict discard", () => {
-    const leafChildren = (count: number) =>
-      Array.from(
-        { length: count },
-        (_, index) => `x/${index.toString().padStart(5, "0")}${"c".repeat(195)}`,
-      );
-    const hardResetFixture = (children: readonly string[]) => {
-      const workspace = makeRepo("/");
-      const blob = workspace.repo.store.write("blob", utf8.encode("keep\n"));
-      const tree = workspace.repo.store.write(
-        "tree",
-        serializeTree([{ mode: MODE_FILE, name: "keep.txt", oid: blob }]),
-      );
-      const commit = workspace.repo.store.write(
-        "commit",
-        serializeCommit({
-          tree,
-          parent: [],
-          author: PERSON,
-          committer: PERSON,
-          message: "keep\n",
-        }),
-      );
-      workspace.repo.checkout.indexReplace([
-        indexed("conflict.txt", blob, 2),
-        indexed("conflict.txt", blob, 3),
-        ...children.map((path) => indexed(path, blob)),
-      ]);
-      workspace.worktree.writeFiles([
-        { path: "/conflict.txt", bytes: utf8.encode("ours\n") },
-        { path: "/x", bytes: utf8.encode("leaf\n") },
-      ]);
-      return { workspace, commit };
-    };
+  it("hard-resets 60,000 tracked paths whose directory a file replaced", () => {
+    const fixture = hardResetFixture(
+      makeRepo("/"),
+      Array.from({ length: 60_000 }, (_, index) => `x/${index.toString().padStart(5, "0")}`),
+      ["x"],
+    );
+    reset(fixture.workspace.context, fixture.workspace.repo, fixture.workspace.worktree, {
+      hard: true,
+      ref: fixture.commit,
+    });
 
-    const atCap = hardResetFixture(leafChildren(49_999));
+    expect([...fixture.workspace.repo.checkout.indexScan()].map((entry) => entry.path)).toEqual([
+      "keep.txt",
+    ]);
+    expect(worktreeState(fixture.workspace)).toEqual(["file /keep.txt", "file /x"]);
+  });
+
+  it("refuses the 50,001st replaced root and rolls back the conflict discard", () => {
+    const leaves = (count: number) =>
+      Array.from({ length: count }, (_, index) => `d${index.toString().padStart(5, "0")}`);
+    const atCapLeaves = leaves(50_000);
+    const atCap = hardResetFixture(
+      makeRepo("/"),
+      atCapLeaves.map((leaf) => `${leaf}/f`),
+      atCapLeaves,
+    );
     reset(atCap.workspace.context, atCap.workspace.repo, atCap.workspace.worktree, {
       hard: true,
       ref: atCap.commit,
@@ -308,9 +330,13 @@ describe("streamed checkout removals", () => {
     expect([...atCap.workspace.repo.checkout.indexScan()].map((entry) => entry.path)).toEqual([
       "keep.txt",
     ]);
-    expect(atCap.workspace.worktree.stat("/x")?.type).toBe("file");
 
-    const over = hardResetFixture(leafChildren(50_000));
+    const overLeaves = leaves(50_001);
+    const over = hardResetFixture(
+      makeRepo("/"),
+      overLeaves.map((leaf) => `${leaf}/f`),
+      overLeaves,
+    );
     const beforeIndex = indexState(over.workspace);
     const beforeWorktree = worktreeState(over.workspace);
     const beforeHead = over.workspace.repo.head();
@@ -322,13 +348,40 @@ describe("streamed checkout removals", () => {
     ).toThrowError(
       expect.objectContaining({
         code: "E2BIG",
-        message: expect.stringContaining("structural state exceeds 50000 paths"),
+        message: expect.stringContaining("structural state exceeds 50000 roots"),
       }),
     );
 
     expect(over.workspace.repo.head()).toEqual(beforeHead);
     expect(indexState(over.workspace)).toEqual(beforeIndex);
     expect(worktreeState(over.workspace)).toEqual(beforeWorktree);
+  });
+
+  it("hard-resets the replaced directory on the local disk adapter", async () => {
+    const fixture = localFixture();
+    const workspace = fixture.workspace();
+    try {
+      await workspace.git.init();
+      const checkout = workspace.gitDatabase.findCheckout("/");
+      if (checkout === null) throw new Error("repository is missing");
+      const repository = new Repository(workspace.gitDatabase.openCheckout(checkout));
+      const commit = keepCommit(repository);
+      writeFileSync(join(fixture.root, "x"), "leaf\n");
+      repository.checkout.indexReplace(
+        Array.from({ length: 60_000 }, (_, index) =>
+          indexed(`x/${index.toString().padStart(5, "0")}`, commit.blob),
+        ),
+      );
+
+      await workspace.git.reset({ ref: commit.oid, hard: true });
+
+      expect([...repository.checkout.indexScan()].map((entry) => entry.path)).toEqual(["keep.txt"]);
+      expect(readdirSync(fixture.root).sort(comparePaths)).toEqual(["keep.txt", "x"]);
+      expect(readFileSync(join(fixture.root, "x"), "utf8")).toBe("leaf\n");
+    } finally {
+      workspace.close();
+      fixture.dispose();
+    }
   });
 
   it("restores the local disk and index after a mid-stream prune refusal", async () => {

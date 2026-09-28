@@ -1,7 +1,8 @@
-// Checkout removes obsolete paths while the tree/index join streams. Only the
-// count-capped directory map outlives a window; which directories became
-// empty is read from the worktree once the removed leaves are gone. A cap that
-// fires mid-stream relies on the caller's transaction to undo earlier windows.
+// Checkout removes obsolete paths while the tree/index join streams. Only
+// count-capped roots outlive a window: the prune directory map and the roots
+// `restoreStructure` found replaced. Which directories became empty is read
+// from the worktree once the removed leaves are gone. A cap that fires
+// mid-stream relies on the caller's transaction to undo earlier windows.
 
 import { GitError } from "../../common/errors.js";
 import { joinPath } from "../../common/paths.js";
@@ -10,7 +11,11 @@ import type { IndexSink } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
-import { planWorktreeRemovalBatches, WorktreeRemovalBatcher } from "./checkout-structure.js";
+import {
+  planWorktreeRemovalBatches,
+  type ReplacedIndexPaths,
+  WorktreeRemovalBatcher,
+} from "./checkout-structure.js";
 import { CHECKOUT_PRUNE_PATHS, CHECKOUT_WINDOW_ROWS } from "./checkout-support.js";
 
 export interface CheckoutPrunePlan {
@@ -19,7 +24,7 @@ export interface CheckoutPrunePlan {
 
 export interface CheckoutRemovalScope {
   /** Paths `restoreStructure` already replaced; their index rows still go. */
-  preserved: ReadonlySet<string>;
+  replaced: ReplacedIndexPaths;
   maxWorktreeRows: number | undefined;
   excludeRoots: string[];
   relativeExcludeRoots: string[];
@@ -44,7 +49,7 @@ export class CheckoutRemovalStream {
 
   remove(path: string): void {
     this.#recordParents(path);
-    if (!this.#scope.preserved.has(path)) this.#removeFiles(this.#batcher.push(path));
+    if (!this.#scope.replaced.has(path)) this.#removeFiles(this.#batcher.push(path));
     this.#sink.remove(path);
     this.#pendingIndexRows++;
     if (this.#pendingIndexRows === CHECKOUT_WINDOW_ROWS) this.#flushIndex();

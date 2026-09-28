@@ -24,7 +24,7 @@ fixed caps, not from the ledger.
 
 The statement ceiling and several modeled retained-byte charges were removed.
 The rule below distinguishes a real payload ceiling from an estimated object
-footprint; checkout still has private charges to review.
+footprint.
 
 ## Decision
 
@@ -67,16 +67,17 @@ still measures its actual JSON payload.
 
 Checkout caps 10,000 conflict paths, 50,000 prune directories and 64
 exclusion roots. It streams removals in windows bounded by the 1,000,000-byte
-removal binding and 1,000 index rows, so only the prune directory map outlives
-a window. A cap that fires after a window has flushed relies on the caller's
-transaction, which every checkout caller holds. The structural sets of
-`restoreStructure` share one 50,000-path cap. At the 8 KiB index path limit,
-that cap and the prune map each retain about 400 MiB of path strings in the
-worst case. These worst cases are new: the 16 MiB modeled charges they replace
-also bounded the prune map. The status cap is the precedent, at 30,000 paths
-of the same limit. The initial
-checkout drops its tracker reseal, never the checkout, past 50,000 gitlinks
-or at a gitlink path above 8 KiB.
+removal binding and 1,000 index rows. Two count-capped sets outlive a window:
+the prune directory map and the structural roots of `restoreStructure`. The
+second set holds worktree entries, not the tracked rows below them, and caps
+at 50,000 roots. A cap that fires after a window has flushed relies on the
+caller's transaction, which every checkout caller holds. At the 8 KiB index
+path limit, the two sets together retain about 800 MiB of path strings in the
+worst case. That bound is new; the modeled charges it replaces refused near
+16 MiB of estimated state per set. Status is the precedent: its 30,000 paths
+and 30,000 directories at the same limit reach about 480 MiB. The initial
+checkout drops its tracker reseal, never the checkout, past 50,000 gitlinks or
+at a gitlink path above 8 KiB.
 
 **Benchmarks own the evidence.** Representative operations have deterministic
 statement and row rows, and memory scenarios run under a leased cgroup that

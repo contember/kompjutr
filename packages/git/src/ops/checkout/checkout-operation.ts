@@ -12,7 +12,11 @@ import {
   CheckoutRemovalStream,
   pruneEmptyDirectories,
 } from "./checkout-removals.js";
-import { discardUnmergedPaths, restoreStructuralConflicts } from "./checkout-structure.js";
+import {
+  discardUnmergedPaths,
+  ReplacedIndexPaths,
+  restoreStructuralConflicts,
+} from "./checkout-structure.js";
 import {
   boundedCheckoutSourceRows,
   boundedCheckoutWorktreeEntries,
@@ -84,17 +88,17 @@ export function checkoutTreeInternal(
       options.excludeRoots,
     );
   }
-  const preservedRemovals =
+  const replaced =
     options.restoreStructure === true
       ? restoreStructuralConflicts(repo, worktree, target, options, index)
-      : new Set<string>();
+      : new ReplacedIndexPaths();
   let prunePlan: CheckoutPrunePlan | undefined;
 
   // Remove obsolete paths before writing replacements. This also handles a
   // directory-to-file transition without retaining the whole target tree.
   applyIndexOwned(index, (sink) => {
     const removals = new CheckoutRemovalStream(repo, worktree, sink, {
-      preserved: preservedRemovals,
+      replaced,
       maxWorktreeRows: options.maxWorktreeRowsPerPass,
       excludeRoots: options.excludeRoots,
       relativeExcludeRoots: options.relativeExcludeRoots,

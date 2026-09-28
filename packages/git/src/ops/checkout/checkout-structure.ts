@@ -1,5 +1,5 @@
 import { GitError } from "../../common/errors.js";
-import { joinPath } from "../../common/paths.js";
+import { gitParentPath, joinPath } from "../../common/paths.js";
 import { comparePaths, joinSorted, joinSorted3 } from "../../common/streams.js";
 import { applyIndexOwned } from "../../store/checkout/checkout.js";
 import { utf8ByteLength } from "../../store/core/json-pages.js";
@@ -11,7 +11,7 @@ import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import {
   boundedCheckoutSourceRows,
   boundedCheckoutWorktreeEntries,
-  CHECKOUT_STRUCTURAL_PATHS,
+  CHECKOUT_STRUCTURAL_ROOTS,
   CHECKOUT_UNMERGED_PATHS,
   CHECKOUT_WINDOW_ROWS,
   matchesPaths,
@@ -70,6 +70,12 @@ export function discardUnmergedPaths(
   });
 }
 
+interface ActiveLeaf {
+  path: string;
+  upper: string;
+  replaced: boolean;
+}
+
 interface StructuralPath {
   path: string;
   type: "file" | "dir" | "symlink";
@@ -81,15 +87,20 @@ export function restoreStructuralConflicts(
   targetEntries: () => Iterable<TargetEntry>,
   options: CheckoutInternalOptions,
   index: IndexStore,
-): Set<string> {
+): ReplacedIndexPaths {
   const removals = new Set<string>();
-  const preservedRemovals = new Set<string>();
-  const activeLeaves: Array<{ path: string; upper: string }> = [];
+  const replaced = new ReplacedIndexPaths();
+  const activeLeaves: ActiveLeaf[] = [];
+  // A leaf that becomes a replaced root stays active but is counted once.
+  let unreplacedLeaves = 0;
+  const releaseLeaf = (leaf: ActiveLeaf): void => {
+    if (!leaf.replaced) unreplacedLeaves--;
+  };
   const requireStructuralCapacity = (): void => {
-    if (removals.size + preservedRemovals.size + activeLeaves.length >= CHECKOUT_STRUCTURAL_PATHS) {
+    if (removals.size + replaced.roots + unreplacedLeaves >= CHECKOUT_STRUCTURAL_ROOTS) {
       throw new GitError(
         "E2BIG",
-        `checkout structural state exceeds ${CHECKOUT_STRUCTURAL_PATHS} paths`,
+        `checkout structural state exceeds ${CHECKOUT_STRUCTURAL_ROOTS} roots`,
       );
     }
   };
@@ -103,12 +114,13 @@ export function restoreStructuralConflicts(
       activeLeaves.length > 0 &&
       comparePaths(row.path, activeLeaves[activeLeaves.length - 1]!.upper) >= 0
     ) {
-      activeLeaves.pop();
+      releaseLeaf(activeLeaves.pop()!);
     }
     const current = row.c;
     if (current !== undefined && current.type !== "dir" && row.a === undefined) {
       requireStructuralCapacity();
-      activeLeaves.push({ path: current.path, upper: `${current.path}0` });
+      activeLeaves.push({ path: current.path, upper: `${current.path}0`, replaced: false });
+      unreplacedLeaves++;
     }
 
     const target = row.a;
@@ -118,17 +130,21 @@ export function restoreStructuralConflicts(
       options.prune !== false &&
       (options.pathspec?.matches(row.b.path) ?? matchesPaths(row.b.path, options.paths))
     ) {
-      const replacedByDirectory = current?.type === "dir";
-      let replacedUnderLeaf = false;
+      let replacingLeaf: ActiveLeaf | undefined;
       for (let index = activeLeaves.length - 1; index >= 0; index--) {
-        if (row.b.path.startsWith(`${activeLeaves[index]!.path}/`)) {
-          replacedUnderLeaf = true;
+        const leaf = activeLeaves[index]!;
+        if (row.b.path.startsWith(`${leaf.path}/`)) {
+          replacingLeaf = leaf;
           break;
         }
       }
-      if ((replacedByDirectory || replacedUnderLeaf) && !preservedRemovals.has(row.b.path)) {
+      if (current?.type === "dir" && !replaced.has(row.b.path)) {
         requireStructuralCapacity();
-        preservedRemovals.add(row.b.path);
+        replaced.addDirectory(row.b.path);
+      } else if (replacingLeaf !== undefined && !replacingLeaf.replaced) {
+        replacingLeaf.replaced = true;
+        unreplacedLeaves--;
+        replaced.addLeaf(replacingLeaf.path);
       }
     }
     if (
@@ -144,7 +160,7 @@ export function restoreStructuralConflicts(
       row.b.mode === Number.parseInt(target.mode, 8);
     if (options.preserveMatchingIndex === true && sameIndex) continue;
 
-    let activeLeaf: { path: string; upper: string } | undefined;
+    let activeLeaf: ActiveLeaf | undefined;
     for (let index = activeLeaves.length - 1; index >= 0; index--) {
       const leaf = activeLeaves[index]!;
       if (target.path.startsWith(`${leaf.path}/`)) {
@@ -158,6 +174,7 @@ export function restoreStructuralConflicts(
     if (structural === undefined || removals.has(structural)) continue;
     if (activeLeaf?.path === structural) {
       activeLeaves.splice(activeLeaves.indexOf(activeLeaf), 1);
+      releaseLeaf(activeLeaf);
     }
     requireStructuralCapacity();
     removals.add(structural);
@@ -170,7 +187,37 @@ export function restoreStructuralConflicts(
       { recursive: true },
     );
   }
-  return preservedRemovals;
+  return replaced;
+}
+
+/**
+ * Tracked paths whose worktree entry `restoreStructure` found replaced. Only
+ * the replacing roots are kept: a directory standing at a tracked path, and a
+ * leaf standing where tracked paths lived below it.
+ */
+export class ReplacedIndexPaths {
+  readonly #directories = new Set<string>();
+  readonly #leaves = new Set<string>();
+
+  get roots(): number {
+    return this.#directories.size + this.#leaves.size;
+  }
+
+  addDirectory(path: string): void {
+    this.#directories.add(path);
+  }
+
+  addLeaf(path: string): void {
+    this.#leaves.add(path);
+  }
+
+  has(path: string): boolean {
+    if (this.#directories.has(path)) return true;
+    for (let parent = gitParentPath(path); parent !== ""; parent = gitParentPath(parent)) {
+      if (this.#leaves.has(parent)) return true;
+    }
+    return false;
+  }
 }
 
 function* walkStructuralPaths(
