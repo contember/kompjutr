@@ -34,6 +34,7 @@ so the two cannot drift.
 - [0006 — Own local Git mutations with SQLite transactions](0006-own-local-git-mutations-with-sqlite-transactions.md) — accepted (2026-09-02)
 - [0007 — Require well-formed UTF-8 paths](0007-require-well-formed-utf8-paths.md) — accepted (2026-08-26)
 - [0021 — Recover local worktree mutations with an undo journal](0021-recover-local-worktree-mutations-with-an-undo-journal.md) — accepted (2026-09-07)
+- [0026 — Gate the workerd clone on a V8 regression limit](0026-gate-the-workerd-clone-on-a-v8-regression-limit.md) — accepted (2026-09-28)
 
 **Storage**
 

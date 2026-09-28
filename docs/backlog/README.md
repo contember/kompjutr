@@ -94,9 +94,11 @@ over different reflog tables. It moved 84 and 105 to
 | Order | Items | Why |
 |---|---|---|
 | 1 | [86](86-bound-sparse-selected-add-and-workerd-clone-peaks.md), [95](95-reduce-the-nextjs-rebase-step-peak.md), [97](97-audit-checkout-modeled-byte-charges.md) | Memory and cost: missed memory gates, repeated full-tree passes, and checkout's remaining modeled byte charges. |
+| Unscheduled | [106](106-reduce-the-workerd-clone-external-memory.md) | The workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it, then decide whether a production probe is needed. |
 
 ## Items
 
 - [86 — Bound the sparse-selected-add and workerd clone memory peaks](86-bound-sparse-selected-add-and-workerd-clone-peaks.md)
 - [95 — Reduce the Next.js rebase step's full-tree passes and peak](95-reduce-the-nextjs-rebase-step-peak.md)
 - [97 — Audit checkout modeled byte charges](97-audit-checkout-modeled-byte-charges.md)
+- [106 — Reduce the workerd clone's external memory](106-reduce-the-workerd-clone-external-memory.md)

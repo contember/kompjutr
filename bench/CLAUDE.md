@@ -12,7 +12,7 @@ npm run bench:statements -- --check --nextjs <path>  # also gate a Next.js resul
 npm run bench:clone-storage  # SQLite bytes a clone costs, and where they go
 npm run bench:memory         # cgroup-backed bounded-memory evidence under cpu-lease
 npm run bench:memory -- --runtime-check  # focused lease/cgroup wiring witness
-npm run bench:workerd:nextjs # clone inside a real SQLite Durable Object
+npm run bench:workerd:nextjs # clone in a SQLite Durable Object; V8 regression gate
 ```
 
 Scenarios: `synthetic.ts` isolates one variable at a time; `macro` replays the
@@ -66,8 +66,13 @@ legacy comparisons are under `docs/archive/benchmarks/`.
    adds about 125–155 MiB under a 1 GiB cap and about 245 MiB without one.
    Record the cap with every memory number, and compare only numbers taken under
    the same cap.
-8. Local workerd has no isolate memory limiter. Its process RSS is a regression
-   signal, not proof that the production 128 MB isolate limit is satisfied.
+8. **Local workerd RSS does not measure the isolate limit.** Local workerd has no
+   isolate memory limiter, and its RSS holds SQLite, allocator and runtime
+   memory. `bench:workerd:nextjs` reports RSS only. It gates peak V8 used +
+   external memory from the GC trace between two forced GCs, a lower bound,
+   against a regression limit at today's level (ADR-0026). External memory
+   holds every `Uint8Array` and counts against the isolate. A pass is not proof
+   that the production 128 MB limit is satisfied.
 9. The Next.js push phase must create a fresh remote branch. Setup and teardown
    delete `bench-work`, so a no-op push cannot masquerade as a measurement.
 10. The Smart HTTP origin is an `http` server in the benchmark process. A child

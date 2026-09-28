@@ -59,30 +59,47 @@ one 100-file commit onto a new `main` commit and adds 96.6 MiB
 `git.diffSummary` measured a peak 0.3 MiB below its baseline; the table
 reports 0.0.
 
-## Next.js clone on workerd — 2026-09-24
+## Next.js clone on workerd — 2026-09-28
 
-Three runs of the clone inside a real SQLite Durable Object:
+Five runs of the clone inside a real SQLite Durable Object, at commit
+`c3b670c`:
 
 ```bash
 cpu-lease run -n 2 -- npm run bench:workerd:nextjs
 ```
 
-The runtime was `workerd` 1.20260820.1 with compatibility date 2026-08-15.
+The runtime was `workerd` 1.20260820.1 with compatibility date 2026-08-15. The
+cgroup `memory.max` was `max` (no limit). Every run made 898 statements, read
+145,777 rows, and left a 228,347,904-byte database.
 
-| Run | SQL | Rows | Database bytes | Baseline RSS, MiB | Added peak RSS, MiB |
+The harness warms the Durable Object and forces a full GC before the baseline,
+resets `VmHWM`, and runs the checkout oracle after the measured region. V8
+values come from the GC trace between two forced GCs, so their peaks are lower
+bounds. The non-V8 residue is RSS after the closing forced GC minus V8 committed
+and external memory at that GC, minus the same value at the baseline.
+
+| Run | V8 used, MiB | V8 external, MiB | V8 used + external, MiB | Added peak RSS, MiB | Non-V8 residue added, MiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1,012 | 145,777 | 228,356,096 | 65.0 | 377.4 |
-| 2 | 1,012 | 145,777 | 228,356,096 | 65.3 | 453.1 |
-| 3 | 1,012 | 145,777 | 228,356,096 | 65.1 | 445.0 |
+| 1 | 46.8 | 203.5 | 238.4 | 380.8 | 210.5 |
+| 2 | 48.7 | 195.1 | 241.2 | 387.9 | 210.9 |
+| 3 | 47.9 | 245.1 | 277.8 | 408.9 | 272.7 |
+| 4 | 50.7 | 315.2 | 363.3 | 468.0 | 238.9 |
+| 5 | 45.6 | 195.1 | 225.6 | 367.6 | 203.0 |
 
-Every run verified HEAD, 24,252 index entries, and 24,252 worktree files with no
-invalid file. Statements and rows match the `node:sqlite` clone exactly. The
-harness's 100 MiB added-RSS gate fails in every run
-([backlog 86](../backlog/86-bound-sparse-selected-add-and-workerd-clone-peaks.md)).
-Runs 2 and 3 overlapped another leased benchmark on separate cores. Local
-workerd has no isolate memory limiter, and its RSS includes the SQLite page
-cache of a 218 MiB database. Wall time from inside a Worker is not a duration
-and is not reported.
+Baseline RSS was 74.0–74.9 MiB. Every run verified HEAD, 24,252 index entries,
+and 24,252 worktree files with no invalid file. Statements and rows match the
+`node:sqlite` clone.
+
+The gate is a regression limit of 450 MiB on V8 used + external
+([ADR-0026](../decisions/0026-gate-the-workerd-clone-on-a-v8-regression-limit.md)).
+It is not the production 128 MB isolate limit, and no local number shows that
+the clone fits it. Process RSS is report-only.
+
+External memory is most of what the isolate counts: 4.6–7.5× the 42 MiB pack
+([backlog 106](../backlog/106-reduce-the-workerd-clone-external-memory.md)).
+The SQLite page cache does not explain the RSS. File-backed memory stays near
+47 MiB, and workerd keeps SQLite's default cache of about 2 MiB. Wall time from
+inside a Worker is not a duration and is not reported.
 
 ## Network clone and fetch — 2026-09-24
 
