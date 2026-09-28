@@ -21,6 +21,9 @@ const TREE: ShellTree = {
   "notes.md": "",
   "sub/c.ts": "",
   "sub/d.md": "",
+  "sub/e.ts": "foo\n",
+  "~/x.ts": "foo\n",
+  "~a.ts": "foo\n",
 };
 
 const HOME = { HOME: "/home/tester" };
@@ -55,6 +58,27 @@ describe.skipIf(!REAL_BASH)("tilde expansion matches Bash", () => {
   it("expands a tilde in a here-string but not in a here-document", async () => {
     await compare("cat <<< ~; cat <<< ~/x; cat <<< a=~; cat <<< '~'");
     await compare("cat <<E\n~ ~/x\nE");
+  });
+
+  it("expands a here-string tilde after each unquoted colon but not after =", async () => {
+    await compare("cat <<< x:~; cat <<< a:~/b; cat <<< a=~/x:~; cat <<< ~:x; cat <<< x:~:y");
+    await compare(`cat <<< "x":~; cat <<< x":"~; cat <<< x\\:~; cat <<< *:~; cat <<< ${"$"}X:~`, {
+      ...HOME,
+      X: "1 2",
+    });
+  });
+
+  it("keeps a quoted tilde literal through the find | xargs search fusion", async () => {
+    const env = { HOME: "/nonexistent" };
+    await compare("find '~' -name '*.ts' | xargs grep -l foo", env);
+    await compare("find \\~ -name '*.ts' | xargs rg -l foo", env);
+    await compare("find . -name '~a.ts' | xargs rg -l foo", env);
+    await compare("find . -name \\~a.ts | xargs grep -l foo", env);
+  });
+
+  it("expands an unquoted tilde in a find | xargs search", async () => {
+    await compare("find ~ -name '*.ts' | xargs grep -l foo", { HOME: "sub" });
+    await compare("find ~/ -name '*.ts' | xargs rg -l foo", { HOME: "sub" });
   });
 
   it("expands a tilde in a redirection target", async () => {
@@ -137,6 +161,10 @@ describe.skipIf(!REAL_BASH)("brace expansion matches Bash", () => {
     await compare(`printf '<%s>\\n' a{=~,b} {a=~,b} a={~,b} {a,b}=~`);
   });
 
+  it("keeps a literal $ outside the braces", async () => {
+    await compare(`printf '<%s>\\n' {a,b}$ {1..3}$ x{a,b}$.y`);
+  });
+
   it("expands braces in a redirection target", async () => {
     await compare("echo x > {o}; cat {o}; echo y > {a..a}; cat a");
   });
@@ -156,6 +184,10 @@ describe.skipIf(!REAL_BASH)("&> redirections match Bash", () => {
 
   it("reads >&file as &>file", async () => {
     await compare("echo hi >& out; cat out; cat nope >&out; cat out");
+  });
+
+  it("reads 1>&file as &>file", async () => {
+    await compare("echo x 1>&out; cat out; cat nope 1>&out; cat out");
   });
 });
 
@@ -194,6 +226,15 @@ describe("word expansion refusals and bounds", () => {
     await refused(source, `tilde expansion of ${prefix}`);
   });
 
+  it.each([
+    ["echo a; echo ~root", "`~root`"],
+    ["echo a; echo a=~+", "`~+`"],
+    ["echo a; cat <<< x:~-", "`~-`"],
+    ["echo a; echo x > ~user/o", "`~user`"],
+  ])("refuses a static named tilde before anything runs: %s", async (source, prefix) => {
+    await refused(source, `tilde expansion of ${prefix}`);
+  });
+
   it("refuses a tilde when HOME is not in the run env", async () => {
     await refused("echo ~", "HOME", {});
     await refused("echo a=~/x", "HOME", {});
@@ -216,7 +257,7 @@ describe("word expansion refusals and bounds", () => {
     ["echo {$,a}HOME", "literal `$`"],
     ["echo {a..Z}", "across letter cases"],
     ["echo ls &", "background execution"],
-    ["echo x 1>&out", "not a descriptor"],
+    ["echo x 2>&out", "not a descriptor"],
     ["echo x >&-", "not a descriptor"],
   ])("refuses %s", async (source, message) => {
     await refused(source, message);

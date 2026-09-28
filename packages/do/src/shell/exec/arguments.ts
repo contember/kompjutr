@@ -1,10 +1,10 @@
 import { join, normalize } from "../../fs/path.js";
 import { ShellSyntaxError } from "../parse/ast.js";
-import type { Argument } from "../plan/types.js";
-import { type FlatPart, flatParts, generateWords, hasBraces } from "./braces.js";
+import { expandTildes } from "../plan/tilde.js";
+import type { Argument, FlatPart } from "../plan/types.js";
+import { flatParts, generateWords, hasBraces } from "./braces.js";
 import { type BoundedFs, ShellLimitError } from "./context.js";
 import { compileGlob, sqlGlobFor } from "./glob.js";
-import { expandTildes } from "./tilde.js";
 import { utf8Bytes } from "./utf8.js";
 
 const ARGUMENT_COUNT_MAX = 10_000;
@@ -82,10 +82,21 @@ export function quotedText(
   env: Readonly<Record<string, string>> | undefined,
 ): string {
   let text = "";
-  for (const part of expandTildes(flatParts(argument.parts), false, env)) {
+  for (const part of expandTildes(flatParts(argument.parts), argument.kind, homeOf(env))) {
     text += part.kind === "parameter" ? environmentValue(env, part.name) : part.value;
   }
   return text;
+}
+
+function homeOf(env: Readonly<Record<string, string>> | undefined): () => string {
+  return () => {
+    const value = env === undefined || !Object.hasOwn(env, "HOME") ? undefined : env.HOME;
+    if (value === undefined) {
+      // Bash would fall back to the passwd entry, which this runtime does not have.
+      throw new ShellSyntaxError("tilde expansion", "tilde expansion needs HOME in the run env", 0);
+    }
+    return value;
+  };
 }
 
 function argumentLimit(): ShellLimitError {
@@ -107,13 +118,13 @@ function* words(
   let generated = 0;
   for (const arg of args) {
     if (!hasBraces(arg.parts)) {
-      yield expandTildes(flatParts(arg.parts), arg.kind === "assignment", env);
+      yield expandTildes(flatParts(arg.parts), arg.kind, homeOf(env));
       continue;
     }
     for (const word of generateWords(arg.parts)) {
       generated++;
       if (generated > ARGUMENT_COUNT_MAX) throw argumentLimit();
-      yield expandTildes(word, false, env);
+      yield expandTildes(word, "word", homeOf(env));
     }
   }
 }

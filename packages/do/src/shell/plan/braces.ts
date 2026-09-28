@@ -12,7 +12,7 @@
 // can form brace syntax, quoted parts and parameters cannot.
 
 import { ShellSyntaxError, type WordPart } from "../parse/ast.js";
-import type { ArgumentPart, BraceSequence } from "./types.js";
+import type { ArgumentPart, BraceSequence, FlatPart } from "./types.js";
 
 type Atom =
   | { readonly kind: "char"; readonly value: string; readonly glob: boolean }
@@ -35,7 +35,7 @@ const SEQUENCE_CHARACTER = /^[0-9A-Za-z+.-]$/;
 const INTMAX = (1n << 63n) - 1n;
 const INTMIN = -(1n << 63n);
 
-export function argumentPart(part: WordPart): ArgumentPart {
+export function argumentPart(part: WordPart): FlatPart {
   if (part.kind === "Parameter") {
     return { kind: "parameter", name: part.name, quoted: part.quoted };
   }
@@ -49,14 +49,6 @@ export function markBraces(parts: readonly WordPart[]): ArgumentPart[] | null {
   const word = new BraceWord(toAtoms(parts));
   const marked = word.mark(0, word.atoms.length, 0);
   if (!marked.some(isBraceNode)) return null;
-  if (word.atoms.some((atom) => atom.kind === "char" && atom.value === "$")) {
-    // Bash re-reads each generated word, so `{$,a}X` expands `$X`.
-    throw new ShellSyntaxError(
-      "brace expansion",
-      "brace expansion with an unquoted literal `$` is not supported",
-      0,
-    );
-  }
   return marked;
 }
 
@@ -200,6 +192,16 @@ class BraceWord {
         `brace expansion nested deeper than ${NESTING_MAX} levels is not supported`,
         0,
       );
+    }
+    for (let at = open + 1; at < close; at++) {
+      if (isChar(this.atoms[at], "$")) {
+        // Bash re-reads each generated word, so `{$,a}X` expands `$X`.
+        throw new ShellSyntaxError(
+          "brace expansion",
+          "an unquoted literal `$` inside brace expansion is not supported",
+          0,
+        );
+      }
     }
     const alternatives: ArgumentPart[][] = [];
     let pieceStart = open + 1;

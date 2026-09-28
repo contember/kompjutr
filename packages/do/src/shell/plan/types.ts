@@ -24,6 +24,9 @@ export type ArgumentPart =
   /** `{1..9..2}` or `{a..e}`; `value` is the unexpanded text. */
   | { readonly kind: "sequence"; readonly value: string; readonly sequence: BraceSequence };
 
+/** A part of a word with no brace expression left: typed, or generated. */
+export type FlatPart = Exclude<ArgumentPart, { readonly kind: "brace" | "sequence" }>;
+
 /**
  * A validated sequence expression. `step` is a positive magnitude; the
  * direction follows from `start` and `end`, as in Bash. Integers stay within
@@ -46,11 +49,12 @@ export type BraceSequence =
 
 /**
  * One argument retained as ordered parts until its run environment is known.
- * An `assignment` is an argument shaped like `NAME=value` with no brace
- * expansion: Bash also expands a tilde after its `=` and after each `:`.
+ * The kind selects where a tilde prefix may start: an `assignment` is shaped
+ * like `NAME=value` with no brace expansion and also expands after its `=`
+ * and each `:`; a `here-string` also expands after each `:`.
  */
 export interface Argument {
-  readonly kind: "word" | "assignment";
+  readonly kind: "word" | "assignment" | "here-string";
   readonly parts: readonly ArgumentPart[];
 }
 

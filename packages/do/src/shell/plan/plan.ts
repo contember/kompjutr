@@ -25,9 +25,10 @@ import {
   type Word,
 } from "../parse/ast.js";
 import { argumentPart, markBraces } from "./braces.js";
+import { refuseNamedTildes } from "./tilde.js";
 import {
   type Argument,
-  type ArgumentPart,
+  type FlatPart,
   type Plan,
   type PlannedCommand,
   type PlannedPipeline,
@@ -166,12 +167,14 @@ function planRedirection(redirection: Redirection): PlannedRedirection {
 /** A here-string admits tilde expansion but no brace or pathname expansion. */
 function hereText(redirection: Extract<Redirection, { readonly op: "<<" | "<<<" }>): Argument {
   const word = redirection.op === "<<" ? redirection.body : redirection.target;
-  const parts = word.parts.map((part): ArgumentPart => {
+  const parts = word.parts.map((part): FlatPart => {
     if (part.kind === "Parameter") return { kind: "parameter", name: part.name, quoted: true };
     const quoted = redirection.op === "<<" || (part.kind !== "Literal" && part.kind !== "Glob");
     return { kind: "literal", value: part.value, quoted };
   });
-  return { kind: "word", parts };
+  if (redirection.op === "<<") return { kind: "word", parts };
+  refuseNamedTildes(parts, "here-string");
+  return { kind: "here-string", parts };
 }
 
 /**
@@ -288,9 +291,9 @@ function fuseFindIntoSearch(
     ...(parsed.pattern === null
       ? []
       : inner.name === "grep"
-        ? [literal(`--include=${parsed.pattern}`)]
-        : [literal("-g"), literal(parsed.pattern)]),
-    literal(parsed.root),
+        ? [quotedLiteral(`--include=${parsed.pattern}`)]
+        : [literal("-g"), quotedLiteral(parsed.pattern)]),
+    quotedLiteral(parsed.root),
   ];
 
   const search: PlannedCommand = {
@@ -328,13 +331,13 @@ function simpleFind(args: readonly Argument[]): { root: string; pattern: string 
 
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
-    if (arg === undefined) return null;
+    if (arg === undefined || mayExpandTilde(arg)) return null;
     if (argumentGlobPattern(arg) !== null) return null;
     const value = argumentLiteral(arg);
     if (value === null) return null;
     if (value === "-name") {
       const next = args[index + 1];
-      if (next === undefined) return null;
+      if (next === undefined || mayExpandTilde(next)) return null;
       pattern = argumentGlobPattern(next) ?? argumentLiteral(next);
       if (pattern === null) return null;
       index++;
@@ -359,6 +362,18 @@ function literal(value: string): Argument {
   return { kind: "word", parts: [{ kind: "literal", value, quoted: false }] };
 }
 
+/** The fused search takes find's operands as text, so an expanding tilde stays with find. */
+function mayExpandTilde(argument: Argument): boolean {
+  return argument.parts.some(
+    (part) => part.kind === "literal" && !part.quoted && part.value.includes("~"),
+  );
+}
+
+/** Text already expanded by planning: a tilde in it is literal. */
+function quotedLiteral(value: string): Argument {
+  return { kind: "word", parts: [{ kind: "literal", value, quoted: true }] };
+}
+
 function hasInputRedirection(command: PlannedCommand): boolean {
   return command.redirections.some(
     (redirection) => redirection.kind === "read" || redirection.kind === "text",
@@ -375,7 +390,10 @@ function hasOutputRedirection(command: PlannedCommand): boolean {
 function toArgument(word: Word): Argument {
   const braces = markBraces(word.parts);
   if (braces !== null) return { kind: "word", parts: braces };
-  return { kind: isAssignment(word) ? "assignment" : "word", parts: word.parts.map(argumentPart) };
+  const kind = isAssignment(word) ? "assignment" : "word";
+  const parts = word.parts.map(argumentPart);
+  refuseNamedTildes(parts, kind);
+  return { kind, parts };
 }
 
 function startsWithTilde(word: Word): boolean {

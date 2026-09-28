@@ -232,7 +232,7 @@ describe("malformed input", () => {
     expect(rejects("ls >").construct).toBe("redirection");
     expect(rejects("ls >&").construct).toBe("redirection");
     expect(rejects("ls &>").construct).toBe("redirection");
-    expect(rejects("ls 1>& x").construct).toBe("redirection");
+    expect(rejects("ls 2>& x").construct).toBe("redirection");
   });
 
   it("parses an empty script as no statements", () => {

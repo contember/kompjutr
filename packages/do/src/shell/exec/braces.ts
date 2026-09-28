@@ -3,10 +3,7 @@
 // counts each word against the argv ceiling as it arrives, so `{1..100000000}`
 // fails at the ceiling without being materialised.
 
-import type { ArgumentPart, BraceSequence } from "../plan/types.js";
-
-/** A generated word: no brace or sequence parts remain. */
-export type FlatPart = Exclude<ArgumentPart, { readonly kind: "brace" | "sequence" }>;
+import type { ArgumentPart, BraceSequence, FlatPart } from "../plan/types.js";
 
 export function hasBraces(parts: readonly ArgumentPart[]): boolean {
   return parts.some((part) => part.kind === "brace" || part.kind === "sequence");

@@ -158,14 +158,14 @@ class Parser {
 
       if (token.type === "fd") {
         this.#index++;
-        redirections.push(...this.#redirection(token.value, true, token.offset));
+        redirections.push(...this.#redirection(token.value, token.offset));
         continue;
       }
 
       if (token.type === "op" && isRedirectionOperator(token.value)) {
         // No explicit fd: the `<` family reads stdin, everything else writes stdout.
         const fd = token.value.startsWith("<") ? 0 : 1;
-        redirections.push(...this.#redirection(fd, false, token.offset));
+        redirections.push(...this.#redirection(fd, token.offset));
         continue;
       }
 
@@ -189,10 +189,10 @@ class Parser {
   }
 
   /**
-   * One redirection, or two for `&>file`, `&>>file`, and `>&file`, which Bash
+   * One redirection, or two for `&>file`, `&>>file`, and `>&file` or `1>&file`, which Bash
    * defines as `>file 2>&1` and `>>file 2>&1`.
    */
-  #redirection(fd: number, explicitFd: boolean, offset: number): Redirection[] {
+  #redirection(fd: number, offset: number): Redirection[] {
     const operator = this.tokens[this.#index];
     if (operator?.type !== "op") {
       throw new ShellSyntaxError("redirection", "expected a redirection operator", offset);
@@ -212,7 +212,7 @@ class Parser {
       if (target?.type !== "word") {
         throw new ShellSyntaxError("redirection", "expected a descriptor after >&", offset);
       }
-      if (!explicitFd && !/^[0-9]+$/.test(wordText(target.word)) && isFileTarget(target.word)) {
+      if (fd === 1 && !/^[0-9]+$/.test(wordText(target.word)) && isFileTarget(target.word)) {
         this.#index++;
         return [
           { kind: "Redirection", fd: 1, op: ">", target: target.word },
