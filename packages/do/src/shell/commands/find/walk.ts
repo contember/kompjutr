@@ -12,19 +12,19 @@
 // stack is as deep as the tree, never as wide.
 //
 // Whether a directory is empty comes from the scan itself: in post-order,
-// from whether every child was deleted; in pre-order, from the next rows of
-// the page already in hand. Only a directory whose children the scan did not
-// read — the last row of a full page, or one cut by `-maxdepth` — costs one
-// `scan` of a single row. When an `-exec` command may have changed the tree,
-// emptiness always asks the filesystem.
+// from whether every child was deleted; in pre-order, from the page in hand
+// (`pages.ts`). When an `-exec` command may have changed the tree, emptiness
+// asks the filesystem and rows are re-read after each command run; a row that
+// vanished is reported as GNU reports a failed lstat or opendir.
 
 import { comparePaths, dirname, subtreeSuccessor } from "../../../fs/path.js";
-import { orderedScan, SCAN_STREAM_PAGE } from "../../../fs/store/scan/scan-stream.js";
-import type { ScanEntry, ScanOptions, Stat } from "../../../fs/types.js";
+import { orderedScan } from "../../../fs/store/scan/scan-stream.js";
+import type { EntryType, Stat } from "../../../fs/types.js";
 import type { CommandContext } from "../../exec/context.js";
 import { displayUnder } from "../../exec/display.js";
 import type { Deleter } from "./delete.js";
 import { type Candidate, type Evaluation, evaluate, type Visit } from "./evaluate.js";
+import { hasDescendants, ScanPages } from "./pages.js";
 import type { FindCommand } from "./types.js";
 
 export interface Walk {
@@ -35,44 +35,65 @@ export interface Walk {
   readonly operand: string;
   readonly start: string;
   readonly root: Stat;
-  /** An `-exec` may change the tree mid-walk, so emptiness asks the filesystem. */
+  /** An `-exec` may change the tree mid-walk, so rows and emptiness are re-read. */
   readonly live: boolean;
   /** The expression tests `-empty` or `-delete`. */
   readonly needsEmptiness: boolean;
+  /** Reports an entry that vanished mid-walk, as GNU's failed lstat or opendir does. */
+  lost(display: string): void;
 }
 
 export async function* preOrder(walk: Walk): AsyncGenerator<Uint8Array, void, undefined> {
   const { context, command, evaluation, operand, start, root } = walk;
   const rootVisit: Visit = { pruned: false };
+  const runsBefore = evaluation.exec.runs;
   if (command.minDepth === 0) {
     const candidate: Candidate = {
       display: operand,
-      stat: root,
+      type: root.type,
+      stat: () => root,
       emptyDirectory: () => !hasDescendants(context, start),
       remove: unreachableRemoval,
     };
     yield* evaluate(command.expression, candidate, evaluation, rootVisit);
   }
   if (!descends(walk) || rootVisit.pruned) return;
+  if (evaluation.exec.runs !== runsBefore && context.fs.stat(start) === null) {
+    walk.lost(operand);
+    return;
+  }
 
-  const pages = new PageLookahead(context, start);
+  const pages = pagesFor(walk);
   const real = realPrefix(context, start);
   let skipLast = false;
   for (const entry of orderedScan(pages.read, { pruneDirectory: () => skipLast })) {
+    const row = pages.current(entry);
     const prefix = real(entry.path);
     const depth = depthUnder(prefix, entry.path);
+    const display = displayUnder(operand, prefix, entry.path);
     const visit: Visit = { pruned: false };
+    const runsAtRow = evaluation.exec.runs;
     if (depth >= command.minDepth) {
       const candidate: Candidate = {
-        display: displayUnder(operand, prefix, entry.path),
-        stat: entry,
-        emptyDirectory: () =>
-          walk.live ? !hasDescendants(context, entry.path) : !pages.hasChildren(entry.path),
+        display,
+        type: entry.type,
+        stat: statOf(walk, display, row),
+        emptyDirectory: () => {
+          if (row === null) return false;
+          return walk.live ? !hasDescendants(context, entry.path) : !pages.hasChildren(entry.path);
+        },
         remove: unreachableRemoval,
       };
       yield* evaluate(command.expression, candidate, evaluation, visit);
     }
     skipLast = visit.pruned || (command.maxDepth !== null && depth >= command.maxDepth);
+    // GNU then fails to open a directory that vanished, including by the command just run.
+    const vanished = (): boolean =>
+      row === null || (evaluation.exec.runs !== runsAtRow && context.fs.stat(entry.path) === null);
+    if (entry.type === "dir" && !skipLast && vanished()) {
+      walk.lost(display);
+      skipLast = true;
+    }
   }
 }
 
@@ -80,7 +101,9 @@ interface Frame {
   /** Real for scanned rows; the resolved operand for the starting point. */
   readonly path: string;
   readonly display: string;
-  readonly stat: Stat;
+  readonly type: EntryType;
+  /** Null when an `-exec` removed the entry after the walk read it. */
+  readonly row: Stat | null;
   readonly depth: number;
   readonly bound: string;
   /** Children exist that the walk did not read, because `-maxdepth` cut them. */
@@ -97,11 +120,11 @@ export async function* postOrder(
   deleter: Deleter | null,
 ): AsyncGenerator<Uint8Array, void, undefined> {
   const { context, command, operand, start, root } = walk;
-  const rootFrame = frame(start, operand, root, 0, () =>
+  const rootFrame = frame(start, operand, root.type, root, 0, () =>
     descends(walk) ? false : root.type === "dir" && hasDescendants(context, start),
   );
   if (descends(walk)) {
-    const pages = new PageLookahead(context, start);
+    const pages = pagesFor(walk);
     const real = realPrefix(context, start);
     const stack: Frame[] = [];
     const parentOf = (child: Frame): Frame => {
@@ -119,19 +142,20 @@ export async function* postOrder(
         stack.pop();
         yield* finish(walk, deleter, top, parentOf(top));
       }
+      const row = pages.current(entry);
       const prefix = real(entry.path);
       const depth = depthUnder(prefix, entry.path);
+      const display = displayUnder(operand, prefix, entry.path);
       const cut = command.maxDepth !== null && depth >= command.maxDepth;
       const unread =
         cut && entry.type === "dir" && walk.needsEmptiness && pages.hasChildren(entry.path);
-      const current = frame(
-        entry.path,
-        displayUnder(operand, prefix, entry.path),
-        entry,
-        depth,
-        () => unread,
-      );
+      const current = frame(entry.path, display, entry.type, row, depth, () => unread);
       skipLast = cut;
+      if (row === null && entry.type === "dir" && !cut) {
+        // GNU fails to open the directory before it evaluates it in post-order.
+        walk.lost(display);
+        skipLast = true;
+      }
       if (entry.type === "dir") {
         stack.push(current);
       } else {
@@ -148,14 +172,16 @@ export async function* postOrder(
 function frame(
   path: string,
   display: string,
-  stat: Stat,
+  type: EntryType,
+  row: Stat | null,
   depth: number,
   unreadChildren: () => boolean,
 ): Frame {
   return {
     path,
     display,
-    stat,
+    type,
+    row,
     depth,
     bound: subtreeSuccessor(path),
     unreadChildren,
@@ -176,11 +202,14 @@ async function* finish(
   if (entry.depth >= walk.command.minDepth) {
     const candidate: Candidate = {
       display: entry.display,
-      stat: entry.stat,
-      emptyDirectory: () =>
-        walk.live
+      type: entry.type,
+      stat: statOf(walk, entry.display, entry.row),
+      emptyDirectory: () => {
+        if (entry.row === null) return false;
+        return walk.live
           ? !hasDescendants(walk.context, entry.path)
-          : !entry.retained && !entry.unreadChildren(),
+          : !entry.retained && !entry.unreadChildren();
+      },
       remove: () => {
         if (deleter === null) return unreachableRemoval();
         const removal = remove(deleter, entry);
@@ -217,11 +246,7 @@ function remove(deleter: Deleter, entry: Frame): RemovalOutcome {
       return { succeeded: false, generation: null };
     }
   }
-  if (
-    !deleter.immediate &&
-    entry.stat.type === "dir" &&
-    (entry.retained || entry.unreadChildren())
-  ) {
+  if (!deleter.immediate && entry.type === "dir" && (entry.retained || entry.unreadChildren())) {
     deleter.refuse(entry.display, "Directory not empty");
     return { succeeded: false, generation: null };
   }
@@ -239,40 +264,21 @@ function unreachableRemoval(): boolean {
   throw new Error("find: -delete implies -depth and never runs in this walk");
 }
 
-function hasDescendants(context: CommandContext, directory: string): boolean {
-  return context.fs.scan(directory, { limit: 1 }).length > 0;
+function pagesFor(walk: Walk): ScanPages {
+  const exec = walk.evaluation.exec;
+  return new ScanPages(walk.context, walk.start, walk.live ? () => exec.runs : null);
 }
 
-/** Remembers the page `orderedScan` is yielding from, to look ahead within it. */
-class PageLookahead {
-  #page: ScanEntry[] = [];
-
-  constructor(
-    private readonly context: CommandContext,
-    private readonly start: string,
-  ) {}
-
-  readonly read = (options: ScanOptions): ScanEntry[] => {
-    this.#page = this.context.fs.scan(this.start, options);
-    return this.#page;
-  };
-
-  /** Whether `directory`, a row of the current page, has children. */
-  hasChildren(directory: string): boolean {
-    const page = this.#page;
-    const lower = `${directory}/`;
-    let low = 0;
-    let high = page.length;
-    while (low < high) {
-      const middle = (low + high) >>> 1;
-      if (comparePaths(page[middle]?.path ?? "", lower) < 0) low = middle + 1;
-      else high = middle;
+/** Metadata for an entry; a vanished one is reported once, the first time a test asks. */
+function statOf(walk: Walk, display: string, row: Stat | null): () => Stat | null {
+  let reported = false;
+  return () => {
+    if (row === null && !reported) {
+      reported = true;
+      walk.lost(display);
     }
-    const next = page[low];
-    if (next !== undefined) return comparePaths(next.path, subtreeSuccessor(directory)) < 0;
-    if (page.length < SCAN_STREAM_PAGE) return false;
-    return hasDescendants(this.context, directory);
-  }
+    return row;
+  };
 }
 
 /**

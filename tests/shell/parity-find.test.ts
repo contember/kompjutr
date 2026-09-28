@@ -205,4 +205,44 @@ describe.skipIf(!REAL_BASH)("find matches GNU find", () => {
   ])("tests ages: %j", async (source) => {
     await compare(source);
   });
+
+  it.each([
+    "find src/a.ts/ -delete; find . | sort",
+    "find src/a.ts/ -print",
+    "find src/a.ts/. -print",
+    "find src/a.ts/ src -name a.ts",
+    "find missing/ src -name a.ts",
+    "find src/ -name a.ts",
+    "find src/deep/. -type f | sort",
+  ])("refuses a file named with a trailing slash: %j", async (source) => {
+    await compare(source);
+  });
+
+  it.each([
+    "find . -size -1 | sort",
+    "find . -size 0 | sort",
+    "find . -size 8 | sort",
+    "find . -type d -size 4k | sort",
+    "find . -size -4097c -size +4095c | sort",
+    "mkdir e && find . -size -1 -delete; find . | sort",
+  ])("sizes directories as 4096 bytes: %j", async (source) => {
+    await compare(source);
+  });
+
+  it.each([
+    "find src -exec rm -rf src ';' -print",
+    "find src -name deep -exec rm -rf src/deep ';' -print",
+    "find src -name deep -exec rm -rf src/deep ';' -o -print | sort",
+    "find top.ts src -name top.ts -exec rm -rf src/deep ';' -o -print | sort",
+  ])("re-reads the tree after -exec changes it: %j", async (source) => {
+    await compare(source);
+  });
+
+  it.each([
+    "find src -print -delete | head -n 0; find . | sort",
+    "find . -name '*.ts' -delete -print | head -n 0; find . | sort",
+    "find src -type f -exec rm {} + | head -n 0; find . | sort",
+  ])("finishes side effects when the reader stops: %j", async (source) => {
+    await compare(source);
+  });
 });

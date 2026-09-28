@@ -28,6 +28,7 @@ interface Batch {
 export class ExecRunner {
   #failed = false;
   #truncated = false;
+  #runs = 0;
   readonly #batches = new Map<ExecNode, Batch>();
 
   /**
@@ -55,6 +56,11 @@ export class ExecRunner {
   /** True when any `-exec … +` invocation failed. */
   get failed(): boolean {
     return this.#failed;
+  }
+
+  /** Invocations started so far; a walk re-reads its rows when this moves. */
+  get runs(): number {
+    return this.#runs;
   }
 
   get truncated(): boolean {
@@ -111,6 +117,7 @@ export class ExecRunner {
   async *#run(argv: readonly string[]): AsyncGenerator<Uint8Array, number, undefined> {
     const [name = "", ...rest] = argv;
     this.beforeRun();
+    this.#runs++;
     const produced = await this.context.invoke(name, rest);
     if (produced === null) {
       this.context.warn(`'${name}': No such file or directory`);

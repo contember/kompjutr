@@ -88,6 +88,14 @@ export class Deleter {
     this.#failed = true;
   }
 
+  /** Drops what is still queued, for a walk that failed before its final flush. */
+  discard(): void {
+    for (const release of this.#releases) release();
+    this.#generations = [];
+    this.#releases = [];
+    this.#pending = 0;
+  }
+
   /** Removes everything queued. True when every removal succeeded. */
   flush(): boolean {
     const generations = this.#generations;

@@ -3,19 +3,26 @@
 // `-exec` command writes — is yielded in evaluation order; the generator's
 // return value is the expression's truth.
 
-import type { Stat } from "../../../fs/types.js";
+import type { EntryType, Stat } from "../../../fs/types.js";
 import { encode } from "../../exec/bytes.js";
 import type { ExecRunner } from "./exec.js";
 import type { Comparison, Expression } from "./types.js";
 
 const MINUTE = 60_000;
 const DAY = 86_400_000;
+/**
+ * The filesystem stores no size for a directory. `-size` sees the block size
+ * the Node compat layer reports (`fs/compat/node-values.ts`), as ext4 does.
+ */
+const DIRECTORY_SIZE = 4096;
 
 export interface Candidate {
   /** The path as find prints it: under its starting point as typed. */
   readonly display: string;
-  /** Null on the indexed-glob path, whose expressions test names only. */
-  readonly stat: Stat | null;
+  /** From the listing; null on the indexed-glob path, whose expressions test names only. */
+  readonly type: EntryType | null;
+  /** Null on the glob path, or after reporting an entry an `-exec` removed. */
+  stat(): Stat | null;
   /** Whether a directory has no entries left. Asked of directories only. */
   emptyDirectory(): boolean;
   /** `-delete`; false when the entry could not be removed. */
@@ -59,7 +66,7 @@ export async function* evaluate(
     case "path":
       return expression.test(candidate.display);
     case "type":
-      return candidate.stat !== null && expression.types.has(candidate.stat.type);
+      return candidate.type !== null && expression.types.has(candidate.type);
     case "constant":
       return expression.value;
     case "print":
@@ -70,21 +77,21 @@ export async function* evaluate(
       return true;
     case "empty":
       return isEmpty(candidate);
-    case "size":
-      return (
-        candidate.stat !== null &&
-        compare(
-          Math.ceil(candidate.stat.size / expression.unit),
-          expression.comparison,
-          expression.count,
-        )
-      );
-    case "newer": {
-      const reference = evaluation.newer.get(expression.reference);
-      return candidate.stat !== null && reference !== undefined && candidate.stat.mtime > reference;
+    case "size": {
+      const stat = candidate.stat();
+      if (stat === null) return false;
+      const size = stat.type === "dir" ? DIRECTORY_SIZE : stat.size;
+      return compare(Math.ceil(size / expression.unit), expression.comparison, expression.count);
     }
-    case "age":
-      return candidate.stat !== null && isAged(expression, evaluation.now - candidate.stat.mtime);
+    case "newer": {
+      const stat = candidate.stat();
+      const reference = evaluation.newer.get(expression.reference);
+      return stat !== null && reference !== undefined && stat.mtime > reference;
+    }
+    case "age": {
+      const stat = candidate.stat();
+      return stat !== null && isAged(expression, evaluation.now - stat.mtime);
+    }
     case "exec":
       return expression.batched
         ? yield* evaluation.exec.queue(expression, candidate.display)
@@ -95,9 +102,8 @@ export async function* evaluate(
 }
 
 function isEmpty(candidate: Candidate): boolean {
-  if (candidate.stat === null) return false;
-  if (candidate.stat.type === "file") return candidate.stat.size === 0;
-  return candidate.stat.type === "dir" && candidate.emptyDirectory();
+  if (candidate.type === "file") return candidate.stat()?.size === 0;
+  return candidate.type === "dir" && candidate.emptyDirectory();
 }
 
 function compare(value: number, comparison: Comparison, operand: number): boolean {
@@ -114,7 +120,7 @@ function compare(value: number, comparison: Comparison, operand: number): boolea
 function isAged(test: Extract<Expression, { readonly kind: "age" }>, age: number): boolean {
   const unit = test.unit === "minutes" ? MINUTE : DAY;
   const upper = test.unit === "minutes" ? test.amount * unit : (test.amount + 1) * unit;
-  if (test.comparison === "greater") return age > upper;
+  if (test.comparison === "greater") return test.unit === "minutes" ? age > upper : age >= upper;
   if (test.comparison === "less") return age < test.amount * unit;
   return age >= upper - unit && age < upper;
 }

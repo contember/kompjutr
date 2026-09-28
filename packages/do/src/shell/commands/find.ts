@@ -1,7 +1,6 @@
 // `find`. Each starting point is one stat plus keyset scan pages; `-prune`
 // and `-maxdepth` resume the scan past the skipped subtree instead of reading
-// it. An expression that is only `-name`, `-path`, `-print`, and `-exec`
-// lowers to an indexed GLOB narrowed by the `-name` pattern's literal tail.
+// it. An expression that is only `-name`, `-path`, and `-print` lowers to an indexed GLOB narrowed by the `-name` pattern's literal tail.
 // Results print under the starting point as typed, as GNU find does. The
 // walks, `-exec`, and `-delete` live in `find/`.
 
@@ -11,7 +10,7 @@ import { displayUnder } from "../exec/display.js";
 import { resolve } from "../exec/execute.js";
 import { sqlGlobFor } from "../exec/glob.js";
 import { Deleter } from "./find/delete.js";
-import { type Evaluation, evaluate } from "./find/evaluate.js";
+import { type Candidate, type Evaluation, evaluate } from "./find/evaluate.js";
 import { ExecRunner } from "./find/exec.js";
 import { type Expression, type FindCommand, FindUsageError, nodes } from "./find/types.js";
 import { postOrder, preOrder, realPrefix, type Walk } from "./find/walk.js";
@@ -56,12 +55,23 @@ export const find: Command = (context) => {
   );
 
   let missing = false;
-  const stream = (async function* (): ByteStream {
+  const lost = (display: string): void => {
+    context.warn(`'${display}': No such file or directory`);
+    missing = true;
+  };
+  const stream = (async function* (): AsyncGenerator<Uint8Array, void, undefined> {
     for (const operand of command.startingPoints) {
       const start = resolve(context.cwd, operand);
-      const root = context.fs.stat(start);
+      // A trailing slash names a directory: GNU follows a symlink to one and
+      // refuses anything else before the walk.
+      const namesDirectory = /\/\.?$/.test(operand);
+      const root = namesDirectory ? context.fs.statTarget(start) : context.fs.stat(start);
       if (root === null) {
-        context.warn(`'${operand}': No such file or directory`);
+        lost(operand);
+        continue;
+      }
+      if (namesDirectory && root.type !== "dir") {
+        context.warn(`'${operand}': Not a directory`);
         missing = true;
         continue;
       }
@@ -74,6 +84,7 @@ export const find: Command = (context) => {
         root,
         live,
         needsEmptiness,
+        lost,
       };
       const pattern = globNarrowing(command, start);
       if (command.depthFirst) {
@@ -88,8 +99,12 @@ export const find: Command = (context) => {
     yield* exec.finish();
   })();
   const failed = (): boolean => missing || exec.failed || (deleter?.failed ?? false);
+  const release = (): void => {
+    exec.release();
+    deleter?.discard();
+  };
   return {
-    stdout: owned(stream, () => exec.release()),
+    stdout: owned(live || deleter !== null ? new FinishingStream(stream) : stream, release),
     status: () => (failed() ? 1 : 0),
     truncated: () => exec.truncated,
   };
@@ -101,9 +116,10 @@ export const find: Command = (context) => {
  */
 async function* globbed(walk: Walk, pattern: string): ByteStream {
   const { context, command, evaluation, operand, start, root } = walk;
-  const rootCandidate = {
+  const rootCandidate: Candidate = {
     display: operand,
-    stat: root,
+    type: root.type,
+    stat: () => root,
     emptyDirectory: unreachable,
     remove: unreachable,
   };
@@ -120,9 +136,10 @@ async function* globbed(walk: Walk, pattern: string): ByteStream {
       after === undefined ? { limit: pageSize } : { after, limit: pageSize },
     );
     for (const path of page.paths) {
-      const candidate = {
+      const candidate: Candidate = {
         display: displayUnder(operand, real(path), path),
-        stat: null,
+        type: null,
+        stat: () => null,
         emptyDirectory: unreachable,
         remove: unreachable,
       };
@@ -133,15 +150,44 @@ async function* globbed(walk: Walk, pattern: string): ByteStream {
   }
 }
 
+/**
+ * A reader that stops early must not abandon side effects: closing runs the
+ * rest of the walk with its output discarded, so queued deletions and pending
+ * `-exec` batches still happen. The operation ceiling still bounds it.
+ */
+class FinishingStream implements AsyncIterableIterator<Uint8Array, void, undefined> {
+  constructor(private readonly source: AsyncGenerator<Uint8Array, void, undefined>) {}
+
+  [Symbol.asyncIterator](): AsyncIterableIterator<Uint8Array, void, undefined> {
+    return this;
+  }
+
+  next(): Promise<IteratorResult<Uint8Array, void>> {
+    return this.source.next();
+  }
+
+  async return(): Promise<IteratorResult<Uint8Array, void>> {
+    for (let next = await this.source.next(); next.done !== true; next = await this.source.next()) {
+      // Discarded: nobody reads it any more.
+    }
+    return { done: true, value: undefined };
+  }
+
+  throw(error: unknown): Promise<IteratorResult<Uint8Array, void>> {
+    return this.source.throw(error);
+  }
+}
+
 function unreachable(): boolean {
   throw new Error("find: the indexed walk evaluates names only");
 }
 
 /**
- * The GLOB for an expression made only of `-name`, `-path`, and actions that
- * need no metadata, narrowed by a case-sensitive `-name`. Types, sizes, times,
- * depths, and `-prune` need the scan's entry metadata, and `-o` or `!` could
- * admit paths a GLOB excludes.
+ * The GLOB for an expression made only of `-name`, `-path`, and `-print`,
+ * narrowed by a case-sensitive `-name`. Types, sizes, times, depths, and
+ * `-prune` need the scan's entry metadata; `-o` or `!` could admit paths a
+ * GLOB excludes; and an `-exec` may change the tree, which only the scan walk
+ * re-reads.
  */
 function globNarrowing(command: FindCommand, start: string): string | null {
   if (command.maxDepth !== null || command.minDepth > 0) return null;
@@ -152,7 +198,7 @@ function globNarrowing(command: FindCommand, start: string): string | null {
       conjuncts.push(next.left, next.right);
     } else if (next.kind === "name" || next.kind === "path") {
       if (next.kind === "name" && !next.ignoreCase) tail ??= literalTail(next.pattern);
-    } else if (next.kind !== "print" && next.kind !== "exec") {
+    } else if (next.kind !== "print") {
       return null;
     }
   }

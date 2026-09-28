@@ -183,3 +183,91 @@ describe("find time tests against a pinned clock", () => {
     expect(run.stdout).toBe("./m0.5\n./m1\n");
   });
 });
+
+describe("find starting points named with a trailing slash", () => {
+  function linked(): Shell {
+    const fs = createFilesystem(new TestDatabase(), { now: () => NOW });
+    fs.writeFiles([
+      { path: "/repo", mode: 0o755 },
+      { path: "/repo/d/sub/g", bytes: ENCODER.encode("g") },
+      { path: "/repo/f", bytes: ENCODER.encode("f") },
+    ]);
+    fs.symlink("d", "/repo/l");
+    fs.symlink("f", "/repo/lf");
+    return createShell({ fs, cwd: "/repo", now: () => NOW });
+  }
+
+  // GNU find 4.10 printed these for the same tree.
+  it("follows a symlink to a directory", async () => {
+    const run = await linked().run("find l/");
+    expect(run.stdout).toBe("l/\nl/sub\nl/sub/g\n");
+    expect(run.exitCode).toBe(0);
+  });
+
+  it("does not follow the same symlink without the slash", async () => {
+    expect((await linked().run("find l")).stdout).toBe("l\n");
+  });
+
+  it("deletes through a followed symlink", async () => {
+    const shell = linked();
+    const run = await shell.run("find l/ -type f -delete");
+    expect(run.stderr).toBe("");
+    expect(run.exitCode).toBe(0);
+    expect((await shell.run("find d")).stdout).toBe("d\nd/sub\n");
+  });
+
+  it("refuses a symlink to a file", async () => {
+    const run = await linked().run("find lf/");
+    expect(run.stderr).toBe("find: 'lf/': Not a directory\n");
+    expect(run.exitCode).toBe(1);
+  });
+});
+
+describe("find -exec that changes the tree", () => {
+  // Path order visits the files before `src/deep`; GNU's readdir did the same.
+  it("reports a directory an earlier command removed and skips its rows", async () => {
+    const shell = shellOver(["src/a.ts", "src/b.md", "src/deep/c.ts", "src/deep/d.ts"]);
+    const run = await shell.run("find src -type f -exec rm -rf src/deep ';' -print");
+    expect(run.stdout).toBe("src/a.ts\nsrc/b.md\n");
+    expect(run.stderr).toBe("find: 'src/deep': No such file or directory\n");
+    expect(run.exitCode).toBe(1);
+  });
+
+  it("re-reads one page per command run, not one stat per row", async () => {
+    const shell = shellOver(wideTree(10, 10));
+    const run = await shell.run("find . -name f000.ts -exec true ';'");
+    expect(run.exitCode).toBe(0);
+    // One stat and one page, then one re-read per directory's command.
+    expect(run.operations).toBeLessThan(30);
+  });
+});
+
+describe("find -mtime boundaries", () => {
+  it("counts an age of exactly N+1 days as more than N", async () => {
+    const shell = shellOver(["two"], { two: NOW - 2 * DAY });
+    expect((await shell.run("find . -type f -mtime +1")).stdout).toBe("./two\n");
+    expect((await shell.run("find . -type f -mtime 2")).stdout).toBe("./two\n");
+    expect((await shell.run("find . -type f -mtime 1")).stdout).toBe("");
+  });
+});
+
+describe("find side effects when the reader stops early", () => {
+  // GNU flushes stdout before each child and dies of SIGPIPE, so the harness
+  // cannot compare this; the shell finishes the walk with output discarded.
+  it("runs every -exec and deletion after head closes the pipe", async () => {
+    const shell = shellOver(["src/a.ts", "src/b.md", "src/deep/c.ts", "top.ts"]);
+    const run = await shell.run("find src -type f -exec rm {} ';' -print | head -n 1");
+    expect(run.stdout).toBe("src/a.ts\n");
+    expect((await shell.run("find .")).stdout).toBe(".\n./src\n./src/deep\n./top.ts\n");
+    const deleting = await shell.run("find src -print -delete | head -n 1");
+    expect(deleting.stdout).toBe("src/deep\n");
+    expect((await shell.run("find .")).stdout).toBe(".\n./top.ts\n");
+  });
+
+  it("still stops a pure expression early", async () => {
+    const shell = shellOver(wideTree(20, 100));
+    const bounded = await shell.run("find . -type f -size -2k | head -n 1");
+    const unbounded = await shell.run("find . -type f -size -2k");
+    expect(bounded.operations).toBeLessThan(unbounded.operations);
+  });
+});
