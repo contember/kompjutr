@@ -47,6 +47,7 @@ import {
   CHECKOUT_COUNT,
   CHECKOUT_HEAD_BYTES,
   CHECKOUT_ROOT_BYTES,
+  FALLBACK_FORMER_LIMIT_BYTES,
   GRAPH_COMMIT_COUNT,
   GRAPH_MESSAGE_BYTES,
   HASH_WORKLOAD_BYTES,
@@ -875,11 +876,12 @@ function packFallbackAuditScenario(): Scenario {
       ).packId;
       fallbackPackId = (
         await created.repo.store.packs.ingest(
-          singleBlobPackStream(PACK_FIXTURE_DATA, spec.formerLimitBytes),
+          singleBlobPackStream(PACK_FIXTURE_DATA, FALLBACK_FORMER_LIMIT_BYTES),
         )
       ).packId;
       if (
-        storedZlibByteLength(PACK_FIXTURE_DATA.length, spec.formerLimitBytes) !== spec.workloadBytes
+        storedZlibByteLength(PACK_FIXTURE_DATA.length, FALLBACK_FORMER_LIMIT_BYTES) !==
+        spec.workloadBytes
       ) {
         throw new Error("fallback audit fixture compressed length is inconsistent");
       }

@@ -32,12 +32,19 @@ export const CHECKOUT_ROOT_BYTES = 4_096;
 export const CHECKOUT_HEAD_BYTES = 1_024;
 export const SPARSE_SELECTED_PATH_COUNT = 1_000;
 export const SPARSE_SELECTED_PATH_BYTES = MAX_INDEX_PATH_BYTES;
+export const CHECKOUT_SWAP_PATH_COUNT = 80_000;
+export const CHECKOUT_SWAP_PATH_BYTES = 224;
+export const CHECKOUT_SWAP_DIRECTORY_COUNT = 1_000;
 
 const RANGE_HASH_CHUNKS = Math.ceil(HASH_WORKLOAD_BYTES / (64 * 1024));
 const PACK_FIXTURE_OBJECT_BYTES = 1;
 const PACK_STREAM_CHUNK_BYTES = 1024 * 1024;
 const SQLITE_OBJECT_CHUNK_BYTES = 1024 * 1024;
-const FALLBACK_COMPRESSED_BYTES = storedZlibBytes(PACK_FIXTURE_OBJECT_BYTES, 48 * 1024 * 1024);
+export const FALLBACK_FORMER_LIMIT_BYTES = 48 * 1024 * 1024;
+const FALLBACK_COMPRESSED_BYTES = storedZlibBytes(
+  PACK_FIXTURE_OBJECT_BYTES,
+  FALLBACK_FORMER_LIMIT_BYTES,
+);
 const GRAPH_MESSAGE = `${"g".repeat(GRAPH_MESSAGE_BYTES - 1)}\n`;
 const GRAPH_PERSON = {
   name: "Memory Benchmark",
@@ -90,6 +97,7 @@ export type MemoryScenarioName =
   | "core.rebase.baseline-hash"
   | "core.staging.add-hash"
   | "core.sparse-selected-add"
+  | "core.checkout.tree-swap"
   | "core.loose-object-stream"
   | "sqlite.pack.fallback-audit"
   | "sqlite.graph.retained"
@@ -103,6 +111,7 @@ export type MemorySource =
   | "rebase"
   | "createSqliteSelectedPathSource"
   | "add"
+  | "checkoutTree"
   | "SharedRepoStore.readBlobs"
   | "PackStore.deleteCompletePacks"
   | "Repository.walkIndexed"
@@ -114,7 +123,8 @@ export interface MemoryScenarioSpec {
   operation: MemoryScenarioName;
   source: MemorySource;
   workloadBytes: number;
-  formerLimitBytes: number;
+  /** `null` when the operation's legal input cannot reach any retired limit. */
+  formerLimitBytes: number | null;
   verifiedContentBytes: number;
   verifiedChunkCount: number;
 }
@@ -174,9 +184,18 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     operation: "core.sparse-selected-add",
     source: "createSqliteSelectedPathSource",
     workloadBytes: SPARSE_SELECTED_PATH_COUNT * SPARSE_SELECTED_PATH_BYTES,
-    formerLimitBytes: 64 * 1024 * 1024,
+    formerLimitBytes: null,
     verifiedContentBytes: SPARSE_SELECTED_PATH_COUNT,
     verifiedChunkCount: SPARSE_SELECTED_PATH_COUNT,
+  },
+  {
+    scenario: "core.checkout.tree-swap",
+    operation: "core.checkout.tree-swap",
+    source: "checkoutTree",
+    workloadBytes: CHECKOUT_SWAP_PATH_COUNT * CHECKOUT_SWAP_PATH_BYTES,
+    formerLimitBytes: 16 * 1024 * 1024,
+    verifiedContentBytes: CHECKOUT_SWAP_PATH_COUNT * CHECKOUT_SWAP_PATH_BYTES,
+    verifiedChunkCount: CHECKOUT_SWAP_PATH_COUNT,
   },
   {
     scenario: "core.loose-object-stream",
@@ -194,7 +213,7 @@ const MEMORY_SCENARIO_SPECS: readonly MemoryScenarioSpec[] = [
     operation: "sqlite.pack.fallback-audit",
     source: "PackStore.deleteCompletePacks",
     workloadBytes: FALLBACK_COMPRESSED_BYTES,
-    formerLimitBytes: 48 * 1024 * 1024,
+    formerLimitBytes: FALLBACK_FORMER_LIMIT_BYTES,
     verifiedContentBytes: PACK_FIXTURE_OBJECT_BYTES,
     verifiedChunkCount: Math.ceil(FALLBACK_COMPRESSED_BYTES / PACK_STREAM_CHUNK_BYTES),
   },
@@ -273,7 +292,7 @@ export interface CgroupMemoryEvidence {
 export interface MemoryPhaseEvidence {
   source: MemorySource;
   workloadBytes: number;
-  formerLimitBytes: number;
+  formerLimitBytes: number | null;
   verifiedContentBytes: number;
   verifiedChunkCount: number;
   verificationDigest: string;
@@ -299,7 +318,7 @@ export interface MemoryRun {
   storageFootprintAfterBytes: number;
   storageFootprintGrowthBytes: number;
   workloadBytes: number;
-  formerLimitBytes: number;
+  formerLimitBytes: number | null;
   verifiedContentBytes: number;
   verifiedChunkCount: number;
   verificationDigest: string;
@@ -567,7 +586,7 @@ export function parseMemoryRun(line: string, expected?: MemoryRunIdentity): Memo
     throw new Error("storage footprint growth is inconsistent");
   }
   const workloadBytes = safeIntegerField(value, "workloadBytes");
-  const formerLimitBytes = safeIntegerField(value, "formerLimitBytes");
+  const formerLimitBytes = nullableSafeIntegerField(value, "formerLimitBytes");
   const verifiedContentBytes = safeIntegerField(value, "verifiedContentBytes");
   const verifiedChunkCount = safeIntegerField(value, "verifiedChunkCount");
   if (
@@ -578,7 +597,7 @@ export function parseMemoryRun(line: string, expected?: MemoryRunIdentity): Memo
   ) {
     throw new Error("scenario metadata does not match its frozen specification");
   }
-  if (workloadBytes <= formerLimitBytes) {
+  if (formerLimitBytes !== null && workloadBytes <= formerLimitBytes) {
     throw new Error("scenario workload does not cross its former limit");
   }
   const verificationDigest = textField(value, "verificationDigest");

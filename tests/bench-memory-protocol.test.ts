@@ -104,13 +104,40 @@ describe("memory benchmark protocol", () => {
       "sqlite.object.singleton",
       "sqlite.config.move",
       "sqlite.checkout.list",
+      "core.checkout.tree-swap",
     ];
     for (const name of required) {
       const spec = memoryScenarioSpec(name);
       expect(spec.scenario).toBe(name);
-      expect(spec.workloadBytes).toBeGreaterThan(spec.formerLimitBytes);
+      expect(spec.formerLimitBytes).not.toBeNull();
+      expect(spec.workloadBytes).toBeGreaterThan(spec.formerLimitBytes ?? Number.POSITIVE_INFINITY);
     }
     expect(() => memoryScenarioSpec("missing-row")).toThrow(/unknown memory scenario/);
+  });
+
+  it("measures the sparse selection at its maximum legal input without a former limit", () => {
+    const spec = memoryScenarioSpec("core.sparse-selected-add");
+    expect(spec.formerLimitBytes).toBeNull();
+    const row = {
+      ...validRow(),
+      scenario: spec.scenario,
+      operation: spec.operation,
+      source: spec.source,
+      workloadBytes: spec.workloadBytes,
+      formerLimitBytes: null,
+      verifiedContentBytes: spec.verifiedContentBytes,
+      verifiedChunkCount: spec.verifiedChunkCount,
+    };
+    const identity = { ...IDENTITY, scenario: spec.scenario, operation: spec.operation };
+    expect(parseMemoryRun(JSON.stringify(row), identity).formerLimitBytes).toBeNull();
+    const numeric = { ...row, formerLimitBytes: 64 * 1024 * 1024 };
+    expect(() => parseMemoryRun(JSON.stringify(numeric), identity)).toThrow(/frozen specification/);
+  });
+
+  it("rejects a null former limit on a row that declares one", () => {
+    const row = validRow();
+    row.formerLimitBytes = null;
+    expect(() => parseMemoryRun(JSON.stringify(row), IDENTITY)).toThrow(/frozen specification/);
   });
 
   it("accepts exact evidence and treats a SQL target miss as data", () => {
