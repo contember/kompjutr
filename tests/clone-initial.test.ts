@@ -408,15 +408,10 @@ describe("clone initial-state fast path", () => {
     const fixture = new GitFixture().init();
     fixture.write("README.md", "hello\n");
     const gitlinkOid = fixture.commit("gitlink target");
-    for (let start = 0; start < 1_000; start += 200) {
-      const args = ["update-index", "--add"];
-      for (let index = start; index < start + 200; index++) {
-        const prefix = `module-${String(index).padStart(4, "0")}-`;
-        const path = `${prefix}${"x".repeat(2_180)}`;
-        args.push("--cacheinfo", `160000,${gitlinkOid},${path}`);
-      }
-      fixture.git(...args);
-    }
+    // A gitlink path above the 8 KiB index path limit drops the tracker seed.
+    const path = Array.from({ length: 41 }, (_, depth) => `m${depth}-${"x".repeat(196)}`).join("/");
+    expect(path.length).toBeGreaterThan(8_192);
+    fixture.git("update-index", "--add", "--cacheinfo", `160000,${gitlinkOid},${path}`);
     fixture.git("commit", "-q", "-m", "overflow tracker seed");
     const server = await startGitServer(fixture.dir);
     const storage = new RecordingStorage();
