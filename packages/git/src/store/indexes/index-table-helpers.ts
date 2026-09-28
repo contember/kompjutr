@@ -13,7 +13,7 @@ import {
 } from "../../common/rows.js";
 import { comparePaths } from "../../common/streams.js";
 import type { IndexEntry, IndexScanOptions, IndexStore } from "../core/contracts.js";
-import { JSON_ENCODER } from "../core/json-pages.js";
+import { utf8ByteLength } from "../core/json-pages.js";
 import { nextPrefix } from "../refs/config.js";
 import { MAX_INDEX_PATH_BYTES } from "../schema/schema.js";
 
@@ -74,7 +74,7 @@ export function serializeIndexMutation(
           r: item.rev ?? null,
         },
   );
-  return { kind, json, bytes: JSON_ENCODER.encode(json).byteLength };
+  return { kind, json, bytes: utf8ByteLength(json) };
 }
 
 export class IndexMutationBuffer {
