@@ -8,11 +8,11 @@
 
 import type { BoundedFs } from "../../exec/context.js";
 import { applyHunks } from "./apply.js";
-import { type Hunk, isHunkStart, readHunk } from "./hunk.js";
-import { FileLines } from "./locate.js";
+import { FileLines } from "./file-lines.js";
+import { type Hunk, HunkStore, isHunkStart, readHunk } from "./hunk.js";
 import type { PatchOptions } from "./options.js";
 import { type RejectNames, settleQuestions, writeRejects } from "./outcome.js";
-import { type Plan, type Reject, render } from "./output.js";
+import { type Plan, Rejects, render } from "./output.js";
 import { PatchFatalError, plural, quoteName, type Report } from "./report.js";
 import type { PatchHeader } from "./scan.js";
 import { resolveTarget, type Target } from "./target.js";
@@ -33,6 +33,15 @@ export interface Session {
 
 /** Process one patch; returns where scanning resumes. */
 export function processPatch(session: Session, header: PatchHeader): number {
+  const store = new HunkStore(session.input.bytes, session.fs.retained);
+  try {
+    return processHunks(session, header, store);
+  } finally {
+    store.release();
+  }
+}
+
+function processHunks(session: Session, header: PatchHeader, store: HunkStore): number {
   const { options, report, workspace } = session;
   let cursor = header.body;
   let more = header.hasHunks;
@@ -57,14 +66,22 @@ export function processPatch(session: Session, header: PatchHeader): number {
   const nextHunk = (): Hunk | null => {
     if (peekPending) peek();
     if (!more) return null;
-    const parsed = readHunk(header.text, cursor, report);
+    const parsed = readHunk(header.text, cursor, report, store);
     cursor = parsed.next;
     peekPending = true;
     return parsed.hunk;
   };
-  const ignoreAll = (): void => {
+  // Hunks that are only counted are dropped as soon as they are read.
+  const skipHunks = (): number => {
     let count = 0;
-    while (nextHunk() !== null) count++;
+    while (nextHunk() !== null) {
+      count++;
+      store.dropLast();
+    }
+    return count;
+  };
+  const ignoreAll = (): void => {
+    const count = skipHunks();
     report.always(`${count} out of ${plural(count, "hunk")} ignored\n`);
     session.status = Math.max(session.status, 1);
   };
@@ -88,30 +105,44 @@ export function processPatch(session: Session, header: PatchHeader): number {
   const escapes = !target.lookup.safe || (target.checked && !workspace.writable(target.name));
   if (!options.dryRun && escapes) {
     report.always(`Invalid file name ${quoteName(target.name)} -- skipping patch\n`);
-    while (nextHunk() !== null);
+    skipHunks();
     session.status = Math.max(session.status, 1);
     return cursor;
   }
 
   const names: RejectNames = { from: resolved.moved?.from ?? target.name, target };
+  // A directory or link named by either side is refused before any question,
+  // as GNU does. GNU crashes renaming onto a directory; this refuses it the same way.
+  const irregular = [target, source].find((side) => {
+    const found = side.lookup.safe ? side.lookup.stat : null;
+    return found !== null && found.type !== "file";
+  });
+  if (irregular !== undefined) {
+    report.always(`File ${quoteName(irregular.name)} is not a regular file -- refusing to patch\n`);
+    const rejects = new Rejects(store, session.fs.retained);
+    try {
+      for (let hunk = nextHunk(); hunk !== null; hunk = nextHunk()) {
+        rejects.add(options.reverse ? hunk.reversed() : hunk, 0);
+      }
+      finishRejects(session, header, names, rejects, rejects.count, "ignored", options.reverse);
+    } finally {
+      rejects.release();
+    }
+    return cursor;
+  }
   const questions = settleQuestions(session, target, resolved.creates, resolved.deletes);
   if (questions.skip) {
     ignoreAll();
     return cursor;
   }
   const stat = source.lookup.safe ? source.lookup.stat : null;
-  if (stat !== null && stat.type !== "file") {
-    report.always(`File ${quoteName(source.name)} is not a regular file -- refusing to patch\n`);
-    const rejects: Reject[] = [];
-    for (let hunk = nextHunk(); hunk !== null; hunk = nextHunk()) rejects.push({ hunk, shift: 0 });
-    finishRejects(session, header, names, rejects, rejects.length, "ignored", options.reverse);
-    return cursor;
-  }
 
   const budget = session.fs.retained;
   const label = `patch target ${source.name}`;
   const release = budget.retain(stat?.size ?? 0, label);
   let file: FileLines | null = null;
+  let plan: Plan | null = null;
+  let rejects: Rejects | null = null;
   try {
     const bytes =
       stat === null || !source.lookup.safe ? new Uint8Array() : workspace.read(source.lookup.path);
@@ -132,7 +163,11 @@ export function processPatch(session: Session, header: PatchHeader): number {
         maxFuzz: options.maxFuzz,
       },
       report,
+      budget,
+      store,
     );
+    plan = applied.plan;
+    rejects = applied.rejects;
     if (applied.skipped) {
       finishRejects(
         session,
@@ -163,6 +198,8 @@ export function processPatch(session: Session, header: PatchHeader): number {
     );
     return cursor;
   } finally {
+    rejects?.release();
+    plan?.release();
     file?.release();
     release();
   }
@@ -216,14 +253,25 @@ function checkPrereq(session: Session, header: PatchHeader, bytes: Uint8Array): 
   throw new PatchFatalError("aborted");
 }
 
+/** Whether `word` occurs in `bytes` delimited by whitespace or the ends. */
 function containsWord(bytes: Uint8Array, word: string): boolean {
-  const text = new TextDecoder().decode(bytes);
-  let at = text.indexOf(word);
-  while (at !== -1) {
-    const before = at === 0 ? " " : text.charAt(at - 1);
-    const after = text.charAt(at + word.length) || " ";
-    if (/\s/.test(before) && /\s/.test(after)) return true;
-    at = text.indexOf(word, at + 1);
+  const needle = new TextEncoder().encode(word);
+  if (needle.length === 0) return true;
+  const blank = (at: number): boolean => {
+    const byte = bytes[at];
+    return byte === undefined || byte === 0x20 || (byte >= 0x09 && byte <= 0x0d);
+  };
+  for (
+    let at = bytes.indexOf(needle[0] ?? 0);
+    at !== -1;
+    at = bytes.indexOf(needle[0] ?? 0, at + 1)
+  ) {
+    if (at + needle.length > bytes.length) return false;
+    let equal = true;
+    for (let index = 1; index < needle.length && equal; index++) {
+      equal = bytes[at + index] === needle[index];
+    }
+    if (equal && (at === 0 || blank(at - 1)) && blank(at + needle.length)) return true;
   }
   return false;
 }
@@ -286,14 +334,16 @@ function finishRejects(
   session: Session,
   header: PatchHeader,
   names: RejectNames,
-  rejects: readonly Reject[],
+  rejects: Rejects,
   total: number,
   verb: "FAILED" | "ignored",
   reverse: boolean,
 ): void {
-  if (rejects.length === 0) return;
+  if (rejects.count === 0) return;
   session.status = Math.max(session.status, 1);
-  const saved = writeRejects(session, header, names, rejects, reverse);
-  const saving = saved === null ? "" : ` -- saving rejects to file ${quoteName(saved)}`;
-  session.report.always(`${rejects.length} out of ${plural(total, "hunk")} ${verb}${saving}\n`);
+  const written = writeRejects(session, header, names, rejects, reverse);
+  const saving =
+    written.shown === null ? "" : ` -- saving rejects to file ${quoteName(written.shown)}`;
+  session.report.always(`${rejects.count} out of ${plural(total, "hunk")} ${verb}${saving}\n`);
+  if (written.refused !== null) throw new PatchFatalError(written.refused);
 }

@@ -62,7 +62,7 @@ export function nextPatch(input: PatchInput, from: number, report: Report): Patc
     const next = text.line(at + 1);
     const found = (header: PatchHeader): PatchHeader => {
       if (text.indent > 0) report.verbose(`(Patch is indented ${plural(text.indent, "space")}.)\n`);
-      if (text.stripCr) {
+      if (header.text.stripCr) {
         report.verbose("(Stripping trailing CRs from patch; use --binary to disable.)\n");
       }
       return header;
@@ -73,11 +73,14 @@ export function nextPatch(input: PatchInput, from: number, report: Report): Patc
     }
     if (startsWith(line, "--- ") && next !== null && startsWith(next, "+++ ")) {
       if (isHunkStart(text.line(at + 2))) {
+        // GNU strips CRs when the `+++` line ends in one.
+        const plus = input.raw(at + 1);
+        const unified = new PatchText(input, text.indent, plus !== null && endsWithCr(plus.bytes));
         return found({
           start: from,
           body: at + 2,
           hasHunks: true,
-          text,
+          text: unified,
           old: parseHeaderName(field(line, 4)),
           new: parseHeaderName(field(next, 4)),
           index,
@@ -87,7 +90,8 @@ export function nextPatch(input: PatchInput, from: number, report: Report): Patc
       }
     }
     if (isHunkStart(line)) {
-      const header = { start: from, body: at, hasHunks: true, text, old: null, new: null };
+      const bare = new PatchText(input, text.indent, false);
+      const header = { start: from, body: at, hasHunks: true, text: bare, old: null, new: null };
       return found({ ...header, index, prereq, git: null });
     }
     const plain = lineText(line);

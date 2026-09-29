@@ -10,6 +10,8 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 
 import { describe, expect, it } from "vitest";
 
@@ -23,6 +25,10 @@ import {
   REAL_BASH,
   type ShellTree,
 } from "../helpers/shell-parity.js";
+import { TIMING_GATE } from "../helpers/timing.js";
+
+// The heap check below measures after a forced collection.
+setFlagsFromString("--expose-gc");
 
 const LINES = Array.from({ length: 30 }, (_, index) => `${index + 1}\n`).join("");
 
@@ -839,6 +845,104 @@ describe.skipIf(!REAL_BASH)("patch matches GNU patch on further forms", () => {
   });
 });
 
+describe.skipIf(!REAL_BASH)("patch matches GNU patch on reviewed edge cases", () => {
+  const tree: ShellTree = {
+    g: "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n",
+    k: "k1\nk2\nk3\n",
+    words: "alpha, beta\ngamma delta\n",
+    "sub/x": "q\n",
+    "outside.txt": "safe\n",
+  };
+  const git = (name: string, body: string): string =>
+    `diff --git a/${name} b/${name}\nindex 1..2 100644\n--- a/${name}\n+++ b/${name}\n${body}`;
+  it.each([
+    [
+      "overlapping hunks",
+      "patch",
+      "--- g\n+++ g\n@@ -2,3 +2,3 @@\n b\n-c\n+C\n d\n@@ -3,3 +3,3 @@\n c\n-d\n+D\n e\n",
+    ],
+    [
+      "an overlap that needs fuzz",
+      "patch",
+      "--- g\n+++ g\n@@ -2,3 +2,3 @@\n b\n-c\n+C\n d\n@@ -2,4 +2,4 @@\n b\n c\n-d\n+D\n e\n",
+    ],
+    [
+      "an overlap after two removals",
+      "patch",
+      "--- g\n+++ g\n@@ -2,4 +2,4 @@\n b\n-c\n-d\n+C\n+D\n e\n@@ -2,5 +2,5 @@\n b\n c\n d\n-e\n+E\n f\n",
+    ],
+    [
+      "an overlap after an insertion",
+      "patch",
+      "--- g\n+++ g\n@@ -2,2 +2,3 @@\n b\n+X\n c\n@@ -2,3 +2,3 @@\n b\n-c\n+C\n d\n",
+    ],
+    [
+      "an overlap onto a changed line",
+      "patch",
+      "--- g\n+++ g\n@@ -2,3 +2,3 @@\n b\n-c\n+C\n d\n@@ -3,2 +3,2 @@\n-c\n+X\n d\n",
+    ],
+    ["a CR on the --- line only", "patch", "--- g\r\n+++ g\n@@ -1 +1 @@\n-a\n+A\n"],
+    ["a CR on the +++ line only", "patch", "--- g\n+++ g\r\n@@ -1 +1 @@\n-a\n+A\n"],
+    ["CRLF lines under a bare hunk", "patch g", "@@ -1 +1 @@\r\n-a\r\n+A\r\n"],
+    ["an existing absolute name", "patch -p0", "--- /g\n+++ /g\n@@ -1 +1 @@\n-a\n+A\n"],
+    [
+      "an existing name through ..",
+      "patch -p0",
+      "--- sub/../g\n+++ sub/../g\n@@ -1 +1 @@\n-a\n+A\n",
+    ],
+    ["a creation named .", "patch -p1", "--- /dev/null\n+++ b/.\n@@ -0,0 +1 @@\n+x\n"],
+    [
+      "a creation named as a directory",
+      "patch -p1",
+      "--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+x\n",
+    ],
+    ["a directory reversed", "patch -R", "--- sub\n+++ sub\n@@ -1 +1 @@\n-a\n+b\n"],
+    [
+      "a second plain patch that fails",
+      "patch",
+      "--- g\n+++ g\n@@ -1 +1 @@\n-a\n+A\n--- g\n+++ g\n@@ -3 +3 @@\n-Q\n+AA\n",
+    ],
+    [
+      "a second git patch at an offset",
+      "patch -p1",
+      `${git("g", "@@ -1 +1 @@\n-a\n+A\n")}${git("g", "@@ -2 +2 @@\n-c\n+C\n")}`,
+    ],
+    [
+      "a first git patch at an offset",
+      "patch -p1",
+      `${git("g", "@@ -2 +2 @@\n-a\n+A\n")}${git("g", "@@ -4 +4 @@\n-d\n+D\n")}`,
+    ],
+    [
+      "a Prereq word followed by a comma",
+      "patch",
+      "Prereq: alpha\n--- words\n+++ words\n@@ -2 +2 @@\n-gamma delta\n+x\n",
+    ],
+    [
+      "a Prereq word inside a line",
+      "patch",
+      "Prereq: gamma\n--- words\n+++ words\n@@ -2 +2 @@\n-gamma delta\n+x\n",
+    ],
+    [
+      "a Prereq word ending a line",
+      "patch -f",
+      "Prereq: beta\n--- words\n+++ words\n@@ -2 +2 @@\n-gamma delta\n+x\n",
+    ],
+  ])("%s: %s", async (_, command, diff) => {
+    const script = `${command} < d.diff; ls -A . sub; cat -A g g.orig g.rej words sub.rej ..rej; echo end`;
+    agreeWithBash(await compareWithBash(script, { tree: { ...tree, "d.diff": diff } }));
+  });
+
+  it.each(["g.rej", "all.rej"])(
+    "replaces a reject file that is a symbolic link: %s",
+    async (name) => {
+      const option = name === "all.rej" ? " -r all.rej" : "";
+      const script = `ln -s outside.txt ${name}; patch${option} < d.diff; test -L ${name} && echo link; ls; cat outside.txt ${name}; echo end`;
+      const diff = "--- g\n+++ g\n@@ -1 +1 @@\n-Q\n+A\n";
+      agreeWithBash(await compareWithBash(script, { tree: { ...tree, "d.diff": diff } }));
+    },
+  );
+});
+
 function seeded(seed: number): () => number {
   let state = seed;
   return () => {
@@ -999,5 +1103,131 @@ describe("patch refusals", () => {
       "patch -p1 < change.diff | head -1; cat src/b.txt",
     );
     expect(run.stdout).toBe("patching file src/a.txt\nalpha\nBETA\ngamma\n");
+  });
+});
+
+describe("patch bounds and failure handling", () => {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const gitChange = (name: string, from: string, to: string): string =>
+    `diff --git a/${name} b/${name}\nindex 1..2 100644\n--- a/${name}\n+++ b/${name}\n@@ -1 +1 @@\n-${from}\n+${to}\n`;
+
+  function setup(
+    files: Readonly<Record<string, string>>,
+    limits: Partial<typeof DEFAULT_LIMITS> = {},
+    cwd = "/repo",
+  ) {
+    const fs = createFilesystem(new TestDatabase(), { now: () => 0 });
+    fs.makeDirectories(["/repo"]);
+    for (const [path, text] of Object.entries(files)) {
+      const full = path.startsWith("/") ? path : `/repo/${path}`;
+      fs.makeDirectories([full.slice(0, full.lastIndexOf("/")) || "/"]);
+      fs.writeFiles([{ path: full, bytes: encoder.encode(text), mode: 0o644 }]);
+    }
+    const shell = createShell({ fs, cwd, limits: { ...DEFAULT_LIMITS, ...limits } });
+    const read = (path: string): string => decoder.decode(fs.readFile(path));
+    const names = (path: string): string[] => fs.readdir(path).map((entry) => entry.name);
+    return { fs, shell, read, names };
+  }
+
+  it("retains what a huge hunk really holds", async () => {
+    const lines = 200_000;
+    const diff = `--- f\n+++ f\n@@ -1 +1,${lines} @@\n-x\n${"+\n".repeat(lines)}`;
+    const { fs, shell } = setup({ f: "x\n", "d.diff": diff });
+    const gc = runInNewContext("gc");
+    const write = fs.writeFileStream.bind(fs);
+    let heapAtWrite = 0;
+    fs.writeFileStream = (path, chunks, options) => {
+      if (path === "/repo/f") heapAtWrite = process.memoryUsage().heapUsed;
+      write(path, chunks, options);
+    };
+    gc();
+    const before = process.memoryUsage().heapUsed;
+    const run = await shell.run("patch < d.diff");
+    expect(run.exitCode).toBe(0);
+    // Hunk lines are nine bytes each, beside the diff and its line index.
+    expect(run.peakRetainedBytes).toBeLessThan(diff.length + lines * 30);
+    expect(heapAtWrite - before).toBeLessThan(2 * run.peakRetainedBytes);
+  });
+
+  it("publishes queued outputs and reports a fatal error after a refused rename", async () => {
+    const diff = `${gitChange("f", "x", "y")}diff --git a/g b/sub\nsimilarity index 90%\nrename from g\nrename to sub\n--- a/g\n+++ b/sub\n@@ -1 +1 @@\n-a\n+A\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n?bad\n`;
+    const { shell, read, names } = setup({ f: "x\n", g: "a\n", "sub/x": "q\n", "d.diff": diff });
+    const run = await shell.run("patch -p1 < d.diff");
+    expect(run.exitCode).toBe(2);
+    expect(run.stderr).toBe("patch: **** malformed patch at line 20: ?bad\n\n");
+    expect(read("/repo/f")).toBe("y\n");
+    expect(names("/repo")).toEqual(["d.diff", "f", "g", "sub", "sub.rej"]);
+  });
+
+  // GNU patch loops and crashes renaming onto a directory; this refuses it
+  // the way GNU refuses any patch to a directory.
+  it("refuses a git rename onto a directory", async () => {
+    const diff =
+      "diff --git a/g b/sub\nsimilarity index 90%\nrename from g\nrename to sub\n--- a/g\n+++ b/sub\n@@ -1 +1 @@\n-a\n+A\n";
+    const { shell, read, names } = setup({ g: "a\n", "sub/x": "q\n", "d.diff": diff });
+    const run = await shell.run("patch -p1 < d.diff");
+    expect(run.stdout).toBe(
+      "File sub is not a regular file -- refusing to patch\n1 out of 1 hunk ignored -- saving rejects to file sub.rej\n",
+    );
+    expect(run.exitCode).toBe(1);
+    expect(read("/repo/g")).toBe("a\n");
+    expect(read("/repo/sub.rej")).toBe("--- g\n+++ sub\n@@ -1 +1 @@\n-a\n+A\n");
+    expect(names("/repo")).toEqual(["d.diff", "g", "sub", "sub.rej"]);
+  });
+
+  it("patches even when stdout is never read", async () => {
+    const { shell, read } = setup({ f: "x\n", g: "x\n", "d.diff": gitChange("f", "x", "y") });
+    const run = await shell.run("patch -p1 < d.diff | true; patch -p1 g < d.diff | head -c 0");
+    expect(run.exitCode).toBe(0);
+    expect(read("/repo/f")).toBe("y\n");
+    expect(read("/repo/g")).toBe("y\n");
+  });
+
+  it("removes directories a deletion empties when the working directory is /", async () => {
+    const diff = "--- a/d/e/f\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
+    const { shell, names } = setup({ "/d/e/f": "x\n", "/change.diff": diff }, {}, "/");
+    const run = await shell.run("patch -p1 < change.diff");
+    expect(run.stdout).toBe("patching file d/e/f\n");
+    expect(names("/")).toEqual(["change.diff", "repo"]);
+  });
+
+  it("keeps the staging directory out of reach of later patches", async () => {
+    const diff = `${gitChange("f", "x", "y")}--- a/.patch-staging~/1\n+++ b/.patch-staging~/1\n@@ -1 +1 @@\n-y\n+EVIL\n`;
+    const { shell, read, names } = setup({ f: "x\n", "d.diff": diff });
+    const run = await shell.run("patch -p1 < d.diff");
+    expect(run.exitCode).toBe(1);
+    expect(read("/repo/f")).toBe("y\n");
+    expect(names("/repo")).toEqual(["d.diff", "f"]);
+  });
+
+  it("publishes nothing when the operation budget runs out", async () => {
+    const files: Record<string, string> = {};
+    let diff = "";
+    for (let index = 0; index < 30; index++) {
+      files[`f${index}`] = "x\n";
+      diff += gitChange(`f${index}`, "x", "y");
+    }
+    const { shell, read } = setup({ ...files, "d.diff": diff }, { maxOperations: 60 });
+    const run = await shell.run("patch -p1 < d.diff > /dev/null");
+    expect(run.stderr).toBe("kompjutr: exceeded 60 filesystem operations\n");
+    for (let index = 0; index < 30; index++) expect(read(`/repo/f${index}`)).toBe("x\n");
+  });
+
+  it("finds hunks through the line index instead of rescanning the file", async () => {
+    const lines = 50_000;
+    const context = 100;
+    let diff = "--- f\n+++ f\n";
+    for (let hunk = 0; hunk < 100; hunk++) {
+      const at = 1 + hunk * (2 * context + 1);
+      diff += `@@ -${at},${2 * context + 1} +${at},${2 * context + 1} @@\n${" a\n".repeat(context)}-b\n+c\n${" a\n".repeat(context)}`;
+    }
+    const { shell } = setup({ f: "a\n".repeat(lines), "d.diff": diff });
+    const started = performance.now();
+    const run = await shell.run("patch --dry-run < d.diff > /dev/null");
+    const elapsed = performance.now() - started;
+    expect(run.exitCode).toBe(1);
+    // A scan per hunk and fuzz level took about 23 s here; the index takes milliseconds.
+    if (TIMING_GATE) expect(elapsed).toBeLessThan(2_000);
   });
 });

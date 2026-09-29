@@ -81,15 +81,20 @@ export function resolveTarget(
   const candidates: string[] = [];
   const add = (name: string | null): void => {
     const stripped = strip(name, options);
-    if (stripped !== null && stripped !== "") candidates.push(stripped);
+    if (stripped !== null && stripped !== "" && !candidates.includes(stripped)) {
+      candidates.push(stripped);
+    }
   };
   if (header.old !== null && !namesAbsentFile(header.old)) add(header.old.name);
   if (header.new !== null && !namesAbsentFile(header.new)) add(header.new.name);
   if (header.old === null && header.new === null) add(header.index);
 
+  // GNU drops an absolute name silently and names a `..` one it found.
   const existing = candidates.filter((name) => {
+    if (name.startsWith("/")) return false;
     const lookup = workspace.lookup(name);
-    return lookup.safe && lookup.stat !== null;
+    if (!lookup.safe || lookup.stat === null) return false;
+    return safeName(name, report) !== null;
   });
   const chosen = bestName(existing);
   if (chosen !== null)

@@ -6,10 +6,13 @@
 // how GNU treats such names. A name that would leave is missing when read
 // and invalid when written. A final symbolic link is never followed.
 //
-// Git-style patches are queued, as GNU queues them: each output is staged in
-// a hidden file beside its target (or in the nearest existing ancestor
-// directory) and later patches in the same run read the staged state. The
-// queue is published in order at the end, or discarded when the run fails.
+// Git-style patches are queued, as GNU queues them. Their outputs are staged
+// in one hidden directory per run, and later patches in the run read the
+// staged state. Publishing is a bulk backup copy, a bulk copy of the staged
+// outputs into place, and one removal of deleted files and the staging
+// directory; a failed run removes the directory in one call. Both need the
+// filesystem, so a run that fails by exhausting `maxOperations` cannot clean
+// up and leaves the staging directory behind.
 
 import type { Stat } from "../../../fs/types.js";
 import type { BoundedFs } from "../../exec/context.js";
@@ -22,20 +25,19 @@ type Pending =
   | { readonly kind: "staged"; readonly staged: string; readonly size: number }
   | { readonly kind: "deleted" };
 
-interface QueueEntry {
-  readonly target: string;
-  readonly staged: string | null;
-  readonly mode: number | null;
-}
-
 const MAX_LINK_EXPANSIONS = 40;
+/** Large enough that one copy call is limited only by its entry page. */
+const WHOLE_BATCH = Number.MAX_SAFE_INTEGER;
 
 export class Workspace {
+  /** Final queued state per target, in the order targets were first queued. */
   readonly #pending = new Map<string, Pending>();
-  readonly #queue: QueueEntry[] = [];
-  readonly #backedUp = new Set<string>();
+  readonly #modes = new Map<string, number>();
   /** Queued targets whose original must be backed up when published. */
   readonly #backups = new Set<string>();
+  /** Files this run already wrote or backed up: GNU never backs them up again. */
+  readonly #touched = new Set<string>();
+  #staging: string | null = null;
   #stagedCount = 0;
 
   constructor(
@@ -45,12 +47,18 @@ export class Workspace {
 
   /** Resolve a diff name inside the working directory. */
   lookup(name: string): Lookup {
-    const parts = name.split("/").filter((part) => part !== "" && part !== ".");
+    const parts = name.split("/").filter((part) => part !== "");
     const leaf = parts.pop();
+    if (leaf === undefined || leaf === "." || leaf === "..") {
+      const directory = this.#walk(leaf === undefined ? parts : [...parts, leaf]);
+      if (directory === null || this.#inStaging(directory.path)) return { safe: false };
+      const stat = directory.missing > 0 ? null : this.fs.stat(directory.path);
+      return { safe: true, path: directory.path, stat };
+    }
     const directory = this.#walk(parts);
     if (directory === null) return { safe: false };
-    if (leaf === undefined) return { safe: true, path: directory.path, stat: null };
     const path = directory.path === "/" ? `/${leaf}` : `${directory.path}/${leaf}`;
+    if (this.#inStaging(path)) return { safe: false };
     if (directory.missing > 0) return { safe: true, path, stat: null };
     return { safe: true, path, stat: this.stat(path) };
   }
@@ -134,144 +142,188 @@ export class Workspace {
     return this.root === "/" ? `/${tail}` : `${this.root}/${tail}`;
   }
 
+  #inStaging(path: string): boolean {
+    return (
+      this.#staging !== null && (path === this.#staging || path.startsWith(`${this.#staging}/`))
+    );
+  }
+
   /** Whether writing a diff name would stay inside the working directory. */
   writable(name: string): boolean {
     const parts = name.split("/").filter((part) => part !== "" && part !== ".");
     parts.pop();
-    return this.#walk(parts) !== null;
+    const directory = this.#walk(parts);
+    return directory !== null && !this.#inStaging(directory.path);
   }
 
   /** Replace or create a file now, backing up the original first when asked. */
   writeNow(path: string, chunks: Iterable<Uint8Array>, backup: boolean, mode: number | null): void {
-    if (backup) this.#backup(path);
+    if (backup) this.#backup([path]);
+    this.#touched.add(path);
     this.#ensureParent(path);
     this.fs.writeFileStream(path, chunks);
     if (mode !== null) this.fs.chmod(path, mode & 0o7777);
   }
 
   removeNow(path: string, backup: boolean): void {
-    if (backup) this.#backup(path);
+    if (backup) this.#backup([path]);
+    this.#touched.add(path);
     this.fs.removeFiles([path]);
-    this.#pruneParents(path);
+    this.#pruneParents([path]);
   }
 
+  isLink(path: string): boolean {
+    return this.fs.stat(path)?.type === "symlink";
+  }
+
+  /** GNU replaces a reject file that is a symbolic link rather than writing through it. */
   writeReject(path: string, chunks: Iterable<Uint8Array>, append: boolean): void {
-    this.#ensureParent(path);
-    this.fs.writeFileStream(path, chunks, { append });
+    const existing = this.fs.stat(path);
+    if (existing?.type === "symlink") this.fs.removeFiles([path]);
+    else this.#ensureParent(path);
+    this.fs.writeFileStream(path, chunks, { append: append && existing?.type === "file" });
   }
 
-  /** Stage an output for publishing at the end of the run. */
+  /** Stage an output for publishing at the end of the run, with the mode it will have. */
   stage(path: string, chunks: Iterable<Uint8Array>, backup: boolean, mode: number | null): void {
-    const staged = this.#stagingPath(path);
+    const staged = this.#stagingFile();
     this.fs.writeFileStream(staged, chunks);
-    const size = this.fs.stat(staged)?.size ?? 0;
-    const previous = this.#pending.get(path);
-    this.#pending.set(path, { kind: "staged", staged, size });
-    this.#queue.push({ target: path, staged, mode });
-    if (backup) this.#backups.add(path);
-    if (previous?.kind === "staged") this.#dropStaged(previous.staged);
+    const stat = this.fs.stat(staged);
+    if (mode !== null && stat !== null && stat.mode !== (mode & 0o7777)) {
+      this.fs.chmod(staged, mode & 0o7777);
+    }
+    this.#queue(path, { kind: "staged", staged, size: stat?.size ?? 0 }, backup);
   }
 
   /** Stage a copy made inside the store, for renames and copies without hunks. */
   stageCopy(source: string, path: string, mode: number | null): void {
     const pending = this.#pending.get(source);
     const from = pending?.kind === "staged" ? pending.staged : source;
-    const staged = this.#stagingPath(path);
-    this.fs.copyFiles([{ source: from, destination: staged }]);
-    const size = this.fs.stat(staged)?.size ?? 0;
-    this.#pending.set(path, { kind: "staged", staged, size });
-    this.#queue.push({ target: path, staged, mode });
+    const staged = this.#stagingFile();
+    this.fs.copyFiles([{ source: from, destination: staged }], { budget: WHOLE_BATCH });
+    const stat = this.fs.stat(staged);
+    if (mode !== null && stat !== null && stat.mode !== (mode & 0o7777)) {
+      this.fs.chmod(staged, mode & 0o7777);
+    }
+    this.#queue(path, { kind: "staged", staged, size: stat?.size ?? 0 }, false);
   }
 
   queueDelete(path: string, backup: boolean): void {
-    const previous = this.#pending.get(path);
-    this.#pending.set(path, { kind: "deleted" });
-    this.#queue.push({ target: path, staged: null, mode: null });
-    if (backup) this.#backups.add(path);
-    if (previous?.kind === "staged") this.#dropStaged(previous.staged);
+    this.#queue(path, { kind: "deleted" }, backup);
   }
 
   queueMode(path: string, mode: number): void {
-    this.#queue.push({ target: path, staged: null, mode });
+    this.#modes.set(path, mode & 0o7777);
   }
 
-  /** Move every queued output into place, in order. */
+  // A queued output counts as written: a later patch to the file makes no backup.
+  #queue(path: string, state: Pending, backup: boolean): void {
+    this.#pending.set(path, state);
+    if (backup && !this.#touched.has(path)) this.#backups.add(path);
+    this.#touched.add(path);
+  }
+
+  /** Put every queued output in place: backups, then outputs, then removals. */
   publish(): void {
-    const live = new Set<string>();
-    for (const pending of this.#pending.values()) {
-      if (pending.kind === "staged") live.add(pending.staged);
+    const copies: Array<{ source: string; destination: string }> = [];
+    const removals: string[] = [];
+    for (const [target, pending] of this.#pending) {
+      if (pending.kind === "staged") copies.push({ source: pending.staged, destination: target });
+      else if (this.fs.stat(target) !== null) removals.push(target);
     }
-    for (const entry of this.#queue) {
-      if (entry.staged !== null) {
-        if (!live.has(entry.staged)) continue;
-        if (this.#backups.has(entry.target)) this.#backup(entry.target);
-        this.#ensureParent(entry.target);
-        this.fs.rename(entry.staged, entry.target);
-        if (entry.mode !== null) this.fs.chmod(entry.target, entry.mode & 0o7777);
-      } else if (entry.mode !== null) {
-        if (this.fs.stat(entry.target) !== null) this.fs.chmod(entry.target, entry.mode & 0o7777);
-      } else if (this.fs.stat(entry.target) !== null) {
-        if (this.#backups.has(entry.target)) this.#backup(entry.target);
-        this.fs.removeFiles([entry.target]);
-        this.#pruneParents(entry.target);
-      }
+    this.#backupNow([...this.#backups].filter((target) => this.#pending.has(target)));
+    this.#copyAll(copies);
+    const staging = this.#staging;
+    if (removals.length > 0 || staging !== null) {
+      this.fs.removeFiles(staging === null ? removals : [...removals, staging], {
+        recursive: true,
+        force: true,
+      });
+    }
+    this.#staging = null;
+    this.#pruneParents(removals);
+    for (const [target, mode] of this.#modes) {
+      if (!this.#pending.has(target) && this.fs.stat(target) !== null) this.fs.chmod(target, mode);
     }
     this.#forget();
   }
 
-  /** Remove every staged file; nothing queued is published. */
+  /** Remove the staging directory; nothing queued is published. */
   discard(): void {
-    for (const pending of this.#pending.values()) {
-      if (pending.kind === "staged") this.#dropStaged(pending.staged);
-    }
+    const staging = this.#staging;
+    this.#staging = null;
     this.#forget();
+    if (staging !== null) this.fs.removeFiles([staging], { recursive: true, force: true });
   }
 
   #forget(): void {
     this.#pending.clear();
-    this.#queue.length = 0;
+    this.#modes.clear();
     this.#backups.clear();
   }
 
-  #dropStaged(staged: string): void {
-    if (this.fs.stat(staged) !== null) this.fs.removeFiles([staged]);
-  }
-
-  #stagingPath(path: string): string {
-    const slash = path.lastIndexOf("/");
-    let directory = slash <= 0 ? "/" : path.slice(0, slash);
-    while (directory !== "/" && this.fs.stat(directory)?.type !== "dir") {
-      const up = directory.lastIndexOf("/");
-      directory = up <= 0 ? "/" : directory.slice(0, up);
-    }
-    const base = path.slice(slash + 1);
-    for (;;) {
-      this.#stagedCount++;
-      const candidate = `${directory === "/" ? "" : directory}/.${base}.patch-${this.#stagedCount}~`;
-      if (this.fs.stat(candidate) === null) return candidate;
+  #copyAll(entries: ReadonlyArray<{ source: string; destination: string }>): void {
+    let remaining = entries;
+    while (remaining.length > 0) {
+      remaining = this.fs.copyFiles(remaining, { budget: WHOLE_BATCH }).remaining;
     }
   }
 
-  #backup(path: string): void {
-    if (this.#backedUp.has(path)) return;
-    this.#backedUp.add(path);
-    if (this.fs.stat(path)?.type !== "file") return;
-    this.fs.copyFiles([{ source: path, destination: `${path}.orig` }]);
+  #stagingFile(): string {
+    if (this.#staging === null) {
+      const prefix = this.root === "/" ? "" : this.root;
+      let candidate = `${prefix}/.patch-staging~`;
+      for (let attempt = 1; this.fs.stat(candidate) !== null; attempt++) {
+        candidate = `${prefix}/.patch-staging-${attempt}~`;
+      }
+      this.fs.makeDirectories([candidate]);
+      this.#staging = candidate;
+    }
+    this.#stagedCount++;
+    return `${this.#staging}/${this.#stagedCount}`;
+  }
+
+  #backup(paths: readonly string[]): void {
+    const fresh = paths.filter((path) => !this.#touched.has(path));
+    for (const path of fresh) this.#touched.add(path);
+    this.#backupNow(fresh);
+  }
+
+  #backupNow(paths: readonly string[]): void {
+    const copies: Array<{ source: string; destination: string }> = [];
+    for (const path of paths) {
+      if (this.fs.stat(path)?.type === "file")
+        copies.push({ source: path, destination: `${path}.orig` });
+    }
+    this.#copyAll(copies);
   }
 
   #ensureParent(path: string): void {
-    const slash = path.lastIndexOf("/");
-    const parent = slash <= 0 ? "/" : path.slice(0, slash);
+    const parent = parentOf(path);
     if (this.fs.stat(parent) === null) this.fs.makeDirectories([parent]);
   }
 
   /** GNU removes directories a deletion left empty, up to the working directory. */
-  #pruneParents(path: string): void {
-    let directory = path.slice(0, path.lastIndexOf("/"));
-    while (directory.length > this.root.length && directory.startsWith(`${this.root}/`)) {
-      if (this.fs.readdir(directory).length > 0) return;
-      this.fs.rmdir(directory);
-      directory = directory.slice(0, directory.lastIndexOf("/"));
+  #pruneParents(paths: readonly string[]): void {
+    const inside = this.root === "/" ? "/" : `${this.root}/`;
+    for (const path of paths) {
+      for (
+        let directory = parentOf(path);
+        directory.startsWith(inside) && directory !== this.root;
+      ) {
+        if (this.fs.stat(directory) === null) {
+          directory = parentOf(directory);
+          continue;
+        }
+        if (this.fs.readdir(directory).length > 0) break;
+        this.fs.rmdir(directory);
+        directory = parentOf(directory);
+      }
     }
   }
+}
+
+function parentOf(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash <= 0 ? "/" : path.slice(0, slash);
 }

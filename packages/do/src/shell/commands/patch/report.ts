@@ -1,7 +1,7 @@
 // What `patch` tells the user. GNU writes its progress, its questions, and
 // the default answers it takes without a terminal to stdout, and only fatal
-// errors to stderr. Progress is buffered per file patch and flushed by the
-// driver, so what is held stays proportional to one file's hunks.
+// errors to stderr. The whole run's progress is held, reserved, until stdout
+// is consumed or closed, because the work does not wait for stdout's reader.
 
 import type { RetainedBudget } from "../../exec/context.js";
 
@@ -48,13 +48,18 @@ export class Report {
     this.#chunks.push(bytes);
   }
 
-  /** Hand the buffered output over; the consumer owns it from here. */
-  take(): Uint8Array[] {
+  /** Hand the buffered output over with its reservation; the receiver releases it. */
+  handOver(): { readonly chunks: readonly Uint8Array[]; release(): void } {
     const chunks = this.#chunks;
-    for (const release of this.#releases) release();
+    const releases = this.#releases;
     this.#chunks = [];
     this.#releases = [];
-    return chunks;
+    return {
+      chunks,
+      release: () => {
+        for (const release of releases) release();
+      },
+    };
   }
 }
 

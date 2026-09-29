@@ -132,21 +132,3 @@ export function lineText(line: Line): string {
 export function hasNul(line: Line): boolean {
   return line.bytes.includes(0);
 }
-
-export function sameLine(left: Line, right: Line): boolean {
-  if (left.newline !== right.newline || left.bytes.length !== right.bytes.length) return false;
-  for (let index = 0; index < left.bytes.length; index++) {
-    if (left.bytes[index] !== right.bytes[index]) return false;
-  }
-  return true;
-}
-
-/** FNV-1a over the bytes, with the newline folded in, so unequal hashes prove unequal lines. */
-export function hashLine(bytes: Uint8Array, start: number, end: number, newline: boolean): number {
-  let hash = newline ? 0x811c9dc5 : 0x050c5d1f;
-  for (let index = start; index < end; index++) {
-    hash ^= bytes[index] ?? 0;
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}

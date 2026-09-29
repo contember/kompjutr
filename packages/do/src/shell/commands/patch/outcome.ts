@@ -4,7 +4,8 @@
 
 import { resolve } from "../../exec/arguments.js";
 import type { Session } from "./file-patch.js";
-import { chunked, type Reject, rejectSection } from "./output.js";
+import { namesAbsentFile } from "./names.js";
+import { chunked, type Rejects, rejectSection } from "./output.js";
 import { quoteName } from "./report.js";
 import type { PatchHeader } from "./scan.js";
 import type { Target } from "./target.js";
@@ -57,17 +58,24 @@ export interface RejectNames {
   readonly target: Target;
 }
 
-/** Write a file's rejects; returns the name to report, or null when none is written. */
+export interface RejectsWritten {
+  /** The name the summary line reports, or null when nothing was written. */
+  readonly shown: string | null;
+  /** GNU refuses to open a `-r` file that is a symbolic link, after reporting it. */
+  readonly refused: string | null;
+}
+
+/** Write a file's rejects to their `.rej` file or to the `-r` file. */
 export function writeRejects(
   session: Session,
   header: PatchHeader,
   names: RejectNames,
-  rejects: readonly Reject[],
+  rejects: Rejects,
   reverse: boolean,
-): string | null {
+): RejectsWritten {
   const { options, workspace } = session;
   const target = names.target;
-  if (options.dryRun || options.rejectFile === "-") return null;
+  if (options.dryRun || options.rejectFile === "-") return { shown: null, refused: null };
   let path: string;
   let shown: string;
   let append = false;
@@ -75,22 +83,44 @@ export function writeRejects(
     path = resolve(workspace.root, options.rejectFile);
     shown = options.rejectFile;
     append = session.rejectFileStarted;
+    if (!append && workspace.isLink(path)) {
+      const refused = `Can't create file ${shown} : Too many levels of symbolic links`;
+      return { shown, refused };
+    }
     session.rejectFileStarted = true;
   } else {
-    if (!target.lookup.safe) return null;
-    path = `${target.lookup.path}.rej`;
     shown = `${target.name}.rej`;
+    // Named beside the target by its name, so `.` rejects into `..rej`.
+    if (target.checked) {
+      const lookup = workspace.lookup(shown);
+      if (!lookup.safe) return { shown: null, refused: null };
+      path = lookup.path;
+    } else {
+      if (!target.lookup.safe) return { shown: null, refused: null };
+      path = `${target.lookup.path}.rej`;
+    }
   }
-  const [oldStamp, newStamp] = reverse
-    ? [header.new?.stamp, header.old?.stamp]
-    : [header.old?.stamp, header.new?.stamp];
-  const stamped = (name: string, stamp: string | null | undefined): string =>
-    stamp === null || stamp === undefined ? name : `${name}\t${stamp}`;
-  const section = rejectSection(
-    stamped(names.from, oldStamp),
-    stamped(target.name, newStamp),
-    rejects,
-  );
+  const section = rejectSection(rejectHeader(header, names, reverse), rejects);
   workspace.writeReject(path, chunked(section, session.fs.retained, "patch rejects"), append);
-  return shown;
+  return { shown, refused: null };
+}
+
+/**
+ * The header GNU writes above a file's rejects: each side named as the target
+ * unless the patch names that side `/dev/null`, with its timestamp; a patch
+ * with no header names gets `/dev/null` on both sides after its `Index:` line.
+ */
+function rejectHeader(header: PatchHeader, names: RejectNames, reverse: boolean): string {
+  const [oldSide, newSide] = reverse ? [header.new, header.old] : [header.old, header.new];
+  if (oldSide === null && newSide === null) {
+    const index = header.index === null ? "" : `Index: ${header.index}\n`;
+    return `${index}--- /dev/null\n+++ /dev/null\n`;
+  }
+  const oldAbsent = header.git === null ? namesAbsentFile(oldSide) : oldSide?.name === "/dev/null";
+  const newAbsent = header.git === null ? namesAbsentFile(newSide) : newSide?.name === "/dev/null";
+  const side = (name: string, absent: boolean, stamp: string | null | undefined): string => {
+    const shown = absent ? "/dev/null" : name;
+    return stamp === null || stamp === undefined ? shown : `${shown}\t${stamp}`;
+  };
+  return `--- ${side(names.from, oldAbsent, oldSide?.stamp)}\n+++ ${side(names.target.name, newAbsent, newSide?.stamp)}\n`;
 }

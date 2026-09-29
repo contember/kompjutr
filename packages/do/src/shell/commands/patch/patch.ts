@@ -1,12 +1,12 @@
 // The `patch` command: read the whole diff under the retained budget, then
-// apply its patches one at a time, flushing progress after each.
+// apply its patches one at a time.
 //
-// Work does not stop when stdout's consumer does: the remaining patches are
-// still applied and their messages dropped, so `patch | head` patches every
-// file. A GNU fatal error publishes what was queued, as GNU does before it
-// exits; a failure of this runtime (a limit, the store) discards it.
+// The work runs before stdout is returned, so it does not depend on stdout's
+// reader: `patch | true` and `patch | head` patch every file. A GNU fatal
+// error publishes what was queued, as GNU does before it exits; a failure of
+// this runtime (a limit, the store) discards it and propagates.
 
-import { type ByteStream, drainBounded, empty } from "../../exec/bytes.js";
+import { drainBounded, empty, owned } from "../../exec/bytes.js";
 import type { Command, CommandContext } from "../../exec/context.js";
 import { result } from "../../exec/context.js";
 import { resolve } from "../../exec/execute.js";
@@ -46,12 +46,23 @@ export const patch: Command = async (context) => {
 
   const held = await readInput(context, options, root);
   if (typeof held === "string") return fatal(held);
-  let status = 0;
-  const stdout = run(context, options, root, held.bytes, held.release, (code) => {
-    status = code;
-  });
-  return { stdout, status: () => status, truncated: () => false };
+  const report = new Report(context.fs.retained, options.silent);
+  let status: number;
+  try {
+    status = runPatches(context, options, root, held.bytes, report);
+  } catch (error) {
+    report.handOver().release();
+    throw error;
+  } finally {
+    held.release();
+  }
+  const output = report.handOver();
+  return result(owned(chunks(output.chunks), output.release), status);
 };
+
+function* chunks(list: readonly Uint8Array[]): Generator<Uint8Array, void, undefined> {
+  yield* list;
+}
 
 interface Held {
   readonly bytes: Uint8Array;
@@ -81,39 +92,17 @@ async function readInput(
   return drainBounded(context.stdin, budget, "patch input");
 }
 
-function run(
+/** Apply every patch in the input; returns the exit status. */
+function runPatches(
   context: CommandContext,
   options: PatchOptions,
   root: string,
   bytes: Uint8Array,
-  releaseInput: () => void,
-  setStatus: (status: number) => void,
-): ByteStream {
-  const steps = patchSteps(context, options, root, bytes, setStatus);
-  return (function* (): Generator<Uint8Array, void, undefined> {
-    try {
-      for (let next = steps.next(); next.done !== true; next = steps.next()) yield next.value;
-    } finally {
-      try {
-        for (let next = steps.next(); next.done !== true; next = steps.next());
-      } finally {
-        releaseInput();
-      }
-    }
-  })();
-}
-
-function* patchSteps(
-  context: CommandContext,
-  options: PatchOptions,
-  root: string,
-  bytes: Uint8Array,
-  setStatus: (status: number) => void,
-): Generator<Uint8Array, void, undefined> {
+  report: Report,
+): number {
   const budget = context.fs.retained;
   const index = lineStarts(bytes, budget, "patch input lines");
   const workspace = new Workspace(context.fs, root);
-  const report = new Report(budget, options.silent);
   const session: Session = {
     fs: context.fs,
     options,
@@ -135,25 +124,38 @@ function* patchSteps(
       if (header === null) break;
       found = true;
       at = processPatch(session, header);
-      yield* report.take();
     }
     if (!found && bytes.length > 0) {
       throw new PatchFatalError("Only garbage was found in the patch input.");
     }
-    workspace.publish();
-    yield* report.take();
-    setStatus(session.status);
+    publishOrDiscard(workspace);
+    return session.status;
   } catch (error) {
     if (!(error instanceof PatchFatalError || error instanceof PatchRefusal)) {
-      workspace.discard();
+      discardQuietly(workspace);
       throw error;
     }
-    workspace.publish();
-    yield* report.take();
     context.warn(error instanceof PatchFatalError ? `**** ${error.message}` : error.message);
-    setStatus(2);
+    publishOrDiscard(workspace);
+    return 2;
   } finally {
-    report.take();
     index.release();
   }
+}
+
+/** Publish the queue; if that fails, remove the staging and let the failure propagate. */
+function publishOrDiscard(workspace: Workspace): void {
+  try {
+    workspace.publish();
+  } catch (error) {
+    discardQuietly(workspace);
+    throw error;
+  }
+}
+
+// The run is already failing; a failure to clean up must not replace its error.
+function discardQuietly(workspace: Workspace): void {
+  try {
+    workspace.discard();
+  } catch {}
 }
