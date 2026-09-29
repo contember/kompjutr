@@ -100,6 +100,9 @@ export function writeRejects(
       path = `${target.lookup.path}.rej`;
     }
   }
+  // GNU names a temporary file in this message; the reject file is named instead.
+  if (workspace.isDirectory(path))
+    return { shown, refused: `Can't create file ${shown} : Is a directory` };
   const section = rejectSection(rejectHeader(header, names, reverse), rejects);
   workspace.writeReject(path, chunked(section, session.fs.retained, "patch rejects"), append);
   return { shown, refused: null };

@@ -23,9 +23,14 @@ export class PatchRefusal extends Error {
 
 const ENCODER = new TextEncoder();
 
+const FIRST_CHUNK = 16;
+const LARGEST_CHUNK = 64 * 1024;
+
 export class Report {
   #chunks: Uint8Array[] = [];
   #releases: Array<() => void> = [];
+  #current = new Uint8Array(0);
+  #used = 0;
 
   constructor(
     private readonly budget: RetainedBudget,
@@ -42,18 +47,41 @@ export class Report {
     if (!this.silent) this.always(text);
   }
 
+  // Messages are copied into reserved chunks that double up to 64 KiB, so a
+  // run of many short messages holds a few buffers, not an object apiece.
   bytes(bytes: Uint8Array): void {
-    if (bytes.length === 0) return;
-    this.#releases.push(this.budget.retain(bytes.length, "patch messages"));
-    this.#chunks.push(bytes);
+    let at = 0;
+    while (at < bytes.length) {
+      if (this.#used === this.#current.length) this.#nextChunk(bytes.length - at);
+      const length = Math.min(this.#current.length - this.#used, bytes.length - at);
+      this.#current.set(bytes.subarray(at, at + length), this.#used);
+      this.#used += length;
+      at += length;
+    }
+  }
+
+  #nextChunk(wanted: number): void {
+    this.#seal();
+    const doubled = Math.max(FIRST_CHUNK, this.#current.length * 2);
+    const size = Math.min(LARGEST_CHUNK, Math.max(doubled, Math.min(wanted, LARGEST_CHUNK)));
+    this.#releases.push(this.budget.retain(size, "patch messages"));
+    this.#current = new Uint8Array(size);
+    this.#used = 0;
+  }
+
+  #seal(): void {
+    if (this.#used > 0) this.#chunks.push(this.#current.subarray(0, this.#used));
   }
 
   /** Hand the buffered output over with its reservation; the receiver releases it. */
   handOver(): { readonly chunks: readonly Uint8Array[]; release(): void } {
+    this.#seal();
     const chunks = this.#chunks;
     const releases = this.#releases;
     this.#chunks = [];
     this.#releases = [];
+    this.#current = new Uint8Array(0);
+    this.#used = 0;
     return {
       chunks,
       release: () => {

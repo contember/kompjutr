@@ -16,7 +16,7 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 
 import { createFilesystem } from "../../packages/do/src/fs/filesystem.js";
-import { DEFAULT_LIMITS } from "../../packages/do/src/shell/exec/context.js";
+import { DEFAULT_LIMITS, RetainedBudget } from "../../packages/do/src/shell/exec/context.js";
 import { createShell } from "../../packages/do/src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 import {
@@ -628,7 +628,11 @@ describe.skipIf(!REAL_BASH)("patch matches GNU patch on generated edits", () => 
   // reversal, and rejects all occur.
   it("applies drifted patches as GNU does", async () => {
     const random = seeded(11);
-    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+    const pick = <T>(items: readonly T[]): T => {
+      const item = items[Math.floor(random() * items.length)];
+      if (item === undefined) throw new Error("pick from an empty list");
+      return item;
+    };
     const lines = (count: number): string[] =>
       Array.from({ length: count }, () => pick(["a", "b", "c", "d", "e", "f"]));
     const mutate = (source: readonly string[], edits: number): string[] => {
@@ -929,6 +933,12 @@ describe.skipIf(!REAL_BASH)("patch matches GNU patch on reviewed edge cases", ()
     ],
   ])("%s: %s", async (_, command, diff) => {
     const script = `${command} < d.diff; ls -A . sub; cat -A g g.orig g.rej words sub.rej ..rej; echo end`;
+    agreeWithBash(await compareWithBash(script, { tree: { ...tree, "d.diff": diff } }));
+  });
+
+  it("stops when the backup name is a directory", async () => {
+    const script = "mkdir g.orig; patch < d.diff; echo st=$?; ls -A; cat g; echo end";
+    const diff = "--- g\n+++ g\n@@ -2 +2 @@\n-a\n+A\n";
     agreeWithBash(await compareWithBash(script, { tree: { ...tree, "d.diff": diff } }));
   });
 
@@ -1236,5 +1246,147 @@ describe("patch bounds and failure handling", () => {
     expect(run.exitCode).toBe(1);
     // A scan per hunk and fuzz level took about 23 s here; the index takes milliseconds.
     if (TIMING_GATE) expect(elapsed).toBeLessThan(2_000);
+  });
+
+  // Every reservation a run takes is returned however patch stops.
+  it.each([
+    [
+      "a malformed hunk",
+      "--- g\n+++ g\n@@ -1 +1 @@\n-a\n+A\n@@ -3 +3 @@\n-Q\n+C\n@@ -5 +5 @@\n?bad\n",
+    ],
+    [
+      "a malformed git hunk",
+      "diff --git a/g b/g\n--- a/g\n+++ b/g\n@@ -1 +1 @@\n-a\n+A\n@@ -3 +3 @@\n-Q\n+C\n@@ -5 +5 @@\n?bad\n",
+    ],
+    ["end of input inside a hunk", "--- g\n+++ g\n@@ -1 +1 @@\n-a\n+A\n@@ -3,1 +3,9 @@\n-c\n+C\n"],
+    ["a malformed hunk after reversal", "--- g\n+++ g\n@@ -1 +1 @@\n-A\n+a\n@@ -5 +5 @@\n?bad\n"],
+    ["a NUL byte after a hunk", "--- g\n+++ g\n@@ -1 +1 @@\n-a\n+A\nx\0y\n"],
+    ["a stray backslash line", "--- g\n+++ g\n@@ -1 +1 @@\n\\ No newline\n-a\n+A\n"],
+    ["a clean run", "--- g\n+++ g\n@@ -1 +1 @@\n-a\n+A\n@@ -3 +3 @@\n-Q\n+C\n"],
+  ])("returns every reservation after %s", async (_, diff) => {
+    const held = await heldAfter({ g: "a\nb\nc\nd\ne\nf\n", "d.diff": diff }, {});
+    expect(held).toEqual([]);
+  });
+
+  it("returns the line index when the hashes do not fit", async () => {
+    const files = { f: "x\n".repeat(100_000), "d.diff": "--- f\n+++ f\n@@ -1 +1 @@\n-x\n+y\n" };
+    expect(await heldAfter(files, { maxRetainedBytes: 700_000 })).toEqual([]);
+  });
+
+  /** Reservations taken under a `patch` label and still held after a run. */
+  async function heldAfter(
+    files: Readonly<Record<string, string>>,
+    limits: Partial<typeof DEFAULT_LIMITS>,
+  ): Promise<string[]> {
+    const held = new Map<number, string>();
+    const retain = RetainedBudget.prototype.retain;
+    let next = 0;
+    RetainedBudget.prototype.retain = function (bytes: number, label: string) {
+      const release = retain.call(this, bytes, label);
+      const id = next++;
+      held.set(id, `${label}:${bytes}`);
+      return () => {
+        held.delete(id);
+        release();
+      };
+    };
+    try {
+      const { shell } = setup(files, limits);
+      await shell.run("patch < d.diff > /dev/null");
+      return [...held.values()].filter((entry) => entry.startsWith("patch"));
+    } finally {
+      RetainedBudget.prototype.retain = retain;
+    }
+  }
+
+  it("scans instead of indexing when the index does not fit", async () => {
+    const { shell, read } = setup({
+      f: `z\n${"x\n".repeat(600_000)}`,
+      "d.diff": "--- f\n+++ f\n@@ -1 +1 @@\n-x\n+y\n",
+    });
+    const run = await shell.run("patch < d.diff");
+    expect(run.stdout).toBe("patching file f\nHunk #1 succeeded at 2 (offset 1 line).\n");
+    expect(read("/repo/f").slice(0, 6)).toBe("z\ny\nx\n");
+  });
+
+  it("holds messages in a few reserved buffers", async () => {
+    const hunks = 60_000;
+    let diff = "--- f\n+++ f\n";
+    for (let hunk = 0; hunk < hunks; hunk++) diff += `@@ -${hunk + 1} +${hunk + 1} @@\n-x\n+y\n`;
+    const { fs, shell } = setup({ f: `z\n${"x\n".repeat(hunks)}`, "d.diff": diff });
+    const gc = runInNewContext("gc");
+    const write = fs.writeFileStream.bind(fs);
+    let heapAtWrite = 0;
+    fs.writeFileStream = (path, chunks, options) => {
+      if (path === "/repo/f") {
+        gc();
+        heapAtWrite = process.memoryUsage().heapUsed;
+      }
+      write(path, chunks, options);
+    };
+    gc();
+    const before = process.memoryUsage().heapUsed;
+    const run = await shell.run("patch < d.diff > /dev/null");
+    expect(run.exitCode).toBe(0);
+    expect(heapAtWrite - before).toBeLessThan(run.peakRetainedBytes);
+  });
+
+  it("finds hunks whose rarest line is common without a byte comparison per candidate", async () => {
+    const lines = Array.from({ length: 50_000 }, (_, line) => (line % 100 === 99 ? "b" : "a"));
+    let diff = "--- f\n+++ f\n";
+    for (let hunk = 0; hunk < 20; hunk++) {
+      diff += `@@ -${1 + hunk * 1000},150 +${1 + hunk * 1000},150 @@\n${" a\n".repeat(75)}-a\n+c\n${" a\n".repeat(74)}`;
+    }
+    const { shell } = setup({ f: `${lines.join("\n")}\n`, "d.diff": diff });
+    const started = performance.now();
+    const run = await shell.run("patch --dry-run < d.diff > /dev/null");
+    expect(run.exitCode).toBe(1);
+    // It took 6.4 s when every comparison sliced the hunk's bytes; GNU takes about 0.35 s.
+    if (TIMING_GATE) expect(performance.now() - started).toBeLessThan(1_000);
+  });
+
+  it("stops when a reject file name is a directory", async () => {
+    const { shell, names } = setup({
+      f: "a\nb\n",
+      "f.rej/x": "",
+      "d.diff": "--- f\n+++ f\n@@ -1 +1 @@\n-Q\n+A\n",
+    });
+    const run = await shell.run("patch --no-backup-if-mismatch < d.diff");
+    // GNU names its temporary file here; the message names the reject file instead.
+    expect(run.stderr).toBe("patch: **** Can't create file f.rej : Is a directory\n");
+    expect(run.stdout).toBe(
+      "patching file f\nHunk #1 FAILED at 1.\n1 out of 1 hunk FAILED -- saving rejects to file f.rej\n",
+    );
+    expect(run.exitCode).toBe(2);
+    expect(names("/repo")).toEqual(["d.diff", "f", "f.rej"]);
+  });
+
+  // GNU loops on this; the queued patch stops the way a plain one does and nothing is published.
+  it("stops a git patch whose backup name is a directory", async () => {
+    const diff = `${gitChange("g", "x", "y")}diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -3 +3 @@\n-c\n+C\n`;
+    const { shell, read, names } = setup({
+      f: "a\nb\nz\nc\n",
+      g: "x\n",
+      "f.orig/x": "",
+      "d.diff": diff,
+    });
+    const run = await shell.run("patch -p1 < d.diff");
+    expect(run.stderr).toBe("patch: **** Can't rename file f to f.orig : Is a directory\n");
+    expect(run.exitCode).toBe(2);
+    expect(read("/repo/f")).toBe("a\nb\nz\nc\n");
+    expect(names("/repo")).toEqual(["d.diff", "f", "f.orig", "g"]);
+  });
+
+  // Divergence: GNU sometimes joins lines added after a copied final line that
+  // lacks a newline ("b" + "bb" gives "bbb"); this ends that line first.
+  it("ends a final line without a newline before lines added after it", async () => {
+    const diff =
+      "--- f\n+++ f\n@@ -1,6 +1,4 @@\n+aX\n+aX\n a\n-a\n-a\n-a\n-b\n b\n@@ -13,2 +11,4 @@\n a\n+bb\n+aX\n b\n\\ No newline at end of file\n";
+    const target = "a\na\nbb\na\nba\nbX\nb\nb\naX\nb\nb\nb\nb";
+    const { shell, read } = setup({ f: target, "d.diff": diff });
+    const run = await shell.run("patch -F3 < d.diff > /dev/null");
+    expect(run.exitCode).toBe(1);
+    // GNU writes "b" + "bb" as "bbb" here.
+    expect(read("/repo/f")).toBe(`${target}\nbb\naX\n`);
   });
 });

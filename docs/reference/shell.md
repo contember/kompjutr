@@ -231,17 +231,23 @@ jq 1.8.1. A row names the reference where it differs from that list.
 | `patch` | Unified diffs from stdin, `-i FILE`, or a second operand; plain `---`/`+++`, `Index:`, `Prereq:`, and git headers (`diff --git`, new/deleted file mode, `/dev/null`, rename, copy, mode). Options: `-pN`/`--strip`, `-R`, `--dry-run`, `-N`, `-s`, `-d DIR`, `-f`, `-t`, `-E`, `--no-backup-if-mismatch`, `-F N`, `-r FILE` (`-` discards), `-i FILE`, and an ORIGFILE operand. Offsets and fuzz (default 2), unified `.rej`, `.orig` on mismatch, reversed/applied detection with the no-terminal default answers, `\ No newline at end of file`, and exit statuses and messages as GNU patch 2.8 prints them. Names that are absolute, contain `..`, or pass through a directory symlink out of the working directory are not patched (an operand is exempt); a final symlink is not a regular file. Refused with status 2: context, normal, and ed diffs, symlink patches (mode 120000), `-o`, `-b`, and the other GNU options not listed. Git binary patches are skipped with GNU's message. |
 
 `patch` holds the diff against `maxRetainedBytes` with a 4-byte-per-line
-index. Hunk lines are offsets into it, and hunks, plan steps, and rejects are
-reserved typed-array rows. Each patched file is held with an 8-byte-per-line
-index and hash; a lazily built hash index lets each fuzz level probe only the
-positions of the hunk's rarest line. Output streams from the plan in chunks of
-at most 64 KiB. The work runs before stdout is returned, so it does not depend
-on stdout's reader. Git-style outputs are staged in one hidden
+index. Hunk lines are offsets into it, and hunks, plan steps, rejects, and
+progress messages are reserved typed-array rows or byte chunks. Each patched
+file is held with an 8-byte-per-line index and hash. A hash index lets each
+fuzz level probe only the positions of the hunk's rarest line; it is built
+only when it fits comfortably in the remaining budget, and otherwise the
+search scans, comparing hashes before bytes. Every reservation is returned on
+success and on failure. Output streams from the plan in chunks of at most
+64 KiB. The work runs before stdout is returned, so it does not depend on
+stdout's reader. Git-style outputs are staged in one hidden
 `.patch-staging~` directory, published by one bulk backup copy and bulk copies
 of at most 1,000 files, and removed in one call; a dry run creates none. A
 failed run removes the directory with a call not counted against
-`maxOperations`, so exhausting the budget leaves nothing hidden behind. A backup is copied before its target is replaced, and a file already
-written in the run is not backed up again.
+`maxOperations`, so exhausting the budget leaves nothing hidden behind. A
+backup is copied before its target is replaced, and a file already written in
+the run is not backed up again. When added lines follow a copied final line
+that has no newline, `patch` ends that line first; GNU patch sometimes joins
+them, for example after fuzz.
 
 `grep` uses GNU grep defaults: non-recursive, dotfiles included, and BRE unless
 `-E` is present. It supports `-r`/`-R`/`--recursive`, `-i`, `-n`, `-l`, `-L`,

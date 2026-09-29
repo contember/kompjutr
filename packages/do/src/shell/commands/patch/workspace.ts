@@ -171,6 +171,15 @@ export class Workspace {
     this.#pruneParents([path]);
   }
 
+  isDirectory(path: string): boolean {
+    return this.fs.stat(path)?.type === "dir";
+  }
+
+  /** A backup of `path` would be made now, but `path.orig` is a directory. */
+  backupBlocked(path: string): boolean {
+    return !this.#touched.has(path) && this.isDirectory(`${path}.orig`);
+  }
+
   isLink(path: string): boolean {
     return this.fs.stat(path)?.type === "symlink";
   }

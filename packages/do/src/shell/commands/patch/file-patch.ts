@@ -300,6 +300,10 @@ function write(
   }
   if (options.dryRun || !target.lookup.safe || !source.lookup.safe) return;
   const path = target.lookup.path;
+  if (settings.backup && workspace.backupBlocked(path)) {
+    const name = target.name;
+    throw new PatchFatalError(`Can't rename file ${name} to ${name}.orig : Is a directory`);
+  }
   const git = header.git;
   const mode = gitMode(session, header);
   if (git === null && !workspace.queued(path)) {

@@ -21,14 +21,17 @@ import type { RetainedBudget } from "../../exec/context.js";
 import { type FileLines, hashLine } from "./file-lines.js";
 import { CONTEXT, type Hunk, REMOVED } from "./hunk.js";
 
-/** The old side of a hunk, prepared for searching; nine bytes a line, reserved. */
+/** The old side of a hunk, prepared for searching; thirteen bytes a line, reserved. */
 export class Pattern {
   readonly length: number;
   readonly prefix: number;
   readonly suffix: number;
   readonly context: number;
-  readonly #lines: Uint32Array;
-  readonly #hashes: Uint32Array;
+  readonly hashes: Uint32Array;
+  readonly #source: Uint8Array;
+  readonly #starts: Uint32Array;
+  readonly #lengths: Uint32Array;
+  readonly #newlines: Uint8Array;
   readonly #release: () => void;
 
   constructor(
@@ -37,17 +40,24 @@ export class Pattern {
   ) {
     let length = 0;
     for (let index = 0; index < hunk.count; index++) if (isOld(hunk, index)) length++;
-    this.#release = budget.retain(length * 8, "patch hunk");
-    this.#lines = new Uint32Array(length);
-    this.#hashes = new Uint32Array(length);
+    this.#release = budget.retain(length * 13, "patch hunk");
+    this.hashes = new Uint32Array(length);
+    this.#starts = new Uint32Array(length);
+    this.#lengths = new Uint32Array(length);
+    this.#newlines = new Uint8Array(length);
+    const source = hunk.source;
     let old = 0;
     for (let index = 0; index < hunk.count; index++) {
       if (!isOld(hunk, index)) continue;
       const bytes = hunk.bytes(index);
-      this.#lines[old] = index;
-      this.#hashes[old] = hashLine(bytes, 0, bytes.length, hunk.newline(index));
+      const newline = hunk.newline(index);
+      this.hashes[old] = hashLine(bytes, 0, bytes.length, newline);
+      this.#starts[old] = bytes.byteOffset - source.byteOffset;
+      this.#lengths[old] = bytes.length;
+      this.#newlines[old] = newline ? 1 : 0;
       old++;
     }
+    this.#source = source;
     this.length = length;
     let prefix = 0;
     while (prefix < hunk.count && hunk.kind(prefix) === CONTEXT) prefix++;
@@ -65,19 +75,25 @@ export class Pattern {
   }
 
   hash(old: number): number {
-    return this.#hashes[old] ?? 0;
+    return this.hashes[old] ?? 0;
   }
 
-  matchesAt(file: FileLines, line: number, old: number): boolean {
-    const index = this.#lines[old] ?? 0;
-    return file.matches(line, this.hunk.bytes(index), this.hunk.newline(index), this.hash(old));
+  /** Byte comparison of old line `old` with file line `line`, once their hashes agree. */
+  bytesMatch(file: FileLines, line: number, old: number): boolean {
+    return file.equals(
+      line,
+      this.#source,
+      this.#starts[old] ?? 0,
+      this.#lengths[old] ?? 0,
+      this.#newlines[old] === 1,
+    );
   }
 
   /** Whether the first old line ends in CR, for GNU's "different line endings" note. */
   firstEndsWithCr(): boolean {
-    if (this.length === 0) return false;
-    const bytes = this.hunk.bytes(this.#lines[0] ?? 0);
-    return bytes[bytes.length - 1] === 0x0d;
+    const length = this.#lengths[0] ?? 0;
+    if (this.length === 0 || length === 0) return false;
+    return this.#source[(this.#starts[0] ?? 0) + length - 1] === 0x0d;
   }
 }
 
@@ -126,8 +142,16 @@ function fits(file: FileLines, pattern: Pattern, at: number, rules: Level): bool
   if (at < 0) return false;
   if (rules.anchorStart && at !== 0) return false;
   if (rules.anchorEnd && at + pattern.length !== file.count) return false;
-  for (let old = rules.skipPrefix; old < pattern.length - rules.skipSuffix; old++) {
-    if (!pattern.matchesAt(file, at + old, old)) return false;
+  const end = pattern.length - rules.skipSuffix;
+  // Hashes first: a mismatch costs two array reads and no byte access.
+  const fileHashes = file.hashes;
+  const hunkHashes = pattern.hashes;
+  for (let old = rules.skipPrefix; old < end; old++) {
+    const line = at + old;
+    if (line >= file.count || fileHashes[line] !== hunkHashes[old]) return false;
+  }
+  for (let old = rules.skipPrefix; old < end; old++) {
+    if (!pattern.bytesMatch(file, at + old, old)) return false;
   }
   return true;
 }
@@ -187,6 +211,7 @@ export function search(
   let fewest = Number.POSITIVE_INFINITY;
   for (let old = first; old < end; old++) {
     const count = file.occurrences(pattern.hash(old));
+    if (count === null) return nearest(guess, lowest, last, (at) => decide(at));
     if (count < fewest) {
       fewest = count;
       probe = old;
@@ -194,6 +219,7 @@ export function search(
   }
   if (fewest === 0) return null;
   const positions = file.positions(pattern.hash(probe));
+  if (positions === null) return nearest(guess, lowest, last, (at) => decide(at));
   try {
     return nearestOf(positions.lines, probe, guess, (at) => decide(at));
   } finally {

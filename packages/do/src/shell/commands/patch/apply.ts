@@ -46,6 +46,24 @@ export function applyHunks(
 ): Applied {
   const plan = new Plan(store, budget);
   const rejects = new Rejects(store, budget);
+  try {
+    return placeHunks(file, nextHunk, settings, report, budget, plan, rejects);
+  } catch (error) {
+    plan.release();
+    rejects.release();
+    throw error;
+  }
+}
+
+function placeHunks(
+  file: FileLines,
+  nextHunk: () => Hunk | null,
+  settings: ApplySettings,
+  report: Report,
+  budget: RetainedBudget,
+  plan: Plan,
+  rejects: Rejects,
+): Applied {
   const lines = file.count;
   let reverse = settings.reverse;
   let skipped = false;

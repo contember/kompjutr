@@ -1,7 +1,8 @@
 // A file's lines, hashed once, with an index from hash to line built the
 // first time a hunk has to be searched for. The search probes only lines
 // holding the rarest line of the hunk, so a hunk that cannot match costs a
-// lookup, not a scan.
+// lookup, not a scan. When the index would not fit the retained budget the
+// search scans instead, comparing hashes before bytes.
 
 import type { RetainedBudget } from "../../exec/context.js";
 import { type LineIndex, lineStarts } from "./text.js";
@@ -16,6 +17,7 @@ export class FileLines {
   readonly #index: LineIndex;
   readonly #releases: Array<() => void> = [];
   #buckets: HashBuckets | null = null;
+  #indexRefused = false;
 
   constructor(
     readonly bytes: Uint8Array,
@@ -25,7 +27,12 @@ export class FileLines {
     this.#index = lineStarts(bytes, budget, label);
     this.count = this.#index.count;
     this.#starts = this.#index.starts;
-    this.#releases.push(budget.retain(this.count * 4, label));
+    try {
+      this.#releases.push(budget.retain(this.count * 4, label));
+    } catch (error) {
+      this.#index.release();
+      throw error;
+    }
     this.#hashes = new Uint32Array(this.count);
     for (let line = 0; line < this.count; line++) {
       const start = this.#starts[line] ?? 0;
@@ -51,14 +58,24 @@ export class FileLines {
     return end > this.start(line) && this.bytes[end - 1] === NEWLINE;
   }
 
-  /** Whether file line `line` equals `expected`, whose hash is `hash`. */
-  matches(line: number, expected: Uint8Array, newline: boolean, hash: number): boolean {
-    if (line < 0 || line >= this.count || this.#hashes[line] !== hash) return false;
-    const start = this.start(line);
+  /** Each line's hash, for comparing before touching bytes. */
+  get hashes(): Uint32Array {
+    return this.#hashes;
+  }
+
+  /** Whether file line `line` holds exactly `length` bytes of `source` at `start`. */
+  equals(
+    line: number,
+    source: Uint8Array,
+    start: number,
+    length: number,
+    newline: boolean,
+  ): boolean {
+    const from = this.start(line);
     const end = this.start(line + 1) - (this.newline(line) ? 1 : 0);
-    if (this.newline(line) !== newline || end - start !== expected.length) return false;
-    for (let index = 0; index < expected.length; index++) {
-      if (this.bytes[start + index] !== expected[index]) return false;
+    if (this.newline(line) !== newline || end - from !== length) return false;
+    for (let index = 0; index < length; index++) {
+      if (this.bytes[from + index] !== source[start + index]) return false;
     }
     return true;
   }
@@ -69,23 +86,36 @@ export class FileLines {
     return end > this.start(0) && this.bytes[end - 1] === 0x0d;
   }
 
-  /** An upper bound on how many lines have this hash. */
-  occurrences(hash: number): number {
-    return this.#bucketIndex().count(hash);
+  /**
+   * An upper bound on how many lines have this hash, or null when the index
+   * does not fit the retained budget and the caller must scan instead.
+   */
+  occurrences(hash: number): number | null {
+    return this.#bucketIndex()?.count(hash) ?? null;
   }
 
-  /** Lines with this hash, ascending; reserved while the caller holds them. */
-  positions(hash: number): { readonly lines: Uint32Array; release(): void } {
+  /** Lines with this hash, ascending, or null when they do not fit the budget. */
+  positions(hash: number): { readonly lines: Uint32Array; release(): void } | null {
     const buckets = this.#bucketIndex();
-    const release = this.budget.retain(buckets.count(hash) * 4, this.label);
+    if (buckets === null) return null;
+    const bytes = buckets.count(hash) * 4;
+    if (bytes > this.budget.available) return null;
+    const release = this.budget.retain(bytes, this.label);
     return { lines: buckets.lines(hash, this.#hashes), release };
   }
 
-  #bucketIndex(): HashBuckets {
-    if (this.#buckets === null) {
+  // The index is an accelerator, so it is built only when it fits comfortably
+  // within what the budget has left; otherwise hunks are found by scanning.
+  #bucketIndex(): HashBuckets | null {
+    if (this.#buckets === null && !this.#indexRefused) {
       let size = MIN_BUCKETS;
       while (size < this.count) size *= 2;
-      this.#releases.push(this.budget.retain(size * 8 + this.count * 4, this.label));
+      const bytes = size * 8 + this.count * 4;
+      if (bytes * 2 > this.budget.available) {
+        this.#indexRefused = true;
+        return null;
+      }
+      this.#releases.push(this.budget.retain(bytes, this.label));
       this.#buckets = new HashBuckets(this.#hashes, size);
     }
     return this.#buckets;

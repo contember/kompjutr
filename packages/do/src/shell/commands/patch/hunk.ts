@@ -62,6 +62,11 @@ export class Hunk {
     readonly swapped: boolean,
   ) {}
 
+  /** The held diff the hunk's lines point into. */
+  get source(): Uint8Array {
+    return this.store.source;
+  }
+
   /** One-based first old line; for an empty range, the line it precedes. */
   get oldFirst(): number {
     return this.store.hunks.get(this.index, this.swapped ? NEW_FIRST : OLD_FIRST);
