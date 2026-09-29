@@ -10,9 +10,8 @@
 // in one hidden directory per run, and later patches in the run read the
 // staged state. Publishing is a bulk backup copy, a bulk copy of the staged
 // outputs into place, and one removal of deleted files and the staging
-// directory; a failed run removes the directory in one call. Both need the
-// filesystem, so a run that fails by exhausting `maxOperations` cannot clean
-// up and leaves the staging directory behind.
+// directory; a failed run removes the directory in one uncharged call, so
+// even a run that exhausted `maxOperations` leaves nothing behind.
 
 import type { Stat } from "../../../fs/types.js";
 import type { BoundedFs } from "../../exec/context.js";
@@ -253,7 +252,7 @@ export class Workspace {
     const staging = this.#staging;
     this.#staging = null;
     this.#forget();
-    if (staging !== null) this.fs.removeFiles([staging], { recursive: true, force: true });
+    if (staging !== null) this.fs.discardStaged([staging]);
   }
 
   #forget(): void {

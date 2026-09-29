@@ -259,6 +259,14 @@ export class BoundedFs {
     this.fs.removeFiles(paths, options);
   }
 
+  /**
+   * Remove what a failing command staged. Uncharged, so a command that ran
+   * out of operations can still leave nothing hidden behind.
+   */
+  discardStaged(paths: readonly string[]): void {
+    this.fs.removeFiles(paths, { recursive: true, force: true });
+  }
+
   rename(oldPath: string, newPath: string): void {
     this.#charge();
     this.fs.rename(oldPath, newPath);

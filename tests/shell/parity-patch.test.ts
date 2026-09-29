@@ -1201,17 +1201,24 @@ describe("patch bounds and failure handling", () => {
     expect(names("/repo")).toEqual(["d.diff", "f"]);
   });
 
-  it("publishes nothing when the operation budget runs out", async () => {
+  it("never half-publishes or leaves staging when the operation budget runs out", async () => {
     const files: Record<string, string> = {};
     let diff = "";
     for (let index = 0; index < 30; index++) {
       files[`f${index}`] = "x\n";
       diff += gitChange(`f${index}`, "x", "y");
     }
-    const { shell, read } = setup({ ...files, "d.diff": diff }, { maxOperations: 60 });
-    const run = await shell.run("patch -p1 < d.diff > /dev/null");
-    expect(run.stderr).toBe("kompjutr: exceeded 60 filesystem operations\n");
-    for (let index = 0; index < 30; index++) expect(read(`/repo/f${index}`)).toBe("x\n");
+    const probe = setup({ ...files, "d.diff": diff });
+    const total = (await probe.shell.run("patch -p1 < d.diff > /dev/null")).operations;
+    for (let maxOperations = 1; maxOperations < total; maxOperations++) {
+      const { shell, read, names } = setup({ ...files, "d.diff": diff }, { maxOperations });
+      const run = await shell.run("patch -p1 < d.diff > /dev/null");
+      expect(run.stderr).toBe(`kompjutr: exceeded ${maxOperations} filesystem operations\n`);
+      // Publication is one bulk copy: every target changes, or none does.
+      const contents = new Set(Array.from({ length: 30 }, (_, index) => read(`/repo/f${index}`)));
+      expect(contents.size).toBe(1);
+      expect(names("/repo")).not.toContain(".patch-staging~");
+    }
   });
 
   it("finds hunks through the line index instead of rescanning the file", async () => {
