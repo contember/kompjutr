@@ -16,9 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [Shell surface expansion](sprints/sprint-2026-09-28-shell-surface-expansion.md)
-  — word fixes, compound syntax, substitution, and text, link, tree, system,
-  `patch`, `jq`, and `awk` commands (ADR-0027).
+None.
 
 ## Specs
 
@@ -50,6 +48,10 @@ decisions → reference → archive.
   rebase phase reads 830,418 rows instead of 1,145,713, and checkout keeps only
   real payload limits and count caps. The workerd clone has a V8 regression limit
   (ADR-0026). Next: the [backlog plan](backlog/README.md#sprint-plan), 108 first.
+- [Shell surface expansion](archive/sprint-2026-09-28-shell-surface-expansion.md)
+  shipped: compound syntax, substitution, assignments, and new text, file, and
+  system commands, including clean-room `patch`, `jq`, and `awk`, all under the
+  parity gate (ADR-0027). Next: backlog 113, then the CPU bound decision in 111.
 - The 2026-09-28 backlog triage cut the backlog from 16 to 8 items and deleted
   stale and look-alike cleanup items; two with no failure behind them moved
   to [`ideas/`](ideas/README.md).

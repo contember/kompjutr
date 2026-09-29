@@ -1,3 +1,28 @@
+> **OUTCOME — shipped 2026-09-29.** The shell admits `~` and brace expansion,
+> `&>`, subshells, groups, `if`, `for … in`, `$?`, `set -euo pipefail`, command
+> substitution, assignments, and `export`/`unset`, plus `cut`, `tr`, `nl`,
+> `rev`, `comm`, `seq`, `ln`, `chmod`, `rmdir`, `readlink`, `realpath`, `du`,
+> `tree`, `env`, `date`, `sleep`, `mktemp`, `sha*sum`, `base64`, `type`,
+> `command -v`, `find` actions, `diff -r`, `patch`, a `jq` subset, and an `awk`
+> subset, each pinned by parity against the installed toolchain. Commit map
+> (SHAs of the history published after the clean-room rewrite): W0 →
+> `c5248de`, `95ab0fc`; S1 → `864391c`, `28d2baa`; S2 → `f21ea8d`, `73e58f7`;
+> S3 → `2b74a59`, `1c8b14c`; C1 → `d74cb11`; C2 → `1fff8ea`; C3 → `71a57c8`;
+> C4 → `29d2e29`; C5 → `8264b2b`; C6 → `99ac4e7`, `3a34cea`; C7 → `76a681a`;
+> C8 → `688e6a1`, `f003318`, `5652d30`, `c2548f8`; C9 → `d944cdd`, `9df42b1`;
+> C10 → `afa6ec4`, `e761cd6`; notices → `4667b44`; docs → `30fc092`,
+> `a52b7df`; follow-ups → `1a5b532`. Verification: `test:full` passed 249
+> files and 7,958 tests (341 skipped, 0 failed; 835 s wall); `test:shell`
+> passed 57 files and 4,632 tests; typecheck, Biome, and package smoke passed.
+> C8, C9, C10, S1–S3, and C6 had independent reviews; every blocker was fixed
+> before commit. The first `patch` was withdrawn and rewritten clean-room; its
+> commits are not in the published history. Backlog closed: none. Deferred:
+> [111](../backlog/111-bound-interpreter-cpu-and-regex-backtracking.md) (needs
+> a decision), [112](../backlog/112-give-invoked-commands-stdin-and-their-own-name.md),
+> [113](../backlog/113-close-small-shell-parity-gaps.md),
+> [114](../backlog/114-share-one-uutils-argument-parser.md), and
+> [115](../backlog/115-bulk-chmod-without-mtime.md).
+
 # Sprint — shell surface expansion (2026-09-28)
 
 **Goal.** Close the gaps between the shell and the command lines coding agents
@@ -100,3 +125,10 @@ leader from each unit's report.
 - **Material findings:** parity against uutils, `for`-only loops, `sleep` admitted.
 
 ## Run log
+
+- Parity gaps, argument-parser duplication, bulk `chmod`, the `invoke` seam,
+  and interpreter CPU → backlog 111–115.
+- Loop budget, subshell pipeline stages, the `jq` and `awk` divergences, and
+  the clean-room rule → ADR-0027.
+- `patch` was first ported from GNU sources; it was removed, rewritten from
+  observed behaviour only, and the ported commits were cut from history.

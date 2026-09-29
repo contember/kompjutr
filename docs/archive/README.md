@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Shell surface expansion](sprint-2026-09-28-shell-surface-expansion.md)
+  — compound syntax, substitution, assignments, and new text, file, and system
+  commands, including clean-room `patch`, `jq`, and `awk`, under the parity gate.
 - [Memory and cost](sprint-2026-09-28-memory-and-cost.md) — sparse selected add
   under its memory gate, an 898-statement clone, a V8 regression limit for the
   workerd clone, checkout without modeled byte charges, and a rebase step without
