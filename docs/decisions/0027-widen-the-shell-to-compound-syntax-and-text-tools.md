@@ -38,6 +38,11 @@ ADR-0018's bounded execution:
   `{ …; }` groups with shared redirections; `if/elif/else/fi`; and
   `for NAME in WORDS; do … done`. `while`, `until`, `case`, and functions stay
   rejected: only `for … in` has a structural bound, the expanded word list.
+  Nested loops multiply that bound, so all iterations of one run share a
+  budget equal to the argv ceiling (10,000), and nesting stops at 64 levels,
+  the depth that keeps the recursive executor off the JavaScript stack limit.
+- Every stage of a multi-stage pipeline runs as a subshell copy, as in Bash:
+  a `cd` or assignment inside a stage does not reach the caller.
 - `$?`, `set -e`, and `set -o pipefail`.
 - Command substitution `$( … )` and backquotes. The inner output is retained
   against `maxRetainedBytes` and shares the run's operation budget.
@@ -51,6 +56,14 @@ ADR-0018's bounded execution:
   reads `ShellOptions.now`. `mktemp` names come from `crypto.getRandomValues`.
 - **The parity reference is the installed toolchain.** Tests compare against
   whatever `bash` finds on PATH; for coreutils that is uutils, for `awk` mawk.
+- Two divergences are deliberate. `jq` regexes run on a linear-time VM, so
+  where Oniguruma gives up at its retry limit, `jq` here returns the real
+  result. `awk`'s `for (k in a)` visits keys in insertion order, not mawk's
+  hash order; scripts that depend on hash order are already unportable.
+- **Clean room for GPL tools.** Implementations of GNU tools (bash, coreutils,
+  patch, diffutils) and of mawk come only from observable behaviour, manuals,
+  and our own tests, never from their sources. MIT-licensed code (uutils, jq)
+  may be adapted and is credited in `LICENSE`.
 
 ## Consequences
 
@@ -59,6 +72,14 @@ ADR-0018's bounded execution:
   last status now travel through execution. Planning stays pure.
 - Parity pins uutils and mawk output. Moving the test host to GNU coreutils or
   gawk can move expectations; the fix is to re-pin, not to normalize.
+- Interpreter CPU is bounded by input size and program shape, not by a step
+  count or a deadline; [backlog 111](../backlog/111-bound-interpreter-cpu-and-regex-backtracking.md)
+  holds the open decision.
+- Evidence: the parity suites under `tests/shell/` named `parity-bash-words`,
+  `parity-bash-compound`, `parity-bash-substitution`, `parity-columns-*`,
+  `parity-options-*`, `parity-links`, `parity-tree`, `parity-system`,
+  `parity-find`, `parity-bash-diff-recursive`, `parity-patch`, `parity-jq*`,
+  and `parity-awk*`, with their local companions for refusals and cost.
 
 ## Alternatives considered
 
