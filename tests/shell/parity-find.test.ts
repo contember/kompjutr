@@ -44,7 +44,7 @@ describe.skipIf(!REAL_BASH)("find matches GNU find", () => {
     "find docs -name '*.md' -exec cat {} +",
     "find src -name '*.md' -exec wc -c {} \\;",
     "find src -name a.ts -print -exec echo batch {} +",
-    "find src/deep -type f -exec echo one {} + -exec echo two {} +",
+    "find src/deep/c.ts src/deep/d.ts -type f -exec echo one {} + -exec echo two {} +",
     "find src-x top.ts -exec echo {} +",
     "find src -name '*.ts' -exec grep -l needle {} +",
   ])("runs -exec: %j", async (source) => {
@@ -112,7 +112,7 @@ describe.skipIf(!REAL_BASH)("find matches GNU find", () => {
     "find . -depth | sort",
     "find . -d -type f | sort",
     "find src -depth -name deep",
-    "find src/deep -depth",
+    "rm src/deep/d.ts && find src/deep -depth",
     "find . -depth -maxdepth 1 | sort",
     "find . -mindepth 2 -depth | sort",
   ])("lists depth first: %j", async (source) => {

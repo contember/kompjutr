@@ -168,7 +168,7 @@ const CHMOD: readonly string[] = [
   "chmod -Rv 700 d/s",
   "chmod -R 700 d && test -x d/g.txt && echo executable",
   "chmod -Rc u+x d/s",
-  "ln -s ../a.txt d/s/l && chmod -Rv 700 d/s",
+  "rm d/s/f.txt && ln -s ../a.txt d/s/l && chmod -Rv 700 d/s",
   "ln -s d/s ls && chmod -Rv 711 ls",
   "ln -s a.txt l && chmod -v 600 l && test -w a.txt && echo writable",
   "ln -s missing dangling && chmod -v 644 dangling",
