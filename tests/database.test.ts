@@ -148,11 +148,11 @@ class MessageOnlyTooBigStorage implements DurableObjectStorageLike {
 class TransactionalTooBigStorage implements DurableObjectStorageLike {
   readonly #platform = new PlatformStorage();
   readonly sql: SQLStorageLike = {
-    exec: <Row extends object>(query: string, ...bindings: unknown[]): SQLCursorLike<Row> => {
+    exec: (query: string, ...bindings: unknown[]): SQLCursorLike => {
       if (query.includes("coded-failure")) {
         throw Object.assign(new Error("coded value failure"), { code: 18 });
       }
-      return this.#platform.sql.exec<Row>(query, ...bindings);
+      return this.#platform.sql.exec(query, ...bindings);
     },
   };
 

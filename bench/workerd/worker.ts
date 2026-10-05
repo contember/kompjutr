@@ -26,12 +26,9 @@ class CountingSqlStorage implements SQLStorageLike {
 
   constructor(private readonly inner: SQLStorageLike) {}
 
-  exec<Row extends object = Record<string, unknown>>(
-    query: string,
-    ...bindings: unknown[]
-  ): SQLCursorLike<Row> {
+  exec(query: string, ...bindings: unknown[]): SQLCursorLike {
     this.statements++;
-    return new CountingCursor(this.inner.exec<Row>(query, ...bindings), () => this.rows++);
+    return new CountingCursor(this.inner.exec(query, ...bindings), () => this.rows++);
   }
 
   reset(): void {

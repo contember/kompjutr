@@ -26,10 +26,7 @@ export interface SQLCursorLike<Row extends object = Record<string, unknown>> ext
 }
 
 export interface SQLStorageLike {
-  exec<Row extends object = Record<string, unknown>>(
-    query: string,
-    ...bindings: unknown[]
-  ): SQLCursorLike<Row>;
+  exec(query: string, ...bindings: unknown[]): SQLCursorLike;
 }
 
 export interface DurableObjectStorageLike {
@@ -77,7 +74,7 @@ export class Database implements SqlDatabase {
   all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
     try {
       return this.sql
-        .exec<Row>(query, ...bindings)
+        .exec(query, ...bindings)
         .toArray()
         .map(normalizeSqlRow<Row>);
     } catch (error) {

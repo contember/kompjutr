@@ -3,6 +3,7 @@ import type {
   SQLCursorLike,
   SQLStorageLike,
 } from "../../packages/do/src/db/db.js";
+import { Database } from "../../packages/do/src/db/db.js";
 import { Workspace } from "../../packages/do/src/runtime/workspace.js";
 import { createGit } from "../../packages/git/src/client.js";
 import { concat, utf8, utf8Decoder } from "../../packages/git/src/common/bytes.js";
@@ -100,12 +101,9 @@ class CountingSqlStorage implements SQLStorageLike {
 
   constructor(private readonly inner: PlatformSqlStorage) {}
 
-  exec<Row extends object = Record<string, unknown>>(
-    query: string,
-    ...bindings: unknown[]
-  ): SQLCursorLike<Row> {
+  exec(query: string, ...bindings: unknown[]): SQLCursorLike {
     this.statements++;
-    return new CountingCursor(this.inner.exec<Row>(query, ...bindings), () => this.rows++);
+    return new CountingCursor(this.inner.exec(query, ...bindings), () => this.rows++);
   }
 
   reset(): void {
@@ -264,7 +262,7 @@ class ProbeReceivePack {
 }
 
 function pragmaForeignKeys(sql: PlatformSqlStorage): number {
-  const row = sql.exec<ForeignKeyRow>("PRAGMA foreign_keys").toArray()[0];
+  const row = new Database({ sql }).one<ForeignKeyRow>("PRAGMA foreign_keys");
   if (row === undefined || (row.foreign_keys !== 0 && row.foreign_keys !== 1)) {
     throw new Error("PRAGMA foreign_keys returned an invalid value");
   }
@@ -347,9 +345,9 @@ export class ProductionProbe {
       this.#foreignKeysAfter,
       Date.now(),
     );
-    const row = this.#storage.sql
-      .exec<OrdinalRow>("SELECT max(ordinal) AS ordinal FROM probe_instance_events")
-      .toArray()[0];
+    const row = new Database(this.#storage).one<OrdinalRow>(
+      "SELECT max(ordinal) AS ordinal FROM probe_instance_events",
+    );
     this.#constructorOrdinal = nonnegativeInteger(row?.ordinal, "constructor ordinal");
   }
 
@@ -454,9 +452,10 @@ export class ProductionProbe {
   }
 
   #getFact(name: string): string | undefined {
-    const row = this.#storage.sql
-      .exec<FactRow>("SELECT value FROM probe_facts WHERE name = ?", name)
-      .toArray()[0];
+    const row = new Database(this.#storage).one<FactRow>(
+      "SELECT value FROM probe_facts WHERE name = ?",
+      name,
+    );
     if (row === undefined) return undefined;
     if (typeof row.value !== "string") throw new Error(`probe fact ${name} is invalid`);
     return row.value;
@@ -706,18 +705,18 @@ export class ProductionProbe {
   }
 
   async #audit(): Promise<unknown> {
-    const quick = this.#storage.sql.exec<CheckRow>("PRAGMA quick_check").toArray();
+    const quick = new Database(this.#storage).all<CheckRow>("PRAGMA quick_check");
     if (quick.length !== 1 || quick[0]?.quick_check !== "ok") {
       throw new Error("SQLite quick_check did not return ok");
     }
     const foreignKeyRows = this.#storage.sql.exec("PRAGMA foreign_key_check").toArray();
     if (foreignKeyRows.length !== 0) throw new Error("SQLite foreign_key_check found violations");
-    const pendingRow = this.#storage.sql
-      .exec<CountRow>("SELECT count(*) AS count FROM git_pack_meta WHERE state = 'pending'")
-      .toArray()[0];
-    const operationRow = this.#storage.sql
-      .exec<CountRow>("SELECT count(*) AS count FROM git_operation_state")
-      .toArray()[0];
+    const pendingRow = new Database(this.#storage).one<CountRow>(
+      "SELECT count(*) AS count FROM git_pack_meta WHERE state = 'pending'",
+    );
+    const operationRow = new Database(this.#storage).one<CountRow>(
+      "SELECT count(*) AS count FROM git_operation_state",
+    );
     const pendingPacks = nonnegativeInteger(pendingRow?.count, "pending pack count");
     const operationStates = nonnegativeInteger(operationRow?.count, "operation state count");
     if (pendingPacks !== 0 || operationStates !== 0) {
