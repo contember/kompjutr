@@ -52,11 +52,11 @@ jobs:
       - run: npm run test:full
       - run: npm run build
       - name: Build and test the release artifact
-        run: npm run package:smoke -- --pack-destination "${{ runner.temp }}/npm-package"
+        run: npm run package:smoke -- --pack-destination release-artifacts/npm-package
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package
-          path: ${{ runner.temp }}/npm-package/*.tgz
+          path: release-artifacts/npm-package/*.tgz
           if-no-files-found: error
           retention-days: 1
 
