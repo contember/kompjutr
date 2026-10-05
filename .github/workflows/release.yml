@@ -84,7 +84,7 @@ jobs:
         run: |
           version="${RELEASE_TAG#v}"
           for package in sqlite drive git do local; do
-            tarball="package/kompjutr-$package-$version.tgz"
+            tarball="./package/kompjutr-$package-$version.tgz"
             specifier="@kompjutr/$package@$version"
             if npm view "$specifier" version --silent >/dev/null 2>&1; then
               published_integrity="$(npm view "$specifier" dist.integrity --silent)"
