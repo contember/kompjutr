@@ -1,8 +1,8 @@
-import { Buffer } from "node:buffer";
 import type { RetainedBudget } from "../../exec/context.js";
 
 const DECODER = new TextDecoder("utf-8", { ignoreBOM: true });
 const STRICT_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const BINARY_STRING_CHUNK_BYTES = 8192;
 
 export type JsonText = { text: string } | { bytes: string };
 
@@ -10,9 +10,11 @@ export function jsonText(bytes: Uint8Array): JsonText {
   try {
     return { text: STRICT_DECODER.decode(bytes) };
   } catch {
-    return {
-      bytes: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64"),
-    };
+    let binary = "";
+    for (let start = 0; start < bytes.length; start += BINARY_STRING_CHUNK_BYTES) {
+      binary += String.fromCharCode(...bytes.subarray(start, start + BINARY_STRING_CHUNK_BYTES));
+    }
+    return { bytes: btoa(binary) };
   }
 }
 

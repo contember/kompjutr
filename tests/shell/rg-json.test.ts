@@ -22,6 +22,8 @@ function records(output: string): unknown[] {
 }
 
 describe.skipIf(!REAL_RG)("rg structured matches", () => {
+  const longNonUtf8Line = new Uint8Array(70_000).fill(0xff);
+  longNonUtf8Line.set(new TextEncoder().encode("hello\n"), longNonUtf8Line.length - 6);
   const corpus = {
     "page.astro": "<h1>Rendered in a Worker</h1>\n<p>hello é hello</p>\nhello again\n",
     "post.md": "Příliš\nžluťoučký\nhello\n",
@@ -52,6 +54,11 @@ describe.skipIf(!REAL_RG)("rg structured matches", () => {
     args: readonly string[];
     path?: string;
   }> = [
+    {
+      name: "large non-UTF-8 JSON content",
+      corpus: { "file.txt": longNonUtf8Line },
+      args: ["hello"],
+    },
     { name: "whitespace before a newline", corpus: { "file.txt": "foo \nbar\n" }, args: ["\\s+"] },
     { name: "a CR is not a line boundary", corpus: { "file.txt": "foo\rbar\n" }, args: ["^bar"] },
     { name: "multiline CR anchors", corpus: { "file.txt": "foo\rbar\n" }, args: ["-U", "^bar"] },
