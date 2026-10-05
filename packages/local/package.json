@@ -1,6 +1,6 @@
 {
   "name": "@kompjutr/local",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Unix local SQLite Git workspace runtime.",
   "license": "MIT",
   "repository": {
@@ -22,9 +22,9 @@
     "README.md"
   ],
   "dependencies": {
-    "@kompjutr/drive": "0.1.1",
-    "@kompjutr/git": "0.1.1",
-    "@kompjutr/sqlite": "0.1.1"
+    "@kompjutr/drive": "0.1.2",
+    "@kompjutr/git": "0.1.2",
+    "@kompjutr/sqlite": "0.1.2"
   },
   "engines": {
     "node": ">=24"

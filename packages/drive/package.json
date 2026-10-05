@@ -1,6 +1,6 @@
 {
   "name": "@kompjutr/drive",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Filesystem contracts for the kompjutr Git engine.",
   "license": "MIT",
   "repository": {

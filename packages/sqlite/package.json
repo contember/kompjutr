@@ -1,6 +1,6 @@
 {
   "name": "@kompjutr/sqlite",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Shared SQLite contracts and codecs for kompjutr runtimes.",
   "license": "MIT",
   "repository": {
