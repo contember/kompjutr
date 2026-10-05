@@ -14,7 +14,8 @@ requires Node.js 24. There is no unscoped `kompjutr` package.
 
 ## Continuous integration
 
-Pull requests and pushes to `main` run these gates on `ubuntu-latest`:
+Pull requests and pushes to `main` run these gates in an Ubuntu 25.10 container
+on `ubuntu-latest`:
 
 1. `npm ci`
 2. `npm run check`
@@ -44,7 +45,7 @@ in `bench/CLAUDE.md`.
 
 ## Release sequence
 
-Package publication is CI-only:
+After the initial publication, package publication is CI-only:
 
 1. Set the same real version in all five package manifests. The placeholder
    `0.0.0` cannot be released.
@@ -55,12 +56,45 @@ Package publication is CI-only:
    artifacts together. A retry skips an already published package only when the
    registry integrity matches the verified tarball, so a partial publication can
    resume without accepting different bytes under the same version.
-5. GitHub holds the publish job at the protected `npm` environment. After its
-   configured approval and protection rules pass, the job publishes the
+5. The publish job uses the `npm` environment, restricted to `v*` tags. After its
+   protection rules pass, the job publishes the
    verified tarballs with provenance, in dependency order: SQLite, drive, Git,
    DO, local.
 
 The `npm` GitHub environment, npm scope ownership, and trusted-publisher
 configuration for each package are release prerequisites. The publish job uses
-OIDC and npm 11; it does not use a long-lived npm token. Never run `npm publish`
-from a maintainer workstation.
+OIDC and npm 11; it does not use a long-lived npm token. Local publication is
+limited to the explicitly approved initial bootstrap below.
+
+## Initial publication
+
+npm requires a package to exist before its trusted publisher can be configured.
+The initial version may be published locally only with explicit maintainer
+approval. After the version commit passes CI, create and test the artifacts:
+
+```bash
+cpu-lease run -n 2 -- npm run package:smoke -- --pack-destination /tmp/opencode/kompjutr-release-0.1.0
+```
+
+Use an empty destination directory. Publish those exact tarballs in dependency
+order, then configure each package's trusted publisher:
+
+```bash
+for package in sqlite drive git do local; do
+  npm publish "/tmp/opencode/kompjutr-release-0.1.0/kompjutr-$package-0.1.0.tgz" --access public
+done
+
+for package in sqlite drive git do local; do
+  npm trust github "@kompjutr/$package" \
+    --repository contember/kompjutr \
+    --file release.yml \
+    --environment npm \
+    --allow-publish \
+    --yes
+done
+```
+
+The npm account must own or have write access to the packages and have 2FA
+enabled. Trust configuration requires interactive authentication. Subsequent
+versions follow the CI-only release sequence above; no npm token is needed in
+GitHub Actions. The local bootstrap does not generate provenance.
