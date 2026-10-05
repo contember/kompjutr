@@ -270,6 +270,14 @@ repeated `-e`/`--regexp`, `-g`/`--glob`, and `-t`/`--type`. Known types are
 `ts`, `js`, `md`, `json`, `css`, `html`, `py`, `go`, `rust`, `sh`, `yaml`,
 `toml`, and `sql`. Ignore files are deliberately not read.
 
+File searches also support `-m`/`--max-count`, `-U`/`--multiline`, and `--json`.
+JSON records carry UTF-8 byte offsets and grouped submatches; multiline searches
+can span source lines. Non-UTF-8 record content uses base64 `bytes` fields; named
+binary files keep JSON output and report `binary_offset` in the end record.
+These three flags are refused on stdin. JSON mode refuses
+count, file listing, inverted matches, only-matching, quiet and context options;
+multiline mode refuses inverted matches, only-matching and context options.
+
 ### find actions
 
 - `-exec CMD ARGS… \;` runs the registered command once per path; `{}` is

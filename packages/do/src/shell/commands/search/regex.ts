@@ -77,6 +77,52 @@ export function compilePatternSet(patterns: readonly string[], options: PatternO
   return new RegExp(compiled.map((pattern) => `(?:${pattern.source})`).join("|"), first.flags);
 }
 
+export interface RecordPattern {
+  readonly pattern: RegExp;
+  readonly multiline: boolean;
+}
+
+export function compileRecordPattern(pattern: RegExp, multiline: boolean): RecordPattern {
+  let source = "";
+  let consumesNewline = false;
+  for (let index = 0; index < pattern.source.length; ) {
+    const char = pattern.source[index];
+    if (char === "[" || char === "\\") {
+      const end =
+        char === "[" ? readClass(pattern.source, index).end : escapeEnd(pattern.source, index);
+      const atom = pattern.source.slice(index, end);
+      const newline = new RegExp(atom, pattern.flags.replace(/[gym]/g, "")).exec("\n");
+      if (newline?.[0] === "\n") consumesNewline = true;
+      source += `(?:(?![\\ud800-\\udfff])${atom})`;
+      index = end;
+      continue;
+    }
+    if (char === "^") source += multiline ? "(?<![^\\n])" : "(?<![\\s\\S])";
+    else if (char === "$") source += multiline ? "(?![^\\n])" : "(?![\\s\\S])";
+    else if (char === ".") source += "[^\\n\\ud800-\\udfff]";
+    else {
+      source += char;
+      if (char === "\n") consumesNewline = true;
+    }
+    index++;
+  }
+  return {
+    pattern: new RegExp(source, `${pattern.flags.replace(/[gym]/g, "")}g`),
+    multiline: multiline && consumesNewline,
+  };
+}
+
+function escapeEnd(source: string, start: number): number {
+  const kind = source[start + 1];
+  if ((kind === "p" || kind === "P" || kind === "u") && source[start + 2] === "{") {
+    return source.indexOf("}", start + 3) + 1;
+  }
+  if (kind === "u") return start + 6;
+  if (kind === "x") return start + 4;
+  if (kind === "c") return start + 3;
+  return start + 2;
+}
+
 function escapeLiteral(value: string): string {
   return value.replace(/[\\^$.|?*+()[\]{}]/g, (match) => `\\${match}`);
 }

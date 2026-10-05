@@ -72,8 +72,23 @@ const SPEC = {
     "--word-regexp",
     "--line-regexp",
     "--no-ignore",
+    "--json",
+    "--multiline",
+    "-U",
   ]),
-  valued: new Set(["-A", "-B", "-C", "-e", "-g", "-t", "--glob", "--type", "--regexp"]),
+  valued: new Set([
+    "-A",
+    "-B",
+    "-C",
+    "-e",
+    "-g",
+    "-t",
+    "-m",
+    "--max-count",
+    "--glob",
+    "--type",
+    "--regexp",
+  ]),
 };
 
 export const rg: Command = (context) => {
@@ -93,12 +108,26 @@ export const rg: Command = (context) => {
     let skipHidden = true;
     let before = 0;
     let after = 0;
+    let json = false;
+    let multiline = false;
+    let maxCount: number | undefined;
     const include: string[] = [];
     const exclude: string[] = [];
     const patterns: string[] = [];
 
     for (const flag of parsed.flags) {
       switch (flag.name) {
+        case "--json":
+          json = true;
+          break;
+        case "--multiline":
+        case "-U":
+          multiline = true;
+          break;
+        case "-m":
+        case "--max-count":
+          maxCount = count(flag.value ?? "", flag.name);
+          break;
         case "-i":
         case "--ignore-case":
           caseMode = "insensitive";
@@ -218,6 +247,28 @@ export const rg: Command = (context) => {
       wholeWord,
       wholeLine,
     });
+    if (
+      json &&
+      (mode !== "content" || invert || onlyMatching || quiet || before > 0 || after > 0)
+    ) {
+      throw new UsageError(
+        "--json with count, file listing, inverted matches, only-matching, quiet or context is not supported",
+      );
+    }
+    if (multiline && (invert || onlyMatching || before > 0 || after > 0)) {
+      throw new UsageError(
+        "--multiline with inverted matches, only-matching or context is not supported",
+      );
+    }
+    if (
+      (json || multiline || maxCount !== undefined) &&
+      operands.length === 0 &&
+      context.stdin !== null
+    ) {
+      throw new UsageError(
+        "--json, --multiline and --max-count on standard input are not supported",
+      );
+    }
     // The SQL content predicate only answers a case-sensitive, positive
     // substring search: `instr` has no case folding and cannot prove the
     // absence an inverted search asks about.
@@ -236,6 +287,9 @@ export const rg: Command = (context) => {
       before,
       after,
       onlyMatching: onlyMatching ? onlyMatchingFor(compiled, "rg") : null,
+      json,
+      multiline,
+      maxCount,
     };
 
     if (operands.length === 0 && context.stdin !== null) {

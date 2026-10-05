@@ -16,13 +16,18 @@
 // is pulled lazily, so a consumer that stops — `| head -20` — stops it here.
 
 import type { RealPath, RegularFileHandle } from "../../../fs/types.js";
-import { type ByteStream, decode, encode, firstNul, lines } from "../../exec/bytes.js";
+import { type ByteStream, encode, firstNul, lines } from "../../exec/bytes.js";
 import type { BoundedFs } from "../../exec/context.js";
 import { displayUnder } from "../../exec/display.js";
 import { compileIncludeGlob, GLOB_PATTERN_MAX_BYTES } from "../../exec/glob.js";
+import { matchesAnywhere, testLine } from "./search-matches.js";
 import { type LineLabel, type OnlyMatching, renderSelected } from "./search-output.js";
+import { emitRecords, type JsonStats, jsonSummary, newJsonStats } from "./search-records.js";
 
 export interface SearchRequest {
+  readonly json?: boolean;
+  readonly multiline?: boolean;
+  readonly maxCount?: number;
   readonly pattern: RegExp;
   /** A file is searched directly; a directory is walked. */
   readonly roots: readonly SearchRoot[];
@@ -98,6 +103,9 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
   };
 
   const stream = (async function* (): ByteStream {
+    const stats = newJsonStats();
+    const started = performance.now();
+    if (request.maxCount === 0) return;
     const includeMatchers = request.include.map(compileIncludeGlob);
     const excludeMatchers = request.exclude.map(compileIncludeGlob);
     // Whether a name is printed follows what is *searched*, not what was
@@ -129,6 +137,7 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
             noteMatch,
             "report",
             fs.retained,
+            stats,
           )) {
             yield chunk;
           }
@@ -165,11 +174,13 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
           noteMatch,
           request.walkedBinaries,
           fs.retained,
+          stats,
         )) {
           yield chunk;
         }
       }
     }
+    if (request.json) yield jsonSummary(stats, performance.now() - started);
   })();
 
   return { stream, status: () => (failed ? 2 : matched ? 0 : 1), matched: () => matched };
@@ -375,7 +386,9 @@ async function* emit(
   noteMatch: () => void,
   binary: "report" | "skip",
   retained: BoundedFs["retained"],
+  stats: JsonStats,
 ): AsyncGenerator<Uint8Array, void, undefined> {
+  if (request.maxCount === 0) return;
   // Only the line-printing mode substitutes a notice for the content. Both
   // real greps count and list a binary file exactly as they would a text
   // one — `-l` names it and `-c` counts it — because neither answer would
@@ -384,12 +397,21 @@ async function* emit(
     const nul = firstNul(bytes);
     if (nul >= 0) {
       if (binary === "skip") return;
+      if (request.json || request.multiline) {
+        yield* emitRecords(path, bytes, request, withFilename, noteMatch, retained, stats);
+        return;
+      }
       if (!(await matchesAnywhere(bytes, request, retained))) return;
       noteMatch();
       const notice = request.reportBinary(path, nul, withFilename);
       if (notice !== null) yield notice;
       return;
     }
+  }
+
+  if (request.json || request.multiline) {
+    yield* emitRecords(path, bytes, request, withFilename, noteMatch, retained, stats);
+    return;
   }
 
   if (request.mode === "files" || request.mode === "files-without-match") {
@@ -406,7 +428,10 @@ async function* emit(
   const hits = new Set<number>();
   for (let index = 0; index < all.length; index++) {
     const text = all[index];
-    if (text !== undefined && test(text, request, retained)) hits.add(index);
+    if (text !== undefined && testLine(text, request, retained)) {
+      hits.add(index);
+      if (request.maxCount !== undefined && hits.size >= request.maxCount) break;
+    }
   }
 
   if (hits.size > 0) noteMatch();
@@ -450,28 +475,6 @@ async function* emit(
         retained,
       );
     }
-  }
-}
-
-async function matchesAnywhere(
-  bytes: Uint8Array,
-  request: SearchRequest,
-  retained: BoundedFs["retained"],
-): Promise<boolean> {
-  for await (const text of lines(chunk(bytes))) {
-    if (test(text, request, retained)) return true;
-  }
-  return false;
-}
-
-function test(text: Uint8Array, request: SearchRequest, retained: BoundedFs["retained"]): boolean {
-  const release = retained.retain(text.length * 2, "search decoded line");
-  try {
-    request.pattern.lastIndex = 0;
-    const hit = request.pattern.test(decode(text));
-    return request.invert ? !hit : hit;
-  } finally {
-    release();
   }
 }
 
