@@ -20,6 +20,7 @@ export type {
   InitialWorktreeSession,
   InitialWriteOptions,
   InitialWriteResult,
+  InitialWriteStat,
 } from "./initial-write/initial-write-types.js";
 
 interface PreflightRow {

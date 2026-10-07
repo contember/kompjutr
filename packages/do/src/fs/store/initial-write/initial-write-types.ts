@@ -8,15 +8,22 @@ export interface InitialSymlinkOptions {
   contentId?: Uint8Array;
 }
 
+/** What `stat` reports for the written entry once the session commits. */
+export interface InitialWriteStat {
+  ino: number;
+  mtime: number;
+  rev: number;
+}
+
 export interface InitialWorktreeSession {
-  writeSymlink(path: string, target: string, options?: InitialSymlinkOptions): void;
-  writeFile(path: string, bytes: Uint8Array, options?: InitialWriteOptions): void;
+  writeSymlink(path: string, target: string, options?: InitialSymlinkOptions): InitialWriteStat;
+  writeFile(path: string, bytes: Uint8Array, options?: InitialWriteOptions): InitialWriteStat;
   writeFileStream(
     path: string,
     size: number,
     chunks: Iterable<Uint8Array>,
     options?: InitialWriteOptions,
-  ): void;
+  ): InitialWriteStat;
 }
 
 export type InitialWriteResult<T> = { kind: "committed"; value: T } | { kind: "unavailable" };

@@ -350,6 +350,12 @@ describe("initial standalone checkout", () => {
       checkout(generic.context, generic.repo, generic.worktree, { ref: "main" });
       expect(genericAttempts).toBe(0);
       expect(utf8Decoder.decode(generic.worktree.readFile("/repo/nested/b.txt"))).toBe("b\n");
+      expect(
+        generic.repo.checkout.indexEntries().map(({ path, mtime, ino }) => ({ path, mtime, ino })),
+      ).toEqual([
+        { path: "a.txt", mtime: null, ino: null },
+        { path: "nested/b.txt", mtime: null, ino: null },
+      ]);
       expect(readIndexTrackerState(generic.db, generic.repo.checkout.checkoutId)).toEqual({
         available: false,
       });

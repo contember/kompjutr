@@ -26,15 +26,34 @@ export interface InitialWorktreeSymlinkOptions {
   contentId?: Uint8Array;
 }
 
+/**
+ * Cached in `git_index` as the entry's stat data. Each field must equal what
+ * `GitContext.worktree.stat` later reports for the untouched path; a value
+ * that a later edit can also produce hides that edit from status and add.
+ */
+export interface InitialWorktreeEntryStat {
+  ino: number;
+  mtime: number;
+  rev: number;
+}
+
 export interface InitialWorktreeSession {
-  writeSymlink(path: string, target: string, options?: InitialWorktreeSymlinkOptions): void;
-  writeFile(path: string, bytes: Uint8Array, options?: InitialWorktreeWriteOptions): void;
+  writeSymlink(
+    path: string,
+    target: string,
+    options?: InitialWorktreeSymlinkOptions,
+  ): InitialWorktreeEntryStat;
+  writeFile(
+    path: string,
+    bytes: Uint8Array,
+    options?: InitialWorktreeWriteOptions,
+  ): InitialWorktreeEntryStat;
   writeFileStream(
     path: string,
     size: number,
     chunks: Iterable<Uint8Array>,
     options?: InitialWorktreeWriteOptions,
-  ): void;
+  ): InitialWorktreeEntryStat;
 }
 
 export type InitialWorktreeResult<T> = { kind: "committed"; value: T } | { kind: "unavailable" };

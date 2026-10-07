@@ -14,6 +14,7 @@ import type {
   InitialSymlinkOptions,
   InitialWorktreeSession,
   InitialWriteOptions,
+  InitialWriteStat,
 } from "./initial-write-types.js";
 import {
   checkedContentId,
@@ -62,13 +63,17 @@ export class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     this.#nextInode = nextInode;
   }
 
-  writeSymlink(path: string, target: string, options: InitialSymlinkOptions = {}): void {
+  writeSymlink(
+    path: string,
+    target: string,
+    options: InitialSymlinkOptions = {},
+  ): InitialWriteStat {
     try {
       if (target.includes("\0")) {
         throw filesystemError("EINVAL", "initial worktree symlink target contains NUL", path);
       }
       const size = utf8Length(target);
-      this.#entry(
+      const inode = this.#entry(
         path,
         "symlink",
         checkedMode(options.mode, DEFAULT_SYMLINK_MODE, path),
@@ -76,13 +81,14 @@ export class InitialWorktreeSessionImpl implements InitialWorktreeSession {
         target,
         checkedContentId(options.contentId, path),
       );
+      return this.#stat(inode);
     } catch (error) {
       this.#failed = true;
       throw error;
     }
   }
 
-  writeFile(path: string, bytes: Uint8Array, options: InitialWriteOptions = {}): void {
+  writeFile(path: string, bytes: Uint8Array, options: InitialWriteOptions = {}): InitialWriteStat {
     try {
       if (!(bytes instanceof Uint8Array)) {
         throw filesystemError("EINVAL", "initial worktree file bytes are invalid", path);
@@ -98,6 +104,7 @@ export class InitialWorktreeSessionImpl implements InitialWorktreeSession {
       for (let offset = 0, index = 0; offset < bytes.length; offset += CHUNK_SIZE, index++) {
         this.#queueCopiedChunk(inode, index, bytes.subarray(offset, offset + CHUNK_SIZE));
       }
+      return this.#stat(inode);
     } catch (error) {
       this.#failed = true;
       throw error;
@@ -109,7 +116,7 @@ export class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     size: number,
     chunks: Iterable<Uint8Array>,
     options: InitialWriteOptions = {},
-  ): void {
+  ): InitialWriteStat {
     try {
       const expected = checkedSize(size, path);
       const inode = this.#entry(
@@ -161,6 +168,7 @@ export class InitialWorktreeSessionImpl implements InitialWorktreeSession {
         const final = buffer.slice(0, filled);
         this.#pushChunk(inode, index, final);
       }
+      return this.#stat(inode);
     } catch (error) {
       this.#failed = true;
       throw error;
@@ -201,6 +209,11 @@ export class InitialWorktreeSessionImpl implements InitialWorktreeSession {
     this.#chunkBytes = 0;
     this.#chunkJsonBytes = 2;
     this.#failed = true;
+  }
+
+  // Every node of the session carries its timestamp and revision.
+  #stat(inode: number): InitialWriteStat {
+    return { ino: inode, mtime: this.timestamp, rev: this.revision };
   }
 
   #entry(

@@ -7,7 +7,11 @@ import { checkoutStoreMutations } from "../../store/core/checkout-mutations-regi
 import { type InitialStateSession, PACK_BLOB_BATCH_TARGET_BYTES } from "../../store/index.js";
 import { MAX_INDEX_PATH_BYTES } from "../../store/schema/schema.js";
 import type { SparseTrackerSeedEntry } from "../../store/sparse/capability.js";
-import type { GitContext, InitialWorktreeSession } from "../core/context.js";
+import type {
+  GitContext,
+  InitialWorktreeEntryStat,
+  InitialWorktreeSession,
+} from "../core/context.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import type { Repository } from "../repository/repository.js";
 import { type TargetEntry, treeStream } from "../tree/tree-stream.js";
@@ -55,12 +59,13 @@ function writeInitialEntry(
   data: Uint8Array,
 ): void {
   const contentId = fromHex(entry.oid);
+  let written: InitialWorktreeEntryStat;
   if (entry.mode === "120000") {
-    worktree.writeSymlink(entry.path, initialTextDecoder.decode(data), { contentId });
+    written = worktree.writeSymlink(entry.path, initialTextDecoder.decode(data), { contentId });
   } else if (data.length <= INITIAL_SMALL_FILE_BYTES) {
-    worktree.writeFile(entry.path, data, { mode: fileModeFor(entry.mode), contentId });
+    written = worktree.writeFile(entry.path, data, { mode: fileModeFor(entry.mode), contentId });
   } else {
-    worktree.writeFileStream(entry.path, data.length, [data], {
+    written = worktree.writeFileStream(entry.path, data.length, [data], {
       mode: fileModeFor(entry.mode),
       contentId,
     });
@@ -71,8 +76,9 @@ function writeInitialEntry(
     mode: Number.parseInt(entry.mode, 8),
     oid: entry.oid,
     size: data.length,
-    mtime: null,
-    ino: null,
+    mtime: written.mtime,
+    ino: written.ino,
+    rev: written.rev,
   });
   index.addBlobId({ contentId, oid: entry.oid });
 }
