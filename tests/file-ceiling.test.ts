@@ -28,7 +28,6 @@ const GRANDFATHERED_SYMBOLS: ReadonlySet<string> = new Set([
   "git/cli/network/network-handlers.ts::createGitCliNetworkHandlers",
   "git/cli/read/read-handlers.ts::createGitCliReadHandlers",
   "git/cli/write/write-refs.ts::createGitCliRefWriteHandlers",
-  "do/fs/filesystem.ts::createFilesystem",
   // A declarative decode schema: one `decodeRow` field per stored column.
   "git/store/maintenance/state/state-view.ts::requireRunView",
   // Linear state machines and single-pass streaming procedures, split further
