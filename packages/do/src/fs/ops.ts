@@ -15,9 +15,16 @@ import {
 } from "./store/ops.js";
 import { readFile as readStoredFile, readRange as readStoredRange } from "./store/read.js";
 import { removeFiles } from "./store/remove.js";
-import { realpath, realpathNoFollow } from "./store/resolve.js";
+import { type PathResolver, storeResolver } from "./store/resolve.js";
 import { writeFiles } from "./store/write.js";
 import type { Dirent, FilesystemOptions, RemoveOptions, Stat } from "./types.js";
+
+/** What a single-path operation needs: the store, its resolver, and a clock. */
+interface OpsContext {
+  readonly db: SqlDatabase;
+  readonly resolver: PathResolver;
+  readonly now: () => number;
+}
 
 function asMissing<T>(work: () => T): T | null {
   try {
@@ -40,40 +47,39 @@ function enotdirAsEnoent<T>(path: string, work: () => T): T {
 }
 
 /** lstat semantics: resolve ancestors, but not a trailing symlink. */
-export function stat(db: SqlDatabase, path: string): Stat | null {
-  return asMissing(() => statRaw(db, realpathNoFollow(db, path)));
+function stat(context: OpsContext, path: string): Stat | null {
+  return asMissing(() => statRaw(context.db, context.resolver.realpathNoFollow(path)));
 }
 
 /** stat semantics: follow every symlink, including the trailing one. */
-export function statTarget(db: SqlDatabase, path: string): Stat | null {
-  return asMissing(() => statRaw(db, realpath(db, path)));
+function statTarget(context: OpsContext, path: string): Stat | null {
+  return asMissing(() => statRaw(context.db, context.resolver.realpath(path)));
 }
 
-export function exists(db: SqlDatabase, path: string): boolean {
-  return statTarget(db, path) !== null;
+function exists(context: OpsContext, path: string): boolean {
+  return statTarget(context, path) !== null;
 }
 
-export function readFile(db: SqlDatabase, path: string): Uint8Array {
-  return enotdirAsEnoent(path, () => readStoredFile(db, path));
+function readFile(context: OpsContext, path: string): Uint8Array {
+  return enotdirAsEnoent(path, () =>
+    readStoredFile(context.db, path, context.resolver.realpath(path)),
+  );
 }
 
-export function readRange(
-  db: SqlDatabase,
-  path: string,
-  offset: number,
-  length: number,
-): Uint8Array {
+function readRange(context: OpsContext, path: string, offset: number, length: number): Uint8Array {
   if (!Number.isSafeInteger(offset) || offset < 0) {
     throw fsError("EINVAL", `invalid read offset: ${offset}`, path);
   }
   if (!Number.isSafeInteger(length) || length < 0) {
     throw fsError("EINVAL", `invalid read length: ${length}`, path);
   }
-  return enotdirAsEnoent(path, () => readStoredRange(db, path, offset, length));
+  return enotdirAsEnoent(path, () =>
+    readStoredRange(context.db, path, offset, length, context.resolver.realpath(path)),
+  );
 }
 
-export function readlink(db: SqlDatabase, path: string): string {
-  const found = stat(db, path);
+function readlink(context: OpsContext, path: string): string {
+  const found = stat(context, path);
   if (found === null) throw fsError("ENOENT", "no such file or directory", path);
   if (found.type !== "symlink" || found.target === null) {
     throw fsError("EINVAL", "not a symbolic link", path);
@@ -81,25 +87,24 @@ export function readlink(db: SqlDatabase, path: string): string {
   return found.target;
 }
 
-export function readdir(db: SqlDatabase, path: string): Dirent[] {
-  const real = realpath(db, path);
-  const found = statRaw(db, real);
+function readdir(context: OpsContext, path: string): Dirent[] {
+  const real = context.resolver.realpath(path);
+  const found = statRaw(context.db, real);
   if (found === null) throw fsError("ENOENT", "no such file or directory", path);
   if (found.type !== "dir") throw fsError("ENOTDIR", "not a directory", path);
-  return readdirRaw(db, real);
+  return readdirRaw(context.db, real);
 }
 
 /** writeFile follows a final symlink and never creates missing parents. */
-export function writeFile(
-  db: SqlDatabase,
+function writeFile(
+  context: OpsContext,
   path: string,
   bytes: Uint8Array,
   options: { mode?: number; contentId?: Uint8Array } = {},
-  now: () => number = Date.now,
 ): void {
-  const target = realpath(db, path);
+  const target = context.resolver.realpath(path);
   writeFiles(
-    db,
+    context.db,
     [
       {
         path: target,
@@ -109,135 +114,127 @@ export function writeFile(
       },
     ],
     { parents: false },
-    now,
+    context.now,
+    context.resolver,
   );
 }
 
-export function createFile(
-  db: SqlDatabase,
-  path: string,
-  mode: number,
-  now: () => number = Date.now,
-): void {
-  const target = realpath(db, path);
-  writeFiles(db, [{ path: target, bytes: new Uint8Array(0), mode }], { parents: true }, now);
+function createFile(context: OpsContext, path: string, mode: number): void {
+  const target = context.resolver.realpath(path);
+  writeFiles(
+    context.db,
+    [{ path: target, bytes: new Uint8Array(0), mode }],
+    { parents: true },
+    context.now,
+    context.resolver,
+  );
 }
 
-export function writeRange(
-  db: SqlDatabase,
-  path: string,
-  bytes: Uint8Array,
-  offset: number,
-  now: () => number = Date.now,
-): void {
-  const target = realpath(db, path);
-  writeRangeRaw(db, target, bytes, offset, now());
+function writeRange(context: OpsContext, path: string, bytes: Uint8Array, offset: number): void {
+  const target = context.resolver.realpath(path);
+  writeRangeRaw(context.db, target, bytes, offset, context.now());
 }
 
-export function truncate(
-  db: SqlDatabase,
-  path: string,
-  length: number,
-  now: () => number = Date.now,
-): void {
-  const target = realpath(db, path);
-  truncateRaw(db, target, length, now());
+function truncate(context: OpsContext, path: string, length: number): void {
+  const target = context.resolver.realpath(path);
+  truncateRaw(context.db, target, length, context.now());
 }
 
-export function mkdir(
-  db: SqlDatabase,
+function mkdir(
+  context: OpsContext,
   path: string,
   options: { recursive?: boolean; mode?: number } = {},
-  now: () => number = Date.now,
 ): void {
   const canonical = normalize(path);
   if (canonical === "/") throw fsError("EEXIST", "path exists", path);
 
-  const existing = stat(db, canonical);
+  const existing = stat(context, canonical);
   if (existing !== null) {
     if (options.recursive === true && existing.type === "dir") return;
     throw fsError("EEXIST", "path exists", path);
   }
 
   writeFiles(
-    db,
+    context.db,
     [{ path: canonical, mode: options.mode }],
     { parents: options.recursive === true },
-    now,
+    context.now,
+    context.resolver,
   );
 }
 
-export function symlink(
-  db: SqlDatabase,
-  target: string,
-  path: string,
-  now: () => number = Date.now,
-): void {
+function symlink(context: OpsContext, target: string, path: string): void {
   const canonical = normalize(path);
-  if (canonical === "/" || stat(db, canonical) !== null) {
+  if (canonical === "/" || stat(context, canonical) !== null) {
     throw fsError("EEXIST", "path exists", path);
   }
-  writeFiles(db, [{ path: canonical, target }], { parents: false }, now);
+  writeFiles(
+    context.db,
+    [{ path: canonical, target }],
+    { parents: false },
+    context.now,
+    context.resolver,
+  );
 }
 
-export function link(db: SqlDatabase, existingPath: string, newPath: string): void {
-  const sourcePath = realpath(db, existingPath);
-  const source = statRaw(db, sourcePath);
+function link(context: OpsContext, existingPath: string, newPath: string): void {
+  const sourcePath = context.resolver.realpath(existingPath);
+  const source = statRaw(context.db, sourcePath);
   if (source === null) throw fsError("ENOENT", "no such file or directory", existingPath);
   if (source.type !== "file") throw fsError("EPERM", "cannot hardlink a non-file", existingPath);
 
   const canonicalNew = normalize(newPath);
   if (canonicalNew === "/") throw fsError("EEXIST", "path exists", newPath);
-  const parent = realpath(db, dirname(canonicalNew));
-  const parentStat = statRaw(db, parent);
+  const parent = context.resolver.realpath(dirname(canonicalNew));
+  const parentStat = statRaw(context.db, parent);
   if (parentStat === null) throw fsError("ENOENT", "parent directory missing", newPath);
   if (parentStat.type !== "dir") throw fsError("ENOTDIR", "parent is not a directory", newPath);
-  const target = realpathNoFollow(db, join(parent, basename(canonicalNew)));
-  if (statRaw(db, target) !== null) throw fsError("EEXIST", "path exists", newPath);
-  linkRaw(db, sourcePath, target);
+  const target = context.resolver.realpathNoFollow(join(parent, basename(canonicalNew)));
+  if (statRaw(context.db, target) !== null) throw fsError("EEXIST", "path exists", newPath);
+  linkRaw(context.db, sourcePath, target);
 }
 
-export function unlink(db: SqlDatabase, path: string): void {
-  const target = realpathNoFollow(db, path);
-  const found = statRaw(db, target);
+function unlink(context: OpsContext, path: string): void {
+  const target = context.resolver.realpathNoFollow(path);
+  const found = statRaw(context.db, target);
   if (found === null) throw fsError("ENOENT", "no such file or directory", path);
   if (found.type === "dir") throw fsError("EISDIR", "illegal operation on a directory", path);
-  removeFiles(db, [target], { force: false });
+  removeFiles(context.db, [target], { force: false });
 }
 
-export function rmdir(db: SqlDatabase, path: string): void {
-  const target = realpathNoFollow(db, path);
-  const found = statRaw(db, target);
+function rmdir(context: OpsContext, path: string): void {
+  const target = context.resolver.realpathNoFollow(path);
+  const found = statRaw(context.db, target);
   if (found === null) throw fsError("ENOENT", "no such file or directory", path);
   if (found.type !== "dir") throw fsError("ENOTDIR", "not a directory", path);
-  removeFiles(db, [target], { force: false });
+  removeFiles(context.db, [target], { force: false });
 }
 
-export function rm(db: SqlDatabase, path: string, options: RemoveOptions = {}): void {
-  const target = realpathNoFollow(db, path);
+function rm(context: OpsContext, path: string, options: RemoveOptions = {}): void {
+  const target = context.resolver.realpathNoFollow(path);
   if (target === "/") throw fsError("EPERM", "cannot remove the root directory", path);
-  removeFiles(db, [target], options);
+  removeFiles(context.db, [target], options);
 }
 
-export function rename(db: SqlDatabase, oldPath: string, newPath: string): void {
-  const sourcePath = realpathNoFollow(db, oldPath);
-  const source = statRaw(db, sourcePath);
+function rename(context: OpsContext, oldPath: string, newPath: string): void {
+  const sourcePath = context.resolver.realpathNoFollow(oldPath);
+  const source = statRaw(context.db, sourcePath);
   if (source === null) throw fsError("ENOENT", "no such file or directory", oldPath);
   if (sourcePath === "/") throw fsError("EINVAL", "cannot rename root", oldPath);
 
   const canonicalNew = normalize(newPath);
   if (canonicalNew === "/") throw fsError("EINVAL", "cannot rename onto root", newPath);
-  const targetParent = realpath(db, dirname(canonicalNew));
-  const parentStat = statRaw(db, targetParent);
+  const targetParent = context.resolver.realpath(dirname(canonicalNew));
+  const parentStat = statRaw(context.db, targetParent);
   if (parentStat === null) throw fsError("ENOENT", "parent directory missing", newPath);
   if (parentStat.type !== "dir") throw fsError("ENOTDIR", "parent is not a directory", newPath);
-  const targetPath = realpathNoFollow(db, join(targetParent, basename(canonicalNew)));
+  const targetPath = context.resolver.realpathNoFollow(join(targetParent, basename(canonicalNew)));
   if (sourcePath === targetPath) return;
   if (source.type === "dir" && targetPath.startsWith(`${sourcePath}/`)) {
     throw fsError("EINVAL", "cannot rename a directory into itself", newPath);
   }
 
-  const target = statRaw(db, targetPath);
+  const target = statRaw(context.db, targetPath);
   if (target !== null) {
     if (source.type === "dir" && target.type !== "dir") {
       throw fsError("ENOTDIR", "cannot overwrite a non-directory", newPath);
@@ -247,19 +244,14 @@ export function rename(db: SqlDatabase, oldPath: string, newPath: string): void 
     }
   }
 
-  renameRaw(db, sourcePath, targetPath);
+  renameRaw(context.db, sourcePath, targetPath);
 }
 
-export function chmod(
-  db: SqlDatabase,
-  path: string,
-  mode: number,
-  now: () => number = Date.now,
-): void {
-  const target = realpath(db, path);
-  const found = statRaw(db, target);
+function chmod(context: OpsContext, path: string, mode: number): void {
+  const target = context.resolver.realpath(path);
+  const found = statRaw(context.db, target);
   if (found === null) throw fsError("ENOENT", "no such file or directory", path);
-  chmodRaw(db, target, mode, now());
+  chmodRaw(context.db, target, mode, context.now());
 }
 
 /** The surface Wave INT delegates into the complete `Filesystem`. */
@@ -290,31 +282,40 @@ export interface FilesystemOps {
   chmod(path: string, mode: number): void;
 }
 
+export interface FilesystemOpsOptions extends FilesystemOptions {
+  /** Defaults to the store's own resolver. A mounted view confines it. */
+  resolver?: PathResolver;
+}
+
 export function createFilesystemOps(
   db: SqlDatabase,
-  options: FilesystemOptions = {},
+  options: FilesystemOpsOptions = {},
 ): FilesystemOps {
-  const now = options.now ?? Date.now;
+  const context: OpsContext = {
+    db,
+    resolver: options.resolver ?? storeResolver(db),
+    now: options.now ?? Date.now,
+  };
   return {
     db,
-    stat: (path) => stat(db, path),
-    statTarget: (path) => statTarget(db, path),
-    exists: (path) => exists(db, path),
-    readFile: (path) => readFile(db, path),
-    readRange: (path, offset, length) => readRange(db, path, offset, length),
-    readlink: (path) => readlink(db, path),
-    readdir: (path) => readdir(db, path),
-    writeFile: (path, bytes, writeOptions) => writeFile(db, path, bytes, writeOptions, now),
-    createFile: (path, mode) => createFile(db, path, mode, now),
-    writeRange: (path, bytes, offset) => writeRange(db, path, bytes, offset, now),
-    truncate: (path, length) => truncate(db, path, length, now),
-    mkdir: (path, mkdirOptions) => mkdir(db, path, mkdirOptions, now),
-    symlink: (target, path) => symlink(db, target, path, now),
-    link: (existingPath, newPath) => link(db, existingPath, newPath),
-    unlink: (path) => unlink(db, path),
-    rmdir: (path) => rmdir(db, path),
-    rm: (path, removeOptions) => rm(db, path, removeOptions),
-    rename: (oldPath, newPath) => rename(db, oldPath, newPath),
-    chmod: (path, mode) => chmod(db, path, mode, now),
+    stat: (path) => stat(context, path),
+    statTarget: (path) => statTarget(context, path),
+    exists: (path) => exists(context, path),
+    readFile: (path) => readFile(context, path),
+    readRange: (path, offset, length) => readRange(context, path, offset, length),
+    readlink: (path) => readlink(context, path),
+    readdir: (path) => readdir(context, path),
+    writeFile: (path, bytes, writeOptions) => writeFile(context, path, bytes, writeOptions),
+    createFile: (path, mode) => createFile(context, path, mode),
+    writeRange: (path, bytes, offset) => writeRange(context, path, bytes, offset),
+    truncate: (path, length) => truncate(context, path, length),
+    mkdir: (path, mkdirOptions) => mkdir(context, path, mkdirOptions),
+    symlink: (target, path) => symlink(context, target, path),
+    link: (existingPath, newPath) => link(context, existingPath, newPath),
+    unlink: (path) => unlink(context, path),
+    rmdir: (path) => rmdir(context, path),
+    rm: (path, removeOptions) => rm(context, path, removeOptions),
+    rename: (oldPath, newPath) => rename(context, oldPath, newPath),
+    chmod: (path, mode) => chmod(context, path, mode),
   };
 }

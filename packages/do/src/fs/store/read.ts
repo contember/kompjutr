@@ -12,7 +12,7 @@ import { jsonStringEncodedBytes } from "@kompjutr/sqlite";
 import { readBlob, type SqlDatabase } from "../../db/db.js";
 import { normalize } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
-import type { ReadBatch, ReadOptions } from "../types.js";
+import type { ReadBatch, ReadOptions, RealPath } from "../types.js";
 import { DEFAULT_READ_BUDGET } from "./read/read-limits.js";
 import { realpath } from "./resolve.js";
 
@@ -293,8 +293,7 @@ function readTargets(
   return buffers;
 }
 
-function lookupFile(db: SqlDatabase, path: string): Target {
-  const real = realpath(db, path);
+function lookupFile(db: SqlDatabase, path: string, real: RealPath): Target {
   const row = db.one<NodeRow>(LOOKUP_ONE_SQL, real);
   if (row === undefined) throw enoent(path);
   if (row.type === "dir") throw eisdir(path);
@@ -413,9 +412,16 @@ export function readFiles(
   return { files, remaining };
 }
 
-/** The whole file. Follows symlinks; throws ENOENT when it is not there. */
-export function readFile(db: SqlDatabase, path: string): Uint8Array {
-  const target = lookupFile(db, path);
+/**
+ * The whole file. Follows symlinks; throws ENOENT when it is not there. A
+ * caller that already resolved `path` passes `real` and skips the lookup.
+ */
+export function readFile(
+  db: SqlDatabase,
+  path: string,
+  real: RealPath = realpath(db, path),
+): Uint8Array {
+  const target = lookupFile(db, path, real);
   const contents = readTargets(db, [target], rowLimitFor([target], DEFAULT_READ_BUDGET));
   return contents.get(target.inode) ?? new Uint8Array(0);
 }
@@ -426,8 +432,9 @@ export function readRange(
   path: string,
   offset: number,
   length: number,
+  real: RealPath = realpath(db, path),
 ): Uint8Array {
-  const target = lookupFile(db, path);
+  const target = lookupFile(db, path, real);
   const start = Math.max(0, Math.trunc(offset));
   const end = Math.min(target.size, start + Math.max(0, Math.trunc(length)));
   if (end <= start) return new Uint8Array(0);

@@ -1,11 +1,13 @@
 import type { SqlDatabase } from "../db/db.js";
 import { filesystemError } from "./errors.js";
 import { assertComputerImportCurrent } from "./import.js";
+import { ResolvedRoots, registerFilesystem } from "./internals.js";
 import { createFilesystemOps } from "./ops.js";
 import { initializeFsSchema } from "./schema.js";
 import { COPY_ENTRY_LIMIT, copyFiles as copyStoredFiles } from "./store/copy.js";
 import { currentRev } from "./store/meta.js";
-import { readFileHandles, readFiles as readStoredFiles } from "./store/read.js";
+import { readResolvedFiles } from "./store/read/read-resolved.js";
+import { readFileHandles } from "./store/read.js";
 import { removeFiles as removeStoredFiles } from "./store/remove.js";
 import { realpath, realpaths, realpathsNoFollow } from "./store/resolve.js";
 import { scanStream } from "./store/scan/scan-stream.js";
@@ -53,48 +55,17 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
   assertComputerImportCurrent(db);
 
   const ops = createFilesystemOps(db, { now });
-  const scanRoots = new Map<string, ReturnType<typeof realpath>>();
-  const globRoots = new Map<string, ReturnType<typeof realpath>>();
-  const listRoots = new Map<string, ReturnType<typeof realpath>>();
+  let epoch = 0;
+  const currentEpoch = (): number => epoch;
   const mutated = (): void => {
-    scanRoots.clear();
-    globRoots.clear();
-    listRoots.clear();
+    epoch++;
   };
+  const scanRoots = new ResolvedRoots(currentEpoch);
+  const globRoots = new ResolvedRoots(currentEpoch);
+  const listRoots = new ResolvedRoots(currentEpoch);
 
-  const readFiles = (paths: readonly string[], readOptions?: ReadOptions): ReadBatch => {
-    const resolved = realpaths(db, paths);
-    const originals = new Map<string, string[]>();
-    for (let index = 0; index < paths.length; index++) {
-      const input = paths[index];
-      const target = resolved[index];
-      if (input === undefined || target === undefined) continue;
-      const callers = originals.get(target);
-      if (callers === undefined) originals.set(target, [input]);
-      else callers.push(input);
-    }
-
-    const batch = readStoredFiles(db, [...originals.keys()], readOptions);
-    const deferredTargets = new Set(batch.remaining);
-    let deferredAt = paths.length;
-    for (let index = 0; index < resolved.length; index++) {
-      const target = resolved[index];
-      if (target !== undefined && deferredTargets.has(target)) {
-        deferredAt = index;
-        break;
-      }
-    }
-    const files = new Map<string, Uint8Array>();
-    for (let index = 0; index < deferredAt; index++) {
-      const input = paths[index];
-      const target = resolved[index];
-      if (input === undefined || target === undefined) continue;
-      const bytes = batch.files.get(target);
-      if (bytes !== undefined) files.set(input, bytes);
-    }
-    const remaining = paths.slice(deferredAt);
-    return { files, remaining };
-  };
+  const readFiles = (paths: readonly string[], readOptions?: ReadOptions): ReadBatch =>
+    readResolvedFiles(db, paths, realpaths(db, paths), readOptions);
 
   const filesystem: Filesystem = {
     db,
@@ -117,8 +88,7 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
         resolved = realpath(db, root);
       }
       const page = scanPage(db, resolved, scanOptions);
-      if (page.length < scanOptions.limit) scanRoots.delete(root);
-      else scanRoots.set(root, resolved);
+      scanRoots.keep(root, resolved, page.length >= scanOptions.limit);
       return page;
     },
     scanStream: (root, streamOptions) => scanStream(db, root, streamOptions),
@@ -137,16 +107,14 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
       let resolved = globRoots.get(root);
       if (resolved === undefined || globOptions.after === undefined) resolved = realpath(db, root);
       const page = scanGlobPage(db, resolved, pattern, globOptions);
-      if (page.next === null) globRoots.delete(root);
-      else globRoots.set(root, resolved);
+      globRoots.keep(root, resolved, page.next !== null);
       return page;
     },
     listEntries(root: string, listOptions: ListOptions = {}): ListPage {
       let resolved = listRoots.get(root);
       if (resolved === undefined || listOptions.after === undefined) resolved = realpath(db, root);
       const page = scanListEntries(db, resolved, listOptions);
-      if (page.next === null) listRoots.delete(root);
-      else listRoots.set(root, resolved);
+      listRoots.keep(root, resolved, page.next !== null);
       return page;
     },
     writeFiles(entries: readonly WriteEntry[], writeOptions?: WriteOptions): void {
@@ -249,5 +217,6 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
     },
     withReadScope: (work) => work(),
   };
+  registerFilesystem(filesystem, { db, now, mutated, epoch: currentEpoch });
   return filesystem;
 }

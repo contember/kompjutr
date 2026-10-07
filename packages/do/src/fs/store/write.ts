@@ -25,7 +25,7 @@ import { assertWellFormedPath, comparePaths } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type { EntryType, WriteEntry, WriteOptions } from "../types.js";
 import { allocateInodes, bumpRev } from "./meta.js";
-import { realpathsNoFollow } from "./resolve.js";
+import { type PathResolver, storeResolver } from "./resolve.js";
 import {
   deleteChunks,
   payloadBudgetOf,
@@ -165,6 +165,7 @@ export function writeFiles(
   entries: readonly WriteEntry[],
   options: WriteOptions = {},
   now: () => number = Date.now,
+  resolver: Pick<PathResolver, "realpathsNoFollow"> = storeResolver(db),
 ): void {
   if (entries.length === 0) return;
   const createParents = options.parents !== false;
@@ -172,10 +173,7 @@ export function writeFiles(
   const timestamp = now();
 
   db.transactionSync(() => {
-    const real = realpathsNoFollow(
-      db,
-      entries.map((entry) => entry.path),
-    );
+    const real = resolver.realpathsNoFollow(entries.map((entry) => entry.path));
 
     const planned = new Map<string, Planned>();
     for (let i = 0; i < entries.length; i++) {
