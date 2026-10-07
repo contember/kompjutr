@@ -9,6 +9,9 @@ decided work or status.
 
 <!-- index the ideas here, one line each -->
 
+- [`full-history-import-performance.md`](full-history-import-performance.md)
+  — measured full-history clone and staging breakdown; physical pack batching,
+  projection/graph SQL, bounded allocation, and conditional native/Wasm options.
 - [`git-server-inside-the-durable-object.md`](git-server-inside-the-durable-object.md)
   — answer Smart HTTP from the Durable Object so a `git` client can clone,
   fetch, and push against it.

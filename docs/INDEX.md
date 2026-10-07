@@ -16,7 +16,8 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprint-2026-10-07-full-history-performance.md`](sprints/sprint-2026-10-07-full-history-performance.md)
+  — full-history clone and `git add` performance.
 
 ## Specs
 
@@ -33,7 +34,10 @@ None.
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
-      If everything is "hot", nothing is. -->
+       If everything is "hot", nothing is. -->
+- [Full-history performance sprint](sprints/sprint-2026-10-07-full-history-performance.md)
+  — cut SQL and row work in full-history clone and `git add`, from the
+  [measured proposal](ideas/full-history-import-performance.md).
 - [Simplification](archive/sprint-2026-09-23-simplification.md) shipped: −14 %
   Git source, 61 → 46 tables, self-contained packs, `STRICT` schema, rebase at
   any size. Next: the [backlog plan](backlog/README.md#sprint-plan).

@@ -20,4 +20,5 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None.
+- [`sprint-2026-10-07-full-history-performance.md`](sprint-2026-10-07-full-history-performance.md)
+  — cut SQL and row work in full-history clone and `git add`.
