@@ -187,15 +187,16 @@ export class PromisorTable {
 
     const missing: PromisedBlob[] = [];
     let nextOrdinal = 0;
+    // A repo-first plan scans every promise for each bounded lookup batch.
     for (const row of this.db.iterate(
       `WITH wanted(ordinal, oid) AS MATERIALIZED (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
        )
        SELECT wanted.ordinal, promised.oid, promised.remote_name
          FROM wanted
-         JOIN git_promised_blobs promised
-           ON promised.repo_id = ? AND promised.oid = wanted.oid
-        WHERE NOT EXISTS (
+         CROSS JOIN git_promised_blobs promised
+        WHERE promised.repo_id = ? AND promised.oid = wanted.oid
+          AND NOT EXISTS (
           SELECT 1 FROM git_objects loose
            WHERE loose.repo_id = ? AND loose.oid = wanted.oid
         )

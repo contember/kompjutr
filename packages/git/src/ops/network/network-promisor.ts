@@ -148,7 +148,7 @@ export async function withPromisorHydration<T>(
   }
 }
 
-/** Hydrate all promised blobs selected for one checkout in one bounded negotiation. */
+/** Hydrate selected checkout blobs in bounded negotiations. */
 export async function hydrateTreeBlobs(
   context: GitContext,
   repo: Repository,
@@ -159,26 +159,28 @@ export async function hydrateTreeBlobs(
   validateRemoteAuthOptions(options);
   validateAbortableNetworkOptions(options);
   throwIfAborted(options.signal);
-  const promised = new Set<string>();
-  let candidates: string[] = [];
-  const flush = (): void => {
-    for (const oid of repo.store.promisedMissing(candidates)) {
-      promised.add(oid);
-      if (promised.size > MAX_PROTOCOL_NEGOTIATION_ENTRIES) {
-        throw new GitError(
-          "E2BIG",
-          `checkout requires more than ${MAX_PROTOCOL_NEGOTIATION_ENTRIES} promised blobs`,
-        );
+  for (;;) {
+    const promised = new Set<string>();
+    let candidates: string[] = [];
+    const flush = (): void => {
+      for (const oid of repo.store.promisedMissing(candidates)) {
+        promised.add(oid);
+        if (promised.size === MAX_PROTOCOL_NEGOTIATION_ENTRIES) break;
       }
+      candidates = [];
+    };
+    // Close the tree cursor before network I/O and pack publication. Hydrated
+    // objects disappear from promisedMissing on the next pass.
+    for (const entry of treeStream(repo, treeOid)) {
+      throwIfAborted(options.signal);
+      if (entry.mode === "160000" || !matchesPaths(entry.path, paths)) continue;
+      candidates.push(entry.oid);
+      if (candidates.length === PROMISOR_LOOKUP_PAGE) flush();
+      if (promised.size === MAX_PROTOCOL_NEGOTIATION_ENTRIES) break;
     }
-    candidates = [];
-  };
-  for (const entry of treeStream(repo, treeOid)) {
-    throwIfAborted(options.signal);
-    if (entry.mode === "160000" || !matchesPaths(entry.path, paths)) continue;
-    candidates.push(entry.oid);
-    if (candidates.length === PROMISOR_LOOKUP_PAGE) flush();
+    flush();
+    if (promised.size === 0) return;
+    await hydratePromisedBlobs(context, repo, [...promised], options);
+    if (promised.size < MAX_PROTOCOL_NEGOTIATION_ENTRIES) return;
   }
-  flush();
-  await hydratePromisedBlobs(context, repo, [...promised], options);
 }

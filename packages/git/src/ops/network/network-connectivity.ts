@@ -2,8 +2,8 @@ import { CorruptError, GitError, hasErrorCode } from "../../common/errors.js";
 import type { ObjectType } from "../../common/objects.js";
 import { MAX_PROMISED_BLOB_LOOKUP_OIDS } from "../../store/fetch/promisor.js";
 import { MAX_BLOB_BATCH_OIDS } from "../../store/objects/objects.js";
-import { readCommitGraph } from "../../store/trees/commits.js";
-import { CHECKED_TREE_CACHE_SIZE } from "../../store/trees/tree-walk.js";
+import { readCommitTreeRoots } from "../../store/trees/commits.js";
+import { readConnectivityObjects } from "../../store/trees/connectivity.js";
 import type { Repository } from "../repository/repository.js";
 import { parseAuthenticatedTag, TAG_PEEL_HOPS } from "./network-tags.js";
 
@@ -23,7 +23,6 @@ export function validateFetchedConnectivity(
   boundary: ReadonlySet<string>,
 ): void {
   const shallow = [...boundary];
-  const checkedTrees = new Set<string>();
   let required: RequiredObject[] = [];
   const flush = (): void => {
     const promises = new Set(
@@ -48,26 +47,6 @@ export function validateFetchedConnectivity(
     required.push(entry);
     if (required.length === METADATA_PAGE) flush();
   };
-  const tree = (oid: string): void => {
-    if (checkedTrees.has(oid)) return;
-    const candidates = new Set<string>();
-    for (const entry of repo.store.walkTreeDiffObjects(null, oid, checkedTrees)) {
-      require(entry);
-      if (entry.type === "tree" && candidates.size < CHECKED_TREE_CACHE_SIZE) {
-        candidates.add(entry.oid);
-      }
-    }
-    // Admission requires both the complete walk and its final partial metadata batch.
-    if (required.length > 0) flush();
-    for (const candidate of candidates) {
-      if (checkedTrees.has(candidate)) continue;
-      if (checkedTrees.size === CHECKED_TREE_CACHE_SIZE) {
-        const oldest = checkedTrees.values().next();
-        if (!oldest.done) checkedTrees.delete(oldest.value);
-      }
-      checkedTrees.add(candidate);
-    }
-  };
   try {
     for (let start = 0; start < roots.length; start += OBJECT_PAGE) {
       let frontier: { oid: string; type?: ObjectType }[] = roots
@@ -85,24 +64,35 @@ export function validateFetchedConnectivity(
           }
         }
         const tags: string[] = [];
+        const treeRoots: { oid: string; type: "commit" | "tree" }[] = [];
         for (const entry of info) {
           if (entry.type === "tag") {
             tags.push(entry.oid);
             continue;
           }
           if (entry.type === "commit") {
-            for (const commit of readCommitGraph(
+            for (const commit of readCommitTreeRoots(
               repo.store.db,
               repo.store.repoId,
               entry.oid,
-              {},
               shallow,
             )) {
               require({ oid: commit.oid, type: "commit" });
-              tree(commit.commit.tree);
             }
-          } else if (entry.type === "tree") tree(entry.oid);
+          }
+          if (entry.type === "commit" || entry.type === "tree") {
+            treeRoots.push({ oid: entry.oid, type: entry.type });
+          }
         }
+        for (const object of readConnectivityObjects(
+          repo.store.db,
+          repo.store.repoId,
+          treeRoots,
+          shallow,
+        )) {
+          require(object);
+        }
+        if (required.length > 0) flush();
         frontier = [];
         let pending = tags;
         while (pending.length > 0) {

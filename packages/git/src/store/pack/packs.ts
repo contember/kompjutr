@@ -179,9 +179,8 @@ export class PackStore {
           return lifecycle?.reserved(packId);
         },
         published: (result) => {
-          // RETURNING replaces a separate `changes()` probe. SQLite buffers its
-          // output, so the delete is already complete at the first row and the
-          // rest of the cursor is abandoned without keeping every fulfilled OID.
+          // Drain RETURNING before publication commits: workerd keeps the write
+          // statement active even when an iterator stops after its first row.
           let fulfilled = false;
           for (const _oid of this.#db.iterate(
             `DELETE FROM git_promised_blobs
@@ -194,7 +193,6 @@ export class PackStore {
             result.packId,
           )) {
             fulfilled = true;
-            break;
           }
           if (fulfilled) bumpMaintenanceRootEpoch(this.#db, this.#repoId);
           return lifecycle?.published(result);

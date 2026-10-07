@@ -508,6 +508,32 @@ describe("clone", () => {
     }
   });
 
+  it("clones a blobless checkout larger than one negotiation in bounded requests", async () => {
+    const fixture = new GitFixture().init();
+    for (let index = 0; index < 16_385; index++) {
+      fixture.write(`bulk/file-${String(index).padStart(5, "0")}`, `content ${index}\n`);
+    }
+    const tip = fixture.commit("large checkout");
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", filter: "blob:none" });
+      const repo = openRepository(workspace.context, "/work");
+      expect(repo.head().oid).toBe(tip);
+      expect(repo.store.promisedBlobCount()).toBe(0);
+      expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(3);
+      for (const path of ["bulk/file-00000", "bulk/file-16383", "bulk/file-16384"]) {
+        expect(new TextDecoder().decode(workspace.worktree.readFile(`/work/${path}`))).toBe(
+          `${fixture.git("show", `HEAD:${path}`)}\n`,
+        );
+      }
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
   it("hydrates diff windows in exact batches and leaves unrelated promises", async () => {
     const { fixture, sideBlob } = makePromisorScaleFixture(0);
     const server = await startGitServer(fixture.dir);

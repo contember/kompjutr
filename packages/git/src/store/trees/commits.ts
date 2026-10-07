@@ -14,5 +14,6 @@ export {
   type CommitGraphLimits,
   readCommitGraph,
   readCommitGraphOwned,
+  readCommitTreeRoots,
   WALK_COMMIT_GRAPH_SQL,
 } from "./commits-graph.js";

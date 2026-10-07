@@ -3,7 +3,7 @@
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import type { Commit } from "../../common/objects.js";
-import { MAX_LOG_COMMITS } from "../../store/trees/commits.js";
+import { MAX_LOG_COMMITS, readCommitTreeRoots } from "../../store/trees/commits.js";
 import { type Repository, walkIndexedOwned } from "../repository/repository.js";
 
 export const MAX_MERGE_BASE_COMMITS = MAX_LOG_COMMITS;
@@ -240,19 +240,31 @@ function withReachableGraph<T>(
 
 /** Count commits reachable from only one side of two bounded indexed histories. */
 export function countAheadBehind(repo: Repository, input: MergeBaseInput): AheadBehindResult {
-  return withReachableGraph(repo, input, (state) => {
-    let ahead = 0;
-    let behind = 0;
-    for (const node of state.nodes.values()) {
-      if (node.sides === CURRENT) ahead++;
-      else if (node.sides === INCOMING) behind++;
+  if (!isOid(input.currentOid) || !isOid(input.incomingOid)) {
+    throw new GitError("EINVAL", "merge-base inputs must be full object ids");
+  }
+  const limits = resolveLimits(input.limits);
+  const sides = new Map<string, number>();
+  for (const { root, side } of [
+    { root: input.currentOid, side: CURRENT },
+    { root: input.incomingOid, side: INCOMING },
+  ]) {
+    const type = repo.typeOf(root);
+    if (type !== "commit") throw new CorruptError(`${root} is a ${type}, not a commit`);
+    for (const { oid } of readCommitTreeRoots(repo.store.db, repo.store.repoId, root)) {
+      if (!sides.has(oid) && sides.size >= limits.maxCommits) {
+        throw new GitError("E2BIG", `merge-base graph exceeds ${limits.maxCommits} unique commits`);
+      }
+      sides.set(oid, (sides.get(oid) ?? 0) | side);
     }
-    return {
-      ahead,
-      behind,
-      commits: state.nodes.size,
-    };
-  });
+  }
+  let ahead = 0;
+  let behind = 0;
+  for (const side of sides.values()) {
+    if (side === CURRENT) ahead++;
+    else if (side === INCOMING) behind++;
+  }
+  return { ahead, behind, commits: sides.size };
 }
 
 /** Compare two caller-selected revisions through one bounded reachable graph. */

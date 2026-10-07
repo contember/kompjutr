@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { concat, utf8 } from "../packages/git/src/common/bytes.js";
 import { hashObject } from "../packages/git/src/common/objects.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
@@ -60,6 +60,32 @@ const looseWriters = [
 ];
 
 describe("promisor store", () => {
+  it("looks up a small requested batch by the full promise key in a large repository", () => {
+    const { db, store } = open();
+    try {
+      store.registerPromisorRemote("origin", "https://example.test/repo.git");
+      store.addPromisedBlobs(
+        "origin",
+        Array.from({ length: 12_000 }, (_, index) => oidAt(index)),
+      );
+      const lastOid = oidAt(11_999);
+      const requested = [lastOid, oidAt(6_000), oidAt(0)];
+      const iterate = vi.spyOn(db, "iterate");
+      expect(store.promisedMissing([...requested, lastOid, oidAt(20_000)])).toEqual(requested);
+      const invocation = iterate.mock.calls.find(([query]) =>
+        query.includes("promised.remote_name"),
+      );
+      if (invocation === undefined) throw new Error("Promise lookup query was not observed");
+      const [query, ...bindings] = invocation;
+      const plan = db.all<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, ...bindings);
+      expect(
+        plan.some((row) => /SEARCH promised USING .*\(repo_id=\? AND oid=\?\)/.test(row.detail)),
+      ).toBe(true);
+    } finally {
+      db.storage.db.close();
+    }
+  });
+
   it("rolls back promise fulfillment and epoch when streamed bytes change during publication", () => {
     const { db, store } = open();
     store.registerPromisorRemote("origin", "https://example.test/repo.git");

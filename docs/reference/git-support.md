@@ -306,9 +306,12 @@ request and retained index rows. Commit-tree
 snapshot instead shares one global 1,000-item counter across its materialized
 dirty, index, directory, and tree-entry results. Overflow makes the fast path
 unavailable and falls back without truncating caller-visible results.
-An unavailable tracker can reseal from a full status pass; its optional seed
-holds at most 50,000 paths. An oversized path or an excess seed entry disables
-resealing for that pass without changing the status result.
+An unfiltered eager full status pass can reseal an unavailable tracker or repair
+a complete tracker whose conservative dirty set exceeds the sparse window. It
+retains only the remaining dirty leaves, so later calls can use sparse status
+again. Its optional seed holds at most 50,000 paths. An oversized path or an
+excess seed entry disables resealing for that pass without changing the status
+result. Filtered calls and the lazy `statusStream()` do not reseal the tracker.
 
 ### `git add` — `add()`
 
@@ -604,6 +607,26 @@ with `signal.reason` as its cause. Clone and fetch check immediately before
 their synchronous local publication; once publication starts, it completes and
 the operation succeeds even if the signal is aborted afterwards. Interrupted
 pack ingest remains invisible, and a retry renegotiates from published state.
+
+Before publishing fetched refs, connectivity validation streams commit IDs and
+their root tree IDs from the parsed store. Each commit root is checked against
+the 50,000-commit bound and the proposed shallow boundaries. It
+does not select commit messages, signatures, or identities, so their aggregate
+size does not consume the parsed-commit capacity used by log and graph readers.
+Missing parents, trees, and unpromised blobs still reject publication.
+
+For each bounded root batch, a recursive `UNION` deduplicates reachable tree
+IDs across the commit histories before streaming their direct object edges.
+Shared subtrees expand once per batch, independent of how many historical paths
+reference them. This traversal retains identities in SQLite, not path strings
+or object payloads in JavaScript, and has no additional tree-count limit.
+
+Promised-blob lookups keep the bounded requested-ID batch as the outer side of
+the join and seek each promise by `(repo_id, oid)`. They do not enumerate the
+repository's unrelated promises for every connectivity or hydration batch.
+Initial checkout hydration uses multiple negotiations when necessary, each with
+at most 16,384 distinct blob IDs. The tree cursor closes before network I/O;
+subsequent passes skip blobs already published by earlier batches.
 
 Push has a stricter certainty boundary. Cancellation before receive-pack POST
 invocation is `EABORTED`. After invocation, an abort, transport failure,
@@ -1036,6 +1059,12 @@ refuse the same size; pack ingest rejects a pack holding a larger entry; and
 `git_pack_entries`. Every one of those failures is `E2BIG`, so cloning or
 fetching a repository that contains a larger object fails instead of producing a
 checkout that cannot be materialised.
+
+Pack ingest retains at most 16 MiB for physical-offset, completion, and
+delta-depth arrays. Their combined allocation is 13 bytes per physical entry,
+so one pack may contain at most 1,290,555 objects. A larger declared count fails
+with `E2BIG` before those arrays are allocated. Compressed pack bytes still
+stream into 1 MiB SQLite rows; this metadata ceiling is not a pack-byte limit.
 
 Every commit gets one parsed `git_commits` row, which a Durable Object stores
 only below about 2 MB. A commit whose message and signature would push the row

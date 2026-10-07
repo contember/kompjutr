@@ -14,6 +14,7 @@ import { commit } from "../packages/git/src/ops/repository/commit.js";
 import { add } from "../packages/git/src/ops/staging/staging.js";
 import {
   eagerStatus,
+  formatPorcelainV1,
   type StatusOptions,
   status,
   statusStream,
@@ -92,6 +93,40 @@ function expectNoFullStatusStreams(histogram: ReadonlyMap<string, number>): void
 }
 
 describe("sparse eager status", () => {
+  it("repairs a complete tracker after a conservative dirty set exceeds the sparse window", () => {
+    const workspace = makeRepo("/");
+    const fixture = new GitFixture().init();
+    try {
+      const paths = Array.from({ length: 1_001 }, (_, index) => `file-${index}.txt`);
+      for (const path of paths) {
+        writeWorkFile(workspace, `/${path}`, "original\n");
+        fixture.write(path, "original\n");
+      }
+      commitFiles(workspace, paths);
+      fixture.commit("fixture");
+      sealIndexTracker(workspace, {
+        entries: paths.map((path) => ({ path, flags: INDEX_DIRTY | WORKTREE_DIRTY })),
+      });
+      writeWorkFile(workspace, "/file-0.txt", "changed\n");
+      fixture.write("file-0.txt", "changed\n");
+      const expected = fixture.git("status", "--porcelain=v1");
+      const context = sparseTrackerContext(workspace);
+      expect(
+        formatPorcelainV1(eagerStatus(workspace.repo, workspace.worktree, {}, context)).trimEnd(),
+      ).toBe(expected);
+      expect([
+        ...requireSparseWorkspace(workspace).dirtyPaths(workspace.repo.checkout.checkoutId),
+      ]).toEqual([{ path: "file-0.txt", flags: WORKTREE_DIRTY }]);
+      expect(
+        formatPorcelainV1(
+          eagerStatus(workspace.repo, new NoScanWorktree(workspace.worktree), {}, context),
+        ).trimEnd(),
+      ).toBe(expected);
+    } finally {
+      fixture.dispose();
+    }
+  });
+
   it("reseals one authoritative full status for an incomplete repository", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a.txt", "a\n");
@@ -1064,7 +1099,7 @@ describe("sparse eager status", () => {
     expect(reseals).toBe(0);
   });
 
-  it("falls back when bounded dirty traversal reports E2BIG", () => {
+  it("reseals the authoritative full pass when bounded dirty traversal reports E2BIG", () => {
     const workspace = makeRepo("/");
     let hydrates = 0;
     let reseals = 0;
@@ -1092,6 +1127,6 @@ describe("sparse eager status", () => {
 
     expect(eagerStatus(workspace.repo, workspace.worktree, {}, context)).toEqual([]);
     expect(hydrates).toBe(0);
-    expect(reseals).toBe(0);
+    expect(reseals).toBe(1);
   });
 });

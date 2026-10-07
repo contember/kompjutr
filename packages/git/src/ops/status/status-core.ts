@@ -74,7 +74,10 @@ export function statusBranch(repo: Repository): StatusBranch {
   const upstream = resolveBranchUpstream(repo, headRef);
   if (upstream === undefined) return base;
   if (oid === null || upstream.oid === null) return { ...base, upstream: upstream.name };
-  const counts = countAheadBehind(repo, { currentOid: oid, incomingOid: upstream.oid });
+  const counts =
+    oid === upstream.oid
+      ? { ahead: 0, behind: 0 }
+      : countAheadBehind(repo, { currentOid: oid, incomingOid: upstream.oid });
   return {
     ...base,
     upstream: upstream.name,
@@ -102,25 +105,27 @@ export function eagerStatus(
   }
 
   const state = source.readState(repo.checkout.checkoutId);
-  if (!state.available) {
-    const baselineTreeOid = repo.headTree();
-    const seed = new FullStatusTrackerSeed();
-    const prepass = fullStatusPrepass(repo, baselineTreeOid, options);
-    const rows = sortStatusDetails([
-      ...applyStatusRenames(
-        statusStreamInternal(repo, worktree, options, baselineTreeOid, prepass, seed),
-        prepass.renames,
-      ),
-    ]);
-    if (seed.resealable) {
-      tracker.reseal(repo.checkout.checkoutId, baselineTreeOid, seed.entries());
+  if (state.available) {
+    const sparse = sparseStatus(repo, worktree, options, context, state.baselineTreeOid);
+    if (sparse !== null) {
+      return sortStatusDetails([...applyStatusRenames(sparse.details, sparse.renames)]);
     }
-    return rows;
   }
 
-  const sparse = sparseStatus(repo, worktree, options, context, state.baselineTreeOid);
-  if (sparse === null) return status(repo, worktree, options);
-  return sortStatusDetails([...applyStatusRenames(sparse.details, sparse.renames)]);
+  // A large conservative dirty set must be repaired too, or every later status repeats the full walk.
+  const baselineTreeOid = repo.headTree();
+  const seed = new FullStatusTrackerSeed();
+  const prepass = fullStatusPrepass(repo, baselineTreeOid, options);
+  const rows = sortStatusDetails([
+    ...applyStatusRenames(
+      statusStreamInternal(repo, worktree, options, baselineTreeOid, prepass, seed),
+      prepass.renames,
+    ),
+  ]);
+  if (seed.resealable) {
+    tracker.reseal(repo.checkout.checkoutId, baselineTreeOid, seed.entries());
+  }
+  return rows;
 }
 
 /**

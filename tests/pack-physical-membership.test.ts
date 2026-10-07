@@ -6,7 +6,7 @@ import { concat, utf8 } from "../packages/git/src/common/bytes.js";
 import { hashObject, serializeTree } from "../packages/git/src/common/objects.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
-import { OFFSET_WINDOW } from "../packages/git/src/store/pack/shared.js";
+import { MAX_PACK_INGEST_OBJECTS, OFFSET_WINDOW } from "../packages/git/src/store/pack/shared.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 
@@ -128,6 +128,63 @@ function repeatedTreePack(tree: Uint8Array, deltas = 0, fillers = 0, malformed =
 }
 
 describe("pack physical offset membership", () => {
+  it("ingests a native-valid pack beyond 131072 objects with a deferred delta", async () => {
+    const incoming = pack(131_071);
+    const native = new GitFixture().init();
+    const db = new TestDatabase();
+    try {
+      execFileSync("git", ["index-pack", "--strict", "--stdin"], {
+        cwd: native.dir,
+        input: incoming.bytes,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+      const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+      const store = database.openCheckout(checkout).shared;
+      const ingested = await store.packs.ingest(slices(incoming.bytes, 64 * 1024));
+      expect(ingested.count).toBe(131_073);
+      expect(
+        db.scalar<number>(
+          "SELECT COUNT(*) FROM git_pack_entries WHERE pack_id = ?",
+          ingested.packId,
+        ),
+      ).toBe(ingested.count);
+      const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(checkout).shared;
+      expect(cold.read(TARGET_OID)?.data).toEqual(native.catFile(TARGET_OID));
+      expect(cold.read(BASE_OID)?.data).toEqual(native.catFile(BASE_OID));
+      const filler = utf8.encode("filler 131070\n");
+      const fillerOid = hashObject("blob", filler);
+      expect(cold.read(fillerOid)?.data).toEqual(native.catFile(fillerOid));
+    } finally {
+      native.dispose();
+      db.storage.db.close();
+    }
+  });
+
+  it("refuses a pack header that exceeds the ingest metadata allocation ceiling", async () => {
+    const header = new Uint8Array(12);
+    header.set(utf8.encode("PACK"));
+    const view = new DataView(header.buffer);
+    view.setUint32(4, 2);
+    view.setUint32(8, MAX_PACK_INGEST_OBJECTS + 1);
+    const bytes = concat([header, createHash("sha1").update(header).digest()]);
+    const db = new TestDatabase();
+    try {
+      const database = new SqliteGitDatabase(db);
+      const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+      const store = database.openCheckout(checkout).shared;
+      await expect(store.packs.ingest(slices(bytes, 4096))).rejects.toMatchObject({
+        code: "E2BIG",
+      });
+      expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'")).toBe(
+        0,
+      );
+      expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_entries")).toBe(0);
+    } finally {
+      db.storage.db.close();
+    }
+  });
+
   it.each([false, true])(
     "keeps exact pack projections through selection and deletion (loose shadow: %s)",
     async (loose) => {

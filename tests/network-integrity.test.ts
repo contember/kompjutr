@@ -12,8 +12,10 @@ import { openRepository } from "../packages/git/src/ops/core/context.js";
 import { clone, fetchInto } from "../packages/git/src/ops/network/network.js";
 import { validateFetchedConnectivity } from "../packages/git/src/ops/network/network-connectivity.js";
 import { maintenance } from "../packages/git/src/ops/repository/maintenance.js";
+import { statusBranch } from "../packages/git/src/ops/status/status.js";
 import { GC_GRACE_MS } from "../packages/git/src/store/maintenance/sweep.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
+import { readConnectivityObjects } from "../packages/git/src/store/trees/connectivity.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { startGitServer, startStubServer } from "./helpers/http-backend.js";
 import { faultyRemote, nativeClone, publicationState } from "./helpers/network-integrity.js";
@@ -162,6 +164,85 @@ describe("network integrity", () => {
 });
 
 describe("fetched graph connectivity", () => {
+  it("expands shared historical trees once and matches native Git's reachable objects", async () => {
+    const fixture = new GitFixture().init();
+    try {
+      for (let index = 0; index < 140; index++) {
+        fixture.write(`shared/dir-${index}/file`, `content ${index}\n`);
+      }
+      fixture.commit("shared trees");
+      for (let index = 0; index < 4; index++) {
+        fixture.write("changing", `${index}\n`);
+        fixture.commit(`change ${index}`);
+      }
+      const { repo } = makeRepo("/work");
+      await repo.store.packs.ingest(slices(fixture.packAll(), 4096));
+      const tip = fixture.git("rev-parse", "HEAD");
+      repo.store.db.transactionSync(() => validateFetchedConnectivity(repo, [tip], new Set()));
+      const objects = [
+        ...readConnectivityObjects(
+          repo.store.db,
+          repo.store.repoId,
+          [{ oid: tip, type: "commit" }],
+          [],
+        ),
+      ];
+      const commits = new Set(fixture.git("rev-list", "HEAD").split("\n"));
+      const expected = fixture
+        .git("rev-list", "--objects", "HEAD")
+        .split("\n")
+        .map((line) => line.split(" ")[0])
+        .filter((oid) => oid !== undefined && !commits.has(oid));
+      expect(new Set(objects.map((object) => object.oid))).toEqual(new Set(expected));
+      const trees = objects.filter((object) => object.type === "tree");
+      expect(trees.length).toBe(new Set(trees.map((tree) => tree.oid)).size);
+      expect(objects.filter((object) => object.type === "blob")).toHaveLength(144);
+    } finally {
+      fixture.dispose();
+    }
+  });
+
+  it("clones complete history beyond the parsed-commit graph capacity like native Git", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write(".git/message", `${"M".repeat(1024 * 1024)}\n`);
+    for (let index = 0; index < 34; index++) {
+      fixture.git("commit", "--allow-empty", "-q", "-F", ".git/message");
+    }
+    fixture.git("config", "uploadpack.allowFilter", "true");
+    const origin = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      expect(await nativeClone(origin.url, ["--filter=blob:none"])).toBe(true);
+      await clone(workspace.context, {
+        url: origin.url,
+        dir: "/work",
+        filter: "blob:none",
+        singleBranch: true,
+        noTags: true,
+      });
+      const repo = openRepository(workspace.context, "/work");
+      expect(repo.head().oid).toBe(fixture.git("rev-parse", "HEAD"));
+      expect(repo.shallow().size).toBe(0);
+      expect(repo.store.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(
+        Number(fixture.git("rev-list", "--count", "HEAD")),
+      );
+      expect(() => [...repo.store.commitGraph(fixture.git("rev-parse", "HEAD"))]).toThrow(
+        /fixed state capacity/,
+      );
+      expect(statusBranch(repo)).toMatchObject({ ahead: 0, behind: 0 });
+      const previous = fixture.git("rev-parse", "HEAD~1");
+      repo.store.setRef("refs/heads/main", previous);
+      const [ahead, behind] = fixture
+        .git("rev-list", "--left-right", "--count", `${previous}...HEAD`)
+        .split(/\s+/)
+        .map(Number);
+      expect(statusBranch(repo)).toMatchObject({ ahead, behind });
+    } finally {
+      await origin.close();
+      fixture.dispose();
+    }
+  });
+
   it("checks shared nested blobs once per invocation and starts the next invocation cold", async () => {
     const fixture = new GitFixture().init();
     fixture.write("shared/file", "shared\n");
@@ -197,7 +278,7 @@ describe("fetched graph connectivity", () => {
     }
   });
 
-  it("flushes a missing blob in the final metadata batch before starting the next root", () => {
+  it("rejects a missing blob in the final metadata batch of shared roots", () => {
     const { repo } = makeRepo("/work");
     const missing = "1".repeat(40);
     const child = repo.store.write(
@@ -208,13 +289,11 @@ describe("fetched graph connectivity", () => {
       "tree",
       serializeTree([{ mode: MODE_TREE, name: "shared", oid: child }]),
     );
-    const walk = vi.spyOn(repo.store, "walkTreeDiffObjects");
     expect(() =>
       repo.store.db.transactionSync(() =>
         validateFetchedConnectivity(repo, [child, root], new Set()),
       ),
     ).toThrow();
-    expect(walk).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a new missing subtree after successfully caching a shared subtree", () => {
@@ -242,7 +321,7 @@ describe("fetched graph connectivity", () => {
     ).toThrow();
   });
 
-  it("retraverses evicted trees after the bounded cache fills", () => {
+  it("expands each tree once even when shared roots exceed the former cache size", () => {
     const { repo } = makeRepo("/work");
     const blob = repo.store.write("blob", utf8("shared"));
     const roots = Array.from({ length: 129 }, (_, index) =>
@@ -262,7 +341,7 @@ describe("fetched graph connectivity", () => {
       validateFetchedConnectivity(repo, [...roots, revisit], new Set()),
     );
     expect(info.mock.calls.flatMap(([oids]) => oids).filter((oid) => oid === blob)).toHaveLength(
-      130,
+      129,
     );
   });
 
@@ -297,7 +376,7 @@ describe("fetched graph connectivity", () => {
     expect(() => validate([blobTree, commit])).toThrow();
   });
 
-  it("retraverses trees beyond one walk's bounded candidate set", () => {
+  it("deduplicates shared descendants beyond the former candidate cache size", () => {
     const { repo } = makeRepo("/work");
     const blob = repo.store.write("blob", utf8("shared"));
     const children = Array.from({ length: 129 }, (_, index) => ({
@@ -317,7 +396,7 @@ describe("fetched graph connectivity", () => {
       validateFetchedConnectivity(repo, [first, second], new Set()),
     );
     expect(info.mock.calls.flatMap(([oids]) => oids).filter((oid) => oid === blob)).toHaveLength(
-      130,
+      129,
     );
   });
 

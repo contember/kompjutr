@@ -31,7 +31,13 @@ export {
 export const PACK_CHUNK = 1024 * 1024;
 export const MAX_PACK_DELETE_BATCH = 48;
 export const PACK_INGEST_LEASE_MS = 5 * 60 * 1_000;
-export const MAX_PACK_INGEST_OBJECTS = 128 * 1024;
+export const MAX_PACK_INGEST_METADATA_BYTES = 16 * 1024 * 1024;
+// Physical offsets, completion flags, and delta depths coexist during ingest.
+const PACK_INGEST_BYTES_PER_OBJECT =
+  Float64Array.BYTES_PER_ELEMENT + Uint8Array.BYTES_PER_ELEMENT + Uint32Array.BYTES_PER_ELEMENT;
+export const MAX_PACK_INGEST_OBJECTS = Math.floor(
+  MAX_PACK_INGEST_METADATA_BYTES / PACK_INGEST_BYTES_PER_OBJECT,
+);
 
 /**
  * Git's `pack-objects` refuses a depth above 4,095, so no Git-produced pack
@@ -227,7 +233,10 @@ export interface PackIngestLease {
 
 export function validatePackMembershipCount(count: number): void {
   if (!Number.isSafeInteger(count) || count < 0 || count > MAX_PACK_INGEST_OBJECTS) {
-    throw new GitError("E2BIG", `pack exceeds ${MAX_PACK_INGEST_OBJECTS} objects`);
+    throw new GitError(
+      "E2BIG",
+      `pack exceeds the ${MAX_PACK_INGEST_METADATA_BYTES}-byte ingest metadata limit (${MAX_PACK_INGEST_OBJECTS} objects)`,
+    );
   }
 }
 
