@@ -16,6 +16,7 @@ export type {
 } from "./compat/node.js";
 export { NodeFsCompat } from "./compat/node.js";
 export { createFilesystem } from "./filesystem.js";
+export { createMountedFilesystem, type MountMode, type MountSpec } from "./mounted/view.js";
 export { subtreeSuccessor } from "./path.js";
 export { FS_SCHEMA_VERSION, initializeFsSchema } from "./schema.js";
 export type {

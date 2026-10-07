@@ -164,6 +164,11 @@ function requireDirectory(row: NodeRow | undefined, sourcePath: string): void {
 interface Walk {
   readonly path: string;
   readonly root: string | null;
+  /**
+   * The root is the top of the namespace, as a chroot's is: `..` at it stays
+   * and an absolute target starts from it. Otherwise both are breaches.
+   */
+  readonly top?: boolean;
 }
 
 function rootDepth(root: string): number {
@@ -213,7 +218,7 @@ function resolveWalk(
           componentsOf(path.slice(root.length)),
           followFinal,
           nodes,
-          rootDepth(root),
+          { depth: rootDepth(root), top: walk.top === true },
         );
   return typeof resolved === "string" ? asRealPath(resolved) : resolved;
 }
@@ -251,7 +256,7 @@ function resolveComponents(
   components: readonly string[],
   followFinal: boolean,
   initialNodes: ReadonlyMap<string, NodeRow> | undefined,
-  confineDepth: number | null,
+  confine: { readonly depth: number; readonly top: boolean } | null,
 ): string | ConfinementBreach {
   let resolved = [...start];
   let pending = [...components];
@@ -276,7 +281,8 @@ function resolveComponents(
       if (component === "" || component === ".") continue;
       if (component === "..") {
         if (missingPrefix !== undefined) throw enoent(missingPrefix);
-        if (confineDepth !== null && resolved.length <= confineDepth) {
+        if (confine !== null && resolved.length <= confine.depth) {
+          if (confine.top) continue;
           if (index < pending.length - callerTail) return OUTSIDE;
           return { breach: "parent", rest: pending.slice(index + 1) };
         }
@@ -297,8 +303,8 @@ function resolveComponents(
       resolved.pop();
       const target = node.link_target ?? "";
       if (target.startsWith("/")) {
-        if (confineDepth !== null && confineDepth > 0) return OUTSIDE;
-        resolved = [];
+        if (confine !== null && !confine.top) return OUTSIDE;
+        resolved = confine === null ? [] : resolved.slice(0, confine.depth);
       }
       callerTail = Math.min(callerTail, pending.length - index - 1);
       pending = [...componentsOf(target), ...pending.slice(index + 1)];
@@ -417,30 +423,31 @@ export function resolveWithin(
   root: string,
   path: string,
   followFinal: boolean,
+  top = false,
 ): RealPath | ConfinementBreach {
-  return resolveWalk(db, { path, root }, followFinal);
+  return resolveWalk(db, { path, root, top }, followFinal);
 }
 
 /** `resolveWithin` for many paths, each under its own root, in one batch. */
 export function resolveManyWithin(
   db: SqlDatabase,
-  walks: readonly { readonly root: string; readonly path: string }[],
+  walks: readonly { readonly root: string; readonly path: string; readonly top?: boolean }[],
   followFinal: boolean,
 ): (RealPath | ConfinementBreach)[] {
   return resolveMany(db, walks, followFinal);
 }
 
 /** A resolver whose every breach reads as an absent path. */
-export function confinedResolver(db: SqlDatabase, root: string): PathResolver {
+export function confinedResolver(db: SqlDatabase, root: string, top = false): PathResolver {
   const one = (path: string, followFinal: boolean): RealPath =>
-    confinedOrThrow(resolveWalk(db, { path, root }, followFinal), path);
+    confinedOrThrow(resolveWalk(db, { path, root, top }, followFinal), path);
   return {
     realpath: (path) => one(path, true),
     realpathNoFollow: (path) => one(path, false),
     realpathsNoFollow: (paths) =>
       resolveMany(
         db,
-        paths.map((path) => ({ path, root })),
+        paths.map((path) => ({ path, root, top })),
         false,
       ).map((real, index) => confinedOrThrow(real, paths[index] ?? "")),
   };
