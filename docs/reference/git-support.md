@@ -313,6 +313,14 @@ again. Its optional seed holds at most 50,000 paths. An oversized path or an
 excess seed entry disables resealing for that pass without changing the status
 result. Filtered calls and the lazy `statusStream()` do not reseal the tracker.
 
+A whole-tree `add()` (`.`, `all`, or tracked-only) over a complete tracker
+takes the same sparse candidate window as status: dirty paths plus the
+baseline-to-HEAD tree diff. Forced adds, scratch indexes, excluded nested
+repositories, an unavailable tracker, and window overflow use the full scan.
+`add()` never reseals the tracker. Initial checkout stores each written file's
+inode, mtime, and revision in the index, so the first add after a clone hashes
+nothing; ordinary checkout and the local drive store NULL stat data.
+
 ### `git add` — `add()`
 
 | Git | kompjutr | |
@@ -616,10 +624,15 @@ size does not consume the parsed-commit capacity used by log and graph readers.
 Missing parents, trees, and unpromised blobs still reject publication.
 
 For each bounded root batch, a recursive `UNION` deduplicates reachable tree
-IDs across the commit histories before streaming their direct object edges.
-Shared subtrees expand once per batch, independent of how many historical paths
-reference them. This traversal retains identities in SQLite, not path strings
+IDs across the commit histories, and the distinct blob IDs of their direct
+edges. Shared subtrees and blobs are checked once per batch, independent of how
+many historical paths reference them. SQLite resolves each identity against
+loose objects and complete packs, exempts only missing blobs that carry a
+promise, and returns failures only, ranked as sourceless tree, commit, missing,
+then wrong type. This traversal retains identities in SQLite, not path strings
 or object payloads in JavaScript, and has no additional tree-count limit.
+Promise registration deduplicates candidate blob IDs before its availability
+probes.
 
 Promised-blob lookups keep the bounded requested-ID batch as the outer side of
 the join and seek each promise by `(repo_id, oid)`. They do not enumerate the

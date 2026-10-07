@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Full-history performance](sprint-2026-10-07-full-history-performance.md)
+  — chunk-once pack range reads, cheaper tree projections, set-based
+  connectivity, tracker-driven `git add`, and stat data at initial checkout.
 - [Shell surface expansion](sprint-2026-09-28-shell-surface-expansion.md)
   — compound syntax, substitution, assignments, and new text, file, and system
   commands, including clean-room `patch`, `jq`, and `awk`, under the parity gate.

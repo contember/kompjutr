@@ -1,10 +1,19 @@
-<!--
-On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
-
-> **OUTCOME — shipped YYYY-MM-DD.** <one-paragraph result.> Commit map: WU1 → <sha>,
-> WU2 → <sha>, … Verification: <the gate command + numbers>. Backlog closed:
-> <ids deleted/rescoped>. Deferred: <honest notes>.
--->
+> **OUTCOME — shipped 2026-10-07.** The full-history `blob:none` clone of
+> Next.js v15.5.2 dropped from 428.8 s / 31,881 statements / 4,918,725 rows
+> returned (`eb89b3d`) to 197.0 s / 6,414 / 537,989 (`2d3bde0`): same harness,
+> fresh persistence, one leased run each (`cpu-lease run -n 2 --no-smt`), exact
+> HEAD, 24,252 files and a clean worktree verified. Native git on the same
+> origin (`file://`, `--no-local`, same lease) takes 17.2–18.9 s, of which
+> 6.5–8.0 s is metadata. A clean whole-tree `add` over a complete tracker now
+> costs 11 statements / 9 rows on 5,000 files; the first add after an initial
+> checkout writes no index rows. Commit map: WU1 → e72f6cc, WU3 → 98b0a48 and
+> 7517f70, WU4 → 8b74380, WU2 → b6975d4, WU5 → 2d3bde0. Verification: every WU
+> passed its witness and an independent review to clean; `npm run typecheck`,
+> `npm run check`, `npm test` (160/160), `bench:statements -- --check` and
+> `npm run test:full` (second run green after the 7517f70 test fix) pass.
+> Backlog filed: 116, 117, 118. Deferred: proposal §6 duplicate work, native
+> SHA-1 and Wasm (→ 118); WU3 temp B-tree memory is unmeasured (→ 118);
+> WU5 narrowed to initial checkout by user decision.
 
 # Sprint — full-history import and staging performance (2026-10-07)
 
@@ -245,37 +254,32 @@ Paths are relative to `packages/git/src/` unless prefixed.
   `store/core/contracts.ts` or `ops/core/context.ts` is a seam change: report
   `blocked`.
 
-### WU5 — Record stat data at checkout (M)
+### WU5 — Record stat data at initial checkout (S)
 
-- **Problem.** Checkout writes NULL `mtime`/`ino`, so the first add after a
-  clone refreshes all 24,252 index rows and, with a complete tracker, marks
-  them dirty.
-- **Verify first.** Count native rows written by the first `git add .` after
-  an initial checkout in `tests/checkout-initial.test.ts` setup.
-- **Scope.** The DO initial-write session and DO `writeFiles` return the
-  written inode, mtime and revision; initial and ordinary checkout store them in
-  `git_index`. The local (disk) drive returns no stat facts and checkout keeps
-  NULL there: its `rev` changes on every observation, its mtime has millisecond
-  resolution, and `indexMatchesStat` has no racy-git guard, so a recorded
-  checkout mtime could hide a same-size edit.
+- **Problem.** Initial checkout writes NULL `mtime`/`ino`, so the first add
+  after a clone refreshes all 24,252 index rows and, with a complete tracker,
+  marks them dirty.
+- **Verify first.** Count rows written by the first `git add .` after an
+  initial checkout in `tests/checkout-initial.test.ts` setup.
+- **Scope.** The DO initial-write session returns the written inode, mtime and
+  revision for each file and symlink; initial checkout stores them in
+  `git_index`. Ordinary checkout and `GitDrive.writeFiles` are unchanged
+  (user decision, 2026-10-07): they keep NULL and rehash only the files they
+  wrote. The session must return exactly what the drive's `stat` later
+  reports; the DO session is the only implementation.
 - **Acceptance / witness.** New `tests/checkout-stat.test.ts`, run with the
-  tracker incomplete (otherwise WU4 already makes the add cheap): after initial
-  and ordinary DO checkout, a clean `git add .` rehashes nothing and writes no
-  index rows; a same-size edit within the same timestamp tick is still
-  reported by status through `rev`; local checkout still stores NULL.
-  `tests/checkout-initial.test.ts`, `tests/clone-initial.test.ts`,
-  `tests/status.test.ts`, the local drive tests pass; `npm run test:fs`.
-- **Touch points.** Leader-owned wave-0 seam: `GitDrive.writeFiles` return type
-  in `packages/drive/src/index.ts` and `InitialWorktreeSession` in
-  `ops/core/context.ts`. WU5 territory: `ops/checkout/initial-checkout.ts`,
-  `ops/checkout/checkout-writes.ts`, `packages/do/src/fs/store/initial-write/*`,
-  `packages/do/src/fs/store/write.ts`, `packages/do/src/fs/compat/node-operations.ts`,
-  `packages/do/src/fs/ops.ts`, `packages/local/src/drive/write.ts`,
-  `packages/local/src/drive/disk-drive.ts`, the other `writeFiles`
-  implementations (`packages/do/src/fs/filesystem.ts:152`,
-  `packages/do/src/fs/types.ts:174`, `packages/do/src/shell/exec/context.ts:232`)
-  and the test overrides in `tests/refs.test.ts`, `tests/clone.test.ts`,
-  `tests/concurrency-clone.test.ts` (type changes only); tests above.
+  tracker incomplete (otherwise WU4 already makes the add cheap): after an
+  initial DO checkout, a clean `git add .` rehashes nothing and writes no index
+  rows; a same-size edit within the same timestamp tick is still reported by
+  status through `rev`. `tests/checkout-initial.test.ts`,
+  `tests/clone-initial.test.ts`, `tests/status.test.ts`,
+  `tests/fs/initial-write.test.ts`, `tests/workspace.test.ts` pass;
+  `npm run test:fs`.
+- **Touch points.** `ops/core/context.ts` (`InitialWorktreeSession` return
+  types; WU5 runs alone, so it owns this seam), `ops/checkout/initial-checkout.ts`,
+  `packages/do/src/fs/store/initial-write/*`, `packages/do/src/fs/store/initial-write.ts`,
+  `packages/do/src/runtime/workspace.ts` (only if the writer wiring needs it);
+  tests above.
 
 ## Review strategy
 
@@ -286,7 +290,7 @@ Paths are relative to `packages/git/src/` unless prefixed.
 | WU2 | Fundamental: projections are trusted at read (ADR-0004); a wrong row is undetected corruption | Witness above; independent review; re-review until clean | Schema change needed; loose-object path behaviour changes |
 | WU3 | Fundamental: connectivity is the fetch integrity check | Witness above; independent review; re-review until clean | Any accepted graph that the current code rejects |
 | WU4 | Normal-high: staging semantics, tracker sealing | Witness above with git parity; independent review; one fix round then re-review | Seam change in `contracts.ts`/`context.ts`; tracker reseal path changes |
-| WU5 | Normal-high: changes the `GitDrive` contract across `git`/`do`/`local`; a wrong stat hides edits | Witness above; independent review; re-review after fixes | Any change to `indexMatchesStat` or local stat semantics |
+| WU5 | Normal-high: a wrong stat hides edits | Witness above; independent review; re-review after fixes | Any change to `indexMatchesStat`, `GitDrive`, or local stat semantics |
 
 ## Test cadence
 
@@ -321,7 +325,8 @@ Paths are relative to `packages/git/src/` unless prefixed.
 - No schema change in this sprint. A WU that needs one reports `blocked`.
 - The leader owns `bench/statements.ts`: new rows and downward rebaselines go
   in each WU's commit, so stale baselines cannot hide a later rise.
-- The local drive keeps NULL checkout stat data (WU5).
+- WU5 covers initial checkout only; ordinary checkout and the local drive keep
+  NULL stat data (user decision, 2026-10-07).
 
 ## Sequencing
 
@@ -329,7 +334,7 @@ Paths are relative to `packages/git/src/` unless prefixed.
 |---|---|---|
 | 1 | WU1 ∥ WU3 | Largest measured regions; disjoint files |
 | 2 | WU2 ∥ WU4 | WU2 after WU1 lands in `store/pack/`; WU4 independent |
-| 3 | WU5 | Leader lands the `GitDrive.writeFiles` and `InitialWorktreeSession` seam first; WU4's bench row is rebaselined after it |
+| 3 | WU5 | Runs alone and owns the `InitialWorktreeSession` seam |
 | Closure | re-profile, `test:full`, archive | — |
 
 ## Plan review
@@ -355,3 +360,62 @@ Paths are relative to `packages/git/src/` unless prefixed.
     per-WU measured figures named.
 
 ## Run log
+
+- WU3: the plan wrongly required `tests/network-integrity.test.ts` to pass
+  unchanged; three tests assert the old per-edge `objectInfo` export. Leader
+  decision: rewrite only those cost-shape assertions (and the shared-tree
+  expansion test) to the new shape; every acceptance/rejection test stays
+  byte-identical.
+- WU3: the HEAD connectivity blob branch plans as
+  `SCAN entry USING INDEX git_tree_entries_by_name_bytes` — a whole-repository
+  entry scan, a likely main source of the 35 M native rows read.
+- WU3: connectivity now ranks failures globally (sourceless tree → commit →
+  missing → wrong type) instead of by HEAD's 4,096-object flush order. A graph
+  with several different failures can report another code than HEAD; every
+  graph HEAD rejects is still rejected (independent review, clean).
+- WU3 follow-up: the commit branch of the connectivity CTE plans `SCAN c` over
+  all of `git_commits` per hop and root page, at HEAD and after WU3. Candidate
+  fix: drive it from `reachable` with `CROSS JOIN`. Verify on the bench fixture.
+- Wave 1 gate (WU1 + WU3 together in the tree): `npm run typecheck`,
+  `npm run check`, `npm test` (160/160), `cpu-lease run -n 4 -- npm run
+  bench:statements -- --check` pass. `transport.fetch` dropped 77 → 73
+  statements and 63 → 53 rows read; rebaselined in the WU3 commit (measured
+  with both units present). `npm run bench:memory` passes, but none of its
+  scenarios runs connectivity over a large history, so WU3's temp B-tree memory
+  is unmeasured until the closure re-profile. The `nextjs:git.clone` row reads
+  a stale 2026-09-24 result and is report-only.
+- WU1: `runnableRows` returning `[]` for a page with no ready row has no test;
+  it is a cost skip only (independent review accepted).
+- WU2 first round: pack ingest 328 → 210 statements on a 683-tree fixture,
+  but loose tree writes rose +1 statement per flush (separate key read);
+  `bench:statements --check` failed on commit/merge/replay/rebase rows
+  (e.g. rebase.transition-2n 1055 → 1063). Sent back: zero rise on the loose
+  path. Binding vs insert per 2,048-row window: old JSON objects + OID join
+  12.4–15.0 ms; JSON arrays + key 8.2–8.8 ms; fixed-width records 5.0–5.4 ms
+  (not adopted; codebase convention is `json_each`).
+- WU4: one shared sparse candidate collector now serves status, diff and
+  tracker-driven add (`ops/worktree/sparse-candidates.ts`). Pre-existing,
+  unchanged: `add -u` restricts to paths in HEAD, not the index (git stages a
+  newly added then modified file; kompjutr does not) → backlog at closure.
+- WU4 gate: independent review clean, verified on an isolated HEAD + WU4 copy
+  where `bench:statements --check` passed. staging.add 17/26 → 16/23,
+  staging.add-selected 24/33 → 23/28 (rebaselined); new row
+  `staging.add-tracker` (5,000 files, clean second add) 11 statements / 9 rows.
+  Witness 304/304. Pre-existing gap found: porcelain v2 shows a pending type
+  change (file ↔ symlink) as `M` where git shows `T` → backlog at closure.
+- WU2 deviation from scope item 1: instead of carrying integer `source_key`s,
+  the entry statement resolves `(repo_id, tree_oid, complete = 0)` once per
+  tree per 2,048-row window in a `MATERIALIZED` CTE (`CROSS JOIN`). Carrying
+  keys needed a separate key read, which raised every loose tree write by one
+  statement (first round). Second round: loose 600/600 and 326/326 statements
+  unchanged; pack ingest of 683 trees ~326 → 202; `bench:statements --check`
+  passes (independent review). workerd bundles SQLite 3.47.0.
+- Closure `test:full` (4,677 passed in other batches): one failure,
+  `tests/objects-query-growth.test.ts` "keeps unchanged legacy fetch metadata
+  pages selective…" — passes at eb89b3d, fails at HEAD. It counted objectInfo
+  pages over blobs that WU3 now checks inside the connectivity SQL; WU3's
+  witness set missed this file. Fix: assert selectivity of the new path.
+- Closure re-profile (fresh persistence, same harness for both sides, one run
+  each, `cpu-lease run -n 2 --no-smt`, host wall time; exact HEAD, 24,252
+  files, clean worktree checked): eb89b3d 428.8 s / 31,881 statements /
+  4,918,725 rows returned → 2d3bde0 197.0 s / 6,414 / 537,989.

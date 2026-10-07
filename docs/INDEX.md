@@ -16,8 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprint-2026-10-07-full-history-performance.md`](sprints/sprint-2026-10-07-full-history-performance.md)
-  — full-history clone and `git add` performance.
+None.
 
 ## Specs
 
@@ -35,9 +34,10 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
        If everything is "hot", nothing is. -->
-- [Full-history performance sprint](sprints/sprint-2026-10-07-full-history-performance.md)
-  — cut SQL and row work in full-history clone and `git add`, from the
-  [measured proposal](ideas/full-history-import-performance.md).
+- [Full-history performance](archive/sprint-2026-10-07-full-history-performance.md)
+  shipped: Next.js full-history clone 428.8 s → 197.0 s (native git 17–19 s),
+  −80 % statements; tracker-driven `git add`. Next: attribute the remaining
+  time ([118](backlog/118-profile-the-remaining-full-history-clone.md)).
 - [Simplification](archive/sprint-2026-09-23-simplification.md) shipped: −14 %
   Git source, 61 → 46 tables, self-contained packs, `STRICT` schema, rebase at
   any size. Next: the [backlog plan](backlog/README.md#sprint-plan).
