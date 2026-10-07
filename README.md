@@ -9,6 +9,9 @@ Kompjutr is a SQLite-native filesystem and Git runtime. It has two compositions:
 
 Neither composition creates a `.git` directory.
 
+Try the [local browser playground](examples/playground/README.md): edit, search,
+and commit the 24,252-file Next.js source tree with a shared editor and terminal.
+
 ```ts
 import { Workspace } from "@kompjutr/do";
 import { createGit } from "@kompjutr/git";

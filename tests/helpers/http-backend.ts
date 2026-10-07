@@ -27,6 +27,8 @@ export interface RequestRecord {
 }
 
 export interface GitServerOptions {
+  /** Keep the origin URL stable across local playground restarts. */
+  port?: number;
   /** Answer 401 until the client sends an Authorization header. */
   requireAuth?: boolean;
   /** Destroy the connection after this many bytes of a POST response body. */
@@ -70,7 +72,13 @@ export async function startGitServer(
     socket.on("close", () => sockets.delete(socket));
   });
 
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(options.port ?? 0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
   const port = addressPort(server);
 
   return {
