@@ -9,6 +9,8 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Fast fresh clone](sprint-2026-10-07-fast-fresh-clone.md) — per-pack
+  connectivity at ingest, trees projected on demand; 179.5 s → 74.5 s.
 - [Full-history performance](sprint-2026-10-07-full-history-performance.md)
   — chunk-once pack range reads, cheaper tree projections, set-based
   connectivity, tracker-driven `git add`, and stat data at initial checkout.

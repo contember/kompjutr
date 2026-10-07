@@ -1,3 +1,57 @@
+> **OUTCOME — shipped 2026-10-08.**
+>
+> **Result.** The full-history `blob:none` clone of Next.js v15.5.2 dropped
+> from 179.5 s / 6,373 statements / 537,955 rows (WU0 baseline at `d3f230f`)
+> to 74.5 s / 2,210 / 512,260 at `1347704`. The database shrank from 1.28 GB
+> to 472 MB. Both are single leased runs of `bench:workerd:nextjs --
+> --history=full` (`cpu-lease run -n 2 --no-smt`), with HEAD, 24,252 files and
+> a clean worktree verified. The CDP profile shows 73.8 s busy, against
+> 204.2 s at `8bd064f`. A one-commit incremental fetch on the full-history
+> store dropped from 28–32 s to 3.2 s.
+>
+> **Memory.** The full-history V8 peak fell from 988 MB to 731 MB. The depth-1
+> ADR-0026 gate passes at 332 MB (limit 450 MiB). That is not a drop from the
+> WU0 run's 314 MB, so the limit is unchanged.
+>
+> **Targets.**
+> - **≤ 60 s:** missed by 14.5 s. Remaining work → backlog 120.
+> - **Request CPU limit:** not met; the clone is still one ~74 s request
+>   → backlog 119.
+>
+> **Commit map.**
+>
+> | Unit | Commit |
+> |---|---|
+> | Plan | `954d2fd` |
+> | WU0 | `d3f230f` |
+> | WU1 | `bb69e93` |
+> | WU2 | `ed4a50d` |
+> | Ceiling fix for the earlier mounted-FS merge | `348a0fd` |
+> | WU3 | `cc2c831` |
+> | WU1b | `c7caa2e` |
+> | WU4 | `1347704` |
+>
+> **Verification.** Every WU passed its witness and an independent review to
+> clean:
+> - WU1: two rounds;
+> - WU2: three rounds;
+> - WU3: two rounds;
+> - WU4: two rounds, with one blocking finding (the sweep strip);
+> - WU1b: leader review.
+>
+> At closure, `npm run typecheck`, `npm run check`, `npm test` (160/160),
+> `bench:statements -- --check`, and `npm run test:full` (8,282 tests, 0
+> failures) all pass.
+>
+> **Decisions.** ADR-0029 and ADR-0030 are accepted. ADR-0004, ADR-0009 and
+> ADR-0015 were updated.
+>
+> **Backlog filed:** 119, 120, 121 and 122.
+>
+> **Deferred.**
+> - The sweep-strip watermark (run log).
+> - Implicit promises; out of scope by design.
+
 # Sprint — fast fresh clone (2026-10-07)
 
 **Goal.** Remove the clone work native Git never does: history-wide

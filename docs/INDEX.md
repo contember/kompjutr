@@ -16,8 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [Fast fresh clone](sprints/sprint-2026-10-07-fast-fresh-clone.md) — per-pack
-  connectivity (ADR-0029) and trees projected on demand (ADR-0030).
+None.
 
 ## Specs
 
@@ -35,10 +34,15 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
        If everything is "hot", nothing is. -->
+- [Fast fresh clone](archive/sprint-2026-10-07-fast-fresh-clone.md) shipped:
+  per-pack connectivity at ingest (ADR-0029) and trees projected on demand
+  (ADR-0030). Next.js full-history clone 179.5 s → 74.5 s, database
+  1.28 GB → 472 MB, one-commit incremental fetch 28 s → 3.2 s. Next: backlog
+  119 (slice the clone under the request CPU limit) and 120.
 - [Full-history performance](archive/sprint-2026-10-07-full-history-performance.md)
   shipped: Next.js full-history clone 428.8 s → 197.0 s (native git 17–19 s),
   −80 % statements; tracker-driven `git add`. Next: the
-  [fast fresh clone](sprints/sprint-2026-10-07-fast-fresh-clone.md) sprint.
+  [fast fresh clone](archive/sprint-2026-10-07-fast-fresh-clone.md) sprint (shipped).
 - [Simplification](archive/sprint-2026-09-23-simplification.md) shipped: −14 %
   Git source, 61 → 46 tables, self-contained packs, `STRICT` schema, rebase at
   any size. Next: the [backlog plan](backlog/README.md#sprint-plan).
