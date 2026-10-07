@@ -13,6 +13,7 @@ npm run bench:clone-storage  # SQLite bytes a clone costs, and where they go
 npm run bench:memory         # cgroup-backed bounded-memory evidence under cpu-lease
 npm run bench:memory -- --runtime-check  # focused lease/cgroup wiring witness
 npm run bench:workerd:nextjs # clone in a SQLite Durable Object; V8 regression gate
+npm run bench:workerd:nextjs -- --history=full  # full-history blob:none clone
 ```
 
 Scenarios: `synthetic.ts` isolates one variable at a time; `macro` replays the
@@ -20,6 +21,10 @@ reference experiment against real repositories; `shell` measures the command
 surface; `nextjs-workflow.ts` runs clone through a 100-file commit and push,
 then rebases that commit onto a new `main` commit;
 `clone-storage.ts` sizes the database a clone leaves behind, against real git.
+`workerd/run.ts` clones Next.js at depth 1 by default. `--history=full` clones
+the whole upstream history with `filter: blob:none` from a bare clone cached at
+`bench/.fixtures/nextjs-history.git`, verifies a clean worktree, and reports
+the V8 peak without gating it. A run takes minutes.
 `statements.ts` checks correctness and frozen SQL/row baselines for operations
 whose runtime query barriers were removed, and for the sparse fast paths
 (`status.sparse-*`, `staging.add-selected`, `worktree.list`). It reports whether

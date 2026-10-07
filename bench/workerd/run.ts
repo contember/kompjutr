@@ -11,6 +11,7 @@ import { Miniflare, type StructuredLogsHandler } from "miniflare";
 import { startGitServer } from "../../tests/helpers/http-backend.js";
 import { FIXTURES, ORIGIN_BRANCH, prepareFixture, trackedEntries } from "../fixtures.js";
 import { GC_TRACE_V8_FLAGS, GcTrace, lineBufferedRuntimeEnv } from "./gc-trace.js";
+import { prepareHistoryOrigin } from "./history-origin.js";
 import {
   MemorySampler,
   resetPeakRss,
@@ -41,6 +42,34 @@ interface CheckoutResult {
 
 type DurableObjectPost = (path: string, body: object) => Promise<unknown>;
 
+type History = "depth1" | "full";
+
+function historyMode(args: readonly string[]): History {
+  if (args.length === 0) return "depth1";
+  if (args.length === 1 && args[0] === "--history=full") return "full";
+  throw new Error(`usage: bench:workerd:nextjs [--history=full]; got ${args.join(" ")}`);
+}
+
+interface Origin {
+  gitDir: string;
+  head: string;
+  files: number;
+}
+
+function depthOneOrigin(): Origin {
+  const fixture = FIXTURES.nextjs;
+  const fixtureDir = prepareFixture(fixture);
+  const files = trackedEntries(fixtureDir).length;
+  if (files !== fixture.files) {
+    throw new Error(`fixture has ${files} tracked files, expected ${fixture.files}`);
+  }
+  const head = execFileSync("git", ["rev-parse", ORIGIN_BRANCH], {
+    cwd: fixtureDir,
+    encoding: "utf8",
+  }).trim();
+  return { gitDir: join(fixtureDir, ".git"), head, files };
+}
+
 function statementTarget(statements: number): "pass" | "miss" {
   return statements <= STATEMENT_TARGET ? "pass" : "miss";
 }
@@ -69,6 +98,11 @@ function checkoutResult(value: unknown): CheckoutResult {
     head,
     databaseBytes: count(value, "databaseBytes"),
   };
+}
+
+function worktreeChangeCount(value: unknown): number {
+  if (typeof value !== "object" || value === null) throw new Error("invalid status result");
+  return count(value, "worktreeChanges");
 }
 
 function durableObjectPost(namespace: unknown): DurableObjectPost {
@@ -136,6 +170,7 @@ function packageVersion(name: string): string {
   return version;
 }
 
+const history = historyMode(process.argv.slice(2));
 const here = dirname(fileURLToPath(import.meta.url));
 const revision = measuredRevision(join(here, "..", ".."));
 const runtimeVersions = {
@@ -157,17 +192,10 @@ const routeWorkerdLog: StructuredLogsHandler = ({ level, message }) => {
 };
 
 try {
-  const fixture = FIXTURES.nextjs;
-  const fixtureDir = prepareFixture(fixture);
-  const expectedFiles = trackedEntries(fixtureDir).length;
-  if (expectedFiles !== fixture.files) {
-    throw new Error(`fixture has ${expectedFiles} tracked files, expected ${fixture.files}`);
-  }
-  const expectedHead = execFileSync("git", ["rev-parse", ORIGIN_BRANCH], {
-    cwd: fixtureDir,
-    encoding: "utf8",
-  }).trim();
-  origin = await startGitServer(join(fixtureDir, ".git"));
+  const source = history === "full" ? prepareHistoryOrigin() : depthOneOrigin();
+  const expectedHead = source.head;
+  const expectedFiles = source.files;
+  origin = await startGitServer(source.gitDir);
   const bundle = join(temporary, "worker.mjs");
   await build({
     entryPoints: [join(here, "worker.ts")],
@@ -225,7 +253,7 @@ try {
     const started = performance.now();
     let counts: CloneCounts;
     try {
-      counts = cloneCounts(await post("/clone", { originUrl: origin.url }));
+      counts = cloneCounts(await post("/clone", { originUrl: origin.url, history }));
     } catch (error) {
       sampler.stop();
       throw error;
@@ -242,6 +270,8 @@ try {
     const v8 = trace.attributeBetweenMarkers(1, 2);
 
     const checkout = checkoutResult(await post("/verify", { expectedHead, expectedFiles }));
+    const worktreeChanges =
+      history === "full" ? worktreeChangeCount(await post("/status", {})) : undefined;
 
     const addedPeakRssBytes = Math.max(0, peakRssBytes - baselineRssBytes);
     // Each residue pairs one smaps_rollup with the forced GC just before it, so
@@ -253,6 +283,7 @@ try {
     process.stdout.write(
       `${JSON.stringify(
         {
+          ...(history === "full" ? { history, filter: "blob:none", worktreeChanges } : {}),
           ...counts,
           ...checkout,
           wallMs,
@@ -308,19 +339,29 @@ try {
             atMost: STATEMENT_TARGET,
             status: statementTarget(counts.statements),
           },
-          v8RegressionLimit: {
-            measure: "clone.v8.peakUsedPlusExternalBytes",
-            limitBytes: V8_USED_PLUS_EXTERNAL_LIMIT_BYTES,
-            status:
-              v8.peakUsedPlusExternalBytes <= V8_USED_PLUS_EXTERNAL_LIMIT_BYTES ? "pass" : "fail",
-          },
+          // The ADR-0026 limit is calibrated on the depth-1 clone; full history only reports.
+          ...(history === "depth1"
+            ? {
+                v8RegressionLimit: {
+                  measure: "clone.v8.peakUsedPlusExternalBytes",
+                  limitBytes: V8_USED_PLUS_EXTERNAL_LIMIT_BYTES,
+                  status:
+                    v8.peakUsedPlusExternalBytes <= V8_USED_PLUS_EXTERNAL_LIMIT_BYTES
+                      ? "pass"
+                      : "fail",
+                },
+              }
+            : {}),
         },
         null,
         2,
       )}\n`,
     );
+    if (worktreeChanges !== undefined && worktreeChanges !== 0) {
+      throw new Error(`clone left ${worktreeChanges} worktree changes`);
+    }
     // Process RSS is report-only: local workerd RSS does not measure the isolate limit.
-    if (v8.peakUsedPlusExternalBytes > V8_USED_PLUS_EXTERNAL_LIMIT_BYTES) {
+    if (history === "depth1" && v8.peakUsedPlusExternalBytes > V8_USED_PLUS_EXTERNAL_LIMIT_BYTES) {
       throw new Error(
         `clone gate failed: ${v8.peakUsedPlusExternalBytes} V8 used + external bytes > ${V8_USED_PLUS_EXTERNAL_LIMIT_BYTES}`,
       );

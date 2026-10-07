@@ -11,8 +11,11 @@ interface DurableObjectContextLike {
   storage: DurableObjectStorageLike;
 }
 
+type History = "depth1" | "full";
+
 interface CloneInput {
   originUrl: string;
+  history: History;
 }
 
 interface VerifyInput {
@@ -75,8 +78,11 @@ class CountingStorage implements DurableObjectStorageLike {
 function cloneInput(value: unknown): CloneInput {
   if (typeof value !== "object" || value === null) throw new Error("invalid clone input");
   const originUrl = Reflect.get(value, "originUrl");
-  if (typeof originUrl !== "string") throw new Error("invalid clone input");
-  return { originUrl };
+  const history = Reflect.get(value, "history");
+  if (typeof originUrl !== "string" || (history !== "depth1" && history !== "full")) {
+    throw new Error("invalid clone input");
+  }
+  return { originUrl, history };
 }
 
 function verifyInput(value: unknown): VerifyInput {
@@ -192,6 +198,10 @@ export class CloneBench {
           return Response.json(await this.#clone(cloneInput(await request.json())));
         case "/verify":
           return Response.json(await this.#verify(verifyInput(await request.json())));
+        case "/status":
+          return Response.json({
+            worktreeChanges: (await this.#workspace.git.status({ dir: "/repo" })).length,
+          });
         default:
           return new Response("not found", { status: 404 });
       }
@@ -207,7 +217,7 @@ export class CloneBench {
       url: input.originUrl,
       dir: "/repo",
       ref: "main",
-      depth: 1,
+      ...(input.history === "full" ? { filter: "blob:none" } : { depth: 1 }),
       singleBranch: true,
     });
     return { statements: this.#storage.sql.statements, rows: this.#storage.sql.rows };
