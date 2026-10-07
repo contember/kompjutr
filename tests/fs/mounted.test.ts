@@ -151,6 +151,52 @@ describe("symlinks fail closed", () => {
     expect(outsideState(base)).toEqual(before);
   });
 
+  it("fails closed at whichever hop of a chain leaves the mount", () => {
+    const { base, view } = sessions();
+    base.writeFiles([
+      { path: "/w/a/sub", mode: 0o755 },
+      { path: "/w/a/abs1", target: "abs2" },
+      { path: "/w/a/abs2", target: "/w/b/src/main.ts" },
+      { path: "/w/a/sub/rel1", target: "../rel2" },
+      { path: "/w/a/rel2", target: "../b/src/main.ts" },
+      { path: "/w/a/mix1", target: "sub/mix2" },
+      { path: "/w/a/sub/mix2", target: "../mix3" },
+      { path: "/w/a/mix3", target: "/w/b/src/main.ts" },
+      { path: "/w/a/dabs1", target: "dabs2" },
+      { path: "/w/a/dabs2", target: "/w/b/src" },
+      { path: "/w/a/sub/drel1", target: "../drel2" },
+      { path: "/w/a/drel2", target: "../b/src" },
+      { path: "/w/a/dmix1", target: "sub/dmix2" },
+      { path: "/w/a/sub/dmix2", target: "../dmix3" },
+      { path: "/w/a/dmix3", target: "/w/b/src" },
+    ]);
+    const before = outsideState(base);
+    for (const chain of ["abs1", "sub/rel1", "mix1"]) {
+      const path = `${W}/${chain}`;
+      const absent = (work: () => unknown) => expect(codeOf(work), chain).toBe("ENOENT");
+      expect(view.statTarget(path), chain).toBeNull();
+      expect(view.readFiles([path]).files.size, chain).toBe(0);
+      absent(() => view.readFile(path));
+      absent(() => view.realpath(path));
+      absent(() => view.writeFile(path, text("x")));
+      absent(() => view.writeFileStream(path, [text("x")]));
+      absent(() => view.touchFiles([path]));
+    }
+    for (const chain of ["dabs1", "sub/drel1", "dmix1"]) {
+      const path = `${W}/${chain}`;
+      const absent = (work: () => unknown) => expect(codeOf(work), chain).toBe("ENOENT");
+      expect(view.scan(path, { limit: 100 }), chain).toEqual([]);
+      absent(() => view.readdir(path));
+      absent(() => view.readFile(`${path}/main.ts`));
+      absent(() => view.writeFile(`${path}/new.ts`, text("x")));
+      absent(() => view.writeFiles([{ path: `${path}/new.ts`, bytes: text("x") }]));
+      absent(() => view.mkdir(`${path}/sub`));
+      absent(() => view.rename(`${W}/README.md`, `${path}/README.md`));
+      absent(() => view.removeFiles([`${path}/main.ts`]));
+    }
+    expect(outsideState(base)).toEqual(before);
+  });
+
   it("stores a target written through the view verbatim", () => {
     const { base, view } = sessions();
     view.symlink("/w/b/src/main.ts", `${W}/planted`);
@@ -305,6 +351,121 @@ describe("mutations", () => {
     expect(base.stat("/w/a/made")?.type).toBe("dir");
     view.removeFiles([`${W}/new`], { recursive: true });
     expect(base.exists("/w/a/new")).toBe(false);
+  });
+});
+
+describe("a mount root reached through a symlink", () => {
+  // `self/.` and `sub/up/` name the mount's source only once the store has
+  // followed `self` or `up`; a lexical comparison cannot see it.
+  const LINKS = [
+    { path: "/w/a/self", target: "." },
+    { path: "/w/a/sub", mode: 0o755 },
+    { path: "/w/a/sub/up", target: ".." },
+  ];
+
+  interface Subject {
+    readonly base: Filesystem;
+    readonly view: Filesystem;
+    /** A file, a directory, and a free name inside the same mount. */
+    readonly inside: { readonly file: string; readonly dir: string; readonly free: string };
+  }
+
+  function nested(): Subject {
+    const { base, view } = sessions();
+    base.writeFiles(LINKS);
+    const inside = { file: `${W}/README.md`, dir: `${W}/src`, free: `${W}/moved` };
+    return { base, view, inside };
+  }
+
+  function top(): Subject {
+    const { base } = sessions();
+    base.writeFiles(LINKS);
+    const view = createMountedFilesystem(base, [{ path: "/", source: "/w/a", mode: "rw" }]);
+    return { base, view, inside: { file: "/README.md", dir: "/src", free: "/moved" } };
+  }
+
+  function mutations(subject: Subject, root: string): Record<string, () => unknown> {
+    const { view, inside } = subject;
+    return {
+      rm: () => view.rm(root, { recursive: true }),
+      rmForce: () => view.rm(root, { recursive: true, force: true }),
+      rmdir: () => view.rmdir(root),
+      removeFiles: () => view.removeFiles([root], { recursive: true }),
+      removeFilesForce: () => view.removeFiles([root], { recursive: true, force: true }),
+      renameFrom: () => view.rename(root, inside.free),
+      renameOntoFromFile: () => view.rename(inside.file, root),
+      renameOntoFromDir: () => view.rename(inside.dir, root),
+      symlink: () => view.symlink("/s/b", root),
+      mkdir: () => view.mkdir(root),
+      writeFile: () => view.writeFile(root, text("x")),
+      createFile: () => view.createFile(root, 0o644),
+      link: () => view.link(inside.file, root),
+      unlink: () => view.unlink(root),
+      writeFilesFile: () => view.writeFiles([{ path: root, bytes: text("x") }]),
+      writeFilesLink: () => view.writeFiles([{ path: root, target: "/s/b" }]),
+      copyFiles: () => view.copyFiles([{ source: inside.file, destination: root }]),
+    };
+  }
+
+  /** The source as the base sees it: its identity and everything under it. */
+  function sourceState(base: Filesystem): string[] {
+    const rows = [`${base.stat("/w/a")?.type} ${base.stat("/w/a")?.ino}`];
+    for (const entry of base.scanStream(base.realpath("/w/a"))) {
+      rows.push(`${entry.path} ${entry.type} ${entry.size} ${entry.mode}`);
+    }
+    return rows;
+  }
+
+  function expectBusy(make: () => Subject, roots: readonly string[]): void {
+    const names = Object.keys(mutations(make(), roots[0] ?? "/"));
+    for (const root of roots) {
+      const codes: Record<string, string | undefined> = {};
+      for (const name of names) {
+        const subject = make();
+        const before = sourceState(subject.base);
+        const attempt = mutations(subject, root)[name];
+        codes[name] = attempt === undefined ? "missing" : codeOf(attempt);
+        expect(sourceState(subject.base), `${name} ${root}`).toEqual(before);
+      }
+      expect(codes, root).toEqual(Object.fromEntries(names.map((name) => [name, "EBUSY"])));
+    }
+  }
+
+  it("refuses every mutation that would remove or replace it", () => {
+    expectBusy(nested, [
+      W,
+      `${W}/.`,
+      `${W}/self/.`,
+      `${W}/self/`,
+      `${W}/self/./`,
+      `${W}/self/self/.`,
+      `${W}/sub/up/.`,
+      `${W}/sub/up/`,
+      `${W}/self/sub/up/.`,
+      `${W}/src/../self/.`,
+      `${W}/sub/..`,
+      `${W}/sub/up/sub/..`,
+    ]);
+  });
+
+  it("refuses the same on a mount at `/`", () => {
+    expectBusy(top, ["/self/.", "/self/", "/sub/up/.", "/self/sub/up/."]);
+  });
+
+  it("still treats `mkdir -p` of the root as satisfied", () => {
+    const subject = nested();
+    const before = sourceState(subject.base);
+    subject.view.mkdir(`${W}/self/.`, { recursive: true });
+    subject.view.makeDirectories([`${W}/sub/up/`, W]);
+    expect(sourceState(subject.base)).toEqual(before);
+  });
+
+  it("leaves the base filesystem pointing at its own session", () => {
+    const { base, view } = nested();
+    expect(codeOf(() => view.rm(`${W}/self/.`, { recursive: true }))).toBe("EBUSY");
+    expect(codeOf(() => view.symlink("/s/b", W))).toBe("EBUSY");
+    expect(base.stat("/w/a")?.type).toBe("dir");
+    expect(DECODER.decode(base.readFile("/w/a/README.md"))).toBe("# A\n");
   });
 });
 

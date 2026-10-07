@@ -126,27 +126,39 @@ describe("writes from session A", () => {
 });
 
 describe("with the git command injected", () => {
-  it("runs the other commands unchanged", async () => {
+  // ADR 0028: git is not confined. It binds the real filesystem and reads the
+  // shell's virtual cwd as a real path, so it sees what the view hides.
+  it("binds the real filesystem and reads the virtual cwd as a real path", async () => {
     const workspace = new Workspace({
       storage: new SqliteTestStorage(),
       git: createGit(),
       defaultGitIdentity: { name: "Agent", email: "agent@example.com" },
       now: () => 1_577_836_800_000,
     });
-    workspace.filesystem.mkdir("/w/a/repo", { recursive: true });
+    const real = workspace.filesystem;
+    real.mkdir("/w/a/repo", { recursive: true });
     await workspace.git.init({ dir: "/w/a/repo" });
-    workspace.filesystem.writeFile("/w/a/repo/file.txt", new TextEncoder().encode("one\n"));
-    const view = createMountedFilesystem(workspace.filesystem, [
-      { path: W, source: "/w/a", mode: "rw" },
-    ]);
+    real.writeFile("/w/a/repo/file.txt", new TextEncoder().encode("one\n"));
+    const view = createMountedFilesystem(real, [{ path: W, source: "/w/a", mode: "rw" }]);
     const gitShell = createShell({
       fs: view,
       cwd: `${W}/repo`,
       commands: new Map([["git", createGitCommand(workspace.git)]]),
     });
     expect((await gitShell.run("cat file.txt && ls /home/user")).stdout).toBe("one\nworkspace\n");
-    const git = await gitShell.run("git status --porcelain");
-    expect(typeof git.exitCode).toBe("number");
+
+    // The view maps the cwd onto the repository at /w/a/repo; git does not.
+    const unmapped = await gitShell.run("git status --porcelain");
+    expect(unmapped.exitCode).toBe(128);
+    expect(unmapped.stderr).toMatch(/not a git repository/);
+
+    real.mkdir(`${W}/repo`, { recursive: true });
+    await workspace.git.init({ dir: `${W}/repo` });
+    real.writeFile(`${W}/repo/hidden.txt`, new TextEncoder().encode("hidden\n"));
+    expect(view.exists(`${W}/repo/hidden.txt`)).toBe(false);
+    const status = await gitShell.run("git status --porcelain");
+    expect(status.exitCode).toBe(0);
+    expect(status.stdout).toBe("?? hidden.txt\n");
   });
 });
 

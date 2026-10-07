@@ -41,6 +41,7 @@ import {
   copyFilesOf,
   crossDevice,
   isMountRoot,
+  notMountRoot,
   removeFilesOf,
   type Target,
   touchFilesOf,
@@ -168,11 +169,11 @@ export function createMountedFilesystem(
       mutated();
     },
     writeFile(path, bytes, options) {
-      const target = writable(context, path, "parent");
+      const target = notMountRoot(context, path, writable(context, path, "parent"));
       single(target, () => ops(target).writeFile(target.real, bytes, options));
     },
     createFile(path, mode) {
-      const target = writable(context, path, "creates");
+      const target = notMountRoot(context, path, writable(context, path, "creates"));
       single(target, () => ops(target).createFile(target.real, mode));
     },
     writeRange(path, bytes, offset) {
@@ -191,10 +192,15 @@ export function createMountedFilesystem(
         throw filesystemError("EEXIST", "path exists", path);
       }
       const target = writable(context, path, recursive ? "creates" : "parent", location);
+      if (isMountRoot(context, target)) {
+        // The mount point exists for as long as the view does.
+        if (recursive) return;
+        throw busy(path);
+      }
       single(target, () => ops(target).mkdir(target.real, options));
     },
     symlink(linkTarget, path) {
-      const target = writable(context, path, "parent");
+      const target = notMountRoot(context, path, writable(context, path, "parent"));
       single(target, () => ops(target).symlink(linkTarget, target.real));
     },
     link(existingPath, newPath) {
@@ -203,18 +209,17 @@ export function createMountedFilesystem(
       if (source.kind === "synthetic") {
         throw filesystemError("EPERM", "cannot hardlink a non-file", existingPath);
       }
-      const target = writable(context, newPath, "parent");
+      const target = notMountRoot(context, newPath, writable(context, newPath, "parent"));
       if (source.mount !== target.mount) throw crossDevice(newPath);
       single(target, () => ops(target).link(source.real, target.real));
     },
     unlink(path) {
-      const target = writable(context, path, "exists");
+      const target = notMountRoot(context, path, writable(context, path, "exists"));
       single(target, () => ops(target).unlink(target.real));
     },
     rmdir(path) {
       if (normalize(path) === "/") throw busy(path);
-      const target = writable(context, path, "exists");
-      if (isMountRoot(target)) throw busy(path);
+      const target = notMountRoot(context, path, writable(context, path, "exists"));
       single(target, () => ops(target).rmdir(target.real));
     },
     rm(path, options = {}) {
@@ -223,8 +228,7 @@ export function createMountedFilesystem(
       }
       const location = context.locate(path);
       if (options.force === true && location.kind === "absent") return;
-      const target = writable(context, path, "exists", location);
-      if (isMountRoot(target)) throw busy(path);
+      const target = notMountRoot(context, path, writable(context, path, "exists", location));
       single(target, () => ops(target).rm(target.real, options));
     },
     rename(oldPath, newPath) {
@@ -236,9 +240,8 @@ export function createMountedFilesystem(
       const source = context.locate(oldPath);
       if (source.kind === "absent") throw missing(oldPath);
       if (source.kind === "synthetic" || source.mount.mode === "ro") throw readOnly(oldPath);
-      if (isMountRoot(source)) throw busy(oldPath);
-      const target = writable(context, newPath, "parent");
-      if (isMountRoot(target)) throw busy(newPath);
+      notMountRoot(context, oldPath, source);
+      const target = notMountRoot(context, newPath, writable(context, newPath, "parent"));
       if (source.mount !== target.mount) throw crossDevice(newPath);
       single(target, () => ops(target).rename(source.real, target.real));
     },

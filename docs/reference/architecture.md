@@ -117,15 +117,15 @@ dangling link to `lstat`, `ENOENT` to reads, writes, and traversal, and
 `realpath` throws `ENOENT`. A kernel bind mount would follow it. A mount at `/`
 is the top of its namespace, as a chroot is: `..` at its root stays there and an
 absolute target resolves from the source. A caller's own `..` after a mount
-prefix leaves the mount as it would leave a bind mount; that path costs one
-extra resolution statement. Targets written through the view are stored
+prefix leaves the mount as it would leave a bind mount; that path, and a
+mutation path ending in `.` or `/`, costs one extra resolution statement. Targets written through the view are stored
 verbatim.
 
 | Mutation | Error |
 | --- | --- |
 | any write into an `ro` mount or a synthetic directory | `EROFS` |
 | creating an absent path whose parent is synthetic, or with parents | `EROFS` |
-| removing or renaming a mount root | `EBUSY` |
+| removing, renaming, or replacing a mount root, including through `.`, `/`, or links that resolve to it | `EBUSY` |
 | `rename` or `link` between two mounts | `EXDEV` (`copyFiles` works) |
 
 A call rooted inside one mount issues exactly the statements the unwrapped call

@@ -1,11 +1,14 @@
 // Mutations through a mounted view.
 //
 // Only a read-write mount accepts a write. A synthetic directory and a
-// read-only mount answer EROFS, a mount root refuses removal and rename with
-// EBUSY as a kernel mount point does, and rename or hard link across two
-// mounts is EXDEV. A path the view does not show is ENOENT, or EROFS when
-// creating it would write into a synthetic directory. Every check here is
-// lexical, so a refusal costs no statement and reveals nothing stored.
+// read-only mount answer EROFS, a mount root refuses removal, rename, and
+// replacement with EBUSY as a kernel mount point does, and rename or hard
+// link across two mounts is EXDEV. A path the view does not show is ENOENT,
+// or EROFS when creating it would write into a synthetic directory. Every
+// check here is lexical, so a refusal costs no statement and reveals nothing
+// stored — except the mount-root check for a path ending in `.` or `/`:
+// `self/.` names the source once the store follows `self`, so such paths
+// resolve first, in one confined batch.
 
 import { filesystemError } from "../errors.js";
 import { normalize } from "../path.js";
@@ -64,8 +67,38 @@ export function writable(
   return location;
 }
 
-export function isMountRoot(target: Target): boolean {
-  return normalize(target.real) === target.mount.source;
+/**
+ * Whether the store may still reach the source through a symlink. Resolved
+ * without following a final link, a named final component stays below the
+ * source, and `real` holds no `..`; only a final `.` or `/` can name it.
+ */
+function endsInDirectory(target: Target): boolean {
+  const final = target.real.slice(target.real.lastIndexOf("/") + 1);
+  return final === "" || final === ".";
+}
+
+/** Which targets resolve, without following a final link, to their mount's source. */
+export function mountRoots(context: ViewContext, targets: readonly Target[]): boolean[] {
+  const pending = targets.filter(endsInDirectory);
+  const found = context.translating(mountsOf(pending), () =>
+    resolveTargets(context, pending, false),
+  );
+  const resolved = new Map(pending.map((target, index) => [target, found[index]]));
+  return targets.map((target) =>
+    resolved.has(target)
+      ? resolved.get(target) === target.mount.source
+      : target.real === target.mount.source,
+  );
+}
+
+export function isMountRoot(context: ViewContext, target: Target): boolean {
+  return mountRoots(context, [target])[0] === true;
+}
+
+/** Refuse a call that would remove or replace a mount's source. */
+export function notMountRoot(context: ViewContext, path: string, target: Target): Target {
+  if (isMountRoot(context, target)) throw busy(path);
+  return target;
 }
 
 export function busy(path: string): Error {
@@ -112,13 +145,27 @@ export function writeFilesOf(
   options: WriteOptions | undefined,
 ): void {
   const absent: Absent = options?.parents === false ? "parent" : "creates";
-  const targets: Target[] = [];
-  const real: WriteEntry[] = [];
+  const named: WriteEntry[] = [];
+  const located: Target[] = [];
   for (const entry of entries) {
     const location = context.locate(entry.path);
     // A synthetic directory already is the directory an entry may name.
     if (location.kind === "synthetic" && isDirectoryEntry(entry)) continue;
-    const target = writable(context, entry.path, absent, location);
+    named.push(entry);
+    located.push(writable(context, entry.path, absent, location));
+  }
+  const roots = mountRoots(context, located);
+  const targets: Target[] = [];
+  const real: WriteEntry[] = [];
+  for (let index = 0; index < named.length; index++) {
+    const entry = named[index];
+    const target = located[index];
+    if (entry === undefined || target === undefined) continue;
+    if (roots[index] === true) {
+      // So is a mount point; anything else would replace the source.
+      if (isDirectoryEntry(entry)) continue;
+      throw busy(entry.path);
+    }
     targets.push(target);
     real.push({ ...entry, path: target.real });
   }
@@ -152,6 +199,9 @@ export function copyFilesOf(
       writable(context, entry.destination, options?.parents === true ? "creates" : "parent"),
     );
   }
+  const roots = mountRoots(context, destinations);
+  const root = roots.indexOf(true);
+  if (root >= 0) throw busy(page[root]?.destination ?? "");
   const copied = context.translating(mountsOf([...sources, ...destinations]), () => {
     const realSources = resolveTargets(context, sources, false);
     const realDestinations = resolveTargets(context, destinations, false);
@@ -208,11 +258,11 @@ export function removeFilesOf(
     if (normalize(path) === "/") throw busy(path);
     const location = context.locate(path);
     if (location.kind === "absent" && force) continue;
-    const target = writable(context, path, "exists", location);
-    if (isMountRoot(target)) throw busy(path);
-    targets.push(target);
+    targets.push(writable(context, path, "exists", location));
     named.push(path);
   }
+  const root = mountRoots(context, targets).indexOf(true);
+  if (root >= 0) throw busy(named[root] ?? "");
   context.translating(mountsOf(targets), () => {
     const resolved: RealPath[] = [];
     const found = resolveTargets(context, targets, false);
