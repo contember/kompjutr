@@ -51,6 +51,26 @@ export function requireStableEpoch(db: SqlDatabase, repoId: number, run: RunStat
   }
 }
 
+/**
+ * Drop the projection of every tree the run did not mark, before the
+ * transaction deletes storage. A marked tree's subtrees are marked and never
+ * deleted, so every projection left names projected subtrees, whatever order
+ * pages delete in (ADR-0030). Projections are derived: no generation bump.
+ */
+export function stripUnmarkedTreeProjections(db: SqlDatabase, repoId: number, run: RunState): void {
+  db.run(
+    `DELETE FROM git_tree_sources
+      WHERE repo_id = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM git_maintenance_objects mark
+           WHERE mark.repo_id = git_tree_sources.repo_id AND mark.run_id = ?
+             AND mark.oid = git_tree_sources.tree_oid
+        )`,
+    repoId,
+    run.runId,
+  );
+}
+
 export function transitionPhase(
   db: SqlDatabase,
   repoId: number,

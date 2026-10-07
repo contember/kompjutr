@@ -2,6 +2,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError, ObjectNotFoundError } from "../../common/errors.js";
 import { expectNullable, expectText } from "../../common/rows.js";
 import { TREE_QUEUE_ROW_FIXED_BYTES } from "../schema/schema.js";
+import { ensureTreeClosure, type TreeObjectReader } from "./tree-closure.js";
 import { WALK_TREE_DIFF_SQL, WALK_TREE_SQL } from "./tree-walk-sql.js";
 
 export { WALK_TREE_SQL } from "./tree-walk-sql.js";
@@ -32,8 +33,9 @@ export interface WalkTreeDiffObject {
 }
 
 /**
- * A walk row's error. A subtree with no source row is an absent tree: every
- * stored tree has one. One whose source is incomplete cannot be projected.
+ * A walk row's error. Under the downward-closed invariant (ADR-0030), a
+ * subtree with no source row is an absent tree; one whose source is
+ * incomplete cannot be projected. A root without a row is retried first.
  */
 function throwTraversalError(row: Record<string, unknown>, label: string): void {
   const error = row.error;
@@ -45,6 +47,7 @@ function throwTraversalError(row: Record<string, unknown>, label: string): void 
   if (kind === "missing_source") {
     throw new ObjectNotFoundError(expectText(row.error_oid, `${label} error oid`));
   }
+  if (kind === "missing_root") throw new CorruptError(`${label} root is still not projected`);
   if (kind !== null && kind !== "incomplete_source") {
     throw new CorruptError(`${label} error kind is invalid`);
   }
@@ -55,21 +58,64 @@ function isTreeMode(mode: string): boolean {
   return mode === "40000" || mode === "040000";
 }
 
+function isMissingRoot(row: Record<string, unknown>): boolean {
+  return row.error !== null && row.error_kind === "missing_root";
+}
+
+/**
+ * Run a walk statement and yield its rows. A first row reporting that a root
+ * has no projection closes the cursor, projects the roots' closures and runs
+ * the statement once more (ADR-0030); a walk over projected trees costs no
+ * extra statement.
+ */
+function* projectedWalk(
+  db: SqlDatabase,
+  repoId: number,
+  objects: TreeObjectReader,
+  roots: readonly (string | null)[],
+  run: () => Iterable<Record<string, unknown>>,
+): Generator<Record<string, unknown>> {
+  let cursor = run()[Symbol.iterator]();
+  try {
+    let step = cursor.next();
+    if (!step.done && isMissingRoot(step.value)) {
+      cursor.return?.();
+      ensureTreeClosure(
+        db,
+        repoId,
+        objects,
+        roots.filter((root) => root !== null),
+      );
+      cursor = run()[Symbol.iterator]();
+      step = cursor.next();
+    }
+    while (!step.done) {
+      yield step.value;
+      step = cursor.next();
+    }
+  } finally {
+    cursor.return?.();
+  }
+}
+
 /** Stream every non-tree entry in raw Git DFS order with one SQL statement. */
 export function* iterateTree(
   db: SqlDatabase,
   repoId: number,
+  objects: TreeObjectReader,
   treeOid: string,
 ): Generator<WalkTreeEntry> {
-  for (const row of db.iterate(
-    WALK_TREE_SQL,
-    repoId,
-    treeOid,
-    TREE_WALK_PATH_BYTES,
-    TREE_WALK_STATE_BYTES,
-    TREE_WALK_QUEUE_BYTES,
-    TREE_QUEUE_ROW_FIXED_BYTES,
-  )) {
+  const run = () =>
+    db.iterate(
+      WALK_TREE_SQL,
+      repoId,
+      treeOid,
+      TREE_WALK_PATH_BYTES,
+      TREE_WALK_STATE_BYTES,
+      TREE_WALK_QUEUE_BYTES,
+      TREE_QUEUE_ROW_FIXED_BYTES,
+    );
+  for (const row of projectedWalk(db, repoId, objects, [treeOid], run)) {
     throwTraversalError(row, "tree traversal");
     const path = expectText(row.path, "tree traversal path");
     const mode = expectText(row.mode, "tree traversal mode");
@@ -82,6 +128,7 @@ export function* iterateTree(
 export function* iterateTreeDiffObjects(
   db: SqlDatabase,
   repoId: number,
+  objects: TreeObjectReader,
   beforeTreeOid: string | null,
   afterTreeOid: string,
   checkedTrees: ReadonlySet<string> = new Set(),
@@ -97,18 +144,20 @@ export function* iterateTreeDiffObjects(
       if (oid.length === 40) snapshot.push(oid);
     }
   }
-  for (const row of db.iterate(
-    WALK_TREE_DIFF_SQL,
-    repoId,
-    beforeTreeOid,
-    afterTreeOid,
-    TREE_WALK_PATH_BYTES,
-    TREE_WALK_STATE_BYTES,
-    TREE_WALK_QUEUE_BYTES,
-    TREE_QUEUE_ROW_FIXED_BYTES,
-    1,
-    JSON.stringify(snapshot),
-  )) {
+  const run = () =>
+    db.iterate(
+      WALK_TREE_DIFF_SQL,
+      repoId,
+      beforeTreeOid,
+      afterTreeOid,
+      TREE_WALK_PATH_BYTES,
+      TREE_WALK_STATE_BYTES,
+      TREE_WALK_QUEUE_BYTES,
+      TREE_QUEUE_ROW_FIXED_BYTES,
+      1,
+      JSON.stringify(snapshot),
+    );
+  for (const row of projectedWalk(db, repoId, objects, [beforeTreeOid, afterTreeOid], run)) {
     throwTraversalError(row, "tree diff object traversal");
     if (row.object_mode === null && row.object_oid === null) continue;
     const mode = expectText(row.object_mode, "tree diff object mode");
@@ -122,22 +171,25 @@ export function* iterateTreeDiffObjects(
 export function* iterateTreeDiff(
   db: SqlDatabase,
   repoId: number,
+  objects: TreeObjectReader,
   beforeTreeOid: string | null,
   afterTreeOid: string | null,
 ): Generator<WalkTreeDiffEntry> {
   if (beforeTreeOid === afterTreeOid) return;
-  for (const row of db.iterate(
-    WALK_TREE_DIFF_SQL,
-    repoId,
-    beforeTreeOid,
-    afterTreeOid,
-    TREE_WALK_PATH_BYTES,
-    TREE_WALK_STATE_BYTES,
-    TREE_WALK_QUEUE_BYTES,
-    TREE_QUEUE_ROW_FIXED_BYTES,
-    0,
-    "[]",
-  )) {
+  const run = () =>
+    db.iterate(
+      WALK_TREE_DIFF_SQL,
+      repoId,
+      beforeTreeOid,
+      afterTreeOid,
+      TREE_WALK_PATH_BYTES,
+      TREE_WALK_STATE_BYTES,
+      TREE_WALK_QUEUE_BYTES,
+      TREE_QUEUE_ROW_FIXED_BYTES,
+      0,
+      "[]",
+    );
+  for (const row of projectedWalk(db, repoId, objects, [beforeTreeOid, afterTreeOid], run)) {
     throwTraversalError(row, "tree diff traversal");
     const path = expectText(row.path, "tree diff path");
     const beforeMode = expectNullable(row.before_mode, (value) =>

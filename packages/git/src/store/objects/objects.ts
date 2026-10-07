@@ -86,7 +86,7 @@ export class ObjectTable {
     packs: PackStore,
     cacheKeys: ObjectCacheKeys,
   ) {
-    this.#context = { db, repoId, objects, packs, cacheKeys };
+    this.#context = { db, repoId, objects, packs, cacheKeys, trees: this };
   }
 
   has(oid: string): boolean {

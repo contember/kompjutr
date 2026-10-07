@@ -85,23 +85,23 @@ describe("tree diff", () => {
       ]),
     );
     db.transactionSync(() => {
-      expect([...iterateTreeDiffObjects(db, 1, null, first)]).toContainEqual({
+      expect([...iterateTreeDiffObjects(db, 1, store, null, first)]).toContainEqual({
         oid: blob,
         type: "blob",
       });
       const checked = new Set([child, empty]);
-      expect([...iterateTreeDiffObjects(db, 1, null, second, checked)]).toEqual([
+      expect([...iterateTreeDiffObjects(db, 1, store, null, second, checked)]).toEqual([
         { oid: second, type: "tree" },
         { oid: empty, type: "tree" },
         { oid: child, type: "tree" },
         { oid: sibling, type: "tree" },
         { oid: blob, type: "blob" },
       ]);
-      expect([...iterateTreeDiffObjects(db, 1, null, empty, checked)]).toEqual([
+      expect([...iterateTreeDiffObjects(db, 1, store, null, empty, checked)]).toEqual([
         { oid: empty, type: "tree" },
       ]);
-      expect([...iterateTreeDiffObjects(db, 1, first, second, checked)]).toEqual([
-        ...iterateTreeDiffObjects(db, 1, first, second),
+      expect([...iterateTreeDiffObjects(db, 1, store, first, second, checked)]).toEqual([
+        ...iterateTreeDiffObjects(db, 1, store, first, second),
       ]);
     });
   });
@@ -136,8 +136,8 @@ describe("tree diff", () => {
     if (last === undefined) throw new Error("missing last tree");
     db.transactionSync(() => {
       for (const tree of trees)
-        expect([...iterateTreeDiffObjects(db, 1, null, tree)]).toHaveLength(2);
-      expect([...iterateTreeDiffObjects(db, 1, null, last, new Set(trees))]).toEqual([
+        expect([...iterateTreeDiffObjects(db, 1, store, null, tree)]).toHaveLength(2);
+      expect([...iterateTreeDiffObjects(db, 1, store, null, last, new Set(trees))]).toEqual([
         { oid: last, type: "tree" },
         { oid: blob, type: "blob" },
       ]);
@@ -151,8 +151,8 @@ describe("tree diff", () => {
     const checked = new Set(Array.from({ length: 128 }, (_, index) => `invalid-${index}`));
     checked.add(tree);
     db.transactionSync(() => {
-      expect([...iterateTreeDiffObjects(db, 1, null, tree)]).toHaveLength(2);
-      expect([...iterateTreeDiffObjects(db, 1, null, tree, checked)]).toEqual([
+      expect([...iterateTreeDiffObjects(db, 1, store, null, tree)]).toHaveLength(2);
+      expect([...iterateTreeDiffObjects(db, 1, store, null, tree, checked)]).toEqual([
         { oid: tree, type: "tree" },
         { oid: blob, type: "blob" },
       ]);
@@ -673,10 +673,12 @@ describe("tree diff", () => {
     };
     expectRejected(null, tree);
     expectRejected(tree, null);
-    expect(() => [...iterateTreeDiffObjects(db, 1, null, tree)]).toThrow(/queue exceeds 16 MiB/);
+    expect(() => [...iterateTreeDiffObjects(db, 1, store, null, tree)]).toThrow(
+      /queue exceeds 16 MiB/,
+    );
     db.transactionSync(() => {
-      expect([...iterateTreeDiffObjects(db, 1, null, child)]).toHaveLength(leafCount + 1);
-      expect([...iterateTreeDiffObjects(db, 1, null, tree, new Set([child]))]).toEqual([
+      expect([...iterateTreeDiffObjects(db, 1, store, null, child)]).toHaveLength(leafCount + 1);
+      expect([...iterateTreeDiffObjects(db, 1, store, null, tree, new Set([child]))]).toEqual([
         { oid: tree, type: "tree" },
         { oid: child, type: "tree" },
       ]);

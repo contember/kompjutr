@@ -604,6 +604,9 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
+    // Imported packs project no tree; the rebase's first read of the upstream tree projects it
+    // on demand (ADR-0030). Project it first, so the counts compare only the operation's output.
+    [...workspace.repo.store.walkTree(workspace.repo.readCommit(upstream).tree)];
     const projectionsBefore = objectProjectionCounts(workspace);
     workspace.repo.store.db.run(
       `CREATE TRIGGER fault_clean_cursor

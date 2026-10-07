@@ -3,6 +3,7 @@ import { CorruptError, GitError, ObjectNotFoundError } from "../../../common/err
 import type { ObjectType } from "../../../common/objects.js";
 import { expectSafeInteger, expectText } from "../../../common/rows.js";
 import { MAX_PROMISED_BLOB_LOOKUP_OIDS } from "../../fetch/promisor.js";
+import type { TreeObjectReader } from "../../trees/tree-closure.js";
 import { iterateTreeDiffObjects, type WalkTreeDiffObject } from "../../trees/tree-walk.js";
 import { isObjectType } from "../shared.js";
 
@@ -105,15 +106,23 @@ function requireType(oid: string, stored: StoredObject | undefined, expected: Ob
 export class ExternalReferenceCheck {
   readonly #db: SqlDatabase;
   readonly #repoId: number;
+  readonly #trees: TreeObjectReader;
   readonly #reachability: FetchReachability;
   readonly #filtered: boolean;
   readonly #reachable: string[] = [];
   readonly #commits: string[] = [];
-  readonly #trees: string[] = [];
+  readonly #externalTrees: string[] = [];
 
-  constructor(db: SqlDatabase, repoId: number, reachability: FetchReachability, filtered: boolean) {
+  constructor(
+    db: SqlDatabase,
+    repoId: number,
+    trees: TreeObjectReader,
+    reachability: FetchReachability,
+    filtered: boolean,
+  ) {
     this.#db = db;
     this.#repoId = repoId;
+    this.#trees = trees;
     this.#reachability = reachability;
     this.#filtered = filtered;
   }
@@ -138,7 +147,7 @@ export class ExternalReferenceCheck {
       }
       if (!present) throw new ObjectNotFoundError(oid);
       if (expected === "tree") {
-        this.#trees.push(oid);
+        this.#externalTrees.push(oid);
         continue;
       }
       this.#reachable.push(oid);
@@ -153,7 +162,7 @@ export class ExternalReferenceCheck {
     for (const oid of this.#reachable) {
       if (!reached.has(oid)) throw new ObjectNotFoundError(oid);
     }
-    if (this.#trees.length === 0) return;
+    if (this.#externalTrees.length === 0) return;
     const verified = new Set<string>();
     for (const tree of this.#outsideProvenClosure()) {
       if (!verified.has(tree)) this.#requireClosure(tree, verified);
@@ -166,13 +175,19 @@ export class ExternalReferenceCheck {
    * already seen.
    */
   #outsideProvenClosure(): Set<string> {
-    const pending = new Set(this.#trees);
+    const pending = new Set(this.#externalTrees);
     const roots = readCommitTrees(this.#db, this.#repoId, this.#commits);
     for (const root of roots) pending.delete(root);
     let previous: string | null = null;
     for (const root of roots) {
       if (pending.size === 0) break;
-      for (const object of iterateTreeDiffObjects(this.#db, this.#repoId, previous, root)) {
+      for (const object of iterateTreeDiffObjects(
+        this.#db,
+        this.#repoId,
+        this.#trees,
+        previous,
+        root,
+      )) {
         if (object.type === "tree" && pending.delete(object.oid) && pending.size === 0) break;
       }
       previous = root;
@@ -204,7 +219,14 @@ export class ExternalReferenceCheck {
       }
       page = [];
     };
-    for (const object of iterateTreeDiffObjects(this.#db, this.#repoId, null, tree, verified)) {
+    for (const object of iterateTreeDiffObjects(
+      this.#db,
+      this.#repoId,
+      this.#trees,
+      null,
+      tree,
+      verified,
+    )) {
       page.push(object);
       if (object.type === "tree") trees.push(object.oid);
       if (page.length === MAX_PROMISED_BLOB_LOOKUP_OIDS) check();

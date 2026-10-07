@@ -807,10 +807,22 @@ describe("maintenance reachability", () => {
 
   it("does not apply blob promises to missing non-blob edges or roots", () => {
     const nonBlob = open();
-    const promisedTree = "b".repeat(40);
+    // A loose write requires its subtrees (ADR-0030); a sweep of the subtree's loose
+    // row, as maintenance performs, leaves the projected parent naming a missing tree.
+    const promisedTree = nonBlob.store.write("tree", serializeTree([]));
     const tree = nonBlob.store.write(
       "tree",
       serializeTree([{ mode: "40000", name: "missing-tree", oid: promisedTree }]),
+    );
+    nonBlob.db.run(
+      "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
+      nonBlob.checkout.repoId,
+      promisedTree,
+    );
+    nonBlob.db.run(
+      "DELETE FROM git_objects WHERE repo_id = ? AND oid = ?",
+      nonBlob.checkout.repoId,
+      promisedTree,
     );
     promiseBlob(nonBlob.db, nonBlob.checkout.repoId, promisedTree);
     seedMark(nonBlob.db, nonBlob.checkout.repoId, [{ oid: tree }]);
@@ -1225,13 +1237,13 @@ describe("maintenance reachability without a tree projection", () => {
     ).toBe(0);
   });
 
-  it("does not apply blob promises to a missing subtree of an unprojected tree", () => {
+  it("does not apply blob promises to a missing subtree of an unprojected tree", async () => {
     const { db, checkout, store } = open();
     const promisedTree = "b".repeat(40);
-    const tree = store.write(
-      "tree",
-      serializeTree([{ mode: "40000", name: "missing-tree", oid: promisedTree }]),
-    );
+    // A loose write would require the subtree (ADR-0030); unchecked pack ingest does not.
+    const treeData = serializeTree([{ mode: "40000", name: "missing-tree", oid: promisedTree }]);
+    await store.packs.ingest(slices(fullObjectPack("tree", treeData), 17));
+    const tree = hashObject("tree", treeData);
     promiseBlob(db, checkout.repoId, promisedTree);
     removeTreeProjections(db, checkout.repoId, "no-row");
     seedMark(db, checkout.repoId, [{ oid: tree }]);

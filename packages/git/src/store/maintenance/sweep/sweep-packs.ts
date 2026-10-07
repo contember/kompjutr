@@ -7,6 +7,7 @@ import {
   eligibilityTime,
   progress,
   requireStableEpoch,
+  stripUnmarkedTreeProjections,
   sweepCutoff,
   transitionPhase,
   updateReclamationCounters,
@@ -100,6 +101,7 @@ function readPackPage(
 
 function deletePackStorage(store: SharedRepoStore, run: RunState, pack: PackAudit): void {
   requireStableEpoch(store.db, store.repoId, run);
+  stripUnmarkedTreeProjections(store.db, store.repoId, run);
   store.db.run(
     `DELETE FROM git_blob_ids
       WHERE repo_id = ?

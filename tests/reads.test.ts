@@ -33,6 +33,7 @@ import {
 } from "../packages/git/src/store/index.js";
 import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
+import { ensureTreeClosure } from "../packages/git/src/store/trees/tree-closure.js";
 import {
   TREE_WALK_PATH_BYTES,
   TREE_WALK_STATE_BYTES,
@@ -1199,6 +1200,9 @@ describe("batched tree reads", () => {
   it("accepts a packed 2,200-byte path repeatedly under the wall gate", async () => {
     for (let attempt = 0; attempt < 3; attempt++) {
       const { db, store, root, leafOid } = await packedDeepTree(1_098, "leaf");
+      // Pack ingest projects no tree, and first projection reads this 1,099-level chain one
+      // level per object read (ADR-0030); the gate measures the walk over the projection.
+      ensureTreeClosure(db, store.repoId, store, [root]);
       db.storage.resetCounters();
       const started = performance.now();
       const entries = [...store.walkTree(root)];

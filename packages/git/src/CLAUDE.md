@@ -53,10 +53,15 @@ caches, queues, and caps tied to real failures; there is no runtime byte ledger.
 
 ## Rules
 
-- Tree traversal reads no object BLOBs. `ops/tree/tree-stream.ts` walks parsed
-  `git_tree_*` edges through the store cursor.
+- Tree traversal reads no object BLOBs over projected trees.
+  `ops/tree/tree-stream.ts` walks parsed `git_tree_*` edges through the store
+  cursor; only a first projection reads tree objects.
 - Loose objects shadow packed objects for reads. A tree OID has one projection,
   shared by every copy; it is not source-qualified.
+- Trees are projected on demand (ADR-0030). The projected set is
+  downward-closed; never write a `complete = 1` projection whose subtrees lack
+  a row. Pack ingest projects nothing. A walk may write, so call it only where
+  `transactionSync` is legal, and pass the walk an object reader.
 - Pack ingest is provisional. Only a complete, trailer-validated pack is
   readable; interrupted or rejected ingest never moves a ref.
 - Push preflights both pack passes before POST. Reopen only for a 401 retry;

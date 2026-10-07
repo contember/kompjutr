@@ -16,7 +16,6 @@ import {
   PackObjectBatch,
   type PackObjectInput,
   PackPendingBatch,
-  PackTreeIndex,
 } from "../pack-ingest-index.js";
 import type { PackReadEngine } from "../read.js";
 import { ExpectedPackMembership, hashByteSource, type PackIngestMemory } from "../shared.js";
@@ -93,7 +92,6 @@ export class PackIndexer {
       depths.record(row[2], row[8]);
     });
     const pendingIndex = new PackPendingBatch(this.db, this.repoId, packId);
-    const treeIndex = new PackTreeIndex(this.db, objectIndex);
     const commitIndex = new PackCommitIndex(this.db, this.repoId, packId, objectIndex);
     const missingBases = new Set<string>();
 
@@ -137,7 +135,6 @@ export class PackIndexer {
           oid,
           type,
           entry.data,
-          treeIndex,
           commitIndex,
           header.dataOff,
           entry.consumed,
@@ -182,7 +179,6 @@ export class PackIndexer {
                 oid,
                 base.type,
                 null,
-                treeIndex,
                 commitIndex,
                 header.dataOff,
                 entry.consumed,
@@ -239,7 +235,6 @@ export class PackIndexer {
     await this.#pending.drainPending(
       packId,
       objectIndex,
-      treeIndex,
       commitIndex,
       yieldNow,
       heartbeat,
@@ -249,7 +244,6 @@ export class PackIndexer {
     );
     heartbeat();
     objectIndex.flush();
-    treeIndex.flush();
     if (deferred > 0) say(`Resolved ${deferred} deferred delta(s)\n`);
     membership.assertComplete();
     return { count, commits: commitIndex, membership };

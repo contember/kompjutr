@@ -7,6 +7,7 @@ import type { ObjectBatch, ObjectBatchOptions, OwnedObjectBatch } from "../core/
 import { isThenableResult } from "../core/json-pages.js";
 import { bumpRepositorySourceGeneration } from "../core/source-generation.js";
 import { insertCommitCaches, prepareCommitCache } from "../trees/commits.js";
+import { ensureTreeClosure } from "../trees/tree-closure.js";
 import { indexSeededTreeSources } from "../trees/tree-index.js";
 import { fulfillLoosePromises } from "./objects-promises.js";
 import {
@@ -207,7 +208,7 @@ function flushObjects(
         JSON.stringify(payload.rows),
       );
     }
-    indexSeededTreeSources(
+    const subtrees = indexSeededTreeSources(
       context.db,
       fresh.flatMap((object) => {
         if (object.type !== "tree" || object.treeData === undefined) return [];
@@ -221,6 +222,7 @@ function flushObjects(
         ];
       }),
     );
+    ensureTreeClosure(context.db, context.repoId, context.trees, subtrees);
     requireCommitCacheWrites(insertCommitCaches(context.db, commitEntries), commitEntries.length);
   });
   if (wroteLoose) context.cacheKeys.markLoose();

@@ -131,6 +131,16 @@ SELECT path, mode, oid,
        CASE WHEN error_code = 'E2BIG' OR descend = 2 THEN 'E2BIG'
             ELSE 'ECORRUPT' END AS error_code,
        CASE
+         WHEN ancestry = '/' AND error_code = 'ECORRUPT'
+           THEN CASE
+             WHEN NOT EXISTS (
+               SELECT 1 FROM params p CROSS JOIN git_tree_sources s
+                WHERE s.repo_id = p.repo_id AND s.tree_oid = p.root_oid
+             ) AND (SELECT length(root_oid) = 40 AND root_oid NOT GLOB '*[^0-9a-f]*'
+                      FROM params)
+               THEN 'missing_root'
+             ELSE NULL
+           END
          WHEN error IS NOT NULL OR mode NOT IN ('40000', '040000') OR descend != 0
               OR instr(ancestry, '/' || oid || '/') != 0
            THEN NULL
@@ -160,9 +170,10 @@ function diffSourceFailsSql(side: "before" | "after", source: string): string {
                   AND NOT ${diffSourceValidSql(source)})`;
 }
 
-/** A subtree source failure: no source row at all, or an unprojectable one. */
+/** A source failure: a root or subtree without a source row, or an unprojectable subtree. */
 function diffSourceKindSql(source: string): string {
-  return `CASE WHEN w.path = '' THEN NULL
+  return `CASE WHEN w.path = '' AND ${source}.source_key IS NULL THEN 'missing_root'
+                         WHEN w.path = '' THEN NULL
                          WHEN ${source}.source_key IS NULL THEN 'missing_source'
                          ELSE 'incomplete_source' END`;
 }

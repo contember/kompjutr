@@ -6,12 +6,7 @@ import { CorruptError } from "../../../common/errors.js";
 import type { ObjectType } from "../../../common/objects.js";
 import { InflateStream } from "../../../common/zlib.js";
 import type { ChunkedBytes } from "../chunks.js";
-import type {
-  PackCommitIndex,
-  PackObjectBatch,
-  PackObjectInput,
-  PackTreeIndex,
-} from "../pack-ingest-index.js";
+import type { PackCommitIndex, PackObjectBatch, PackObjectInput } from "../pack-ingest-index.js";
 import type { PackReadEngine } from "../read.js";
 import { PACK_CHUNK } from "../shared.js";
 import type { PackReferenceCollector } from "./ingest-references.js";
@@ -27,7 +22,6 @@ export class PackResolvedProjection {
     oid: string,
     type: ObjectType,
     data: Uint8Array | null,
-    treeIndex: PackTreeIndex,
     commitIndex: PackCommitIndex,
     dataOff: number,
     dataLen: number,
@@ -49,28 +43,17 @@ export class PackResolvedProjection {
       references?.addCommit(oid, commitData);
     }
     if (type === "tag") references?.addTag(whole());
-    if (type !== "tree") return;
-    references?.addTree(
+    if (type !== "tree" || references === null) return;
+    references.addTree(
       data !== null
         ? [data]
         : chunked !== null
           ? chunked.chunks()
           : this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize),
     );
-    if (chunked !== null) {
-      treeIndex.addChunked(this.repoId, oid, objectSize, chunked);
-      return;
-    }
-    if (data !== null) {
-      treeIndex.addBuffered(this.repoId, oid, objectSize, data);
-      return;
-    }
-    treeIndex.addStream(this.repoId, oid, objectSize, () =>
-      this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize),
-    );
   }
 
-  /** Re-inflate a large full object directly into the streaming parser. */
+  /** Re-inflate a large full object directly into the reference collector. */
   *#inflateEntryChunks(
     packId: number,
     dataOff: number,

@@ -15,21 +15,35 @@ export interface TreeSourceInput extends TreeSource {
   chunks: Iterable<Uint8Array>;
 }
 
-/** Parse one tree into `batch`; `write: false` validates without queueing rows. */
+function isTreeMode(mode: string): boolean {
+  return mode === "40000" || mode === "040000";
+}
+
+/**
+ * Parse one tree into `batch`; `write: false` validates without queueing rows.
+ * When it queues a complete projection, the subtree OIDs it names are
+ * appended to `subtrees`; an unprojectable tree's subtrees need no closure.
+ */
 export function parseTreeSourceInto(
   batch: TreeIndexBatch,
   source: TreeSource,
   chunks: Iterable<Uint8Array>,
   write = true,
+  subtrees: string[] = [],
 ): void {
   const parser = new TreeParser();
   try {
     const indexer = new TreeSourceIndexer(source, batch, write);
+    const named: string[] = [];
     for (const chunk of chunks) {
       indexer.acceptChunk(chunk.length);
-      for (const parsed of parser.push(chunk)) indexer.push(parsed);
+      for (const parsed of parser.push(chunk)) {
+        indexer.push(parsed);
+        if (isTreeMode(parsed.entry.mode)) named.push(parsed.entry.oid);
+      }
     }
     indexer.finish(parser.finish());
+    if (indexer.queuedProjection) for (const oid of named) subtrees.push(oid);
   } finally {
     parser.dispose();
   }
@@ -45,7 +59,7 @@ export class TreeIndexSink {
   constructor(db: SqlDatabase, source: TreeSource) {
     this.#parser = new TreeParser();
     try {
-      this.#batch = new TreeIndexBatch(db, { seeded: false, autoFlush: true });
+      this.#batch = new TreeIndexBatch(db, { seeded: false });
     } catch (error) {
       this.#parser.dispose();
       throw error;
@@ -100,17 +114,27 @@ export function createTreeIndexSink(db: SqlDatabase, source: TreeSource): TreeIn
   return new TreeIndexSink(db, source);
 }
 
-/** A repeated tree OID is parsed again but writes nothing: its entries are already queued. */
-function indexTreePass(db: SqlDatabase, sources: Iterable<TreeSourceInput>, seeded: boolean): void {
-  const batch = new TreeIndexBatch(db, { seeded, autoFlush: true });
+/**
+ * A repeated tree OID is parsed again but writes nothing: its entries are
+ * already queued. Returns the subtree OIDs the trees name when a seeded tree
+ * names one without a projection row, and none otherwise.
+ */
+function indexTreePass(
+  db: SqlDatabase,
+  sources: Iterable<TreeSourceInput>,
+  seeded: boolean,
+): string[] {
+  const batch = new TreeIndexBatch(db, { seeded });
+  const subtrees: string[] = [];
   try {
     const queued = new Set<string>();
     for (const source of sources) {
       const key = `${source.repoId}:${source.treeOid}`;
-      parseTreeSourceInto(batch, source, source.chunks, !queued.has(key));
+      parseTreeSourceInto(batch, source, source.chunks, !queued.has(key), subtrees);
       queued.add(key);
     }
     batch.flush();
+    return batch.openSubtrees ? subtrees : [];
   } finally {
     batch.dispose();
   }
@@ -125,17 +149,20 @@ export function indexTreeSources(db: SqlDatabase, sources: Iterable<TreeSourceIn
  * Index loose trees whose `git_objects` insert trigger already seeded the
  * projection, so no seed statement runs; a complete one gets no entries.
  */
-export function indexSeededTreeSources(db: SqlDatabase, sources: Iterable<TreeSourceInput>): void {
-  indexTreePass(db, sources, true);
+export function indexSeededTreeSources(
+  db: SqlDatabase,
+  sources: Iterable<TreeSourceInput>,
+): string[] {
+  return indexTreePass(db, sources, true);
 }
 
-/** Index one loose tree whose object insert seeded its projection. */
+/** Index one loose tree whose object insert seeded its projection; returns its unclosed subtrees' OIDs. */
 export function indexSeededTreeSource(
   db: SqlDatabase,
   source: TreeSource,
   chunks: Iterable<Uint8Array>,
-): void {
-  indexSeededTreeSources(db, [{ ...source, chunks }]);
+): string[] {
+  return indexSeededTreeSources(db, [{ ...source, chunks }]);
 }
 
 /** Seed and index one tree projection through the streaming sink. The caller owns the transaction. */

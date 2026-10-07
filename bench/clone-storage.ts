@@ -11,6 +11,9 @@
 // reports on the platform. `dbstat` attributes pages to individual tables and
 // indexes, and its `payload` column is the row bytes those pages carry, so
 // allocated minus payload is b-tree overhead rather than data.
+//
+// Pack ingest projects no tree (ADR-0030). The tree projection group is the
+// HEAD closure the clone's checkout projects, not every tree of the history.
 
 import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";

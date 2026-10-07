@@ -64,13 +64,16 @@ and no loose-over-pack shadowing. A second copy writes no entries; deleting the
 last copy deletes the projection (a `git_objects` delete trigger for loose rows,
 pack deletion for packed entries, including pending-pack reclaim).
 
-Pack ingest writes a new tree's projection while its pack is still pending, so
-the projection is visible before any copy is readable. That is safe because the
-projection is content-addressed; pending pack objects themselves stay invisible.
-An incomplete marker (`complete = 0`) represents a tree whose projection is not
-available; indexing may retry it. `name_bytes` is the only stored name
-representation and remains the canonical BINARY value for Git ordering and exact
-lookup; bounded readers derive TEXT names.
+Projections are created on demand
+([ADR-0030](0030-project-trees-on-demand.md)): a loose tree write projects the
+tree and its subtrees' closure, and a tree walk projects its root's closure
+from the object bytes when the root has no row. Pack ingest writes no
+projection. A tree OID has no row, an unprojectable marker (`complete = 0`, an
+oversized tree, terminal), or a complete projection, and the projected set is
+downward-closed. A loose tree's insert trigger seeds a `complete = 0`
+placeholder that the same transaction completes; it never commits as such. `name_bytes` is the only stored name representation and
+remains the canonical BINARY value for Git ordering and exact lookup; bounded
+readers derive TEXT names.
 
 Under [ADR-0004](0004-trust-stored-rows-validate-at-the-boundary.md), projection
 rows are trusted at read time, and columns kept purely as read-time

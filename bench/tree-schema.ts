@@ -1,4 +1,7 @@
 // Compares the frozen v12 per-source tree projection with the current per-OID layout.
+// It projects every tree of the fixture itself, so it measures a fully projected
+// history: the upper bound since clones project only the trees a reader reaches
+// (ADR-0030).
 
 import { execFileSync } from "node:child_process";
 import { createHash, type Hash } from "node:crypto";

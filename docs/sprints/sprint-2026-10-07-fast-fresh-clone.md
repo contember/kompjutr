@@ -521,4 +521,41 @@ Paths are relative to `packages/git/src/`.
 - **Ceiling fix.** `348a0fd` brings `createMountedFilesystem` (447c544) back
   under the 173-line symbol ceiling. `file-ceiling` runs only in `test:full`,
   which is why the earlier merge missed it.
+- **WU1b.** The collector's tree scan over all 307,705 Next.js history trees
+  dropped from 10.8–11.5 s to 1.16–1.32 s (`c7caa2e`).
+- **WU4 verify-first.**
+  - On the Next.js store (node, leased), the cold HEAD closure reads and
+    parses 11,027 trees in 0.92 s cold and 0.37 s warm. Writing their
+    projection takes 1.18 s and 69 statements. That is under the 10 s
+    threshold.
+  - Walk-caller audit: every walk closes its own cursor before it projects.
+    A projection nests as a savepoint inside an open transaction. Interleaved
+    streams never advance another cursor inside a closure's scope.
+  - The interleaving witness passes on the storage double, the local adapter
+    and workerd.
+- **WU4 statement rows (rebaselined).**
+  - These rows rise because they now project pack-ingested trees on first
+    read: `checkout.remove`, `checkout.initial`, `merge.virtual-base`,
+    `merge.apply`, `rebase.transition*`, `rebase.large*`, and
+    `fetch.reachability-parents` (171 → 371).
+  - With every tree projected first, every row returns exactly to its old
+    baseline, so none of this is a steady-state cost. Accepted.
+  - `transport.fetch` dropped from 76 to 73.
+  - `rebase.transition-2n` (1,118) still misses the 1,000 target, as it did
+    before.
+- **WU4 costs, recorded under ADR-0005.**
+  - The first projection of a 1,099-level packed chain costs about
+    6,600 statements, once.
+  - The first incremental fetch over unprojected tips takes 2.1–2.2 s on
+    Next.js.
+  - The sweep strip costs one statement per destructive page. It scans the
+    projection table: about 1.5 ms at 11k projections, 45 ms at 307k.
+    Accepted. The reviewer's watermark optimisation (strip only rows above
+    the last stripped `source_key`) is left for when sweep cost is measured.
+- **WU4 measured (`c7caa2e` + WU4, isolated snapshot, leased, one run).**
+  - 74.7 s wall, against the 179.5 s WU0 baseline.
+  - 2,210 statements, 512,259 rows.
+  - Database 472 MB, against 1.28 GB.
+  - V8 peak 815,556,403 bytes.
+  - HEAD, 24,252 files and a clean worktree were verified.
 

@@ -339,6 +339,7 @@ describe("per-pack connectivity rejects on a fresh store", () => {
       repo.store.packs.ingest(slices(packOf([commit, root]), 4096), {
         connectivity: {
           reachability: null,
+          trees: repo.store,
           promisor: { remoteName: "origin", url: "https://example.test/repo.git" },
           shallow: [],
           unshallow: [],

@@ -50,7 +50,9 @@ const MARKER_WINDOW_SQL = `INSERT INTO git_tree_sources
      entry_count = excluded.entry_count, base_cost = excluded.base_cost
     WHERE git_tree_sources.complete = 0`;
 
-// The join proves every loose source was seeded by its object insert.
+// The join proves every loose source was seeded by its object insert. Each
+// returned row says whether the tree names a subtree without a projection row,
+// so a write whose subtrees are projected needs no separate probe (ADR-0030).
 const SEEDED_MARKER_WINDOW_SQL = `INSERT INTO git_tree_sources
      (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
    SELECT existing.repo_id, existing.tree_oid,
@@ -64,7 +66,15 @@ const SEEDED_MARKER_WINDOW_SQL = `INSERT INTO git_tree_sources
    ON CONFLICT(repo_id, tree_oid) DO UPDATE SET
      complete = 1, object_size = excluded.object_size,
      entry_count = excluded.entry_count, base_cost = excluded.base_cost
-   RETURNING source_key`;
+   RETURNING EXISTS (
+     SELECT 1 FROM git_tree_entries entry
+      WHERE entry.source_key = git_tree_sources.source_key
+        AND entry.mode IN ('40000', '040000')
+        AND NOT EXISTS (
+          SELECT 1 FROM git_tree_sources child
+           WHERE child.repo_id = git_tree_sources.repo_id AND child.tree_oid = entry.oid
+        )
+   ) AS open_subtrees`;
 
 function validateParsedTreeEntry(parsed: ParsedTreeEntry): void {
   const { entry, nameBytes } = parsed;
@@ -84,20 +94,15 @@ function validateTreeSource(source: TreeSource): void {
 export interface TreeIndexBatchOptions {
   /** The loose object trigger seeded every source; a missing one is corrupt. */
   seeded: boolean;
-  /**
-   * Flush whenever the buffers fill. A deferred batch never flushes on its
-   * own: its owner admits only sources that fit and flushes in a transaction.
-   */
-  autoFlush: boolean;
-  /** Buffers borrowed from their owner; without them the batch owns its own. */
-  buffers?: TreeIndexBuffers;
 }
 
-/** Parsed rows awaiting one flush; each statement resolves a tree's identity once. */
+/**
+ * Parsed rows awaiting a flush, which runs whenever the buffers fill; each
+ * statement resolves a tree's identity once.
+ */
 export class TreeIndexBatch {
   readonly #seeded: boolean;
-  readonly #autoFlush: boolean;
-  readonly #owned: boolean;
+  #openSubtrees = false;
   #buffers: TreeIndexBuffers | null;
   readonly #pending: TreeSourceSlot[] = [];
   readonly #unseeded: TreeSourceSlot[] = [];
@@ -114,20 +119,16 @@ export class TreeIndexBatch {
     options: TreeIndexBatchOptions,
   ) {
     this.#seeded = options.seeded;
-    this.#autoFlush = options.autoFlush;
-    this.#owned = options.buffers === undefined;
-    const buffers = options.buffers ?? new TreeIndexBuffers(TREE_INDEX_ROWS, TREE_INDEX_NAME_BYTES);
-    buffers.borrow();
-    this.#buffers = buffers;
+    this.#buffers = new TreeIndexBuffers(TREE_INDEX_ROWS, TREE_INDEX_NAME_BYTES);
   }
 
   get retainedRows(): number {
     return this.#rows().rows;
   }
 
-  /** Whether a deferred batch can admit a source of `objectBytes` raw bytes. */
-  holds(objectBytes: number): boolean {
-    return this.#rows().holds(objectBytes);
+  /** Whether a seeded tree this batch completed names a subtree without a projection row. */
+  get openSubtrees(): boolean {
+    return this.#openSubtrees;
   }
 
   open(source: TreeSource): TreeSourceSlot {
@@ -138,7 +139,7 @@ export class TreeIndexBatch {
   addEntry(slot: TreeSourceSlot, parsed: ParsedTreeEntry, cumulativeBase: number): boolean {
     const rows = this.#rows();
     if (!rows.canAppend(parsed.nameBytes.length)) {
-      this.#flushFull();
+      this.flush();
       if (!rows.canAppend(parsed.nameBytes.length)) {
         return this.#insertOversizedEntry(slot, parsed, cumulativeBase);
       }
@@ -150,7 +151,7 @@ export class TreeIndexBatch {
 
   addMarker(slot: TreeSourceSlot, count: number, baseCost: number): void {
     const rows = this.#rows();
-    if (!rows.canMark()) this.#flushFull();
+    if (!rows.canMark()) this.flush();
     rows.appendMarker(this.#pendingIndex(slot), count, baseCost);
   }
 
@@ -187,7 +188,6 @@ export class TreeIndexBatch {
     if (buffers === null) return;
     this.#buffers = null;
     this.#clearPending();
-    if (!this.#owned) buffers.release();
   }
 
   #writeMarkers(rows: TreeIndexRows, bytes: Uint8Array): void {
@@ -200,8 +200,11 @@ export class TreeIndexBatch {
       return;
     }
     let returnedRows = 0;
-    for (const _row of this.db.iterate(SEEDED_MARKER_WINDOW_SQL, blob(bytes), jsonLength)) {
+    for (const row of this.db.iterate(SEEDED_MARKER_WINDOW_SQL, blob(bytes), jsonLength)) {
       returnedRows++;
+      if (expectSafeInteger(row.open_subtrees, 0, 1, "tree open subtree flag") === 1) {
+        this.#openSubtrees = true;
+      }
     }
     if (returnedRows !== rows.markers) throw new CorruptError("tree index source was not seeded");
   }
@@ -216,11 +219,6 @@ export class TreeIndexBatch {
     for (const slot of this.#pending) slot.pending = -1;
     this.#pending.length = 0;
     this.#unseeded.length = 0;
-  }
-
-  #flushFull(): void {
-    if (!this.#autoFlush) throw new Error("deferred tree index batch admitted more than it holds");
-    this.flush();
   }
 
   #pendingIndex(slot: TreeSourceSlot): number {
@@ -298,6 +296,11 @@ export class TreeSourceIndexer {
       validateTreeSource(source);
       this.#slot = null;
     }
+  }
+
+  /** Whether this source queued a complete projection: written, and not unprojectable. */
+  get queuedProjection(): boolean {
+    return this.#slot !== null && this.#cacheAvailable;
   }
 
   acceptChunk(length: number): void {

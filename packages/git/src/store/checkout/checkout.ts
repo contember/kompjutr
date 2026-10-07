@@ -156,21 +156,27 @@ export class CheckoutStore implements Api.IndexStore {
   }
 
   *walkTree(treeOid: string): Generator<Api.WalkTreeEntry> {
-    yield* iterateTree(this.#db, this.#state.repoId, treeOid);
+    yield* iterateTree(this.#db, this.#state.repoId, this.shared, treeOid);
   }
 
   *walkTreeDiff(
     beforeTreeOid: string | null,
     afterTreeOid: string | null,
   ): Generator<Api.WalkTreeDiffEntry> {
-    yield* iterateTreeDiff(this.#db, this.#state.repoId, beforeTreeOid, afterTreeOid);
+    yield* iterateTreeDiff(this.#db, this.#state.repoId, this.shared, beforeTreeOid, afterTreeOid);
   }
 
   *walkTreeDiffObjects(
     beforeTreeOid: string | null,
     afterTreeOid: string,
   ): Generator<Api.WalkTreeDiffObject> {
-    yield* iterateTreeDiffObjects(this.#db, this.#state.repoId, beforeTreeOid, afterTreeOid);
+    yield* iterateTreeDiffObjects(
+      this.#db,
+      this.#state.repoId,
+      this.shared,
+      beforeTreeOid,
+      afterTreeOid,
+    );
   }
 
   write(type: Api.ObjectType, data: Uint8Array): string {

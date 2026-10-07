@@ -25,7 +25,9 @@ import { SqliteTestStorage } from "./helpers/storage.js";
 class RecordingStorage implements DurableObjectStorageLike {
   readonly inner = new SqliteTestStorage();
   readonly sql: SQLStorageLike;
-  // These counters distinguish fast-path and fallback query shapes, not total SQL cost.
+  // These counters distinguish fast-path and fallback query shapes, not total SQL cost. A clone's
+  // first walk meets an unprojected root and runs once more after projecting its closure, which
+  // reads the trees in one batched object read (ADR-0030).
   walkStatements = 0;
   blobReadStatements = 0;
   provisionalOwnerReads = 0;
@@ -113,7 +115,7 @@ describe("clone initial-state fast path", () => {
       expect(await workspace.fs.readFile("/repo/deep/note.txt", "utf8")).toBe("nested\n");
       expect(await workspace.fs.readlink("/repo/readme-link")).toBe("README.md");
       expect((workspace.filesystem.stat("/repo/bin/run.sh")?.mode ?? 0) & 0o111).not.toBe(0);
-      expect(storage.walkStatements).toBe(1);
+      expect(storage.walkStatements).toBe(2);
       expect(storage.maxBlobReadOids).toBeLessThanOrEqual(1_000);
 
       const linkOid = fixture.git("rev-parse", "HEAD:readme-link");
@@ -192,8 +194,8 @@ describe("clone initial-state fast path", () => {
       expect(await workspace.fs.readFile("/repo/a.bin")).toEqual(first);
       expect(await workspace.fs.readFile("/repo/b.bin")).toEqual(second);
       expect(await workspace.fs.readFile("/repo/c.bin")).toEqual(first);
-      expect(storage.blobReadStatements).toBe(3);
-      expect(storage.walkStatements).toBe(1);
+      expect(storage.blobReadStatements).toBe(4);
+      expect(storage.walkStatements).toBe(2);
       expect(await git.status({ dir: "/repo" })).toEqual([]);
     } finally {
       await server.close();
@@ -221,7 +223,7 @@ describe("clone initial-state fast path", () => {
       expect(equalBytes(actual, large)).toBe(true);
       expect(await workspace.fs.readFile("/repo/small.txt", "utf8")).toBe("small\n");
       expect(count(workspace, "git_index")).toBe(2);
-      expect(storage.walkStatements).toBe(1);
+      expect(storage.walkStatements).toBe(2);
       expect(await git.status({ dir: "/repo" })).toEqual([]);
     } finally {
       await server.close();
@@ -249,7 +251,7 @@ describe("clone initial-state fast path", () => {
       expect(await workspace.fs.readFile("/repo/file-0000.txt", "utf8")).toBe("same\n");
       expect(await workspace.fs.readFile("/repo/zz-large.bin")).toEqual(large);
       expect(count(workspace, "git_index")).toBe(1_101);
-      expect(storage.walkStatements).toBe(1);
+      expect(storage.walkStatements).toBe(2);
       expect(readIndexTrackerState(workspace.db, repoId(workspace))).toEqual({
         available: true,
         baselineTreeOid: fixture.git("rev-parse", "HEAD^{tree}"),
@@ -288,7 +290,7 @@ describe("clone initial-state fast path", () => {
       expect(pathAttempts).toBe(0);
       expect(await paths.fs.readFile("/repo/a.txt", "utf8")).toBe("a\n");
       expect(paths.filesystem.stat("/repo/b.txt")).toBeNull();
-      expect(pathStorage.walkStatements).toBe(3);
+      expect(pathStorage.walkStatements).toBe(4);
       expect(readIndexTrackerState(paths.db, repoId(paths))).toEqual({ available: false });
 
       const absentFactory: GitFactory = (binding) =>
@@ -298,7 +300,7 @@ describe("clone initial-state fast path", () => {
       await absent.git.clone({ url: server.url, dir: "/repo" });
       expect(await absent.fs.readFile("/repo/a.txt", "utf8")).toBe("a\n");
       expect(await absent.fs.readFile("/repo/b.txt", "utf8")).toBe("b\n");
-      expect(absentStorage.walkStatements).toBe(3);
+      expect(absentStorage.walkStatements).toBe(4);
       expect(readIndexTrackerState(absent.db, repoId(absent))).toEqual({ available: false });
 
       let unavailableAttempts = 0;
@@ -322,7 +324,7 @@ describe("clone initial-state fast path", () => {
       expect(unavailableAttempts).toBe(1);
       expect(await unavailable.fs.readFile("/repo/keep.txt", "utf8")).toBe("keep\n");
       expect(await unavailable.fs.readFile("/repo/b.txt", "utf8")).toBe("b\n");
-      expect(unavailableStorage.walkStatements).toBe(3);
+      expect(unavailableStorage.walkStatements).toBe(4);
       expect(readIndexTrackerState(unavailable.db, repoId(unavailable))).toEqual({
         available: false,
       });
@@ -449,7 +451,7 @@ describe("clone initial-state fast path", () => {
       await git.clone({ url: server.url, dir: "/repo" });
 
       expect(count(workspace, "git_index")).toBe(24_252);
-      expect(storage.walkStatements).toBe(3);
+      expect(storage.walkStatements).toBe(4);
       expect(storage.maxBlobReadOids).toBe(1_000);
       expect(storage.provisionalOwnerReads).toBe(1);
       expect(storage.inner.statementCount).toBeLessThan(1_000);

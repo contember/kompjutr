@@ -344,6 +344,9 @@ describe("non-fresh fetch cost", () => {
     try {
       repo.store.configSet("remote.origin.url", server.url);
       await fetchInto(context, repo, { remote: "origin" });
+      // A checkout would have projected the tip's tree; this fetch-only setup projects it here,
+      // so the measured fetch prices the steady state rather than first projection (ADR-0030).
+      [...repo.store.walkTree(fixture.git("rev-parse", "HEAD^{tree}"))];
       const closure = fixture.git("ls-tree", "-r", "-t", "HEAD").split("\n").length + 1;
       fixture.write("root.txt", "changed at the root only\n");
       const head = fixture.commit("incremental");
@@ -386,6 +389,10 @@ describe("non-fresh fetch cost", () => {
       repo.store.configSet("remote.origin.url", server.url);
       await fetchInto(context, repo, { remote: "origin", singleBranch: false, tags: false });
       const closure = fixture.git("ls-tree", "-r", "-t", "b0").split("\n").length + 1;
+      // Project the fetched tips' trees, as checkouts of them would have (ADR-0030).
+      for (let index = 0; index < branches; index++) {
+        [...repo.store.walkTree(fixture.git("rev-parse", `b${index}^{tree}`))];
+      }
       for (let index = 0; index < branches; index++) {
         fixture.git("checkout", "-q", `b${index}`);
         fixture.write(`moved-${index}.txt`, "moved\n");

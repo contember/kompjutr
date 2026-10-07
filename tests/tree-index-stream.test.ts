@@ -12,10 +12,6 @@ import {
 } from "../packages/git/src/common/objects.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import {
-  PackObjectBatch,
-  PackTreeIndex,
-} from "../packages/git/src/store/pack/pack-ingest-index.js";
-import {
   createTreeIndexSink,
   indexTreeSource,
   indexTreeSources,
@@ -23,6 +19,10 @@ import {
   TREE_QUEUE_ROW_FIXED_BYTES,
   type TreeSource,
 } from "../packages/git/src/store/schema/schema.js";
+import {
+  ensureTreeClosure,
+  type TreeObjectReader,
+} from "../packages/git/src/store/trees/tree-closure.js";
 import {
   indexSeededTreeSource,
   indexSeededTreeSources,
@@ -39,9 +39,27 @@ function initializeTreeSchema(db: SqlDatabase): void {
   db.run("INSERT INTO git_repositories (id) VALUES (1)");
 }
 
-it("loads the pack tree index directly without a schema module cycle", () => {
-  expect(typeof PackTreeIndex).toBe("function");
+it("loads the on-demand tree closure directly without a schema module cycle", () => {
+  expect(typeof ensureTreeClosure).toBe("function");
 });
+
+/** Serves tree objects from memory, as the store's object reader would. */
+function treeReader(trees: readonly Uint8Array[]): TreeObjectReader {
+  const byOid = new Map(trees.map((data) => [hashObject("tree", data), data]));
+  return {
+    readObjects(oids) {
+      const objects = new Map<string, { type: "tree"; data: Uint8Array }>();
+      let bytes = 0;
+      for (const oid of oids) {
+        const data = byOid.get(oid);
+        if (data === undefined) throw new Error(`test reader has no tree ${oid}`);
+        objects.set(oid, { type: "tree", data });
+        bytes += data.length;
+      }
+      return { objects, remaining: [], bytes };
+    },
+  };
+}
 
 function rawEntry(mode: string, name: string, oid = OID): Uint8Array {
   return rawEntryBytes(mode, utf8.encode(name), oid);
@@ -237,23 +255,18 @@ describe("incremental tree parser", () => {
 });
 
 describe("incremental tree index sink", () => {
-  it("batches exact-source lookups for repeated small packed trees", () => {
+  it("batches exact-source lookups for repeated small on-demand trees", () => {
     const inner = new TestDatabase();
     initializeTreeSchema(inner);
     const db = new ObservedDatabase(inner);
-    const index = new PackTreeIndex(db, new PackObjectBatch(db, 1));
+    const trees = Array.from({ length: 3000 }, (_, at) => rawEntry("100644", `file-${at}`));
+    const oids = trees.map((data) => hashObject("tree", data));
     inner.storage.resetCounters();
-    for (let at = 0; at < 3000; at++) {
-      const data = rawEntry("100644", `file-${at}`);
-      const oid = hashObject("tree", data);
-      index.addBuffered(1, oid, data.length, data);
-      index.addBuffered(1, oid, data.length, data);
-    }
-    index.flush();
-    // Entry windows resolve each tree once inside the INSERT: no separate lookup
-    // read, one seed per pack batch, and repeats do not occupy a batch slot.
-    expect(db.exactSourceLookups).toBe(0);
-    expect(db.sourceSeeds).toBe(2);
+    ensureTreeClosure(db, 1, treeReader(trees), [...oids, ...oids]);
+    // Entry windows resolve each tree once inside the INSERT: one probe for the
+    // level, one seed per batch flush, and repeats do not occupy a batch slot.
+    expect(db.exactSourceLookups).toBe(1);
+    expect(db.sourceSeeds).toBe(3);
     expect(db.windowTreeLookups).toEqual(db.entryRowCounts);
     expect(inner.storage.statementCount).toBeLessThan(100);
     expect(inner.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(3000);
@@ -269,12 +282,7 @@ describe("incremental tree index sink", () => {
     db.run("INSERT INTO git_repositories (id) VALUES (2)");
     const data = rawEntry("100644", "file");
     const oid = hashObject("tree", data);
-    const index = new PackTreeIndex(db, new PackObjectBatch(db, 1));
-    for (const repoId of [1, 1, 2]) {
-      index.addBuffered(repoId, oid, data.length, data);
-      index.addBuffered(repoId, oid, data.length, data);
-    }
-    index.flush();
+    for (const repoId of [1, 1, 2]) ensureTreeClosure(db, repoId, treeReader([data]), [oid, oid]);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(2);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(2);
     db.storage.db.close();
@@ -287,9 +295,7 @@ describe("incremental tree index sink", () => {
     db.rejectOversizedEntries = true;
     const data = concat([rawEntry("100644", "a"), rawEntry("100644", `z${"x".repeat(ONE_MIB)}`)]);
     const oid = hashObject("tree", data);
-    const index = new PackTreeIndex(db, new PackObjectBatch(db, 1));
-    for (let at = 0; at < 2; at++) index.addBuffered(1, oid, data.length, data);
-    index.flush();
+    for (let at = 0; at < 2; at++) ensureTreeClosure(db, 1, treeReader([data]), [oid, oid]);
     expect(inner.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
     expect(inner.one("SELECT complete, entry_count, base_cost FROM git_tree_sources")).toEqual({
       complete: 0,
@@ -484,9 +490,10 @@ describe("incremental tree index sink", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const subtree = store.write("tree", serializeTree([{ mode: "100644", name: "c", oid: OID }]));
     const data = serializeTree([
       { mode: "100644", name: "a", oid: OID },
-      { mode: "40000", name: "b", oid: "33".repeat(20) },
+      { mode: "40000", name: "b", oid: subtree },
     ]);
     db.storage.histogram = new Map();
     store.write("tree", data);
@@ -501,6 +508,7 @@ describe("incremental tree index sink", () => {
         : query.startsWith("INSERT INTO git_tree_sources")
           ? "marker"
           : query;
+    // The marker reports the subtree projected, so the write runs no closure (ADR-0030).
     expect(treeStatements.map(([query, count]) => [shape(query), count])).toEqual([
       ["entries", 1],
       ["marker", 1],

@@ -4,6 +4,7 @@ import type { ByteLru } from "../../common/lru.js";
 import { MAX_OBJECT_BYTES, type ObjectType, type RawObject } from "../../common/objects.js";
 import type { PackStore } from "../pack/packs.js";
 import type { CommitCacheEntry, CommitCacheWriteResult } from "../trees/commits.js";
+import type { TreeObjectReader } from "../trees/tree-closure.js";
 
 /** Bytes per `git_object_chunks` row. */
 export const OBJECT_CHUNK = 1024 * 1024;
@@ -74,9 +75,11 @@ export interface ObjectReadContext extends ObjectQueryContext {
 
 export interface ObjectBatchContext extends ObjectDatabaseContext {
   readonly cacheKeys: ObjectCacheKeys;
+  /** Reads the subtrees a written tree names, to project their closure (ADR-0030). */
+  readonly trees: TreeObjectReader;
 }
 
-export type ObjectWriteContext = ObjectReadContext;
+export interface ObjectWriteContext extends ObjectReadContext, ObjectBatchContext {}
 
 export function requireStorableObjectSize(type: ObjectType, size: number): void {
   if (size > MAX_OBJECT_BYTES) {

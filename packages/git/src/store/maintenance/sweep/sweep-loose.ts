@@ -7,6 +7,7 @@ import {
   eligibilityTime,
   progress,
   requireStableEpoch,
+  stripUnmarkedTreeProjections,
   sweepCutoff,
   transitionPhase,
   updateReclamationCounters,
@@ -193,6 +194,7 @@ export function advanceLoose(
   let updated: RunState = { ...run, cursorText: last };
   if (doomed.length > 0) {
     requireStableEpoch(db, repoId, run);
+    stripUnmarkedTreeProjections(db, repoId, run);
     deleteLooseObjects(
       db,
       repoId,

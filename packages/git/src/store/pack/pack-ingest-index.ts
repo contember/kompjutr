@@ -8,14 +8,7 @@ import {
   prepareCommitCache,
 } from "../trees/commits.js";
 import { promoteCommitCaches, stageCommitCaches } from "../trees/commits-staging.js";
-import { parseTreeSourceInto, type TreeSource } from "../trees/tree-index.js";
-import { TreeIndexBatch } from "../trees/tree-index-batch.js";
-import { TREE_INDEX_DEFERRED_ROWS, TreeIndexBuffers } from "../trees/tree-index-rows.js";
-import type { ChunkedBytes } from "./chunks.js";
 
-const PACK_TREE_BATCH_SOURCES = 2048;
-/** Tree names one pack batch retains; a larger tree is indexed in its own transaction. */
-const PACK_TREE_NAME_BYTES = 512 * 1024;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
 const PACK_COMMIT_BATCH_SOURCE_BYTES = 2 * 1024 * 1024;
 export const PACK_COMMIT_PAYLOAD_BYTES = 256;
@@ -184,120 +177,6 @@ export class PackPendingBatch {
     );
     this.#rows.length = 0;
     this.#bytes = 2;
-  }
-}
-
-/**
- * Pack trees parsed while their bytes are live, pending one bounded,
- * transactional index flush. It owns the index buffers its batches borrow.
- * Pack entries flush first: a projection without its entry row escapes
- * pending-pack reclaim.
- */
-export class PackTreeIndex {
-  readonly #buffers = new TreeIndexBuffers(TREE_INDEX_DEFERRED_ROWS, PACK_TREE_NAME_BYTES);
-  readonly #queued = new Set<string>();
-  #batch: TreeIndexBatch | null = null;
-  #failed = false;
-
-  constructor(
-    private readonly db: SqlDatabase,
-    private readonly objects: PackObjectBatch,
-  ) {}
-
-  addBuffered(repoId: number, treeOid: string, objectSize: number, data: Uint8Array): void {
-    this.#add({ repoId, treeOid, objectSize }, [data], data.length);
-  }
-
-  addStream(
-    repoId: number,
-    treeOid: string,
-    objectSize: number,
-    chunks: () => Iterable<Uint8Array>,
-  ): void {
-    this.flush();
-    this.#direct({ repoId, treeOid, objectSize }, chunks());
-  }
-
-  /** `target` is reused once this returns, so its tree is parsed now. */
-  addChunked(repoId: number, treeOid: string, objectSize: number, target: ChunkedBytes): void {
-    this.#add({ repoId, treeOid, objectSize }, target.chunks(), target.length);
-  }
-
-  flush(): void {
-    this.#assertUsable();
-    const batch = this.#batch;
-    if (batch === null) return;
-    this.#batch = null;
-    this.#queued.clear();
-    try {
-      this.objects.flush();
-      this.db.transactionSync(() => batch.flush());
-    } catch (error) {
-      this.#failed = true;
-      throw error;
-    } finally {
-      batch.dispose();
-    }
-  }
-
-  #add(source: TreeSource, chunks: Iterable<Uint8Array>, objectBytes: number): void {
-    this.#assertUsable();
-    if (!this.#buffers.rows.holdsAlone(objectBytes)) {
-      this.flush();
-      this.#direct(source, chunks);
-      return;
-    }
-    const key = `${source.repoId}:${source.treeOid}`;
-    if (this.#queued.has(key)) return;
-    if (
-      this.#batch !== null &&
-      (this.#queued.size >= PACK_TREE_BATCH_SOURCES || !this.#batch.holds(objectBytes))
-    ) {
-      this.flush();
-    }
-    const batch = this.#pendingBatch();
-    this.#queued.add(key);
-    try {
-      parseTreeSourceInto(batch, source, chunks);
-    } catch (error) {
-      // Rows of the rejected tree are already queued, so the batch is unusable.
-      this.#failed = true;
-      this.#batch = null;
-      batch.dispose();
-      throw error;
-    }
-  }
-
-  #pendingBatch(): TreeIndexBatch {
-    if (this.#batch === null) {
-      this.#batch = new TreeIndexBatch(this.db, {
-        seeded: false,
-        autoFlush: false,
-        buffers: this.#buffers,
-      });
-    }
-    return this.#batch;
-  }
-
-  #direct(source: TreeSource, chunks: Iterable<Uint8Array>): void {
-    this.objects.flush();
-    this.db.transactionSync(() => {
-      const batch = new TreeIndexBatch(this.db, {
-        seeded: false,
-        autoFlush: true,
-        buffers: this.#buffers,
-      });
-      try {
-        parseTreeSourceInto(batch, source, chunks);
-        batch.flush();
-      } finally {
-        batch.dispose();
-      }
-    });
-  }
-
-  #assertUsable(): void {
-    if (this.#failed) throw new Error("pack tree index failed on an earlier tree");
   }
 }
 

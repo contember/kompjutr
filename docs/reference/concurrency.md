@@ -206,16 +206,13 @@ their stored source.
 `git_pack_entries` authenticates every physical entry of each pack, including
 duplicate OIDs. `git_pack_objects` remains the single canonical read location
 for each OID. A tree OID has one projection in `git_tree_sources`, shared by
-every loose and packed copy. Pack tree projection batches deduplicate
-repository/OID identities and query completed projections in one batch; a
-completed projection is reused and its tree is not parsed again. An unavailable
-projection remains eligible for another indexing attempt. Every physical
-occurrence still passes object authentication, and loose tree writes still parse
-a duplicate but write no entries. Ingest writes a new tree's projection while its
-pack is still pending, so the projection can exist before any copy is readable.
-`PackTreeIndex` flushes the pack's `git_pack_entries` rows before it commits a
-projection, so reclaim finds every projection a failed ingest wrote and loose
-deletion never drops one that a pending pack still holds.
+every loose and packed copy. Pack ingest writes no tree projection
+([ADR-0030](../decisions/0030-project-trees-on-demand.md)); a reader or a loose
+write creates it, and every physical occurrence still passes object
+authentication. A loose write of a tree that is already projected writes no
+entries. A sweep transaction that deletes storage first deletes the projection
+of every tree its run did not mark, so a projection never names a subtree
+without a row.
 Deleting the last loose row (a trigger) or the last pack entry (`PackDeletion`,
 including pending-pack reclaim) deletes the projection.
 Packs are self-contained: every delta names its base by offset inside its own
@@ -389,8 +386,8 @@ after a cold reopen:
   path. Ordinary reads decode trusted rows; only a newly introduced result is
   authenticated.
 - Pending pack objects remain invisible and cleanup removes only an abandoned
-  exact owner. Tree projections written during ingest are visible, since they
-  are content-addressed, and reclaim deletes those no other copy holds.
+  exact owner. Pack ingest writes no tree projection; a reader or a loose
+  write creates it, and deletion of the last copy removes it.
 - Maintenance state is resumable, and a stale root snapshot never authorizes
   deletion of a newer root.
 - Statement cost is observable in benchmarks against the at-most-1,000 target;

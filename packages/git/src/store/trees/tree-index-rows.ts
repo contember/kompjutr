@@ -4,10 +4,6 @@ import type { TreeSource } from "./tree-index.js";
 
 /** Entry or marker rows per statement window. */
 export const TREE_INDEX_ROWS = 2048;
-/** Rows the deferred pack batch retains until its transaction. */
-export const TREE_INDEX_DEFERRED_ROWS = 16 * TREE_INDEX_ROWS;
-/** Smallest valid entry: a five-byte mode, a space, a one-byte name, NUL, and a raw OID. */
-const TREE_ENTRY_MIN_BYTES = 28;
 const TREE_INDEX_ENTRY_ARENA_BYTES = 704 * 1024;
 const TREE_INDEX_MARKER_ARENA_BYTES = 192 * 1024;
 const OID_BYTES = 20;
@@ -27,11 +23,6 @@ function modeCode(mode: string): number {
   const code = MODE_CODES.get(mode);
   if (code === undefined) throw new CorruptError(`invalid tree mode ${mode}`);
   return code;
-}
-
-/** A source's entries plus its marker, if every entry had the smallest valid size. */
-function worstCaseRows(objectBytes: number): number {
-  return Math.floor(objectBytes / TREE_ENTRY_MIN_BYTES) + 1;
 }
 
 /** The value of one lowercase hex digit; OIDs are validated before they reach a row. */
@@ -107,20 +98,6 @@ export class TreeIndexRows {
 
   get markers(): number {
     return this.#markers;
-  }
-
-  /** Whether a source of `objectBytes` raw bytes fits beside the rows already held. */
-  holds(objectBytes: number): boolean {
-    return (
-      this.rows + worstCaseRows(objectBytes) <= this.capacity &&
-      this.#markers < TREE_INDEX_ROWS &&
-      this.#nameBytes() + objectBytes <= this.nameCapacity
-    );
-  }
-
-  /** Whether a source of `objectBytes` raw bytes fits once the rows are flushed. */
-  holdsAlone(objectBytes: number): boolean {
-    return worstCaseRows(objectBytes) <= this.capacity && objectBytes <= this.nameCapacity;
   }
 
   canAppend(nameLength: number): boolean {
@@ -310,28 +287,13 @@ export class TreeIndexRows {
   }
 }
 
-/**
- * The fixed-size buffers one owner reuses across batches: a pack ingest's
- * `PackTreeIndex`, or a loose batch that allocates its own. One batch borrows
- * them at a time and resets them when it is disposed.
- */
+/** The fixed-size row buffers and statement windows of one tree index batch. */
 export class TreeIndexBuffers {
   readonly rows: TreeIndexRows;
   readonly entryWindow = new Uint8Array(TREE_INDEX_ENTRY_ARENA_BYTES);
   readonly markerWindow = new Uint8Array(TREE_INDEX_MARKER_ARENA_BYTES);
-  #borrowed = false;
 
   constructor(rowCapacity: number, nameCapacity: number) {
     this.rows = new TreeIndexRows(rowCapacity, nameCapacity);
-  }
-
-  borrow(): void {
-    if (this.#borrowed) throw new Error("tree index buffers are already in use");
-    this.#borrowed = true;
-  }
-
-  release(): void {
-    this.rows.reset();
-    this.#borrowed = false;
   }
 }

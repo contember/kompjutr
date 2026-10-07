@@ -7,6 +7,7 @@ import { Sha1 } from "../../common/sha1.js";
 import { deflate } from "../../common/zlib.js";
 import { bumpRepositorySourceGeneration } from "../core/source-generation.js";
 import { insertCommitCaches, prepareCommitCache } from "../trees/commits.js";
+import { ensureTreeClosure } from "../trees/tree-closure.js";
 import { indexSeededTreeSource } from "../trees/tree-index.js";
 import { fulfillLoosePromises } from "./objects-promises.js";
 import { hasObject } from "./objects-query.js";
@@ -59,7 +60,7 @@ export function writeObject(
       );
     }
     if (type === "tree") {
-      indexSeededTreeSource(
+      const subtrees = indexSeededTreeSource(
         context.db,
         {
           repoId: context.repoId,
@@ -68,6 +69,7 @@ export function writeObject(
         },
         [data],
       );
+      ensureTreeClosure(context.db, context.repoId, context.trees, subtrees);
     }
     if (commitEntry !== undefined) {
       requireCommitCacheWrites(insertCommitCaches(context.db, [commitEntry]), 1);
@@ -171,7 +173,7 @@ export function writeObjectStream(
     };
     const storage = storageChunks();
     if (type === "tree") {
-      indexSeededTreeSource(
+      const subtrees = indexSeededTreeSource(
         context.db,
         {
           repoId: context.repoId,
@@ -180,6 +182,7 @@ export function writeObjectStream(
         },
         storage,
       );
+      ensureTreeClosure(context.db, context.repoId, context.trees, subtrees);
     } else {
       for (const _chunk of storage) {
         // Storage and hashing advance together without retaining the object.

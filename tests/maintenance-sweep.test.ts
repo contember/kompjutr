@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { blob, type SqlDatabase } from "../packages/do/src/db/db.js";
+import { Workspace } from "../packages/do/src/runtime/workspace.js";
+import { createGit } from "../packages/git/src/client.js";
 import { concat, utf8 } from "../packages/git/src/common/bytes.js";
 import {
   hashObject,
@@ -17,8 +19,10 @@ import {
 import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
+import { packOf } from "./helpers/fetch-pack.js";
 import { slices } from "./helpers/git.js";
 import { promiseMaintenance } from "./helpers/promise-maintenance.js";
+import { SqliteTestStorage } from "./helpers/storage.js";
 
 const PERSON = {
   name: "Sweep Fixture",
@@ -692,6 +696,8 @@ describe("maintenance sweep", () => {
     seedBlobId(db, checkout.repoId, new Uint8Array([4, 5, 6]), blobOid);
     expect(store.read(blobOid)?.data).toEqual(blobData);
     expect(store.read(treeOid)?.data).toEqual(treeData);
+    // Ingest projects no tree (ADR-0030); a first walk creates the projection the rollback keeps.
+    expect([...store.walkTree(treeOid)]).toHaveLength(1);
     expect(store.cachedCommit(commitOid)?.commit.message).toBe("packed rollback commit\n");
     const dataRows = inner.scalar<number>(
       "SELECT count(*) FROM git_pack_data WHERE repo_id = ? AND pack_id = ?",
@@ -896,5 +902,92 @@ describe("maintenance sweep", () => {
       nextEligibleMs: 2 * GC_GRACE_MS,
     });
     expect(store.read(fresh)).not.toBeNull();
+  });
+});
+
+describe("sweep and on-demand tree projections", () => {
+  it("keeps projections downward-closed when a page sweeps a child before its parent", async () => {
+    const storage = new SqliteTestStorage();
+    let now = 1_800_000_000_000;
+    const open = () =>
+      new Workspace({
+        storage,
+        git: createGit(),
+        now: () => now,
+        defaultGitIdentity: { name: "Sweep Fixture", email: "sweep@example.com" },
+      });
+    const workspace = open();
+    await workspace.git.init({ dir: "/repo" });
+    workspace.filesystem.writeFiles([{ path: "/repo/kept.txt", bytes: utf8.encode("kept\n") }]);
+    await workspace.git.add({ dir: "/repo", paths: ["kept.txt"] });
+    await workspace.git.commit({ dir: "/repo", message: "kept" });
+    const db = new TestDatabase(storage);
+    const database = new SqliteGitDatabase(db);
+    const row = database.findCheckout("/repo");
+    if (row === null) throw new Error("checkout is missing");
+    const store = database.openCheckout(row).shared;
+
+    // An unreachable parent and child, the child first in the sweep's OID order.
+    let attempt = 0;
+    const objects = () => {
+      const blobData = utf8.encode(`swept ${attempt}\n`);
+      const childData = serializeTree([
+        { mode: MODE_FILE, name: "f", oid: hashObject("blob", blobData) },
+      ]);
+      const child = hashObject("tree", childData);
+      const parentData = serializeTree([{ mode: "40000", name: "d", oid: child }]);
+      return { blobData, childData, child, parentData, parent: hashObject("tree", parentData) };
+    };
+    let fixture = objects();
+    while (fixture.child.localeCompare(fixture.parent) >= 0) {
+      attempt++;
+      fixture = objects();
+    }
+    const { blobData, childData, child, parentData, parent } = fixture;
+    store.write("blob", blobData);
+    store.write("tree", childData);
+    store.write("tree", parentData);
+
+    const maintain = async () => (await open().git.maintenance({ dir: "/repo" })).phase;
+    for (let calls = 0; ; calls++) {
+      if (calls === 100) throw new Error("maintenance did not finish");
+      const result = await open().git.maintenance({ dir: "/repo" });
+      if (result.status === "complete") break;
+    }
+    now += GC_GRACE_MS + 1;
+    while ((await maintain()) !== "loose") {
+      // Advance roots and mark of the run that may delete the nominated objects.
+    }
+    expect(store.has(parent)).toBe(true);
+    // One object per page: the child goes in a page of its own, the parent stays.
+    while (store.has(child)) advanceMaintenanceSweep(store, { nowMs: now, pageRows: 1 });
+    expect(store.has(parent)).toBe(true);
+
+    // The run is interrupted: the parent becomes reachable, and a fetch brings the child back.
+    const revived = store.write(
+      "commit",
+      serializeCommit({
+        tree: parent,
+        parent: [],
+        author: { name: "A", email: "a@example.com", timestamp: 1, timezoneOffset: 0 },
+        committer: { name: "A", email: "a@example.com", timestamp: 1, timezoneOffset: 0 },
+        message: "revived\n",
+      }),
+    );
+    store.setRef("refs/heads/revived", revived);
+    await store.packs.ingest(
+      slices(
+        packOf([
+          { type: "blob", data: blobData },
+          { type: "tree", data: childData },
+        ]),
+        4096,
+      ),
+    );
+
+    expect([...store.walkTree(parent)]).toEqual([
+      { path: "d/f", mode: MODE_FILE, oid: hashObject("blob", blobData) },
+    ]);
+    storage.db.close();
   });
 });

@@ -80,6 +80,7 @@ async function ingestPack(
       : {
           connectivity: {
             reachability: connectivity.reachability,
+            trees: repo.store,
             ...(connectivity.promisor === undefined ? {} : { promisor: connectivity.promisor }),
             shallow: [...connectivity.shallow],
             unshallow: [...connectivity.unshallow],

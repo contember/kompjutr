@@ -1,12 +1,9 @@
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { readBlob } from "../packages/do/src/db/db.js";
 import { displayMode, typeForMode } from "../packages/git/src/common/objects.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
-import {
-  PackObjectBatch,
-  PackTreeIndex,
-} from "../packages/git/src/store/pack/pack-ingest-index.js";
 import { TREE_QUEUE_ROW_FIXED_BYTES } from "../packages/git/src/store/schema/schema.js";
+import { ensureTreeClosure } from "../packages/git/src/store/trees/tree-closure.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 
@@ -26,6 +23,8 @@ const trees = fixture
   .filter(([, type]) => type === "tree")
   .map(([oid]) => oid!);
 const expected = new Map(trees.map((oid) => [oid, lsTree(oid)]));
+/** Every tree after the subtrees it names, the order a loose writer builds them in. */
+const bottomUp = subtreesFirst();
 
 afterAll(() => fixture.dispose());
 
@@ -88,6 +87,19 @@ function lsTree(oid: string): ListedEntry[] {
     start = at + 1;
   }
   return entries;
+}
+
+function subtreesFirst(): string[] {
+  const ordered: string[] = [];
+  const visited = new Set<string>();
+  const visit = (oid: string): void => {
+    if (visited.has(oid)) return;
+    visited.add(oid);
+    for (const entry of expected.get(oid) ?? []) if (entry.type === "tree") visit(entry.oid);
+    ordered.push(oid);
+  };
+  for (const oid of trees) visit(oid);
+  return ordered;
 }
 
 function projected(db: TestDatabase, oid: string): ListedEntry[] {
@@ -160,49 +172,35 @@ describe("tree projection parity with git ls-tree", () => {
     expect(fixture.git("rev-parse", "HEAD:twin-a")).toBe(fixture.git("rev-parse", "HEAD:twin-b"));
   });
 
-  it("projects every tree of an ingested pack exactly", async () => {
+  it("projects every tree of an ingested pack exactly when a walk first reads it", async () => {
     const { db, store } = open();
-    const chunked = vi.spyOn(PackTreeIndex.prototype, "addChunked");
-    const buffered = vi.spyOn(PackTreeIndex.prototype, "addBuffered");
-    try {
-      await store.packs.ingest(slices(fixture.packAll(), 64 * 1024));
-      // Delta-resolved trees reach the index through reused chunks.
-      expect(chunked).toHaveBeenCalled();
-      expect(buffered).toHaveBeenCalled();
-    } finally {
-      chunked.mockRestore();
-      buffered.mockRestore();
-    }
+    await store.packs.ingest(slices(fixture.packAll(), 64 * 1024));
+    expect(db.scalar<number>("SELECT count(*) FROM git_tree_sources")).toBe(0);
+    for (const oid of trees) [...store.walkTree(oid)];
     expectParity(db);
 
-    // An incremental fetch that sees every tree again writes no projection row.
+    // An incremental fetch that sees every tree again, then walks, writes no projection row.
     const projectionWrites = watchProjectionWrites(db);
     await store.packs.ingest(slices(fixture.packAll(), 64 * 1024));
+    for (const oid of trees) [...store.walkTree(oid)];
     expect(projectionWrites()).toBe(0);
     expectParity(db);
   });
 
-  it("writes nothing for trees that recur after a pack tree batch flush", () => {
-    const { db } = open();
-    const repoId = db.scalar<number>("SELECT id FROM git_repositories");
-    if (repoId === undefined) throw new Error("repository missing");
-    const index = new PackTreeIndex(db, new PackObjectBatch(db, repoId));
-    const raw = trees.map((oid) => new Uint8Array(fixture.gitBinary("cat-file", "tree", oid)));
-    for (const [at, data] of raw.entries())
-      index.addBuffered(repoId, trees[at]!, data.length, data);
-    index.flush();
+  it("writes nothing when a tree closure is ensured again", async () => {
+    const { db, store } = open();
+    await store.packs.ingest(slices(fixture.packAll(), 64 * 1024));
+    ensureTreeClosure(db, store.repoId, store, trees);
     expectParity(db);
 
     const projectionWrites = watchProjectionWrites(db);
-    for (const [at, data] of raw.entries())
-      index.addBuffered(repoId, trees[at]!, data.length, data);
-    index.flush();
+    ensureTreeClosure(db, store.repoId, store, trees);
     expect(projectionWrites()).toBe(0);
     expectParity(db);
   });
 
   it("projects every loose tree exactly, written singly or in one batch", () => {
-    const raw = trees.map((oid) => new Uint8Array(fixture.gitBinary("cat-file", "tree", oid)));
+    const raw = bottomUp.map((oid) => new Uint8Array(fixture.gitBinary("cat-file", "tree", oid)));
     const single = open();
     for (const data of [...raw, ...raw]) single.store.write("tree", data);
     expectParity(single.db);

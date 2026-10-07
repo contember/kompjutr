@@ -33,6 +33,7 @@ import {
 import { PackDataReader } from "../packages/git/src/store/pack/read/read-data.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { COMMIT_ROW_MAX_BYTES } from "../packages/git/src/store/trees/commits.js";
+import { ensureTreeClosure } from "../packages/git/src/store/trees/tree-closure.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { completePackMatches, type PackMember, reclaimPending } from "./helpers/pack-store.js";
@@ -1895,6 +1896,12 @@ describe("pack deferred resolution", () => {
 
     db.storage.resetCounters();
     await store.packs.ingest(slices(concat(chunks), 97));
+    // Ingest projects no tree; on-demand projection reads the deferred deltas back (ADR-0030).
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1")).toBe(0);
+    ensureTreeClosure(db, 1, store, [
+      baseOid,
+      ...targets.map((target) => hashObject("tree", target)),
+    ]);
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1")).toBe(81);
     expect(db.storage.statementCount).toBeLessThan(1_000);
@@ -2422,7 +2429,10 @@ describe("pack deferred resolution", () => {
       writer.object("tree", data);
       writer.finish();
       await store.packs.ingest(slices(concat(chunks), 64 * 1024));
-      return { db, store, oid: hashObject("tree", data) };
+      const oid = hashObject("tree", data);
+      // Ingest projects no tree; the first reader projects it from the pack (ADR-0030).
+      ensureTreeClosure(db, 1, store, [oid]);
+      return { db, store, oid };
     };
 
     const small = syntheticTree(2_000);
@@ -2528,6 +2538,9 @@ describe("pack publication and deletion", () => {
         "SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?",
         oid,
       );
+    // Ingest projects no tree; a first walk creates the projection the reclaim must drop.
+    expect(projections()).toBe(0);
+    expect([...store.walkTree(oid)]).toHaveLength(1);
     expect(projections()).toBe(1);
 
     store.db.run(
@@ -2625,7 +2638,7 @@ describe("pack publication and deletion", () => {
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_data")).toBe(0);
   });
 
-  it("leaves a pack with an invalid UTF-8 tree name incomplete and unreadable", async () => {
+  it("publishes a tree with an invalid UTF-8 name and refuses it at first projection", async () => {
     const store = open();
     const data = concat([
       utf8.encode("100644 "),
@@ -2639,18 +2652,14 @@ describe("pack publication and deletion", () => {
     writer.object("tree", data);
     writer.finish();
 
-    await expect(store.packs.ingest(slices(concat(chunks), 64))).rejects.toMatchObject({
-      code: "EUNSUPPORTED",
-    });
-    expect(
-      store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'"),
-    ).toBe(0);
-    expect(
-      store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'pending'"),
-    ).toBe(1);
-    expect(store.typeAndSize(oid)).toBeNull();
-    expect(store.read(oid)).toBeNull();
+    // Ingest parses no tree name, so the refusal moves to the first walk (ADR-0030).
+    await store.packs.ingest(slices(concat(chunks), 64));
+    expect(store.typeAndSize(oid)).toEqual({ type: "tree", size: data.length });
+    expect(() => [...store.walkTree(oid)]).toThrowError(
+      expect.objectContaining({ code: "EUNSUPPORTED" }),
+    );
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
   });
 
   it("streams an entry larger than the buffered limit", async () => {
@@ -2811,7 +2820,8 @@ describe("pack publication and deletion", () => {
         store.sharedRepoId,
       ),
     ).toEqual({ state: "pending", pack_id: 1, stored_bytes: 0 });
-    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(1);
+    // Ingest projects no tree (ADR-0030), so the unpublished pack leaves no projection either.
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
     expect(store.packs.completePackedEntry(oid)).toBeNull();
     expect(store.read(oid)).toBeNull();
     store.db.run(
@@ -2963,6 +2973,9 @@ describe("pack publication and deletion", () => {
     expect(store.read(treeOid)?.data).toEqual(tree);
     expect(store.read(commitOid)?.data).toEqual(commitData);
     expect(store.cachedCommit(commitOid)?.commit.message).toBe("packed commit\n");
+    // Ingest projects no tree; a first walk creates the projection deletion must drop.
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
+    expect([...store.walkTree(treeOid)]).toHaveLength(1);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(1);
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(1);
 

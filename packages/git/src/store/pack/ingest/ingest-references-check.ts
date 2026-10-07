@@ -4,6 +4,7 @@ import type { ObjectType } from "../../../common/objects.js";
 import { expectSafeInteger, expectText } from "../../../common/rows.js";
 import { MAX_PROMISED_BLOB_LOOKUP_OIDS, PromisorTable } from "../../fetch/promisor.js";
 import { ShallowTable } from "../../refs/shallow.js";
+import type { TreeObjectReader } from "../../trees/tree-closure.js";
 import { isObjectType } from "../shared.js";
 import { PackReferenceCollector, type UnresolvedReference } from "./ingest-references.js";
 import {
@@ -20,6 +21,8 @@ export interface PackConnectivityOptions {
    * fetch's packs resolves.
    */
   readonly reachability: FetchReachability | null;
+  /** Reads the tree objects whose projections a closure walk creates (ADR-0030). */
+  readonly trees: TreeObjectReader;
   /** A filtered fetch promises the blobs its packs reference but do not deliver. */
   readonly promisor?: { readonly remoteName: string; readonly url: string };
   /** The operation's shallow response so far, applied over the stored boundary. */
@@ -134,7 +137,13 @@ export class PackConnectivityCheck {
     const external =
       reachability === null
         ? null
-        : new ExternalReferenceCheck(this.#db, this.#repoId, reachability, promisor !== undefined);
+        : new ExternalReferenceCheck(
+            this.#db,
+            this.#repoId,
+            this.#options.trees,
+            reachability,
+            promisor !== undefined,
+          );
     let page: UnresolvedReference[] = [];
     const flush = (): void => {
       const unresolved = this.#resolveAccepted(page);

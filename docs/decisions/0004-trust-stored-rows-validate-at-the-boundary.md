@@ -49,7 +49,9 @@ We validate at the boundary and trust the store.
   advertisement parsing. Fetched data is genuinely untrusted.
 - The schema at open — version and exact shape.
 - Write time — schema `CHECK` constraints and write-path validation. They are
-  the reason reads may trust rows.
+  the reason reads may trust rows. Tree content, including entry names, is
+  validated on the projection write path, not at pack ingest
+  ([ADR-0030](0030-project-trees-on-demand.md)).
 - The sparse capability — `createGit` checks only that it reads the Git
   store's database. Its results are trusted; a capability not built by
   `createSqliteSparseCapability`, or with replaced members, is host code, and

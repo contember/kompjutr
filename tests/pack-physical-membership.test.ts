@@ -4,8 +4,9 @@ import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { concat, utf8 } from "../packages/git/src/common/bytes.js";
 import { hashObject, serializeTree } from "../packages/git/src/common/objects.js";
-import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { type SharedRepoStore, SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
+import type { PackConnectivityOptions } from "../packages/git/src/store/pack/ingest/ingest-references-check.js";
 import { MAX_PACK_INGEST_OBJECTS, OFFSET_WINDOW } from "../packages/git/src/store/pack/shared.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
@@ -127,6 +128,11 @@ function repeatedTreePack(tree: Uint8Array, deltas = 0, fillers = 0, malformed =
   return { bytes: concat([body, createHash("sha1").update(body).digest()]), offsets };
 }
 
+/** The connectivity option a fetch into a fresh store passes to pack ingest. */
+function fetchConnectivity(store: SharedRepoStore): PackConnectivityOptions {
+  return { reachability: null, trees: store, shallow: [], unshallow: [], acceptedPacks: [] };
+}
+
 describe("pack physical offset membership", () => {
   it("ingests a native-valid pack beyond 131072 objects with a deferred delta", async () => {
     const incoming = pack(131_071);
@@ -198,6 +204,11 @@ describe("pack physical offset membership", () => {
         if (loose) store.write("tree", tree);
         const first = await store.packs.ingest(slices(repeatedTreePack(tree).bytes, 4096));
         const second = await store.packs.ingest(slices(repeatedTreePack(tree, 2).bytes, 4096));
+        // Ingest projects no tree (ADR-0030); a first walk creates the one shared projection.
+        expect(
+          db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE tree_oid = ?", oid),
+        ).toBe(loose ? 1 : 0);
+        expect([...store.walkTree(oid)]).toHaveLength(1);
         expect(
           db.scalar<number>(
             "SELECT COUNT(*) FROM git_tree_sources WHERE tree_oid = ? AND complete = 1",
@@ -225,7 +236,7 @@ describe("pack physical offset membership", () => {
     },
   );
 
-  it("rejects a malformed later tree and drops its projections with the pending pack", async () => {
+  it("rejects a malformed later tree at fetch ingest and leaves no projection", async () => {
     const tree = serializeTree([{ mode: "100644", name: "file", oid: BASE_OID }]);
     const oid = hashObject("tree", tree);
     const db = new TestDatabase();
@@ -233,8 +244,11 @@ describe("pack physical offset membership", () => {
     const checkout = database.createRepository("/repo", "ref: refs/heads/main");
     const store = database.openCheckout(checkout).shared;
     try {
+      // Only a fetch's reference collector parses trees at ingest (ADR-0029, ADR-0030).
       await expect(
-        store.packs.ingest(slices(repeatedTreePack(tree, 2, 2048, true).bytes, 4096)),
+        store.packs.ingest(slices(repeatedTreePack(tree, 2, 2048, true).bytes, 4096), {
+          connectivity: fetchConnectivity(store),
+        }),
       ).rejects.toThrow(/malformed tree/);
       const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(checkout).shared;
       expect(cold.has(oid)).toBe(false);
@@ -242,7 +256,7 @@ describe("pack physical offset membership", () => {
       expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'")).toBe(
         0,
       );
-      // The next ingest reclaims the rejected pending pack and every projection it held.
+      // The next ingest reclaims the rejected pending pack; no projection was ever written.
       await store.packs.ingest(slices(pack(null).bytes, 4096));
       expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'pending'")).toBe(
         0,
@@ -263,9 +277,11 @@ describe("pack physical offset membership", () => {
       const store = database.openCheckout(
         database.createRepository("/repo", "ref: refs/heads/main"),
       ).shared;
-      // The fillers fill one tree batch, so the tree commits before the malformed one fails.
+      // The pending pack keeps a physical entry of the tree after the malformed one fails.
       await expect(
-        store.packs.ingest(slices(repeatedTreePack(tree, 0, 2048, true).bytes, 4096)),
+        store.packs.ingest(slices(repeatedTreePack(tree, 0, 2048, true).bytes, 4096), {
+          connectivity: fetchConnectivity(store),
+        }),
       ).rejects.toThrow(/malformed tree/);
       const projection = () =>
         db.one<{ source_key: number; complete: number }>(
@@ -283,16 +299,16 @@ describe("pack physical offset membership", () => {
       return { db, store, projection, entryRows, reclaim };
     }
 
-    it("adds no entries when a loose write repeats its complete projection", async () => {
+    it("leaves no projection and lets a loose write project the tree once", async () => {
       const { db, store, projection, entryRows } = await pendingProjection();
       try {
-        const packed = projection();
-        expect(packed).toMatchObject({ complete: 1 });
-        expect(entryRows()).toBe(1);
+        expect(projection()).toBeUndefined();
         expect(store.has(oid)).toBe(false);
 
         expect(store.write("tree", tree)).toBe(oid);
-        expect(projection()).toEqual(packed);
+        expect(projection()).toMatchObject({ complete: 1 });
+        expect(entryRows()).toBe(1);
+        expect(store.write("tree", tree)).toBe(oid);
         expect(entryRows()).toBe(1);
       } finally {
         db.storage.db.close();
@@ -302,9 +318,10 @@ describe("pack physical offset membership", () => {
     it("keeps the projection through a loose delete and drops it on reclaim", async () => {
       const { db, store, projection, entryRows, reclaim } = await pendingProjection();
       try {
+        expect(projection()).toBeUndefined();
+        store.write("tree", tree);
         const before = projection();
         expect(before).toMatchObject({ complete: 1 });
-        store.write("tree", tree);
         db.run("DELETE FROM git_objects WHERE oid = ?", oid);
         expect(projection()).toEqual(before);
 
@@ -317,7 +334,7 @@ describe("pack physical offset membership", () => {
     });
   });
 
-  it("reclaims the streamed tree projection of a rejected ingest", async () => {
+  it("writes no streamed tree projection in a rejected ingest", async () => {
     const tree = serializeTree(
       Array.from({ length: 30000 }, (_, at) => ({
         mode: "100644",
@@ -332,14 +349,14 @@ describe("pack physical offset membership", () => {
     const oid = hashObject("tree", tree);
     const projections = () => db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources");
     try {
-      // The streamed tree commits its projection, then a later streamed tree fails to parse.
+      // The streamed tree reaches the collector, then a later streamed tree fails to parse.
       await expect(
-        store.packs.ingest(slices(repeatedTreePack(tree, 0, 0, true).bytes, 4096)),
+        store.packs.ingest(slices(repeatedTreePack(tree, 0, 0, true).bytes, 4096), {
+          connectivity: fetchConnectivity(store),
+        }),
       ).rejects.toThrow(/malformed tree/);
-      expect(projections()).toBe(1);
-      expect(
-        db.scalar<number>("SELECT COUNT(*) FROM git_pack_entries WHERE oid = ?", oid),
-      ).toBeGreaterThan(0);
+      expect(projections()).toBe(0);
+      expect(store.has(oid)).toBe(false);
 
       await store.packs.ingest(slices(pack(null).bytes, 4096));
       expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'pending'")).toBe(
@@ -410,6 +427,8 @@ describe("pack physical offset membership", () => {
         });
         expect(Buffer.from(tree).equals(nativeTree)).toBe(true);
         expect(Buffer.from(cold.read(oid)?.data ?? []).equals(nativeTree)).toBe(true);
+        // Ingest projects no tree; the first walk projects it from one of the copies (ADR-0030).
+        expect([...cold.walkTree(oid)]).toHaveLength(count);
         expect(
           db.all<{ offset: number }>(
             "SELECT offset FROM git_pack_entries WHERE oid = ? ORDER BY offset",

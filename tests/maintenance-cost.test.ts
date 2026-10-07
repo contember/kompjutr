@@ -218,6 +218,8 @@ async function createFixture(storage: SqliteTestStorage, clock: Clock): Promise<
     { now: () => clock.value },
   );
 
+  // Pack ingest projects no tree; a first walk creates the projection the sweep must delete.
+  [...store.walkTree(deadPackTreeOid)];
   const deadLooseTreeSourceKey = treeSourceKey(db, checkout.repoId, deadLoose.treeOid);
   const deadPackTreeSourceKey = treeSourceKey(db, checkout.repoId, deadPackTreeOid);
   const deadLooseBlobOid = requiredItem(deadLoose.blobOids, 0, "dead loose blob");

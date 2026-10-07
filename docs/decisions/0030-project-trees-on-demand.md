@@ -1,7 +1,7 @@
 ---
 id: 0030
 title: Project trees on demand as a downward-closed set
-status: proposed
+status: accepted
 date: 2026-10-07
 ---
 
@@ -33,27 +33,36 @@ A tree OID has one of three projection states:
 - **`complete = 0`** — unprojectable (an oversized tree), terminal;
 - **`complete = 1`** — projected.
 
+A loose tree's insert trigger also seeds a `complete = 0` row that the same
+transaction completes; that placeholder is transaction-local and never
+committed as such, so it is not a fourth committed state.
+
 **Invariant: the projected set is downward-closed.** If a tree is projected,
 every subtree it names is projected or unprojectable. A walk therefore needs
 only its root to be projected; it meets an unprojectable subtree exactly where
 it does today.
 
-- `ensureTreeClosure(roots)` projects every tree of the roots' closures that is
-  not yet complete. It reads the tree objects through the ordinary object
+- `ensureTreeClosure(roots)` projects every tree of the roots' closures that
+  has no row. It reads the tree objects through the ordinary object
   reader, parses them, and writes sources and entries level by level. It stops
   at subtrees that are projected or unprojectable, because the invariant
-  guarantees their closure. A missing tree object is `ObjectNotFoundError`; an
+  guarantees their closure. The subtrees of a tree that turns out to be
+  unprojectable are not visited. A missing tree object is `ObjectNotFoundError`; an
   object of another type is `CorruptError`. All of it runs in one `transactionSync`, nested as a savepoint when a
   caller already holds one, so a fault leaves no partial closure.
 - A tree walk starts without a check. If the walk reports a structured
   `missing_root` error (its root has no row) before it yields any row, the
   wrapper closes the cursor, ensures the root's closure and runs the walk once
-  more. A walk over a
-  projected tree costs no extra statement. Any other missing source
-  stays `ECORRUPT`, including an unprojectable root.
+  more. A walk over a projected tree costs no extra statement. Any other
+  missing source stays `ECORRUPT`, including an unprojectable root. The walk
+  API takes the object reader the closure needs; a fetch's connectivity
+  check passes the repository's.
 - A loose tree write projects the new tree and ensures the closure of its
   subtrees in the same transaction, so a written tree never names an
-  unprojected subtree.
+  unprojected subtree. The statement that completes the projection also
+  reports whether the tree names a subtree without a row, so a write whose
+  subtrees are projected runs no extra statement. Blob entries are not
+  checked.
 - Maintenance expands a tree from its projection when it is complete, and
   otherwise parses the object bytes without writing a projection. Marking all
   of history must not project all of history. The fallback accepts entry
@@ -85,12 +94,38 @@ fails its walk as before.
   ("no valid parsed source"). The walk already reports a subtree without a
   source row as `ENOTFOUND` through its `missing_source` error kind; an
   unprojectable subtree stays `ECORRUPT`.
+- **Changed error.** Writing a loose tree whose subtree object is absent
+  fails with `ENOTFOUND` and writes nothing. Otherwise a missing row would no
+  longer mean a missing tree, and a subtree that arrived later would be
+  misreported. Blob entries may still name absent or promised blobs.
+- **Moved error.** Pack ingest no longer parses trees, except through a
+  fetch's reference collector, which checks structure but not names. A tree
+  whose entry name is not UTF-8 is published and refused with `EUNSUPPORTED`
+  when it is first projected, as a loose write of it is refused; an unchecked
+  ingest of a malformed tree is refused with `CorruptError` at the same point.
 - A read can write. Every walk entry point must run where a `transactionSync`
   is legal, and an open cursor must be closed before the closure is written.
-- Pack deletion, loose-object deletion and the delete triggers stay as they
-  are. While maintenance deletes unreachable trees across pages, a projected
-  unreachable parent can name a deleted child; walking that parent by OID was
-  already `ECORRUPT` before this decision.
+  Interleaved streams (status, three-way integration) are safe: a closure
+  runs in a nested scope in which no other open cursor is advanced, so its
+  rollback invalidates none of them.
+- The first projection of a deep chain costs statements per level: each level
+  is one probe and one object read. A 1,099-level packed chain costs several
+  thousand statements once; later walks cost one.
+- Deleting the last copy of a tree still deletes its projection. Maintenance
+  sweeps unreachable trees across pages in OID order, so a child can go before
+  its parent. If the parent later became reachable again and the child came
+  back in a pack, the parent's projection would name a child without a row,
+  and its walk would fail forever. So every sweep transaction that deletes
+  storage first deletes the projection of every tree the run did not mark.
+  A marked tree's subtrees are marked and never deleted, so every projection
+  that remains stays downward-closed. The strip is one statement over the
+  projection table; it bumps no generation or epoch. It also drops the
+  projections of recent unmarked trees, which a later read projects again.
+  Each destructive page scans the whole projection table, which on-demand
+  projection keeps small.
+- Promisor hydration ingests packs without the reference collector, so no
+  tree content is checked there. A malformed tree such a pack publishes is
+  unreachable from any ref, fails only if walked by OID, and is swept.
 - Repositories that are never read deeply never pay for their history's
   projections, and the database is smaller by the unread projections.
 

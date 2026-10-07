@@ -190,7 +190,7 @@ root, including one behind an ancestor symlink loop, is prunable.
 | --- | --- |
 | Repository (`repo_id`) | objects, packs, refs, ordinary config, shallow, fetch and promisor state, direct-ref reflogs, tree/commit projections, blob-ID cache, maintenance |
 | Checkout (`checkout_id`) | canonical root, raw `HEAD`, index, tracker state, operation journal, checkout `HEAD` reflog |
-| Tree projection (`repo_id`, `tree_oid`) | `git_tree_sources` row and its `git_tree_entries`, shared by every copy; deleted with the last copy |
+| Tree projection (`repo_id`, `tree_oid`) | `git_tree_sources` row and its `git_tree_entries`, shared by every copy; created when a reader or a loose write first needs it, deleted with the last copy |
 | Pack (`repo_id`, `pack_id`) | pending `git_pack_commit_staging` projections; promoted at complete publication or removed with the pack |
 | Synchronous scratch transaction | named scratch indexes; rows never survive the callback and are not maintenance roots |
 
@@ -290,13 +290,26 @@ materialise one object as a single buffer, so the worktree stat, loose write
 paths, pack ingest, and the `size` `CHECK`s all refuse it with `E2BIG` at the
 boundary.
 
+Trees are projected on demand
+([ADR-0030](../decisions/0030-project-trees-on-demand.md)). A tree OID has no
+projection row, an unprojectable `complete = 0` row (an oversized tree), or a
+`complete = 1` projection. The projected set is downward-closed: a projected
+tree's subtrees are projected or unprojectable. A tree walk whose root has no
+row closes its cursor, projects the root's closure through the object reader in
+one transaction, and runs once more. A loose tree write projects the tree and
+its subtrees' closure in the same transaction, so a written tree must name
+present subtrees. Pack ingest projects no tree, and maintenance parses
+unprojected trees without projecting them. A sweep transaction that deletes
+storage first deletes the projections of every tree its run did not mark, so
+paging order cannot leave a projection naming a swept subtree.
+
 Pack ingest is provisional:
 
 ```text
 pending metadata
 → streamed 1 MiB pack rows
 → object and delta indexes, plus the pack reference collector (fetch only)
-→ tree and commit projections
+→ commit projections
 → trailer and parse-time membership validation
 → complete pack: reference check and promise insert (fetch only)
 → ref publication
@@ -376,9 +389,12 @@ epochs, CAS, or leases rather than the local mutation guard.
 - Maintenance consumes each root source as a single decoded keyset page and
   operation journals through bounded root pages. A repository root epoch
   restarts discovery before destructive work. Maintenance owns no pack.
-- Pending pack objects are durable but invisible; tree projections that ingest
-  writes are visible, since they are content-addressed. Complete packs may
-  survive a stale publication and be reused.
+- Pending pack objects are durable but invisible, and ingest writes no tree
+  projection. Complete packs may survive a stale publication and be reused.
+- A tree walk can write: projecting a closure runs in its own nested
+  `transactionSync`, and the walk closes its cursor first. Another stream's
+  open cursor is not advanced inside that scope, so a failed closure rolls back
+  without invalidating it.
 
 One live `Workspace` represents one Durable Object isolate. A second facade over
 the same storage is a cold replacement after eviction, not a concurrent peer.

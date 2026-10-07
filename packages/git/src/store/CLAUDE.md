@@ -34,7 +34,10 @@ fetch state, direct-ref reflogs, projections, blob IDs, and maintenance.
 `checkout_id` owns the root, raw `HEAD`, index and tracker state, operation
 journals, and `HEAD` reflog. `git_tree_sources` holds one projection per tree
 OID, shared by every loose and packed copy and deleted with the last copy;
-`git_tree_entries` is owned through its source surrogate. `git_scratch_index*`
+`git_tree_entries` is owned through its source surrogate. Projections are
+derived rows created on demand (`trees/tree-closure.ts`, ADR-0030): a walk
+projects a missing root's closure and a loose tree write its subtrees'
+closure. Creating one bumps no source generation. `git_scratch_index*`
 rows are transaction-local and never become maintenance roots. `git_commits`
 holds one row per stored commit, written in the object's transaction (a packed
 one's at pack publication) and deleted with the last copy; a NULL message marks a

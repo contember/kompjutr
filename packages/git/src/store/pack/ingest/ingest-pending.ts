@@ -12,7 +12,6 @@ import {
   type PackCommitIndex,
   type PackObjectBatch,
   type PackObjectInput,
-  type PackTreeIndex,
   type PendingRow,
   validatePendingRow,
 } from "../pack-ingest-index.js";
@@ -107,7 +106,6 @@ export class PackPendingResolver {
   async drainPending(
     packId: number,
     objectIndex: PackObjectBatch,
-    treeIndex: PackTreeIndex,
     commitIndex: PackCommitIndex,
     yieldNow: () => Promise<void>,
     heartbeat: () => void,
@@ -263,7 +261,6 @@ export class PackPendingResolver {
                 oid,
                 base.type,
                 null,
-                treeIndex,
                 commitIndex,
                 row.data_off,
                 row.data_len,

@@ -45,7 +45,7 @@ so the two cannot drift.
 - [0025 — Bound packed reads by chain depth and restart maintenance on source drift](0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md) — accepted (2026-09-24)
 - [0028 — Confine mounted views and fail closed](0028-confine-mounted-views-and-fail-closed.md) — accepted (2026-10-07)
 - [0029 — Check fetched connectivity per received pack](0029-check-fetched-connectivity-per-pack.md) — accepted (2026-10-07)
-- [0030 — Project trees on demand as a downward-closed set](0030-project-trees-on-demand.md) — proposed (2026-10-07)
+- [0030 — Project trees on demand as a downward-closed set](0030-project-trees-on-demand.md) — accepted (2026-10-07)
 
 **Git domain**
 
