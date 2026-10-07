@@ -1,6 +1,7 @@
 import { CorruptError, GitError, hasErrorCode, ObjectNotFoundError } from "../../common/errors.js";
 import type { ObjectType } from "../../common/objects.js";
 import { MAX_BLOB_BATCH_OIDS } from "../../store/objects/objects.js";
+import { readAcceptedPackTypes } from "../../store/pack/ingest/ingest-references-check.js";
 import { readCommitTreeRoots } from "../../store/trees/commits.js";
 import { readConnectivityFailures } from "../../store/trees/connectivity.js";
 import type { Repository } from "../repository/repository.js";
@@ -9,12 +10,20 @@ import { parseAuthenticatedTag, TAG_PEEL_HOPS } from "./network-tags.js";
 const OBJECT_PAGE = 512;
 const TAG_BATCH_BYTES = 4 * 1024 * 1024;
 
-/** The caller holds the publication transaction until all validated refs are written. */
+/**
+ * Validate the fetched roots before refs publish. With `acceptedPacks` (a
+ * fresh store, ADR-0029), every pack of the fetch already resolved its
+ * references at ingest, so each root and tag-peel hop must be in one of those
+ * packs; otherwise the history walk proves the roots' closure. The caller
+ * holds the publication transaction until all validated refs are written.
+ */
 export function validateFetchedConnectivity(
   repo: Repository,
   roots: readonly string[],
   boundary: ReadonlySet<string>,
+  acceptedPacks: readonly number[] | null = null,
 ): void {
+  const packsChecked = acceptedPacks !== null;
   const shallow = [...boundary];
   let commits: string[] = [];
   const flushCommits = (): void => {
@@ -36,7 +45,19 @@ export function validateFetchedConnectivity(
         const info = repo.store.objectInfo(frontier.map((entry) => entry.oid));
         const types = new Map(info.map((entry) => [entry.oid, entry.type]));
         const sizes = new Map(info.map((entry) => [entry.oid, entry.size]));
+        const delivered =
+          acceptedPacks === null
+            ? null
+            : readAcceptedPackTypes(
+                repo.store.db,
+                repo.store.repoId,
+                acceptedPacks,
+                frontier.map((entry) => entry.oid),
+              );
         for (const entry of frontier) {
+          if (delivered !== null && !delivered.has(entry.oid)) {
+            throw new ObjectNotFoundError(entry.oid);
+          }
           if (entry.type !== undefined && types.get(entry.oid) !== entry.type) {
             throw new CorruptError(`fetched tag target ${entry.oid} has a mismatched type`);
           }
@@ -48,7 +69,7 @@ export function validateFetchedConnectivity(
             tags.push(entry.oid);
             continue;
           }
-          if (entry.type === "commit") {
+          if (entry.type === "commit" && !packsChecked) {
             for (const commit of readCommitTreeRoots(
               repo.store.db,
               repo.store.repoId,
@@ -63,13 +84,9 @@ export function validateFetchedConnectivity(
             treeRoots.push({ oid: entry.oid, type: entry.type });
           }
         }
-        const [failure] = readConnectivityFailures(
-          repo.store.db,
-          repo.store.repoId,
-          treeRoots,
-          shallow,
-          1,
-        );
+        const [failure] = packsChecked
+          ? []
+          : readConnectivityFailures(repo.store.db, repo.store.repoId, treeRoots, shallow, 1);
         // Failures rank globally and deterministically: sourceless tree, commits, missing,
         // wrong type. The former code ranked per 4,096-entry flush; both reject the same graphs.
         if (failure?.kind === "source") {

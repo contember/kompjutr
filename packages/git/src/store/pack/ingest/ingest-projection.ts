@@ -14,6 +14,7 @@ import type {
 } from "../pack-ingest-index.js";
 import type { PackReadEngine } from "../read.js";
 import { PACK_CHUNK } from "../shared.js";
+import type { PackReferenceCollector } from "./ingest-references.js";
 
 export class PackResolvedProjection {
   constructor(
@@ -33,21 +34,29 @@ export class PackResolvedProjection {
     objectSize: number,
     objectIndex: PackObjectBatch,
     chunked: ChunkedBytes | null,
+    references: PackReferenceCollector | null,
   ): void {
     objectIndex.add(row);
+    references?.addObject(oid, type);
+    const whole = (): Uint8Array => {
+      if (data !== null) return data;
+      if (chunked !== null) return chunked.toUint8Array();
+      return concat([...this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize)]);
+    };
     if (type === "commit") {
-      let commitData: Uint8Array;
-      if (data !== null) {
-        commitData = data;
-      } else if (chunked !== null) {
-        commitData = chunked.toUint8Array();
-      } else {
-        const inflated = [...this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize)];
-        commitData = concat(inflated);
-      }
+      const commitData = whole();
       commitIndex.add({ repoId: this.repoId, oid, data: commitData });
+      references?.addCommit(oid, commitData);
     }
+    if (type === "tag") references?.addTag(whole());
     if (type !== "tree") return;
+    references?.addTree(
+      data !== null
+        ? [data]
+        : chunked !== null
+          ? chunked.chunks()
+          : this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize),
+    );
     if (chunked !== null) {
       treeIndex.addChunked(this.repoId, oid, objectSize, chunked);
       return;
@@ -61,7 +70,7 @@ export class PackResolvedProjection {
     );
   }
 
-  /** Re-inflate a large full tree directly into the streaming parser. */
+  /** Re-inflate a large full object directly into the streaming parser. */
   *#inflateEntryChunks(
     packId: number,
     dataOff: number,

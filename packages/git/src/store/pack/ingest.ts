@@ -9,6 +9,10 @@ import { bumpRepositorySourceGeneration } from "../core/source-generation.js";
 import { ChunkPool } from "./chunks.js";
 import { PackIndexer } from "./ingest/ingest-index.js";
 import { type AbortablePackIngestOptions, throwIfIngestAborted } from "./ingest/ingest-options.js";
+import {
+  PackConnectivityCheck,
+  type PackConnectivityOptions,
+} from "./ingest/ingest-references-check.js";
 import { PackChunkWriter } from "./ingest/ingest-write.js";
 import type { PackLifecycle } from "./lifecycle.js";
 import type { PackReadEngine } from "./read.js";
@@ -20,6 +24,11 @@ import {
   requireIngestTime,
   requireLifecycleResult,
 } from "./shared.js";
+
+export interface CheckedPackIngestOptions extends AbortablePackIngestOptions {
+  /** Supplied by a network fetch; the pack publishes only if its references resolve. */
+  connectivity?: PackConnectivityOptions;
+}
 
 export class PackIngestEngine {
   readonly #db: SqlDatabase;
@@ -64,14 +73,14 @@ export class PackIngestEngine {
   /** Stream a pack through storage, indexing, delta resolution, and publication. */
   async ingest(
     source: AsyncIterable<Uint8Array>,
-    options: AbortablePackIngestOptions = {},
+    options: CheckedPackIngestOptions = {},
   ): Promise<PackIngestResult> {
     return this.#ingest(source, options);
   }
 
   async #ingest(
     source: AsyncIterable<Uint8Array>,
-    options: AbortablePackIngestOptions,
+    options: CheckedPackIngestOptions,
   ): Promise<PackIngestResult> {
     const now = options.now ?? this.#now;
     const say = options.onProgress ?? (() => {});
@@ -83,6 +92,10 @@ export class PackIngestEngine {
     let lease: PackIngestLease | null = null;
     try {
       throwIfIngestAborted(signal);
+      const connectivity =
+        options.connectivity === undefined
+          ? null
+          : new PackConnectivityCheck(this.#db, this.#repoId, options.connectivity);
       const reservation = this.#lifecycle.reservePending(requireIngestTime(now), options.lifecycle);
       activePackId = reservation.packId;
       const activeLease = reservation.lease;
@@ -110,6 +123,7 @@ export class PackIngestEngine {
         heartbeat,
         memory,
         signal,
+        connectivity,
       );
       heartbeat();
       const result = { packId: reservation.packId, count, bytes: total };
@@ -139,6 +153,7 @@ export class PackIngestEngine {
         this.#lifecycle.auditPublishedMembership(reservation.packId, membership);
         commits.finish();
         bumpRepositorySourceGeneration(this.#db, this.#repoId);
+        connectivity?.publish();
         if (options.lifecycle !== undefined) {
           requireLifecycleResult(options.lifecycle.published(result), "published");
         }

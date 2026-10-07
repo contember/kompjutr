@@ -112,12 +112,6 @@ export class CheckoutStore implements Api.IndexStore {
     this.#mutate(() => this.#state.mutations.addPromisedBlobsOwned(remoteName, oids));
   }
 
-  addPromisedBlobsFromPackTrees(remoteName: string, packId: number): void {
-    this.#mutate(() =>
-      this.#state.mutations.addPromisedBlobsFromPackTreesOwned(remoteName, packId),
-    );
-  }
-
   promisedMissing(oids: readonly string[]): string[] {
     return this.shared.promisedMissing(oids);
   }

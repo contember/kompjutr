@@ -119,50 +119,40 @@ export class PromisorTable {
     });
   }
 
-  addBlobsFromPackTrees(remoteName: string, packId: number): void {
-    const checkedName = requireRemoteName(remoteName);
-    if (!Number.isSafeInteger(packId) || packId < 0) {
-      throw new GitError("EINVAL", "promisor pack id is invalid");
-    }
-    this.db.transactionSync(() => {
-      if (this.#read(checkedName) === null) {
-        throw new GitError("ENOREMOTE", `promisor remote ${checkedName} is not registered`);
-      }
-      // Shared blobs repeat across tree edges; probe availability once per distinct OID.
-      this.db.run(
-        `WITH candidates(oid) AS MATERIALIZED (
-           SELECT DISTINCT entry.oid
-             FROM git_pack_entries tree
-             JOIN git_tree_sources source
-               ON source.repo_id = tree.repo_id AND source.tree_oid = tree.oid
-             JOIN git_tree_entries entry ON entry.source_key = source.source_key
-            WHERE tree.repo_id = ? AND tree.pack_id = ? AND tree.type = 'tree'
-              AND source.complete = 1
-              AND entry.mode NOT IN ('40000', '040000', '160000')
-         )
-         INSERT INTO git_promised_blobs (repo_id, oid, remote_name, type)
-         SELECT ?, candidate.oid, ?, 'blob'
-           FROM candidates candidate
-          WHERE NOT EXISTS (
-              SELECT 1 FROM git_objects loose
-               WHERE loose.repo_id = ? AND loose.oid = candidate.oid
-            )
-            AND NOT EXISTS (
-              SELECT 1 FROM git_pack_objects packed
-              JOIN git_pack_meta pack
-                ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-               AND pack.state = 'complete'
-               WHERE packed.repo_id = ? AND packed.oid = candidate.oid
-            )
-         ON CONFLICT(repo_id, oid) DO NOTHING`,
-        this.repoId,
-        packId,
-        this.repoId,
-        checkedName,
-        this.repoId,
-        this.repoId,
+  /**
+   * Promise one page of blobs a filtered pack references but does not deliver.
+   * The caller registered the remote; a present blob is not promised.
+   */
+  addUnresolvedBlobs(remoteName: string, oids: readonly string[]): void {
+    if (oids.length > MAX_PROMISED_BLOB_LOOKUP_OIDS) {
+      throw new GitError(
+        "E2BIG",
+        `promised blob page exceeds ${MAX_PROMISED_BLOB_LOOKUP_OIDS} inputs`,
       );
-    });
+    }
+    if (oids.length === 0) return;
+    this.db.run(
+      `INSERT INTO git_promised_blobs (repo_id, oid, remote_name, type)
+       SELECT ?, candidate.value, ?, 'blob'
+         FROM json_each(?) candidate
+        WHERE NOT EXISTS (
+            SELECT 1 FROM git_objects loose
+             WHERE loose.repo_id = ? AND loose.oid = candidate.value
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM git_pack_objects packed
+            JOIN git_pack_meta pack
+              ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
+             AND pack.state = 'complete'
+             WHERE packed.repo_id = ? AND packed.oid = candidate.value
+          )
+       ON CONFLICT(repo_id, oid) DO NOTHING`,
+      this.repoId,
+      requireRemoteName(remoteName),
+      JSON.stringify(oids),
+      this.repoId,
+      this.repoId,
+    );
   }
 
   promisedMissing(oids: readonly string[]): string[] {

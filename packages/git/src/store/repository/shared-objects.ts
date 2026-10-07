@@ -72,16 +72,6 @@ export abstract class SharedRepoObjectStore extends SharedRepoCore {
     this.promisorTable().addBlobs(remoteName, oids);
   }
 
-  addPromisedBlobsFromPackTrees(remoteName: string, packId: number): void {
-    withGitMutationGuard(this.db, () =>
-      this.addPromisedBlobsFromPackTreesOwned(remoteName, packId),
-    );
-  }
-
-  protected addPromisedBlobsFromPackTreesOwned(remoteName: string, packId: number): void {
-    this.promisorTable().addBlobsFromPackTrees(remoteName, packId);
-  }
-
   promisedMissing(oids: readonly string[]): string[] {
     return this.promisorTable().promisedMissing(oids);
   }

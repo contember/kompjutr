@@ -616,12 +616,34 @@ their synchronous local publication; once publication starts, it completes and
 the operation succeeds even if the signal is aborted afterwards. Interrupted
 pack ingest remains invisible, and a retry renegotiates from published state.
 
-Before publishing fetched refs, connectivity validation streams commit IDs and
-their root tree IDs from the parsed store. Each commit root is checked against
-the 50,000-commit bound and the proposed shallow boundaries. It
-does not select commit messages, signatures, or identities, so their aggregate
-size does not consume the parsed-commit capacity used by log and graph readers.
-Missing parents, trees, and unpromised blobs still reject publication.
+Every received pack is checked at ingest
+([ADR-0029](../decisions/0029-check-fetched-connectivity-per-pack.md)). Ingest
+records each object's type and the references its objects make: a commit's tree
+and parents, a tag's target with its declared type, and tree entries by mode (a
+`160000` gitlink is not checked). Inside the pack's publication transaction, a
+reference to an object in the pack, or in a pack this fetch already accepted,
+must have the expected type; a mismatch is `ECORRUPT`. An unresolved OID that
+references expect as two different types, or a pack holding one OID as two
+types, is `ECORRUPT` in every mode. A commit in the shallow
+boundary (stored boundary plus the response's `shallow`, minus `unshallow`) has
+unchecked parents. In a filtered fetch, the referenced blobs that no pack of
+the fetch delivered, minus blobs already present, become promises in that same
+transaction. A failed check leaves the pack unpublished.
+
+When the store held no loose object, complete pack, or promise as the fetch
+began, every reference must resolve inside the fetch's packs. A missing object
+fails the fetch with `EFETCHFAIL`, including a missing subtree and a dangling
+object no fetched ref reaches; Git accepts such a dangling object. Before refs
+publish, each root and each tag-peel hop must be in one of the fetch's packs;
+root types and tag peels are checked, with no history walk.
+
+Any other fetch keeps the history walk before it publishes refs. Connectivity
+validation streams commit IDs and their root tree IDs from the parsed store.
+Each commit root is checked against the 50,000-commit bound and the proposed
+shallow boundaries. It does not select commit messages, signatures, or
+identities, so their aggregate size does not consume the parsed-commit capacity
+used by log and graph readers. Missing parents, trees, and unpromised blobs
+still reject publication.
 
 For each bounded root batch, a recursive `UNION` deduplicates reachable tree
 IDs across the commit histories, and the distinct blob IDs of their direct
@@ -631,8 +653,6 @@ loose objects and complete packs, exempts only missing blobs that carry a
 promise, and returns failures only, ranked as sourceless tree, commit, missing,
 then wrong type. This traversal retains identities in SQLite, not path strings
 or object payloads in JavaScript, and has no additional tree-count limit.
-Promise registration deduplicates candidate blob IDs before its availability
-probes.
 
 Promised-blob lookups keep the bounded requested-ID batch as the outer side of
 the join and seek each promise by `(repo_id, oid)`. They do not enumerate the

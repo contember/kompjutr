@@ -7,12 +7,13 @@ import {
   type ObjectType,
   serializeTree,
 } from "../packages/git/src/common/objects.js";
+import { fetchInto } from "../packages/git/src/ops/network/network.js";
 import { validateFetchedConnectivity } from "../packages/git/src/ops/network/network-connectivity.js";
 import { hydratePromisedBlobs } from "../packages/git/src/ops/network/network-promisor.js";
-import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import type { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { MAX_BLOB_BATCH_OIDS } from "../packages/git/src/store/objects/objects.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
-import { TestDatabase } from "./helpers/db.js";
+import { commitObject, packRemote } from "./helpers/fetch-pack.js";
 import { slices } from "./helpers/git.js";
 import { startStubServer } from "./helpers/http-backend.js";
 import { makeRepo } from "./helpers/workspace.js";
@@ -70,16 +71,8 @@ async function packServer(pack: Uint8Array, tip: string) {
   });
 }
 
-function openStore() {
-  const db = new TestDatabase();
-  const database = new SqliteGitDatabase(db);
-  const repository = database.createRepository("/repo", "ref: refs/heads/main");
-  return { db, store: database.openCheckout(repository) };
-}
-
-/** Pack `count` trees that each name the same blob once plus one blob of their own. */
-async function sharedBlobPack(count: number) {
-  const { db, store } = openStore();
+/** Fetch, filtered, `count` trees that each name the same blob once plus one blob of their own. */
+async function sharedBlobFetch(count: number, before: (repo: Repository) => Promise<void>) {
   const shared = hashObject("blob", utf8.encode("shared"));
   const trees = Array.from({ length: count }, (_, index) =>
     serializeTree([
@@ -87,40 +80,65 @@ async function sharedBlobPack(count: number) {
       { mode: MODE_FILE, name: `own-${index}`, oid: hashObject("blob", utf8.encode(`${index}`)) },
     ]),
   );
-  const { packId } = await store.packs.ingest(
-    slices(packOf(trees.map((data) => ({ type: "tree", data }))), 4096),
+  const root = serializeTree(
+    trees.map((data, index) => ({
+      mode: MODE_TREE,
+      name: `dir-${String(index).padStart(3, "0")}`,
+      oid: hashObject("tree", data),
+    })),
   );
-  store.registerPromisorRemote("origin", REMOTE);
-  return { db, store, packId, shared };
+  const commit = commitObject(hashObject("tree", root));
+  const server = await packRemote(
+    packOf([
+      commit,
+      { type: "tree", data: root },
+      ...trees.map((data): PackObject => ({ type: "tree", data })),
+    ]),
+    commit.oid,
+    { filter: true },
+  );
+  const { repo, context } = makeRepo("/work");
+  try {
+    repo.store.configSet("remote.origin.url", server.url);
+    await before(repo);
+    const run = vi.spyOn(repo.store.db, "run");
+    await fetchInto(context, repo, { remote: "origin", tags: false, filter: "blob:none" });
+    return { db: repo.store.db, store: repo.store, run, shared };
+  } finally {
+    await server.close();
+  }
 }
 
 describe("set-based promise insert", () => {
   it("plans availability probes over distinct candidates, not tree edges", async () => {
-    const fixture = await sharedBlobPack(64);
-    const run = vi.spyOn(fixture.db, "run");
-    fixture.store.addPromisedBlobsFromPackTrees("origin", fixture.packId);
-    const insert = run.mock.calls.find(([query]) => query.includes("INSERT INTO git_promised"));
+    const fixture = await sharedBlobFetch(64, async () => {});
+    const insert = fixture.run.mock.calls.find(([query]) =>
+      query.includes("INSERT INTO git_promised"),
+    );
     if (insert === undefined) throw new Error("promise insert was not observed");
     const [query, ...bindings] = insert;
+    const candidates = bindings.find(
+      (binding) => typeof binding === "string" && binding.startsWith("["),
+    );
+    if (typeof candidates !== "string") throw new Error("promise candidates were not bound");
+    expect(JSON.parse(candidates)).toHaveLength(65);
     const plan = fixture.db
       .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, ...bindings)
       .map((row) => row.detail);
     expect(fixture.store.promisedBlobCount()).toBe(65);
     expect(fixture.store.promisedMissing([fixture.shared])).toEqual([fixture.shared]);
-    const distinct = plan.indexOf("USE TEMP B-TREE FOR DISTINCT");
-    const scan = plan.indexOf("SCAN candidate");
+    const scan = plan.findIndex((detail) => detail.startsWith("SCAN candidate"));
     const probe = plan.findIndex((detail) => detail.startsWith("SEARCH loose"));
-    expect(distinct).toBeGreaterThanOrEqual(0);
-    expect(scan).toBeGreaterThan(distinct);
+    expect(scan).toBeGreaterThanOrEqual(0);
     expect(probe).toBeGreaterThan(scan);
   });
 
   it("does not promise a blob that a complete pack already holds", async () => {
-    const fixture = await sharedBlobPack(4);
-    await fixture.store.packs.ingest(
-      slices(packOf([{ type: "blob", data: utf8.encode("shared") }]), 4096),
-    );
-    fixture.store.addPromisedBlobsFromPackTrees("origin", fixture.packId);
+    const fixture = await sharedBlobFetch(4, async (repo) => {
+      await repo.store.packs.ingest(
+        slices(packOf([{ type: "blob", data: utf8.encode("shared") }]), 4096),
+      );
+    });
     expect(fixture.store.promisedBlobCount()).toBe(4);
     expect(fixture.store.promisedMissing([fixture.shared])).toEqual([]);
   });

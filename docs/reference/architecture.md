@@ -295,11 +295,19 @@ Pack ingest is provisional:
 ```text
 pending metadata
 → streamed 1 MiB pack rows
-→ object and delta indexes
+→ object and delta indexes, plus the pack reference collector (fetch only)
 → tree and commit projections
 → trailer and parse-time membership validation
-→ complete pack and ref publication
+→ complete pack: reference check and promise insert (fetch only)
+→ ref publication
 ```
+
+A network fetch passes a connectivity option to ingest. While objects resolve,
+an in-memory table keyed by binary OID records each object's type and the types
+its references expect. Publication type-checks the pack's own references,
+promises the unresolved blobs of a filtered fetch, and, when the store was
+fresh at fetch start, rejects any reference that the fetch's packs do not
+resolve ([ADR-0029](../decisions/0029-check-fetched-connectivity-per-pack.md)).
 
 Only complete packs are readable. Parse records an ordered digest for every
 physical membership row. Publication compares the stored rows with those

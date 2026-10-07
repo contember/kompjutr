@@ -451,3 +451,22 @@ Paths are relative to `packages/git/src/`.
     added.
 
 ## Run log
+
+- **WU0 baseline (`d3f230f`, isolated snapshot, one leased run).**
+  - 179.5 s wall, 6,373 statements, 537,955 rows, HEAD `497ec6aa`, 24,252 files,
+    clean worktree.
+  - `clone.v8.peakUsedPlusExternalBytes` was 987,608,064 (942 MiB). The full
+    mode reports this peak and does not gate it.
+  - The first WU0 run (6,419 statements) is void: WU1 edits were in the tree.
+- **WU1 statements.** `transport.fetch` rose from 72/53 to 76/56. The extra
+  statements are the fresh-store probe, two shallow reads at ingest start and
+  the shallow revision re-read at publication. Accepted and rebaselined.
+- **WU1 deferred to WU3.** A tag-fallback round on a fresh store can fail
+  closed (`EFETCHFAIL`) when a concurrent fetch publishes the same tag object
+  during the awaits. WU3 reworks want selection, so it computes fallback wants
+  against the accepted packs.
+- **WU1 deferred to WU4.** Streamed trees are inflated twice, once for the
+  collector and once for the projection. The projection goes away in WU4.
+- **Stale workflow results.** `nextjs:git.clone` in `bench:statements` reads a
+  stale, ignored `bench/results/nextjs-workflow.json` from Sep 24. It is
+  report-only and predates this sprint.

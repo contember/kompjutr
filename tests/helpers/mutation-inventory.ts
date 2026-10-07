@@ -64,7 +64,6 @@ export const GIT_MUTATION_BOUNDARY_INVENTORY = Object.freeze({
   repository: Object.freeze(["invalidateShallow", "mutateRefs", "publishFetchRefs"]),
   checkoutStore: Object.freeze([
     "addPromisedBlobs",
-    "addPromisedBlobsFromPackTrees",
     "clearMergeState",
     "clearOperationState",
     "configAdd",
@@ -99,7 +98,6 @@ export const GIT_MUTATION_BOUNDARY_INVENTORY = Object.freeze({
   ]),
   sharedRepoStore: Object.freeze([
     "addPromisedBlobs",
-    "addPromisedBlobsFromPackTrees",
     "configAdd",
     "configMoveSection",
     "configSet",

@@ -32,7 +32,6 @@ export interface SharedRepoStoreMutations {
   upsertBlobIdsOwned(mappings: Iterable<BlobIdMapping>): void;
   registerPromisorRemoteOwned(remoteName: string, url: string): PromisorRemote;
   addPromisedBlobsOwned(remoteName: string, oids: Iterable<string>): void;
-  addPromisedBlobsFromPackTreesOwned(remoteName: string, packId: number): void;
   writeOwned(type: ObjectType, data: Uint8Array): string;
   writeStreamOwned(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string;
   writeBatchOwned(options?: ObjectBatchOptions): OwnedObjectBatch;

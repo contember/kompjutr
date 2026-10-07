@@ -23,8 +23,10 @@ separate from loose and packed objects. A promise never makes a physical `has`,
 object or pack publication removes the matching promises in the same
 transaction.
 
-A filtered fetch records every absent blob referenced by authenticated tree
-projections before it publishes refs. Shallow boundaries stay independent:
+A filtered fetch records every absent blob its received packs reference, as
+collected during pack ingest and inserted in the pack's publication transaction
+([ADR-0029](0029-check-fetched-connectivity-per-pack.md)), before it publishes
+refs. Shallow boundaries stay independent:
 shallow controls commit ancestry, partial clone controls blob presence.
 Maintenance treats an explicitly promised missing blob as a terminal leaf, not as
 a root and not as corruption; every other missing reachable object still fails.

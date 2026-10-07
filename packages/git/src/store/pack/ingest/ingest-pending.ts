@@ -32,6 +32,7 @@ import {
 import type { PackIngestInflater } from "./ingest-inflate.js";
 import { throwIfIngestAborted } from "./ingest-options.js";
 import type { PackResolvedProjection } from "./ingest-projection.js";
+import type { PackReferenceCollector } from "./ingest-references.js";
 
 /**
  * Deferred deltas name their base by offset, or by OID for a ref-delta, and the
@@ -112,6 +113,7 @@ export class PackPendingResolver {
     heartbeat: () => void,
     memory: PackIngestMemory,
     signal: AbortSignal | undefined,
+    references: PackReferenceCollector | null,
   ): Promise<void> {
     let remaining =
       this.db.scalar<number>(
@@ -268,6 +270,7 @@ export class PackPendingResolver {
                 target.length,
                 objectIndex,
                 target,
+                references,
               );
               completed.push(row.offset);
               if (children.length > 0) {

@@ -42,8 +42,6 @@ export class SharedRepoStore extends SharedRepoRefStore {
       registerPromisorRemoteOwned: (remoteName, url) =>
         this.registerPromisorRemoteOwned(remoteName, url),
       addPromisedBlobsOwned: (remoteName, oids) => this.addPromisedBlobsOwned(remoteName, oids),
-      addPromisedBlobsFromPackTreesOwned: (remoteName, packId) =>
-        this.addPromisedBlobsFromPackTreesOwned(remoteName, packId),
       writeOwned: (type, data) => this.writeOwned(type, data),
       writeStreamOwned: (type, size, chunks) => this.writeStreamOwned(type, size, chunks),
       writeBatchOwned: (batchOptions) => this.writeBatchOwned(batchOptions),

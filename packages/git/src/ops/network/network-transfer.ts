@@ -1,5 +1,5 @@
 import { isOid } from "../../common/bytes.js";
-import { GitError } from "../../common/errors.js";
+import { GitError, hasErrorCode } from "../../common/errors.js";
 import {
   type MessageCallback,
   type ProgressCallback,
@@ -12,13 +12,50 @@ import {
   uploadPack,
 } from "../../protocol/remote.js";
 import { throwIfAborted } from "../../protocol/stream.js";
-import { sharedRepoStoreMutations } from "../../store/repository/shared.js";
+import { readFreshObjectStore } from "../../store/pack/ingest/ingest-references-check.js";
 import type { GitContext } from "../core/context.js";
 import { type Repository, walkOwned } from "../repository/repository.js";
 import { runFetchCheckpoint } from "./network-checkpoint.js";
 import type { FetchCheckpointStage } from "./network-types.js";
 
 const HAVE_BUDGET = 256;
+
+/** What every pack of one fetch operation is checked against at ingest (ADR-0029). */
+export interface FetchConnectivity {
+  /** Read once, when the fetch begins. */
+  readonly fresh: boolean;
+  readonly promisor?: { readonly remoteName: string; readonly url: string };
+  readonly shallow: Set<string>;
+  readonly unshallow: Set<string>;
+  readonly acceptedPacks: number[];
+}
+
+export function beginFetchConnectivity(
+  repo: Repository,
+  promisor: { remoteName: string; url: string } | undefined,
+): FetchConnectivity {
+  return {
+    fresh: readFreshObjectStore(repo.store.db, repo.store.repoId),
+    ...(promisor === undefined ? {} : { promisor }),
+    shallow: new Set(),
+    unshallow: new Set(),
+    acceptedPacks: [],
+  };
+}
+
+function applyConnectivityShallow(
+  connectivity: FetchConnectivity,
+  response: { shallow: readonly string[]; unshallow: readonly string[] },
+): void {
+  for (const oid of response.unshallow) {
+    connectivity.shallow.delete(oid);
+    connectivity.unshallow.add(oid);
+  }
+  for (const oid of response.shallow) {
+    connectivity.unshallow.delete(oid);
+    connectivity.shallow.add(oid);
+  }
+}
 
 /** Recent commits from every local ref, as negotiation `have`s. */
 function collectHaves(repo: Repository): string[] {
@@ -54,7 +91,7 @@ async function ingestPack(
   pack: AsyncIterable<Uint8Array>,
   say: ((text: string) => void) | undefined,
   checkpoint: ((stage: FetchCheckpointStage) => Promise<void> | undefined) | undefined,
-  promisor: { remote: string; url: string } | undefined,
+  connectivity: FetchConnectivity | undefined,
   signal: AbortSignal | undefined,
 ): Promise<void> {
   const yieldNow =
@@ -68,18 +105,30 @@ async function ingestPack(
     now: context.now,
     ...(yieldNow === undefined ? {} : { yieldNow }),
     ...(signal === undefined ? {} : { signal }),
-    ...(promisor === undefined
+    ...(connectivity === undefined
       ? {}
       : {
-          lifecycle: {
-            reserved() {},
-            published(result: { readonly packId: number }) {
-              recordPartialFetch(repo, promisor.remote, promisor.url, result.packId);
-            },
+          connectivity: {
+            fresh: connectivity.fresh,
+            ...(connectivity.promisor === undefined ? {} : { promisor: connectivity.promisor }),
+            shallow: [...connectivity.shallow],
+            unshallow: [...connectivity.unshallow],
+            acceptedPacks: [...connectivity.acceptedPacks],
           },
         }),
   };
-  await repo.store.packs.ingest(pack, ingestOptions);
+  let packId: number;
+  try {
+    ({ packId } = await repo.store.packs.ingest(pack, ingestOptions));
+  } catch (error) {
+    if (hasErrorCode(error, "ENOTFOUND")) {
+      throw new GitError("EFETCHFAIL", "fetched graph references a missing object", {
+        cause: error,
+      });
+    }
+    throw error;
+  }
+  connectivity?.acceptedPacks.push(packId);
 }
 
 export async function transferPack(
@@ -93,7 +142,8 @@ export async function transferPack(
     deepenRelative?: boolean;
     includeTag?: boolean;
     filter?: UploadPackFilter;
-    promisorRemote?: string;
+    /** Every fetch supplies it; promisor hydration ingests unchecked. */
+    connectivity?: FetchConnectivity;
     advertised: Set<string>;
     haves?: string[];
     useLocalHaves?: boolean;
@@ -135,15 +185,14 @@ export async function transferPack(
     throw new GitError("EHTTP", "upload-pack request failed", { cause: error });
   }
   await runFetchCheckpoint(checkpoint, "before-ingest", signal);
+  if (request.connectivity !== undefined) applyConnectivityShallow(request.connectivity, result);
   await ingestPack(
     context,
     repo,
     fetchPackStream(result.pack, signal),
     say,
     checkpoint,
-    request.promisorRemote === undefined
-      ? undefined
-      : { remote: request.promisorRemote, url: request.url },
+    request.connectivity,
     signal,
   );
   await runFetchCheckpoint(checkpoint, "after-ingest", signal);
@@ -168,11 +217,6 @@ async function* fetchPackStream(
     if (isPublicFetchNetworkError(error)) throw error;
     throw new GitError("EHTTP", "upload-pack response stream failed", { cause: error });
   }
-}
-
-function recordPartialFetch(repo: Repository, remote: string, url: string, packId: number): void {
-  sharedRepoStoreMutations(repo.store).registerPromisorRemoteOwned(remote, url);
-  sharedRepoStoreMutations(repo.store).addPromisedBlobsFromPackTreesOwned(remote, packId);
 }
 
 export function fetchProgressSink(

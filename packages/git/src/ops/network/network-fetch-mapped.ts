@@ -30,7 +30,12 @@ import {
   authenticateTags,
   eligibleAutoTags,
 } from "./network-tags.js";
-import { fetchProgressSink, transferPack } from "./network-transfer.js";
+import {
+  beginFetchConnectivity,
+  type FetchConnectivity,
+  fetchProgressSink,
+  transferPack,
+} from "./network-transfer.js";
 import type {
   AdvertisedTag,
   FetchBehavior,
@@ -173,7 +178,13 @@ export async function fetchMappedInto(
     const rootNames = new Set(plan.roots.map((ref) => ref.name));
     const selectedTags = tags.filter((tag) => rootNames.has(tag.ref.name));
     const boundary = new Set(publication.shallow);
+    // Read in the same synchronous step as want selection: a fresh store wants every root.
+    const connectivity = beginFetchConnectivity(
+      repo,
+      options.filter === undefined ? undefined : { remoteName: target.remote, url: target.url },
+    );
     const followed = await transferFetchObjects(context, repo, {
+      connectivity,
       options,
       behavior,
       target,
@@ -222,7 +233,12 @@ export async function fetchMappedInto(
       const finalBoundary = repo.shallow();
       for (const oid of shallow.remove) finalBoundary.delete(oid);
       for (const oid of shallow.add) finalBoundary.add(oid);
-      validateFetchedConnectivity(repo, roots, finalBoundary);
+      validateFetchedConnectivity(
+        repo,
+        roots,
+        finalBoundary,
+        connectivity.fresh ? connectivity.acceptedPacks : null,
+      );
       repositoryMutations(repo).publishFetchRefsOwned(
         publication,
         publicationPlan,
@@ -249,6 +265,7 @@ interface FetchTransfer {
   readonly followable: readonly AdvertisedTag[];
   /** The proposed boundary; every shallow response is applied to it. */
   readonly boundary: Set<string>;
+  readonly connectivity: FetchConnectivity;
 }
 
 /** Transfer the selected objects, then return the tags auto-follow completed. */
@@ -259,8 +276,10 @@ async function transferFetchObjects(
 ): Promise<AdvertisedTag[]> {
   const { options, behavior, target, plan, publication, followable, boundary } = transfer;
   const say = fetchProgressSink(options.onProgress, options.onMessage);
-  const filter =
-    options.filter === undefined ? {} : { filter: options.filter, promisorRemote: target.remote };
+  const packScope = {
+    ...(options.filter === undefined ? {} : { filter: options.filter }),
+    connectivity: transfer.connectivity,
+  };
   const initialFollow =
     followable.length > 0 ? eligibleAutoTags(repo, followable, publication) : [];
   const wanted = [
@@ -283,7 +302,7 @@ async function transferFetchObjects(
         advertised: transfer.advertisement.capabilities,
         ...shallowTransfer(plan.shallow),
         ...(plan.followTags ? { includeTag: true } : {}),
-        ...filter,
+        ...packScope,
       },
       transfer.auth,
       say,
@@ -308,7 +327,7 @@ async function transferFetchObjects(
         shallows: [...boundary],
         advertised: transfer.advertisement.capabilities,
         haves: eligible.filter((tag) => missing.has(tag.ref.oid)).map((tag) => tag.peeledOid),
-        ...filter,
+        ...packScope,
       },
       transfer.auth,
       say,

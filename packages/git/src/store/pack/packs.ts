@@ -10,7 +10,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import type { ByteLru } from "../../common/lru.js";
 import type { ObjectType, RawObject } from "../../common/objects.js";
 import { bumpMaintenanceRootEpoch } from "../maintenance/control.js";
-import { PackIngestEngine } from "./ingest.js";
+import { type CheckedPackIngestOptions, PackIngestEngine } from "./ingest.js";
 import { PackLifecycle } from "./lifecycle.js";
 import { PackReadEngine } from "./read.js";
 import {
@@ -20,11 +20,12 @@ import {
   MAX_DELTA_DEPTH,
   type PackCacheOptions,
   type PackedEntry,
-  type PackIngestOptions,
   type PackIngestResult,
   type PackSharedState,
 } from "./shared.js";
 
+export type { PackConnectivityOptions } from "./ingest/ingest-references-check.js";
+export type { CheckedPackIngestOptions } from "./ingest.js";
 export type {
   CompletePackedEntry,
   PackCacheOptions,
@@ -167,9 +168,10 @@ export class PackStore {
     return this.#lifecycle.deleteCompletePacks(packIds);
   }
 
+  /** Only a network fetch passes `connectivity`; this primitive is otherwise unchecked. */
   async ingest(
     source: AsyncIterable<Uint8Array>,
-    options: PackIngestOptions = {},
+    options: CheckedPackIngestOptions = {},
   ): Promise<PackIngestResult> {
     const lifecycle = options.lifecycle;
     return this.#ingest.ingest(source, {

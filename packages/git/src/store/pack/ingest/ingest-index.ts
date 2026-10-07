@@ -26,6 +26,7 @@ import { throwIfIngestAborted } from "./ingest-options.js";
 import { PackPendingResolver } from "./ingest-pending.js";
 import { PackResolvedProjection } from "./ingest-projection.js";
 import { OffsetWindow, PackReader } from "./ingest-reader.js";
+import type { PackConnectivityCheck } from "./ingest-references-check.js";
 
 export class PackIndexer {
   readonly #inflater: PackIngestInflater;
@@ -62,6 +63,7 @@ export class PackIndexer {
     heartbeat: () => void,
     memory: PackIngestMemory,
     signal: AbortSignal | undefined,
+    connectivity: PackConnectivityCheck | null,
   ): Promise<{
     count: number;
     commits: PackCommitIndex;
@@ -83,6 +85,7 @@ export class PackIndexer {
       throw new CorruptError(`unsupported pack version ${version}`);
     const membership = new ExpectedPackMembership(count);
     const depths = new PackDeltaDepths(membership, this.maxDeltaDepth);
+    const references = connectivity?.collector(count) ?? null;
 
     const offsets = new OffsetWindow();
     const objectIndex = new PackObjectBatch(this.db, this.repoId, (row) => {
@@ -141,6 +144,7 @@ export class PackIndexer {
           header.entrySize,
           objectIndex,
           null,
+          references,
         );
         offsets.set(header.offset, oid);
         missingBases.delete(oid);
@@ -185,6 +189,7 @@ export class PackIndexer {
                 target.length,
                 objectIndex,
                 target,
+                references,
               );
               offsets.set(header.offset, oid);
               missingBases.delete(oid);
@@ -240,6 +245,7 @@ export class PackIndexer {
       heartbeat,
       memory,
       signal,
+      references,
     );
     heartbeat();
     objectIndex.flush();

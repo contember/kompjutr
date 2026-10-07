@@ -37,7 +37,6 @@ export interface CheckoutStoreMutations {
   upsertBlobIdsOwned(mappings: Iterable<BlobIdMapping>): void;
   registerPromisorRemoteOwned(remoteName: string, url: string): PromisorRemote;
   addPromisedBlobsOwned(remoteName: string, oids: Iterable<string>): void;
-  addPromisedBlobsFromPackTreesOwned(remoteName: string, packId: number): void;
   writeOwned(type: ObjectType, data: Uint8Array): string;
   writeStreamOwned(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string;
   setRefOwned(name: string, target: string): void;
@@ -110,8 +109,6 @@ export function createCheckoutStoreMutations(
       sharedMutations().registerPromisorRemoteOwned(remoteName, url),
     addPromisedBlobsOwned: (remoteName, oids) =>
       sharedMutations().addPromisedBlobsOwned(remoteName, oids),
-    addPromisedBlobsFromPackTreesOwned: (remoteName, packId) =>
-      sharedMutations().addPromisedBlobsFromPackTreesOwned(remoteName, packId),
     writeOwned: (type, data) => sharedMutations().writeOwned(type, data),
     writeStreamOwned: (type, size, chunks) =>
       sharedMutations().writeStreamOwned(type, size, chunks),
