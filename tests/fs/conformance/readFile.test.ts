@@ -1,11 +1,10 @@
 // Ported from Cloudflare DOFS under MIT. See LICENSES/cloudflare-computer.txt.
 
 import { describe, expect, it } from "vitest";
-
-import { createFilesystemOps } from "../../../packages/do/src/fs/ops.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../../packages/do/src/fs/schema.js";
 import { TestDatabase } from "../../helpers/db.js";
 import { conformance } from "./harness.js";
+import { createFilesystemOps } from "./target.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

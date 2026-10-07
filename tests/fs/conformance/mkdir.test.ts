@@ -1,11 +1,10 @@
 // Ported from Cloudflare DOFS under MIT. See LICENSES/cloudflare-computer.txt.
 
 import { describe, expect, it } from "vitest";
-
-import { createFilesystemOps } from "../../../packages/do/src/fs/ops.js";
 import { initializeFsSchema } from "../../../packages/do/src/fs/schema.js";
 import { TestDatabase } from "../../helpers/db.js";
 import { conformance } from "./harness.js";
+import { createFilesystemOps } from "./target.js";
 
 function setup(now = 0) {
   const db = new TestDatabase();

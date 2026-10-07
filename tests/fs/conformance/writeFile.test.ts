@@ -1,11 +1,10 @@
 // Ported from Cloudflare DOFS under MIT. See LICENSES/cloudflare-computer.txt.
 
 import { describe, expect, it } from "vitest";
-
-import { createFilesystemOps } from "../../../packages/do/src/fs/ops.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../../packages/do/src/fs/schema.js";
 import { TestDatabase } from "../../helpers/db.js";
 import { conformance } from "./harness.js";
+import { createFilesystemOps, storedPath } from "./target.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -23,7 +22,7 @@ function chunkCount(db: TestDatabase, path: string): number {
       `SELECT count(*) FROM fs_chunks c
          JOIN fs_paths p ON p.inode = c.inode
         WHERE p.path = ?`,
-      path,
+      storedPath(path),
     ) ?? 0
   );
 }
