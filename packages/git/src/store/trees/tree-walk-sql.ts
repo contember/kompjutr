@@ -129,7 +129,18 @@ SELECT path, mode, oid,
          ELSE NULL
        END AS error,
        CASE WHEN error_code = 'E2BIG' OR descend = 2 THEN 'E2BIG'
-            ELSE 'ECORRUPT' END AS error_code
+            ELSE 'ECORRUPT' END AS error_code,
+       CASE
+         WHEN error IS NOT NULL OR mode NOT IN ('40000', '040000') OR descend != 0
+              OR instr(ancestry, '/' || oid || '/') != 0
+           THEN NULL
+         WHEN EXISTS (
+           SELECT 1 FROM git_tree_sources s
+            WHERE s.repo_id = (SELECT repo_id FROM params) AND s.tree_oid = walk.oid
+         ) THEN 'incomplete_source'
+         ELSE 'missing_source'
+       END AS error_kind,
+       oid AS error_oid
   FROM walk
  WHERE error IS NOT NULL
     OR mode NOT IN ('40000', '040000')
@@ -138,6 +149,22 @@ SELECT path, mode, oid,
 
 function diffSourceValidSql(source: string): string {
   return `((${source}.source_key IS NOT NULL AND ${source}.complete = 1) IS TRUE)`;
+}
+
+/** Whether one side of row `w` is a changed tree without a complete source. */
+function diffSourceFailsSql(side: "before" | "after", source: string): string {
+  const other = side === "before" ? "after" : "before";
+  return `(w.${side}_mode IN ('40000', '040000')
+                  AND NOT (COALESCE(w.${other}_mode IN ('40000', '040000'), 0)
+                           AND w.before_oid = w.after_oid)
+                  AND NOT ${diffSourceValidSql(source)})`;
+}
+
+/** A subtree source failure: no source row at all, or an unprojectable one. */
+function diffSourceKindSql(source: string): string {
+  return `CASE WHEN w.path = '' THEN NULL
+                         WHEN ${source}.source_key IS NULL THEN 'missing_source'
+                         ELSE 'incomplete_source' END`;
 }
 
 function diffEntryNameSql(entry: string): string {
@@ -163,7 +190,8 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
     AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?)),
   checked_trees(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
   walk(path, path_bytes, sort_key, before_mode, before_oid, after_mode, after_oid,
-       before_ancestry, after_ancestry, state_bytes, reserved_bytes, error, error_code) AS (
+       before_ancestry, after_ancestry, state_bytes, reserved_bytes, error, error_code,
+       error_kind, error_oid) AS (
     SELECT '', 0, CAST('' AS BLOB),
            CASE WHEN p.before_root IS NULL THEN NULL ELSE '40000' END, p.before_root,
            CASE WHEN p.after_root IS NULL THEN NULL ELSE '40000' END, p.after_root,
@@ -187,7 +215,8 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                   (length(p.after_root) != 40 OR p.after_root GLOB '*[^0-9a-f]*')
                THEN 'ECORRUPT'
              ELSE 'PENDING'
-           END
+           END,
+           NULL, NULL
       FROM params p
      WHERE p.before_root IS NOT p.after_root
     UNION ALL
@@ -195,23 +224,27 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
            w.before_mode, w.before_oid, w.after_mode, w.after_oid,
            w.before_ancestry, w.after_ancestry, w.state_bytes, w.reserved_bytes,
            CASE
-             WHEN w.before_mode IN ('40000', '040000')
-                  AND NOT (COALESCE(w.after_mode IN ('40000', '040000'), 0)
-                           AND w.before_oid = w.after_oid)
-                  AND NOT ${diffSourceValidSql("bps")}
+             WHEN ${diffSourceFailsSql("before", "bps")}
                THEN CASE WHEN w.path = '' THEN 'tree source is invalid; reimport or reclone'
                          ELSE 'tree ' || w.before_oid
                            || ' has no valid v3 parsed source; reimport or reclone' END
-             WHEN w.after_mode IN ('40000', '040000')
-                  AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
-                           AND w.before_oid = w.after_oid)
-                  AND NOT ${diffSourceValidSql("aps")}
+             WHEN ${diffSourceFailsSql("after", "aps")}
                THEN CASE WHEN w.path = '' THEN 'tree source is invalid; reimport or reclone'
                          ELSE 'tree ' || w.after_oid
                            || ' has no valid v3 parsed source; reimport or reclone' END
              ELSE NULL
            END,
-           'ECORRUPT'
+           'ECORRUPT',
+           CASE
+             WHEN ${diffSourceFailsSql("before", "bps")} THEN ${diffSourceKindSql("bps")}
+             WHEN ${diffSourceFailsSql("after", "aps")} THEN ${diffSourceKindSql("aps")}
+             ELSE NULL
+           END,
+           CASE
+             WHEN ${diffSourceFailsSql("before", "bps")} THEN w.before_oid
+             WHEN ${diffSourceFailsSql("after", "aps")} THEN w.after_oid
+             ELSE NULL
+           END
       FROM walk w
       CROSS JOIN params p
       LEFT JOIN git_tree_sources bps
@@ -223,7 +256,7 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
     SELECT w.path, w.path_bytes, w.sort_key,
            w.before_mode, w.before_oid, w.after_mode, w.after_oid,
            w.before_ancestry, w.after_ancestry, w.state_bytes, w.reserved_bytes,
-           'tree traversal queue exceeds 16 MiB', 'E2BIG'
+           'tree traversal queue exceeds 16 MiB', 'E2BIG', NULL, NULL
       FROM walk w
       CROSS JOIN params p
       LEFT JOIN git_tree_sources bps
@@ -320,7 +353,8 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                        AND be.oid = ae.oid
                      )
                   THEN 'PENDING'
-                ELSE 'ECORRUPT' END
+                ELSE 'ECORRUPT' END,
+           NULL, NULL
       FROM walk w
       CROSS JOIN params p
       CROSS JOIN git_tree_sources bps
@@ -382,7 +416,8 @@ export const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                             + length(ae.name_bytes)) + 55 > p.state_cap
                   THEN 'E2BIG'
                 WHEN ae.mode IN ('40000', '040000') THEN 'PENDING'
-                ELSE 'ECORRUPT' END
+                ELSE 'ECORRUPT' END,
+           NULL, NULL
       FROM walk w
       CROSS JOIN params p
       CROSS JOIN git_tree_sources aps
@@ -416,7 +451,8 @@ SELECT path,
        CASE WHEN after_mode IN ('40000', '040000') THEN NULL ELSE after_oid END AS after_oid,
        after_mode AS object_mode, after_oid AS object_oid,
        error, CASE WHEN error_code = 'PENDING' THEN 'ECORRUPT'
-                   ELSE error_code END AS error_code
+                   ELSE error_code END AS error_code,
+       error_kind, error_oid
   FROM walk
   CROSS JOIN params p
  WHERE error IS NOT NULL

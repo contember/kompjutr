@@ -6,8 +6,9 @@ import { fetchInto } from "../packages/git/src/ops/network/network.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { MAX_BLOB_BATCH_OIDS, OBJECT_CHUNK } from "../packages/git/src/store/objects/objects.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
-import { CONNECTIVITY_FAILURES_SQL } from "../packages/git/src/store/trees/connectivity.js";
+import { WALK_TREE_DIFF_SQL } from "../packages/git/src/store/trees/tree-walk-sql.js";
 import { TestDatabase } from "./helpers/db.js";
+import { ANCESTRY_WALK, fingerprint, statementsOf } from "./helpers/fetch-pack.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { publicationState } from "./helpers/network-integrity.js";
@@ -25,15 +26,12 @@ interface Instruction {
 
 class MetadataDatabase extends TestDatabase {
   observe: ((query: string, bindings: unknown[]) => void) | undefined;
-  observeConnectivity: ((bindings: unknown[], rows: number) => void) | undefined;
 
   override all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
     if (query.startsWith("WITH wanted(ordinal, oid)") && query.includes("git_object_chunks")) {
       this.observe?.(query, bindings);
     }
-    const rows = super.all<Row>(query, ...bindings);
-    if (query === CONNECTIVITY_FAILURES_SQL) this.observeConnectivity?.(bindings, rows.length);
-    return rows;
+    return super.all<Row>(query, ...bindings);
   }
 }
 
@@ -182,32 +180,19 @@ describe("object metadata lookup growth", () => {
           expect.stringContaining("(repo_id=? AND oid=?)"),
         ]);
       };
-      // The 4,097 loose blobs are checked inside the connectivity query, not in metadata pages.
-      let connectivityQueries = 0;
-      db.observeConnectivity = (bindings, rows) => {
-        connectivityQueries++;
-        expect(rows).toBe(0);
-        const plan = db
-          .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${CONNECTIVITY_FAILURES_SQL}`, ...bindings)
-          .map((row) => row.detail);
-        expect(plan.filter((detail) => /^SCAN (?:loose|packed|entry)\b/.test(detail))).toEqual([]);
-        expect(plan).toContainEqual(
-          expect.stringMatching(/^SEARCH loose USING .*\(repo_id=\? AND oid=\?\)$/),
-        );
-        expect(plan).toContainEqual(
-          expect.stringMatching(/^SEARCH packed USING .*\(repo_id=\? AND oid=\?\)$/),
-        );
-        expect(plan).toContainEqual("SEARCH entry USING PRIMARY KEY (source_key=?)");
-      };
       const before = publicationState(repo);
-      await fetchInto(context, repo, {
-        remote: "origin",
-        url: server.url,
-        singleBranch: true,
-        tags: false,
-      });
+      const { statements } = await statementsOf(workspace, () =>
+        fetchInto(context, repo, {
+          remote: "origin",
+          url: server.url,
+          singleBranch: true,
+          tags: false,
+        }),
+      );
       expect(metadataPages).toBeGreaterThan(0);
-      expect(connectivityQueries).toBe(1);
+      // The root is a starting ref tip: neither its history nor the 4,097 loose blobs are walked.
+      expect(statements.has(ANCESTRY_WALK)).toBe(false);
+      expect(statements.has(fingerprint(WALK_TREE_DIFF_SQL))).toBe(false);
       expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(0);
       expect(publicationState(repo)).toEqual(before);
     } finally {

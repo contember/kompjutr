@@ -1,7 +1,7 @@
 ---
 id: 0029
 title: Check fetched connectivity per received pack
-status: proposed
+status: accepted
 date: 2026-10-07
 ---
 
@@ -64,7 +64,8 @@ Inside the pack's publication transaction, every reference must resolve.
   repository is always fresh.
 - **A non-fresh store** follows Git's `--not --all` rule:
   - An external **commit** must be reachable from the refs or `HEAD` as they
-    stood when the fetch began.
+    stood when the fetch began. So must an external **tag**, which a tag
+    naming another tag references.
   - An external **blob** must be present or promised.
   - An external **tree** that lies in the root-tree closure of an external
     commit proven reachable needs no further check. Such a commit is normally
@@ -101,7 +102,13 @@ type and tag-peel checks stay.
   - work proportional to its pack;
   - a walk of the negotiated parents' root trees;
   - a commits-only reachability walk that exits early and has no cap. Proving a
-    commit unreachable can take a full pass over `git_commits`.
+    commit unreachable can take a full pass over `git_commits`. The walk keeps
+    the commits it reached for the rest of the fetch, so its memory grows with
+    the history walked: about 3 MB for the 30,347 commits of Next.js, and
+    above 100 MB for a history of 1.3 million commits. A walk resumed for a
+    later query starts from the frontier of the stopped one; SQLite does not
+    know the commits already reached, so it may traverse them again, at most
+    one extra pass per page of seeds. The cache only skips reporting them.
 - None of that involves projections or the history of trees. The 50,000-commit
   root limit no longer applies to fetch.
 - Ingest holds an in-memory table of the pack's OIDs, types and expected
@@ -115,9 +122,11 @@ type and tag-peel checks stay.
   accepts such a dangling object.
 - **Changed error.** A fetched tree that names a missing subtree fails with
   `EFETCHFAIL`, as native Git's "did not send all necessary objects". It used
-  to fail as `ECORRUPT` ("no complete parsed source"). A tree without a
-  projection no longer fails a fetch at all. A tree that does not parse still
-  fails ingest.
+  to fail as `ECORRUPT` ("no complete parsed source"). The check reads an
+  external tree's closure through the tree walk: a subtree with no projection
+  row is an absent object and fails with `EFETCHFAIL`, while an unprojectable
+  subtree (an incomplete projection) still fails with `ECORRUPT`. A tree that
+  does not parse still fails ingest.
 - A root that is present but not reachable from the refs costs a refetch.
 - Hydration packs carry only blobs and make no references.
 

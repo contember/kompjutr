@@ -1,5 +1,5 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
-import { CorruptError, GitError } from "../../common/errors.js";
+import { CorruptError, GitError, ObjectNotFoundError } from "../../common/errors.js";
 import { expectNullable, expectText } from "../../common/rows.js";
 import { TREE_QUEUE_ROW_FIXED_BYTES } from "../schema/schema.js";
 import { WALK_TREE_DIFF_SQL, WALK_TREE_SQL } from "./tree-walk-sql.js";
@@ -31,12 +31,23 @@ export interface WalkTreeDiffObject {
   type: "tree" | "blob";
 }
 
+/**
+ * A walk row's error. A subtree with no source row is an absent tree: every
+ * stored tree has one. One whose source is incomplete cannot be projected.
+ */
 function throwTraversalError(row: Record<string, unknown>, label: string): void {
   const error = row.error;
   if (error === null) return;
   const message = expectText(error, `${label} error`);
   const errorCode = expectText(row.error_code, `${label} error code`);
   if (errorCode === "E2BIG") throw new GitError("E2BIG", message);
+  const kind = expectNullable(row.error_kind, (value) => expectText(value, `${label} error kind`));
+  if (kind === "missing_source") {
+    throw new ObjectNotFoundError(expectText(row.error_oid, `${label} error oid`));
+  }
+  if (kind !== null && kind !== "incomplete_source") {
+    throw new CorruptError(`${label} error kind is invalid`);
+  }
   throw new CorruptError(message);
 }
 
@@ -76,7 +87,7 @@ export function* iterateTreeDiffObjects(
   checkedTrees: ReadonlySet<string> = new Set(),
 ): Generator<WalkTreeDiffObject> {
   if (beforeTreeOid === afterTreeOid) return;
-  // Only connectivity's stable publication transaction may reuse checked subtrees.
+  // Only the per-pack reference check, inside its publication transaction, reuses checked subtrees.
   const snapshot: string[] = [];
   if (beforeTreeOid === null) {
     let examined = 0;

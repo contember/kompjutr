@@ -28,6 +28,7 @@ import { diff as diffIndexWorktree } from "../packages/git/src/ops/diff/diff.js"
 import { integrationIndexMatchesTree } from "../packages/git/src/ops/integration/integration-worktree.js";
 import { merge, mergeAbort, mergeContinue } from "../packages/git/src/ops/merge/merge.js";
 import { selectMergeBases } from "../packages/git/src/ops/merge/merge-base.js";
+import { fetchInto } from "../packages/git/src/ops/network/network.js";
 import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
 import { planRebase } from "../packages/git/src/ops/rebase/rebase-plan.js";
 import { checkout } from "../packages/git/src/ops/refs/refs.js";
@@ -43,6 +44,14 @@ import { advanceMaintenanceMark } from "../packages/git/src/store/maintenance/re
 import { encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { TestDatabase } from "../tests/helpers/db.js";
+import {
+  blobObject,
+  commitObject,
+  type PackObject,
+  packOf,
+  packRemote,
+  treeObject,
+} from "../tests/helpers/fetch-pack.js";
 import { GitFixture, slices } from "../tests/helpers/git.js";
 import { startGitServer } from "../tests/helpers/http-backend.js";
 import { importFixture } from "../tests/helpers/import.js";
@@ -144,6 +153,8 @@ type RequiredRow =
   | "commit.sparse"
   | "diff.index-worktree"
   | "fetch.publication"
+  | "fetch.reachability-unreachable"
+  | "fetch.reachability-parents"
   | "merge-base.select"
   | "merge.virtual-base"
   | "merge.apply"
@@ -191,6 +202,8 @@ const REQUIRED_ROWS: readonly RequiredRow[] = [
   "commit.sparse",
   "diff.index-worktree",
   "fetch.publication",
+  "fetch.reachability-unreachable",
+  "fetch.reachability-parents",
   "merge-base.select",
   "merge.virtual-base",
   "merge.apply",
@@ -273,6 +286,8 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "commit.sparse": 36,
   "diff.index-worktree": 35,
   "fetch.publication": 22,
+  "fetch.reachability-unreachable": 298,
+  "fetch.reachability-parents": 171,
   "merge-base.select": 9,
   "merge.virtual-base": 176,
   "merge.apply": 133,
@@ -321,6 +336,8 @@ const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
   "commit.sparse": 28,
   "diff.index-worktree": 35,
   "fetch.publication": 12,
+  "fetch.reachability-unreachable": 2_282,
+  "fetch.reachability-parents": 582,
   "merge-base.select": 8,
   "merge.virtual-base": 134,
   "merge.apply": 109,
@@ -2420,6 +2437,104 @@ async function maintenanceMarkRows(rows: ResultRow[]): Promise<void> {
   }
 }
 
+const REACHABILITY_HISTORY = 2_000;
+const REACHABILITY_BRANCHES = 20;
+
+/**
+ * The worst case of the ADR-0029 reachability walk: a fetched commit names a
+ * present parent that no ref reaches, so the walk passes the whole history.
+ */
+async function reachabilityUnreachableRow(rows: ResultRow[]): Promise<void> {
+  const file = blobObject("file\n");
+  const root = treeObject([{ mode: MODE_FILE, name: "file", oid: file.oid }]);
+  const history: PackObject[] = [root, file];
+  let tip: string | null = null;
+  for (let index = 0; index < REACHABILITY_HISTORY; index++) {
+    const commit = commitObject(root.oid, tip === null ? [] : [tip], `history ${index}\n`);
+    history.push(commit);
+    tip = commit.oid;
+  }
+  assert(tip !== null, "reachability history is empty");
+  const orphan = commitObject(root.oid, [], "unreachable\n");
+  const incoming = commitObject(root.oid, [orphan.oid], "on unreachable\n");
+  const server = await packRemote(packOf([incoming]), incoming.oid);
+  const workspace = makeRepo("/repo");
+  const { repo, context } = workspace;
+  try {
+    await repo.store.packs.ingest(slices(packOf(history), 1 << 20));
+    repo.store.setRef("refs/remotes/origin/main", tip);
+    repo.store.write("commit", orphan.data);
+    repo.store.configSet("remote.origin.url", server.url);
+    await measure(
+      rows,
+      workspace.storage,
+      "fetch.reachability-unreachable",
+      () =>
+        fetchInto(context, repo, { remote: "origin", tags: false }).then(
+          () => null,
+          (error: unknown) => error,
+        ),
+      (outcome) => {
+        assert(
+          typeof outcome === "object" &&
+            outcome !== null &&
+            Reflect.get(outcome, "code") === "EFETCHFAIL",
+          "an unreachable external parent was accepted",
+        );
+        assert(repo.store.getRef("refs/remotes/origin/main") === tip, "the ref moved");
+      },
+    );
+  } finally {
+    await server.close();
+  }
+}
+
+/** Many branches each moved by one commit: one closure walk, then a diff per proven parent. */
+async function reachabilityParentsRow(rows: ResultRow[]): Promise<void> {
+  const fixture = new GitFixture().init();
+  for (let index = 0; index < 20; index++) {
+    for (let file = 0; file < 5; file++) {
+      fixture.write(`shared/dir-${index}/file-${file}.txt`, `${index}.${file}\n`);
+    }
+  }
+  fixture.commit("shared");
+  for (let index = 0; index < REACHABILITY_BRANCHES; index++) {
+    fixture.git("checkout", "-q", "-b", `b${index}`, "main");
+    fixture.write(`own-${index}/file.txt`, `own ${index}\n`);
+    fixture.commit(`branch ${index}`);
+  }
+  const server = await startGitServer(fixture.dir);
+  const workspace = makeRepo("/repo");
+  const { repo, context } = workspace;
+  try {
+    repo.store.configSet("remote.origin.url", server.url);
+    await fetchInto(context, repo, { remote: "origin", singleBranch: false, tags: false });
+    for (let index = 0; index < REACHABILITY_BRANCHES; index++) {
+      fixture.git("checkout", "-q", `b${index}`);
+      fixture.write(`moved-${index}.txt`, "moved\n");
+      fixture.commit(`move ${index}`);
+    }
+    await measure(
+      rows,
+      workspace.storage,
+      "fetch.reachability-parents",
+      () => fetchInto(context, repo, { remote: "origin", singleBranch: false, tags: false }),
+      () => {
+        for (let index = 0; index < REACHABILITY_BRANCHES; index++) {
+          assert(
+            repo.store.getRef(`refs/remotes/origin/b${index}`) ===
+              fixture.git("rev-parse", `b${index}`),
+            `fetch did not publish b${index}`,
+          );
+        }
+      },
+    );
+  } finally {
+    await server.close();
+    fixture.dispose();
+  }
+}
+
 async function transportRows(rows: ResultRow[]): Promise<void> {
   const fixture = new GitFixture().init();
   fixture.write("README.md", "base\n");
@@ -2725,6 +2840,8 @@ await checkoutInitialRow(rows);
 await commitSparseRow(rows);
 await diffIndexWorktreeRow(rows);
 await fetchPublicationRow(rows);
+await reachabilityUnreachableRow(rows);
+await reachabilityParentsRow(rows);
 await mergeRows(rows);
 await replayRows(rows);
 await rebaseRows(rows);

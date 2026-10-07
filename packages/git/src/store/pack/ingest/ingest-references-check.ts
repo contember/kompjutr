@@ -6,11 +6,20 @@ import { MAX_PROMISED_BLOB_LOOKUP_OIDS, PromisorTable } from "../../fetch/promis
 import { ShallowTable } from "../../refs/shallow.js";
 import { isObjectType } from "../shared.js";
 import { PackReferenceCollector, type UnresolvedReference } from "./ingest-references.js";
+import {
+  type ExternalReference,
+  ExternalReferenceCheck,
+  type FetchReachability,
+} from "./ingest-references-external.js";
 
 /** What a fetch tells pack ingest so the pack publishes only when its references resolve. */
 export interface PackConnectivityOptions {
-  /** The store held no loose object, complete pack, or promise when the fetch began. */
-  readonly fresh: boolean;
+  /**
+   * Reachability from the refs the fetch began with; null when the store then
+   * held no loose object, complete pack, or promise, so nothing outside the
+   * fetch's packs resolves.
+   */
+  readonly reachability: FetchReachability | null;
   /** A filtered fetch promises the blobs its packs reference but do not deliver. */
   readonly promisor?: { readonly remoteName: string; readonly url: string };
   /** The operation's shallow response so far, applied over the stored boundary. */
@@ -121,9 +130,15 @@ export class PackConnectivityCheck {
     const promisor = this.#options.promisor;
     const promises = new PromisorTable(this.#db, this.#repoId);
     if (promisor !== undefined) promises.register(promisor.remoteName, promisor.url);
+    const reachability = this.#options.reachability;
+    const external =
+      reachability === null
+        ? null
+        : new ExternalReferenceCheck(this.#db, this.#repoId, reachability, promisor !== undefined);
     let page: UnresolvedReference[] = [];
     const flush = (): void => {
-      const blobs = this.#resolveExternal(page);
+      const unresolved = this.#resolveAccepted(page);
+      const blobs = external === null ? this.#resolveFresh(unresolved) : external.add(unresolved);
       if (promisor !== undefined) promises.addUnresolvedBlobs(promisor.remoteName, blobs);
       page = [];
     };
@@ -132,33 +147,40 @@ export class PackConnectivityCheck {
       if (page.length === MAX_PROMISED_BLOB_LOOKUP_OIDS) flush();
     }
     if (page.length > 0) flush();
+    external?.finish();
   }
 
-  /** Resolve one page against the accepted packs; returns the blobs left to promise. */
-  #resolveExternal(page: readonly UnresolvedReference[]): string[] {
+  /** Resolve one page against the accepted packs; returns the references left outside them. */
+  #resolveAccepted(page: readonly UnresolvedReference[]): ExternalReference[] {
     const accepted = readAcceptedPackTypes(
       this.#db,
       this.#repoId,
       this.#options.acceptedPacks,
       page.map((reference) => reference.oid),
     );
-    const blobs: string[] = [];
+    const external: ExternalReference[] = [];
     for (const reference of page) {
       // `requireTypes` leaves at most one expected type on an unresolved reference.
       const expected = reference.expected[0];
       if (expected === undefined) continue;
       const types = accepted.get(reference.oid);
-      if (types !== undefined) {
-        if (!types.has(expected)) {
-          throw new CorruptError(`fetched graph requires ${reference.oid} to be a ${expected}`);
-        }
-        continue;
+      if (types === undefined) {
+        external.push({ oid: reference.oid, expected });
+      } else if (!types.has(expected)) {
+        throw new CorruptError(`fetched graph requires ${reference.oid} to be a ${expected}`);
       }
-      if (expected === "blob" && this.#options.promisor !== undefined) {
-        blobs.push(reference.oid);
-      } else if (this.#options.fresh) {
-        throw new ObjectNotFoundError(reference.oid);
+    }
+    return external;
+  }
+
+  /** A fresh store resolves nothing outside the fetch; returns the blobs a filtered fetch promises. */
+  #resolveFresh(external: readonly ExternalReference[]): string[] {
+    const blobs: string[] = [];
+    for (const { oid, expected } of external) {
+      if (expected !== "blob" || this.#options.promisor === undefined) {
+        throw new ObjectNotFoundError(oid);
       }
+      blobs.push(oid);
     }
     return blobs;
   }

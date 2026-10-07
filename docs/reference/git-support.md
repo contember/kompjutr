@@ -633,30 +633,42 @@ transaction. A failed check leaves the pack unpublished.
 When the store held no loose object, complete pack, or promise as the fetch
 began, every reference must resolve inside the fetch's packs. A missing object
 fails the fetch with `EFETCHFAIL`, including a missing subtree and a dangling
-object no fetched ref reaches; Git accepts such a dangling object. Before refs
-publish, each root and each tag-peel hop must be in one of the fetch's packs;
-root types and tag peels are checked, with no history walk.
+object no fetched ref reaches; Git accepts such a dangling object.
 
-Any other fetch keeps the history walk before it publishes refs. Connectivity
-validation streams commit IDs and their root tree IDs from the parsed store.
-Each commit root is checked against the 50,000-commit bound and the proposed
-shallow boundaries. It does not select commit messages, signatures, or
-identities, so their aggregate size does not consume the parsed-commit capacity
-used by log and graph readers. Missing parents, trees, and unpromised blobs
-still reject publication.
+Any other store follows Git's `--not --all` rule against the refs and the
+`HEAD` of every checkout as they stood when the fetch began. A reference that
+no pack of the fetch resolves must be:
 
-For each bounded root batch, a recursive `UNION` deduplicates reachable tree
-IDs across the commit histories, and the distinct blob IDs of their direct
-edges. Shared subtrees and blobs are checked once per batch, independent of how
-many historical paths reference them. SQLite resolves each identity against
-loose objects and complete packs, exempts only missing blobs that carry a
-promise, and returns failures only, ranked as sourceless tree, commit, missing,
-then wrong type. This traversal retains identities in SQLite, not path strings
-or object payloads in JavaScript, and has no additional tree-count limit.
+- a commit or tag reachable from those refs. One commit walk over the parsed
+  commit rows, stopping at shallow boundaries, serves the whole fetch: it exits
+  once every queried commit is found, resumes from its frontier for a later
+  query, and has no commit bound. Tag refs are peeled only when the commit walk
+  alone does not answer;
+- a blob that is present or promised, or, in a filtered fetch, becomes a
+  promise;
+- a tree inside the root-tree closure of a commit proven that way, or a present
+  tree whose closure is present: every subtree present and every blob present
+  or promised. Both closures are read through the tree walk. A subtree with no
+  projection row is an absent object (`EFETCHFAIL`); one with an incomplete
+  projection fails with `ECORRUPT`. After the first proven commit, each further
+  root tree is walked as a diff against the previous one, and a closure check
+  does not descend into a subtree an earlier one verified.
+
+A present object of another type is `ECORRUPT`; anything else fails with
+`EFETCHFAIL`, and the pack stays unpublished. A commit that is present but not
+reachable, such as one left by an earlier failed fetch or one whose tree
+maintenance already swept, is not trusted.
+
+Want selection skips a root only when it is reachable from those refs, and
+annotated-tag auto-follow and its fallback round count a peeled target only
+when a pack of this fetch delivered it or the refs reach it. A root that is
+merely present is fetched again. Before refs publish, each root and each
+tag-peel hop must be in one of the fetch's packs or reachable from the starting
+refs; root types and tag peels are checked, with no history walk over trees.
 
 Promised-blob lookups keep the bounded requested-ID batch as the outer side of
 the join and seek each promise by `(repo_id, oid)`. They do not enumerate the
-repository's unrelated promises for every connectivity or hydration batch.
+repository's unrelated promises for every reference or hydration batch.
 Initial checkout hydration uses multiple negotiations when necessary, each with
 at most 16,384 distinct blob IDs. The tree cursor closes before network I/O;
 subsequent passes skip blobs already published by earlier batches.
@@ -752,13 +764,14 @@ complete validated pack precedes atomic publication of selected destinations.
 Interrupted ingest, a stale candidate, or one invalid destination moves no ref.
 Every selected ref is authenticated against the received objects before
 publication; a transfer that omits one fails with `EFETCHFAIL` and moves no ref.
-Immediately before ref publication, a synchronous metadata walk checks the
-complete selected graph under the publication guard, including branches outside
-the checkout and tag targets. Missing parents, trees, or blobs reject publication.
-Only declared shallow parent boundaries, gitlinks, and durable promised blob
-leaves are exceptions. The check also covers fetches that reuse existing objects
-without a transfer. Rejection leaves refs and shallow state unchanged; a complete
-unreachable pack may remain for maintenance.
+Each received pack is checked before it publishes, as described above, so a
+pack whose graph is not connected never becomes readable. Immediately before
+ref publication, under the publication guard, every selected root and tag
+target must be in a pack of this fetch or reachable from the refs the fetch
+began with; a fetch that reuses existing objects without a transfer therefore
+only names objects already reachable. Rejection leaves refs and shallow state
+unchanged; a pack accepted earlier in a fetch that then fails may remain for
+maintenance.
 Sideband responses require a terminating flush and reject empty packets or
 unknown channel numbers.
 A selected tag is still fetched when it is itself the explicit selector. Tag

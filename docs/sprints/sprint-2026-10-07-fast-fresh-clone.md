@@ -492,4 +492,33 @@ Paths are relative to `packages/git/src/`.
   ends, so a tree over the 2 MiB object-cache admission limit is read once per
   call, not once per page. Statements are unchanged: `maintenance.mark-*` stays
   at 10/8.
+- **WU3 verify-first.**
+  - `collectHaves` walks only ref tips and `HEAD`. After WU3 it walks the tips
+    captured when the fetch began, so every have is ref-reachable.
+  - One-commit incremental fetch on the full-history Next.js store (node,
+    leased, `--no-smt`):
+
+    | | Old SQL walk (`bb69e93`) | New check |
+    |---|---|---|
+    | Wall time | 28.4 s / 32.3 s | 3.16 s / 3.18 s |
+    | Statements | 340 | 332 |
+    | Rows | 61,004 | 31,928 |
+
+  - Proving one commit unreachable (worst-case walk) costs 0.9 s,
+    8 statements and 30,353 rows.
+  - Most of the new 3.2 s is one walk of the parent's root-tree closure
+    (~31k rows). A diff against the parent could prune it; not done.
+- **WU3 bench rows (new).**
+  - `fetch.reachability-unreachable` is 298/2,282. The walk itself is one
+    statement; the rest is have negotiation.
+  - `fetch.reachability-parents` is 171/582: 20 branches each moved one
+    commit. Proven roots are diffed in a chain, and verified trees are pruned
+    through `checkedTrees`.
+- **WU3 → WU4.**
+  - `iterateTreeDiffObjects`' `checkedTrees` has a caller again, so WU4 keeps it.
+  - Tree walks now report `error_kind`: a missing subtree is `ENOTFOUND`, an
+    unprojectable one is `ECORRUPT`. WU4 adds `missing_root` on the same column.
+- **Ceiling fix.** `348a0fd` brings `createMountedFilesystem` (447c544) back
+  under the 173-line symbol ceiling. `file-ceiling` runs only in `test:full`,
+  which is why the earlier merge missed it.
 

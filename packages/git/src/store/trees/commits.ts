@@ -11,9 +11,12 @@ export {
   readCommitCache,
 } from "./commits-cache.js";
 export {
+  type CommitAncestry,
   type CommitGraphLimits,
+  REACHABLE_ANCESTRY_SQL,
   readCommitGraph,
   readCommitGraphOwned,
   readCommitTreeRoots,
+  readReachableAncestry,
   WALK_COMMIT_GRAPH_SQL,
 } from "./commits-graph.js";

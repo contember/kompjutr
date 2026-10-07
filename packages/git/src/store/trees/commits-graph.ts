@@ -1,7 +1,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
-import { expectText } from "../../common/rows.js";
+import { array, expectText, RowShape, text } from "../../common/rows.js";
 import {
   COMMIT_GRAPH_WALK_BYTES,
   COMMIT_ROW_MAX_BYTES,
@@ -189,6 +189,68 @@ export function* readCommitTreeRoots(
       oid: expectText(row.oid, "commit graph commit oid"),
       tree: expectText(row.tree, "commit graph tree oid"),
     };
+  }
+}
+
+/**
+ * Commits reachable from `seeds` with their parents, stopping at shallow
+ * boundaries, whose parents come back empty. Rows stream in breadth-first
+ * order, so a caller may stop once it has what it needs. CROSS JOIN pins each
+ * commit lookup to its primary key; otherwise the planner scans the
+ * repository's commits per step.
+ */
+export const REACHABLE_ANCESTRY_SQL = `WITH RECURSIVE
+  params(repo_id) AS (VALUES (?)),
+  boundaries(oid) AS MATERIALIZED (
+    SELECT s.oid FROM params p CROSS JOIN git_shallow s WHERE s.repo_id = p.repo_id
+  ),
+  reachable(oid, parents) AS (
+    SELECT c.oid, c.parents
+      FROM params p
+      CROSS JOIN json_each(?) seed
+      CROSS JOIN git_commits c
+     WHERE c.repo_id = p.repo_id AND c.oid = seed.value
+    UNION
+    SELECT c.oid, c.parents
+      FROM reachable r
+      CROSS JOIN params p
+      CROSS JOIN json_each(r.parents) parent
+      CROSS JOIN git_commits c
+     WHERE c.repo_id = p.repo_id AND c.oid = parent.value
+       AND r.oid NOT IN (SELECT oid FROM boundaries)
+  )
+SELECT oid, CASE WHEN oid IN (SELECT oid FROM boundaries) THEN '[]' ELSE parents END AS parents
+  FROM reachable`;
+
+const ANCESTRY_ROW = new RowShape(
+  { oid: text("commit ancestry has an invalid oid"), parents: text() },
+  "commit ancestry has an invalid row",
+);
+const ANCESTRY_PARENTS = new RowShape(
+  { parents: array(text(), "commit ancestry has invalid parents") },
+  "commit ancestry has invalid parents",
+);
+
+export interface CommitAncestry {
+  oid: string;
+  parents: string[];
+}
+
+/** Stream the commits reachable from `seeds`; seeds without a commit row contribute nothing. */
+export function* readReachableAncestry(
+  db: SqlDatabase,
+  repoId: number,
+  seeds: readonly string[],
+): Generator<CommitAncestry> {
+  for (const value of db.iterate(REACHABLE_ANCESTRY_SQL, repoId, JSON.stringify(seeds))) {
+    const row = ANCESTRY_ROW.decode(value);
+    let parents: unknown;
+    try {
+      parents = JSON.parse(row.parents);
+    } catch {
+      throw new CorruptError("commit ancestry has invalid parents");
+    }
+    yield { oid: row.oid, parents: ANCESTRY_PARENTS.decode({ parents }).parents };
   }
 }
 

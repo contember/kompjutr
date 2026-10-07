@@ -7,10 +7,17 @@ import {
   type ObjectType,
   serializeCommit,
   serializeTag,
+  serializeTree,
+  type TreeEntry,
 } from "../../packages/git/src/common/objects.js";
+import { fetchInto } from "../../packages/git/src/ops/network/network.js";
+import type { FetchCheckpointStage } from "../../packages/git/src/ops/network/network-types.js";
+import type { Repository } from "../../packages/git/src/ops/repository/repository.js";
 import type { GitHttpRequest } from "../../packages/git/src/protocol/transport.js";
 import { PackWriter } from "../../packages/git/src/store/pack/writer.js";
+import { REACHABLE_ANCESTRY_SQL } from "../../packages/git/src/store/trees/commits.js";
 import { startStubServer } from "./http-backend.js";
+import { makeRepo, type TestRepository, type TestWorkspace } from "./workspace.js";
 
 export interface PackObject {
   type: ObjectType;
@@ -43,6 +50,14 @@ export function commitObject(tree: string, parents: readonly string[] = [], mess
     "commit",
     serializeCommit({ tree, parent: [...parents], author: PERSON, committer: PERSON, message }),
   );
+}
+
+export function treeObject(entries: TreeEntry[]) {
+  return packed("tree", serializeTree(entries));
+}
+
+export function blobObject(text: string) {
+  return packed("blob", utf8.encode(text));
 }
 
 export function tagObject(object: string, type: ObjectType, name: string) {
@@ -127,4 +142,95 @@ export function withoutIncludeTag(request: GitHttpRequest): GitHttpRequest {
     ...request,
     body: concat([packet(rewritten), request.body.subarray(frameLength)]),
   };
+}
+
+/** A query's key in the storage histogram. */
+export function fingerprint(query: string): string {
+  return query.replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
+/** The commit reachability walk of ADR-0029, the only history a fetch walks. */
+export const ANCESTRY_WALK = fingerprint(REACHABLE_ANCESTRY_SQL);
+
+/** Statements and rows returned by fingerprint while `run` executes. */
+export async function statementsOf(workspace: TestWorkspace, run: () => Promise<unknown>) {
+  const statements = new Map<string, number>();
+  const rows = new Map<string, number>();
+  workspace.storage.histogram = statements;
+  workspace.storage.rowHistogram = rows;
+  try {
+    await run();
+    return { statements, rows };
+  } finally {
+    workspace.storage.histogram = null;
+    workspace.storage.rowHistogram = null;
+  }
+}
+
+export function completePacks(repo: Repository): unknown {
+  return repo.store.db.scalar(
+    "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND state = 'complete'",
+    repo.store.repoId,
+  );
+}
+
+/**
+ * Fetch `objects` served as one pack into a repository, fresh unless `seed`
+ * prepares it, and return the outcome and what stayed.
+ */
+export async function fetchPacked(
+  objects: readonly PackObject[],
+  tip: string,
+  options: {
+    filter?: boolean;
+    shallow?: readonly string[];
+    seed?: (workspace: TestRepository) => void | Promise<void>;
+    checkpoint?: (stage: FetchCheckpointStage, repo: Repository) => void;
+  } = {},
+) {
+  const server = await packRemote(packOf(objects), tip, {
+    ...(options.filter === true ? { filter: true } : {}),
+    ...(options.shallow === undefined ? {} : { shallow: options.shallow }),
+  });
+  const workspace = makeRepo("/work");
+  const { repo, context } = workspace;
+  try {
+    repo.store.configSet("remote.origin.url", server.url);
+    await options.seed?.(workspace);
+    const before = repo.store.listRefs();
+    const packsBefore = completePacks(repo);
+    const promisesBefore = repo.store.promisedBlobCount();
+    const checkpoint = options.checkpoint;
+    const outcome = await fetchInto(
+      context,
+      repo,
+      {
+        remote: "origin",
+        tags: false,
+        ...(options.filter === true ? { filter: "blob:none" } : {}),
+        ...(options.shallow === undefined ? {} : { depth: 1 }),
+      },
+      "fetch",
+      checkpoint === undefined
+        ? {}
+        : {
+            checkpoint: (stage) => {
+              checkpoint(stage, repo);
+              return undefined;
+            },
+          },
+    ).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    return {
+      workspace,
+      outcome,
+      refsChanged: JSON.stringify(repo.store.listRefs()) !== JSON.stringify(before),
+      packsAdded: Number(completePacks(repo)) - Number(packsBefore),
+      promisesAdded: repo.store.promisedBlobCount() - promisesBefore,
+    };
+  } finally {
+    await server.close();
+  }
 }

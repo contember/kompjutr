@@ -7,112 +7,32 @@ import {
   MODE_FILE,
   MODE_TREE,
   type ObjectType,
-  serializeTree,
   type TreeEntry,
 } from "../packages/git/src/common/objects.js";
 import { openRepository } from "../packages/git/src/ops/core/context.js";
 import { clone, fetchInto } from "../packages/git/src/ops/network/network.js";
-import type {
-  CloneOptions,
-  FetchCheckpointStage,
-} from "../packages/git/src/ops/network/network-types.js";
+import { beginFetchConnectivity } from "../packages/git/src/ops/network/network-reachability.js";
+import type { CloneOptions } from "../packages/git/src/ops/network/network-types.js";
 import type { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { fetchHttpClient, type GitHttpClient } from "../packages/git/src/protocol/transport.js";
 import { PackReferenceCollector } from "../packages/git/src/store/pack/ingest/ingest-references.js";
-import { CONNECTIVITY_FAILURES_SQL } from "../packages/git/src/store/trees/connectivity.js";
 import {
+  ANCESTRY_WALK,
+  blobObject as blob,
   commitObject,
-  type PackObject,
-  packed,
+  completePacks,
+  fetchPacked as fetchFresh,
   packOf,
-  packRemote,
+  statementsOf,
   tagObject,
+  treeObject as tree,
   withoutIncludeTag,
 } from "./helpers/fetch-pack.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
-import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
+import { makeRepo, makeWorkspace } from "./helpers/workspace.js";
 
 const execFileAsync = promisify(execFile);
-const CONNECTIVITY_WALK = CONNECTIVITY_FAILURES_SQL.replace(/\s+/g, " ").trim().slice(0, 120);
-
-function tree(entries: TreeEntry[]) {
-  return packed("tree", serializeTree(entries));
-}
-
-function blob(text: string) {
-  return packed("blob", utf8.encode(text));
-}
-
-/** Statement fingerprints `run` executes, through the storage histogram. */
-async function statementsOf(workspace: TestWorkspace, run: () => Promise<unknown>) {
-  workspace.storage.histogram = new Map();
-  try {
-    await run();
-    return new Set(workspace.storage.histogram.keys());
-  } finally {
-    workspace.storage.histogram = null;
-  }
-}
-
-function completePacks(repo: Repository): unknown {
-  return repo.store.db.scalar(
-    "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND state = 'complete'",
-    repo.store.repoId,
-  );
-}
-
-/** Fetch `objects` into a fresh repository and return the outcome and what stayed. */
-async function fetchFresh(
-  objects: readonly PackObject[],
-  tip: string,
-  options: {
-    filter?: boolean;
-    shallow?: readonly string[];
-    checkpoint?: (stage: FetchCheckpointStage, repo: Repository) => void;
-  } = {},
-) {
-  const server = await packRemote(packOf(objects), tip, {
-    ...(options.filter === true ? { filter: true } : {}),
-    ...(options.shallow === undefined ? {} : { shallow: options.shallow }),
-  });
-  const { repo, context } = makeRepo("/work");
-  try {
-    repo.store.configSet("remote.origin.url", server.url);
-    const before = repo.store.listRefs();
-    const checkpoint = options.checkpoint;
-    const outcome = await fetchInto(
-      context,
-      repo,
-      {
-        remote: "origin",
-        tags: false,
-        ...(options.filter === true ? { filter: "blob:none" } : {}),
-        ...(options.shallow === undefined ? {} : { depth: 1 }),
-      },
-      "fetch",
-      checkpoint === undefined
-        ? {}
-        : {
-            checkpoint: (stage) => {
-              checkpoint(stage, repo);
-              return undefined;
-            },
-          },
-    ).then(
-      () => null,
-      (error: unknown) => error,
-    );
-    return {
-      outcome,
-      refsChanged: JSON.stringify(repo.store.listRefs()) !== JSON.stringify(before),
-      completePacks: completePacks(repo),
-      promises: repo.store.promisedBlobCount(),
-    };
-  } finally {
-    await server.close();
-  }
-}
 
 function expectRejected(
   state: Awaited<ReturnType<typeof fetchFresh>>,
@@ -121,8 +41,8 @@ function expectRejected(
 ): void {
   expect(state.outcome).toMatchObject(message === undefined ? { code } : { code, message });
   expect(state.refsChanged).toBe(false);
-  expect(state.completePacks).toBe(0);
-  expect(state.promises).toBe(0);
+  expect(state.packsAdded).toBe(0);
+  expect(state.promisesAdded).toBe(0);
 }
 
 /** A fixture with history, a deleted file, a subdirectory, an annotated tag and a gitlink. */
@@ -181,7 +101,7 @@ describe("per-pack connectivity accepts", () => {
     ["a full clone", {}],
     ["a blob:none clone", { filter: "blob:none" }],
     ["a --depth clone", { depth: 1 }],
-  ])("publishes %s without the connectivity walk", async (_name, options) => {
+  ])("publishes %s without a reachability walk", async (_name, options) => {
     const fixture = new GitFixture().init();
     fixture.write("a.txt", "a\n");
     fixture.commit("first");
@@ -191,13 +111,13 @@ describe("per-pack connectivity accepts", () => {
     const server = await startGitServer(fixture.dir);
     const workspace = makeWorkspace();
     try {
-      const statements = await statementsOf(workspace, () =>
+      const { statements } = await statementsOf(workspace, () =>
         clone(workspace.context, { url: server.url, dir: "/work", ...options }),
       );
       const repo = openRepository(workspace.context, "/work");
       expect(repo.head().oid).toBe(head);
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(head);
-      expect(statements.has(CONNECTIVITY_WALK)).toBe(false);
+      expect(statements.has(ANCESTRY_WALK)).toBe(false);
     } finally {
       await server.close();
       fixture.dispose();
@@ -211,7 +131,7 @@ describe("per-pack connectivity accepts", () => {
     const { repo, context } = workspace;
     try {
       repo.store.configSet("remote.origin.url", server.url);
-      const statements = await statementsOf(workspace, () =>
+      const { statements } = await statementsOf(workspace, () =>
         fetchInto(context, repo, {
           remote: "origin",
           singleBranch: false,
@@ -223,7 +143,7 @@ describe("per-pack connectivity accepts", () => {
       const native = await nativePromises(server.url);
       expect(native.size).toBeGreaterThan(0);
       expect(promised).toEqual(native);
-      expect(statements.has(CONNECTIVITY_WALK)).toBe(false);
+      expect(statements.has(ANCESTRY_WALK)).toBe(false);
       expect(repo.store.getRef("refs/remotes/origin/topic")).toBe(
         fixture.git("rev-parse", "topic"),
       );
@@ -274,6 +194,41 @@ describe("per-pack connectivity accepts", () => {
     }
   });
 
+  it("wants a fallback tag a concurrent write made present on a fresh store", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("file.txt", "tagged\n");
+    const tagged = fixture.commit("tagged");
+    fixture.git("tag", "-a", "v1", "-m", "release");
+    const tag = fixture.git("rev-parse", "v1");
+    const server = await startGitServer(fixture.dir);
+    const { repo, context } = makeRepo("/work");
+    let posts = 0;
+    const http: GitHttpClient = (request) => {
+      if (request.method === "POST") posts++;
+      return fetchHttpClient(withoutIncludeTag(request));
+    };
+    let written = false;
+    try {
+      repo.store.configSet("remote.origin.url", server.url);
+      await fetchInto({ ...context, http }, repo, { remote: "origin" }, "fetch", {
+        checkpoint: (stage) => {
+          // Another writer publishes the tag object between the two rounds.
+          if (stage !== "after-ingest" || written) return undefined;
+          repo.store.write("tag", fixture.catFile(tag));
+          written = true;
+          return undefined;
+        },
+      });
+      expect(written).toBe(true);
+      expect(posts).toBe(2);
+      expect(repo.store.getRef("refs/tags/v1")).toBe(tag);
+      expect(repo.peel(tag)).toBe(tagged);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
   it("accepts a missing parent of a shallow boundary commit", async () => {
     const file = blob("file\n");
     const root = tree([{ mode: MODE_FILE, name: "file", oid: file.oid }]);
@@ -281,33 +236,6 @@ describe("per-pack connectivity accepts", () => {
     const state = await fetchFresh([commit, root, file], commit.oid, { shallow: [commit.oid] });
     expect(state.outcome).toBeNull();
     expect(state.refsChanged).toBe(true);
-  });
-
-  it("keeps the connectivity walk for a store that already holds a complete pack", async () => {
-    const fixture = new GitFixture().init();
-    fixture.write("a.txt", "a\n");
-    fixture.commit("first");
-    const server = await startGitServer(fixture.dir);
-    const workspace = makeRepo("/work");
-    const { repo, context } = workspace;
-    try {
-      repo.store.configSet("remote.origin.url", server.url);
-      await repo.store.packs.ingest(
-        (async function* () {
-          yield fixture.packAll();
-        })(),
-      );
-      fixture.write("b.txt", "b\n");
-      const head = fixture.commit("second");
-      const statements = await statementsOf(workspace, () =>
-        fetchInto(context, repo, { remote: "origin" }),
-      );
-      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(head);
-      expect(statements.has(CONNECTIVITY_WALK)).toBe(true);
-    } finally {
-      await server.close();
-      fixture.dispose();
-    }
   });
 });
 
@@ -386,7 +314,7 @@ describe("per-pack connectivity rejects on a fresh store", () => {
       message: "fetched graph references a missing object",
     });
     expect(state.refsChanged).toBe(false);
-    expect(state.promises).toBe(0);
+    expect(state.promisesAdded).toBe(0);
   });
 
   it("a shallow boundary that changed during ingest", async () => {
@@ -410,7 +338,7 @@ describe("per-pack connectivity rejects on a fresh store", () => {
     await expect(
       repo.store.packs.ingest(slices(packOf([commit, root]), 4096), {
         connectivity: {
-          fresh: true,
+          reachability: null,
           promisor: { remoteName: "origin", url: "https://example.test/repo.git" },
           shallow: [],
           unshallow: [],
@@ -431,8 +359,12 @@ describe("per-pack connectivity rejects on a fresh store", () => {
 });
 
 describe("fresh-store detection", () => {
-  it.each<[string, (repo: Repository) => void]>([
+  it.each<[string, (repo: Repository) => Promise<unknown> | unknown]>([
     ["a loose object", (repo) => repo.store.write("blob", utf8.encode("loose only\n"))],
+    [
+      "a complete pack",
+      (repo) => repo.store.packs.ingest(slices(packOf([blob("packed only\n")]), 4096)),
+    ],
     [
       "a promise",
       (repo) => {
@@ -445,16 +377,14 @@ describe("fresh-store detection", () => {
     fixture.write("a.txt", "a\n");
     const head = fixture.commit("first");
     const server = await startGitServer(fixture.dir);
-    const workspace = makeRepo("/work");
-    const { repo, context } = workspace;
+    const { repo, context } = makeRepo("/work");
     try {
       repo.store.configSet("remote.origin.url", server.url);
-      seed(repo);
-      const statements = await statementsOf(workspace, () =>
-        fetchInto(context, repo, { remote: "origin" }),
-      );
+      expect(beginFetchConnectivity(context, repo, undefined).reachability).toBeNull();
+      await seed(repo);
+      expect(beginFetchConnectivity(context, repo, undefined).reachability).not.toBeNull();
+      await fetchInto(context, repo, { remote: "origin" });
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(head);
-      expect(statements.has(CONNECTIVITY_WALK)).toBe(true);
     } finally {
       await server.close();
       fixture.dispose();

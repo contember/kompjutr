@@ -82,7 +82,9 @@ fails its walk as before.
   commit by commit projects each tree once.
 - **Changed error.** A walk whose closure meets a missing tree object fails
   with `ENOTFOUND` from `ensureTreeClosure`. It used to fail as `ECORRUPT`
-  ("no valid parsed source").
+  ("no valid parsed source"). The walk already reports a subtree without a
+  source row as `ENOTFOUND` through its `missing_source` error kind; an
+  unprojectable subtree stays `ECORRUPT`.
 - A read can write. Every walk entry point must run where a `transactionSync`
   is legal, and an open cursor must be closed before the closure is written.
 - Pack deletion, loose-object deletion and the delete triggers stay as they

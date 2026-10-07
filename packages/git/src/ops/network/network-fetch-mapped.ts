@@ -17,6 +17,11 @@ import { repositoryMutations } from "../repository/repository.js";
 import { runFetchCheckpoint } from "./network-checkpoint.js";
 import { validateFetchedConnectivity } from "./network-connectivity.js";
 import {
+  beginFetchConnectivity,
+  connectedObjects,
+  type FetchConnectivity,
+} from "./network-reachability.js";
+import {
   applyShallowResponse,
   authenticateShallowTransition,
   requestsBoundary,
@@ -30,12 +35,7 @@ import {
   authenticateTags,
   eligibleAutoTags,
 } from "./network-tags.js";
-import {
-  beginFetchConnectivity,
-  type FetchConnectivity,
-  fetchProgressSink,
-  transferPack,
-} from "./network-transfer.js";
+import { fetchProgressSink, transferPack } from "./network-transfer.js";
 import type {
   AdvertisedTag,
   FetchBehavior,
@@ -178,8 +178,9 @@ export async function fetchMappedInto(
     const rootNames = new Set(plan.roots.map((ref) => ref.name));
     const selectedTags = tags.filter((tag) => rootNames.has(tag.ref.name));
     const boundary = new Set(publication.shallow);
-    // Read in the same synchronous step as want selection: a fresh store wants every root.
+    // Read in the same synchronous step as want selection, which trusts only what it proves.
     const connectivity = beginFetchConnectivity(
+      context,
       repo,
       options.filter === undefined ? undefined : { remoteName: target.remote, url: target.url },
     );
@@ -230,15 +231,7 @@ export async function fetchMappedInto(
     await runFetchCheckpoint(behavior.checkpoint, "before-ref-publication", options.signal);
     throwIfAborted(options.signal);
     withGitMutationGuardOwned(context.database, () => {
-      const finalBoundary = repo.shallow();
-      for (const oid of shallow.remove) finalBoundary.delete(oid);
-      for (const oid of shallow.add) finalBoundary.add(oid);
-      validateFetchedConnectivity(
-        repo,
-        roots,
-        finalBoundary,
-        connectivity.fresh ? connectivity.acceptedPacks : null,
-      );
+      validateFetchedConnectivity(repo, roots, connectivity);
       repositoryMutations(repo).publishFetchRefsOwned(
         publication,
         publicationPlan,
@@ -280,8 +273,16 @@ async function transferFetchObjects(
     ...(options.filter === undefined ? {} : { filter: options.filter }),
     connectivity: transfer.connectivity,
   };
+  const connected = (oids: readonly string[]) =>
+    connectedObjects(repo, transfer.connectivity, oids);
+  // A held object counts only once it is proven; one an earlier failed fetch left is fetched again.
+  const unconnected = (oids: readonly string[]) => {
+    const unique = [...new Set(oids)];
+    const held = connected(unique);
+    return unique.filter((oid) => !held.has(oid));
+  };
   const initialFollow =
-    followable.length > 0 ? eligibleAutoTags(repo, followable, publication) : [];
+    followable.length > 0 ? eligibleAutoTags(followable, publication, connected) : [];
   const wanted = [
     ...plan.roots.map((ref) => ref.oid),
     ...initialFollow.map((tag) => tag.ref.oid),
@@ -289,7 +290,7 @@ async function transferFetchObjects(
   ];
   const wants = wantsHeldRoots(plan.shallow, plan.roots, publication.shallow)
     ? [...new Set(wanted)]
-    : repo.store.missing(wanted);
+    : unconnected(wanted);
   applyShallowResponse(
     boundary,
     await transferPack(
@@ -312,9 +313,9 @@ async function transferFetchObjects(
   if (followable.length === 0) return [];
 
   // A server without include-tag may omit annotated tag objects. Once their
-  // peeled targets are local, one bounded fallback request completes them.
-  const eligible = eligibleAutoTags(repo, followable, publication);
-  const fallbackWants = repo.store.missing(eligible.map((tag) => tag.ref.oid));
+  // peeled targets are connected, one bounded fallback request completes them.
+  const eligible = eligibleAutoTags(followable, publication, connected);
+  const fallbackWants = unconnected(eligible.map((tag) => tag.ref.oid));
   const missing = new Set(fallbackWants);
   applyShallowResponse(
     boundary,
@@ -334,5 +335,5 @@ async function transferFetchObjects(
       behavior.checkpoint,
     ),
   );
-  return eligibleAutoTags(repo, followable, publication);
+  return eligibleAutoTags(followable, publication, connected);
 }

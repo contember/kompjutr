@@ -305,9 +305,14 @@ pending metadata
 A network fetch passes a connectivity option to ingest. While objects resolve,
 an in-memory table keyed by binary OID records each object's type and the types
 its references expect. Publication type-checks the pack's own references,
-promises the unresolved blobs of a filtered fetch, and, when the store was
-fresh at fetch start, rejects any reference that the fetch's packs do not
-resolve ([ADR-0029](../decisions/0029-check-fetched-connectivity-per-pack.md)).
+promises the unresolved blobs of a filtered fetch, and resolves every other
+reference ([ADR-0029](../decisions/0029-check-fetched-connectivity-per-pack.md)).
+A store that was fresh at fetch start resolves nothing outside the fetch's
+packs. Any other store resolves an external commit or tag through one cached
+walk of the commits reachable from the refs and checkout `HEAD`s the fetch
+began with, an external blob by presence or promise, and an external tree
+through the tree walk of a proven commit's root tree or of the tree's own
+closure.
 
 Only complete packs are readable. Parse records an ordered digest for every
 physical membership row. Publication compares the stored rows with those
@@ -318,7 +323,9 @@ objects for reads.
 
 Tree objects are parsed into edge rows once per tree OID, when the first copy
 is stored; a later loose or packed copy writes no entries. Tree walks use one
-recursive SQLite cursor and read no object BLOBs.
+recursive SQLite cursor and read no object BLOBs. A subtree with no source row
+is an absent object, and the walk fails with `ENOTFOUND`; a subtree whose source
+is incomplete fails with `ECORRUPT`.
 Every commit, loose or packed, has one `git_commits` row, written atomically
 with the commit's visibility (a packed commit's at pack publication). A row that
 would exceed the Durable Object ~2 MB row ceiling stores message and signature

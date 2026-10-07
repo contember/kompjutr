@@ -28,14 +28,16 @@ function snapshottedTagNames(snapshot: FetchPublicationToken): Set<string> {
   return new Set(snapshot.exactRefs.filter((ref) => ref.target !== null).map((ref) => ref.name));
 }
 
+/** Tags new to this repository whose peeled target the fetch can build on. */
 export function eligibleAutoTags(
-  repo: Repository,
   tags: readonly AdvertisedTag[],
   snapshot: FetchPublicationToken,
+  connected: (oids: readonly string[]) => ReadonlySet<string>,
 ): AdvertisedTag[] {
   const local = snapshottedTagNames(snapshot);
-  const present = repo.store.hasAll(tags.map((tag) => tag.peeledOid));
-  return tags.filter((tag) => !local.has(tag.ref.name) && present.has(tag.peeledOid));
+  const candidates = tags.filter((tag) => !local.has(tag.ref.name));
+  const held = connected(candidates.map((tag) => tag.peeledOid));
+  return candidates.filter((tag) => held.has(tag.peeledOid));
 }
 
 function readTagObjects(repo: Repository, oids: readonly string[]): Map<string, RawObject> {

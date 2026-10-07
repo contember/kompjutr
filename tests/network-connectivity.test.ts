@@ -8,7 +8,6 @@ import {
   serializeTree,
 } from "../packages/git/src/common/objects.js";
 import { fetchInto } from "../packages/git/src/ops/network/network.js";
-import { validateFetchedConnectivity } from "../packages/git/src/ops/network/network-connectivity.js";
 import { hydratePromisedBlobs } from "../packages/git/src/ops/network/network-promisor.js";
 import type { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { MAX_BLOB_BATCH_OIDS } from "../packages/git/src/store/objects/objects.js";
@@ -17,8 +16,6 @@ import { commitObject, packRemote } from "./helpers/fetch-pack.js";
 import { slices } from "./helpers/git.js";
 import { startStubServer } from "./helpers/http-backend.js";
 import { makeRepo } from "./helpers/workspace.js";
-
-const REMOTE = "https://example.test/repo.git";
 
 interface PackObject {
   type: ObjectType;
@@ -141,123 +138,6 @@ describe("set-based promise insert", () => {
     });
     expect(fixture.store.promisedBlobCount()).toBe(4);
     expect(fixture.store.promisedMissing([fixture.shared])).toEqual([]);
-  });
-});
-
-describe("fetched graph connectivity failures", () => {
-  const validate = (repo: ReturnType<typeof makeRepo>["repo"], roots: string[]) =>
-    repo.store.db.transactionSync(() => validateFetchedConnectivity(repo, roots, new Set()));
-
-  it("rejects a subtree entry whose object is a blob", () => {
-    const { repo } = makeRepo("/work");
-    const blob = repo.store.write("blob", utf8.encode("not a tree"));
-    const root = repo.store.write(
-      "tree",
-      serializeTree([{ mode: MODE_TREE, name: "dir", oid: blob }]),
-    );
-    expect(() => validate(repo, [root])).toThrowError(
-      expect.objectContaining({
-        code: "ECORRUPT",
-        message: `tree ${blob} has no complete parsed source`,
-      }),
-    );
-  });
-
-  it("rejects a file entry whose object is a tree", () => {
-    const { repo } = makeRepo("/work");
-    const leaf = repo.store.write("blob", utf8.encode("leaf"));
-    const tree = repo.store.write(
-      "tree",
-      serializeTree([{ mode: MODE_FILE, name: "leaf", oid: leaf }]),
-    );
-    const root = repo.store.write(
-      "tree",
-      serializeTree([{ mode: MODE_FILE, name: "file", oid: tree }]),
-    );
-    expect(() => validate(repo, [root])).toThrowError(
-      expect.objectContaining({
-        code: "ECORRUPT",
-        message: `fetched graph requires ${tree} to be a blob`,
-      }),
-    );
-  });
-
-  it("rejects a subtree present only in an incomplete pack", async () => {
-    const { repo } = makeRepo("/work");
-    const blob = repo.store.write("blob", utf8.encode("file"));
-    const subtree = serializeTree([{ mode: MODE_FILE, name: "file", oid: blob }]);
-    const subtreeOid = hashObject("tree", subtree);
-    await expect(
-      repo.store.packs.ingest(slices(packOf([{ type: "tree", data: subtree }]), 4096), {
-        lifecycle: {
-          reserved: () => undefined,
-          published: () => {
-            throw new Error("interrupted publication");
-          },
-        },
-      }),
-    ).rejects.toThrow(/interrupted publication/);
-    expect(repo.store.db.all("SELECT state FROM git_pack_meta")).toEqual([{ state: "pending" }]);
-    expect(
-      repo.store.db.scalar("SELECT complete FROM git_tree_sources WHERE tree_oid = ?", subtreeOid),
-    ).toBe(1);
-    const root = repo.store.write(
-      "tree",
-      serializeTree([{ mode: MODE_TREE, name: "dir", oid: subtreeOid }]),
-    );
-    expect(repo.store.has(subtreeOid)).toBe(false);
-    expect(() => validate(repo, [root])).toThrowError(
-      expect.objectContaining({
-        code: "EFETCHFAIL",
-        message: "fetched graph references a missing object",
-      }),
-    );
-  });
-
-  it("rejects a blob present only in an incomplete pack", async () => {
-    const { repo } = makeRepo("/work");
-    const data = utf8.encode("pending");
-    await expect(
-      repo.store.packs.ingest(slices(packOf([{ type: "blob", data }]), 4096), {
-        lifecycle: {
-          reserved: () => undefined,
-          published: () => {
-            throw new Error("interrupted publication");
-          },
-        },
-      }),
-    ).rejects.toThrow(/interrupted publication/);
-    expect(repo.store.db.all("SELECT state FROM git_pack_meta")).toEqual([{ state: "pending" }]);
-    const root = repo.store.write(
-      "tree",
-      serializeTree([{ mode: MODE_FILE, name: "file", oid: hashObject("blob", data) }]),
-    );
-    expect(() => validate(repo, [root])).toThrowError(
-      expect.objectContaining({
-        code: "EFETCHFAIL",
-        message: "fetched graph references a missing object",
-      }),
-    );
-  });
-
-  it("does not let a promise exempt an object that is physically a tree", () => {
-    const { repo } = makeRepo("/work");
-    const leaf = repo.store.write("blob", utf8.encode("leaf"));
-    const tree = serializeTree([{ mode: MODE_FILE, name: "leaf", oid: leaf }]);
-    const treeOid = hashObject("tree", tree);
-    repo.store.registerPromisorRemote("origin", REMOTE);
-    repo.store.addPromisedBlobs("origin", [treeOid]);
-    repo.store.write("tree", tree);
-    const root = repo.store.write(
-      "tree",
-      serializeTree([{ mode: MODE_FILE, name: "file", oid: treeOid }]),
-    );
-    expect(() => validate(repo, [root])).toThrowError(
-      expect.objectContaining({
-        code: "ECORRUPT",
-        message: `fetched graph requires ${treeOid} to be a blob`,
-      }),
-    );
   });
 });
 

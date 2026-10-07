@@ -1,4 +1,3 @@
-import { isOid } from "../../common/bytes.js";
 import { GitError, hasErrorCode } from "../../common/errors.js";
 import {
   type MessageCallback,
@@ -12,36 +11,13 @@ import {
   uploadPack,
 } from "../../protocol/remote.js";
 import { throwIfAborted } from "../../protocol/stream.js";
-import { readFreshObjectStore } from "../../store/pack/ingest/ingest-references-check.js";
 import type { GitContext } from "../core/context.js";
 import { type Repository, walkOwned } from "../repository/repository.js";
 import { runFetchCheckpoint } from "./network-checkpoint.js";
+import type { FetchConnectivity } from "./network-reachability.js";
 import type { FetchCheckpointStage } from "./network-types.js";
 
 const HAVE_BUDGET = 256;
-
-/** What every pack of one fetch operation is checked against at ingest (ADR-0029). */
-export interface FetchConnectivity {
-  /** Read once, when the fetch begins. */
-  readonly fresh: boolean;
-  readonly promisor?: { readonly remoteName: string; readonly url: string };
-  readonly shallow: Set<string>;
-  readonly unshallow: Set<string>;
-  readonly acceptedPacks: number[];
-}
-
-export function beginFetchConnectivity(
-  repo: Repository,
-  promisor: { remoteName: string; url: string } | undefined,
-): FetchConnectivity {
-  return {
-    fresh: readFreshObjectStore(repo.store.db, repo.store.repoId),
-    ...(promisor === undefined ? {} : { promisor }),
-    shallow: new Set(),
-    unshallow: new Set(),
-    acceptedPacks: [],
-  };
-}
 
 function applyConnectivityShallow(
   connectivity: FetchConnectivity,
@@ -57,16 +33,10 @@ function applyConnectivityShallow(
   }
 }
 
-/** Recent commits from every local ref, as negotiation `have`s. */
-function collectHaves(repo: Repository): string[] {
+/** Recent commits from the refs the fetch began with, as negotiation `have`s. */
+function collectHaves(repo: Repository, tips: readonly string[]): string[] {
   const haves: string[] = [];
   const seen = new Set<string>();
-  const tips = repo.store
-    .listRefs()
-    .map((ref) => ref.target)
-    .filter((target) => isOid(target));
-  const head = repo.head().oid;
-  if (head !== null) tips.unshift(head);
   const unique = [...new Set(tips)];
   const present = repo.store.hasAll(unique);
   for (const tip of unique) {
@@ -109,7 +79,7 @@ async function ingestPack(
       ? {}
       : {
           connectivity: {
-            fresh: connectivity.fresh,
+            reachability: connectivity.reachability,
             ...(connectivity.promisor === undefined ? {} : { promisor: connectivity.promisor }),
             shallow: [...connectivity.shallow],
             unshallow: [...connectivity.unshallow],
@@ -160,7 +130,10 @@ export async function transferPack(
   try {
     const haves = [
       ...new Set([
-        ...(request.useLocalHaves === false ? [] : collectHaves(repo)),
+        // Only commits the fetch can prove reachable may be offered; refs read now could have moved.
+        ...(request.useLocalHaves === false
+          ? []
+          : collectHaves(repo, request.connectivity?.reachability?.tips ?? [])),
         ...(request.haves ?? []),
       ]),
     ];

@@ -413,8 +413,25 @@ describe("tree diff", () => {
     );
     db.run("DELETE FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?", child);
 
-    expect(() => store.walkTreeDiff(null, root).next()).toThrow(/no valid v3 parsed source/);
-    expect(() => store.walkTreeDiffObjects(null, root).next()).toThrow(/no valid v3 parsed source/);
+    // Every stored tree has a source row, so a subtree without one is an absent object.
+    const missing = expect.objectContaining({
+      code: "ENOTFOUND",
+      message: `object not found: ${child}`,
+    });
+    expect(() => store.walkTreeDiff(null, root).next()).toThrowError(missing);
+    expect(() => store.walkTreeDiffObjects(null, root).next()).toThrowError(missing);
+    expect(() => [...store.walkTree(root)]).toThrowError(missing);
+
+    db.run(
+      `INSERT INTO git_tree_sources
+         (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
+       VALUES (1, ?, 0, 1, NULL, NULL)`,
+      child,
+    );
+    const incomplete = expect.objectContaining({ code: "ECORRUPT" });
+    expect(() => store.walkTreeDiff(null, root).next()).toThrowError(incomplete);
+    expect(() => store.walkTreeDiffObjects(null, root).next()).toThrowError(incomplete);
+    expect(() => [...store.walkTree(root)]).toThrow(/no valid v3 parsed source/);
   });
 
   it("permits DAG reuse and rejects an active-stack cycle", () => {
