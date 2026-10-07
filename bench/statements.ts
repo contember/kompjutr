@@ -138,6 +138,7 @@ type RequiredRow =
   | "status.sparse-clean"
   | "status.sparse-dirty"
   | "staging.add-selected"
+  | "staging.add-tracker"
   | "worktree.list"
   | "checkout.initial"
   | "commit.sparse"
@@ -184,6 +185,7 @@ const REQUIRED_ROWS: readonly RequiredRow[] = [
   "status.sparse-clean",
   "status.sparse-dirty",
   "staging.add-selected",
+  "staging.add-tracker",
   "worktree.list",
   "checkout.initial",
   "commit.sparse",
@@ -259,12 +261,13 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "sparse.prune": 126,
   "checkout.remove": 39,
   "worktree.guard": 7,
-  "staging.add": 17,
+  "staging.add": 16,
   "staging.rm": 27,
   "status.full": 28,
   "status.sparse-clean": 7,
   "status.sparse-dirty": 24,
-  "staging.add-selected": 24,
+  "staging.add-selected": 23,
+  "staging.add-tracker": 11,
   "worktree.list": 9,
   "checkout.initial": 24,
   "commit.sparse": 36,
@@ -306,12 +309,13 @@ const BASELINE_ROWS_READ: Partial<Record<RequiredRow, number>> = {
   "sparse.prune": 247,
   "checkout.remove": 30,
   "worktree.guard": 12,
-  "staging.add": 26,
+  "staging.add": 23,
   "staging.rm": 31,
   "status.full": 31,
   "status.sparse-clean": 5,
   "status.sparse-dirty": 23,
-  "staging.add-selected": 33,
+  "staging.add-selected": 28,
+  "staging.add-tracker": 9,
   "worktree.list": 14,
   "checkout.initial": 21,
   "commit.sparse": 28,
@@ -1178,6 +1182,64 @@ async function stagingAddSelectedRow(rows: ResultRow[]): Promise<void> {
         ["M  dir/b.txt", "A  new.txt", " M z.txt"],
         "selected add status",
       );
+    },
+  );
+}
+
+/**
+ * 5,000 files: five 1,000-row index pages, so a fallback to the full scan
+ * shows as a multi-page statement and row rise, while setup stays fast.
+ */
+const STAGING_ADD_TRACKER_FILES = 5_000;
+
+async function stagingAddTrackerRow(rows: ResultRow[]): Promise<void> {
+  const storage = new SqliteTestStorage();
+  const workspace = new Workspace({
+    storage,
+    git: createGit(),
+    now: () => 1_600_000_000_000,
+    defaultGitIdentity: IDENTITY,
+  });
+  const git = workspace.git;
+  await git.init({ dir: "/repo" });
+  workspace.filesystem.writeFiles(
+    Array.from({ length: STAGING_ADD_TRACKER_FILES }, (_, index) => {
+      const path = `/repo/d${Math.floor(index / 100)}/f${index % 100}.txt`;
+      return { path, bytes: utf8.encode(`${path}\n`), mode: 0o644 };
+    }),
+  );
+  await git.add({ dir: "/repo", paths: [], all: true });
+  const base = (await git.commit({ dir: "/repo", message: "tracker base" })).oid;
+  await git.add({ dir: "/repo", paths: ["."] });
+  const checkoutId = workspace.db.scalar<unknown>(
+    "SELECT id FROM git_checkouts WHERE root = ?",
+    "/repo",
+  );
+  assert(typeof checkoutId === "number", "tracker add fixture has no checkout");
+  assert((await git.status({ dir: "/repo" })).length === 0, "tracker add fixture is dirty");
+  assert(
+    readIndexTrackerState(workspace.db, checkoutId).available,
+    "tracker add fixture did not seal its tracker",
+  );
+  await measure(
+    rows,
+    storage,
+    "staging.add-tracker",
+    () => withQueries(storage, () => git.add({ dir: "/repo", paths: ["."] })),
+    async ({ queries }) => {
+      assert(queries.includes(TRACKER_DIRTY_SQL), "tracker add did not read tracker dirty paths");
+      assert(!queries.includes(FULL_INDEX_SCAN_SQL), "tracker add fell back to a full index scan");
+      assert(
+        (await git.revParse({ dir: "/repo", ref: "HEAD" })) === base,
+        "tracker add moved HEAD",
+      );
+      assert(
+        readIndexTrackerState(workspace.db, checkoutId).available,
+        "tracker add left its tracker incomplete",
+      );
+      assert((await git.status({ dir: "/repo" })).length === 0, "tracker add changed status");
+      const index = await git.lsFiles({ dir: "/repo" });
+      assert(index.length === STAGING_ADD_TRACKER_FILES, "tracker add changed index row count");
     },
   );
 }
@@ -2657,6 +2719,7 @@ await stagingRmRow(rows);
 await statusFullRow(rows);
 await statusSparseRows(rows);
 await stagingAddSelectedRow(rows);
+await stagingAddTrackerRow(rows);
 await worktreeListRow(rows);
 await checkoutInitialRow(rows);
 await commitSparseRow(rows);

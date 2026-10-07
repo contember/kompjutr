@@ -6,12 +6,11 @@ import { applyIndexOwned } from "../../store/checkout/checkout.js";
 import { type IndexEntry, type IndexStore, indexScanOwned } from "../../store/index.js";
 import type { GitContext } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";
-import { treeStream } from "../tree/tree-stream.js";
+import { type TargetEntry, treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
 import {
   type CompiledPathspecMatcher,
   compilePathspecs,
-  createWorktreeHashCursor,
   hasGlobSyntax,
   indexMatchesStat,
   type WorktreePath,
@@ -27,6 +26,7 @@ import {
   type StageCandidateBatch,
   stageCandidates,
 } from "./staging-add-stage.js";
+import { trackedAddSources } from "./staging-add-tracker.js";
 import {
   assertSelectedPathspecsMatch,
   selectAddPaths,
@@ -50,6 +50,13 @@ export interface AddOptions {
    * The caller resolves these before entering the staging operation.
    */
   excludeRoots?: string[];
+}
+
+/** The three sorted inputs one add merges; `head` is present only for `trackedOnly`. */
+interface AddSources {
+  index: AddIndexSnapshot;
+  worktree: Iterable<WorktreePath>;
+  head?: Iterable<TargetEntry>;
 }
 
 export type AddLiteralPathsResult =
@@ -129,11 +136,12 @@ function runAdd(
         repo,
         worktree,
         options,
-        addIndexSource(selected.index, pathspec),
-        selectedWorktreeFiles(selected.worktree, pathspec),
+        {
+          index: addIndexSource(selected.index, pathspec),
+          worktree: selectedWorktreeFiles(selected.worktree, pathspec),
+        },
         pathspec,
         force,
-        false,
         index,
         limits,
         preloadedIgnores,
@@ -143,7 +151,30 @@ function runAdd(
     assertPathspecsMatch(repo, worktree, specs, index, options.excludeRoots);
   }
 
-  const snapshot = addIndexSource(indexScanOwned(index), pathspec);
+  // A forced add needs ignored files the tracker may never have recorded.
+  const wholeTree = all || (specs.length === 1 && specs[0] === "");
+  if (wholeTree && !force && index === repo.checkout && (options.excludeRoots?.length ?? 0) === 0) {
+    const tracked = trackedAddSources(repo, context?.sparseWorkspace);
+    if (tracked !== null) {
+      applyAdd(
+        repo,
+        worktree,
+        options,
+        {
+          index: addIndexSource(tracked.index, pathspec),
+          worktree: tracked.worktree,
+          head: trackedOnly ? tracked.head : undefined,
+        },
+        pathspec,
+        force,
+        index,
+        limits,
+        preloadedIgnores,
+      );
+      return;
+    }
+  }
+
   const walked = walkWorktreeEntriesStream(worktree, repo.root, {
     pathspec,
     excludeRoots: options.excludeRoots,
@@ -154,11 +185,14 @@ function runAdd(
     repo,
     worktree,
     options,
-    snapshot,
-    walked,
+    {
+      index: addIndexSource(indexScanOwned(index), pathspec),
+      worktree: walked,
+      // `commit -a` never adds a path HEAD does not already have.
+      head: trackedOnly ? treeStream(repo, repo.headTree()) : undefined,
+    },
     pathspec,
     force,
-    trackedOnly,
     index,
     limits,
     preloadedIgnores,
@@ -169,11 +203,9 @@ function applyAdd(
   repo: Repository,
   worktree: Worktree,
   options: AddOptions,
-  snapshot: AddIndexSnapshot,
-  walked: Iterable<WorktreePath>,
+  sources: AddSources,
   pathspec: CompiledPathspecMatcher | undefined,
   force: boolean,
-  trackedOnly: boolean,
   index: IndexStore,
   limits: AddOperationLimits,
   preloadedIgnores?: IgnoreMatcher,
@@ -185,18 +217,16 @@ function applyAdd(
     return ignores.ignores(path, false);
   };
   const excluded = relativeExcludeRoots(repo.root, options.excludeRoots);
-  // `commit -a` never adds a path HEAD does not already have.
-  const head = trackedOnly ? treeStream(repo, repo.headTree()) : [];
+  const trackedOnly = sources.head !== undefined;
   const pending: StageCandidateBatch = {
     rows: [],
   };
-  const hashCursor = createWorktreeHashCursor(options.excludeRoots);
   applyIndexOwned(index, (sink) => {
-    const flush = (): void => stageCandidates(repo, worktree, pending, sink, hashCursor);
+    const flush = (): void => stageCandidates(repo, worktree, pending, sink);
     for (const row of joinSorted3(
-      boundedAddWorktreeRows(walked, limits),
-      snapshot.paths,
-      boundedAddHeadRows(head, limits),
+      boundedAddWorktreeRows(sources.worktree, limits),
+      sources.index.paths,
+      boundedAddHeadRows(sources.head ?? [], limits),
       {
         a: (entry) => entry.path,
         b: (entry) => entry.path,

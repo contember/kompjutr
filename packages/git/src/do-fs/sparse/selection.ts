@@ -133,28 +133,40 @@ function validateSelectedCheckout(db: SqlDatabase, request: SelectedPathRequest)
   if (row.root !== request.root) throw inputError("selected path root does not match checkout");
 }
 
+// Exact and subtree lookups are separate branches so each seeks the full
+// `(checkout_id, path)` key; one OR join scans every row of the checkout.
 const SELECTED_INDEX_SQL = `WITH wanted(path, recursive) AS MATERIALIZED (
   SELECT json_extract(value, '$.p'), json_extract(value, '$.r') FROM json_each(?)
 )
-SELECT DISTINCT candidate.path, candidate.stage, candidate.mode, candidate.oid,
-       candidate.size, candidate.mtime, candidate.ino, candidate.rev
-  FROM wanted
-  JOIN git_index candidate
-    ON candidate.checkout_id = ?
-   AND (candidate.path = wanted.path
-     OR (wanted.recursive = 1
-       AND candidate.path >= wanted.path || '/'
-       AND candidate.path < wanted.path || '0'))
- ORDER BY candidate.path, candidate.stage
+SELECT DISTINCT path, stage, mode, oid, size, mtime, ino, rev FROM (
+  SELECT candidate.path, candidate.stage, candidate.mode, candidate.oid,
+         candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted
+    CROSS JOIN git_index candidate
+      ON candidate.checkout_id = ? AND candidate.path = wanted.path
+  UNION ALL
+  SELECT candidate.path, candidate.stage, candidate.mode, candidate.oid,
+         candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted
+    CROSS JOIN git_index candidate
+      ON candidate.checkout_id = ?
+     AND candidate.path >= wanted.path || '/'
+     AND candidate.path < wanted.path || '0'
+   WHERE wanted.recursive = 1
+)
+ ORDER BY path, stage
  LIMIT ${MAX_SELECTED_INDEX_ROWS + 1}`;
 
+// CROSS JOIN pins `wanted` outermost; otherwise the planner satisfies the ORDER BY by
+// walking every row of the checkout and probing `wanted` per row.
 const SELECTED_EXACT_INDEX_SQL = `WITH wanted(path) AS MATERIALIZED (
   SELECT json_extract(value, '$.p') FROM json_each(?)
 )
 SELECT candidate.path, candidate.stage, candidate.mode, candidate.oid,
        candidate.size, candidate.mtime, candidate.ino, candidate.rev
   FROM wanted
-  JOIN git_index candidate ON candidate.checkout_id = ? AND candidate.path = wanted.path
+  CROSS JOIN git_index candidate
+    ON candidate.checkout_id = ? AND candidate.path = wanted.path
  ORDER BY candidate.path, candidate.stage
  LIMIT ${MAX_SELECTED_INDEX_ROWS + 1}`;
 
@@ -167,11 +179,11 @@ export function readSelectedIndex(
   const rows: IndexEntry[] = [];
   let previous: IndexEntry | null = null;
   let available = true;
-  for (const raw of db.iterate(
-    exact ? SELECTED_EXACT_INDEX_SQL : SELECTED_INDEX_SQL,
-    validated.json,
-    validated.request.checkoutId,
-  )) {
+  const checkoutId = validated.request.checkoutId;
+  const cursor = exact
+    ? db.iterate(SELECTED_EXACT_INDEX_SQL, validated.json, checkoutId)
+    : db.iterate(SELECTED_INDEX_SQL, validated.json, checkoutId, checkoutId);
+  for (const raw of cursor) {
     const entry = validatedSparseIndexEntry(raw);
     if (
       previous !== null &&

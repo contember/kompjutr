@@ -1,5 +1,4 @@
 import { CorruptError, hasErrorCode } from "../../common/errors.js";
-import { comparePaths } from "../../common/streams.js";
 import type { SparseWorkspaceRow, SparseWorkspaceSource } from "../../store/core/contracts.js";
 import { matchesPaths } from "../checkout/checkout.js";
 import {
@@ -11,6 +10,7 @@ import {
 } from "../diff/diff-internal.js";
 import type { Repository } from "../repository/repository.js";
 import type { TargetEntry } from "../tree/tree-stream.js";
+import { hydrateSparseCandidates, sparseCandidatePaths } from "./sparse-candidates.js";
 import type { WorktreePath } from "./worktree-io.js";
 
 const SPARSE_DIFF_PATHS = 1000;
@@ -51,35 +51,31 @@ export function sparseWorkingCandidates(
   try {
     const state = source.readState(repo.checkout.checkoutId);
     if (!state.available) return null;
-    const paths = sparseWorkingPaths(
+    const paths = sparseCandidatePaths(
       repo,
       source.dirtyPaths(repo.checkout.checkoutId),
       state.baselineTreeOid,
       currentTreeOid,
-      options.paths,
+      (path) => matchesPaths(path, options.paths),
     );
     if (paths === null) return null;
     if (paths.length === 0) return [];
 
-    const hydrated = source.hydrate({
-      repoId: repo.store.repoId,
-      checkoutId: repo.checkout.checkoutId,
-      root: repo.root,
-      baselineTreeOid: state.baselineTreeOid,
+    const rows = hydrateSparseCandidates(
+      repo,
+      source,
+      state.baselineTreeOid,
       currentTreeOid,
       paths,
-    });
-    if (!hydrated.available) return null;
-    if (hydrated.rows.length !== paths.length) {
-      throw new CorruptError("sparse diff hydration returned the wrong row count");
-    }
+    );
+    if (rows === null) return null;
 
     const candidates: WorkingCandidate[] = [];
     for (let ordinal = 0; ordinal < paths.length; ordinal++) {
       const path = paths[ordinal];
-      const row = hydrated.rows[ordinal];
-      if (path === undefined || row === undefined || row.path !== path) {
-        throw new CorruptError("sparse diff hydration returned unordered rows");
+      const row = rows[ordinal];
+      if (path === undefined || row === undefined) {
+        throw new CorruptError("sparse diff hydration lost a row");
       }
       const stage = row.index.find((entry) => entry.stage === 0);
       if (row.current === null && stage === undefined) continue;
@@ -95,29 +91,6 @@ export function sparseWorkingCandidates(
     if (hasErrorCode(error, "E2BIG")) return null;
     throw error;
   }
-}
-
-function sparseWorkingPaths(
-  repo: Repository,
-  dirty: Iterable<{ path: string }>,
-  baselineTreeOid: string | null,
-  currentTreeOid: string | null,
-  pathspecs: string[] | undefined,
-): string[] | null {
-  const paths = new Set<string>();
-  const add = (path: string): boolean => {
-    if (!matchesPaths(path, pathspecs) || paths.has(path)) return true;
-    if (paths.size >= SPARSE_DIFF_PATHS) return false;
-    paths.add(path);
-    return true;
-  };
-  for (const entry of dirty) {
-    if (!add(entry.path)) return null;
-  }
-  for (const entry of repo.walkTreeDiff(baselineTreeOid, currentTreeOid)) {
-    if (!add(entry.path)) return null;
-  }
-  return [...paths].sort(comparePaths);
 }
 
 function sparseTarget(path: string, row: SparseWorkspaceRow): TargetEntry | undefined {

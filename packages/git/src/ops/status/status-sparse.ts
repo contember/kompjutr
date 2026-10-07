@@ -1,17 +1,14 @@
 import { CorruptError, GitError, hasErrorCode } from "../../common/errors.js";
 import { comparePaths } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
-import type {
-  SparseIndexAncestorFact,
-  SparseWorkspaceResult,
-  SparseWorkspaceRow,
-} from "../../store/core/contracts.js";
+import type { SparseIndexAncestorFact, SparseWorkspaceRow } from "../../store/core/contracts.js";
 import { contentIdKey, type IndexEntry } from "../../store/index.js";
 import { sharedRepoStoreMutations } from "../../store/repository/shared.js";
 import type { SparseTrackerSeedEntry } from "../../store/sparse/capability.js";
 import type { TargetEntry } from "../checkout/checkout.js";
 import type { GitContext } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";
+import { hydrateSparseCandidates, sparseCandidatePaths } from "../worktree/sparse-candidates.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
   type HashedPath,
@@ -38,7 +35,6 @@ import {
   untrackedRow,
 } from "./status-rows.js";
 
-const SPARSE_STATUS_PATHS = 1_000;
 const SPARSE_STATUS_ANCESTORS = 32_768;
 const SPARSE_INDEX_DIRTY = 1;
 const SPARSE_WORKTREE_DIRTY = 2;
@@ -92,7 +88,7 @@ function prepareSparseStatus(
   const currentTreeOid = repo.headTree();
   let candidates: string[] | null;
   try {
-    candidates = sparseStatusCandidates(
+    candidates = sparseCandidatePaths(
       repo,
       source.dirtyPaths(repo.checkout.checkoutId),
       baselineTreeOid,
@@ -110,18 +106,8 @@ function prepareSparseStatus(
     return { details: [], renames: renameClassifier?.finish(), reseal: null };
   }
 
-  const hydrated: SparseWorkspaceResult = source.hydrate({
-    repoId: repo.store.repoId,
-    checkoutId: repo.checkout.checkoutId,
-    root: repo.root,
-    baselineTreeOid,
-    currentTreeOid,
-    paths: candidates,
-  });
-  if (!hydrated.available) return null;
-  if (hydrated.rows.length !== candidates.length) {
-    throw new CorruptError("sparse status hydration returned the wrong row count");
-  }
+  const rows = hydrateSparseCandidates(repo, source, baselineTreeOid, currentTreeOid, candidates);
+  if (rows === null) return null;
   const untrackedMode = options.untrackedFiles ?? "normal";
   let ignores = options.ignores;
   let classifyingRenames = renameClassifier !== undefined;
@@ -129,10 +115,9 @@ function prepareSparseStatus(
   const reportableUntracked: string[] = [];
   for (let index = 0; index < candidates.length; index++) {
     const path = candidates[index];
-    const row = hydrated.rows[index];
-    if (path === undefined || row === undefined || row.path !== path) {
-      throw new CorruptError("sparse status hydration returned unordered rows");
-    }
+    const row = rows[index];
+    if (path === undefined || row === undefined)
+      throw new CorruptError("sparse status row missing");
     const group = oneStatusIndexGroup(row.index, row.path);
     if (renameClassifier !== undefined && classifyingRenames && group?.kind !== "unmerged") {
       const stage = group?.entry;
@@ -180,14 +165,14 @@ function prepareSparseStatus(
     }
   }
 
-  const worktreeComparison = compareSparseWorktree(repo, worktree, hydrated.rows);
+  const worktreeComparison = compareSparseWorktree(repo, worktree, rows);
   const buffered: BufferedStatusRow[] = [];
   const retained = new Map<string, number>();
   const collapsedIgnored = new Set<string>();
   const collapsedUntracked = new Set<string>();
   for (let index = 0; index < candidates.length; index++) {
     const path = candidates[index];
-    const row = hydrated.rows[index];
+    const row = rows[index];
     if (path === undefined || row === undefined)
       throw new CorruptError("sparse status row missing");
     const group = oneStatusIndexGroup(row.index, row.path);
@@ -313,32 +298,6 @@ function compareSparseWorktree(
     if (hashed.get(candidate.path)?.oid !== expected.get(candidate.path)) dirty.add(candidate.path);
   }
   return { dirty, hashes: hashed };
-}
-
-function sparseStatusCandidates(
-  repo: Repository,
-  dirty: Iterable<{ path: string }>,
-  baselineTreeOid: string | null,
-  currentTreeOid: string | null,
-): string[] | null {
-  const paths = new Set<string>();
-  const add = (path: string): boolean => {
-    if (paths.has(path)) return true;
-    if (paths.size === SPARSE_STATUS_PATHS) return false;
-    paths.add(path);
-    return true;
-  };
-  for (const entry of dirty) {
-    if (!add(entry.path)) {
-      return null;
-    }
-  }
-  for (const entry of repo.store.walkTreeDiff(baselineTreeOid, currentTreeOid)) {
-    if (!add(entry.path)) {
-      return null;
-    }
-  }
-  return [...paths].sort(comparePaths);
 }
 
 function sparseUntrackedAncestors(paths: readonly string[]): { paths: string[] } {

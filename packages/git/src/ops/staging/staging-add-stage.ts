@@ -6,10 +6,9 @@ import type { TargetEntry } from "../tree/tree-stream.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
   type CompiledPathspecMatcher,
-  hashWorktreePaths,
+  hashExactWorktreePaths,
   indexEntryFor,
   indexMatchesStat,
-  type WorktreeHashCursor,
   type WorktreePath,
 } from "../worktree/worktree-io.js";
 
@@ -100,7 +99,6 @@ export function stageCandidates(
   worktree: Worktree,
   candidates: StageCandidateBatch,
   sink: IndexSink,
-  hashCursor: WorktreeHashCursor,
 ): void {
   if (candidates.rows.length === 0) return;
   try {
@@ -125,7 +123,8 @@ export function stageCandidates(
         mapped.set(row.path, oid);
       }
     }
-    const hashes = hashWorktreePaths(repo, worktree, unresolved, {}, hashCursor);
+    // Every candidate carries a stat read in this operation; re-scanning up to it costs O(tree).
+    const hashes = hashExactWorktreePaths(repo, worktree, unresolved);
     sharedRepoStoreMutations(repo.store).upsertBlobIdsOwned(
       [...hashes.values()].flatMap((hashed) => {
         const contentId = hashed.stat.contentId;
