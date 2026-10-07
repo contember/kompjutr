@@ -1,11 +1,6 @@
 import { CorruptError } from "../../../common/errors.js";
-import {
-  type ObjectType,
-  parseCommit,
-  parseTag,
-  TreeParser,
-  typeForMode,
-} from "../../../common/objects.js";
+import { type ObjectType, parseCommit, parseTag } from "../../../common/objects.js";
+import { TreeReferenceScanner } from "./ingest-references-scan.js";
 
 const OID_WORDS = 5;
 const TYPE_MASK = 0b111;
@@ -21,9 +16,14 @@ function expectedBit(type: ObjectType): number {
   return 1 << (TYPE_CODE[type] + 2);
 }
 
-/** Callers pass parsed, validated OIDs. */
+/** Callers pass parsed, validated lowercase OIDs. */
 function hexWord(hex: string, word: number): number {
-  return Number.parseInt(hex.slice(word * 8, word * 8 + 8), 16) >>> 0;
+  let value = 0;
+  for (let at = word * 8; at < word * 8 + 8; at++) {
+    const code = hex.charCodeAt(at);
+    value = (value << 4) | (code <= 0x39 ? code - 0x30 : code - 0x57);
+  }
+  return value >>> 0;
 }
 
 /** Mix all five OID words with a per-table salt, so crafted OIDs cannot share a probe chain. */
@@ -67,6 +67,9 @@ export class PackReferenceCollector {
   readonly #salt = crypto.getRandomValues(new Uint32Array(1))[0] ?? 0;
   readonly #probe = new Uint32Array(OID_WORDS);
   readonly #boundary: ReadonlySet<string>;
+  readonly #trees = new TreeReferenceScanner((oid, type) =>
+    this.#expectAt(this.#slotOf(oid), type),
+  );
 
   /** `boundary` commits contribute their tree, never their parents. */
   constructor(objectCount: number, boundary: ReadonlySet<string>) {
@@ -108,18 +111,10 @@ export class PackReferenceCollector {
 
   /** A tree references its entries by mode; a gitlink is not checked. */
   addTree(chunks: Iterable<Uint8Array>): void {
-    const parser = new TreeParser();
-    try {
-      for (const chunk of chunks) {
-        for (const parsed of parser.push(chunk)) {
-          const type = typeForMode(parsed.entry.mode);
-          if (type !== "commit") this.#expect(parsed.entry.oid, type);
-        }
-      }
-      parser.finish();
-    } finally {
-      parser.dispose();
-    }
+    const scanner = this.#trees;
+    scanner.reset();
+    for (const chunk of chunks) scanner.push(chunk);
+    scanner.finish();
   }
 
   /** Throw `CorruptError` when a reference expects another type than the object has. */
@@ -151,7 +146,10 @@ export class PackReferenceCollector {
   }
 
   #expect(oid: string, type: ObjectType): void {
-    const slot = this.#slot(oid);
+    this.#expectAt(this.#slot(oid), type);
+  }
+
+  #expectAt(slot: number, type: ObjectType): void {
     this.#states[slot] = (this.#states[slot] ?? 0) | expectedBit(type);
   }
 
@@ -165,11 +163,16 @@ export class PackReferenceCollector {
 
   /** The slot holding `oid`, claimed when absent. */
   #slot(oid: string): number {
+    const probe = this.#probe;
+    for (let word = 0; word < OID_WORDS; word++) probe[word] = hexWord(oid, word);
+    return this.#slotOf(probe);
+  }
+
+  /** The slot holding the OID whose five words `probe` holds, claimed when absent. */
+  #slotOf(probe: Uint32Array): number {
     if ((this.#size + 1) * MAX_LOAD_DENOMINATOR > this.#states.length * MAX_LOAD_NUMERATOR) {
       this.#grow();
     }
-    const probe = this.#probe;
-    for (let word = 0; word < OID_WORDS; word++) probe[word] = hexWord(oid, word);
     let slot = mixWords(this.#salt, probe, 0) & this.#mask;
     for (let visited = 1; ; visited++) {
       if (visited > this.#longestProbe) this.#longestProbe = visited;
