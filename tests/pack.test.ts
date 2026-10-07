@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { blob, readBlob, type SqlDatabase } from "../packages/do/src/db/db.js";
 import { concat, utf8, utf8Decoder } from "../packages/git/src/common/bytes.js";
 import { GitError } from "../packages/git/src/common/errors.js";
@@ -30,6 +30,7 @@ import {
   MAX_PACK_DELTA_WORKING_BYTES,
   PACK_CHUNK,
 } from "../packages/git/src/store/pack/packs.js";
+import { PackDataReader } from "../packages/git/src/store/pack/read/read-data.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
 import { COMMIT_ROW_MAX_BYTES } from "../packages/git/src/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -62,7 +63,7 @@ class ReorderedRangeDatabase implements SqlDatabase {
 
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
     const rows = this.inner.iterate(query, ...bindings);
-    if (!query.startsWith("WITH RECURSIVE /* pack-range")) return rows;
+    if (!query.startsWith("WITH requested(pack_id, seq)")) return rows;
     return [...rows].reverse();
   }
 
@@ -1742,7 +1743,14 @@ describe("pack deferred resolution", () => {
 
     db.storage.histogram = new Map();
     db.storage.resetCounters();
-    await store.packs.ingest(slices(packBytes, 64 * 1024));
+    const ranges = vi.spyOn(PackDataReader.prototype, "readRangeBatch");
+    try {
+      await store.packs.ingest(slices(packBytes, 64 * 1024));
+      expect(ranges).toHaveBeenCalledTimes(1);
+      expect(ranges.mock.calls[0]?.[1]).toHaveLength(targets.length);
+    } finally {
+      ranges.mockRestore();
+    }
 
     expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(
@@ -1750,11 +1758,6 @@ describe("pack deferred resolution", () => {
         .filter(([query]) => query.startsWith("SELECT data FROM git_pack_data"))
         .reduce((count, [, calls]) => count + calls, 0),
     ).toBe(Math.ceil(packBytes.length / PACK_CHUNK));
-    expect(
-      [...db.storage.histogram]
-        .filter(([query]) => query.startsWith("WITH RECURSIVE /* pack-range substr <= 262144 */"))
-        .reduce((count, [, calls]) => count + calls, 0),
-    ).toBe(1);
     expect(
       [...db.storage.histogram].filter(([query]) =>
         query.startsWith("SELECT pack_id, offset, data_off, data_len, type, size"),
@@ -1788,8 +1791,15 @@ describe("pack deferred resolution", () => {
     const packBytes = concat(chunks);
 
     db.storage.histogram = new Map();
+    db.storage.rowHistogram = new Map();
     db.storage.resetCounters();
-    await store.packs.ingest(slices(packBytes, 64 * 1024));
+    const ranges = vi.spyOn(PackDataReader.prototype, "readRangeBatch");
+    try {
+      await store.packs.ingest(slices(packBytes, 64 * 1024));
+      expect(ranges).toHaveBeenCalledTimes(1);
+    } finally {
+      ranges.mockRestore();
+    }
 
     const packed = store.packs.lookup(targetOid);
     expect(packed).not.toBeNull();
@@ -1802,11 +1812,17 @@ describe("pack deferred resolution", () => {
         .filter(([query]) => query.startsWith("SELECT data FROM git_pack_data"))
         .reduce((count, [, calls]) => count + calls, 0),
     ).toBe(Math.ceil(packBytes.length / PACK_CHUNK));
+    // One batched chunk load for the base, one for the range's uncached row.
     expect(
       [...db.storage.histogram]
-        .filter(([query]) => query.startsWith("WITH RECURSIVE /* pack-range substr <= 262144 */"))
+        .filter(([query]) => query.startsWith("WITH requested(pack_id, seq)"))
         .reduce((count, [, calls]) => count + calls, 0),
-    ).toBe(1);
+    ).toBe(2);
+    expect(
+      [...(db.storage.rowHistogram ?? [])]
+        .filter(([query]) => query.startsWith("WITH requested(pack_id, seq)"))
+        .reduce((count, [, rows]) => count + rows, 0),
+    ).toBe(2);
     expect(store.read(targetOid)?.data).toEqual(target);
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
@@ -1833,18 +1849,19 @@ describe("pack deferred resolution", () => {
 
     db.storage.histogram = new Map();
     db.storage.resetCounters();
-    await store.packs.ingest(slices(packBytes, 64 * 1024));
+    const ranges = vi.spyOn(PackDataReader.prototype, "readRangeBatch");
+    try {
+      await store.packs.ingest(slices(packBytes, 64 * 1024));
+      expect(ranges).not.toHaveBeenCalled();
+    } finally {
+      ranges.mockRestore();
+    }
 
     const compressedBytes = targets.reduce(
       (bytes, target) => bytes + (store.packs.lookup(target.oid)?.dataLen ?? 0),
       0,
     );
     expect(compressedBytes).toBeGreaterThan(1024 * 1024);
-    expect(
-      [...db.storage.histogram]
-        .filter(([query]) => query.startsWith("WITH RECURSIVE /* pack-range substr <= 262144 */"))
-        .reduce((count, [, calls]) => count + calls, 0),
-    ).toBe(0);
     expect(
       [...db.storage.histogram]
         .filter(([query]) => query.startsWith("SELECT data FROM git_pack_data"))

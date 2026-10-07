@@ -11,16 +11,21 @@ import {
   MAX_PACK_DELTA_WORKING_BYTES,
   PACK_CHUNK,
   PACK_RANGE_BATCH_BYTES,
-  PACK_RANGE_SLICE_BYTES,
   PACK_READ_BYTES,
   type PackedEntry,
   type PackRangeRequest,
   type PackSharedState,
-  packRangeFragment,
-  packRangeFragmentMask,
   pushExactInflate,
   requirePackId,
 } from "../shared.js";
+import { loadPackChunks, type PackChunkCoordinate } from "./read-chunks.js";
+
+/** One requested range and the bytes scattered into it so far. */
+interface RangeTarget {
+  request: PackRangeRequest;
+  output: Uint8Array;
+  filled: number;
+}
 
 export class PackDataReader {
   constructor(
@@ -156,11 +161,9 @@ export class PackDataReader {
     for (const request of requests) {
       totalBytes += request.length;
       if (
-        !Number.isSafeInteger(request.ordinal) ||
         !Number.isSafeInteger(request.offset) ||
         !Number.isSafeInteger(request.position) ||
         !Number.isSafeInteger(request.length) ||
-        request.ordinal < 0 ||
         request.offset < 0 ||
         request.position < 0 ||
         request.length < 1 ||
@@ -172,88 +175,49 @@ export class PackDataReader {
     }
 
     const outputs = new Map<number, Uint8Array>();
-    const seen = new Map<number, number>();
+    const targets: RangeTarget[] = [];
+    const consumers = new Map<number, RangeTarget[]>();
     for (const request of requests) {
       if (outputs.has(request.offset)) {
         throw new CorruptError("pack range batch has a duplicate object offset");
       }
-      outputs.set(request.offset, new Uint8Array(request.length));
-      seen.set(request.offset, 0);
+      const target = { request, output: new Uint8Array(request.length), filled: 0 };
+      outputs.set(request.offset, target.output);
+      targets.push(target);
+      const first = Math.floor(request.position / PACK_CHUNK);
+      const last = Math.floor((request.position + request.length - 1) / PACK_CHUNK);
+      for (let seq = first; seq <= last; seq++) {
+        const list = consumers.get(seq);
+        if (list === undefined) consumers.set(seq, [target]);
+        else list.push(target);
+      }
     }
-    for (const range of this.db.iterate(
-      `WITH RECURSIVE /* pack-range substr <= ${PACK_RANGE_SLICE_BYTES} */
-         requested(ordinal, object_offset, position, remaining) AS (
-           SELECT json_extract(value, '$.ordinal'), json_extract(value, '$.offset'),
-                  json_extract(value, '$.position'), json_extract(value, '$.length')
-             FROM json_each(?)
-         ),
-         slices(ordinal, object_offset, position, remaining) AS (
-           SELECT ordinal, object_offset, position, remaining FROM requested
-           UNION ALL
-           SELECT ordinal, object_offset,
-                  position + min(remaining, ${PACK_RANGE_SLICE_BYTES},
-                                 ${PACK_CHUNK} - position % ${PACK_CHUNK}),
-                  remaining - min(remaining, ${PACK_RANGE_SLICE_BYTES},
-                                  ${PACK_CHUNK} - position % ${PACK_CHUNK})
-             FROM slices WHERE remaining > 0
-         )
-       SELECT slices.ordinal, slices.object_offset AS offset, slices.position,
-              min(slices.remaining, ${PACK_RANGE_SLICE_BYTES},
-                  ${PACK_CHUNK} - slices.position % ${PACK_CHUNK}) AS expected,
-              substr(data.data, slices.position % ${PACK_CHUNK} + 1,
-                     min(slices.remaining, ${PACK_RANGE_SLICE_BYTES},
-                         ${PACK_CHUNK} - slices.position % ${PACK_CHUNK})) AS data
-         FROM slices
-        JOIN git_pack_data data
-           ON data.repo_id = ? AND data.pack_id = ?
-          AND data.seq = CAST(slices.position / ${PACK_CHUNK} AS INTEGER)
-        WHERE slices.remaining > 0`,
-      JSON.stringify(requests),
-      this.repoId,
-      packId,
-    )) {
-      if (
-        typeof range.ordinal !== "number" ||
-        typeof range.offset !== "number" ||
-        typeof range.position !== "number" ||
-        typeof range.expected !== "number" ||
-        !Number.isSafeInteger(range.ordinal) ||
-        !Number.isSafeInteger(range.offset) ||
-        !Number.isSafeInteger(range.position) ||
-        !Number.isSafeInteger(range.expected) ||
-        range.ordinal < 0 ||
-        range.ordinal >= requests.length ||
-        range.expected < 1 ||
-        range.expected > PACK_RANGE_SLICE_BYTES
-      ) {
-        throw new CorruptError("pack range batch returned invalid coordinates");
+
+    const scatter = (seq: number, chunk: Uint8Array): void => {
+      const chunkStart = seq * PACK_CHUNK;
+      for (const target of consumers.get(seq) ?? []) {
+        const { position, length } = target.request;
+        const from = Math.max(position, chunkStart);
+        const to = Math.min(position + length, chunkStart + PACK_CHUNK);
+        if (to - chunkStart > chunk.length) {
+          throw new CorruptError(`pack ${packId}: chunk ${seq} is truncated`);
+        }
+        target.output.set(chunk.subarray(from - chunkStart, to - chunkStart), from - position);
+        target.filled += to - from;
       }
-      const request = requests[range.ordinal];
-      const output = outputs.get(range.offset);
-      const seenMask = seen.get(range.offset);
-      const fragment =
-        request === undefined || typeof range.position !== "number"
-          ? -1
-          : packRangeFragment(request, range.position, range.expected);
-      if (
-        request === undefined ||
-        output === undefined ||
-        seenMask === undefined ||
-        request.offset !== range.offset ||
-        fragment < 0 ||
-        (seenMask & (2 ** fragment)) !== 0
-      ) {
-        throw new CorruptError("pack range batch returned an unexpected slice");
-      }
-      const data = readBlob(range.data);
-      if (data.length !== range.expected) {
-        throw new CorruptError("pack range batch returned a truncated slice");
-      }
-      output.set(data, range.position - request.position);
-      seen.set(range.offset, seenMask | (2 ** fragment));
+    };
+    const missing: PackChunkCoordinate[] = [];
+    for (const seq of consumers.keys()) {
+      const hit = this.getCachedChunk(packId, seq);
+      if (hit === undefined) missing.push({ packId, seq });
+      else scatter(seq, hit);
     }
-    for (const request of requests) {
-      if (seen.get(request.offset) !== packRangeFragmentMask(request)) {
+    loadPackChunks(this.db, this.repoId, missing, (_, seq, chunk) => {
+      scatter(seq, chunk);
+      this.cacheChunk(packId, seq, chunk);
+    });
+    for (const target of targets) {
+      if (target.filled !== target.request.length) {
         throw new CorruptError(`pack ${packId}: missing range bytes`);
       }
     }

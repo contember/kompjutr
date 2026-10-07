@@ -13,7 +13,6 @@ import { Sha1 } from "../../common/sha1.js";
 import { type InflateInto, InflateSizeError } from "../../common/zlib.js";
 import type { ByteSource, ChunkedBytes } from "./chunks.js";
 import type { PackObjectInput } from "./pack-ingest-index.js";
-import type { PackRangeRequest } from "./shared-delta.js";
 
 export {
   type CompressedEntry,
@@ -124,38 +123,6 @@ export function validatePackReadInputs(
       throw new GitError("EINVAL", "packed object read contains an invalid object id");
     }
   }
-}
-
-export function packRangeFragment(
-  request: PackRangeRequest,
-  position: number,
-  length: number,
-): number {
-  let current = request.position;
-  let fragment = 0;
-  const end = request.position + request.length;
-  while (current < end) {
-    const expected = Math.min(
-      end - current,
-      PACK_RANGE_SLICE_BYTES,
-      PACK_CHUNK - (current % PACK_CHUNK),
-    );
-    if (current === position) return expected === length ? fragment : -1;
-    current += expected;
-    fragment++;
-  }
-  return -1;
-}
-
-export function packRangeFragmentMask(request: PackRangeRequest): number {
-  let current = request.position;
-  let fragments = 0;
-  const end = request.position + request.length;
-  while (current < end) {
-    current += Math.min(end - current, PACK_RANGE_SLICE_BYTES, PACK_CHUNK - (current % PACK_CHUNK));
-    fragments++;
-  }
-  return 2 ** fragments - 1;
 }
 
 export class FlatByteSource implements ByteSource {

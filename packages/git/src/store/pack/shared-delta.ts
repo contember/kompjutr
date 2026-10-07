@@ -18,7 +18,6 @@ export interface CompressedEntry {
 }
 
 export interface PackRangeRequest {
-  ordinal: number;
   offset: number;
   position: number;
   length: number;

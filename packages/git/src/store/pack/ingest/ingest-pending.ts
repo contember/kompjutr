@@ -65,6 +65,34 @@ function push<K>(map: Map<K, PendingRow[]>, key: K, row: PendingRow): void {
   else children.push(row);
 }
 
+/**
+ * Rows this page can resolve: deltas on an admitted base, ref-deltas whose base
+ * may be produced on this page, and their offset descendants. Without a ready
+ * row nothing can resolve. Other rows wait for a later pass unread.
+ */
+function runnableRows(
+  ready: readonly ReadyDelta[],
+  byBaseOffset: ReadonlyMap<number, readonly PendingRow[]>,
+  byBaseOid: ReadonlyMap<string, readonly PendingRow[]>,
+): PendingRow[] {
+  if (ready.length === 0) return [];
+  const rows: PendingRow[] = [];
+  const seen = new Set<number>();
+  const add = (row: PendingRow): void => {
+    if (seen.has(row.offset)) return;
+    seen.add(row.offset);
+    rows.push(row);
+  };
+  for (const { row } of ready) add(row);
+  for (const children of byBaseOid.values()) for (const row of children) add(row);
+  for (let cursor = 0; cursor < rows.length; cursor++) {
+    const row = rows[cursor];
+    if (row === undefined) break;
+    for (const child of byBaseOffset.get(row.offset) ?? []) add(child);
+  }
+  return rows;
+}
+
 export class PackPendingResolver {
   constructor(
     private readonly db: SqlDatabase,
@@ -168,23 +196,20 @@ export class PackPendingResolver {
 
         const completed: number[] = [];
         let compressedBatch = new Map<number, Uint8Array>();
+        const rangeRows = runnableRows(ready, byBaseOffset, byBaseOid);
         let compressedBatchBytes = 0;
-        for (const row of page) {
+        for (const row of rangeRows) {
           compressedBatchBytes += row.data_len;
           if (!Number.isSafeInteger(compressedBatchBytes)) {
             throw new CorruptError("pending pack page has invalid compressed size");
           }
         }
         if (compressedBatchBytes > 0 && compressedBatchBytes <= PACK_RANGE_BATCH_BYTES) {
-          const requests: PackRangeRequest[] = [];
-          for (const row of page) {
-            requests.push({
-              ordinal: requests.length,
-              offset: row.offset,
-              position: row.data_off,
-              length: row.data_len,
-            });
-          }
+          const requests: PackRangeRequest[] = rangeRows.map((row) => ({
+            offset: row.offset,
+            position: row.data_off,
+            length: row.data_len,
+          }));
           compressedBatch = this.read.readRangeBatch(packId, requests);
         }
         try {

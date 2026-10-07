@@ -1,7 +1,7 @@
 // Derived from dgit (MIT, Copyright (c) 2026 Divy Srivastava),
 // https://github.com/littledivy/dgit — the three-phase ingest, the rotating offset window, the deferred-delta table and the iterative delta-chain walk all follow dgit's src/git/packstore.ts.
 
-import { readBlob, type SqlDatabase } from "@kompjutr/sqlite";
+import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import type { ByteLru } from "../../../common/lru.js";
@@ -20,11 +20,11 @@ import {
   type PackedEntry,
   validateDeltaWorkingSet,
 } from "../shared.js";
+import { loadPackChunks, type PackChunkCoordinate } from "./read-chunks.js";
 import type { PackDataReader } from "./read-data.js";
 import { packGraphSql } from "./read-graph-sql.js";
 
 const INVALID_ENTRY = "packed blob index contains invalid metadata";
-const INVALID_CHUNK = "pack chunk query returned invalid coordinates";
 
 const PACKED_ENTRY_ROW = new RowShape(
   {
@@ -50,14 +50,6 @@ interface GraphEntry extends PackedEntry {
 function entryKey(packId: number, offset: number): string {
   return `${packId}:${offset}`;
 }
-
-const CHUNK_COORDINATES_ROW = new RowShape(
-  {
-    pack_id: int(0, Number.MAX_SAFE_INTEGER, INVALID_CHUNK),
-    seq: int(0, Number.MAX_SAFE_INTEGER, INVALID_CHUNK),
-  },
-  INVALID_CHUNK,
-);
 
 function decodePackedEntry(row: Record<string, unknown>): GraphEntry {
   const decoded = PACKED_ENTRY_ROW.decode(row);
@@ -261,43 +253,19 @@ export class PackObjectResolver {
       }
     };
 
-    const missingChunks: { p: number; q: number }[] = [];
+    const missingChunks: PackChunkCoordinate[] = [];
     for (const key of consumers.keys()) {
       const separator = key.indexOf(":");
       const packId = Number(key.slice(0, separator));
       const seq = Number(key.slice(separator + 1));
       const hit = bypassCache ? undefined : this.data.getCachedChunk(packId, seq);
-      if (hit === undefined) missingChunks.push({ p: packId, q: seq });
+      if (hit === undefined) missingChunks.push({ packId, seq });
       else copyChunk(packId, seq, hit);
     }
-    missingChunks.sort((left, right) => left.p - right.p || left.q - right.q);
-    const returned = new Set<string>();
-    if (missingChunks.length > 0) {
-      for (const row of this.db.iterate(
-        `WITH requested(pack_id, seq) AS (
-           SELECT json_extract(value, '$.p'), json_extract(value, '$.q') FROM json_each(?)
-         )
-         SELECT d.pack_id, d.seq, d.data
-           FROM requested r
-           JOIN git_pack_data d
-             ON d.repo_id = ? AND d.pack_id = r.pack_id AND d.seq = r.seq
-          WHERE length(d.data) <= ${PACK_CHUNK}
-          ORDER BY d.pack_id, d.seq`,
-        JSON.stringify(missingChunks),
-        this.repoId,
-      )) {
-        const { pack_id: packId, seq } = CHUNK_COORDINATES_ROW.decode(row);
-        const data = readBlob(row.data);
-        returned.add(`${packId}:${seq}`);
-        if (!bypassCache) this.data.cacheChunk(packId, seq, data);
-        copyChunk(packId, seq, data);
-      }
-    }
-    for (const chunk of missingChunks) {
-      if (!returned.has(`${chunk.p}:${chunk.q}`)) {
-        throw new CorruptError(`pack ${chunk.p}: missing chunk ${chunk.q}`);
-      }
-    }
+    loadPackChunks(this.db, this.repoId, missingChunks, (packId, seq, data) => {
+      if (!bypassCache) this.data.cacheChunk(packId, seq, data);
+      copyChunk(packId, seq, data);
+    });
     for (const [key, value] of compressed) {
       if (value.filled !== value.bytes.length) {
         throw new CorruptError(
