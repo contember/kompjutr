@@ -9,6 +9,9 @@ const MESSAGES: ReadonlyMap<string, string> = new Map([
   ["EACCES", "Permission denied"],
   ["ENOTEMPTY", "Directory not empty"],
   ["ELOOP", "Too many levels of symbolic links"],
+  ["EROFS", "Read-only file system"],
+  ["EXDEV", "Invalid cross-device link"],
+  ["EBUSY", "Device or resource busy"],
 ]);
 
 export function strerror(error: Error & { readonly code: string }): string {
