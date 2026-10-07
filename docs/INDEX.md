@@ -142,6 +142,7 @@ None.
 - [0025 — Bound packed reads by chain depth and restart maintenance on source drift](decisions/0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md)
 - [0026 — Gate the workerd clone on a V8 regression limit](decisions/0026-gate-the-workerd-clone-on-a-v8-regression-limit.md)
 - [0027 — Widen the shell to compound syntax and text tools](decisions/0027-widen-the-shell-to-compound-syntax-and-text-tools.md)
+- [0028 — Confine mounted views and fail closed](decisions/0028-confine-mounted-views-and-fail-closed.md)
 
 The set was renumbered on 2026-09-04; [`decisions/README.md`](decisions/README.md#renumbered-on-2026-09-04)
 decodes an old number found in `archive/` or `specs/`.

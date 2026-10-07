@@ -94,6 +94,51 @@ across a yield; a page that ends inside a pruned directory resumes past its
 subtree. Discovery returns revision-bearing regular-file handles; batched
 reads revalidate every handle before exposing content.
 
+### Mounted views
+
+`createMountedFilesystem(fs, mounts)` (`@kompjutr/do/fs`) returns a
+`Filesystem` over the same database that shows only its mounts. Each mount maps
+an absolute canonical virtual path onto an existing real directory, `rw` or
+`ro`; mount paths may not nest, sources may overlap. `fs` must come from
+`createFilesystem`; the view shares its clock, revision, and paged-root cache
+epoch. The shell runs over a view unchanged. Git does not: an injected `git`
+command keeps the real filesystem and treats the shell's virtual `cwd` as a
+real path, so the view does not confine it.
+
+| Path | Behaviour |
+| --- | --- |
+| under a mount | translated by prefix to the source; results and error messages are translated back |
+| ancestor of a mount | synthetic directory, mode `0555`, distinct negative inode, lists only its children |
+| anything else | absent, without a statement: `stat` is `null`, reads are `ENOENT` |
+
+Resolution is confined to the mount it starts in. A symlink whose target is
+absolute, climbs above the source, or reaches another mount reads as absent: a
+dangling link to `lstat`, `ENOENT` to reads, writes, and traversal, and
+`realpath` throws `ENOENT`. A kernel bind mount would follow it. A mount at `/`
+is the top of its namespace, as a chroot is: `..` at its root stays there and an
+absolute target resolves from the source. A caller's own `..` after a mount
+prefix leaves the mount as it would leave a bind mount; that path costs one
+extra resolution statement. Targets written through the view are stored
+verbatim.
+
+| Mutation | Error |
+| --- | --- |
+| any write into an `ro` mount or a synthetic directory | `EROFS` |
+| creating an absent path whose parent is synthetic, or with parents | `EROFS` |
+| removing or renaming a mount root | `EBUSY` |
+| `rename` or `link` between two mounts | `EXDEV` (`copyFiles` works) |
+
+A call rooted inside one mount issues exactly the statements the unwrapped call
+issues: one confined resolution, then the store's own page, batch, or
+single-path statements. A root above the mounts costs nothing for synthetic
+entries, one metadata read per mount root it lists, and one page statement per
+covered mount, in `comparePaths` order with keyset cursors in virtual paths.
+`tests/fs/mounted-cost.test.ts` witnesses both. A GLOB pattern is rewritten per
+mount by consuming the virtual mount prefix in JS: the real pattern is exact
+when the escaped source prefix fits the 50-byte cap, and otherwise starts with
+`*` and is filtered against the virtual path, so the pattern stays pushed down
+in one statement. A filtered page may be short and still carry a cursor.
+
 ## Local disk and recovery
 
 `DiskDrive` resolves virtual paths component by component and rejects ancestor

@@ -43,6 +43,7 @@ so the two cannot drift.
 - [0022 — Stage pack commit projections until publication](0022-stage-pack-commit-projections-until-publication.md) — accepted (2026-09-11)
 - [0024 — Hold integration plans in a scoped SQL workspace and write output as ordinary objects](0024-own-integration-output-in-a-scoped-sql-workspace.md) — accepted (2026-09-24)
 - [0025 — Bound packed reads by chain depth and restart maintenance on source drift](0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md) — accepted (2026-09-24)
+- [0028 — Confine mounted views and fail closed](0028-confine-mounted-views-and-fail-closed.md) — accepted (2026-10-07)
 
 **Git domain**
 
