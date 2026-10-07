@@ -16,7 +16,8 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [Fast fresh clone](sprints/sprint-2026-10-07-fast-fresh-clone.md) — per-pack
+  connectivity (ADR-0029) and trees projected on demand (ADR-0030).
 
 ## Specs
 
@@ -37,7 +38,7 @@ None.
 - [Full-history performance](archive/sprint-2026-10-07-full-history-performance.md)
   shipped: Next.js full-history clone 428.8 s → 197.0 s (native git 17–19 s),
   −80 % statements; tracker-driven `git add`. Next: the
-  [fast fresh clone](ideas/fast-fresh-clone.md) proposal (needs a decision).
+  [fast fresh clone](sprints/sprint-2026-10-07-fast-fresh-clone.md) sprint.
 - [Simplification](archive/sprint-2026-09-23-simplification.md) shipped: −14 %
   Git source, 61 → 46 tables, self-contained packs, `STRICT` schema, rebase at
   any size. Next: the [backlog plan](backlog/README.md#sprint-plan).

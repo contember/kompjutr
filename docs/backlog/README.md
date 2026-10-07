@@ -101,8 +101,8 @@ filed 110 (a bimodal sparse add peak), which is now closed: four allocation fixe
 keep the peak at or below 75.4 MiB in ten runs at `25d07ea`.
 
 The 2026-10-07 [full-history performance sprint](../archive/sprint-2026-10-07-full-history-performance.md)
-filed 116–118 from its findings; 118's attribution became
-[`../ideas/fast-fresh-clone.md`](../ideas/fast-fresh-clone.md).
+filed 116–118 from its findings; 118's attribution became the active
+[fast fresh clone sprint](../sprints/sprint-2026-10-07-fast-fresh-clone.md).
 
 | Order | Items | Why |
 |---|---|---|

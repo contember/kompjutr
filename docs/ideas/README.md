@@ -9,9 +9,6 @@ decided work or status.
 
 <!-- index the ideas here, one line each -->
 
-- [`fast-fresh-clone.md`](fast-fresh-clone.md) — measured breakdown of the
-  197 s full-history clone; lazy historical projections, implicit promises, and
-  pack-local connectivity toward a ≤ 60 s (stretch ≤ 30 s) clone.
 - [`git-server-inside-the-durable-object.md`](git-server-inside-the-durable-object.md)
   — answer Smart HTTP from the Durable Object so a `git` client can clone,
   fetch, and push against it.

@@ -20,4 +20,5 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None.
+- [`sprint-2026-10-07-fast-fresh-clone.md`](sprint-2026-10-07-fast-fresh-clone.md)
+  — per-pack connectivity and trees projected on demand.
