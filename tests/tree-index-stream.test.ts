@@ -70,10 +70,13 @@ class ObservedDatabase implements SqlDatabase {
   maxBoundBytes = 0;
   entryInserts = 0;
   markerInserts = 0;
+  sourceSeeds = 0;
   failEntryInsert = 0;
   rejectOversizedEntries = false;
   exactSourceLookups = 0;
   entryRowCounts: number[] = [];
+  /** Trees each entry window resolves in its CTE. */
+  windowTreeLookups: number[] = [];
   markerRowCounts: number[] = [];
   sharedEntryPayload = true;
   writes: string[] = [];
@@ -81,38 +84,38 @@ class ObservedDatabase implements SqlDatabase {
   constructor(readonly inner: TestDatabase) {}
 
   run(query: string, ...bindings: unknown[]): void {
-    if (query.startsWith("INSERT INTO git_tree_entries")) {
+    if (query.includes("INSERT INTO git_tree_entries")) {
       this.entryInserts++;
       if (this.rejectOversizedEntries && typeof bindings[0] === "number") {
         throw new GitError("E2BIG", "injected SQLite row-size limit");
       }
       if (this.entryInserts === this.failEntryInsert) throw new Error("injected tree INSERT");
-      const encoded = bindings[1];
-      const offset = bindings[2];
-      const length = bindings[3];
-      if (
-        !(encoded instanceof Uint8Array) ||
-        typeof offset !== "number" ||
-        typeof length !== "number"
-      ) {
-        throw new Error("tree entry JSON binding missing");
+      if (typeof bindings[0] !== "number") {
+        const sources = bindings[0];
+        const encoded = bindings[2];
+        const offset = bindings[3];
+        const length = bindings[4];
+        if (
+          typeof sources !== "string" ||
+          !(encoded instanceof Uint8Array) ||
+          typeof offset !== "number" ||
+          typeof length !== "number"
+        ) {
+          throw new Error("tree entry JSON binding missing");
+        }
+        const parsed: unknown = JSON.parse(
+          utf8Decoder.decode(encoded.subarray(offset - 1, offset - 1 + length)),
+        );
+        const trees: unknown = JSON.parse(sources);
+        if (!Array.isArray(parsed) || !Array.isArray(trees)) {
+          throw new Error("tree entry JSON binding is not an array");
+        }
+        this.maxEntryRows = Math.max(this.maxEntryRows, parsed.length);
+        this.entryRowCounts.push(parsed.length);
+        this.windowTreeLookups.push(trees.length);
+        this.sharedEntryPayload &&= bindings[1] === bindings[2];
       }
-      const parsed: unknown = JSON.parse(
-        utf8Decoder.decode(encoded.subarray(offset - 1, offset - 1 + length)),
-      );
-      if (!Array.isArray(parsed)) throw new Error("tree entry JSON binding is not an array");
-      this.maxEntryRows = Math.max(this.maxEntryRows, parsed.length);
-      this.entryRowCounts.push(parsed.length);
-      this.sharedEntryPayload &&= bindings[0] === bindings[1];
-      for (const binding of bindings) {
-        const bytes =
-          typeof binding === "string"
-            ? utf8.encode(binding).length
-            : binding instanceof Uint8Array
-              ? binding.length
-              : 0;
-        this.maxBoundBytes = Math.max(this.maxBoundBytes, bytes);
-      }
+      this.#recordBoundBytes(bindings);
       this.writes.push("entries");
     } else if (query.startsWith("INSERT INTO git_tree_sources")) {
       this.markerInserts++;
@@ -124,9 +127,25 @@ class ObservedDatabase implements SqlDatabase {
       const parsed: unknown = JSON.parse(utf8Decoder.decode(encoded.subarray(0, length)));
       if (!Array.isArray(parsed)) throw new Error("tree marker JSON binding is not an array");
       this.markerRowCounts.push(parsed.length);
+      this.#recordBoundBytes(bindings);
       this.writes.push("marker");
+    } else if (query.startsWith("INSERT OR IGNORE INTO git_tree_sources")) {
+      this.sourceSeeds++;
+      this.writes.push("seed");
     }
     this.inner.run(query, ...bindings);
+  }
+
+  #recordBoundBytes(bindings: readonly unknown[]): void {
+    for (const binding of bindings) {
+      const bytes =
+        typeof binding === "string"
+          ? utf8.encode(binding).length
+          : binding instanceof Uint8Array
+            ? binding.length
+            : 0;
+      this.maxBoundBytes = Math.max(this.maxBoundBytes, bytes);
+    }
   }
 
   all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
@@ -142,7 +161,7 @@ class ObservedDatabase implements SqlDatabase {
   }
 
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
-    if (query.startsWith("SELECT CAST(j.key AS INTEGER) AS ordinal")) this.exactSourceLookups++;
+    if (query.startsWith("SELECT") && query.includes("git_tree_sources")) this.exactSourceLookups++;
     return this.inner.iterate(query, ...bindings);
   }
 
@@ -231,7 +250,11 @@ describe("incremental tree index sink", () => {
       index.addBuffered(1, oid, data.length, data);
     }
     index.flush();
-    expect(db.exactSourceLookups).toBe(3);
+    // Entry windows resolve each tree once inside the INSERT: no separate lookup
+    // read, one seed per pack batch, and repeats do not occupy a batch slot.
+    expect(db.exactSourceLookups).toBe(0);
+    expect(db.sourceSeeds).toBe(2);
+    expect(db.windowTreeLookups).toEqual(db.entryRowCounts);
     expect(inner.storage.statementCount).toBeLessThan(100);
     expect(inner.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(3000);
     expect(inner.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(
@@ -366,6 +389,7 @@ describe("incremental tree index sink", () => {
     expect(db.maxEntryRows).toBeLessThanOrEqual(2_048);
     expect(db.maxBoundBytes).toBeLessThanOrEqual(ONE_MIB);
     expect(db.sharedEntryPayload).toBe(true);
+    expect(db.windowTreeLookups.every((trees) => trees === 1)).toBe(true);
     expect(db.writes.at(-1)).toBe("marker");
     expect(inner.storage.statementCount).toBeLessThan(1_000);
   });
@@ -454,6 +478,33 @@ describe("incremental tree index sink", () => {
       "55".repeat(20),
     );
     expect(legacy).toEqual(direct);
+  });
+
+  it("projects one loose tree in one entry window and one seeded marker", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const data = serializeTree([
+      { mode: "100644", name: "a", oid: OID },
+      { mode: "40000", name: "b", oid: "33".repeat(20) },
+    ]);
+    db.storage.histogram = new Map();
+    store.write("tree", data);
+    const treeStatements = [...db.storage.histogram.entries()].filter(([query]) =>
+      query.includes("git_tree_"),
+    );
+    db.storage.histogram = null;
+    // The histogram keeps a 120-character prefix of each statement.
+    const shape = (query: string): string =>
+      query.startsWith("WITH source(position, source_key)")
+        ? "entries"
+        : query.startsWith("INSERT INTO git_tree_sources")
+          ? "marker"
+          : query;
+    expect(treeStatements.map(([query, count]) => [shape(query), count])).toEqual([
+      ["entries", 1],
+      ["marker", 1],
+    ]);
   });
 
   it("fails closed when a seeded loose source is missing", () => {

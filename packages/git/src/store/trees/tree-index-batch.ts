@@ -3,15 +3,68 @@ import { isOid } from "../../common/bytes.js";
 import { CorruptError, hasErrorCode } from "../../common/errors.js";
 import type { ParsedTreeEntry, TreeParseResult } from "../../common/objects.js";
 import { expectSafeInteger } from "../../common/rows.js";
-import type { TreeSource, TreeSourceInput } from "./tree-index.js";
+import type { TreeSource } from "./tree-index.js";
+import {
+  TREE_INDEX_ROWS,
+  TreeIndexBuffers,
+  type TreeIndexRows,
+  type TreeIndexWindow,
+} from "./tree-index-rows.js";
+import { seedTreeSourceSlots, TreeSourceSlot } from "./tree-source-slots.js";
 
 /** SQLite queue record, four integer fields, and bounded error fields. */
 export const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
 
-const TREE_INDEX_ROWS = 2048;
-const TREE_INDEX_ENTRY_ARENA_BYTES = 704 * 1024;
-const TREE_INDEX_MARKER_JSON_BYTES = 192 * 1024;
+/** Names a batch-owned buffer holds; a longer name takes the single-row path. */
+const TREE_INDEX_NAME_BYTES = 128 * 1024;
 const TREE_MODE = /^(?:0?40000|100644|100755|120000|160000)$/;
+
+// Each window resolves its sources once, in the CTE. The `complete = 0` join
+// skips a projection completed earlier and keeps a missing source from reaching
+// the deferred FK check at COMMIT.
+const ENTRY_WINDOW_SQL = `WITH source(position, source_key) AS MATERIALIZED (
+     SELECT j.key, s.source_key
+       FROM json_each(?) j
+       JOIN git_tree_sources s
+         ON s.repo_id = json_extract(j.value, '$[0]')
+        AND s.tree_oid = json_extract(j.value, '$[1]')
+        AND s.complete = 0
+   )
+   INSERT INTO git_tree_entries
+     (source_key, ordinal, mode, name_bytes, oid, cumulative_base)
+   SELECT source.source_key, json_extract(e.value, '$[1]'), json_extract(e.value, '$[2]'),
+          substr(?, json_extract(e.value, '$[4]'), json_extract(e.value, '$[5]')),
+          json_extract(e.value, '$[3]'), json_extract(e.value, '$[6]')
+     FROM json_each(CAST(substr(?, ?, ?) AS TEXT)) e
+    CROSS JOIN source ON source.position = json_extract(e.value, '$[0]')`;
+
+const MARKER_WINDOW_SQL = `INSERT INTO git_tree_sources
+     (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
+   SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+          1, json_extract(value, '$[2]'), json_extract(value, '$[3]'),
+          json_extract(value, '$[4]')
+     FROM json_each(CAST(substr(?, 1, ?) AS TEXT))
+    WHERE true
+   ON CONFLICT(repo_id, tree_oid) DO UPDATE SET
+     complete = 1, object_size = excluded.object_size,
+     entry_count = excluded.entry_count, base_cost = excluded.base_cost
+    WHERE git_tree_sources.complete = 0`;
+
+// The join proves every loose source was seeded by its object insert.
+const SEEDED_MARKER_WINDOW_SQL = `INSERT INTO git_tree_sources
+     (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
+   SELECT existing.repo_id, existing.tree_oid,
+          1, json_extract(marker.value, '$[2]'), json_extract(marker.value, '$[3]'),
+          json_extract(marker.value, '$[4]')
+     FROM json_each(CAST(substr(?, 1, ?) AS TEXT)) marker
+     JOIN git_tree_sources existing
+       ON existing.repo_id = json_extract(marker.value, '$[0]')
+      AND existing.tree_oid = json_extract(marker.value, '$[1]')
+    WHERE true
+   ON CONFLICT(repo_id, tree_oid) DO UPDATE SET
+     complete = 1, object_size = excluded.object_size,
+     entry_count = excluded.entry_count, base_cost = excluded.base_cost
+   RETURNING source_key`;
 
 function validateParsedTreeEntry(parsed: ParsedTreeEntry): void {
   const { entry, nameBytes } = parsed;
@@ -28,157 +81,163 @@ function validateTreeSource(source: TreeSource): void {
   if (!isOid(source.treeOid)) throw new CorruptError("tree source has invalid metadata");
 }
 
-class AsciiJsonArray {
-  readonly bytes: Uint8Array;
-  #length = 1;
-  #rows = 0;
-
-  constructor(capacity: number) {
-    this.bytes = new Uint8Array(capacity);
-    this.bytes[0] = 0x5b;
-  }
-
-  get rows(): number {
-    return this.#rows;
-  }
-
-  get encodedLength(): number {
-    return this.#length + 1;
-  }
-
-  canAppend(value: string): boolean {
-    return this.#length + (this.#rows === 0 ? 0 : 1) + value.length + 1 <= this.bytes.length;
-  }
-
-  append(value: string): void {
-    if (!this.canAppend(value)) throw new CorruptError("tree index JSON row exceeds its buffer");
-    if (this.#rows !== 0) this.bytes[this.#length++] = 0x2c;
-    for (let at = 0; at < value.length; at++) {
-      const byte = value.charCodeAt(at);
-      if (byte > 0x7f) throw new CorruptError("tree index JSON row is not ASCII");
-      this.bytes[this.#length++] = byte;
-    }
-    this.#rows++;
-  }
-
-  seal(): number {
-    this.bytes[this.#length] = 0x5d;
-    return this.#length + 1;
-  }
-
-  reset(): void {
-    this.#length = 1;
-    this.#rows = 0;
-    this.bytes[0] = 0x5b;
-  }
+export interface TreeIndexBatchOptions {
+  /** The loose object trigger seeded every source; a missing one is corrupt. */
+  seeded: boolean;
+  /**
+   * Flush whenever the buffers fill. A deferred batch never flushes on its
+   * own: its owner admits only sources that fit and flushes in a transaction.
+   */
+  autoFlush: boolean;
+  /** Buffers borrowed from their owner; without them the batch owns its own. */
+  buffers?: TreeIndexBuffers;
 }
 
-class TreeEntryArena {
-  readonly bytes = new Uint8Array(TREE_INDEX_ENTRY_ARENA_BYTES);
-  #payloadLength = 0;
-  #jsonStart = this.bytes.length - 1;
-  #rows = 0;
-
-  constructor() {
-    this.bytes[this.#jsonStart] = 0x5d;
-  }
-
-  get payloadLength(): number {
-    return this.#payloadLength;
-  }
-
-  get rows(): number {
-    return this.#rows;
-  }
-
-  canAppend(payloadLength: number, json: string): boolean {
-    const jsonBytes = json.length + (this.#rows === 0 ? 0 : 1);
-    return this.#payloadLength + payloadLength < this.#jsonStart - jsonBytes;
-  }
-
-  append(payload: Uint8Array, json: string): void {
-    if (!this.canAppend(payload.length, json)) {
-      throw new CorruptError("tree entry arena capacity changed after admission");
-    }
-    this.bytes.set(payload, this.#payloadLength);
-    this.#payloadLength += payload.length;
-    if (this.#rows !== 0) this.bytes[--this.#jsonStart] = 0x2c;
-    this.#jsonStart -= json.length;
-    for (let at = 0; at < json.length; at++) {
-      const byte = json.charCodeAt(at);
-      if (byte > 0x7f) throw new CorruptError("tree index JSON row is not ASCII");
-      this.bytes[this.#jsonStart + at] = byte;
-    }
-    this.#rows++;
-  }
-
-  seal(): { offset: number; length: number } {
-    this.bytes[--this.#jsonStart] = 0x5b;
-    return { offset: this.#jsonStart + 1, length: this.bytes.length - this.#jsonStart };
-  }
-
-  reset(): void {
-    this.#payloadLength = 0;
-    this.#jsonStart = this.bytes.length - 1;
-    this.#rows = 0;
-    this.bytes[this.#jsonStart] = 0x5d;
-  }
-}
-
+/** Parsed rows awaiting one flush; each statement resolves a tree's identity once. */
 export class TreeIndexBatch {
-  #entries: TreeEntryArena | null;
-  #markers: AsciiJsonArray | null;
-  #sourcesSeeded: boolean;
+  readonly #seeded: boolean;
+  readonly #autoFlush: boolean;
+  readonly #owned: boolean;
+  #buffers: TreeIndexBuffers | null;
+  readonly #pending: TreeSourceSlot[] = [];
+  readonly #unseeded: TreeSourceSlot[] = [];
+  readonly #window: TreeIndexWindow = {
+    rows: 0,
+    firstSource: 0,
+    lastSource: 0,
+    jsonOffset: 0,
+    jsonLength: 0,
+  };
 
   constructor(
     private readonly db: SqlDatabase,
-    sourcesSeeded = false,
-    private readonly seedOnce = false,
-    private readonly requireSeededSources = false,
+    options: TreeIndexBatchOptions,
   ) {
-    this.#sourcesSeeded = sourcesSeeded;
-    this.#entries = new TreeEntryArena();
-    this.#markers = new AsciiJsonArray(TREE_INDEX_MARKER_JSON_BYTES);
+    this.#seeded = options.seeded;
+    this.#autoFlush = options.autoFlush;
+    this.#owned = options.buffers === undefined;
+    const buffers = options.buffers ?? new TreeIndexBuffers(TREE_INDEX_ROWS, TREE_INDEX_NAME_BYTES);
+    buffers.borrow();
+    this.#buffers = buffers;
   }
 
   get retainedRows(): number {
-    return this.#entryArena().rows + this.#markerArena().rows;
+    return this.#rows().rows;
   }
 
-  addEntry(source: TreeSource, parsed: ParsedTreeEntry, cumulativeBase: number): boolean {
-    let entries = this.#entryArena();
-    const payloadBytes = parsed.nameBytes.length;
-    let json = this.#entryJson(source, parsed, cumulativeBase, entries.payloadLength + 1);
-    if (this.retainedRows >= TREE_INDEX_ROWS || !entries.canAppend(payloadBytes, json)) {
-      this.flush();
-      entries = this.#entryArena();
-      json = this.#entryJson(source, parsed, cumulativeBase, 1);
+  /** Whether a deferred batch can admit a source of `objectBytes` raw bytes. */
+  holds(objectBytes: number): boolean {
+    return this.#rows().holds(objectBytes);
+  }
+
+  open(source: TreeSource): TreeSourceSlot {
+    validateTreeSource(source);
+    return new TreeSourceSlot(source, this.#seeded);
+  }
+
+  addEntry(slot: TreeSourceSlot, parsed: ParsedTreeEntry, cumulativeBase: number): boolean {
+    const rows = this.#rows();
+    if (!rows.canAppend(parsed.nameBytes.length)) {
+      this.#flushFull();
+      if (!rows.canAppend(parsed.nameBytes.length)) {
+        return this.#insertOversizedEntry(slot, parsed, cumulativeBase);
+      }
     }
-    if (!entries.canAppend(payloadBytes, json)) {
-      return this.#insertOversizedEntry(source, parsed, cumulativeBase);
-    }
-    entries.append(parsed.nameBytes, json);
+    if (!slot.seeded && slot.pending < 0) this.#unseeded.push(slot);
+    rows.appendEntry(this.#pendingIndex(slot), parsed, cumulativeBase);
     return true;
   }
 
-  #entryJson(
-    source: TreeSource,
-    parsed: ParsedTreeEntry,
-    cumulativeBase: number,
-    nameAt: number,
-  ): string {
-    return `{"p":${source.repoId},"t":"${source.treeOid}","b":${source.objectSize},"q":${parsed.ordinal},"m":"${parsed.entry.mode}","o":"${parsed.entry.oid}","a":${nameAt},"l":${parsed.nameBytes.length},"c":${cumulativeBase}}`;
+  addMarker(slot: TreeSourceSlot, count: number, baseCost: number): void {
+    const rows = this.#rows();
+    if (!rows.canMark()) this.#flushFull();
+    rows.appendMarker(this.#pendingIndex(slot), count, baseCost);
+  }
+
+  /** Seed sources that have entries, then write entries before markers. */
+  flush(): void {
+    const buffers = this.#live();
+    const rows = buffers.rows;
+    if (rows.rows === 0) return;
+    try {
+      seedTreeSourceSlots(this.db, this.#unseeded);
+      for (let row = 0; row < rows.entries; ) {
+        row = rows.fillEntryWindow(row, buffers.entryWindow, this.#window);
+        const bytes = blob(buffers.entryWindow);
+        this.db.run(
+          ENTRY_WINDOW_SQL,
+          this.#sourcesJson(this.#window.firstSource, this.#window.lastSource),
+          bytes,
+          bytes,
+          this.#window.jsonOffset,
+          this.#window.jsonLength,
+        );
+      }
+      if (rows.markers !== 0) this.#writeMarkers(rows, buffers.markerWindow);
+    } catch (error) {
+      this.dispose();
+      throw error;
+    }
+    rows.reset();
+    this.#clearPending();
+  }
+
+  dispose(): void {
+    const buffers = this.#buffers;
+    if (buffers === null) return;
+    this.#buffers = null;
+    this.#clearPending();
+    if (!this.#owned) buffers.release();
+  }
+
+  #writeMarkers(rows: TreeIndexRows, bytes: Uint8Array): void {
+    const jsonLength = rows.fillMarkerWindow(
+      this.#pending.map((slot) => slot.source),
+      bytes,
+    );
+    if (!this.#seeded) {
+      this.db.run(MARKER_WINDOW_SQL, blob(bytes), jsonLength);
+      return;
+    }
+    let returnedRows = 0;
+    for (const _row of this.db.iterate(SEEDED_MARKER_WINDOW_SQL, blob(bytes), jsonLength)) {
+      returnedRows++;
+    }
+    if (returnedRows !== rows.markers) throw new CorruptError("tree index source was not seeded");
+  }
+
+  #sourcesJson(first: number, last: number): string {
+    return JSON.stringify(
+      this.#pending.slice(first, last + 1).map(({ source }) => [source.repoId, source.treeOid]),
+    );
+  }
+
+  #clearPending(): void {
+    for (const slot of this.#pending) slot.pending = -1;
+    this.#pending.length = 0;
+    this.#unseeded.length = 0;
+  }
+
+  #flushFull(): void {
+    if (!this.#autoFlush) throw new Error("deferred tree index batch admitted more than it holds");
+    this.flush();
+  }
+
+  #pendingIndex(slot: TreeSourceSlot): number {
+    if (slot.pending < 0) {
+      slot.pending = this.#pending.length;
+      this.#pending.push(slot);
+    }
+    return slot.pending;
   }
 
   #insertOversizedEntry(
-    source: TreeSource,
+    slot: TreeSourceSlot,
     parsed: ParsedTreeEntry,
     cumulativeBase: number,
   ): boolean {
-    if (!this.#sourcesSeeded) {
-      this.#seedSource(source);
-      if (this.seedOnce) this.#sourcesSeeded = true;
-    }
+    if (!slot.seeded) seedTreeSourceSlots(this.db, [slot]);
+    const { repoId, treeOid } = slot.source;
     try {
       this.db.run(
         `INSERT INTO git_tree_entries
@@ -191,184 +250,36 @@ export class TreeIndexBatch {
         blob(parsed.nameBytes),
         parsed.entry.oid,
         cumulativeBase,
-        source.repoId,
-        source.treeOid,
+        repoId,
+        treeOid,
       );
       return true;
     } catch (error) {
       if (!hasErrorCode(error, "E2BIG")) throw error;
-      this.#leaveSourceUnavailable(source);
+      this.db.run(
+        `DELETE FROM git_tree_entries WHERE source_key = (
+           SELECT source_key FROM git_tree_sources
+            WHERE repo_id = ? AND tree_oid = ? AND complete = 0
+         )`,
+        repoId,
+        treeOid,
+      );
       return false;
     }
   }
 
-  #seedSource(source: TreeSource): void {
-    this.db.run(
-      `INSERT OR IGNORE INTO git_tree_sources
-         (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
-       VALUES (?, ?, 0, ?, NULL, NULL)`,
-      source.repoId,
-      source.treeOid,
-      source.objectSize,
-    );
+  #live(): TreeIndexBuffers {
+    if (this.#buffers === null) throw new Error("tree index batch is disposed");
+    return this.#buffers;
   }
 
-  #leaveSourceUnavailable(source: TreeSource): void {
-    this.db.run(
-      `DELETE FROM git_tree_entries WHERE source_key = (
-         SELECT source_key FROM git_tree_sources
-          WHERE repo_id = ? AND tree_oid = ? AND complete = 0
-       )`,
-      source.repoId,
-      source.treeOid,
-    );
+  #rows(): TreeIndexRows {
+    return this.#live().rows;
   }
-
-  addMarker(source: TreeSource, count: number, baseCost: number): void {
-    (() => {
-      const markers = this.#markerArena();
-      const json = `{"p":${source.repoId},"t":"${source.treeOid}","z":${source.objectSize},"n":${count},"b":${baseCost}}`;
-      if (json.length + 2 > markers.bytes.length) {
-        throw new CorruptError("tree source marker exceeds the index buffer limit");
-      }
-      if (this.retainedRows >= TREE_INDEX_ROWS || !markers.canAppend(json)) {
-        this.flush();
-      }
-      this.#markerArena().append(json);
-    })();
-  }
-
-  flush(): void {
-    this.#flushEntries();
-    this.#flushMarkers();
-  }
-
-  #flushEntries(): void {
-    const entries = this.#entryArena();
-    if (entries.rows === 0) return;
-    const json = entries.seal();
-    if (!this.#sourcesSeeded) {
-      this.db.run(
-        `INSERT OR IGNORE INTO git_tree_sources
-         (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
-       SELECT json_extract(j.value, '$.p'), json_extract(j.value, '$.t'),
-              0, json_extract(j.value, '$.b'), NULL, NULL
-         FROM json_each(CAST(substr(?, ?, ?) AS TEXT)) j`,
-        blob(entries.bytes),
-        json.offset,
-        json.length,
-      );
-      if (this.seedOnce) this.#sourcesSeeded = true;
-    }
-    this.db.run(
-      `INSERT INTO git_tree_entries
-         (source_key, ordinal, mode, name_bytes, oid, cumulative_base)
-       SELECT s.source_key, json_extract(j.value, '$.q'), json_extract(j.value, '$.m'),
-              substr(?, json_extract(j.value, '$.a'), json_extract(j.value, '$.l')),
-              json_extract(j.value, '$.o'), json_extract(j.value, '$.c')
-         FROM json_each(CAST(substr(?, ?, ?) AS TEXT)) j
-         JOIN git_tree_sources s
-           ON s.repo_id = json_extract(j.value, '$.p')
-          AND s.tree_oid = json_extract(j.value, '$.t')
-          AND s.complete = 0`,
-      blob(entries.bytes),
-      blob(entries.bytes),
-      json.offset,
-      json.length,
-    );
-    entries.reset();
-  }
-
-  #flushMarkers(): void {
-    const markers = this.#markerArena();
-    if (markers.rows === 0) return;
-    const markerRows = markers.rows;
-    const jsonLength = markers.seal();
-    if (this.requireSeededSources) {
-      let returnedRows = 0;
-      for (const _row of this.db.iterate(
-        `INSERT INTO git_tree_sources
-               (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
-             SELECT existing.repo_id, existing.tree_oid,
-                    1, json_extract(marker.value, '$.z'), json_extract(marker.value, '$.n'),
-                    json_extract(marker.value, '$.b')
-               FROM json_each(CAST(substr(?, 1, ?) AS TEXT)) marker
-               JOIN git_tree_sources existing
-                 ON existing.repo_id = json_extract(marker.value, '$.p')
-                AND existing.tree_oid = json_extract(marker.value, '$.t')
-              WHERE true
-             ON CONFLICT(repo_id, tree_oid) DO UPDATE SET
-               complete = 1, object_size = excluded.object_size,
-               entry_count = excluded.entry_count, base_cost = excluded.base_cost
-             RETURNING source_key`,
-        blob(markers.bytes),
-        jsonLength,
-      )) {
-        returnedRows++;
-        if (returnedRows > markerRows) {
-          throw new CorruptError("tree index source was not seeded");
-        }
-      }
-      if (returnedRows !== markerRows) {
-        throw new CorruptError("tree index source was not seeded");
-      }
-      markers.reset();
-      return;
-    }
-    this.db.run(
-      `INSERT INTO git_tree_sources
-         (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
-       SELECT json_extract(value, '$.p'), json_extract(value, '$.t'),
-              1, json_extract(value, '$.z'), json_extract(value, '$.n'),
-              json_extract(value, '$.b')
-         FROM json_each(CAST(substr(?, 1, ?) AS TEXT))
-        WHERE true
-       ON CONFLICT(repo_id, tree_oid) DO UPDATE SET
-         complete = 1, object_size = excluded.object_size,
-         entry_count = excluded.entry_count, base_cost = excluded.base_cost`,
-      blob(markers.bytes),
-      jsonLength,
-    );
-    markers.reset();
-  }
-
-  dispose(): void {
-    if (this.#entries === null) return;
-    this.#entries = null;
-    this.#markers = null;
-  }
-
-  #entryArena(): TreeEntryArena {
-    if (this.#entries === null) throw new Error("tree index batch is disposed");
-    return this.#entries;
-  }
-
-  #markerArena(): AsciiJsonArray {
-    if (this.#markers === null) throw new Error("tree index batch is disposed");
-    return this.#markers;
-  }
-}
-
-export function seedTreeSources(db: SqlDatabase, sources: readonly TreeSourceInput[]): void {
-  if (sources.length === 0) return;
-  for (const source of sources) validateTreeSource(source);
-  const rows = sources.map((source) => ({
-    p: source.repoId,
-    t: source.treeOid,
-    z: source.objectSize,
-  }));
-  const json = JSON.stringify(rows);
-  db.run(
-    `INSERT OR IGNORE INTO git_tree_sources
-         (repo_id, tree_oid, complete, object_size, entry_count, base_cost)
-       SELECT json_extract(value, '$.p'), json_extract(value, '$.t'),
-              0, json_extract(value, '$.z'), NULL, NULL
-         FROM json_each(?)`,
-    json,
-  );
 }
 
 export class TreeSourceIndexer {
+  readonly #slot: TreeSourceSlot | null;
   #count = 0;
   #receivedBytes = 0;
   #observedSize = 0;
@@ -379,9 +290,14 @@ export class TreeSourceIndexer {
   constructor(
     private readonly source: TreeSource,
     private readonly batch: TreeIndexBatch,
-    private readonly write = true,
+    write = true,
   ) {
-    validateTreeSource(source);
+    if (write) {
+      this.#slot = batch.open(source);
+    } else {
+      validateTreeSource(source);
+      this.#slot = null;
+    }
   }
 
   acceptChunk(length: number): void {
@@ -404,8 +320,8 @@ export class TreeSourceIndexer {
     if (!Number.isSafeInteger(this.#baseCost)) {
       throw new CorruptError("tree index cost exceeds the safe integer range");
     }
-    if (this.write && this.#cacheAvailable) {
-      this.#cacheAvailable = this.batch.addEntry(this.source, parsed, this.#baseCost);
+    if (this.#slot !== null && this.#cacheAvailable) {
+      this.#cacheAvailable = this.batch.addEntry(this.#slot, parsed, this.#baseCost);
     }
     this.#count++;
   }
@@ -421,8 +337,8 @@ export class TreeSourceIndexer {
         `tree ${this.source.treeOid} parsed ${parsed.observedSize} bytes, expected ${this.source.objectSize}`,
       );
     }
-    if (this.write && this.#cacheAvailable) {
-      this.batch.addMarker(this.source, this.#count, this.#baseCost);
+    if (this.#slot !== null && this.#cacheAvailable) {
+      this.batch.addMarker(this.#slot, this.#count, this.#baseCost);
     }
   }
 }

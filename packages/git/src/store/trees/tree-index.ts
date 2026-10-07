@@ -1,7 +1,6 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { TreeParser } from "../../common/objects.js";
-import { expectSafeInteger } from "../../common/rows.js";
-import { seedTreeSources, TreeIndexBatch, TreeSourceIndexer } from "./tree-index-batch.js";
+import { TreeIndexBatch, TreeSourceIndexer } from "./tree-index-batch.js";
 
 export { TREE_QUEUE_ROW_FIXED_BYTES } from "./tree-index-batch.js";
 
@@ -16,30 +15,24 @@ export interface TreeSourceInput extends TreeSource {
   chunks: Iterable<Uint8Array>;
 }
 
-/** The caller supplies a bounded batch of already authenticated pack occurrences. */
-export function indexPackTreeSources(db: SqlDatabase, sources: readonly TreeSourceInput[]): void {
-  const seen = new Set<string>();
-  const unique = sources.filter((source) => {
-    const key = projectionKey(source);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-  const completed = new Set<number>();
-  for (const row of db.iterate(
-    `SELECT CAST(j.key AS INTEGER) AS ordinal FROM json_each(?) j
-       JOIN git_tree_sources s
-         ON s.repo_id = json_extract(j.value, '$.repoId')
-        AND s.tree_oid = json_extract(j.value, '$.treeOid')
-      WHERE s.complete = 1`,
-    JSON.stringify(unique.map(({ repoId, treeOid }) => ({ repoId, treeOid }))),
-  )) {
-    completed.add(expectSafeInteger(row.ordinal, 0, unique.length - 1, "tree source ordinal"));
+/** Parse one tree into `batch`; `write: false` validates without queueing rows. */
+export function parseTreeSourceInto(
+  batch: TreeIndexBatch,
+  source: TreeSource,
+  chunks: Iterable<Uint8Array>,
+  write = true,
+): void {
+  const parser = new TreeParser();
+  try {
+    const indexer = new TreeSourceIndexer(source, batch, write);
+    for (const chunk of chunks) {
+      indexer.acceptChunk(chunk.length);
+      for (const parsed of parser.push(chunk)) indexer.push(parsed);
+    }
+    indexer.finish(parser.finish());
+  } finally {
+    parser.dispose();
   }
-  indexTreeSources(
-    db,
-    unique.filter((_, ordinal) => !completed.has(ordinal)),
-  );
 }
 
 /** Incrementally parse and index one tree. The caller owns the transaction. */
@@ -52,7 +45,7 @@ export class TreeIndexSink {
   constructor(db: SqlDatabase, source: TreeSource) {
     this.#parser = new TreeParser();
     try {
-      this.#batch = new TreeIndexBatch(db, false, true, false);
+      this.#batch = new TreeIndexBatch(db, { seeded: false, autoFlush: true });
     } catch (error) {
       this.#parser.dispose();
       throw error;
@@ -107,51 +100,25 @@ export function createTreeIndexSink(db: SqlDatabase, source: TreeSource): TreeIn
   return new TreeIndexSink(db, source);
 }
 
-function projectionKey(source: TreeSource): string {
-  return `${source.repoId}:${source.treeOid}`;
-}
-
 /** A repeated tree OID is parsed again but writes nothing: its entries are already queued. */
-function indexTreePass(batch: TreeIndexBatch, sources: Iterable<TreeSourceInput>): void {
-  const queued = new Set<string>();
-  for (const source of sources) {
-    const parser = new TreeParser();
-    try {
-      const key = projectionKey(source);
-      const write = !queued.has(key);
+function indexTreePass(db: SqlDatabase, sources: Iterable<TreeSourceInput>, seeded: boolean): void {
+  const batch = new TreeIndexBatch(db, { seeded, autoFlush: true });
+  try {
+    const queued = new Set<string>();
+    for (const source of sources) {
+      const key = `${source.repoId}:${source.treeOid}`;
+      parseTreeSourceInto(batch, source, source.chunks, !queued.has(key));
       queued.add(key);
-      const indexer = new TreeSourceIndexer(source, batch, write);
-      for (const chunk of source.chunks) {
-        indexer.acceptChunk(chunk.length);
-        for (const parsed of parser.push(chunk)) indexer.push(parsed);
-      }
-      indexer.finish(parser.finish());
-    } finally {
-      parser.dispose();
     }
+    batch.flush();
+  } finally {
+    batch.dispose();
   }
-  batch.flush();
 }
 
 /** Seed and index tree projections; a complete one gets no entries. The caller owns the transaction. */
 export function indexTreeSources(db: SqlDatabase, sources: Iterable<TreeSourceInput>): void {
-  const arraySources = Array.isArray(sources) ? sources : null;
-  if (arraySources?.every((source: TreeSourceInput) => Array.isArray(source.chunks))) {
-    seedTreeSources(db, arraySources);
-    const batch = new TreeIndexBatch(db, true, false, false);
-    try {
-      indexTreePass(batch, arraySources);
-    } finally {
-      batch.dispose();
-    }
-    return;
-  }
-  const batch = new TreeIndexBatch(db, false, false, false);
-  try {
-    indexTreePass(batch, sources);
-  } finally {
-    batch.dispose();
-  }
+  indexTreePass(db, sources, false);
 }
 
 /**
@@ -159,12 +126,7 @@ export function indexTreeSources(db: SqlDatabase, sources: Iterable<TreeSourceIn
  * projection, so no seed statement runs; a complete one gets no entries.
  */
 export function indexSeededTreeSources(db: SqlDatabase, sources: Iterable<TreeSourceInput>): void {
-  const batch = new TreeIndexBatch(db, true, false, true);
-  try {
-    indexTreePass(batch, sources);
-  } finally {
-    batch.dispose();
-  }
+  indexTreePass(db, sources, true);
 }
 
 /** Index one loose tree whose object insert seeded its projection. */

@@ -1,4 +1,4 @@
-import { ownedBytes, type SqlDatabase } from "@kompjutr/sqlite";
+import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import type { ObjectType } from "../../common/objects.js";
@@ -8,14 +8,14 @@ import {
   prepareCommitCache,
 } from "../trees/commits.js";
 import { promoteCommitCaches, stageCommitCaches } from "../trees/commits-staging.js";
-import { indexPackTreeSources, type TreeSourceInput } from "../trees/tree-index.js";
-import { type ChunkedBytes, PACK_CHUNK_BYTES } from "./chunks.js";
+import { parseTreeSourceInto, type TreeSource } from "../trees/tree-index.js";
+import { TreeIndexBatch } from "../trees/tree-index-batch.js";
+import { TREE_INDEX_DEFERRED_ROWS, TreeIndexBuffers } from "../trees/tree-index-rows.js";
+import type { ChunkedBytes } from "./chunks.js";
 
-export const PACK_TREE_BATCH_BYTES = 1024 * 1024;
 const PACK_TREE_BATCH_SOURCES = 2048;
-const PACK_TREE_SOURCE_BYTES = 256;
-export const PACK_TREE_CHUNK_BYTES = 64;
-const PACK_TREE_CHUNK_ARRAY_BYTES = 64;
+/** Tree names one pack batch retains; a larger tree is indexed in its own transaction. */
+const PACK_TREE_NAME_BYTES = 512 * 1024;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
 const PACK_COMMIT_BATCH_SOURCE_BYTES = 2 * 1024 * 1024;
 export const PACK_COMMIT_PAYLOAD_BYTES = 256;
@@ -188,13 +188,16 @@ export class PackPendingBatch {
 }
 
 /**
- * Parsed pack trees pending a bounded, transactional index flush. Pack entries
- * flush first: a projection without its entry row escapes pending-pack reclaim.
+ * Pack trees parsed while their bytes are live, pending one bounded,
+ * transactional index flush. It owns the index buffers its batches borrow.
+ * Pack entries flush first: a projection without its entry row escapes
+ * pending-pack reclaim.
  */
 export class PackTreeIndex {
-  readonly #sources: TreeSourceInput[] = [];
-  #payloadBytes = 0;
-  #retainedBytes = 0;
+  readonly #buffers = new TreeIndexBuffers(TREE_INDEX_DEFERRED_ROWS, PACK_TREE_NAME_BYTES);
+  readonly #queued = new Set<string>();
+  #batch: TreeIndexBatch | null = null;
+  #failed = false;
 
   constructor(
     private readonly db: SqlDatabase,
@@ -202,24 +205,7 @@ export class PackTreeIndex {
   ) {}
 
   addBuffered(repoId: number, treeOid: string, objectSize: number, data: Uint8Array): void {
-    const retained = this.#sourceBytes(data.length, 1);
-    if (
-      this.#sources.length > 0 &&
-      (this.#sources.length >= PACK_TREE_BATCH_SOURCES ||
-        this.#payloadBytes + data.length > PACK_TREE_BATCH_BYTES ||
-        this.#retainedBytes + retained > PACK_TREE_BATCH_BYTES)
-    ) {
-      this.flush();
-    }
-    if (retained > PACK_TREE_BATCH_BYTES) {
-      this.#direct(() =>
-        indexPackTreeSources(this.db, [this.#source(repoId, treeOid, objectSize, [data])]),
-      );
-      return;
-    }
-    this.#sources.push(this.#source(repoId, treeOid, objectSize, [data]));
-    this.#payloadBytes += data.length;
-    this.#retainedBytes += retained;
+    this.#add({ repoId, treeOid, objectSize }, [data], data.length);
   }
 
   addStream(
@@ -229,72 +215,89 @@ export class PackTreeIndex {
     chunks: () => Iterable<Uint8Array>,
   ): void {
     this.flush();
-    this.#direct(() => {
-      indexPackTreeSources(this.db, [this.#source(repoId, treeOid, objectSize, chunks())]);
-    });
+    this.#direct({ repoId, treeOid, objectSize }, chunks());
   }
 
+  /** `target` is reused once this returns, so its tree is parsed now. */
   addChunked(repoId: number, treeOid: string, objectSize: number, target: ChunkedBytes): void {
-    const chunkCount = Math.max(1, Math.ceil(target.length / PACK_CHUNK_BYTES));
-    const retained = this.#sourceBytes(target.length, chunkCount);
-    if (retained > PACK_TREE_BATCH_BYTES) {
-      this.flush();
-      this.#direct(() => {
-        indexPackTreeSources(this.db, [this.#source(repoId, treeOid, objectSize, target.chunks())]);
-      });
-      return;
-    }
-    if (
-      this.#sources.length > 0 &&
-      (this.#sources.length >= PACK_TREE_BATCH_SOURCES ||
-        this.#payloadBytes + target.length > PACK_TREE_BATCH_BYTES ||
-        this.#retainedBytes + retained > PACK_TREE_BATCH_BYTES)
-    ) {
-      this.flush();
-    }
-    const chunks: Uint8Array[] = [];
-    for (const chunk of target.chunks()) chunks.push(ownedBytes(chunk));
-    this.#sources.push(this.#source(repoId, treeOid, objectSize, chunks));
-    this.#payloadBytes += target.length;
-    this.#retainedBytes += retained;
+    this.#add({ repoId, treeOid, objectSize }, target.chunks(), target.length);
   }
 
   flush(): void {
-    if (this.#sources.length === 0) return;
-    this.objects.flush();
+    this.#assertUsable();
+    const batch = this.#batch;
+    if (batch === null) return;
+    this.#batch = null;
+    this.#queued.clear();
     try {
-      this.db.transactionSync(() => indexPackTreeSources(this.db, this.#sources));
+      this.objects.flush();
+      this.db.transactionSync(() => batch.flush());
+    } catch (error) {
+      this.#failed = true;
+      throw error;
     } finally {
-      this.#sources.length = 0;
-      this.#payloadBytes = 0;
-      this.#retainedBytes = 0;
+      batch.dispose();
     }
   }
 
-  #sourceBytes(payloadBytes: number, chunkCount: number): number {
-    const retained =
-      payloadBytes +
-      PACK_TREE_SOURCE_BYTES +
-      PACK_TREE_CHUNK_ARRAY_BYTES +
-      chunkCount * PACK_TREE_CHUNK_BYTES;
-    if (!Number.isSafeInteger(retained)) {
-      throw new GitError("E2BIG", "packed tree batch retained state is too large");
+  #add(source: TreeSource, chunks: Iterable<Uint8Array>, objectBytes: number): void {
+    this.#assertUsable();
+    if (!this.#buffers.rows.holdsAlone(objectBytes)) {
+      this.flush();
+      this.#direct(source, chunks);
+      return;
     }
-    return retained;
+    const key = `${source.repoId}:${source.treeOid}`;
+    if (this.#queued.has(key)) return;
+    if (
+      this.#batch !== null &&
+      (this.#queued.size >= PACK_TREE_BATCH_SOURCES || !this.#batch.holds(objectBytes))
+    ) {
+      this.flush();
+    }
+    const batch = this.#pendingBatch();
+    this.#queued.add(key);
+    try {
+      parseTreeSourceInto(batch, source, chunks);
+    } catch (error) {
+      // Rows of the rejected tree are already queued, so the batch is unusable.
+      this.#failed = true;
+      this.#batch = null;
+      batch.dispose();
+      throw error;
+    }
   }
 
-  #source(
-    repoId: number,
-    treeOid: string,
-    objectSize: number,
-    chunks: Iterable<Uint8Array>,
-  ): TreeSourceInput {
-    return { repoId, treeOid, objectSize, chunks };
+  #pendingBatch(): TreeIndexBatch {
+    if (this.#batch === null) {
+      this.#batch = new TreeIndexBatch(this.db, {
+        seeded: false,
+        autoFlush: false,
+        buffers: this.#buffers,
+      });
+    }
+    return this.#batch;
   }
 
-  #direct(write: () => void): void {
+  #direct(source: TreeSource, chunks: Iterable<Uint8Array>): void {
     this.objects.flush();
-    this.db.transactionSync(write);
+    this.db.transactionSync(() => {
+      const batch = new TreeIndexBatch(this.db, {
+        seeded: false,
+        autoFlush: true,
+        buffers: this.#buffers,
+      });
+      try {
+        parseTreeSourceInto(batch, source, chunks);
+        batch.flush();
+      } finally {
+        batch.dispose();
+      }
+    });
+  }
+
+  #assertUsable(): void {
+    if (this.#failed) throw new Error("pack tree index failed on an earlier tree");
   }
 }
 

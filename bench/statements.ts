@@ -296,7 +296,7 @@ const BASELINE_STATEMENTS: Partial<Record<RequiredRow, number>> = {
   "maintenance.mark-depth-n": 10,
   "maintenance.mark-depth-2n": 10,
   "transport.discovery": 2,
-  "transport.fetch": 73,
+  "transport.fetch": 72,
   "transport.push": 50,
 };
 
