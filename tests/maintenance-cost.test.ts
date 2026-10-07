@@ -636,3 +636,120 @@ describe("public maintenance storage pressure", () => {
     expect(afterBytes).toBe(beforeBytes - deadLooseStoredBytes - fixture.deadPackBytes);
   });
 });
+
+describe("maintenance mark cost over unprojected trees", () => {
+  const HISTORY_TREE_ENTRIES = 300;
+  const CHANGED_ENTRIES_PER_COMMIT = 30;
+
+  interface MarkCost {
+    statements: number;
+    calls: number;
+    reachableObjects: number;
+    treeEdges: number;
+  }
+
+  // Each commit's flat tree spans two edge pages, so every tree pages across durable steps.
+  async function markHistory(commits: number, projected: boolean): Promise<MarkCost> {
+    const storage = new SqliteTestStorage();
+    const clock: Clock = { value: START_MS };
+    const workspace = new Workspace({
+      storage,
+      git: createGit(),
+      now: () => clock.value,
+      defaultGitIdentity: IDENTITY,
+    });
+    await workspace.git.init({ dir: "/repo" });
+    const db = new TestDatabase(storage);
+    const database = new SqliteGitDatabase(db, { now: () => clock.value });
+    const checkout = database.findCheckout("/repo");
+    if (checkout === null) throw new Error("maintenance history checkout is missing");
+    const store = database.openCheckout(checkout);
+    const tip = store.writeObjects((batch) => {
+      const current: string[] = [];
+      for (let index = 0; index < HISTORY_TREE_ENTRIES; index++) {
+        current.push(batch.write("blob", utf8.encode(`history 0 ${index}\n`)));
+      }
+      let parent: string | null = null;
+      for (let commitIndex = 0; commitIndex < commits; commitIndex++) {
+        for (let change = 0; change < CHANGED_ENTRIES_PER_COMMIT; change++) {
+          const index = (commitIndex * CHANGED_ENTRIES_PER_COMMIT + change) % HISTORY_TREE_ENTRIES;
+          current[index] = batch.write("blob", utf8.encode(`history ${commitIndex} ${index}\n`));
+        }
+        const tree = batch.write(
+          "tree",
+          serializeTree(
+            current.map((oid, index) => ({
+              mode: MODE_FILE,
+              name: `file-${String(index).padStart(3, "0")}`,
+              oid,
+            })),
+          ),
+        );
+        parent = batch.write(
+          "commit",
+          serializeCommit({
+            tree,
+            parent: parent === null ? [] : [parent],
+            author: IDENTITY,
+            committer: IDENTITY,
+            message: `history ${commitIndex}\n`,
+          }),
+        );
+      }
+      if (parent === null) throw new Error("maintenance history has no commit");
+      return parent;
+    });
+    store.setRef("refs/heads/main", tip);
+    if (!projected) db.run("DELETE FROM git_tree_sources WHERE repo_id = ?", checkout.repoId);
+    const sourcesBefore = db.scalar<number>(
+      "SELECT count(*) FROM git_tree_sources WHERE repo_id = ?",
+      checkout.repoId,
+    );
+    const generationBefore = db.scalar<number>(
+      "SELECT source_generation FROM git_repositories WHERE id = ?",
+      checkout.repoId,
+    );
+
+    let result = (await publicMaintenanceCall(storage, clock)).result;
+    for (let call = 0; call < 100 && result.phase !== "mark"; call++) {
+      result = (await publicMaintenanceCall(storage, clock)).result;
+    }
+    expect(result.phase).toBe("mark");
+    let statements = 0;
+    let calls = 0;
+    while (result.phase === "mark") {
+      if (++calls > 10_000) throw new Error("the mark phase did not complete");
+      result = (await publicMaintenanceCall(storage, clock)).result;
+      statements += storage.statementCount;
+    }
+
+    expect(result.phase).toBe("loose");
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_tree_sources WHERE repo_id = ?", checkout.repoId),
+    ).toBe(sourcesBefore);
+    expect(
+      db.scalar<number>(
+        "SELECT source_generation FROM git_repositories WHERE id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(generationBefore);
+    return {
+      statements,
+      calls,
+      reachableObjects: result.reachableObjects,
+      treeEdges: commits * HISTORY_TREE_ENTRIES,
+    };
+  }
+
+  it("marks a history of unprojected trees at the projected cost, linear in edges", async () => {
+    const projected = await markHistory(16, true);
+    const unprojected = await markHistory(16, false);
+    const doubled = await markHistory(32, false);
+
+    expect(unprojected.reachableObjects).toBe(projected.reachableObjects);
+    expect(unprojected.calls).toBe(projected.calls);
+    expect(unprojected.statements).toBeLessThan(1.1 * projected.statements);
+    expect(doubled.treeEdges).toBe(2 * unprojected.treeEdges);
+    expect(doubled.statements).toBeLessThan(2.2 * unprojected.statements);
+  });
+});

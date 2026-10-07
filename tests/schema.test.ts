@@ -307,7 +307,16 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   ],
   [
     "git_maintenance_objects",
-    ["repo_id", "run_id", "oid", "source_mask", "expanded", "shallow_boundary", "edge_cursor"],
+    [
+      "repo_id",
+      "run_id",
+      "oid",
+      "source_mask",
+      "expanded",
+      "shallow_boundary",
+      "edge_cursor",
+      "edge_offset",
+    ],
   ],
   ["git_loose_gc_candidates", ["repo_id", "oid", "unreachable_since_ms"]],
   [

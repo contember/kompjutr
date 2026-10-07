@@ -56,7 +56,9 @@ it does today.
   unprojected subtree.
 - Maintenance expands a tree from its projection when it is complete, and
   otherwise parses the object bytes without writing a projection. Marking all
-  of history must not project all of history.
+  of history must not project all of history. The fallback accepts entry
+  names the projection path refuses (non-UTF-8), because marking must
+  over-approximate reachability.
 - Sparse snapshot readers keep their existing fallback: a commit tree without a
   complete projection makes the snapshot unavailable, and the caller uses the
   full path.

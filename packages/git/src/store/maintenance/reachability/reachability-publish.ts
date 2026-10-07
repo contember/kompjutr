@@ -142,21 +142,25 @@ function publishExpansionOwned(
   }
   const updatedObject = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_objects
-        SET expanded = ?, edge_cursor = ?
+        SET expanded = ?, edge_cursor = ?, edge_offset = ?
       WHERE repo_id = ? AND run_id = ? AND oid = ? AND expanded = 0 AND edge_cursor = ?
-      RETURNING oid, expanded, edge_cursor`,
+        AND edge_offset IS ?
+      RETURNING oid, expanded, edge_cursor, edge_offset`,
     expansion.complete ? 1 : 0,
     expansion.nextCursor,
+    expansion.nextOffset,
     store.repoId,
     run.runId,
     object.oid,
     object.edgeCursor,
+    object.edgeOffset,
   );
   if (
     updatedObject === undefined ||
     updatedObject.oid !== object.oid ||
     updatedObject.expanded !== (expansion.complete ? 1 : 0) ||
-    updatedObject.edge_cursor !== expansion.nextCursor
+    updatedObject.edge_cursor !== expansion.nextCursor ||
+    updatedObject.edge_offset !== expansion.nextOffset
   ) {
     throw new CorruptError("maintenance object progress was not published atomically");
   }

@@ -21,6 +21,8 @@ export interface QueueObject {
   sourceMask: number;
   shallowBoundary: boolean;
   edgeCursor: number;
+  /** Byte offset of entry `edgeCursor` when an unprojected tree was paged; null otherwise. */
+  edgeOffset: number | null;
 }
 
 export interface ReachabilityEdge {
@@ -33,6 +35,7 @@ export interface ReachabilityEdge {
 export interface ObjectExpansion {
   edges: ReachabilityEdge[];
   nextCursor: number;
+  nextOffset: number | null;
   complete: boolean;
 }
 

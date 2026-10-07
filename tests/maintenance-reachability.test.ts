@@ -16,6 +16,7 @@ import {
 import { deflate } from "../packages/git/src/common/zlib.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import {
+  advanceMaintenanceMark,
   advanceMaintenanceReachability,
   MARK_EXPANSIONS_PER_CALL,
 } from "../packages/git/src/store/maintenance/reachability.js";
@@ -1086,5 +1087,378 @@ describe("maintenance mark batching", () => {
     expect(markCalls).toBeLessThanOrEqual(Math.ceil(stored.length / MARK_EXPANSIONS_PER_CALL) + 2);
     // One mark call per reachable object is the cost this guards against.
     expect(markCalls).toBeLessThan(stored.length / 16);
+  });
+});
+
+describe("maintenance reachability without a tree projection", () => {
+  type Projection = "projected" | "no-row" | "unprojectable";
+
+  // Pack ingest no longer projects trees (ADR-0030), so a reachable tree may have no row.
+  function removeTreeProjections(db: TestDatabase, repoId: number, projection: Projection): void {
+    if (projection === "projected") return;
+    if (projection === "no-row") {
+      db.run("DELETE FROM git_tree_sources WHERE repo_id = ?", repoId);
+      return;
+    }
+    db.run(
+      `DELETE FROM git_tree_entries WHERE source_key IN (
+         SELECT source_key FROM git_tree_sources WHERE repo_id = ?
+       )`,
+      repoId,
+    );
+    db.run(
+      `UPDATE git_tree_sources SET complete = 0, entry_count = NULL, base_cost = NULL
+        WHERE repo_id = ?`,
+      repoId,
+    );
+  }
+
+  function projectionState(db: TestDatabase, repoId: number) {
+    return {
+      sources: db.all<{ tree_oid: string; complete: number }>(
+        "SELECT tree_oid, complete FROM git_tree_sources WHERE repo_id = ? ORDER BY tree_oid",
+        repoId,
+      ),
+      entries: db.scalar<number>(
+        `SELECT count(*) FROM git_tree_entries WHERE source_key IN (
+           SELECT source_key FROM git_tree_sources WHERE repo_id = ?
+         )`,
+        repoId,
+      ),
+      sourceGeneration: db.scalar<number>(
+        "SELECT source_generation FROM git_repositories WHERE id = ?",
+        repoId,
+      ),
+      rootEpoch: db.scalar<number>(
+        "SELECT root_epoch FROM git_maintenance_control WHERE repo_id = ?",
+        repoId,
+      ),
+    };
+  }
+
+  function markHistory(projection: Projection) {
+    const { db, checkout, store } = open();
+    const gitlinkTree = store.write("tree", serializeTree([]));
+    const gitlinkCommit = store.write("commit", commit(gitlinkTree, [], "gitlink\n"));
+    const nestedBlob = store.write("blob", utf8.encode("nested\n"));
+    const subtree = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "nested", oid: nestedBlob }]),
+    );
+    const firstBlob = store.write("blob", utf8.encode("first\n"));
+    const firstTree = store.write(
+      "tree",
+      serializeTree([
+        { mode: MODE_FILE, name: "file", oid: firstBlob },
+        { mode: "40000", name: "dir", oid: subtree },
+      ]),
+    );
+    const first = store.write("commit", commit(firstTree, [], "first\n"));
+    const secondBlob = store.write("blob", utf8.encode("second\n"));
+    const secondTree = store.write(
+      "tree",
+      serializeTree([
+        { mode: MODE_FILE, name: "file", oid: secondBlob },
+        { mode: "100755", name: "tool", oid: firstBlob },
+        { mode: "120000", name: "link", oid: nestedBlob },
+        { mode: "40000", name: "dir", oid: subtree },
+        { mode: "040000", name: "padded-dir", oid: subtree },
+        { mode: MODE_COMMIT, name: "missing", oid: "f".repeat(40) },
+        { mode: MODE_COMMIT, name: "present", oid: gitlinkCommit },
+      ]),
+    );
+    const second = store.write("commit", commit(secondTree, [first], "second\n"));
+    removeTreeProjections(db, checkout.repoId, projection);
+    seedMark(db, checkout.repoId, [{ oid: second }]);
+    const before = projectionState(db, checkout.repoId);
+
+    drain(db, store.shared);
+
+    expect(projectionState(db, checkout.repoId)).toEqual(before);
+    return {
+      marks: marks(db, checkout.repoId),
+      run: db.one<{ phase: string; queued_objects: number; reachable_objects: number }>(
+        `SELECT phase, queued_objects, reachable_objects
+           FROM git_maintenance_runs WHERE repo_id = ?`,
+        checkout.repoId,
+      ),
+    };
+  }
+
+  it("marks the same closure from tree objects as from their projections", () => {
+    const projected = markHistory("projected");
+    expect(projected.marks).toHaveLength(10);
+
+    expect(markHistory("no-row")).toEqual(projected);
+    expect(markHistory("unprojectable")).toEqual(projected);
+  });
+
+  it("keeps a promised blob under an unprojected tree a terminal leaf", () => {
+    const { db, checkout, store } = open();
+    const promised = "a".repeat(40);
+    const present = store.write("blob", utf8.encode("present\n"));
+    const tree = store.write(
+      "tree",
+      serializeTree([
+        { mode: MODE_FILE, name: "present", oid: present },
+        { mode: MODE_FILE, name: "promised", oid: promised },
+      ]),
+    );
+    promiseBlob(db, checkout.repoId, promised);
+    removeTreeProjections(db, checkout.repoId, "no-row");
+    seedMark(db, checkout.repoId, [{ oid: tree }]);
+
+    expect(advanceMaintenanceReachability(store.shared)).toMatchObject({
+      processedOid: tree,
+      discoveredObjects: 1,
+    });
+    drain(db, store.shared);
+
+    expect(marks(db, checkout.repoId)).toEqual(
+      [
+        { oid: present, expanded: 1, edge_cursor: 0 },
+        { oid: tree, expanded: 1, edge_cursor: 2 },
+      ].sort((left, right) => (left.oid < right.oid ? -1 : 1)),
+    );
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_tree_sources WHERE repo_id = ?", checkout.repoId),
+    ).toBe(0);
+  });
+
+  it("does not apply blob promises to a missing subtree of an unprojected tree", () => {
+    const { db, checkout, store } = open();
+    const promisedTree = "b".repeat(40);
+    const tree = store.write(
+      "tree",
+      serializeTree([{ mode: "40000", name: "missing-tree", oid: promisedTree }]),
+    );
+    promiseBlob(db, checkout.repoId, promisedTree);
+    removeTreeProjections(db, checkout.repoId, "no-row");
+    seedMark(db, checkout.repoId, [{ oid: tree }]);
+
+    expect(() => advanceMaintenanceReachability(store.shared)).toThrow(
+      /references a missing object/,
+    );
+  });
+
+  it("pages an unprojected tree of more than 256 entries across durable steps", () => {
+    const { db, checkout, store } = open();
+    const entries: { mode: string; name: string; oid: string }[] = [];
+    for (let index = 0; index < 600; index++) {
+      const oid = store.write("blob", utf8.encode(`blob ${index}\n`));
+      entries.push({ mode: MODE_FILE, name: `file-${String(index).padStart(3, "0")}`, oid });
+    }
+    const tree = store.write("tree", serializeTree(entries));
+    removeTreeProjections(db, checkout.repoId, "no-row");
+    seedMark(db, checkout.repoId, [{ oid: tree }]);
+    const cursor = () =>
+      db.one<{ expanded: number; edge_cursor: number; edge_offset: number | null }>(
+        `SELECT expanded, edge_cursor, edge_offset FROM git_maintenance_objects
+          WHERE repo_id = ? AND run_id = 1 AND oid = ?`,
+        checkout.repoId,
+        tree,
+      );
+    const offset = (count: number) => serializeTree(entries.slice(0, count)).length;
+    const settleDiscovered = () => {
+      db.run(
+        `UPDATE git_maintenance_objects SET expanded = 1
+          WHERE repo_id = ? AND run_id = 1 AND oid != ? AND expanded = 0`,
+        checkout.repoId,
+        tree,
+      );
+      db.run(
+        "UPDATE git_maintenance_runs SET queued_objects = 1 WHERE repo_id = ?",
+        checkout.repoId,
+      );
+    };
+
+    expect(advanceMaintenanceReachability(store.shared)).toMatchObject({
+      processedOid: tree,
+      discoveredObjects: 256,
+    });
+    expect(cursor()).toEqual({ expanded: 0, edge_cursor: 256, edge_offset: offset(256) });
+    settleDiscovered();
+    const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(checkout.id);
+    expect(advanceMaintenanceReachability(cold.shared)).toMatchObject({
+      processedOid: tree,
+      discoveredObjects: 256,
+    });
+    expect(cursor()).toEqual({ expanded: 0, edge_cursor: 512, edge_offset: offset(512) });
+    settleDiscovered();
+    expect(advanceMaintenanceReachability(cold.shared)).toMatchObject({
+      processedOid: tree,
+      discoveredObjects: 88,
+    });
+    expect(cursor()).toEqual({ expanded: 1, edge_cursor: 600, edge_offset: null });
+
+    const marked = new Set(marks(db, checkout.repoId).map((row) => row.oid));
+    expect(marked).toEqual(new Set([tree, ...entries.map((entry) => entry.oid)]));
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_tree_sources WHERE repo_id = ?", checkout.repoId),
+    ).toBe(0);
+  });
+
+  it("marks a packed tree without a projection", async () => {
+    const { db, checkout, store } = open();
+    const blobData = utf8.encode("packed blob\n");
+    const blobOid = hashObject("blob", blobData);
+    const treeData = serializeTree([{ mode: MODE_FILE, name: "packed", oid: blobOid }]);
+    const treeOid = hashObject("tree", treeData);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.object("blob", blobData);
+    writer.object("tree", treeData);
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 17));
+    removeTreeProjections(db, checkout.repoId, "no-row");
+    seedMark(db, checkout.repoId, [{ oid: treeOid }]);
+
+    drain(db, store.shared);
+
+    expect(new Set(marks(db, checkout.repoId).map((row) => row.oid))).toEqual(
+      new Set([treeOid, blobOid]),
+    );
+  });
+
+  it("fails a tree object that does not parse as corrupt", () => {
+    const { db, checkout } = open();
+    const data = utf8.encode("100644 truncated\0abc");
+    const oid = hashObject("tree", data);
+    db.run(
+      "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, 'tree', ?)",
+      checkout.repoId,
+      oid,
+      data.length,
+    );
+    db.run(
+      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
+      checkout.repoId,
+      oid,
+      deflate(data),
+    );
+    removeTreeProjections(db, checkout.repoId, "no-row");
+    seedMark(db, checkout.repoId, [{ oid }]);
+    const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(checkout.id);
+
+    expect(() => advanceMaintenanceReachability(cold.shared)).toThrowError(
+      expect.objectContaining({
+        code: "ECORRUPT",
+        message: expect.stringMatching(/tree entry is truncated/),
+      }),
+    );
+    expect(
+      db.scalar<number>(
+        "SELECT expanded FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
+        checkout.repoId,
+        oid,
+      ),
+    ).toBe(0);
+  });
+  it("switches a paged tree from its projection to its object at the same ordinal", () => {
+    const { db, checkout, store } = open();
+    const entries: { mode: string; name: string; oid: string }[] = [];
+    for (let index = 0; index < 600; index++) {
+      const oid = store.write("blob", utf8.encode(`switch ${index}\n`));
+      entries.push({ mode: MODE_FILE, name: `file-${String(index).padStart(3, "0")}`, oid });
+    }
+    const tree = store.write("tree", serializeTree(entries));
+    seedMark(db, checkout.repoId, [{ oid: tree }]);
+    const cursor = () =>
+      db.one<{ expanded: number; edge_cursor: number; edge_offset: number | null }>(
+        `SELECT expanded, edge_cursor, edge_offset FROM git_maintenance_objects
+          WHERE repo_id = ? AND run_id = 1 AND oid = ?`,
+        checkout.repoId,
+        tree,
+      );
+
+    expect(advanceMaintenanceReachability(store.shared)).toMatchObject({
+      processedOid: tree,
+      discoveredObjects: 256,
+    });
+    expect(cursor()).toEqual({ expanded: 0, edge_cursor: 256, edge_offset: null });
+    removeTreeProjections(db, checkout.repoId, "no-row");
+    drain(db, store.shared);
+
+    expect(cursor()).toEqual({ expanded: 1, edge_cursor: 600, edge_offset: null });
+    expect(new Set(marks(db, checkout.repoId).map((row) => row.oid))).toEqual(
+      new Set([tree, ...entries.map((entry) => entry.oid)]),
+    );
+  });
+
+  it("reads a paged unprojected tree once per maintenance call it spans", () => {
+    const { db, checkout, store } = open();
+    const entryCount = 64 * 256 + 600;
+    const pages = Math.ceil(entryCount / 256);
+    const entries = store.writeObjects((batch) => {
+      const written: { mode: string; name: string; oid: string }[] = [];
+      for (let index = 0; index < entryCount; index++) {
+        const oid = batch.write("blob", utf8.encode(`child ${index}\n`));
+        written.push({ mode: MODE_FILE, name: `file-${String(index).padStart(5, "0")}`, oid });
+      }
+      return written;
+    });
+    const tree = store.write("tree", serializeTree(entries));
+    removeTreeProjections(db, checkout.repoId, "no-row");
+    seedMark(db, checkout.repoId, [{ oid: tree }]);
+    const cold = new SqliteGitDatabase(db, { objectCacheBytes: 0 }).openCheckout(checkout.id);
+    db.storage.histogram = new Map();
+    let treeReads = 0;
+    let calls = 0;
+    for (;;) {
+      if (++calls > 1_000) throw new Error("the mark did not complete");
+      db.storage.resetCounters();
+      const progress = advanceMaintenanceMark(cold.shared);
+      expect(db.storage.statementCount).toBeLessThan(1_000);
+      for (const [query, count] of db.storage.histogram) {
+        if (query.includes("loose-object-payload")) treeReads += count;
+      }
+      if (progress.status === "complete") break;
+    }
+    db.storage.histogram = null;
+
+    expect(pages).toBeGreaterThan(MARK_EXPANSIONS_PER_CALL);
+    expect(treeReads).toBeLessThanOrEqual(Math.ceil(pages / MARK_EXPANSIONS_PER_CALL) + 1);
+    expect(marks(db, checkout.repoId)).toHaveLength(entryCount + 1);
+  });
+
+  it("starts a page at the stored byte offset, not by rescanning to the cursor", () => {
+    const { db, checkout, store } = open();
+    const entries: { mode: string; name: string; oid: string }[] = [];
+    for (let index = 0; index < 800; index++) {
+      const oid = store.write("blob", utf8.encode(`offset ${index}\n`));
+      entries.push({ mode: MODE_FILE, name: `file-${String(index).padStart(3, "0")}`, oid });
+    }
+    const tree = store.write("tree", serializeTree(entries));
+    removeTreeProjections(db, checkout.repoId, "no-row");
+    seedMark(db, checkout.repoId, [{ oid: tree }]);
+    expect(advanceMaintenanceReachability(store.shared)).toMatchObject({
+      processedOid: tree,
+      discoveredObjects: 256,
+    });
+    db.run(
+      `UPDATE git_maintenance_objects SET expanded = 1
+        WHERE repo_id = ? AND run_id = 1 AND oid != ?`,
+      checkout.repoId,
+      tree,
+    );
+    db.run("UPDATE git_maintenance_runs SET queued_objects = 1 WHERE repo_id = ?", checkout.repoId);
+    // Probe only: point the offset at entry 512 while the cursor stays at 256.
+    db.run(
+      `UPDATE git_maintenance_objects SET edge_offset = ?
+        WHERE repo_id = ? AND run_id = 1 AND oid = ?`,
+      serializeTree(entries.slice(0, 512)).length,
+      checkout.repoId,
+      tree,
+    );
+
+    expect(advanceMaintenanceReachability(store.shared)).toMatchObject({
+      processedOid: tree,
+      discoveredObjects: 256,
+    });
+
+    const marked = new Set(marks(db, checkout.repoId).map((row) => row.oid));
+    expect(entries.slice(512, 768).every((entry) => marked.has(entry.oid))).toBe(true);
+    expect(entries.slice(256, 512).some((entry) => marked.has(entry.oid))).toBe(false);
   });
 });

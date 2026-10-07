@@ -2,7 +2,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../../common/errors.js";
 import { expectSafeInteger } from "../../../common/rows.js";
 import type { SharedRepoStore } from "../../index.js";
-import { booleanInteger, oidField } from "./reachability-codecs.js";
+import { booleanInteger, oidField, treeModeEdge } from "./reachability-codecs.js";
 import {
   EDGE_PAGE,
   type ObjectExpansion,
@@ -11,6 +11,7 @@ import {
   type ReachabilityObjectInfo,
 } from "./reachability-contracts.js";
 import { scanHeaders } from "./reachability-headers.js";
+import { type TreeObjectReads, treeObjectExpansion } from "./reachability-tree-object.js";
 
 export function headerExpansion(
   store: SharedRepoStore,
@@ -19,7 +20,7 @@ export function headerExpansion(
 ): ObjectExpansion {
   if (info.type === "blob") {
     if (object.edgeCursor !== 0) throw new CorruptError("blob retained a semantic edge cursor");
-    return { edges: [], nextCursor: 0, complete: true };
+    return { edges: [], nextCursor: 0, nextOffset: null, complete: true };
   }
   if (info.type === "tag") {
     if (object.edgeCursor !== 0) throw new CorruptError("tag retained a semantic edge cursor");
@@ -34,7 +35,7 @@ export function headerExpansion(
         allowPromisedMissing: false,
       },
     ];
-    return { edges, nextCursor: 0, complete: true };
+    return { edges, nextCursor: 0, nextOffset: null, complete: true };
   }
   if (info.type !== "commit") {
     throw new CorruptError(`header expansion received unexpected ${info.type} object`);
@@ -71,7 +72,7 @@ export function headerExpansion(
     }
   }
   const nextCursor = Math.min(semanticCount, object.edgeCursor + edges.length);
-  return { edges, nextCursor, complete: nextCursor === semanticCount };
+  return { edges, nextCursor, nextOffset: null, complete: nextCursor === semanticCount };
 }
 
 function treeEdge(
@@ -81,31 +82,15 @@ function treeEdge(
 ): ReachabilityEdge {
   if (row.source_key !== sourceKey) throw new CorruptError("tree edge crossed source boundaries");
   if (row.ordinal !== ordinal) throw new CorruptError("tree edge ordinals are not contiguous");
-  const mode = row.mode;
-  if (
-    mode !== "40000" &&
-    mode !== "040000" &&
-    mode !== "100644" &&
-    mode !== "100755" &&
-    mode !== "120000" &&
-    mode !== "160000"
-  ) {
-    throw new CorruptError("tree edge mode is invalid");
-  }
-  const type =
-    mode === "40000" || mode === "040000" ? "tree" : mode === "160000" ? "commit" : "blob";
-  return {
-    oid: oidField(row.oid, "tree edge OID"),
-    type,
-    optionalMissing: mode === "160000",
-    allowPromisedMissing: type === "blob",
-  };
+  return treeModeEdge(row.mode, oidField(row.oid, "tree edge OID"));
 }
 
 export function treeExpansion(
   db: SqlDatabase,
   store: SharedRepoStore,
   object: QueueObject,
+  info: ReachabilityObjectInfo,
+  trees: TreeObjectReads,
 ): ObjectExpansion {
   const source = db.one<Record<string, unknown>>(
     `SELECT source_key, complete, entry_count
@@ -113,11 +98,9 @@ export function treeExpansion(
     store.repoId,
     object.oid,
   );
-  if (source === undefined) {
-    throw new CorruptError(`tree ${object.oid} has no parsed source`);
-  }
-  if (!booleanInteger(source.complete, "tree source completion marker")) {
-    throw new CorruptError("tree source is incomplete");
+  // Marking all of history must not project it: an unprojected tree is parsed and left so.
+  if (source === undefined || !booleanInteger(source.complete, "tree source completion marker")) {
+    return treeObjectExpansion(store, object, info, trees);
   }
   const sourceKey = expectSafeInteger(
     source.source_key,
@@ -154,5 +137,5 @@ export function treeExpansion(
     throw new CorruptError("tree source rows are incomplete");
   }
   const nextCursor = object.edgeCursor + Math.min(remaining, EDGE_PAGE);
-  return { edges, nextCursor, complete: nextCursor === entryCount };
+  return { edges, nextCursor, nextOffset: null, complete: nextCursor === entryCount };
 }

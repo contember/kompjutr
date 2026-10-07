@@ -470,3 +470,26 @@ Paths are relative to `packages/git/src/`.
 - **Stale workflow results.** `nextjs:git.clone` in `bench:statements` reads a
   stale, ignored `bench/results/nextjs-workflow.json` from Sep 24. It is
   report-only and predates this sprint.
+- **WU1 measured (`bb69e93`, isolated snapshot, leased).**
+  - The clone ran 230.5 s wall: 6,420 statements, 477,263 rows, V8 peak 776 MB
+    (baseline 988 MB).
+  - Wall time is noisy at load ~15, so the CDP profile is the authority. It
+    shows 194.5 s busy, against 204.2 s at `8bd064f`.
+  - Connectivity fell from 50.2 s to 0.09 s, and the promise projection join is
+    gone.
+  - The collector costs about 25 s on its own. It parses with `TreeParser`,
+    which decodes every name and mode as text, then converts each OID to hex
+    and back (`hexWord` 5.3 s, `toHex` 3.2 s, `isOid` 3.4 s, plus the
+    `TreeParser` push, take and decode work).
+  - → **WU1b** (added, S, after WU3, same territory): replace the collector's
+    tree parse with a byte scanner that reads the raw 20-byte OIDs into the
+    table's words. It decodes no names, does no hex round trip, and keeps the
+    mode and structure checks. Witness: the WU1 suites, plus a profile showing
+    the collector under 3 s.
+- **WU2 schema.** The fallback carries the byte offset of `edge_cursor` in a new
+  nullable `git_maintenance_objects.edge_offset`, the leader's remedy for
+  quadratic paging. A call keeps expanding an incomplete tree until its budget
+  ends, so a tree over the 2 MiB object-cache admission limit is read once per
+  call, not once per page. Statements are unchanged: `maintenance.mark-*` stays
+  at 10/8.
+

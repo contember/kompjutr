@@ -88,6 +88,10 @@ export const MAINTENANCE_SCHEMA_STATEMENTS = [
      edge_cursor INTEGER NOT NULL CHECK (
        edge_cursor BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
      ),
+     -- Byte offset of entry edge_cursor in a tree expanded from its object bytes.
+     edge_offset INTEGER CHECK (
+       edge_offset IS NULL OR edge_offset BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
      PRIMARY KEY (repo_id, run_id, oid),
      FOREIGN KEY (repo_id, run_id)
        REFERENCES git_maintenance_runs (repo_id, run_id) ON DELETE CASCADE

@@ -14,6 +14,7 @@ import {
 import { headerExpansion, treeExpansion } from "./reachability-expand.js";
 import { requireObjectInfo } from "./reachability-headers.js";
 import { publishExpansion } from "./reachability-publish.js";
+import { TreeObjectReads } from "./reachability-tree-object.js";
 
 function readRun(db: SqlDatabase, repoId: number): RunState {
   const run = readMaintenanceRunView(db, repoId);
@@ -54,7 +55,7 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
   let rows = 0;
   for (const row of db.iterate(
     `SELECT object.repo_id, object.run_id, object.oid, object.source_mask,
-            object.expanded, object.shallow_boundary, object.edge_cursor
+            object.expanded, object.shallow_boundary, object.edge_cursor, object.edge_offset
        FROM git_maintenance_objects object
       WHERE object.repo_id = ? AND object.run_id = ? AND object.expanded = 0
       ORDER BY object.oid COLLATE BINARY LIMIT 2`,
@@ -92,6 +93,15 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
         ),
         shallowBoundary,
         edgeCursor,
+        edgeOffset:
+          row.edge_offset === null
+            ? null
+            : expectSafeInteger(
+                row.edge_offset,
+                0,
+                Number.MAX_SAFE_INTEGER,
+                "maintenance edge offset",
+              ),
       };
     }
   }
@@ -143,10 +153,17 @@ interface MarkExpansion {
   run: RunState;
   processedOid: string;
   discoveredObjects: number;
+  /** The same tree at its next page, while its expansion is incomplete. */
+  continuation: QueueObject | null;
 }
 
-function expandNextMarkObject(store: SharedRepoStore, run: RunState): MarkExpansion | null {
-  const object = readNextObject(store.db, store.repoId, run.runId);
+function expandNextMarkObject(
+  store: SharedRepoStore,
+  run: RunState,
+  trees: TreeObjectReads,
+  continuation: QueueObject | null,
+): MarkExpansion | null {
+  const object = continuation ?? readNextObject(store.db, store.repoId, run.runId);
   if (object === null) return null;
   if (run.queuedObjects === 0) {
     throw new CorruptError("maintenance queued count omitted an unexpanded mark");
@@ -157,7 +174,7 @@ function expandNextMarkObject(store: SharedRepoStore, run: RunState): MarkExpans
   }
   const expansion: ObjectExpansion =
     info.type === "tree"
-      ? treeExpansion(store.db, store, object)
+      ? treeExpansion(store.db, store, object, info, trees)
       : headerExpansion(store, object, info);
   const published = publishExpansion(store.db, store, run, object, expansion);
   return {
@@ -168,6 +185,10 @@ function expandNextMarkObject(store: SharedRepoStore, run: RunState): MarkExpans
     },
     processedOid: object.oid,
     discoveredObjects: published.discoveredObjects,
+    continuation:
+      info.type === "tree" && !expansion.complete
+        ? { ...object, edgeCursor: expansion.nextCursor, edgeOffset: expansion.nextOffset }
+        : null,
   };
 }
 
@@ -191,8 +212,12 @@ function advanceMark(
     }
     let processedOid: string | null = null;
     let discoveredObjects = 0;
+    const trees = new TreeObjectReads();
+    // A paged tree keeps the budget until it completes; otherwise children that sort
+    // below it would push its next page into a later call and a fresh object read.
+    let continuation: QueueObject | null = null;
     for (let expansions = 0; expansions < expansionBudget; expansions++) {
-      const expansion = expandNextMarkObject(store, run);
+      const expansion = expandNextMarkObject(store, run, trees, continuation);
       if (expansion === null) {
         // A call that expanded leaves the settled transition to the next one, as one step does.
         if (expansions > 0) break;
@@ -207,6 +232,7 @@ function advanceMark(
       run = expansion.run;
       processedOid = expansion.processedOid;
       discoveredObjects += expansion.discoveredObjects;
+      continuation = expansion.continuation;
     }
     return {
       runId: run.runId,
