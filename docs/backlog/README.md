@@ -101,7 +101,8 @@ filed 110 (a bimodal sparse add peak), which is now closed: four allocation fixe
 keep the peak at or below 75.4 MiB in ten runs at `25d07ea`.
 
 The 2026-10-07 [full-history performance sprint](../archive/sprint-2026-10-07-full-history-performance.md)
-filed 116–118 from its findings.
+filed 116–118 from its findings; 118's attribution became
+[`../ideas/fast-fresh-clone.md`](../ideas/fast-fresh-clone.md).
 
 | Order | Items | Why |
 |---|---|---|
@@ -109,10 +110,9 @@ filed 116–118 from its findings.
 | 1 | [108](108-local-checkout-removes-missing-paths.md) | Tier A: local `reset --hard` fails with `ENOENT` when a tracked path is already gone. It blocks a common workflow. |
 | 2 | [109](109-keep-parent-directory-when-replacing-its-only-child.md) | Tier S, but narrow: only a directory's mode changes when its only child changes type. |
 | 3 | [107](107-bound-shared-integration-step-passes.md) | Cost: the shared integration step still makes full-tree passes for every rebase, merge, cherry-pick and revert step. |
-| 4 | [118](118-profile-the-remaining-full-history-clone.md) | Cost: attribute the remaining 197 s of the full-history clone before more optimization or native work. |
-| 5 | [106](106-reduce-the-workerd-clone-external-memory.md) | Memory: the workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it first, then decide whether a production probe is needed. |
-| 6 | [113](113-close-small-shell-parity-gaps.md), [111](111-bound-interpreter-cpu-and-regex-backtracking.md) | Shell: silent divergences first, then the CPU and regex bound, which needs a decision. |
-| 7 | [112](112-give-invoked-commands-stdin-and-their-own-name.md), [115](115-bulk-chmod-without-mtime.md), [114](114-share-one-uutils-argument-parser.md) | Shell: seam gaps, then cost, then deduplication. |
+| 4 | [106](106-reduce-the-workerd-clone-external-memory.md) | Memory: the workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it first, then decide whether a production probe is needed. |
+| 5 | [113](113-close-small-shell-parity-gaps.md), [111](111-bound-interpreter-cpu-and-regex-backtracking.md) | Shell: silent divergences first, then the CPU and regex bound, which needs a decision. |
+| 6 | [112](112-give-invoked-commands-stdin-and-their-own-name.md), [115](115-bulk-chmod-without-mtime.md), [114](114-share-one-uutils-argument-parser.md) | Shell: seam gaps, then cost, then deduplication. |
 
 ## Items
 
@@ -127,4 +127,3 @@ filed 116–118 from its findings.
 - [115 — Change modes in bulk without touching mtime](115-bulk-chmod-without-mtime.md)
 - [116 — Make `add -u` follow the index, not HEAD](116-add-update-follows-the-index.md)
 - [117 — Report a pending type change as `T` in status](117-report-type-changes-as-t.md)
-- [118 — Attribute the remaining full-history clone time](118-profile-the-remaining-full-history-clone.md)
