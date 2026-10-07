@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { concat } from "../packages/git/src/common/bytes.js";
@@ -15,12 +15,16 @@ import { maintenance } from "../packages/git/src/ops/repository/maintenance.js";
 import { statusBranch } from "../packages/git/src/ops/status/status.js";
 import { GC_GRACE_MS } from "../packages/git/src/store/maintenance/sweep.js";
 import { PackWriter } from "../packages/git/src/store/pack/writer.js";
-import { readConnectivityObjects } from "../packages/git/src/store/trees/connectivity.js";
+import {
+  CONNECTIVITY_FAILURES_SQL,
+  MAX_CONNECTIVITY_FAILURES,
+  readConnectivityFailures,
+} from "../packages/git/src/store/trees/connectivity.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { startGitServer, startStubServer } from "./helpers/http-backend.js";
 import { faultyRemote, nativeClone, publicationState } from "./helpers/network-integrity.js";
 import { reopenTestRepository } from "./helpers/repository-invariants.js";
-import { makeRepo, makeWorkspace } from "./helpers/workspace.js";
+import { makeRepo, makeWorkspace, type TestRepository } from "./helpers/workspace.js";
 
 const execFileAsync = promisify(execFile);
 const utf8 = (text: string): Uint8Array => new TextEncoder().encode(text);
@@ -163,6 +167,19 @@ describe("network integrity", () => {
   });
 });
 
+/** One validation's statement count, rows returned to JS, and OIDs handed to `objectInfo`. */
+function measureConnectivity(workspace: TestRepository, roots: string[]) {
+  const info = vi.spyOn(workspace.repo.store, "objectInfo");
+  workspace.storage.resetCounters();
+  workspace.repo.store.db.transactionSync(() =>
+    validateFetchedConnectivity(workspace.repo, roots, new Set()),
+  );
+  const cost = { statements: workspace.storage.statementCount, rows: workspace.storage.rowCount };
+  const exported = info.mock.calls.flatMap(([oids]) => oids);
+  info.mockRestore();
+  return { cost, exported };
+}
+
 describe("fetched graph connectivity", () => {
   it("expands shared historical trees once and matches native Git's reachable objects", async () => {
     const fixture = new GitFixture().init();
@@ -175,28 +192,72 @@ describe("fetched graph connectivity", () => {
         fixture.write("changing", `${index}\n`);
         fixture.commit(`change ${index}`);
       }
-      const { repo } = makeRepo("/work");
-      await repo.store.packs.ingest(slices(fixture.packAll(), 4096));
       const tip = fixture.git("rev-parse", "HEAD");
-      repo.store.db.transactionSync(() => validateFetchedConnectivity(repo, [tip], new Set()));
-      const objects = [
-        ...readConnectivityObjects(
-          repo.store.db,
-          repo.store.repoId,
-          [{ oid: tip, type: "commit" }],
-          [],
-        ),
-      ];
       const commits = new Set(fixture.git("rev-list", "HEAD").split("\n"));
-      const expected = fixture
-        .git("rev-list", "--objects", "HEAD")
-        .split("\n")
-        .map((line) => line.split(" ")[0])
-        .filter((oid) => oid !== undefined && !commits.has(oid));
-      expect(new Set(objects.map((object) => object.oid))).toEqual(new Set(expected));
-      const trees = objects.filter((object) => object.type === "tree");
-      expect(trees.length).toBe(new Set(trees.map((tree) => tree.oid)).size);
-      expect(objects.filter((object) => object.type === "blob")).toHaveLength(144);
+      const blobs = new Set(
+        fixture
+          .git("rev-list", "--objects", "--filter=blob:none", "--filter-print-omitted", "HEAD")
+          .split("\n")
+          .filter((line) => line.startsWith("~"))
+          .map((line) => line.slice(1)),
+      );
+      const withoutBlobs = execFileSync("git", ["pack-objects", "--stdout", "-q"], {
+        cwd: fixture.dir,
+        input: fixture
+          .git("rev-list", "--objects", "--filter=blob:none", "HEAD")
+          .split("\n")
+          .map((line) => `${line.split(" ")[0]}\n`)
+          .join(""),
+      });
+      const partial = makeRepo("/partial");
+      await partial.repo.store.packs.ingest(slices(new Uint8Array(withoutBlobs), 4096));
+      const missing = readConnectivityFailures(
+        partial.repo.store.db,
+        partial.repo.store.repoId,
+        [{ oid: tip, type: "commit" }],
+        [],
+        MAX_CONNECTIVITY_FAILURES,
+      );
+      expect(missing.every((failure) => failure.kind === "missing")).toBe(true);
+      expect(missing).toHaveLength(144);
+      expect(new Set(missing.map((failure) => failure.oid))).toEqual(blobs);
+
+      const sharedTree = fixture.git("rev-parse", "HEAD:shared");
+      const rootsOnly = execFileSync("git", ["pack-objects", "--stdout", "-q"], {
+        cwd: fixture.dir,
+        input: [...commits]
+          .map((oid) => `${oid}\n${fixture.git("rev-parse", `${oid}^{tree}`)}\n`)
+          .join(""),
+      });
+      const shallowTrees = makeRepo("/roots");
+      await shallowTrees.repo.store.packs.ingest(slices(new Uint8Array(rootsOnly), 4096));
+      const sourceless = readConnectivityFailures(
+        shallowTrees.repo.store.db,
+        shallowTrees.repo.store.repoId,
+        [{ oid: tip, type: "commit" }],
+        [],
+        MAX_CONNECTIVITY_FAILURES,
+      ).filter((failure) => failure.kind === "source");
+      expect(sourceless).toEqual([{ kind: "source", oid: sharedTree }]);
+
+      const complete = makeRepo("/work");
+      await complete.repo.store.packs.ingest(slices(fixture.packAll(), 4096));
+      const { cost, exported } = measureConnectivity(complete, [tip]);
+      expect(exported.filter((oid) => !commits.has(oid))).toEqual([]);
+      expect(cost.statements).toBeLessThanOrEqual(5);
+      expect(cost.rows).toBeLessThanOrEqual(591);
+      const plan = complete.repo.store.db
+        .all<{ detail: string }>(
+          `EXPLAIN QUERY PLAN ${CONNECTIVITY_FAILURES_SQL}`,
+          complete.repo.store.repoId,
+          JSON.stringify([{ oid: tip, type: "commit" }]),
+          "[]",
+          1,
+        )
+        .map((row) => row.detail);
+      expect(plan).toContain("USE TEMP B-TREE FOR DISTINCT");
+      expect(plan.some((detail) => detail.startsWith("SCAN entry"))).toBe(false);
+      expect(plan).toContain("SEARCH entry USING PRIMARY KEY (source_key=?)");
     } finally {
       fixture.dispose();
     }
@@ -253,23 +314,17 @@ describe("fetched graph connectivity", () => {
     fixture.commit("second");
     const second = fixture.git("rev-parse", "HEAD^{tree}");
     const shared = fixture.git("rev-parse", "HEAD:shared/file");
-    const { repo } = makeRepo("/work");
+    const workspace = makeRepo("/work");
+    const { repo } = workspace;
     try {
       await repo.store.packs.ingest(slices(fixture.packAll(), 4096));
-      const info = vi.spyOn(repo.store, "objectInfo");
-      const run = () =>
-        repo.store.db.transactionSync(() =>
-          validateFetchedConnectivity(repo, [first, second], new Set()),
-        );
-      run();
-      expect(
-        info.mock.calls.flatMap(([oids]) => oids).filter((oid) => oid === shared),
-      ).toHaveLength(1);
-      info.mockClear();
-      run();
-      expect(
-        info.mock.calls.flatMap(([oids]) => oids).filter((oid) => oid === shared),
-      ).toHaveLength(1);
+      const warm = measureConnectivity(workspace, [first, second]);
+      expect(warm.exported).not.toContain(shared);
+      expect(warm.cost.statements).toBeLessThanOrEqual(4);
+      expect(warm.cost.rows).toBeLessThanOrEqual(14);
+      const cold = measureConnectivity(workspace, [first, second]);
+      expect(cold.exported).not.toContain(shared);
+      expect(cold.cost).toEqual(warm.cost);
       for (const entry of repo.store.walkTree(second)) {
         expect(repo.store.read(entry.oid)?.data).toEqual(fixture.catFile(entry.oid));
       }
@@ -322,7 +377,8 @@ describe("fetched graph connectivity", () => {
   });
 
   it("expands each tree once even when shared roots exceed the former cache size", () => {
-    const { repo } = makeRepo("/work");
+    const workspace = makeRepo("/work");
+    const { repo } = workspace;
     const blob = repo.store.write("blob", utf8("shared"));
     const roots = Array.from({ length: 129 }, (_, index) =>
       repo.store.write(
@@ -336,13 +392,10 @@ describe("fetched graph connectivity", () => {
       "tree",
       serializeTree([{ mode: MODE_TREE, name: "revisit", oid: first }]),
     );
-    const info = vi.spyOn(repo.store, "objectInfo");
-    repo.store.db.transactionSync(() =>
-      validateFetchedConnectivity(repo, [...roots, revisit], new Set()),
-    );
-    expect(info.mock.calls.flatMap(([oids]) => oids).filter((oid) => oid === blob)).toHaveLength(
-      129,
-    );
+    const { cost, exported } = measureConnectivity(workspace, [...roots, revisit]);
+    expect(exported).not.toContain(blob);
+    expect(cost.statements).toBeLessThanOrEqual(4);
+    expect(cost.rows).toBeLessThanOrEqual(520);
   });
 
   it("allows promised missing blobs but never promised missing trees or commits", () => {
@@ -377,7 +430,8 @@ describe("fetched graph connectivity", () => {
   });
 
   it("deduplicates shared descendants beyond the former candidate cache size", () => {
-    const { repo } = makeRepo("/work");
+    const workspace = makeRepo("/work");
+    const { repo } = workspace;
     const blob = repo.store.write("blob", utf8("shared"));
     const children = Array.from({ length: 129 }, (_, index) => ({
       mode: MODE_TREE,
@@ -391,13 +445,10 @@ describe("fetched graph connectivity", () => {
     if (last === undefined) throw new Error("missing last child");
     const first = repo.store.write("tree", serializeTree(children));
     const second = repo.store.write("tree", serializeTree([last]));
-    const info = vi.spyOn(repo.store, "objectInfo");
-    repo.store.db.transactionSync(() =>
-      validateFetchedConnectivity(repo, [first, second], new Set()),
-    );
-    expect(info.mock.calls.flatMap(([oids]) => oids).filter((oid) => oid === blob)).toHaveLength(
-      129,
-    );
+    const { cost, exported } = measureConnectivity(workspace, [first, second]);
+    expect(exported).not.toContain(blob);
+    expect(cost.statements).toBeLessThanOrEqual(4);
+    expect(cost.rows).toBeLessThanOrEqual(394);
   });
 
   it("preserves durable blob promises on legacy and mapped fetch of an unmaterialized branch", async () => {

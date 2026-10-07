@@ -1,20 +1,13 @@
-import { CorruptError, GitError, hasErrorCode } from "../../common/errors.js";
+import { CorruptError, GitError, hasErrorCode, ObjectNotFoundError } from "../../common/errors.js";
 import type { ObjectType } from "../../common/objects.js";
-import { MAX_PROMISED_BLOB_LOOKUP_OIDS } from "../../store/fetch/promisor.js";
 import { MAX_BLOB_BATCH_OIDS } from "../../store/objects/objects.js";
 import { readCommitTreeRoots } from "../../store/trees/commits.js";
-import { readConnectivityObjects } from "../../store/trees/connectivity.js";
+import { readConnectivityFailures } from "../../store/trees/connectivity.js";
 import type { Repository } from "../repository/repository.js";
 import { parseAuthenticatedTag, TAG_PEEL_HOPS } from "./network-tags.js";
 
 const OBJECT_PAGE = 512;
-const METADATA_PAGE = Math.min(MAX_BLOB_BATCH_OIDS, MAX_PROMISED_BLOB_LOOKUP_OIDS);
 const TAG_BATCH_BYTES = 4 * 1024 * 1024;
-
-interface RequiredObject {
-  oid: string;
-  type: ObjectType;
-}
 
 /** The caller holds the publication transaction until all validated refs are written. */
 export function validateFetchedConnectivity(
@@ -23,29 +16,14 @@ export function validateFetchedConnectivity(
   boundary: ReadonlySet<string>,
 ): void {
   const shallow = [...boundary];
-  let required: RequiredObject[] = [];
-  const flush = (): void => {
-    const promises = new Set(
-      repo.store.promisedMissing(
-        required.filter((entry) => entry.type === "blob").map((entry) => entry.oid),
-      ),
-    );
-    const physical = required.filter((entry) => entry.type !== "blob" || !promises.has(entry.oid));
-    const types = new Map(
-      repo.store
-        .objectInfo(physical.map((entry) => entry.oid))
-        .map((entry) => [entry.oid, entry.type]),
-    );
-    for (const entry of physical) {
-      if (types.get(entry.oid) !== entry.type) {
-        throw new CorruptError(`fetched graph requires ${entry.oid} to be a ${entry.type}`);
+  let commits: string[] = [];
+  const flushCommits = (): void => {
+    for (const entry of repo.store.objectInfo(commits)) {
+      if (entry.type !== "commit") {
+        throw new CorruptError(`fetched graph requires ${entry.oid} to be a commit`);
       }
     }
-    required = [];
-  };
-  const require = (entry: RequiredObject): void => {
-    required.push(entry);
-    if (required.length === METADATA_PAGE) flush();
+    commits = [];
   };
   try {
     for (let start = 0; start < roots.length; start += OBJECT_PAGE) {
@@ -77,22 +55,33 @@ export function validateFetchedConnectivity(
               entry.oid,
               shallow,
             )) {
-              require({ oid: commit.oid, type: "commit" });
+              commits.push(commit.oid);
+              if (commits.length === MAX_BLOB_BATCH_OIDS) flushCommits();
             }
           }
           if (entry.type === "commit" || entry.type === "tree") {
             treeRoots.push({ oid: entry.oid, type: entry.type });
           }
         }
-        for (const object of readConnectivityObjects(
+        const [failure] = readConnectivityFailures(
           repo.store.db,
           repo.store.repoId,
           treeRoots,
           shallow,
-        )) {
-          require(object);
+          1,
+        );
+        // Failures rank globally and deterministically: sourceless tree, commits, missing,
+        // wrong type. The former code ranked per 4,096-entry flush; both reject the same graphs.
+        if (failure?.kind === "source") {
+          throw new CorruptError(`tree ${failure.oid} has no complete parsed source`);
         }
-        if (required.length > 0) flush();
+        if (commits.length > 0) flushCommits();
+        if (failure?.kind === "missing") throw new ObjectNotFoundError(failure.oid);
+        if (failure?.kind === "type") {
+          throw new CorruptError(
+            `fetched graph requires ${failure.oid} to be a ${failure.expected}`,
+          );
+        }
         frontier = [];
         let pending = tags;
         while (pending.length > 0) {
@@ -109,7 +98,6 @@ export function validateFetchedConnectivity(
         }
       }
     }
-    if (required.length > 0) flush();
   } catch (error) {
     if (hasErrorCode(error, "ENOTFOUND")) {
       throw new GitError("EFETCHFAIL", "fetched graph references a missing object", {

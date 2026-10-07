@@ -128,32 +128,37 @@ export class PromisorTable {
       if (this.#read(checkedName) === null) {
         throw new GitError("ENOREMOTE", `promisor remote ${checkedName} is not registered`);
       }
+      // Shared blobs repeat across tree edges; probe availability once per distinct OID.
       this.db.run(
-        `INSERT INTO git_promised_blobs (repo_id, oid, remote_name, type)
-         SELECT ?, entry.oid, ?, 'blob'
-           FROM git_pack_entries tree
-           JOIN git_tree_sources source
-             ON source.repo_id = tree.repo_id AND source.tree_oid = tree.oid
-           JOIN git_tree_entries entry ON entry.source_key = source.source_key
-          WHERE tree.repo_id = ? AND tree.pack_id = ? AND tree.type = 'tree'
-            AND source.complete = 1
-            AND entry.mode NOT IN ('40000', '040000', '160000')
-            AND NOT EXISTS (
+        `WITH candidates(oid) AS MATERIALIZED (
+           SELECT DISTINCT entry.oid
+             FROM git_pack_entries tree
+             JOIN git_tree_sources source
+               ON source.repo_id = tree.repo_id AND source.tree_oid = tree.oid
+             JOIN git_tree_entries entry ON entry.source_key = source.source_key
+            WHERE tree.repo_id = ? AND tree.pack_id = ? AND tree.type = 'tree'
+              AND source.complete = 1
+              AND entry.mode NOT IN ('40000', '040000', '160000')
+         )
+         INSERT INTO git_promised_blobs (repo_id, oid, remote_name, type)
+         SELECT ?, candidate.oid, ?, 'blob'
+           FROM candidates candidate
+          WHERE NOT EXISTS (
               SELECT 1 FROM git_objects loose
-               WHERE loose.repo_id = ? AND loose.oid = entry.oid
+               WHERE loose.repo_id = ? AND loose.oid = candidate.oid
             )
             AND NOT EXISTS (
               SELECT 1 FROM git_pack_objects packed
               JOIN git_pack_meta pack
                 ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
                AND pack.state = 'complete'
-               WHERE packed.repo_id = ? AND packed.oid = entry.oid
+               WHERE packed.repo_id = ? AND packed.oid = candidate.oid
             )
          ON CONFLICT(repo_id, oid) DO NOTHING`,
         this.repoId,
-        checkedName,
-        this.repoId,
         packId,
+        this.repoId,
+        checkedName,
         this.repoId,
         this.repoId,
       );

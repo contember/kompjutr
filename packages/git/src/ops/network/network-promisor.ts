@@ -1,7 +1,8 @@
-import { CorruptError, GitError, promisedObjectOids } from "../../common/errors.js";
+import { CorruptError, GitError, hasErrorCode, promisedObjectOids } from "../../common/errors.js";
 import { MAX_PROTOCOL_NEGOTIATION_ENTRIES, normalizeRemoteUrl } from "../../protocol/remote.js";
 import { throwIfAborted } from "../../protocol/stream.js";
-import type { PromisedBlob } from "../../store/index.js";
+import type { ObjectReadInfo, PromisedBlob } from "../../store/index.js";
+import { MAX_BLOB_BATCH_OIDS } from "../../store/objects/objects.js";
 import { matchesPaths } from "../checkout/checkout.js";
 import type { GitContext } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";
@@ -104,17 +105,30 @@ export async function hydratePromisedBlobs(
     if (transfer.shallow.length > 0 || transfer.unshallow.length > 0) {
       throw new CorruptError("promisor hydration received an unsolicited shallow response");
     }
-    const missing = repo.store.missing(wants);
-    if (missing.length > 0) {
+    requireHydratedBlobs(repo, wants, options.signal);
+  }
+}
+
+// A missing want outranks a wrong type, so every page is checked before the type failure.
+function requireHydratedBlobs(
+  repo: Repository,
+  wants: readonly string[],
+  signal: AbortSignal | undefined,
+): void {
+  let nonBlob: string | undefined;
+  for (let offset = 0; offset < wants.length; offset += MAX_BLOB_BATCH_OIDS) {
+    throwIfAborted(signal);
+    let page: ObjectReadInfo[];
+    try {
+      page = repo.store.objectInfo(wants.slice(offset, offset + MAX_BLOB_BATCH_OIDS));
+    } catch (error) {
+      if (!hasErrorCode(error, "ENOTFOUND")) throw error;
       throw new GitError("EFETCHFAIL", "promisor remote did not return every requested blob");
     }
-    for (const oid of wants) {
-      throwIfAborted(options.signal);
-      const metadata = repo.store.typeAndSize(oid);
-      if (metadata?.type !== "blob") {
-        throw new CorruptError(`promisor returned a non-blob object for ${oid}`);
-      }
-    }
+    nonBlob ??= page.find((entry) => entry.type !== "blob")?.oid;
+  }
+  if (nonBlob !== undefined) {
+    throw new CorruptError(`promisor returned a non-blob object for ${nonBlob}`);
   }
 }
 
