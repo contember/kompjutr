@@ -187,7 +187,8 @@ export class PackStore {
           for (const _oid of this.#db.iterate(
             `DELETE FROM git_promised_blobs
               WHERE repo_id = ? AND oid IN (
-                SELECT oid FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?
+                SELECT oid FROM git_pack_entries
+                 WHERE repo_id = ? AND pack_id = ? AND type = 'blob'
               )
               RETURNING oid`,
             this.#repoId,
