@@ -19,6 +19,7 @@ import {
 import { log, show } from "../packages/git/src/ops/repository/reads.js";
 import { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { SqliteGitDatabase, type StoreOptions } from "../packages/git/src/store/index.js";
+import { ChunkPool, PACK_CHUNK_BYTES } from "../packages/git/src/store/pack/chunks.js";
 import { applyDelta, encodeDeltaHeader } from "../packages/git/src/store/pack/delta.js";
 import {
   type FullObjectPackInput,
@@ -1966,6 +1967,62 @@ describe("pack deferred resolution", () => {
       type: "blob",
       size: large.length,
     });
+  });
+
+  it("keeps small deferred bases out of whole pack chunks", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const root = utf8.encode("root");
+    const rootOid = hashObject("blob", root);
+    const large = deterministicBytes(PACK_CHUNK_BYTES + 1);
+    const largeOid = hashObject("blob", large);
+    const leaves: { oid: string; data: Uint8Array }[] = [];
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2 * 200 + 3);
+    for (let index = 0; index < 200; index++) {
+      const middle = utf8.encode(`middle-${index}`);
+      const leaf = utf8.encode(`leaf-${index}`);
+      writer.refDelta(rootOid, literalDelta(root.length, middle));
+      writer.refDelta(hashObject("blob", middle), literalDelta(middle.length, leaf));
+      leaves.push({ oid: hashObject("blob", leaf), data: leaf });
+    }
+    const largeLeaf = utf8.encode("large-leaf");
+    writer.refDelta(rootOid, literalDelta(root.length, large));
+    writer.refDelta(largeOid, literalDelta(large.length, largeLeaf));
+    writer.object("blob", root);
+    writer.finish();
+
+    let checkedOut = 0;
+    let peak = 0;
+    const acquire = ChunkPool.prototype.acquire;
+    const release = ChunkPool.prototype.release;
+    const acquired = vi.spyOn(ChunkPool.prototype, "acquire").mockImplementation(function (
+      this: ChunkPool,
+    ) {
+      const chunk = acquire.call(this);
+      peak = Math.max(peak, ++checkedOut);
+      return chunk;
+    });
+    const released = vi.spyOn(ChunkPool.prototype, "release").mockImplementation(function (
+      this: ChunkPool,
+      chunk: Uint8Array,
+    ) {
+      release.call(this, chunk);
+      checkedOut--;
+    });
+    try {
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    } finally {
+      acquired.mockRestore();
+      released.mockRestore();
+    }
+
+    // 200 retained bases of a few bytes each once pinned 200 chunks.
+    expect(peak).toBeLessThan(16);
+    for (const leaf of leaves) expect(store.read(leaf.oid)?.data).toEqual(leaf.data);
+    expect(store.read(hashObject("blob", largeLeaf))?.data).toEqual(largeLeaf);
   });
 
   it("resolves 999 child-before-base deltas in bounded statements", async () => {

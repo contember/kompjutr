@@ -6,7 +6,7 @@ import { isOid } from "../../../common/bytes.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import type { ByteLru } from "../../../common/lru.js";
 import type { ObjectType, RawObject } from "../../../common/objects.js";
-import type { ChunkedBytes } from "../chunks.js";
+import { type ChunkedBytes, PACK_CHUNK_BYTES } from "../chunks.js";
 import {
   PACK_PENDING_PAGE_ROWS,
   type PackCommitIndex,
@@ -273,18 +273,30 @@ export class PackPendingResolver {
               if (children.length > 0) {
                 remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + children.length);
               }
+              let retainedBase = false;
               if (children.length > 0 && !bases.has(oid)) {
                 const nextBaseBytes = retainedBaseBytes + target.length;
                 if (
                   Number.isSafeInteger(nextBaseBytes) &&
                   (retainedBaseBytes === 0 || nextBaseBytes <= PACK_BLOB_BATCH_TARGET_BYTES)
                 ) {
-                  bases.set(oid, { type: base.type, source: target, owned: target });
+                  // The budget counts length, but a chunked base holds whole chunks:
+                  // a 900-byte tree would pin 64 KiB. Keep small bases as exact copies.
+                  if (target.length < PACK_CHUNK_BYTES) {
+                    bases.set(oid, {
+                      type: base.type,
+                      source: new FlatByteSource(target.toUint8Array()),
+                      owned: null,
+                    });
+                  } else {
+                    bases.set(oid, { type: base.type, source: target, owned: target });
+                    retainedTarget = true;
+                  }
                   retainedBaseBytes = nextBaseBytes;
-                  retainedTarget = true;
+                  retainedBase = true;
                 }
               }
-              if (retainedTarget) {
+              if (retainedBase) {
                 for (const child of children) enqueue(child, oid, row.offset);
               }
               if (target.length <= this.cacheEntryLimit) {
