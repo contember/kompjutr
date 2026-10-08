@@ -70,7 +70,7 @@ describe("pack prefix selection", () => {
           expect(
             zlib.inflatePrefix(compressed.subarray(0, 1024 * 1024 - 16), data.length),
           ).toBeNull();
-        const prefix = vi.spyOn(zlib, "inflatePrefix");
+        const prefix = vi.spyOn(zlib.PrefixInflater.prototype, "inflate");
         const exact = vi.spyOn(zlib.InflateInto.prototype, "push");
         const { store, cold } = open(db);
         await store.packs.ingest(slices(pack, 65536));
@@ -113,7 +113,7 @@ describe("pack prefix selection", () => {
     const db = new TestDatabase();
     try {
       nativeIndex(repo, pack);
-      const prefix = vi.spyOn(zlib, "inflatePrefix");
+      const prefix = vi.spyOn(zlib.PrefixInflater.prototype, "inflate");
       const exact = vi.spyOn(zlib.InflateInto.prototype, "push");
       const { store, cold } = open(db);
       await store.packs.ingest(slices(pack, 64));

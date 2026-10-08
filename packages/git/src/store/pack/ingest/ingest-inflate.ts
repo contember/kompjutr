@@ -5,7 +5,7 @@ import { toHex } from "../../../common/bytes.js";
 import { CorruptError } from "../../../common/errors.js";
 import { type ObjectType, objectHeader } from "../../../common/objects.js";
 import { Sha1 } from "../../../common/sha1.js";
-import { InflateInto, InflateStream, inflatePrefix } from "../../../common/zlib.js";
+import { InflateInto, InflateStream, PrefixInflater } from "../../../common/zlib.js";
 import { type ByteSource, type ChunkedBytes, type ChunkPool, chunkFootprint } from "../chunks.js";
 import { DeltaApplier } from "../delta.js";
 import type { PackReadEngine } from "../read.js";
@@ -27,6 +27,8 @@ export interface InflatedPackEntry {
 }
 
 export class PackIngestInflater {
+  readonly #prefix = new PrefixInflater();
+
   constructor(
     private readonly read: PackReadEngine,
     private readonly maxBufferedEntry: number,
@@ -162,7 +164,7 @@ export class PackIngestInflater {
     const input = compressed ?? this.read.readRaw(packId, dataOff, dataLen);
     let inflated: { data: Uint8Array; consumed: number } | null;
     try {
-      inflated = inflatePrefix(input, instructionSize);
+      inflated = this.#prefix.inflate(input, instructionSize);
     } catch (error) {
       throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });
     }
@@ -236,7 +238,7 @@ export class PackIngestInflater {
       if (window.length === 0) throw new CorruptError(`truncated pack entry at ${dataOff}`);
       let exact: { data: Uint8Array; consumed: number } | null;
       try {
-        exact = window.length >= entrySize ? inflatePrefix(window, entrySize) : null;
+        exact = window.length >= entrySize ? this.#prefix.inflate(window, entrySize) : null;
       } catch (error) {
         throw new CorruptError(`invalid pack entry at ${dataOff}`, { cause: error });
       }

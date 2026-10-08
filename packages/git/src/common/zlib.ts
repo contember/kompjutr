@@ -9,6 +9,8 @@
 import * as zlib from "node:zlib";
 
 import pako from "pako";
+import { inflateInit2, inflateReset, inflate as inflateZStream } from "pako/lib/zlib/inflate.js";
+import ZStream from "pako/lib/zlib/zstream.js";
 
 /** Output chunk for the streaming inflater. See the note in InflateStream. */
 const INFLATE_CHUNK = 16 * 1024;
@@ -112,6 +114,54 @@ export function inflatePrefix(
 }
 
 export class InflateSizeError extends Error {}
+
+const Z_OK = 0;
+const Z_STREAM_END = 1;
+const Z_BUF_ERROR = -5;
+const Z_FINISH = 4;
+
+/**
+ * `inflatePrefix` for many small streams in a row, through one reused
+ * decoder. workerd serves `inflatePrefix`'s `info` through a stream object
+ * whose native zlib state lives until a major GC: a pack's first pass piled
+ * up gigabytes of external memory that way, and paid the setup per entry.
+ */
+export class PrefixInflater {
+  readonly #strm = new ZStream();
+
+  constructor() {
+    if (inflateInit2(this.#strm, 15) !== Z_OK) throw new Error("inflate init failed");
+  }
+
+  inflate(
+    input: Uint8Array,
+    maxOutputLength: number,
+  ): { data: Uint8Array; consumed: number } | null {
+    const strm = this.#strm;
+    if (inflateReset(strm) !== Z_OK) throw new Error("inflate reset failed");
+    // One spare byte tells output above the limit apart from output that
+    // fills it exactly.
+    const output = new Uint8Array(maxOutputLength + 1);
+    strm.input = input;
+    strm.next_in = 0;
+    strm.avail_in = input.length;
+    strm.output = output;
+    strm.next_out = 0;
+    strm.avail_out = output.length;
+    const status = inflateZStream(strm, Z_FINISH);
+    const { next_in: consumed, next_out: produced, avail_in: unread } = strm;
+    strm.input = null;
+    strm.output = null;
+    if (status === Z_STREAM_END && produced <= maxOutputLength) {
+      return { data: output.subarray(0, produced), consumed };
+    }
+    if (status === Z_STREAM_END || (status === Z_BUF_ERROR && produced > maxOutputLength)) {
+      throw new InflateSizeError("inflate exceeded its expected size");
+    }
+    if (status === Z_BUF_ERROR && unread === 0) return null;
+    throw new Error(`inflate failed: ${strm.msg}`);
+  }
+}
 
 /** Incremental inflate directly into one caller-sized output allocation. */
 export class InflateInto {
