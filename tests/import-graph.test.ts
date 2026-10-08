@@ -262,6 +262,7 @@ function edgeViolations(
     const allowed =
       file.packageName === "local" ||
       (file.id === "git/src/common/zlib.ts" && specifier === "node:zlib") ||
+      (file.id === "git/src/common/sha1.ts" && specifier === "node:crypto") ||
       (file.id === "do/src/fs/compat/node-path.ts" && specifier === "node:buffer");
     if (!allowed) reasons.push("Node builtin is not Worker-safe");
   }

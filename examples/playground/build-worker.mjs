@@ -10,7 +10,7 @@ export async function buildWorker() {
     format: "esm",
     platform: "neutral",
     target: "es2023",
-    external: ["node:buffer", "node:zlib"],
+    external: ["node:buffer", "node:crypto", "node:zlib"],
     tsconfig: fileURLToPath(new URL("../../tsconfig.json", import.meta.url)),
     sourcemap: true,
   });
