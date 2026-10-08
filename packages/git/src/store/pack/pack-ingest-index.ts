@@ -72,8 +72,8 @@ export function validatePendingRow(row: PendingRow): void {
   }
 }
 
-const PACK_JSON_ENCODER = new TextEncoder();
-
+// Batch rows hold only hex OIDs, integers, type names and null, so their JSON
+// is ASCII and its string length is its byte length.
 export class PackObjectBatch {
   readonly #rows: string[] = [];
   #bytes = 2;
@@ -87,7 +87,7 @@ export class PackObjectBatch {
   add(row: PackObjectInput): void {
     this.onAdd?.(row);
     const json = JSON.stringify(row);
-    const bytes = PACK_JSON_ENCODER.encode(json).length;
+    const bytes = json.length;
     if (
       this.#rows.length > 0 &&
       (this.#rows.length >= PACK_INDEX_BATCH_ROWS ||
@@ -147,7 +147,7 @@ export class PackPendingBatch {
 
   add(row: PendingInput): void {
     const json = JSON.stringify(row);
-    const bytes = PACK_JSON_ENCODER.encode(json).length;
+    const bytes = json.length;
     if (
       this.#rows.length > 0 &&
       (this.#rows.length >= PACK_INDEX_BATCH_ROWS ||
