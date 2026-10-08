@@ -50,13 +50,15 @@ export const OBJECT_SCHEMA_STATEMENTS = [
   // are then read from the object.
   COMMIT_TABLE,
 
+  // A rowid table: staged rows carry whole messages, and keying those wide rows
+  // by OID made each insert split pages of a WITHOUT ROWID B-tree.
   `CREATE TABLE IF NOT EXISTS git_pack_commit_staging (
      ${COMMIT_COLUMNS},
      pack_id INTEGER NOT NULL CHECK (pack_id >= 0),
      PRIMARY KEY (repo_id, pack_id, oid),
      FOREIGN KEY (repo_id, pack_id)
        REFERENCES git_pack_meta (repo_id, pack_id) ON DELETE CASCADE
-   ) STRICT, WITHOUT ROWID`,
+   ) STRICT`,
 
   `CREATE TABLE IF NOT EXISTS git_object_chunks (
      repo_id INTEGER NOT NULL,
