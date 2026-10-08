@@ -44,16 +44,58 @@ measurement says whether the clone fits the production isolate.
     (`PrefixInflater`, `2768f53`). The full-history clone's peak V8 used +
     external fell from 731 MB to 376–549 MB. The depth-1 peak is 247–304 MB.
 - **Remaining.** The read path (`read-data.ts`, `inflatePrefix`) still uses
-  `info`, and about 90 MB of non-ArrayBuffer external memory remains during
-  hydration and checkout. Its tests require a native decoder that consumes
-  the whole input, so changing it is a contract decision.
+  `info`. Its tests require a native decoder that consumes the whole input,
+  so changing it is a contract decision. The live-set probe below finds no
+  retained non-ArrayBuffer external memory, so this is garbage, not live.
+
+## Live set (heap probe, `25d6c6e`)
+
+The gate's peak adds heap used *before* a GC, so it counts garbage. A probe
+measured the live set instead.
+
+- **Method.** A scratch copy of the bench worker forces three `gc()` calls
+  every N SQL statements and logs a marker. The GC trace after the third call
+  gives live used + external. One `gc()` is not enough: it leaves ArrayBuffers
+  that wait for concurrent sweeping in the backing-store counter. At one
+  depth-1 point, one call reported 54 MiB and three calls 22 MiB. A heap
+  snapshot at the same point found 23.6 MiB.
+- **Snapshots.** workerd dispatches CDP only while the isolate is idle, and
+  `HeapProfiler.collectGarbage` never answers. A `debugger;` statement before
+  chosen statements pauses the isolate, and the harness takes the snapshot
+  from the paused loop.
+
+| Clone | Live peak, MiB | Where | Rest of the clone, MiB |
+| --- | ---: | --- | ---: |
+| depth 1 (GC every statement) | 28.3 | checkout `fs_chunks` writes | 20–28 |
+| full history `blob:none` (GC every 2 statements) | 99.4 | delta resolution, statements ~750–1200 | 21–51 |
+
+Owners at the full-history peak (snapshot at statement 896, 100.5 MiB):
+
+| Owner | Retained, MiB |
+| --- | ---: |
+| `ChunkPool.#free` (pack ingest) | 46.9 |
+| `PackReferenceCollector.#keys` | 20.0 |
+| `ByteLru` (object and pack-row caches) | 14.4 |
+| Worker bundle source string | 4.1 |
+| `ExpectedPackMembership`, `PackDeltaDepths` | 4.2 |
+
+- **Fixed: chunk footprint of retained delta bases.** Delta resolution
+  budgets retained bases by logical length (`PACK_BLOB_BATCH_TARGET_BYTES`,
+  4 MiB), but a chunked base holds whole 64 KiB chunks. At the chunk
+  high-water mark, 863 small bases held 1.5 MiB of data in 54 MiB of chunks.
+  `ChunkPool` keeps its free list until `dispose()`, so the mark stayed live.
+  Bases below one chunk are now kept as exact copies. The chunk high-water
+  mark fell from 54 to 1.9 MiB, and the full-history live peak fell from 99.4
+  to 55.0 MiB. Statements are unchanged.
+- The probe is a lower bound between markers. Memory that lives only inside
+  one statement-free stretch is not sampled.
 
 ## Approach / acceptance
 
-1. Attribute the ArrayBuffer owners per phase before changing code: pack ingest,
-   delta resolution, and checkout. The GC trace shows totals only; a phase marker
-   or a heap snapshot at the peak names the owners.
-2. Reduce the owners that the attribution names.
+1. ~~Attribute the owners per phase.~~ Done for the live set; see above.
+2. Reduce the owners that the attribution names. The chunk footprint is
+   fixed; `PackReferenceCollector` power-of-two growth (about 6 MiB) and the
+   cache budgets (a CPU and SQL tradeoff) remain.
 3. Decide whether a production Durable Object probe is needed to answer the
    128 MB question. Local workerd has no isolate limiter.
 
