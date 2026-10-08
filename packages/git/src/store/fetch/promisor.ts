@@ -149,7 +149,9 @@ export class PromisorTable {
        ON CONFLICT(repo_id, oid) DO NOTHING`,
       this.repoId,
       requireRemoteName(remoteName),
-      JSON.stringify(oids),
+      // Sorted input keeps consecutive inserts and probes on the same B-tree
+      // pages. Lowercase hex sorts identically as UTF-16 and as bytes.
+      JSON.stringify(oids.toSorted()),
       this.repoId,
       this.repoId,
     );
