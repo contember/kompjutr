@@ -15,6 +15,9 @@ decided work or status.
 - [`local-git-compatible-binary.md`](local-git-compatible-binary.md)
   — wrap the local argv runner as a Git-compatible command, discover SQLite
   through `.git`, support linked-worktree pointers, and import existing repos.
+- [`one-oid-index-for-pack-objects.md`](one-oid-index-for-pack-objects.md) — keep
+  one random-OID B-tree per ingested object instead of two; about 45 % of the
+  largest SQL cost of a full-history clone.
 - [`offload-large-objects-to-r2.md`](offload-large-objects-to-r2.md) — keep
   objects above the materialisation ceiling in R2 keyed by OID instead of
   refusing them at `add` and ingest.

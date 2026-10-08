@@ -6,21 +6,21 @@ blocked-by: []
 
 # 119 — Slice the clone under the Durable Object request CPU limit
 
-**Summary.** A full-history clone still needs about 74 s of CPU in one request.
+**Summary.** A full-history clone still needs about 47 s of CPU in one request.
 A Durable Object request has a 30 s CPU limit by default. Effort: L.
 
 ## Problem
 
 `clone()` ingests, publishes, hydrates and checks out in one call. The
-reference full-history `blob:none` clone of Next.js v15.5.2 is busy for 73.8 s
-at `1347704`:
+reference full-history `blob:none` clone of Next.js v15.5.2 is busy for 47.4 s
+at `2768f53` (CDP profile, `cpu-lease run -n 2 --no-smt`):
 
-| Phase | CPU |
+| Phase | Busy CPU |
 |---|---:|
-| Metadata first pass | 16.5 s |
-| Deferred deltas | 26.3 s |
-| Hydration | ~15 s |
-| Checkout | 4.3 s |
+| Metadata receive and first pass | 12.4 s |
+| Deferred deltas | 16.1 s |
+| Hydration (candidate scan, blob receive and indexing) | 10.2 s |
+| Checkout | 3.8 s |
 
 Each phase alone fits under the limit; their sum does not. Pending-pack
 ingest already survives interruption, but no caller resumes it. A restarted

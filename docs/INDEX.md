@@ -37,8 +37,9 @@ None.
 - [Fast fresh clone](archive/sprint-2026-10-07-fast-fresh-clone.md) shipped:
   per-pack connectivity at ingest (ADR-0029) and trees projected on demand
   (ADR-0030). Next.js full-history clone 179.5 s → 74.5 s, database
-  1.28 GB → 472 MB, one-commit incremental fetch 28 s → 3.2 s. Next: backlog
-  119 (slice the clone under the request CPU limit) and 120.
+  1.28 GB → 472 MB, one-commit incremental fetch 28 s → 3.2 s. A follow-up
+  pass closed backlog 120: 52.8–53.0 s and a full-history V8 peak of
+  376–549 MB. Next: backlog 119 (slice the clone under the request CPU limit).
 - [Full-history performance](archive/sprint-2026-10-07-full-history-performance.md)
   shipped: Next.js full-history clone 428.8 s → 197.0 s (native git 17–19 s),
   −80 % statements; tracker-driven `git add`. Next: the

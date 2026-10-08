@@ -33,6 +33,21 @@ SQLite page cache of the database file.
 The harness gates this number only as a regression limit at today's level. No
 measurement says whether the clone fits the production isolate.
 
+## Attributed so far
+
+- **Native zlib state from `inflateSync({ info: true })`.** workerd serves the
+  `info` path through a stream object whose native zlib state is freed only by
+  a major GC, and reports that state as external memory.
+  - A workerd microbenchmark of 200k 300-byte streams left 1.8 GB external
+    after GC. The same calls without `info` left 1.8 MB.
+  - Pack ingest now decodes through one reused decoder
+    (`PrefixInflater`, `2768f53`). The full-history clone's peak V8 used +
+    external fell from 731 MB to 376–549 MB. The depth-1 peak is 247–304 MB.
+- **Remaining.** The read path (`read-data.ts`, `inflatePrefix`) still uses
+  `info`, and about 90 MB of non-ArrayBuffer external memory remains during
+  hydration and checkout. Its tests require a native decoder that consumes
+  the whole input, so changing it is a contract decision.
+
 ## Approach / acceptance
 
 1. Attribute the ArrayBuffer owners per phase before changing code: pack ingest,

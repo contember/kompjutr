@@ -103,13 +103,15 @@ keep the peak at or below 75.4 MiB in ten runs at `25d07ea`.
 The 2026-10-07 [full-history performance sprint](../archive/sprint-2026-10-07-full-history-performance.md)
 filed 116–118 from its findings; 118's attribution became the
 [fast fresh clone sprint](../archive/sprint-2026-10-07-fast-fresh-clone.md),
-which filed 119–122.
+which filed 119–122. A follow-up pass shipped 120: the clone fell to
+52.8–53.0 s, and the next lever is the idea
+[`one-oid-index-for-pack-objects.md`](../ideas/one-oid-index-for-pack-objects.md).
 
 | Order | Items | Why |
 |---|---|---|
 | 0 | [116](116-add-update-follows-the-index.md), [117](117-report-type-changes-as-t.md) | Tier S: `add -u` ignores index-only paths; status shows a type change as `M`. |
-| 0 | [119](119-slice-the-clone-under-the-request-cpu-limit.md) | Production blocker: a full-history clone needs ~74 s of CPU in one request; a Durable Object request allows 30 s. |
-| 1 | [120](120-cut-the-remaining-full-history-clone-cpu.md), [121](121-prune-the-parent-closure-walk-in-incremental-fetch.md) | Cost: the clone is 74.5 s against ≤ 60 s; an incremental fetch walks its parent's whole tree. |
+| 0 | [119](119-slice-the-clone-under-the-request-cpu-limit.md) | Production blocker: a full-history clone needs ~47 s of CPU in one request; a Durable Object request allows 30 s. |
+| 1 | [121](121-prune-the-parent-closure-walk-in-incremental-fetch.md) | Cost: an incremental fetch walks its parent's whole tree. |
 | 1 | [108](108-local-checkout-removes-missing-paths.md) | Tier A: local `reset --hard` fails with `ENOENT` when a tracked path is already gone. It blocks a common workflow. |
 | 2 | [109](109-keep-parent-directory-when-replacing-its-only-child.md) | Tier S, but narrow: only a directory's mode changes when its only child changes type. |
 | 3 | [107](107-bound-shared-integration-step-passes.md) | Cost: the shared integration step still makes full-tree passes for every rebase, merge, cherry-pick and revert step. |
@@ -131,6 +133,5 @@ which filed 119–122.
 - [116 — Make `add -u` follow the index, not HEAD](116-add-update-follows-the-index.md)
 - [117 — Report a pending type change as `T` in status](117-report-type-changes-as-t.md)
 - [119 — Slice the clone under the Durable Object request CPU limit](119-slice-the-clone-under-the-request-cpu-limit.md)
-- [120 — Cut the remaining full-history clone CPU](120-cut-the-remaining-full-history-clone-cpu.md)
 - [121 — Prune the parent closure walk in incremental fetch connectivity](121-prune-the-parent-closure-walk-in-incremental-fetch.md)
 - [122 — Stop the workerd bench RSS reset flake](122-stop-the-workerd-bench-rss-reset-flake.md)
