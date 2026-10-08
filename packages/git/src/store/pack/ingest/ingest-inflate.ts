@@ -33,12 +33,16 @@ export class PackIngestInflater {
     private readonly cacheEntryLimit: number,
   ) {}
   applyDeltaBytes(base: Uint8Array, delta: Uint8Array, pool: ChunkPool): ChunkedBytes {
+    return this.#applyBufferedDelta(new FlatByteSource(base), delta, pool);
+  }
+
+  #applyBufferedDelta(base: ByteSource, delta: Uint8Array, pool: ChunkPool): ChunkedBytes {
     const probe = new DeltaHeaderProbe();
     probe.update(delta);
     const header = probe.finish();
     if (header.sourceSize !== base.length) throw new CorruptError("delta base size mismatch");
     this.#validatePoolTarget(base.length, header.targetSize);
-    const applier = new DeltaApplier(new FlatByteSource(base), pool, {
+    const applier = new DeltaApplier(base, pool, {
       expectedTargetSize: header.targetSize,
       maxWorkingBytes: MAX_PACK_DELTA_WORKING_BYTES,
       maxInstructionBytes: MAX_PACK_DELTA_WORKING_BYTES,
@@ -76,6 +80,15 @@ export class PackIngestInflater {
     ) {
       throw new CorruptError(`${label} exceeds the bounded working set`);
     }
+    const instructions = this.#inflateBufferedDelta(
+      packId,
+      dataOff,
+      dataLen,
+      instructionSize,
+      label,
+      compressed,
+    );
+    if (instructions !== null) return this.#applyBufferedDelta(base, instructions, pool);
     const header = this.#probeStoredDeltaHeader(packId, dataOff, dataLen, label, compressed);
     if (header.sourceSize !== base.length) throw new CorruptError("delta base size mismatch");
     const targetSize = header.targetSize;
@@ -127,6 +140,40 @@ export class PackIngestInflater {
       applier.abort();
       throw error;
     }
+  }
+
+  /**
+   * One native inflate of the whole instruction stream. pako streams only
+   * instructions too large to buffer, where it also had to probe the header
+   * in a separate pass before the applier could be sized.
+   */
+  #inflateBufferedDelta(
+    packId: number,
+    dataOff: number,
+    dataLen: number,
+    instructionSize: number,
+    label: string,
+    compressed: Uint8Array | null,
+  ): Uint8Array | null {
+    if (instructionSize > this.maxBufferedEntry || dataLen > PACK_READ_BYTES) return null;
+    if (compressed !== null && compressed.length !== dataLen) {
+      throw new CorruptError(`${label} compressed range has the wrong size`);
+    }
+    const input = compressed ?? this.read.readRaw(packId, dataOff, dataLen);
+    let inflated: { data: Uint8Array; consumed: number } | null;
+    try {
+      inflated = inflatePrefix(input, instructionSize);
+    } catch (error) {
+      throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });
+    }
+    if (
+      inflated === null ||
+      inflated.consumed !== dataLen ||
+      inflated.data.length !== instructionSize
+    ) {
+      throw new CorruptError(`${label} size does not match its index metadata`);
+    }
+    return inflated.data;
   }
 
   #probeStoredDeltaHeader(
