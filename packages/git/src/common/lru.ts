@@ -4,8 +4,21 @@
  */
 const MIN_ENTRY_BYTES = 256;
 
+interface LruNode<K, V> {
+  readonly key: K;
+  value: V;
+  bytes: number;
+  older: LruNode<K, V> | null;
+  newer: LruNode<K, V> | null;
+}
+
+// Recency lives in an explicit list. Evicting from the front of an
+// insertion-ordered Map leaves deleted slots that every later
+// `keys().next()` scans past, which made eviction dominate pack ingest.
 export class ByteLru<K, V> {
-  readonly #entries = new Map<K, V>();
+  readonly #entries = new Map<K, LruNode<K, V>>();
+  #oldest: LruNode<K, V> | null = null;
+  #newest: LruNode<K, V> | null = null;
   readonly #sizeOf: (value: V) => number;
   #budget: number;
   #bytes = 0;
@@ -31,12 +44,11 @@ export class ByteLru<K, V> {
   }
 
   get(key: K): V | undefined {
-    const hit = this.#entries.get(key);
-    if (hit === undefined) return undefined;
-    // Re-insert so the most recently used entry sits last.
-    this.#entries.delete(key);
-    this.#entries.set(key, hit);
-    return hit;
+    const node = this.#entries.get(key);
+    if (node === undefined) return undefined;
+    this.#unlink(node);
+    this.#append(node);
+    return node.value;
   }
 
   has(key: K): boolean {
@@ -48,36 +60,52 @@ export class ByteLru<K, V> {
     // A single entry may never take more than a quarter of the budget,
     // otherwise one large object evicts everything else.
     if (size > this.#budget / 4) return;
-    const existing = this.#entries.get(key);
-    if (existing !== undefined) {
-      this.#bytes -= this.#entryBytes(existing);
-      this.#entries.delete(key);
-    }
-    this.#entries.set(key, value);
+    this.delete(key);
+    const node: LruNode<K, V> = { key, value, bytes: size, older: null, newer: null };
+    this.#entries.set(key, node);
+    this.#append(node);
     this.#bytes += size;
     this.#evict();
   }
 
   delete(key: K): void {
-    const existing = this.#entries.get(key);
-    if (existing === undefined) return;
-    this.#bytes -= this.#entryBytes(existing);
-    this.#entries.delete(key);
+    const node = this.#entries.get(key);
+    if (node === undefined) return;
+    this.#remove(node);
   }
 
   clear(): void {
     this.#entries.clear();
+    this.#oldest = null;
+    this.#newest = null;
     this.#bytes = 0;
   }
 
   #evict(): void {
-    while (this.#bytes > this.#budget) {
-      const oldest = this.#entries.keys().next();
-      if (oldest.done === true) return;
-      const value = this.#entries.get(oldest.value)!;
-      this.#bytes -= this.#entryBytes(value);
-      this.#entries.delete(oldest.value);
-    }
+    while (this.#bytes > this.#budget && this.#oldest !== null) this.#remove(this.#oldest);
+  }
+
+  #remove(node: LruNode<K, V>): void {
+    this.#unlink(node);
+    this.#entries.delete(node.key);
+    this.#bytes -= node.bytes;
+  }
+
+  #append(node: LruNode<K, V>): void {
+    node.older = this.#newest;
+    node.newer = null;
+    if (this.#newest === null) this.#oldest = node;
+    else this.#newest.newer = node;
+    this.#newest = node;
+  }
+
+  #unlink(node: LruNode<K, V>): void {
+    if (node.older === null) this.#oldest = node.newer;
+    else node.older.newer = node.newer;
+    if (node.newer === null) this.#newest = node.older;
+    else node.newer.older = node.older;
+    node.older = null;
+    node.newer = null;
   }
 
   #entryBytes(value: V): number {
