@@ -375,9 +375,12 @@ const SELECTED_EXACT_INDEX_SQL =
 const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
   {
     operation: "git.clone",
-    statements: 898,
-    rowsRead: 145_777,
+    statements: 931,
+    rowsRead: 111_475,
     source:
+      "2026-10-07 fast fresh clone sprint, bisected: the sprint fell to 849 statements and 78,224 rows " +
+      "at c7caa2e, then 1347704 moved tree projection from pack ingest to the first walk, so the " +
+      "checkout projects the root's closure (+82 statements, +33,251 rows, ADR-0030). " +
       "2026-09-28 memory and cost sprint: initial-write metadata flushes at 256 KiB (-114 statements). " +
       "2026-09-24 simplification sprint: self-contained packs and one tree projection per OID " +
       "(-17 statements, -18,508 rows). 2026-09-23 HEAD: commit promotion stopped recounting staged rows (-2 statements, " +
