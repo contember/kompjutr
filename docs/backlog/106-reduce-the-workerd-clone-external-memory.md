@@ -53,16 +53,16 @@ measurement says whether the clone fits the production isolate.
 The gate's peak adds heap used *before* a GC, so it counts garbage. A probe
 measured the live set instead.
 
-- **Method.** A scratch copy of the bench worker forces three `gc()` calls
-  every N SQL statements and logs a marker. The GC trace after the third call
+- **Method.** `bench:workerd:nextjs -- --live-set` forces three `gc()` calls
+  every N SQL statements and logs a marker (ADR-0026). The GC trace after the third call
   gives live used + external. One `gc()` is not enough: it leaves ArrayBuffers
   that wait for concurrent sweeping in the backing-store counter. At one
   depth-1 point, one call reported 54 MiB and three calls 22 MiB. A heap
   snapshot at the same point found 23.6 MiB.
-- **Snapshots.** workerd dispatches CDP only while the isolate is idle, and
-  `HeapProfiler.collectGarbage` never answers. A `debugger;` statement before
-  chosen statements pauses the isolate, and the harness takes the snapshot
-  from the paused loop.
+- **Snapshots** came from a scratch probe. workerd dispatches CDP only while
+  the isolate is idle, and `HeapProfiler.collectGarbage` never answers. A
+  `debugger;` statement before chosen statements pauses the isolate, and the
+  probe takes the snapshot from the paused loop.
 
 | Clone | Live peak, MiB | Where | Rest of the clone, MiB |
 | --- | ---: | --- | ---: |
@@ -99,11 +99,13 @@ Owners at the full-history peak (snapshot at statement 896, 100.5 MiB):
 3. Decide whether a production Durable Object probe is needed to answer the
    128 MB question. Local workerd has no isolate limiter.
 
-Witness: the maximum peak V8 used + external of at least three leased
-`cpu-lease run -n 2 -- npm run bench:workerd:nextjs` runs is below 225 MiB,
-today's minimum. The oracle is unchanged, and `memory.max` and the commit are
-recorded. Lower
-`V8_USED_PLUS_EXTERNAL_LIMIT_BYTES` in `bench/workerd/run.ts` to the new level.
+Witness: the maximum live-set peak of three leased
+`cpu-lease run -n 2 --no-smt -- npm run bench:workerd:nextjs -- --live-set`
+runs falls below today's level (28.4 MiB at depth 1, 55.1 MiB in full
+history at `a42ffaa`) for the history the change targets. The oracle is
+unchanged, and `memory.max` and the commit are recorded. Lower
+`LIVE_SET_LIMIT_BYTES` in `bench/workerd/run.ts` to the new level in the same
+change.
 
 ## Touch points
 

@@ -24,6 +24,14 @@ import {
 const STATEMENT_TARGET = 1_000;
 // A regression limit, not the isolate limit: 1.2 × the 363 MiB five-run peak (ADR-0026).
 const V8_USED_PLUS_EXTERNAL_LIMIT_BYTES = 450 * 1024 * 1024;
+// Regression limits on the sampled live set: 1.2 × the three-run maximum, rounded
+// up to 5 MiB (ADR-0026).
+const LIVE_SET_LIMIT_BYTES: Record<History, number> = {
+  depth1: 35 * 1024 * 1024,
+  full: 70 * 1024 * 1024,
+};
+// Statements between live-set samples; every second statement keeps full history near two minutes.
+const LIVE_SET_EVERY: Record<History, number> = { depth1: 1, full: 2 };
 const SAMPLE_INTERVAL_MS = 5;
 const TRACE_TIMEOUT_MS = 10_000;
 
@@ -44,10 +52,23 @@ type DurableObjectPost = (path: string, body: object) => Promise<unknown>;
 
 type History = "depth1" | "full";
 
-function historyMode(args: readonly string[]): History {
-  if (args.length === 0) return "depth1";
-  if (args.length === 1 && args[0] === "--history=full") return "full";
-  throw new Error(`usage: bench:workerd:nextjs [--history=full]; got ${args.join(" ")}`);
+interface Options {
+  history: History;
+  liveSet: boolean;
+}
+
+function options(args: readonly string[]): Options {
+  const known = new Set(["--history=full", "--live-set"]);
+  const unknown = args.filter((arg) => !known.has(arg));
+  if (unknown.length > 0 || new Set(args).size !== args.length) {
+    throw new Error(
+      `usage: bench:workerd:nextjs [--history=full] [--live-set]; got ${args.join(" ")}`,
+    );
+  }
+  return {
+    history: args.includes("--history=full") ? "full" : "depth1",
+    liveSet: args.includes("--live-set"),
+  };
 }
 
 interface Origin {
@@ -170,7 +191,8 @@ function packageVersion(name: string): string {
   return version;
 }
 
-const history = historyMode(process.argv.slice(2));
+const { history, liveSet } = options(process.argv.slice(2));
+const liveSetEvery = liveSet ? LIVE_SET_EVERY[history] : 0;
 const here = dirname(fileURLToPath(import.meta.url));
 const revision = measuredRevision(join(here, "..", ".."));
 const runtimeVersions = {
@@ -253,7 +275,7 @@ try {
     const started = performance.now();
     let counts: CloneCounts;
     try {
-      counts = cloneCounts(await post("/clone", { originUrl: origin.url, history }));
+      counts = cloneCounts(await post("/clone", { originUrl: origin.url, history, liveSetEvery }));
     } catch (error) {
       sampler.stop();
       throw error;
@@ -268,6 +290,10 @@ try {
     await trace.waitForMarker(2, TRACE_TIMEOUT_MS);
     const afterGcRollup = rollupSample(runtimePid);
     const v8 = trace.attributeBetweenMarkers(1, 2);
+    const live = liveSet ? trace.liveSetBetweenMarkers(1, 2) : undefined;
+    const liveSetLimitBytes = LIVE_SET_LIMIT_BYTES[history];
+    // Forced GCs every few statements lower the organic peak, so it is not gated then.
+    const gateOrganicPeak = history === "depth1" && !liveSet;
 
     const checkout = checkoutResult(await post("/verify", { expectedHead, expectedFiles }));
     const worktreeChanges =
@@ -335,12 +361,22 @@ try {
               addedBytes: afterCloneNonV8Bytes - baselineNonV8Bytes,
             },
           },
+          ...(live !== undefined
+            ? {
+                liveSet: {
+                  lowerBound: `sampled every ${liveSetEvery} statement(s); wall time includes the forced GCs`,
+                  ...live,
+                  limitBytes: liveSetLimitBytes,
+                  status: live.peakBytes <= liveSetLimitBytes ? "pass" : "fail",
+                },
+              }
+            : {}),
           statementTarget: {
             atMost: STATEMENT_TARGET,
             status: statementTarget(counts.statements),
           },
           // The ADR-0026 limit is calibrated on the depth-1 clone; full history only reports.
-          ...(history === "depth1"
+          ...(gateOrganicPeak
             ? {
                 v8RegressionLimit: {
                   measure: "clone.v8.peakUsedPlusExternalBytes",
@@ -361,7 +397,10 @@ try {
       throw new Error(`clone left ${worktreeChanges} worktree changes`);
     }
     // Process RSS is report-only: local workerd RSS does not measure the isolate limit.
-    if (history === "depth1" && v8.peakUsedPlusExternalBytes > V8_USED_PLUS_EXTERNAL_LIMIT_BYTES) {
+    if (live !== undefined && live.peakBytes > liveSetLimitBytes) {
+      throw new Error(`live-set gate failed: ${live.peakBytes} bytes > ${liveSetLimitBytes}`);
+    }
+    if (gateOrganicPeak && v8.peakUsedPlusExternalBytes > V8_USED_PLUS_EXTERNAL_LIMIT_BYTES) {
       throw new Error(
         `clone gate failed: ${v8.peakUsedPlusExternalBytes} V8 used + external bytes > ${V8_USED_PLUS_EXTERNAL_LIMIT_BYTES}`,
       );

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 
-import { GC_DONE_MARKER } from "./protocol.js";
+import { GC_DONE_MARKER, LIVE_SET_MARKER } from "./protocol.js";
 
 // Parses V8 `--trace-gc --trace-gc-verbose` output from workerd. A GC line gives
 // heap used and committed before and after the collection; the verbose block that
@@ -12,6 +12,7 @@ import { GC_DONE_MARKER } from "./protocol.js";
 const MIB = 1024 * 1024;
 const KIB = 1024;
 const MAX_REPORTED_LINES = 5;
+const LIVE_SET_LINE = new RegExp(`^${LIVE_SET_MARKER} (\\d+)$`);
 
 export const GC_TRACE_V8_FLAGS = ["--trace-gc", "--trace-gc-verbose", "--expose-gc"];
 
@@ -43,6 +44,19 @@ export interface GcEvent {
   committedAfterBytes: number;
   externalAfterBytes: number | null;
   arrayBufferAfterBytes: number | null;
+}
+
+export interface LiveSetPeak {
+  samples: number;
+  peakStatement: number;
+  peakUsedBytes: number;
+  peakExternalBytes: number;
+  peakBytes: number;
+}
+
+interface LiveSetMarker {
+  statement: number;
+  eventCount: number;
 }
 
 export interface V8HeapSnapshot {
@@ -102,6 +116,7 @@ function kilobytes(value: string | undefined): number | null {
 export class GcTrace {
   readonly events: GcEvent[] = [];
   readonly #markers: number[] = [];
+  readonly #liveSetMarkers: LiveSetMarker[] = [];
   readonly #rejected: string[] = [];
   readonly #unrecognized: string[] = [];
   #unrecognizedCount = 0;
@@ -111,6 +126,11 @@ export class GcTrace {
     if (message.trim() === GC_DONE_MARKER) {
       this.#markers.push(this.events.length);
       this.#settle();
+      return true;
+    }
+    const liveSet = LIVE_SET_LINE.exec(message.trim());
+    if (liveSet !== null) {
+      this.#liveSetMarkers.push({ statement: Number(liveSet[1]), eventCount: this.events.length });
       return true;
     }
     for (const line of message.split("\n")) {
@@ -189,6 +209,52 @@ export class GcTrace {
       peakUsedPlusExternalBytes,
       peakCommittedPlusExternalBytes,
     };
+  }
+
+  // Each live-set marker follows forced GCs; the last one before it gives the
+  // live heap and external memory at that statement.
+  liveSetBetweenMarkers(first: number, second: number): LiveSetPeak {
+    const lower = this.#markers[first - 1];
+    const upper = this.#markers[second - 1];
+    if (lower === undefined || upper === undefined) throw new Error("GC markers are missing");
+    const isolate = this.events[this.#forcedBeforeMarker(first)]?.isolate;
+    let previous = lower;
+    let peak: Omit<LiveSetPeak, "samples"> | undefined;
+    let samples = 0;
+    for (const marker of this.#liveSetMarkers) {
+      if (marker.eventCount <= lower || marker.eventCount > upper) continue;
+      const event = this.#lastForced(isolate, previous, marker.eventCount);
+      if (event === undefined) {
+        throw new Error(
+          `no forced GC precedes the live-set marker at statement ${marker.statement}`,
+        );
+      }
+      previous = marker.eventCount;
+      samples++;
+      const external = requiredExternal(event);
+      // The external counter also holds non-ArrayBuffer memory, and the backing
+      // store counter runs a constant offset above it; neither contains the other.
+      const externalBytes = Math.max(external.externalBytes, external.arrayBufferBytes);
+      const bytes = event.usedAfterBytes + externalBytes;
+      if (peak === undefined || bytes > peak.peakBytes) {
+        peak = {
+          peakStatement: marker.statement,
+          peakUsedBytes: event.usedAfterBytes,
+          peakExternalBytes: externalBytes,
+          peakBytes: bytes,
+        };
+      }
+    }
+    if (peak === undefined) throw new Error("the measured region holds no live-set marker");
+    return { samples, ...peak };
+  }
+
+  #lastForced(isolate: string | undefined, lower: number, bound: number): GcEvent | undefined {
+    for (let index = bound - 1; index >= lower; index--) {
+      const event = this.events[index];
+      if (event?.forced === true && event.isolate === isolate) return event;
+    }
+    return undefined;
   }
 
   // One gc() call can log two forced collections (finishing incremental marking,

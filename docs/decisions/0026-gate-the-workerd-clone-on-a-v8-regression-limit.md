@@ -48,6 +48,13 @@ The sprint plan required a stop and a re-gate with the user if the sum did not f
 At that escalation the user chose a V8 measurement with a regression limit at
 today's level, and a backlog item for the external memory.
 
+Backlog 106 later measured the live set: the memory that survives forced GCs.
+The organic peak adds heap used *before* a GC, so it counts garbage. At
+`25d6c6e` the depth-1 clone's live set peaked at 28.3 MiB against an organic
+peak of 247–304 MiB. The full-history live set peaked at 99.4 MiB, and a
+retention bug held 54 MiB of it. The organic gate could not see that bug,
+because it gates only the depth-1 clone.
+
 ## Decision
 
 We gate the workerd clone on a **regression limit**, not on a production claim.
@@ -61,6 +68,21 @@ We gate the workerd clone on a **regression limit**, not on a production claim.
   (898 statements, 145,777 rows, `memory.max` = `max`) measured 238.4, 241.2,
   277.8, 363.3 and 225.6 MiB. The limit is the maximum × 1.2, rounded up to
   25 MiB.
+- **A second, opt-in gate measures the live set.** `--live-set` makes the
+  worker force three GCs before every statement (every second statement in
+  full history) and log a marker. One `gc()` leaves ArrayBuffers that wait for
+  concurrent sweeping in the backing-store counter; the third call reports the
+  live set, which a heap snapshot confirmed. The sample is heap used after the
+  last forced GC plus the larger of the external and backing-store counters.
+  The gated measure is the highest sample of the clone.
+- **The live-set limits** are `LIVE_SET_LIMIT_BYTES` in `bench/workerd/run.ts`,
+  one per history, the maximum of three leased runs × 1.2, rounded up to
+  5 MiB. Leased runs at `a42ffaa` (931 statements at depth 1, 2,210 in full
+  history, `memory.max` = `max`) measured 28.39, 28.29 and 28.29 MiB at
+  depth 1, so the limit is 35 MiB, and 55.07, 55.07 and 55.03 MiB in full
+  history, so the limit is 70 MiB.
+- **The forced GCs change the run.** In `--live-set` mode the wall time and the
+  organic peak are report-only, and the 450 MiB limit is not checked.
 - **Process RSS is report-only.** The harness still prints baseline, peak and
   added RSS, the sampled anonymous and file peaks, and the non-V8 residue.
 - **Correctness stays hard.** A clone result with invalid counts, or a checkout
@@ -85,6 +107,12 @@ owns that question and the external memory.
 - A draft of the WU3 harness measured 399.9 MiB at `06de5e5`, 89% of the limit.
   A failure near 450 MiB may be spread, not a regression; rerun before blaming
   the change.
+- The live set is nearly deterministic, so its limits have a narrow margin and
+  catch retention regressions of a few MiB, in both histories. Its samples sit
+  between statements: memory that lives only inside one statement-free stretch
+  is not sampled, so the live peak is also a lower bound.
+- A `--live-set` run takes about 4× the plain run: about 45 s at depth 1 and
+  about 120 s in full history.
 - The production 128 MB question stays open until backlog 106 attributes and
   reduces the external memory, or a production probe answers it.
 
@@ -100,5 +128,8 @@ owns that question and the external memory.
   `--max-semi-space-size=8` pin belonged to that old-space gate, so the harness
   passes only the GC trace flags. Nobody measured whether the pin narrows the
   run-to-run spread.
+- **Replace the organic gate with the live set.** The plain run stays the
+  record of wall time and RSS, and forced GCs would distort both. The live
+  set is a separate mode.
 - **Report only, with no limit.** Nothing would catch a regression while
   backlog 106 is open.

@@ -5,7 +5,7 @@ import {
   type SQLStorageLike,
   Workspace,
 } from "../../packages/do/src/index.js";
-import { GC_DONE_MARKER } from "./protocol.js";
+import { GC_DONE_MARKER, LIVE_SET_MARKER } from "./protocol.js";
 
 interface DurableObjectContextLike {
   storage: DurableObjectStorageLike;
@@ -16,6 +16,7 @@ type History = "depth1" | "full";
 interface CloneInput {
   originUrl: string;
   history: History;
+  liveSetEvery: number;
 }
 
 interface VerifyInput {
@@ -26,17 +27,22 @@ interface VerifyInput {
 class CountingSqlStorage implements SQLStorageLike {
   statements = 0;
   rows = 0;
+  liveSetEvery = 0;
 
   constructor(private readonly inner: SQLStorageLike) {}
 
   exec(query: string, ...bindings: unknown[]): SQLCursorLike {
     this.statements++;
+    if (this.liveSetEvery > 0 && this.statements % this.liveSetEvery === 0) {
+      sampleLiveSet(this.statements);
+    }
     return new CountingCursor(this.inner.exec(query, ...bindings), () => this.rows++);
   }
 
-  reset(): void {
+  reset(liveSetEvery: number): void {
     this.statements = 0;
     this.rows = 0;
+    this.liveSetEvery = liveSetEvery;
   }
 }
 
@@ -79,10 +85,17 @@ function cloneInput(value: unknown): CloneInput {
   if (typeof value !== "object" || value === null) throw new Error("invalid clone input");
   const originUrl = Reflect.get(value, "originUrl");
   const history = Reflect.get(value, "history");
-  if (typeof originUrl !== "string" || (history !== "depth1" && history !== "full")) {
+  const liveSetEvery = Reflect.get(value, "liveSetEvery");
+  if (
+    typeof originUrl !== "string" ||
+    (history !== "depth1" && history !== "full") ||
+    typeof liveSetEvery !== "number" ||
+    !Number.isSafeInteger(liveSetEvery) ||
+    liveSetEvery < 0
+  ) {
     throw new Error("invalid clone input");
   }
-  return { originUrl, history };
+  return { originUrl, history, liveSetEvery };
 }
 
 function verifyInput(value: unknown): VerifyInput {
@@ -108,6 +121,15 @@ function forceGc(): void {
   if (typeof gc !== "function")
     throw new Error("gc() is unavailable; start workerd with --expose-gc");
   Reflect.apply(gc, globalThis, []);
+}
+
+// One gc() leaves ArrayBuffers that wait for concurrent sweeping in the backing
+// store counter; the third collection reports the live set.
+const LIVE_SET_COLLECTIONS = 3;
+
+function sampleLiveSet(statement: number): void {
+  for (let collection = 0; collection < LIVE_SET_COLLECTIONS; collection++) forceGc();
+  console.log(`${LIVE_SET_MARKER} ${statement}`);
 }
 
 function databaseBytes(storage: DurableObjectStorageLike): number {
@@ -212,14 +234,18 @@ export class CloneBench {
   }
 
   async #clone(input: CloneInput): Promise<{ statements: number; rows: number }> {
-    this.#storage.sql.reset();
-    await this.#workspace.git.clone({
-      url: input.originUrl,
-      dir: "/repo",
-      ref: "main",
-      ...(input.history === "full" ? { filter: "blob:none" } : { depth: 1 }),
-      singleBranch: true,
-    });
+    this.#storage.sql.reset(input.liveSetEvery);
+    try {
+      await this.#workspace.git.clone({
+        url: input.originUrl,
+        dir: "/repo",
+        ref: "main",
+        ...(input.history === "full" ? { filter: "blob:none" } : { depth: 1 }),
+        singleBranch: true,
+      });
+    } finally {
+      this.#storage.sql.liveSetEvery = 0;
+    }
     return { statements: this.#storage.sql.statements, rows: this.#storage.sql.rows };
   }
 

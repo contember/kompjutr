@@ -14,6 +14,7 @@ npm run bench:memory         # cgroup-backed bounded-memory evidence under cpu-l
 npm run bench:memory -- --runtime-check  # focused lease/cgroup wiring witness
 npm run bench:workerd:nextjs # clone in a SQLite Durable Object; V8 regression gate
 npm run bench:workerd:nextjs -- --history=full  # full-history blob:none clone
+npm run bench:workerd:nextjs -- --live-set      # gate the sampled live set
 ```
 
 Scenarios: `synthetic.ts` isolates one variable at a time; `macro` replays the
@@ -24,7 +25,10 @@ then rebases that commit onto a new `main` commit;
 `workerd/run.ts` clones Next.js at depth 1 by default. `--history=full` clones
 the whole upstream history with `filter: blob:none` from a bare clone cached at
 `bench/.fixtures/nextjs-history.git`, verifies a clean worktree, and reports
-the V8 peak without gating it. A run takes minutes.
+the V8 peak without gating it. `--live-set` forces three GCs every statement
+(every two in full history) and gates the highest live heap + external memory
+for either history; the forced GCs make its wall time and organic peak
+report-only. A run takes minutes.
 `statements.ts` checks correctness and frozen SQL/row baselines for operations
 whose runtime query barriers were removed, and for the sparse fast paths
 (`status.sparse-*`, `staging.add-selected`, `worktree.list`). It reports whether
@@ -75,7 +79,8 @@ legacy comparisons are under `docs/archive/benchmarks/`.
    isolate memory limiter, and its RSS holds SQLite, allocator and runtime
    memory. `bench:workerd:nextjs` reports RSS only. It gates peak V8 used +
    external memory from the GC trace between two forced GCs, a lower bound,
-   against a regression limit at today's level (ADR-0026). External memory
+   against a regression limit at today's level (ADR-0026). `--live-set` gates
+   the live set instead: memory that survives three forced GCs. External memory
    holds every `Uint8Array` and counts against the isolate. A pass is not proof
    that the production 128 MB limit is satisfied.
 9. The Next.js push phase must create a fresh remote branch. Setup and teardown

@@ -16,7 +16,8 @@ then requires `VmHWM` to equal `VmRSS` within one page. RSS can drop between
 the two non-atomic reads, for example "VmHWM 78266368 did not reset to VmRSS
 78221312". The run then throws, and a leased benchmark of several minutes must
 be repeated. This happened in about one of eight runs in the
-2026-10-07 sprint.
+2026-10-07 sprint, and in 5 of 11 leased `--live-set` calibration runs on
+2026-10-09.
 
 ## Approach / acceptance
 
