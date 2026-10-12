@@ -20,4 +20,6 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None.
+- [One OID index for pack objects](sprint-2026-10-09-one-oid-index.md) —
+  derive the canonical pack copy from `git_pack_entries` and drop
+  `git_pack_objects` (ADR-0031, proposed).
