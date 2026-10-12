@@ -45,9 +45,9 @@ identifies the set of sources an ordinary complete read sees: for every OID,
 which loose row or which complete pack serves it. The owners that change that set
 bump it inside the transaction that makes the change visible: pack publication,
 pack storage deletion, loose object writes, and loose object deletion. Pack
-deletion is conditional — a deletion that neither removes a complete pack owning
-canonical rows nor promotes a fallback changes nothing a complete read can
-observe, and a pending-only reclamation must not restart in-flight maintenance.
+deletion bumps the generation whenever any deleted pack was complete, including
+redundant and empty packs. Pending-only reclamation does not restart in-flight
+maintenance ([ADR-0031](0031-derive-the-canonical-pack-copy-from-pack-entries.md)).
 Pending sources are covered by ingest *ownership*, not by the generation: only
 the owning ingest can write a pending pack's rows, and only that owner reads
 with its pack id.

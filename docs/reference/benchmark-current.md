@@ -14,6 +14,39 @@ This is `node:sqlite` unless the section names workerd. Statement counts
 transfer to the Durable Object cost model. Local wall time and process RSS are
 regression signals, not proof of a production isolate limit.
 
+## Full-history Next.js clone on workerd — 2026-10-12
+
+Three alternating pairs compare `c373b41` with `9f24c41` after
+[ADR-0031](../decisions/0031-derive-the-canonical-pack-copy-from-pack-entries.md).
+Each uses fresh persistence and `cpu-lease run -n 2 --no-smt`, with no cgroup
+memory cap. Runtime: workerd 1.20260820.1, Miniflare 5.20260820.0-alpha;
+compatibility date 2026-08-15. The full-history `blob:none` fixture is pinned at
+`497ec6aa08a33f9e2d65a5c8461f550c2549d3e6`, with 24,252 checked-out files.
+
+| Measure | Baseline | Derived canonical entries |
+| --- | ---: | ---: |
+| Wall, three runs (s) | 57.573 / 58.023 / 57.282 | 49.342 / 50.463 / 48.855 |
+| SQL statements | 2,210 | 1,924 |
+| Returned rows (median; observed range) | 512,260; 512,259–512,260 | 512,260; 512,259–512,260 |
+| Database allocation (median bytes) | 472,096,768 | 419,373,056 |
+
+Median **paired** wall saving: **8.231 s**; every pair is faster. Median paired
+database saving: 52,703,232 bytes (52.70 MB, about 11.2%). SQL and returned-row
+gates pass. Depth-1 statements fall from 931 to 900 with 111,475 returned rows
+on both revisions. All runs verify HEAD and checkout/file metadata; the
+full-history harness also verifies clean status.
+
+The sampled live-set gates pass: depth 1 peaks at 29,766,656 bytes against
+36,700,160 (900 samples, every statement); full history peaks at 57,120,973
+against 73,400,320 (962 samples, every two statements). These forced-GC samples
+are lower bounds. Two CDP profiles per revision attribute 12.134–12.482 s to
+pack-row writes before and 5.951–6.021 s after; audit attribution falls from
+1.462–1.557 s to 0.023–0.024 s.
+
+The separate native depth-1 storage ladder at `9f24c41` passes all six
+fixtures. Next.js uses 221,790,208 bytes (211.52 MiB), 900 statements and
+111,475 returned rows. Its harness acquires a four-vCPU `--no-smt` lease.
+
 ## Next.js workflow — 2026-09-28
 
 Three runs at commit `b7a5118`, each under a cgroup with `memory.max`

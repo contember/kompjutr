@@ -62,8 +62,8 @@ object or on another pack.
 The `packs` phase is one monotone pass. It persists its last examined pack ID in
 the phase-specific cursor. Each call examines one bounded page and deletes at
 most one pack; the pass then continues after that pack. A deletion only
-promotes canonical rows into later packs, so it never changes a verdict the
-pass already made, and an exhausted pass completes the phase. Epoch restart and
+moves derived canonical ownership to later packs, so it never changes a verdict
+the pass already made, and an exhausted pass completes the phase. Epoch restart and
 phase exit clear the cursor.
 
 ## Consequences

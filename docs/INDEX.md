@@ -19,7 +19,7 @@ decisions → reference → archive.
 - [One OID index for pack objects](sprints/sprint-2026-10-09-one-oid-index.md):
   pack ingest writes each object once, and readers derive the canonical copy
   ([ADR-0031](decisions/0031-derive-the-canonical-pack-copy-from-pack-entries.md),
-  proposed).
+  accepted); closure awaits resolution of baseline shell parity failures.
 
 ## Specs
 

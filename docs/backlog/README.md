@@ -104,8 +104,8 @@ The 2026-10-07 [full-history performance sprint](../archive/sprint-2026-10-07-fu
 filed 116–118 from its findings; 118's attribution became the
 [fast fresh clone sprint](../archive/sprint-2026-10-07-fast-fresh-clone.md),
 which filed 119–122. A follow-up pass shipped 120: the clone fell to
-52.8–53.0 s, and the next lever is the idea
-[`one-oid-index-for-pack-objects.md`](../ideas/one-oid-index-for-pack-objects.md).
+52.8–53.0 s. The subsequent single-OID-index implementation is recorded in
+[ADR-0031](../decisions/0031-derive-the-canonical-pack-copy-from-pack-entries.md).
 
 | Order | Items | Why |
 |---|---|---|

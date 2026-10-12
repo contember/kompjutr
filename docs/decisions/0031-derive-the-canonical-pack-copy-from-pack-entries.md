@@ -1,7 +1,7 @@
 ---
 id: 0031
 title: Derive the canonical pack copy from pack entries
-status: proposed
+status: accepted
 date: 2026-10-09
 ---
 
@@ -62,9 +62,13 @@ We derive the canonical copy instead of storing it.
 
 ## Consequences
 
-- Ingest writes three B-tree rows per object instead of five. One random-OID
-  tree remains.
-- The clone database loses the table and its two indexes.
+- Ingest writes two B-tree rows per physical entry instead of five for a
+  new OID. One random-OID tree remains.
+- The clone database loses the table and its two indexes. Three paired
+  workerd clones save a median 52,703,232 bytes and 8.231 s wall time. All
+  pairs are faster; SQL and returned-row gates pass. The measured runtime,
+  fixture and sampled live-set results are in
+  [the benchmark snapshot](../reference/benchmark-current.md#full-history-nextjs-clone-on-workerd--2026-10-12).
 - Reads by OID seek `git_pack_entries_by_oid` and then the primary key for type
   and size. Locally, a single type-and-size lookup costs about 15 % more, a
   2,048-OID metadata batch about 10–20 % more, and the pack-graph start is
@@ -83,8 +87,8 @@ We derive the canonical copy instead of storing it.
   [ADR-0022](0022-stage-pack-commit-projections-until-publication.md) commit
   promotion after the membership audit,
   [ADR-0025](0025-scope-paged-read-metadata-and-linearize-maintenance-expansion.md)
-  generation bumps and `docs/reference/concurrency.md` describe the stored
-  canonical row and change with this decision.
+  generation bumps and `docs/reference/concurrency.md` follow this derived
+  ownership rule.
 
 ## Alternatives considered
 

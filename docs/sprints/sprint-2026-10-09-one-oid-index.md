@@ -3,7 +3,7 @@
 **Goal.** Pack ingest writes each object once, to `git_pack_entries`, and every
 reader derives the canonical copy from it
 ([ADR-0031](../decisions/0031-derive-the-canonical-pack-copy-from-pack-entries.md),
-proposed).
+accepted).
 
 **Theme.** The full-history `blob:none` Next.js clone spends 12.5–14.2 s of
 58.8–64.4 s busy CPU on pack-row inserts and 1.4–1.9 s on the publication audit
@@ -470,3 +470,166 @@ sprint risk. Resolve blocking findings before implementation.
   suites passed. The long store file reproduced the known forks RPC timeout;
   its existing full-suite threads-pool configuration passed 107/107 (64.46 s).
   The remaining WU1/WU2 witnesses passed 71/71 (100.35 s).
+
+### WU4 — Paired workerd measurements (2026-10-12)
+
+Baseline `c373b41` and WU3 `9f24c41`, alternating order, fresh persistence,
+`cpu-lease run -n 2 --no-smt`, committed full-history harness. Runtime:
+workerd 1.20260820.1, Miniflare 5.20260820.0-alpha, Node v24.4.0,
+compatibility date 2026-08-15. Fixture HEAD
+`497ec6aa08a33f9e2d65a5c8461f550c2549d3e6`, 24,252 files, `blob:none`.
+No cgroup memory cap. Every completed clone verified HEAD, file counts and a
+clean worktree. Snapshot source files match their commits; dirty-tree metadata
+lists only the external `node_modules` and `bench/.fixtures` symlinks.
+
+| Round | Execution order | Baseline wall, s | WU3 wall, s | Saved, s | SQL baseline / WU3 | Returned rows baseline / WU3 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | baseline → WU3 | 57.573 | 49.342 | 8.231 | 2,210 / 1,924 | 512,259 / 512,260 |
+| 2 | WU3 → baseline | 58.023 | 50.463 | 7.560 | 2,210 / 1,924 | 512,260 / 512,260 |
+| 3 | baseline → WU3 | 57.282 | 48.855 | 8.427 | 2,210 / 1,924 | 512,260 / 512,259 |
+
+The median paired saving is **8.231 s**; every pair is faster. The ≥4 s floor
+passes. SQL falls from 2,210 to 1,924. Returned-row medians are equal at
+512,260; both revisions span 512,259–512,260. An isolated instrumented pair
+also returned exactly 512,259 rows on each revision, including identical
+pack-graph totals (115 statements, 55,464 rows). A repeat on the same candidate
+returned 55,465 graph rows; all other SQL shapes were identical. Both revisions
+show the one-row total variation; the candidate repeat localizes it to graph
+results without an additional statement. The source of the baseline
+variation was not localized.
+
+Depth-1: 931 → 900 statements; 111,475 returned rows on both revisions.
+Both depth-1 V8 regression gates pass. Full-history database allocation is
+472,010,752 / 472,141,824 / 472,096,768 bytes at baseline and
+419,336,192 / 419,373,056 / 419,393,536 bytes at WU3. Median paired saving:
+52,703,232 bytes (52.70 MB, approximately 11.2%).
+
+Two round-2 candidate attempts failed the harness's RSS-reset check before
+clone began (32–36 KiB RSS movement). Their logs are retained; they produced
+no measured result and were retried unchanged. No successful run was discarded.
+Raw measurements and diagnostic SQL histograms are retained outside Git at
+`/tmp/kompjutr-one-oid-20261012/`.
+
+The first full-suite pass exposed one missed query-plan alias assertion in
+`network-connectivity.test.ts`. Commit `e3316ca` updates the expected JSON input
+alias; independent review is clean and the focused file passes 6/6.
+
+#### Live set and storage
+
+Both forced-GC live-set gates pass at `9f24c41`. These are sampled lower
+bounds, not exact maxima; their wall times include forced collections.
+
+| History | Sample interval (statements) | Samples | Peak bytes | Limit bytes | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Depth 1 | 1 | 900 | 29,766,656 | 36,700,160 | pass |
+| Full | 2 | 962 | 57,120,973 | 73,400,320 | pass |
+
+The full-history live-set setup also needed an unchanged retry after an
+RSS-reset failure before clone. No completed measurement was discarded.
+
+`bench:clone-storage` passes all six fixtures at `9f24c41`. The harness
+requires and acquires its own four-vCPU `--no-smt` lease (two executing CPUs),
+so it ran through that entry point instead of the plan's outer two-vCPU lease.
+This is the native `node:sqlite` depth-1 storage ladder, distinct from the
+full-history workerd pairs above.
+
+| Fixture | Files | Database bytes | SQL statements |
+| --- | ---: | ---: | ---: |
+| express | 218 | 1,642,496 | 151 |
+| tailwind | 541 | 7,876,608 | 168 |
+| vue | 1,075 | 14,790,656 | 179 |
+| eslint | 2,358 | 33,943,552 | 245 |
+| prettier | 9,329 | 43,700,224 | 342 |
+| nextjs | 24,252 | 221,790,208 | 900 |
+
+#### CDP attribution
+
+Two profiles per revision used the same scratch Miniflare inspector harness
+and 1 ms sampling, each under `cpu-lease run -n 2 --no-smt`. Execution order
+was baseline 1, WU3 1, WU3 2, baseline 2. All four checkout oracles pass.
+The analyzer derives class line ranges from each revision's source, rather
+than reusing baseline line numbers.
+
+Each table separates host workerd CPU (user + system from `/proc`) from
+sampled phase attribution. Sampling estimates are not exact process CPU.
+The old analyzer's headline incorrectly includes an excluded unsampled gap;
+these tables use the phase rows and host counters directly. SQL totals belong
+to this instrumented harness, which adds diagnostic queries; the acceptance
+gate uses the committed harness above.
+
+**Baseline profile 1** (`profile-1-baseline/`). Host workerd CPU: 48.19 s.
+
+| Phase | Sampled CPU, s | SQL statements | Returned rows |
+| --- | ---: | ---: | ---: |
+| pack object rows (PackObjectBatch) | 12.482 | 528 | 0 |
+| membership audit | 1.557 | 1 | 1 |
+| deferred deltas (drainPending, excl. projections) | 8.652 | 297 | 246,395 |
+| metadata indexing first pass (indexPack, excl. projections) | 4.893 | 60 | 60 |
+| GC (no JS stack) | 3.197 | 0 | 0 |
+| All other phases | 18.394 | 1,361 | 265,837 |
+| Total | 49.174 | 2,247 | 512,293 |
+
+**WU3 profile 1** (`profile-1-candidate/`). Host workerd CPU: 38.58 s.
+
+| Phase | Sampled CPU, s | SQL statements | Returned rows |
+| --- | ---: | ---: | ---: |
+| pack object rows (PackObjectBatch) | 5.951 | 264 | 0 |
+| membership audit | 0.024 | 1 | 1 |
+| deferred deltas (drainPending, excl. projections) | 8.435 | 297 | 246,395 |
+| metadata indexing first pass (indexPack, excl. projections) | 4.676 | 60 | 60 |
+| GC (no JS stack) | 2.942 | 0 | 0 |
+| All other phases | 17.374 | 1,339 | 265,837 |
+| Total | 39.402 | 1,961 | 512,293 |
+
+**Baseline profile 2** (`profile-2-baseline/`). Host workerd CPU: 47.33 s.
+
+| Phase | Sampled CPU, s | SQL statements | Returned rows |
+| --- | ---: | ---: | ---: |
+| pack object rows (PackObjectBatch) | 12.134 | 528 | 0 |
+| membership audit | 1.462 | 1 | 1 |
+| deferred deltas (drainPending, excl. projections) | 8.483 | 297 | 246,395 |
+| metadata indexing first pass (indexPack, excl. projections) | 4.693 | 60 | 60 |
+| GC (no JS stack) | 3.092 | 0 | 0 |
+| All other phases | 18.124 | 1,361 | 265,837 |
+| Total | 47.988 | 2,247 | 512,293 |
+
+**WU3 profile 2** (`profile-2-candidate/`). Host workerd CPU: 40.01 s.
+
+| Phase | Sampled CPU, s | SQL statements | Returned rows |
+| --- | ---: | ---: | ---: |
+| pack object rows (PackObjectBatch) | 6.021 | 264 | 0 |
+| membership audit | 0.023 | 1 | 1 |
+| deferred deltas (drainPending, excl. projections) | 8.904 | 297 | 246,395 |
+| metadata indexing first pass (indexPack, excl. projections) | 5.157 | 60 | 60 |
+| GC (no JS stack) | 2.916 | 0 | 0 |
+| All other phases | 17.692 | 1,339 | 265,836 |
+| Total | 40.714 | 1,961 | 512,292 |
+
+Pack-row attribution falls from 12.134–12.482 s to 5.951–6.021 s; the audit
+falls from 1.462–1.557 s to 0.023–0.024 s. This confirms the intended savings
+on workerd. These profiles attribute the improvement; their wall times are
+not substituted for the paired acceptance runs.
+
+#### Closure blocker
+
+The first full suite finished in 842.0 s. Besides the query-plan assertion
+fixed in `e3316ca`, it found 14 `tests/shell/rg-json.test.ts` parity failures.
+The same file at baseline `c373b41` reproduces all 14 failures (31 tests pass),
+and the shell implementation is unchanged by this sprint. Native oracle:
+rg 15.2.0, PCRE2 10.45. Independent read-only diagnosis traces the failures
+to JSON search/byte statistics and adjacent multiline match limits.
+
+A second complete run after the alias fix finished in 821.7 s: **8,282 tests
+passed, 14 failed**, all failures in the same baseline `rg-json` cases. Every
+other batch passed, including all eight root shards, pack slices, protocol,
+filesystem and end-to-end. Command:
+`GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true cpu-lease run -n 4 -- npm run test:full`.
+
+The full-suite gate is not green. Sprint closure remains pending an explicit
+choice to extend scope to the shell fixes or accept these baseline failures
+as an exception. ADR-0031 records the implemented decision; this plan stays
+in `sprints/` until that closure decision is resolved.
+
+Independent WU4 evidence and documentation reviews are clean after narrowing
+two measurement claims to their observed scope and fixing one stale ADR status
+label. Relative file links, Biome format/check and diff whitespace checks pass.

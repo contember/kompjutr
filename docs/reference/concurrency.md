@@ -204,9 +204,11 @@ Discovery-time cache entries evicted before consumption are loaded again from
 their stored source.
 
 `git_pack_entries` authenticates every physical entry of each pack, including
-duplicate OIDs. `git_pack_objects` remains the single canonical read location
-for each OID. A tree OID has one projection in `git_tree_sources`, shared by
-every loose and packed copy. Pack ingest writes no tree projection
+duplicate OIDs. The canonical read location is the complete entry with the
+lowest `(pack_id, offset)`, derived through one shared SQL fragment
+([ADR-0031](../decisions/0031-derive-the-canonical-pack-copy-from-pack-entries.md)).
+A tree OID has one projection in `git_tree_sources`, shared by every loose and
+packed copy. Pack ingest writes no tree projection
 ([ADR-0030](../decisions/0030-project-trees-on-demand.md)); a reader or a loose
 write creates it, and every physical occurrence still passes object
 authentication. A loose write of a tree that is already projected writes no
@@ -224,8 +226,9 @@ and rejects a chain longer than 4,095 edges, Git's `pack-objects` limit, with
 canonical row's pack and follows base offsets within it, so an older canonical
 owner never redirects a chain into another pack. Parsing requires every entry to be indexed exactly once at a strictly ordered
 offset, and publication requires the published entry count to match the parsed
-count and every entry's canonical owner to be complete. Deleting that owner
-promotes one complete fallback entry atomically before the old rows disappear.
+count. Deleting a complete copy makes the next complete entry canonical without
+promotion writes. A pending pack with its own copy still publishes successfully
+when an earlier complete copy is deleted during ingest.
 No surviving chain can lose its base to a deletion, so deletion checks no
 dependency. Neither publication nor deletion re-hashes stored objects.
 Page and read sizes shape the work, but accumulated pages or projected reads do
@@ -236,18 +239,18 @@ the separate rounded chunk-allocation guard also applies.
 The `packs` phase classifies and sweeps in one pass. It examines at most one
 bounded page per call and deletes at most one pack. Its durable cursor records
 the last examined pack, and one pass over the packs completes the phase: a
-deletion only promotes canonical rows into later packs, so no earlier verdict
-changes.
+deletion only moves derived canonical ownership to later packs, so no earlier
+verdict changes. A pack holds a marked OID only when it contains that OID's
+canonical entry; a redundant later pack can be swept.
 Cold reopen preserves the cursor; root-epoch restart and phase exit clear it.
 Candidate analysis uses SQLite metadata, including the actual canonical fallback
 order, without loading object payloads.
 
 A run carries a second drift axis beside the root epoch: the repository source
 generation, recorded in `git_maintenance_runs.observed_source_generation`. Pack
-publication, loose writes, loose deletion, and a pack deletion that removes a
-complete canonical owner or promotes a fallback all advance
-`git_repositories.source_generation` inside their own transaction; a pending-only
-reclamation that promotes nothing does not, because no complete read can see it.
+publication, loose writes, loose deletion, and every complete-pack deletion
+advance `git_repositories.source_generation` inside their own transaction.
+Pending-only reclamation does not, because no complete read can see it.
 A maintenance step that changes sources adopts its own bump as the last statement
 of that step's transaction, so it never restarts itself. Adoption is safe only
 because the mutation-guard transaction serializes the drift check with the page:
@@ -272,14 +275,14 @@ public method that reaches the same synchronous transaction.
 |---|---|---|
 | Repository route and readiness | `clone` × clone/public calls | One exact provisional owner hides partial state while its root remains a traversal barrier. An active same-root clone gets `EBUSY`; exact-expiry cold retry replaces only the abandoned owner, and a fenced owner gets `ESTALE`. Different roots `coexist`. Ready publication follows complete refs, index, and worktree; fallback target collisions get `EEXIST`, and fallback index/worktree writes are atomic. |
 | Ordinary pack ownership | `clone`/`fetch` × `clone`/`fetch` | One durable generation lease fences ordinary ingest per repository. An unexpired competitor gets `EBUSY`; expiry fences the old owner with `ESTALE`, reclaims only its pending pack, and allocates a never-reused pack ID. Unrelated local work still `coexist`s. |
-| Maintenance pack ownership | `maintenance` × pack owners | Selected, pending, published, and finalized maintenance packs keep exact durable ownership and bypass the ordinary lease. Disjoint packs `coexist`; a publication whose canonical OID is still owned by another pending pack gets `stale-reject` and remains pending for exact recovery. If an ordinary complete owner wins first, maintenance finalizes against it and atomically discards its fully redundant pack. |
+| Maintenance pack ownership | `maintenance` × pack owners | Maintenance owns no pack. It sweeps complete packs using derived canonical ownership and restarts discovery on a foreign source-generation change. Pending packs remain owned by ingest. Deleting an earlier complete copy does not prevent a self-contained pending copy from publishing. |
 | Tracking refs, tags, prune, and shallow boundaries | `fetch`/`pull` × fetch/local mutation | The latest discovery fences each overlapping tracking namespace. Same-namespace drift and tracking ABA `stale-reject`; complete fetched objects remain. Disjoint namespaces `coexist` when selected global tags and shallow state do not conflict. Selected tags use exact CAS with an idempotent same-target winner. Repository-wide shallow deltas use a durable revision, so the first valid publisher wins and the loser retries. Local branches, index changes, and journals `coexist`. |
 | Remote push leases and CAS | `push` × push/remote writer | Every explicit or pre-discovery tracking-derived lease is compared with discovery before hydration or pack planning. Any mismatch is `ESTALELEASE` with no receive-pack POST. A matching lease does not imply force. The discovered OID remains the wire CAS and produces `stale-reject` for a later remote writer. Before POST, confirmed cancellation is `EABORTED`; after invocation, every failure that leaves remote status unconfirmed is `EPUSHUNCERTAIN`. 401 responses and known-local pack failures retain their safe classifications. |
 | Local push tracking ref | configured `push` × fetch/push | Push snapshots the raw tracking ref and its exact durable revision before POST. A fetch observation advances only exact revision rows inside its tracking prefix. After confirmed success push publishes the targets `report-status` confirmed, without a second discovery, and only when the exact pre-POST snapshot is unchanged. A no-op branch target sends no pack, so its stored metadata must name a local commit. Any later relevant fetch or push observation wins, including same-OID ABA; an idempotent push advances the exact revision and relevant namespace revisions to fence older owners. Explicit-URL push does not publish a local tracking ref. |
 | Pull snapshot | `pull` × HEAD/upstream/journal/index/worktree mutation | Changed HEAD, upstream configuration, or strategy produces `stale-reject` after fetched state is retained. An active journal at invocation produces `active-reject`; pull rechecks state after fetch. Pull-rebase journals capture the fetched OID rather than a moving tracking ref. Overlapping staged or dirty paths reject integration; unrelated changes `coexist` with merge pull but rebase still requires its clean-worktree baseline. |
 | Local refs, index, worktree, and operation journals | paused async owner × synchronous local call, or public mutation re-entry | Disjoint state normally `coexist`s. Each synchronous public mutation owns one outer transaction; same-stack public re-entry rejects with `EREENTRANT` before state changes. Ref and journal transitions publish atomically. Journal plans are immutable, and each replay step conditionally advances O(1) journal rows plus its bounded conflict snapshot. Interrupted add, path reset, and full index replacement may expose a valid page prefix; cold retry deterministically converges. Active merge, cherry-pick, revert, and rebase journals reject competing operation starts, preserve exact recovery state on stale branch CAS, and remain recoverable after reopen. A pull-created completed rebase journal survives final branch CAS failure and retries against its original branch OID. |
 | Maintenance roots | `maintenance` × root mutation | Refs, index, checkout lifecycle, shallow state, commits, and operation journals advance the root epoch and produce `root-restart`. Each source is decoded from one bounded keyset page, including operation-root pages; epoch drift restarts before destructive work. Read-only work and config-only changes `coexist`. |
-| Concurrent maintenance | `maintenance` × maintenance | One live `Workspace` keeps exact in-memory ownership of its durable pending pack. A rival call gets `EBUSY`; finalization and counters publish once. A cold `Workspace` denotes replacement after isolate eviction and therefore reclaims selected, pending, or published abandoned ownership exactly. |
+| Concurrent maintenance | `maintenance` × maintenance | Each synchronous step holds the repository mutation guard, publishes its cursor and counters atomically, and releases ownership before returning. A later call continues the durable run. Cold reopen needs no pending-pack settlement; foreign root or source drift restarts discovery before destruction. |
 
 One live `Workspace` models one Durable Object isolate. Two simultaneously live
 `Workspace` facades over the same storage would conflict with the platform's
@@ -326,13 +329,13 @@ reason to invalidate an otherwise correct durable outcome.
 | Repository route and readiness | [`concurrency-clone.test.ts`](../../tests/concurrency-clone.test.ts): “fences the real clone flow at every durable publication checkpoint”, “keeps reservation, complete pack, refs, and worktree private until the ready CAS”, and exact-expiry/collision/identity witnesses. | The real-flow witness replaces the evicted owner with a fresh `Workspace`; clone statement and composed-memory cost are measured separately. |
 | Ordinary pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): same-store overlap, separate-store active rejection, failed-owner retry, exact-expiry takeover, and duplicate/canonical ownership witnesses. | Reopened stores prove readable winner and fallback objects; pack statement and composed-memory cost are measured separately. |
 | Provisional commit projections | [`pack-projection-publication.test.ts`](../../tests/pack-projection-publication.test.ts): real Smart HTTP fetch pauses after staging; same/second handles cannot read pending-only commit or graph results, and live leases prevent reclaim. [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts) covers duplicate small and oversized commits, expiry, and publication/release/discard rollback. | Abort, cold reopen, reclaim, and retry preserve refs/HEAD and publish readable complete history; staging is empty after publication or cleanup. |
-| Maintenance and pending packs | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): pending dependency rejection; [`maintenance-qualification.test.ts`](../../tests/maintenance-qualification.test.ts): a pending fetch pack survives classification and sweep; [`maintenance.test.ts`](../../tests/maintenance.test.ts): reachable loose objects stay loose and readable across full runs and a cold reopen. | Cold reopen tests read every retained object; the maintenance benchmark reports statement-target status and process-memory evidence. |
+| Maintenance and pending packs | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): successful publication after deleting an earlier complete copy; [`maintenance-qualification.test.ts`](../../tests/maintenance-qualification.test.ts): a pending fetch pack survives classification and sweep; [`maintenance.test.ts`](../../tests/maintenance.test.ts): reachable loose objects stay loose and readable across full runs and a cold reopen. | Cold reopen tests read every retained object; the maintenance benchmark reports statement-target status and process-memory evidence. |
 | Tracking refs, tags, prune, and shallow boundaries | [`concurrency-fetch.test.ts`](../../tests/concurrency-fetch.test.ts): both same-remote orders, prune, local tracking ABA, response loss, disjoint namespaces, selected tags, and both shallow orders. | Every terminal schedule reopens and runs the shared repository oracle. [`store.test.ts`](../../tests/store.test.ts) exercises 9,329 tracking refs and the real memory/input bounds; `fetch.publication` owns representative query cost. |
 | Remote push leases, CAS, and local tracking | [`concurrency-network.test.ts`](../../tests/concurrency-network.test.ts): both push/fetch orders, same-OID fetch ABA, a buffered push losing to a post-snapshot fetch, a no-op push fencing an older fetch, both same-ref push orders, lease snapshots and remote races, and preservation of HEAD/index/journal/maintenance state; [`push.test.ts`](../../tests/push.test.ts): one discovery per confirmed push, rejection, response loss, abort certainty, leases, delete, no-op, and explicit URL; [`network-safety.test.ts`](../../tests/network-safety.test.ts): integrated real-backend abort/retry deepening and stale/fresh multi-ref leases. | Every concurrency schedule cold-reopens through the shared oracle; [`store.test.ts`](../../tests/store.test.ts) directly proves exact revision creation, prefix-scoped fetch observations, idempotent fencing, historical narrow/broad disjointness, maximal namespaces, and token ownership. `transport.push` measures configured and no-op push query cost without reserving a statement currency. |
 | Pull snapshot | [`concurrency-network.test.ts`](../../tests/concurrency-network.test.ts): merge/rebase overlapping staged/dirty rejection and merge unrelated negative control; [`pull.test.ts`](../../tests/pull.test.ts): HEAD, branch OID, upstream, strategy, cancellation, captured target, and pull-created final-CAS recovery. | Concurrency schedules retain the fetch then cold-reopen through the shared oracle. The fetched pack and synchronous merge/rebase integration use the pack, checkout, journal, and branch-CAS publication bounds. |
 | Local refs, index, worktree, and journals | [`concurrency-operations.test.ts`](../../tests/concurrency-operations.test.ts): every directed active merge/cherry-pick/revert cell, same-client/second-client/CLI/scratch/low-level re-entry, guard retention after a caught rejection, rollback, and stale branch CAS; [`operation-state.test.ts`](../../tests/operation-state.test.ts): immutable journal transitions and recovery. | Every schedule runs the shared oracle after reopen; merge, replay, rebase, and ref benchmark rows own representative query cost, including linear N/2N rebase transition rows. |
 | Maintenance roots | [`maintenance-roots.test.ts`](../../tests/maintenance-roots.test.ts): every public root mutation shape and one-projection source pages; [`maintenance-qualification.test.ts`](../../tests/maintenance-qualification.test.ts): index, journal, commit, and fetch drift; [`concurrency-maintenance.test.ts`](../../tests/concurrency-maintenance.test.ts): push, exact ref, and sibling checkout drift. | Each principal concurrent schedule ends with cold `cat-file` and `status`; [`maintenance-cost.test.ts`](../../tests/maintenance-cost.test.ts) supplies the large-input memory envelope and the maintenance benchmark owns query cost. |
-| Concurrent maintenance | [`concurrency-maintenance.test.ts`](../../tests/concurrency-maintenance.test.ts): selected owner to pending barrier, same-runtime `EBUSY`, once-only finalization, and cold selected/pending/published settlement. | Owner prefix/tail and rival calls are measured separately; every settled state is read through a fresh `Workspace`. |
+| Concurrent maintenance | [`concurrency-maintenance.test.ts`](../../tests/concurrency-maintenance.test.ts): “reaches finish cold at every durable boundary without restarting”, root drift and source drift schedules. | Each resumed call opens a fresh `Workspace`; [`maintenance-sweep-continuation.test.ts`](../../tests/maintenance-sweep-continuation.test.ts) checks bounded cold pages and one-pass sweep completion. |
 
 The implementation seams are
 [`network.ts`](../../packages/git/src/ops/network/network.ts),

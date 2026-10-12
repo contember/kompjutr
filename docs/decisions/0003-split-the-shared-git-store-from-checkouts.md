@@ -30,6 +30,9 @@ checkout id is a safe positive integer, immutable for its row's lifetime, and
 never derived from its root. A `Repository` is a checkout-bound view over one
 shared store. The current owner-by-owner table is in
 [the architecture reference](../reference/architecture.md#git-storage-and-ownership).
+Pack metadata and physical entries belong to the shared repository. Canonical
+OID ownership is derived from complete entries, not stored in a separate row
+([ADR-0031](0031-derive-the-canonical-pack-copy-from-pack-entries.md)).
 
 Each root is a globally unique canonical absolute path, immutable for the
 checkout's lifetime. Exactly one checkout per store carries the primary marker,

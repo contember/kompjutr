@@ -1101,7 +1101,7 @@ One object is at most 48 MiB, because a read materialises it as a single buffer
 inside the isolate. `add` refuses an oversized working-tree file from its stat,
 before any content is read; `writeStream()` and the other loose write paths
 refuse the same size; pack ingest rejects a pack holding a larger entry; and
-`CHECK` constraints hold the bound on `git_objects`, `git_pack_objects`, and
+`CHECK` constraints hold the bound on `git_objects` and
 `git_pack_entries`. Every one of those failures is `E2BIG`, so cloning or
 fetching a repository that contains a larger object fails instead of producing a
 checkout that cannot be materialised.

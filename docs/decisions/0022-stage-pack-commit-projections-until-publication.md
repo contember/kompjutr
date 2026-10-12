@@ -30,8 +30,9 @@ Repeated physical occurrences produce one staging row for that pack and OID.
 
 Flush bounded projection batches while the pack remains pending. Promote staged
 rows into `git_commits` only inside the pack's final publication transaction,
-after the existing complete-membership audit. Preserve already-published
-projections for duplicate OIDs. Promotion and staging deletion share the
+after checking that its physical entry count matches the parsed count
+([ADR-0031](0031-derive-the-canonical-pack-copy-from-pack-entries.md)). Preserve
+already-published projections for duplicate OIDs. Promotion and staging deletion share the
 transaction with the publication callback and ingest lease release.
 
 Promotion uses SQL over stored rows rather than reconstructing the pack's commit

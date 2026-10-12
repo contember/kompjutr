@@ -191,8 +191,15 @@ root, including one behind an ancestor symlink loop, is prunable.
 | Repository (`repo_id`) | objects, packs, refs, ordinary config, shallow, fetch and promisor state, direct-ref reflogs, tree/commit projections, blob-ID cache, maintenance |
 | Checkout (`checkout_id`) | canonical root, raw `HEAD`, index, tracker state, operation journal, checkout `HEAD` reflog |
 | Tree projection (`repo_id`, `tree_oid`) | `git_tree_sources` row and its `git_tree_entries`, shared by every copy; created when a reader or a loose write first needs it, deleted with the last copy |
-| Pack (`repo_id`, `pack_id`) | pending `git_pack_commit_staging` projections; promoted at complete publication or removed with the pack |
+| Pack (`repo_id`, `pack_id`) | physical `git_pack_entries`, compressed data, and pending `git_pack_commit_staging` projections; projections publish atomically or disappear with the pack |
 | Synchronous scratch transaction | named scratch indexes; rows never survive the callback and are not maintenance roots |
+
+`git_pack_entries` contains every physical copy, keyed by repository, pack and
+offset. The shared canonical SQL fragment chooses the lowest `(pack_id, offset)`
+among complete copies for each OID. An OID index supports that selection;
+metadata joins return one row per OID. Publication checks physical entry count,
+and deletion needs no ownership updates
+([ADR-0031](../decisions/0031-derive-the-canonical-pack-copy-from-pack-entries.md)).
 
 `packages/git/src/store/index.ts` is the facade. `store/database/` owns schema initialization
 and repository/checkout routing. `store/repository/` composes repository-owned
@@ -327,12 +334,12 @@ began with, an external blob by presence or promise, and an external tree
 through the tree walk of a proven commit's root tree or of the tree's own
 closure.
 
-Only complete packs are readable. Parse records an ordered digest for every
-physical membership row. Publication compares the stored rows with those
-digests; it does not re-read and re-inflate the whole pack. Every pack is
-self-contained: a delta's base is an entry of the same pack, so pack deletion
-only promotes fallbacks and checks no dependency. Loose objects shadow packed
-objects for reads.
+Only complete packs are readable. Parsing requires ordered offsets indexed
+exactly once. Publication checks that the stored physical-entry count matches
+the parsed count; it does not re-read and re-inflate the whole pack. Every pack
+is self-contained: a delta's base is an entry of the same pack. Deletion lets
+the canonical lookup select the next complete copy and checks no dependency.
+Loose objects shadow packed objects for reads.
 
 Tree objects are parsed into edge rows once per tree OID, when the first copy
 is stored; a later loose or packed copy writes no entries. Tree walks use one

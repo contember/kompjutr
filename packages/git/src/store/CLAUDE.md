@@ -72,16 +72,19 @@ ADR-0003.
 
 Received packs stay compressed in 1 MiB `git_pack_data` rows. The delta
 workspace separately uses operation-local 64 KiB chunks. Publication validates
-the trailer and compares stored membership with digests recorded during parse;
-it does not re-read and re-inflate the pack. Only complete packs are readable.
+the trailer. Parse-time checks require ordered offsets indexed exactly once;
+publication checks that the stored physical-entry count matches the parsed count.
+It does not re-read and re-inflate the pack. Only complete packs are readable.
 
 Packs are self-contained. `git_pack_entries.base_offset` names a delta's base
 inside the same pack; ingest converts REF deltas to it, rejects a base outside
 the pack, and rejects a chain above `MAX_DELTA_DEPTH` (4,095, Git's
 `pack-objects` limit), all with `ECORRUPT`. A read starts at the canonical
-`git_pack_objects` row and follows base offsets within that pack, so pack
-deletion only promotes fallbacks and never checks a dependency. A read discovers
-its batch's delta closure in one graph query of at most `MAX_DELTA_DEPTH + 1`
+`git_pack_entries` row with the lowest `(pack_id, offset)` among complete
+packs, through `pack/canonical.ts`, and follows base offsets within that pack.
+OID probes pin `git_pack_entries_by_oid`; query-plan witnesses guard against a
+repository-wide primary-key scan. Deletion needs no promotion or dependency check.
+A read discovers its batch's delta closure in one graph query of at most `MAX_DELTA_DEPTH + 1`
 entries and halves the batch while the closure is larger, so a single chain
 always fits; it opens no transaction and writes nothing.
 
