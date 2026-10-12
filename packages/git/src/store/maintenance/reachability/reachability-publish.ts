@@ -2,6 +2,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import type { SharedRepoStore } from "../../index.js";
+import { canonicalPackEntrySql } from "../../pack/canonical.js";
 import { objectType, oidField } from "./reachability-codecs.js";
 import {
   EDGE_PAGE,
@@ -59,18 +60,19 @@ function validateEdgeTargets(store: SharedRepoStore, wanted: readonly Normalized
   for (const row of store.db.iterate(
     `SELECT /* maintenance-edge-targets */ input.value AS oid,
              CASE WHEN loose.oid IS NOT NULL THEN 'loose'
-                  WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
+                  WHEN packed.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
              CASE WHEN loose.oid IS NOT NULL THEN loose.type ELSE packed.type END AS type,
              promised.oid AS promised_oid
        FROM json_each(?) input
        LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = input.value
-       LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = input.value
-       LEFT JOIN git_pack_meta pack
-         ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-         AND pack.state = 'complete'
+       LEFT JOIN git_pack_entries packed
+         ON packed.repo_id = ? AND (packed.pack_id, packed.offset) = (
+           ${canonicalPackEntrySql("?", "input.value")}
+         )
        LEFT JOIN git_promised_blobs promised
          ON promised.repo_id = ? AND promised.oid = input.value`,
     JSON.stringify(wanted.map((edge) => edge.oid)),
+    store.repoId,
     store.repoId,
     store.repoId,
     store.repoId,

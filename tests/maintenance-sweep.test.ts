@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { blob, type SqlDatabase } from "../packages/do/src/db/db.js";
 import { Workspace } from "../packages/do/src/runtime/workspace.js";
 import { createGit } from "../packages/git/src/client.js";
@@ -11,6 +11,7 @@ import {
   serializeTree,
 } from "../packages/git/src/common/objects.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
+import { advanceMaintenanceMark } from "../packages/git/src/store/maintenance/reachability.js";
 import {
   advanceMaintenanceSweep,
   GC_GRACE_MS,
@@ -496,6 +497,170 @@ describe("maintenance sweep", () => {
       phase: "finish",
       status: "complete",
     });
+  });
+
+  it("sweeps a redundant marked copy and keeps its canonical holder and blob mapping", async () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const data = utf8.encode("reachable duplicate\n");
+    const oid = hashObject("blob", data);
+    const bytes = fullPack([{ type: "blob", data }]);
+    const first = await store.packs.ingest(slices(bytes, 17));
+    const later = await store.packs.ingest(slices(bytes, 17));
+    seedRun(db, checkout.repoId, "packs", [{ oid }]);
+    seedBlobId(db, checkout.repoId, new Uint8Array([7]), oid);
+    expect(advance(db, store.shared, 100)).toMatchObject({ phase: "finish", reclaimedPacks: 0 });
+    expect(
+      candidateAge(db, "git_pack_gc_candidates", checkout.repoId, first.packId),
+    ).toBeUndefined();
+    expect(candidateAge(db, "git_pack_gc_candidates", checkout.repoId, later.packId)).toBe(100);
+    db.run("UPDATE git_maintenance_runs SET phase = 'packs' WHERE repo_id = ?", checkout.repoId);
+    expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({ reclaimedPacks: 1 });
+    expect(store.packs.lookup(oid)?.packId).toBe(first.packId);
+    expect(store.read(oid)?.data).toEqual(data);
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE pack_id = ?", later.packId),
+    ).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_blob_ids WHERE oid = ?", oid)).toBe(1);
+    expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({ phase: "finish" });
+  });
+
+  it("marks the surviving holder after the earlier pack is deleted", async () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const data = utf8.encode("promoted reachable duplicate\n");
+    const oid = hashObject("blob", data);
+    const bytes = fullPack([{ type: "blob", data }]);
+    const first = await store.packs.ingest(slices(bytes, 17));
+    const later = await store.packs.ingest(slices(bytes, 17));
+    seedRun(db, checkout.repoId, "packs", [{ oid }]);
+    advance(db, store.shared, 100);
+    expect(candidateAge(db, "git_pack_gc_candidates", checkout.repoId, later.packId)).toBe(100);
+    store.packs.deleteCompletePacks([first.packId]);
+    db.run("DELETE FROM git_maintenance_runs WHERE repo_id = ?", checkout.repoId);
+    seedRun(db, checkout.repoId, "packs", [{ oid }]);
+    expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({
+      phase: "finish",
+      reclaimedPacks: 0,
+    });
+    expect(
+      candidateAge(db, "git_pack_gc_candidates", checkout.repoId, later.packId),
+    ).toBeUndefined();
+    expect(store.packs.lookup(oid)?.packId).toBe(later.packId);
+    expect(store.read(oid)?.data).toEqual(data);
+  });
+
+  it.each([false, true])(
+    "sweeps a canonical holder with a fallback (loose shadow: %s)",
+    async (loose) => {
+      const db = new TestDatabase();
+      const { checkout, store } = open(db);
+      const data = utf8.encode("unreachable duplicate\n");
+      const oid = hashObject("blob", data);
+      if (loose) store.write("blob", data);
+      const bytes = fullPack([{ type: "blob", data }]);
+      const first = await store.packs.ingest(slices(bytes, 17));
+      const later = await store.packs.ingest(slices(bytes, 17));
+      seedRun(db, checkout.repoId, "packs");
+      seedBlobId(db, checkout.repoId, new Uint8Array([8]), oid);
+      db.run(
+        "INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms) VALUES (?, ?, 100)",
+        checkout.repoId,
+        first.packId,
+      );
+      expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({ reclaimedPacks: 1 });
+      expect(store.packs.lookup(oid)?.packId).toBe(later.packId);
+      expect(store.read(oid)?.data).toEqual(data);
+      expect(db.scalar<number>("SELECT count(*) FROM git_blob_ids WHERE oid = ?", oid)).toBe(
+        loose ? 1 : 0,
+      );
+    },
+  );
+
+  it("pins every rewritten maintenance query to OID or physical-entry seeks", async () => {
+    const db = new TestDatabase();
+    const { database, checkout, store } = open(db);
+    const data = utf8.encode("rooted leaf\n");
+    const oid = hashObject("blob", data);
+    const treeData = serializeTree([{ mode: MODE_FILE, name: "leaf", oid }]);
+    const tree = hashObject("tree", treeData);
+    const commitData = serializeCommit({
+      tree,
+      parent: [],
+      author: PERSON,
+      committer: PERSON,
+      message: "root\n",
+    });
+    const head = hashObject("commit", commitData);
+    const bytes = fullPack([
+      { type: "blob", data },
+      { type: "tree", data: treeData },
+      { type: "commit", data: commitData },
+    ]);
+    await store.packs.ingest(slices(bytes, 17));
+    await store.packs.ingest(slices(bytes, 17));
+    store.setRef("refs/heads/main", head);
+    store.write("blob", utf8.encode("unreachable loose\n"));
+    const all = vi.spyOn(db, "all");
+    const iterate = vi.spyOn(db, "iterate");
+    const run = vi.spyOn(db, "run");
+    try {
+      for (let step = 0; ; step++) {
+        if (step > 100) throw new Error("root snapshot did not finish");
+        if (database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: 100 }).complete)
+          break;
+      }
+      for (let step = 0; ; step++) {
+        if (step > 100) throw new Error("marking did not finish");
+        if (advanceMaintenanceMark(store.shared).status === "complete") break;
+      }
+      advanceToPhase(db, store.shared, 100, "finish");
+      db.run(
+        "UPDATE git_maintenance_runs SET phase = 'loose', next_eligible_ms = NULL WHERE repo_id = ?",
+        checkout.repoId,
+      );
+      advanceToPhase(db, store.shared, 100 + GC_GRACE_MS, "finish");
+      const queries = new Map(
+        [...all.mock.calls, ...iterate.mock.calls, ...run.mock.calls]
+          .filter(
+            ([sql]) =>
+              sql.includes("git_pack_entries candidate") &&
+              (sql.includes("maintenance-edge-targets") ||
+                sql.includes("maintenance-object-info") ||
+                sql.includes("loose_type") ||
+                sql.includes("pack-sweep-page") ||
+                sql.includes("AS actionable") ||
+                sql.startsWith("DELETE FROM git_blob_ids") ||
+                (sql.startsWith("DELETE FROM git_commits") &&
+                  sql.includes("git_commits.object_size"))),
+          )
+          .map(([sql, ...bindings]) => [sql, bindings]),
+      );
+      expect(queries.size).toBe(8);
+      for (const [sql, bindings] of queries) {
+        const plan = db
+          .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...bindings)
+          .map((row) => row.detail);
+        expect(
+          plan.some((row) =>
+            /SEARCH candidate USING COVERING INDEX git_pack_entries_by_oid \(repo_id=\? AND oid=\?\)/.test(
+              row,
+            ),
+          ),
+          sql,
+        ).toBe(true);
+        for (const row of plan) {
+          expect(row, sql).not.toMatch(/^SCAN (candidate|packed|object)\b/);
+          expect(row, sql).not.toMatch(
+            /SEARCH (candidate|packed|object) USING PRIMARY KEY \(repo_id=\?\)(?: |$)/,
+          );
+        }
+      }
+      expect(store.read(oid)?.data).toEqual(data);
+    } finally {
+      vi.restoreAllMocks();
+      db.storage.db.close();
+    }
   });
 
   it("preserves an existing pack age and retains it one millisecond before eligibility", async () => {

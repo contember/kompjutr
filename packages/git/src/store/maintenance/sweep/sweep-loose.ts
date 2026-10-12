@@ -2,6 +2,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import { decodeRow, expectSafeInteger, int, nullable, text } from "../../../common/rows.js";
 import { bumpRepositorySourceGeneration } from "../../core/source-generation.js";
+import { canonicalPackEntrySql, completePackEntriesSql } from "../../pack/canonical.js";
 import type { LooseRow, RunState, SliceResult } from "./sweep-contracts.js";
 import {
   eligibilityTime,
@@ -111,11 +112,7 @@ function deleteLooseObjects(db: SqlDatabase, repoId: number, oids: readonly stri
     `DELETE FROM git_blob_ids
       WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))
         AND NOT EXISTS (
-          SELECT 1 FROM git_pack_objects packed
-          JOIN git_pack_meta pack
-            ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-           AND pack.state = 'complete'
-          WHERE packed.repo_id = git_blob_ids.repo_id AND packed.oid = git_blob_ids.oid
+          SELECT 1 ${completePackEntriesSql("git_blob_ids.repo_id", "git_blob_ids.oid")}
         )`,
     repoId,
     payload,
@@ -124,12 +121,12 @@ function deleteLooseObjects(db: SqlDatabase, repoId: number, oids: readonly stri
     `DELETE FROM git_commits
       WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))
         AND NOT EXISTS (
-          SELECT 1 FROM git_pack_objects packed
-          JOIN git_pack_meta pack
-            ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-           AND pack.state = 'complete'
-          WHERE packed.repo_id = git_commits.repo_id AND packed.oid = git_commits.oid
-            AND packed.type = 'commit' AND packed.size = git_commits.object_size
+          SELECT 1 FROM git_pack_entries packed
+           WHERE packed.repo_id = git_commits.repo_id
+             AND (packed.pack_id, packed.offset) = (
+               ${canonicalPackEntrySql("git_commits.repo_id", "git_commits.oid")}
+             )
+             AND packed.type = 'commit' AND packed.size = git_commits.object_size
         )`,
     repoId,
     payload,

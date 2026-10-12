@@ -4,6 +4,7 @@ import { CorruptError, GitError } from "../../../common/errors.js";
 import type { ObjectType } from "../../../common/objects.js";
 import { expectSafeInteger } from "../../../common/rows.js";
 import { readRepositorySourceGeneration } from "../../core/source-generation.js";
+import { canonicalPackEntrySql } from "../../pack/canonical.js";
 import { ensureMaintenanceControl } from "../control.js";
 import type { MaintenanceRunView } from "../state/state-contracts.js";
 import { readMaintenanceRunView } from "../state/state-view.js";
@@ -149,17 +150,15 @@ function validateObjectRoots(db: SqlDatabase, repoId: number, roots: RootCandida
        FROM json_each(?) input
        LEFT JOIN git_objects loose
          ON loose.repo_id = ? AND loose.oid = json_extract(input.value, '$.oid')
-       LEFT JOIN git_pack_objects packed
-         ON packed.repo_id = ? AND packed.oid = json_extract(input.value, '$.oid')
-        AND EXISTS (
-          SELECT 1 FROM git_pack_meta meta
-           WHERE meta.repo_id = packed.repo_id AND meta.pack_id = packed.pack_id
-             AND meta.state = 'complete'
-        )
+       LEFT JOIN git_pack_entries packed
+         ON packed.repo_id = ? AND (packed.pack_id, packed.offset) = (
+           ${canonicalPackEntrySql("?", "json_extract(input.value, '$.oid')")}
+         )
        LEFT JOIN git_promised_blobs promised
          ON promised.repo_id = ? AND promised.oid = json_extract(input.value, '$.oid')
       ORDER BY CAST(input.key AS INTEGER)`,
     payload,
+    repoId,
     repoId,
     repoId,
     repoId,

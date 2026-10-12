@@ -2,6 +2,7 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../../common/errors.js";
 import { decodeRow, expectSafeInteger, int, nullable, oneOf } from "../../../common/rows.js";
 import type { SharedRepoStore } from "../../index.js";
+import { canonicalPackEntrySql } from "../../pack/canonical.js";
 import type { PackAudit, RunState, SliceResult } from "./sweep-contracts.js";
 import {
   eligibilityTime,
@@ -13,14 +14,18 @@ import {
   updateReclamationCounters,
 } from "./sweep-shared.js";
 
-const PACK_COLUMNS = `pack.repo_id, pack.pack_id, pack.size, pack.count, pack.state,
-  candidate.unreachable_since_ms,
-  EXISTS (
-    SELECT 1 FROM git_pack_objects object
-    JOIN git_maintenance_objects mark
+const MARKED_CANONICAL_PACK_SQL = `EXISTS (
+    SELECT 1 FROM git_pack_entries object
+    CROSS JOIN git_maintenance_objects mark
       ON mark.repo_id = object.repo_id AND mark.run_id = ? AND mark.oid = object.oid
     WHERE object.repo_id = pack.repo_id AND object.pack_id = pack.pack_id
-  ) AS marked`;
+      AND (object.pack_id, object.offset) = (
+        ${canonicalPackEntrySql("mark.repo_id", "mark.oid")}
+      )
+  )`;
+
+const PACK_COLUMNS = `pack.repo_id, pack.pack_id, pack.size, pack.count, pack.state,
+  gc_candidate.unreachable_since_ms, ${MARKED_CANONICAL_PACK_SQL} AS marked`;
 
 function readPackRow(row: Record<string, unknown>, repoId: number): PackAudit {
   const decoded = decodeRow(
@@ -79,8 +84,8 @@ function readPackPage(
     `WITH audits AS (
         SELECT ${PACK_COLUMNS}
           FROM git_pack_meta pack
-          LEFT JOIN git_pack_gc_candidates candidate
-            ON candidate.repo_id = pack.repo_id AND candidate.pack_id = pack.pack_id
+          LEFT JOIN git_pack_gc_candidates gc_candidate
+            ON gc_candidate.repo_id = pack.repo_id AND gc_candidate.pack_id = pack.pack_id
          WHERE pack.repo_id = ? AND pack.pack_id > ?
      )
       SELECT /* pack-sweep-page */ * FROM audits
@@ -105,7 +110,13 @@ function deletePackStorage(store: SharedRepoStore, run: RunState, pack: PackAudi
   store.db.run(
     `DELETE FROM git_blob_ids
       WHERE repo_id = ?
-        AND oid IN (SELECT oid FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?)
+        AND oid IN (
+          SELECT object.oid FROM git_pack_entries object
+           WHERE object.repo_id = ? AND object.pack_id = ?
+             AND (object.pack_id, object.offset) = (
+               ${canonicalPackEntrySql("object.repo_id", "object.oid")}
+             )
+        )
         AND NOT EXISTS (
           SELECT 1 FROM git_objects loose
            WHERE loose.repo_id = git_blob_ids.repo_id AND loose.oid = git_blob_ids.oid
@@ -119,22 +130,17 @@ function deletePackStorage(store: SharedRepoStore, run: RunState, pack: PackAudi
 
 function nextPackEligibility(db: SqlDatabase, repoId: number, run: RunState): number | null {
   const row = db.one<Record<string, unknown>>(
-    `SELECT min(candidate.unreachable_since_ms) AS since,
+    `SELECT min(gc_candidate.unreachable_since_ms) AS since,
             EXISTS (
-              SELECT 1 FROM git_pack_gc_candidates candidate
+              SELECT 1 FROM git_pack_gc_candidates gc_candidate
               JOIN git_pack_meta pack
-                ON pack.repo_id = candidate.repo_id AND pack.pack_id = candidate.pack_id
-              WHERE candidate.repo_id = ? AND (
+                ON pack.repo_id = gc_candidate.repo_id AND pack.pack_id = gc_candidate.pack_id
+              WHERE gc_candidate.repo_id = ? AND (
                 pack.state != 'complete' OR
-                EXISTS (
-                  SELECT 1 FROM git_pack_objects object
-                  JOIN git_maintenance_objects mark
-                    ON mark.repo_id = object.repo_id AND mark.run_id = ? AND mark.oid = object.oid
-                  WHERE object.repo_id = pack.repo_id AND object.pack_id = pack.pack_id
-                )
+                ${MARKED_CANONICAL_PACK_SQL}
               )
             ) AS actionable
-       FROM git_pack_gc_candidates candidate WHERE candidate.repo_id = ?`,
+       FROM git_pack_gc_candidates gc_candidate WHERE gc_candidate.repo_id = ?`,
     repoId,
     run.runId,
     repoId,

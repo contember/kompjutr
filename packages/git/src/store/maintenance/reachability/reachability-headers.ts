@@ -5,6 +5,7 @@ import { expectSafeInteger } from "../../../common/rows.js";
 import { InflateStream } from "../../../common/zlib.js";
 import type { SharedRepoStore } from "../../index.js";
 import { maximumDeflatedBytes, STREAM_CHUNK } from "../../objects/objects.js";
+import { canonicalPackEntrySql } from "../../pack/canonical.js";
 import { bytesField, objectType } from "./reachability-codecs.js";
 import type { HeaderScanResult, ReachabilityObjectInfo } from "./reachability-contracts.js";
 
@@ -135,16 +136,17 @@ export function requireObjectInfo(store: SharedRepoStore, oid: string): Reachabi
   const row = store.db.one<Record<string, unknown>>(
     `SELECT /* maintenance-object-info */ input.oid,
             CASE WHEN loose.oid IS NOT NULL THEN 'loose'
-                 WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
+                 WHEN packed.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
             CASE WHEN loose.oid IS NOT NULL THEN loose.type ELSE packed.type END AS type,
             CASE WHEN loose.oid IS NOT NULL THEN loose.size ELSE packed.size END AS size
        FROM (SELECT ? AS oid) input
        LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = input.oid
-       LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = input.oid
-       LEFT JOIN git_pack_meta pack
-         ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-        AND pack.state = 'complete'`,
+       LEFT JOIN git_pack_entries packed
+         ON packed.repo_id = ? AND (packed.pack_id, packed.offset) = (
+           ${canonicalPackEntrySql("?", "input.oid")}
+         )`,
     oid,
+    store.repoId,
     store.repoId,
     store.repoId,
   );

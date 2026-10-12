@@ -430,3 +430,19 @@ sprint risk. Resolve blocking findings before implementation.
   yields between completed maintenance calls every 512 iterations; no timeout
   or assertion changed. Its independent review is clean, and the entire file
   now passes 30/30 with exit 0 (106.80 s). The test fix is a separate commit.
+
+### WU2 — Maintenance (2026-10-12)
+
+- WU1 committed as `6840774`. Roots, reachability, loose sweep and pack sweep
+  now derive complete membership and canonical ownership from physical entries.
+  Page classification and finish validation share the marked-holder predicate.
+- All eight rewritten statement shapes have query-plan witnesses. A read-only
+  full-history bytecode probe confirmed that an absent reachability mark skips
+  the canonical subquery entirely; the mark correlation prevents unnecessary
+  canonical lookups for unmarked entries.
+- Independent correctness, coverage/architecture and SQL-performance reviews
+  are clean. No unresolved findings.
+- Passed under CPU leases: seven maintenance suites (89 tests), the expanded
+  sweep suite (23 tests), smoke (160 tests), typecheck and the statement-budget
+  gate. Biome and diff whitespace checks passed. Added witnesses cover redundant
+  pack deletion, ownership transfer and blob-ID retention with surviving copies.
