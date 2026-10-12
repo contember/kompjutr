@@ -1,3 +1,38 @@
+> **OUTCOME — shipped 2026-10-12.**
+>
+> **Result.** Canonical packed objects are derived from the lowest
+> `(pack_id, offset)` among complete physical entries. The stored canonical
+> table, its writes and deletion-time promotions are removed.
+>
+> Three alternating workerd pairs (`c373b41` → `9f24c41`) save a median
+> **8.231 s** and **52,703,232 bytes**. Every pair is faster; SQL falls from
+> 2,210 to 1,924 with unchanged returned-row medians. Depth-1 SQL falls from
+> 931 to 900 with unchanged rows. Both sampled live-set gates pass.
+> Four CDP profiles attribute the gain to pack-row writes and the audit.
+>
+> **Commit map.**
+>
+> | Unit | Commit |
+> | --- | --- |
+> | Plan and proposed ADR | `09993cf` |
+> | Baseline maintenance test scheduling fix | `ec11704` |
+> | WU1 — derived reads | `6840774` |
+> | WU2 — maintenance ownership | `dd352c8` |
+> | WU3 — remove stored canonical ownership | `9f24c41` |
+> | Query-plan witness alias fix | `e3316ca` |
+> | WU4 — measurements and documentation | `c7ad36c` |
+> | Authorized baseline rg parity fixes | `b43aa38` |
+>
+> **Verification.** **8,304 tests pass** in 814.7 s under a four-vCPU lease.
+> Typecheck, Biome, smoke, focused pack/maintenance/query-plan witnesses and
+> independent reviews pass.
+> The baseline shell failures were fixed with native parity witnesses;
+> closure needs no exception. ADR-0031 is accepted and the consumed idea
+> is deleted.
+>
+> **Deferred.** No planned WU is deferred. The covering index, inflate changes,
+> larger caches and request CPU-limit slicing (backlog 119) remain out of scope.
+
 # Sprint — One OID index for pack objects (2026-10-09)
 
 **Goal.** Pack ingest writes each object once, to `git_pack_entries`, and every
@@ -610,7 +645,7 @@ falls from 1.462–1.557 s to 0.023–0.024 s. This confirms the intended saving
 on workerd. These profiles attribute the improvement; their wall times are
 not substituted for the paired acceptance runs.
 
-#### Closure blocker
+#### Initial closure blocker
 
 The first full suite finished in 842.0 s. Besides the query-plan assertion
 fixed in `e3316ca`, it found 14 `tests/shell/rg-json.test.ts` parity failures.
@@ -625,10 +660,9 @@ other batch passed, including all eight root shards, pack slices, protocol,
 filesystem and end-to-end. Command:
 `GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true cpu-lease run -n 4 -- npm run test:full`.
 
-The full-suite gate is not green. Sprint closure remains pending an explicit
-choice to extend scope to the shell fixes or accept these baseline failures
-as an exception. ADR-0031 records the implemented decision; this plan stays
-in `sprints/` until that closure decision is resolved.
+At this point the full-suite gate was not green. Closure awaited the user's
+choice to extend scope to the shell fixes or accept the baseline failures as
+an exception. The authorized follow-up below resolves the blocker.
 
 Independent WU4 evidence and documentation reviews are clean after narrowing
 two measurement claims to their observed scope and fixing one stale ADR status
@@ -659,3 +693,16 @@ The cost witness searches 2,000 and 6,000 files with an absent literal. Text
 mode takes three filesystem operations at both sizes; JSON takes eight and
 twenty, respectively, and reports every candidate. Tests and typecheck ran under CPU
 leases; these operation counts are not wall-time benchmark claims.
+
+### Final closure (2026-10-12)
+
+At `b43aa38`, the complete suite passes with exit 0: **8,304 tests**, including
+all **4,691 shell tests**, in **814.7 s** under a four-vCPU lease (two test
+lanes). Command: `GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true cpu-lease run -n 4
+-- npm run test:full`. No full-suite exception is needed. The final log is
+retained outside Git at `/tmp/kompjutr-rg-test-full.log`.
+
+All four WUs are complete. Independent code and documentation reviews are
+clean, ADR-0031 is accepted, the consumed idea is deleted, and the sprint
+moves to `archive/` with its commit map and measured outcome. The request
+CPU-limit work remains out of scope in backlog 119.

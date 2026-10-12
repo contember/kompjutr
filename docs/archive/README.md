@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [One OID index for pack objects](sprint-2026-10-09-one-oid-index.md) —
+  derived canonical copies, one physical-entry index family; median paired
+  workerd clone savings of 8.231 s and 52.70 MB, with 8,304 tests passing.
 - [Fast fresh clone](sprint-2026-10-07-fast-fresh-clone.md) — per-pack
   connectivity at ingest, trees projected on demand; 179.5 s → 74.5 s.
 - [Full-history performance](sprint-2026-10-07-full-history-performance.md)

@@ -20,7 +20,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [One OID index for pack objects](sprint-2026-10-09-one-oid-index.md) —
-  derive the canonical pack copy from `git_pack_entries` and drop
-  stored canonical ownership (ADR-0031, accepted); closure awaits resolution
-  of baseline shell parity failures.
+No active sprints.

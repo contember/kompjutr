@@ -16,10 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [One OID index for pack objects](sprints/sprint-2026-10-09-one-oid-index.md):
-  pack ingest writes each object once, and readers derive the canonical copy
-  ([ADR-0031](decisions/0031-derive-the-canonical-pack-copy-from-pack-entries.md),
-  accepted); closure awaits resolution of baseline shell parity failures.
+No active sprints.
 
 ## Specs
 
@@ -37,6 +34,9 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
        If everything is "hot", nothing is. -->
+- [One OID index for pack objects](archive/sprint-2026-10-09-one-oid-index.md)
+  shipped: canonical copies derived from physical entries (ADR-0031), median
+  paired full-history clone saving 8.231 s and 52.70 MB; 8,304 tests pass.
 - [Fast fresh clone](archive/sprint-2026-10-07-fast-fresh-clone.md) shipped:
   per-pack connectivity at ingest (ADR-0029) and trees projected on demand
   (ADR-0030). Next.js full-history clone 179.5 s → 74.5 s, database
