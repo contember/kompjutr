@@ -633,3 +633,29 @@ in `sprints/` until that closure decision is resolved.
 Independent WU4 evidence and documentation reviews are clean after narrowing
 two measurement claims to their observed scope and fixing one stale ADR status
 label. Relative file links, Biome format/check and diff whitespace checks pass.
+
+### Authorized closure follow-up — rg parity (2026-10-12)
+
+The user authorized fixing the baseline `rg` failures instead of waiving the
+full-suite gate. Scope: search statistics, multiline count limits and focused
+differential/cost witnesses. JSON needs all selected candidate files to report
+complete search and byte totals; its literal searches therefore use bounded
+discovery and batched reads. Text-mode literal pushdown remains unchanged.
+
+The fix counts nonmatching candidates and skipped walked binaries, reports
+single-line capped bytes through the selected line, and counts every multiline
+submatch while preserving overlapping matching line ranges at the cap. A
+binary offset cannot extend searched bytes past the single-line cap.
+
+Independent correctness, coverage and architecture reviews are clean. The
+correctness review's two additional cases (overlapping submatches at `-m 2`,
+and NUL after a single-line cap) have exact native parity witnesses; a NUL
+before the cap is covered too. Final focused search witnesses pass 109/109
+(52 JSON cases, ordinary rg and pushdown). The broader shell run passed
+4,688 tests before those final two fixes; smoke passed 160/160. Typecheck,
+Biome format/check and diff whitespace checks pass.
+
+The cost witness searches 2,000 and 6,000 files with an absent literal. Text
+mode takes three filesystem operations at both sizes; JSON takes eight and
+twenty, respectively, and reports every candidate. Tests and typecheck ran under CPU
+leases; these operation counts are not wall-time benchmark claims.

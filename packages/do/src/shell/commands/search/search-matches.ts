@@ -22,9 +22,10 @@ export function* matchGroups(
   bytes: Uint8Array,
   compiled: RecordPattern,
   retained: RetainedBudget,
+  maxCount?: number,
 ): Generator<MatchGroup> {
   if (compiled.multiline) {
-    yield* multilineGroups(input, bytes, compiled.pattern, retained);
+    yield* multilineGroups(input, bytes, compiled.pattern, retained, maxCount);
     return;
   }
   const text = input.text;
@@ -65,11 +66,13 @@ function* multilineGroups(
   bytes: Uint8Array,
   pattern: RegExp,
   retained: RetainedBudget,
+  maxCount?: number,
 ): Generator<MatchGroup> {
   const text = input.text;
   let group: MatchGroup | undefined;
   let line = 1;
   let position = 0;
+  let count = 0;
   const releases: Array<() => void> = [];
   try {
     for (const match of text.matchAll(pattern)) {
@@ -79,6 +82,15 @@ function* multilineGroups(
       const newline = text.indexOf("\n", Math.max(match.index, matchEnd - 1));
       const end = input.byteOffset(newline < 0 ? text.length : newline + 1);
       const byteStart = input.byteOffset(start);
+      // A cap stops at the next matching line range, preserving overlapping submatches.
+      if (
+        (group === undefined || byteStart >= group.end) &&
+        maxCount !== undefined &&
+        count >= maxCount
+      ) {
+        break;
+      }
+      count++;
       if (group !== undefined && byteStart > group.end) {
         yield group;
         for (const release of releases) release();

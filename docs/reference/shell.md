@@ -274,6 +274,11 @@ File searches also support `-m`/`--max-count`, `-U`/`--multiline`, and `--json`.
 JSON records carry UTF-8 byte offsets and grouped submatches; multiline searches
 can span source lines. Non-UTF-8 record content uses base64 `bytes` fields; named
 binary files keep JSON output and report `binary_offset` in the end record.
+JSON summary statistics include nonmatching files and skipped walked binaries.
+JSON searches read selected candidates in bounded batches to count their searched
+bytes. Text searches retain the literal SQL predicate. A multiline maximum count counts
+submatches, but stops only before the next nonoverlapping matching line range.
+Submatches that share source lines stay together even at the limit.
 These three flags are refused on stdin. JSON mode refuses
 count, file listing, inverted matches, only-matching, quiet and context options;
 multiline mode refuses inverted matches, only-matching and context options.

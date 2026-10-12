@@ -223,7 +223,8 @@ function* walk(
   // which is what that suite is for.
   const complementary =
     request.mode === "files-without-match" || (request.mode === "count" && request.zeroCounts);
-  if (request.literal !== null && !complementary) {
+  // JSON statistics include candidates without matches and skipped binaries.
+  if (request.literal !== null && !complementary && !request.json) {
     yield* walkByContent(fs, realRoot, sqlPattern, request, include, exclude, needsBytes);
     return;
   }
@@ -396,7 +397,10 @@ async function* emit(
   if (request.mode === "content" || binary === "skip") {
     const nul = firstNul(bytes);
     if (nul >= 0) {
-      if (binary === "skip") return;
+      if (binary === "skip") {
+        if (request.json) stats.searches++;
+        return;
+      }
       if (request.json || request.multiline) {
         yield* emitRecords(path, bytes, request, withFilename, noteMatch, retained, stats);
         return;

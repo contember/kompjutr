@@ -61,15 +61,15 @@ export async function* emitRecords(
   const binaryOffset = nul < 0 ? null : nul;
   const started = performance.now();
   const stats = newJsonStats();
+  stats.searches = 1;
   let began = false;
   let count = 0;
-  let capped = false;
+  let searchedEnd = content.length;
   try {
-    for (const group of matchGroups(input, content, compiled, retained)) {
+    for (const group of matchGroups(input, content, compiled, retained, request.maxCount)) {
       noteMatch();
       count++;
       const selected = content.subarray(group.start, group.end);
-      stats.searches = 1;
       stats.matches += group.submatches.length;
       let lineCount = selected[selected.length - 1] === 10 ? 0 : 1;
       for (const byte of selected) if (byte === 10) lineCount++;
@@ -121,8 +121,8 @@ export async function* emitRecords(
           start = end + 1;
         }
       }
-      if (request.maxCount !== undefined && count >= request.maxCount) {
-        capped = true;
+      if (!compiled.multiline && request.maxCount !== undefined && count >= request.maxCount) {
+        searchedEnd = group.end;
         break;
       }
     }
@@ -131,8 +131,7 @@ export async function* emitRecords(
         `${withFilename ? `${path}:` : ""}${compiled.multiline ? stats.matches : count}\n`,
       );
     }
-    if (stats.searches > 0)
-      stats.bytes_searched = binaryOffset ?? (!compiled.multiline && capped ? 0 : content.length);
+    stats.bytes_searched = Math.min(binaryOffset ?? content.length, searchedEnd);
     stats.duration = performance.now() - started;
     if (began)
       yield encode(

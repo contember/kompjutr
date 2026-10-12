@@ -124,6 +124,18 @@ describe("a search does not scale with the tree", () => {
     expect(small).toBeLessThan(1000);
     expect(large).toBeLessThan(1000);
   });
+  it("counts every JSON candidate through batched reads", async () => {
+    for (const size of [2000, 6000]) {
+      const fixture = tree(size);
+      const text = await fixture.shell.run("rg absent /repo/src");
+      const json = await fixture.shell.run("rg --json absent /repo/src");
+      expect(json.exitCode).toBe(1);
+      expect(json.truncated).toBe(false);
+      expect(json.stdout).toContain(`"searches":${size},`);
+      expect(json.operations).toBeLessThan(1000);
+      console.log(`rg absent, ${size} files: text ${text.operations}, JSON ${json.operations}`);
+    }
+  });
   it("falls back, and visibly scales, when the pattern is a real expression", async () => {
     // The contrast that proves the push-down is doing the work: SQLite has
     // no regex, so this reads every candidate file exactly as the first

@@ -95,6 +95,44 @@ describe.skipIf(!REAL_RG)("rg structured matches", () => {
       args: ["-U", "foo\\nbar|baz"],
     },
     {
+      name: "capped overlapping matching lines",
+      corpus: { "file.txt": "foo\nbar baz\nfoo\nbar\n" },
+      args: ["-U", "-m", "1", "foo\\nbar|baz"],
+    },
+    {
+      name: "overlapping submatches consume the multiline count limit",
+      corpus: { "file.txt": "foo\nbar baz\nfoo\nbar baz\n" },
+      args: ["-U", "-m", "2", "foo\\nbar|baz"],
+    },
+    {
+      name: "binary byte before a single-line limit",
+      corpus: { "file.txt": "other\0\nhello\nhello\n" },
+      args: ["-m", "1", "hello"],
+      path: "file.txt",
+    },
+    {
+      name: "single-line limit before a binary byte",
+      corpus: { "file.txt": "hello\nother\0there\nhello\n" },
+      args: ["-m", "1", "hello"],
+      path: "file.txt",
+    },
+    {
+      name: "two capped adjacent multiline hits before a disjoint hit",
+      corpus: { "file.txt": "foo\nbar\nfoo\nbar\nskip\nfoo\nbar\n" },
+      args: ["-U", "-m", "2", "foo\\nbar"],
+    },
+    {
+      name: "capped single-line byte offsets before EOF",
+      corpus: { "file.txt": "é\nhello\nother\n" },
+      args: ["-m", "1", "hello"],
+    },
+    {
+      name: "named binary with no match",
+      corpus: { "file.txt": "other\0there\n" },
+      args: ["hello"],
+      path: "file.txt",
+    },
+    {
       name: "maximum count reached at EOF",
       corpus: { "file.txt": "hello\n" },
       args: ["-m", "1", "hello"],
