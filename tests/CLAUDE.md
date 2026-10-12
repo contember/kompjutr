@@ -38,7 +38,9 @@ implementation can be asked instead.
   `RIPGREP_CONFIG_PATH`. `rg --sort path` compares ordered; GNU grep has no
   equivalent, so its recursive cases compare as sets —
   `agree(parity, { ordered: false })`. That the shell's own order is sorted is
-  asserted separately, as a property of the shell.
+  asserted separately, as a property of the shell. The `rg` oracle is
+  ripgrep 15 (CI pins 15.1.0); distro rg 14 reports different `--json`
+  summary statistics, so `rg-json.test.ts` fails against it.
 - **Filesystem behaviour** is checked by the ported conformance suite against
   POSIX/Node semantics.
 

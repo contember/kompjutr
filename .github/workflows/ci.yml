@@ -25,7 +25,14 @@ jobs:
           apt-get update
           apt-get install --yes ca-certificates software-properties-common
           add-apt-repository --yes ppa:git-core/ppa
-          apt-get install --yes ca-certificates git ripgrep jq tree patch mawk diffutils findutils grep sed util-linux coreutils-from-uutils
+          apt-get install --yes ca-certificates curl git jq tree patch mawk diffutils findutils grep sed util-linux coreutils-from-uutils
+          # rg 15 fixed the --json summary statistics; Ubuntu still ships 14.
+          rg_archive=ripgrep-15.1.0-x86_64-unknown-linux-musl
+          cd "$(mktemp -d)"
+          curl -fsSLO "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/${rg_archive}.tar.gz"
+          echo "1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599  ${rg_archive}.tar.gz" | sha256sum --check -
+          tar -xzf "${rg_archive}.tar.gz" -C /usr/local/bin --strip-components=1 "${rg_archive}/rg"
+          rg --version
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
