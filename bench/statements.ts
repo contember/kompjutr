@@ -373,9 +373,11 @@ const SELECTED_EXACT_INDEX_SQL =
 const FROZEN_NEXTJS_REFERENCES: readonly NextjsReference[] = [
   {
     operation: "git.clone",
-    statements: 931,
+    statements: 900,
     rowsRead: 111_475,
     source:
+      "2026-10-09 one OID index sprint: ingest stopped claiming and auditing canonical pack rows " +
+      "(-31 statements, ADR-0031). " +
       "2026-10-07 fast fresh clone sprint, bisected: the sprint fell to 849 statements and 78,224 rows " +
       "at c7caa2e, then 1347704 moved tree projection from pack ingest to the first walk, so the " +
       "checkout projects the root's closure (+82 statements, +33,251 rows, ADR-0030). " +
