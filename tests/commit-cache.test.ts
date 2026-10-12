@@ -510,6 +510,20 @@ describe("parsed commit cache", () => {
       data.length,
       data.length,
     );
+    db.run(
+      `INSERT INTO git_pack_entries
+         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      1,
+      oid,
+      7,
+      12,
+      13,
+      data.length,
+      "commit",
+      data.length,
+      data.length,
+    );
 
     expect(insertSource(db, oid, data)).toBe(1);
     expect(store.cachedCommit(oid)?.commit).toEqual(commit);
@@ -519,6 +533,7 @@ describe("parsed commit cache", () => {
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
     db.run("UPDATE git_pack_meta SET state = 'complete' WHERE repo_id = ? AND pack_id = ?", 1, 7);
     db.run("UPDATE git_pack_objects SET size = size + 1 WHERE repo_id = ? AND oid = ?", 1, oid);
+    db.run("UPDATE git_pack_entries SET size = size + 1 WHERE repo_id = ? AND oid = ?", 1, oid);
     expect(insertSource(db, oid, data)).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
   });

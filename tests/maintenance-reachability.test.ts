@@ -741,6 +741,14 @@ describe("maintenance reachability", () => {
       oid,
       bytes.length,
     );
+    db.run(
+      `INSERT INTO git_pack_entries
+         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
+       VALUES (?, ?, 0, 0, 0, 0, 'blob', ?, 0)`,
+      checkout.repoId,
+      oid,
+      bytes.length,
+    );
     expect(store.packs.completePackedEntry(oid)?.packId).toBe(0);
     seedMark(db, checkout.repoId, [{ oid }]);
 

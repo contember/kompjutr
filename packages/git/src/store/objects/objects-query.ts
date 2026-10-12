@@ -3,6 +3,7 @@ import { CorruptError, GitError, ObjectNotFoundError } from "../../common/errors
 import type { ObjectType } from "../../common/objects.js";
 import { int, nullable, oneOf, RowShape } from "../../common/rows.js";
 import type { ObjectReadInfo } from "../core/contracts.js";
+import { canonicalPackEntrySql, completePackEntriesSql } from "../pack/canonical.js";
 import { nextPrefix } from "../refs/config.js";
 import {
   MAX_BLOB_BATCH_OIDS,
@@ -50,10 +51,7 @@ export function hasAllObjects(context: ObjectDatabaseContext, oids: Iterable<str
       `SELECT j.value AS oid FROM json_each(?) j
         WHERE EXISTS (SELECT 1 FROM git_objects o WHERE o.repo_id = ? AND o.oid = j.value)
            OR EXISTS (
-             SELECT 1 FROM git_pack_objects p
-             JOIN git_pack_meta m
-               ON m.repo_id = p.repo_id AND m.pack_id = p.pack_id AND m.state = 'complete'
-              WHERE p.repo_id = ? AND p.oid = j.value
+             SELECT 1 ${completePackEntriesSql("?", "j.value")}
            )`,
       JSON.stringify(page),
       context.repoId,
@@ -100,6 +98,7 @@ export function objectInfo(
     if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
   }
   // Materialized lengths keep payload BLOBs out of the grouping sorter.
+  // Bind the subquery repo directly: correlating it to the LEFT JOIN prevents a full-key seek.
   const rows = context.db.all<Record<string, unknown>>(
     `WITH wanted(ordinal, oid) AS MATERIALIZED (
        SELECT CAST(key AS INTEGER), value FROM json_each(?)
@@ -116,11 +115,11 @@ export function objectInfo(
          GROUP BY oid
      )
      SELECT CASE WHEN loose.oid IS NOT NULL THEN 'loose'
-                 WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
+                 WHEN packed.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
             CASE WHEN loose.oid IS NOT NULL THEN loose.type
-                 WHEN pack.pack_id IS NOT NULL THEN packed.type END AS type,
+                 WHEN packed.pack_id IS NOT NULL THEN packed.type END AS type,
             CASE WHEN loose.oid IS NOT NULL THEN loose.size
-                 WHEN pack.pack_id IS NOT NULL THEN packed.size END AS size,
+                 WHEN packed.pack_id IS NOT NULL THEN packed.size END AS size,
             CASE WHEN loose.oid IS NULL THEN 0 ELSE COALESCE(chunks.chunk_rows, 0) END AS chunk_rows,
             CASE WHEN loose.oid IS NULL THEN NULL ELSE chunks.first_chunk END AS first_chunk,
             CASE WHEN loose.oid IS NULL THEN NULL ELSE chunks.last_chunk END AS last_chunk,
@@ -129,12 +128,13 @@ export function objectInfo(
        FROM wanted w
        LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = w.oid
        LEFT JOIN chunks ON chunks.oid = w.oid
-       LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = w.oid
-       LEFT JOIN git_pack_meta pack
-         ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-        AND pack.state = 'complete'
+       LEFT JOIN git_pack_entries packed
+         ON packed.repo_id = ? AND (packed.pack_id, packed.offset) = (
+           ${canonicalPackEntrySql("?", "w.oid")}
+         )
       ORDER BY w.ordinal`,
     JSON.stringify(wanted),
+    context.repoId,
     context.repoId,
     context.repoId,
     context.repoId,

@@ -5,6 +5,8 @@ import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError } from "../../common/errors.js";
 import type { ByteLru } from "../../common/lru.js";
 import { hashObject, type ObjectType, type RawObject } from "../../common/objects.js";
+import { expectText } from "../../common/rows.js";
+import { canonicalPackEntrySql } from "./canonical.js";
 import { PackDataReader } from "./read/read-data.js";
 import { PackObjectResolver } from "./read/read-resolver.js";
 import {
@@ -54,14 +56,10 @@ export class PackReadEngine {
     const row = this.#db.one<PackObjectRow>(
       `SELECT entry.pack_id, entry.offset, entry.data_off, entry.data_len,
               entry.type, entry.size, entry.entry_size, entry.base_offset
-         FROM git_pack_objects object
-         JOIN git_pack_meta pack
-           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-          AND pack.state = 'complete'
-         JOIN git_pack_entries entry
-           ON entry.repo_id = object.repo_id AND entry.pack_id = object.pack_id
-          AND entry.offset = object.offset
-        WHERE object.repo_id = ? AND object.oid = ?`,
+         FROM git_pack_entries entry
+        WHERE entry.repo_id = ? AND (entry.pack_id, entry.offset) = (
+          ${canonicalPackEntrySql("entry.repo_id", "?")}
+        )`,
       this.#repoId,
       oid,
     );
@@ -81,12 +79,11 @@ export class PackReadEngine {
 
   typeAndSize(oid: string): { type: ObjectType; size: number } | null {
     const row = this.#db.one<{ type: ObjectType; size: number }>(
-      `SELECT object.type, object.size
-         FROM git_pack_objects object
-         JOIN git_pack_meta pack
-           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-          AND pack.state = 'complete'
-        WHERE object.repo_id = ? AND object.oid = ?`,
+      `SELECT entry.type, entry.size
+         FROM git_pack_entries entry
+        WHERE entry.repo_id = ? AND (entry.pack_id, entry.offset) = (
+          ${canonicalPackEntrySql("entry.repo_id", "?")}
+        )`,
       this.#repoId,
       oid,
     );
@@ -96,8 +93,8 @@ export class PackReadEngine {
   count(): number {
     return (
       this.#db.scalar<number>(
-        `SELECT COUNT(*)
-           FROM git_pack_objects object
+        `SELECT COUNT(DISTINCT object.oid)
+           FROM git_pack_entries object INDEXED BY git_pack_entries_by_oid
            JOIN git_pack_meta pack
              ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
             AND pack.state = 'complete'
@@ -110,8 +107,8 @@ export class PackReadEngine {
   findPrefix(prefix: string, limit: number): string[] {
     return this.#db
       .all<{ oid: string }>(
-        `SELECT object.oid
-           FROM git_pack_objects object
+        `SELECT DISTINCT object.oid
+           FROM git_pack_entries object INDEXED BY git_pack_entries_by_oid
            JOIN git_pack_meta pack
              ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
             AND pack.state = 'complete'
@@ -127,18 +124,20 @@ export class PackReadEngine {
 
   /** Every oid the pack index holds, in index order. */
   oids(): string[] {
-    return this.#db
-      .all<{ oid: string }>(
-        `SELECT object.oid
-           FROM git_pack_objects object
-           JOIN git_pack_meta pack
-             ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-            AND pack.state = 'complete'
-          WHERE object.repo_id = ?
-          ORDER BY object.oid`,
-        this.#repoId,
-      )
-      .map((row) => row.oid);
+    const oids: string[] = [];
+    for (const row of this.#db.iterate(
+      `SELECT DISTINCT object.oid
+         FROM git_pack_entries object INDEXED BY git_pack_entries_by_oid
+         JOIN git_pack_meta pack
+           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+          AND pack.state = 'complete'
+        WHERE object.repo_id = ?
+        ORDER BY object.oid`,
+      this.#repoId,
+    )) {
+      oids.push(expectText(row.oid, "packed object id"));
+    }
+    return oids;
   }
 
   read(oid: string): RawObject | null {

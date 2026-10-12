@@ -2,6 +2,8 @@
 // in-pack bases by offset, stopping one row past `limit` so an oversized batch
 // is detected without materialising it.
 
+import { canonicalPackEntrySql } from "../canonical.js";
+
 /**
  * Where each requested OID's chain starts. A read on behalf of a pending pack
  * starts at that pack's own entry, so its bases never depend on another pack's
@@ -22,11 +24,10 @@ function packGraphStartsSql(source: string): string {
        UNION ALL
        SELECT object.pack_id, object.offset
          FROM ${source} requested
-         CROSS JOIN git_pack_objects object
-         CROSS JOIN git_pack_meta pack
-        WHERE object.repo_id = ? AND object.oid = requested.oid
-          AND pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-          AND pack.state = 'complete'
+         CROSS JOIN git_pack_entries object
+        WHERE object.repo_id = ? AND (object.pack_id, object.offset) = (
+          ${canonicalPackEntrySql("object.repo_id", "requested.oid")}
+        )
           AND NOT EXISTS (
             SELECT 1 FROM git_pack_entries own
              WHERE own.repo_id = object.repo_id AND own.oid = requested.oid AND own.pack_id = ?

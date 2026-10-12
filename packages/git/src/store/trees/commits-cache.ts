@@ -3,6 +3,7 @@ import { isOid, utf8Decoder } from "../../common/bytes.js";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { type Commit, hashObject, parseCommit } from "../../common/objects.js";
 import { array, blob, int, nullable, RowShape, text } from "../../common/rows.js";
+import { canonicalPackEntrySql } from "../pack/canonical.js";
 
 const JSON_ENCODER = new TextEncoder();
 
@@ -273,13 +274,13 @@ function insertCommitCacheJson(db: SqlDatabase, json: string): number {
            AND o.type = 'commit'
            AND o.size = json_extract(j.value, '$.s')
         UNION ALL
-        SELECT 1 FROM git_pack_objects o
-          JOIN git_pack_meta m ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id
+        SELECT 1 FROM git_pack_entries o
          WHERE o.repo_id = json_extract(j.value, '$.r')
-           AND o.oid = json_extract(j.value, '$.o')
+           AND (o.pack_id, o.offset) = (
+             ${canonicalPackEntrySql("json_extract(j.value, '$.r')", "json_extract(j.value, '$.o')")}
+           )
            AND o.type = 'commit'
            AND o.size = json_extract(j.value, '$.s')
-           AND m.state = 'complete'
       )
      ON CONFLICT(repo_id, oid) DO UPDATE SET
        parents = excluded.parents,

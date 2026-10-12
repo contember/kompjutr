@@ -4,6 +4,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError } from "../../../common/errors.js";
+import { canonicalPackEntrySql } from "../canonical.js";
 import { type CompletePackedEntry, isObjectType } from "../shared.js";
 
 export class PackMembershipReader {
@@ -16,16 +17,13 @@ export class PackMembershipReader {
   completePackedEntry(oid: string): CompletePackedEntry | null {
     if (!isOid(oid)) throw new RangeError("packed entry requires a valid object id");
     let result: CompletePackedEntry | null = null;
-    let rows = 0;
     for (const row of this.db.iterate(
       `SELECT /* complete-packed-entry */ object.oid, object.pack_id,
               object.type, object.size
-         FROM git_pack_objects object
-         JOIN git_pack_meta pack
-           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-          AND pack.state = 'complete'
-        WHERE object.repo_id = ? AND object.oid = ?
-        LIMIT 2`,
+         FROM git_pack_entries object
+        WHERE object.repo_id = ? AND (object.pack_id, object.offset) = (
+          ${canonicalPackEntrySql("object.repo_id", "?")}
+        )`,
       this.repoId,
       oid,
     )) {
@@ -48,8 +46,6 @@ export class PackMembershipReader {
       ) {
         throw new CorruptError(`packed entry ${oid} has invalid metadata`);
       }
-      rows++;
-      if (rows > 1) throw new CorruptError(`packed entry ${oid} is not unique`);
       result = { packId, type, size };
     }
     return result;

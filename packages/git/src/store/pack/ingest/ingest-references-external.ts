@@ -5,6 +5,7 @@ import { expectSafeInteger, expectText } from "../../../common/rows.js";
 import { MAX_PROMISED_BLOB_LOOKUP_OIDS } from "../../fetch/promisor.js";
 import type { TreeObjectReader } from "../../trees/tree-closure.js";
 import { iterateTreeDiffObjects, type WalkTreeDiffObject } from "../../trees/tree-walk.js";
+import { canonicalPackEntrySql } from "../canonical.js";
 import { isObjectType } from "../shared.js";
 
 /** Reachability from the refs and checkout `HEAD`s a fetch began with (ADR-0029). */
@@ -47,11 +48,10 @@ function readStoredObjects(
             COALESCE(
               (SELECT loose.type FROM git_objects loose
                 WHERE loose.repo_id = ? AND loose.oid = wanted.value),
-              (SELECT packed.type FROM git_pack_objects packed
-                 JOIN git_pack_meta pack
-                   ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-                  AND pack.state = 'complete'
-                WHERE packed.repo_id = ? AND packed.oid = wanted.value)
+              (SELECT packed.type FROM git_pack_entries packed
+                WHERE packed.repo_id = ? AND (packed.pack_id, packed.offset) = (
+                  ${canonicalPackEntrySql("packed.repo_id", "wanted.value")}
+                ))
             ) AS type,
             EXISTS (
               SELECT 1 FROM git_promised_blobs promised

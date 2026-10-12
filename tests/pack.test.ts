@@ -2066,7 +2066,9 @@ describe("pack deferred resolution", () => {
         .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
         .map((row) => row.detail);
       const seeks = {
-        object: /SEARCH .* USING .*INDEX .* \(repo_id=\? AND oid=\?\)/,
+        candidate:
+          /SEARCH .* USING COVERING INDEX git_pack_entries_by_oid \(repo_id=\? AND oid=\?\)/,
+        object: /SEARCH .* USING PRIMARY KEY \(repo_id=\? AND pack_id=\? AND offset=\?\)/,
         child: /SEARCH .* USING PRIMARY KEY \(repo_id=\? AND pack_id=\? AND offset=\?\)/,
         base: /SEARCH .* USING PRIMARY KEY \(repo_id=\? AND pack_id=\? AND offset=\?\)/,
         entry: /SEARCH .* USING PRIMARY KEY \(repo_id=\? AND pack_id=\? AND offset=\?\)/,

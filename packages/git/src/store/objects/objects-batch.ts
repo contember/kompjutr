@@ -6,6 +6,7 @@ import { deflate } from "../../common/zlib.js";
 import type { ObjectBatch, ObjectBatchOptions, OwnedObjectBatch } from "../core/contracts.js";
 import { isThenableResult } from "../core/json-pages.js";
 import { bumpRepositorySourceGeneration } from "../core/source-generation.js";
+import { completePackEntriesSql } from "../pack/canonical.js";
 import { insertCommitCaches, prepareCommitCache } from "../trees/commits.js";
 import { ensureTreeClosure } from "../trees/tree-closure.js";
 import { indexSeededTreeSources } from "../trees/tree-index.js";
@@ -140,13 +141,7 @@ function flushObjects(
               json_extract(j.value, '$.s')
          FROM json_each(?) j
         WHERE NOT EXISTS (
-          SELECT 1
-            FROM git_pack_objects packed
-            JOIN git_pack_meta pack
-              ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-             AND pack.state = 'complete'
-           WHERE packed.repo_id = ?
-             AND packed.oid = json_extract(j.value, '$.o')
+          SELECT 1 ${completePackEntriesSql("?", "json_extract(j.value, '$.o')")}
         )
        ON CONFLICT(repo_id, oid) DO NOTHING
        RETURNING oid`,

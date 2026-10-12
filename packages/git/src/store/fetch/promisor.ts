@@ -6,6 +6,7 @@ import { expectSafeInteger, expectText } from "../../common/rows.js";
 import { normalizeRemoteUrl } from "../../protocol/remote.js";
 import type { PromisedBlob, PromisorRemote } from "../core/contracts.js";
 import { jsonPages, utf8ByteLength } from "../core/json-pages.js";
+import { completePackEntriesSql } from "../pack/canonical.js";
 
 export const MAX_PROMISOR_REMOTE_NAME_BYTES = 8 * 1_024;
 export const MAX_PROMISOR_URL_BYTES = 1_500_000;
@@ -102,11 +103,7 @@ export class PromisorTable {
                WHERE loose.repo_id = ? AND loose.oid = input.value
             )
               AND NOT EXISTS (
-                SELECT 1 FROM git_pack_objects packed
-                JOIN git_pack_meta pack
-                  ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-                 AND pack.state = 'complete'
-                 WHERE packed.repo_id = ? AND packed.oid = input.value
+                SELECT 1 ${completePackEntriesSql("?", "input.value")}
               )
            ON CONFLICT(repo_id, oid) DO NOTHING`,
           this.repoId,
@@ -133,18 +130,14 @@ export class PromisorTable {
     if (oids.length === 0) return;
     this.db.run(
       `INSERT INTO git_promised_blobs (repo_id, oid, remote_name, type)
-       SELECT ?, candidate.value, ?, 'blob'
-         FROM json_each(?) candidate
+       SELECT ?, input.value, ?, 'blob'
+         FROM json_each(?) input
         WHERE NOT EXISTS (
             SELECT 1 FROM git_objects loose
-             WHERE loose.repo_id = ? AND loose.oid = candidate.value
+             WHERE loose.repo_id = ? AND loose.oid = input.value
           )
           AND NOT EXISTS (
-            SELECT 1 FROM git_pack_objects packed
-            JOIN git_pack_meta pack
-              ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-             AND pack.state = 'complete'
-             WHERE packed.repo_id = ? AND packed.oid = candidate.value
+            SELECT 1 ${completePackEntriesSql("?", "input.value")}
           )
        ON CONFLICT(repo_id, oid) DO NOTHING`,
       this.repoId,
@@ -198,11 +191,7 @@ export class PromisorTable {
            WHERE loose.repo_id = ? AND loose.oid = wanted.oid
         )
           AND NOT EXISTS (
-            SELECT 1 FROM git_pack_objects packed
-            JOIN git_pack_meta pack
-              ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-             AND pack.state = 'complete'
-             WHERE packed.repo_id = ? AND packed.oid = wanted.oid
+            SELECT 1 ${completePackEntriesSql("?", "wanted.oid")}
           )
         ORDER BY wanted.ordinal`,
       JSON.stringify(wanted),

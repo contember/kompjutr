@@ -5,6 +5,7 @@ import type { ObjectType, RawObject } from "../../common/objects.js";
 import { int, nullable, oneOf, RowShape } from "../../common/rows.js";
 import { InflateStream } from "../../common/zlib.js";
 import type { ObjectReadBatch } from "../core/contracts.js";
+import { canonicalPackEntrySql } from "../pack/canonical.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../pack/packs.js";
 import { looseRow } from "./objects-query.js";
 import { INFLATE_FEED, MAX_BLOB_BATCH_OIDS, type ObjectReadContext } from "./objects-shared.js";
@@ -54,24 +55,26 @@ export function readObjects(
 
   const encodedWanted = JSON.stringify(wanted);
 
+  // Bind the subquery repo directly: correlating it to the LEFT JOIN prevents a full-key seek.
   const rawMetadata = context.db.all<Record<string, unknown>>(
     `WITH wanted(ordinal, oid) AS (
        SELECT CAST(key AS INTEGER), value FROM json_each(?)
      )
      SELECT CASE WHEN loose.oid IS NOT NULL THEN 'loose'
-                  WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
+                  WHEN packed.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
             CASE WHEN loose.oid IS NOT NULL THEN loose.type
-                 WHEN pack.pack_id IS NOT NULL THEN packed.type END AS type,
+                 WHEN packed.pack_id IS NOT NULL THEN packed.type END AS type,
             CASE WHEN loose.oid IS NOT NULL THEN loose.size
-                 WHEN pack.pack_id IS NOT NULL THEN packed.size END AS size
+                 WHEN packed.pack_id IS NOT NULL THEN packed.size END AS size
        FROM wanted w
        LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = w.oid
-       LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = w.oid
-      LEFT JOIN git_pack_meta pack
-        ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-        AND pack.state = 'complete'
+       LEFT JOIN git_pack_entries packed
+         ON packed.repo_id = ? AND (packed.pack_id, packed.offset) = (
+           ${canonicalPackEntrySql("?", "w.oid")}
+         )
       ORDER BY w.ordinal`,
     encodedWanted,
+    context.repoId,
     context.repoId,
     context.repoId,
   );

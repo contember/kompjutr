@@ -396,3 +396,37 @@ sprint risk. Resolve blocking findings before implementation.
   `pack object rows` 12.5–14.2 s; membership audit 1.4–1.9 s. The machine was
   about 12 % slower than on 2026-10-08 in every phase, so WU4 compares only
   interleaved runs. Raw output stays in the session scratchpad.
+
+### WU1 — Derived reads (2026-10-12)
+
+- Plan and proposed ADR committed as `09993cf`; WU1 is implemented and
+  verified. All 16 WU1 statement sites use complete physical membership or
+  the shared canonical fragment. Lifecycle writes and maintenance reads remain
+  assigned to WU2/WU3.
+- `EXPLAIN QUERY PLAN` checked all 16 issued statements against the full-history
+  clone database (357,637 objects). OID probes use `git_pack_entries_by_oid`,
+  physical lookups use all three primary-key columns, and enumeration uses the
+  OID index. The new witness captures every statement shape.
+- Planner discovery: correlating the canonical subquery to the entry being
+  joined can leave a repository-only primary-key search, even with the OID
+  index pinned inside the subquery. Metadata LEFT JOINs bind the repository
+  directly; commit-cache insertion takes it from the input JSON row. Regression
+  assertions reject repository-only primary-key searches.
+- Independent read-only review against `09993cf`: clean across
+  correctness/security, completeness/tests/docs, and
+  architecture/simplicity/SQL performance. The initially missing batch-write
+  query-plan capture was added; all 16 plans were reviewed. Reviewers ran no
+  tests. No unresolved review findings.
+- Passed: typecheck, Biome check, diff whitespace check; smoke 160/160 in
+  15.25 s; e2e 137/137; canonical witness 5/5; pack suite 85/85; import graph
+  3/3; integration structure 23/23; source ceilings 3/3. The other focused WU1
+  suites passed their assertions in the combined run.
+- `bench:statements -- --check` passed under a CPU lease, with no statement
+  increases and no returned-row regression. No timing claim is made for WU1;
+  the paired workerd measurements remain WU4.
+- The maintenance reachability file originally passed all 30 assertions but
+  exited with Vitest's `onTaskUpdate` RPC timeout. The isolated 50,001-commit
+  test at `09993cf` reproduced the same error. After user approval, the test
+  yields between completed maintenance calls every 512 iterations; no timeout
+  or assertion changed. Its independent review is clean, and the entire file
+  now passes 30/30 with exit 0 (106.80 s). The test fix is a separate commit.
