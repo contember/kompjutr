@@ -124,7 +124,7 @@ describe("set-based promise insert", () => {
       .map((row) => row.detail);
     expect(fixture.store.promisedBlobCount()).toBe(65);
     expect(fixture.store.promisedMissing([fixture.shared])).toEqual([fixture.shared]);
-    const scan = plan.findIndex((detail) => detail.startsWith("SCAN candidate"));
+    const scan = plan.findIndex((detail) => detail.startsWith("SCAN input"));
     const probe = plan.findIndex((detail) => detail.startsWith("SEARCH loose"));
     expect(scan).toBeGreaterThanOrEqual(0);
     expect(probe).toBeGreaterThan(scan);
