@@ -4,6 +4,7 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import { bumpRepositorySourceGeneration } from "../../core/source-generation.js";
+import { completePackEntriesSql } from "../canonical.js";
 import { MAX_PACK_DELETE_BATCH, type PackSharedState, uniquePackIds } from "../shared.js";
 
 export class PackDeletion {
@@ -56,95 +57,31 @@ export class PackDeletion {
 
   deletePacks(deletingPackIds: readonly number[]): void {
     if (deletingPackIds.length === 0) return;
-    // Read before the first promotion: afterwards the canonical rows already
-    // point at the surviving packs and a complete owner looks like none.
-    const ownedCanonicalRows = this.#ownsVisibleCanonicalRows(deletingPackIds);
-    let promoted = 0;
-    for (const packId of deletingPackIds) {
-      promoted += this.#promoteFallbacks(packId, deletingPackIds);
-    }
-    for (const packId of deletingPackIds) this.#deletePackStorage(packId);
-    // Pending rows are invisible to complete reads, so a pending-only deletion
-    // that promotes nothing changes no source an ordinary reader can observe.
-    if (ownedCanonicalRows || promoted > 0) {
-      bumpRepositorySourceGeneration(this.db, this.repoId);
-    }
-  }
-
-  #ownsVisibleCanonicalRows(deletingPackIds: readonly number[]): boolean {
-    const owned = this.db.scalar<unknown>(
+    const encodedDeletingPackIds = JSON.stringify(deletingPackIds);
+    const complete = this.db.scalar<unknown>(
       `SELECT EXISTS(
-         SELECT 1 FROM git_pack_objects o
-         JOIN git_pack_meta m
-           ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id AND m.state = 'complete'
-         WHERE o.repo_id = ? AND o.pack_id IN (SELECT value FROM json_each(?))
+         SELECT 1 FROM git_pack_meta
+          WHERE repo_id = ? AND state = 'complete'
+            AND pack_id IN (SELECT value FROM json_each(?))
        )`,
       this.repoId,
-      JSON.stringify(deletingPackIds),
-    );
-    if (owned !== 0 && owned !== 1) {
-      throw new CorruptError("canonical pack ownership probe returned an invalid value");
-    }
-    return owned === 1;
-  }
-
-  #promoteFallbacks(packId: number, deletingPackIds: readonly number[]): number {
-    const encodedDeletingPackIds = JSON.stringify(deletingPackIds);
-    this.db.run(
-      `INSERT OR REPLACE INTO git_pack_objects
-         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
-       SELECT candidate.repo_id, candidate.oid, candidate.pack_id, candidate.offset,
-              candidate.data_off, candidate.data_len, candidate.type, candidate.size,
-              candidate.entry_size
-         FROM git_pack_entries candidate
-         JOIN git_pack_meta candidate_meta
-           ON candidate_meta.repo_id = candidate.repo_id
-          AND candidate_meta.pack_id = candidate.pack_id
-          AND candidate_meta.state = 'complete'
-        WHERE candidate.repo_id = ?
-          AND candidate.pack_id NOT IN (SELECT value FROM json_each(?))
-          AND EXISTS (
-            SELECT 1 FROM git_pack_objects current
-             WHERE current.repo_id = candidate.repo_id AND current.oid = candidate.oid
-               AND current.pack_id = ?
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM git_pack_entries earlier
-            JOIN git_pack_meta earlier_meta
-              ON earlier_meta.repo_id = earlier.repo_id
-             AND earlier_meta.pack_id = earlier.pack_id
-             AND earlier_meta.state = 'complete'
-             WHERE earlier.repo_id = candidate.repo_id AND earlier.oid = candidate.oid
-               AND earlier.pack_id NOT IN (SELECT value FROM json_each(?))
-               AND earlier.pack_id < candidate.pack_id
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM git_pack_entries same_pack
-             WHERE same_pack.repo_id = candidate.repo_id
-               AND same_pack.pack_id = candidate.pack_id
-               AND same_pack.oid = candidate.oid
-               AND same_pack.offset < candidate.offset
-           )`,
-      this.repoId,
-      encodedDeletingPackIds,
-      packId,
       encodedDeletingPackIds,
     );
-    // `#promoteFallbacks` runs once per deleted pack, so the promotions have to
-    // accumulate: a later iteration must not hide an earlier one.
-    const promoted = this.db.scalar<unknown>("SELECT changes()");
-    if (typeof promoted !== "number" || !Number.isSafeInteger(promoted) || promoted < 0) {
-      throw new CorruptError("pack fallback promotion returned an invalid row count");
+    if (complete !== 0 && complete !== 1) {
+      throw new CorruptError("complete pack deletion probe returned an invalid value");
     }
-    return promoted;
+    for (const packId of deletingPackIds) {
+      this.#deletePackStorage(packId, encodedDeletingPackIds);
+    }
+    if (complete === 1) bumpRepositorySourceGeneration(this.db, this.repoId);
   }
 
-  #deletePackStorage(packId: number): void {
+  #deletePackStorage(packId: number, encodedDeletingPackIds: string): void {
     this.db.run(
       `DELETE FROM git_commits
         WHERE repo_id = ?
           AND oid IN (
-            SELECT oid FROM git_pack_objects WHERE repo_id = ? AND pack_id = ? AND type = 'commit'
+            SELECT oid FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND type = 'commit'
           )
           AND NOT EXISTS (
             SELECT 1 FROM git_objects loose
@@ -152,10 +89,15 @@ export class PackDeletion {
                AND loose.oid = git_commits.oid
                AND loose.type = 'commit'
                AND loose.size = git_commits.object_size
+          )
+          AND NOT EXISTS (
+            SELECT 1 ${completePackEntriesSql("git_commits.repo_id", "git_commits.oid")}
+              AND candidate.pack_id NOT IN (SELECT value FROM json_each(?))
           )`,
       this.repoId,
       this.repoId,
       packId,
+      encodedDeletingPackIds,
     );
     this.db.run(
       `DELETE FROM git_tree_sources
@@ -181,7 +123,6 @@ export class PackDeletion {
     for (const table of [
       "git_pack_data",
       "git_pack_entries",
-      "git_pack_objects",
       "git_pack_pending",
       "git_pack_meta",
     ]) {

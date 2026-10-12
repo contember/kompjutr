@@ -636,7 +636,7 @@ describe("maintenance sweep", () => {
           )
           .map(([sql, ...bindings]) => [sql, bindings]),
       );
-      expect(queries.size).toBe(8);
+      expect(queries.size).toBe(9);
       for (const [sql, bindings] of queries) {
         const plan = db
           .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...bindings)
@@ -699,7 +699,7 @@ describe("maintenance sweep", () => {
     const data = utf8.encode("marked during sweep\n");
     const result = await store.packs.ingest(slices(fullPack([{ type: "blob", data }]), 11));
     const oid = db.scalar<string>(
-      "SELECT oid FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?",
+      "SELECT oid FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?",
       checkout.repoId,
       result.packId,
     );
@@ -891,7 +891,7 @@ describe("maintenance sweep", () => {
     ).toBe(dataRows);
     expect(
       inner.scalar<number>(
-        "SELECT count(*) FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?",
+        "SELECT count(*) FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?",
         checkout.repoId,
         packed.packId,
       ),

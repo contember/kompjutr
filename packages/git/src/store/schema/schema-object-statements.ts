@@ -123,28 +123,7 @@ export const OBJECT_SCHEMA_STATEMENTS = [
      FOREIGN KEY (repo_id, pack_id) REFERENCES git_pack_meta (repo_id, pack_id) ON DELETE CASCADE
    ) STRICT`,
 
-  `CREATE TABLE IF NOT EXISTS git_pack_objects (
-     repo_id INTEGER NOT NULL CHECK (repo_id >= 1),
-     oid TEXT NOT NULL CHECK (length(CAST(oid AS BLOB)) = 40),
-     pack_id INTEGER NOT NULL CHECK (pack_id >= 0),
-     offset INTEGER NOT NULL CHECK (offset >= 0),
-     data_off INTEGER NOT NULL CHECK (data_off >= 0),
-     data_len INTEGER NOT NULL CHECK (data_len >= 0),
-     type TEXT NOT NULL CHECK (type IN ('blob','tree','commit','tag')),
-     size INTEGER NOT NULL CHECK (
-       size BETWEEN 0 AND ${MAX_OBJECT_BYTES}
-     ),
-     entry_size INTEGER NOT NULL CHECK (entry_size >= 0),
-     PRIMARY KEY (repo_id, oid),
-     FOREIGN KEY (repo_id, pack_id) REFERENCES git_pack_meta (repo_id, pack_id) ON DELETE CASCADE
-   ) STRICT`,
-
-  `CREATE INDEX IF NOT EXISTS git_pack_objects_loc
-     ON git_pack_objects (repo_id, pack_id, offset)`,
-
-  // Every pack keeps its own authenticated index while git_pack_objects
-  // remains the canonical read owner for each OID. Packs are self-contained:
-  // a delta names its base by offset inside the same pack.
+  // Packs are self-contained: each delta names its base by offset in this pack.
   `CREATE TABLE IF NOT EXISTS git_pack_entries (
      repo_id INTEGER NOT NULL CHECK (repo_id >= 1),
      pack_id INTEGER NOT NULL CHECK (pack_id >= 0),

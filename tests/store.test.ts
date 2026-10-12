@@ -120,7 +120,6 @@ describe("repository registry", () => {
       "git_pack_gc_candidates",
       "git_pack_ingest_control",
       "git_pack_meta",
-      "git_pack_objects",
       "git_pack_pending",
       "git_promised_blobs",
       "git_promisor_remotes",

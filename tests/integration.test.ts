@@ -260,7 +260,7 @@ describe("bounded three-way integration plan", () => {
     ).toBe(0);
     expect(
       store.db.scalar<number>(
-        `SELECT COUNT(*) FROM git_pack_objects
+        `SELECT COUNT(*) FROM git_pack_entries
          WHERE repo_id = 1 AND oid IN (?, ?, ?, ?)`,
         packedIdentities.cleanBase,
         packedIdentities.cleanIncoming,

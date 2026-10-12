@@ -118,17 +118,6 @@ export class PackObjectBatch {
         this.repoId,
         rows,
       );
-      this.db.run(
-        `INSERT OR IGNORE INTO git_pack_objects
-           (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
-         SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'),
-                json_extract(value, '$[2]'), json_extract(value, '$[3]'),
-                json_extract(value, '$[4]'), json_extract(value, '$[5]'),
-                json_extract(value, '$[6]'), json_extract(value, '$[7]')
-           FROM json_each(?)`,
-        this.repoId,
-        rows,
-      );
     });
     this.#rows.length = 0;
     this.#bytes = 2;

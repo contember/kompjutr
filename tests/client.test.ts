@@ -1371,7 +1371,7 @@ describe("git client", () => {
     try {
       const { workspace, storage } = makeWorkspace();
       await workspace.git.clone({ url: server.url, dir: "/" });
-      expect(storage.db.prepare("SELECT COUNT(*) AS n FROM git_pack_objects").get()).toEqual({
+      expect(storage.db.prepare("SELECT COUNT(*) AS n FROM git_pack_entries").get()).toEqual({
         n: 3,
       });
       const oid = fixture.git("rev-parse", "HEAD:README.md");

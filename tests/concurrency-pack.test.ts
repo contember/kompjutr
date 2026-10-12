@@ -167,10 +167,10 @@ function blobMembership(data: Uint8Array): PackMember {
   return { oid: hashObject("blob", data), type: "blob", size: data.length };
 }
 
-function packedOwner(store: CheckoutStore, oid: string): number | null {
+function firstIndexedPack(store: CheckoutStore, oid: string): number | null {
   return (
     store.db.scalar<number>(
-      "SELECT pack_id FROM git_pack_objects WHERE repo_id = ? AND oid = ?",
+      "SELECT pack_id FROM git_pack_entries WHERE repo_id = ? AND oid = ? ORDER BY pack_id, offset LIMIT 1",
       store.sharedRepoId,
       oid,
     ) ?? null
@@ -194,6 +194,55 @@ function expectCheckpointReadable(store: CheckoutStore, fixture: CheckpointPack)
 }
 
 describe("concurrent pack ownership", () => {
+  it("bumps source generation for every complete deletion but not pending reclamation", async () => {
+    const opened = createStore();
+    const generation = () =>
+      opened.db.scalar<number>(
+        "SELECT source_generation FROM git_repositories WHERE id = ?",
+        opened.store.sharedRepoId,
+      );
+    const bytes = fullObjectPack([utf8.encode("generation copy")]);
+    const first = await opened.store.packs.ingest(singleChunk(bytes));
+    const duplicate = await opened.store.packs.ingest(singleChunk(bytes));
+    const empty = await opened.store.packs.ingest(singleChunk(lifecyclePack(() => {}, 0)));
+    for (const packId of [duplicate.packId, empty.packId, first.packId]) {
+      const before = generation();
+      expect(typeof before).toBe("number");
+      expect(opened.store.packs.deleteCompletePacks([packId])).toBe(1);
+      expect(generation()).toBe((before ?? -1) + 1);
+      expect(opened.store.packs.deleteCompletePacks([packId])).toBe(0);
+      expect(generation()).toBe((before ?? -1) + 1);
+    }
+    const failure = new Error("leave indexed pending membership");
+    await expect(
+      opened.store.packs.ingest(singleChunk(bytes), {
+        lifecycle: {
+          reserved() {},
+          published() {
+            throw failure;
+          },
+        },
+      }),
+    ).rejects.toBe(failure);
+    expect(
+      opened.db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'pending'"),
+    ).toBe(1);
+    const before = generation();
+    let observed: number | undefined;
+    await opened.store.packs.ingest(singleChunk(bytes), {
+      lifecycle: {
+        reserved() {
+          observed = generation();
+        },
+        published() {},
+      },
+    });
+    expect(observed).toBe(before);
+    expect(
+      opened.db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'pending'"),
+    ).toBe(0);
+  });
+
   it.each(["publication", "lease release"])(
     "rolls back commit promotion after %s failure",
     async (seam) => {
@@ -379,23 +428,16 @@ describe("concurrent pack ownership", () => {
       for (let i = 0; i < 1022; i++) writer.object("blob", utf8.encode(`own base filler ${i}\n`));
     }, 1024);
     let deleted = 0;
-    // The pending pack's own base resolves the delta; only publication notices that
-    // the base's canonical owner vanished, and that is the retryable ESTALE.
-    await expect(
-      cold.store.packs.ingest(singleChunk(bytes), {
-        async yieldNow() {
-          const pending = cold.db.scalar<number>("SELECT count(*) FROM git_pack_pending") ?? 0;
-          if (deleted === 0 && pending > 0) {
-            deleted = reopenStore(opened.storage).store.packs.deleteCompletePacks([
-              duplicate.packId,
-            ]);
-          }
-        },
-      }),
-    ).rejects.toMatchObject({ code: "ESTALE" });
+    await cold.store.packs.ingest(singleChunk(bytes), {
+      async yieldNow() {
+        const pending = cold.db.scalar<number>("SELECT count(*) FROM git_pack_pending") ?? 0;
+        if (deleted === 0 && pending > 0) {
+          deleted = reopenStore(opened.storage).store.packs.deleteCompletePacks([duplicate.packId]);
+        }
+      },
+    });
     expect(deleted).toBe(1);
     expect(cold.db.scalar<number>("SELECT count(*) FROM git_pack_pending")).toBe(0);
-    await cold.store.packs.ingest(singleChunk(bytes));
     const reader = reopenStore(opened.storage).store;
     expect(reader.read(baseOid)?.data).toEqual(base);
     expect(reader.read(hashObject("blob", target))?.data).toEqual(target);
@@ -421,7 +463,7 @@ describe("concurrent pack ownership", () => {
           activePackId,
         ),
       ).toEqual({ pack_id: activePackId, state: "pending" });
-      expect(packedOwner(opened.store, pending.targetOid)).toBe(activePackId);
+      expect(firstIndexedPack(opened.store, pending.targetOid)).toBe(activePackId);
       expect(opened.store.packs.completePackedEntry(pending.targetOid)).toBeNull();
       expect(opened.store.read(pending.targetOid)).toBeNull();
       const rejectedStart = opened.storage.statementCount;
@@ -480,7 +522,7 @@ describe("concurrent pack ownership", () => {
           activePackId,
         ),
       ).toEqual({ pack_id: activePackId, state: "pending" });
-      expect(packedOwner(first.store, pending.targetOid)).toBeNull();
+      expect(firstIndexedPack(first.store, pending.targetOid)).toBeNull();
       expect(first.store.packs.completePackedEntry(pending.targetOid)).toBeNull();
       const rejectedStart = first.storage.statementCount;
       await expect(
@@ -495,7 +537,7 @@ describe("concurrent pack ownership", () => {
           first.store.sharedRepoId,
           activePackId,
         ) ?? null;
-      targetOwnerAfterWinner = packedOwner(first.store, pending.targetOid);
+      targetOwnerAfterWinner = firstIndexedPack(first.store, pending.targetOid);
       activeResumeStart = first.storage.statementCount;
     } finally {
       active.barrier.release();
@@ -581,8 +623,8 @@ describe("concurrent pack ownership", () => {
     const loserPackId = loser.packId();
     let loserResumeStart = opened.storage.statementCount;
     try {
-      expect(packedOwner(opened.store, pending.targetOid)).toBe(winner.packId);
-      expect(packedOwner(opened.store, pending.uniqueOid)).toBe(loserPackId);
+      expect(firstIndexedPack(opened.store, pending.targetOid)).toBe(winner.packId);
+      expect(firstIndexedPack(opened.store, pending.uniqueOid)).toBe(loserPackId);
       expect(
         opened.db.scalar<string>(
           "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",

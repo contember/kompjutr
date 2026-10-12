@@ -446,3 +446,27 @@ sprint risk. Resolve blocking findings before implementation.
   sweep suite (23 tests), smoke (160 tests), typecheck and the statement-budget
   gate. Biome and diff whitespace checks passed. Added witnesses cover redundant
   pack deletion, ownership transfer and blob-ID retention with surviving copies.
+
+### WU3 — Remove stored canonical ownership (2026-10-12)
+
+- WU2 committed as `dd352c8`. Ingest now writes only physical entries;
+  publication audits their count. Complete-pack deletion advances source
+  generation, and pending-only reclamation does not. Commit projections survive
+  only with a loose source or a complete copy outside the entire deletion set.
+- The former canonical-owner-deletion `ESTALE` schedule now publishes and reads
+  both objects cold without retry. Added generation and commit-cache witnesses
+  cover redundant/empty packs, absent retries, pending copies and batch deletion.
+- All TypeScript references to the removed table/index are gone. The OID
+  prototype now retains all 30,901 physical fixture entries, including duplicate
+  OIDs, and checks count and same-pack bases. TEXT/BLOB correctness checks pass.
+- Independent WU3 and integrated WU1–WU3 reviews are clean after two fixes:
+  cold cache tests reopen the existing checkout; the benchmark preserves all
+  physical copies instead of its previous one-location-per-OID population.
+  Production SQL plans use physical ranges and indexed OID probes.
+- Passed: typecheck, Biome, diff whitespace; smoke 160/160 (15.41 s), e2e
+  137/137 (97.28 s), pack/schema/concurrency/cold-admission witnesses, all WU1/WU2
+  query-plan witnesses (the maintenance capture now includes nine statements),
+  and the statement/row gate with no increase. Additional read/store/maintenance
+  suites passed. The long store file reproduced the known forks RPC timeout;
+  its existing full-suite threads-pool configuration passed 107/107 (64.46 s).
+  The remaining WU1/WU2 witnesses passed 71/71 (100.35 s).

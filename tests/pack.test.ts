@@ -1767,7 +1767,7 @@ describe("pack deferred resolution", () => {
     ).toEqual([]);
     expect(
       [...db.storage.histogram]
-        .filter(([query]) => query.startsWith("INSERT OR IGNORE INTO git_pack_objects"))
+        .filter(([query]) => query.startsWith("INSERT OR IGNORE INTO git_pack_entries"))
         .reduce((count, [, calls]) => count + calls, 0),
     ).toBeLessThanOrEqual(5);
     expect(store.read(targets[0]!.oid)?.data).toEqual(targets[0]!.data);
@@ -2310,7 +2310,7 @@ describe("pack deferred resolution", () => {
       yieldNow: async () => {
         if (observed !== undefined) return;
         const indexed =
-          store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_objects WHERE repo_id = 1") ?? 0;
+          store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_entries WHERE repo_id = 1") ?? 0;
         if (indexed !== objects.length) return;
         observed = {
           lookup: store.packs.lookup(first.oid),
@@ -2537,12 +2537,10 @@ describe("pack deferred resolution", () => {
     writer.object("blob", data);
     writer.finish();
     await store.packs.ingest(slices(concat(chunks), 64 * 1024));
-    for (const table of ["git_pack_objects", "git_pack_entries"]) {
-      store.db.run(
-        `UPDATE ${table} SET size = 1, entry_size = 1 WHERE repo_id = 1 AND oid = ?`,
-        oid,
-      );
-    }
+    store.db.run(
+      "UPDATE git_pack_entries SET size = 1, entry_size = 1 WHERE repo_id = 1 AND oid = ?",
+      oid,
+    );
 
     expect(() => store.readBlobs([oid])).toThrow(/exceeds its indexed size/);
   });
@@ -3182,7 +3180,7 @@ describe("real git packs", () => {
     expect(
       store.db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'complete'"),
     ).toBe(0);
-    expect(store.db.scalar<number>("SELECT count(*) FROM git_pack_objects")).toBe(0);
+    expect(store.db.scalar<number>("SELECT count(*) FROM git_pack_entries")).toBe(0);
     expect(store.listRefs()).toEqual([]);
   });
 });

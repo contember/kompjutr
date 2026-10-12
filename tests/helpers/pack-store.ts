@@ -1,5 +1,6 @@
 import type { SqlDatabase } from "../../packages/do/src/db/db.js";
 import type { ObjectType } from "../../packages/git/src/common/objects.js";
+import { completePackEntriesSql } from "../../packages/git/src/store/pack/canonical.js";
 import type { PackStore } from "../../packages/git/src/store/pack/packs.js";
 import { lifecyclePack } from "./pack-maintenance.js";
 
@@ -29,11 +30,7 @@ export function completePackMatches(
   const entries = store.db.all<{ oid: string; type: string; size: number; owned: number }>(
     `SELECT entry.oid, entry.type, entry.size,
             EXISTS (
-              SELECT 1 FROM git_pack_objects object
-              JOIN git_pack_meta owner
-                ON owner.repo_id = object.repo_id AND owner.pack_id = object.pack_id
-               AND owner.state = 'complete'
-             WHERE object.repo_id = entry.repo_id AND object.oid = entry.oid
+              SELECT 1 ${completePackEntriesSql("entry.repo_id", "entry.oid")}
             ) AS owned
        FROM git_pack_entries entry
       WHERE entry.repo_id = ? AND entry.pack_id = ?`,

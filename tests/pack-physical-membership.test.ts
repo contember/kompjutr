@@ -497,13 +497,10 @@ describe("pack physical offset membership", () => {
       }
       const evidence = db.all<{
         base_offset: number;
-        canonical_oid: string | null;
         physical_oid: string | null;
       }>(
-        `SELECT pending.base_offset, canonical.oid AS canonical_oid, physical.oid AS physical_oid
+        `SELECT pending.base_offset, physical.oid AS physical_oid
           FROM git_pack_pending pending
-          LEFT JOIN git_pack_objects canonical ON canonical.repo_id = pending.repo_id
-            AND canonical.pack_id = pending.pack_id AND canonical.offset = pending.base_offset
           LEFT JOIN git_pack_entries physical ON physical.repo_id = pending.repo_id
             AND physical.pack_id = pending.pack_id AND physical.offset = pending.base_offset
           WHERE pending.repo_id = ? LIMIT 2`,

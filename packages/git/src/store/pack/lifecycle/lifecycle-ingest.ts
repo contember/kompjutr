@@ -236,25 +236,13 @@ export class PackIngestLifecycleControl {
   }
 
   auditPublishedMembership(packId: number, expected: ExpectedPackMembership): void {
-    const unavailable = this.db.scalar<number>(
-      `SELECT CASE WHEN count(*) != ? THEN -1
-              ELSE coalesce(sum(CASE
-                WHEN canonical.oid IS NULL OR owner.state IS NOT 'complete' THEN 1
-                ELSE 0
-              END), 0)
-            END
-         FROM git_pack_entries entry
-         LEFT JOIN git_pack_objects canonical
-           ON canonical.repo_id = entry.repo_id AND canonical.oid = entry.oid
-         LEFT JOIN git_pack_meta owner
-           ON owner.repo_id = canonical.repo_id AND owner.pack_id = canonical.pack_id
-        WHERE entry.repo_id = ? AND entry.pack_id = ?`,
-      expected.count,
+    const count = this.db.scalar<number>(
+      `SELECT count(*) FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?`,
       this.repoId,
       packId,
     );
-    if (unavailable !== 0) {
-      throw new GitError("ESTALE", "pack membership was claimed by another ingest");
+    if (count !== expected.count) {
+      throw new GitError("ESTALE", "pack membership count changed before publication");
     }
   }
 }

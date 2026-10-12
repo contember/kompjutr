@@ -543,7 +543,7 @@ describe("public maintenance storage pressure", () => {
     ).toEqual({ state: "complete", count: 2 });
     expect(
       db.scalar<number>(
-        "SELECT count(*) FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?",
+        "SELECT count(*) FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?",
         fixture.repoId,
         fixture.mixedPackId,
       ),
@@ -560,7 +560,7 @@ describe("public maintenance storage pressure", () => {
         `SELECT EXISTS(
            SELECT 1 FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?
            UNION ALL SELECT 1 FROM git_pack_data WHERE repo_id = ? AND pack_id = ?
-           UNION ALL SELECT 1 FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?
+           UNION ALL SELECT 1 FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?
            UNION ALL SELECT 1 FROM git_pack_gc_candidates WHERE repo_id = ? AND pack_id = ?
          )`,
         fixture.repoId,

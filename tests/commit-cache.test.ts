@@ -21,6 +21,8 @@ import {
   WALK_COMMIT_GRAPH_SQL,
 } from "../packages/git/src/store/trees/commits.js";
 import { TestDatabase } from "./helpers/db.js";
+import { slices } from "./helpers/git.js";
+import { lifecyclePack } from "./helpers/pack-maintenance.js";
 import { makeRepo } from "./helpers/workspace.js";
 
 class MeasuredDatabase implements SqlDatabase {
@@ -140,6 +142,43 @@ function commitChain(store: ReturnType<typeof open>, count: number): string[] {
 }
 
 describe("parsed commit cache", () => {
+  it.each([false, true])(
+    "retains commit metadata only with a surviving source (loose=%s)",
+    async (loose) => {
+      const db = new TestDatabase();
+      const store = open(db);
+      const data = serializeCommit(fixture());
+      const oid = hashObject("commit", data);
+      if (loose) store.write("commit", data);
+      const bytes = lifecyclePack((writer) => writer.object("commit", data), 1);
+      const packs = [];
+      for (let i = 0; i < 3; i++) packs.push(await store.packs.ingest(slices(bytes, 4096)));
+      const first = packs[0];
+      const second = packs[1];
+      const third = packs[2];
+      if (!first || !second || !third) throw new Error("missing fixture packs");
+      expect(store.packs.deleteCompletePacks([first.packId])).toBe(1);
+      expect(
+        new SqliteGitDatabase(db).openCheckout(store.checkoutId).cachedCommit(oid)?.commit,
+      ).toEqual(fixture());
+      const failure = new Error("leave pending duplicate");
+      await expect(
+        store.packs.ingest(slices(bytes, 4096), {
+          lifecycle: {
+            reserved() {},
+            published() {
+              throw failure;
+            },
+          },
+        }),
+      ).rejects.toBe(failure);
+      expect(store.packs.deleteCompletePacks([second.packId, third.packId])).toBe(2);
+      expect(
+        new SqliteGitDatabase(db).openCheckout(store.checkoutId).cachedCommit(oid)?.commit ?? null,
+      ).toEqual(loose ? fixture() : null);
+    },
+  );
+
   it("normalizes both signed zero timezone spellings before caching", () => {
     const store = open();
     for (const timezone of ["+0000", "-0000"]) {
@@ -497,20 +536,6 @@ describe("parsed commit cache", () => {
       0,
     );
     db.run(
-      `INSERT INTO git_pack_objects
-         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      1,
-      oid,
-      7,
-      12,
-      13,
-      data.length,
-      "commit",
-      data.length,
-      data.length,
-    );
-    db.run(
       `INSERT INTO git_pack_entries
          (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -532,7 +557,6 @@ describe("parsed commit cache", () => {
     expect(insertSource(db, oid, data)).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
     db.run("UPDATE git_pack_meta SET state = 'complete' WHERE repo_id = ? AND pack_id = ?", 1, 7);
-    db.run("UPDATE git_pack_objects SET size = size + 1 WHERE repo_id = ? AND oid = ?", 1, oid);
     db.run("UPDATE git_pack_entries SET size = size + 1 WHERE repo_id = ? AND oid = ?", 1, oid);
     expect(insertSource(db, oid, data)).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);

@@ -707,11 +707,11 @@ describe("maintenance crash and restart qualification", () => {
       slices(fullPack([{ type: "blob", data: currentData }]), 17),
     );
     const oldOid = db.scalar<string>(
-      "SELECT oid FROM git_pack_objects WHERE pack_id = ?",
+      "SELECT oid FROM git_pack_entries WHERE pack_id = ?",
       oldPack.packId,
     );
     const currentOid = db.scalar<string>(
-      "SELECT oid FROM git_pack_objects WHERE pack_id = ?",
+      "SELECT oid FROM git_pack_entries WHERE pack_id = ?",
       currentPack.packId,
     );
     if (oldOid === undefined || currentOid === undefined) {

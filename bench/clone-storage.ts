@@ -107,7 +107,7 @@ function tableGroup(table: string): string {
 /** Tables whose row count says something about the bytes above it. */
 const COUNTED_TABLES = [
   "git_pack_data",
-  "git_pack_objects",
+  "git_pack_entries",
   "git_objects",
   "git_object_chunks",
   "git_commits",

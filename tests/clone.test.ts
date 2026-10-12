@@ -1509,7 +1509,7 @@ describe("clone", () => {
       expect(failure).toBeInstanceOf(Error);
       expect(tableRows(workspace, "SELECT root FROM git_checkouts")).toEqual([]);
       expect(tableRows(workspace, "SELECT pack_id, state FROM git_pack_meta")).toEqual([]);
-      expect(tableRows(workspace, "SELECT oid FROM git_pack_objects")).toEqual([]);
+      expect(tableRows(workspace, "SELECT oid FROM git_pack_entries")).toEqual([]);
       expect(tableRows(workspace, "SELECT offset FROM git_pack_pending")).toEqual([]);
       expect(tableRows(workspace, "SELECT seq FROM git_pack_data")).toEqual([]);
       expect(tableRows(workspace, "SELECT ref_name FROM git_reflog_entries")).toEqual([]);

@@ -51,7 +51,6 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_pack_meta", "shared"],
   ["git_pack_data", "shared"],
   ["git_pack_entries", "shared"],
-  ["git_pack_objects", "shared"],
   ["git_pack_pending", "shared"],
   ["git_tree_sources", "shared"],
   ["git_tree_entries", "shared"],
@@ -110,8 +109,6 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_pack_gc_candidates" },
   { type: "table", name: "git_pack_ingest_control" },
   { type: "table", name: "git_pack_meta" },
-  { type: "table", name: "git_pack_objects" },
-  { type: "index", name: "git_pack_objects_loc" },
   { type: "table", name: "git_pack_pending" },
   { type: "table", name: "git_promised_blobs" },
   { type: "trigger", name: "git_promised_blobs_loose_present" },
@@ -396,10 +393,6 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
       "worktree_oid",
       "worktree_revision",
     ],
-  ],
-  [
-    "git_pack_objects",
-    ["repo_id", "oid", "pack_id", "offset", "data_off", "data_len", "type", "size", "entry_size"],
   ],
   [
     "git_pack_pending",

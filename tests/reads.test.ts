@@ -744,7 +744,7 @@ describe("ls-tree and cat-file", () => {
 
     const source = db.one<{ data_off: number; data: unknown }>(
       `SELECT object.data_off, data.data
-         FROM git_pack_objects object
+         FROM git_pack_entries object
          JOIN git_pack_data data
            ON data.repo_id = object.repo_id AND data.pack_id = object.pack_id AND data.seq = 0
         WHERE object.repo_id = ? AND object.oid = ?`,

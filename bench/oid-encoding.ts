@@ -6,9 +6,10 @@ import { createHash, type Hash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { cpus, platform, release, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
+import { canonicalPackEntrySql } from "../packages/git/src/store/pack/canonical.js";
 import { FIXTURES, prepareFixture } from "./fixtures.js";
 
 type Encoding = "text" | "blob";
@@ -24,7 +25,7 @@ interface PackLocation {
   packId: number;
   offset: number;
   storedSize: number;
-  baseOid: string | null;
+  baseOffset: number | null;
 }
 
 interface PackFile {
@@ -72,7 +73,7 @@ interface TreeEntry {
 interface Dataset {
   workload: Workload;
   objects: ObjectRecord[];
-  packLocations: Map<string, PackLocation>;
+  packEntries: { oid: string; location: PackLocation }[];
   packs: PackFile[];
   index: IndexEntry[];
   commits: CommitRecord[];
@@ -193,7 +194,7 @@ const TABLES = [
   "git_object_chunks",
   "git_pack_meta",
   "git_pack_data",
-  "git_pack_objects",
+  "git_pack_entries",
   "git_commits",
   "git_tree_sources",
   "git_tree_entries",
@@ -392,15 +393,27 @@ function loadPackFiles(): PackFile[] {
   }));
 }
 
-function loadPackLocations(): { locations: Map<string, PackLocation>; storedEntries: number } {
+function loadPackLocations(): {
+  locations: Map<string, PackLocation>;
+  entries: { oid: string; location: PackLocation }[];
+} {
   const directory = join(fixturePath(), ".git", "objects", "pack");
   const indexes = readdirSync(directory)
     .filter((name) => name.endsWith(".idx"))
     .sort(compareAscii);
   const locations = new Map<string, PackLocation>();
-  let storedEntries = 0;
+  const entries: { oid: string; location: PackLocation }[] = [];
   for (const [index, name] of indexes.entries()) {
     const output = git(["verify-pack", "-v", join(directory, name)]);
+    const offsets = new Map<string, number>();
+    for (const line of output.split("\n")) {
+      const fields = line.trim().split(/\s+/);
+      const oid = fields[0];
+      const offset = fields[4];
+      if (oid !== undefined && OID_PATTERN.test(oid) && offset !== undefined) {
+        offsets.set(oid, parsePositiveInteger(offset, "pack offset"));
+      }
+    }
     for (const line of output.split("\n")) {
       const fields = line.trim().split(/\s+/);
       const oid = fields[0];
@@ -410,19 +423,27 @@ function loadPackLocations(): { locations: Map<string, PackLocation>; storedEntr
       if (storedSizeText === undefined || offsetText === undefined) {
         throw new Error(`invalid verify-pack row: ${line}`);
       }
-      storedEntries++;
-      if (locations.has(oid)) continue;
       const baseField = fields[6];
       const baseOid = baseField === undefined ? null : requireOid(baseField, "delta base");
-      locations.set(oid, {
+      const baseOffset = baseOid === null ? null : offsets.get(baseOid);
+      if (baseOffset === undefined) throw new Error(`missing in-pack base for ${oid}`);
+      const location = {
         packId: index + 1,
         offset: parsePositiveInteger(offsetText, "pack offset"),
         storedSize: parsePositiveInteger(storedSizeText, "stored object size"),
-        baseOid,
-      });
+        baseOffset,
+      };
+      entries.push({ oid, location });
+      const prior = locations.get(oid);
+      if (
+        prior === undefined ||
+        (prior.packId === location.packId && prior.offset > location.offset)
+      ) {
+        locations.set(oid, location);
+      }
     }
   }
-  return { locations, storedEntries };
+  return { locations, entries };
 }
 
 function loadIndex(objects: ReadonlyMap<string, ObjectRecord>): IndexEntry[] {
@@ -585,7 +606,7 @@ function loadPackedDataset(): {
   const objectsByOid = new Map<string, ObjectRecord>();
   for (const object of objects) objectsByOid.set(object.oid, object);
   const packs = loadPackFiles();
-  const { locations, storedEntries } = loadPackLocations();
+  const { locations, entries: packEntries } = loadPackLocations();
   for (const object of objects) {
     if (!locations.has(object.oid)) throw new Error(`packed object ${object.oid} has no location`);
   }
@@ -598,7 +619,7 @@ function loadPackedDataset(): {
     dataset: {
       workload: "packed-nextjs",
       objects,
-      packLocations: locations,
+      packEntries,
       packs,
       index,
       commits: [commit],
@@ -617,14 +638,14 @@ function loadPackedDataset(): {
       trackedPaths: index.length,
       reachableObjects,
       uniquePackedObjects: objects.length,
-      storedPackEntries: storedEntries,
+      storedPackEntries: packEntries.length,
       packFiles: packs.length,
       packBytes,
       trees: trees.sources.length,
       treeEntries: trees.entries.length,
     },
     paths: index.map((entry) => entry.path),
-    storedPackEntries: storedEntries,
+    storedPackEntries: packEntries.length,
   };
 }
 
@@ -735,7 +756,7 @@ function buildLooseDataset(paths: readonly string[]): Dataset {
   return {
     workload: "loose-shaped",
     objects,
-    packLocations: new Map<string, PackLocation>(),
+    packEntries: [],
     packs: [],
     index,
     commits,
@@ -790,13 +811,13 @@ function schema(encoding: Encoding): string {
       repo_id INTEGER NOT NULL, pack_id INTEGER NOT NULL, seq INTEGER NOT NULL, data BLOB NOT NULL,
       PRIMARY KEY (repo_id, pack_id, seq)
     );
-    CREATE TABLE git_pack_objects (
+    CREATE TABLE git_pack_entries (
       repo_id INTEGER NOT NULL, oid ${oid} NOT NULL, pack_id INTEGER NOT NULL,
       offset INTEGER NOT NULL, data_off INTEGER NOT NULL, data_len INTEGER NOT NULL,
-      type TEXT NOT NULL, size INTEGER NOT NULL, entry_size INTEGER NOT NULL, base_oid ${oid},
-      PRIMARY KEY (repo_id, oid)
-    );
-    CREATE INDEX git_pack_objects_loc ON git_pack_objects (repo_id, pack_id, offset);
+      type TEXT NOT NULL, size INTEGER NOT NULL, entry_size INTEGER NOT NULL, base_offset INTEGER,
+      PRIMARY KEY (repo_id, pack_id, offset)
+    ) WITHOUT ROWID;
+    CREATE INDEX git_pack_entries_by_oid ON git_pack_entries (repo_id, oid, pack_id, offset);
     CREATE TABLE git_commits (
       repo_id INTEGER NOT NULL, oid ${oid} NOT NULL, parents ${oid} NOT NULL,
       tree ${oid} NOT NULL, author_name BLOB NOT NULL, author_email BLOB NOT NULL,
@@ -827,10 +848,6 @@ function schema(encoding: Encoding): string {
       ON git_tree_entries (repo_id, tree_oid, storage, source_id, name_bytes)
       WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200;
   `;
-}
-
-function bindNullableOid(encoding: Encoding, oid: string | null): SQLInputValue {
-  return oid === null ? null : encodeOid(encoding, oid);
 }
 
 function populate(db: DatabaseSync, encoding: Encoding, dataset: Dataset): void {
@@ -869,19 +886,20 @@ function populate(db: DatabaseSync, encoding: Encoding, dataset: Dataset): void 
       seq++;
     }
     let count = 0;
-    for (const location of dataset.packLocations.values()) {
+    for (const { location } of dataset.packEntries) {
       if (location.packId === pack.packId) count++;
     }
     packMeta.run(pack.packId, pack.bytes.byteLength, count);
   }
 
   const packObject = db.prepare(
-    "INSERT INTO git_pack_objects VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO git_pack_entries VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   );
   if (dataset.workload === "packed-nextjs") {
-    for (const row of dataset.objects) {
-      const location = dataset.packLocations.get(row.oid);
-      if (location === undefined) throw new Error(`missing location for ${row.oid}`);
+    const objects = new Map(dataset.objects.map((row) => [row.oid, row]));
+    for (const { oid, location } of dataset.packEntries) {
+      const row = objects.get(oid);
+      if (row === undefined) throw new Error(`missing object for ${oid}`);
       packObject.run(
         encodeOid(encoding, row.oid),
         location.packId,
@@ -891,10 +909,23 @@ function populate(db: DatabaseSync, encoding: Encoding, dataset: Dataset): void 
         row.type,
         row.size,
         location.storedSize,
-        bindNullableOid(encoding, location.baseOid),
+        location.baseOffset,
       );
     }
   }
+
+  const physicalCount = db.prepare("SELECT count(*) AS count FROM git_pack_entries").get();
+  if (physicalCount?.count !== dataset.packEntries.length) {
+    throw new Error("physical pack entry count differs from the fixture");
+  }
+  const missingBase = db
+    .prepare(`SELECT 1 FROM git_pack_entries entry
+    WHERE base_offset IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM git_pack_entries base WHERE base.repo_id = entry.repo_id
+        AND base.pack_id = entry.pack_id AND base.offset = entry.base_offset
+    ) LIMIT 1`)
+    .get();
+  if (missingBase !== undefined) throw new Error("physical pack entry has a missing base");
 
   const commit = db.prepare(
     "INSERT INTO git_commits VALUES " +
@@ -1055,8 +1086,8 @@ function snapshot(db: DatabaseSync, encoding: Encoding): Snapshot {
   }
   for (const row of db
     .prepare(
-      "SELECT oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid " +
-        "FROM git_pack_objects ORDER BY repo_id, oid",
+      "SELECT oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_offset " +
+        "FROM git_pack_entries ORDER BY repo_id, oid",
     )
     .iterate()) {
     hashString(hash, "pack-object");
@@ -1068,8 +1099,10 @@ function snapshot(db: DatabaseSync, encoding: Encoding): Snapshot {
     hashString(hash, requireText(row.type, "pack object type"));
     hashString(hash, String(requireInteger(row.size, "pack object size")));
     hashString(hash, String(requireInteger(row.entry_size, "pack object entry size")));
-    if (row.base_oid === null) hashString(hash, "no-base");
-    else observeOid(hash, oids, decodeOid(encoding, row.base_oid));
+    hashString(
+      hash,
+      row.base_offset === null ? "no-base" : String(requireInteger(row.base_offset, "base offset")),
+    );
   }
   for (const row of db
     .prepare(
@@ -1245,8 +1278,12 @@ function timingResult(
   options: Options,
 ): TimingResult {
   const lookupOids = sampleLookupOids(dataset);
-  const lookupTable = dataset.workload === "packed-nextjs" ? "git_pack_objects" : "git_objects";
-  const lookup = db.prepare(`SELECT oid FROM ${lookupTable} WHERE repo_id = 1 AND oid = ?`);
+  const lookup = db.prepare(
+    dataset.workload === "packed-nextjs"
+      ? `SELECT oid FROM git_pack_entries WHERE repo_id = 1
+       AND (pack_id, offset) = (${canonicalPackEntrySql("1", "?")})`
+      : "SELECT oid FROM git_objects WHERE repo_id = 1 AND oid = ?",
+  );
   const encoded = dataset.conversionOids.map((oid) => encodeOid(encoding, oid));
 
   const runLookup = (): number => {

@@ -362,7 +362,7 @@ describe("durable operation journal", () => {
     store.writeOperationJournal(state, steps, []);
 
     const objectReads = [...histogram].filter(
-      ([query]) => query.includes("git_objects") || query.includes("git_pack_objects"),
+      ([query]) => query.includes("git_objects") || query.includes("git_pack_entries"),
     );
     expect(objectReads).toEqual([]);
     const coldDatabase = new SqliteGitDatabase(db);
