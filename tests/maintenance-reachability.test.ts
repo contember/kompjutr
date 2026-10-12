@@ -1,3 +1,4 @@
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../packages/do/src/db/db.js";
 import { Workspace } from "../packages/do/src/runtime/workspace.js";
@@ -977,7 +978,7 @@ describe("maintenance reachability", () => {
     expect(marks(packed.db, packed.checkout.repoId).map((row) => row.oid)).toContain(packedTree);
   });
 
-  it("resumes a 50,001-commit history cold beyond the bounded graph-reader limit", () => {
+  it("resumes a 50,001-commit history cold beyond the bounded graph-reader limit", async () => {
     const { db, checkout, store } = open();
     const tree = store.write("tree", serializeTree([]));
     const chain: string[] = [];
@@ -1026,6 +1027,8 @@ describe("maintenance reachability", () => {
         throw new Error(`reachability slice used ${db.storage.statementCount} statements`);
       }
       if (call > 50_005) throw new Error("large history did not terminate");
+      // Let Vitest service its RPC messages during this long synchronous traversal.
+      if (call % 512 === 0) await setImmediate();
     }
 
     expect(maximumStatements).toBeLessThan(1_000);
