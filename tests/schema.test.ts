@@ -3,10 +3,12 @@
 
 import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../packages/do/src/db/db.js";
+import { createFilesystem } from "../packages/do/src/fs/filesystem.js";
 import { FS_SCHEMA_VERSION, initializeFsSchema, ROOT_INODE } from "../packages/do/src/fs/schema.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { initializeGitSchema, SCHEMA_VERSION } from "../packages/git/src/store/schema/schema.js";
 import { TestDatabase } from "./helpers/db.js";
+import { SqliteTestStorage } from "./helpers/storage.js";
 
 interface SchemaObject {
   type: string;
@@ -1085,6 +1087,42 @@ describe("fs schema", () => {
     expect(() => initializeFsSchema(db)).toThrow(/unexpected object fs_unexpected/);
   });
 
+  it("migrates a version-one database by adding the empty subtree revision table", () => {
+    const storage = new SqliteTestStorage();
+    const db = new TestDatabase(storage);
+    const before = createFilesystem(db, { now: () => 1234 });
+    before.writeFiles([
+      { path: "/sessions/a/file", bytes: new Uint8Array([1]) },
+      { path: "/sessions/b/file", bytes: new Uint8Array([2]) },
+    ]);
+    db.run("DROP TABLE fs_subtree_revs");
+    db.run("UPDATE fs_meta SET v = 1 WHERE k = 'schema_version'");
+
+    const fs = createFilesystem(new TestDatabase(storage), { now: () => 5678 });
+
+    expect(db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'schema_version'")).toBe(
+      FS_SCHEMA_VERSION,
+    );
+    expect(db.scalar<number>("SELECT count(*) FROM fs_subtree_revs")).toBe(0);
+    expect(fs.readFile("/sessions/a/file")).toEqual(new Uint8Array([1]));
+    const a = fs.realpath("/sessions/a");
+    const b = fs.realpath("/sessions/b");
+    const [aBefore, bBefore] = [fs.subtreeRev(a), fs.subtreeRev(b)];
+    fs.writeFile("/sessions/a/file", new Uint8Array([3]));
+    expect(fs.subtreeRev(a)).toBeGreaterThan(aBefore);
+    expect(fs.subtreeRev(b)).toBe(bBefore);
+    initializeFsSchema(db);
+  });
+
+  it("refuses to migrate a version-one database that already has the new table", () => {
+    const db = new TestDatabase();
+    initializeFsSchema(db);
+    db.run("UPDATE fs_meta SET v = 1 WHERE k = 'schema_version'");
+
+    expect(() => initializeFsSchema(db)).toThrow(/unexpected object fs_subtree_revs/);
+    expect(db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'schema_version'")).toBe(1);
+  });
+
   it("rejects a partial filesystem schema without changing it", () => {
     const current = new TestDatabase();
     initializeFsSchema(current);
@@ -1166,10 +1204,7 @@ describe("fs schema", () => {
        )`,
     ];
     for (const statement of former) db.run(statement);
-    db.run(
-      "INSERT INTO fs_meta (k, v) VALUES ('schema_version', ?), ('rev', 17)",
-      FS_SCHEMA_VERSION,
-    );
+    db.run("INSERT INTO fs_meta (k, v) VALUES ('schema_version', 1), ('rev', 17)");
     const before = fsSchemaDefinitions(db);
 
     expect(() => initializeFsSchema(db)).toThrow(/fs_nodes does not match its current definition/);

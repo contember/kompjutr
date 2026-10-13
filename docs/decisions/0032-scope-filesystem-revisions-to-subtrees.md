@@ -65,8 +65,10 @@ answers 0.
 - When only the link count of a surviving hard link changes, because another
   name was removed or replaced, the containing directory's revision does not
   move. The survivor's own node revision still moves.
-- The schema version is now 2. A version-1 database is refused, as for any
-  schema change.
+- The schema version is now 2. Opening a version-1 database adds the empty
+  table and sets the version to 2. This is correct without a backfill:
+  until a call marks a subtree, its revision rests on its node revisions, and
+  every later call's revision is newer than all of them.
 
 ## Alternatives considered
 

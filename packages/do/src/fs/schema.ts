@@ -15,6 +15,21 @@ export const CHUNK_SIZE = 512 * 1024;
 
 export const ROOT_INODE = 1;
 
+// Per-subtree revision marks; `store/subtree.ts` owns the semantics. Keyed
+// like `fs_paths`, but a row outlives its path: a removed name keeps the
+// revision that removed it until an ancestor is replaced.
+const SUBTREE_REVS_TABLE = `CREATE TABLE IF NOT EXISTS fs_subtree_revs (
+   path TEXT NOT NULL PRIMARY KEY CHECK (
+     typeof(path) = 'text' AND substr(path, 1, 1) = '/'
+   ),
+   rev INTEGER NOT NULL CHECK (
+     typeof(rev) = 'integer' AND rev BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+   ),
+   replaced_rev INTEGER NOT NULL CHECK (
+     typeof(replaced_rev) = 'integer' AND replaced_rev BETWEEN 0 AND rev
+   )
+ ) WITHOUT ROWID`;
+
 const STATEMENTS = [
   // Seeded rows: 'schema_version', 'rev', 'next_inode'.
   //   rev        — monotonic, bumped once per mutating call, not per row.
@@ -103,20 +118,7 @@ const STATEMENTS = [
   // Reverse lookup for unlink/link/nlink.
   `CREATE INDEX IF NOT EXISTS fs_paths_by_inode ON fs_paths(inode)`,
 
-  // Per-subtree revision marks; `store/subtree.ts` owns the semantics. Keyed
-  // like `fs_paths`, but a row outlives its path: a removed name keeps the
-  // revision that removed it until an ancestor is replaced.
-  `CREATE TABLE IF NOT EXISTS fs_subtree_revs (
-     path TEXT NOT NULL PRIMARY KEY CHECK (
-       typeof(path) = 'text' AND substr(path, 1, 1) = '/'
-     ),
-     rev INTEGER NOT NULL CHECK (
-       typeof(rev) = 'integer' AND rev BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
-     ),
-     replaced_rev INTEGER NOT NULL CHECK (
-       typeof(replaced_rev) = 'integer' AND replaced_rev BETWEEN 0 AND rev
-     )
-   ) WITHOUT ROWID`,
+  SUBTREE_REVS_TABLE,
 
   // A rowid table on purpose: rows carry up to CHUNK_SIZE of payload, and
   // WITHOUT ROWID wants small rows.
@@ -237,7 +239,7 @@ function requireCurrentSchema(objects: ReadonlyMap<string, SchemaObject>): void 
   }
 }
 
-function requireCurrentVersion(db: SqlDatabase): void {
+function readVersion(db: SqlDatabase): number {
   const row = db.one<{ version: unknown }>(
     `SELECT CASE WHEN typeof(v) = 'integer' THEN v END AS version
        FROM fs_meta WHERE k = 'schema_version'`,
@@ -246,11 +248,36 @@ function requireCurrentVersion(db: SqlDatabase): void {
   if (typeof row.version !== "number" || !Number.isSafeInteger(row.version)) {
     throw schemaError("filesystem schema has an invalid version");
   }
-  if (row.version !== FS_SCHEMA_VERSION) {
-    throw schemaError(
-      `filesystem schema version ${row.version} is unsupported; expected ${FS_SCHEMA_VERSION}`,
-    );
+  return row.version;
+}
+
+function unsupportedVersion(version: number): Error {
+  return schemaError(
+    `filesystem schema version ${version} is unsupported; expected ${FS_SCHEMA_VERSION}`,
+  );
+}
+
+function requireCurrentVersion(db: SqlDatabase): void {
+  const version = readVersion(db);
+  if (version !== FS_SCHEMA_VERSION) throw unsupportedVersion(version);
+}
+
+/**
+ * Version 1 is version 2 without `fs_subtree_revs`. An empty table is a
+ * correct start: a subtree's revision then rests on its node revisions until
+ * the next call marks it, and every later call's revision is newer.
+ */
+function migrateFromVersionOne(db: SqlDatabase, objects: ReadonlyMap<string, SchemaObject>): void {
+  for (const name of EXPECTED_SCHEMA_OBJECTS.keys()) {
+    if (name !== "fs_subtree_revs") requireCurrentSchemaObject(objects, name);
   }
+  for (const name of objects.keys()) {
+    if (!EXPECTED_SCHEMA_OBJECTS.has(name) || name === "fs_subtree_revs") {
+      throw schemaError(`filesystem schema contains unexpected object ${name}`);
+    }
+  }
+  db.run(SUBTREE_REVS_TABLE);
+  db.run("UPDATE fs_meta SET v = ? WHERE k = 'schema_version'", FS_SCHEMA_VERSION);
 }
 
 /**
@@ -269,7 +296,13 @@ export function initializeFsSchema(db: SqlDatabase, now: () => number = Date.now
         throw schemaError("filesystem schema metadata is missing from an existing database");
       }
       requireCurrentSchemaObject(before, "fs_meta");
-      requireCurrentVersion(db);
+      const version = readVersion(db);
+      if (version === 1) {
+        migrateFromVersionOne(db, before);
+        requireCurrentSchema(readSchemaObjects(db));
+        return;
+      }
+      if (version !== FS_SCHEMA_VERSION) throw unsupportedVersion(version);
       requireCurrentSchema(before);
       return;
     }
