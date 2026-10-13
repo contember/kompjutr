@@ -33,6 +33,7 @@ import {
   readRangeOf,
   realpathOf,
   statOf,
+  subtreeRevOf,
 } from "./reads.js";
 import { listPage, scanPage, scanStreamFrom } from "./scan.js";
 import { discoverFrom, globFrom, globPageFrom, searchFrom } from "./search.js";
@@ -100,6 +101,7 @@ export function createMountedFilesystem(
     db: base.db,
     mutationScope: base.mutationScope,
     rev: () => base.rev(),
+    subtreeRev: (root) => subtreeRevOf(context, root),
     realpath: (path) => realpathOf(context, path),
     stat: (path) => statOf(context, path, false),
     statTarget: (path) => statOf(context, path, true),

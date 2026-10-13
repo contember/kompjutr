@@ -20,6 +20,7 @@ import {
 } from "./store/scan.js";
 import { discoverFilesContaining } from "./store/search.js";
 import { writeFileStream as writeStoredStream } from "./store/stream-write.js";
+import { subtreeRev } from "./store/subtree.js";
 import { TOUCH_PATH_LIMIT, touchFiles as touchStoredFiles } from "./store/touch.js";
 import {
   makeDirectories as makeStoredDirectories,
@@ -71,6 +72,7 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
     db,
     mutationScope: db.mutationScope ?? db,
     rev: () => currentRev(db),
+    subtreeRev: (root) => subtreeRev(db, root),
     realpath: (path) => realpath(db, path),
     stat: ops.stat,
     statTarget: ops.statTarget,

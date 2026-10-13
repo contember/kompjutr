@@ -6,6 +6,7 @@ import { filesystemError as fsError } from "../errors.js";
 import { comparePaths, dirname, normalize } from "../path.js";
 import type { EntryType, RealPath } from "../types.js";
 import { allocateInodes, bumpRev } from "./meta.js";
+import { recordSubtreeChanges } from "./subtree.js";
 
 export const TOUCH_PATH_LIMIT = 10_000;
 const MAX_JSON_BYTES = 1_500_000;
@@ -189,5 +190,6 @@ export function touchFiles(
       );
     }
     runBatches(db, UPDATE_EXISTING, existingInodes.map(String), mtime, rev);
+    recordSubtreeChanges(db, { created: missing, changedInPlace: found.keys() });
   });
 }

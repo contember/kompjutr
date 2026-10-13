@@ -7,6 +7,7 @@ import { comparePaths, dirname, normalize } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type { CopyOptions, EntryType, RealPath } from "../types.js";
 import { allocateInodes, bumpRev } from "./meta.js";
+import { recordSubtreeChanges } from "./subtree.js";
 import { utf8Length } from "./write/write-batches.js";
 
 const DEFAULT_COPY_BUDGET = 1_500_000;
@@ -423,6 +424,7 @@ export function copyFiles(
         `{"p":${JSON.stringify(row.path)},"pa":${JSON.stringify(row.parent)},"i":${row.inode}}`,
     );
     writeJsonBatches(db, UPSERT_PATHS, pathItems);
+    recordSubtreeChanges(db, { created: orderedPaths });
 
     const oldInodes = [
       ...new Set(

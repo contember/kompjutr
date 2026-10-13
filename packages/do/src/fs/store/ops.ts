@@ -14,6 +14,7 @@ import {
   S_IFREG,
   type Stat,
 } from "../types.js";
+import { recordSubtreeChanges } from "./subtree.js";
 
 const PERMISSION_BITS = 0o7777;
 const CHUNK_WRITE_BUDGET = 3 * CHUNK_SIZE;
@@ -321,6 +322,7 @@ export function writeRangeRaw(
       mtime,
       file.inode,
     );
+    recordSubtreeChanges(db, { changedInPlace: [path] });
   });
 }
 
@@ -357,6 +359,7 @@ export function truncateRaw(db: SqlDatabase, path: RealPath, length: number, mti
       mtime,
       file.inode,
     );
+    recordSubtreeChanges(db, { changedInPlace: [path] });
   });
 }
 
@@ -378,6 +381,7 @@ export function linkRaw(db: SqlDatabase, existingPath: RealPath, newPath: RealPa
         WHERE inode = (SELECT inode FROM fs_paths WHERE path = ?)`,
       existingPath,
     );
+    recordSubtreeChanges(db, { changedInPlace: [existingPath] });
   });
 }
 
@@ -393,6 +397,7 @@ export function chmodRaw(db: SqlDatabase, path: RealPath, mode: number, mtime: n
       mtime,
       path,
     );
+    recordSubtreeChanges(db, { changedInPlace: [path] });
   });
 }
 
