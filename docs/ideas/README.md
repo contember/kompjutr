@@ -22,11 +22,11 @@ decided work or status.
   — verify or dismiss the unresolved hypotheses from the 2026-09-02 storage
   architecture review before they enter the backlog.
 - [`resolve-filesystem-paths-incrementally.md`](resolve-filesystem-paths-incrementally.md)
-  — the filesystem path planner rebuilds every ancestor prefix, so one resolve
-  costs `O(components²)`; a 1,000-component merge abort spends 8.6 s of 10 s there.
+  — canonical paths already use sliced prefixes; measure repeated prefix joins
+  in the remaining noncanonical and symlink component walk.
 - [`read-integration-worktree-inputs-once.md`](read-integration-worktree-inputs-once.md)
-  — a conflicted three-way integration reads every worktree input eight times;
-  it costs wall time in a 150-file binary merge, not memory.
+  — remeasure repeated content reads during conflicted integration; the old
+  eight-read fixture overlaps the shared-pass work in backlog 107.
 - [`shell-bounded-loops-and-arithmetic.md`](shell-bounded-loops-and-arithmetic.md)
   — `while read`, arithmetic expansion, bounded awk C-style `for`, and larger
   `jq` inputs, each waiting for a bound that names a real failure.

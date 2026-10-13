@@ -22,6 +22,13 @@ qualified malformed-sideband finding into
 [the completed lifecycle/network sprint](../archive/sprint-2026-09-08-lifecycle-and-network-integrity.md).
 Their evidence and acceptance live in those records.
 
+## Review scope
+
+The 2026-10-13 pass at `f8a677a` checked selected premises against source,
+history, and existing tests; it was not an adversarial audit of every row.
+Unchanged candidates below remain unverified unless their text cites current
+evidence. Neither performance costs nor public failure cases were remeasured.
+
 ## Subsumed claims
 
 These claims need no separate backlog item. Verification can strengthen the
@@ -42,7 +49,7 @@ acceptance witness of the listed verified finding.
 | CORR-23 | Mapped fetch refuses 1,025 destinations while legacy fetch admits 16,384. | Reproduce the boundary, identify the real retained-state owner, and decide whether the limits should match. |
 | CORR-24 | Clone and fetch do not validate `depth` consistently. | Exercise zero, negative, fractional, infinite, and unsafe values through both public APIs and require stable errors. |
 | CORR-25 | Smart HTTP discovery redirects are not carried to the service POST. | Test a server where POST succeeds only at the redirected base and compare with real Git. |
-| CORR-26 / DOCS-1 / TEST-1 | `branchList` and `tagList` use UTF-16 sorting instead of Git byte order. | Compare astral and BMP ref names with real Git and add a call-site witness for forbidden path ordering. |
+| CORR-26 / DOCS-1 / TEST-1 | Confirmed in source at `f8a677a`: `branchList` and `tagList` still use bare `.sort()` in `ops/refs/refs-branches.ts`. | Compare astral and BMP ref names with real Git and add a call-site witness for forbidden path ordering. |
 | CORR-27 | Tree ingest does not establish sortedness before projection. | Ingest a validly hashed unsorted tree and determine whether Git accepts it and whether traversal invariants fail. |
 | CORR-28 | Sparse checkout issues two scalar probes per candidate directory. | Measure statement growth and identify a set-based emptiness or removal primitive. |
 | CORR-29 | Literal add can reject a directory when a sibling sorts between it and its subtree. | Reproduce files, directories, and sibling-prefix boundaries against real Git. |
@@ -55,7 +62,6 @@ acceptance witness of the listed verified finding.
 | Missing operation gitlinks | Journal gitlink OIDs may be mandatory roots while index gitlinks are optional. | Create an operation over an absent gitlink and establish maintenance and recovery semantics. |
 | Clean sibling ordering | Ignored-subtree state may reset at an interleaving sibling prefix. | Build the ordering fixture and compare clean selection with Git before any deletion. |
 | Join equality | `joinSorted` and `joinSorted3` use different equality definitions. | Find reachable distinct strings that compare equal, or prove boundary validation makes the difference unreachable. |
-| Tracking reconciliation | Resolved 2026-09-23: `deferred` was removed; tracking follows `report-status` without rediscovery. | None. |
 
 ## Architecture and cost candidates
 
@@ -64,10 +70,10 @@ acceptance witness of the listed verified finding.
 | ARCH-41 dead estimators | Four JSON/ref sizing exports and the `jsonPages` label are unused. | Check package exports and tests, then remove only confirmed dead members; the report dismissed the broader counter-removal claim. |
 | Store facade boundary | `store/index.ts` claims to be the consumer seam while ops deep-imports store modules. | Inventory imports and decide whether the facade is a binding boundary, compatibility surface, or obsolete. |
 | Duplicate index batching | `IndexMutationBuffer` independently duplicates `jsonPages`. | Compare framing, oversize-row, ordering, and flush behavior before unifying. |
-| Shallow enumeration | `ShallowTable.read()` materializes every shallow OID with no explicit limit. | Establish reachable cardinality and caller needs, then page it or tie a cap to a real failure. |
+| Shallow enumeration | Confirmed in source at `f8a677a`: `ShallowTable.read()` in `store/refs/shallow.ts` still uses `db.all()` and constructs a `Set` of every shallow OID. | Establish reachable cardinality, measured cost, and caller needs before choosing paging or a cap tied to a real failure. |
 | OID schema coverage | OID grammar checks are inconsistent across OID-bearing join columns. | Generate a complete column/writer matrix and find values a supported writer can persist. |
 | Provisional error consistency | Hidden provisional state appears as `EBUSY` through one entry point and `ENOTFOUND` through another. | Define whether endpoint-specific errors are intentional and add public contract tests. |
-| Reflog query limit | `readRefLog` may fetch all 1,024 retained rows before applying caller limits in JavaScript. | Demonstrate an equivalent SQL-level page that preserves retention and cursor semantics. |
+| Reflog query limit | Confirmed in source at `f8a677a`: `readRefLog()` in `store/refs/reflog.ts` iterates a retention-bounded SQL result and applies the caller's limit and cursor in JavaScript. | Measure the cost and demonstrate an equivalent SQL-level page that preserves retention and cursor semantics. |
 | Shared-store cache publication | `openShared` caches a shared store before primary checkout binding completes. | Force a supported post-cache failure and show whether a later open observes poisoned state. |
 | Dead checkout-root branch | The `stored` branch of `requireCheckoutRoot` may be unreachable. | Trace all callers and decoders before removal. |
 | `write-tree` retained OIDs | Plumbing retains one required OID per index row before authentication. | Measure high-water by index cardinality and test whether batched authentication preserves all-before-write behavior. |
@@ -81,7 +87,6 @@ acceptance witness of the listed verified finding.
 | DOCS-4 | Compare every README implementation-status claim with current reference and archived sprint outcomes. |
 | DOCS-5 | Compare the `packages/git/src/store/CLAUDE.md` map with current ownership-bearing modules, without turning it into a file inventory. |
 | DOCS-8 | Decide whether root invariant 4 and ADR-0004 govern all domains or only the Git store before changing filesystem checks. |
-| DOCS-9 | ~~Reconcile ADR-0014's statement that fetch cannot deepen a clone with shipped deepen and unshallow support.~~ Resolved in the 2026-09-04 ADR rewrite: ADR-0014 now records that the premise lapsed and why the decision survives it. |
 | DOCS-10 | Establish which synchronous APIs return `EPROMISED` and which asynchronous operations hydrate before documenting it. |
 | DOCS-11 / DOCS-12 | Re-check the headers of `shared.ts`, `database.ts`, and `operations.ts` against current ownership. |
 | DOCS-14 | Find a reproducible artifact for the exact 54,423,552-byte memory claim or replace the unsupported precision. |
@@ -91,11 +96,9 @@ acceptance witness of the listed verified finding.
 
 | Claims | Verification needed |
 |---|---|
-| TEST-3 | Add a platform-shaped witness that production code delegates transactions and never sends transaction SQL through `sql.exec`. |
-| TEST-4 | Enforce the documented production `node:` import allowlist without flagging allowed compatibility facades. |
 | TEST-5 | Publish shallow-only fetch state and witness the exact maintenance root-epoch transition and restart. |
 | TEST-7 | Inventory promised-blob hydration races and add a deterministic lease-contention/cold-reopen witness if existing owner tests do not cover them. |
-| Nested rollback | Verify caught inner-failure semantics with Miniflare/workerd or the real Durable Object adapter; hand-written test storage currently flattens nesting. |
+| Nested rollback | The test double now uses savepoints (`tests/helpers/storage.ts`), and `tests/database.test.ts` covers caught inner failures and outer rollback after an inner commit. Verify remaining differences against Miniflare/workerd or the real Durable Object adapter, especially critical-error abort semantics; the old flattened-nesting premise no longer applies. |
 
 ## Graduation
 
