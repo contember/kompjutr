@@ -2,6 +2,7 @@ import type { SqlDatabase } from "../../db/db.js";
 import { filesystemError as fsError } from "../errors.js";
 import { codePointLength, dirname, subtreeSuccessor } from "../path.js";
 import type { RealPath } from "../types.js";
+import { recordSubtreeChanges } from "./subtree.js";
 
 interface RenameRow {
   source_inode: number | null;
@@ -47,6 +48,10 @@ export function renameRaw(db: SqlDatabase, oldPath: RealPath, newPath: RealPath)
           WHERE inode = ?`,
         classified.source_inode,
       );
+      recordSubtreeChanges(db, {
+        replaced: [{ path: oldPath, directory: false }],
+        changedInPlace: [newPath],
+      });
       return;
     }
     if (classified !== undefined && classified.target_child === 1) {
@@ -109,5 +114,12 @@ export function renameRaw(db: SqlDatabase, oldPath: RealPath, newPath: RealPath)
       newPath,
       subtreeSuccessor(newPath),
     );
+    // Either end may be a directory; the drop below a file finds no rows.
+    recordSubtreeChanges(db, {
+      replaced: [
+        { path: oldPath, directory: true },
+        { path: newPath, directory: true },
+      ],
+    });
   });
 }

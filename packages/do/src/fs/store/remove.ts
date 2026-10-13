@@ -13,6 +13,7 @@ import type { SqlDatabase } from "../../db/db.js";
 import { filesystemError as fsError } from "../errors.js";
 import { codePointLength, dirname, normalize, subtreeSuccessor } from "../path.js";
 import type { RemoveOptions } from "../types.js";
+import { type ReplacedEntry, recordSubtreeChanges } from "./subtree.js";
 
 // ---------------------------------------------------------------------------
 // removeFiles
@@ -96,8 +97,8 @@ const RELINK = `UPDATE fs_nodes
 const DELETE_PATHS = `DELETE FROM fs_paths WHERE path IN (SELECT t.path FROM (${TARGETS}) t)`;
 
 /**
- * Remove many paths. Six statements regardless of how many paths are named
- * or how deep the trees under them are: the descendants are found by a
+ * Remove many paths. Seven statements, eight when a directory goes, regardless
+ * of how many paths are named or how deep the trees under them are: the descendants are found by a
  * range scan on the `fs_paths` primary key, never enumerated in JS.
  *
  * `fs_nodes` and `fs_chunks` rows go with their inode, but only when no
@@ -126,6 +127,7 @@ export function removeFiles(
 
   const exact: string[] = [];
   const subtrees: string[] = [];
+  const replaced: ReplacedEntry[] = [];
   for (const row of rows) {
     if (row.type === null) {
       if (!force) {
@@ -143,6 +145,7 @@ export function removeFiles(
       }
     }
     exact.push(row.path);
+    replaced.push({ path: row.path, directory: row.type === "dir" });
   }
   if (exact.length === 0) return;
 
@@ -155,6 +158,7 @@ export function removeFiles(
     db.run(DELETE_NODES, named, roots);
     db.run(RELINK, named, roots, named, roots);
     db.run(DELETE_PATHS, named, roots);
+    recordSubtreeChanges(db, { replaced });
   });
 }
 

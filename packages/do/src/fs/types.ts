@@ -84,6 +84,15 @@ export interface Filesystem extends GitDrive {
   rev(): number;
 
   /**
+   * The revision of everything at and below an already resolved `root`. It
+   * moves exactly when a call changes an entry there: content, metadata, a
+   * create, a removal, or a rename in or out, including a removal or rename of
+   * an ancestor. A write elsewhere leaves it alone. Monotonic, durable, and
+   * one statement whatever the subtree's size.
+   */
+  subtreeRev(root: RealPath): number;
+
+  /**
    * Canonicalise and resolve every symlink on the path. One statement in
    * the common case, one more per symlink encountered.
    */

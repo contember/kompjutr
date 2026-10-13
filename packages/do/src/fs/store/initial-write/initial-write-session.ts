@@ -2,6 +2,7 @@ import type { SqlDatabase } from "../../../db/db.js";
 import { filesystemError } from "../../errors.js";
 import { comparePaths, dirname } from "../../path.js";
 import { CHUNK_SIZE } from "../../schema.js";
+import { recordSubtreeChanges } from "../subtree.js";
 import { utf8Length } from "../write/write-batches.js";
 import {
   type InitialChunkRow as ChunkRow,
@@ -193,6 +194,7 @@ export class InitialWorktreeSessionImpl implements InitialWorktreeSession {
       startRevision,
     );
     if (revision !== this.revision) throw new Error("fs revision changed during initial write");
+    recordSubtreeChanges(this.db, { directories: [this.root] });
   }
 
   invalidate(): void {

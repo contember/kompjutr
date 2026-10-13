@@ -7,6 +7,7 @@ import { dirname, normalize } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type { RealPath } from "../types.js";
 import { allocateInodes, bumpRev } from "./meta.js";
+import { recordSubtreeChanges } from "./subtree.js";
 
 const DEFAULT_FILE_MODE = 0o644;
 
@@ -167,5 +168,6 @@ export function writeFileStream(
       rev,
       inode,
     );
+    recordSubtreeChanges(db, existing === null ? { created: [path] } : { changedInPlace: [path] });
   });
 }

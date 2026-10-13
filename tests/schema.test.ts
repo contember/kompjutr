@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { SqlDatabase } from "../packages/do/src/db/db.js";
-import { initializeFsSchema, ROOT_INODE } from "../packages/do/src/fs/schema.js";
+import { FS_SCHEMA_VERSION, initializeFsSchema, ROOT_INODE } from "../packages/do/src/fs/schema.js";
 import { SqliteGitDatabase } from "../packages/git/src/store/index.js";
 import { initializeGitSchema, SCHEMA_VERSION } from "../packages/git/src/store/schema/schema.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -1062,12 +1062,12 @@ describe("fs schema", () => {
     expect(db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'next_inode'")).toBe(ROOT_INODE + 1);
   });
 
-  it("keeps version one only when every filesystem schema object is exact", () => {
+  it("keeps the current version only when every filesystem schema object is exact", () => {
     const db = new TestDatabase();
     initializeFsSchema(db, () => 1234);
     const before = fsSchemaDefinitions(db);
 
-    expect(db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'schema_version'")).toBe(1);
+    expect(db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'schema_version'")).toBe(2);
     expect(before.map(({ type, name }) => ({ type, name }))).toEqual([
       { type: "table", name: "fs_chunks" },
       { type: "table", name: "fs_meta" },
@@ -1075,6 +1075,7 @@ describe("fs schema", () => {
       { type: "table", name: "fs_paths" },
       { type: "index", name: "fs_paths_by_inode" },
       { type: "index", name: "fs_paths_by_parent" },
+      { type: "table", name: "fs_subtree_revs" },
     ]);
 
     initializeFsSchema(db, () => 9999);
@@ -1094,7 +1095,7 @@ describe("fs schema", () => {
 
     const db = new TestDatabase();
     db.run(currentMeta);
-    db.run("INSERT INTO fs_meta (k, v) VALUES ('schema_version', 1)");
+    db.run("INSERT INTO fs_meta (k, v) VALUES ('schema_version', ?)", FS_SCHEMA_VERSION);
     const before = fsSchemaDefinitions(db);
 
     expect(() => initializeFsSchema(db)).toThrow(/missing required table fs_nodes/);
@@ -1165,7 +1166,10 @@ describe("fs schema", () => {
        )`,
     ];
     for (const statement of former) db.run(statement);
-    db.run("INSERT INTO fs_meta (k, v) VALUES ('schema_version', 1), ('rev', 17)");
+    db.run(
+      "INSERT INTO fs_meta (k, v) VALUES ('schema_version', ?), ('rev', 17)",
+      FS_SCHEMA_VERSION,
+    );
     const before = fsSchemaDefinitions(db);
 
     expect(() => initializeFsSchema(db)).toThrow(/fs_nodes does not match its current definition/);

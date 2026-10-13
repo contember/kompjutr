@@ -10,6 +10,7 @@ import { normalize } from "../path.js";
 import { readResolvedFiles } from "../store/read/read-resolved.js";
 import { readFileHandles as storeReadFileHandles } from "../store/read.js";
 import { resolveManyWithin, resolveWithin, unstoredRealPath } from "../store/resolve.js";
+import { subtreeRev } from "../store/subtree.js";
 import type {
   Dirent,
   HandleReadBatch,
@@ -19,7 +20,7 @@ import type {
   RegularFileHandle,
   Stat,
 } from "../types.js";
-import { missing, type ViewContext } from "./context.js";
+import { missing, resolvedRoot, type ViewContext } from "./context.js";
 import { realRealPath, virtualRealPath } from "./items.js";
 import type { Mount } from "./mounts.js";
 
@@ -33,6 +34,21 @@ export function realpathOf(context: ViewContext, path: string): RealPath {
   );
   if (typeof real !== "string") throw missing(path);
   return virtualRealPath(mount, real);
+}
+
+/**
+ * A mount's subtree revision is its source's. Above the mounts it is the
+ * newest of the mounts below; outside them nothing can change.
+ */
+export function subtreeRevOf(context: ViewContext, root: RealPath): number {
+  const resolved = resolvedRoot(context, root);
+  if (resolved.kind === "mount") return subtreeRev(context.db, resolved.real);
+  if (resolved.kind === "none") return 0;
+  let newest = 0;
+  for (const mount of context.table.mountsUnder(resolved.path)) {
+    newest = Math.max(newest, subtreeRev(context.db, context.source(mount)));
+  }
+  return newest;
 }
 
 /** `stat` (lstat) or `statTarget`. A path that would leave its mount is absent. */

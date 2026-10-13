@@ -318,6 +318,9 @@ export function importFromComputer(
     db.run(INSERT_PATHS);
     db.run(INSERT_CHUNKS);
     db.run(ADVANCE_ALLOCATOR);
+    // Marks left by writes the fresh tree saw before it was emptied would
+    // outrank the imported revision, which can be lower.
+    db.run("DELETE FROM fs_subtree_revs");
     writeLatch(db, vfsRev, now());
 
     return {

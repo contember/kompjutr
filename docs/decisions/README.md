@@ -47,6 +47,7 @@ so the two cannot drift.
 - [0029 — Check fetched connectivity per received pack](0029-check-fetched-connectivity-per-pack.md) — accepted (2026-10-07)
 - [0030 — Project trees on demand as a downward-closed set](0030-project-trees-on-demand.md) — accepted (2026-10-07)
 - [0031 — Derive the canonical pack copy from pack entries](0031-derive-the-canonical-pack-copy-from-pack-entries.md) — accepted (2026-10-09)
+- [0032 — Scope filesystem revisions to subtrees with ancestor marks](0032-scope-filesystem-revisions-to-subtrees.md) — accepted (2026-10-13)
 
 **Git domain**
 

@@ -1,8 +1,9 @@
 # @kompjutr/do filesystem
 
-A POSIX-shaped filesystem whose entire state is three tables in Durable Object
+A POSIX-shaped filesystem whose entire state is four tables in Durable Object
 SQLite: `fs_paths` (path → inode, revision), `fs_nodes` (type, mode, size,
-times, link count), `fs_chunks` (bounded content chunks).
+times, link count), `fs_chunks` (bounded content chunks), and
+`fs_subtree_revs` (per-directory revision marks, ADR-0032).
 
 ```
 filesystem.ts   assembles the Filesystem from the store layer
@@ -54,6 +55,8 @@ readable it looks.
   split or rejected, not silently truncated.
 - **`scanStream` holds no SQL cursor across a yield.** Git writes between
   rows, so each 1,000-row page is a fresh keyset statement from the last path.
-- One mutating *call* bumps the revision once, not once per row.
+- One mutating *call* bumps the revision once, not once per row, and records
+  its changed paths with `recordSubtreeChanges` in the same transaction. A
+  mutation that skips it leaves every `subtreeRev` cache stale, silently.
 - Mutations land in a single `db.transactionSync()`: path, node, and chunk state
   together.

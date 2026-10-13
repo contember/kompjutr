@@ -376,7 +376,7 @@ describe("writeFiles — statement cost", () => {
       });
     };
 
-    const metadata = 7;
+    const metadata = 8;
     expect(cost(1024 * 1024)).toBe(metadata + total / (1024 * 1024));
     expect(cost(256 * 1024)).toBe(metadata + total / (256 * 1024));
     expect(cost(64 * 1024)).toBe(metadata + total / (64 * 1024));

@@ -85,6 +85,7 @@ The working tree is relational:
 | `fs_paths` | filesystem | canonical real path to inode |
 | `fs_nodes` | filesystem | type, mode, size, timestamps, revision, link count |
 | `fs_chunks` | filesystem | file content in 512 KiB rows |
+| `fs_subtree_revs` | filesystem | per-directory revision marks behind `subtreeRev` |
 
 Paths are resolved component by component before store access. Mutations update
 path, node, and chunk state in one `transactionSync()` call and bump one
@@ -94,6 +95,14 @@ across a yield; a page that ends inside a pruned directory resumes past its
 subtree. Discovery returns revision-bearing regular-file handles; batched
 reads revalidate every handle before exposing content.
 
+`subtreeRev(root)` is the revision scoped to one subtree: it moves when a call
+changes anything at or below `root`, including a rename in or out and the
+removal of an ancestor, and stays put for writes elsewhere. Each call marks the
+parent directories of its entries and their ancestors in one upsert, and a
+removal or rename also marks the replaced path; the read combines those marks
+with the root's node revision in one statement
+([ADR-0032](../decisions/0032-scope-filesystem-revisions-to-subtrees.md)).
+
 ### Mounted views
 
 `createMountedFilesystem(fs, mounts)` (`@kompjutr/do/fs`) returns a
@@ -101,7 +110,9 @@ reads revalidate every handle before exposing content.
 an absolute canonical virtual path onto an existing real directory, `rw` or
 `ro`; mount paths may not nest, sources may overlap. `fs` must come from
 `createFilesystem`; the view shares its clock, revision, and paged-root cache
-epoch. The shell runs over a view unchanged. Git does not: an injected `git`
+epoch. Its `subtreeRev` answers for a mount from the mount's source, above the
+mounts with the newest of the mounts below, and with 0 outside them. The shell
+runs over a view unchanged. Git does not: an injected `git`
 command keeps the real filesystem and treats the shell's virtual `cwd` as a
 real path, so the view does not confine it.
 

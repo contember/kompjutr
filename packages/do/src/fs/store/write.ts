@@ -26,6 +26,7 @@ import { CHUNK_SIZE } from "../schema.js";
 import type { EntryType, WriteEntry, WriteOptions } from "../types.js";
 import { allocateInodes, bumpRev } from "./meta.js";
 import { type PathResolver, storeResolver } from "./resolve.js";
+import { recordSubtreeChanges } from "./subtree.js";
 import {
   deleteChunks,
   payloadBudgetOf,
@@ -276,6 +277,10 @@ export function writeFiles(
 
     writeNodes(db, nodes, rev);
     writePaths(db, paths);
+    recordSubtreeChanges(db, {
+      created: creating,
+      changedInPlace: overwriting.map((entry) => entry.path),
+    });
 
     const chunks: WriteChunkRow[] = [];
     for (const entry of targets) {

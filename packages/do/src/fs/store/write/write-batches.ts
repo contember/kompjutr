@@ -109,7 +109,8 @@ export function payloadBudgetOf(requested: number | undefined): number {
   return Math.min(Math.floor(requested), MAX_PAYLOAD_BYTES);
 }
 
-function jsonBatches(items: readonly string[], sizes: readonly number[]): string[] {
+/** JSON arrays of `items`, each under the bound one bound parameter may carry. */
+export function jsonBatches(items: readonly string[], sizes: readonly number[]): string[] {
   const out: string[] = [];
   let group: string[] = [];
   let bytes = 2;

@@ -8,7 +8,7 @@
 import type { SqlDatabase } from "../db/db.js";
 import { filesystemError } from "./errors.js";
 
-export const FS_SCHEMA_VERSION = 1;
+export const FS_SCHEMA_VERSION = 2;
 
 /** DOFS uses 512 KiB; the Durable Object BLOB ceiling is 2 MB. */
 export const CHUNK_SIZE = 512 * 1024;
@@ -102,6 +102,21 @@ const STATEMENTS = [
 
   // Reverse lookup for unlink/link/nlink.
   `CREATE INDEX IF NOT EXISTS fs_paths_by_inode ON fs_paths(inode)`,
+
+  // Per-subtree revision marks; `store/subtree.ts` owns the semantics. Keyed
+  // like `fs_paths`, but a row outlives its path: a removed name keeps the
+  // revision that removed it until an ancestor is replaced.
+  `CREATE TABLE IF NOT EXISTS fs_subtree_revs (
+     path TEXT NOT NULL PRIMARY KEY CHECK (
+       typeof(path) = 'text' AND substr(path, 1, 1) = '/'
+     ),
+     rev INTEGER NOT NULL CHECK (
+       typeof(rev) = 'integer' AND rev BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     replaced_rev INTEGER NOT NULL CHECK (
+       typeof(replaced_rev) = 'integer' AND replaced_rev BETWEEN 0 AND rev
+     )
+   ) WITHOUT ROWID`,
 
   // A rowid table on purpose: rows carry up to CHUNK_SIZE of payload, and
   // WITHOUT ROWID wants small rows.

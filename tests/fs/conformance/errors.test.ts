@@ -28,6 +28,7 @@ import {
 } from "../../../packages/do/src/fs/store/scan.js";
 import { discoverFilesContaining } from "../../../packages/do/src/fs/store/search.js";
 import { writeFileStream } from "../../../packages/do/src/fs/store/stream-write.js";
+import { subtreeRev } from "../../../packages/do/src/fs/store/subtree.js";
 import { touchFiles } from "../../../packages/do/src/fs/store/touch.js";
 import { makeDirectories, writeFiles } from "../../../packages/do/src/fs/store/write.js";
 import type { Filesystem } from "../../../packages/do/src/fs/types.js";
@@ -40,6 +41,7 @@ function createTestProvider(): NodeFsCompat {
   const filesystem: Filesystem = {
     ...ops,
     rev: () => currentRev(db),
+    subtreeRev: (root) => subtreeRev(db, root),
     realpath: (path) => realpath(db, path),
     scan: (root, options) => scan(db, realpath(db, root), options),
     scanStream: (root, options) => scanStream(db, root, options),
