@@ -221,7 +221,7 @@ export function cleanupTransfers(store: SharedRepoStore, nowMs: number): boolean
     );
     store.db.run(
       `DELETE FROM git_transfer_roots WHERE root_id IN
-      (SELECT root_id FROM git_transfer_roots WHERE repo_id = ? AND transfer_id = ? ORDER BY root_id LIMIT ${TRANSFER_PAGE})`,
+      (SELECT root_id FROM git_transfer_roots WHERE repo_id = ? AND transfer_id = ? ORDER BY oid LIMIT ${TRANSFER_PAGE})`,
       store.repoId,
       id,
     );

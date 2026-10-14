@@ -286,6 +286,13 @@ honor `no-thin`. These replace the idea's single-round and thin-ingest assumptio
   capacity, update this plan for compressed-entry reuse or bounded deltas before
   declaring that envelope supported; never silently truncate history or impose
   a projected-statement refusal.
+  Qualification also covers shared-reader resource failures: the large receive
+  witness exposed per-entry native inflater state retained until major GC.
+  Reuse the existing bounded decoder in the owning pack reader, preserve exact
+  size/stream validation, and review its existing read callers and malformed
+  input regressions. This prerequisite fixes the measured receive failure;
+  outbound compression is still reconsidered if the corrected output exceeds
+  the runtime envelope.
 - **Touch points.** `tests/server/`, `bench/server/`, `package.json`, CI test
   discovery, public example, and reference docs for architecture, concurrency
   and supported Git behavior. Deployments, if later requested, go through CI.
@@ -387,6 +394,37 @@ Qualification harness work can start early, but WU6's verdict requires WU3–WU5
   namespace conflicts and receive metadata bounds are incorporated above.
 
 ## Run log
+
+- 2026-10-14: Reusable packed-reader decoder committed as `96a71ae` after
+  Newton's independent review and 58 focused pack/decoder/server tests.
+  Typecheck passed. The maintenance queue and owner-root paging fixes passed
+  22 maintenance/lifetime tests, including 50,001-commit history; Newton
+  independently approved their index paths, bounded deletion and cold resume.
+  Actual disconnect testing localized lost cancellation to Miniflare 5's
+  internal development router, which omits `enable_request_signal`. The helper
+  will use Miniflare's direct application socket, retaining the real Worker
+  authorization and DO boundary, and re-run the native/cancellation witnesses.
+
+- 2026-10-14: Large Node baseline completed all four transfer phases, but cleanup
+  entered the existing maintenance marker's same expanded-prefix scan. Live
+  EXPLAIN proved the missing `expanded` index constraint at 84,698 marked
+  objects. Qualification therefore includes pinning its existing queue index
+  and paging released transfer roots through the existing owner/OID index;
+  exact bounded deletion and cold-continuation witnesses remain required.
+  The baseline was stopped to avoid spending CPU on the proven quadratic scan;
+  its completed phase metrics are diagnostic, not final qualification.
+
+- 2026-10-14: Root build and isolated-consumer package smoke passed for all five
+  artifacts. Large workerd receive completes native push but qualification
+  captured 5.61 GB process RSS and a DO GC sample with 5.21 GB external memory;
+  this is a real capacity failure, not a passing envelope. Its read path uses
+  native per-entry `inflatePrefix`, unlike ingest's reusable `PrefixInflater`.
+  The shared pack reader fix and its broader malformed-input review are now a
+  WU6 prerequisite. Control reads also reset pooled connections after long
+  requests; diagnostics retain the completed operation and GC evidence instead
+  of losing it. Medium cancellation exposed a missing Worker
+  `enable_request_signal` flag; the example and actual-workerd witness must
+  enable and verify disconnect propagation before closure.
 
 - 2026-10-14: DO example and benchmark harness committed as `363c126` after
   Huygens approved chunked-forwarding correction. Actual-workerd witnesses pass

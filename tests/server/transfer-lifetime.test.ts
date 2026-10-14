@@ -86,6 +86,74 @@ describe("server transfer lifetime", () => {
     expect(next.transferId).toBeGreaterThan(owner.transferId);
   });
 
+  it("cleans only the released owner's root page through its repository and owner index", () => {
+    const { store, db } = open();
+    const roots = Array.from({ length: 300 }, (_, index) => ({
+      oid: store.write("blob", utf8.encode(`root ${index}`)),
+    }));
+    const active = createTransfer(store, { wanted: roots, nowMs: 100 });
+    const released = createTransfer(store, { wanted: roots, nowMs: 100 });
+    releaseTransfer(store, released);
+    const writes = vi.spyOn(db, "run");
+    cleanupTransfers(store, 100);
+    const call = writes.mock.calls.find(([sql]) =>
+      sql.startsWith("DELETE FROM git_transfer_roots"),
+    );
+    if (call === undefined) throw new Error("cleanup did not delete a root page");
+    const [sql, ...bindings] = call;
+    writes.mockRestore();
+    const details = [...db.iterate(`EXPLAIN QUERY PLAN ${sql}`, ...bindings)].map(
+      (row) => row.detail,
+    );
+    expect(details).toContainEqual(
+      expect.stringMatching(/USING COVERING INDEX .*repo_id=\? AND transfer_id=\?/),
+    );
+    expect(details).not.toContainEqual(expect.stringContaining("USE TEMP B-TREE"));
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_transfer_roots WHERE transfer_id = ?",
+        released.transferId,
+      ),
+    ).toBe(172);
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_transfer_roots WHERE transfer_id = ?",
+        active.transferId,
+      ),
+    ).toBe(300);
+    const cold = new SqliteGitDatabase(db).openBareRepository(store.repoId);
+    while (!cleanupTransfers(cold, 100)) {}
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_transfer_roots WHERE transfer_id = ?",
+        released.transferId,
+      ),
+    ).toBe(0);
+    expect(() => assertTransfer(cold, active, 100)).not.toThrow();
+  });
+
+  it("seeks the maintenance frontier after transfer roots seed a complete graph", () => {
+    const { store, db, database } = open();
+    const roots = Array.from({ length: 300 }, (_, index) => ({
+      oid: store.write("blob", utf8.encode(`mark ${index}`)),
+    }));
+    const owner = createTransfer(store, { wanted: roots, nowMs: 100 });
+    const walks = vi.spyOn(db, "iterate");
+    expect(maintain(database, store.repoId, 100).reachableObjects).toBe(300);
+    const call = walks.mock.calls.find(([sql]) => sql.includes("AND object.expanded = 0"));
+    if (call === undefined) throw new Error("maintenance did not read its frontier");
+    const [sql, ...bindings] = call;
+    walks.mockRestore();
+    const details = [...db.iterate(`EXPLAIN QUERY PLAN ${sql}`, ...bindings)].map(
+      (row) => row.detail,
+    );
+    expect(details).toContainEqual(
+      expect.stringMatching(/USING INDEX git_maintenance_objects_queue .*expanded=\?/),
+    );
+    expect(details).not.toContainEqual(expect.stringContaining("USE TEMP B-TREE"));
+    releaseTransfer(store, owner);
+  });
+
   it("checks an owner after output backpressure before reading the next object", async () => {
     const { store } = open();
     const oid = store.write("blob", utf8.encode("body"));

@@ -53,10 +53,11 @@ function readNextObject(db: SqlDatabase, repoId: number, runId: number): QueueOb
   let result: QueueObject | null = null;
   let previous: string | null = null;
   let rows = 0;
+  // Seek the unexpanded frontier instead of rescanning its processed OID prefix.
   for (const row of db.iterate(
     `SELECT object.repo_id, object.run_id, object.oid, object.source_mask,
             object.expanded, object.shallow_boundary, object.edge_cursor, object.edge_offset
-       FROM git_maintenance_objects object
+       FROM git_maintenance_objects object INDEXED BY git_maintenance_objects_queue
       WHERE object.repo_id = ? AND object.run_id = ? AND object.expanded = 0
       ORDER BY object.oid COLLATE BINARY LIMIT 2`,
     repoId,
