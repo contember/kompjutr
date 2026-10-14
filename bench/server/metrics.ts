@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { requireParentLeaseCpus } from "../memory-run.js";
-import { statusBytes, workerdCgroup } from "../workerd/proc-memory.js";
+import { resetPeakRss, workerdCgroup } from "../workerd/proc-memory.js";
 
 export function assertLease(): void {
   requireParentLeaseCpus(1);
@@ -55,5 +55,12 @@ export class CpuCheckpoints {
 }
 
 export function memoryContext(pid: number) {
-  return { processBaselineRssBytes: statusBytes(pid, "VmRSS"), cgroup: workerdCgroup(pid) };
+  const cgroup = workerdCgroup(pid);
+  const reset = resetPeakRss(pid);
+  return {
+    processBaselineRssBytes: reset.peakRssBytes,
+    processResetPeakRssBytes: reset.peakRssBytes,
+    processResetCurrentRssBytes: reset.rssBytes,
+    cgroup,
+  };
 }

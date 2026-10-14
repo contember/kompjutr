@@ -38,6 +38,10 @@ the supplied Content-Length. HTTP gzip request decoding is supported. The
 [Durable Object example](../../examples/git-server/README.md) includes repository
 routing, Basic authentication, persisted identity and alarm maintenance. Its
 tokens cover all repository names; applications own any finer access policy.
+Worker deployments need `nodejs_compat` and `enable_request_signal`. The latter
+connects client disconnects to `Request.signal` so active transfer owners can
+release immediately; see
+[Cloudflare's cancellation contract](https://developers.cloudflare.com/changelog/post/2025-05-22-handle-request-cancellation/).
 
 ## Protocol contract
 
@@ -63,11 +67,14 @@ self-contained. Shallow boundaries and unresolved promised objects prevent
 serving. Protocol v2, SHA-256, shallow/deepen, filters, LFS, SSH, hooks,
 push options and negotiated atomic pushes are unsupported.
 
-Discovery and negotiation allow at most 16,384 entries, receive allows 1,024
-commands, and ref names allow 1,024 UTF-8 bytes. These bound retained request
-metadata. Duplicate receive destinations fail. Repeated wants/haves are
-deduplicated but still count toward the incoming frame bound. The existing
-48 MiB individual object limit also applies. Oversized requests fail explicitly.
+Discovery allows at most 16,384 stored heads/tags; synthetic HEAD and peeled-tag
+lines are additional. Negotiation allows 16,384 incoming entries, receive allows
+1,024 commands, and ref names allow 1,024 UTF-8 bytes. These bound retained
+request metadata. Duplicate receive destinations fail. Repeated wants/haves are
+deduplicated but still count toward the incoming frame bound. Existing ingest
+limits also apply: 48 MiB per object, a 48 MiB delta working set, and at most
+1,290,555 objects per incoming pack for bounded index metadata. See
+[Git limits](git-support.md#limits). Oversized requests fail explicitly.
 
 ## Push publication
 
@@ -105,8 +112,11 @@ an await, and object sources are reacquired after storage changes.
 Each transfer retains its roots until explicit release. Its renewable five-
 minute expiry prevents an abandoned reader from resuming. Expiry alone does
 not remove GC roots: bounded maintenance releases the owner and advances the
-root epoch before deleting scratch pages. Success and cancellation release
-ownership immediately, including cancellation before the first output read.
+root epoch before deleting scratch pages. Success and a delivered abort or
+stream cancellation release ownership immediately, including cancellation
+before the first output read. Network delivery depends on the runtime: a TCP
+reset can abort a pending stream, while a graceful close may be noticed only
+when the stream next progresses.
 See [ADR-0033](../decisions/0033-retain-transfer-roots-until-explicit-release.md).
 
 Call `maintainRepository(database, repoId, { nowMs })` repeatedly to advance

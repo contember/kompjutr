@@ -5,14 +5,34 @@ import example, {
   type ServerEnvironment,
 } from "../../examples/git-server/worker.js";
 import { GC_DONE_MARKER } from "../workerd/protocol.js";
-import { CountedStorage } from "./storage.js";
+import { CountedStorage, type SqlCounts } from "./storage.js";
 import { transferState } from "./transfer-state.js";
+
+interface PhaseCounters {
+  phase: string | null;
+  generations: number;
+  totals: SqlCounts;
+}
+
+// DO eviction must not discard a measured phase; an isolate restart loses its epoch.
+const countersByObject = new Map<string, PhaseCounters>();
 
 export class ServerBench extends GitRepository {
   readonly counts: CountedStorage;
   readonly measuredServer;
-  constructor(context: RepositoryContext, env: { BENCH_MARKER_URL: string }) {
-    const counts = new CountedStorage(context.storage);
+  readonly phaseCounters: PhaseCounters;
+  constructor(
+    context: RepositoryContext & { id: { toString(): string } },
+    env: { BENCH_MARKER_URL: string },
+  ) {
+    const key = context.id.toString();
+    let phaseCounters = countersByObject.get(key);
+    if (phaseCounters === undefined) {
+      phaseCounters = { phase: null, generations: 0, totals: { statements: 0, returnedRows: 0 } };
+      countersByObject.set(key, phaseCounters);
+    }
+    phaseCounters.generations++;
+    const counts = new CountedStorage(context.storage, phaseCounters.totals);
     super({
       storage: {
         sql: counts.sql,
@@ -22,21 +42,34 @@ export class ServerBench extends GitRepository {
       },
     });
     this.counts = counts;
+    this.phaseCounters = phaseCounters;
     this.measuredServer = createGitServer(this.database.openBareRepository(this.repoId), {
       maxPackBytes: 256 * 1024 * 1024,
       yieldNow: async () => {
         const response = await fetch(env.BENCH_MARKER_URL);
         if (!response.ok) throw new Error("host CPU checkpoint failed");
+        await response.text();
       },
     });
   }
   override async fetch(request: Request): Promise<Response> {
-    const path = new URL(request.url).pathname;
+    const url = new URL(request.url);
+    const path = url.pathname;
     if (path === "/__bench/reset") {
+      const phase = url.searchParams.get("phase");
+      if (phase === null || !/^[a-zA-Z0-9-]{1,64}$/.test(phase))
+        return new Response("invalid phase epoch", { status: 400 });
       this.counts.reset();
+      this.phaseCounters.phase = phase;
+      this.phaseCounters.generations = 1;
       return Response.json({ reset: true });
     }
-    if (path === "/__bench/counts") return Response.json(this.counts.counts());
+    if (path === "/__bench/counts")
+      return Response.json({
+        ...this.counts.counts(),
+        phase: this.phaseCounters.phase,
+        generations: this.phaseCounters.generations,
+      });
     if (path === "/__bench/gc") {
       const gc = Reflect.get(globalThis, "gc");
       if (typeof gc !== "function") throw new Error("missing exposed gc");

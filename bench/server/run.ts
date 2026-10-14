@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runGit } from "../../tests/helpers/server-oracle-http.js";
 import { basicAuth, WORKER_WRITE_TOKEN } from "../../tests/helpers/server-workerd.js";
-import { MemorySampler, resetPeakRss, statusBytes } from "../workerd/proc-memory.js";
+import { MemorySampler, statusBytes } from "../workerd/proc-memory.js";
+import { openResettableUpload } from "./cancellation.js";
 import { prepareServerFixture } from "./fixtures.js";
 import { assertLease, CpuCheckpoints, memoryContext } from "./metrics.js";
 import { startBenchmarkRuntime } from "./runtime.js";
@@ -27,16 +28,32 @@ assertLease();
 const fixture = await prepareServerFixture(fixtureName);
 const directory = await mkdtemp(join(tmpdir(), "kompjutr-server-bench-"));
 let cpu: CpuCheckpoints | undefined;
-const server = await startBenchmarkRuntime(runtime, directory, () => cpu?.checkpoint());
+await mkdir("bench/results", { recursive: true });
+const diagnosticLogPath = `bench/results/server-${runtime}-${fixtureName}.runtime.log`;
+await writeFile(diagnosticLogPath, "");
+const server = await startBenchmarkRuntime(
+  runtime,
+  directory,
+  () => cpu?.checkpoint(),
+  diagnosticLogPath,
+);
 cpu = new CpuCheckpoints(server.pid);
 const auth = ["-c", `http.extraHeader=Authorization: ${basicAuth(WORKER_WRITE_TOKEN)}`];
 const url = `${server.url}/demo.git`;
 const phases: object[] = [];
+let failedPhase: string | undefined;
+const cancellationState: { beforeCancel?: unknown; afterCancel?: unknown } = {};
+function diagnostic<T>(read: () => T): T | { diagnosticError: string } {
+  try {
+    return read();
+  } catch (error) {
+    return { diagnosticError: String(error) };
+  }
+}
 async function phase(name: string, operation: () => Promise<unknown>): Promise<void> {
   await server.gc();
   await server.reset();
   const memory = memoryContext(server.pid);
-  resetPeakRss(server.pid);
   const sampler = new MemorySampler(server.pid, 5);
   let nodePeakHeapExternalBytes = 0;
   const sampleNode = () => {
@@ -49,13 +66,18 @@ async function phase(name: string, operation: () => Promise<unknown>): Promise<v
   const nodeTimer = runtime === "node" ? setInterval(sampleNode, 5) : undefined;
   const start = performance.now();
   cpu?.start();
+  let operationCompleted = false;
+  let cpuResult: ReturnType<CpuCheckpoints["finish"]> | undefined;
+  let sampled: ReturnType<MemorySampler["stop"]> | undefined;
+  let processPeakRssBytes: number | undefined;
   try {
     await operation();
-    const cpuResult = cpu?.finish();
+    operationCompleted = true;
+    cpuResult = cpu?.finish();
     const wallMs = performance.now() - start;
+    sampled = sampler.stop();
+    processPeakRssBytes = statusBytes(server.pid, "VmHWM");
     const counts = await server.counts();
-    const sampled = sampler.stop();
-    const processPeakRssBytes = statusBytes(server.pid, "VmHWM");
     if (nodeTimer !== undefined) {
       clearInterval(nodeTimer);
       sampleNode();
@@ -75,8 +97,33 @@ async function phase(name: string, operation: () => Promise<unknown>): Promise<v
     };
     phases.push(result);
     process.stderr.write(`${name}: ${JSON.stringify(result)}\n`);
+  } catch (error) {
+    failedPhase = name;
+    const failure = {
+      runtime,
+      fixture,
+      phase: name,
+      operationCompleted,
+      wallMs: performance.now() - start,
+      error: String(error),
+      cause: error instanceof Error ? String(error.cause) : undefined,
+      cpu: cpuResult ?? diagnostic(() => cpu?.finish()),
+      sampled: sampled ?? diagnostic(() => sampler.stop()),
+      processPeakRssBytes:
+        processPeakRssBytes ?? diagnostic(() => statusBytes(server.pid, "VmHWM")),
+      ...memory,
+      diagnostics: server.diagnostics(),
+      diagnosticLogPath,
+      completedPhases: phases,
+    };
+    const failurePath = `bench/results/server-${runtime}-${fixtureName}.failure.json`;
+    await writeFile(failurePath, `${JSON.stringify(failure, null, 2)}\n`);
+    process.stderr.write(
+      `Benchmark failed in ${name}; diagnostics: ${failurePath} and ${diagnosticLogPath}\n`,
+    );
+    throw error;
   } finally {
-    sampler.stop();
+    diagnostic(() => sampler.stop());
     if (nodeTimer !== undefined) clearInterval(nodeTimer);
   }
 }
@@ -111,30 +158,47 @@ try {
     throw new Error("incremental head differs");
   await runGit(clone, ["fsck", "--full", "--strict"]);
   const currentHead = (await runGit(source, ["rev-parse", "HEAD"])).stdout.toString().trim();
-  const body = `0032want ${currentHead}\n00000009done\n`;
-  const abort = new AbortController();
-  const response = await fetch(`${url}/git-upload-pack`, {
-    method: "POST",
-    signal: abort.signal,
-    headers: {
-      authorization: basicAuth(WORKER_WRITE_TOKEN),
-      "content-type": "application/x-git-upload-pack-request",
-    },
-    body,
-  });
-  if (!response.ok)
-    throw new Error(`cancellation upload returned ${response.status}: ${await response.text()}`);
-  const reader = response.body?.getReader();
-  await reader?.read();
+  const authorization = basicAuth(WORKER_WRITE_TOKEN);
+  const cancellationTransport =
+    runtime === "workerd"
+      ? "TCP reset to direct application HTTP entry"
+      : "Fetch cancellation through measured Node HTTP proxy";
+  let cancel: () => Promise<void>;
+  if ("directUrl" in server && typeof server.directUrl === "string") {
+    const upload = await openResettableUpload(
+      `${server.directUrl}/demo.git/git-upload-pack`,
+      authorization,
+      currentHead,
+    );
+    cancel = async () => upload.reset();
+  } else {
+    const abort = new AbortController();
+    const response = await fetch(`${url}/git-upload-pack`, {
+      method: "POST",
+      signal: abort.signal,
+      headers: { authorization, "content-type": "application/x-git-upload-pack-request" },
+      body: `0032want ${currentHead}\n00000009done\n`,
+    });
+    if (!response.ok)
+      throw new Error(`cancellation upload returned ${response.status}: ${await response.text()}`);
+    const reader = response.body?.getReader();
+    await reader?.read();
+    cancel = async () => {
+      await reader?.cancel();
+      abort.abort();
+    };
+  }
   const beforeCancel = await server.transferState();
+  cancellationState.beforeCancel = beforeCancel;
   if (activeOwners(beforeCancel) === 0)
     throw new Error("cancellation witness has no active transfer");
-  await reader?.cancel();
-  abort.abort();
+  await cancel();
   let afterCancel = await server.transferState();
+  cancellationState.afterCancel = afterCancel;
   for (let poll = 0; activeOwners(afterCancel) > 0 && poll < 100; poll++) {
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
     afterCancel = await server.transferState();
+    cancellationState.afterCancel = afterCancel;
   }
   if (activeOwners(afterCancel) !== 0)
     throw new Error("cancellation failed to release its owner before expiry");
@@ -151,6 +215,7 @@ try {
     fixture,
     phases,
     cancellation: {
+      transport: cancellationTransport,
       beforeCancel,
       afterCancel,
       immediateRelease: true,
@@ -176,6 +241,27 @@ try {
     `${JSON.stringify(result, null, 2)}\n`,
   );
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+} catch (error) {
+  if (failedPhase === undefined) {
+    await writeFile(
+      `bench/results/server-${runtime}-${fixtureName}.failure.json`,
+      `${JSON.stringify(
+        {
+          runtime,
+          fixture,
+          stage: "verification-or-cancellation",
+          error: String(error),
+          completedPhases: phases,
+          cancellationState,
+          diagnostics: server.diagnostics(),
+          diagnosticLogPath,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+  }
+  throw error;
 } finally {
   await server.close();
   await rm(directory, { recursive: true, force: true });

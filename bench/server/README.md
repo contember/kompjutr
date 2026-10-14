@@ -35,13 +35,24 @@ maintenance at current time plus ten minutes drains owners and scratch objects. 
 streams; the harness does not buffer entire packs.
 
 Each phase records SQL statements and returned rows, transmitted bytes, host wall
-time, process CPU, process RSS and cgroup memory limits. CPU checkpoints bracket
+time, process CPU, process RSS and cgroup memory limits. Workerd counters live in
+a benchmark-only map keyed by Durable Object identity. Ordinary DO reconstruction
+preserves the phase totals and increments a reported generation count. Constructor
+queries after phase reset are included. The host supplies a unique phase epoch and
+rejects missing or changed epochs, so isolate loss cannot silently reset counts.
+CPU checkpoints bracket
 each phase and each explicit server yield. Workerd awaits an HTTP acknowledgement
 from the host, which reads `/proc/<pid>/stat` before replying. The maximum process
 CPU interval plus two scheduler ticks is a conservative upper bound between
 these checkpoints, including native SQL/compression and background runtime work.
 Node uses `process.cpuUsage()`. Checkpoint instrumentation changes wall time.
 No synchronous Durable Object clock is used as a timer.
+
+Each phase resets the process high-water mark through Linux `clear_refs=5`;
+a failed write is fatal. One following `status` snapshot records both `VmHWM`
+and `VmRSS`. The reset `VmHWM` is the delta baseline, alongside the absolute
+end-of-phase high-water mark. RSS can change after the reset, so the two fields
+need not be equal. See the [kernel proc documentation](https://www.kernel.org/doc/html/latest/filesystems/proc.html).
 
 Workerd GC trace samples report V8 used plus external memory as a lower bound.
 Node samples heap used plus external memory on the host event loop, also a lower
@@ -52,3 +63,23 @@ cannot prove that Cloudflare's production memory or CPU limits are satisfied.
 The benchmark worker exposes unauthenticated control endpoints only for this
 local harness. Deploy the separate `examples/git-server/` worker, never this
 benchmark worker.
+
+The workerd harness uses Miniflare 5.20260820.0-alpha's direct application socket
+(`unsafeDirectSockets` / `unsafeGetDirectURL`). Its normal development entry
+worker uses compatibility date 2025-03-17 without `enable_request_signal`.
+The direct socket preserves the application's authentication, routing and real
+Durable Object while removing that development-only intermediary.
+
+Workerd cancellation qualification sends a TCP reset directly to that application
+HTTP entry. It is separate from the proxy used to count normal Git traffic.
+The deterministic test pauses a server yield and verifies release before the
+yield resumes. Graceful TCP closure from Node Fetch cancellation becomes
+observable on subsequent stream progress; no claim of immediate notification
+for every transport is made. Node qualification keeps Fetch cancellation through
+its measured HTTP proxy. Results name the cancellation transport explicitly.
+
+Control probes use fresh `node:http` connections (`agent: false`), without
+retries, to avoid reusing a socket idle during a long Git operation. Raw workerd
+logs are retained in ignored `*.runtime.log` files. Failed phases and later
+verification/cancellation failures retain `*.failure.json` diagnostics and any
+completed phase measurements.

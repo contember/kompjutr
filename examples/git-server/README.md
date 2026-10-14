@@ -26,3 +26,12 @@ limit is 256 MiB. Durable alarms advance bounded maintenance and expire
 abandoned transfers. Requests preserve an earlier pending alarm, so continuous
 traffic cannot postpone cleanup. Deploy through CI using `wrangler.jsonc`; this example does
 not provision secrets or deploy itself.
+
+The `enable_request_signal` compatibility flag is required for disconnect
+cleanup through `Request.signal`; a compatibility date alone does not enable
+it. See [Cloudflare incoming request cancellation](https://developers.cloudflare.com/changelog/post/2025-05-22-handle-request-cancellation/).
+
+The example configures a 300,000 ms CPU ceiling per request because large
+repository publication can exceed the default 30 seconds. Yielding does not
+reset CPU accounting. This is a configured ceiling, not evidence of production
+capacity; see [Durable Object limits](https://developers.cloudflare.com/durable-objects/platform/limits/).

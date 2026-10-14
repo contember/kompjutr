@@ -402,6 +402,15 @@ Qualification harness work can start early, but WU6's verdict requires WU3–WU5
 
 ## Run log
 
+- 2026-10-14: Final measurement corrections passed parent actual-workerd and
+  reconstruction tests (5/5), Linux peak-reset tests (2/2), typecheck and Biome
+  (1,138 files). Huygens independently approved all fixes. A post-reset HWM/RSS
+  snapshot replaces the invalid equality assertion between changing counters;
+  failed kernel writes remain fatal. Counter epochs detect isolate loss, while
+  module-scoped totals preserve DO reconstruction and report its generations.
+  The package smoke check rebuilt and verified all five artifacts after the
+  sparse-read change. Final measurements now use the reviewed harness.
+
 - 2026-10-14: Sparse packed-read correction passed the parent's five native
   parity/returned-byte witnesses and 21 range/delta/strict-closure regressions;
   the author passed 46 focused tests. Typecheck and full Biome pass. Newton

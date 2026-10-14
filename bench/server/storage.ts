@@ -1,14 +1,23 @@
 import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from "@kompjutr/do";
 
+export interface SqlCounts {
+  statements: number;
+  returnedRows: number;
+}
+
 export class CountedStorage implements DurableObjectStorageLike {
-  statements = 0;
-  rows = 0;
   readonly sql: SQLStorageLike;
-  constructor(private readonly inner: DurableObjectStorageLike) {
+  constructor(
+    private readonly inner: DurableObjectStorageLike,
+    private readonly totals: SqlCounts = { statements: 0, returnedRows: 0 },
+  ) {
     this.sql = {
       exec: (query, ...bindings) => {
-        this.statements++;
-        return new CountedCursor(inner.sql.exec(query, ...bindings), () => this.rows++);
+        this.totals.statements++;
+        return new CountedCursor(
+          inner.sql.exec(query, ...bindings),
+          () => this.totals.returnedRows++,
+        );
       },
     };
   }
@@ -17,11 +26,11 @@ export class CountedStorage implements DurableObjectStorageLike {
     return this.inner.transactionSync(closure);
   }
   reset(): void {
-    this.statements = 0;
-    this.rows = 0;
+    this.totals.statements = 0;
+    this.totals.returnedRows = 0;
   }
   counts() {
-    return { statements: this.statements, returnedRows: this.rows };
+    return { ...this.totals };
   }
 }
 

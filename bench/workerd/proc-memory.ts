@@ -23,18 +23,21 @@ export interface WorkerdCgroup {
 }
 
 export function workerdPid(): number {
-  const children = readFileSync(`/proc/${process.pid}/task/${process.pid}/children`, "utf8").trim();
+  const children = readFileSync("/proc/thread-self/children", "utf8").trim();
+  const matches: number[] = [];
   for (const field of children.split(/\s+/)) {
     if (field === "") continue;
     const pid = Number(field);
     if (!Number.isSafeInteger(pid) || pid <= 0) continue;
     try {
-      if (readlinkSync(`/proc/${pid}/exe`).endsWith("/workerd")) return pid;
+      if (readlinkSync(`/proc/${pid}/exe`).endsWith("/workerd")) matches.push(pid);
     } catch {
       // A short-lived child can exit while the process list is inspected.
     }
   }
-  throw new Error("Miniflare workerd process was not found");
+  const pid = matches[0];
+  if (matches.length === 1 && pid !== undefined) return pid;
+  throw new Error(`Expected one workerd child of this thread; found ${matches.length}`);
 }
 
 function kilobyteField(text: string, field: string, source: string): number {
@@ -47,16 +50,15 @@ export function statusBytes(pid: number, field: "VmRSS" | "VmHWM"): number {
   return kilobyteField(readFileSync(`/proc/${pid}/status`, "utf8"), field, `workerd ${pid} status`);
 }
 
-const PAGE_BYTES = 4096;
-
-// Writing 5 to clear_refs resets VmHWM to the current RSS.
-export function resetPeakRss(pid: number): void {
+// clear_refs resets the peak, but RSS may change before the following snapshot.
+export function resetPeakRss(pid: number): { peakRssBytes: number; rssBytes: number } {
   writeFileSync(`/proc/${pid}/clear_refs`, "5");
-  const peak = statusBytes(pid, "VmHWM");
-  const current = statusBytes(pid, "VmRSS");
-  if (Math.abs(peak - current) > PAGE_BYTES) {
-    throw new Error(`VmHWM ${peak} did not reset to VmRSS ${current} for workerd ${pid}`);
-  }
+  const status = readFileSync(`/proc/${pid}/status`, "utf8");
+  const source = `workerd ${pid} status after peak reset`;
+  return {
+    peakRssBytes: kilobyteField(status, "VmHWM", source),
+    rssBytes: kilobyteField(status, "VmRSS", source),
+  };
 }
 
 // The kernel's per-process counters. They cost microseconds to read, so they can

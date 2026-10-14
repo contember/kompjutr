@@ -43,11 +43,13 @@ export async function startWorkerdServer(
     ...(options.runtimeEnv === undefined ? {} : { unsafeRuntimeEnv: options.runtimeEnv }),
     workers: [
       {
+        // The development router does not enable incoming Request.signal.
+        dev: { unsafeDirectSockets: [{ host: "127.0.0.1", port: 0 }] },
         config: {
           name: "server",
           type: "worker",
           compatibilityDate: "2026-08-15",
-          compatibilityFlags: ["nodejs_compat"],
+          compatibilityFlags: ["nodejs_compat", "enable_request_signal"],
           manifest: {
             mainModule: "server.mjs",
             modulesRoot: directory,
@@ -67,7 +69,12 @@ export async function startWorkerdServer(
     ],
   });
   try {
-    return { runtime, url: (await runtime.ready).origin, close: () => runtime.dispose() };
+    await runtime.ready;
+    return {
+      runtime,
+      url: (await runtime.unsafeGetDirectURL("server")).origin,
+      close: () => runtime.dispose(),
+    };
   } catch (error) {
     await runtime.dispose();
     throw error;
