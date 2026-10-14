@@ -178,7 +178,7 @@ truncation never replaces them. A thrown `EPUSHUNCERTAIN` carries its bounded
 |---|---|---|
 | exact forms above | strict argv runner | ✔ database-only creation; output truncated after commit |
 | `--initial-branch=<name>` | `defaultBranch` (default `main`) | ★ ✔ |
-| `--bare` | `bare` | ~ recorded as `core.bare` only; every repository is effectively bare, since the object database is never a directory |
+| `--bare` | `bare` | ~ recorded as `core.bare` only; true bare ownership uses `SqliteGitDatabase.createBareRepository()`, not this workspace initializer; see [server reference](git-server.md) |
 | working directory, `git -C <dir>` | `dir` (default `/`) | ★ ~ several repositories may share one workspace; `init()` records the checkout in SQLite but does not create `dir` in the filesystem |
 | `--template`, `--separate-git-dir`, `--shared` | — | ✘ |
 

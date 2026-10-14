@@ -9,6 +9,11 @@ Kompjutr is a SQLite-native filesystem and Git runtime. It has two compositions:
 
 Neither composition creates a `.git` directory.
 
+A SQLite bare repository can also serve ordinary Git clone, fetch and push
+over Smart HTTP. Push updates refs and objects; checkout updates are explicit.
+See the [server reference](docs/reference/git-server.md) and
+[Durable Object example](examples/git-server/README.md).
+
 Try the [local browser playground](examples/playground/README.md): edit, search,
 and commit the 24,252-file Next.js source tree with a shared editor and terminal.
 
@@ -175,10 +180,11 @@ restart-safe rebase lifecycle with the fetched OID captured in its journal.
 `pull()` returns a `PullResult` discriminated by `strategy`, wrapping either a
 `MergeResult` or `RebaseResult`. Merge remains the default.
 
-Push creates, fast-forwards, force-updates, or deletes one `refs/heads/*` ref.
+The native client push creates, fast-forwards, force-updates, or deletes one `refs/heads/*` ref.
 It streams a replayable full-object pack and updates the local remote-tracking
 ref only after `receive-pack` confirms success. Multi-ref pushes, tags, push
-options, SSH, and outbound Git deltas are not implemented yet.
+options, SSH, and outbound Git deltas are not implemented in that client.
+The separate Smart HTTP server accepts native Git multi-ref branch and tag pushes.
 
 ## Shell
 

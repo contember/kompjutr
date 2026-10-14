@@ -120,6 +120,7 @@ decisions → reference → archive.
 - [`reference/benchmark-current.md`](reference/benchmark-current.md) — current native benchmark snapshot.
 - [`reference/concurrency.md`](reference/concurrency.md) — async owners, durable seams, and restart outcomes.
 - [`reference/git-support.md`](reference/git-support.md) — what of Git is supported, command by command.
+- [`reference/git-server.md`](reference/git-server.md) — bare Smart HTTP hosting and transfer ownership.
 - [`reference/oid-encoding-measurement.md`](reference/oid-encoding-measurement.md) — measured TEXT-versus-BLOB OID evidence.
 - [`reference/production-probe.md`](reference/production-probe.md) — production Durable Object probe runbook and current witness.
 - [`reference/release.md`](reference/release.md) — CI gates and the tag-driven release process.

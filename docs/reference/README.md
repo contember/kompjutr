@@ -14,6 +14,7 @@ behaviour.
 - [`benchmark-current.md`](benchmark-current.md) — current native Next.js workflow snapshot.
 - [`concurrency.md`](concurrency.md) — asynchronous owners, durable seams, restart outcomes, and invariants.
 - [`git-support.md`](git-support.md) — per-command checklist of the supported Git surface and its options.
+- [`git-server.md`](git-server.md) — bare Smart HTTP hosting, authorization, publication, and transfer lifetime.
 - [`oid-encoding-measurement.md`](oid-encoding-measurement.md) — reproducible TEXT-versus-BLOB OID evidence.
 - [`production-probe.md`](production-probe.md) — authenticated production Durable Object probe runbook and current witness.
 - [`release.md`](release.md) — CI gates, package smoke checks, and the tag-driven release process.

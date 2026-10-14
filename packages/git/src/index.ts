@@ -221,6 +221,7 @@ export {
   worktreeRemove,
 } from "./ops/worktree/worktrees.js";
 export type { GitHttpClient } from "./protocol/transport.js";
+export { createGitServer, type GitServer, type GitServerOptions } from "./server.js";
 export type {
   CommitTreeSnapshotSource,
   SelectedPathSource,

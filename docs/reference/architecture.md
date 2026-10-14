@@ -191,6 +191,14 @@ calls `transactionSync()` and never emits `BEGIN`, `COMMIT`, or `ROLLBACK`.
 
 ## Git storage and ownership
 
+Repositories have an explicit workspace or bare kind. Workspace repositories
+own one primary checkout; bare repositories start without any checkout and may
+own ordinary explicit checkouts. Their default branch is repository metadata,
+separate from every checkout's `HEAD`. `createGitServer()` binds a bare store
+without constructing a filesystem or workspace. See the
+[server reference](git-server.md) and
+[ownership decision](../decisions/0032-serve-bare-repositories-with-explicit-checkouts.md).
+
 Several repositories can share one database. Each repository can have several
 checkout-bound views. The nearest registered checkout ancestor selects the
 view, and nested checkout roots are excluded from parent worktree scans.
@@ -204,6 +212,7 @@ root, including one behind an ancestor symlink loop, is prunable.
 | Tree projection (`repo_id`, `tree_oid`) | `git_tree_sources` row and its `git_tree_entries`, shared by every copy; created when a reader or a loose write first needs it, deleted with the last copy |
 | Pack (`repo_id`, `pack_id`) | physical `git_pack_entries`, compressed data, and pending `git_pack_commit_staging` projections; projections publish atomically or disappear with the pack |
 | Synchronous scratch transaction | named scratch indexes; rows never survive the callback and are not maintenance roots |
+| Transfer (`repo_id`, `transfer_id`) | retained roots, expiry, SQL traversal frontier and paged object plan; released roots advance the maintenance epoch before bounded scratch cleanup |
 
 `git_pack_entries` contains every physical copy, keyed by repository, pack and
 offset. The shared canonical SQL fragment chooses the lowest `(pack_id, offset)`

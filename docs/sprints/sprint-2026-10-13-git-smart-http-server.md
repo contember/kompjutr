@@ -388,6 +388,32 @@ Qualification harness work can start early, but WU6's verdict requires WU3–WU5
 
 ## Run log
 
+- 2026-10-14: Anscombe approved WU2/3 after independent symbolic-chain update
+  and deletion reproductions. All original review blockers are fixed. Parent
+  complete server slice passed 106/106 across 14 files in 45.11 s; typecheck
+  passed. Full Biome found only the benchmark proxy diagnostic being edited
+  during investigation. Wire codecs committed as `b26af12`; HTTP, publication,
+  upload and concurrency witnesses form the next integrated API checkpoint.
+  The failed workerd push was traced to forwarding a hop-by-hop
+  Transfer-Encoding header through Node fetch, not Git ingest. The benchmark
+  adapter fix adds a native chunked-push regression before remeasurement.
+
+- 2026-10-14: Foundation checkpoint committed as `36cbc23`. Final integration
+  review (Newton) approved HTTP/retention/publication/auth/restart/alarm seams;
+  independent concurrency and actual-workerd witnesses passed 13/13. Huygens
+  approved the benchmark and example after fixes for alarm starvation, immediate
+  cancellation release and explicit returned-row metric naming. Root Node/medium
+  qualification passed all four phases, native closure/fsck and cleanup; SQL
+  counts exceed the 1,000-statement target. Workerd/medium failed its first push
+  with a connection reset and is under harness investigation.
+- 2026-10-14: Boundary review found symbolic destination CAS and checkout-chain
+  protection gaps. Both now use effective destinations in final publication;
+  author receive/symbolic/concurrency gate passed 41/41. Native Git 2.54 local
+  and stateless HTTP batching disagree for duplicate aliases. The explicit
+  deterministic server policy and characterized compatibility boundary graduate
+  to [the server reference](../reference/git-server.md). Anscombe subsequently
+  approved the final WU2/3 re-review.
+
 - 2026-10-14: Newton independently approved WU4 after the malformed-header,
   schema and lifecycle fixes, and approved WU5 after reviewing its actual
   negotiation/access implementation (independent 11/11 native/access tests).

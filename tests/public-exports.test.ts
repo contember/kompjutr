@@ -1074,3 +1074,15 @@ describe("public Git CLI exports", () => {
     expect(typeof createGitCommand).toBe("function");
   });
 });
+
+describe("public Git server exports", () => {
+  it("exports the bare server constructor and its typed Fetch contract", async () => {
+    const entry = await import("../packages/git/src/index.js");
+    const facade = await import("../packages/git/src/server.js");
+    const create: (
+      store: import("../packages/git/src/index.js").SharedRepoStore,
+      options: import("../packages/git/src/index.js").GitServerOptions,
+    ) => import("../packages/git/src/index.js").GitServer = entry.createGitServer;
+    expect(create).toBe(facade.createGitServer);
+  });
+});

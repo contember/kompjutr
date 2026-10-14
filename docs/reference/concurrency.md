@@ -291,6 +291,37 @@ the old asynchronous owner can no longer resume.
 
 ## Network cancellation
 
+### Bare server requests
+
+Receive-pack owns one provisional incoming pack. Its final transaction checks
+old OIDs, effective symbolic destinations, namespace conflicts and the current
+checkout `HEAD` chains. It publishes the accepted ref subset with the complete
+pack. Failure before that transaction exposes neither its pack nor its refs;
+failure after commit never retracts them. Cleanup names the exact pending pack
+and generation and cannot delete another request's published pack.
+
+Upload-pack retains the accepted wanted and proven common roots before yielding.
+Discovery itself owns nothing: a stale want that is no longer exposed fails.
+After acceptance, ref movement does not change the selected object closure.
+SQL-backed planning and output pages never keep a cursor or transaction across
+an await. Physical object sources are reacquired after storage changes.
+
+Cancellation releases upload ownership, including before the first iterator
+read. An expired owner cannot resume; maintenance explicitly releases its roots
+and advances the root epoch before reclaiming scratch rows. Expired roots remain
+GC roots until that release, so advancing the clock cannot silently invalidate
+a sweep snapshot. See
+[ADR-0033](../decisions/0033-retain-transfer-roots-until-explicit-release.md).
+
+`tests/server/concurrency.test.ts` exercises receive/receive, upload/receive,
+upload/GC, checkout attachment and restart around publication with deterministic
+barriers and cold ref/object checks. `receive-symbolic.test.ts` adds checkout
+chain protection and effective-destination collisions. Actual-workerd native
+interoperability and persisted alarm scheduling live in `workerd.test.ts`.
+The [server reference](git-server.md) defines its protocol and alias policy.
+
+### Outbound client requests
+
 Clone, fetch, pull, and push propagate one `AbortSignal` through discovery,
 authentication retry, transfer, and their cooperative synchronous phases.
 Clone and fetch check cancellation immediately before synchronous local

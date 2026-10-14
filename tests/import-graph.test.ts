@@ -434,3 +434,10 @@ it("keeps the value-import graph acyclic", () => {
 
   expect(valueCycles(edges)).toEqual([]);
 });
+
+it("classifies the Git server facade at the public surface rank", () => {
+  const file = allSourceFiles().find((candidate) => candidate.id === "git/src/server.ts");
+  expect(file).toBeDefined();
+  if (file === undefined) throw new Error("missing Git server facade");
+  expect(gitSlice(file)).toBe("surface");
+});

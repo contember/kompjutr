@@ -1,7 +1,10 @@
 # @kompjutr/git — the Git domain
 
 Git operations and Smart HTTP over a `Repository` and a `Worktree`. Nothing in
-this domain knows about Durable Objects; HTTP stays behind `GitHttpClient`.
+this domain knows about Durable Objects; outbound HTTP stays behind `GitHttpClient`. The `server.ts` facade binds a bare
+repository to a Fetch handler; the outer Worker authorizes each request and maps
+its validated repository mount to the fixed Smart HTTP paths. Pushes never
+update a checkout.
 
 ## Layers
 
@@ -10,7 +13,7 @@ common/                           bytes, objects, errors, rows, paths, streams, 
 diff/ | ignore/ | protocol/       independent algorithm and wire slices
 store/<table-family>/             SQLite tables, packs, projections, maintenance
 ops/<command-family>/             commands, Repository, Worktree, context
-client.ts | cli/<command-shape>/  public client and asynchronous argv surface
+client.ts | server.ts | cli/<command-shape>/  public client and asynchronous argv surface
 ```
 
 Dependencies point down this list. `diff`, `ignore`, and `protocol` may use

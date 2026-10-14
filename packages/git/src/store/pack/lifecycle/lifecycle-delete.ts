@@ -55,6 +55,31 @@ export class PackDeletion {
     return states.size;
   }
 
+  /** Discard only the failed caller's released reservation; completed packs are never eligible. */
+  discardPendingPack(packId: number, generation: number): boolean {
+    uniquePackIds([packId], 1);
+    if (!Number.isSafeInteger(generation) || generation < 1) {
+      throw new GitError("EINVAL", "invalid pending pack reservation generation");
+    }
+    return this.db.transactionSync(() => {
+      const owned = this.db.one<Record<string, unknown>>(
+        `SELECT pack.pack_id FROM git_pack_meta pack
+         JOIN git_pack_ingest_control control ON control.repo_id = pack.repo_id
+         WHERE pack.repo_id = ? AND pack.pack_id = ? AND pack.state = 'pending'
+           AND control.owner_generation = ? AND control.last_pack_id = ?
+           AND control.active_pack_id IS NULL`,
+        this.repoId,
+        packId,
+        generation,
+        packId,
+      );
+      if (owned === undefined || this.sharedState.activePending.has(packId)) return false;
+      this.deletePacks([packId]);
+      this.#clearCaches();
+      return true;
+    });
+  }
+
   deletePacks(deletingPackIds: readonly number[]): void {
     if (deletingPackIds.length === 0) return;
     const encodedDeletingPackIds = JSON.stringify(deletingPackIds);

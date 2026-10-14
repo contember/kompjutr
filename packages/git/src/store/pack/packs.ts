@@ -163,6 +163,11 @@ export class PackStore {
     return this.#lifecycle.completePackedEntry(oid);
   }
 
+  /** Discard only an unpublished pack owned by the failed, released reservation. */
+  discardPendingPack(packId: number, generation: number): boolean {
+    return this.#lifecycle.discardPendingPack(packId, generation);
+  }
+
   /** Delete a bounded set of complete packs; absent ids make retries idempotent. */
   deleteCompletePacks(packIds: readonly number[]): number {
     return this.#lifecycle.deleteCompletePacks(packIds);

@@ -28,6 +28,10 @@ export class PackLifecycle {
     return this.#membership.completePackedEntry(oid);
   }
 
+  discardPendingPack(packId: number, generation: number): boolean {
+    return this.#deletion.discardPendingPack(packId, generation);
+  }
+
   deleteCompletePacks(packIds: readonly number[]): number {
     return this.#deletion.deleteCompletePacks(packIds);
   }
