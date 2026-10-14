@@ -33,7 +33,11 @@ export async function abortable<T>(
   operation: PromiseLike<T>,
   signal: AbortSignal | undefined,
 ): Promise<T> {
-  throwIfAborted(signal);
+  if (signal?.aborted === true) {
+    // The caller may have started this promise before its source synchronously aborted.
+    void Promise.resolve(operation).catch(() => {});
+    throw abortedError(signal);
+  }
   if (signal === undefined) return await operation;
   return await new Promise<T>((resolve, reject) => {
     const abort = (): void => reject(abortedError(signal));
