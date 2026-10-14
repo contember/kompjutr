@@ -57,8 +57,9 @@ export function advanceTransfer(
     if (phase === "complete") return true;
     const trees = new TreeObjectReads();
     for (let step = 0; step < EXPANSIONS_PER_STEP; step++) {
+      // An OID-ordered primary-key scan would revisit every already expanded object.
       const raw = store.db.one<Record<string, unknown>>(
-        `SELECT oid, edge_cursor, edge_offset FROM git_transfer_objects
+        `SELECT oid, edge_cursor, edge_offset FROM git_transfer_objects INDEXED BY git_transfer_objects_frontier
         WHERE repo_id = ? AND transfer_id = ? AND side = ? AND expanded = 0 ORDER BY oid LIMIT 1`,
         owner.repoId,
         owner.transferId,

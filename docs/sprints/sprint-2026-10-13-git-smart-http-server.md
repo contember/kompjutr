@@ -388,6 +388,17 @@ Qualification harness work can start early, but WU6's verdict requires WU3–WU5
 
 ## Run log
 
+- 2026-10-14: DO example and benchmark harness committed as `363c126` after
+  Huygens approved chunked-forwarding correction. Actual-workerd witnesses pass
+  3/3; corrected medium qualification passed all phases and cancellation. Root
+  routine smoke passed 161/161 in 15.66 s; full Biome passed 1,132 files.
+  Initial Node/large receive was stopped after more than 230 CPU seconds without
+  completing its first phase. Live EXPLAIN identified a repeated expanded-prefix
+  scan in transfer planning. Pinning the existing frontier index fixes the
+  owning query without changing semantics or limits. Newton independently
+  approved the access path and regression witness; author pack-plan and strict
+  publication tests pass 8/8. All four final measurements use this corrected query.
+
 - 2026-10-14: Anscombe approved WU2/3 after independent symbolic-chain update
   and deletion reproductions. All original review blockers are fixed. Parent
   complete server slice passed 106/106 across 14 files in 45.11 s; typecheck

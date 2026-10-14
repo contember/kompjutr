@@ -1,16 +1,18 @@
 import { execFileSync } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { concat, utf8 } from "../../packages/git/src/common/bytes.js";
 import { serializeTree } from "../../packages/git/src/common/objects.js";
 import { planTransfer } from "../../packages/git/src/ops/server/transfer.js";
 import { streamTransferPack } from "../../packages/git/src/ops/server/transfer-stream.js";
 import { type SharedRepoStore, SqliteGitDatabase } from "../../packages/git/src/store/index.js";
 import {
+  advanceTransfer,
   countTransferObjects,
   readTransferObjectPage,
   validateCompleteClosure,
 } from "../../packages/git/src/store/transfer/closure.js";
 import {
+  createTransfer,
   releaseTransfer,
   type TransferOwner,
 } from "../../packages/git/src/store/transfer/lifetime.js";
@@ -54,6 +56,33 @@ function install(git: GitFixture, bytes: Uint8Array): void {
 }
 
 describe("server transfer closure and pack stream", () => {
+  it("seeks the unexpanded frontier without rescanning already expanded objects", () => {
+    const db = new TestDatabase();
+    const store = new SqliteGitDatabase(db).createBareRepository();
+    const roots = Array.from({ length: 300 }, (_, index) => ({
+      oid: store.write("blob", utf8.encode(`frontier ${index}`)),
+    }));
+    const owner = createTransfer(store, { wanted: roots, nowMs: 100 });
+    const reads = vi.spyOn(db, "one");
+    expect(advanceTransfer(store, owner, 100)).toBe(false);
+    const call = reads.mock.calls.find(([sql]) =>
+      sql.includes("SELECT oid, edge_cursor, edge_offset FROM git_transfer_objects"),
+    );
+    if (call === undefined) throw new Error("transfer step did not read its frontier");
+    const [sql, ...bindings] = call;
+    reads.mockRestore();
+    const details = [...db.iterate(`EXPLAIN QUERY PLAN ${sql}`, ...bindings)].map(
+      (row) => row.detail,
+    );
+    expect(details).toContainEqual(
+      expect.stringMatching(/USING INDEX git_transfer_objects_frontier .*expanded=\?/),
+    );
+    expect(details).not.toContainEqual(expect.stringContaining("USE TEMP B-TREE"));
+    while (!advanceTransfer(store, owner, 100)) {}
+    expect(countTransferObjects(store, owner, 100)).toBe(roots.length);
+    releaseTransfer(store, owner);
+  });
+
   it("matches Git's reachable set minus common history and emits a usable full pack", async () => {
     const git = fixture();
     git.write("same", "same");
