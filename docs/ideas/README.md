@@ -9,9 +9,6 @@ decided work or status.
 
 <!-- index the ideas here, one line each -->
 
-- [`git-server-inside-the-durable-object.md`](git-server-inside-the-durable-object.md)
-  — answer Smart HTTP from the Durable Object so a `git` client can clone,
-  fetch, and push against it.
 - [`local-git-compatible-binary.md`](local-git-compatible-binary.md)
   — wrap the local argv runner as a Git-compatible command, discover SQLite
   through `.git`, support linked-worktree pointers, and import existing repos.

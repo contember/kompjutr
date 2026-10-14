@@ -16,7 +16,9 @@ decisions → reference → archive.
 
 ## Active sprints
 
-No active sprints.
+- [Git Smart HTTP server in a Durable Object](sprints/sprint-2026-10-13-git-smart-http-server.md)
+  — bare remote with explicit checkouts; receive-pack, streamed clone/fetch,
+  native Git witnesses, and DO qualification.
 
 ## Specs
 
@@ -152,6 +154,7 @@ No active sprints.
 - [0026 — Gate the workerd clone on a V8 regression limit](decisions/0026-gate-the-workerd-clone-on-a-v8-regression-limit.md)
 - [0027 — Widen the shell to compound syntax and text tools](decisions/0027-widen-the-shell-to-compound-syntax-and-text-tools.md)
 - [0028 — Confine mounted views and fail closed](decisions/0028-confine-mounted-views-and-fail-closed.md)
+- [0032 — Serve bare repositories with explicit checkouts](decisions/0032-serve-bare-repositories-with-explicit-checkouts.md)
 
 The set was renumbered on 2026-09-04; [`decisions/README.md`](decisions/README.md#renumbered-on-2026-09-04)
 decodes an old number found in `archive/` or `specs/`.
