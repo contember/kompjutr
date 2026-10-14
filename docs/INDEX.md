@@ -16,9 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [Git Smart HTTP server in a Durable Object](sprints/sprint-2026-10-13-git-smart-http-server.md)
-  — bare remote with explicit checkouts; receive-pack, streamed clone/fetch,
-  native Git witnesses, and DO qualification.
+None.
 
 ## Specs
 
@@ -36,6 +34,11 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
        If everything is "hot", nothing is. -->
+- [Git Smart HTTP server](archive/sprint-2026-10-13-git-smart-http-server.md)
+  shipped: bare clone/fetch/push, explicit checkouts, 8,435 passing tests and
+  four local runtime/fixture benchmarks. Large production capacity remains
+  unqualified; see [the measurements](reference/benchmark-server.md) and
+  [follow-up 123](backlog/123-qualify-large-git-server-production-capacity.md).
 - [One OID index for pack objects](archive/sprint-2026-10-09-one-oid-index.md)
   shipped: canonical copies derived from physical entries (ADR-0031), median
   paired full-history clone saving 8.231 s and 52.70 MB; 8,304 tests pass.

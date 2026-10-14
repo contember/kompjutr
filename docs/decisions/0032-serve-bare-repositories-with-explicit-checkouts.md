@@ -21,7 +21,7 @@ without updating its files or index. A synthetic empty checkout would hide that
 ownership dependency instead of removing it.
 
 Implementation is planned in the
-[Smart HTTP server sprint](../sprints/sprint-2026-10-13-git-smart-http-server.md);
+[Smart HTTP server sprint](../archive/sprint-2026-10-13-git-smart-http-server.md);
 the server and bare lifecycle are not implemented at this decision's acceptance.
 
 ## Decision

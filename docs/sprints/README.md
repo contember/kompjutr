@@ -20,6 +20,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [Git Smart HTTP server in a Durable Object](sprint-2026-10-13-git-smart-http-server.md)
-  — bare repository ownership, receive-pack first, then streamed clone/fetch,
-  native Git interoperability, and DO concurrency/cost qualification.
+None.

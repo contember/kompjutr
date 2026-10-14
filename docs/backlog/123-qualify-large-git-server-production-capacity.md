@@ -53,4 +53,4 @@ green. Until this evidence exists, describe large production capacity as
 `packages/git/src/store/transfer/`, `examples/git-server/`, and
 `docs/reference/benchmark-server.md`.
 
-Origin: [Smart HTTP server sprint](../sprints/sprint-2026-10-13-git-smart-http-server.md).
+Origin: [Smart HTTP server sprint](../archive/sprint-2026-10-13-git-smart-http-server.md).

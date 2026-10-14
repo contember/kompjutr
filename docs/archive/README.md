@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Git Smart HTTP server](sprint-2026-10-13-git-smart-http-server.md) —
+  bare clone/fetch/push with explicit checkouts; 8,435 passing tests and four
+  local qualification runs. Large production capacity remains unqualified.
 - [One OID index for pack objects](sprint-2026-10-09-one-oid-index.md) —
   derived canonical copies, one physical-entry index family; median paired
   workerd clone savings of 8.231 s and 52.70 MB, with 8,304 tests passing.

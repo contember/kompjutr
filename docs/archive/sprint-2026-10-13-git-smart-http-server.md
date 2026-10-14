@@ -1,3 +1,56 @@
+> **OUTCOME — shipped 2026-10-14.**
+>
+> **Result.** WU0–WU6 implement a SQLite bare remote for native Git clone,
+> fetch and push over Smart HTTP. Push updates shared objects and refs;
+> checkout updates stay explicit. The authenticated Durable Object example
+> preserves repository identity, cancellation and bounded alarm maintenance.
+>
+> **Qualification.** All four Node/workerd × medium/large runs pass native
+> refs/object-closure verification, strict fsck, cancellation and cleanup.
+> The largest complete fixture has 640 commits and 113,920 objects. These are
+> local results: **large production capacity remains unqualified**. Workerd's
+> largest sampled heap plus external memory is 147.03 MiB; local workerd has no
+> production isolate limiter. All measured phases exceed the 1,000-statement
+> target. The [benchmark reference](../reference/benchmark-server.md) records
+> the exact environment, bytes, CPU, memory, SQL and measurement limitations.
+>
+> **Commit map.**
+>
+> | Unit | Commit |
+> | --- | --- |
+> | Approved plan and bare ownership ADR | `8110161` |
+> | WU0 — native protocol witnesses | `62fb1de` |
+> | WU1/WU4 — bare lifecycle, retained planning, strict closure | `36cbc23` |
+> | WU2 — wire codecs | `b26af12` |
+> | WU2/WU3/WU5/WU6 — HTTP, publication, upload and concurrency | `08bef0a` |
+> | WU6 — DO example and qualification harness | `363c126` |
+> | Indexed transfer and maintenance walks | `e025479`, `09762d8` |
+> | Reused decoder and sparse packed SQL reads | `96a71ae`, `6df678c` |
+> | Actual cancellation, durable counters and Linux peak reset | `d84864a` |
+> | Exact sliced/full-row read witnesses | `9829bbd`, `e0a1bef` |
+> | Measured baseline and capacity follow-up | `87a94ea` |
+>
+> **Verification.** The final full suite at `87a94ea` passes **8,435 tests**
+> in **933.8 s** under a four-vCPU lease, with no failures. Five existing opt-in
+> `.gitignore` timing cases are disabled; pack slices collectively run all 85
+> pack cases. Typecheck and Biome pass (1,138 files). Build and
+> isolated-consumer package smoke pass for all five
+> packages. The routine smoke passed 161/161 in 15.66 s. Native protocol,
+> concurrency, actual-workerd cancellation and shared pack/maintenance witnesses
+> passed their focused gates. Newton, Anscombe, Arendt and Huygens approved
+> their independent lifecycle, storage, protocol, integration and measurement
+> reviews; Huygens also checked every final benchmark table against raw results.
+>
+> **Follow-up and scope.** No implementation WU is deferred. Backlog 122 is
+> closed by checked kernel reset semantics and an actual Linux witness; backlog
+> 106 now identifies the shared-reader fixes without claiming its separate
+> workload was remeasured. Production capacity is tracked in
+> [123](../backlog/123-qualify-large-git-server-production-capacity.md).
+> Protocol v2, shallow/partial serving, thin receive, negotiated atomic push,
+> outbound deltas, SSH/LFS, automatic checkout and production deployment remain
+> outside this sprint. Implementation commits were not pushed; no deployment
+> was performed.
+
 # Sprint — Git Smart HTTP server in a Durable Object (2026-10-13)
 
 **Goal.** Let an ordinary Git CLI clone, fetch, and push a SQLite-backed bare
@@ -401,6 +454,12 @@ Qualification harness work can start early, but WU6's verdict requires WU3–WU5
   namespace conflicts and receive metadata bounds are incorporated above.
 
 ## Run log
+
+- 2026-10-14: Final closure at `87a94ea` passes all 8,435 tests in 933.8 s;
+  no failures. All four benchmark runs, typecheck, Biome, build and five-package
+  consumer smoke pass. Huygens approved the outcome after checking its commit
+  map. WU0–WU6 are complete; local qualification and production follow-up
+  graduate to the benchmark reference and backlog 123. Backlog 122 is closed.
 
 - 2026-10-14: The second closure suite exposed one remaining stale SQL-prefix
   assertion in the cold corrupt packed-source witness. The exact slice-query
