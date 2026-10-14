@@ -1,0 +1,10 @@
+{
+  "name": "kompjutr-git-server",
+  "main": "worker.ts",
+  "compatibility_date": "2026-08-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "REPOSITORIES", "class_name": "GitRepository" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GitRepository"] }]
+}

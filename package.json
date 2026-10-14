@@ -33,6 +33,7 @@
     "bench:statements": "node --experimental-transform-types --import ./bench/register.mjs bench/statements.ts",
     "bench:clone-storage": "node --experimental-transform-types --import ./bench/register.mjs bench/clone-storage.ts",
     "bench:tree-schema": "node --experimental-transform-types --import ./bench/register.mjs bench/tree-schema.ts",
+    "bench:server": "node --expose-gc --experimental-transform-types --import ./bench/register.mjs bench/server/run.ts",
     "bench:workerd:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/workerd/run.ts",
     "probe:dry-run": "wrangler deploy --config bench/production/wrangler.jsonc --dry-run --outdir ../../tmp/production-probe",
     "probe:deploy": "wrangler deploy --config bench/production/wrangler.jsonc",
