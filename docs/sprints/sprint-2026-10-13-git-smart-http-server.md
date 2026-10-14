@@ -402,6 +402,20 @@ Qualification harness work can start early, but WU6's verdict requires WU3–WU5
 
 ## Run log
 
+- 2026-10-14: The first closure suite found the threaded workerd PID issue
+  already corrected above and one stale deferred-read query classifier. Its
+  replacement requires exactly one slice query/one row and one whole-row
+  batch/two rows, with the existing native-byte and statement checks. Partial
+  slices cannot supply the whole-row cache; this case intentionally reads an
+  extra row. Parent deferred-resolution rerun passed 25/25, and Newton approved
+  the precise witness adjustment. A fresh full suite runs on the frozen code.
+- 2026-10-14: Huygens confirmed the WU6 closure contract: all local matrix and
+  verification gates may close the sprint with an explicit local-only verdict.
+  Corrected large workerd GC samples still exceed 128 MiB. Newton identified a
+  reclaimable component in initial push, but neither reviewer inferred
+  production fit or unavoidable production failure. Large production capacity
+  remains unqualified and must stay prominent in the outcome and reference.
+
 - 2026-10-14: Final measurement corrections passed parent actual-workerd and
   reconstruction tests (5/5), Linux peak-reset tests (2/2), typecheck and Biome
   (1,138 files). Huygens independently approved all fixes. A post-reset HWM/RSS

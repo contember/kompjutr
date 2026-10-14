@@ -40,6 +40,13 @@ import { GitFixture, slices } from "./helpers/git.js";
 import { completePackMatches, type PackMember, reclaimPending } from "./helpers/pack-store.js";
 import { TIMING_GATE } from "./helpers/timing.js";
 
+function isPackRangeRead(query: string): boolean {
+  return (
+    query.startsWith("WITH requested(pack_id, seq)") ||
+    query.startsWith("WITH requested(pack_id, seq, start, end)")
+  );
+}
+
 class ReorderedRangeDatabase implements SqlDatabase {
   constructor(readonly inner: TestDatabase) {}
 
@@ -65,7 +72,7 @@ class ReorderedRangeDatabase implements SqlDatabase {
 
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
     const rows = this.inner.iterate(query, ...bindings);
-    if (!query.startsWith("WITH requested(pack_id, seq)")) return rows;
+    if (!isPackRangeRead(query)) return rows;
     return [...rows].reverse();
   }
 
@@ -1774,7 +1781,7 @@ describe("pack deferred resolution", () => {
     expect(store.read(targets[998]!.oid)?.data).toEqual(targets[998]!.data);
   });
 
-  it("reads a deferred range crossing physical rows without full-row rereads", async () => {
+  it("batches a deferred range crossing physical rows after a sliced base read", async () => {
     const db = new ReorderedRangeDatabase(new TestDatabase());
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
@@ -1814,17 +1821,22 @@ describe("pack deferred resolution", () => {
         .filter(([query]) => query.startsWith("SELECT data FROM git_pack_data"))
         .reduce((count, [, calls]) => count + calls, 0),
     ).toBe(Math.ceil(packBytes.length / PACK_CHUNK));
-    // One batched chunk load for the base, one for the range's uncached row.
-    expect(
-      [...db.storage.histogram]
-        .filter(([query]) => query.startsWith("WITH requested(pack_id, seq)"))
-        .reduce((count, [, calls]) => count + calls, 0),
-    ).toBe(2);
-    expect(
-      [...(db.storage.rowHistogram ?? [])]
-        .filter(([query]) => query.startsWith("WITH requested(pack_id, seq)"))
-        .reduce((count, [, rows]) => count + rows, 0),
-    ).toBe(2);
+    // The base slice does not populate the full-row cache used by the deferred range batch.
+    for (const { prefix, returnedRows } of [
+      { prefix: "WITH requested(pack_id, seq, start, end)", returnedRows: 1 },
+      { prefix: "WITH requested(pack_id, seq)", returnedRows: 2 },
+    ]) {
+      expect(
+        [...db.storage.histogram]
+          .filter(([query]) => query.startsWith(prefix))
+          .reduce((count, [, calls]) => count + calls, 0),
+      ).toBe(1);
+      expect(
+        [...(db.storage.rowHistogram ?? [])]
+          .filter(([query]) => query.startsWith(prefix))
+          .reduce((count, [, rows]) => count + rows, 0),
+      ).toBe(returnedRows);
+    }
     expect(store.read(targetOid)?.data).toEqual(target);
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
