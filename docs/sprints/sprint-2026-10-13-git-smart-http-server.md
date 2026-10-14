@@ -388,6 +388,14 @@ Qualification harness work can start early, but WU6's verdict requires WU3–WU5
 
 ## Run log
 
+- 2026-10-14: WU0 verified against Git 2.54.0: 3/3 native protocol witnesses,
+  parent rerun 2.56 s, typecheck and focused Biome clean. Exact detailed upload
+  capabilities and non-thin push work. Existing-object creation sends a zero-
+  object pack; deletion sends none. Native base-ACK stateless fallback fails;
+  WU0 records that negative control and WU5 must prove our NAK-only fallback
+  against the native client. No ACK/pack response fixture substitutes for that
+  remaining acceptance. WU1 implementation started; wire and transfer slices
+  use frozen typed contracts and disjoint files while its public seam lands.
 - 2026-10-14: User authorized executing the complete sprint. Baseline remains
   `a695b22`; the approved plan and ADR are the only initial working-tree changes.
   Execution uses the current branch, disjoint agent territories, independent
