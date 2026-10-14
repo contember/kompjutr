@@ -5,7 +5,7 @@ import { readBlob, type SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, hasErrorCode } from "../../../common/errors.js";
 import type { ByteLru } from "../../../common/lru.js";
 import type { RawObject } from "../../../common/objects.js";
-import { InflateInto, inflatePrefix } from "../../../common/zlib.js";
+import { InflateInto, PrefixInflater } from "../../../common/zlib.js";
 import { PACK_PENDING_PAGE_ROWS } from "../pack-ingest-index.js";
 import {
   MAX_PACK_DELTA_WORKING_BYTES,
@@ -28,6 +28,9 @@ interface RangeTarget {
 }
 
 export class PackDataReader {
+  // workerd retains native info-mode decoder state until major GC, so reuse one bounded decoder.
+  readonly #prefix = new PrefixInflater();
+
   constructor(
     private readonly db: SqlDatabase,
     private readonly repoId: number,
@@ -69,11 +72,11 @@ export class PackDataReader {
     ) {
       throw new CorruptError(`${label} exceeds the bounded inflate limit`);
     }
-    let result: ReturnType<typeof inflatePrefix>;
+    let result: ReturnType<PrefixInflater["inflate"]>;
     try {
-      result = inflatePrefix(input, expectedSize);
+      result = this.#prefix.inflate(input, expectedSize);
     } catch (error) {
-      if (hasErrorCode(error, "ERR_BUFFER_TOO_LARGE")) {
+      if (hasErrorCode(error, "EINFLATESIZE")) {
         throw new CorruptError(`${label} exceeds its indexed size`, { cause: error });
       }
       throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });

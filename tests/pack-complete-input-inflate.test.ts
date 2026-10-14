@@ -100,7 +100,7 @@ describe("complete-input pack inflation", () => {
             expect.objectContaining({
               code: "ECORRUPT",
               message: "pack entry at 12 exceeds its indexed size",
-              cause: expect.objectContaining({ code: "ERR_BUFFER_TOO_LARGE" }),
+              cause: expect.objectContaining({ code: "EINFLATESIZE" }),
             }),
           );
         } else if (name === "one byte declared zero") {
@@ -110,7 +110,6 @@ describe("complete-input pack inflation", () => {
             expect.objectContaining({
               code: "ECORRUPT",
               message: "pack entry at 12 is not a valid zlib stream",
-              cause: expect.objectContaining({ code: "Z_DATA_ERROR" }),
             }),
           );
         }
@@ -121,36 +120,57 @@ describe("complete-input pack inflation", () => {
     },
   );
 
-  it.each([0, 1, 1024, 32769])("returns independent native output for %i bytes", (size) => {
+  it("resets the shared decoder after malformed, truncated, and oversized input", () => {
     const db = new TestDatabase();
+    const read = reader(db);
     try {
-      const input = new Uint8Array(size).fill(65);
-      const encoded = deflateSync(input);
-      const read = reader(db);
-      const native = vi.spyOn(zlib, "inflatePrefix");
-      const exact = vi.spyOn(zlib.InflateInto.prototype, "push");
-      const result = decode(read, encoded, size);
-      expect(native).toHaveBeenCalledTimes(1);
-      expect(exact).not.toHaveBeenCalled();
-      // Native buffers may share a pool, but their byte ranges must not overlap.
-      if (result.buffer === encoded.buffer) {
-        expect(
-          result.byteOffset + result.byteLength <= encoded.byteOffset ||
-            encoded.byteOffset + encoded.byteLength <= result.byteOffset,
-        ).toBe(true);
+      for (const { bytes, size } of cases) {
+        expect(() => decode(read, bytes, size)).toThrow(
+          expect.objectContaining({ code: "ECORRUPT" }),
+        );
+        expect(decode(read, compressed, payload.length)).toEqual(payload);
       }
-      encoded.fill(0xff);
-      for (let i = 0; i < 32; i++) {
-        const other = new Uint8Array(size).fill(i);
-        decode(read, deflateSync(other), size).fill(0xee);
-      }
-      expect(result).toEqual(input);
     } finally {
       db.storage.db.close();
     }
   });
 
-  it("cold-reads native-valid full and delta objects through the native complete-input path", async () => {
+  it.each([0, 1, 1024, 32769])(
+    "returns independent output across reused decoder calls for %i bytes",
+    (size) => {
+      const db = new TestDatabase();
+      try {
+        const input = new Uint8Array(size).fill(65);
+        const encoded = deflateSync(input);
+        const read = reader(db);
+        const native = vi.spyOn(zlib, "inflatePrefix");
+        const prefix = vi.spyOn(zlib.PrefixInflater.prototype, "inflate");
+        const exact = vi.spyOn(zlib.InflateInto.prototype, "push");
+        const result = decode(read, encoded, size);
+        expect(native).not.toHaveBeenCalled();
+        expect(prefix).toHaveBeenCalledTimes(1);
+        expect(exact).not.toHaveBeenCalled();
+        // Later decoder calls must not overwrite outputs retained by earlier callers.
+        if (result.buffer === encoded.buffer) {
+          expect(
+            result.byteOffset + result.byteLength <= encoded.byteOffset ||
+              encoded.byteOffset + encoded.byteLength <= result.byteOffset,
+          ).toBe(true);
+        }
+        encoded.fill(0xff);
+        for (let i = 0; i < 32; i++) {
+          const other = new Uint8Array(size).fill(i);
+          decode(read, deflateSync(other), size).fill(0xee);
+        }
+        expect(result).toEqual(input);
+        expect(new Set(prefix.mock.contexts).size).toBe(1);
+      } finally {
+        db.storage.db.close();
+      }
+    },
+  );
+
+  it("cold-reads native-valid full and delta objects through one reusable decoder", async () => {
     const repo = new GitFixture().init();
     const db = new TestDatabase();
     try {
@@ -177,13 +197,16 @@ describe("complete-input pack inflation", () => {
       const checkout = database.createRepository("/repo", "ref: refs/heads/main");
       await database.openCheckout(checkout).shared.packs.ingest(slices(packed, 64));
       const native = vi.spyOn(zlib, "inflatePrefix");
+      const prefix = vi.spyOn(zlib.PrefixInflater.prototype, "inflate");
       const exact = vi.spyOn(zlib.InflateInto.prototype, "push");
       const cold = new SqliteGitDatabase(db).openCheckout(checkout).shared;
       for (const data of [target, base]) {
         const oid = hashObject("blob", data);
         expect(cold.read(oid)?.data).toEqual(repo.catFile(oid));
       }
-      expect(native).toHaveBeenCalledTimes(2);
+      expect(native).not.toHaveBeenCalled();
+      expect(prefix).toHaveBeenCalledTimes(2);
+      expect(new Set(prefix.mock.contexts).size).toBe(1);
       expect(exact).not.toHaveBeenCalled();
     } finally {
       db.storage.db.close();

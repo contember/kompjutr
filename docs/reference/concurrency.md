@@ -188,12 +188,14 @@ size and consumed-length checks.
 Ingest hashes slices of at least 20 bytes without concatenating the checksum
 tail; shorter slices use a join of at most 39 bytes. Retained tail and row bytes
 remain owned. Full blobs above the explicit cache-entry limit stream through
-hashing without a full output target. Other buffered entries attempt native
-prefix inflation when the available compressed window is at least their declared
-output size. Incomplete native results and smaller windows use exact incremental
+hashing without a full output target. Other buffered entries reuse a prefix
+decoder when the available compressed window is at least their declared
+output size. Incomplete results and smaller windows use exact incremental
 inflation. That selection is a heuristic, not proof of a compressed boundary.
-Complete-input packed reads use native inflation with exact output and
-input-consumption checks; stored-entry reads remain incremental. The ingest
+Complete-input packed reads reuse one bounded prefix decoder per pack reader,
+with exact output and input-consumption checks. This avoids native info-mode
+decoder state accumulating until a major GC. Stored-entry reads remain
+incremental. The ingest
 push boundary and complete-input decoder wrap failures as `ECORRUPT`, with reader
 access outside those catches. Incremental stored-entry error handling is separate.
 

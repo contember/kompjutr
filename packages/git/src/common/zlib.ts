@@ -113,7 +113,9 @@ export function inflatePrefix(
   }
 }
 
-export class InflateSizeError extends Error {}
+export class InflateSizeError extends Error {
+  readonly code = "EINFLATESIZE";
+}
 
 const Z_OK = 0;
 const Z_STREAM_END = 1;
