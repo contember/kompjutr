@@ -107,6 +107,10 @@ which filed 119–122. A follow-up pass shipped 120: the clone fell to
 52.8–53.0 s. The subsequent single-OID-index implementation is recorded in
 [ADR-0031](../decisions/0031-derive-the-canonical-pack-copy-from-pack-entries.md).
 
+The Smart HTTP server sprint closes 122 with a checked kernel reset and a
+post-reset HWM/RSS snapshot. It files 123 for the separate question of large
+server production capacity; local qualification does not establish that limit.
+
 | Order | Items | Why |
 |---|---|---|
 | 0 | [116](116-add-update-follows-the-index.md), [117](117-report-type-changes-as-t.md) | Tier S: `add -u` ignores index-only paths; status shows a type change as `M`. |
@@ -116,6 +120,7 @@ which filed 119–122. A follow-up pass shipped 120: the clone fell to
 | 2 | [109](109-keep-parent-directory-when-replacing-its-only-child.md) | Tier S, but narrow: only a directory's mode changes when its only child changes type. |
 | 3 | [107](107-bound-shared-integration-step-passes.md) | Cost: the shared integration step still makes full-tree passes for every rebase, merge, cherry-pick and revert step. |
 | 4 | [106](106-reduce-the-workerd-clone-external-memory.md) | Memory: the workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it first, then decide whether a production probe is needed. |
+| 4 | [123](123-qualify-large-git-server-production-capacity.md) | Memory: large bare-server GC samples exceed 128 MiB locally; production capacity remains unqualified. |
 | 5 | [113](113-close-small-shell-parity-gaps.md), [111](111-bound-interpreter-cpu-and-regex-backtracking.md) | Shell: silent divergences first, then the CPU and regex bound, which needs a decision. |
 | 6 | [112](112-give-invoked-commands-stdin-and-their-own-name.md), [115](115-bulk-chmod-without-mtime.md), [114](114-share-one-uutils-argument-parser.md) | Shell: seam gaps, then cost, then deduplication. |
 
@@ -134,4 +139,4 @@ which filed 119–122. A follow-up pass shipped 120: the clone fell to
 - [117 — Report a pending type change as `T` in status](117-report-type-changes-as-t.md)
 - [119 — Slice the clone under the Durable Object request CPU limit](119-slice-the-clone-under-the-request-cpu-limit.md)
 - [121 — Prune the parent closure walk in incremental fetch connectivity](121-prune-the-parent-closure-walk-in-incremental-fetch.md)
-- [122 — Stop the workerd bench RSS reset flake](122-stop-the-workerd-bench-rss-reset-flake.md)
+- [123 — Qualify large Git server production capacity](123-qualify-large-git-server-production-capacity.md)

@@ -43,10 +43,11 @@ measurement says whether the clone fits the production isolate.
   - Pack ingest now decodes through one reused decoder
     (`PrefixInflater`, `2768f53`). The full-history clone's peak V8 used +
     external fell from 731 MB to 376–549 MB. The depth-1 peak is 247–304 MB.
-- **Remaining.** The read path (`read-data.ts`, `inflatePrefix`) still uses
-  `info`. Its tests require a native decoder that consumes the whole input,
-  so changing it is a contract decision. The live-set probe below finds no
-  retained non-ArrayBuffer external memory, so this is garbage, not live.
+- **Packed reads.** `96a71ae` replaces the complete-input read path's native
+  `info` decoder with a reused `PrefixInflater`, preserving exact output size
+  and consumed-input validation. `6df678c` also selects exact compressed SQL
+  ranges for sparse cache misses. These changes were qualified against the
+  bare server workload; they do not remeasure the Next.js live-set gate below.
 
 ## Live set (heap probe, `25d6c6e`)
 

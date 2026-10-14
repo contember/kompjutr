@@ -76,6 +76,12 @@ limits also apply: 48 MiB per object, a 48 MiB delta working set, and at most
 1,290,555 objects per incoming pack for bounded index metadata. See
 [Git limits](git-support.md#limits). Oversized requests fail explicitly.
 
+The [server benchmark](benchmark-server.md) verifies complete synthetic histories
+up to 640 commits and 113,920 objects locally in Node and workerd. Large
+production capacity remains unqualified: workerd GC samples exceed 128 MiB,
+and local success does not establish Cloudflare isolate fit. The example's
+300,000 ms request CPU ceiling also does not prove that envelope.
+
 ## Push publication
 
 Ingest authenticates the pack and validates complete connectivity and object

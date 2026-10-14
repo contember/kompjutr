@@ -1,5 +1,8 @@
 # Current benchmark snapshot
 
+Bare Smart HTTP hosting has its own [server benchmark](benchmark-server.md).
+The measurements below cover client/workspace workflows.
+
 Unless a section says otherwise, measurements ran on 2026-09-24 at commit
 `62ffbf0fb491731365d9a563437fc6b1d5540d3a` with Node v24.4.0, SQLite 3.50.2,
 git 2.54.0, Linux 6.17.0-41-generic x64, and an AMD Ryzen 7 PRO 8840HS. The

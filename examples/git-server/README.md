@@ -35,3 +35,5 @@ The example configures a 300,000 ms CPU ceiling per request because large
 repository publication can exceed the default 30 seconds. Yielding does not
 reset CPU accounting. This is a configured ceiling, not evidence of production
 capacity; see [Durable Object limits](https://developers.cloudflare.com/durable-objects/platform/limits/).
+The [local qualification](../../docs/reference/benchmark-server.md) passes native
+Git workflows, but the large production memory envelope remains unqualified.

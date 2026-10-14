@@ -1,5 +1,7 @@
 # Bare Smart HTTP server qualification
 
+See the [measured baseline and capacity verdict](../../docs/reference/benchmark-server.md).
+
 Run each combination from the repository root. The runner verifies an enforced
 CPU lease with one logical CPU (`-n 2 --no-smt`) and never acquires a nested lease.
 

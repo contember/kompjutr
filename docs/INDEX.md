@@ -118,6 +118,7 @@ decisions → reference → archive.
 
 - [`reference/architecture.md`](reference/architecture.md) — domains, shared database kernel, trust model, structural bounds, and concurrency seams.
 - [`reference/benchmark-current.md`](reference/benchmark-current.md) — current native benchmark snapshot.
+- [`reference/benchmark-server.md`](reference/benchmark-server.md) — bare Smart HTTP server measurements and capacity limits.
 - [`reference/concurrency.md`](reference/concurrency.md) — async owners, durable seams, and restart outcomes.
 - [`reference/git-support.md`](reference/git-support.md) — what of Git is supported, command by command.
 - [`reference/git-server.md`](reference/git-server.md) — bare Smart HTTP hosting and transfer ownership.

@@ -12,6 +12,7 @@ behaviour.
 
 - [`architecture.md`](architecture.md) — domains, shared database kernel, trusted storage, structural bounds, and concurrency seams.
 - [`benchmark-current.md`](benchmark-current.md) — current native Next.js workflow snapshot.
+- [`benchmark-server.md`](benchmark-server.md) — bare-server Node/workerd measurements and the unqualified large production envelope.
 - [`concurrency.md`](concurrency.md) — asynchronous owners, durable seams, restart outcomes, and invariants.
 - [`git-support.md`](git-support.md) — per-command checklist of the supported Git surface and its options.
 - [`git-server.md`](git-server.md) — bare Smart HTTP hosting, authorization, publication, and transfer lifetime.
