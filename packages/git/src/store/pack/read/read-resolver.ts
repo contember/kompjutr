@@ -20,7 +20,7 @@ import {
   type PackedEntry,
   validateDeltaWorkingSet,
 } from "../shared.js";
-import { loadPackChunks, type PackChunkCoordinate } from "./read-chunks.js";
+import { loadPackSlices, type PackChunkSlice } from "./read-chunks.js";
 import type { PackDataReader } from "./read-data.js";
 import { packGraphSql } from "./read-graph-sql.js";
 
@@ -241,9 +241,9 @@ export class PackObjectResolver {
       }
     }
 
-    const copyChunk = (packId: number, seq: number, chunk: Uint8Array): void => {
+    const copyChunk = (packId: number, seq: number, start: number, chunk: Uint8Array): void => {
       for (const { entry, output } of consumers.get(`${packId}:${seq}`) ?? []) {
-        const chunkStart = seq * PACK_CHUNK;
+        const chunkStart = seq * PACK_CHUNK + start;
         const from = Math.max(entry.dataOff, chunkStart);
         const to = Math.min(entry.dataOff + entry.dataLen, chunkStart + chunk.length);
         if (to <= from) continue;
@@ -253,19 +253,26 @@ export class PackObjectResolver {
       }
     };
 
-    const missingChunks: PackChunkCoordinate[] = [];
+    const missingChunks: PackChunkSlice[] = [];
     for (const key of consumers.keys()) {
       const separator = key.indexOf(":");
       const packId = Number(key.slice(0, separator));
       const seq = Number(key.slice(separator + 1));
       const hit = bypassCache ? undefined : this.data.getCachedChunk(packId, seq);
-      if (hit === undefined) missingChunks.push({ packId, seq });
-      else copyChunk(packId, seq, hit);
+      if (hit === undefined) {
+        let start = PACK_CHUNK;
+        let end = 0;
+        for (const { entry } of consumers.get(key) ?? []) {
+          start = Math.min(start, Math.max(0, entry.dataOff - seq * PACK_CHUNK));
+          end = Math.max(
+            end,
+            Math.min(PACK_CHUNK, entry.dataOff + entry.dataLen - seq * PACK_CHUNK),
+          );
+        }
+        missingChunks.push({ packId, seq, start, end });
+      } else copyChunk(packId, seq, 0, hit);
     }
-    loadPackChunks(this.db, this.repoId, missingChunks, (packId, seq, data) => {
-      if (!bypassCache) this.data.cacheChunk(packId, seq, data);
-      copyChunk(packId, seq, data);
-    });
+    loadPackSlices(this.db, this.repoId, missingChunks, copyChunk);
     for (const [key, value] of compressed) {
       if (value.filled !== value.bytes.length) {
         throw new CorruptError(

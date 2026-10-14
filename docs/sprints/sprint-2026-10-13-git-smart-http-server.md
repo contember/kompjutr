@@ -293,6 +293,13 @@ honor `no-thin`. These replace the idea's single-round and thin-ingest assumptio
   input regressions. This prerequisite fixes the measured receive failure;
   outbound compression is still reconsidered if the corrected output exceeds
   the runtime envelope.
+  Follow-up qualification also exposed full-row BLOB read amplification:
+  random structural-object reads copy 1 MiB SQLite chunks through a 4 MiB
+  cache during synchronous publication. Extend the existing packed-object
+  resolver to fetch only requested compressed ranges on cache misses. Preserve
+  cached full-row reads, missing/truncated-row errors and cross-chunk/delta
+  behavior. Witness actual returned BLOB bytes as well as object parity before
+  repeating workerd qualification. Publication stays synchronous and atomic.
 - **Touch points.** `tests/server/`, `bench/server/`, `package.json`, CI test
   discovery, public example, and reference docs for architecture, concurrency
   and supported Git behavior. Deployments, if later requested, go through CI.
@@ -394,6 +401,35 @@ Qualification harness work can start early, but WU6's verdict requires WU3–WU5
   namespace conflicts and receive metadata bounds are incorporated above.
 
 ## Run log
+
+- 2026-10-14: Sparse packed-read correction passed the parent's five native
+  parity/returned-byte witnesses and 21 range/delta/strict-closure regressions;
+  the author passed 46 focused tests. Typecheck and full Biome pass. Newton
+  independently approved exact ranges, cache isolation and corruption handling.
+  The witness returns exactly the requested compressed bytes across a pack
+  larger than the row cache. The actual-workerd/threaded harness passes 5/5
+  parent tests; Huygens approved retained counters, phase epochs, owned process
+  lookup and startup cleanup. Large workerd qualification is still required.
+
+- 2026-10-14: Final Node medium/large and workerd medium runs complete native
+  verification, immediate owner release and bounded cleanup. Large workerd
+  remains blocked: native push completes, but RSS reaches 10.28 GB and the
+  sampled DO external memory reaches 9.86 GB after the reader change. Its SQL
+  counters also reset unexpectedly before collection. This is failed capacity
+  evidence, not a supported envelope; investigate both allocation lifetime and
+  counter ownership before another qualification run. The closure suite found
+  that the new cancellation test cannot locate workerd under Vitest's threads
+  pool; the process lookup must preserve child ownership in that execution mode.
+
+- 2026-10-14: Final harness review (Huygens) approved the direct application
+  socket, fresh control connections, retained failure diagnostics and explicit
+  cancellation transport contract. The actual-workerd gate passes 4/4, including
+  TCP reset while a server yield remains blocked. Graceful Fetch cancellation
+  depends on subsequent stream progress; this distinction graduates to the
+  [server reference](../reference/git-server.md) and benchmark runbook. All four
+  final runtime/fixture measurements and the closure suite use enforced CPU
+  leases. The example configures the documented 300,000 ms request CPU ceiling;
+  this is not a production capacity claim.
 
 - 2026-10-14: Reusable packed-reader decoder committed as `96a71ae` after
   Newton's independent review and 58 focused pack/decoder/server tests.

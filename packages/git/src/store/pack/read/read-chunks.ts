@@ -21,6 +21,48 @@ export interface PackChunkCoordinate {
   seq: number;
 }
 
+export interface PackChunkSlice extends PackChunkCoordinate {
+  start: number;
+  end: number;
+}
+
+/** Sparse object reads must not allocate a whole physical row for a few compressed bytes. */
+export function loadPackSlices(
+  db: SqlDatabase,
+  repoId: number,
+  slices: readonly PackChunkSlice[],
+  visit: (packId: number, seq: number, start: number, data: Uint8Array) => void,
+): void {
+  if (slices.length === 0) return;
+  const requested = new Map(slices.map((slice) => [`${slice.packId}:${slice.seq}`, slice]));
+  for (const row of db.iterate(
+    `WITH requested(pack_id, seq, start, end) AS (
+       SELECT json_extract(value, '$.packId'), json_extract(value, '$.seq'),
+              json_extract(value, '$.start'), json_extract(value, '$.end') FROM json_each(?)
+     )
+     SELECT d.pack_id, d.seq, substr(d.data, r.start + 1, r.end - r.start) AS data
+       FROM requested r JOIN git_pack_data d
+         ON d.repo_id = ? AND d.pack_id = r.pack_id AND d.seq = r.seq
+      WHERE length(d.data) <= ${PACK_CHUNK}
+      ORDER BY d.pack_id, d.seq`,
+    JSON.stringify(slices),
+    repoId,
+  )) {
+    const { pack_id: packId, seq } = CHUNK_COORDINATES_ROW.decode(row);
+    const key = `${packId}:${seq}`;
+    const slice = requested.get(key);
+    const data = readBlob(row.data);
+    if (slice === undefined || data.length !== slice.end - slice.start) {
+      throw new CorruptError(`pack ${packId}: chunk ${seq} is truncated`);
+    }
+    visit(packId, seq, slice.start, data);
+    requested.delete(key);
+  }
+  for (const slice of requested.values()) {
+    throw new CorruptError(`pack ${slice.packId}: missing chunk ${slice.seq}`);
+  }
+}
+
 const CHUNK_SQL = `WITH requested(pack_id, seq) AS (
            SELECT json_extract(value, '$.p'), json_extract(value, '$.q') FROM json_each(?)
          )

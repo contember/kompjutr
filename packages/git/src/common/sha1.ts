@@ -5,9 +5,7 @@
 // workerd implements `node:crypto` hashing natively under nodejs_compat;
 // it replaced a TypeScript compression loop that cost seconds per clone.
 //
-// No collision detection (dgit's sha1dc): this is a client writing into
-// its own workspace, not a hosting server accepting pushes from
-// strangers.
+// SHA-1 collision detection is not implemented.
 
 import { createHash, type Hash } from "node:crypto";
 

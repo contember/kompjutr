@@ -35,6 +35,13 @@ delta closure in one bounded graph query and halves the batch while the closure
 is larger, so on `@kompjutr/local` a read-only caller never takes the writer
 reservation.
 
+On a physical-row cache miss, packed object resolution selects only the
+compressed byte span needed from each SQLite chunk. It consumes those slices
+one row at a time and never caches a partial slice as a full row. Existing
+full-row cache hits remain usable; sequential ingest range reads retain their
+whole-row batching. Sparse graph walks therefore avoid copying a 1 MiB BLOB
+for each small structural object.
+
 Local cursors created or advanced in a rolled-back scope are closed before SQL
 rollback; advancing them again fails with `ESTALE`. This includes unstarted
 cursors, so a failed scope cannot defer a write until after rollback. Successful
