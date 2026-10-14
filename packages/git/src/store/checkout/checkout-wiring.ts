@@ -88,15 +88,6 @@ export function createCheckoutStoreState(wiring: CheckoutStoreWiring): CheckoutS
     now,
     requireActive,
   });
-  shared.bindCheckoutOperations(
-    {
-      sharedRepoId: repoId,
-      checkoutId,
-      isPrimary,
-      destroyOwned,
-    },
-    refs.headOwner,
-  );
   const mutations = createCheckoutStoreMutations({
     shared: activeShared,
     refs,

@@ -31,6 +31,12 @@ maintenance/   roots, reachability, sweep, and durable run control
 
 `repo_id` owns shared objects, packs, refs, ordinary config, shallow state,
 fetch state, direct-ref reflogs, projections, blob IDs, and maintenance.
+Repository kind and default branch are repository-owned. A workspace repository
+has exactly one primary checkout; a bare repository has no primary and may have
+zero ordinary checkouts. Removing its last checkout keeps the repository.
+Shared services and destruction never select a checkout. Direct-ref changes
+append causal HEAD reflogs only for actual attached checkouts.
+
 `checkout_id` owns the root, raw `HEAD`, index and tracker state, operation
 journals, and `HEAD` reflog. `git_tree_sources` holds one projection per tree
 OID, shared by every loose and packed copy and deleted with the last copy;

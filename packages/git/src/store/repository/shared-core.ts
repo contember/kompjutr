@@ -1,8 +1,9 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
-import { CorruptError } from "../../common/errors.js";
+import { CorruptError, GitError } from "../../common/errors.js";
 import type { ByteLru } from "../../common/lru.js";
 import type { ObjectType, RawObject } from "../../common/objects.js";
-import type { StoreOptions } from "../core/contracts.js";
+import { expectText } from "../../common/rows.js";
+import type { RepositoryKind, StoreOptions } from "../core/contracts.js";
 import { withGitMutationGuard } from "../core/mutation-guard.js";
 import { advanceCheckoutRevision } from "../database/lifecycle.js";
 import { FetchPublicationTable } from "../fetch/fetch-publication.js";
@@ -12,18 +13,19 @@ import { BlobIdTable } from "../objects/blob-ids.js";
 import { ObjectTable } from "../objects/objects.js";
 import { PackStore } from "../pack/packs.js";
 import { ConfigTable } from "../refs/config.js";
+import { requireDefaultBranch } from "../refs/ref-validation.js";
 import { type Clock, RefLogWriter } from "../refs/reflog.js";
-import { type HeadOwner, RefTable } from "../refs/refs.js";
+import { RefTable, type RepositoryHeadOwner } from "../refs/refs.js";
+import { RepositoryHeads } from "../refs/repository-heads.js";
 import { ShallowTable } from "../refs/shallow.js";
-import {
-  type CheckoutOperations,
-  type ScratchTransactionCoordinator,
-  scratchTransactionsFor,
-} from "./shared-support.js";
+import { type ScratchTransactionCoordinator, scratchTransactionsFor } from "./shared-support.js";
 
 /** Shared repository construction, ownership binding, and storage caches. */
 export abstract class SharedRepoCore {
-  readonly db: SqlDatabase;
+  readonly #database: SqlDatabase;
+  readonly kind: RepositoryKind;
+  readonly #destroyRepository: () => void;
+  #active = true;
   readonly repoId: number;
   readonly objects: ByteLru<string, RawObject>;
   readonly packRows: ByteLru<string, Uint8Array>;
@@ -38,8 +40,7 @@ export abstract class SharedRepoCore {
   readonly #scratchTransactions: ScratchTransactionCoordinator;
   readonly #packs: PackStore;
   #objectTable: ObjectTable | null = null;
-  #operations: CheckoutOperations | null = null;
-  #headOwner: HeadOwner | null = null;
+  readonly #heads: RepositoryHeadOwner;
   #cacheGeneration = 0;
   #hasLoose: boolean;
   #shallow: Set<string> | null = null;
@@ -52,8 +53,13 @@ export abstract class SharedRepoCore {
     packRows: ByteLru<string, Uint8Array>,
     clock: Clock,
     options: StoreOptions,
+    kind: RepositoryKind,
+    destroyRepository: () => void,
   ) {
-    this.db = db;
+    this.#database = db;
+    this.kind = kind;
+    this.#destroyRepository = destroyRepository;
+    this.#heads = new RepositoryHeads(db, repoId, () => this.requireActive());
     this.repoId = repoId;
     this.objects = objects;
     this.packRows = packRows;
@@ -106,20 +112,43 @@ export abstract class SharedRepoCore {
 
   abstract readAuthenticatedObjectOwned(oid: string, expectedType: ObjectType): RawObject | null;
 
-  bindCheckoutOperations(operations: CheckoutOperations, headOwner: HeadOwner): void {
-    if (operations.sharedRepoId !== this.repoId) {
-      throw new CorruptError("shared operations facade belongs to another repository");
-    }
-    if (headOwner.checkoutId !== operations.checkoutId) {
-      throw new CorruptError("shared HEAD owner belongs to another checkout");
-    }
-    if (this.#operations === null) {
-      if (!operations.isPrimary) {
-        throw new CorruptError("shared operations facade must use the primary checkout");
-      }
-      this.#operations = operations;
-      this.#headOwner = headOwner;
-    }
+  get db(): SqlDatabase {
+    this.requireActive();
+    return this.#database;
+  }
+
+  protected requireActive(): void {
+    if (!this.#active) throw new GitError("ENOTFOUND", "repository is no longer active");
+  }
+
+  revoke(): void {
+    this.clearCaches();
+    this.#active = false;
+  }
+
+  defaultBranch(): string {
+    const branch = this.db.scalar<unknown>(
+      "SELECT default_branch FROM git_repositories WHERE id = ?",
+      this.repoId,
+    );
+    if (branch === undefined) throw new GitError("ENOTFOUND", "repository does not exist");
+    return expectText(branch, "repository default branch");
+  }
+
+  setDefaultBranch(value: string): void {
+    const branch = requireDefaultBranch(value);
+    withGitMutationGuard(this.db, () => {
+      this.db.run(
+        "UPDATE git_repositories SET default_branch = ? WHERE id = ?",
+        branch,
+        this.repoId,
+      );
+    });
+  }
+
+  protected destroyRepositoryOwned(): void {
+    this.requireActive();
+    this.db.transactionSync(this.#destroyRepository);
   }
 
   /** Poison an owning scratch transaction when a nested operation fails. */
@@ -133,21 +162,13 @@ export abstract class SharedRepoCore {
     }
   }
 
-  protected requireOperations(): CheckoutOperations {
-    if (this.#operations === null) {
-      throw new CorruptError("shared repository operations facade is unavailable");
-    }
-    return this.#operations;
-  }
-
-  protected requireHeads(): HeadOwner {
-    if (this.#headOwner === null) {
-      throw new CorruptError("shared repository HEAD owner is unavailable");
-    }
-    return this.#headOwner;
+  protected requireHeads(): RepositoryHeadOwner {
+    this.requireActive();
+    return this.#heads;
   }
 
   protected requireObjectTable(): ObjectTable {
+    this.requireActive();
     if (this.#objectTable === null) {
       throw new CorruptError("shared repository object table is unavailable");
     }
@@ -155,10 +176,12 @@ export abstract class SharedRepoCore {
   }
 
   get packs(): PackStore {
+    this.requireActive();
     return this.#packs;
   }
 
   get hasLoose(): boolean {
+    this.requireActive();
     return this.#hasLoose;
   }
 
@@ -213,11 +236,13 @@ export abstract class SharedRepoCore {
   }
 
   shallow(): Set<string> {
+    this.requireActive();
     if (this.#shallow === null) this.#shallow = this.#shallowTable.read();
     return new Set(this.#shallow);
   }
 
   readShallowOwned(): Set<string> {
+    this.requireActive();
     return this.#shallowTable.read();
   }
 
@@ -235,26 +260,32 @@ export abstract class SharedRepoCore {
   }
 
   protected configTable(): ConfigTable {
+    this.requireActive();
     return this.#config;
   }
 
   protected blobIdTable(): BlobIdTable {
+    this.requireActive();
     return this.#blobIds;
   }
 
   protected refTable(): RefTable {
+    this.requireActive();
     return this.#refs;
   }
 
   protected fetchPublicationTable(): FetchPublicationTable {
+    this.requireActive();
     return this.#fetchPublication;
   }
 
   protected promisorTable(): PromisorTable {
+    this.requireActive();
     return this.#promisor;
   }
 
   protected scratchTransactionCoordinator(): ScratchTransactionCoordinator {
+    this.requireActive();
     return this.#scratchTransactions;
   }
 }

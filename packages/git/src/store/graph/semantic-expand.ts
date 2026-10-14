@@ -1,17 +1,17 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
-import { CorruptError } from "../../../common/errors.js";
-import { expectSafeInteger } from "../../../common/rows.js";
-import type { SharedRepoStore } from "../../index.js";
-import { booleanInteger, oidField, treeModeEdge } from "./reachability-codecs.js";
+import { CorruptError } from "../../common/errors.js";
+import { expectSafeInteger } from "../../common/rows.js";
+import type { SharedRepoStore } from "../index.js";
+import { booleanInteger, oidField, treeModeEdge } from "./semantic-codecs.js";
 import {
   EDGE_PAGE,
   type ObjectExpansion,
   type QueueObject,
   type ReachabilityEdge,
   type ReachabilityObjectInfo,
-} from "./reachability-contracts.js";
-import { scanHeaders } from "./reachability-headers.js";
-import { type TreeObjectReads, treeObjectExpansion } from "./reachability-tree-object.js";
+} from "./semantic-contracts.js";
+import { scanHeaders } from "./semantic-headers.js";
+import { type TreeObjectReads, treeObjectExpansion } from "./semantic-tree-object.js";
 
 export function headerExpansion(
   store: SharedRepoStore,

@@ -223,6 +223,19 @@ export class SqliteGitDatabase {
     this.#provisional.discardProvisionalCloneOwned(owner, now, cleanup);
   }
 
+  createBareRepository(defaultBranch = "refs/heads/main"): SharedRepoStore {
+    return withGitMutationGuard(this.#state.db, () => {
+      const repoId = this.#checkouts.createBareRepositoryOwned(defaultBranch);
+      return this.#registry.openShared(repoId);
+    });
+  }
+
+  openBareRepository(repoId: number): SharedRepoStore {
+    const store = this.#registry.openShared(repoId);
+    if (store.kind !== "bare") throw new GitError("EINVAL", "repository is not bare");
+    return store;
+  }
+
   createRepository(root: string, head: string): CheckoutRow {
     return withGitMutationGuard(this.#state.db, () => this.createRepositoryOwned(root, head));
   }

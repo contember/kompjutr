@@ -1,9 +1,12 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../../common/errors.js";
 import { expectSafeInteger } from "../../../common/rows.js";
+import { booleanInteger, oidField } from "../../graph/semantic-codecs.js";
+import { headerExpansion, treeExpansion } from "../../graph/semantic-expand.js";
+import { requireObjectInfo } from "../../graph/semantic-headers.js";
+import { TreeObjectReads } from "../../graph/semantic-tree-object.js";
 import type { SharedRepoStore } from "../../index.js";
 import { expectPhase, expectRootsSettled, readMaintenanceRunView } from "../state/state-view.js";
-import { booleanInteger, oidField } from "./reachability-codecs.js";
 import {
   MARK_EXPANSIONS_PER_CALL,
   type MaintenanceReachabilityProgress,
@@ -11,10 +14,7 @@ import {
   type QueueObject,
   type RunState,
 } from "./reachability-contracts.js";
-import { headerExpansion, treeExpansion } from "./reachability-expand.js";
-import { requireObjectInfo } from "./reachability-headers.js";
 import { publishExpansion } from "./reachability-publish.js";
-import { TreeObjectReads } from "./reachability-tree-object.js";
 
 function readRun(db: SqlDatabase, repoId: number): RunState {
   const run = readMaintenanceRunView(db, repoId);

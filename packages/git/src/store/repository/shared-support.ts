@@ -21,13 +21,6 @@ export interface ScratchStorageCache {
   revalidateStorageCaches(): void;
 }
 
-export interface CheckoutOperations {
-  readonly sharedRepoId: number;
-  readonly checkoutId: number;
-  readonly isPrimary: boolean;
-  destroyOwned(): void;
-}
-
 export interface SharedRepoStoreMutations {
   upsertBlobIdsOwned(mappings: Iterable<BlobIdMapping>): void;
   registerPromisorRemoteOwned(remoteName: string, url: string): PromisorRemote;

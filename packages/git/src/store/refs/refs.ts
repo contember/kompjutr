@@ -5,18 +5,13 @@ import { expectText, RowShape, text } from "../../common/rows.js";
 import { comparePaths } from "../../common/streams.js";
 import type { CheckoutStore } from "../checkout/checkout.js";
 import { checkoutStoreMutations } from "../core/checkout-mutations-registry.js";
-import type {
-  CheckoutRow,
-  RefLogMetadata,
-  RefMutation,
-  RefMutationExpected,
-  RefRow,
-} from "../core/contracts.js";
+import type { CheckoutRow, RefLogMetadata, RefMutation, RefRow } from "../core/contracts.js";
 import { jsonPages } from "../core/json-pages.js";
 import { requireSafeId } from "../database/lifecycle.js";
 import { MAX_REFLOG_ORDINAL, MAX_REFLOG_STATE_ROWS } from "../schema/reflog-schema.js";
 import { nextPrefix } from "./config.js";
-import { rawSymbolicTarget, requireRawRefTarget, requireRefName } from "./ref-validation.js";
+import { type NormalizedRefMutation, normalizeRefMutation } from "./ref-mutation.js";
+import { rawSymbolicTarget, requireRefName } from "./ref-validation.js";
 import {
   type CheckoutRefLogEvent,
   type Clock,
@@ -27,14 +22,11 @@ import {
   validateRefLogMetadata,
 } from "./reflog.js";
 
-export const MAX_REF_MUTATION_INPUTS = 100_000;
-
-export interface NormalizedRefMutation {
-  puts: Map<string, string>;
-  deletes: Set<string>;
-  head: string | undefined;
-  expected: RefMutationExpected | undefined;
-}
+export {
+  MAX_REF_MUTATION_INPUTS,
+  type NormalizedRefMutation,
+  normalizeRefMutation,
+} from "./ref-mutation.js";
 
 export interface RefMutationRevisionState {
   readonly trackingRefRevisionCount: number;
@@ -47,15 +39,25 @@ export interface RefMutationRevisions {
   bumpFetchNamespaceRevisions(changedNames: ReadonlySet<string>): void;
 }
 
-export interface HeadOwner {
-  readonly checkoutId: number;
+interface RefMutationHeads {
   readRefMutationHeads(): CheckoutRow[];
-  findAttachedBranchOwner(head: string): CheckoutRow | null;
-  updateRefMutationHead(expectedHead: string, newHead: string): void;
   appendCheckoutRefLogs(events: readonly CheckoutRefLogEvent[]): void;
   pruneExpiredCheckoutRefLogs(cutoff: number): void;
   pruneRetainedCheckoutRefLogs(events: readonly CheckoutRefLogEvent[]): void;
 }
+
+export interface HeadOwner extends RefMutationHeads {
+  readonly kind: "checkout";
+  readonly checkoutId: number;
+  findAttachedBranchOwner(head: string): CheckoutRow | null;
+  updateRefMutationHead(expectedHead: string, newHead: string): void;
+}
+
+export interface RepositoryHeadOwner extends RefMutationHeads {
+  readonly kind: "repository";
+}
+
+export type RefOwner = HeadOwner | RepositoryHeadOwner;
 
 export interface RefTableOptions {
   readonly revisions: RefMutationRevisions;
@@ -85,54 +87,6 @@ function requireRefGeneration(value: unknown, label: string, minimum: number): n
     throw new CorruptError(`${label} is invalid`);
   }
   return value;
-}
-
-export function normalizeRefMutation(mutation: RefMutation): NormalizedRefMutation {
-  const puts = new Map<string, string>();
-  const deletes = new Set<string>();
-  let inputs = 0;
-  const countInput = (): void => {
-    inputs++;
-    if (inputs > MAX_REF_MUTATION_INPUTS) {
-      throw new GitError("E2BIG", "ref mutation exceeds its retained input count bound");
-    }
-  };
-  for (const value of mutation.deletes ?? []) {
-    const name = requireRefName(value, "deleted ref name", "input");
-    countInput();
-    deletes.add(name);
-  }
-  for (const row of mutation.puts ?? []) {
-    if (typeof row !== "object" || row === null) {
-      throw new GitError("EINVAL", "ref update row is invalid");
-    }
-    const name = requireRefName(row.name, "updated ref name", "input");
-    const target = requireRawRefTarget(row.target, "updated ref target", "input");
-    countInput();
-    puts.set(name, target);
-  }
-  const head =
-    mutation.head === undefined
-      ? undefined
-      : requireRawRefTarget(mutation.head, "HEAD target", "input");
-  if (head !== undefined) countInput();
-  let expected: RefMutationExpected | undefined;
-  if (mutation.expected !== undefined) {
-    const name = requireRefName(mutation.expected.name, "conditional ref name", "input");
-    const target =
-      mutation.expected.target === null
-        ? null
-        : requireRawRefTarget(mutation.expected.target, "expected ref target", "input");
-    countInput();
-    expected = { name, target };
-    if (puts.has(name) === deletes.has(name)) {
-      throw new GitError(
-        "EINVAL",
-        "conditional ref update must include exactly one destination put or delete",
-      );
-    }
-  }
-  return { puts, deletes, head, expected };
 }
 
 export function resolveRawRef(
@@ -171,7 +125,7 @@ export class RefTable {
     return row === undefined ? null : expectText(row.target, storedTargetLabel);
   }
 
-  setRef(headOwner: HeadOwner, name: string, target: string): void {
+  setRef(headOwner: RefOwner, name: string, target: string): void {
     this.mutateRefs(
       headOwner,
       { puts: [{ name, target }] },
@@ -181,7 +135,7 @@ export class RefTable {
 
   /** Move one direct ref only if it still contains the caller's observed OID. */
   updateRefExpected(
-    headOwner: HeadOwner,
+    headOwner: RefOwner,
     name: string,
     expectedOid: string,
     targetOid: string,
@@ -199,24 +153,24 @@ export class RefTable {
     );
   }
 
-  deleteRef(headOwner: HeadOwner, name: string): void {
+  deleteRef(headOwner: RefOwner, name: string): void {
     this.mutateRefs(headOwner, { deletes: [name] }, this.#genericRefLogMetadata("ref delete"));
   }
 
   /** Apply bounded ref deletions and updates atomically. */
-  updateRefs(headOwner: HeadOwner, puts: Iterable<RefRow>, deletes: Iterable<string> = []): void {
+  updateRefs(headOwner: RefOwner, puts: Iterable<RefRow>, deletes: Iterable<string> = []): void {
     this.mutateRefs(headOwner, { puts, deletes }, this.#genericRefLogMetadata("ref batch update"));
   }
 
   /** Apply current ref state and its bounded history through one atomic seam. */
-  mutateRefs(headOwner: HeadOwner, mutation: RefMutation, metadata: RefLogMetadata): boolean {
+  mutateRefs(headOwner: RefOwner, mutation: RefMutation, metadata: RefLogMetadata): boolean {
     const normalized = normalizeRefMutation(mutation);
     const checkedMetadata = validateRefLogMetadata(metadata);
     return this.mutateNormalized(headOwner, normalized, checkedMetadata);
   }
 
   mutateNormalized(
-    headOwner: HeadOwner,
+    headOwner: RefOwner,
     normalized: NormalizedRefMutation,
     checkedMetadata: RefLogMetadata,
   ): boolean {
@@ -224,7 +178,7 @@ export class RefTable {
   }
 
   #mutateRefs(
-    headOwner: HeadOwner,
+    headOwner: RefOwner,
     normalized: NormalizedRefMutation,
     checkedMetadata: RefLogMetadata,
   ): boolean {
@@ -264,12 +218,16 @@ export class RefTable {
         if (checkout.repoId !== this.repoId) {
           throw new CorruptError("reflog checkout scan crossed repositories");
         }
-        if (checkout.id === headOwner.checkoutId) selected = checkout;
+        if (headOwner.kind === "checkout" && checkout.id === headOwner.checkoutId)
+          selected = checkout;
       }
-      if (selected === null) {
+      if (headOwner.kind === "checkout" && selected === null) {
         throw new CorruptError("selected checkout disappeared during ref mutation");
       }
-      const oldHead = selected.head;
+      if (headOwner.kind === "repository" && normalized.head !== undefined) {
+        throw new GitError("EINVAL", "HEAD belongs to a checkout");
+      }
+      const oldHead = selected?.head;
 
       const before = new Map<string, string>();
       let rows = 0;
@@ -299,8 +257,8 @@ export class RefTable {
         return beforeTarget(name);
       };
       const newHead = normalized.head ?? oldHead;
-      const newAttachedBranch = rawSymbolicTarget(newHead);
-      if (newHead !== oldHead) {
+      if (headOwner.kind === "checkout" && newHead !== undefined && newHead !== oldHead) {
+        const newAttachedBranch = rawSymbolicTarget(newHead);
         const owner = headOwner.findAttachedBranchOwner(newHead);
         if (owner !== null) {
           throw new GitError(
@@ -341,7 +299,10 @@ export class RefTable {
       }
       const pendingHeads: { checkoutId: number; event: Omit<RefLogEvent, "ordinal"> }[] = [];
       for (const checkout of checkouts) {
-        const checkoutNewHead = checkout.id === headOwner.checkoutId ? newHead : checkout.head;
+        const checkoutNewHead =
+          headOwner.kind === "checkout" && checkout.id === headOwner.checkoutId
+            ? (newHead ?? checkout.head)
+            : checkout.head;
         const attached = rawSymbolicTarget(checkout.head);
         const causalHeadChange = attached?.startsWith("refs/heads/") && changedNames.has(attached);
         const oldHeadOid = resolveRawRef(checkout.head, beforeTarget);
@@ -403,7 +364,12 @@ export class RefTable {
           page,
         );
       }
-      if (newHead !== oldHead) {
+      if (
+        headOwner.kind === "checkout" &&
+        oldHead !== undefined &&
+        newHead !== undefined &&
+        newHead !== oldHead
+      ) {
         headOwner.updateRefMutationHead(oldHead, newHead);
         this.options.advanceCheckoutRevision(checkoutRevision);
       }

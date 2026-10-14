@@ -203,7 +203,7 @@ export class DatabaseProvisionalClones {
               SET lifecycle = 'ready', clone_expires_ms = NULL
             WHERE id = ? AND lifecycle = 'provisional'
               AND clone_expires_ms = ? AND clone_expires_ms > ?
-          RETURNING id AS repo_id, lifecycle, clone_expires_ms`,
+          RETURNING id AS repo_id, kind, lifecycle, clone_expires_ms`,
           stored.repoId,
           expiry,
           nowMs,
@@ -287,7 +287,7 @@ export class DatabaseProvisionalClones {
     const row = this.state.db.one<Record<string, unknown>>(
       `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
                 checkout.head,
-                checkout.is_primary, repository.lifecycle,
+                checkout.is_primary, repository.kind, repository.lifecycle,
                 repository.clone_expires_ms,
                 ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
            FROM git_repositories repository
@@ -347,6 +347,10 @@ export class DatabaseProvisionalClones {
       this.state.packRows,
       this.state.options.now ?? Date.now,
       this.state.options,
+      "workspace",
+      () => {
+        throw new GitError("EINVAL", "provisional clone requires exact-owner discard");
+      },
     );
     const lifetime = new CheckoutStoreLifetime();
     const store = new CheckoutStore(
@@ -379,7 +383,7 @@ export class DatabaseProvisionalClones {
   private evictProvisionalRecord(record: ProvisionalStoreRecord): void {
     if (this.state.provisionalStores.get(record.repoId) !== record) return;
     record.lifetime.revoke();
-    record.shared.clearCaches();
+    record.shared.revoke();
     this.state.provisionalStores.delete(record.repoId);
   }
 

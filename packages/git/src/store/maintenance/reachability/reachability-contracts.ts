@@ -1,7 +1,15 @@
-import type { ObjectType } from "../../../common/objects.js";
 import type { MaintenanceRunView } from "../state/state-contracts.js";
 
-export const EDGE_PAGE = 256;
+export type {
+  HeaderScanResult,
+  ObjectExpansion,
+  QueueObject,
+  ReachabilityEdge,
+  ReachabilityObjectInfo,
+} from "../../graph/semantic-contracts.js";
+export { EDGE_PAGE } from "../../graph/semantic-contracts.js";
+
+import type { ReachabilityEdge } from "../../graph/semantic-contracts.js";
 // Bounds one synchronous mark transaction: each expansion reads one queue row and its edge page.
 export const MARK_EXPANSIONS_PER_CALL = 64;
 
@@ -16,37 +24,6 @@ export interface MaintenanceReachabilityProgress {
 
 export type RunState = MaintenanceRunView;
 
-export interface QueueObject {
-  oid: string;
-  sourceMask: number;
-  shallowBoundary: boolean;
-  edgeCursor: number;
-  /** Byte offset of entry `edgeCursor` when an unprojected tree was paged; null otherwise. */
-  edgeOffset: number | null;
-}
-
-export interface ReachabilityEdge {
-  oid: string;
-  type: ObjectType;
-  optionalMissing: boolean;
-  allowPromisedMissing: boolean;
-}
-
-export interface ObjectExpansion {
-  edges: ReachabilityEdge[];
-  nextCursor: number;
-  nextOffset: number | null;
-  complete: boolean;
-}
-
-export interface HeaderScanResult {
-  treeOid: string | null;
-  parentOids: string[];
-  parentCount: number;
-  tagOid: string | null;
-  tagType: ObjectType | null;
-}
-
 export interface NormalizedEdge extends ReachabilityEdge {
   present: boolean;
 }
@@ -55,11 +32,4 @@ export interface PublicationResult {
   discoveredObjects: number;
   queuedObjects: number;
   reachableObjects: number;
-}
-
-export interface ReachabilityObjectInfo {
-  oid: string;
-  type: ObjectType;
-  size: number;
-  source: "loose" | "pack";
 }

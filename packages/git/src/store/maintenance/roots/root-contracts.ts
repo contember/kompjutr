@@ -16,6 +16,7 @@ export const ROOT_INDEX = 8;
 export const ROOT_INDEX_BASELINE = 16;
 export const ROOT_SHALLOW = 32;
 export const ROOT_OPERATIONS = 64;
+export const ROOT_TRANSFERS = 128;
 
 export type MaintenanceRootSource =
   | "refs"
@@ -25,6 +26,7 @@ export type MaintenanceRootSource =
   | "index-baseline"
   | "shallow"
   | "operations"
+  | "transfers"
   | "done";
 
 export type OperationRootPageReader = (
@@ -77,6 +79,7 @@ export const ROOT_SOURCES: readonly MaintenanceRootSource[] = [
   "index-baseline",
   "shallow",
   "operations",
+  "transfers",
   "done",
 ];
 
@@ -151,7 +154,7 @@ export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): 
     }
     return;
   }
-  if (run.rootSource === "reflogs") {
+  if (run.rootSource === "reflogs" || run.rootSource === "transfers") {
     if (run.cursorCheckoutId !== null || run.cursorText !== null) {
       throw new CorruptError("reflog root cursor has unrelated fields");
     }

@@ -3,7 +3,11 @@ import { CheckoutStore } from "../checkout/checkout.js";
 import type { CheckoutRow } from "../core/contracts.js";
 import { isThenableResult } from "../core/json-pages.js";
 import { bumpMaintenanceRootEpoch } from "../maintenance/control.js";
-import { rawSymbolicTarget, requireRawRefTarget } from "../refs/ref-validation.js";
+import {
+  rawSymbolicTarget,
+  requireDefaultBranch,
+  requireRawRefTarget,
+} from "../refs/ref-validation.js";
 import { MAX_CHECKOUTS_PER_REPOSITORY } from "../schema/schema.js";
 import type { DatabaseIdentities } from "./database-identities.js";
 import type { DatabaseRegistry } from "./database-registry.js";
@@ -28,6 +32,29 @@ export class DatabaseCheckoutMutations {
     private readonly identities: DatabaseIdentities,
     private readonly registry: DatabaseRegistry,
   ) {}
+
+  createBareRepositoryOwned(defaultBranch: string): number {
+    const branch = requireDefaultBranch(defaultBranch);
+    return this.state.db.transactionSync(() => {
+      const repoId = this.identities.insertRepository("ready", null);
+      this.state.db.run(
+        "UPDATE git_repositories SET kind = 'bare', default_branch = ? WHERE id = ?",
+        branch,
+        repoId,
+      );
+      this.state.db.run(
+        `INSERT INTO git_pack_ingest_control
+           (repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms)
+         VALUES (?, 0, 0, NULL, NULL)`,
+        repoId,
+      );
+      this.state.db.run(
+        "INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (?, 0)",
+        repoId,
+      );
+      return repoId;
+    });
+  }
 
   createRepositoryOwned(root: string, head: string): CheckoutRow {
     const normalized = checkoutRootInput(root);
@@ -98,7 +125,11 @@ export class DatabaseCheckoutMutations {
           "SELECT count(*) FROM git_checkouts WHERE repo_id = ?",
           repoId,
         );
-        if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 1) {
+        if (
+          typeof count !== "number" ||
+          !Number.isSafeInteger(count) ||
+          count < (shared.kind === "workspace" ? 1 : 0)
+        ) {
           throw new CorruptError("repository checkout count is invalid");
         }
         if (count >= MAX_CHECKOUTS_PER_REPOSITORY) {
@@ -344,8 +375,11 @@ export class DatabaseCheckoutMutations {
     this.identities.requireReadyRepository(repoId);
     this.state.db.run("DELETE FROM git_repositories WHERE id = ? AND lifecycle = 'ready'", repoId);
     const shared = this.state.sharedStores.get(repoId);
-    shared?.clearCaches();
+    shared?.revoke();
     this.state.sharedStores.delete(repoId);
+    for (const [checkoutId, identity] of this.state.checkoutRowIdentities) {
+      if (identity.repoId === repoId) this.registry.evictCheckout(checkoutId);
+    }
     for (const [checkoutId, store] of this.state.checkoutStores) {
       if (store.sharedRepoId === repoId) this.registry.evictCheckout(checkoutId);
     }

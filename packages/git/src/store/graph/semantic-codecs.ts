@@ -1,7 +1,7 @@
-import { isOid } from "../../../common/bytes.js";
-import { CorruptError } from "../../../common/errors.js";
-import type { ObjectType } from "../../../common/objects.js";
-import type { ReachabilityEdge } from "./reachability-contracts.js";
+import { isOid } from "../../common/bytes.js";
+import { CorruptError } from "../../common/errors.js";
+import type { ObjectType } from "../../common/objects.js";
+import type { ReachabilityEdge } from "./semantic-contracts.js";
 
 export function booleanInteger(value: unknown, label: string): boolean {
   if (value !== 0 && value !== 1) throw new CorruptError(`${label} is not boolean`);

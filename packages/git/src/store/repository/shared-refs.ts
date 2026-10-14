@@ -146,14 +146,7 @@ export abstract class SharedRepoRefStore extends SharedRepoObjectStore {
 
   reflog(refName: string, options: RefLogReadOptions = {}): RefLogEntry[] {
     if (refName === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
-    return readRefLog(
-      this.db,
-      this.repoId,
-      this.requireOperations().checkoutId,
-      this.refLogClock(),
-      refName,
-      options,
-    );
+    return readRefLog(this.db, this.repoId, null, this.refLogClock(), refName, options);
   }
 
   configGetAll(path: string): string[] {
@@ -233,6 +226,6 @@ export abstract class SharedRepoRefStore extends SharedRepoObjectStore {
   }
 
   protected destroyOwned(): void {
-    this.requireOperations().destroyOwned();
+    this.destroyRepositoryOwned();
   }
 }

@@ -1,9 +1,9 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { isOid } from "../../../common/bytes.js";
 import { CorruptError, GitError } from "../../../common/errors.js";
+import { objectType, oidField } from "../../graph/semantic-codecs.js";
 import type { SharedRepoStore } from "../../index.js";
 import { canonicalPackEntrySql } from "../../pack/canonical.js";
-import { objectType, oidField } from "./reachability-codecs.js";
 import {
   EDGE_PAGE,
   type NormalizedEdge,

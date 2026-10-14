@@ -163,6 +163,12 @@ export type {
   ReplaySnapshotResult,
 } from "./ops/replay/replay-types.js";
 export {
+  type MaintenanceCompleteResult,
+  type MaintenanceProgressResult,
+  type MaintenanceResult,
+  maintainRepository,
+} from "./ops/repository/maintenance.js";
+export {
   type CommitTreeOptions,
   commitTree,
   type RawRefTarget,
@@ -225,6 +231,7 @@ export {
   CheckoutStore,
   type IndexEntry,
   type IndexStore,
+  type RepositoryKind,
   SharedRepoStore,
   SqliteGitDatabase,
   type StoreOptions,

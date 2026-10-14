@@ -388,6 +388,34 @@ Qualification harness work can start early, but WU6's verdict requires WU3–WU5
 
 ## Run log
 
+- 2026-10-14: Newton independently approved WU4 after the malformed-header,
+  schema and lifecycle fixes, and approved WU5 after reviewing its actual
+  negotiation/access implementation (independent 11/11 native/access tests).
+  Parent integrated gate passed 111/112 cases; its one ref-ancestor bug was
+  corrected using the shared relative Git-path helper. Parent rerun of receive,
+  recovery and strict publication passed 16/16; typecheck passed. WU1 and WU4
+  share the final schema and repository-maintenance edits, so they form one
+  foundation checkpoint. Retention semantics graduate to
+  [ADR-0033](../decisions/0033-retain-transfer-roots-until-explicit-release.md).
+- 2026-10-14: Independent WU1 lifecycle review (Newton) approved after fixing
+  invalidation of remembered, unopened checkout rows on repository destruction.
+  Parent recheck passed bare/database (21 tests), transfer plan/lifetime (8),
+  maintenance roots/reachability (45), and 25 schema tests. Two exact schema
+  inventory/ownership witnesses still need the new transfer tables and columns;
+  this failed gate blocks the checkpoint commit. Typecheck and full Biome passed
+  before the HTTP additions (1,104 files). Native HTTP tests subsequently exposed
+  legal duplicate wants when refs share a tip; wire parsing now deduplicates IDs
+  while retaining the raw-frame bound. Duplicate receive destinations remain
+  invalid. Native prefix-conflict outcomes also determine publication ordering.
+- 2026-10-14: Parent rerun of bare lifecycle, database, worktrees, reflog,
+  import graph and server wire witnesses passed: 6 files, 86 tests, 15.34 s.
+  WU1 awaits independent lifecycle review. WU2 wire codecs now include native
+  multi-round requests; HTTP and receive orchestration follow the frozen bare
+  API. WU4's strict semantic closure is implemented before WU3 publication so
+  receive can share it instead of inheriting fetch's shallow/promisor rules.
+  Review found a loose-object iterator could survive repacking across an
+  await; bounded object materialization and a source-replacement witness fix
+  that physical-source lifetime hole. No new architecture or capability scope.
 - 2026-10-14: WU0 verified against Git 2.54.0: 3/3 native protocol witnesses,
   parent rerun 2.56 s, typecheck and focused Biome clean. Exact detailed upload
   capabilities and non-thin push work. Existing-object creation sends a zero-

@@ -10,6 +10,7 @@ import type {
   ObjectBatch,
   ObjectBatchOptions,
   OwnedObjectBatch,
+  RepositoryKind,
   StoreOptions,
 } from "../core/contracts.js";
 import { isThenableResult, requireBooleanProbe } from "../core/json-pages.js";
@@ -35,8 +36,10 @@ export class SharedRepoStore extends SharedRepoRefStore {
     packRows: ByteLru<string, Uint8Array>,
     clock: Clock,
     options: StoreOptions,
+    kind: RepositoryKind,
+    destroyRepository: () => void,
   ) {
-    super(db, repoId, storeGeneration, objects, packRows, clock, options);
+    super(db, repoId, storeGeneration, objects, packRows, clock, options, kind, destroyRepository);
     registerSharedRepoStoreMutations(this, {
       upsertBlobIdsOwned: (mappings) => this.upsertBlobIdsOwned(mappings),
       registerPromisorRemoteOwned: (remoteName, url) =>

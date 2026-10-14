@@ -28,7 +28,7 @@ export const MAINTENANCE_SCHEMA_STATEMENTS = [
        started_ms BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
      ),
      root_source TEXT NOT NULL CHECK (root_source IN (
-       'refs', 'heads', 'reflogs', 'index', 'index-baseline', 'shallow', 'operations', 'done'
+       'refs', 'heads', 'reflogs', 'index', 'index-baseline', 'shallow', 'operations', 'transfers', 'done'
      )),
      cursor_checkout_id INTEGER CHECK (
        cursor_checkout_id IS NULL OR (

@@ -39,7 +39,7 @@ export interface DatabaseState {
   readonly checkoutStores: Map<number, CheckoutStore>;
   readonly checkoutLifetimes: Map<number, CheckoutStoreLifetime>;
   readonly validatedCheckoutRows: WeakMap<CheckoutRow, number>;
-  readonly checkoutRowGenerations: Map<number, number>;
+  readonly checkoutRowIdentities: Map<number, { repoId: number; generation: number }>;
   readonly provisionalStores: Map<number, ProvisionalStoreRecord>;
   readonly issuedProvisionalOwners: WeakSet<ProvisionalCloneOwner>;
   readonly objects: ByteLru<string, RawObject>;
@@ -56,7 +56,7 @@ export function createDatabaseState(db: SqlDatabase, options: StoreOptions): Dat
     checkoutStores: new Map(),
     checkoutLifetimes: new Map(),
     validatedCheckoutRows: new WeakMap(),
-    checkoutRowGenerations: new Map(),
+    checkoutRowIdentities: new Map(),
     provisionalStores: new Map(),
     issuedProvisionalOwners: new WeakSet(),
     objects: new ByteLru(

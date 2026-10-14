@@ -25,10 +25,12 @@ import {
   ROOT_REFS,
   ROOT_SHALLOW,
   ROOT_SOURCES,
+  ROOT_TRANSFERS,
   type RootCandidate,
   type RootPage,
 } from "./root-contracts.js";
 import { rootsFromHeads, rootsFromReflogs, rootsFromRefs } from "./root-ref-pages.js";
+import { rootsFromTransfers } from "./root-transfer-pages.js";
 import {
   rootsFromIndex,
   rootsFromIndexBaselines,
@@ -251,6 +253,7 @@ function sourceMask(source: MaintenanceRootSource): number {
   if (source === "index-baseline") return ROOT_INDEX_BASELINE;
   if (source === "shallow") return ROOT_SHALLOW;
   if (source === "operations") return ROOT_OPERATIONS;
+  if (source === "transfers") return ROOT_TRANSFERS;
   return 0;
 }
 
@@ -261,6 +264,9 @@ function pageForSource(
   pageRows: number,
   readOperationRootPage: OperationRootPageReader,
 ): RootPage {
+  if (run.rootSource === "transfers") {
+    return rootsFromTransfers(db, repoId, run.cursorOrdinal, pageRows);
+  }
   if (run.rootSource === "refs") {
     return rootsFromRefs(db, repoId, run.cursorText, pageRows);
   }

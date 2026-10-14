@@ -1,13 +1,13 @@
-import { isOid } from "../../../common/bytes.js";
-import { CorruptError, hasErrorCode } from "../../../common/errors.js";
-import { MAX_OBJECT_BYTES, type ObjectType } from "../../../common/objects.js";
-import { expectSafeInteger } from "../../../common/rows.js";
-import { InflateStream } from "../../../common/zlib.js";
-import type { SharedRepoStore } from "../../index.js";
-import { maximumDeflatedBytes, STREAM_CHUNK } from "../../objects/objects.js";
-import { canonicalPackEntrySql } from "../../pack/canonical.js";
-import { bytesField, objectType } from "./reachability-codecs.js";
-import type { HeaderScanResult, ReachabilityObjectInfo } from "./reachability-contracts.js";
+import { isOid } from "../../common/bytes.js";
+import { CorruptError, hasErrorCode } from "../../common/errors.js";
+import { MAX_OBJECT_BYTES, type ObjectType } from "../../common/objects.js";
+import { expectSafeInteger } from "../../common/rows.js";
+import { InflateStream } from "../../common/zlib.js";
+import type { SharedRepoStore } from "../index.js";
+import { maximumDeflatedBytes, STREAM_CHUNK } from "../objects/objects.js";
+import { canonicalPackEntrySql } from "../pack/canonical.js";
+import { bytesField, objectType } from "./semantic-codecs.js";
+import type { HeaderScanResult, ReachabilityObjectInfo } from "./semantic-contracts.js";
 
 const HEADER_LINE_PREFIX_BYTES = 128;
 // Streamed writes use the smallest loose payload rows, so they set the legitimate row ceiling.
@@ -99,6 +99,7 @@ class StreamingHeaders {
     }
     const value = this.#ascii(space + 1, this.#prefixLength);
     if (key === "tree") {
+      if (this.#treeOid !== null) throw new CorruptError("commit has duplicate tree headers");
       if (!isOid(value)) throw new CorruptError("commit has a malformed tree oid");
       this.#treeOid = value;
       return;
@@ -112,10 +113,12 @@ class StreamingHeaders {
       return;
     }
     if (key === "object") {
+      if (this.#tagOid !== null) throw new CorruptError("tag has duplicate object headers");
       if (!isOid(value)) throw new CorruptError("tag has a malformed object oid");
       this.#tagOid = value;
       return;
     }
+    if (this.#tagType !== null) throw new CorruptError("tag has duplicate type headers");
     this.#tagType = objectType(value, "tag target type");
   }
 

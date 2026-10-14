@@ -15,6 +15,14 @@ export const CORE_SCHEMA_STATEMENTS = [
      id INTEGER PRIMARY KEY AUTOINCREMENT CHECK (
        id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
      ),
+     kind TEXT NOT NULL DEFAULT 'workspace' CHECK (kind IN ('workspace', 'bare')),
+     default_branch TEXT NOT NULL DEFAULT 'refs/heads/main' CHECK (
+       substr(default_branch, 1, 11) = 'refs/heads/'
+       AND length(default_branch) > 11
+       AND instr(default_branch, char(0)) = 0
+       AND instr(default_branch, char(10)) = 0
+       AND instr(default_branch, char(13)) = 0
+     ),
      lifecycle TEXT NOT NULL DEFAULT 'ready' CHECK (
        lifecycle IN ('ready', 'provisional')
      ),
@@ -36,7 +44,7 @@ export const CORE_SCHEMA_STATEMENTS = [
      ),
      CHECK (
        (lifecycle = 'ready' AND clone_expires_ms IS NULL)
-       OR (lifecycle = 'provisional' AND clone_expires_ms IS NOT NULL)
+       OR (lifecycle = 'provisional' AND kind = 'workspace' AND clone_expires_ms IS NOT NULL)
      )
    ) STRICT`,
 

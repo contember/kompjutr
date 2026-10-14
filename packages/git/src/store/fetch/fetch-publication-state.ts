@@ -3,7 +3,7 @@ import { CorruptError, GitError } from "../../common/errors.js";
 import { hasCanonicalRefSyntax } from "../../common/ref-name.js";
 import type { FetchPublicationPlan, RefRow } from "../core/contracts.js";
 import { refTextBytes, requireRawRefTarget, requireRefName } from "../refs/ref-validation.js";
-import type { HeadOwner, NormalizedRefMutation } from "../refs/refs.js";
+import type { NormalizedRefMutation, RefOwner } from "../refs/refs.js";
 
 export const MAX_FETCH_NAMESPACES = 1_024;
 export const MAX_FETCH_PUBLICATION_INPUTS = 100_000;
@@ -34,7 +34,7 @@ export interface NormalizedFetchPublication {
 }
 
 export interface FetchPublicationOptions {
-  readonly headOwner: () => HeadOwner;
+  readonly headOwner: () => RefOwner;
   readonly invalidateShallow: () => void;
   readonly bumpMaintenanceRootEpoch: () => void;
 }

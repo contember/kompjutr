@@ -155,6 +155,7 @@ decisions → reference → archive.
 - [0027 — Widen the shell to compound syntax and text tools](decisions/0027-widen-the-shell-to-compound-syntax-and-text-tools.md)
 - [0028 — Confine mounted views and fail closed](decisions/0028-confine-mounted-views-and-fail-closed.md)
 - [0032 — Serve bare repositories with explicit checkouts](decisions/0032-serve-bare-repositories-with-explicit-checkouts.md)
+- [0033 — Retain transfer roots until explicit release](decisions/0033-retain-transfer-roots-until-explicit-release.md)
 
 The set was renumbered on 2026-09-04; [`decisions/README.md`](decisions/README.md#renumbered-on-2026-09-04)
 decodes an old number found in `archive/` or `specs/`.

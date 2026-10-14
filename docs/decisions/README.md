@@ -58,6 +58,7 @@ so the two cannot drift.
 - [0014 — Make an optionless clone complete](0014-make-an-optionless-clone-complete.md) — accepted (2026-08-28)
 - [0015 — Model partial-clone blobs as durable promises](0015-model-partial-clone-blobs-as-durable-promises.md) — accepted (2026-08-31)
 - [0032 — Serve bare repositories with explicit checkouts](0032-serve-bare-repositories-with-explicit-checkouts.md) — accepted (2026-10-13)
+- [0033 — Retain transfer roots until explicit release](0033-retain-transfer-roots-until-explicit-release.md) — accepted (2026-10-14)
 
 **Command surfaces**
 

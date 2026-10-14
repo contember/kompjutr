@@ -29,6 +29,7 @@ export type {
   RefLogReadOptions,
   RefMutation,
   RefRow,
+  RepositoryKind,
   RepositoryLifecycle,
   StoreOptions,
 } from "./core/contracts.js";

@@ -182,7 +182,6 @@ export function requireRefLogLimit(value: unknown): number {
 export function requireRefLogHeader(row: Record<string, unknown>, repoId: number): number {
   const stored = new RowShape({
     repo_id: int(1),
-    head: text(),
     next_ordinal: int(0, MAX_REFLOG_ORDINAL),
   }).decode(row);
   if (stored.repo_id !== repoId) {
@@ -244,12 +243,14 @@ function nowSeconds(clock: Clock): number {
 export function readRefLog(
   db: SqlDatabase,
   repoId: number,
-  checkoutId: number,
+  checkoutId: number | null,
   clock: Clock,
   refName: string,
   options: RefLogReadOptions = {},
 ): RefLogEntry[] {
   const name = requireRefName(refName, "reflog ref name", "input", true);
+  if (name === "HEAD" && checkoutId === null)
+    throw new GitError("EINVAL", "HEAD belongs to a checkout");
   const now = nowSeconds(clock);
   const limit =
     options.limit === undefined ? REFLOG_RETENTION_ROWS : requireRefLogLimit(options.limit);
@@ -262,15 +263,14 @@ export function readRefLog(
   let headerSeen = false;
   let nextOrdinal = 0;
   let entryCount = 0;
-  const headerSql = `SELECT 0 AS kind, repository.id AS repo_id, checkout.head,
+  const headerSql = `SELECT 0 AS kind, repository.id AS repo_id, NULL AS head,
                state.next_ordinal,
                NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
                NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
               NULL AS timestamp, NULL AS timezone, NULL AS reason
          FROM git_repositories repository
          JOIN git_reflog_state state ON state.repo_id = repository.id
-         JOIN git_checkouts checkout ON checkout.repo_id = repository.id
-        WHERE repository.id = ? AND checkout.id = ?`;
+        WHERE repository.id = ?`;
   const rows =
     name === "HEAD"
       ? db.iterate(
@@ -286,7 +286,6 @@ export function readRefLog(
               ORDER BY kind, ordinal DESC
               LIMIT ${REFLOG_RETENTION_ROWS + 2}`,
           repoId,
-          checkoutId,
           repoId,
           checkoutId,
         )
@@ -303,7 +302,6 @@ export function readRefLog(
               ORDER BY kind, ordinal DESC
               LIMIT ${REFLOG_RETENTION_ROWS + 2}`,
           repoId,
-          checkoutId,
           repoId,
           name,
         );

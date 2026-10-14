@@ -30,6 +30,8 @@ export interface ProvisionalCloneOwner {
   readonly store: CheckoutStore;
 }
 
+export type RepositoryKind = "workspace" | "bare";
+
 export type RepositoryLifecycle = "ready" | "provisional";
 
 export interface RefRow {

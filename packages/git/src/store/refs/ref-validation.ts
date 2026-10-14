@@ -55,3 +55,11 @@ export function requireRawRefTarget(value: unknown, label: string, source: RefVa
   }
   return value;
 }
+
+export function requireDefaultBranch(value: unknown): string {
+  const name = requireRefName(value, "default branch", "input");
+  if (!name.startsWith("refs/heads/")) {
+    throw new GitError("EINVAL", "default branch must be a full refs/heads/ name");
+  }
+  return name;
+}

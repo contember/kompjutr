@@ -21,6 +21,9 @@ interface SchemaDefinition extends SchemaObject {
 
 const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_meta", "global"],
+  ["git_transfers", "shared"],
+  ["git_transfer_roots", "shared"],
+  ["git_transfer_objects", "shared"],
   ["git_repositories", "shared"],
   ["git_refs", "shared"],
   ["git_tracking_ref_revisions", "shared"],
@@ -125,6 +128,12 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_scratch_indexes" },
   { type: "table", name: "git_shallow" },
   { type: "table", name: "git_tracking_ref_revisions" },
+  { type: "table", name: "git_transfer_objects" },
+  { type: "index", name: "git_transfer_objects_frontier" },
+  { type: "table", name: "git_transfer_roots" },
+  { type: "index", name: "git_transfer_roots_page" },
+  { type: "table", name: "git_transfers" },
+  { type: "index", name: "git_transfers_cleanup" },
   { type: "table", name: "git_tree_entries" },
   { type: "index", name: "git_tree_entries_by_name_bytes" },
   { type: "table", name: "git_tree_sources" },
@@ -134,10 +143,18 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
 
 const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] = [
   ["git_meta", ["key", "value"]],
+  ["git_transfers", ["transfer_id", "repo_id", "expires_ms", "released", "phase"]],
+  ["git_transfer_roots", ["root_id", "repo_id", "transfer_id", "oid"]],
+  [
+    "git_transfer_objects",
+    ["repo_id", "transfer_id", "side", "oid", "expanded", "edge_cursor", "edge_offset"],
+  ],
   [
     "git_repositories",
     [
       "id",
+      "kind",
+      "default_branch",
       "lifecycle",
       "clone_expires_ms",
       "fetch_generation",
@@ -549,6 +566,23 @@ describe("git schema", () => {
     expect(primaryKeyOf(db, "git_operation_steps")).toEqual(["checkout_id", "ordinal"]);
     expect(primaryKeyOf(db, "git_operation_touched")).toEqual(["checkout_id", "ordinal"]);
     expect(primaryKeyOf(db, "git_checkout_reflog_entries")).toEqual(["checkout_id", "ordinal"]);
+    expect(primaryKeyOf(db, "git_transfers")).toEqual(["transfer_id"]);
+    expect(primaryKeyOf(db, "git_transfer_roots")).toEqual(["root_id"]);
+    expect(primaryKeyOf(db, "git_transfer_objects")).toEqual([
+      "repo_id",
+      "transfer_id",
+      "side",
+      "oid",
+    ]);
+    expect(cascadeForeignKeysOf(db, "git_transfers")).toEqual([
+      { table: "git_repositories", from: "repo_id", to: "id" },
+    ]);
+    for (const table of ["git_transfer_roots", "git_transfer_objects"]) {
+      expect(cascadeForeignKeysOf(db, table), table).toEqual([
+        { table: "git_transfers", from: "repo_id", to: "repo_id" },
+        { table: "git_transfers", from: "transfer_id", to: "transfer_id" },
+      ]);
+    }
     expect(primaryKeyOf(db, "git_pack_ingest_control")).toEqual(["repo_id"]);
     expect(primaryKeyOf(db, "git_pack_entries")).toEqual(["repo_id", "pack_id", "offset"]);
     expect(primaryKeyOf(db, "git_pack_commit_staging")).toEqual(["repo_id", "pack_id", "oid"]);

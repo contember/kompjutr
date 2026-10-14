@@ -14,7 +14,6 @@ import {
   CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES,
   requireCheckoutLifecycleCardinality,
   requireStoredCheckoutLifecycle,
-  requireStoredCheckoutRow,
 } from "./lifecycle.js";
 
 export class DatabaseRouting {
@@ -29,7 +28,7 @@ export class DatabaseRouting {
     const row = this.state.db.one<Record<string, unknown>>(
       `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
                 checkout.head,
-                checkout.is_primary, repository.lifecycle,
+                checkout.is_primary, repository.kind, repository.lifecycle,
                 repository.clone_expires_ms,
                 ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
            FROM git_checkouts checkout
@@ -54,7 +53,7 @@ export class DatabaseRouting {
     const row = this.state.db.one<Record<string, unknown>>(
       `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
                 checkout.head,
-                checkout.is_primary, repository.lifecycle,
+                checkout.is_primary, repository.kind, repository.lifecycle,
                 repository.clone_expires_ms,
                 ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
            FROM git_checkouts checkout
@@ -82,39 +81,39 @@ export class DatabaseRouting {
       throw new GitError("EINVAL", "repository id must be a safe positive integer");
     }
     const rows: CheckoutRow[] = [];
-    let primaryCount = 0;
     for (const raw of this.state.db.iterate(
-      `SELECT id AS checkout_id, repo_id, root, head, is_primary
-           FROM git_checkouts WHERE repo_id = ?
-           ORDER BY root COLLATE BINARY LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
+      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root, checkout.head,
+              checkout.is_primary, repository.kind, repository.lifecycle, repository.clone_expires_ms,
+              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+         FROM git_checkouts checkout
+         JOIN git_repositories repository ON repository.id = checkout.repo_id
+        WHERE checkout.repo_id = ?
+        ORDER BY checkout.root COLLATE BINARY LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
       repoId,
     )) {
-      const row = requireStoredCheckoutRow(raw);
+      const stored = requireStoredCheckoutLifecycle(raw);
+      requireCheckoutLifecycleCardinality(raw, stored);
+      const row = stored.checkout;
       if (row.repoId !== repoId) {
         throw new CorruptError("checkout listing crossed repository boundaries");
       }
       rows.push(this.registry.rememberCheckout(row));
-      if (row.isPrimary) primaryCount++;
       if (rows.length > MAX_CHECKOUTS_PER_REPOSITORY) {
         throw new GitError("E2BIG", "checkout listing exceeds its retained bound");
       }
-    }
-    if (rows.length > 0 && primaryCount !== 1) {
-      throw new CorruptError("repository must have exactly one primary checkout");
     }
     return Object.freeze(rows);
   }
 
   listRoutingCheckouts(): CheckoutRow[] {
     const rows: CheckoutRow[] = [];
-    const primaryCounts = new Map<number, number>();
     const checkoutCounts = new Map<number, number>();
     let policyRetainedBytes = 0;
     let routingCount = 0;
     for (const raw of this.state.db.iterate(
       `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
               checkout.head,
-              checkout.is_primary, repository.lifecycle,
+              checkout.is_primary, repository.kind, repository.lifecycle,
               repository.clone_expires_ms,
               ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
          FROM git_checkouts checkout
@@ -133,19 +132,14 @@ export class DatabaseRouting {
         throw new GitError("E2BIG", "checkout routing exceeds its 16 MiB retained bound");
       }
       if (stored.lifecycle === "ready") rows.push(this.registry.rememberCheckout(row));
-      const primaryCount = (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0);
       const checkoutCount = (checkoutCounts.get(row.repoId) ?? 0) + 1;
       if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
         throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
       }
-      primaryCounts.set(row.repoId, primaryCount);
       checkoutCounts.set(row.repoId, checkoutCount);
       if (routingCount > MAX_ROUTING_CHECKOUTS) {
         throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
       }
-    }
-    for (const count of primaryCounts.values()) {
-      if (count !== 1) throw new CorruptError("repository must have exactly one primary checkout");
     }
     return rows;
   }
@@ -153,14 +147,13 @@ export class DatabaseRouting {
   /** All routing roots, including provisional roots that block parent traversal. */
   listRoutingRoots(): string[] {
     const roots: string[] = [];
-    const primaryCounts = new Map<number, number>();
     const checkoutCounts = new Map<number, number>();
     let policyRetainedBytes = 0;
     let rootUtf8Bytes = 0;
     for (const raw of this.state.db.iterate(
       `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
               checkout.head,
-              checkout.is_primary, repository.lifecycle,
+              checkout.is_primary, repository.kind, repository.lifecycle,
               repository.clone_expires_ms,
               ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
          FROM git_checkouts checkout
@@ -170,7 +163,6 @@ export class DatabaseRouting {
       const stored = requireStoredCheckoutLifecycle(raw);
       requireCheckoutLifecycleCardinality(raw, stored);
       const row = stored.checkout;
-      const primaryCount = (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0);
       const checkoutCount = (checkoutCounts.get(row.repoId) ?? 0) + 1;
       if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
         throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
@@ -185,15 +177,11 @@ export class DatabaseRouting {
       if (policyRetainedBytes > MAX_ROUTING_CHECKOUTS_RETAINED_BYTES) {
         throw new GitError("E2BIG", "checkout routing exceeds its 16 MiB retained bound");
       }
-      primaryCounts.set(row.repoId, primaryCount);
       checkoutCounts.set(row.repoId, checkoutCount);
       roots.push(row.root);
       if (roots.length > MAX_ROUTING_CHECKOUTS) {
         throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
       }
-    }
-    for (const count of primaryCounts.values()) {
-      if (count !== 1) throw new CorruptError("repository must have exactly one primary checkout");
     }
     return roots;
   }

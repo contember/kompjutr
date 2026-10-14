@@ -10,17 +10,17 @@
 // of its object; a later call reads it again, since the object cache refuses
 // large values.
 
-import { toHex, utf8Decoder } from "../../../common/bytes.js";
-import { CorruptError } from "../../../common/errors.js";
-import type { SharedRepoStore } from "../../index.js";
-import { treeModeEdge } from "./reachability-codecs.js";
+import { toHex, utf8Decoder } from "../../common/bytes.js";
+import { CorruptError } from "../../common/errors.js";
+import type { SharedRepoStore } from "../index.js";
+import { treeModeEdge } from "./semantic-codecs.js";
 import {
   EDGE_PAGE,
   type ObjectExpansion,
   type QueueObject,
   type ReachabilityEdge,
   type ReachabilityObjectInfo,
-} from "./reachability-contracts.js";
+} from "./semantic-contracts.js";
 
 const SPACE = 0x20;
 const NUL = 0x00;
@@ -48,7 +48,7 @@ function entryBounds(data: Uint8Array, start: number): TreeEntryBounds {
   return { modeEnd, oidStart: nameEnd + 1, next };
 }
 
-/** The last tree object read in one maintenance call; its expansions page through it. */
+/** The last tree object read in one synchronous graph step; its expansions page through it. */
 export class TreeObjectReads {
   #oid: string | null = null;
   #data: Uint8Array = new Uint8Array(0);

@@ -82,7 +82,17 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
       ),
       root_source: nullable(
         oneOf(
-          ["refs", "heads", "reflogs", "index", "index-baseline", "shallow", "operations", "done"],
+          [
+            "refs",
+            "heads",
+            "reflogs",
+            "index",
+            "index-baseline",
+            "shallow",
+            "operations",
+            "transfers",
+            "done",
+          ],
           "maintenance root source is invalid",
         ),
       ),

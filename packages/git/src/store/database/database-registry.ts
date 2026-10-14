@@ -10,9 +10,9 @@ import {
   CHECKOUT_LIFECYCLE_CARDINALITY_SQL,
   CheckoutStoreLifetime,
   requireCheckoutLifecycleCardinality,
+  requireRepositoryPrimaryCount,
   requireSafeId,
   requireStoredCheckoutLifecycle,
-  requireStoredCheckoutRow,
 } from "./lifecycle.js";
 
 export class DatabaseRegistry {
@@ -26,7 +26,7 @@ export class DatabaseRegistry {
     if (!Number.isSafeInteger(repoId) || repoId < 1) {
       throw new GitError("EINVAL", "repository id must be a safe positive integer");
     }
-    this.identities.requireReadyRepository(repoId);
+    const repository = this.identities.requireReadyRepository(repoId);
     const existing = this.state.sharedStores.get(repoId);
     if (existing !== undefined) return existing;
     const row = this.state.db.one<Record<string, unknown>>(
@@ -45,7 +45,7 @@ export class DatabaseRegistry {
     const checkoutCount = requireSafeRefLogInteger(
       row.checkout_count,
       "repository checkout count",
-      1,
+      repository.kind === "workspace" ? 1 : 0,
       Number.MAX_SAFE_INTEGER,
     );
     if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
@@ -57,8 +57,7 @@ export class DatabaseRegistry {
       0,
       checkoutCount,
     );
-    if (primaryCount !== 1)
-      throw new CorruptError("repository must have exactly one primary checkout");
+    requireRepositoryPrimaryCount(repository.kind, primaryCount);
     if (!Number.isSafeInteger(this.state.nextStoreGeneration)) {
       throw new GitError("E2BIG", "repository store generation is exhausted");
     }
@@ -71,30 +70,10 @@ export class DatabaseRegistry {
       this.state.packRows,
       this.state.options.now ?? Date.now,
       this.state.options,
+      repository.kind,
+      () => this.destroyRepositoryOwned(repoId),
     );
     this.state.sharedStores.set(repoId, store);
-    const primaryRaw = this.state.db.one<Record<string, unknown>>(
-      `SELECT id AS checkout_id, repo_id, root, head, is_primary
-         FROM git_checkouts WHERE repo_id = ? AND is_primary = 1`,
-      repoId,
-    );
-    if (primaryRaw === undefined) throw new CorruptError("repository primary checkout is missing");
-    const primary = requireStoredCheckoutRow(primaryRaw);
-    if (primary.repoId !== repoId || !primary.isPrimary) {
-      throw new CorruptError("repository primary checkout lookup returned another checkout");
-    }
-    // The non-removable primary keeps shared operations and pack callbacks live.
-    const lifetime = new CheckoutStoreLifetime();
-    const primaryStore = new CheckoutStore(
-      store,
-      primary,
-      this.state.options,
-      () => this.destroyRepositoryOwned(repoId),
-      lifetime,
-      isLifecycleMutationCheckout,
-    );
-    this.state.checkoutStores.set(primary.id, primaryStore);
-    this.state.checkoutLifetimes.set(primary.id, lifetime);
     return store;
   }
 
@@ -142,13 +121,15 @@ export class DatabaseRegistry {
   }
 
   rememberCheckout(row: CheckoutRow, replaceIdentity = false): CheckoutRow {
-    let generation = replaceIdentity ? undefined : this.state.checkoutRowGenerations.get(row.id);
+    let generation = replaceIdentity
+      ? undefined
+      : this.state.checkoutRowIdentities.get(row.id)?.generation;
     if (generation === undefined) {
       if (!Number.isSafeInteger(this.state.nextCheckoutRowGeneration)) {
         throw new GitError("E2BIG", "checkout row generation is exhausted");
       }
       generation = this.state.nextCheckoutRowGeneration++;
-      this.state.checkoutRowGenerations.set(row.id, generation);
+      this.state.checkoutRowIdentities.set(row.id, { repoId: row.repoId, generation });
     }
     const remembered = Object.freeze(row);
     this.state.validatedCheckoutRows.set(remembered, generation);
@@ -179,14 +160,14 @@ export class DatabaseRegistry {
     this.state.checkoutLifetimes.get(checkoutId)?.revoke();
     this.state.checkoutLifetimes.delete(checkoutId);
     this.state.checkoutStores.delete(checkoutId);
-    this.state.checkoutRowGenerations.delete(checkoutId);
+    this.state.checkoutRowIdentities.delete(checkoutId);
   }
 
   private checkoutById(checkoutId: number): CheckoutRow {
     const raw = this.state.db.one<Record<string, unknown>>(
       `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
                 checkout.head,
-                checkout.is_primary, repository.lifecycle,
+                checkout.is_primary, repository.kind, repository.lifecycle,
                 repository.clone_expires_ms,
                 ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
            FROM git_checkouts checkout
@@ -207,7 +188,7 @@ export class DatabaseRegistry {
     const rememberedGeneration = this.state.validatedCheckoutRows.get(checkout);
     if (
       rememberedGeneration !== undefined &&
-      rememberedGeneration !== this.state.checkoutRowGenerations.get(checkoutId)
+      rememberedGeneration !== this.state.checkoutRowIdentities.get(checkoutId)?.generation
     ) {
       throw new GitError("EWORKTREENOTFOUND", "checkout identity is no longer active");
     }

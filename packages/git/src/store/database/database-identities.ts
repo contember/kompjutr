@@ -40,7 +40,7 @@ export class DatabaseIdentities {
     const row = this.state.db.one<Record<string, unknown>>(
       `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
                 checkout.head,
-                checkout.is_primary, repository.lifecycle,
+                checkout.is_primary, repository.kind, repository.lifecycle,
                 repository.clone_expires_ms,
                 ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
            FROM git_checkouts checkout
@@ -56,7 +56,7 @@ export class DatabaseIdentities {
 
   requireReadyRepository(repoId: number): StoredRepositoryLifecycle {
     const row = this.state.db.one<Record<string, unknown>>(
-      `SELECT id AS repo_id, lifecycle, clone_expires_ms
+      `SELECT id AS repo_id, kind, lifecycle, clone_expires_ms
          FROM git_repositories WHERE id = ?`,
       repoId,
     );

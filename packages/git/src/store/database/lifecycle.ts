@@ -1,13 +1,15 @@
 import type { SqlDatabase } from "@kompjutr/sqlite";
 import { CorruptError, GitError } from "../../common/errors.js";
 import { expectSafeInteger, int, oneOf, RowShape, text } from "../../common/rows.js";
-import type { CheckoutRow, RepositoryLifecycle } from "../core/contracts.js";
+import type { CheckoutRow, RepositoryKind, RepositoryLifecycle } from "../core/contracts.js";
 import { JSON_ENCODER } from "../core/json-pages.js";
 import { MAX_CHECKOUTS_PER_REPOSITORY, MAX_SCRATCH_INDEX_NAME_BYTES } from "../schema/schema.js";
 
 export const CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES = 1_024;
 export const PROVISIONAL_CLONE_LEASE_MS = 5 * 60 * 1_000;
 export const PROVISIONAL_CLONE_RENEW_WINDOW_MS = PROVISIONAL_CLONE_LEASE_MS / 2;
+
+const REPOSITORY_KIND_ROW = new RowShape({ kind: oneOf(["workspace", "bare"]) });
 
 const CHECKOUT_ROW = new RowShape({
   checkout_id: int(1),
@@ -154,6 +156,7 @@ export function provisionalCloneExpiry(nowMs: number): number {
 export interface StoredRepositoryLifecycle {
   repoId: number;
   lifecycle: RepositoryLifecycle;
+  kind: RepositoryKind;
   cloneExpiresMs: number | null;
 }
 
@@ -161,6 +164,7 @@ export function requireStoredRepositoryLifecycle(
   row: Record<string, unknown>,
 ): StoredRepositoryLifecycle {
   const repoId = requireSafeId(row.repo_id, "repository id");
+  const { kind } = REPOSITORY_KIND_ROW.decode(row);
   const lifecycle = row.lifecycle;
   if (lifecycle !== "ready" && lifecycle !== "provisional") {
     throw new CorruptError("repository lifecycle is invalid");
@@ -175,7 +179,7 @@ export function requireStoredRepositoryLifecycle(
   ) {
     throw new CorruptError("repository lifecycle fields are inconsistent");
   }
-  return { repoId, lifecycle, cloneExpiresMs };
+  return { repoId, kind, lifecycle, cloneExpiresMs };
 }
 
 export interface StoredCheckoutLifecycle extends StoredRepositoryLifecycle {
@@ -224,9 +228,7 @@ export function requireCheckoutLifecycleCardinality(
     checkoutCount,
     "repository primary checkout count",
   );
-  if (primaryCount !== 1) {
-    throw new CorruptError("repository must have exactly one primary checkout");
-  }
+  requireRepositoryPrimaryCount(stored.kind, primaryCount);
   if (stored.lifecycle === "provisional" && (checkoutCount !== 1 || !stored.checkout.isPrimary)) {
     throw new CorruptError("provisional repository must have exactly one primary checkout");
   }
@@ -307,5 +309,15 @@ export class CheckoutStoreLifetime {
 
   revoke(): void {
     this.#active = false;
+  }
+}
+
+export function requireRepositoryPrimaryCount(kind: RepositoryKind, primaryCount: number): void {
+  if (primaryCount !== (kind === "workspace" ? 1 : 0)) {
+    throw new CorruptError(
+      kind === "workspace"
+        ? "repository must have exactly one primary checkout"
+        : "bare repository cannot have a primary checkout",
+    );
   }
 }
