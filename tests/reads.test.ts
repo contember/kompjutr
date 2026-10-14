@@ -776,7 +776,9 @@ describe("ls-tree and cat-file", () => {
       expect.objectContaining({ code: "ECORRUPT" }),
     );
     expect(
-      [...histogram.keys()].some((query) => query.startsWith("WITH requested(pack_id, seq)")),
+      [...histogram.keys()].some((query) =>
+        query.startsWith("WITH requested(pack_id, seq, start, end)"),
+      ),
     ).toBe(true);
     expect(store.cacheBytes()).toEqual({ objects: 0, chunks: 0 });
   });

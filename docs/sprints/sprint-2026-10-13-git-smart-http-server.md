@@ -402,6 +402,18 @@ Qualification harness work can start early, but WU6's verdict requires WU3–WU5
 
 ## Run log
 
+- 2026-10-14: The second closure suite exposed one remaining stale SQL-prefix
+  assertion in the cold corrupt packed-source witness. The exact slice-query
+  prefix now matches the resolver; `ECORRUPT` and zero-cache assertions remain
+  unchanged. Author full-file verification passed 55/55; the parent repeated
+  the exact witness, and Newton independently approved. An exhaustive classifier
+  search found only intentional full-row expectations elsewhere. No runtime
+  source changed, so the final benchmark and package evidence remains valid.
+- 2026-10-14: All four final Node/workerd medium/large measurements pass native
+  Git closure/fsck, cancellation and bounded cleanup. Huygens independently
+  checked every cost, memory and byte row against the raw results and approved
+  the capacity wording. → [Measured server baseline](../reference/benchmark-server.md)
+  and [production capacity follow-up 123](../backlog/123-qualify-large-git-server-production-capacity.md).
 - 2026-10-14: The first closure suite found the threaded workerd PID issue
   already corrected above and one stale deferred-read query classifier. Its
   replacement requires exactly one slice query/one row and one whole-row
