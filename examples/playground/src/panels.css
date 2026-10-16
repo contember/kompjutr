@@ -212,18 +212,20 @@
   background: var(--workspace);
   z-index: 1;
 }
-.history-entry h3 {
+.history-subject {
+  display: block;
   margin: 0 0 8px;
   font-size: 12px;
   font-weight: 500;
   line-height: 1.5;
 }
-.history-entry p {
+.history-author {
+  display: block;
   margin: 0 0 8px;
   color: var(--ink-secondary);
   font-size: 11px;
 }
-.history-entry p span {
+.history-author span {
   color: var(--ink-tertiary);
 }
 .history-entry code {

@@ -92,9 +92,17 @@ runner bundles it once at startup.
    git log --oneline -n 3
    ```
 
-6. Switch between `main` and `demo` using the branch selector. The open file
+6. Open **History** and select the new commit. The detail lists its changed
+   files with line counts; select a file to see its patch, or **↗** to open the
+   file read-only as it was in that commit.
+7. Click **History** in the editor toolbar to list the commits that changed the
+   open file.
+8. Open **Compare** with base `main` and compare `demo` to see ahead/behind
+   counts and the changes since the merge base. The branch selector also
+   creates and switches to a new branch.
+9. Switch between `main` and `demo` using the branch selector. The open file
    updates to the checked-out contents.
-7. Reload the browser or restart the server to show persistence.
+10. Reload the browser or restart the server to show persistence.
 
 The footer reports browser-observed request round-trip time, SQL statement
 count, and rows **returned**, not rows scanned. These are live operation
@@ -106,7 +114,12 @@ diagnostics, not benchmark results. Follow `bench/CLAUDE.md` for benchmarks.
   readline editing, arrow-key history, multiline paste, and Ctrl+C to discard
   the current input. Ctrl+L clears the screen.
 - Paginated directory loading, SQLite-native literal content search, and paged
-  first-parent commit history.
+  first-parent commit history, optionally limited to one file.
+- Commit detail and branch comparison use native `show`, `diffSummary`, `diff`,
+  `catFile`, `divergence`, and `mergeBase`. A change list shows at most 1,000
+  files and states the total. A merge commit is compared with its first parent.
+  The root commit has no file list, because no public API diffs a commit
+  against the empty tree. `blame` is not part of kompjutr.
 - Typed Git controls call `workspace.git`; the terminal composes `createShell`
   with `createGitCommand` over the same filesystem and Git client.
 - Requests are serialized per workspace. Saves compare file versions and reject
@@ -130,6 +143,8 @@ npm run check
 ```
 
 The focused suite runs against local workerd and a real Git HTTP origin. It
-checks editor/shell/Git parity, cold persistence, history pagination, lazy
+checks editor/shell/Git parity, cold persistence, history pagination, commit
+detail, file history, historical file reads, branch comparison, literal
+bracketed paths in patches, lazy
 historical patch hydration after an origin restart, stale-save protection,
 directory/search pagination, and boundary failures.

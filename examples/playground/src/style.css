@@ -1,4 +1,5 @@
 @import "./panels.css";
+@import "./git-views.css";
 
 :root {
   color-scheme: dark;

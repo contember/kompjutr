@@ -7,6 +7,7 @@ const path = z
   .max(4096)
   .refine((value) => value.isWellFormed());
 const cursor = z.object({ directory: path, path: path.nullable() });
+const revision = z.string().min(1).max(1024);
 
 export const requestSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("state") }),
@@ -19,7 +20,18 @@ export const requestSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("stage"), path }),
   z.object({ action: z.literal("commit"), message: z.string().trim().min(1).max(4096) }),
   z.object({ action: z.literal("checkout"), branch: z.string().min(1).max(1024) }),
-  z.object({ action: z.literal("history"), ref: z.string().max(1024).optional() }),
+  z.object({ action: z.literal("branch"), name: z.string().min(1).max(1024) }),
+  z.object({ action: z.literal("history"), ref: revision.optional(), path: path.optional() }),
+  z.object({ action: z.literal("show"), ref: revision }),
+  z.object({ action: z.literal("changes"), from: revision, to: revision }),
+  z.object({
+    action: z.literal("patch"),
+    from: revision,
+    to: revision,
+    paths: z.array(path).min(1).max(2),
+  }),
+  z.object({ action: z.literal("blob"), ref: revision, path }),
+  z.object({ action: z.literal("compare"), base: revision, head: revision }),
   z.object({
     action: z.literal("search"),
     query: z.string().min(1).max(512),
@@ -69,6 +81,40 @@ export const historySchema = z.object({
   next: z.string().nullable(),
 });
 export type HistoryPage = z.infer<typeof historySchema>;
+const person = z.object({ name: z.string(), email: z.string(), timestamp: z.number() });
+export const commitSchema = z.object({
+  oid: z.string(),
+  message: z.string(),
+  author: person,
+  committer: person,
+  parents: z.array(z.string()),
+});
+export type CommitDetail = z.infer<typeof commitSchema>;
+export const MAX_LISTED_CHANGES = 1000;
+export const changesSchema = z.object({
+  files: z.array(
+    z.object({
+      path: z.string(),
+      status: z.enum(["A", "M", "D", "R"]),
+      insertions: z.number(),
+      deletions: z.number(),
+      originalPath: z.string().optional(),
+    }),
+  ),
+  total: z.number(),
+});
+export type ChangeList = z.infer<typeof changesSchema>;
+export type ChangedFile = ChangeList["files"][number];
+export const blobSchema = z.object({ path: z.string(), text: z.string(), bytes: z.number() });
+export const compareSchema = z.object({
+  base: z.string(),
+  head: z.string(),
+  relationship: z.enum(["identical", "ahead", "behind", "diverged", "unrelated", "shallow"]),
+  ahead: z.number(),
+  behind: z.number(),
+  mergeBases: z.array(z.string()),
+});
+export type Comparison = z.infer<typeof compareSchema>;
 export const searchSchema = z.object({
   hits: z.array(z.object({ path: z.string(), confirmed: z.boolean() })),
   next: z.string().nullable(),

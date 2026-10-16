@@ -1,7 +1,9 @@
 import { useRef, useState } from "react";
+import type { RevisionTarget } from "./change-set.js";
 import { Editor } from "./editor.js";
 import { Explorer } from "./explorer.js";
 import { Inspector, type InspectorTab } from "./inspector.js";
+import { RevisionView } from "./revision-view.js";
 import { Terminal } from "./terminal.js";
 import { useWorkspace } from "./use-workspace.js";
 
@@ -9,6 +11,9 @@ export function App() {
   const workspace = useWorkspace();
   const [tab, setTab] = useState<InspectorTab>("search");
   const [query, setQuery] = useState("");
+  const [historyPath, setHistoryPath] = useState<string>();
+  const [revision, setRevision] = useState<RevisionTarget>();
+  const [branchName, setBranchName] = useState("");
   const branchMenu = useRef<HTMLDetailsElement>(null);
   const state = workspace.state;
   const busy = workspace.pending !== "";
@@ -16,7 +21,12 @@ export function App() {
 
   function open(path: string, search = "") {
     setQuery(search);
+    setRevision(undefined);
     void workspace.open(path);
+  }
+
+  function closeBranchMenu() {
+    if (branchMenu.current !== null) branchMenu.current.open = false;
   }
 
   return (
@@ -45,7 +55,7 @@ export function App() {
                     key={branch}
                     disabled={busy || branch === state.branch}
                     onClick={() => {
-                      if (branchMenu.current !== null) branchMenu.current.open = false;
+                      closeBranchMenu();
                       void workspace.mutate({ action: "checkout", branch }, "Switching branch");
                     }}
                   >
@@ -53,6 +63,28 @@ export function App() {
                     {branch === state.branch ? " ✓" : ""}
                   </button>
                 ))}
+                <form
+                  className="branch-create"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    const name = branchName.trim();
+                    if (name === "") return;
+                    closeBranchMenu();
+                    setBranchName("");
+                    void workspace.mutate({ action: "branch", name }, "Creating branch");
+                  }}
+                >
+                  <input
+                    aria-label="New branch name"
+                    placeholder="new-branch"
+                    value={branchName}
+                    spellCheck={false}
+                    onChange={(event) => setBranchName(event.target.value)}
+                  />
+                  <button type="submit" disabled={busy || branchName.trim() === ""}>
+                    Create
+                  </button>
+                </form>
               </div>
             </details>
           )}
@@ -83,46 +115,87 @@ export function App() {
           <div className="editor-column">
             <section className="editor-panel" aria-label="Source editor">
               <div className="editor-tabbar">
-                <span className="editor-tab">
-                  {file?.path.split("/").at(-1) ?? "No file open"}
-                  {workspace.dirty && (
-                    <span className="dirty-dot" title="Unsaved changes">
-                      ●
+                {revision !== undefined ? (
+                  <>
+                    <span className="editor-tab">
+                      {revision.path.split("/").at(-1)}
+                      <code className="revision-ref">@ {revision.ref.slice(0, 8)}</code>
                     </span>
-                  )}
-                </span>
-                <div className="editor-actions">
-                  <button
-                    type="button"
-                    className="quiet"
-                    disabled={busy || file === undefined}
-                    onClick={workspace.reload}
-                  >
-                    Reload
-                  </button>
-                  <button
-                    type="button"
-                    className="save-button"
-                    disabled={busy || !workspace.dirty || workspace.conflict}
-                    onClick={() => void workspace.save()}
-                  >
-                    Save <kbd>⌘/Ctrl S</kbd>
-                  </button>
-                </div>
+                    <div className="editor-actions">
+                      <button
+                        type="button"
+                        className="quiet"
+                        onClick={() => setRevision(undefined)}
+                      >
+                        Back to editor
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <span className="editor-tab">
+                      {file?.path.split("/").at(-1) ?? "No file open"}
+                      {workspace.dirty && (
+                        <span className="dirty-dot" title="Unsaved changes">
+                          ●
+                        </span>
+                      )}
+                    </span>
+                    <div className="editor-actions">
+                      <button
+                        type="button"
+                        className="quiet"
+                        disabled={file === undefined}
+                        onClick={() => {
+                          setHistoryPath(file?.path);
+                          setTab("history");
+                        }}
+                      >
+                        History
+                      </button>
+                      <button
+                        type="button"
+                        className="quiet"
+                        disabled={busy || file === undefined}
+                        onClick={workspace.reload}
+                      >
+                        Reload
+                      </button>
+                      <button
+                        type="button"
+                        className="save-button"
+                        disabled={busy || !workspace.dirty || workspace.conflict}
+                        onClick={() => void workspace.save()}
+                      >
+                        Save <kbd>⌘/Ctrl S</kbd>
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
               <div className="breadcrumbs">
-                <span>next.js</span> / {file?.path ?? "Select a file"}
+                <span>next.js</span> / {revision?.path ?? file?.path ?? "Select a file"}
                 <span className="buffer-status">
-                  {workspace.dirty ? "Unsaved" : "Saved to SQLite"}
+                  {revision !== undefined
+                    ? `Read-only · ${revision.ref.slice(0, 8)}`
+                    : workspace.dirty
+                      ? "Unsaved"
+                      : "Saved to SQLite"}
                 </span>
               </div>
-              {workspace.conflict && (
+              {revision === undefined && workspace.conflict && (
                 <div className="conflict-banner">
                   The file changed on the server. Your draft is preserved. Copy it, then reload to
                   reconcile.
                 </div>
               )}
-              {file === undefined ? (
+              {revision !== undefined ? (
+                <RevisionView
+                  target={revision}
+                  onError={workspace.setError}
+                  onMeasure={workspace.setMeasurement}
+                />
+              ) : file === undefined ? (
                 <div className="editor-empty">Open a file from the explorer or search.</div>
               ) : (
                 <Editor
@@ -146,7 +219,10 @@ export function App() {
             state={state}
             revision={workspace.revision}
             disabled={busy}
+            historyPath={historyPath}
+            clearHistoryPath={() => setHistoryPath(undefined)}
             open={open}
+            openRevision={setRevision}
             stage={(path) => void workspace.mutate({ action: "stage", path }, "Staging file")}
             commit={(message) =>
               void workspace.mutate({ action: "commit", message }, "Committing changes")

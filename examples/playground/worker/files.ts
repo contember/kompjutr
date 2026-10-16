@@ -37,14 +37,24 @@ export function readDocument(workspace: Workspace, path: string) {
     throw new RequestError("EFBIG", "Editor supports files up to 512 KiB; use the terminal");
   }
   const bytes = workspace.filesystem.readFile(absolute);
+  return {
+    path,
+    text: editorText(bytes),
+    version: `${stat.ino}:${stat.rev}`,
+    bytes: bytes.byteLength,
+  };
+}
+
+export function editorText(bytes: Uint8Array): string {
+  if (bytes.byteLength > MAX_EDITOR_BYTES) {
+    throw new RequestError("EFBIG", "Editor supports files up to 512 KiB; use the terminal");
+  }
   if (bytes.includes(0)) throw new RequestError("EUNSUPPORTED", "Binary file; use the terminal");
-  let text: string;
   try {
-    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     throw new RequestError("EUNSUPPORTED", "File is not UTF-8 text; use the terminal");
   }
-  return { path, text, version: `${stat.ino}:${stat.rev}`, bytes: bytes.byteLength };
 }
 
 export function saveDocument(workspace: Workspace, path: string, text: string, version: string) {

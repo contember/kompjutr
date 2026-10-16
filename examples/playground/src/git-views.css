@@ -1,0 +1,138 @@
+.history-open {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  text-align: left;
+  border-radius: 0;
+}
+.history-open:hover:not(:disabled) .history-subject {
+  color: var(--signal);
+}
+.history-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--seam);
+  font: 11px var(--mono);
+  color: var(--signal);
+}
+.history-filter span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.commit-detail {
+  flex-shrink: 0;
+  max-height: 40%;
+  overflow: auto;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--seam);
+}
+.back-button {
+  padding: 4px 0;
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: var(--ink-secondary);
+}
+.commit-detail h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+.commit-body {
+  margin: 0 0 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink-secondary);
+  font: 11px / 1.6 var(--mono);
+}
+.commit-meta {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 0 0 8px;
+  font-size: 11px;
+}
+.commit-meta dt {
+  color: var(--ink-tertiary);
+  font-family: var(--mono);
+}
+.commit-meta dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink-secondary);
+}
+.commit-meta code {
+  color: var(--signal);
+  font: 10px var(--mono);
+}
+.commit-link {
+  padding: 0 8px 0 0;
+  color: var(--signal);
+  font: 11px var(--mono);
+}
+.change-stats {
+  flex-shrink: 0;
+  margin: 0 8px;
+  font: 10px var(--mono);
+}
+.change-stats .added {
+  color: var(--signal);
+}
+.change-stats .removed {
+  color: var(--removed);
+}
+.compare-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+}
+.compare-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--ink-secondary);
+  font-size: 11px;
+}
+.compare-form input {
+  font: 12px var(--mono);
+}
+.compare-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--seam);
+  font-size: 12px;
+}
+.compare-summary code {
+  color: var(--signal);
+  font: 10px var(--mono);
+}
+.branch-create {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-top: 1px solid var(--seam);
+  margin-top: 4px;
+}
+.branch-create input {
+  flex: 1;
+  min-width: 0;
+  font: 11px var(--mono);
+}
+.branch-options .branch-create button {
+  width: auto;
+  color: var(--signal);
+}
+.revision-ref {
+  margin-left: 8px;
+  color: var(--unsaved);
+  font: 10px var(--mono);
+}

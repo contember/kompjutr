@@ -9,6 +9,10 @@ import { type GitServer, startGitServer } from "../../tests/helpers/http-backend
 import { createRuntime } from "./runtime.js";
 import {
   type ApiRequest,
+  blobSchema,
+  changesSchema,
+  commitSchema,
+  compareSchema,
   diffSchema,
   errorSchema,
   fileSchema,
@@ -26,6 +30,8 @@ let origin: GitServer;
 let fixture: GitFixture;
 let directory: string;
 let historicalCommit: string;
+let removalCommit: string;
+let routesCommit: string;
 
 function openRuntime() {
   return createRuntime({
@@ -59,14 +65,19 @@ beforeAll(async () => {
     .init()
     .write("historical.txt", "historical contents\n")
     .write("README.md", "# Original\n")
-    .write("src/index.ts", "export const answer = 42;\n");
+    .write("src/index.ts", "export const answer = 42;\n")
+    .write("app/[slug]/page.tsx", "export const page = 1;\n")
+    .write("app/s/page.tsx", "export const page = 1;\n");
   fixture.write("binary.dat", new Uint8Array([0, 255, 1]));
   for (let index = 0; index < 105; index++) {
     fixture.write(`many/file-${String(index).padStart(3, "0")}.txt`, "pagination witness\n");
   }
   historicalCommit = fixture.commit("Initial fixture");
   fixture.remove("historical.txt");
-  fixture.commit("Remove historical file");
+  removalCommit = fixture.commit("Remove historical file");
+  fixture.write("app/[slug]/page.tsx", "export const page = 2;\n");
+  fixture.write("app/s/page.tsx", "export const page = 2;\n");
+  routesCommit = fixture.commit("Edit routes");
   for (let index = 1; index < 25; index++) {
     fixture.git("commit", "--allow-empty", "-q", "-m", `Upstream commit ${index}`);
   }
@@ -199,6 +210,8 @@ it("rejects malformed requests, path escapes, binary editing, and failed shell c
     { action: "unknown" },
     { action: "file", path: "../outside" },
     { action: "file", path: "binary.dat" },
+    { action: "blob", ref: "HEAD", path: "../outside" },
+    { action: "history", path: "../outside" },
   ]) {
     const response = await post(input);
     expect(response.status).toBe(400);
@@ -207,4 +220,80 @@ it("rejects malformed requests, path escapes, binary editing, and failed shell c
   const failed = await call({ action: "shell", source: "git nonexistent" }, shellSchema);
   expect(failed.exitCode).not.toBe(0);
   expect(failed.stderr).not.toBe("");
+});
+
+it("shows commits, file history, historical files, and patches between revisions", async () => {
+  const root = await call({ action: "show", ref: historicalCommit }, commitSchema);
+  expect(root.parents).toEqual([]);
+  expect(root.message.trim()).toBe("Initial fixture");
+  const removal = await call({ action: "show", ref: removalCommit }, commitSchema);
+  expect(removal.parents).toEqual([historicalCommit]);
+
+  const removed = await call(
+    { action: "changes", from: historicalCommit, to: removalCommit },
+    changesSchema,
+  );
+  expect(removed).toEqual({
+    files: [{ path: "historical.txt", status: "D", insertions: 0, deletions: 1 }],
+    total: 1,
+  });
+  const patch = await call(
+    { action: "patch", from: historicalCommit, to: removalCommit, paths: ["historical.txt"] },
+    diffSchema,
+  );
+  expect(patch.patch.trimEnd()).toBe(
+    fixture.git("diff", historicalCommit, removalCommit, "--", "historical.txt"),
+  );
+  const blob = await call(
+    { action: "blob", ref: historicalCommit, path: "historical.txt" },
+    blobSchema,
+  );
+  expect(blob.text).toBe("historical contents\n");
+
+  const fileHistory = await call(
+    { action: "history", ref: "main", path: "historical.txt" },
+    historySchema,
+  );
+  expect(fileHistory.commits.map((commit) => commit.oid)).toEqual([
+    removalCommit,
+    historicalCommit,
+  ]);
+  expect(fileHistory.next).toBeNull();
+
+  const routes = await call(
+    {
+      action: "patch",
+      from: removalCommit,
+      to: routesCommit,
+      paths: ["app/[slug]/page.tsx"],
+    },
+    diffSchema,
+  );
+  expect(routes.patch.trimEnd()).toBe(
+    fixture.git("diff", removalCommit, routesCommit, "--", ":(literal)app/[slug]/page.tsx"),
+  );
+});
+
+it("creates a branch and compares it with its merge base", async () => {
+  const before = await call({ action: "state" }, stateSchema);
+  await call({ action: "branch", name: "feature" }, okSchema);
+  const after = await call({ action: "state" }, stateSchema);
+  expect(after.branch).toBe("feature");
+  expect(after.head).toBe(before.head);
+
+  const main = fixture.git("rev-parse", "main");
+  const comparison = await call(
+    { action: "compare", base: "main", head: "feature" },
+    compareSchema,
+  );
+  expect(comparison).toEqual({
+    base: main,
+    head: after.head,
+    relationship: "ahead",
+    ahead: 1,
+    behind: 0,
+    mergeBases: [main],
+  });
+  const changed = await call({ action: "changes", from: main, to: after.head }, changesSchema);
+  expect(changed.files).toEqual([{ path: "README.md", status: "M", insertions: 1, deletions: 1 }]);
 });

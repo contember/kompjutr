@@ -1,16 +1,17 @@
 import { useEffect, useState } from "react";
 import {
   diffSchema,
-  type HistoryPage,
-  historySchema,
   type SearchPage,
   searchSchema,
   type WorkspaceState,
 } from "../shared/protocol.js";
 import { type Measurement, request } from "./api.js";
+import type { RevisionTarget } from "./change-set.js";
+import { Compare } from "./compare.js";
+import { History } from "./history.js";
 import { PatchView } from "./patch-view.js";
 
-export type InspectorTab = "search" | "changes" | "history";
+export type InspectorTab = "search" | "changes" | "history" | "compare";
 
 interface Props {
   tab: InspectorTab;
@@ -18,7 +19,10 @@ interface Props {
   state: WorkspaceState;
   revision: number;
   disabled: boolean;
+  historyPath: string | undefined;
+  clearHistoryPath(): void;
   open(path: string, query?: string): void;
+  openRevision(target: RevisionTarget): void;
   stage(path: string): void;
   commit(message: string): void;
   onError(message: string): void;
@@ -301,77 +305,6 @@ function Changes({ state, revision, disabled, open, stage, commit, onError, onMe
   );
 }
 
-function History({ state, disabled, onError }: Props) {
-  const [page, setPage] = useState<HistoryPage>();
-  const [loading, setLoading] = useState(false);
-  const head = state.head;
-
-  useEffect(() => {
-    let cancelled = false;
-    void request({ action: "history", ref: head }, historySchema)
-      .then(({ data }) => {
-        if (!cancelled) setPage(data);
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) onError(error instanceof Error ? error.message : String(error));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [head, onError]);
-
-  async function more() {
-    if (page?.next === undefined || page.next === null || loading) return;
-    setLoading(true);
-    try {
-      const result = await request({ action: "history", ref: page.next }, historySchema);
-      setPage({ commits: [...page.commits, ...result.data.commits], next: result.data.next });
-    } catch (error) {
-      onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <div className="inspector-scroll history-list">
-      {page?.commits.map((entry) => (
-        <article className="history-entry" key={entry.oid}>
-          <span className="history-dot" />
-          <div>
-            <h3>{entry.message.split("\n")[0]}</h3>
-            <p>
-              {entry.author}{" "}
-              <span>
-                ·{" "}
-                {new Date(entry.timestamp * 1000).toLocaleDateString("en", {
-                  month: "short",
-                  day: "numeric",
-                })}
-              </span>
-            </p>
-            <code>{entry.oid.slice(0, 8)}</code>
-          </div>
-        </article>
-      ))}
-      {page?.next && (
-        <button
-          type="button"
-          className="more-button"
-          disabled={disabled || loading}
-          onClick={() => void more()}
-        >
-          Older commits
-        </button>
-      )}
-      <div className="fixture-note">
-        First-parent history, 20 commits per page. Use git log in the terminal to include merged
-        branches.
-      </div>
-    </div>
-  );
-}
-
 export function Inspector(props: Props) {
   return (
     <aside className="inspector" aria-label="Repository tools">
@@ -397,10 +330,37 @@ export function Inspector(props: Props) {
         >
           History
         </button>
+        <button
+          type="button"
+          aria-pressed={props.tab === "compare"}
+          onClick={() => props.setTab("compare")}
+        >
+          Compare
+        </button>
       </nav>
       {props.tab === "search" && <Search {...props} />}
       {props.tab === "changes" && <Changes {...props} />}
-      {props.tab === "history" && <History {...props} />}
+      {props.tab === "history" && (
+        <History
+          head={props.state.head}
+          path={props.historyPath}
+          clearPath={props.clearHistoryPath}
+          disabled={props.disabled}
+          openRevision={props.openRevision}
+          onError={props.onError}
+          onMeasure={props.onMeasure}
+        />
+      )}
+      {props.tab === "compare" && (
+        <Compare
+          branches={props.state.branches}
+          branch={props.state.branch}
+          disabled={props.disabled}
+          openRevision={props.openRevision}
+          onError={props.onError}
+          onMeasure={props.onMeasure}
+        />
+      )}
     </aside>
   );
 }

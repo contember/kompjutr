@@ -8,6 +8,15 @@ import { NEEDLE_MAX_BYTES } from "../../../packages/do/src/fs/store/search.js";
 import { type ApiRequest, REPO, requestSchema } from "../shared/protocol.js";
 import { CountingStorage } from "./counting-storage.js";
 import { RequestError, readDocument, resolvedPath, saveDocument, workspacePath } from "./files.js";
+import {
+  changes,
+  compare,
+  history,
+  revisionFile,
+  revisionPatch,
+  showCommit,
+  workingTreePatch,
+} from "./git-views.js";
 
 interface Environment {
   ORIGIN_URL: string;
@@ -180,8 +189,7 @@ export class Playground {
       case "shell":
         return this.#shell.run(input.source);
       case "diff":
-        workspacePath(input.path);
-        return { patch: await git.diff({ dir: REPO, paths: [input.path], staged: input.staged }) };
+        return { patch: await workingTreePatch(git, input.path, input.staged) };
       case "stage":
         workspacePath(input.path);
         await git.add({ dir: REPO, paths: [input.path] });
@@ -192,18 +200,21 @@ export class Playground {
       case "checkout":
         await git.checkout({ dir: REPO, ref: input.branch });
         return { ok: true };
-      case "history": {
-        const commits = await git.log({ dir: REPO, ref: input.ref, depth: 21, firstParent: true });
-        return {
-          commits: commits.slice(0, 20).map((commit) => ({
-            oid: commit.oid,
-            message: commit.message,
-            author: commit.author.name,
-            timestamp: commit.author.timestamp,
-          })),
-          next: commits[20]?.oid ?? null,
-        };
-      }
+      case "branch":
+        await git.branch({ dir: REPO, name: input.name, checkout: true });
+        return { ok: true };
+      case "history":
+        return history(git, input.ref, input.path);
+      case "show":
+        return showCommit(git, input.ref);
+      case "changes":
+        return changes(git, input.from, input.to);
+      case "patch":
+        return { patch: await revisionPatch(git, input.from, input.to, input.paths) };
+      case "blob":
+        return revisionFile(git, input.ref, input.path);
+      case "compare":
+        return compare(git, input.base, input.head);
       case "search": {
         const fs = workspace.filesystem;
         const needle = new TextEncoder().encode(input.query);
