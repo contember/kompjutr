@@ -6,7 +6,8 @@
     "runtime.ts",
     "worker.test.ts",
     "vitest.config.ts",
-    "../../packages/git/src/common/pako.d.ts"
+    "../../packages/git/src/common/pako.d.ts",
+    "../../packages/git/src/common/pako-inflate.d.ts"
   ],
   "exclude": ["node_modules", "dist", ".state"]
 }
