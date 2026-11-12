@@ -52,8 +52,7 @@ cleanup would mistake for caller-owned data.
 - A crashed clone can block the same root for at most one lease interval.
 - A retry repeats network work instead of resuming it, and the monotonic
   identity counters grow across deletion.
-- The development-only version-1 schema contains this lifecycle directly and has
-  no compatibility migration.
+- Schema version 1 contains this lifecycle directly.
 
 ## Alternatives considered
 

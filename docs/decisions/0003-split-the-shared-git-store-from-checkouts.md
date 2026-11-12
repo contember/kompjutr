@@ -96,6 +96,5 @@ outside this model.
   here, so this adds emulation with no storage benefit.
 - **Duplicate refs or ordinary config per checkout.** Breaks immediate shared
   publication and changes the repository model rather than only the checkout.
-- **Add a schema upgrade chain.** No schema version has been deployed, so
-  migration code would preserve development-only states and become permanent
-  trust surface.
+- **Add a schema upgrade chain.** Rejected while no schema version had been
+  deployed; schema changes now ship as forward migrations (see `CLAUDE.md`).
