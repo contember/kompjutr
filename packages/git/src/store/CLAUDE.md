@@ -19,7 +19,7 @@ indexes/       checkout/scratch indexes and filesystem change tracker
 operations/    restartable merge, replay, and rebase state; the scoped
                integration workspace that owns plans, reservations, and touched
                snapshots
-schema/        editable schema version 1; no migrations
+schema/        schema version 1; changes ship as forward migrations
 trees/         tree/commit projections and streaming walks
 pack/          pack read, ingest, publication, deletion, and delta workspace
 sparse/        the sparse capability contract; `do-fs` implements it

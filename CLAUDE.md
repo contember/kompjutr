@@ -3,7 +3,10 @@
 SQLite-native Git runtime with Cloudflare Durable Object and Unix local
 compositions. Neither creates a `.git` directory.
 
-The project is still in development and has no production users, so backward compatibility, including schema migrations, is not required unless explicitly requested.
+kompjutr has production users. A change to stored data or schema (SQLite
+schemas and rows, local on-disk state such as the recovery journal) ships as a
+forward migration that keeps existing data readable, with a test that opens a
+database built from the previous version's exact schema.
 
 ## Commands
 
