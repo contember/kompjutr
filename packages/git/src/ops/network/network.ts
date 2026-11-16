@@ -17,6 +17,8 @@ export {
 } from "./network-options.js";
 export {
   hydrateTreeBlobs,
+  promisorGuardedMutation,
+  withPromisorHydratedMutation,
   withPromisorHydration,
 } from "./network-promisor.js";
 export type {

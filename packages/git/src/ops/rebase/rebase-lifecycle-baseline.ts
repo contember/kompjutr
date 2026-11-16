@@ -208,7 +208,7 @@ export function preflightBaselineTree(repo: Repository, treeOid: string): void {
     const oids = [...page];
     page = new Set<string>();
     const types = new Map<string, string>();
-    for (const object of repo.store.objectInfo(oids)) types.set(object.oid, object.type);
+    for (const object of repo.store.contentObjectInfo(oids)) types.set(object.oid, object.type);
     for (const oid of oids) {
       const type = types.get(oid);
       if (type === undefined) {

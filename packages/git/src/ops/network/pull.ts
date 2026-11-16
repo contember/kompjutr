@@ -5,7 +5,6 @@ import { isOid } from "../../common/bytes.js";
 import { CorruptError, GitError, UnsupportedOperationError } from "../../common/errors.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../../common/ref-name.js";
 import { normalizeRemoteUrl } from "../../protocol/remote.js";
-import { withGitMutationGuardOwned } from "../../store/database/database.js";
 import { type GitContext, type GitIdentity, nestedRoots } from "../core/context.js";
 import type { PullResult } from "../core/kinds.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
@@ -13,7 +12,12 @@ import { type MergeBehavior, merge } from "../merge/merge.js";
 import { rebase } from "../rebase/rebase.js";
 import { type Repository, resolveHeadOwned } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { type AbortableNetworkOptions, fetchInto, type RemoteAuthOptions } from "./network.js";
+import {
+  type AbortableNetworkOptions,
+  fetchInto,
+  type RemoteAuthOptions,
+  withPromisorHydratedMutation,
+} from "./network.js";
 
 const HEADS = "refs/heads/";
 const FALSE_CONFIG_VALUES = new Set(["", "0", "false", "no", "off"]);
@@ -362,43 +366,49 @@ export async function pull(
   if (upstream === null) {
     throw new GitError("EFETCHFAIL", `remote ${plan.remote} advertised no usable upstream ref`);
   }
-  return withGitMutationGuardOwned(context.database, () => {
-    requireSharedMutationScope(repo.store.db, worktree);
-    validatePullAfterFetch(repo, options, plan);
-    if (plan.strategy === "rebase") {
-      const rebaseOptions = {
-        upstream,
-        ...(options.committer === undefined ? {} : { committer: options.committer }),
-        ...(options.env === undefined ? {} : { env: options.env }),
-      };
-      return {
-        strategy: "rebase",
-        result: rebase(context, repo, worktree, nestedRoots(context, repo.root), rebaseOptions),
-      };
-    }
+  // After fetch publication the signal cancels promised-blob hydration only.
+  return withPromisorHydratedMutation(
+    context,
+    repo,
+    () => {
+      requireSharedMutationScope(repo.store.db, worktree);
+      validatePullAfterFetch(repo, options, plan);
+      if (plan.strategy === "rebase") {
+        const rebaseOptions = {
+          upstream,
+          ...(options.committer === undefined ? {} : { committer: options.committer }),
+          ...(options.env === undefined ? {} : { env: options.env }),
+        };
+        return {
+          strategy: "rebase",
+          result: rebase(context, repo, worktree, nestedRoots(context, repo.root), rebaseOptions),
+        };
+      }
 
-    const message = options.message === undefined ? defaultPullMessage(plan) : options.message;
-    const result = merge(
-      context,
-      repo,
-      worktree,
-      {
-        theirs: upstream,
-        ours: plan.headRef,
-        ...(plan.fastForward === undefined ? {} : { fastForward: plan.fastForward }),
-        ...(plan.fastForwardOnly === undefined ? {} : { fastForwardOnly: plan.fastForwardOnly }),
-        message,
-        ...(options.author === undefined ? {} : { author: options.author }),
-        ...(options.committer === undefined ? {} : { committer: options.committer }),
-        ...(options.env === undefined ? {} : { env: options.env }),
-        ...(options.commit === undefined ? {} : { commit: options.commit }),
-      },
-      {
-        ...behavior,
-        incomingLabel: upstream,
-        origin: "pull",
-      },
-    );
-    return { strategy: "merge", result };
-  });
+      const message = options.message === undefined ? defaultPullMessage(plan) : options.message;
+      const result = merge(
+        context,
+        repo,
+        worktree,
+        {
+          theirs: upstream,
+          ours: plan.headRef,
+          ...(plan.fastForward === undefined ? {} : { fastForward: plan.fastForward }),
+          ...(plan.fastForwardOnly === undefined ? {} : { fastForwardOnly: plan.fastForwardOnly }),
+          message,
+          ...(options.author === undefined ? {} : { author: options.author }),
+          ...(options.committer === undefined ? {} : { committer: options.committer }),
+          ...(options.env === undefined ? {} : { env: options.env }),
+          ...(options.commit === undefined ? {} : { commit: options.commit }),
+        },
+        {
+          ...behavior,
+          incomingLabel: upstream,
+          origin: "pull",
+        },
+      );
+      return { strategy: "merge", result };
+    },
+    options.signal === undefined ? {} : { signal: options.signal },
+  );
 }

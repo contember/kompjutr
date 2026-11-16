@@ -1,6 +1,7 @@
 import { CorruptError, GitError, hasErrorCode, promisedObjectOids } from "../../common/errors.js";
 import { MAX_PROTOCOL_NEGOTIATION_ENTRIES, normalizeRemoteUrl } from "../../protocol/remote.js";
 import { throwIfAborted } from "../../protocol/stream.js";
+import { withGitMutationGuardOwned } from "../../store/database/database.js";
 import type { ObjectReadInfo, PromisedBlob } from "../../store/index.js";
 import { MAX_BLOB_BATCH_OIDS } from "../../store/objects/objects.js";
 import { matchesPaths } from "../checkout/checkout.js";
@@ -140,9 +141,25 @@ export async function withPromisorHydration<T>(
   options: AbortableNetworkOptions = {},
 ): Promise<T> {
   validateAbortableNetworkOptions(options);
+  return retryAfterHydration(
+    context,
+    repo,
+    () => {
+      throwIfAborted(options.signal);
+      return body();
+    },
+    options,
+  );
+}
+
+async function retryAfterHydration<T>(
+  context: GitContext,
+  repo: Repository,
+  body: () => T,
+  options: AbortableNetworkOptions,
+): Promise<T> {
   const requested = new Set<string>();
   for (;;) {
-    throwIfAborted(options.signal);
     try {
       return body();
     } catch (error) {
@@ -160,6 +177,44 @@ export async function withPromisorHydration<T>(
       await hydratePromisedBlobs(context, repo, oids, options);
     }
   }
+}
+
+/**
+ * One guarded mutation attempt. A throw rolls the whole guard transaction
+ * back: drive, index, refs, reflogs, and operation state share its mutation
+ * scope, so an attempt that missed a promised blob may be retried.
+ */
+export function promisorGuardedMutation<T>(
+  context: GitContext,
+  repo: Repository,
+  body: () => T,
+): T {
+  try {
+    return withGitMutationGuardOwned(context.database, body);
+  } catch (error) {
+    // Caches may still describe objects the rolled-back attempt wrote.
+    if (promisedObjectOids(error) !== null) repo.store.revalidateStorageCaches();
+    throw error;
+  }
+}
+
+/**
+ * Retry one guarded mutation after hydrating the promised blobs it reported.
+ * The signal cancels hydration only; an attempt that started runs to completion.
+ */
+export function withPromisorHydratedMutation<T>(
+  context: GitContext,
+  repo: Repository,
+  body: () => T,
+  options: AbortableNetworkOptions = {},
+): Promise<T> {
+  validateAbortableNetworkOptions(options);
+  return retryAfterHydration(
+    context,
+    repo,
+    () => promisorGuardedMutation(context, repo, body),
+    options,
+  );
 }
 
 /** Hydrate selected checkout blobs in bounded negotiations. */

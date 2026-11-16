@@ -33,7 +33,7 @@ export class IntegrationWorkspaceObjects implements IntegrationSource {
 
   objectInfo(oids: readonly string[]): IntegrationObjectInfo[] {
     this.owner.requireActive();
-    return this.ordinary.objectInfo(oids);
+    return this.ordinary.contentObjectInfo(oids);
   }
 
   readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {

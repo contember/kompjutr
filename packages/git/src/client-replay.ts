@@ -6,6 +6,7 @@ import {
   mergeContinue as mergeContinueOp,
   merge as mergeOp,
 } from "./ops/merge/merge.js";
+import { withPromisorHydratedMutation } from "./ops/network/network.js";
 import {
   rebaseAbort as rebaseAbortOp,
   rebaseContinue as rebaseContinueOp,
@@ -51,10 +52,10 @@ export function createGitClientReplayMethods(services: GitClientServices): Repla
   const { context, at, excludeRoots, mutate } = services;
   return {
     async merge(input) {
-      return mutate(() => {
-        const repo = at(input.dir);
-        return mergeOp(context, repo, context.worktree, input);
-      });
+      const repo = at(input.dir);
+      return withPromisorHydratedMutation(context, repo, () =>
+        mergeOp(context, repo, context.worktree, input),
+      );
     },
     async mergeContinue(input = {}) {
       return mutate(() => mergeContinueOp(context, at(input.dir), input));
@@ -63,7 +64,10 @@ export function createGitClientReplayMethods(services: GitClientServices): Repla
       mutate(() => mergeAbortOp(at(input.dir), context.worktree));
     },
     async cherryPick(input) {
-      return mutate(() => cherryPickOp(context, at(input.dir), context.worktree, input));
+      const repo = at(input.dir);
+      return withPromisorHydratedMutation(context, repo, () =>
+        cherryPickOp(context, repo, context.worktree, input),
+      );
     },
     async cherryPickContinue(input = {}) {
       return mutate(() => cherryPickContinueOp(context, at(input.dir), input));
@@ -75,7 +79,10 @@ export function createGitClientReplayMethods(services: GitClientServices): Repla
       mutate(() => cherryPickAbortOp(at(input.dir), context.worktree));
     },
     async revert(input) {
-      return mutate(() => revertOp(context, at(input.dir), context.worktree, input));
+      const repo = at(input.dir);
+      return withPromisorHydratedMutation(context, repo, () =>
+        revertOp(context, repo, context.worktree, input),
+      );
     },
     async revertContinue(input = {}) {
       return mutate(() => revertContinueOp(context, at(input.dir), input));
@@ -87,22 +94,22 @@ export function createGitClientReplayMethods(services: GitClientServices): Repla
       mutate(() => revertAbortOp(at(input.dir), context.worktree));
     },
     async rebase(input) {
-      return mutate(() => {
-        const repo = at(input.dir);
-        return rebaseOp(context, repo, context.worktree, excludeRoots(repo), input);
-      });
+      const repo = at(input.dir);
+      return withPromisorHydratedMutation(context, repo, () =>
+        rebaseOp(context, repo, context.worktree, excludeRoots(repo), input),
+      );
     },
     async rebaseContinue(input = {}) {
-      return mutate(() => {
-        const repo = at(input.dir);
-        return rebaseContinueOp(context, repo, context.worktree, excludeRoots(repo), input);
-      });
+      const repo = at(input.dir);
+      return withPromisorHydratedMutation(context, repo, () =>
+        rebaseContinueOp(context, repo, context.worktree, excludeRoots(repo), input),
+      );
     },
     async rebaseSkip(input = {}) {
-      return mutate(() => {
-        const repo = at(input.dir);
-        return rebaseSkipOp(context, repo, context.worktree, excludeRoots(repo), input);
-      });
+      const repo = at(input.dir);
+      return withPromisorHydratedMutation(context, repo, () =>
+        rebaseSkipOp(context, repo, context.worktree, excludeRoots(repo), input),
+      );
     },
     async rebaseAbort(input = {}) {
       mutate(() => {

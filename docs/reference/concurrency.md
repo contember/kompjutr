@@ -339,8 +339,12 @@ returns success. Before that point, `EABORTED` exposes no provisional clone,
 new ref, shallow boundary, or incomplete readable pack.
 
 Pull cancellation before fetch publication has the same `EABORTED` boundary.
-After fetch publication, local merge or rebase runs synchronously; cancellation
-does not roll back the fetched refs or interrupt a journal transaction.
+After fetch publication, each local merge or rebase attempt runs synchronously
+to completion; cancellation does not roll back the fetched refs or interrupt a
+journal transaction. On a partial clone an attempt that needs promised blobs
+rolls back and hydrates them before the next attempt. Cancellation during that
+hydration is `EABORTED`: the fetched refs stay published and nothing is
+integrated.
 
 Push distinguishes remote certainty from local tracking. Before receive-pack
 POST invocation, cancellation is `EABORTED`. After invocation, cancellation,

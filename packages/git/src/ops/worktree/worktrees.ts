@@ -198,19 +198,35 @@ export function worktreeAdd(
   );
 }
 
+function prepareWorktreeAdd(
+  context: GitContext,
+  repo: Repository,
+  options: WorktreeAddOptions,
+): { root: string; plan: AddPlan } {
+  requireSharedDatabaseScope(context.database.db, repo.store.db);
+  requireSharedMutationScope(context.database.db, context.worktree);
+  if (typeof options.root !== "string" || options.root === "") {
+    throw worktreeError("EINVAL", "worktree root is required");
+  }
+  return { root: normalizePath(options.root), plan: addPlan(repo, options.target) };
+}
+
+/** The tree a worktree add would check out, resolved without writing. */
+export function worktreeAddTree(
+  context: GitContext,
+  repo: Repository,
+  options: WorktreeAddOptions,
+): string {
+  return prepareWorktreeAdd(context, repo, options).plan.treeOid;
+}
+
 /** @internal Add a worktree while the caller owns the Git mutation guard. */
 export function worktreeAddOwned(
   context: GitContext,
   repo: Repository,
   options: WorktreeAddOptions,
 ): WorktreeInfo {
-  requireSharedDatabaseScope(context.database.db, repo.store.db);
-  requireSharedMutationScope(context.database.db, context.worktree);
-  if (typeof options.root !== "string" || options.root === "") {
-    throw worktreeError("EINVAL", "worktree root is required");
-  }
-  const root = normalizePath(options.root);
-  const plan = addPlan(repo, options.target);
+  const { root, plan } = prepareWorktreeAdd(context, repo, options);
   const row = sqliteGitDatabaseMutations(context.database).createCheckoutOwned(
     repo.store.repoId,
     root,

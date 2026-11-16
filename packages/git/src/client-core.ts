@@ -1,6 +1,7 @@
 import type { GitClientServices } from "./client-services.js";
 import type { Git, GitLsFilesOptions } from "./client-types.js";
-import { GitError } from "./common/errors.js";
+import { GitError, promisedObjectOids } from "./common/errors.js";
+import type { GitContext } from "./ops/core/context.js";
 import { recoverRefOwned as recoverRefOp, reflog as reflogOp } from "./ops/core/ref-log.js";
 import { diff as diffOp, diffSummary as diffSummaryOp } from "./ops/diff/diff.js";
 import { mergeContinue as mergeContinueOp } from "./ops/merge/merge.js";
@@ -9,7 +10,10 @@ import { lsRemote as lsRemoteOp } from "./ops/network/ls-remote.js";
 import {
   clone as cloneOp,
   fetchInto,
+  hydrateTreeBlobs,
+  promisorGuardedMutation,
   validateFetchOptions,
+  withPromisorHydratedMutation,
   withPromisorHydration,
 } from "./ops/network/network.js";
 import { currentBranch as currentBranchOp } from "./ops/refs/refs.js";
@@ -23,6 +27,7 @@ import {
   lsTree as lsTreeOp,
   show as showOp,
 } from "./ops/repository/reads.js";
+import type { Repository } from "./ops/repository/repository.js";
 import {
   add as addOp,
   lsFilesWithWorktree,
@@ -36,7 +41,10 @@ import {
   statusBranch,
 } from "./ops/status/status.js";
 import {
+  type WorktreeAddOptions,
+  type WorktreeInfo,
   worktreeAddOwned as worktreeAddOp,
+  worktreeAddTree,
   worktreeList as worktreeListOp,
   worktreePruneOwned as worktreePruneOp,
   worktreeRemoveOwned as worktreeRemoveOp,
@@ -78,6 +86,26 @@ type CoreMethods = Pick<
   | "lsFiles"
   | "lsTree"
 >;
+
+/**
+ * Runs the add first, so its root and branch checks win over any network call.
+ * Only a promised blob then hydrates the whole tree it writes, in bounded batches
+ * instead of one retry per read batch; the retry only covers a moved target.
+ */
+async function worktreeAddHydrated(
+  context: GitContext,
+  repo: Repository,
+  input: WorktreeAddOptions,
+): Promise<WorktreeInfo> {
+  const add = () => worktreeAddOp(context, repo, input);
+  try {
+    return promisorGuardedMutation(context, repo, add);
+  } catch (error) {
+    if (promisedObjectOids(error) === null) throw error;
+  }
+  await hydrateTreeBlobs(context, repo, worktreeAddTree(context, repo, input), undefined);
+  return withPromisorHydratedMutation(context, repo, add);
+}
 
 export function createGitClientCoreMethods(services: GitClientServices): CoreMethods {
   const { context, at, excludeRoots, mutate } = services;
@@ -150,8 +178,8 @@ export function createGitClientCoreMethods(services: GitClientServices): CoreMet
       });
     },
     async reset(input = {}) {
-      mutate(() => {
-        const repo = at(input.dir);
+      const repo = at(input.dir);
+      await withPromisorHydratedMutation(context, repo, () => {
         if (input.hard === true) {
           repo.store.db.transactionSync(() => {
             resetOp(context, repo, context.worktree, input);
@@ -204,7 +232,7 @@ export function createGitClientCoreMethods(services: GitClientServices): CoreMet
       return readRefOp(at(input.dir), input);
     },
     async worktreeAdd(input) {
-      return mutate(() => worktreeAddOp(context, at(input.dir), input));
+      return worktreeAddHydrated(context, at(input.dir), input);
     },
     async worktreeList(input = {}) {
       return worktreeListOp(context, at(input.dir));
