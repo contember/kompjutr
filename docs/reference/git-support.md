@@ -902,6 +902,20 @@ authoritative reread, index/worktree changes, conditional journal transition,
 and maintenance-root epoch bump.
 Supported public mutation re-entry fails with `EREENTRANT`.
 
+Two restrictions are deliberate, and Git has neither:
+
+- **A pending integration owns the checkout.** Until it continues, skips, or
+  aborts, every command that moves a ref, the checkout, or a remote fails with
+  `EOPACTIVE`: branch and tag create and delete, checkout, switch, restore,
+  clean, mixed and path reset, fetch, pull, push, `updateRef()`, and
+  `recoverRef()`. Staging (`add`, `rm`) stays available for resolution, a hard
+  reset clears the operation, and `commit()` finalizes only a pending merge.
+  Git lets these run beside its sequencer state; the journal's plan and
+  anchors are immutable, so kompjutr refuses rather than replan.
+- **Merge, cherry-pick, revert and rebase need a checked-out branch.** On a
+  detached HEAD each fails with `EDETACHED` before it starts; Git integrates
+  into the detached HEAD.
+
 Merge abort and cherry-pick or revert skip and abort follow Git's
 `reset --merge`. They fail with `ECHECKOUTFAIL` and change nothing when a
 restored path that is present in the worktree differs from its stage-0 index
