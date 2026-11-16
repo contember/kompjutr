@@ -36,7 +36,6 @@ describe("differential regressions: status type changes", () => {
   });
 
   it("reports a committed symlink replaced by a file, staged and back", async () => {
-    // The link resolves: `remove` cannot delete a dangling one.
     const scenario: Scenario = {
       start: "init",
       ops: [
@@ -105,6 +104,23 @@ describe("differential regressions: clean -d", () => {
         { op: "write", path: "dir/empty/z.txt", content: { text: "x\n" } },
         { op: "mv", from: "dir/empty/z.txt", to: "a-b" },
         { op: "clean", directories: true },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+});
+
+describe("differential regressions: status of a path replaced by a directory", () => {
+  it("lists an untracked directory where a staged deletion was", async () => {
+    const scenario: Scenario = {
+      start: "init",
+      ops: [
+        { op: "write", path: "b.txt", content: { text: "b\n" } },
+        { op: "add", paths: ["b.txt"] },
+        { op: "commit", message: "b" },
+        { op: "rm", paths: ["b.txt"], cached: true },
+        { op: "remove", path: "b.txt" },
+        { op: "write", path: "b.txt/f", content: { text: "f\n" } },
       ],
     };
     await expectAgreement(scenario);

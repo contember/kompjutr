@@ -675,6 +675,47 @@ describe("status", () => {
     expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2", "-uall"));
   });
 
+  it("lists a directory standing where a staged deletion was, in every untracked mode", async () => {
+    const { fixture, workspace } = await build({
+      name: "staged deletion replaced by a directory",
+      commits: [
+        [
+          { op: "write", path: "b.txt", content: "b\n" },
+          { op: "write", path: "d/c.txt", content: "c\n" },
+          { op: "write", path: "kept.txt", content: "kept\n" },
+        ],
+      ],
+      mutate: [
+        { op: "gitRemoveCached", path: "b.txt" },
+        { op: "remove", path: "b.txt" },
+        { op: "write", path: "b.txt/f", content: "f\n" },
+        { op: "write", path: "b.txt/sub/g", content: "g\n" },
+        { op: "gitRemoveCached", path: "d/c.txt" },
+        { op: "remove", path: "d/c.txt" },
+        { op: "write", path: "d/c.txt/h", content: "h\n" },
+        { op: "remove", path: "kept.txt" },
+        { op: "write", path: "kept.txt/f", content: "f\n" },
+      ],
+    });
+    const witnesses: Array<{ options: StatusOptions; flags: string[] }> = [
+      { options: {}, flags: [] },
+      { options: { untrackedFiles: "all" }, flags: ["-uall"] },
+      { options: { untrackedFiles: "no" }, flags: ["-uno"] },
+      { options: { includeIgnored: true }, flags: ["--ignored"] },
+    ];
+    for (const { options, flags } of witnesses) {
+      const entries = status(workspace.repo, workspace.worktree, options);
+      const label = flags.join(" ");
+      expect(formatPorcelainV2(entries), label).toBe(
+        gitStatus(fixture, "--porcelain=v2", ...flags),
+      );
+      expect(formatPorcelainV1(entries), label).toBe(
+        gitStatus(fixture, "--porcelain=v1", ...flags),
+      );
+      expect(formatShort(entries), label).toBe(gitStatus(fixture, "--short", ...flags));
+    }
+  });
+
   it("matches Git when cached removal leaves an independently untracked path", async () => {
     const { fixture, workspace } = await build({
       name: "cached removal",
