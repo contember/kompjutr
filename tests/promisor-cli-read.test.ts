@@ -95,8 +95,12 @@ describe("git show <rev>:<path> in a blobless clone", () => {
   it("keeps a UTF-8 byte order mark as Git does", async () => {
     const h = await partialClone();
     h.workspace.worktree.writeFile("/work/bom.txt", new Uint8Array([0xef, 0xbb, 0xbf, 0x41, 0x0a]));
-    await h.git.runCli({ argv: ["add", "bom.txt"], cwd: "/work" });
-    await h.git.runCli({ argv: ["commit", "-m", "bom"], cwd: "/work" });
+    expect(await h.git.runCli({ argv: ["add", "bom.txt"], cwd: "/work" })).toMatchObject({
+      exitCode: 0,
+    });
+    expect(await h.git.runCli({ argv: ["commit", "-m", "bom"], cwd: "/work" })).toMatchObject({
+      exitCode: 0,
+    });
 
     const shown = await h.git.runCli({ argv: ["show", "HEAD:bom.txt"], cwd: "/work" });
 
