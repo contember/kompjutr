@@ -271,15 +271,6 @@ export const KNOWN: KnownDivergence[] = [
       (opIs(d, "revertContinue", "cherryPickContinue") && d.field === "outcome" && stoppedEmpty(d)),
   },
   {
-    id: "push-after-rename",
-    reason:
-      "open: push of a renamed branch targets its moved upstream instead of its own name " +
-      "and does not create its remote-tracking ref",
-    fields: ["outcome", "refs", "originRefs"],
-    matches: ({ op: push, before }) =>
-      push.op === "push" && before.some((op) => op.op === "branchRename" && op.to === push.ref),
-  },
-  {
     id: "reset-unborn-head",
     reason: "open: `reset HEAD` on an unborn branch succeeds where git cannot resolve HEAD",
     fields: ["outcome"],

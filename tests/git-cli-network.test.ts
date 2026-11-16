@@ -132,6 +132,42 @@ describe("Git network argv", () => {
     );
   });
 
+  it("refuses push --delete of an absent short branch name as Git does, without POST", async () => {
+    const fixture = remoteFixture();
+    const server = await serverFor(fixture);
+    const workspace = runtime();
+    await workspace.git.runCli({ argv: ["clone", server.url, "repo"], cwd: "/" });
+    const posts = server.requests.filter((request) => request.method === "POST").length;
+
+    const deleted = await workspace.git.runCli({
+      argv: ["push", "--delete", "origin", "nosuch"],
+      cwd: "/repo",
+    });
+    expect(deleted).toMatchObject({
+      stdout: "",
+      stderr:
+        "error: unable to delete 'nosuch': remote ref does not exist\n" +
+        "error: failed to push some refs to 'origin'\n",
+      exitCode: 1,
+    });
+    expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(posts);
+
+    const full = await workspace.git.runCli({
+      argv: ["push", "--delete", "origin", "refs/heads/nosuch"],
+      cwd: "/repo",
+    });
+    expect(full).toMatchObject({ stdout: "", exitCode: 0 });
+    expect(full.stderr).not.toContain("unable to delete");
+
+    const leased = await workspace.git.runCli({
+      argv: ["push", "--delete", "--force-with-lease=nosuch", "origin", "nosuch"],
+      cwd: "/repo",
+    });
+    expect(leased.exitCode).toBe(128);
+    expect(leased.stderr).toContain("tracking ref not found for push lease");
+    expect(leased.stderr).not.toContain("unable to delete");
+  });
+
   it("uses binding auth and preserves binding cancellation without environment credentials", async () => {
     const fixture = remoteFixture();
     const server = await serverFor(fixture, { requireAuth: true });

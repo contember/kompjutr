@@ -11,6 +11,7 @@ import {
 import {
   requireBranchRef,
   validatePushOptions as validateReceivePushOptions,
+  ZERO_OID,
 } from "../../protocol/receive-pack.js";
 import {
   remoteUrlFor,
@@ -19,7 +20,7 @@ import {
 } from "../network/network.js";
 import type { NormalizedPushLease, PushRefspec, RefspecSourceRef } from "../refs/refspec.js";
 import type { Repository } from "../repository/repository.js";
-import type { LegacyPushSelection, PushOptions } from "./push-types.js";
+import type { JoinedPushUpdate, LegacyPushSelection, PushOptions } from "./push-types.js";
 
 const PUSH_OPTIONS = new OptionsSchema(
   {
@@ -75,9 +76,12 @@ function targetBranch(
   repo: Repository,
   localRef: string,
   remote: string,
-  requested: string | undefined,
+  options: LegacyPushSelection,
 ): string {
-  if (requested !== undefined) return fullBranchRef(requested);
+  if (options.remoteRef !== undefined) return fullBranchRef(options.remoteRef);
+  // Like `git push <remote> <branch>`, a named branch updates its namesake;
+  // only the implicit current-branch push follows the upstream.
+  if (options.ref !== undefined) return localRef;
   const branch = localRef.slice("refs/heads/".length);
   const upstreamRemote = repo.store.configGet(`branch.${branch}.remote`);
   const merge = repo.store.configGet(`branch.${branch}.merge`);
@@ -96,10 +100,24 @@ export function legacyRefspecs(
     options.delete === true && options.ref === undefined && options.remoteRef !== undefined
       ? fullBranchRef(options.remoteRef)
       : localBranch(repo, options.ref);
-  const destination = targetBranch(repo, localRef, remote, options.remoteRef);
+  const destination = targetBranch(repo, localRef, remote, options);
   return options.delete === true
     ? [{ source: null, destination }]
     : [{ source: localRef, destination, force: options.force === true }];
+}
+
+// Like `git push --delete`, a short branch name the remote lacks is refused
+// before POST; git sends a full `refs/` name and the remote only warns.
+export function requireLegacyDeletionTargets(
+  options: PushOptions,
+  updates: readonly JoinedPushUpdate[],
+): void {
+  if (options.refspecs !== undefined || options.delete !== true) return;
+  for (const update of updates) {
+    const name = options.remoteRef ?? options.ref ?? update.destination;
+    if (update.oldOid !== ZERO_OID || name.startsWith("refs/")) continue;
+    throw new GitError("EDELETEMISSING", `unable to delete '${name}': remote ref does not exist`);
+  }
 }
 
 function resolveRawLocalRef(name: string, refs: ReadonlyMap<string, string>): string | null {
