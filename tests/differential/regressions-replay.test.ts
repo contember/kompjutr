@@ -14,6 +14,43 @@ describe("differential regressions: cherry-pick and revert", () => {
     await expectAgreement(scenario);
   });
 
+  for (const leave of ["revertAbort", "revertSkip"] as const) {
+    it(`leaves a stop over a missing worktree file with ${leave}`, async () => {
+      const scenario: Scenario = {
+        start: "clone",
+        ops: [
+          { op: "remove", path: "dir/x.txt" },
+          { op: "revert", source: "HEAD^" },
+          { op: leave },
+        ],
+      };
+      await expectAgreement(scenario);
+    });
+  }
+
+  it("aborts a cherry-pick that stopped over a missing worktree file", async () => {
+    const scenario: Scenario = {
+      start: "init",
+      ops: [
+        { op: "write", path: "a.txt", content: { text: "a\n" } },
+        { op: "write", path: "b.txt", content: { text: "b\n" } },
+        { op: "addAll" },
+        { op: "commit", message: "base" },
+        { op: "checkoutNew", name: "topic" },
+        { op: "rm", paths: ["a.txt"] },
+        { op: "write", path: "b.txt", content: { text: "topic\n" } },
+        { op: "commit", message: "drop", all: true },
+        { op: "checkout", ref: "main" },
+        { op: "write", path: "b.txt", content: { text: "main\n" } },
+        { op: "commit", message: "edit", all: true },
+        { op: "remove", path: "a.txt" },
+        { op: "cherryPick", source: "topic" },
+        { op: "cherryPickAbort" },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+
   it("reverts a commit whose added file is missing from the worktree", async () => {
     const scenario: Scenario = {
       start: "init",
