@@ -940,8 +940,9 @@ Merge abort and cherry-pick or revert skip and abort run Git's
 `reset --merge` to HEAD over every path, not only the paths the operation
 touched. An index entry that matches HEAD keeps its worktree file, edited or
 deleted. Every other entry, whether the operation or the user staged it,
-returns to HEAD in the index and the worktree; a staged new file is removed,
-and a path the index lacks but HEAD has is written back. They fail with
+returns to HEAD in the index and the worktree, even when its file was already
+missing before the operation started; a staged new file is removed, and a path
+the index lacks but HEAD has is written back. They fail with
 `ECHECKOUTFAIL` and change nothing when such an entry's file is present and
 differs from the entry (`Entry '<path>' not uptodate`), or when an untracked
 file, including one `rm --cached` untracked, stands where HEAD's tree writes

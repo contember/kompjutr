@@ -3,10 +3,9 @@ import { fromHex, utf8Decoder } from "../../../common/bytes.js";
 import { CorruptError } from "../../../common/errors.js";
 import { joinPath } from "../../../common/paths.js";
 import { PACK_BLOB_BATCH_TARGET_BYTES } from "../../../store/index.js";
-import type { MergeTouchedPath } from "../../merge/merge-state.js";
 import type { Repository } from "../../repository/repository.js";
 import type { Worktree } from "../../worktree/worktree.js";
-import type { AdmittedBlobBatch } from "./apply-types.js";
+import type { AdmittedBlobBatch, RestoredFile } from "./apply-types.js";
 
 const OBJECT_INFO_PAGE = 4_096;
 
@@ -110,7 +109,7 @@ function readAdmittedBlobBatch<T>(
 export function restoreWorktreeFiles(
   repo: Repository,
   worktree: Worktree,
-  pending: readonly MergeTouchedPath[],
+  pending: readonly RestoredFile[],
   sizes: ReadonlyMap<string, number>,
 ): void {
   let offset = 0;
@@ -120,29 +119,24 @@ export function restoreWorktreeFiles(
       pending,
       offset,
       sizes,
-      (entry) =>
-        entry.worktree.kind === "file" || entry.worktree.kind === "symlink"
-          ? entry.worktree.oid
-          : "",
+      (entry) => entry.oid,
       "merge restore batch",
     );
     const writes: WriteEntry[] = [];
     for (let index = offset; index < batch.end; index++) {
       const entry = pending[index];
       if (entry === undefined) throw new CorruptError("merge restore selection is incomplete");
-      const snapshot = entry.worktree;
-      if (snapshot.kind !== "file" && snapshot.kind !== "symlink") continue;
-      const bytes = batch.blobs.get(snapshot.oid);
-      if (bytes === undefined) throw new CorruptError(`merge abort lost object ${snapshot.oid}`);
+      const bytes = batch.blobs.get(entry.oid);
+      if (bytes === undefined) throw new CorruptError(`merge abort lost object ${entry.oid}`);
       const path = joinPath(repo.root, entry.path);
       writes.push(
-        snapshot.kind === "symlink"
-          ? { path, target: utf8Decoder.decode(bytes), contentId: fromHex(snapshot.oid) }
+        entry.kind === "symlink"
+          ? { path, target: utf8Decoder.decode(bytes), contentId: fromHex(entry.oid) }
           : {
               path,
               bytes,
-              mode: snapshot.mode & 0o7777,
-              contentId: fromHex(snapshot.oid),
+              mode: entry.mode & 0o7777,
+              contentId: fromHex(entry.oid),
             },
       );
     }

@@ -16,6 +16,7 @@ import type { Worktree } from "../worktree/worktree.js";
 import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import { collectBlobSizes, restoreWorktreeFiles } from "./apply/apply-blobs.js";
 import { restoreIndex } from "./apply/apply-index.js";
+import type { RestoredFile } from "./apply/apply-types.js";
 
 /**
  * Git's `reset --merge` to the pre-operation HEAD, which merge abort and
@@ -65,8 +66,32 @@ function requireMergeResettable(repo: Repository, worktree: Worktree, tree: stri
   }
 }
 
+type RestoreTarget =
+  | { kind: "absent" }
+  | { kind: "directory"; mode: number }
+  | Omit<RestoredFile, "path">;
+
+/**
+ * What abort puts at a touched path. `reset --merge` writes a tracked primary
+ * path from HEAD's entry, whatever was on disk when the operation started;
+ * directories and moved-aside paths return to their journaled state.
+ */
+function restoreTarget(entry: MergeTouchedPath): RestoreTarget {
+  const index = entry.index;
+  if (
+    entry.purpose !== "primary" ||
+    index === null ||
+    index.mode === 0o160000 ||
+    entry.worktree.kind === "directory"
+  ) {
+    return entry.worktree;
+  }
+  return { kind: index.mode === 0o120000 ? "symlink" : "file", mode: index.mode, oid: index.oid };
+}
+
 interface RestoredTouchedPath {
   saved: MergeTouchedPath;
+  target: RestoreTarget;
   /** The index holds the saved entry again, or no entry where none was saved. */
   unchanged: boolean;
 }
@@ -84,6 +109,7 @@ function* restoredTouched(
     const current = row.right;
     yield {
       saved: row.left,
+      target: restoreTarget(row.left),
       unchanged:
         saved === null
           ? current === undefined
@@ -102,7 +128,7 @@ function restoreTouched(
   const absent = workspace.reservations(removals, "occupied");
   function* absentPaths() {
     for (const entry of touched)
-      if (entry.worktree.kind === "absent")
+      if (restoreTarget(entry).kind === "absent")
         yield {
           path: entry.path,
           logicalPath: entry.logicalPath,
@@ -129,17 +155,17 @@ function restoreTouched(
       // operation created never had one and still goes.
       const kept =
         row.left?.unchanged === true &&
-        !(row.left.saved.worktree.kind === "absent" && row.right?.stat.type === "dir");
-      const saved = kept ? undefined : row.left?.saved;
+        !(row.left.target.kind === "absent" && row.right?.stat.type === "dir");
+      const target = kept ? undefined : row.left?.target;
       if (destructive !== null && row.path !== destructive && !isNestedPath(destructive, row.path))
         destructive = null;
-      if (destructive === null && saved !== undefined && saved.worktree.kind !== "directory")
+      if (destructive === null && target !== undefined && target.kind !== "directory")
         destructive = row.path;
       if (
         row.right !== undefined &&
         destructive !== null &&
         row.path !== destructive &&
-        saved?.worktree.kind !== "absent" &&
+        target?.kind !== "absent" &&
         !absent.hasDescendant(row.path)
       ) {
         throw new GitError(
@@ -147,12 +173,12 @@ function restoreTouched(
           `working tree path blocks merge restoration: ${row.path}`,
         );
       }
-      if (saved === undefined) continue;
-      const kind = saved.worktree.kind;
+      // Only a present entry is removed; the user may already have deleted it.
       const current = row.right?.stat.type;
+      if (target === undefined || current === undefined) continue;
       if (
-        kind === "absent" ||
-        (kind === "directory" ? current !== undefined && current !== "dir" : current === "dir")
+        target.kind === "absent" ||
+        (target.kind === "directory" ? current !== "dir" : current === "dir")
       ) {
         removalCount++;
         yield {
@@ -175,27 +201,21 @@ function restoreTouched(
       { recursive: true },
     );
   function* directories(): Generator<WriteEntry> {
-    for (const entry of touched)
-      if (entry.worktree.kind === "directory")
-        yield { path: joinPath(repo.root, entry.path), mode: entry.worktree.mode & 0o7777 };
+    for (const entry of touched) {
+      const target = restoreTarget(entry);
+      if (target.kind === "directory")
+        yield { path: joinPath(repo.root, entry.path), mode: target.mode & 0o7777 };
+    }
   }
   for (const page of integrationPages(directories())) worktree.writeFiles(page);
   // The index is still unrestored here, so this agrees with the removal pass.
-  function* files(): Generator<MergeTouchedPath> {
-    for (const { saved, unchanged } of restoredTouched(repo, touched))
-      if (!unchanged && (saved.worktree.kind === "file" || saved.worktree.kind === "symlink"))
-        yield saved;
+  function* files(): Generator<RestoredFile> {
+    for (const { saved, target, unchanged } of restoredTouched(repo, touched))
+      if (!unchanged && (target.kind === "file" || target.kind === "symlink"))
+        yield { path: saved.path, ...target };
   }
   for (const page of integrationPages(files())) {
-    const sizes = collectBlobSizes(
-      repo,
-      page,
-      (entry) =>
-        entry.worktree.kind === "file" || entry.worktree.kind === "symlink"
-          ? entry.worktree.oid
-          : null,
-      "merge abort",
-    );
+    const sizes = collectBlobSizes(repo, page, (entry) => entry.oid, "merge abort");
     restoreWorktreeFiles(repo, worktree, page, sizes);
   }
   restoreIndex(repo, touched);

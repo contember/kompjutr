@@ -8,27 +8,31 @@ import { expectAgreement } from "../helpers/differential/run.js";
 const emptyPick: Op = { op: "cherryPick", source: "main" };
 const text = (value: string) => ({ text: value });
 
-/** A local `side` branch that adds `dir/y.txt` and, optionally, `dir/z.txt`. */
-function sideBranch(extra: boolean): Op[] {
+/**
+ * A local `side` commit adds `dir/y.txt` and makes `changes`; main then adds a
+ * different `dir/y.txt`, so merging or picking `side` conflicts there.
+ */
+function conflictingSide(changes: Op[] = []): Op[] {
   return [
     { op: "checkoutNew", name: "side" },
     { op: "write", path: "dir/y.txt", content: text("feature\n") },
-    ...(extra ? [{ op: "write", path: "dir/z.txt", content: text("z\n") } satisfies Op] : []),
+    ...changes,
     { op: "addAll" },
     { op: "commit", message: "side" },
     { op: "checkout", ref: "main" },
-  ];
-}
-
-/** `dir/y.txt` is added on both sides, so merging `side` conflicts. */
-function conflictingMerge(extra = false): Op[] {
-  return [
-    ...sideBranch(extra),
     { op: "write", path: "dir/y.txt", content: text("mine\n") },
     { op: "add", paths: ["dir/y.txt"] },
     { op: "commit", message: "mine" },
-    { op: "merge", theirs: "side", message: "merge side" },
   ];
+}
+
+const mergeSide: Op = { op: "merge", theirs: "side", message: "merge side" };
+const pickSide: Op = { op: "cherryPick", source: "side" };
+const addZ: Op = { op: "write", path: "dir/z.txt", content: text("z\n") };
+const changeX: Op = { op: "write", path: "dir/x.txt", content: text("changed\n") };
+
+function conflictingMerge(changes: Op[] = []): Op[] {
+  return [...conflictingSide(changes), mergeSide];
 }
 
 /** Rebase abort is `reset --hard` to the original head instead. */
@@ -202,9 +206,63 @@ describe("differential: abort and skip reset the index like reset --merge", () =
   it("keeps a file the merge added once rm --cached untracks it", async () => {
     await expectAgreement(
       clone([
-        ...conflictingMerge(true),
+        ...conflictingMerge([addZ]),
         { op: "rm", paths: ["dir/z.txt"], cached: true },
         { op: "mergeAbort" },
+      ]),
+    );
+  });
+
+  it("aborts a merge after the user removes a file it added", async () => {
+    await expectAgreement(
+      clone([
+        ...conflictingMerge([addZ]),
+        { op: "remove", path: "dir/z.txt" },
+        { op: "mergeAbort" },
+      ]),
+    );
+  });
+
+  it("skips a pick after the user removes a file it added", async () => {
+    await expectAgreement(
+      clone([
+        ...conflictingSide([addZ]),
+        pickSide,
+        { op: "remove", path: "dir/z.txt" },
+        { op: "cherryPickSkip" },
+      ]),
+    );
+  });
+
+  it("restores HEAD's file a merge changed after it went missing", async () => {
+    await expectAgreement(
+      clone([
+        ...conflictingSide([changeX]),
+        { op: "remove", path: "dir/x.txt" },
+        mergeSide,
+        { op: "mergeAbort" },
+      ]),
+    );
+  });
+
+  it("restores HEAD's file for a conflict path missing before the merge", async () => {
+    await expectAgreement(
+      clone([
+        ...conflictingSide(),
+        { op: "remove", path: "dir/y.txt" },
+        mergeSide,
+        { op: "mergeAbort" },
+      ]),
+    );
+  });
+
+  it("restores HEAD's file a pick changed after it went missing", async () => {
+    await expectAgreement(
+      clone([
+        ...conflictingSide([changeX]),
+        { op: "remove", path: "dir/x.txt" },
+        pickSide,
+        { op: "cherryPickAbort" },
       ]),
     );
   });
