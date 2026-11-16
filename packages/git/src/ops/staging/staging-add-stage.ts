@@ -2,7 +2,6 @@ import { GitError } from "../../common/errors.js";
 import { contentIdKey, type IndexEntry, type IndexSink } from "../../store/index.js";
 import { sharedRepoStoreMutations } from "../../store/repository/shared.js";
 import type { Repository } from "../repository/repository.js";
-import type { TargetEntry } from "../tree/tree-stream.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
 import {
   type CompiledPathspecMatcher,
@@ -26,7 +25,6 @@ export interface AddIndexSnapshot {
 
 export interface AddOperationLimits {
   worktreeRows: number;
-  headRows: number;
 }
 
 export interface StageCandidate {
@@ -77,19 +75,6 @@ export function* boundedAddWorktreeRows(
       throw new GitError("E2BIG", `add worktree scan exceeds ${ADD_MAX_ROWS_PER_STREAM} rows`);
     }
     limits.worktreeRows++;
-    yield entry;
-  }
-}
-
-export function* boundedAddHeadRows(
-  entries: Iterable<TargetEntry>,
-  limits: AddOperationLimits,
-): Generator<TargetEntry> {
-  for (const entry of entries) {
-    if (limits.headRows >= ADD_MAX_ROWS_PER_STREAM) {
-      throw new GitError("E2BIG", `add HEAD scan exceeds ${ADD_MAX_ROWS_PER_STREAM} rows`);
-    }
-    limits.headRows++;
     yield entry;
   }
 }

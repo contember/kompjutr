@@ -339,7 +339,7 @@ nothing; ordinary checkout and the local drive store NULL stat data.
 |---|---|---|
 | `<pathspec>...` | `paths` | ★ ~ exact path, directory prefix, or default globs; no `:(exclude)` magic |
 | `-A`, `--all` | `all` | ★ ✔ |
-| `-u`, `--update` | `trackedOnly` (with `all`) | ✔ this is the `commit -a` shape |
+| `-u`, `--update` | `trackedOnly` (with `all`) | ✔ stages modifications and deletions of every indexed path, staged-new ones included; the `commit -a` shape |
 | `-f`, `--force` | `force` | ★ ✔ stage an ignored path |
 | explicitly named ignored path without `--force` | default | ★ ~ succeeds without changing the index, matching isomorphic-git and the Computer contract; the Git CLI fails |
 | `-p`, `-i`, `-N`, `--renormalize` | — | ✘ |

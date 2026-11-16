@@ -2,14 +2,12 @@ import { hasErrorCode } from "../../common/errors.js";
 import type { SparseWorkspaceRow, SparseWorkspaceSource } from "../../store/core/contracts.js";
 import type { IndexEntry } from "../../store/index.js";
 import type { Repository } from "../repository/repository.js";
-import type { TargetEntry } from "../tree/tree-stream.js";
 import { hydrateSparseCandidates, sparseCandidatePaths } from "../worktree/sparse-candidates.js";
 import type { WorktreePath } from "../worktree/worktree-io.js";
 
 export interface TrackedAddSources {
   index: IndexEntry[];
   worktree: WorktreePath[];
-  head: TargetEntry[];
 }
 
 /**
@@ -33,7 +31,7 @@ export function trackedAddSources(
       currentTreeOid,
     );
     if (paths === null) return null;
-    if (paths.length === 0) return { index: [], worktree: [], head: [] };
+    if (paths.length === 0) return { index: [], worktree: [] };
     const rows = hydrateSparseCandidates(
       repo,
       source,
@@ -49,14 +47,11 @@ export function trackedAddSources(
 }
 
 function trackedRows(rows: readonly SparseWorkspaceRow[]): TrackedAddSources {
-  const sources: TrackedAddSources = { index: [], worktree: [], head: [] };
+  const sources: TrackedAddSources = { index: [], worktree: [] };
   for (const row of rows) {
     sources.index.push(...row.index);
     if (row.worktree !== null && row.worktree.type !== "dir") {
       sources.worktree.push({ path: row.path, stat: row.worktree });
-    }
-    if (row.current !== null) {
-      sources.head.push({ path: row.path, mode: row.current.mode, oid: row.current.oid });
     }
   }
   return sources;
