@@ -75,9 +75,12 @@ function targetBranch(
   repo: Repository,
   localRef: string,
   remote: string,
-  requested: string | undefined,
+  options: LegacyPushSelection,
 ): string {
-  if (requested !== undefined) return fullBranchRef(requested);
+  if (options.remoteRef !== undefined) return fullBranchRef(options.remoteRef);
+  // Like `git push <remote> <branch>`, a named branch updates its namesake;
+  // only the implicit current-branch push follows the upstream.
+  if (options.ref !== undefined) return localRef;
   const branch = localRef.slice("refs/heads/".length);
   const upstreamRemote = repo.store.configGet(`branch.${branch}.remote`);
   const merge = repo.store.configGet(`branch.${branch}.merge`);
@@ -96,7 +99,7 @@ export function legacyRefspecs(
     options.delete === true && options.ref === undefined && options.remoteRef !== undefined
       ? fullBranchRef(options.remoteRef)
       : localBranch(repo, options.ref);
-  const destination = targetBranch(repo, localRef, remote, options.remoteRef);
+  const destination = targetBranch(repo, localRef, remote, options);
   return options.delete === true
     ? [{ source: null, destination }]
     : [{ source: localRef, destination, force: options.force === true }];

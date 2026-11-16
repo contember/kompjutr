@@ -857,7 +857,7 @@ visible even if the integration afterwards refuses (`ESTALEHEAD`,
 
 | Git | kompjutr | |
 |---|---|---|
-| one legacy branch | `remote`, `ref`, `remoteRef` | ✔ translated through the structured operation |
+| one legacy branch | `remote`, `ref`, `remoteRef` | ✔ translated through the structured operation; a named `ref` updates the remote branch of the same name, an omitted `ref` pushes the current branch to its upstream |
 | `<src>:<dst>` mappings | `refspecs: [{ source, destination, force? }]` | ★ ✔ exact refs, one-star wildcards, full-OID sources, and custom namespaces |
 | explicit URL | `url` | ✔ also honours `remote.<n>.pushurl` |
 | `--force` | legacy `force`, or per-mapping `force` | ★ ✔ |
