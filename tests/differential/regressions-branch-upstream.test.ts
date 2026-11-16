@@ -68,4 +68,29 @@ describe("differential regressions: branch auto-upstream", () => {
     };
     await expectAgreement(scenario);
   });
+
+  it("drops the upstream of a deleted branch before its name is reused", async () => {
+    const scenario: Scenario = {
+      start: "clone",
+      ops: [
+        { op: "branch", name: "topic", startPoint: "origin/feature" },
+        { op: "branchDelete", name: "topic", force: true },
+        { op: "branch", name: "topic", startPoint: "main" },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+
+  it("renames onto the name of a deleted tracking branch", async () => {
+    const scenario: Scenario = {
+      start: "clone",
+      ops: [
+        { op: "branch", name: "topic", startPoint: "origin/feature" },
+        { op: "branchDelete", name: "topic", force: true },
+        { op: "branch", name: "other", startPoint: "main" },
+        { op: "branchRename", from: "other", to: "topic" },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
 });

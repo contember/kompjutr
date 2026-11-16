@@ -564,7 +564,7 @@ selection.
 |---|---|---|
 | `git branch <name> [<start>]` | `name`, `startPoint` | ★ ✔ start point peels annotated tags; a remote-tracking start point records `branch.<name>.remote`/`merge` in the same transaction, as Git's default `branch.autoSetupMerge=true` does |
 | `-f`, `--force` | `force` | ✔ typed API only; the strict argv runner rejects force-create/reset |
-| `-d` | `branchDelete({ name })` | ★ ✔ deletes only when the tip is provably reachable from the comparison commit; retains bounded recovery history |
+| `-d` | `branchDelete({ name })` | ★ ✔ deletes only when the tip is provably reachable from the comparison commit; removes the `branch.<name>.*` config section in the same transaction; retains bounded recovery history |
 | `-D` | `branchDelete({ name, force: true })` | ✔ bypasses only the reachability proof |
 | `-m <new>` / `-m <old> <new>` | `branchRename({ newName })` / `branchRename({ oldName, newName })` | ★ ✔ atomically moves the direct ref, selected symbolic `HEAD`, and bounded `branch.<name>.*` config |
 | `--list` | `branchList()` | ✔ names only |

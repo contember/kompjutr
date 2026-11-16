@@ -372,6 +372,28 @@ describe("branch", () => {
     expect(gitRawRefTarget("refs/heads/side")).toEqual({ kind: "absent" });
   });
 
+  it("removes exactly the deleted branch's config section, as git does", () => {
+    const config: [string, string][] = [
+      ["branch.side.remote", "origin"],
+      ["branch.side.merge", "refs/heads/side"],
+      ["branch.side.description", "kept nowhere"],
+      ["branch.side.x.remote", "nested"],
+      ["branch.sidecar.remote", "sibling"],
+    ];
+    for (const [path, value] of config) {
+      ws.repo.store.configSet(path, value);
+      fixture.git("config", path, value);
+    }
+
+    branchDelete(ws.context, ws.repo, { name: "side", force: true });
+    fixture.git("branch", "-D", "side");
+
+    for (const [path] of config) {
+      const native = runGit("config", "--get", path);
+      expect(ws.repo.store.configGet(path)).toBe(native.ok ? native.output.trim() : undefined);
+    }
+  });
+
   it("rolls back a branch-level stale delete interleaving", () => {
     branch(ws.context, ws.repo, { name: "raced", startPoint: "side" });
     const name = "refs/heads/raced";

@@ -213,6 +213,10 @@ export abstract class SharedRepoRefStore extends SharedRepoObjectStore {
     this.configTable().moveSection(sourcePrefix, destinationPrefix);
   }
 
+  protected configRemoveSectionOwned(prefix: string): void {
+    this.configTable().removeSection(prefix);
+  }
+
   cachedCommit(oid: string): CommitCacheEntry | null {
     return readCommitCache(this.db, this.repoId, oid);
   }

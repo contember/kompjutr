@@ -229,6 +229,7 @@ function branchDeleteOwned(
       { deletes: [full], expected: { name: full, target: tip } },
       operationRefLogMetadata(context, repo, "branch: delete"),
     );
+    sharedRepoStoreMutations(repo.store).configRemoveSectionOwned(branchConfigPrefix(full));
   });
 }
 
