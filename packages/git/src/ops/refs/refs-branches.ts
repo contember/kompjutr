@@ -8,7 +8,7 @@ import type { GitContext } from "../core/context.js";
 import { operationRefLogMetadata } from "../core/ref-log.js";
 import { selectMergeBases } from "../merge/merge-base.js";
 import { type Repository, resolveHeadOwned } from "../repository/repository.js";
-import { resolveBranchUpstream } from "./branch-upstream.js";
+import { resolveBranchUpstream, startPointUpstream } from "./branch-upstream.js";
 
 const HEADS = "refs/heads/";
 const TAGS = "refs/tags/";
@@ -35,8 +35,10 @@ function branchOwned(context: GitContext, repo: Repository, options: BranchOptio
   if (options.force !== true && exists) {
     throw new GitError("EBRANCHFAIL", `a branch named '${options.name}' already exists`);
   }
+  const startPoint = options.startPoint ?? "HEAD";
   // A branch names a commit, so an annotated tag start point is peeled.
-  const oid = repo.peel(repo.revParse(options.startPoint ?? "HEAD"));
+  const oid = repo.peel(repo.revParse(startPoint));
+  const upstream = startPointUpstream(repo, startPoint);
   repo.store.db.transactionSync(() => {
     const mutation =
       options.checkout === true
@@ -47,6 +49,11 @@ function branchOwned(context: GitContext, repo: Repository, options: BranchOptio
       mutation,
       operationRefLogMetadata(context, repo, exists ? "branch: reset" : "branch: create"),
     );
+    if (upstream !== undefined) {
+      const config = sharedRepoStoreMutations(repo.store);
+      config.configSetOwned(`branch.${options.name}.remote`, upstream.remote);
+      config.configSetOwned(`branch.${options.name}.merge`, upstream.merge);
+    }
   });
 }
 
