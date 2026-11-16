@@ -24,6 +24,7 @@ import type { Repository } from "../repository/repository.js";
 import { fileModeFor, type Worktree } from "../worktree/worktree.js";
 import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import { applyIndex } from "./apply/apply-index.js";
+import { EmptiedDirectories } from "./apply/apply-prune.js";
 import { snapshotWorktreeObjects, touchedFromDrafts } from "./apply/apply-snapshot.js";
 import type { ActiveRebaseApply, SnapshotDraft } from "./apply/apply-types.js";
 import { validateProjectedIndexEntries } from "./apply/apply-validation.js";
@@ -170,6 +171,7 @@ export function applyIntegrationOwned(
   else if (suspendedState !== null)
     throw new CorruptError("rebase apply supplied two journal transitions");
   const state = activeRebase?.conflictState ?? suspendedState;
+  const emptied = EmptiedDirectories.fromPlan(plan.entries);
   for (const page of integrationPages(snapshotDrafts(repo, worktree, plan, touched))) {
     const objects = state === null ? null : snapshotWorktreeObjects(repo, worktree, page);
     touched.save(touchedFromDrafts(page, objects));
@@ -184,7 +186,7 @@ export function applyIntegrationOwned(
         right: (entry) => entry.path,
       })) {
         const before = row.left;
-        if (before === undefined) continue;
+        if (before === undefined || before.worktree.kind === "absent") continue;
         const entry = row.right;
         const removeExact =
           entry !== undefined && (entry.worktree === null || before.worktree.kind === "directory");
@@ -222,6 +224,7 @@ export function applyIntegrationOwned(
       { recursive: true },
     );
   materialize(workspace, repo, worktree, plan);
+  emptied.prune(repo, worktree);
   applyIndex(repo.checkout, plan.entries, touched.shapes());
   if (state !== null) {
     if (activeRebase !== null) suspendRebaseOwned(repo.checkout, activeRebase.currentStep, touched);

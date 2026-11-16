@@ -365,7 +365,7 @@ describe("revert lifecycle", () => {
     );
   });
 
-  it("ends a conflict resolved back to HEAD as a terminal empty revert", async () => {
+  it("keeps a conflict resolved back to HEAD pending until changes are staged", async () => {
     const source = fixture();
     source.write("conflict.txt", "base\n");
     source.commit("base");
@@ -386,10 +386,20 @@ describe("revert lifecycle", () => {
       reason: "result",
     });
     expect(workspace.repo.head().oid).toBe(current);
+    expect(workspace.repo.checkout.readOperationState()).toMatchObject({ kind: "revert" });
+    expect(revertContinue(workspace.context, workspace.repo)).toEqual({
+      outcome: "empty",
+      reason: "result",
+    });
+
+    writeWorkFile(workspace, "/extra.txt", "extra\n");
+    add(workspace.repo, workspace.worktree, { paths: ["extra.txt"], excludeRoots: [] });
+    const result = revertContinue(workspace.context, workspace.repo);
+    if (result.outcome !== "committed") throw new Error(`unexpected ${result.outcome}`);
+    const commit = workspace.repo.readCommit(result.oid);
+    expect(commit.parent).toEqual([current]);
+    expect(commit.message).toBe(`Revert "source"\n\nThis reverts commit ${reverted}.\n`);
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
-    expect(() => revertContinue(workspace.context, workspace.repo)).toThrow(
-      expect.objectContaining({ code: "ENOREVERT" }),
-    );
   });
 
   it("restores owned paths on skip and abort after partial resolution", async () => {
