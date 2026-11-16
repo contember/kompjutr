@@ -260,11 +260,6 @@ export function continueReplay(
   return repo.store.db.transactionSync(() => {
     const journal = requireReplayJournal(repo, policy.kind);
     const head = requireOriginalHead(repo, journal.state);
-    if (journal.state.phase === "empty") {
-      const reason = journal.state.emptyReason;
-      if (reason === null) throw new GitError("ECORRUPT", "empty replay lost its reason");
-      return { outcome: "empty", reason };
-    }
     if (repo.checkout.hasConflicts()) {
       throw new GitError(
         "EUNMERGED",
@@ -272,13 +267,16 @@ export function continueReplay(
       );
     }
     requireBoundedIntegrationIndex(repo);
+    // Git commits whatever is staged by now; with nothing staged it stays
+    // stopped, for revert too, although a revert that starts empty does not.
     if (integrationIndexMatchesTree(repo, repo.readCommit(journal.state.originalHeadOid).tree)) {
-      const reason: ReplayEmptyReason = "result";
-      if (policy.suspendEmpty) {
-        markReplayEmptyOwned(repo.checkout, policy.kind, reason);
-      } else {
-        checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
+      if (journal.state.phase === "empty") {
+        const reason = journal.state.emptyReason;
+        if (reason === null) throw new GitError("ECORRUPT", "empty replay lost its reason");
+        return { outcome: "empty", reason };
       }
+      const reason: ReplayEmptyReason = "result";
+      markReplayEmptyOwned(repo.checkout, policy.kind, reason);
       return { outcome: "empty", reason };
     }
     const source = repo.readCommit(journal.state.sourceOid);

@@ -100,22 +100,6 @@ function differsOnlyOn(d: Divergence, allowed: Set<string>): boolean {
   return paths.length > 0 && paths.every((path) => allowed.has(path));
 }
 
-/** The last cherry-pick or revert before the op stopped with nothing to resolve. */
-function stoppedEmpty(d: Divergence): boolean {
-  for (let index = d.before.length - 1; index >= 0; index--) {
-    const op = d.before[index];
-    if (op?.op !== "cherryPick" && op?.op !== "revert") continue;
-    const stopped = d.history[index + 1];
-    return (
-      stopped !== undefined &&
-      stopped.operation !== null &&
-      !/^u /m.test(stopped.status) &&
-      stagedPaths(stopped.status).size === 0
-    );
-  }
-  return false;
-}
-
 /** Untracked paths in porcelain v2 `status`, a directory without its trailing slash. */
 function untrackedPaths(status: string): string[] {
   return status
@@ -147,19 +131,6 @@ function refusedOnlyForUntracked(d: Divergence): boolean {
 /** Before the op, an indexed path absent from HEAD had an unstaged change. */
 function hadAddedPathChanged(d: Divergence): boolean {
   return /^1 A[MDT]/m.test(d.prior.status);
-}
-
-/** The worktrees differ only by directories kompjutr left behind. */
-function onlyLeftoverDirectories(d: Divergence): boolean {
-  if (d.after === null) return false;
-  const files = (entries: DiskEntry[]): string =>
-    JSON.stringify(entries.filter((entry) => entry.type !== "dir"));
-  const kompjutr = new Set(d.after.kompjutr.worktree.map((entry) => entry.path));
-  return (
-    d.after.kompjutr.worktree.length > d.after.git.worktree.length &&
-    files(d.after.kompjutr.worktree) === files(d.after.git.worktree) &&
-    d.after.git.worktree.every((entry) => kompjutr.has(entry.path))
-  );
 }
 
 const INTEGRATIONS: Op["op"][] = ["merge", "pull", "cherryPick", "revert", "rebase"];
@@ -224,19 +195,6 @@ export const KNOWN: KnownDivergence[] = [
         d,
         /^(EOPACTIVE|EMERGEACTIVE):|^exit 128: .*(operation is already active|another operation is in progress|Committing is not possible because you have unmerged files)/s,
       ),
-  },
-  {
-    id: "replay-worktree",
-    reason:
-      "open: revert/cherry-pick trip on a missing worktree file, keep emptied directories, " +
-      "and mishandle continue after an empty stop",
-    fields: ["outcome", "worktree"],
-    matches: (d) =>
-      (opIs(d, "revert", "cherryPick", "revertContinue", "cherryPickContinue") &&
-        refused(d, /ENOENT/)) ||
-      (opIs(d, ...INTEGRATIONS, "revertContinue", "cherryPickContinue", "rebaseContinue") &&
-        onlyLeftoverDirectories(d)) ||
-      (opIs(d, "revertContinue", "cherryPickContinue") && d.field === "outcome" && stoppedEmpty(d)),
   },
   {
     id: "rebase-unrelated",

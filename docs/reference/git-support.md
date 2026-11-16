@@ -999,8 +999,11 @@ Same shape: one `source` per call, `mainline` for merge commits, `message` /
 
 `ReplayResult` is `committed`, `conflicted`, or `empty` with reason `source`
 (the source changed nothing) or `result` (the result equals the current tree).
-Cherry-pick suspends both empty outcomes for explicit cancellation, as Git
-does; revert completes an empty operation immediately.
+An empty start suspends a cherry-pick for explicit cancellation, as Git does;
+an empty revert start completes immediately and leaves no operation. A
+`…Continue()` whose index equals the current tree returns `empty` and keeps
+either operation pending, as Git does; once changes are staged, continue
+commits them with the operation's message and identities.
 
 ### `git rebase` — `rebase()` + `…Continue/Skip/Abort()`
 
