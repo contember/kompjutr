@@ -11,11 +11,7 @@ import { treeOf } from "../repository/reads.js";
 import { type Repository, resolveHeadOwned } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
-import {
-  type CompiledPathspecMatcher,
-  compilePathspecs,
-  requirePathspecsMatched,
-} from "../worktree/worktree-io.js";
+import { requirePathspecsMatched } from "../worktree/worktree-io.js";
 import { branch } from "./refs-branches.js";
 import { checkoutBlockers, describeBlockers } from "./refs-checkout-guard.js";
 
@@ -56,7 +52,7 @@ export interface CheckoutOptions {
   ref: string;
   /** Update only these paths, and leave HEAD where it is. */
   paths?: string[];
-  /** Overwrite local changes instead of refusing. */
+  /** Overwrite local changes instead of refusing. Path checkout always overwrites. */
   force?: boolean;
 }
 
@@ -94,16 +90,8 @@ function checkoutInternal(
     const tree = treeOf(repo, repo.peel(repo.revParse(options.ref)));
     // Git matches a path checkout's pathspecs against the source tree alone.
     requirePathspecsMatched(paths, [treeStream(repo, tree)]);
-    requireCheckoutAllowed(
-      repo,
-      worktree,
-      tree,
-      compilePathspecs(paths),
-      false,
-      options.force === true,
-      excludeRoots,
-    );
-    // Path checkout restores named targets without pruning absent ones.
+    // Path checkout overwrites local changes, as Git does, and restores named
+    // targets without pruning absent ones.
     checkoutTreeExcluding(repo, worktree, tree, excludeRoots, {
       paths,
       prune: false,
@@ -153,15 +141,7 @@ function checkoutLegacy(
   head: string,
   excludeRoots: readonly string[],
 ): void {
-  requireCheckoutAllowed(
-    repo,
-    worktree,
-    tree,
-    undefined,
-    true,
-    options.force === true,
-    excludeRoots,
-  );
+  requireCheckoutAllowed(repo, worktree, tree, options.force === true, excludeRoots);
   checkoutTreeExcluding(repo, worktree, tree, excludeRoots, {
     preserveMatchingIndex: options.force !== true,
     restoreStructure: true,
@@ -173,16 +153,13 @@ function requireCheckoutAllowed(
   repo: Repository,
   worktree: Worktree,
   tree: string | null,
-  paths: string[] | CompiledPathspecMatcher | undefined,
-  prune: boolean,
   force: boolean,
   excludeRoots: readonly string[],
 ): void {
   if (force) return;
   const blocked = checkoutBlockers(repo, worktree, {
     tree,
-    paths,
-    prune,
+    prune: true,
     excludeRoots: [...excludeRoots],
     mode: "checkout",
   });

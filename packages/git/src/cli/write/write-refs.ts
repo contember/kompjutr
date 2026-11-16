@@ -88,20 +88,26 @@ export function createGitCliRefWriteHandlers(context: GitContext): RefHandlers {
           options,
           () => {
             const exclusions = nestedRoots(context, repo.root);
+            // Without `--`, Git takes a lone operand as a revision only when it
+            // resolves; an explicit HEAD on an unborn branch does not. It is
+            // resolved once, before HEAD moves, so `HEAD~1` names one commit.
+            const target =
+              paths.length === 0 && command.ref !== undefined
+                ? repo.revParse(command.ref)
+                : command.ref;
             if (command.mode === "hard") {
               requireTransactionalWorktree(context, repo);
               reset(context, repo, context.worktree, {
                 hard: true,
-                ...(command.ref === undefined ? {} : { ref: command.ref }),
+                ...(target === undefined ? {} : { ref: target }),
                 excludeRoots: exclusions,
               });
               checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
             } else {
               repo.checkout.requireNoOperationState();
-              if (paths.length === 0 && command.ref !== undefined)
-                moveResetHead(context, repo, command.ref);
+              if (paths.length === 0 && target !== undefined) moveResetHead(context, repo, target);
               reset(context, repo, context.worktree, {
-                ...(command.ref === undefined ? {} : { ref: command.ref }),
+                ...(target === undefined ? {} : { ref: target }),
                 ...(paths.length === 0 ? {} : { paths: paths.map((path) => path.path) }),
               });
             }

@@ -122,4 +122,108 @@ describe("differential regressions: ref and pathspec edges", () => {
     };
     await expectAgreement(scenario);
   });
+
+  it("path checkout of the root overwrites staged changes", async () => {
+    await expectAgreement({
+      start: "clone",
+      ops: [
+        { op: "write", path: "dir/x.txt", content: { text: "x\n" } },
+        { op: "add", paths: ["dir/x.txt"] },
+        { op: "checkoutPaths", ref: "main", paths: ["."] },
+      ],
+    });
+  });
+
+  it("path checkout overwrites a staged and unstaged file", async () => {
+    await expectAgreement({
+      start: "clone",
+      ops: [
+        { op: "write", path: "README.md", content: { text: "x\n" } },
+        { op: "add", paths: ["README.md"] },
+        { op: "write", path: "README.md", content: { text: "y\n" } },
+        { op: "checkoutPaths", ref: "origin/main", paths: ["README.md"] },
+      ],
+    });
+  });
+
+  it("path checkout overwrites a file staged with add -A", async () => {
+    await expectAgreement({
+      start: "clone",
+      ops: [
+        { op: "write", path: "dir/x.txt", content: { text: "alpha\nbeta\ngamma 6\n" } },
+        { op: "addAll" },
+        { op: "checkoutPaths", ref: "main", paths: ["dir/x.txt"] },
+      ],
+    });
+  });
+
+  it("path checkout overwrites an untracked file in the way", async () => {
+    await expectAgreement({
+      start: "init",
+      ops: [
+        ...COMMITTED,
+        { op: "rm", paths: ["b.txt"], cached: true },
+        { op: "write", path: "b.txt", content: { text: "untracked\n" } },
+        { op: "checkoutPaths", ref: "main", paths: ["b.txt"] },
+      ],
+    });
+  });
+
+  it("path checkout replaces an untracked directory in the way", async () => {
+    await expectAgreement({
+      start: "init",
+      ops: [
+        ...COMMITTED,
+        { op: "rm", paths: ["b.txt"] },
+        { op: "commit", message: "d" },
+        { op: "write", path: "b.txt/z", content: { text: "untracked\n" } },
+        { op: "checkoutPaths", ref: "main~1", paths: ["b.txt"] },
+      ],
+    });
+  });
+
+  it("an explicit HEAD is not a revision on an unborn branch", async () => {
+    await expectAgreement({ start: "init", ops: [{ op: "reset", ref: "HEAD", hard: true }] });
+    await expectAgreement({ start: "init", ops: [{ op: "reset", ref: "HEAD" }] });
+  });
+
+  it("reset resolves a relative revision once, before HEAD moves", async () => {
+    await expectAgreement({
+      start: "clone",
+      ops: [
+        { op: "revert", source: "main" },
+        { op: "reset", ref: "HEAD~1" },
+      ],
+    });
+    await expectAgreement({
+      start: "clone",
+      ops: [
+        { op: "revert", source: "main" },
+        { op: "reset", ref: "HEAD^" },
+      ],
+    });
+    await expectAgreement({
+      start: "clone",
+      ops: [
+        { op: "revert", source: "main" },
+        { op: "reset", ref: "HEAD~1", hard: true },
+      ],
+    });
+  });
+
+  it("reset without a revision succeeds on an unborn branch", async () => {
+    await expectAgreement({
+      start: "init",
+      ops: [
+        { op: "write", path: "a.txt", content: { text: "a\n" } },
+        { op: "add", paths: ["a.txt"] },
+        { op: "reset", hard: true },
+        { op: "write", path: "a.txt", content: { text: "a\n" } },
+        { op: "add", paths: ["a.txt"] },
+        { op: "reset" },
+        { op: "add", paths: ["a.txt"] },
+        { op: "reset", ref: "HEAD", paths: ["a.txt"] },
+      ],
+    });
+  });
 });

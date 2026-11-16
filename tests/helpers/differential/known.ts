@@ -244,24 +244,6 @@ export const KNOWN: KnownDivergence[] = [
       (opIs(d, "revertContinue", "cherryPickContinue") && d.field === "outcome" && stoppedEmpty(d)),
   },
   {
-    id: "reset-unborn-head",
-    reason: "open: `reset HEAD` on an unborn branch succeeds where git cannot resolve HEAD",
-    fields: ["outcome"],
-    matches: (d) =>
-      d.op.op === "reset" &&
-      d.op.ref === "HEAD" &&
-      d.prior.head === null &&
-      d.field === "outcome" &&
-      d.outcomes.kompjutr.kind === "clean" &&
-      d.outcomes.git.kind === "failed",
-  },
-  {
-    id: "checkout-paths-staged",
-    reason: "open: path checkout refuses staged changes git overwrites",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "checkoutPaths") && refused(d, /would be overwritten by checkout/),
-  },
-  {
     id: "rebase-unrelated",
     reason: "intentional: rebase refuses unrelated histories (git-support.md, git rebase)",
     fields: ["outcome"],
@@ -281,13 +263,6 @@ export const KNOWN: KnownDivergence[] = [
     reason: "open: add and forced checkout leak ENOENT/ENOTDIR for a staged path missing on disk",
     fields: ["outcome"],
     matches: (d) => opIs(d, "add", "addAll", "checkout") && refused(d, /ENOENT|ENOTDIR/),
-  },
-  {
-    id: "reset-ref-resolved-twice",
-    reason: "open: argv reset resolves a relative ref again after moving HEAD",
-    fields: ["index", "status", "worktree"],
-    matches: (d) =>
-      d.op.op === "reset" && /[~^]/.test(d.op.ref ?? "") && d.fields.includes("index"),
   },
 ];
 
