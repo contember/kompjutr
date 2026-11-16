@@ -291,8 +291,11 @@ export function continueReplay(
     const result = commitIndex(
       repo,
       {
-        // git cleans the message of a pick concluded after a stop.
-        message: { mode: "clean", value: input.message ?? journal.state.message },
+        // git concludes a stopped pick through the editor, which also strips `#` lines.
+        message:
+          input.message === undefined
+            ? { mode: "strip", value: journal.state.message }
+            : { mode: "clean", value: input.message },
         parent: [journal.state.originalHeadOid],
         identities,
         expectedHead: head,

@@ -978,7 +978,7 @@ start remains available only through the typed API and pull orchestration.
 |---|---|---|
 | `git cherry-pick <commit>` | `source` | ~ **one commit per call**; no ranges, no lists |
 | `-m <parent>` | `mainline` | ✔ required for a merge commit |
-| message / committer override | `message`, `committer` | ~ kompjutr extension; author and message are inherited by default. As in Git, an uninterrupted pick keeps the inherited message verbatim from its first non-blank line, while a given message and a continued pick are whitespace-cleaned |
+| message / committer override | `message`, `committer` | ~ kompjutr extension; author and message are inherited by default. As in Git, an uninterrupted pick keeps the inherited message verbatim from its first non-blank line; a continued pick cleans it as Git's editor does (whitespace, and lines starting with `#` dropped); a given message gets the whitespace cleanup of `-m` |
 | `--continue` / `--skip` / `--abort` | `cherryPickContinue()` / `…Skip()` / `…Abort()` | ✔ |
 | `-n`, `-x`, `-e`, `-s` | — | ✘ |
 

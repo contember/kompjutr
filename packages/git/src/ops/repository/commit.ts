@@ -59,8 +59,14 @@ export interface UnpublishedCommitResult {
   tree: string;
 }
 
-/** `clean` stores the message as `git commit -m` does; `exact` stores it verbatim. */
-export type CommitMessage = { mode: "clean"; value: string } | { mode: "exact"; value: string };
+/**
+ * `clean` stores the message as `git commit -m` does, `strip` as an edited
+ * commit does (also without `#` lines), and `exact` verbatim.
+ */
+export interface CommitMessage {
+  mode: "clean" | "strip" | "exact";
+  value: string;
+}
 type PublishedCommitContext = Pick<GitContext, "commitTrees" | "indexTracker">;
 
 export function commit(
@@ -68,7 +74,7 @@ export function commit(
   repo: Repository,
   options: CommitOptions,
 ): CommitResult {
-  validatePublishedMessage(options.message);
+  const message = storedMessage({ mode: "clean", value: options.message });
   return repo.store.db.transactionSync(() => {
     if (repo.checkout.hasConflicts()) {
       throw new GitError("EUNMERGED", "cannot commit: the index has unmerged paths");
@@ -86,13 +92,7 @@ export function commit(
           ? EMPTY_TREE_OID
           : headTree;
     const identities = resolveIdentity(context, repo, options, amended);
-    const result = writeCommitObjects(
-      repo,
-      { parent, identities },
-      { mode: "clean", value: options.message },
-      context,
-      headTree,
-    );
+    const result = writeCommitObjects(repo, { parent, identities }, message, context, headTree);
     if (baselineTree !== undefined && options.allowEmpty !== true && result.tree === baselineTree) {
       throw new GitError(
         "EEMPTYCOMMIT",
@@ -119,14 +119,14 @@ export function commitIndex(
   options: IndexedCommitOptions,
   context?: PublishedCommitContext,
 ): CommitResult {
-  validatePublishedMessage(options.message.value);
+  const message = storedMessage(options.message);
   return repo.store.db.transactionSync(() => {
     const head = resolveHeadOwned(repo);
     if (head.ref !== options.expectedHead.ref || head.oid !== options.expectedHead.oid) {
       throw new GitError("ESTALEHEAD", "HEAD changed while the commit was being prepared");
     }
     const headTree = head.oid === null ? null : readCommitOwned(repo, head.oid).tree;
-    return publishCommit(repo, options, context, headTree);
+    return publishCommit(repo, options, message, context, headTree);
   });
 }
 
@@ -135,7 +135,7 @@ export function writeUnpublishedCommit(
   repo: Repository,
   options: UnpublishedCommitOptions,
 ): UnpublishedCommitResult {
-  return writeCommitObjects(repo, options, { mode: "exact", value: options.message });
+  return writeCommitObjects(repo, options, options.message);
 }
 
 /** Caller owns the transaction and has authenticated the explicit tree and parents. */
@@ -145,7 +145,7 @@ export function writeUnpublishedCommitFromTree(
   options: UnpublishedCommitOptions,
 ): string {
   return writeObjectsOwned(repo.store, (batch) =>
-    writeSerializedCommit(batch.write, options, { mode: "exact", value: options.message }, tree),
+    writeSerializedCommit(batch.write, options, options.message, tree),
   );
 }
 
@@ -153,7 +153,7 @@ export function writeUnpublishedCommitFromTree(
 function writeCommitObjects(
   repo: Repository,
   options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
-  message: CommitMessage,
+  message: string,
   context?: PublishedCommitContext,
   baselineTreeOid?: string | null,
 ): UnpublishedCommitResult {
@@ -179,7 +179,7 @@ function writeCommitObjects(
 function writeSerializedCommit(
   write: (type: "commit", data: Uint8Array) => string,
   options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
-  message: CommitMessage,
+  message: string,
   tree: string,
 ): string {
   return write("commit", serializedCommit(options, message, tree));
@@ -187,7 +187,7 @@ function writeSerializedCommit(
 
 function serializedCommit(
   options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
-  message: CommitMessage,
+  message: string,
   tree: string,
 ): Uint8Array {
   return serializeCommit({
@@ -195,7 +195,7 @@ function serializedCommit(
     parent: [...options.parent],
     author: options.identities.author,
     committer: options.identities.committer,
-    message: message.mode === "clean" ? cleanMessage(message.value) : message.value,
+    message,
   });
 }
 
@@ -226,10 +226,11 @@ function sparseTreePlan(
 function publishCommit(
   repo: Repository,
   options: IndexedCommitOptions,
+  message: string,
   context: PublishedCommitContext | undefined,
   baselineTreeOid: string | null,
 ): CommitResult {
-  const result = writeCommitObjects(repo, options, options.message, context, baselineTreeOid);
+  const result = writeCommitObjects(repo, options, message, context, baselineTreeOid);
   return publishCommitResult(
     repo,
     options.expectedHead,
@@ -258,10 +259,6 @@ function publishCommitResult(
   // A false result leaves the prior baseline mismatched, so sparse readers safely use full scans.
   context?.indexTracker?.advanceBaseline(repo.checkout.checkoutId, result.tree);
   return { oid: result.oid };
-}
-
-function validatePublishedMessage(message: string): void {
-  if (message.trim() === "") throw new GitError("EMSG", "commit message is required");
 }
 
 function readCommitOwned(repo: Repository, oid: string): Commit {
@@ -380,11 +377,24 @@ function stamp(context: GitContext): { timestamp: number; timezoneOffset: number
   };
 }
 
+/** The message as stored; one that is blank once cleaned is refused like git. */
+function storedMessage(message: CommitMessage): string {
+  const stored =
+    message.mode === "exact"
+      ? message.value
+      : cleanMessage(message.value, message.mode === "strip");
+  for (let index = 0; index < stored.length; index++) {
+    if (!isMessageWhitespace(stored.charCodeAt(index))) return stored;
+  }
+  throw new GitError("EMSG", "commit message is required");
+}
+
 /**
  * git's whitespace cleanup: trailing whitespace off every line, no leading or
  * trailing blank lines, inner blank runs collapsed to one, one LF per line.
+ * `strip` also drops lines that start with `#`, leaving no blank line behind.
  */
-function cleanMessage(message: string): string {
+function cleanMessage(message: string, strip: boolean): string {
   let cleaned = "";
   let blankPending = false;
   let start = 0;
@@ -393,9 +403,10 @@ function cleanMessage(message: string): string {
     const lineEnd = newline < 0 ? message.length : newline;
     let end = lineEnd;
     while (end > start && isMessageWhitespace(message.charCodeAt(end - 1))) end--;
+    const comment = strip && message.charCodeAt(start) === 0x23;
     if (end === start) {
       blankPending = cleaned !== "";
-    } else {
+    } else if (!comment) {
       if (blankPending) cleaned += "\n";
       cleaned += `${message.slice(start, end)}\n`;
       blankPending = false;
