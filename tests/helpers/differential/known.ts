@@ -72,20 +72,56 @@ function hadStagedChange(d: Divergence): boolean {
   return stagedPaths(d.prior.status).size > 0;
 }
 
-/** Every path whose index entry the two sides disagree on was staged before the op. */
-function indexDiffersOnlyOnStaged(d: Divergence): boolean {
-  if (d.after === null) return false;
+/** Unmerged paths in porcelain v2 `status`. */
+function unmergedPaths(status: string): Set<string> {
+  const paths = new Set<string>();
+  for (const line of status.split("\n")) {
+    const fields = line.split(" ");
+    if (fields[0] === "u") paths.add(unquote(fields.slice(10).join(" ")));
+  }
+  return paths;
+}
+
+/** Paths whose index entry or worktree file the two sides disagree on. */
+function differingPaths(d: Divergence): string[] {
+  if (d.after === null) return [];
+  const { kompjutr, git } = d.after;
+  const paths: string[] = [];
+  const indexPath = (entry: string): string => entry.slice(entry.indexOf("\t") + 1);
+  const leftIndex = new Set(kompjutr.index);
+  const rightIndex = new Set(git.index);
+  for (const entry of kompjutr.index) if (!rightIndex.has(entry)) paths.push(indexPath(entry));
+  for (const entry of git.index) if (!leftIndex.has(entry)) paths.push(indexPath(entry));
+  const files = (entries: DiskEntry[]): string[] =>
+    entries.filter((entry) => entry.type !== "dir").map((entry) => JSON.stringify(entry));
+  const leftFiles = new Set(files(kompjutr.worktree));
+  const rightFiles = new Set(files(git.worktree));
+  for (const entry of kompjutr.worktree.concat(git.worktree)) {
+    if (entry.type === "dir") continue;
+    const key = JSON.stringify(entry);
+    if (!leftFiles.has(key) || !rightFiles.has(key)) paths.push(entry.path);
+  }
+  return paths;
+}
+
+/** The sides disagree on some path, and only on paths in `allowed`. */
+function differsOnlyOn(d: Divergence, allowed: Set<string>): boolean {
+  const paths = differingPaths(d);
+  return paths.length > 0 && paths.every((path) => allowed.has(path));
+}
+
+/** Paths the user staged during the pending integration, not the integration itself. */
+function userStagedDuringIntegration(d: Divergence): Set<string> {
   const staged = stagedPaths(d.prior.status);
-  const kompjutr = new Set(d.after.kompjutr.index);
-  const git = new Set(d.after.git.index);
-  const differing = [
-    ...d.after.kompjutr.index.filter((entry) => !git.has(entry)),
-    ...d.after.git.index.filter((entry) => !kompjutr.has(entry)),
-  ];
-  return (
-    differing.length > 0 &&
-    differing.every((entry) => staged.has(entry.slice(entry.indexOf("\t") + 1)))
-  );
+  for (let index = d.before.length - 1; index >= 0; index--) {
+    const op = d.before[index];
+    if (op === undefined || !INTEGRATIONS.includes(op.op)) continue;
+    const stop = d.history[index + 1];
+    if (stop === undefined) return new Set();
+    const owned = new Set([...stagedPaths(stop.status), ...unmergedPaths(stop.status)]);
+    return new Set([...staged].filter((path) => !owned.has(path)));
+  }
+  return new Set();
 }
 
 /** The last cherry-pick or revert before the op stopped with nothing to resolve. */
@@ -187,7 +223,7 @@ export const KNOWN: KnownDivergence[] = [
     matches: (d) =>
       opIs(d, "checkout", "checkoutNew") &&
       ((hadStagedChange(d) && refused(d, /would be overwritten by checkout/)) ||
-        indexDiffersOnlyOnStaged(d)),
+        (d.fields.includes("index") && differsOnlyOn(d, stagedPaths(d.prior.status)))),
   },
   {
     id: "reset-unmatched-path",
@@ -207,7 +243,8 @@ export const KNOWN: KnownDivergence[] = [
     fields: ["index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "mergeAbort", "cherryPickAbort", "cherryPickSkip", "revertAbort", "revertSkip") &&
-      indexDiffersOnlyOnStaged(d),
+      d.fields.includes("index") &&
+      differsOnlyOn(d, userStagedDuringIntegration(d)),
   },
   {
     id: "add-update-index",
@@ -238,8 +275,13 @@ export const KNOWN: KnownDivergence[] = [
       (opIs(d, ...REFUSED_WHILE_PENDING) ||
         (d.op.op === "reset" && d.op.hard !== true) ||
         (d.op.op === "commit" && d.prior.operation !== "merge")) &&
-      // The typed API reports the code; the argv runner, git-style text.
-      refused(d, /EOPACTIVE|operation is already active|another operation is in progress/),
+      // A typed call fails with the code (EMERGEACTIVE for a pending merge);
+      // the argv runner, with git-style text, where commit's unmerged-index
+      // check can answer before the operation check does.
+      refused(
+        d,
+        /^(EOPACTIVE|EMERGEACTIVE):|^exit 128: .*(operation is already active|another operation is in progress|Committing is not possible because you have unmerged files)/s,
+      ),
   },
   {
     id: "branch-rename-edges",

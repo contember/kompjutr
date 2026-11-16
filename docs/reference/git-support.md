@@ -910,10 +910,10 @@ Two restrictions are deliberate:
 
 - **A pending integration owns the checkout.** Until it continues, skips, or
   aborts, every command that moves a ref, the checkout, or a remote fails with
-  `EOPACTIVE`: branch create, rename and delete, tag create and delete,
-  checkout, switch, restore, clean, mixed and path reset, fetch, pull, push,
-  starting a second merge, cherry-pick, revert or rebase, `updateRef()`, and
-  `recoverRef()`.
+  `EOPACTIVE` (`EMERGEACTIVE` while a merge is pending): branch create, rename
+  and delete, tag create and delete, checkout, switch, restore, clean, mixed
+  and path reset, fetch, pull, push, starting a second merge, cherry-pick,
+  revert or rebase, `updateRef()`, and `recoverRef()`.
   Staging (`add`, `rm`) stays available for resolution, a hard reset clears
   the operation, and `commit()` finalizes only a pending merge. Git runs most
   of these beside its sequencer state, refusing only some (a checkout or a
