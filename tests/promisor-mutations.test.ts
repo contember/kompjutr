@@ -4,6 +4,7 @@ import type { Git } from "../packages/git/src/client-types.js";
 import { GitError } from "../packages/git/src/common/errors.js";
 import { openRepository } from "../packages/git/src/ops/core/context.js";
 import { clone } from "../packages/git/src/ops/network/network.js";
+import { pull as pullCore } from "../packages/git/src/ops/network/pull.js";
 import type { Repository } from "../packages/git/src/ops/repository/repository.js";
 import { fetchHttpClient, type GitHttpClient } from "../packages/git/src/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
@@ -69,6 +70,7 @@ interface Harness extends Fixture {
   git: Git;
   offline: Git;
   posts(): number;
+  offlineRequests(): number;
 }
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -92,7 +94,9 @@ async function partialClone(): Promise<Harness> {
     timezoneOffset: workspace.context.timezoneOffset,
     defaultIdentity: IDENTITY,
   };
+  let offlineRequests = 0;
   const unreachable: GitHttpClient = async () => {
+    offlineRequests++;
     throw new GitError("EFETCHFAIL", "promisor remote is unreachable");
   };
   const repo = openRepository(workspace.context, "/work");
@@ -115,6 +119,7 @@ async function partialClone(): Promise<Harness> {
     git: createGit()({ ...binding, http: fetchHttpClient }),
     offline: createGit()({ ...binding, http: unreachable }),
     posts: () => server.requests.filter((request) => request.method === "POST").length,
+    offlineRequests: () => offlineRequests,
   };
 }
 
@@ -175,12 +180,77 @@ async function repositoryState(h: Harness) {
     head: await h.git.revParse({ dir: "/work", ref: "HEAD" }),
     branches: await h.git.branchList({ dir: "/work" }),
     reflog: reflogReasons(h),
-    operations: h.repo.store.db.all("SELECT * FROM git_operation_state"),
+    operations: [
+      h.repo.store.db.all("SELECT * FROM git_operation_state"),
+      h.repo.store.db.all("SELECT * FROM git_operation_steps"),
+      h.repo.store.db.all("SELECT * FROM git_operation_touched"),
+    ],
     status: await h.git.status({ dir: "/work" }),
     worktrees: await h.git.worktreeList({ dir: "/work" }),
     files,
     promised: promised(h.repo),
   };
+}
+
+/** Repository state minus what a published fetch legitimately changes. */
+function localOf(state: Awaited<ReturnType<typeof repositoryState>>) {
+  const { branches: _branches, reflog, ...local } = state;
+  return {
+    ...local,
+    reflog: reflog.filter((entry) => !entry.ref_name.startsWith("refs/remotes/")),
+  };
+}
+
+async function localState(h: Harness) {
+  return localOf(await repositoryState(h));
+}
+
+/** Rebase stack onto main: step one conflicts, step two reads the promised base notes. */
+async function stopRebaseWithResolvedConflict(h: Harness): Promise<void> {
+  await h.git.branch({ dir: "/work", name: "work", startPoint: "origin/stack" });
+  await h.git.checkout({ dir: "/work", ref: "work" });
+  const stopped = await h.git.rebase({ dir: "/work", upstream: "main", committer: IDENTITY });
+  expect(stopped).toMatchObject({ outcome: "conflicted", replayed: 0 });
+  expect(h.repo.store.promisedMissing([h.blobs.baseNotes])).toEqual([h.blobs.baseNotes]);
+  h.workspace.worktree.writeFile("/work/shared.txt", new TextEncoder().encode("AS\nb\nc\nd\ne\n"));
+  await h.git.add({ dir: "/work", paths: ["shared.txt"] });
+}
+
+/**
+ * A filtered fetch leaves fresh.txt promised on origin/main; origin then moves
+ * on, so the pull's own fetch omits that blob and its fast-forward must hydrate it.
+ */
+async function promisedUpstream(h: Harness): Promise<{ fresh: string; incoming: string }> {
+  h.fixture.write("fresh.txt", "fresh\n");
+  const filtered = h.fixture.commit("fresh");
+  await h.git.fetch({ dir: "/work", filter: "blob:none" });
+  const fresh = h.fixture.git("rev-parse", `${filtered}:fresh.txt`);
+  expect(h.repo.store.promisedMissing([fresh])).toEqual([fresh]);
+  h.fixture.write("later.txt", "later\n");
+  return { fresh, incoming: h.fixture.commit("later") };
+}
+
+/** Pull with requests after fetch publication, which only hydration makes, sent to `hydration`. */
+function pullThrough(h: Harness, hydration: GitHttpClient, signal?: AbortSignal) {
+  let published = false;
+  let hydrationRequests = 0;
+  const http: GitHttpClient = (request) => {
+    if (!published) return fetchHttpClient(request);
+    hydrationRequests++;
+    return hydration(request);
+  };
+  const pulling = pullCore(
+    { ...h.workspace.context, http },
+    h.repo,
+    h.workspace.worktree,
+    { committer: IDENTITY, author: IDENTITY, ...(signal === undefined ? {} : { signal }) },
+    {
+      afterFetch: () => {
+        published = true;
+      },
+    },
+  );
+  return { pulling, hydrationRequests: () => hydrationRequests };
 }
 
 describe("partial clone mutations hydrate promised blobs", () => {
@@ -240,17 +310,7 @@ describe("partial clone mutations hydrate promised blobs", () => {
 
   it("continues a rebase whose next step reads a promised base", async () => {
     const h = await partialClone();
-    await h.git.branch({ dir: "/work", name: "work", startPoint: "origin/stack" });
-    await h.git.checkout({ dir: "/work", ref: "work" });
-    const stopped = await h.git.rebase({ dir: "/work", upstream: "main", committer: IDENTITY });
-    expect(stopped).toMatchObject({ outcome: "conflicted", replayed: 0 });
-    expect(h.repo.store.promisedMissing([h.blobs.baseNotes])).toEqual([h.blobs.baseNotes]);
-
-    h.workspace.worktree.writeFile(
-      "/work/shared.txt",
-      new TextEncoder().encode("AS\nb\nc\nd\ne\n"),
-    );
-    await h.git.add({ dir: "/work", paths: ["shared.txt"] });
+    await stopRebaseWithResolvedConflict(h);
     const result = await h.git.rebaseContinue({ dir: "/work", committer: IDENTITY });
 
     expect(result).toMatchObject({ outcome: "completed", replayed: 2 });
@@ -293,16 +353,16 @@ describe("partial clone mutations hydrate promised blobs", () => {
     expectHydratedExactly(h, ["baseNotes", "old", "topicShared", "topicFile"]);
   });
 
-  it("pulls an upstream commit that restores a promised blob", async () => {
+  it("pulls an upstream whose tree holds a promised blob", async () => {
     const h = await partialClone();
-    h.fixture.write("old.txt", "old\n");
-    h.fixture.commit("restore old");
+    const { fresh, incoming } = await promisedUpstream(h);
+    const { pulling, hydrationRequests } = pullThrough(h, fetchHttpClient);
 
-    const result = await h.git.pull({ dir: "/work", committer: IDENTITY, author: IDENTITY });
-
-    expect(result).toMatchObject({ strategy: "merge", result: { fastForward: true } });
-    await expectCleanAt(h, "/work", h.fixture.git("rev-parse", "main^{tree}"));
-    expectHydratedExactly(h, ["old"]);
+    expect(await pulling).toMatchObject({ strategy: "merge", result: { fastForward: true } });
+    expect(hydrationRequests()).toBeGreaterThan(0);
+    await expectCleanAt(h, "/work", h.fixture.git("rev-parse", `${incoming}^{tree}`));
+    expect(h.repo.has(fresh)).toBe(true);
+    expectHydratedExactly(h, []);
   });
 });
 
@@ -349,5 +409,128 @@ describe("a failed hydration leaves the partial clone unchanged", () => {
 
     expect(await repositoryState(h)).toEqual(before);
     expect(h.workspace.worktree.stat("/topic")).toBeNull();
+  });
+
+  it("rolls back a worktree add that missed a promised blob inside its mutation", async () => {
+    const h = await partialClone();
+    const before = await repositoryState(h);
+
+    await expect(
+      h.offline.worktreeAdd({
+        dir: "/work",
+        root: "/topic",
+        target: { kind: "detached", startPoint: "origin/topic" },
+      }),
+    ).rejects.toMatchObject({ code: "EFETCHFAIL" });
+
+    expect(h.offlineRequests()).toBeGreaterThan(0);
+    expect(await repositoryState(h)).toEqual(before);
+    expect(h.workspace.worktree.stat("/topic")).toBeNull();
+    expect(h.workspace.database.findCheckout("/topic")).toBeNull();
+  });
+
+  it("rolls back a rebase", async () => {
+    const h = await partialClone();
+    const before = await repositoryState(h);
+
+    await expect(
+      h.offline.rebase({ dir: "/work", upstream: "origin/topic", committer: IDENTITY }),
+    ).rejects.toMatchObject({ code: "EFETCHFAIL" });
+
+    expect(await repositoryState(h)).toEqual(before);
+  });
+
+  it("keeps a resolved rebase stop when its continuation cannot hydrate", async () => {
+    const h = await partialClone();
+    await stopRebaseWithResolvedConflict(h);
+    const before = await repositoryState(h);
+
+    await expect(
+      h.offline.rebaseContinue({ dir: "/work", committer: IDENTITY }),
+    ).rejects.toMatchObject({ code: "EFETCHFAIL" });
+
+    expect(await repositoryState(h)).toEqual(before);
+    expect(before.operations[0]).toHaveLength(1);
+  });
+
+  it("rolls back a cherry-pick", async () => {
+    const h = await partialClone();
+    const before = await repositoryState(h);
+
+    await expect(
+      h.offline.cherryPick({ dir: "/work", source: "origin/topic", committer: IDENTITY }),
+    ).rejects.toMatchObject({ code: "EFETCHFAIL" });
+
+    expect(await repositoryState(h)).toEqual(before);
+  });
+
+  it("keeps fetched refs and integrates nothing when pull hydration fails", async () => {
+    const h = await partialClone();
+    const { incoming } = await promisedUpstream(h);
+    const before = await repositoryState(h);
+    const unreachable: GitHttpClient = async () => {
+      throw new GitError("EFETCHFAIL", "promisor remote is unreachable");
+    };
+    const { pulling, hydrationRequests } = pullThrough(h, unreachable);
+
+    await expect(pulling).rejects.toMatchObject({ code: "EFETCHFAIL" });
+    expect(hydrationRequests()).toBeGreaterThan(0);
+
+    expect(h.repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
+    expect(await localState(h)).toEqual(localOf(before));
+  });
+
+  it("cancels pull hydration after fetch publication without integrating", async () => {
+    const h = await partialClone();
+    const { incoming } = await promisedUpstream(h);
+    const before = await repositoryState(h);
+    const controller = new AbortController();
+    const abortOnHydration: GitHttpClient = (request) => {
+      controller.abort(new Error("cancel during hydration"));
+      return fetchHttpClient(request);
+    };
+    const { pulling, hydrationRequests } = pullThrough(h, abortOnHydration, controller.signal);
+
+    await expect(pulling).rejects.toMatchObject({ code: "EABORTED" });
+    expect(hydrationRequests()).toBeGreaterThan(0);
+
+    expect(h.repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
+    expect(await localState(h)).toEqual(localOf(before));
+  });
+});
+
+describe("worktree add checks its target before hydration", () => {
+  it("rejects a registered root without contacting the promisor", async () => {
+    const h = await partialClone();
+    await h.offline.worktreeAdd({ dir: "/work", root: "/taken", target: { kind: "detached" } });
+
+    await expect(
+      h.offline.worktreeAdd({
+        dir: "/work",
+        root: "/taken",
+        target: { kind: "detached", startPoint: "origin/topic" },
+      }),
+    ).rejects.toMatchObject({ code: "EWORKTREEEXISTS" });
+
+    expect(h.offlineRequests()).toBe(0);
+  });
+
+  it("rejects a branch attached elsewhere without contacting the promisor", async () => {
+    const h = await partialClone();
+    // Attach HEAD to a branch whose tree is promised, leaving the worktree alone.
+    await h.git.branch({ dir: "/work", name: "work", startPoint: "origin/topic", checkout: true });
+    const postsBefore = h.posts();
+
+    await expect(
+      h.offline.worktreeAdd({
+        dir: "/work",
+        root: "/other",
+        target: { kind: "existing-branch", name: "work" },
+      }),
+    ).rejects.toMatchObject({ code: "EBRANCHINUSE" });
+
+    expect(h.offlineRequests()).toBe(0);
+    expect(h.posts()).toBe(postsBefore);
+    expect(h.workspace.worktree.stat("/other")).toBeNull();
   });
 });
