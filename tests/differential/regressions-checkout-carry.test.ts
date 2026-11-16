@@ -94,6 +94,58 @@ describe("differential regressions: checkout carries staged changes", () => {
     await expectAgreement(scenario);
   });
 
+  it("forces a checkout over a staged new file missing from disk", async () => {
+    const scenario: Scenario = {
+      start: "clone",
+      ops: [
+        { op: "write", path: "x", content: { text: "x\n" } },
+        { op: "addAll" },
+        { op: "remove", path: "x" },
+        { op: "checkout", ref: "origin/feature", force: true },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+
+  it("forces a checkout over a nested staged file missing from disk", async () => {
+    const scenario: Scenario = {
+      start: "clone",
+      ops: [
+        { op: "branchRename", from: "main", to: "fix/one" },
+        { op: "write", path: "dir/sub/z.txt", content: { text: "x\n" } },
+        { op: "add", paths: ["dir/sub/z.txt"] },
+        { op: "remove", path: "dir/sub/z.txt" },
+        { op: "checkout", ref: "fix/one", force: true },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+
+  it("removes a tracked path already deleted from disk", async () => {
+    const scenario: Scenario = {
+      start: "clone",
+      ops: [
+        { op: "checkout", ref: "origin/feature" },
+        { op: "remove", path: "dir/y.txt" },
+        { op: "checkout", ref: "main" },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+
+  it("carries a staged new file missing from disk", async () => {
+    const scenario: Scenario = {
+      start: "clone",
+      ops: [
+        { op: "write", path: "x", content: { text: "x\n" } },
+        { op: "addAll" },
+        { op: "remove", path: "x" },
+        { op: "checkout", ref: "origin/feature" },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+
   it("refuses a staged deletion of a path the target changes", async () => {
     const scenario: Scenario = {
       start: "clone",

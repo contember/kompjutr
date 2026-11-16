@@ -109,7 +109,8 @@ export class CheckoutRemovalStream {
 
   #removeFiles(batch: string[] | undefined): void {
     if (batch === undefined) return;
-    this.#worktree.removeFiles(batch);
+    // A tracked file already deleted from disk is already where checkout wants it.
+    this.#worktree.removeFiles(batch, { force: true });
   }
 
   #flushIndex(): void {
