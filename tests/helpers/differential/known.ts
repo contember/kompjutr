@@ -158,11 +158,6 @@ function onlyLeftoverDirectories(d: Divergence): boolean {
   );
 }
 
-/** Git's stripspace changes this message: trailing blanks or blank edge lines. */
-function needsCleanup(message: string): boolean {
-  return /[ \t\r]\n|[ \t\r]$|\n\n$|^\n/.test(message);
-}
-
 const INTEGRATIONS: Op["op"][] = ["merge", "pull", "cherryPick", "revert", "rebase"];
 
 /** The mutations git-support.md lists as refused while an integration is pending. */
@@ -188,12 +183,6 @@ export const KNOWN: KnownDivergence[] = [
     reason: "open: `checkout -b` on an unborn branch fails to resolve HEAD",
     fields: ["outcome"],
     matches: (d) => opIs(d, "checkoutNew") && refused(d, /unknown revision: HEAD/),
-  },
-  {
-    id: "message-cleanup",
-    reason: "open: commit messages are stored without git's whitespace cleanup",
-    fields: ["refs", "head"],
-    matches: (d) => "message" in d.op && needsCleanup(d.op.message),
   },
   {
     id: "detached-integration",

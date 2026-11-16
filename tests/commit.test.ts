@@ -430,6 +430,7 @@ describe("explicit-parent commit seam", () => {
     );
     const published = commitIndex(repo.workspace.repo, {
       ...options,
+      message: { mode: "exact", value: options.message },
       expectedHead,
       refLogReason: "commit",
     });
@@ -448,7 +449,7 @@ describe("explicit-parent commit seam", () => {
     const head = repo.workspace.repo.head();
 
     const result = commitIndex(repo.workspace.repo, {
-      message: "merge",
+      message: { mode: "clean", value: "merge" },
       parent: [first, second],
       identities: resolveIdentity(repo.workspace.context, repo.workspace.repo, {}),
       expectedHead: head,
@@ -474,7 +475,7 @@ describe("explicit-parent commit seam", () => {
 
     expect(() =>
       commitIndex(repo.workspace.repo, {
-        message: "stale",
+        message: { mode: "clean", value: "stale" },
         parent: [first],
         identities: resolveIdentity(repo.workspace.context, repo.workspace.repo, {}),
         expectedHead,

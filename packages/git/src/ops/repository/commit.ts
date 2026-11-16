@@ -41,7 +41,7 @@ export interface CommitIdentities {
 }
 
 export interface IndexedCommitOptions {
-  message: string;
+  message: CommitMessage;
   parent: readonly string[];
   identities: CommitIdentities;
   expectedHead: ResolvedHead;
@@ -59,7 +59,8 @@ export interface UnpublishedCommitResult {
   tree: string;
 }
 
-type CommitMessage = { mode: "clean"; value: string } | { mode: "exact"; value: string };
+/** `clean` stores the message as `git commit -m` does; `exact` stores it verbatim. */
+export type CommitMessage = { mode: "clean"; value: string } | { mode: "exact"; value: string };
 type PublishedCommitContext = Pick<GitContext, "commitTrees" | "indexTracker">;
 
 export function commit(
@@ -81,11 +82,10 @@ export function commit(
     const baselineTree =
       amended !== undefined ? undefined : headTree === null ? EMPTY_TREE_OID : headTree;
     const identities = resolveIdentity(context, repo, options, amended);
-    const message = cleanPublishedMessage(options.message);
     const result = writeCommitObjects(
       repo,
       { parent, identities },
-      { mode: "exact", value: message },
+      { mode: "clean", value: options.message },
       context,
       headTree,
     );
@@ -110,7 +110,7 @@ export function commitIndex(
   options: IndexedCommitOptions,
   context?: PublishedCommitContext,
 ): CommitResult {
-  validatePublishedMessage(options.message);
+  validatePublishedMessage(options.message.value);
   return repo.store.db.transactionSync(() => {
     const head = resolveHeadOwned(repo);
     if (head.ref !== options.expectedHead.ref || head.oid !== options.expectedHead.oid) {
@@ -220,14 +220,7 @@ function publishCommit(
   context: PublishedCommitContext | undefined,
   baselineTreeOid: string | null,
 ): CommitResult {
-  const message = cleanPublishedMessage(options.message);
-  const result = writeCommitObjects(
-    repo,
-    options,
-    { mode: "exact", value: message },
-    context,
-    baselineTreeOid,
-  );
+  const result = writeCommitObjects(repo, options, options.message, context, baselineTreeOid);
   return publishCommitResult(
     repo,
     options.expectedHead,
@@ -260,10 +253,6 @@ function publishCommitResult(
 
 function validatePublishedMessage(message: string): void {
   if (message.trim() === "") throw new GitError("EMSG", "commit message is required");
-}
-
-function cleanPublishedMessage(message: string): string {
-  return cleanMessage(message);
 }
 
 function readCommitOwned(repo: Repository, oid: string): Commit {
@@ -371,7 +360,32 @@ function stamp(context: GitContext): { timestamp: number; timezoneOffset: number
   };
 }
 
-/** git's message cleanup: no CRs, no surrounding blank lines, exactly one trailing newline. */
+/**
+ * git's whitespace cleanup: trailing whitespace off every line, no leading or
+ * trailing blank lines, inner blank runs collapsed to one, one LF per line.
+ */
 function cleanMessage(message: string): string {
-  return `${message.replace(/\r/g, "").replace(/^\n+/, "").replace(/\n+$/, "")}\n`;
+  let cleaned = "";
+  let blankPending = false;
+  let start = 0;
+  while (start <= message.length) {
+    const newline = message.indexOf("\n", start);
+    const lineEnd = newline < 0 ? message.length : newline;
+    let end = lineEnd;
+    while (end > start && isMessageWhitespace(message.charCodeAt(end - 1))) end--;
+    if (end === start) {
+      blankPending = cleaned !== "";
+    } else {
+      if (blankPending) cleaned += "\n";
+      cleaned += `${message.slice(start, end)}\n`;
+      blankPending = false;
+    }
+    start = lineEnd + 1;
+  }
+  return cleaned;
+}
+
+/** Git's whitespace is space, tab, CR, and LF; `\v`, `\f`, and NBSP are content. */
+export function isMessageWhitespace(code: number): boolean {
+  return code === 0x20 || code === 0x09 || code === 0x0d || code === 0x0a;
 }

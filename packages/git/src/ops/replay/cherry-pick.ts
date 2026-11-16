@@ -3,7 +3,7 @@
 import type { GitContext, GitIdentity } from "../core/context.js";
 import { requireJournalIdentity } from "../core/journal-input.js";
 import type { ReplayResult } from "../core/kinds.js";
-import { resolveIdentity } from "../repository/commit.js";
+import { isMessageWhitespace, resolveIdentity } from "../repository/commit.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import {
@@ -29,11 +29,22 @@ export interface CherryPickContinueOptions {
   env?: Record<string, string>;
 }
 
+/** git copies a picked message from its first non-blank line on, verbatim. */
+function pickedMessage(message: string): string {
+  let start = 0;
+  let index = 0;
+  while (index < message.length && isMessageWhitespace(message.charCodeAt(index))) {
+    if (message.charCodeAt(index) === 0x0a) start = index + 1;
+    index++;
+  }
+  return index === message.length ? "" : message.slice(start);
+}
+
 const POLICY: ReplayPolicy = {
   kind: "cherry-pick",
   incomingLabelStyle: "source-subject",
   suspendEmpty: true,
-  defaultMessage: (plan) => plan.sourceCommit.message,
+  defaultMessage: (plan) => pickedMessage(plan.sourceCommit.message),
   resolveIdentities: (context, repo, source, input) => {
     const identities = resolveIdentity(
       context,

@@ -307,7 +307,7 @@ function mergeInTransaction(
     return commitIndex(
       repo,
       {
-        message: mergeMetadata.message,
+        message: { mode: "clean", value: mergeMetadata.message },
         parent: [head.oid, incomingOid],
         identities,
         expectedHead: head,
@@ -350,7 +350,7 @@ export function mergeContinue(
     const result = commitIndex(
       repo,
       {
-        message: options.message ?? journal.state.message,
+        message: { mode: "clean", value: options.message ?? journal.state.message },
         parent: [journal.state.currentParentOid, journal.state.incomingParentOid],
         identities,
         expectedHead: head,

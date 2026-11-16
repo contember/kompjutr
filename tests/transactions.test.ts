@@ -73,7 +73,7 @@ describe("commit transactions", () => {
 
     expect(() =>
       commitIndex(repo, {
-        message: "must roll back",
+        message: { mode: "clean", value: "must roll back" },
         parent: [],
         identities: {
           author: {

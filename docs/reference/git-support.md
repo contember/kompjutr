@@ -459,7 +459,7 @@ returns the complete add/delete output.
 
 | Git | kompjutr | |
 |---|---|---|
-| `-m <msg>` | `message` | ★ ~ **required**; an empty message throws `EMSG` |
+| `-m <msg>` | `message` | ★ ~ **required**; an empty message throws `EMSG`; stored after Git's whitespace cleanup, as are merge messages |
 | `--amend` | `amend` | ✔ |
 | `--author` | `author` | ✔ |
 | committer override | `committer` | ✔ |
@@ -975,7 +975,7 @@ start remains available only through the typed API and pull orchestration.
 |---|---|---|
 | `git cherry-pick <commit>` | `source` | ~ **one commit per call**; no ranges, no lists |
 | `-m <parent>` | `mainline` | ✔ required for a merge commit |
-| message / committer override | `message`, `committer` | ~ kompjutr extension; author and message are inherited by default |
+| message / committer override | `message`, `committer` | ~ kompjutr extension; author and message are inherited by default. As in Git, an uninterrupted pick keeps the inherited message verbatim from its first non-blank line, while a given message and a continued pick are whitespace-cleaned |
 | `--continue` / `--skip` / `--abort` | `cherryPickContinue()` / `…Skip()` / `…Abort()` | ✔ |
 | `-n`, `-x`, `-e`, `-s` | — | ✘ |
 
