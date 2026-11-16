@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const MAX_CHECKOUTS_PER_REPOSITORY = 1_024;
 export const MAX_INDEX_PATH_BYTES = 8 * 1_024;
 export const MAX_SCRATCH_INDEXES_PER_REPOSITORY = 16;
