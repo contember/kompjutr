@@ -2,7 +2,7 @@ import { GitError } from "../../common/errors.js";
 import { comparePaths, joinSorted } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { contentIdKey, type IndexEntry, indexScanOwned } from "../../store/index.js";
-import { matchesPaths, stageZero, type TargetEntry } from "../checkout/checkout.js";
+import { matchesPaths, type TargetEntry } from "../checkout/checkout.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
@@ -55,8 +55,12 @@ export interface CheckoutGuard {
   prune: boolean;
   limits?: CheckoutBlockerLimits;
   excludeRoots?: string[];
-  /** `hard-reset` intentionally discards tracked edits, as a sequencer reset does. */
-  mode: "checkout" | "hard-reset";
+  /**
+   * `hard-reset` intentionally discards tracked edits, as a sequencer reset does.
+   * `merge` is Git's one-way `reset --merge`: a changed index entry needs a
+   * worktree file that matches it or is gone, and unmerged paths reset regardless.
+   */
+  mode: "checkout" | "merge" | "hard-reset";
 }
 
 /**
@@ -77,6 +81,7 @@ export function checkoutBlockers(
   const { tree, paths, prune, limits } = guard;
   const excludeRoots = guard.excludeRoots ?? [];
   const discardTrackedChanges = guard.mode === "hard-reset";
+  const resetMerge = guard.mode === "merge";
   const tracked = new BlockerList();
   const untracked = new BlockerList();
   const dirtyCandidates: GuardCandidate[] = [];
@@ -103,11 +108,8 @@ export function checkoutBlockers(
     expireRanges(pendingTargets, row.path);
     expireRanges(pendingTrackedPaths, row.path);
     expireRanges(untrackedAncestors, row.path);
-    if (
-      row.worktree !== undefined &&
-      row.index === undefined &&
-      (!discardTrackedChanges || row.head === undefined)
-    ) {
+    // A path with conflict stages is tracked; Git protects only paths the index lacks.
+    if (row.worktree !== undefined && row.index === undefined && !row.unmerged) {
       for (let index = pendingTargets.length - 1; index >= 0; index--) {
         const pending = pendingTargets[index]!;
         if (!row.path.startsWith(`${pending.path}/`)) continue;
@@ -141,7 +143,7 @@ export function checkoutBlockers(
       // Only the checkout that prunes would remove this path.
       if (!prune || existing === undefined) continue;
     } else if (existing === undefined) {
-      if (discardTrackedChanges && row.head !== undefined) {
+      if (row.unmerged) {
         if (row.worktree === undefined) retainRange(pendingTrackedPaths, row.path);
         continue;
       }
@@ -175,7 +177,7 @@ export function checkoutBlockers(
       }
       continue;
     }
-    if (changesIndex && differsFromHead(existing, row.head)) {
+    if (changesIndex && !resetMerge && differsFromHead(existing, row.head)) {
       retainBlocker(tracked, row.path);
       continue;
     }
@@ -228,7 +230,30 @@ interface CheckoutGuardRow {
   target: TargetEntry | undefined;
   head: TargetEntry | undefined;
   index: IndexEntry | undefined;
+  /** The index holds conflict stages for this path. */
+  unmerged: boolean;
   worktree: WorktreePath | undefined;
+}
+
+interface GuardIndexRow {
+  path: string;
+  stageZero: IndexEntry | undefined;
+  unmerged: boolean;
+}
+
+/** One row per indexed path: its stage-0 entry and whether conflict stages exist. */
+function* guardIndexRows(entries: Iterable<IndexEntry>): Generator<GuardIndexRow> {
+  let pending: GuardIndexRow | undefined;
+  for (const entry of entries) {
+    if (pending !== undefined && pending.path !== entry.path) {
+      yield pending;
+      pending = undefined;
+    }
+    pending ??= { path: entry.path, stageZero: undefined, unmerged: false };
+    if (entry.stage === 0) pending.stageZero = entry;
+    else pending.unmerged = true;
+  }
+  if (pending !== undefined) yield pending;
 }
 
 function* checkoutGuardRows(
@@ -243,7 +268,7 @@ function* checkoutGuardRows(
     right: (entry) => entry.path,
   });
   const current = joinSorted(
-    stageZero(indexScanOwned(repo.checkout)),
+    guardIndexRows(indexScanOwned(repo.checkout)),
     walkWorktreeEntriesStream(worktree, repo.root, { excludeRoots }),
     { left: (entry) => entry.path, right: (entry) => entry.path },
   );
@@ -259,7 +284,8 @@ function* checkoutGuardRows(
       path: row.path,
       target,
       head,
-      index,
+      index: index?.stageZero,
+      unmerged: index?.unmerged === true,
       worktree: worktreeEntry,
     };
   }

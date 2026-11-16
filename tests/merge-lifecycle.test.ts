@@ -1013,7 +1013,7 @@ describe("merge lifecycle", () => {
     expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
-  it("restores an originally missing tracked conflict path on abort", async () => {
+  it("writes HEAD's file for a conflict path missing before the merge, as git does", async () => {
     const history = conflictingDivergence();
     const workspace = await clonedFrom(history.fixture);
     workspace.worktree.unlink("/conflict.txt");
@@ -1030,7 +1030,7 @@ describe("merge lifecycle", () => {
 
     mergeAbort(workspace.repo, workspace.worktree);
 
-    expect(textAt(workspace, "conflict.txt")).toBeNull();
+    expect(textAt(workspace, "conflict.txt")).toBe("current\n");
     expect(workspace.repo.checkout.indexGet("conflict.txt")).toEqual(originalIndex);
     expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });

@@ -27,7 +27,7 @@ import {
   type RevertJournal,
 } from "../core/operation-state.js";
 import { applyIntegrationOwned } from "../integration/integration-apply-owned.js";
-import { restoreIntegrationOwned } from "../integration/integration-restore-owned.js";
+import { resetIntegrationOwned } from "../integration/integration-restore-owned.js";
 import { projectIntegrationStepOwned } from "../integration/integration-step.js";
 import {
   integrationIndexMatchesTree,
@@ -313,9 +313,12 @@ export function cancelReplay(repo: Repository, worktree: Worktree, kind: ReplayK
   withIntegrationWorkspaceOwned(repo.store, (workspace) => {
     const journal = requireReplayJournal(repo, kind);
     requireOriginalHead(repo, journal.state);
-    if (journal.state.phase !== "empty" && journal.touched.length > 0) {
-      restoreIntegrationOwned(workspace, repo, worktree, journal.touched);
-    }
+    resetIntegrationOwned(
+      workspace,
+      repo,
+      worktree,
+      journal.state.phase === "empty" ? null : journal.touched,
+    );
     checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
   });
 }

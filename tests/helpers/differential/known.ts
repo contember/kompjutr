@@ -72,16 +72,6 @@ function hadStagedChange(d: Divergence): boolean {
   return stagedPaths(d.prior.status).size > 0;
 }
 
-/** Unmerged paths in porcelain v2 `status`. */
-function unmergedPaths(status: string): Set<string> {
-  const paths = new Set<string>();
-  for (const line of status.split("\n")) {
-    const fields = line.split(" ");
-    if (fields[0] === "u") paths.add(unquote(fields.slice(10).join(" ")));
-  }
-  return paths;
-}
-
 /** Paths whose index entry or worktree file the two sides disagree on. */
 function differingPaths(d: Divergence): string[] {
   if (d.after === null) return [];
@@ -108,20 +98,6 @@ function differingPaths(d: Divergence): string[] {
 function differsOnlyOn(d: Divergence, allowed: Set<string>): boolean {
   const paths = differingPaths(d);
   return paths.length > 0 && paths.every((path) => allowed.has(path));
-}
-
-/** Paths the user staged during the pending integration, not the integration itself. */
-function userStagedDuringIntegration(d: Divergence): Set<string> {
-  const staged = stagedPaths(d.prior.status);
-  for (let index = d.before.length - 1; index >= 0; index--) {
-    const op = d.before[index];
-    if (op === undefined || !INTEGRATIONS.includes(op.op)) continue;
-    const stop = d.history[index + 1];
-    if (stop === undefined) return new Set();
-    const owned = new Set([...stagedPaths(stop.status), ...unmergedPaths(stop.status)]);
-    return new Set([...staged].filter((path) => !owned.has(path)));
-  }
-  return new Set();
 }
 
 /** The last cherry-pick or revert before the op stopped with nothing to resolve. */
@@ -222,15 +198,6 @@ export const KNOWN: KnownDivergence[] = [
         (d.fields.includes("index") && differsOnlyOn(d, stagedPaths(d.prior.status)))),
   },
   {
-    id: "abort-resets-index",
-    reason: "open: cherry-pick/revert/merge abort leaves staged changes git's reset --merge drops",
-    fields: ["index", "status", "worktree"],
-    matches: (d) =>
-      opIs(d, "mergeAbort", "cherryPickAbort", "cherryPickSkip", "revertAbort", "revertSkip") &&
-      d.fields.includes("index") &&
-      differsOnlyOn(d, userStagedDuringIntegration(d)),
-  },
-  {
     id: "add-update-index",
     reason: "open: `add -u` stages only paths in HEAD, git stages every indexed path",
     fields: ["outcome", "refs", "head", "index", "status"],
@@ -285,15 +252,6 @@ export const KNOWN: KnownDivergence[] = [
     fields: ["outcome"],
     matches: (d) =>
       opIs(d, "checkoutPaths") && d.outcomes.git.kind === "clean" && refusedOnlyForUntracked(d),
-  },
-  {
-    id: "abort-refuses-unmerged-entry",
-    reason: "open: abort proceeds where git's reset --merge refuses an entry that is not uptodate",
-    fields: ["outcome"],
-    matches: (d) =>
-      opIs(d, "mergeAbort", "cherryPickAbort", "revertAbort") &&
-      d.field === "outcome" &&
-      /not uptodate/.test(d.outcomes.git.detail ?? ""),
   },
   {
     id: "missing-worktree-path",

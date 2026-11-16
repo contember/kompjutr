@@ -281,10 +281,7 @@ describe("trusted ordinary read policy", () => {
       scopedSource(merge, "export function mergeContinue("),
       scopedSource(replay, "export function continueReplay("),
       scopedSource(rebase, "export function rebaseContinue("),
-      scopedSource(
-        "packages/git/src/ops/integration/integration-restore-owned.ts",
-        "export function restoreIntegrationOwned(",
-      ),
+      scopedSource("packages/git/src/ops/integration/integration-restore-owned.ts", "import"),
     ];
     for (const scope of scopes) expect(journalReaderViolations(scope)).toEqual([]);
 
