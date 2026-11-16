@@ -12,7 +12,7 @@ import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata, type RefLogReason } from "../core/ref-log.js";
 import { applyIntegrationOwned } from "../integration/integration-apply-owned.js";
 import { planIntegrationOwned } from "../integration/integration-plan-owned.js";
-import { restoreIntegrationOwned } from "../integration/integration-restore-owned.js";
+import { resetIntegrationOwned } from "../integration/integration-restore-owned.js";
 import { projectIntegrationStepOwned } from "../integration/integration-step.js";
 import {
   requireBoundedIntegrationIndex,
@@ -363,14 +363,14 @@ export function mergeContinue(
   });
 }
 
-/** Restore only paths owned by the active merge and clear its durable state. */
+/** Reset the checkout to HEAD as `git reset --merge` does and clear the merge's durable state. */
 export function mergeAbort(repo: Repository, worktree: Worktree): void {
   requireSharedMutationScope(repo.store.db, worktree);
   repo.store.db.transactionSync(() => {
     const journal = requireMergeJournalOwned(repo);
     requireOriginalHead(repo, journal.state);
     withIntegrationWorkspaceOwned(repo.store, (workspace) => {
-      restoreIntegrationOwned(workspace, repo, worktree, journal.touched);
+      resetIntegrationOwned(workspace, repo, worktree, journal.touched);
       checkoutStoreMutations(repo.checkout).clearMergeStateOwned();
     });
   });

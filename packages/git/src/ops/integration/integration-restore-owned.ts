@@ -1,73 +1,103 @@
 import type { WriteEntry } from "@kompjutr/drive";
 import { GitError } from "../../common/errors.js";
 import { isNestedPath, joinPath } from "../../common/paths.js";
-import { joinSorted, joinSorted3 } from "../../common/streams.js";
+import { joinSorted } from "../../common/streams.js";
 import { indexScanOwned } from "../../store/index.js";
 import type { ProjectedMergeEntry } from "../../store/operations/integration-workspace/descriptors.js";
 import { integrationPages } from "../../store/operations/integration-workspace/storage.js";
 import type { IntegrationWorkspace } from "../../store/operations/integration-workspace/workspace.js";
 import type { OperationTouchedSource } from "../../store/operations/operation-journal-types.js";
 import type { MergeTouchedPath } from "../../store/operations/operations.js";
+import { checkoutTree } from "../checkout/checkout.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
+import { checkoutBlockers } from "../refs/refs.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
-import { dirtyPathStream } from "../worktree/worktree-io-dirty.js";
 import { collectBlobSizes, restoreWorktreeFiles } from "./apply/apply-blobs.js";
 import { restoreIndex } from "./apply/apply-index.js";
 
-interface GuardedTouchedPath {
-  saved: MergeTouchedPath;
-  indexed: boolean;
-  dirty: boolean;
-}
-
-/** Each touched path with whether the index still holds it and whether its stage-0 entry is dirty. */
-function* guardedTouched(
+/**
+ * Git's `reset --merge` to the pre-operation HEAD, which merge abort and
+ * cherry-pick or revert skip and abort run. Every path is checked before
+ * anything is written. Operation-owned paths return to their journaled state,
+ * then every other index entry and its file follow HEAD's tree; an entry that
+ * already matches keeps its worktree file. `touched` is null when nothing was applied.
+ */
+export function resetIntegrationOwned(
+  workspace: IntegrationWorkspace,
   repo: Repository,
   worktree: Worktree,
-  touched: OperationTouchedSource,
-): Generator<GuardedTouchedPath> {
-  for (const row of joinSorted3(
-    touched,
-    indexScanOwned(repo.checkout),
-    dirtyPathStream(repo, worktree),
-    { a: (entry) => entry.path, b: (entry) => entry.path, c: (path) => path },
-  )) {
-    if (row.a === undefined) continue;
-    yield { saved: row.a, indexed: row.b !== undefined, dirty: row.c !== undefined };
-  }
+  touched: OperationTouchedSource | null,
+): void {
+  requireSharedMutationScope(repo.store.db, worktree);
+  const tree = repo.headTree();
+  requireMergeResettable(repo, worktree, tree);
+  if (touched !== null && touched.length > 0) restoreTouched(workspace, repo, worktree, touched);
+  checkoutTree(repo, worktree, tree, {
+    prune: true,
+    preserveMatchingIndex: true,
+    restoreStructure: true,
+  });
 }
 
 /**
- * Mirrors Git's `reset --merge`: a present path whose stage-0 entry differs
- * from the worktree, or an untracked file the restore would overwrite, stops
- * the abort before anything is written. Unmerged paths are reset regardless.
+ * A changed index entry whose worktree file differs from it, or an untracked
+ * file where HEAD's tree writes one, stops the reset as it stops Git's.
  */
-function requireRestorable(guarded: GuardedTouchedPath, currentIsDirectory: boolean): void {
-  const { saved } = guarded;
-  if (guarded.dirty) {
-    throw new GitError("ECHECKOUTFAIL", `Entry '${saved.path}' not uptodate. Cannot merge.`);
+function requireMergeResettable(repo: Repository, worktree: Worktree, tree: string | null): void {
+  const blockers = checkoutBlockers(repo, worktree, {
+    baselineTree: tree,
+    tree,
+    prune: true,
+    mode: "merge",
+  });
+  const tracked = blockers.tracked[0];
+  if (tracked !== undefined) {
+    throw new GitError("ECHECKOUTFAIL", `Entry '${tracked}' not uptodate. Cannot merge.`);
   }
-  if (
-    !guarded.indexed &&
-    !currentIsDirectory &&
-    (saved.worktree.kind === "file" || saved.worktree.kind === "symlink")
-  ) {
+  const untracked = blockers.untracked[0];
+  if (untracked !== undefined) {
     throw new GitError(
       "ECHECKOUTFAIL",
-      `Untracked working tree file '${saved.path}' would be overwritten by merge.`,
+      `Untracked working tree file '${untracked}' would be overwritten by merge.`,
     );
   }
 }
 
-export function restoreIntegrationOwned(
+interface RestoredTouchedPath {
+  saved: MergeTouchedPath;
+  /** The index holds the saved entry again, or no entry where none was saved. */
+  unchanged: boolean;
+}
+
+function* restoredTouched(
+  repo: Repository,
+  touched: OperationTouchedSource,
+): Generator<RestoredTouchedPath> {
+  for (const row of joinSorted(touched, indexScanOwned(repo.checkout), {
+    left: (entry) => entry.path,
+    right: (entry) => entry.path,
+  })) {
+    if (row.left === undefined) continue;
+    const saved = row.left.index;
+    const current = row.right;
+    yield {
+      saved: row.left,
+      unchanged:
+        saved === null
+          ? current === undefined
+          : current?.stage === 0 && current.mode === saved.mode && current.oid === saved.oid,
+    };
+  }
+}
+
+function restoreTouched(
   workspace: IntegrationWorkspace,
   repo: Repository,
   worktree: Worktree,
   touched: OperationTouchedSource,
 ): void {
-  requireSharedMutationScope(repo.store.db, worktree);
   const removals = workspace.projectedPlan();
   const absent = workspace.reservations(removals, "occupied");
   function* absentPaths() {
@@ -85,7 +115,7 @@ export function restoreIntegrationOwned(
   function* removalEntries(): Generator<ProjectedMergeEntry> {
     let destructive: string | null = null;
     for (const row of joinSorted(
-      guardedTouched(repo, worktree, touched),
+      restoredTouched(repo, touched),
       walkWorktreeEntriesStream(worktree, repo.root, {
         includeDirectories: true,
         includeIgnored: true,
@@ -95,9 +125,12 @@ export function restoreIntegrationOwned(
         right: (entry) => entry.path,
       },
     )) {
-      if (row.left !== undefined && row.right !== undefined)
-        requireRestorable(row.left, row.right.stat.type === "dir");
-      const saved = row.left?.saved;
+      // An unchanged entry keeps its worktree entry, but a directory the
+      // operation created never had one and still goes.
+      const kept =
+        row.left?.unchanged === true &&
+        !(row.left.saved.worktree.kind === "absent" && row.right?.stat.type === "dir");
+      const saved = kept ? undefined : row.left?.saved;
       if (destructive !== null && row.path !== destructive && !isNestedPath(destructive, row.path))
         destructive = null;
       if (destructive === null && saved !== undefined && saved.worktree.kind !== "directory")
@@ -147,9 +180,11 @@ export function restoreIntegrationOwned(
         yield { path: joinPath(repo.root, entry.path), mode: entry.worktree.mode & 0o7777 };
   }
   for (const page of integrationPages(directories())) worktree.writeFiles(page);
+  // The index is still unrestored here, so this agrees with the removal pass.
   function* files(): Generator<MergeTouchedPath> {
-    for (const entry of touched)
-      if (entry.worktree.kind === "file" || entry.worktree.kind === "symlink") yield entry;
+    for (const { saved, unchanged } of restoredTouched(repo, touched))
+      if (!unchanged && (saved.worktree.kind === "file" || saved.worktree.kind === "symlink"))
+        yield saved;
   }
   for (const page of integrationPages(files())) {
     const sizes = collectBlobSizes(

@@ -936,15 +936,19 @@ Two restrictions are deliberate:
   detached HEAD each fails with `EDETACHED` before it starts; Git integrates
   into the detached HEAD.
 
-Merge abort and cherry-pick or revert skip and abort follow Git's
-`reset --merge`. They fail with `ECHECKOUTFAIL` and change nothing when a
-restored path that is present in the worktree differs from its stage-0 index
-entry (`Entry '<path>' not uptodate`), or when an untracked file stands where
-the restore writes one (`Untracked working tree file '<path>' would be
-overwritten`). Conflicted paths are reset regardless, and a path the user
-removed is restored. One narrow divergence: Git keeps an unstaged edit to a
-touched path whose staged entry the user set back to the pre-operation entry;
-kompjutr refuses. Rebase abort restores unconditionally, as Git's does.
+Merge abort and cherry-pick or revert skip and abort run Git's
+`reset --merge` to HEAD over every path, not only the paths the operation
+touched. An index entry that matches HEAD keeps its worktree file, edited or
+deleted. Every other entry, whether the operation or the user staged it,
+returns to HEAD in the index and the worktree; a staged new file is removed,
+and a path the index lacks but HEAD has is written back. They fail with
+`ECHECKOUTFAIL` and change nothing when such an entry's file is present and
+differs from the entry (`Entry '<path>' not uptodate`), or when an untracked
+file, including one `rm --cached` untracked, stands where HEAD's tree writes
+one (`Untracked working tree file '<path>' would be overwritten`). Conflicted
+paths are reset regardless. Rebase skip and abort are Git's `reset --hard`:
+they discard staged and unstaged edits alike and refuse only over such an
+untracked file.
 
 When the two sides put a regular or executable file and a symlink at the same
 path, the symlink stays at the logical path and the regular side is materialised
@@ -965,7 +969,7 @@ cannot be materialised and fails atomically with `EUNSUPPORTED`.
 | `-m <msg>` | `message` | ✔ |
 | `--no-commit` | `commit: false` | ✔ leaves a resumable pending merge |
 | `--continue` | `mergeContinue()` or plain `commit()` | ✔ |
-| `--abort` | `mergeAbort()` | ✔ restores only merge-owned paths; refuses over unstaged edits as Git does |
+| `--abort` | `mergeAbort()` | ✔ `reset --merge` to HEAD; refuses over an unstaged edit to a reset path as Git does |
 | `--squash` | — | ✘ |
 | `-s <strategy>`, `-X ours\|theirs\|patience`, `--conflict-style` | — | ✘ one built-in three-way strategy, default markers |
 | rename detection | — | ✘ a path renamed on one side and edited on the other conflicts as modify/delete; Git follows the rename and merges cleanly |
