@@ -190,6 +190,18 @@ describe("differential regressions: ref and pathspec edges", () => {
     });
   });
 
+  it("path checkout refuses to delete an untracked file a glob selects", async () => {
+    await expectUntrackedBlocker({
+      start: "init",
+      ops: [
+        ...COMMITTED,
+        { op: "rm", paths: ["b.txt"], cached: true },
+        { op: "write", path: "b.txt", content: { text: "untracked\n" } },
+        { op: "checkoutPaths", ref: "main", paths: ["*.txt"] },
+      ],
+    });
+  });
+
   it("path checkout refuses to delete an untracked directory in the way", async () => {
     await expectUntrackedBlocker({
       start: "init",

@@ -148,15 +148,23 @@ function untrackedPaths(status: string): string[] {
     .map((line) => unquote(line.slice(2)).replace(/\/$/, ""));
 }
 
-/** Before a path checkout, untracked content sat on, above or below a selected path. */
-function hadUntrackedInSelection(d: Divergence): boolean {
-  if (d.op.op !== "checkoutPaths") return false;
-  const specs = d.op.paths.map((spec) => spec.replace(/\/+$/, ""));
-  return untrackedPaths(d.prior.status).some((path) =>
-    specs.some(
-      (spec) =>
-        spec === "." || spec === path || path.startsWith(`${spec}/`) || spec.startsWith(`${path}/`),
-    ),
+const UNTRACKED_BLOCKERS =
+  "ECHECKOUTFAIL: untracked working tree files would be overwritten by checkout: ";
+
+/**
+ * kompjutr refused naming blockers that were each untracked before the op,
+ * or inside an untracked directory. A truncated list counts its named part.
+ */
+function refusedOnlyForUntracked(d: Divergence): boolean {
+  const detail = d.outcomes.kompjutr.detail ?? "";
+  if (!refused(d, /^ECHECKOUTFAIL:/) || !detail.startsWith(UNTRACKED_BLOCKERS)) return false;
+  const named = detail
+    .slice(UNTRACKED_BLOCKERS.length)
+    .replace(/, and \d+ more$/, "")
+    .split(", ");
+  const untracked = untrackedPaths(d.prior.status);
+  return named.every((path) =>
+    untracked.some((root) => path === root || path.startsWith(`${root}/`)),
   );
 }
 
@@ -276,10 +284,7 @@ export const KNOWN: KnownDivergence[] = [
       "git deletes it (git-support.md, git checkout)",
     fields: ["outcome"],
     matches: (d) =>
-      opIs(d, "checkoutPaths") &&
-      d.outcomes.git.kind === "clean" &&
-      hadUntrackedInSelection(d) &&
-      refused(d, /^ECHECKOUTFAIL: untracked working tree files would be overwritten/),
+      opIs(d, "checkoutPaths") && d.outcomes.git.kind === "clean" && refusedOnlyForUntracked(d),
   },
   {
     id: "abort-refuses-unmerged-entry",
