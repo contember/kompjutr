@@ -38,11 +38,13 @@ binding-level credential provider, and a non-thin pack. The public client
 transparently hydrates current clone, checkout, and worktree-add targets,
 `catFile`, diff reads, push closure batches, and the content that `merge`,
 `cherryPick`, `revert`, `rebase` (start, continue, skip), hard `reset`,
-and `pull` integration read. A mutation is retried after hydration only because
+and `pull` integration read. Every `runCli` write command (`rebase`, `reset`,
+`checkout`, `switch`, `restore`, `merge --continue|--abort`, and the rest) runs
+through the same retry. A mutation is retried after hydration only because
 its guard transaction rolls every staged drive, index, ref, reflog, and
 operation-state write back when it throws. Store metadata read ahead of content
 reports a missing promised blob as `EPROMISED`, never `ENOTFOUND`. Synchronous
-repository and CLI write paths return `EPROMISED` when they need omitted content,
+repository write paths return `EPROMISED` when they need omitted content,
 and a changed or removed promisor URL fails with `EPROMISORREMOTE` before an
 outbound pack is sent.
 

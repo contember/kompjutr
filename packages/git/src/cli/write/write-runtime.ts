@@ -4,11 +4,11 @@ import { stageZero } from "../../ops/checkout/checkout.js";
 import { type GitContext, openRepository } from "../../ops/core/context.js";
 import { requireSharedMutationScope } from "../../ops/core/mutation-scope.js";
 import { operationRefLogMetadata } from "../../ops/core/ref-log.js";
+import { withPromisorHydratedMutation } from "../../ops/network/network.js";
 import type { Repository } from "../../ops/repository/repository.js";
 import { repositoryMutations } from "../../ops/repository/repository.js";
 import { treeStream } from "../../ops/tree/tree-stream.js";
 import { compilePathspecs } from "../../ops/worktree/worktree-io.js";
-import { withGitMutationGuardOwned } from "../../store/database/database.js";
 import { boundedPublishedGitCliResult, gitCliResult } from "../result.js";
 import type { GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
 
@@ -17,18 +17,22 @@ export interface ResolvedAddPath {
   path: string;
 }
 
-export function runMutation<Outcome>(
+/**
+ * One guarded CLI mutation. A promised blob it reads is hydrated from the
+ * promisor remote and the whole attempt retried, as the client API does.
+ */
+export async function runMutation<Outcome>(
   context: GitContext,
   repo: Repository,
   options: ResolvedGitCliRunOptions,
   operation: () => Outcome,
   formatSuccess: (outcome: Outcome) => GitCliResult,
   mapOperationFailure: (error: unknown) => GitCliResult | undefined,
-): GitCliResult {
+): Promise<GitCliResult> {
   let result: GitCliResult;
   // Map native refusals only after the guard transaction has rolled every staged write back.
   try {
-    result = withGitMutationGuardOwned(context.database, () => formatSuccess(operation()));
+    result = await withPromisorHydratedMutation(context, repo, () => formatSuccess(operation()));
   } catch (error) {
     repo.store.revalidateStorageCaches();
     const mapped = mapOperationFailure(error);
@@ -38,12 +42,12 @@ export function runMutation<Outcome>(
   return boundedPublishedGitCliResult(result, options);
 }
 
-export function withRepository(
+export async function withRepository(
   context: GitContext,
   cwd: string,
   options: ResolvedGitCliRunOptions,
-  body: (repo: Repository) => GitCliResult,
-): GitCliResult {
+  body: (repo: Repository) => GitCliResult | Promise<GitCliResult>,
+): Promise<GitCliResult> {
   let repo: Repository;
   try {
     repo = openRepository(context, cwd);
