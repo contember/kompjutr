@@ -355,6 +355,23 @@ const SCENARIOS: Scenario[] = [
     mutate: [{ op: "symlink", path: "link", target: "keep.txt" }],
   },
   {
+    name: "type changes between file and symlink",
+    commits: [[...BASE, { op: "symlink", path: "link", target: "base.txt" }]],
+    mutate: [
+      { op: "symlink", path: "base.txt", target: "keep.txt" },
+      { op: "remove", path: "link" },
+      { op: "write", path: "link", content: "file\n" },
+      { op: "stage", path: "link" },
+      { op: "symlink", path: "keep.txt", target: "link" },
+      { op: "stage", path: "keep.txt" },
+      { op: "remove", path: "keep.txt" },
+      { op: "write", path: "keep.txt", content: "keep\n" },
+      { op: "write", path: "added.txt", content: "added\n" },
+      { op: "stage", path: "added.txt" },
+      { op: "symlink", path: "added.txt", target: "link" },
+    ],
+  },
+  {
     name: "file replaced by directory",
     commits: [BASE],
     mutate: [

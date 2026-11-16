@@ -258,7 +258,9 @@ export function trackedRow(
   let staged: OrdinaryStatusEntry["index"] = " ";
   if (head === undefined) staged = entry === undefined ? " " : "A";
   else if (entry === undefined) staged = "D";
-  else if (head.oid !== entry.oid || head.mode !== indexMode) staged = "M";
+  else if (head.oid !== entry.oid || head.mode !== indexMode) {
+    staged = changeCode(head.mode, indexMode);
+  }
 
   const state = worktreeState(entry, worktree, {
     path,
@@ -352,7 +354,7 @@ export function* flushStatusRows(
       actualOid === undefined
         ? "D"
         : actualOid !== tracked.indexOid || actualMode !== tracked.indexMode
-          ? "M"
+          ? changeCode(tracked.indexMode, actualMode)
           : " ";
     observer?.observeHashed(tracked.path, code !== " ");
     if (tracked.staged === " " && code === " ") continue;
@@ -367,6 +369,11 @@ export function* flushStatusRows(
       tracked.indexOid,
     );
   }
+}
+
+/** `T` when the object type (file, symlink, gitlink) differs; the executable bit alone is `M`. */
+function changeCode(before: string, after: string): "M" | "T" {
+  return before.slice(0, 3) === after.slice(0, 3) ? "M" : "T";
 }
 
 function statusDetail(
