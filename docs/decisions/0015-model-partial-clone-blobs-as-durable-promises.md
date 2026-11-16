@@ -35,10 +35,16 @@ Asynchronous operations hydrate bounded exact OID batches before retrying
 synchronous work, under one aggregate operation cap that prevents a
 network-per-object loop. Hydration uses the pinned promisor URL, a fresh
 binding-level credential provider, and a non-thin pack. The public client
-transparently hydrates current clone and checkout targets, `catFile`, diff reads,
-and push closure batches. Synchronous repository and CLI paths return `EPROMISED`
-when they need omitted content, and a changed or removed promisor URL fails with
-`EPROMISORREMOTE` before an outbound pack is sent.
+transparently hydrates current clone, checkout, and worktree-add targets,
+`catFile`, diff reads, push closure batches, and the content that `merge`,
+`cherryPick`, `revert`, `rebase` (start, continue, skip), hard `reset`,
+and `pull` integration read. A mutation is retried after hydration only because
+its guard transaction rolls every staged drive, index, ref, reflog, and
+operation-state write back when it throws. Store metadata read ahead of content
+reports a missing promised blob as `EPROMISED`, never `ENOTFOUND`. Synchronous
+repository and CLI write paths return `EPROMISED` when they need omitted content,
+and a changed or removed promisor URL fails with `EPROMISORREMOTE` before an
+outbound pack is sent.
 
 ## Consequences
 

@@ -1,6 +1,7 @@
 import { CorruptError, GitError, hasErrorCode, promisedObjectOids } from "../../common/errors.js";
 import { MAX_PROTOCOL_NEGOTIATION_ENTRIES, normalizeRemoteUrl } from "../../protocol/remote.js";
 import { throwIfAborted } from "../../protocol/stream.js";
+import { withGitMutationGuardOwned } from "../../store/database/database.js";
 import type { ObjectReadInfo, PromisedBlob } from "../../store/index.js";
 import { MAX_BLOB_BATCH_OIDS } from "../../store/objects/objects.js";
 import { matchesPaths } from "../checkout/checkout.js";
@@ -160,6 +161,33 @@ export async function withPromisorHydration<T>(
       await hydratePromisedBlobs(context, repo, oids, options);
     }
   }
+}
+
+/**
+ * Retry one guarded mutation after hydrating the promised blobs it reported.
+ * Safe only because a throw rolls the whole guard transaction back: drive,
+ * index, refs, reflogs, and operation state all share its mutation scope.
+ */
+export function withPromisorHydratedMutation<T>(
+  context: GitContext,
+  repo: Repository,
+  body: () => T,
+  options: AbortableNetworkOptions = {},
+): Promise<T> {
+  return withPromisorHydration(
+    context,
+    repo,
+    () => {
+      try {
+        return withGitMutationGuardOwned(context.database, body);
+      } catch (error) {
+        // Caches may still describe objects the rolled-back attempt wrote.
+        repo.store.revalidateStorageCaches();
+        throw error;
+      }
+    },
+    options,
+  );
 }
 
 /** Hydrate selected checkout blobs in bounded negotiations. */

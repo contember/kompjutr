@@ -9,7 +9,9 @@ import { lsRemote as lsRemoteOp } from "./ops/network/ls-remote.js";
 import {
   clone as cloneOp,
   fetchInto,
+  hydrateTreeBlobs,
   validateFetchOptions,
+  withPromisorHydratedMutation,
   withPromisorHydration,
 } from "./ops/network/network.js";
 import { currentBranch as currentBranchOp } from "./ops/refs/refs.js";
@@ -37,6 +39,7 @@ import {
 } from "./ops/status/status.js";
 import {
   worktreeAddOwned as worktreeAddOp,
+  worktreeAddTree,
   worktreeList as worktreeListOp,
   worktreePruneOwned as worktreePruneOp,
   worktreeRemoveOwned as worktreeRemoveOp,
@@ -150,8 +153,8 @@ export function createGitClientCoreMethods(services: GitClientServices): CoreMet
       });
     },
     async reset(input = {}) {
-      mutate(() => {
-        const repo = at(input.dir);
+      const repo = at(input.dir);
+      await withPromisorHydratedMutation(context, repo, () => {
         if (input.hard === true) {
           repo.store.db.transactionSync(() => {
             resetOp(context, repo, context.worktree, input);
@@ -204,7 +207,11 @@ export function createGitClientCoreMethods(services: GitClientServices): CoreMet
       return readRefOp(at(input.dir), input);
     },
     async worktreeAdd(input) {
-      return mutate(() => worktreeAddOp(context, at(input.dir), input));
+      const repo = at(input.dir);
+      // The whole tree is written, so hydrate it in bounded batches up front;
+      // the retry only covers a target that moved during that hydration.
+      await hydrateTreeBlobs(context, repo, worktreeAddTree(context, repo, input), undefined);
+      return withPromisorHydratedMutation(context, repo, () => worktreeAddOp(context, repo, input));
     },
     async worktreeList(input = {}) {
       return worktreeListOp(context, at(input.dir));
