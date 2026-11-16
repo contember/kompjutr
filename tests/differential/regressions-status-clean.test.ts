@@ -69,3 +69,44 @@ describe("differential regressions: status type changes", () => {
     await expectAgreement(scenario);
   });
 });
+
+describe("differential regressions: clean -d", () => {
+  it("removes an untracked tree of empty directories", async () => {
+    const scenario: Scenario = {
+      start: "init",
+      ops: [
+        { op: "write", path: "dir/sub/z.txt", content: { text: "x\n" } },
+        { op: "mv", from: "dir/sub/z.txt", to: "a-b" },
+        { op: "clean", directories: true },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+
+  it("removes an empty directory beside an untracked file", async () => {
+    const scenario: Scenario = {
+      start: "init",
+      ops: [
+        { op: "write", path: "dir/sub/z.txt", content: { text: "x\n" } },
+        { op: "mv", from: "dir/sub/z.txt", to: "a-b" },
+        { op: "write", path: "dir/u.txt", content: { text: "u\n" } },
+        { op: "clean", directories: true },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+
+  it("keeps a directory that holds only an ignored file", async () => {
+    const scenario: Scenario = {
+      start: "init",
+      ops: [
+        { op: "write", path: ".gitignore", content: { text: "*.log\n" } },
+        { op: "write", path: "dir/sub/x.log", content: { text: "x\n" } },
+        { op: "write", path: "dir/empty/z.txt", content: { text: "x\n" } },
+        { op: "mv", from: "dir/empty/z.txt", to: "a-b" },
+        { op: "clean", directories: true },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+});

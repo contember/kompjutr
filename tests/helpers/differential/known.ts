@@ -379,12 +379,6 @@ export const KNOWN: KnownDivergence[] = [
       d.op.op === "reset" && /[~^]/.test(d.op.ref ?? "") && d.fields.includes("index"),
   },
   {
-    id: "clean-empty-directories",
-    reason: "open: clean -d fails on a tree of empty directories",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "clean") && refused(d, /ENOTEMPTY/),
-  },
-  {
     id: "branch-auto-upstream",
     reason: "open: a branch started from a remote-tracking ref gets no upstream config",
     fields: ["upstreams"],
