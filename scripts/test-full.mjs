@@ -9,6 +9,7 @@ const rootExcludes = [
   "--exclude=tests/fs/**",
   "--exclude=tests/shell/**",
   "--exclude=tests/e2e/**",
+  "--exclude=tests/differential/**",
   "--exclude=tests/pack.test.ts",
   "--exclude=tests/protocol.test.ts",
 ];
@@ -45,6 +46,7 @@ const slices = [
   { name: "filesystem", args: ["tests/fs"], weight: 18 },
   { name: "shell", args: ["tests/shell"], weight: 10 },
   { name: "end-to-end", args: ["tests/e2e"], weight: 100 },
+  { name: "differential", args: ["tests/differential"], weight: 120 },
 ];
 
 const workersFor = (slice) => slice.workers ?? 2;

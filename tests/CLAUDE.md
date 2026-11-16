@@ -16,6 +16,8 @@ helpers/parity.ts    differential harness for grep and rg
 helpers/workspace.ts full runtime under test
 helpers/e2e.ts       journey harness: a step DSL played against both sides
 e2e/                 whole-workflow journeys built on it
+helpers/differential/ random op sequences: generator, two-sided world, shrinker
+differential/        the bounded seed set and the shrunk regression scenarios
 fs/conformance/      the dofs suite, ported; MIT, keep the file headers
 shell/               parse, plan, bounds, cost, parity, session
 ```
@@ -67,6 +69,38 @@ v2 text, worktree bytes and modes, the log, and which integration is pending.
   branch at its original OID. Everything else still is. **Do not widen it** —
   reach for `runLocal` and an explicit assertion only where Git has no
   equivalent at all, and say so in a comment.
+
+## Differential — the layer above journeys
+
+`tests/differential/` generates random op sequences (`helpers/differential/`)
+and plays each op on kompjutr's local Unix composition and on the `git` binary,
+comparing outcome, refs, HEAD, the staged index (`ls-files -s`), worktree bytes
+and modes, porcelain v2 status, the pending operation, branch upstreams, and
+origin refs after every op. A failing seed is shrunk by delta debugging to the
+smallest sequence that still diverges the same way, and printed as a scenario.
+
+- Two dimensions are controlled on the git side: `LC_ALL=C`, and
+  `merge.renames=false`, because kompjutr's integrations detect no renames
+  (`docs/reference/git-support.md`, `git merge`).
+- Some ops are modeled rather than run verbatim. `pull` checks the upstream
+  before it fetches (kompjutr's documented order), then merges it as
+  `pull --no-rebase` does. `mergeContinue` is `commit -m` guarded by a pending
+  merge. `mv` is a rename on disk plus `add <from> <to>` on both sides, not
+  `git mv`.
+- The rebase narrowing above applies here too, and nothing else is narrowed.
+- A shrunk repro lands with its fix as a scenario in
+  `differential/regressions-<topic>.test.ts`, replayed through `expectAgreement`.
+- `helpers/differential/known.ts` lists the divergences that are understood
+  but not fixed: intentional differences, each documented where the behaviour
+  is, and open defects, each leaving the list with its fix. An entry names the
+  op and preconditions it explains and every field it may make differ; keep it
+  that narrow, or it hides the next divergence.
+- A known divergence ends its seed early; the CI set fails when it plays less
+  than its coverage floor of ops. Raise the floor as entries leave.
+- The CI seed set is fixed. Explore further with
+  `KOMPJUTR_DIFF_SEEDS=2000 KOMPJUTR_DIFF_STEPS=80 npx vitest run tests/differential/random.test.ts`;
+  `KOMPJUTR_DIFF_FIRST_SEED` moves the window, `KOMPJUTR_DIFF_REPORT=<file>`
+  collects one JSON line per diverging seed.
 
 ## Rules
 

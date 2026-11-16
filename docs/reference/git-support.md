@@ -813,6 +813,10 @@ after its first filtered fetch, fails with `EPROMISORREMOTE` before discovery.
 | local-path remote | — | ✘ throws `UnsupportedOperationError` |
 | `--autostash`, `--recurse-submodules` | — | ✘ |
 
+Pull resolves the upstream before it fetches: a branch with neither an explicit
+`remoteRef` nor `branch.<n>.merge` fails without network traffic, where Git
+fetches the remote first and then refuses.
+
 Pull targets the checked-out symbolic branch only. Its default fetch coverage
 accepts only the canonical
 `+refs/heads/*:refs/remotes/<remote>/*` mapping, updates every advertised head
@@ -902,6 +906,23 @@ authoritative reread, index/worktree changes, conditional journal transition,
 and maintenance-root epoch bump.
 Supported public mutation re-entry fails with `EREENTRANT`.
 
+Two restrictions are deliberate:
+
+- **A pending integration owns the checkout.** Until it continues, skips, or
+  aborts, every command that moves a ref, the checkout, or a remote fails with
+  `EOPACTIVE` (`EMERGEACTIVE` while a merge is pending): branch create, rename
+  and delete, tag create and delete, checkout, switch, restore, clean, mixed
+  and path reset, fetch, pull, push, starting a second merge, cherry-pick,
+  revert or rebase, `updateRef()`, and `recoverRef()`.
+  Staging (`add`, `rm`) stays available for resolution, a hard reset clears
+  the operation, and `commit()` finalizes only a pending merge. Git runs most
+  of these beside its sequencer state, refusing only some (a checkout or a
+  second merge over unmerged entries); the journal's plan and anchors are
+  immutable, so kompjutr refuses all of them rather than replan.
+- **Merge, cherry-pick, revert and rebase need a checked-out branch.** On a
+  detached HEAD each fails with `EDETACHED` before it starts; Git integrates
+  into the detached HEAD.
+
 Merge abort and cherry-pick or revert skip and abort follow Git's
 `reset --merge`. They fail with `ECHECKOUTFAIL` and change nothing when a
 restored path that is present in the worktree differs from its stage-0 index
@@ -934,6 +955,7 @@ cannot be materialised and fails atomically with `EUNSUPPORTED`.
 | `--abort` | `mergeAbort()` | ✔ restores only merge-owned paths; refuses over unstaged edits as Git does |
 | `--squash` | — | ✘ |
 | `-s <strategy>`, `-X ours\|theirs\|patience`, `--conflict-style` | — | ✘ one built-in three-way strategy, default markers |
+| rename detection | — | ✘ a path renamed on one side and edited on the other conflicts as modify/delete; Git follows the rename and merges cleanly |
 | octopus (3+ heads) | — | ✘ |
 | `--allow-unrelated-histories` | — | ✘ unrelated histories are refused |
 
