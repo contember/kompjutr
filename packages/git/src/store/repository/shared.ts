@@ -67,6 +67,7 @@ export class SharedRepoStore extends SharedRepoRefStore {
       configUnsetOwned: (path) => this.configUnsetOwned(path),
       configMoveSectionOwned: (sourcePrefix, destinationPrefix) =>
         this.configMoveSectionOwned(sourcePrefix, destinationPrefix),
+      configRemoveSectionOwned: (prefix) => this.configRemoveSectionOwned(prefix),
       setShallowOwned: (add, remove) => this.setShallowOwned(add, remove),
       destroyOwned: () => this.destroyOwned(),
     });

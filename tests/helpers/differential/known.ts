@@ -372,15 +372,6 @@ export const KNOWN: KnownDivergence[] = [
     matches: (d) =>
       d.op.op === "reset" && /[~^]/.test(d.op.ref ?? "") && d.fields.includes("index"),
   },
-  {
-    id: "branch-auto-upstream",
-    reason: "open: a branch started from a remote-tracking ref gets no upstream config",
-    fields: ["upstreams"],
-    matches: ({ op, after }) =>
-      (op.op === "branch" || op.op === "checkoutNew") &&
-      (op.startPoint ?? "").startsWith("origin/") &&
-      after?.kompjutr.upstreams.includes(`${op.name} - -`) === true,
-  },
 ];
 
 export function knownDivergence(divergence: Divergence): KnownDivergence | undefined {
