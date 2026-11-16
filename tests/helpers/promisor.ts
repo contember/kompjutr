@@ -90,6 +90,7 @@ export async function partialClone(): Promise<Harness> {
     defaultIdentity: IDENTITY,
   };
   let offlineRequests = 0;
+  // Rejection-code assertions only prove propagation; unchanged state is the witness.
   const unreachable: GitHttpClient = async () => {
     offlineRequests++;
     throw new GitError("EFETCHFAIL", "promisor remote is unreachable");

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   expectCleanAt,
@@ -111,7 +113,12 @@ describe("git CLI writes in a blobless clone hydrate promised blobs", () => {
     );
     expect(await cli(h, "add", "shared.txt")).toMatchObject({ exitCode: 0 });
     expect(await cli(h, "merge", "--continue")).toMatchObject({ exitCode: 0 });
-    expect(await h.git.status({ dir: "/work" })).toEqual([]);
+
+    expect(h.fixture.gitResult("merge", "stack").status).not.toBe(0);
+    h.fixture.write("shared.txt", "AS\nb\nc\nd\ne\n");
+    h.fixture.git("add", "shared.txt");
+    h.fixture.gitWithEnv({ GIT_EDITOR: "true" }, "merge", "--continue");
+    await expectCleanAt(h, "/work", h.fixture.git("rev-parse", "HEAD^{tree}"));
   });
 
   it("checks out and restores a promised path", async () => {
@@ -124,12 +131,18 @@ describe("git CLI writes in a blobless clone hydrate promised blobs", () => {
       exitCode: 0,
     });
 
-    expect(h.workspace.worktree.readFile("/work/topic.txt")).toEqual(
-      h.fixture.catFile(h.blobs.topicFile),
-    );
-    expect(h.workspace.worktree.readFile("/work/shared.txt")).toEqual(
-      h.fixture.catFile(h.blobs.topicShared),
-    );
+    h.fixture.git("checkout", "topic", "--", "topic.txt");
+    h.fixture.git("restore", "--source=topic", "shared.txt");
+    // Porcelain v2 carries index modes and OIDs: checkout stages, restore does not.
+    expect(await cli(h, "status", "--porcelain=v2")).toMatchObject({
+      stdout: `${h.fixture.git("status", "--porcelain=v2")}\n`,
+      exitCode: 0,
+    });
+    for (const path of ["topic.txt", "shared.txt"]) {
+      expect(h.workspace.worktree.readFile(`/work/${path}`)).toEqual(
+        new Uint8Array(readFileSync(join(h.fixture.dir, path))),
+      );
+    }
     expectHydratedExactly(h, ["topicShared", "topicFile"]);
   });
 

@@ -159,11 +159,13 @@ failures are mapped only after rollback and cache revalidation. After the
 transaction commits, the result is cut to the stdout, stderr, and combined
 ceilings at a UTF-8 boundary, stdout first, and `truncated` records any loss.
 Formatters stream into per-stream truncating buffers, so retained output never
-exceeds its ceiling. The promise-returning dispatcher awaits only after the
-synchronous transaction callback has completed. In a partial clone, a mutation
-that reads a promised blob rolls back, hydrates the reported blobs from the
-promisor remote, and retries; each retry fetches one checkout or merge read
-batch in one request, up to the shared 16,384-blob operation cap (`E2BIG`). A
+exceeds its ceiling. Each attempt's transaction callback is synchronous. In a
+partial clone, a mutation that reads a promised blob rolls back, hydrates the
+reported blobs from the promisor remote, and retries; the dispatcher awaits
+that hydration between attempts. Each retry fetches one checkout or merge read
+batch in one fetch, up to the shared 16,384-blob operation cap (`E2BIG`).
+Hydration authenticates through the binding's `promisorHeaders` or
+`promisorAuth`, not `cliNetwork`, and `cliNetwork.signal` does not cancel it. A
 failed hydration leaves the repository as it was and its error propagates.
 
 Network argv follows the same policy. `init`, mutating `remote` forms, clone,
