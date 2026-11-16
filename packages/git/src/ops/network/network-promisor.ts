@@ -141,9 +141,25 @@ export async function withPromisorHydration<T>(
   options: AbortableNetworkOptions = {},
 ): Promise<T> {
   validateAbortableNetworkOptions(options);
+  return retryAfterHydration(
+    context,
+    repo,
+    () => {
+      throwIfAborted(options.signal);
+      return body();
+    },
+    options,
+  );
+}
+
+async function retryAfterHydration<T>(
+  context: GitContext,
+  repo: Repository,
+  body: () => T,
+  options: AbortableNetworkOptions,
+): Promise<T> {
   const requested = new Set<string>();
   for (;;) {
-    throwIfAborted(options.signal);
     try {
       return body();
     } catch (error) {
@@ -164,9 +180,27 @@ export async function withPromisorHydration<T>(
 }
 
 /**
+ * One guarded mutation attempt. A throw rolls the whole guard transaction
+ * back: drive, index, refs, reflogs, and operation state share its mutation
+ * scope, so an attempt that missed a promised blob may be retried.
+ */
+export function promisorGuardedMutation<T>(
+  context: GitContext,
+  repo: Repository,
+  body: () => T,
+): T {
+  try {
+    return withGitMutationGuardOwned(context.database, body);
+  } catch (error) {
+    // Caches may still describe objects the rolled-back attempt wrote.
+    if (promisedObjectOids(error) !== null) repo.store.revalidateStorageCaches();
+    throw error;
+  }
+}
+
+/**
  * Retry one guarded mutation after hydrating the promised blobs it reported.
- * Safe only because a throw rolls the whole guard transaction back: drive,
- * index, refs, reflogs, and operation state all share its mutation scope.
+ * The signal cancels hydration only; an attempt that started runs to completion.
  */
 export function withPromisorHydratedMutation<T>(
   context: GitContext,
@@ -174,18 +208,11 @@ export function withPromisorHydratedMutation<T>(
   body: () => T,
   options: AbortableNetworkOptions = {},
 ): Promise<T> {
-  return withPromisorHydration(
+  validateAbortableNetworkOptions(options);
+  return retryAfterHydration(
     context,
     repo,
-    () => {
-      try {
-        return withGitMutationGuardOwned(context.database, body);
-      } catch (error) {
-        // Caches may still describe objects the rolled-back attempt wrote.
-        repo.store.revalidateStorageCaches();
-        throw error;
-      }
-    },
+    () => promisorGuardedMutation(context, repo, body),
     options,
   );
 }

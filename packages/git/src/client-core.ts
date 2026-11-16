@@ -1,6 +1,6 @@
 import type { GitClientServices } from "./client-services.js";
 import type { Git, GitLsFilesOptions } from "./client-types.js";
-import { GitError } from "./common/errors.js";
+import { GitError, promisedObjectOids } from "./common/errors.js";
 import { recoverRefOwned as recoverRefOp, reflog as reflogOp } from "./ops/core/ref-log.js";
 import { diff as diffOp, diffSummary as diffSummaryOp } from "./ops/diff/diff.js";
 import { mergeContinue as mergeContinueOp } from "./ops/merge/merge.js";
@@ -10,6 +10,7 @@ import {
   clone as cloneOp,
   fetchInto,
   hydrateTreeBlobs,
+  promisorGuardedMutation,
   validateFetchOptions,
   withPromisorHydratedMutation,
   withPromisorHydration,
@@ -208,10 +209,16 @@ export function createGitClientCoreMethods(services: GitClientServices): CoreMet
     },
     async worktreeAdd(input) {
       const repo = at(input.dir);
-      // The whole tree is written, so hydrate it in bounded batches up front;
-      // the retry only covers a target that moved during that hydration.
+      const add = () => worktreeAddOp(context, repo, input);
+      try {
+        return promisorGuardedMutation(context, repo, add);
+      } catch (error) {
+        if (promisedObjectOids(error) === null) throw error;
+      }
+      // The whole tree is written, so hydrate it in bounded batches instead of
+      // one retry per read batch; the retry then only covers a moved target.
       await hydrateTreeBlobs(context, repo, worktreeAddTree(context, repo, input), undefined);
-      return withPromisorHydratedMutation(context, repo, () => worktreeAddOp(context, repo, input));
+      return withPromisorHydratedMutation(context, repo, add);
     },
     async worktreeList(input = {}) {
       return worktreeListOp(context, at(input.dir));
