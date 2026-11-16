@@ -19,6 +19,9 @@ const ENV = {
   GIT_COMMITTER_EMAIL: IDENTITY.email,
 };
 
+const FETCH_FAILURE =
+  "fatal: could not fetch from promisor remote: promisor remote is unreachable\n";
+
 function cli(h: Harness, ...argv: string[]) {
   return h.git.runCli({ argv, cwd: "/work", env: ENV });
 }
@@ -165,9 +168,9 @@ describe("a failed CLI hydration leaves the blobless clone unchanged", () => {
     const h = await partialClone();
     const before = await repositoryState(h);
 
-    await expect(
-      h.offline.runCli({ argv: ["reset", "--hard", h.base], cwd: "/work", env: ENV }),
-    ).rejects.toMatchObject({ code: "EFETCHFAIL" });
+    expect(
+      await h.offline.runCli({ argv: ["reset", "--hard", h.base], cwd: "/work", env: ENV }),
+    ).toMatchObject({ stdout: "", stderr: FETCH_FAILURE, exitCode: 128 });
 
     expect(h.offlineRequests()).toBeGreaterThan(0);
     expect(await repositoryState(h)).toEqual(before);
@@ -178,9 +181,9 @@ describe("a failed CLI hydration leaves the blobless clone unchanged", () => {
     await stopRebaseWithResolvedConflict(h);
     const before = await repositoryState(h);
 
-    await expect(
-      h.offline.runCli({ argv: ["rebase", "--continue"], cwd: "/work", env: ENV }),
-    ).rejects.toMatchObject({ code: "EFETCHFAIL" });
+    expect(
+      await h.offline.runCli({ argv: ["rebase", "--continue"], cwd: "/work", env: ENV }),
+    ).toMatchObject({ stdout: "", stderr: FETCH_FAILURE, exitCode: 128 });
 
     expect(await repositoryState(h)).toEqual(before);
     expect(before.operations[0]).toHaveLength(1);

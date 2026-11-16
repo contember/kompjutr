@@ -15,6 +15,7 @@ import {
   statusFormatOptions,
 } from "../../ops/status/status-format.js";
 import type { StatusDetail } from "../../ops/status/status-rows.js";
+import { promisorFetchFailure } from "../network/network-output.js";
 import {
   type GitCliOutputContext,
   gitCliDiagnosticResult,
@@ -32,6 +33,7 @@ import {
   type ResolvedGitCliRunOptions,
 } from "../types.js";
 import { formatLog } from "./read-log.js";
+import { showNonCommit } from "./read-show.js";
 
 const HEADS = "refs/heads/";
 const REFS = "refs/";
@@ -257,6 +259,11 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
         }
         const revision: GitCliRevision = { kind: "ref", ref };
         if (missingRevision(repo, revision)) return ambiguousRevision(revision, output);
+        const maximum = stdoutCeiling(runOptions);
+        const shown = await withPromisorHydration(context, repo, () =>
+          showNonCommit(repo, ref, maximum, output),
+        );
+        if (shown !== undefined) return shown;
         const oid = repo.peel(repo.revParse(ref));
         if (
           repo.readCommit(oid).parent.length > 1 &&
@@ -278,7 +285,6 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
             ...(invocation.command.firstParent === true ? { mainline: 1 } : {}),
           }),
         );
-        const maximum = stdoutCeiling(runOptions);
         const metadata = formatLog([result.commit], { kind: "default" }, maximum);
         const patch = result.patch ?? "";
         return gitCliStdoutPartsResult(
@@ -350,6 +356,8 @@ async function withRepository(
         output,
       );
     }
+    const failure = promisorFetchFailure(error, output);
+    if (failure !== undefined) return failure;
     throw error;
   }
 }

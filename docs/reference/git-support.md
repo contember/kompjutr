@@ -72,7 +72,7 @@ The accepted argv grammar is exact:
 | `ls-files` | Optional `--cached`, `--others`, and `--exclude-standard` selection plus bounded default pathspecs |
 | `diff` | Plain diff with zero, one, or two refs, optional joined `-U<n>`, `--name-only`, `-z`, and optional `-- <default-pathspecs>`; staged diff as `--cached|--staged [<ref>] [-- <default-pathspecs>]` |
 | `log` | At most one of `-1`, `-n <count>`, `--max-count=<count>`; at most one of `--oneline`, `--format=<template>`; optional `--first-parent`; then at most one ref or admitted `<a>..<b>` range and optional `-- <literal-paths>...` |
-| `show` | `[--first-parent] [<ref>]`; a merge requires `--first-parent` rather than silently choosing a parent |
+| `show` | `[--first-parent] [<ref>]`; a merge requires `--first-parent` rather than silently choosing a parent. `<rev>:<path>` naming a blob prints its content and one naming a tree prints Git's name listing; a blob that is not UTF-8 fails with `fatal:` and exit 128, because CLI stdout is text. An annotated tag is peeled without printing Git's tag header |
 | `rev-list` | Exactly `--count <a>..<b>` |
 | `symbolic-ref` | Exactly `--short <ref>` |
 | `add` | One or more default pathspecs, optionally with `-f|--force`; or repository-wide `-A|--all` or `-u|--update`, optionally with force; `--` ends option parsing |
@@ -166,7 +166,11 @@ that hydration between attempts. Each retry fetches one checkout or merge read
 batch in one fetch, up to the shared 16,384-blob operation cap (`E2BIG`).
 Hydration authenticates through the binding's `promisorHeaders` or
 `promisorAuth`, not `cliNetwork`, and `cliNetwork.signal` does not cancel it. A
-failed hydration leaves the repository as it was and its error propagates.
+failed hydration leaves the repository as it was. A promisor fetch failure
+(`EFETCHFAIL`, `EHTTP`, `EAUTH`, `EURLSCHEME`, `EPROMISORREMOTE`) returns
+`fatal: could not fetch from promisor remote: <message>` with exit 128; other
+errors, including the `E2BIG` cap, propagate. Reads (`show`, `diff`,
+`rev-parse`) hydrate and report failures the same way.
 
 Network argv follows the same policy. `init`, mutating `remote` forms, clone,
 fetch, pull, and push run to completion and return bounded output with

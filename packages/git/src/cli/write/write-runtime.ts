@@ -9,6 +9,7 @@ import type { Repository } from "../../ops/repository/repository.js";
 import { repositoryMutations } from "../../ops/repository/repository.js";
 import { treeStream } from "../../ops/tree/tree-stream.js";
 import { compilePathspecs } from "../../ops/worktree/worktree-io.js";
+import { promisorFetchFailure } from "../network/network-output.js";
 import { boundedPublishedGitCliResult, gitCliResult } from "../result.js";
 import type { GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
 
@@ -35,7 +36,7 @@ export async function runMutation<Outcome>(
     result = await withPromisorHydratedMutation(context, repo, () => formatSuccess(operation()));
   } catch (error) {
     repo.store.revalidateStorageCaches();
-    const mapped = mapOperationFailure(error);
+    const mapped = mapOperationFailure(error) ?? promisorFetchFailure(error, { options });
     if (mapped === undefined) throw error;
     result = mapped;
   }
