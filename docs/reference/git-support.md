@@ -258,8 +258,10 @@ checkout; another attachment fails with `EBRANCHINUSE` and has no force bypass.
 
 `status()` and `Git.status()` remain array-returning APIs. `statusReport()` and
 `Git.statusReport()` add an object result only when callers need branch
-metadata. `StatusEntry` uses `" " A M D ? ! U R`. An exact rename row uses the
-destination as `path`, carries the source as `originalPath`, and reports
+metadata. `StatusEntry` uses `" " A M T D ? ! U R`. `T` marks a change between
+regular file, symlink, and gitlink; an executable-bit change alone is `M`. An
+exact rename row uses the destination as `path`, carries the source as
+`originalPath`, and reports
 `similarity: 100`. `StatusDetail` adds the modes and OIDs required by ordinary,
 unmerged, and rename porcelain v2 rows. Exact detection pairs equal authoritative
 blob OIDs within compatible regular-file or symlink mode classes. It honours an

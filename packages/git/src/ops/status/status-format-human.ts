@@ -154,10 +154,13 @@ function humanUnstaged(entry: StatusDetail): boolean {
   );
 }
 
-function stagedLabel(entry: StatusDetail): "new file" | "modified" | "deleted" | "renamed" {
+function stagedLabel(
+  entry: StatusDetail,
+): "new file" | "modified" | "deleted" | "renamed" | "typechange" {
   if (entry.renamed === true) return "renamed";
   if (entry.index === "A") return "new file";
   if (entry.index === "D") return "deleted";
+  if (entry.index === "T") return "typechange";
   return "modified";
 }
 
@@ -248,14 +251,6 @@ export function formatCommitRefusalStatus(
 
 function commitWorktreeLabel(entry: StatusDetail): "deleted" | "modified" | "typechange" {
   if (entry.worktree === "D") return "deleted";
-  if (
-    entry.unmerged !== true &&
-    entry.ignored !== true &&
-    "indexMode" in entry &&
-    "worktreeMode" in entry &&
-    entry.indexMode.slice(0, 3) !== entry.worktreeMode.slice(0, 3)
-  ) {
-    return "typechange";
-  }
+  if (entry.worktree === "T") return "typechange";
   return "modified";
 }

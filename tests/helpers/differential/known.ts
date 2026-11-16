@@ -379,18 +379,6 @@ export const KNOWN: KnownDivergence[] = [
       d.op.op === "reset" && /[~^]/.test(d.op.ref ?? "") && d.fields.includes("index"),
   },
   {
-    id: "status-typechange",
-    reason: "open: status reports a file/symlink type change as M instead of T",
-    fields: ["status"],
-    matches: (d) => d.after !== null && /^1 (\.T|T\.)/m.test(d.after.git.status),
-  },
-  {
-    id: "clean-empty-directories",
-    reason: "open: clean -d fails on a tree of empty directories",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "clean") && refused(d, /ENOTEMPTY/),
-  },
-  {
     id: "branch-auto-upstream",
     reason: "open: a branch started from a remote-tracking ref gets no upstream config",
     fields: ["upstreams"],

@@ -21,7 +21,6 @@ not effort: a wrong answer outranks a missing one.
 - **S — silent divergence.** kompjutr returns a plausible result where Git
   returns a different one or refuses. Nothing warns the caller.
   [116](116-add-update-follows-the-index.md),
-  [117](117-report-type-changes-as-t.md),
   [109](109-keep-parent-directory-when-replacing-its-only-child.md).
 - **A — blocks a common workflow, loudly.**
   [108](108-local-checkout-removes-missing-paths.md).
@@ -113,7 +112,7 @@ server production capacity; local qualification does not establish that limit.
 
 | Order | Items | Why |
 |---|---|---|
-| 0 | [116](116-add-update-follows-the-index.md), [117](117-report-type-changes-as-t.md) | Tier S: `add -u` ignores index-only paths; status shows a type change as `M`. |
+| 0 | [116](116-add-update-follows-the-index.md) | Tier S: `add -u` ignores index-only paths. |
 | 0 | [119](119-slice-the-clone-under-the-request-cpu-limit.md) | Production blocker: a full-history clone needs ~47 s of CPU in one request; a Durable Object request allows 30 s. |
 | 1 | [121](121-prune-the-parent-closure-walk-in-incremental-fetch.md) | Cost: an incremental fetch walks its parent's whole tree. |
 | 1 | [108](108-local-checkout-removes-missing-paths.md) | Tier A: local `reset --hard` fails with `ENOENT` when a tracked path is already gone. It blocks a common workflow. |
@@ -136,7 +135,6 @@ server production capacity; local qualification does not establish that limit.
 - [114 — Share one uutils argument parser across shell commands](114-share-one-uutils-argument-parser.md)
 - [115 — Change modes in bulk without touching mtime](115-bulk-chmod-without-mtime.md)
 - [116 — Make `add -u` follow the index, not HEAD](116-add-update-follows-the-index.md)
-- [117 — Report a pending type change as `T` in status](117-report-type-changes-as-t.md)
 - [119 — Slice the clone under the Durable Object request CPU limit](119-slice-the-clone-under-the-request-cpu-limit.md)
 - [121 — Prune the parent closure walk in incremental fetch connectivity](121-prune-the-parent-closure-walk-in-incremental-fetch.md)
 - [123 — Qualify large Git server production capacity](123-qualify-large-git-server-production-capacity.md)
