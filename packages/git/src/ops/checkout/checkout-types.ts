@@ -7,6 +7,11 @@ export interface CheckoutOptions {
   prune?: boolean;
   /** Keep local changes to entries that are identical in the index and target. */
   preserveMatchingIndex?: boolean;
+  /**
+   * The tree the checkout leaves, `null` when unborn. Paths it shares with the
+   * target keep their staged state, as in git's two-way merge.
+   */
+  baselineTree?: string | null;
   /** Remove worktree entries whose type prevents materialising the target. */
   restoreStructure?: boolean;
   /** Discard conflict stages before hard materialisation. */

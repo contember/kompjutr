@@ -2,7 +2,7 @@ import { GitError } from "../../common/errors.js";
 import { comparePaths, joinSorted } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { contentIdKey, type IndexEntry, indexScanOwned } from "../../store/index.js";
-import { matchesPaths, type TargetEntry } from "../checkout/checkout.js";
+import { matchesPaths, sameTreeEntry, type TargetEntry } from "../checkout/checkout.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
@@ -61,6 +61,12 @@ export interface CheckoutGuard {
    * worktree file that matches it or is gone, and unmerged paths reset regardless.
    */
   mode: "checkout" | "merge" | "hard-reset";
+  /**
+   * Git's two-way merge, for a checkout applied with the same `baselineTree`:
+   * a path the baseline and target agree on keeps its staged state, and a
+   * staged deletion the target would change refuses.
+   */
+  carryStaged?: boolean;
 }
 
 /**
@@ -139,6 +145,13 @@ export function checkoutBlockers(
         : paths.matches(row.path);
     if (!selected) continue;
 
+    if (guard.carryStaged === true) {
+      if (sameTreeEntry(target, row.head)) continue;
+      if (existing === undefined && target !== undefined && row.head !== undefined) {
+        retainBlocker(tracked, row.path);
+        continue;
+      }
+    }
     if (target === undefined) {
       // Only the checkout that prunes would remove this path.
       if (!prune || existing === undefined) continue;

@@ -4,7 +4,7 @@ import { applyIndexOwned } from "../../store/checkout/checkout.js";
 import type { IndexStore } from "../../store/index.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import type { Repository } from "../repository/repository.js";
-import type { TargetEntry } from "../tree/tree-stream.js";
+import { type TargetEntry, treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { compilePathspecs, walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import {
@@ -22,6 +22,7 @@ import {
   boundedCheckoutWorktreeEntries,
   CHECKOUT_WINDOW_ROWS,
   type CheckoutCandidate,
+  carriedTarget,
   checkoutWriteBudget,
   flushCheckoutCandidates,
   intersectsExcluded,
@@ -64,12 +65,20 @@ function requireExcludedIndexIdentity(
 export function checkoutTreeInternal(
   repo: Repository,
   worktree: Worktree,
-  target: () => Iterable<TargetEntry>,
+  tree: () => Iterable<TargetEntry>,
   options: CheckoutInternalOptions,
   index: IndexStore,
 ): void {
+  const baselineTree = options.baselineTree;
+  const target =
+    baselineTree === undefined
+      ? tree
+      : () => carriedTarget(tree(), treeStream(repo, baselineTree), index.indexScan());
   const pathspec = compilePathspecs(options.paths);
-  options = { ...options, pathspec };
+  // A carried entry is the index entry itself, so preserving matches keeps it.
+  const preserveMatchingIndex =
+    options.preserveMatchingIndex === true || baselineTree !== undefined;
+  options = { ...options, pathspec, preserveMatchingIndex };
   requireSharedMutationScope(repo.store.db, worktree);
   requireExcludedIndexIdentity(
     target,

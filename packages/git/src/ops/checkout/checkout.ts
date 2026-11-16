@@ -14,6 +14,7 @@ export {
   indexFromTree,
   isTree,
   matchesPaths,
+  sameTreeEntry,
   stageZero,
   treeEntries,
   writeEntry,

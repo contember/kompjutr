@@ -148,12 +148,22 @@ function checkoutLegacy(
   head: string,
   excludeRoots: readonly string[],
 ): void {
-  requireCheckoutAllowed(repo, worktree, tree, options.force === true, excludeRoots);
+  const force = options.force === true;
+  // git's initial checkout, with no index yet, skips the carry; an empty
+  // index is the nearest state kompjutr can tell apart.
+  const baselineTree = force || !hasIndexEntries(repo) ? undefined : repo.headTree();
+  requireCheckoutAllowed(repo, worktree, tree, force, excludeRoots, baselineTree !== undefined);
   checkoutTreeExcluding(repo, worktree, tree, excludeRoots, {
-    preserveMatchingIndex: options.force !== true,
+    preserveMatchingIndex: !force,
     restoreStructure: true,
+    baselineTree,
   });
   moveHead(context, repo, head);
+}
+
+function hasIndexEntries(repo: Repository): boolean {
+  for (const _entry of repo.checkout.indexScan({ pageSize: 1 })) return true;
+  return false;
 }
 
 function requireCheckoutAllowed(
@@ -162,6 +172,7 @@ function requireCheckoutAllowed(
   tree: string | null,
   force: boolean,
   excludeRoots: readonly string[],
+  carryStaged: boolean,
 ): void {
   if (force) return;
   const blocked = checkoutBlockers(repo, worktree, {
@@ -169,6 +180,7 @@ function requireCheckoutAllowed(
     prune: true,
     excludeRoots: [...excludeRoots],
     mode: "checkout",
+    carryStaged,
   });
   if (blocked.tracked.length > 0) {
     throw new GitError(

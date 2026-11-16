@@ -67,9 +67,10 @@ function stagedPaths(status: string): Set<string> {
   return paths;
 }
 
-/** Before the op, the index held a change against HEAD. */
-function hadStagedChange(d: Divergence): boolean {
-  return stagedPaths(d.prior.status).size > 0;
+/** kompjutr's index holds git's entries plus target entries git kept deleted. */
+function restoresOnly(kompjutr: string[], git: string[]): boolean {
+  const left = new Set(kompjutr);
+  return kompjutr.length > git.length && git.every((entry) => left.has(entry));
 }
 
 /** Paths whose index entry or worktree file the two sides disagree on. */
@@ -155,13 +156,17 @@ export const KNOWN: KnownDivergence[] = [
     matches: (d) => opIs(d, ...INTEGRATIONS) && refused(d, /EDETACHED/),
   },
   {
-    id: "checkout-carry",
-    reason: "open: checkout drops or refuses staged changes git carries to the target",
-    fields: ["outcome", "index", "status", "worktree"],
+    id: "checkout-empty-index",
+    reason:
+      "intentional: from an empty index, checkout writes the whole target as git's initial checkout does (git-support.md, checkout)",
+    fields: ["index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "checkout", "checkoutNew") &&
-      ((hadStagedChange(d) && refused(d, /would be overwritten by checkout/)) ||
-        (d.fields.includes("index") && differsOnlyOn(d, stagedPaths(d.prior.status)))),
+      d.prior.head !== null &&
+      d.prior.index.length === 0 &&
+      d.fields.includes("index") &&
+      d.after !== null &&
+      restoresOnly(d.after.kompjutr.index, d.after.git.index),
   },
   {
     id: "operation-active",
