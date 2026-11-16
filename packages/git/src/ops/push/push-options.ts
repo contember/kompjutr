@@ -106,16 +106,17 @@ export function legacyRefspecs(
     : [{ source: localRef, destination, force: options.force === true }];
 }
 
-// Like `git push --delete`, a branch the remote lacks is refused before POST.
+// Like `git push --delete`, a short branch name the remote lacks is refused
+// before POST; git sends a full `refs/` name and the remote only warns.
 export function requireLegacyDeletionTargets(
   options: PushOptions,
   updates: readonly JoinedPushUpdate[],
 ): void {
   if (options.refspecs !== undefined || options.delete !== true) return;
   for (const update of updates) {
-    if (update.oldOid !== ZERO_OID) continue;
     const name = options.remoteRef ?? options.ref ?? update.destination;
-    throw new GitError("EREFNOTFOUND", `unable to delete '${name}': remote ref does not exist`);
+    if (update.oldOid !== ZERO_OID || name.startsWith("refs/")) continue;
+    throw new GitError("EDELETEMISSING", `unable to delete '${name}': remote ref does not exist`);
   }
 }
 

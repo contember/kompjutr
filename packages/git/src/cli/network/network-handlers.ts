@@ -298,7 +298,7 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
           output.append(mapFailure(error).stderr);
           throw new GitCliPushUncertainError(error, output.result(128));
         }
-        if (command.delete && hasErrorCode(error, "EREFNOTFOUND")) {
+        if (hasErrorCode(error, "EDELETEMISSING")) {
           return pushDeletionRefusal(error, options, displayTarget(destination));
         }
         return networkFailure(error, output);

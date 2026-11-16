@@ -403,7 +403,7 @@ describe("push", () => {
     }
   });
 
-  it("refuses a legacy deletion the remote lacks before POST, but not a mapped one", async () => {
+  it("refuses a short legacy deletion the remote lacks before POST, but not a full or mapped one", async () => {
     const fixture = remoteFixture();
     const server = await startGitServer(fixture.dir);
     try {
@@ -413,15 +413,19 @@ describe("push", () => {
       const before = posts();
 
       await expect(ws.git.push({ ref: "nosuch", delete: true })).rejects.toMatchObject({
-        code: "EREFNOTFOUND",
+        code: "EDELETEMISSING",
         message: "unable to delete 'nosuch': remote ref does not exist",
       });
       await expect(ws.git.push({ remoteRef: "nosuch", delete: true })).rejects.toMatchObject({
-        code: "EREFNOTFOUND",
+        code: "EDELETEMISSING",
       });
+      const absent = { ok: true, refs: [{ ref: "refs/heads/nosuch", ok: true }] };
+      await expect(ws.git.push({ ref: "refs/heads/nosuch", delete: true })).resolves.toMatchObject(
+        absent,
+      );
       await expect(
         ws.git.push({ refspecs: [{ source: null, destination: "refs/heads/nosuch" }] }),
-      ).resolves.toMatchObject({ ok: true, refs: [{ ref: "refs/heads/nosuch", ok: true }] });
+      ).resolves.toMatchObject(absent);
       expect(posts()).toBe(before);
     } finally {
       await server.close();

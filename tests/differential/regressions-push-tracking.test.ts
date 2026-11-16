@@ -1,6 +1,6 @@
 // An explicitly named branch pushes to the remote branch of the same name, even
 // when its upstream names another, and moves only that remote-tracking ref.
-// Deleting a branch the remote lacks fails, as in git.
+// Deleting a short branch name the remote lacks fails, as in git.
 
 import { describe, it } from "vitest";
 import type { Scenario } from "../helpers/differential/ops.js";
@@ -68,6 +68,14 @@ describe("differential regressions: push destination and tracking", () => {
         { op: "checkoutNew", name: "x" },
         { op: "push", ref: "x", delete: true },
       ],
+    };
+    await expectAgreement(scenario);
+  });
+
+  it("accepts deleting an absent remote branch by its full name", async () => {
+    const scenario: Scenario = {
+      start: "clone",
+      ops: [{ op: "push", ref: "refs/heads/nosuch", delete: true }],
     };
     await expectAgreement(scenario);
   });
