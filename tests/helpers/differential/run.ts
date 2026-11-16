@@ -6,6 +6,7 @@ import { knownDivergence } from "./known.js";
 import { describeScenario, type Op, type Scenario, type WorldStart } from "./ops.js";
 import {
   compareSnapshots,
+  type Snapshot,
   type StateDifference,
   snapshotGit,
   snapshotKompjutr,
@@ -18,6 +19,9 @@ export interface Divergence {
   op: Op;
   /** The ops played before `op`, oldest first. */
   before: Op[];
+  /** git's state before `op`, which both sides still agreed on. */
+  prior: Snapshot;
+  outcomes: { kompjutr: Outcome; git: Outcome };
   /** `outcome`, `crash`, or the first differing snapshot field. */
   field: string;
   /** Every differing field; a known divergence must explain all of them. */
@@ -26,6 +30,8 @@ export interface Divergence {
   git: unknown;
   /** Each differing snapshot field with both values; empty for an outcome. */
   differences: StateDifference[];
+  /** Both states after `op`; null when the outcomes already differed. */
+  after: { kompjutr: Snapshot; git: Snapshot } | null;
 }
 
 export interface PlayResult {
@@ -33,46 +39,65 @@ export interface PlayResult {
   divergence: Divergence | null;
 }
 
+type Step = { divergence: Divergence } | { divergence: null; after: Snapshot };
+
 async function step(
   world: DifferentialWorld,
   ops: Op[],
   index: number,
-): Promise<Divergence | null> {
+  prior: Snapshot,
+): Promise<Step> {
   const op = ops[index];
-  if (op === undefined) return null;
-  const before = ops.slice(0, index);
+  if (op === undefined) throw new Error(`no op at ${index}`);
   const kompjutr: Outcome = await world.applyKompjutr(op);
   const git = world.applyGit(op);
-  const at = { step: index, op, before, differences: [] };
+  const at = {
+    step: index,
+    op,
+    before: ops.slice(0, index),
+    prior,
+    outcomes: { kompjutr, git },
+    differences: [],
+    after: null,
+  };
   if (kompjutr.crash === true) {
-    return { ...at, field: "crash", fields: ["crash"], kompjutr: kompjutr.detail, git };
+    const divergence = { ...at, field: "crash", fields: ["crash"], kompjutr: kompjutr.detail, git };
+    return { divergence };
   }
   if (kompjutr.kind !== git.kind) {
-    return { ...at, field: "outcome", fields: ["outcome"], kompjutr, git };
+    return { divergence: { ...at, field: "outcome", fields: ["outcome"], kompjutr, git } };
   }
   const origin = world.origins;
   const left = await snapshotKompjutr(world.workspace, world.root, origin?.kompjutr ?? null);
-  const right = snapshotGit(world.mirror, origin?.git ?? null);
+  const right = gitSnapshot(world);
   const differences = compareSnapshots(left, right);
   const first = differences[0];
-  if (first === undefined) return null;
-  return {
+  if (first === undefined) return { divergence: null, after: right };
+  const divergence = {
     ...at,
     field: first.field,
     fields: differences.map((difference) => difference.field),
     kompjutr: first.kompjutr,
     git: first.git,
     differences,
+    after: { kompjutr: left, git: right },
   };
+  return { divergence };
+}
+
+function gitSnapshot(world: DifferentialWorld): Snapshot {
+  return snapshotGit(world.mirror, world.origins?.git ?? null);
 }
 
 /** Replay a fixed op list. */
 export async function play(scenario: Scenario): Promise<Divergence | null> {
   const world = await createWorld(scenario.start);
   try {
+    let prior = gitSnapshot(world);
     for (let index = 0; index < scenario.ops.length; index++) {
-      const divergence = await step(world, scenario.ops, index);
-      if (divergence !== null) return divergence;
+      const result = await step(world, scenario.ops, index, prior);
+      if (result.divergence !== null) return result.divergence;
+      prior = result.after;
     }
     return null;
   } finally {
@@ -91,12 +116,15 @@ export async function explore(seed: number, length: number): Promise<PlayResult>
   const world = await createWorld(start);
   const ops: Op[] = [];
   try {
+    let prior = gitSnapshot(world);
     for (let index = 0; index < length; index++) {
-      const view = viewOf(snapshotGit(world.mirror, world.origins?.git ?? null));
-      const op = generator.next(view);
+      const op = generator.next(viewOf(prior));
       ops.push(op);
-      const divergence = await step(world, ops, index);
-      if (divergence !== null) return { scenario: { start, ops }, divergence };
+      const result = await step(world, ops, index, prior);
+      if (result.divergence !== null) {
+        return { scenario: { start, ops }, divergence: result.divergence };
+      }
+      prior = result.after;
     }
     return { scenario: { start, ops }, divergence: null };
   } finally {
@@ -104,7 +132,18 @@ export async function explore(seed: number, length: number): Promise<PlayResult>
   }
 }
 
+/**
+ * The same op, the same differing fields, and for an outcome the same kinds
+ * and kompjutr error code: a different defect must not stand in for this one.
+ */
 function signature(divergence: Divergence): string {
+  const { kompjutr, git } = divergence.outcomes;
+  const code = (kompjutr.detail ?? "").split(":")[0] ?? "";
+  const outcome = divergence.field === "outcome" ? `${kompjutr.kind}/${git.kind}/${code}` : "";
+  return `${divergence.op.op}:${divergence.fields.join(",")}:${outcome}`;
+}
+
+function label(divergence: Divergence): string {
   return `${divergence.op.op}:${divergence.field}`;
 }
 
@@ -214,12 +253,19 @@ export function report(seed: number, original: PlayResult, shrunk: PlayResult): 
   const divergence = shrunk.divergence;
   if (divergence === null) return `seed ${seed}: no divergence`;
   return [
-    `seed ${seed}: kompjutr diverged from git on ${signature(divergence)} at step ${divergence.step + 1}`,
+    `seed ${seed}: kompjutr diverged from git on ${label(divergence)} at step ${divergence.step + 1}`,
     `(${original.scenario.ops.length} generated ops shrunk to ${shrunk.scenario.ops.length})`,
     describeScenario(shrunk.scenario),
     `differing: ${divergence.fields.join(", ")}`,
-    `kompjutr: ${JSON.stringify(divergence.kompjutr, null, 1)}`,
-    `git:      ${JSON.stringify(divergence.git, null, 1)}`,
+    ...(divergence.differences.length === 0
+      ? [
+          `kompjutr: ${JSON.stringify(divergence.kompjutr, null, 1)}`,
+          `git:      ${JSON.stringify(divergence.git, null, 1)}`,
+        ]
+      : divergence.differences.flatMap((difference) => [
+          `${difference.field} kompjutr: ${JSON.stringify(difference.kompjutr, null, 1)}`,
+          `${difference.field} git:      ${JSON.stringify(difference.git, null, 1)}`,
+        ])),
     `replay:   ${JSON.stringify(shrunk.scenario)}`,
   ].join("\n");
 }
@@ -228,6 +274,7 @@ export function report(seed: number, original: PlayResult, shrunk: PlayResult): 
 export async function expectAgreement(scenario: Scenario): Promise<void> {
   const divergence = await play(scenario);
   if (divergence !== null) {
-    throw new Error(`kompjutr diverged from git:\n${JSON.stringify(divergence, null, 1)}`);
+    const { prior: _prior, after: _after, ...shown } = divergence;
+    throw new Error(`kompjutr diverged from git:\n${JSON.stringify(shown, null, 1)}`);
   }
 }

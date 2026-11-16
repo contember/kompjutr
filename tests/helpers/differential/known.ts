@@ -6,6 +6,7 @@
 // and only when every differing field is one it explains: a broad matcher
 // would hide the next, unrelated divergence behind an old one.
 
+import type { DiskEntry } from "./disk.js";
 import type { Op } from "./ops.js";
 import type { Divergence } from "./run.js";
 
@@ -17,48 +18,50 @@ export interface KnownDivergence {
   matches(divergence: Divergence): boolean;
 }
 
-function outcomeKind(value: unknown): string {
-  return typeof value === "object" && value !== null && "kind" in value ? String(value.kind) : "";
-}
-
-function detail(value: unknown): string {
-  return typeof value === "object" && value !== null && "detail" in value
-    ? String(value.detail)
-    : "";
-}
-
 /** kompjutr failed with `code` where git did something else. */
 function refused(d: Divergence, code: RegExp): boolean {
-  return (
-    d.field === "outcome" && outcomeKind(d.kompjutr) === "failed" && code.test(detail(d.kompjutr))
-  );
+  const kompjutr = d.outcomes.kompjutr;
+  return d.field === "outcome" && kompjutr.kind === "failed" && code.test(kompjutr.detail ?? "");
 }
 
 function opIs(d: Divergence, ...kinds: Op["op"][]): boolean {
   return kinds.includes(d.op.op);
 }
 
-function playedBefore(d: Divergence, ...kinds: Op["op"][]): boolean {
-  return d.before.some((op) => kinds.includes(op.op));
+/** Before the op, the index held a change against HEAD. */
+function hadStagedChange(d: Divergence): boolean {
+  return /^[12] [^.]/m.test(d.prior.status);
 }
 
-function worktreeOf(d: Divergence, side: "kompjutr" | "git"): string[] {
-  const difference = d.differences.find((entry) => entry.field === "worktree");
-  const value = difference?.[side];
-  return Array.isArray(value) ? value.map((entry) => JSON.stringify(entry)) : [];
+/** Before the op, an indexed path absent from HEAD had an unstaged change. */
+function hadAddedPathChanged(d: Divergence): boolean {
+  return /^1 A[MDT]/m.test(d.prior.status);
+}
+
+function worktrees(d: Divergence, normalize: (entry: DiskEntry) => DiskEntry): [string, string] {
+  const show = (entries: DiskEntry[]): string => JSON.stringify(entries.map(normalize));
+  return d.after === null
+    ? ["", ""]
+    : [show(d.after.kompjutr.worktree), show(d.after.git.worktree)];
 }
 
 /** The worktrees differ only by directories kompjutr left behind. */
 function onlyLeftoverDirectories(d: Divergence): boolean {
-  const git = new Set(worktreeOf(d, "git"));
-  const kompjutr = new Set(worktreeOf(d, "kompjutr"));
-  const extra = [...kompjutr].filter((entry) => !git.has(entry));
-  const missing = [...git].filter((entry) => !kompjutr.has(entry));
+  if (d.after === null) return false;
+  const files = (entries: DiskEntry[]): string =>
+    JSON.stringify(entries.filter((entry) => entry.type !== "dir"));
   return (
-    extra.length > 0 &&
-    missing.length === 0 &&
-    extra.every((entry) => entry.includes('"type":"dir"'))
+    d.after.kompjutr.worktree.length > d.after.git.worktree.length &&
+    files(d.after.kompjutr.worktree) === files(d.after.git.worktree)
   );
+}
+
+/** Conflict marker lines with their labels dropped. */
+function unlabeled(entry: DiskEntry): DiskEntry {
+  if (entry.content === undefined) return entry;
+  const text = Buffer.from(entry.content, "hex").toString("latin1");
+  const bare = text.replace(/^(<<<<<<<|>>>>>>>) .*$/gm, "$1");
+  return { ...entry, content: Buffer.from(bare, "latin1").toString("hex") };
 }
 
 /** Git's stripspace changes this message: trailing blanks or blank edge lines. */
@@ -82,7 +85,6 @@ const REFUSED_WHILE_PENDING: Op["op"][] = [
   "fetch",
   "pull",
   "push",
-  "commit",
   ...INTEGRATIONS,
 ];
 
@@ -111,6 +113,7 @@ export const KNOWN: KnownDivergence[] = [
     fields: ["outcome", "index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "checkout", "checkoutNew") &&
+      hadStagedChange(d) &&
       (refused(d, /would be overwritten by checkout/) || d.fields.includes("index")),
   },
   {
@@ -121,7 +124,7 @@ export const KNOWN: KnownDivergence[] = [
   },
   {
     id: "checkout-ancestor-ref",
-    reason: "open: checkout of `<branch>~<n>` fails with EINVAL in a cloned repository",
+    reason: "open: checkout of `<ref>~<n>` fails with EINVAL",
     fields: ["outcome"],
     matches: (d) => opIs(d, "checkout") && refused(d, /ref name is invalid/),
   },
@@ -131,6 +134,7 @@ export const KNOWN: KnownDivergence[] = [
     fields: ["index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "mergeAbort", "cherryPickAbort", "cherryPickSkip", "revertAbort", "revertSkip") &&
+      hadStagedChange(d) &&
       d.fields.includes("index"),
   },
   {
@@ -138,14 +142,19 @@ export const KNOWN: KnownDivergence[] = [
     reason: "open: `add -u` stages only paths in HEAD, git stages every indexed path",
     fields: ["outcome", "refs", "head", "index", "status"],
     matches: (d) =>
-      (d.op.op === "addAll" && d.op.update === true && d.fields.includes("index")) ||
-      (d.op.op === "commit" && d.op.all === true),
+      d.prior.operation === null &&
+      hadAddedPathChanged(d) &&
+      ((d.op.op === "addAll" && d.op.update === true) ||
+        (d.op.op === "commit" && d.op.all === true)),
   },
   {
     id: "checkout-paths-unmatched",
     reason: "open: path checkout accepts a pathspec that matches nothing",
     fields: ["outcome"],
-    matches: (d) => opIs(d, "checkoutPaths") && /did not match any file/.test(detail(d.git)),
+    matches: (d) =>
+      opIs(d, "checkoutPaths") &&
+      d.field === "outcome" &&
+      /did not match any file/.test(d.outcomes.git.detail ?? ""),
   },
   {
     id: "operation-active",
@@ -153,7 +162,10 @@ export const KNOWN: KnownDivergence[] = [
       "intentional: the mutations git-support.md lists are refused while an integration is pending",
     fields: ["outcome"],
     matches: (d) =>
-      (opIs(d, ...REFUSED_WHILE_PENDING) || (d.op.op === "reset" && d.op.hard !== true)) &&
+      d.prior.operation !== null &&
+      (opIs(d, ...REFUSED_WHILE_PENDING) ||
+        (d.op.op === "reset" && d.op.hard !== true) ||
+        (d.op.op === "commit" && d.prior.operation !== "merge")) &&
       refused(d, /EOPACTIVE/),
   },
   {
@@ -172,25 +184,30 @@ export const KNOWN: KnownDivergence[] = [
       (opIs(d, "revert", "cherryPick", "revertContinue", "cherryPickContinue") &&
         refused(d, /ENOENT/)) ||
       (opIs(d, ...INTEGRATIONS, "revertContinue", "cherryPickContinue", "rebaseContinue") &&
-        d.field === "worktree" &&
         onlyLeftoverDirectories(d)) ||
       (opIs(d, "revertContinue", "cherryPickContinue") &&
         d.field === "outcome" &&
-        playedBefore(d, "revert", "cherryPick")),
+        (d.prior.operation === "revert" || d.prior.operation === "cherry-pick") &&
+        !/^u /m.test(d.prior.status)),
   },
   {
     id: "merge-marker-label",
     reason: "open: conflict markers name the expanded ref instead of the name as given",
     fields: ["worktree"],
-    // `>>>>>>> ` in hex: only conflicted files can differ.
-    matches: (d) =>
-      opIs(d, "merge", "pull") && worktreeOf(d, "git").some((e) => e.includes("3e3e3e3e3e3e3e20")),
+    matches: (d) => {
+      if (!opIs(d, "merge", "pull")) return false;
+      const [kompjutr, git] = worktrees(d, unlabeled);
+      return kompjutr !== "" && kompjutr === git;
+    },
   },
   {
-    id: "push-tracking-after-rename",
-    reason: "open: push of a renamed branch does not create its remote-tracking ref",
-    fields: ["refs"],
-    matches: (d) => opIs(d, "push") && playedBefore(d, "branchRename"),
+    id: "push-after-rename",
+    reason:
+      "open: push of a renamed branch targets its moved upstream instead of its own name " +
+      "and does not create its remote-tracking ref",
+    fields: ["outcome", "refs", "originRefs"],
+    matches: ({ op: push, before }) =>
+      push.op === "push" && before.some((op) => op.op === "branchRename" && op.to === push.ref),
   },
   {
     id: "amend-empty",
@@ -199,8 +216,9 @@ export const KNOWN: KnownDivergence[] = [
     matches: (d) =>
       d.op.op === "commit" &&
       d.op.amend === true &&
-      outcomeKind(d.kompjutr) === "clean" &&
-      outcomeKind(d.git) === "failed",
+      d.field === "outcome" &&
+      d.outcomes.kompjutr.kind === "clean" &&
+      d.outcomes.git.kind === "failed",
   },
   {
     id: "reset-unborn-head",
@@ -209,26 +227,16 @@ export const KNOWN: KnownDivergence[] = [
     matches: (d) =>
       d.op.op === "reset" &&
       d.op.ref === "HEAD" &&
-      outcomeKind(d.kompjutr) === "clean" &&
-      outcomeKind(d.git) === "failed",
+      d.prior.head === null &&
+      d.field === "outcome" &&
+      d.outcomes.kompjutr.kind === "clean" &&
+      d.outcomes.git.kind === "failed",
   },
   {
     id: "checkout-paths-staged",
     reason: "open: path checkout refuses staged changes git overwrites",
     fields: ["outcome"],
     matches: (d) => opIs(d, "checkoutPaths") && refused(d, /would be overwritten by checkout/),
-  },
-  {
-    id: "merge-without-renames",
-    reason: "intentional: three-way integration detects no renames (git-support.md, git merge)",
-    fields: ["outcome"],
-    // Git can pair a rename only after a path was moved or removed.
-    matches: (d) =>
-      opIs(d, ...INTEGRATIONS, "rebaseContinue") &&
-      playedBefore(d, "mv", "rm", "remove") &&
-      d.field === "outcome" &&
-      outcomeKind(d.kompjutr) === "stopped" &&
-      outcomeKind(d.git) === "clean",
   },
   {
     id: "rebase-unrelated",
@@ -243,13 +251,7 @@ export const KNOWN: KnownDivergence[] = [
     matches: (d) =>
       opIs(d, "mergeAbort", "cherryPickAbort", "revertAbort") &&
       d.field === "outcome" &&
-      /not uptodate/.test(detail(d.git)),
-  },
-  {
-    id: "push-destination-after-rename",
-    reason: "open: push of a renamed branch targets its moved upstream instead of its own name",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "push") && d.field === "outcome" && playedBefore(d, "branchRename"),
+      /not uptodate/.test(d.outcomes.git.detail ?? ""),
   },
   {
     id: "missing-worktree-path",
@@ -268,13 +270,21 @@ export const KNOWN: KnownDivergence[] = [
     id: "status-typechange",
     reason: "open: status reports a file/symlink type change as M instead of T",
     fields: ["status"],
-    matches: (d) => d.field === "status" && /^1 (\.T|T\.)/m.test(String(d.git)),
+    matches: (d) => d.after !== null && /^1 (\.T|T\.)/m.test(d.after.git.status),
   },
   {
     id: "clean-empty-directories",
     reason: "open: clean -d fails on a tree of empty directories",
     fields: ["outcome"],
     matches: (d) => opIs(d, "clean") && refused(d, /ENOTEMPTY/),
+  },
+  {
+    id: "branch-auto-upstream",
+    reason: "open: a branch started from a remote-tracking ref gets no upstream config",
+    fields: ["upstreams"],
+    matches: (d) =>
+      (d.op.op === "branch" || d.op.op === "checkoutNew") &&
+      (d.op.startPoint ?? "").startsWith("origin/"),
   },
 ];
 

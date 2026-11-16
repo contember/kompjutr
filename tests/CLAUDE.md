@@ -79,9 +79,14 @@ and modes, porcelain v2 status, the pending operation, branch upstreams, and
 origin refs after every op. A failing seed is shrunk by delta debugging to the
 smallest sequence that still diverges the same way, and printed as a scenario.
 
-- The git side runs under `LC_ALL=C`, and two ops are modeled rather than run
-  verbatim: `pull` checks the upstream before it fetches, kompjutr's documented
-  order, and `mergeContinue` is `commit -m` guarded by a pending merge.
+- Two dimensions are controlled on the git side: `LC_ALL=C`, and
+  `merge.renames=false`, because kompjutr's integrations detect no renames
+  (`docs/reference/git-support.md`, `git merge`).
+- Some ops are modeled rather than run verbatim. `pull` checks the upstream
+  before it fetches (kompjutr's documented order), then merges it as
+  `pull --no-rebase` does. `mergeContinue` is `commit -m` guarded by a pending
+  merge. `mv` is a rename on disk plus `add <from> <to>` on both sides, not
+  `git mv`.
 - The rebase narrowing above applies here too, and nothing else is narrowed.
 - A shrunk repro lands with its fix as a scenario in
   `differential/regressions-<topic>.test.ts`, replayed through `expectAgreement`.
