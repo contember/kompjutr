@@ -7,7 +7,8 @@ import {
 } from "../result.js";
 import type { GitCliResult } from "../types.js";
 
-const UTF8 = new TextDecoder("utf-8", { fatal: true });
+// Keep a leading BOM: Git prints blob bytes unchanged.
+const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /**
  * `git show` of a blob prints its content and of a tree its entry names, as
@@ -29,9 +30,10 @@ export function showNonCommit(
     return gitCliStdoutPartsResult([`tree ${ref}\n\n`, ...names], maximum);
   }
   if (type !== "blob") return undefined;
+  const bytes = repo.readBlob(oid);
   let text: string;
   try {
-    text = UTF8.decode(repo.readBlob(oid));
+    text = UTF8.decode(bytes);
   } catch {
     // CLI stdout is a string; lossy decoding would corrupt a redirected binary file.
     return gitCliDiagnosticResult("fatal: ", ref, " is not UTF-8 text\n", 128, output);

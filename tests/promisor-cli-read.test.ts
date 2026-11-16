@@ -80,6 +80,29 @@ describe("git show <rev>:<path> in a blobless clone", () => {
     expect(await repositoryState(h)).toEqual(before);
   });
 
+  it("reports a failed fetch in diff as fatal with exit 128", async () => {
+    const h = await partialClone();
+
+    expect(
+      await h.offline.runCli({ argv: ["diff", h.base, "origin/topic"], cwd: "/work" }),
+    ).toMatchObject({
+      stdout: "",
+      stderr: "fatal: could not fetch from promisor remote: promisor remote is unreachable\n",
+      exitCode: 128,
+    });
+  });
+
+  it("keeps a UTF-8 byte order mark as Git does", async () => {
+    const h = await partialClone();
+    h.workspace.worktree.writeFile("/work/bom.txt", new Uint8Array([0xef, 0xbb, 0xbf, 0x41, 0x0a]));
+    await h.git.runCli({ argv: ["add", "bom.txt"], cwd: "/work" });
+    await h.git.runCli({ argv: ["commit", "-m", "bom"], cwd: "/work" });
+
+    const shown = await h.git.runCli({ argv: ["show", "HEAD:bom.txt"], cwd: "/work" });
+
+    expect(shown.stdout).toBe("\uFEFFA\n");
+  });
+
   it("refuses a blob that is not UTF-8 instead of corrupting it", async () => {
     const h = await partialClone();
     h.workspace.worktree.writeFile("/work/binary.bin", new Uint8Array([0xff, 0x00, 0xfe]));
