@@ -12,10 +12,11 @@ const IDENTITY = { name: "Fixture", email: "fixture@example.com" };
 
 /**
  * `stopped` is an integration that paused for the user — a conflict, or an
- * empty cherry-pick waiting for skip — which git reports with a non-zero exit
- * and kompjutr with a result object.
+ * empty cherry-pick waiting for skip — and `empty` a revert that had nothing
+ * to undo and left no state behind. git reports both with exit status 1;
+ * kompjutr returns a result object.
  */
-export type OutcomeKind = "clean" | "stopped" | "failed";
+export type OutcomeKind = "clean" | "stopped" | "empty" | "failed";
 
 export interface Outcome {
   kind: OutcomeKind;
@@ -136,6 +137,7 @@ function bareClone(source: GitFixture): GitFixture {
 
 const CLEAN: Outcome = { kind: "clean" };
 const STOPPED: Outcome = { kind: "stopped" };
+const EMPTY: Outcome = { kind: "empty" };
 
 async function capture(run: () => Promise<Outcome>): Promise<Outcome> {
   try {
@@ -178,7 +180,7 @@ function merged(result: { conflicted?: boolean }): Outcome {
 function replayed(result: { outcome: string }, pending: boolean): Outcome {
   if (result.outcome === "conflicted") return STOPPED;
   // A suspended empty cherry-pick waits for skip, as git's does.
-  if (result.outcome === "empty" && pending) return STOPPED;
+  if (result.outcome === "empty") return pending ? STOPPED : EMPTY;
   return CLEAN;
 }
 
@@ -349,9 +351,10 @@ const INTEGRATION = new Set<Op["op"]>([
 function run(fixture: GitFixture, op: Op, args: string[]): Outcome {
   const result = fixture.gitResult(...args);
   if (result.status === 0) return CLEAN;
-  // 128 is a refusal; anything else may have stopped on a conflict.
-  if (INTEGRATION.has(op.op) && result.status !== 128 && gitOperation(fixture) !== null) {
-    return STOPPED;
+  // 128 is a refusal; 1 stopped on a conflict, or found nothing to do.
+  if (INTEGRATION.has(op.op) && result.status === 1) {
+    if (gitOperation(fixture) !== null) return STOPPED;
+    if (op.op === "revert" || op.op === "revertContinue") return EMPTY;
   }
   return { kind: "failed", detail: `exit ${result.status}: ${result.stderr.trim()}` };
 }
