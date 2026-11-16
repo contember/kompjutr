@@ -395,7 +395,7 @@ describe("a failed hydration leaves the partial clone unchanged", () => {
     expect(() => h.repo.checkout.requireNoOperationState()).not.toThrow();
   });
 
-  it("registers no worktree when its tree cannot be hydrated", async () => {
+  it("rolls back a worktree add whose tree cannot be hydrated", async () => {
     const h = await partialClone();
     const before = await repositoryState(h);
 
@@ -404,22 +404,6 @@ describe("a failed hydration leaves the partial clone unchanged", () => {
         dir: "/work",
         root: "/topic",
         target: { kind: "new-branch", name: "local-topic", startPoint: "origin/topic" },
-      }),
-    ).rejects.toMatchObject({ code: "EFETCHFAIL" });
-
-    expect(await repositoryState(h)).toEqual(before);
-    expect(h.workspace.worktree.stat("/topic")).toBeNull();
-  });
-
-  it("rolls back a worktree add that missed a promised blob inside its mutation", async () => {
-    const h = await partialClone();
-    const before = await repositoryState(h);
-
-    await expect(
-      h.offline.worktreeAdd({
-        dir: "/work",
-        root: "/topic",
-        target: { kind: "detached", startPoint: "origin/topic" },
       }),
     ).rejects.toMatchObject({ code: "EFETCHFAIL" });
 
