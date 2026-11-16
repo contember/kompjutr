@@ -1,4 +1,5 @@
 import { GitError } from "../../common/errors.js";
+import { checkRefText, hasCanonicalRefSyntax } from "../../common/ref-name.js";
 import { mutateRefsOwned } from "../../store/refs/refs.js";
 import { checkoutTreeExcluding } from "../checkout/checkout.js";
 import { isInitialCheckoutFallback, tryInitialCheckout } from "../checkout/initial-checkout.js";
@@ -7,9 +8,14 @@ import type { GitContext } from "../core/context.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata } from "../core/ref-log.js";
 import { treeOf } from "../repository/reads.js";
-import { expandRefOwned, type Repository, resolveHeadOwned } from "../repository/repository.js";
+import { type Repository, resolveHeadOwned } from "../repository/repository.js";
+import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { type CompiledPathspecMatcher, compilePathspecs } from "../worktree/worktree-io.js";
+import {
+  type CompiledPathspecMatcher,
+  compilePathspecs,
+  requirePathspecsMatched,
+} from "../worktree/worktree-io.js";
 import { branch } from "./refs-branches.js";
 import { checkoutBlockers, describeBlockers } from "./refs-checkout-guard.js";
 
@@ -83,10 +89,11 @@ function checkoutInternal(
 ): void {
   requireSharedMutationScope(repo.store.db, worktree);
   const paths = options.paths !== undefined && options.paths.length > 0 ? options.paths : undefined;
-  const commit = repo.peel(repo.revParse(options.ref));
-  const tree = treeOf(repo, commit);
 
   if (paths !== undefined) {
+    const tree = treeOf(repo, repo.peel(repo.revParse(options.ref)));
+    // Git matches a path checkout's pathspecs against the source tree alone.
+    requirePathspecsMatched(paths, [treeStream(repo, tree)]);
     requireCheckoutAllowed(
       repo,
       worktree,
@@ -105,6 +112,8 @@ function checkoutInternal(
     return;
   }
 
+  const { head, commit } = checkoutTarget(repo, options.ref);
+  const tree = treeOf(repo, commit);
   try {
     repo.store.db.transactionSync(() => {
       if (
@@ -112,7 +121,7 @@ function checkoutInternal(
         tryInitialCheckout(context, repo, tree, {
           requireSharedDatabase: true,
           fallbackOnCapacity: true,
-          afterMaterialize: () => moveHead(context, repo, options.ref, commit),
+          afterMaterialize: () => moveHead(context, repo, head),
         })
       ) {
         return;
@@ -120,17 +129,17 @@ function checkoutInternal(
       const tracker = context.indexTracker;
       if (tracker !== undefined && excludeRoots.length === 0) {
         if (trySparseCleanCheckout(context, repo, worktree, tree)) {
-          moveHead(context, repo, options.ref, commit);
+          moveHead(context, repo, head);
           tracker.reseal(repo.checkout.checkoutId, tree, []);
           return;
         }
       }
-      checkoutLegacy(context, repo, worktree, options, tree, commit, excludeRoots);
+      checkoutLegacy(context, repo, worktree, options, tree, head, excludeRoots);
     });
   } catch (error) {
     if (!isInitialCheckoutFallback(error)) throw error;
     repo.store.db.transactionSync(() => {
-      checkoutLegacy(context, repo, worktree, options, tree, commit, excludeRoots);
+      checkoutLegacy(context, repo, worktree, options, tree, head, excludeRoots);
     });
   }
 }
@@ -141,7 +150,7 @@ function checkoutLegacy(
   worktree: Worktree,
   options: CheckoutOptions,
   tree: string,
-  commit: string,
+  head: string,
   excludeRoots: readonly string[],
 ): void {
   requireCheckoutAllowed(
@@ -157,7 +166,7 @@ function checkoutLegacy(
     preserveMatchingIndex: options.force !== true,
     restoreStructure: true,
   });
-  moveHead(context, repo, options.ref, commit);
+  moveHead(context, repo, head);
 }
 
 function requireCheckoutAllowed(
@@ -217,6 +226,10 @@ export function switchBranchExcluding(
 ): void {
   requireSharedMutationScope(repo.store.db, worktree);
   repo.store.db.transactionSync(() => {
+    if (options.create === true && options.startPoint === undefined && repo.head().oid === null) {
+      switchUnbornBranch(context, repo, options.name);
+      return;
+    }
     // The branch is created first, so a name collision leaves the tree alone.
     if (options.create === true) {
       branch(context, repo, { name: options.name, startPoint: options.startPoint });
@@ -225,17 +238,41 @@ export function switchBranchExcluding(
   });
 }
 
+/** An unborn HEAD has no commit to branch from, so Git only renames the unborn branch. */
+function switchUnbornBranch(context: GitContext, repo: Repository, name: string): void {
+  const full = `${HEADS}${name}`;
+  if (repo.store.getRef(full) !== null) {
+    throw new GitError("EBRANCHFAIL", `a branch named '${name}' already exists`);
+  }
+  moveHead(context, repo, `ref: ${full}`);
+}
+
+interface CheckoutTarget {
+  /** The raw HEAD value to write: `ref: <branch>`, or the commit to detach at. */
+  head: string;
+  commit: string;
+}
+
 /**
- * HEAD stays symbolic when the requested ref is a local branch, and
- * detaches at the commit for anything else — a tag, a remote-tracking
- * branch, or a raw oid.
+ * Git attaches HEAD only when the argument names a local branch, and then
+ * takes that branch's tip even over a same-named tag. Anything else — a tag,
+ * a full ref name, a revision expression, a raw oid — detaches.
  */
-function moveHead(context: GitContext, repo: Repository, ref: string, commit: string): void {
-  const expanded = expandRefOwned(repo, ref);
-  const full = expanded === "HEAD" ? resolveHeadOwned(repo).ref : expanded;
-  mutateRefsOwned(
-    repo.checkout,
-    { head: full?.startsWith(HEADS) ? `ref: ${full}` : commit },
-    operationRefLogMetadata(context, repo, "checkout"),
-  );
+function checkoutTarget(repo: Repository, ref: string): CheckoutTarget {
+  if (ref === "HEAD") {
+    const current = resolveHeadOwned(repo).ref;
+    const commit = repo.peel(repo.revParse("HEAD"));
+    return { head: current === null ? commit : `ref: ${current}`, commit };
+  }
+  const branchRef = `${HEADS}${ref}`;
+  const isBranchName = checkRefText(branchRef).problem === null && hasCanonicalRefSyntax(branchRef);
+  if (isBranchName && repo.store.getRef(branchRef) !== null) {
+    return { head: `ref: ${branchRef}`, commit: repo.peel(repo.revParse(branchRef)) };
+  }
+  const commit = repo.peel(repo.revParse(ref));
+  return { head: commit, commit };
+}
+
+function moveHead(context: GitContext, repo: Repository, head: string): void {
+  mutateRefsOwned(repo.checkout, { head }, operationRefLogMetadata(context, repo, "checkout"));
 }

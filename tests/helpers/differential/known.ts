@@ -179,12 +179,6 @@ const REFUSED_WHILE_PENDING: Op["op"][] = [
 
 export const KNOWN: KnownDivergence[] = [
   {
-    id: "unborn-checkout-b",
-    reason: "open: `checkout -b` on an unborn branch fails to resolve HEAD",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "checkoutNew") && refused(d, /unknown revision: HEAD/),
-  },
-  {
     id: "detached-integration",
     reason: "intentional: integrations need a checked-out branch (git-support.md, Integration)",
     fields: ["outcome"],
@@ -198,18 +192,6 @@ export const KNOWN: KnownDivergence[] = [
       opIs(d, "checkout", "checkoutNew") &&
       ((hadStagedChange(d) && refused(d, /would be overwritten by checkout/)) ||
         (d.fields.includes("index") && differsOnlyOn(d, stagedPaths(d.prior.status)))),
-  },
-  {
-    id: "reset-unmatched-path",
-    reason: "open: path reset fails on a pathspec git accepts silently",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "reset") && refused(d, /did not match any file/),
-  },
-  {
-    id: "checkout-ancestor-ref",
-    reason: "open: checkout of `<ref>~<n>` fails with EINVAL",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "checkout") && refused(d, /ref name is invalid/),
   },
   {
     id: "abort-resets-index",
@@ -229,15 +211,6 @@ export const KNOWN: KnownDivergence[] = [
       hadAddedPathChanged(d) &&
       ((d.op.op === "addAll" && d.op.update === true) ||
         (d.op.op === "commit" && d.op.all === true)),
-  },
-  {
-    id: "checkout-paths-unmatched",
-    reason: "open: path checkout accepts a pathspec that matches nothing",
-    fields: ["outcome"],
-    matches: (d) =>
-      opIs(d, "checkoutPaths") &&
-      d.field === "outcome" &&
-      /did not match any file/.test(d.outcomes.git.detail ?? ""),
   },
   {
     id: "operation-active",

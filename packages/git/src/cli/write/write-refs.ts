@@ -20,7 +20,6 @@ import { outputContext } from "./write-output.js";
 import {
   moveResetHead,
   requireIndexPaths,
-  requireResetPaths,
   requireTransactionalWorktree,
   requireTreePaths,
   resolveMutationPaths,
@@ -99,7 +98,6 @@ export function createGitCliRefWriteHandlers(context: GitContext): RefHandlers {
               checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
             } else {
               repo.checkout.requireNoOperationState();
-              if (paths.length > 0) requireResetPaths(repo, command.ref, paths);
               if (paths.length === 0 && command.ref !== undefined)
                 moveResetHead(context, repo, command.ref);
               reset(context, repo, context.worktree, {
@@ -151,7 +149,6 @@ export function createGitCliRefWriteHandlers(context: GitContext): RefHandlers {
               return `Switched to a new branch '${command.name}'\n`;
             }
             if (command.ref === undefined) throw new Error("parsed checkout lost its ref");
-            if (paths.length > 0) requireTreePaths(repo, command.ref, paths);
             checkoutExcluding(
               context,
               repo,
