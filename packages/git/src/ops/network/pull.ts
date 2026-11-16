@@ -366,44 +366,49 @@ export async function pull(
   if (upstream === null) {
     throw new GitError("EFETCHFAIL", `remote ${plan.remote} advertised no usable upstream ref`);
   }
-  // No signal: cancellation after fetch publication does not stop the integration.
-  return withPromisorHydratedMutation(context, repo, () => {
-    requireSharedMutationScope(repo.store.db, worktree);
-    validatePullAfterFetch(repo, options, plan);
-    if (plan.strategy === "rebase") {
-      const rebaseOptions = {
-        upstream,
-        ...(options.committer === undefined ? {} : { committer: options.committer }),
-        ...(options.env === undefined ? {} : { env: options.env }),
-      };
-      return {
-        strategy: "rebase",
-        result: rebase(context, repo, worktree, nestedRoots(context, repo.root), rebaseOptions),
-      };
-    }
+  // After fetch publication the signal cancels promised-blob hydration only.
+  return withPromisorHydratedMutation(
+    context,
+    repo,
+    () => {
+      requireSharedMutationScope(repo.store.db, worktree);
+      validatePullAfterFetch(repo, options, plan);
+      if (plan.strategy === "rebase") {
+        const rebaseOptions = {
+          upstream,
+          ...(options.committer === undefined ? {} : { committer: options.committer }),
+          ...(options.env === undefined ? {} : { env: options.env }),
+        };
+        return {
+          strategy: "rebase",
+          result: rebase(context, repo, worktree, nestedRoots(context, repo.root), rebaseOptions),
+        };
+      }
 
-    const message = options.message === undefined ? defaultPullMessage(plan) : options.message;
-    const result = merge(
-      context,
-      repo,
-      worktree,
-      {
-        theirs: upstream,
-        ours: plan.headRef,
-        ...(plan.fastForward === undefined ? {} : { fastForward: plan.fastForward }),
-        ...(plan.fastForwardOnly === undefined ? {} : { fastForwardOnly: plan.fastForwardOnly }),
-        message,
-        ...(options.author === undefined ? {} : { author: options.author }),
-        ...(options.committer === undefined ? {} : { committer: options.committer }),
-        ...(options.env === undefined ? {} : { env: options.env }),
-        ...(options.commit === undefined ? {} : { commit: options.commit }),
-      },
-      {
-        ...behavior,
-        incomingLabel: upstream,
-        origin: "pull",
-      },
-    );
-    return { strategy: "merge", result };
-  });
+      const message = options.message === undefined ? defaultPullMessage(plan) : options.message;
+      const result = merge(
+        context,
+        repo,
+        worktree,
+        {
+          theirs: upstream,
+          ours: plan.headRef,
+          ...(plan.fastForward === undefined ? {} : { fastForward: plan.fastForward }),
+          ...(plan.fastForwardOnly === undefined ? {} : { fastForwardOnly: plan.fastForwardOnly }),
+          message,
+          ...(options.author === undefined ? {} : { author: options.author }),
+          ...(options.committer === undefined ? {} : { committer: options.committer }),
+          ...(options.env === undefined ? {} : { env: options.env }),
+          ...(options.commit === undefined ? {} : { commit: options.commit }),
+        },
+        {
+          ...behavior,
+          incomingLabel: upstream,
+          origin: "pull",
+        },
+      );
+      return { strategy: "merge", result };
+    },
+    options.signal === undefined ? {} : { signal: options.signal },
+  );
 }
