@@ -11,9 +11,13 @@ import { treeOf } from "../repository/reads.js";
 import { type Repository, resolveHeadOwned } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { requirePathspecsMatched } from "../worktree/worktree-io.js";
+import { compilePathspecs, requirePathspecsMatched } from "../worktree/worktree-io.js";
 import { branch } from "./refs-branches.js";
-import { checkoutBlockers, describeBlockers } from "./refs-checkout-guard.js";
+import {
+  type CheckoutBlockers,
+  checkoutBlockers,
+  describeBlockers,
+} from "./refs-checkout-guard.js";
 
 // Branches, tags and HEAD movement, plus the working-tree reconciliation
 // that goes with moving HEAD. Refs are rows; HEAD is a column on the
@@ -52,7 +56,10 @@ export interface CheckoutOptions {
   ref: string;
   /** Update only these paths, and leave HEAD where it is. */
   paths?: string[];
-  /** Overwrite local changes instead of refusing. Path checkout always overwrites. */
+  /**
+   * Overwrite local changes instead of refusing. Path checkout overwrites
+   * tracked changes regardless and refuses only over untracked content.
+   */
   force?: boolean;
 }
 
@@ -90,8 +97,8 @@ function checkoutInternal(
     const tree = treeOf(repo, repo.peel(repo.revParse(options.ref)));
     // Git matches a path checkout's pathspecs against the source tree alone.
     requirePathspecsMatched(paths, [treeStream(repo, tree)]);
-    // Path checkout overwrites local changes, as Git does, and restores named
-    // targets without pruning absent ones.
+    requirePathCheckoutAllowed(repo, worktree, tree, paths, options.force === true, excludeRoots);
+    // Path checkout restores named targets without pruning absent ones.
     checkoutTreeExcluding(repo, worktree, tree, excludeRoots, {
       paths,
       prune: false,
@@ -169,6 +176,34 @@ function requireCheckoutAllowed(
       `local changes to ${describeBlockers(blocked.tracked, blocked.trackedOmitted)} would be overwritten by checkout`,
     );
   }
+  requireNoUntrackedBlockers(blocked);
+}
+
+/**
+ * Path checkout overwrites tracked changes as Git does, but unlike Git it
+ * refuses to delete untracked content in the way of a selected path.
+ */
+function requirePathCheckoutAllowed(
+  repo: Repository,
+  worktree: Worktree,
+  tree: string | null,
+  paths: readonly string[],
+  force: boolean,
+  excludeRoots: readonly string[],
+): void {
+  if (force) return;
+  requireNoUntrackedBlockers(
+    checkoutBlockers(repo, worktree, {
+      tree,
+      paths: compilePathspecs(paths),
+      prune: false,
+      excludeRoots: [...excludeRoots],
+      mode: "checkout",
+    }),
+  );
+}
+
+function requireNoUntrackedBlockers(blocked: CheckoutBlockers): void {
   if (blocked.untracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",

@@ -140,6 +140,26 @@ function stoppedEmpty(d: Divergence): boolean {
   return false;
 }
 
+/** Untracked paths in porcelain v2 `status`, a directory without its trailing slash. */
+function untrackedPaths(status: string): string[] {
+  return status
+    .split("\n")
+    .filter((line) => line.startsWith("? "))
+    .map((line) => unquote(line.slice(2)).replace(/\/$/, ""));
+}
+
+/** Before a path checkout, untracked content sat on, above or below a selected path. */
+function hadUntrackedInSelection(d: Divergence): boolean {
+  if (d.op.op !== "checkoutPaths") return false;
+  const specs = d.op.paths.map((spec) => spec.replace(/\/+$/, ""));
+  return untrackedPaths(d.prior.status).some((path) =>
+    specs.some(
+      (spec) =>
+        spec === "." || spec === path || path.startsWith(`${spec}/`) || spec.startsWith(`${path}/`),
+    ),
+  );
+}
+
 /** Before the op, an indexed path absent from HEAD had an unstaged change. */
 function hadAddedPathChanged(d: Divergence): boolean {
   return /^1 A[MDT]/m.test(d.prior.status);
@@ -248,6 +268,18 @@ export const KNOWN: KnownDivergence[] = [
     reason: "intentional: rebase refuses unrelated histories (git-support.md, git rebase)",
     fields: ["outcome"],
     matches: (d) => opIs(d, "rebase") && refused(d, /EUNRELATED/),
+  },
+  {
+    id: "path-checkout-untracked-blocker",
+    reason:
+      "intentional: path checkout refuses to delete untracked content in the way; " +
+      "git deletes it (git-support.md, git checkout)",
+    fields: ["outcome"],
+    matches: (d) =>
+      opIs(d, "checkoutPaths") &&
+      d.outcomes.git.kind === "clean" &&
+      hadUntrackedInSelection(d) &&
+      refused(d, /^ECHECKOUTFAIL: untracked working tree files would be overwritten/),
   },
   {
     id: "abort-refuses-unmerged-entry",

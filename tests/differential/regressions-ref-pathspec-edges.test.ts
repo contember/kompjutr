@@ -1,12 +1,22 @@
-import { describe, it } from "vitest";
+import { describe, expect, it } from "vitest";
+import { knownDivergence } from "../helpers/differential/known.js";
 import type { Op, Scenario } from "../helpers/differential/ops.js";
-import { expectAgreement } from "../helpers/differential/run.js";
+import { expectAgreement, play } from "../helpers/differential/run.js";
 
 const COMMITTED: Op[] = [
   { op: "write", path: "b.txt", content: { text: "x\n" } },
   { op: "add", paths: ["b.txt"] },
   { op: "commit", message: "m" },
 ];
+
+/** The scenario's last op hits the documented untracked-blocker difference. */
+async function expectUntrackedBlocker(scenario: Scenario): Promise<void> {
+  const divergence = await play(scenario);
+  expect(divergence?.step).toBe(scenario.ops.length - 1);
+  expect(divergence === null ? undefined : knownDivergence(divergence)?.id).toBe(
+    "path-checkout-untracked-blocker",
+  );
+}
 
 describe("differential regressions: ref and pathspec edges", () => {
   it("checkout -b on an unborn branch renames the unborn branch", async () => {
@@ -157,8 +167,8 @@ describe("differential regressions: ref and pathspec edges", () => {
     });
   });
 
-  it("path checkout overwrites an untracked file in the way", async () => {
-    await expectAgreement({
+  it("path checkout refuses to delete an untracked file in the way", async () => {
+    await expectUntrackedBlocker({
       start: "init",
       ops: [
         ...COMMITTED,
@@ -169,8 +179,8 @@ describe("differential regressions: ref and pathspec edges", () => {
     });
   });
 
-  it("path checkout replaces an untracked directory in the way", async () => {
-    await expectAgreement({
+  it("path checkout refuses to delete an untracked directory in the way", async () => {
+    await expectUntrackedBlocker({
       start: "init",
       ops: [
         ...COMMITTED,
