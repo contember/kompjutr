@@ -346,7 +346,8 @@ nothing; ordinary checkout and the local drive store NULL stat data.
 
 A pathspec that matches nothing throws `PathspecNotFoundError`. An ignored path
 exists and therefore counts as a match even when it is skipped; `force: true`
-stages it.
+stages it. A pathspec with a symlink as a leading directory fails with
+`EPATHSPEC` (`is beyond a symbolic link`) before the index changes, as Git does.
 
 ### `git rm` — `rm()`
 

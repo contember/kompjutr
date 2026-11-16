@@ -52,20 +52,21 @@ export function mapAddFailure(
     }
     for (const path of paths) {
       const prefix = "pathspec '";
-      const suffix = "' did not match any files";
-      if (
-        message.length === prefix.length + path.path.length + suffix.length &&
-        message.startsWith(prefix) &&
-        message.startsWith(path.path, prefix.length) &&
-        message.endsWith(suffix)
-      ) {
-        return gitCliDiagnosticResult(
-          "fatal: pathspec '",
-          path.input,
-          "' did not match any files\n",
-          128,
-          output,
-        );
+      for (const suffix of ["' did not match any files", "' is beyond a symbolic link"]) {
+        if (
+          message.length === prefix.length + path.path.length + suffix.length &&
+          message.startsWith(prefix) &&
+          message.startsWith(path.path, prefix.length) &&
+          message.endsWith(suffix)
+        ) {
+          return gitCliDiagnosticResult(
+            "fatal: pathspec '",
+            path.input,
+            `${suffix}\n`,
+            128,
+            output,
+          );
+        }
       }
     }
     return gitCliDiagnosticResult("fatal: ", message, "\n", 128, output);

@@ -294,7 +294,7 @@ describe("add", () => {
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
   });
 
-  it("falls back after a selected source finds a symlink ancestor", () => {
+  it("refuses a pathspec beyond a symlink once the selected source falls back", () => {
     const workspace = makeRepo("/");
     workspace.repo.checkout.indexPut({
       path: "link/child.txt",
@@ -305,18 +305,28 @@ describe("add", () => {
       mtime: null,
       ino: null,
     });
+    writeWorkFile(workspace, "/target/child.txt", "new\n");
     workspace.worktree.symlink("target", "/link");
+    writeWorkFile(workspace, "/other.txt", "other\n");
+    const before = workspace.repo.checkout.indexEntries();
     const sourceStatements: number[] = [];
 
-    add(
-      workspace.repo,
-      workspace.worktree,
-      { paths: ["link/child.txt"] },
-      nativeAddContext(workspace, sourceStatements),
+    expect(() =>
+      add(
+        workspace.repo,
+        workspace.worktree,
+        { paths: ["other.txt", "link/child.txt"] },
+        nativeAddContext(workspace, sourceStatements),
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "EPATHSPEC",
+        message: "pathspec 'link/child.txt' is beyond a symbolic link",
+      }),
     );
 
     expect(sourceStatements).toEqual([3]);
-    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
+    expect(workspace.repo.checkout.indexEntries()).toEqual(before);
   });
 
   it("falls back before mutation when exact classification exceeds source capacity", () => {

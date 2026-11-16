@@ -62,6 +62,26 @@ describe("differential regressions: add under a replaced parent", () => {
     await expectAgreement(parentBecameFile({ op: "add", paths: ["x"] }));
   });
 
+  it("refuses a pathspec beyond a symlinked parent", async () => {
+    await expectAgreement(parentBecameSymlink({ op: "add", paths: ["x/y"] }));
+  });
+
+  it("refuses an untracked pathspec beyond a symlinked parent", async () => {
+    const scenario = parentBecameSymlink({ op: "add", paths: ["x/z"] });
+    scenario.ops.splice(-1, 0, { op: "write", path: "realdir/z", content: { text: "z\n" } });
+    await expectAgreement(scenario);
+  });
+
+  it("refuses a glob beyond a symlinked parent", async () => {
+    await expectAgreement(parentBecameSymlink({ op: "add", paths: ["x/*"] }));
+  });
+
+  it("stages nothing when one of several pathspecs is beyond a symlink", async () => {
+    const scenario = parentBecameSymlink({ op: "add", paths: ["target.txt", "x/y"] });
+    scenario.ops.splice(-1, 0, { op: "write", path: "target.txt", content: { text: "t2\n" } });
+    await expectAgreement(scenario);
+  });
+
   it("stages the symlink and the removal through add -A", async () => {
     await expectAgreement(parentBecameSymlink({ op: "addAll" }));
   });

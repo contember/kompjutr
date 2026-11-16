@@ -125,6 +125,8 @@ function runAdd(
       index === repo.checkout && !specs.some(hasGlobSyntax)
         ? selectAddPaths(repo, specs, context)
         : null;
+    // A selection is unavailable when a spec has a symlink ancestor, so that
+    // case always reaches the check below.
     if (selected !== null) {
       assertSelectedPathspecsMatch(specs, selected);
       applyAdd(
@@ -143,6 +145,7 @@ function runAdd(
       );
       return;
     }
+    assertNoSymlinkLeadingPath(repo, worktree, specs);
     assertPathspecsMatch(repo, worktree, specs, index, options.excludeRoots);
   }
 
@@ -312,6 +315,27 @@ function literalSelectionIsExactTracked(repo: Repository, spec: string): boolean
     return exact.done !== true && exact.value.path === spec;
   } finally {
     entries.return?.();
+  }
+}
+
+/**
+ * Git refuses a pathspec whose leading directory is a symlink instead of
+ * staging through it. The walk stops at the first component that is not a
+ * directory, as Git's `has_symlink_leading_path` does.
+ */
+function assertNoSymlinkLeadingPath(
+  repo: Repository,
+  worktree: Worktree,
+  specs: readonly string[],
+): void {
+  for (const spec of specs) {
+    for (let at = spec.indexOf("/"); at > 0; at = spec.indexOf("/", at + 1)) {
+      const stat = worktree.stat(joinPath(repo.root, spec.slice(0, at)));
+      if (stat?.type === "symlink") {
+        throw new GitError("EPATHSPEC", `pathspec '${spec}' is beyond a symbolic link`);
+      }
+      if (stat?.type !== "dir") break;
+    }
   }
 }
 
