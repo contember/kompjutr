@@ -689,6 +689,36 @@ describe("mutating git CLI handlers", () => {
     expect(result.stderr).toContain("Author identity unknown");
     expect(repositoryState(workspace.context, workspace.repo)).toEqual(before);
   });
+  it("rolls back commit-all staging when a merge continuation fails", async () => {
+    const source = fixture();
+    source.write("s.txt", "base\n").write("tracked.txt", "one\n");
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("s.txt", "topic\n");
+    source.commit("topic");
+    source.git("checkout", "-q", "main");
+    source.write("s.txt", "main\n");
+    source.commit("main");
+    const workspace = nativeRepository();
+    await importFixture(source, workspace.repo.checkout);
+    checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+    expect(
+      merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
+    ).toMatchObject({ conflicted: true });
+    workspace.context.defaultIdentity = undefined;
+    writeWorkFile(workspace, "/repo/s.txt", "resolved\n");
+    writeWorkFile(workspace, "/repo/tracked.txt", "two\n");
+    const before = repositoryState(workspace.context, workspace.repo);
+
+    const result = await runner(workspace.context).runCli({
+      argv: ["commit", "-a", "-m", "missing identity"],
+      cwd: "/repo",
+    });
+    expect(result).toMatchObject({ stdout: "", exitCode: 128, truncated: false });
+    expect(result.stderr).toContain("Author identity unknown");
+    expect(repositoryState(workspace.context, workspace.repo)).toEqual(before);
+    expect(workspace.repo.checkout.readOperationState()?.state.kind).toBe("merge");
+  });
   it("summarizes a root blob above the repository batching target", async () => {
     const workspace = nativeRepository();
     const content = new Uint8Array(PACK_BLOB_BATCH_TARGET_BYTES + 1).fill(0x61);
