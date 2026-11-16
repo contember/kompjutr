@@ -21,6 +21,8 @@ export interface Divergence {
   before: Op[];
   /** git's state before `op`, which both sides still agreed on. */
   prior: Snapshot;
+  /** The agreed git state before each op so far: `history[i]` before op `i`. */
+  history: Snapshot[];
   outcomes: { kompjutr: Outcome; git: Outcome };
   /** `outcome`, `crash`, or the first differing snapshot field. */
   field: string;
@@ -41,14 +43,11 @@ export interface PlayResult {
 
 type Step = { divergence: Divergence } | { divergence: null; after: Snapshot };
 
-async function step(
-  world: DifferentialWorld,
-  ops: Op[],
-  index: number,
-  prior: Snapshot,
-): Promise<Step> {
+async function step(world: DifferentialWorld, ops: Op[], history: Snapshot[]): Promise<Step> {
+  const index = history.length - 1;
   const op = ops[index];
-  if (op === undefined) throw new Error(`no op at ${index}`);
+  const prior = history[index];
+  if (op === undefined || prior === undefined) throw new Error(`no op at ${index}`);
   const kompjutr: Outcome = await world.applyKompjutr(op);
   const git = world.applyGit(op);
   const at = {
@@ -56,6 +55,7 @@ async function step(
     op,
     before: ops.slice(0, index),
     prior,
+    history: [...history],
     outcomes: { kompjutr, git },
     differences: [],
     after: null,
@@ -93,11 +93,11 @@ function gitSnapshot(world: DifferentialWorld): Snapshot {
 export async function play(scenario: Scenario): Promise<Divergence | null> {
   const world = await createWorld(scenario.start);
   try {
-    let prior = gitSnapshot(world);
+    const history = [gitSnapshot(world)];
     for (let index = 0; index < scenario.ops.length; index++) {
-      const result = await step(world, scenario.ops, index, prior);
+      const result = await step(world, scenario.ops, history);
       if (result.divergence !== null) return result.divergence;
-      prior = result.after;
+      history.push(result.after);
     }
     return null;
   } finally {
@@ -117,14 +117,15 @@ export async function explore(seed: number, length: number): Promise<PlayResult>
   const ops: Op[] = [];
   try {
     let prior = gitSnapshot(world);
+    const history = [prior];
     for (let index = 0; index < length; index++) {
-      const op = generator.next(viewOf(prior));
-      ops.push(op);
-      const result = await step(world, ops, index, prior);
+      ops.push(generator.next(viewOf(prior)));
+      const result = await step(world, ops, history);
       if (result.divergence !== null) {
         return { scenario: { start, ops }, divergence: result.divergence };
       }
       prior = result.after;
+      history.push(prior);
     }
     return { scenario: { start, ops }, divergence: null };
   } finally {
@@ -133,14 +134,20 @@ export async function explore(seed: number, length: number): Promise<PlayResult>
 }
 
 /**
- * The same op, the same differing fields, and for an outcome the same kinds
- * and kompjutr error code: a different defect must not stand in for this one.
+ * The same op, the same differing fields, for an outcome the same kinds and
+ * kompjutr error code, and for a crash the same message with its scratch
+ * paths dropped: a different defect must not stand in for this one.
  */
 function signature(divergence: Divergence): string {
   const { kompjutr, git } = divergence.outcomes;
-  const code = (kompjutr.detail ?? "").split(":")[0] ?? "";
-  const outcome = divergence.field === "outcome" ? `${kompjutr.kind}/${git.kind}/${code}` : "";
-  return `${divergence.op.op}:${divergence.fields.join(",")}:${outcome}`;
+  const firstLine = (kompjutr.detail ?? "").split("\n")[0] ?? "";
+  let detail = "";
+  if (divergence.field === "outcome") {
+    detail = `${kompjutr.kind}/${git.kind}/${firstLine.split(":")[0] ?? ""}`;
+  } else if (divergence.field === "crash") {
+    detail = firstLine.replace(/\/\S*/g, "<path>");
+  }
+  return `${divergence.op.op}:${divergence.fields.join(",")}:${detail}`;
 }
 
 function label(divergence: Divergence): string {
@@ -274,7 +281,7 @@ export function report(seed: number, original: PlayResult, shrunk: PlayResult): 
 export async function expectAgreement(scenario: Scenario): Promise<void> {
   const divergence = await play(scenario);
   if (divergence !== null) {
-    const { prior: _prior, after: _after, ...shown } = divergence;
+    const { prior: _prior, history: _history, after: _after, ...shown } = divergence;
     throw new Error(`kompjutr diverged from git:\n${JSON.stringify(shown, null, 1)}`);
   }
 }

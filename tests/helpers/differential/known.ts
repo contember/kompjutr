@@ -28,9 +28,80 @@ function opIs(d: Divergence, ...kinds: Op["op"][]): boolean {
   return kinds.includes(d.op.op);
 }
 
+const ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13 };
+
+/** A path as status prints it, C-quoted when it holds special or non-ASCII bytes. */
+function unquote(path: string): string {
+  if (!path.startsWith('"')) return path;
+  const bytes: number[] = [];
+  const body = path.slice(1, -1);
+  for (let index = 0; index < body.length; index++) {
+    const char = body[index] ?? "";
+    if (char !== "\\") {
+      bytes.push(...Buffer.from(char, "utf8"));
+      continue;
+    }
+    const next = body[++index] ?? "";
+    if (/[0-7]/.test(next)) {
+      bytes.push(Number.parseInt(body.slice(index, index + 3), 8));
+      index += 2;
+    } else {
+      bytes.push(ESCAPES[next] ?? next.charCodeAt(0));
+    }
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+/** Paths with a staged change against HEAD in porcelain v2 `status`. */
+function stagedPaths(status: string): Set<string> {
+  const paths = new Set<string>();
+  for (const line of status.split("\n")) {
+    const fields = line.split(" ");
+    if (fields[0] === "1" && !fields[1]?.startsWith(".")) {
+      paths.add(unquote(fields.slice(8).join(" ")));
+    }
+    if (fields[0] === "2" && !fields[1]?.startsWith(".")) {
+      paths.add(unquote(fields.slice(9).join(" ").split("\t")[0] ?? ""));
+    }
+  }
+  return paths;
+}
+
 /** Before the op, the index held a change against HEAD. */
 function hadStagedChange(d: Divergence): boolean {
-  return /^[12] [^.]/m.test(d.prior.status);
+  return stagedPaths(d.prior.status).size > 0;
+}
+
+/** Every path whose index entry the two sides disagree on was staged before the op. */
+function indexDiffersOnlyOnStaged(d: Divergence): boolean {
+  if (d.after === null) return false;
+  const staged = stagedPaths(d.prior.status);
+  const kompjutr = new Set(d.after.kompjutr.index);
+  const git = new Set(d.after.git.index);
+  const differing = [
+    ...d.after.kompjutr.index.filter((entry) => !git.has(entry)),
+    ...d.after.git.index.filter((entry) => !kompjutr.has(entry)),
+  ];
+  return (
+    differing.length > 0 &&
+    differing.every((entry) => staged.has(entry.slice(entry.indexOf("\t") + 1)))
+  );
+}
+
+/** The last cherry-pick or revert before the op stopped with nothing to resolve. */
+function stoppedEmpty(d: Divergence): boolean {
+  for (let index = d.before.length - 1; index >= 0; index--) {
+    const op = d.before[index];
+    if (op?.op !== "cherryPick" && op?.op !== "revert") continue;
+    const stopped = d.history[index + 1];
+    return (
+      stopped !== undefined &&
+      stopped.operation !== null &&
+      !/^u /m.test(stopped.status) &&
+      stagedPaths(stopped.status).size === 0
+    );
+  }
+  return false;
 }
 
 /** Before the op, an indexed path absent from HEAD had an unstaged change. */
@@ -50,9 +121,11 @@ function onlyLeftoverDirectories(d: Divergence): boolean {
   if (d.after === null) return false;
   const files = (entries: DiskEntry[]): string =>
     JSON.stringify(entries.filter((entry) => entry.type !== "dir"));
+  const kompjutr = new Set(d.after.kompjutr.worktree.map((entry) => entry.path));
   return (
     d.after.kompjutr.worktree.length > d.after.git.worktree.length &&
-    files(d.after.kompjutr.worktree) === files(d.after.git.worktree)
+    files(d.after.kompjutr.worktree) === files(d.after.git.worktree) &&
+    d.after.git.worktree.every((entry) => kompjutr.has(entry.path))
   );
 }
 
@@ -113,8 +186,8 @@ export const KNOWN: KnownDivergence[] = [
     fields: ["outcome", "index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "checkout", "checkoutNew") &&
-      hadStagedChange(d) &&
-      (refused(d, /would be overwritten by checkout/) || d.fields.includes("index")),
+      ((hadStagedChange(d) && refused(d, /would be overwritten by checkout/)) ||
+        indexDiffersOnlyOnStaged(d)),
   },
   {
     id: "reset-unmatched-path",
@@ -134,8 +207,7 @@ export const KNOWN: KnownDivergence[] = [
     fields: ["index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "mergeAbort", "cherryPickAbort", "cherryPickSkip", "revertAbort", "revertSkip") &&
-      hadStagedChange(d) &&
-      d.fields.includes("index"),
+      indexDiffersOnlyOnStaged(d),
   },
   {
     id: "add-update-index",
@@ -166,7 +238,8 @@ export const KNOWN: KnownDivergence[] = [
       (opIs(d, ...REFUSED_WHILE_PENDING) ||
         (d.op.op === "reset" && d.op.hard !== true) ||
         (d.op.op === "commit" && d.prior.operation !== "merge")) &&
-      refused(d, /EOPACTIVE/),
+      // The typed API reports the code; the argv runner, git-style text.
+      refused(d, /EOPACTIVE|operation is already active|another operation is in progress/),
   },
   {
     id: "branch-rename-edges",
@@ -185,10 +258,7 @@ export const KNOWN: KnownDivergence[] = [
         refused(d, /ENOENT/)) ||
       (opIs(d, ...INTEGRATIONS, "revertContinue", "cherryPickContinue", "rebaseContinue") &&
         onlyLeftoverDirectories(d)) ||
-      (opIs(d, "revertContinue", "cherryPickContinue") &&
-        d.field === "outcome" &&
-        (d.prior.operation === "revert" || d.prior.operation === "cherry-pick") &&
-        !/^u /m.test(d.prior.status)),
+      (opIs(d, "revertContinue", "cherryPickContinue") && d.field === "outcome" && stoppedEmpty(d)),
   },
   {
     id: "merge-marker-label",
@@ -282,9 +352,10 @@ export const KNOWN: KnownDivergence[] = [
     id: "branch-auto-upstream",
     reason: "open: a branch started from a remote-tracking ref gets no upstream config",
     fields: ["upstreams"],
-    matches: (d) =>
-      (d.op.op === "branch" || d.op.op === "checkoutNew") &&
-      (d.op.startPoint ?? "").startsWith("origin/"),
+    matches: ({ op, after }) =>
+      (op.op === "branch" || op.op === "checkoutNew") &&
+      (op.startPoint ?? "").startsWith("origin/") &&
+      after?.kompjutr.upstreams.includes(`${op.name} - -`) === true,
   },
 ];
 
