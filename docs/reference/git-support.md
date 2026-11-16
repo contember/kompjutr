@@ -464,7 +464,7 @@ returns the complete add/delete output.
 | `--author` | `author` | ✔ |
 | committer override | `committer` | ✔ |
 | `GIT_AUTHOR_*` / `GIT_COMMITTER_*` | `env` | ~ read from the passed record only, never from `process.env` |
-| `-a` | `add({ all: true, trackedOnly: true })` first | ✔ the argv runner composes staging and commit in one transaction |
+| `-a` | `add({ all: true, trackedOnly: true })` first | ✔ the argv runner composes staging and the commit, or a pending merge's continuation, in one transaction |
 | `--allow-empty` | `allowEmpty: true` | ★ ✔ |
 | continue a merge | `commit()` during a pending merge finalizes it | ✔ `--amend` is rejected there |
 | `-F <file>`, `-S`, `--fixup`, `--squash`, `--no-verify` | — | ✘ (no hooks and no signing exist) |
