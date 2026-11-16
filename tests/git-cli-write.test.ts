@@ -651,6 +651,25 @@ describe("mutating git CLI handlers", () => {
     ).toEqual(cliResult(gitResult(source, amend)));
     expect(repositoryState(workspace.context, workspace.repo)).toEqual(before);
   });
+  it("matches the refusal of a commit-all amend that would become empty", async () => {
+    const amend = ["commit", "-a", "--amend", "-m", "amended"];
+    const source = fixture();
+    source.write("a.txt", "a\n").commit("first");
+    const workspace = await importedPair(source, [
+      { path: "a.txt", content: "two\n" },
+      { path: "b.txt", content: "b\n" },
+    ]);
+    removeBoth(source, workspace, [{ path: "b.txt", content: "" }]);
+    writeBoth(source, workspace, [
+      { path: "a.txt", content: "a\n" },
+      { path: "untracked.txt", content: "u\n" },
+    ]);
+    const before = repositoryState(workspace.context, workspace.repo);
+    expect(
+      await runner(workspace.context).runCli({ argv: amend, cwd: "/repo", env: IDENTITY_ENV }),
+    ).toEqual(cliResult(gitResult(source, amend)));
+    expect(repositoryState(workspace.context, workspace.repo)).toEqual(before);
+  });
   it("rolls back commit-all staging when identity resolution fails", async () => {
     const source = fixture();
     source.write("tracked.txt", "one\n");

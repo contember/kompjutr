@@ -9,7 +9,12 @@ import {
   statusFormatOptions,
 } from "../../ops/status/status-format.js";
 import { type GitCliOutputContext, gitCliDiagnosticResult, gitCliResult } from "../result.js";
-import type { GitCliEnvironment, GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
+import type {
+  GitCliCommitCommand,
+  GitCliEnvironment,
+  GitCliResult,
+  ResolvedGitCliRunOptions,
+} from "../types.js";
 import {
   stderrOutput,
   stdoutOutput,
@@ -82,15 +87,15 @@ export function mapCommitFailure(
   repo: Repository,
   error: unknown,
   options: ResolvedGitCliRunOptions,
-  amend: boolean,
+  command: GitCliCommitCommand,
 ): GitCliResult | undefined {
   if (hasErrorCode(error, "EMSG")) {
     return gitCliResult("", "Aborting commit due to empty commit message.\n", 1);
   }
   if (hasErrorCode(error, "EEMPTYCOMMIT")) {
     return gitCliResult(
-      cleanCommitRefusal(context, repo, amend),
-      amend
+      cleanCommitRefusal(context, repo, command),
+      command.amend === true
         ? "You asked to amend the most recent commit, but doing so would make\n" +
             "it empty. You can repeat your command with --allow-empty, or you can\n" +
             'remove the commit entirely with "git reset HEAD^".\n'
@@ -261,7 +266,11 @@ export function environmentRecord(environment: GitCliEnvironment): Record<string
   return record;
 }
 
-function cleanCommitRefusal(context: GitContext, repo: Repository, amend: boolean): string {
+function cleanCommitRefusal(
+  context: GitContext,
+  repo: Repository,
+  command: GitCliCommitCommand,
+): string {
   const head = repo.head();
   const rows = eagerStatus(
     repo,
@@ -269,10 +278,12 @@ function cleanCommitRefusal(context: GitContext, repo: Repository, amend: boolea
     { excludeRoots: nestedRoots(context, repo.root) },
     context,
   );
+  // `-a` staged every tracked change in an index git renders and then drops;
+  // after the rollback only the untracked rows still describe it.
   return formatCommitRefusalStatus(
-    rows,
+    command.all === true ? rows.filter((row) => row.worktree === "?") : rows,
     branchLabel(head.ref),
-    amend && head.oid !== null ? amendRefusalBase(repo, head.oid) : "head",
+    command.amend === true && head.oid !== null ? amendRefusalBase(repo, head.oid) : "head",
     statusFormatOptions(repo),
   );
 }
