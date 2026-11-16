@@ -430,6 +430,7 @@ describe("explicit-parent commit seam", () => {
     );
     const published = commitIndex(repo.workspace.repo, {
       ...options,
+      message: { mode: "exact", value: options.message },
       expectedHead,
       refLogReason: "commit",
     });
@@ -448,7 +449,7 @@ describe("explicit-parent commit seam", () => {
     const head = repo.workspace.repo.head();
 
     const result = commitIndex(repo.workspace.repo, {
-      message: "merge",
+      message: { mode: "clean", value: "merge" },
       parent: [first, second],
       identities: resolveIdentity(repo.workspace.context, repo.workspace.repo, {}),
       expectedHead: head,
@@ -474,7 +475,7 @@ describe("explicit-parent commit seam", () => {
 
     expect(() =>
       commitIndex(repo.workspace.repo, {
-        message: "stale",
+        message: { mode: "clean", value: "stale" },
         parent: [first],
         identities: resolveIdentity(repo.workspace.context, repo.workspace.repo, {}),
         expectedHead,
@@ -537,6 +538,37 @@ describe("amend", () => {
     expect(() =>
       commit(workspace.context, workspace.repo, { message: "nothing", amend: true }),
     ).toThrow(/cannot amend/);
+  });
+
+  it("compares an amend at a shallow boundary with the empty tree, as git does", () => {
+    const repo = mirror();
+    repo.write("a.txt", "a\n");
+    repo.expectSameCommit("first");
+    repo.write("b.txt", "b\n");
+    const second = repo.expectSameCommit("second");
+    const shallow = new GitFixture();
+    fixtures.push(shallow);
+    shallow.git("clone", "-q", "--depth", "1", `file://${repo.fixture.dir}`, ".");
+    repo.workspace.repo.store.setShallow([second]);
+    const amend = { message: "amended", amend: true };
+
+    shallow.git("rm", "-q", "a.txt", "b.txt");
+    expect(shallow.gitResult("commit", "-q", "--amend", "-m", amend.message).status).toBe(1);
+    repo.workspace.worktree.unlink("/a.txt");
+    repo.workspace.worktree.unlink("/b.txt");
+    stageAll(repo.workspace);
+    expect(() => commit(repo.workspace.context, repo.workspace.repo, amend)).toThrow(
+      expect.objectContaining({ code: "EEMPTYCOMMIT" }),
+    );
+
+    // The parent's tree is not empty, so git amends to it at the boundary.
+    shallow.git("reset", "-q", "--hard");
+    shallow.git("rm", "-q", "b.txt");
+    shallow.git("commit", "-q", "--amend", "-m", amend.message);
+    writeWorkFile(repo.workspace, "/a.txt", "a\n");
+    stageAll(repo.workspace);
+    const ours = commit(repo.workspace.context, repo.workspace.repo, amend).oid;
+    expect(repo.workspace.repo.readCommit(ours).tree).toBe(shallow.git("rev-parse", "HEAD^{tree}"));
   });
 });
 

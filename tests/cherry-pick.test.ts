@@ -505,6 +505,47 @@ describe("cherry-pick lifecycle", () => {
     }
   });
 
+  it("keeps an unclean source message like git, and cleans it on continue", async () => {
+    const message = "\n \n  subject  \t\n\n\n\nbody \r\nmid\rcr\n\n\n";
+    const source = fixture();
+    source.write("a.txt", "base\n");
+    const base = source.commit("base");
+    source.write("c.txt", "c\n").git("add", "c.txt");
+    const cleanTree = source.git("write-tree");
+    source.git("rm", "-q", "--cached", "c.txt");
+    source.remove("c.txt").write("a.txt", "source\n").git("add", "a.txt");
+    const conflictTree = source.git("write-tree");
+    const clean = source.gitInput(message, "commit-tree", cleanTree, "-p", base);
+    const conflicting = source.gitInput(message, "commit-tree", conflictTree, "-p", base);
+    source.git("branch", "clean", clean);
+    source.git("branch", "conflicting", conflicting);
+    source.write("a.txt", "main\n").commit("main");
+    const workspace = await imported(source);
+    const gitMessage = (): string => {
+      const text = utf8Decoder.decode(source.catFile(source.git("rev-parse", "HEAD")));
+      return text.slice(text.indexOf("\n\n") + 2);
+    };
+
+    source.git("cherry-pick", clean);
+    const picked = cherryPick(workspace.context, workspace.repo, workspace.worktree, {
+      source: clean,
+    });
+    if (picked.outcome !== "committed") throw new Error("clean pick did not commit");
+    expect(workspace.repo.readCommit(picked.oid).message).toBe(gitMessage());
+
+    expect(source.gitResult("cherry-pick", conflicting).status).not.toBe(0);
+    source.write("a.txt", "resolved\n").git("add", "a.txt");
+    source.gitWithEnv({ GIT_EDITOR: "true" }, "cherry-pick", "--continue");
+    expect(
+      cherryPick(workspace.context, workspace.repo, workspace.worktree, { source: conflicting }),
+    ).toEqual({ outcome: "conflicted" });
+    writeWorkFile(workspace, "/a.txt", "resolved\n");
+    add(workspace.repo, workspace.worktree, { paths: ["a.txt"], excludeRoots: [] });
+    const continued = cherryPickContinue(workspace.context, workspace.repo);
+    if (continued.outcome !== "committed") throw new Error("continuation did not commit");
+    expect(workspace.repo.readCommit(continued.oid).message).toBe(gitMessage());
+  });
+
   it("continues a distinct regular-symlink conflict from its cold journal", async () => {
     const source = fixture();
     source.write("target.txt", "target\n");

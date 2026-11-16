@@ -459,7 +459,7 @@ returns the complete add/delete output.
 
 | Git | kompjutr | |
 |---|---|---|
-| `-m <msg>` | `message` | ★ ~ **required**; an empty message throws `EMSG` |
+| `-m <msg>` | `message` | ★ ~ **required**; an empty message throws `EMSG`; stored after Git's whitespace cleanup, as are merge messages |
 | `--amend` | `amend` | ✔ |
 | `--author` | `author` | ✔ |
 | committer override | `committer` | ✔ |
@@ -476,8 +476,11 @@ wins only when it supplies both name and email; none left throws
 
 An ordinary commit refuses a tree identical to its first parent with
 `EEMPTYCOMMIT` unless the native caller sets `allowEmpty`. The same default
-refuses an empty root commit; a non-empty root commit succeeds. Amend and
-integration continuation keep their own semantics and may create a commit
+refuses an empty root commit; a non-empty root commit succeeds. An amend, as in
+Git, refuses a tree identical to the amended commit's first parent (the empty
+tree for a root or shallow commit) unless `allowEmpty` is set; amending a merge
+is exempt.
+Integration continuation keeps its own semantics and may create a commit
 without an ordinary tree change.
 
 ### `git log` — `log()`
@@ -975,7 +978,7 @@ start remains available only through the typed API and pull orchestration.
 |---|---|---|
 | `git cherry-pick <commit>` | `source` | ~ **one commit per call**; no ranges, no lists |
 | `-m <parent>` | `mainline` | ✔ required for a merge commit |
-| message / committer override | `message`, `committer` | ~ kompjutr extension; author and message are inherited by default |
+| message / committer override | `message`, `committer` | ~ kompjutr extension; author and message are inherited by default. As in Git, an uninterrupted pick keeps the inherited message verbatim from its first non-blank line; a continued pick cleans it as Git's editor does (whitespace, and lines starting with `#` dropped); a given message gets the whitespace cleanup of `-m` |
 | `--continue` / `--skip` / `--abort` | `cherryPickContinue()` / `…Skip()` / `…Abort()` | ✔ |
 | `-n`, `-x`, `-e`, `-s` | — | ✘ |
 

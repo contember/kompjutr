@@ -234,7 +234,11 @@ export function startReplay(
     const result = commitIndex(
       repo,
       {
-        message,
+        // git commits an uninterrupted pick's own message verbatim; a given one is cleaned like `-m`.
+        message:
+          input.message === undefined
+            ? { mode: "exact", value: message }
+            : { mode: "clean", value: message },
         parent: [head.oid],
         identities,
         expectedHead: head,
@@ -287,7 +291,11 @@ export function continueReplay(
     const result = commitIndex(
       repo,
       {
-        message: input.message ?? journal.state.message,
+        // git concludes a stopped pick through the editor, which also strips `#` lines.
+        message:
+          input.message === undefined
+            ? { mode: "strip", value: journal.state.message }
+            : { mode: "clean", value: input.message },
         parent: [journal.state.originalHeadOid],
         identities,
         expectedHead: head,
