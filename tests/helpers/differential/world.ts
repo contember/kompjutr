@@ -492,6 +492,13 @@ function applyGit(fixture: GitFixture, op: Op): Outcome {
     case "pull": {
       // `git pull` takes no `-m`: spell it as the fetch and merge it is, and
       // merge by OID so a conflict hunk is labelled as kompjutr labels it.
+      // kompjutr resolves the upstream before fetching (git-support.md,
+      // `git pull`); git fetches first, so ask for the upstream up front.
+      const branch = fixture.gitResult("symbolic-ref", "--quiet", "--short", "HEAD");
+      const merge = fixture.gitResult("config", `branch.${branch.stdout.trim()}.merge`);
+      if (branch.status !== 0 || merge.status !== 0) {
+        return { kind: "failed", detail: "no upstream" };
+      }
       const fetched = run(fixture, op, ["fetch", "-q", "origin"]);
       if (fetched.kind !== "clean") return fetched;
       const upstream = fixture.gitResult("rev-parse", "--verify", "--quiet", "@{upstream}");

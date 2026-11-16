@@ -813,6 +813,10 @@ after its first filtered fetch, fails with `EPROMISORREMOTE` before discovery.
 | local-path remote | — | ✘ throws `UnsupportedOperationError` |
 | `--autostash`, `--recurse-submodules` | — | ✘ |
 
+Pull resolves the upstream before it fetches: a branch with neither an explicit
+`remoteRef` nor `branch.<n>.merge` fails without network traffic, where Git
+fetches the remote first and then refuses.
+
 Pull targets the checked-out symbolic branch only. Its default fetch coverage
 accepts only the canonical
 `+refs/heads/*:refs/remotes/<remote>/*` mapping, updates every advertised head
@@ -948,6 +952,7 @@ cannot be materialised and fails atomically with `EUNSUPPORTED`.
 | `--abort` | `mergeAbort()` | ✔ restores only merge-owned paths; refuses over unstaged edits as Git does |
 | `--squash` | — | ✘ |
 | `-s <strategy>`, `-X ours\|theirs\|patience`, `--conflict-style` | — | ✘ one built-in three-way strategy, default markers |
+| rename detection | — | ✘ a path renamed on one side and edited on the other conflicts as modify/delete; Git follows the rename and merges cleanly |
 | octopus (3+ heads) | — | ✘ |
 | `--allow-unrelated-histories` | — | ✘ unrelated histories are refused |
 

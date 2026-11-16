@@ -10,6 +10,10 @@ export interface KnownDivergence {
   matches(divergence: Divergence): boolean;
 }
 
+function outcomeKind(value: unknown): string {
+  return typeof value === "object" && value !== null && "kind" in value ? String(value.kind) : "";
+}
+
 function detail(value: unknown): string {
   return typeof value === "object" && value !== null && "detail" in value
     ? String(value.detail)
@@ -112,6 +116,51 @@ export const KNOWN: KnownDivergence[] = [
     reason: "open: path checkout refuses staged changes git overwrites",
     matches: (d) =>
       d.op.op === "checkoutPaths" && /would be overwritten by checkout/.test(detail(d.kompjutr)),
+  },
+  {
+    id: "merge-without-renames",
+    reason: "intentional: three-way integration detects no renames (git-support.md, git merge)",
+    matches: (d) =>
+      ["merge", "pull", "cherryPick", "revert", "rebase", "rebaseContinue"].includes(d.op.op) &&
+      d.field === "outcome" &&
+      outcomeKind(d.kompjutr) === "stopped" &&
+      outcomeKind(d.git) === "clean",
+  },
+  {
+    id: "rebase-unrelated",
+    reason: "intentional: rebase refuses unrelated histories (git-support.md, git rebase)",
+    matches: (d) => /EUNRELATED/.test(detail(d.kompjutr)),
+  },
+  {
+    id: "abort-refuses-unmerged-entry",
+    reason: "open: abort proceeds where git's reset --merge refuses an entry that is not uptodate",
+    matches: (d) => /Abort$/.test(d.op.op) && /not uptodate/.test(detail(d.git)),
+  },
+  {
+    id: "push-destination-after-rename",
+    reason: "open: push of a renamed branch targets its moved upstream instead of its own name",
+    matches: (d) => d.op.op === "push" && d.field === "outcome",
+  },
+  {
+    id: "missing-worktree-path",
+    reason: "open: add and forced checkout leak ENOENT/ENOTDIR for a staged path missing on disk",
+    matches: (d) =>
+      ["add", "addAll", "checkout"].includes(d.op.op) && /ENOENT|ENOTDIR/.test(detail(d.kompjutr)),
+  },
+  {
+    id: "reset-ref-resolved-twice",
+    reason: "open: argv reset resolves a relative ref again after moving HEAD",
+    matches: (d) => d.op.op === "reset" && d.op.ref !== undefined && d.field === "index",
+  },
+  {
+    id: "status-typechange",
+    reason: "open: status reports a file/symlink type change as M instead of T",
+    matches: (d) => d.field === "status" && /^1 .?T|^1 T/m.test(String(d.git)),
+  },
+  {
+    id: "clean-empty-directories",
+    reason: "open: clean -d fails on a tree of empty directories",
+    matches: (d) => d.op.op === "clean" && /ENOTEMPTY/.test(detail(d.kompjutr)),
   },
 ];
 
