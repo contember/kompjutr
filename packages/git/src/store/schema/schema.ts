@@ -265,13 +265,8 @@ function requireVersionOneSchema(objects: ReadonlyMap<string, ExpectedSchemaObje
   }
 }
 
-/**
- * Bring a 0.1.4 store to version 2 without dropping a table whose child rows
- * would be lost: Durable Objects keep foreign keys on inside an event, so a
- * dropped parent cascades. Repositories gain their columns in place.
- * Maintenance runs are recreated with the wider root-source CHECK; their only
- * child table is copied aside first, so run progress survives exactly.
- */
+// Never drop a table with child rows: Durable Objects keep foreign keys on, so
+// it would cascade. The maintenance queue is copied aside and restored exactly.
 function migrateVersionOne(db: SqlDatabase): void {
   for (const statement of VERSION_ONE_REPOSITORY_ALTERATIONS) db.run(statement);
   db.run("CREATE TABLE kompjutr_migrate_runs AS SELECT * FROM git_maintenance_runs");

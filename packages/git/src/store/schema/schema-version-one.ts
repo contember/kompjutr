@@ -1,4 +1,4 @@
-// Frozen 0.1.4 definitions of the tables schema version 2 rebuilt. Never edit:
+// Frozen 0.1.4 definitions of the tables schema version 2 migrated. Never edit:
 // a version-one database is recognized by this exact text.
 
 export const VERSION_ONE_REPOSITORIES = `CREATE TABLE IF NOT EXISTS git_repositories (
