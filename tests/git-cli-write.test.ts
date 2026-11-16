@@ -1212,6 +1212,32 @@ describe("mutating git CLI handlers", () => {
     );
     await expectPublicGitState(source, workspace);
   });
+  it("restores from a local branch over a tag of the same name", async () => {
+    const source = fixture();
+    source.write("file.txt", "branch\n");
+    const base = source.commit("base");
+    source.git("branch", "side", base);
+    source.write("file.txt", "tag\n");
+    source.commit("tagged");
+    source.git("tag", "side");
+    source.write("file.txt", "main\n");
+    source.commit("main");
+
+    const workspace = nativeRepository();
+    await importFixture(source, workspace.repo.checkout);
+    checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+    const native = runner(workspace.context);
+
+    expect(gitResult(source, ["restore", "--source=side", "file.txt"]).status).toBe(0);
+    expect(
+      (await native.runCli({ argv: ["restore", "--source=side", "file.txt"], cwd: "/repo" }))
+        .exitCode,
+    ).toBe(0);
+    expect(new TextDecoder().decode(workspace.worktree.readFile("/repo/file.txt"))).toBe(
+      "branch\n",
+    );
+    await expectPublicGitState(source, workspace);
+  });
   it("matches Git state for path, mixed, hard, and detached resets", async () => {
     const source = fixture();
     source.write("nested/file.txt", "base\n");

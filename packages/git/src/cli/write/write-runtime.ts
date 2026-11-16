@@ -5,6 +5,7 @@ import { type GitContext, openRepository } from "../../ops/core/context.js";
 import { requireSharedMutationScope } from "../../ops/core/mutation-scope.js";
 import { operationRefLogMetadata } from "../../ops/core/ref-log.js";
 import { withPromisorHydratedMutation } from "../../ops/network/network.js";
+import { checkoutCommit } from "../../ops/refs/refs.js";
 import type { Repository } from "../../ops/repository/repository.js";
 import { repositoryMutations } from "../../ops/repository/repository.js";
 import { treeStream } from "../../ops/tree/tree-stream.js";
@@ -95,8 +96,7 @@ export function requireTreePaths(
   ref: string,
   paths: readonly ResolvedAddPath[],
 ): string {
-  const commit = repo.peel(repo.revParse(ref));
-  const tree = repo.readCommit(commit).tree;
+  const tree = repo.readCommit(checkoutCommit(repo, ref)).tree;
   requirePathspecsMatched(
     paths.map((path) => path.path),
     [treeStream(repo, tree), repo.checkout.indexScan()],

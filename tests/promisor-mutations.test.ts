@@ -153,6 +153,18 @@ describe("partial clone mutations hydrate promised blobs", () => {
     expectHydratedExactly(h, ["baseNotes", "old", "topicShared", "topicFile"]);
   });
 
+  it("hydrates the local branch a checkout switches to, not a same-named tag", async () => {
+    const h = await partialClone();
+    await h.git.branch({ dir: "/work", name: "topic", startPoint: "origin/topic" });
+    await h.git.tag({ dir: "/work", name: "topic", object: "origin/side" });
+
+    await h.git.checkout({ dir: "/work", ref: "topic" });
+
+    expect(h.repo.head().ref).toBe("refs/heads/topic");
+    await expectCleanAt(h, "/work", h.fixture.git("rev-parse", "topic^{tree}"));
+    expectHydratedExactly(h, ["baseNotes", "old", "topicShared", "topicFile"]);
+  });
+
   it("pulls an upstream whose tree holds a promised blob", async () => {
     const h = await partialClone();
     const { fresh, incoming } = await promisedUpstream(h);

@@ -71,6 +71,17 @@ describe("differential regressions: ref and pathspec edges", () => {
     });
   });
 
+  it("path checkout reads a local branch over a tag of the same name", async () => {
+    await expectAgreement({
+      start: "clone",
+      ops: [
+        { op: "branch", name: "side", startPoint: "main~1" },
+        { op: "tag", name: "side" },
+        { op: "checkoutPaths", ref: "side", paths: ["README.md"] },
+      ],
+    });
+  });
+
   it("reset of an unmatched path on an unborn branch succeeds", async () => {
     const scenario: Scenario = {
       start: "init",

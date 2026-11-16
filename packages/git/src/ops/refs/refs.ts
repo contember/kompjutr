@@ -94,7 +94,7 @@ function checkoutInternal(
   const paths = options.paths !== undefined && options.paths.length > 0 ? options.paths : undefined;
 
   if (paths !== undefined) {
-    const tree = treeOf(repo, repo.peel(repo.revParse(options.ref)));
+    const tree = treeOf(repo, checkoutCommit(repo, options.ref));
     // Git matches a path checkout's pathspecs against the source tree alone.
     requirePathspecsMatched(paths, [treeStream(repo, tree)]);
     requirePathCheckoutAllowed(repo, worktree, tree, paths, options.force === true, excludeRoots);
@@ -265,10 +265,16 @@ interface CheckoutTarget {
   commit: string;
 }
 
+/** The commit `checkout` and `restore --source` read `ref` from, as git resolves it. */
+export function checkoutCommit(repo: Repository, ref: string): string {
+  return checkoutTarget(repo, ref).commit;
+}
+
 /**
  * Git attaches HEAD only when the argument names a local branch, and then
- * takes that branch's tip even over a same-named tag. Anything else — a tag,
- * a full ref name, a revision expression, a raw oid — detaches.
+ * takes that branch's tip even over a same-named tag; a path checkout reads
+ * the same commit. Anything else — a tag, a full ref name, a revision
+ * expression, a raw oid — detaches.
  */
 function checkoutTarget(repo: Repository, ref: string): CheckoutTarget {
   if (ref === "HEAD") {

@@ -17,6 +17,7 @@ import {
   branchList as branchListOp,
   branch as branchOp,
   branchRename as branchRenameOp,
+  checkoutCommit,
   checkout as checkoutOp,
   tagDelete as tagDeleteOp,
   tagList as tagListOp,
@@ -86,12 +87,12 @@ export function createGitClientRefMethods(services: GitClientServices): RefMetho
       const repo = at(input.dir);
       requireSharedMutationScope(repo.store.db, context.worktree);
       repo.checkout.requireNoOperationState();
-      const commit = repo.peel(repo.revParse(input.ref));
+      const commit = checkoutCommit(repo, input.ref);
       const tree = repo.readCommit(commit).tree;
       await hydrateTreeBlobs(context, repo, tree, input.paths);
       mutate(() => {
         repo.checkout.requireNoOperationState();
-        const currentCommit = repo.peel(repo.revParse(input.ref));
+        const currentCommit = checkoutCommit(repo, input.ref);
         if (currentCommit !== commit || repo.readCommit(currentCommit).tree !== tree) {
           throw new GitError(
             "ESTALE",
