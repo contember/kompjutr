@@ -66,6 +66,44 @@ describe("commit -a concluding a paused merge", () => {
     };
     await expectAgreement(scenario);
   });
+
+  it("stages a file the merge added and the user then edited", async () => {
+    const scenario: Scenario = {
+      start: "init",
+      ops: [
+        ...conflictingTopic.slice(0, 7),
+        { op: "write", path: "new.txt", content: { text: "added\n" } },
+        { op: "add", paths: ["a.txt", "new.txt"] },
+        ...conflictingTopic.slice(8),
+        { op: "merge", theirs: "topic", message: "merge topic" },
+        { op: "write", path: "a.txt", content: { text: "resolved\n" } },
+        { op: "add", paths: ["a.txt"] },
+        { op: "write", path: "new.txt", content: { text: "edited\n" } },
+        { op: "commit", message: "m", all: true },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
+
+  it("resolves a modify/delete conflict whose path HEAD deleted", async () => {
+    const scenario: Scenario = {
+      start: "init",
+      ops: [
+        { op: "write", path: "a.txt", content: { text: "base\n" } },
+        { op: "add", paths: ["a.txt"] },
+        { op: "commit", message: "base" },
+        { op: "checkoutNew", name: "topic" },
+        { op: "write", path: "a.txt", content: { text: "topic\n" } },
+        { op: "commit", message: "topic", all: true },
+        { op: "checkout", ref: "main" },
+        { op: "rm", paths: ["a.txt"] },
+        { op: "commit", message: "main" },
+        { op: "merge", theirs: "topic", message: "merge topic" },
+        { op: "commit", message: "m", all: true },
+      ],
+    };
+    await expectAgreement(scenario);
+  });
 });
 
 // git commits beside its sequencer state; kompjutr refuses on purpose
