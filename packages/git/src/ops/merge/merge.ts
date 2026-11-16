@@ -27,7 +27,6 @@ import { requireMergeJournalOwned } from "./merge-journal.js";
 import type { MergeOrigin, MergeStateMetadata } from "./merge-state.js";
 import { commitTree, selectedBaseTreeOwned, type VirtualState } from "./merge-virtual-base.js";
 
-const HEADS = "refs/heads/";
 const MAX_MERGE_REVISION_CODE_UNITS = 1_024;
 
 export interface MergeOptions {
@@ -92,16 +91,6 @@ function requireCurrentHead(repo: Repository, ours: string | undefined): Resolve
     throw new GitError("EWRONGHEAD", `merge target ${ours} is not the checked-out branch`);
   }
   return head;
-}
-
-function shortRef(ref: string): string {
-  return ref.startsWith(HEADS) ? ref.slice(HEADS.length) : ref;
-}
-
-function incomingLabel(repo: Repository, theirs: string, oid: string): string {
-  const expanded = repo.expandRef(theirs);
-  if (expanded !== null && expanded !== "HEAD") return shortRef(expanded);
-  return oid.slice(0, 12);
 }
 
 function defaultMessage(label: string): string {
@@ -220,9 +209,10 @@ function mergeInTransaction(
 
   const currentTree = commitTree(repo, head.oid);
   const nextTree = commitTree(repo, incomingOid);
+  // Git labels the incoming side with the revision as spelled, never its expansion.
   const nextLabel =
     behavior.incomingLabel === undefined
-      ? incomingLabel(repo, theirs, incomingOid)
+      ? theirs
       : requireMergeRevision(behavior.incomingLabel, "incoming label");
   const currentLabel = "HEAD";
   const isFastForward = selection.kind === "fast-forward" && options.fastForward !== false;

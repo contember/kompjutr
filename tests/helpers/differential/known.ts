@@ -145,13 +145,6 @@ function hadAddedPathChanged(d: Divergence): boolean {
   return /^1 A[MDT]/m.test(d.prior.status);
 }
 
-function worktrees(d: Divergence, normalize: (entry: DiskEntry) => DiskEntry): [string, string] {
-  const show = (entries: DiskEntry[]): string => JSON.stringify(entries.map(normalize));
-  return d.after === null
-    ? ["", ""]
-    : [show(d.after.kompjutr.worktree), show(d.after.git.worktree)];
-}
-
 /** The worktrees differ only by directories kompjutr left behind. */
 function onlyLeftoverDirectories(d: Divergence): boolean {
   if (d.after === null) return false;
@@ -163,14 +156,6 @@ function onlyLeftoverDirectories(d: Divergence): boolean {
     files(d.after.kompjutr.worktree) === files(d.after.git.worktree) &&
     d.after.git.worktree.every((entry) => kompjutr.has(entry.path))
   );
-}
-
-/** Conflict marker lines with their labels dropped. */
-function unlabeled(entry: DiskEntry): DiskEntry {
-  if (entry.content === undefined) return entry;
-  const text = Buffer.from(entry.content, "hex").toString("latin1");
-  const bare = text.replace(/^(<<<<<<<|>>>>>>>) .*$/gm, "$1");
-  return { ...entry, content: Buffer.from(bare, "latin1").toString("hex") };
 }
 
 /** Git's stripspace changes this message: trailing blanks or blank edge lines. */
@@ -295,16 +280,6 @@ export const KNOWN: KnownDivergence[] = [
       (opIs(d, ...INTEGRATIONS, "revertContinue", "cherryPickContinue", "rebaseContinue") &&
         onlyLeftoverDirectories(d)) ||
       (opIs(d, "revertContinue", "cherryPickContinue") && d.field === "outcome" && stoppedEmpty(d)),
-  },
-  {
-    id: "merge-marker-label",
-    reason: "open: conflict markers name the expanded ref instead of the name as given",
-    fields: ["worktree"],
-    matches: (d) => {
-      if (!opIs(d, "merge", "pull")) return false;
-      const [kompjutr, git] = worktrees(d, unlabeled);
-      return kompjutr !== "" && kompjutr === git;
-    },
   },
   {
     id: "push-after-rename",
