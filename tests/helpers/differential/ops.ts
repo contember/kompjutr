@@ -49,6 +49,8 @@ export type Op =
   | { op: "pull"; message: string; mode?: "no-ff" | "ff-only" }
   /** A colleague commits on `branch` and pushes it to both origins. */
   | { op: "peerCommit"; branch: string; path: string; content: Content; message: string }
+  // -- storage: kompjutr repacks loose objects, git runs `gc`
+  | { op: "maintenance" }
   // -- the process lifecycle: kompjutr closes and reopens its database
   | { op: "reopen" };
 

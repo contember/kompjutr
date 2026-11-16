@@ -60,13 +60,30 @@ export async function createWorld(start: WorldStart): Promise<DifferentialWorld>
       timezoneOffset: () => 0,
       defaultGitIdentity: IDENTITY,
     });
-  let workspace = open();
-  const mirror = track(new GitFixture());
+  let workspace: LocalWorkspace | null = null;
   let server: GitServer | null = null;
   let origins: DifferentialWorld["origins"] = null;
   let peers: { kompjutr: GitFixture; git: GitFixture } | null = null;
+  const release = async (): Promise<void> => {
+    try {
+      workspace?.close();
+      workspace = null;
+    } finally {
+      try {
+        await server?.close();
+      } finally {
+        for (const fixture of fixtures) fixture.dispose();
+        local.dispose();
+      }
+    }
+  };
 
+  let opened: LocalWorkspace;
+  let mirror: GitFixture;
   try {
+    mirror = track(new GitFixture());
+    opened = open();
+    workspace = opened;
     if (start === "clone") {
       const seed = track(new GitFixture().init());
       seedOrigin(seed);
@@ -77,7 +94,7 @@ export async function createWorld(start: WorldStart): Promise<DifferentialWorld>
       server = await startGitServer(origins.kompjutr.dir);
       // kompjutr's clone defaults are shallow, single-branch and tagless;
       // ask for the shape `git clone` produces.
-      await workspace.git.clone({
+      await opened.git.clone({
         url: server.url,
         dir: "/",
         depth: 0,
@@ -87,44 +104,38 @@ export async function createWorld(start: WorldStart): Promise<DifferentialWorld>
       mirror.git("clone", "-q", origins.git.dir, ".");
       mirror.git("config", "core.autocrlf", "false");
     } else {
-      await workspace.git.init();
+      await opened.git.init();
       mirror.init("main");
     }
   } catch (error) {
-    workspace.close();
-    await server?.close();
-    for (const fixture of fixtures) fixture.dispose();
-    local.dispose();
+    await release();
     throw error;
   }
 
   const world: DifferentialWorld = {
     start,
     get workspace() {
-      return workspace;
+      return opened;
     },
     root: local.root,
     mirror,
     origins,
     async applyKompjutr(op) {
       if (op.op === "reopen") {
-        workspace.close();
-        workspace = open();
+        workspace = null;
+        opened.close();
+        opened = open();
+        workspace = opened;
         return CLEAN;
       }
       if (op.op === "peerCommit") return peerCommit(peers?.kompjutr, op);
-      return capture(() => applyKompjutr(workspace, op));
+      return capture(() => applyKompjutr(opened, op));
     },
     applyGit(op) {
       if (op.op === "peerCommit") return peerCommit(peers?.git, op);
       return applyGit(mirror, op);
     },
-    async dispose() {
-      workspace.close();
-      await server?.close();
-      for (const fixture of fixtures) fixture.dispose();
-      local.dispose();
-    },
+    dispose: release,
   };
   return world;
 }
@@ -325,6 +336,9 @@ async function applyKompjutr(workspace: LocalWorkspace, op: Op): Promise<Outcome
       return merged(pulled.result);
     }
     case "peerCommit":
+    case "maintenance":
+      await git.maintenance({});
+      return CLEAN;
     case "reopen":
       throw new Error(`${op.op} is played by the world`);
   }
@@ -349,7 +363,8 @@ const INTEGRATION = new Set<Op["op"]>([
 ]);
 
 function run(fixture: GitFixture, op: Op, args: string[]): Outcome {
-  const result = fixture.gitResult(...args);
+  // Known divergences match git's English messages.
+  const result = fixture.gitInputResultWithEnv("", { LC_ALL: "C" }, ...args);
   if (result.status === 0) return CLEAN;
   // 128 is a refusal; 1 stopped on a conflict, or found nothing to do.
   if (INTEGRATION.has(op.op) && result.status === 1) {
@@ -446,6 +461,10 @@ function applyGit(fixture: GitFixture, op: Op): Outcome {
       return run(fixture, op, [...args, op.theirs]);
     }
     case "mergeContinue":
+      // `commit` stands in for `merge --continue`, which cannot take a message.
+      if (gitOperation(fixture) !== "merge") {
+        return { kind: "failed", detail: "There is no merge in progress (MERGE_HEAD missing)." };
+      }
       return run(fixture, op, ["commit", "-q", "-m", op.message]);
     case "mergeAbort":
       return run(fixture, op, ["merge", "--abort"]);
@@ -508,6 +527,8 @@ function applyGit(fixture: GitFixture, op: Op): Outcome {
       if (op.mode === "ff-only") args.push("--ff-only");
       return run(fixture, op, [...args, upstream.stdout.trim()]);
     }
+    case "maintenance":
+      return run(fixture, op, ["gc", "-q"]);
     case "reopen":
       // kompjutr-only: git holds nothing in memory between commands.
       return CLEAN;

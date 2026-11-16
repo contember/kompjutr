@@ -9,7 +9,7 @@
 
 import { appendFileSync } from "node:fs";
 
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { knownDivergence } from "../helpers/differential/known.js";
 import { explore, report, shrink } from "../helpers/differential/run.js";
 
@@ -20,16 +20,33 @@ const STEPS = Number(process.env.KOMPJUTR_DIFF_STEPS ?? 30);
 const REPORT = process.env.KOMPJUTR_DIFF_REPORT;
 /** Shrinking shares the 60 s test budget with generation. */
 const SHRINK_MS = 40_000;
+/**
+ * A known divergence ends its seed early, so the fixed CI set must still play
+ * this share of its ops; otherwise known entries silently hollow it out.
+ */
+const COVERAGE_FLOOR = 0.6;
+const CI_SET = FIRST === 1 && SEEDS === 40 && STEPS === 30;
 
 describe("differential: kompjutr local vs git", () => {
   const seeds = Array.from({ length: SEEDS }, (_, index) => FIRST + index);
+  let played = 0;
+  let finished = 0;
+  afterAll(() => {
+    if (!CI_SET || finished !== SEEDS) return;
+    expect(played / (SEEDS * STEPS)).toBeGreaterThanOrEqual(COVERAGE_FLOOR);
+  });
   it.each(seeds)("seed %i", async (seed) => {
     const result = await explore(seed, STEPS);
+    played += result.scenario.ops.length;
+    finished++;
     if (result.divergence === null) return;
     const known = knownDivergence(result.divergence);
     if (known !== undefined) {
       if (REPORT !== undefined)
-        appendFileSync(REPORT, `${JSON.stringify({ seed, known: known.id })}\n`);
+        appendFileSync(
+          REPORT,
+          `${JSON.stringify({ seed, known: known.id, step: result.divergence.step + 1 })}\n`,
+        );
       return;
     }
     const shrunk = await shrink(result, Date.now() + SHRINK_MS);

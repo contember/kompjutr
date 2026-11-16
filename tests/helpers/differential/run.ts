@@ -2,18 +2,30 @@
 // one online from a seed; shrink a failing one to a minimal repro.
 
 import { Generator, viewOf } from "./generate.js";
+import { knownDivergence } from "./known.js";
 import { describeScenario, type Op, type Scenario, type WorldStart } from "./ops.js";
-import { compareSnapshots, snapshotGit, snapshotKompjutr } from "./snapshot.js";
+import {
+  compareSnapshots,
+  type StateDifference,
+  snapshotGit,
+  snapshotKompjutr,
+} from "./snapshot.js";
 import { createWorld, type DifferentialWorld, type Outcome } from "./world.js";
 
 export interface Divergence {
   /** Zero-based index of the op after which the sides disagreed. */
   step: number;
   op: Op;
+  /** The ops played before `op`, oldest first. */
+  before: Op[];
   /** `outcome`, `crash`, or the first differing snapshot field. */
   field: string;
+  /** Every differing field; a known divergence must explain all of them. */
+  fields: string[];
   kompjutr: unknown;
   git: unknown;
+  /** Each differing snapshot field with both values; empty for an outcome. */
+  differences: StateDifference[];
 }
 
 export interface PlayResult {
@@ -21,28 +33,45 @@ export interface PlayResult {
   divergence: Divergence | null;
 }
 
-async function step(world: DifferentialWorld, op: Op, index: number): Promise<Divergence | null> {
+async function step(
+  world: DifferentialWorld,
+  ops: Op[],
+  index: number,
+): Promise<Divergence | null> {
+  const op = ops[index];
+  if (op === undefined) return null;
+  const before = ops.slice(0, index);
   const kompjutr: Outcome = await world.applyKompjutr(op);
   const git = world.applyGit(op);
+  const at = { step: index, op, before, differences: [] };
   if (kompjutr.crash === true) {
-    return { step: index, op, field: "crash", kompjutr: kompjutr.detail, git };
+    return { ...at, field: "crash", fields: ["crash"], kompjutr: kompjutr.detail, git };
   }
   if (kompjutr.kind !== git.kind) {
-    return { step: index, op, field: "outcome", kompjutr, git };
+    return { ...at, field: "outcome", fields: ["outcome"], kompjutr, git };
   }
   const origin = world.origins;
   const left = await snapshotKompjutr(world.workspace, world.root, origin?.kompjutr ?? null);
   const right = snapshotGit(world.mirror, origin?.git ?? null);
-  const difference = compareSnapshots(left, right);
-  return difference === null ? null : { step: index, op, ...difference };
+  const differences = compareSnapshots(left, right);
+  const first = differences[0];
+  if (first === undefined) return null;
+  return {
+    ...at,
+    field: first.field,
+    fields: differences.map((difference) => difference.field),
+    kompjutr: first.kompjutr,
+    git: first.git,
+    differences,
+  };
 }
 
 /** Replay a fixed op list. */
 export async function play(scenario: Scenario): Promise<Divergence | null> {
   const world = await createWorld(scenario.start);
   try {
-    for (const [index, op] of scenario.ops.entries()) {
-      const divergence = await step(world, op, index);
+    for (let index = 0; index < scenario.ops.length; index++) {
+      const divergence = await step(world, scenario.ops, index);
       if (divergence !== null) return divergence;
     }
     return null;
@@ -66,7 +95,7 @@ export async function explore(seed: number, length: number): Promise<PlayResult>
       const view = viewOf(snapshotGit(world.mirror, world.origins?.git ?? null));
       const op = generator.next(view);
       ops.push(op);
-      const divergence = await step(world, op, index);
+      const divergence = await step(world, ops, index);
       if (divergence !== null) return { scenario: { start, ops }, divergence };
     }
     return { scenario: { start, ops }, divergence: null };
@@ -79,11 +108,16 @@ function signature(divergence: Divergence): string {
   return `${divergence.op.op}:${divergence.field}`;
 }
 
-/** A harness fault in a candidate is not the failure being shrunk. */
+/**
+ * A candidate reproduces when it fails the same way and is still unexplained:
+ * a candidate that drifts into a known divergence is a different failure. A
+ * harness fault in a candidate is not the failure being shrunk either.
+ */
 async function reproduces(scenario: Scenario, wanted: string): Promise<Divergence | null> {
   try {
     const divergence = await play(scenario);
-    return divergence !== null && signature(divergence) === wanted ? divergence : null;
+    if (divergence === null || signature(divergence) !== wanted) return null;
+    return knownDivergence(divergence) === undefined ? divergence : null;
   } catch {
     return null;
   }
@@ -92,8 +126,9 @@ async function reproduces(scenario: Scenario, wanted: string): Promise<Divergenc
 /**
  * Delta debugging over the op list, then over each op's optional fields and
  * contents, keeping a candidate only while it fails the same way: the same
- * op kind diverging on the same field. Stops at `deadline` with the best so
- * far.
+ * op kind diverging on the same field. Repeats until a pass changes nothing,
+ * so a simplification can unlock further removals. Stops at `deadline` with
+ * the best so far.
  */
 export async function shrink(failed: PlayResult, deadline: number): Promise<PlayResult> {
   const first = failed.divergence;
@@ -110,25 +145,38 @@ export async function shrink(failed: PlayResult, deadline: number): Promise<Play
     return true;
   };
 
-  if (best.start === "clone" && !best.ops.some(needsNetwork)) {
-    await attempt({ ...best, start: "init" });
-  }
-  for (
-    let size = Math.max(1, Math.floor(best.ops.length / 2));
-    size >= 1;
-    size = Math.floor(size / 2)
-  ) {
-    let index = 0;
-    while (index < best.ops.length - 1 && Date.now() < deadline) {
-      const ops = [...best.ops.slice(0, index), ...best.ops.slice(index + size)];
-      if (ops.length === 0 || !(await attempt({ ...best, ops }))) index += size;
+  let changed = true;
+  while (changed && Date.now() < deadline) {
+    changed = false;
+    if (best.start === "clone" && !best.ops.some(needsNetwork)) {
+      changed = (await attempt({ ...best, start: "init" })) || changed;
     }
-  }
-  for (let index = 0; index < best.ops.length && Date.now() < deadline; index++) {
-    for (const simpler of simplifications(best.ops[index])) {
-      const ops = [...best.ops];
-      ops[index] = simpler;
-      await attempt({ ...best, ops });
+    for (
+      let size = Math.max(1, Math.floor(best.ops.length / 2));
+      size >= 1;
+      size = Math.floor(size / 2)
+    ) {
+      let index = 0;
+      while (index < best.ops.length - 1 && Date.now() < deadline) {
+        const ops = [...best.ops.slice(0, index), ...best.ops.slice(index + size)];
+        if (ops.length > 0 && (await attempt({ ...best, ops }))) changed = true;
+        else index += size;
+      }
+    }
+    for (let index = 0; index < best.ops.length && Date.now() < deadline; index++) {
+      let simplified = true;
+      while (simplified) {
+        simplified = false;
+        for (const simpler of simplifications(best.ops[index])) {
+          const ops = [...best.ops];
+          ops[index] = simpler;
+          if (await attempt({ ...best, ops })) {
+            changed = true;
+            simplified = true;
+            break;
+          }
+        }
+      }
     }
   }
   return { scenario: best, divergence };
@@ -169,6 +217,7 @@ export function report(seed: number, original: PlayResult, shrunk: PlayResult): 
     `seed ${seed}: kompjutr diverged from git on ${signature(divergence)} at step ${divergence.step + 1}`,
     `(${original.scenario.ops.length} generated ops shrunk to ${shrunk.scenario.ops.length})`,
     describeScenario(shrunk.scenario),
+    `differing: ${divergence.fields.join(", ")}`,
     `kompjutr: ${JSON.stringify(divergence.kompjutr, null, 1)}`,
     `git:      ${JSON.stringify(divergence.git, null, 1)}`,
     `replay:   ${JSON.stringify(shrunk.scenario)}`,

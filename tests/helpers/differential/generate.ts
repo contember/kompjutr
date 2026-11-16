@@ -159,6 +159,7 @@ export class Generator {
       [2, () => ({ op: "revert", source: this.#ref(view) })],
       [4, () => ({ op: "rebase", upstream: this.#branch(view) })],
       [1, () => ({ op: "reopen" })],
+      [1, () => ({ op: "maintenance" })],
     ];
     if (this.#network) {
       choices.push(

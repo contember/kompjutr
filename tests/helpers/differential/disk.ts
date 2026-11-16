@@ -13,6 +13,7 @@ import {
   rmSync,
   type Stats,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -39,11 +40,10 @@ function clearFor(root: string, path: string): string {
   for (const part of parts.slice(0, -1)) {
     current = join(current, part);
     const stat = lstatOrNull(current);
-    if (stat !== null && !stat.isDirectory()) rmSync(current, { force: true });
+    if (stat !== null && !stat.isDirectory()) unlinkSync(current);
   }
   const full = join(root, path);
-  const leaf = lstatOrNull(full);
-  if (leaf !== null) rmSync(full, { recursive: true, force: true });
+  removeEntry(full);
   mkdirSync(join(full, ".."), { recursive: true });
   return full;
 }
@@ -67,7 +67,15 @@ export function writeSymlink(root: string, path: string, target: string): void {
 }
 
 export function removePath(root: string, path: string): void {
-  rmSync(join(root, path), { recursive: true, force: true });
+  removeEntry(join(root, path));
+}
+
+/** `rmSync` with `force` silently keeps a dangling symlink; unlink it instead. */
+function removeEntry(full: string): void {
+  const stat = lstatOrNull(full);
+  if (stat === null) return;
+  if (stat.isDirectory()) rmSync(full, { recursive: true });
+  else unlinkSync(full);
 }
 
 /** `mv` on disk; a missing source or an occupied destination is a no-op. */

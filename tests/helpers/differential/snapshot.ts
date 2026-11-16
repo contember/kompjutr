@@ -37,6 +37,8 @@ export interface Snapshot {
   status: string;
   worktree: DiskEntry[];
   operation: Operation;
+  /** `<branch> <remote> <merge>` per local branch, `-` for an unset key. */
+  upstreams: string[];
   originRefs: string[];
 }
 
@@ -77,15 +79,16 @@ export async function snapshotKompjutr(
     head = null;
   }
   const status = await workspace.git.runCli({ argv: ["status", "--porcelain=v2"], cwd: "/" });
+  const refs = sortedRefs(
+    repo.store
+      .listRefs("refs/")
+      .filter((row) => !row.target.startsWith("ref: "))
+      .map((row) => `${row.name} ${row.target}`),
+  );
   return {
     head,
     branch: (await workspace.git.currentBranch({ fullname: true })) ?? null,
-    refs: sortedRefs(
-      repo.store
-        .listRefs("refs/")
-        .filter((row) => !row.target.startsWith("ref: "))
-        .map((row) => `${row.name} ${row.target}`),
-    ),
+    refs,
     index: [...repo.checkout.indexScan()].map(
       (entry) => `${entry.mode.toString(8)} ${entry.oid} ${entry.stage}\t${entry.path}`,
     ),
@@ -95,22 +98,56 @@ export async function snapshotKompjutr(
         : `exit ${status.exitCode}: ${status.stderr.trimEnd()}`,
     worktree: readDisk(root),
     operation: repo.checkout.readOperationState()?.kind ?? null,
+    upstreams: await kompjutrUpstreams(workspace, refs),
     originRefs: origin === null ? [] : gitRefs(origin),
   };
+}
+
+async function kompjutrUpstreams(workspace: LocalWorkspace, refs: string[]): Promise<string[]> {
+  const read = async (path: string): Promise<string> => {
+    const value = await workspace.git.configGet({ path });
+    return typeof value === "string" ? value : "-";
+  };
+  const out: string[] = [];
+  for (const name of localBranches(refs)) {
+    out.push(
+      `${name} ${await read(`branch.${name}.remote`)} ${await read(`branch.${name}.merge`)}`,
+    );
+  }
+  return out;
+}
+
+function gitUpstreams(fixture: GitFixture, refs: string[]): string[] {
+  const read = (path: string): string => {
+    const result = fixture.gitResult("config", "--get", path);
+    return result.status === 0 ? result.stdout.trim() : "-";
+  };
+  return localBranches(refs).map(
+    (name) => `${name} ${read(`branch.${name}.remote`)} ${read(`branch.${name}.merge`)}`,
+  );
+}
+
+function localBranches(refs: string[]): string[] {
+  return refs
+    .map((ref) => ref.slice(0, ref.indexOf(" ")))
+    .filter((name) => name.startsWith("refs/heads/"))
+    .map((name) => name.slice("refs/heads/".length));
 }
 
 export function snapshotGit(fixture: GitFixture, origin: GitFixture | null): Snapshot {
   const head = fixture.gitResult("rev-parse", "--verify", "--quiet", "HEAD");
   const branch = fixture.gitResult("symbolic-ref", "--quiet", "HEAD");
+  const refs = gitRefs(fixture);
   return {
     head: head.status === 0 ? head.stdout.trim() : null,
     branch: branch.status === 0 ? branch.stdout.trim() : null,
-    refs: gitRefs(fixture),
+    refs,
     index: nulRecords(fixture.gitBinary("ls-files", "-s", "-z")),
     // kompjutr detects exact renames only; ask git for the same.
     status: fixture.git("status", "--porcelain=v2", "--find-renames=100%"),
     worktree: readDisk(fixture.dir, ".git"),
     operation: gitOperation(fixture),
+    upstreams: gitUpstreams(fixture, refs),
     originRefs: origin === null ? [] : gitRefs(origin),
   };
 }
@@ -132,13 +169,13 @@ export interface StateDifference {
 }
 
 /**
- * The first field that differs, or null. While a rebase is pending, git
- * detaches onto the new base and kompjutr keeps the branch at its original
- * OID (`docs/reference/git-support.md`, `git rebase`), so HEAD, the branch
- * and every HEAD-relative status row are left out; tests/CLAUDE.md fixes
- * exactly this narrowing for the journey harness too.
+ * Every field that differs, in comparison order. While a rebase is pending,
+ * git detaches onto the new base and kompjutr keeps the branch at its
+ * original OID (`docs/reference/git-support.md`, `git rebase`), so HEAD, the
+ * branch and every HEAD-relative status row are left out; tests/CLAUDE.md
+ * fixes exactly this narrowing for the journey harness too.
  */
-export function compareSnapshots(kompjutr: Snapshot, git: Snapshot): StateDifference | null {
+export function compareSnapshots(kompjutr: Snapshot, git: Snapshot): StateDifference[] {
   const rebasing = kompjutr.operation === "rebase" && git.operation === "rebase";
   const fields: (keyof Snapshot)[] = [
     "operation",
@@ -148,17 +185,19 @@ export function compareSnapshots(kompjutr: Snapshot, git: Snapshot): StateDiffer
     "index",
     "worktree",
     "status",
+    "upstreams",
     "originRefs",
   ];
+  const differences: StateDifference[] = [];
   for (const field of fields) {
     if (rebasing && (field === "head" || field === "branch")) continue;
     const left = rebasing && field === "status" ? headless(kompjutr.status) : kompjutr[field];
     const right = rebasing && field === "status" ? headless(git.status) : git[field];
     if (JSON.stringify(left) !== JSON.stringify(right)) {
-      return { field, kompjutr: left, git: right };
+      differences.push({ field, kompjutr: left, git: right });
     }
   }
-  return null;
+  return differences;
 }
 
 /** Unmerged, untracked and ignored rows: the ones independent of HEAD. */

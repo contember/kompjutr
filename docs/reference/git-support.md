@@ -910,12 +910,14 @@ Two restrictions are deliberate, and Git has neither:
 
 - **A pending integration owns the checkout.** Until it continues, skips, or
   aborts, every command that moves a ref, the checkout, or a remote fails with
-  `EOPACTIVE`: branch and tag create and delete, checkout, switch, restore,
-  clean, mixed and path reset, fetch, pull, push, `updateRef()`, and
-  `recoverRef()`. Staging (`add`, `rm`) stays available for resolution, a hard
-  reset clears the operation, and `commit()` finalizes only a pending merge.
-  Git lets these run beside its sequencer state; the journal's plan and
-  anchors are immutable, so kompjutr refuses rather than replan.
+  `EOPACTIVE`: branch and tag create, rename and delete, checkout, switch,
+  restore, clean, mixed and path reset, fetch, pull, push, starting a second
+  merge, cherry-pick, revert or rebase, `updateRef()`, and `recoverRef()`.
+  Staging (`add`, `rm`) stays available for resolution, a hard reset clears
+  the operation, and `commit()` finalizes only a pending merge. Git runs most
+  of these beside its sequencer state, refusing only some (a checkout or a
+  second merge over unmerged entries); the journal's plan and anchors are
+  immutable, so kompjutr refuses all of them rather than replan.
 - **Merge, cherry-pick, revert and rebase need a checked-out branch.** On a
   detached HEAD each fails with `EDETACHED` before it starts; Git integrates
   into the detached HEAD.
