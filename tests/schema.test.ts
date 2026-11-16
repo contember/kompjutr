@@ -513,13 +513,13 @@ class FailVersionWriteDatabase implements SqlDatabase {
 }
 
 describe("git schema", () => {
-  it("creates the exact current schema at deployable version one", () => {
+  it("creates the exact current schema at deployable version two", () => {
     const db = new TestDatabase();
 
     initializeGitSchema(db);
 
-    expect(SCHEMA_VERSION).toBe(1);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("1");
+    expect(SCHEMA_VERSION).toBe(2);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("2");
     expect(schemaObjects(db)).toEqual(EXPECTED_SCHEMA_OBJECTS);
     for (const [table, columns] of EXPECTED_TABLE_COLUMNS) {
       expect(columnsOf(db, table), table).toEqual(columns);
@@ -1004,13 +1004,13 @@ describe("git schema", () => {
       `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
        VALUES (17, 1, '/repo', 'ref: refs/heads/main', 1)`,
     );
-    db.run("UPDATE git_meta SET value = '2' WHERE key = 'schema_version'");
+    db.run("UPDATE git_meta SET value = '3' WHERE key = 'schema_version'");
     const before = schemaObjects(db);
 
-    expect(() => initializeGitSchema(db)).toThrow(/version 2 is unsupported/);
+    expect(() => initializeGitSchema(db)).toThrow(/version 3 is unsupported/);
 
     expect(schemaObjects(db)).toEqual(before);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("2");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("3");
     expect(db.scalar<string>("SELECT root FROM git_checkouts WHERE id = 17")).toBe("/repo");
   });
 

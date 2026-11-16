@@ -10,6 +10,13 @@ import { MAINTENANCE_SCHEMA_STATEMENTS } from "./schema-maintenance-statements.j
 import { OBJECT_SCHEMA_STATEMENTS } from "./schema-object-statements.js";
 import { TRANSFER_SCHEMA_STATEMENTS } from "./schema-transfer-statements.js";
 import { TREE_SCHEMA_STATEMENTS } from "./schema-tree-statements.js";
+import {
+  MIGRATED_REPOSITORIES,
+  VERSION_ONE_MAINTENANCE_RUN_COLUMNS,
+  VERSION_ONE_MAINTENANCE_RUNS,
+  VERSION_ONE_REPOSITORIES,
+  VERSION_ONE_REPOSITORY_ALTERATIONS,
+} from "./schema-version-one.js";
 import { WORKTREE_SCHEMA_STATEMENTS } from "./schema-worktree-statements.js";
 
 export { MAX_BLOB_ID_CACHE_ROWS } from "../objects/blob-id-cache.js";
@@ -63,6 +70,12 @@ if (EXPECTED_SCHEMA_OBJECTS.size !== STATEMENTS.length) {
   throw new Error("git schema contains duplicate definitions");
 }
 
+// A store migrated from 0.1.4 keeps the in-place form of git_repositories; its
+// constraints are equivalent to the fresh definition.
+const ALTERNATE_SCHEMA_SQL = new Map([
+  ["git_repositories", expectedSchemaObject(MIGRATED_REPOSITORIES)[1].sql],
+]);
+
 const schemaTextEncoder = new TextEncoder();
 let maxSchemaObjectNameBytes = 0;
 let maxSchemaObjectDefinitionBytes = 0;
@@ -74,6 +87,7 @@ for (const [name, definition] of EXPECTED_SCHEMA_OBJECTS) {
   maxSchemaObjectDefinitionBytes = Math.max(
     maxSchemaObjectDefinitionBytes,
     schemaTextEncoder.encode(definition.sql).length,
+    schemaTextEncoder.encode(ALTERNATE_SCHEMA_SQL.get(name) ?? "").length,
   );
 }
 const MAX_SCHEMA_OBJECT_ROWS = EXPECTED_SCHEMA_OBJECTS.size + 1;
@@ -167,7 +181,7 @@ function requireCurrentSchemaObject(
       `git schema object ${name} is a ${actual.type}, expected ${expected.type}`,
     );
   }
-  if (actual.sql !== expected.sql) {
+  if (actual.sql !== expected.sql && actual.sql !== ALTERNATE_SCHEMA_SQL.get(name)) {
     throw new CorruptError(`git schema object ${name} does not match its current definition`);
   }
 }
@@ -183,7 +197,7 @@ function requireCurrentSchema(objects: ReadonlyMap<string, ExpectedSchemaObject>
   }
 }
 
-function requireCurrentVersion(db: SqlDatabase): void {
+function readVersion(db: SqlDatabase): number {
   const row = db.one<{ value: unknown; invalid: unknown }>(
     `SELECT
        CASE WHEN typeof(value) = 'text'
@@ -205,13 +219,82 @@ function requireCurrentVersion(db: SqlDatabase): void {
   }
   const version = Number(recorded);
   if (!Number.isSafeInteger(version)) throw new CorruptError("git schema has an invalid version");
-  if (version !== SCHEMA_VERSION) {
-    throw new CorruptError(
-      `git schema version ${version} is unsupported; expected ${SCHEMA_VERSION}`,
-    );
+  return version;
+}
+
+function unsupportedVersion(version: number): CorruptError {
+  return new CorruptError(
+    `git schema version ${version} is unsupported; expected ${SCHEMA_VERSION}`,
+  );
+}
+
+function requireCurrentVersion(db: SqlDatabase): void {
+  const version = readVersion(db);
+  if (version !== SCHEMA_VERSION) throw unsupportedVersion(version);
+}
+
+function writeCurrentVersion(db: SqlDatabase): void {
+  db.run("UPDATE git_meta SET value = ? WHERE key = 'schema_version'", String(SCHEMA_VERSION));
+}
+
+const VERSION_ONE_DEFINITIONS = new Map([
+  ["git_repositories", VERSION_ONE_REPOSITORIES],
+  ["git_maintenance_runs", VERSION_ONE_MAINTENANCE_RUNS],
+]);
+const VERSION_ONE_ABSENT = new Set(
+  TRANSFER_SCHEMA_STATEMENTS.map((statement) => expectedSchemaObject(statement)[0]),
+);
+
+/** Version 1 as 0.1.4 created it: no transfer tables and two older table definitions. */
+function requireVersionOneSchema(objects: ReadonlyMap<string, ExpectedSchemaObject>): void {
+  for (const name of EXPECTED_SCHEMA_OBJECTS.keys()) {
+    if (VERSION_ONE_ABSENT.has(name)) continue;
+    const legacy = VERSION_ONE_DEFINITIONS.get(name);
+    if (legacy === undefined) {
+      requireCurrentSchemaObject(objects, name);
+    } else if (!objects.has(name)) {
+      throw new CorruptError(`git schema is missing required table ${name}`);
+    } else if (objects.get(name)?.sql !== expectedSchemaObject(legacy)[1].sql) {
+      throw new CorruptError(`git schema object ${name} does not match its version-one definition`);
+    }
+  }
+  for (const name of objects.keys()) {
+    if (!EXPECTED_SCHEMA_OBJECTS.has(name) || VERSION_ONE_ABSENT.has(name)) {
+      throw new CorruptError(`git schema contains unexpected object ${name}`);
+    }
   }
 }
 
+// Never drop a table with child rows: Durable Objects keep foreign keys on, so
+// it would cascade. The maintenance queue is copied aside and restored exactly.
+function migrateVersionOne(db: SqlDatabase): void {
+  for (const statement of VERSION_ONE_REPOSITORY_ALTERATIONS) db.run(statement);
+  db.run("CREATE TABLE kompjutr_migrate_runs AS SELECT * FROM git_maintenance_runs");
+  db.run("CREATE TABLE kompjutr_migrate_objects AS SELECT * FROM git_maintenance_objects");
+  db.run("DELETE FROM git_maintenance_runs");
+  db.run("DROP TABLE git_maintenance_runs");
+  db.run(currentStatement("git_maintenance_runs"));
+  db.run(
+    `INSERT INTO git_maintenance_runs (${VERSION_ONE_MAINTENANCE_RUN_COLUMNS})
+     SELECT ${VERSION_ONE_MAINTENANCE_RUN_COLUMNS} FROM kompjutr_migrate_runs`,
+  );
+  db.run("INSERT INTO git_maintenance_objects SELECT * FROM kompjutr_migrate_objects");
+  db.run("DROP TABLE kompjutr_migrate_runs");
+  db.run("DROP TABLE kompjutr_migrate_objects");
+  for (const statement of TRANSFER_SCHEMA_STATEMENTS) db.run(statement);
+  writeCurrentVersion(db);
+}
+
+function currentStatement(name: string): string {
+  const statement = STATEMENTS.find((candidate) => expectedSchemaObject(candidate)[0] === name);
+  if (statement === undefined) throw new Error(`git schema has no definition for ${name}`);
+  return statement;
+}
+
+/**
+ * Version 1 has two shapes: 0.1.4 created it without the transfer tables, and
+ * 0.1.5 and 0.1.6 created the current schema under the same number.
+ */
 export function initializeGitSchema(db: SqlDatabase): void {
   db.transactionSync(() => {
     const before = readSchemaObjects(db);
@@ -220,7 +303,20 @@ export function initializeGitSchema(db: SqlDatabase): void {
         throw new CorruptError("git schema metadata is missing from an existing database");
       }
       requireCurrentSchemaObject(before, "git_meta");
-      requireCurrentVersion(db);
+      const version = readVersion(db);
+      if (version === 1 && !before.has("git_transfers")) {
+        requireVersionOneSchema(before);
+        migrateVersionOne(db);
+        requireCurrentSchema(readSchemaObjects(db));
+        requireCurrentVersion(db);
+        return;
+      }
+      if (version === 1) {
+        requireCurrentSchema(before);
+        writeCurrentVersion(db);
+        return;
+      }
+      if (version !== SCHEMA_VERSION) throw unsupportedVersion(version);
       requireCurrentSchema(before);
       return;
     }
