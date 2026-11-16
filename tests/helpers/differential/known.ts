@@ -284,12 +284,6 @@ export const KNOWN: KnownDivergence[] = [
       ),
   },
   {
-    id: "branch-rename-edges",
-    reason: "open: branch rename refuses an unborn branch and a rename onto itself",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "branchRename") && refused(d, /EBRANCHFAIL/),
-  },
-  {
     id: "replay-worktree",
     reason:
       "open: revert/cherry-pick trip on a missing worktree file, keep emptied directories, " +

@@ -584,8 +584,11 @@ transactional expected-tip guard that prevents deleting a concurrently moved
 
 Rename has no force mode. It rejects an occupied destination, a detached
 selected checkout, a source attached to another checkout, destination branch
-config, and an active operation. Upstream management and remote rename remain
-separate, unsupported operations.
+config, and an active operation. As in Git, renaming the selected checkout's
+unborn branch moves only `HEAD` and its `branch.<name>.*` config, and a rename
+onto the same name succeeds without moving a ref or config; unlike Git, neither
+writes a reflog entry. Upstream management and remote rename remain separate,
+unsupported operations.
 
 The strict argv runner exposes normal create, safe and force delete, rename,
 list, and show-current through the exact spellings in [Strict local argv

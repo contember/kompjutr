@@ -99,25 +99,29 @@ function branchRenameOwned(
       source = requestedSource;
     }
 
+    const sourceHead = symbolicRef(source);
+    const checkoutOwner = listCheckoutsOwned(context.database, repo.store.repoId).find(
+      (checkout) => checkout.head === sourceHead,
+    );
     const tip = repo.store.getRef(source);
-    if (tip === null) {
+    // Like Git, an unborn branch exists for rename while a HEAD names it.
+    if (tip === null && checkoutOwner === undefined) {
       throw new GitError("EBRANCHFAIL", `branch '${source.slice(HEADS.length)}' not found`);
     }
-    if (!isOid(tip)) {
-      throw new CorruptError(`branch '${source.slice(HEADS.length)}' is not a direct ref`);
+    if (tip !== null) {
+      if (!isOid(tip)) {
+        throw new CorruptError(`branch '${source.slice(HEADS.length)}' is not a direct ref`);
+      }
+      repo.readAuthenticatedCommit(tip);
     }
-    repo.readAuthenticatedCommit(tip);
-    if (source === destination || repo.store.getRef(destination) !== null) {
+    // Git accepts a rename onto itself and leaves the ref, HEAD, and config unchanged.
+    if (source === destination) return;
+    if (repo.store.getRef(destination) !== null) {
       throw new GitError(
         "EBRANCHFAIL",
         `a branch named '${destination.slice(HEADS.length)}' already exists`,
       );
     }
-
-    const sourceHead = symbolicRef(source);
-    const checkoutOwner = listCheckoutsOwned(context.database, repo.store.repoId).find(
-      (checkout) => checkout.head === sourceHead,
-    );
     if (checkoutOwner !== undefined && checkoutOwner.id !== repo.checkout.checkoutId) {
       throw new GitError(
         "EBRANCHFAIL",
@@ -130,12 +134,14 @@ function branchRenameOwned(
     sharedRepoStoreMutations(repo.store).configMoveSectionOwned(sourceConfig, destinationConfig);
     mutateRefsOwned(
       repo.checkout,
-      {
-        puts: [{ name: destination, target: tip }],
-        deletes: [source],
-        head: oldHead === sourceHead ? symbolicRef(destination) : undefined,
-        expected: { name: source, target: tip },
-      },
+      tip === null
+        ? { head: symbolicRef(destination) }
+        : {
+            puts: [{ name: destination, target: tip }],
+            deletes: [source],
+            head: oldHead === sourceHead ? symbolicRef(destination) : undefined,
+            expected: { name: source, target: tip },
+          },
       metadata,
     );
   });
