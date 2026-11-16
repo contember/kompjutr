@@ -28,7 +28,7 @@ export function collectBlobSizes<T>(
   const sizes = new Map<string, number>();
   for (let offset = 0; offset < oids.length; offset += OBJECT_INFO_PAGE) {
     const page = oids.slice(offset, offset + OBJECT_INFO_PAGE);
-    for (const object of repo.store.objectInfo(page)) {
+    for (const object of repo.store.contentObjectInfo(page)) {
       if (object.type !== "blob") {
         throw new CorruptError(`${label} object ${object.oid} is not a blob`);
       }

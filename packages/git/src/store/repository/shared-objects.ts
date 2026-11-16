@@ -1,3 +1,4 @@
+import { hasErrorCode, PromisedObjectError } from "../../common/errors.js";
 import type { ObjectType, RawObject } from "../../common/objects.js";
 import type {
   BlobIdMapping,
@@ -106,6 +107,18 @@ export abstract class SharedRepoObjectStore extends SharedRepoCore {
 
   objectInfo(oids: readonly string[]): ObjectReadInfo[] {
     return this.requireObjectTable().objectInfo(oids);
+  }
+
+  /** Metadata ahead of a content read: a missing promised blob is EPROMISED, so it can be hydrated. */
+  contentObjectInfo(oids: readonly string[]): ObjectReadInfo[] {
+    try {
+      return this.objectInfo(oids);
+    } catch (error) {
+      if (!hasErrorCode(error, "ENOTFOUND")) throw error;
+      const promised = this.promisedMissing([...new Set(oids)]);
+      if (promised.length > 0) throw new PromisedObjectError(promised, { cause: error });
+      throw error;
+    }
   }
 
   readObjects(oids: readonly string[], options: { budgetBytes?: number } = {}): ObjectReadBatch {
