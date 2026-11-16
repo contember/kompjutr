@@ -339,14 +339,15 @@ nothing; ordinary checkout and the local drive store NULL stat data.
 |---|---|---|
 | `<pathspec>...` | `paths` | ★ ~ exact path, directory prefix, or default globs; no `:(exclude)` magic |
 | `-A`, `--all` | `all` | ★ ✔ |
-| `-u`, `--update` | `trackedOnly` (with `all`) | ✔ this is the `commit -a` shape |
+| `-u`, `--update` | `trackedOnly` (with `all`) | ✔ stages modifications and deletions of every indexed path, staged-new ones included; the `commit -a` shape |
 | `-f`, `--force` | `force` | ★ ✔ stage an ignored path |
 | explicitly named ignored path without `--force` | default | ★ ~ succeeds without changing the index, matching isomorphic-git and the Computer contract; the Git CLI fails |
 | `-p`, `-i`, `-N`, `--renormalize` | — | ✘ |
 
 A pathspec that matches nothing throws `PathspecNotFoundError`. An ignored path
 exists and therefore counts as a match even when it is skipped; `force: true`
-stages it.
+stages it. A pathspec with a symlink as a leading directory fails with
+`EPATHSPEC` (`is beyond a symbolic link`) before the index changes, as Git does.
 
 ### `git rm` — `rm()`
 

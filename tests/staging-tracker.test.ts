@@ -168,6 +168,22 @@ describe.each<TrackerMode>(["sealed", "invalid"])("whole-tree add, tracker %s", 
     );
   });
 
+  it("-u stages every indexed path, including staged-new ones, and nothing else", async () => {
+    world = await createWorld({ seed: { "a.txt": "a\n", "b.txt": "b\n" } });
+    await world.run(
+      track(mode),
+      { op: "write", path: "new.txt", content: "new\n" },
+      { op: "write", path: "gone.txt", content: "gone\n" },
+      { op: "add", paths: ["new.txt", "gone.txt"] },
+      { op: "rm", paths: ["b.txt"], cached: true },
+      { op: "write", path: "new.txt", content: "changed\n" },
+      { op: "remove", path: "gone.txt" },
+      { op: "write", path: "untracked.txt", content: "u\n" },
+      expectTracker(mode),
+      { op: "add", all: true, trackedOnly: true },
+    );
+  });
+
   it("keeps ignored files out unless forced, even when they predate the seal", async () => {
     world = await createWorld({ seed: { ".gitignore": "*.log\n", "README.md": "seed\n" } });
     await world.run(

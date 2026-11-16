@@ -759,6 +759,19 @@ describe("mutating git CLI handlers", () => {
       exitCode: 128,
       truncated: false,
     });
+    workspace.worktree.writeFiles([
+      { path: "/repo/sub/keep.txt", bytes: new TextEncoder().encode("keep\n") },
+      { path: "/repo/target/x", bytes: new TextEncoder().encode("x\n") },
+    ]);
+    workspace.worktree.symlink("target", "/repo/link");
+    expect(
+      await native.runCli({ argv: ["add", "keep.txt", "../link/x"], cwd: "/repo/sub" }),
+    ).toEqual({
+      stdout: "",
+      stderr: "fatal: pathspec '../link/x' is beyond a symbolic link\n",
+      exitCode: 128,
+      truncated: false,
+    });
     expect([...workspace.repo.checkout.indexScan()]).toEqual(before);
   });
   it("preserves literal add operands and matches ignored-path behavior", async () => {

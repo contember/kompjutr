@@ -128,11 +128,6 @@ function refusedOnlyForUntracked(d: Divergence): boolean {
   );
 }
 
-/** Before the op, an indexed path absent from HEAD had an unstaged change. */
-function hadAddedPathChanged(d: Divergence): boolean {
-  return /^1 A[MDT]/m.test(d.prior.status);
-}
-
 const INTEGRATIONS: Op["op"][] = ["merge", "pull", "cherryPick", "revert", "rebase"];
 
 /** The mutations git-support.md lists as refused while an integration is pending. */
@@ -169,16 +164,6 @@ export const KNOWN: KnownDivergence[] = [
         (d.fields.includes("index") && differsOnlyOn(d, stagedPaths(d.prior.status)))),
   },
   {
-    id: "add-update-index",
-    reason: "open: `add -u` stages only paths in HEAD, git stages every indexed path",
-    fields: ["outcome", "refs", "head", "index", "status"],
-    matches: (d) =>
-      d.prior.operation === null &&
-      hadAddedPathChanged(d) &&
-      ((d.op.op === "addAll" && d.op.update === true) ||
-        (d.op.op === "commit" && d.op.all === true)),
-  },
-  {
     id: "operation-active",
     reason:
       "intentional: the mutations git-support.md lists are refused while an integration is pending",
@@ -210,12 +195,6 @@ export const KNOWN: KnownDivergence[] = [
     fields: ["outcome"],
     matches: (d) =>
       opIs(d, "checkoutPaths") && d.outcomes.git.kind === "clean" && refusedOnlyForUntracked(d),
-  },
-  {
-    id: "missing-worktree-path",
-    reason: "open: add and forced checkout leak ENOENT/ENOTDIR for a staged path missing on disk",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "add", "addAll", "checkout") && refused(d, /ENOENT|ENOTDIR/),
   },
 ];
 
