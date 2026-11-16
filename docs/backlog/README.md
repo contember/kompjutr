@@ -21,8 +21,7 @@ not effort: a wrong answer outranks a missing one.
 - **S — silent divergence.** kompjutr returns a plausible result where Git
   returns a different one or refuses. Nothing warns the caller.
   [109](109-keep-parent-directory-when-replacing-its-only-child.md).
-- **A — blocks a common workflow, loudly.**
-  [108](108-local-checkout-removes-missing-paths.md).
+- **A — blocks a common workflow, loudly.** None filed.
 - **B — real gap, narrower audience or a workaround exists.** None filed.
 - **No caller yet.** Stash, plumbing reads, branch and remote management,
   rebase extensions, interactive rebase, rebase merges, gitlink
@@ -113,7 +112,6 @@ server production capacity; local qualification does not establish that limit.
 |---|---|---|
 | 0 | [119](119-slice-the-clone-under-the-request-cpu-limit.md) | Production blocker: a full-history clone needs ~47 s of CPU in one request; a Durable Object request allows 30 s. |
 | 1 | [121](121-prune-the-parent-closure-walk-in-incremental-fetch.md) | Cost: an incremental fetch walks its parent's whole tree. |
-| 1 | [108](108-local-checkout-removes-missing-paths.md) | Tier A: local `reset --hard` fails with `ENOENT` when a tracked path is already gone. It blocks a common workflow. |
 | 2 | [109](109-keep-parent-directory-when-replacing-its-only-child.md) | Tier S, but narrow: only a directory's mode changes when its only child changes type. |
 | 3 | [107](107-bound-shared-integration-step-passes.md) | Cost: the shared integration step still makes full-tree passes for every rebase, merge, cherry-pick and revert step. |
 | 4 | [106](106-reduce-the-workerd-clone-external-memory.md) | Memory: the workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it first, then decide whether a production probe is needed. |
@@ -125,7 +123,6 @@ server production capacity; local qualification does not establish that limit.
 
 - [106 — Reduce the workerd clone's external memory](106-reduce-the-workerd-clone-external-memory.md)
 - [107 — Bound the shared integration step's full-tree passes](107-bound-shared-integration-step-passes.md)
-- [108 — Let local checkout remove paths that are already gone](108-local-checkout-removes-missing-paths.md)
 - [109 — Keep a directory whose only child changes type](109-keep-parent-directory-when-replacing-its-only-child.md)
 - [111 — Bound interpreter CPU and regex backtracking in the shell](111-bound-interpreter-cpu-and-regex-backtracking.md)
 - [112 — Give invoked commands stdin and their own diagnostic name](112-give-invoked-commands-stdin-and-their-own-name.md)
