@@ -196,12 +196,6 @@ export const KNOWN: KnownDivergence[] = [
     matches: (d) =>
       opIs(d, "checkoutPaths") && d.outcomes.git.kind === "clean" && refusedOnlyForUntracked(d),
   },
-  {
-    id: "missing-worktree-path",
-    reason: "open: add and forced checkout leak ENOENT/ENOTDIR for a staged path missing on disk",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "add", "addAll", "checkout") && refused(d, /ENOENT|ENOTDIR/),
-  },
 ];
 
 export function knownDivergence(divergence: Divergence): KnownDivergence | undefined {
