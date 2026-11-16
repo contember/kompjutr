@@ -2,7 +2,7 @@ import { fromHex } from "../../common/bytes.js";
 import { GitError } from "../../common/errors.js";
 import { isTreeMode, type TreeEntry } from "../../common/objects.js";
 import { joinPath, relativeTo } from "../../common/paths.js";
-import { comparePaths, joinSorted3 } from "../../common/streams.js";
+import { comparePaths } from "../../common/streams.js";
 import {
   contentIdKey,
   type IndexEntry,
@@ -90,34 +90,6 @@ export function* targetFromIndex(entries: Iterable<IndexEntry>): Generator<Targe
   for (const entry of entries) {
     if (entry.stage !== 0) continue;
     yield { path: entry.path, mode: entry.mode.toString(8), oid: entry.oid };
-  }
-}
-
-/** Both absent, or the same object at the same mode. */
-export function sameTreeEntry(
-  left: TargetEntry | undefined,
-  right: TargetEntry | undefined,
-): boolean {
-  if (left === undefined || right === undefined) return left === right;
-  return left.oid === right.oid && left.mode === right.mode;
-}
-
-/**
- * The target as git's two-way merge applies it: where `baseline` and `target`
- * agree, the current stage-0 entry, or its absence, stands in for the target.
- */
-export function* carriedTarget(
-  target: Iterable<TargetEntry>,
-  baseline: Iterable<TargetEntry>,
-  index: Iterable<IndexEntry>,
-): Generator<TargetEntry> {
-  for (const row of joinSorted3(target, baseline, targetFromIndex(index), {
-    a: (entry) => entry.path,
-    b: (entry) => entry.path,
-    c: (entry) => entry.path,
-  })) {
-    const carried = sameTreeEntry(row.a, row.b) ? row.c : row.a;
-    if (carried !== undefined) yield carried;
   }
 }
 

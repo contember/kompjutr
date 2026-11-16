@@ -419,9 +419,13 @@ Path checkout overwrites tracked changes, as Git does. Its refusal over
 non-ignored untracked content is a deliberate difference: Git deletes that
 content.
 A branch checkout keeps staged changes on paths the current and target trees
-agree on, as Git's two-way merge does. With an empty index it writes the whole
-target, as Git's initial checkout does; kompjutr cannot tell an index emptied by
-`rm --cached` from one never written.
+agree on, as Git's two-way merge does; a path it takes from the target replaces
+a kept entry that collides with it as file versus directory. With an empty index
+it writes the whole target, as Git's initial checkout does when no index exists
+yet: after `init`, `fetch` and `updateRef`, `checkout` must populate the
+worktree rather than keep every path staged as deleted. An index emptied by
+`rm --cached` looks the same, so there kompjutr writes the target where Git
+keeps the deletions or refuses.
 
 ### `git clean` — `clean()`
 

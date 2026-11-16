@@ -95,6 +95,7 @@ export function checkoutBlockers(
   const pendingTrackedPaths: PendingTarget[] = [];
   const untrackedAncestors: PendingTarget[] = [];
   const hashCursor = createWorktreeHashCursor(excludeRoots);
+  const carry = guard.carryStaged === true ? new CarryCollisions() : undefined;
   let ignores: IgnoreMatcher | undefined;
   const isIgnored = (path: string): boolean => {
     ignores ??= loadIgnoreMatcher(worktree, repo.root, { excludeRoots });
@@ -114,6 +115,7 @@ export function checkoutBlockers(
     expireRanges(pendingTargets, row.path);
     expireRanges(pendingTrackedPaths, row.path);
     expireRanges(untrackedAncestors, row.path);
+    carry?.expire(row.path);
     // A path with conflict stages is tracked; Git protects only paths the index lacks.
     if (row.worktree !== undefined && row.index === undefined && !row.unmerged) {
       for (let index = pendingTargets.length - 1; index >= 0; index--) {
@@ -145,8 +147,25 @@ export function checkoutBlockers(
         : paths.matches(row.path);
     if (!selected) continue;
 
-    if (guard.carryStaged === true) {
-      if (sameTreeEntry(target, row.head)) continue;
+    if (carry !== undefined) {
+      if (sameTreeEntry(target, row.head)) {
+        if (existing === undefined) continue;
+        if (!carry.replacedByTaken(row.path)) {
+          carry.keep(row.path, row.worktree !== undefined);
+          continue;
+        }
+        // A taken file replaces this kept entry; git allows it only without local changes.
+        if (row.worktree === undefined || indexMatchesStat(existing, row.worktree.stat)) continue;
+        dirtyCandidates.push({ entry: existing, worktree: row.worktree });
+        if (dirtyCandidates.length >= CHECKOUT_GUARD_BATCH) {
+          flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, limits, hashCursor);
+        }
+        continue;
+      }
+      if (target !== undefined) {
+        const keptOnDisk = carry.take(row.path);
+        if (keptOnDisk !== undefined) retainBlocker(untracked, keptOnDisk);
+      }
       if (existing === undefined && target !== undefined && row.head !== undefined) {
         retainBlocker(tracked, row.path);
         continue;
@@ -314,6 +333,43 @@ interface PendingTarget {
   upper: string;
 }
 
+interface KeptLeaf extends PendingTarget {
+  onDisk: boolean;
+}
+
+/**
+ * File/directory collisions between staged entries a switch keeps and paths it
+ * takes from the target. A taken file replaces kept entries below it; a taken
+ * path below a kept file replaces that file, which git refuses while the file
+ * is still on disk.
+ */
+class CarryCollisions {
+  readonly #taken: PendingTarget[] = [];
+  readonly #kept: KeptLeaf[] = [];
+
+  expire(path: string): void {
+    expireRanges(this.#taken, path);
+    expireRanges(this.#kept, path);
+  }
+
+  replacedByTaken(path: string): boolean {
+    return findAncestor(this.#taken, path) !== undefined;
+  }
+
+  keep(path: string, onDisk: boolean): void {
+    this.#kept.push({ path, upper: `${path}0`, onDisk });
+  }
+
+  /** Record a taken path; returns the kept file it replaces when that file is on disk. */
+  take(path: string): string | undefined {
+    retainRange(this.#taken, path);
+    const kept = findAncestor(this.#kept, path);
+    if (kept === undefined) return undefined;
+    this.#kept.splice(this.#kept.indexOf(kept), 1);
+    return kept.onDisk ? kept.path : undefined;
+  }
+}
+
 function retainBlocker(paths: BlockerList, path: string): void {
   paths.add(path);
 }
@@ -328,7 +384,7 @@ function expireRanges(ranges: PendingTarget[], path: string): void {
   }
 }
 
-function findAncestor(ranges: PendingTarget[], path: string): PendingTarget | undefined {
+function findAncestor<T extends PendingTarget>(ranges: T[], path: string): T | undefined {
   for (let index = ranges.length - 1; index >= 0; index--) {
     const range = ranges[index]!;
     if (path.startsWith(`${range.path}/`)) return range;

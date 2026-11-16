@@ -1,8 +1,9 @@
 // Branch checkout is git's two-way merge: a path HEAD and the target agree on
-// keeps its staged state; a staged path the switch would change is refused.
+// keeps its staged state; a staged path the switch would change is refused; a
+// path the switch takes replaces a kept entry it collides with.
 
 import { describe, it } from "vitest";
-import type { Scenario } from "../helpers/differential/ops.js";
+import type { Op, Scenario } from "../helpers/differential/ops.js";
 import { expectAgreement } from "../helpers/differential/run.js";
 
 describe("differential regressions: checkout carries staged changes", () => {
@@ -155,5 +156,66 @@ describe("differential regressions: checkout carries staged changes", () => {
       ],
     };
     await expectAgreement(scenario);
+  });
+});
+
+/** `side` adds `path`; back on `main`, `staged` runs, then `side` is checked out. */
+function switchOver(path: string, staged: Op[]): Scenario {
+  return {
+    start: "init",
+    ops: [
+      { op: "write", path: "keep", content: { text: "k\n" } },
+      { op: "addAll" },
+      { op: "commit", message: "base" },
+      { op: "checkoutNew", name: "side" },
+      { op: "write", path, content: { text: "side\n" } },
+      { op: "add", paths: [path] },
+      { op: "commit", message: "side" },
+      { op: "checkout", ref: "main" },
+      ...staged,
+      { op: "checkout", ref: "side" },
+      { op: "commit", message: "after", allowEmpty: true },
+    ],
+  };
+}
+
+function stage(path: string): Op[] {
+  return [
+    { op: "write", path, content: { text: "staged\n" } },
+    { op: "add", paths: [path] },
+  ];
+}
+
+describe("differential regressions: carried entries never collide as file and directory", () => {
+  it("drops a staged file below a file the target adds", async () => {
+    await expectAgreement(switchOver("a", stage("a/b")));
+  });
+
+  it("drops a nested staged file below a file the target adds", async () => {
+    await expectAgreement(switchOver("a", stage("a/b/c")));
+  });
+
+  it("drops staged files below the target's file when one is gone from disk", async () => {
+    await expectAgreement(
+      switchOver("a", [...stage("a/b"), ...stage("a/c"), { op: "remove", path: "a/c" }]),
+    );
+  });
+
+  it("refuses when a staged file below the target's file has local changes", async () => {
+    await expectAgreement(
+      switchOver("a", [...stage("a/b"), { op: "write", path: "a/b", content: { text: "x\n" } }]),
+    );
+  });
+
+  it("refuses a staged file on disk where the target adds a path below it", async () => {
+    await expectAgreement(switchOver("a/b/c", stage("a")));
+  });
+
+  it("drops a staged file gone from disk where the target adds a path below it", async () => {
+    await expectAgreement(switchOver("a/b", [...stage("a"), { op: "remove", path: "a" }]));
+  });
+
+  it("drops a nested staged file gone from disk below the target's new directory", async () => {
+    await expectAgreement(switchOver("a/b/c", [...stage("a/b"), { op: "remove", path: "a" }]));
   });
 });

@@ -10,11 +10,11 @@ import type { CheckoutOptions } from "./checkout-types.js";
 
 export type { TargetEntry } from "../tree/tree-stream.js";
 export { type CompiledPathspecMatcher, compilePathspecs } from "../worktree/worktree-io.js";
+export { sameTreeEntry } from "./checkout-carry.js";
 export {
   indexFromTree,
   isTree,
   matchesPaths,
-  sameTreeEntry,
   stageZero,
   treeEntries,
   writeEntry,

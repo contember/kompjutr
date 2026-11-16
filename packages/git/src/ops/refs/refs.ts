@@ -149,8 +149,8 @@ function checkoutLegacy(
   excludeRoots: readonly string[],
 ): void {
   const force = options.force === true;
-  // git's initial checkout, with no index yet, skips the carry; an empty
-  // index is the nearest state kompjutr can tell apart.
+  // An empty index is git's initial checkout: a repository fetched into but
+  // never checked out would otherwise keep its whole tree staged as deleted.
   const baselineTree = force || !hasIndexEntries(repo) ? undefined : repo.headTree();
   requireCheckoutAllowed(repo, worktree, tree, force, excludeRoots, baselineTree !== undefined);
   checkoutTreeExcluding(repo, worktree, tree, excludeRoots, {

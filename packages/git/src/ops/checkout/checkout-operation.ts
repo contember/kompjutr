@@ -7,6 +7,7 @@ import type { Repository } from "../repository/repository.js";
 import { type TargetEntry, treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { compilePathspecs, walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
+import { carriedTarget } from "./checkout-carry.js";
 import {
   type CheckoutPrunePlan,
   CheckoutRemovalStream,
@@ -22,7 +23,6 @@ import {
   boundedCheckoutWorktreeEntries,
   CHECKOUT_WINDOW_ROWS,
   type CheckoutCandidate,
-  carriedTarget,
   checkoutWriteBudget,
   flushCheckoutCandidates,
   intersectsExcluded,
@@ -73,7 +73,7 @@ export function checkoutTreeInternal(
   const target =
     baselineTree === undefined
       ? tree
-      : () => carriedTarget(tree(), treeStream(repo, baselineTree), index.indexScan());
+      : () => carriedTarget(tree, () => treeStream(repo, baselineTree), index.indexScan());
   const pathspec = compilePathspecs(options.paths);
   // A carried entry is the index entry itself, so preserving matches keeps it.
   const preserveMatchingIndex =

@@ -52,27 +52,6 @@ function unquote(path: string): string {
   return Buffer.from(bytes).toString("utf8");
 }
 
-/** Paths with a staged change against HEAD in porcelain v2 `status`. */
-function stagedPaths(status: string): Set<string> {
-  const paths = new Set<string>();
-  for (const line of status.split("\n")) {
-    const fields = line.split(" ");
-    if (fields[0] === "1" && !fields[1]?.startsWith(".")) {
-      paths.add(unquote(fields.slice(8).join(" ")));
-    }
-    if (fields[0] === "2" && !fields[1]?.startsWith(".")) {
-      paths.add(unquote(fields.slice(9).join(" ").split("\t")[0] ?? ""));
-    }
-  }
-  return paths;
-}
-
-/** kompjutr's index holds git's entries plus target entries git kept deleted. */
-function restoresOnly(kompjutr: string[], git: string[]): boolean {
-  const left = new Set(kompjutr);
-  return kompjutr.length > git.length && git.every((entry) => left.has(entry));
-}
-
 /** Paths whose index entry or worktree file the two sides disagree on. */
 function differingPaths(d: Divergence): string[] {
   if (d.after === null) return [];
@@ -129,6 +108,49 @@ function refusedOnlyForUntracked(d: Divergence): boolean {
   );
 }
 
+/** HEAD's entries git's status reports as staged deletions, as `ls-files -s` lines. */
+function stagedDeletions(status: string): Set<string> {
+  const entries = new Set<string>();
+  for (const line of status.split("\n")) {
+    const fields = line.split(" ");
+    if (fields[0] === "1" && fields[1]?.startsWith("D")) {
+      entries.add(`${fields[3]} ${fields[6]} 0\t${unquote(fields.slice(8).join(" "))}`);
+    }
+  }
+  return entries;
+}
+
+/**
+ * kompjutr's index is git's plus target entries git kept staged as deleted,
+ * and the sides differ on no other path.
+ */
+function restoredDeletionsOnly(d: Divergence): boolean {
+  if (d.after === null) return false;
+  const { kompjutr, git } = d.after;
+  const left = new Set(kompjutr.index);
+  const right = new Set(git.index);
+  if (!git.index.every((entry) => left.has(entry))) return false;
+  const deleted = stagedDeletions(git.status);
+  const restored = kompjutr.index.filter((entry) => !right.has(entry));
+  if (!restored.every((entry) => deleted.has(entry))) return false;
+  return differsOnlyOn(d, new Set(restored.map((entry) => entry.slice(entry.indexOf("\t") + 1))));
+}
+
+/** kompjutr's index holds a file where git kept the staged entries below it. */
+function keptBelowTaken(d: Divergence): boolean {
+  if (d.after === null) return false;
+  const pathOf = (entry: string): string => entry.slice(entry.indexOf("\t") + 1);
+  const prior = new Set(d.prior.index);
+  const left = new Set(d.after.kompjutr.index);
+  const kept = d.after.git.index
+    .filter((entry) => prior.has(entry) && !left.has(entry))
+    .map(pathOf);
+  const taken = d.after.kompjutr.index
+    .map(pathOf)
+    .filter((path) => kept.some((below) => below.startsWith(`${path}/`)));
+  return taken.length > 0 && differsOnlyOn(d, new Set([...taken, ...kept]));
+}
+
 const INTEGRATIONS: Op["op"][] = ["merge", "pull", "cherryPick", "revert", "rebase"];
 
 /** The mutations git-support.md lists as refused while an integration is pending. */
@@ -158,15 +180,31 @@ export const KNOWN: KnownDivergence[] = [
   {
     id: "checkout-empty-index",
     reason:
-      "intentional: from an empty index, checkout writes the whole target as git's initial checkout does (git-support.md, checkout)",
-    fields: ["index", "status", "worktree"],
+      "intentional: an empty index is git's initial checkout, so init, fetch, updateRef and " +
+      "checkout populate the worktree; an index emptied by `rm` looks the same, where git " +
+      "keeps the deletions or refuses (git-support.md, checkout)",
+    fields: ["outcome", "index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "checkout", "checkoutNew") &&
       d.prior.head !== null &&
       d.prior.index.length === 0 &&
+      ((d.field === "outcome" &&
+        d.outcomes.kompjutr.kind === "clean" &&
+        d.outcomes.git.kind === "failed" &&
+        /would be overwritten by checkout/.test(d.outcomes.git.detail ?? "")) ||
+        (d.fields.includes("index") && restoredDeletionsOnly(d))),
+  },
+  {
+    id: "checkout-kept-below-taken",
+    reason:
+      "open: a switch that takes a file over staged entries below it writes the file where " +
+      "git keeps the staged entries when the directory is gone or a sibling sorts between them",
+    fields: ["index", "status", "worktree"],
+    matches: (d) =>
+      opIs(d, "checkout", "checkoutNew") &&
       d.fields.includes("index") &&
       d.after !== null &&
-      restoresOnly(d.after.kompjutr.index, d.after.git.index),
+      keptBelowTaken(d),
   },
   {
     id: "operation-active",
