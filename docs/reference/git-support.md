@@ -857,7 +857,7 @@ visible even if the integration afterwards refuses (`ESTALEHEAD`,
 
 | Git | kompjutr | |
 |---|---|---|
-| one legacy branch | `remote`, `ref`, `remoteRef` | ✔ translated through the structured operation; a named `ref` updates the remote branch of the same name, an omitted `ref` pushes the current branch to its upstream |
+| one legacy branch | `remote`, `ref`, `remoteRef` | ~ translated through the structured operation; a named `ref` updates the remote branch of the same name, as Git does. An omitted `ref` pushes in upstream mode: the current branch goes to its upstream on that remote, or to the same name when it has none. Git's default `push.default=simple` instead exits 128 when the upstream's name differs from the branch's or no upstream is set |
 | `<src>:<dst>` mappings | `refspecs: [{ source, destination, force? }]` | ★ ✔ exact refs, one-star wildcards, full-OID sources, and custom namespaces |
 | explicit URL | `url` | ✔ also honours `remote.<n>.pushurl` |
 | `--force` | legacy `force`, or per-mapping `force` | ★ ✔ |
