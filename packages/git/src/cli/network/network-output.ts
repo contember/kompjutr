@@ -1,6 +1,8 @@
-import { GitError, hasErrorCode } from "../../common/errors.js";
+import { errorCode, GitError, hasErrorCode } from "../../common/errors.js";
 import {
   boundedPublishedGitCliResult,
+  type GitCliOutputContext,
+  gitCliDiagnosticResult,
   gitCliResult,
   gitCliUtf8ByteLength,
   utf8Prefix,
@@ -33,6 +35,32 @@ export function mapFailure(error: unknown): GitCliResult {
   )
     throw error;
   return gitCliResult("", `fatal: ${errorMessage(error)}\n`, 128);
+}
+
+// Hydration is the only network I/O of a local command; codes shared with local
+// failures (ECORRUPT, E2BIG) stay thrown.
+const PROMISOR_FETCH_FAILURES = new Set([
+  "EFETCHFAIL",
+  "EHTTP",
+  "EAUTH",
+  "EURLSCHEME",
+  "EPROMISORREMOTE",
+]);
+
+/** A failed promisor hydration, reported as Git does: `fatal:` and exit 128. */
+export function promisorFetchFailure(
+  error: unknown,
+  output: GitCliOutputContext,
+): GitCliResult | undefined {
+  const code = errorCode(error);
+  if (code === undefined || !PROMISOR_FETCH_FAILURES.has(code)) return undefined;
+  return gitCliDiagnosticResult(
+    "fatal: could not fetch from promisor remote: ",
+    errorMessage(error),
+    "\n",
+    128,
+    output,
+  );
 }
 
 function errorMessage(error: unknown): string {
