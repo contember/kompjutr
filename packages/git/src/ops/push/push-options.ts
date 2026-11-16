@@ -11,6 +11,7 @@ import {
 import {
   requireBranchRef,
   validatePushOptions as validateReceivePushOptions,
+  ZERO_OID,
 } from "../../protocol/receive-pack.js";
 import {
   remoteUrlFor,
@@ -19,7 +20,7 @@ import {
 } from "../network/network.js";
 import type { NormalizedPushLease, PushRefspec, RefspecSourceRef } from "../refs/refspec.js";
 import type { Repository } from "../repository/repository.js";
-import type { LegacyPushSelection, PushOptions } from "./push-types.js";
+import type { JoinedPushUpdate, LegacyPushSelection, PushOptions } from "./push-types.js";
 
 const PUSH_OPTIONS = new OptionsSchema(
   {
@@ -103,6 +104,19 @@ export function legacyRefspecs(
   return options.delete === true
     ? [{ source: null, destination }]
     : [{ source: localRef, destination, force: options.force === true }];
+}
+
+// Like `git push --delete`, a branch the remote lacks is refused before POST.
+export function requireLegacyDeletionTargets(
+  options: PushOptions,
+  updates: readonly JoinedPushUpdate[],
+): void {
+  if (options.refspecs !== undefined || options.delete !== true) return;
+  for (const update of updates) {
+    if (update.oldOid !== ZERO_OID) continue;
+    const name = options.remoteRef ?? options.ref ?? update.destination;
+    throw new GitError("EREFNOTFOUND", `unable to delete '${name}': remote ref does not exist`);
+  }
 }
 
 function resolveRawLocalRef(name: string, refs: ReadonlyMap<string, string>): string | null {

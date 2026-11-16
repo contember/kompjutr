@@ -30,6 +30,7 @@ import {
   localRefSnapshot,
   needsLocalRefs,
   pushTarget,
+  requireLegacyDeletionTargets,
   snapshotPushLeases,
   validatePushOperationOptions,
 } from "./push-options.js";
@@ -77,6 +78,7 @@ export async function push(
     let advertisement: Advertisement | null = await discover(target.url, "git-receive-pack", auth);
     throwIfAborted(options.signal);
     const joined = joinAdvertisement(mappings, advertisement);
+    requireLegacyDeletionTargets(options, joined.updates);
     verifyPushLeases(joined.updates, leaseSnapshot);
     const activeUpdates = activePlanningUpdates(joined.updates);
     let plan: PushPlan | null = null;

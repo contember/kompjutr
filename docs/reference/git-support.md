@@ -861,7 +861,7 @@ visible even if the integration afterwards refuses (`ESTALEHEAD`,
 | `<src>:<dst>` mappings | `refspecs: [{ source, destination, force? }]` | ★ ✔ exact refs, one-star wildcards, full-OID sources, and custom namespaces |
 | explicit URL | `url` | ✔ also honours `remote.<n>.pushurl` |
 | `--force` | legacy `force`, or per-mapping `force` | ★ ✔ |
-| `--delete` | legacy `delete`, or `{ source: null, destination }` | ★ ✔ several explicit deletions may share one request |
+| `--delete` | legacy `delete`, or `{ source: null, destination }` | ★ ~ several explicit deletions may share one request; a legacy deletion of a branch the remote lacks throws `EREFNOTFOUND` before POST, as Git refuses it, while a mapped deletion of an absent ref is a no-op where Git refuses `:<dst>` |
 | `--force-with-lease=<ref>:<expect>` | `leases: { [destination]: { expected: oidOrNull } }` | ✔ partial per-destination map; `null` expects absence |
 | tracking-derived lease | `leases: { [branch]: { tracking: true } }` | ✔ named remotes and branch destinations only; snapshots the tracking OID before discovery |
 | `--atomic` | `atomic` | ★ ✔ requires the advertised capability |

@@ -31,6 +31,7 @@ import {
   mapFailure,
   NetworkOutput,
   networkFailure,
+  pushDeletionRefusal,
 } from "./network-output.js";
 
 type NetworkHandlers = Pick<
@@ -296,6 +297,9 @@ export function createGitCliNetworkHandlers(context: GitContext): NetworkHandler
         if (hasErrorCode(error, "EPUSHUNCERTAIN")) {
           output.append(mapFailure(error).stderr);
           throw new GitCliPushUncertainError(error, output.result(128));
+        }
+        if (command.delete && hasErrorCode(error, "EREFNOTFOUND")) {
+          return pushDeletionRefusal(error, options, displayTarget(destination));
         }
         return networkFailure(error, output);
       }
