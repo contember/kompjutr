@@ -140,6 +140,34 @@ function stoppedEmpty(d: Divergence): boolean {
   return false;
 }
 
+/** Untracked paths in porcelain v2 `status`, a directory without its trailing slash. */
+function untrackedPaths(status: string): string[] {
+  return status
+    .split("\n")
+    .filter((line) => line.startsWith("? "))
+    .map((line) => unquote(line.slice(2)).replace(/\/$/, ""));
+}
+
+const UNTRACKED_BLOCKERS =
+  "ECHECKOUTFAIL: untracked working tree files would be overwritten by checkout: ";
+
+/**
+ * kompjutr refused naming blockers that were each untracked before the op,
+ * or inside an untracked directory. A truncated list counts its named part.
+ */
+function refusedOnlyForUntracked(d: Divergence): boolean {
+  const detail = d.outcomes.kompjutr.detail ?? "";
+  if (!refused(d, /^ECHECKOUTFAIL:/) || !detail.startsWith(UNTRACKED_BLOCKERS)) return false;
+  const named = detail
+    .slice(UNTRACKED_BLOCKERS.length)
+    .replace(/, and \d+ more$/, "")
+    .split(", ");
+  const untracked = untrackedPaths(d.prior.status);
+  return named.every((path) =>
+    untracked.some((root) => path === root || path.startsWith(`${root}/`)),
+  );
+}
+
 /** Before the op, an indexed path absent from HEAD had an unstaged change. */
 function hadAddedPathChanged(d: Divergence): boolean {
   return /^1 A[MDT]/m.test(d.prior.status);
@@ -179,12 +207,6 @@ const REFUSED_WHILE_PENDING: Op["op"][] = [
 
 export const KNOWN: KnownDivergence[] = [
   {
-    id: "unborn-checkout-b",
-    reason: "open: `checkout -b` on an unborn branch fails to resolve HEAD",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "checkoutNew") && refused(d, /unknown revision: HEAD/),
-  },
-  {
     id: "detached-integration",
     reason: "intentional: integrations need a checked-out branch (git-support.md, Integration)",
     fields: ["outcome"],
@@ -198,18 +220,6 @@ export const KNOWN: KnownDivergence[] = [
       opIs(d, "checkout", "checkoutNew") &&
       ((hadStagedChange(d) && refused(d, /would be overwritten by checkout/)) ||
         (d.fields.includes("index") && differsOnlyOn(d, stagedPaths(d.prior.status)))),
-  },
-  {
-    id: "reset-unmatched-path",
-    reason: "open: path reset fails on a pathspec git accepts silently",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "reset") && refused(d, /did not match any file/),
-  },
-  {
-    id: "checkout-ancestor-ref",
-    reason: "open: checkout of `<ref>~<n>` fails with EINVAL",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "checkout") && refused(d, /ref name is invalid/),
   },
   {
     id: "abort-resets-index",
@@ -229,15 +239,6 @@ export const KNOWN: KnownDivergence[] = [
       hadAddedPathChanged(d) &&
       ((d.op.op === "addAll" && d.op.update === true) ||
         (d.op.op === "commit" && d.op.all === true)),
-  },
-  {
-    id: "checkout-paths-unmatched",
-    reason: "open: path checkout accepts a pathspec that matches nothing",
-    fields: ["outcome"],
-    matches: (d) =>
-      opIs(d, "checkoutPaths") &&
-      d.field === "outcome" &&
-      /did not match any file/.test(d.outcomes.git.detail ?? ""),
   },
   {
     id: "operation-active",
@@ -271,28 +272,19 @@ export const KNOWN: KnownDivergence[] = [
       (opIs(d, "revertContinue", "cherryPickContinue") && d.field === "outcome" && stoppedEmpty(d)),
   },
   {
-    id: "reset-unborn-head",
-    reason: "open: `reset HEAD` on an unborn branch succeeds where git cannot resolve HEAD",
-    fields: ["outcome"],
-    matches: (d) =>
-      d.op.op === "reset" &&
-      d.op.ref === "HEAD" &&
-      d.prior.head === null &&
-      d.field === "outcome" &&
-      d.outcomes.kompjutr.kind === "clean" &&
-      d.outcomes.git.kind === "failed",
-  },
-  {
-    id: "checkout-paths-staged",
-    reason: "open: path checkout refuses staged changes git overwrites",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "checkoutPaths") && refused(d, /would be overwritten by checkout/),
-  },
-  {
     id: "rebase-unrelated",
     reason: "intentional: rebase refuses unrelated histories (git-support.md, git rebase)",
     fields: ["outcome"],
     matches: (d) => opIs(d, "rebase") && refused(d, /EUNRELATED/),
+  },
+  {
+    id: "path-checkout-untracked-blocker",
+    reason:
+      "intentional: path checkout refuses to delete untracked content in the way; " +
+      "git deletes it (git-support.md, git checkout)",
+    fields: ["outcome"],
+    matches: (d) =>
+      opIs(d, "checkoutPaths") && d.outcomes.git.kind === "clean" && refusedOnlyForUntracked(d),
   },
   {
     id: "abort-refuses-unmerged-entry",
@@ -308,13 +300,6 @@ export const KNOWN: KnownDivergence[] = [
     reason: "open: add and forced checkout leak ENOENT/ENOTDIR for a staged path missing on disk",
     fields: ["outcome"],
     matches: (d) => opIs(d, "add", "addAll", "checkout") && refused(d, /ENOENT|ENOTDIR/),
-  },
-  {
-    id: "reset-ref-resolved-twice",
-    reason: "open: argv reset resolves a relative ref again after moving HEAD",
-    fields: ["index", "status", "worktree"],
-    matches: (d) =>
-      d.op.op === "reset" && /[~^]/.test(d.op.ref ?? "") && d.fields.includes("index"),
   },
 ];
 

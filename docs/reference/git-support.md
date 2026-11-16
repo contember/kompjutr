@@ -385,11 +385,13 @@ before removal.
 | `--mixed` (default) | default | ★ ✔ replaces the index from `ref` |
 | `--hard` | `hard` | ★ ✔ rewrites index and working tree, and clears any pending merge/replay state |
 | `<commit>` | `ref` (default HEAD) | ★ ✔ |
-| `-- <paths>` | `paths` | ✔ unstage those paths; clears their conflict stages |
+| `-- <paths>` | `paths` | ✔ unstage those paths; clears their conflict stages; an unmatched pathspec is a no-op, as in Git |
 | `--soft`, `--merge`, `--keep` | — | ✘ |
 
 The strict argv runner also moves the current symbolic branch or detached HEAD
-for whole-tree mixed and hard resets, matching Git. Path reset leaves HEAD and
+for whole-tree mixed and hard resets, matching Git; as in Git, an explicit
+`HEAD` there fails on an unborn branch, while `reset [--hard]` without a ref and
+`reset HEAD -- <paths>` succeed. Path reset leaves HEAD and
 the worktree unchanged. Registered nested repository roots are excluded from
 hard-reset worktree changes.
 
@@ -397,10 +399,10 @@ hard-reset worktree changes.
 
 | Git | kompjutr | |
 |---|---|---|
-| `git checkout <ref>` | `checkout({ ref })` | ★ ✔ branch, tag or commit; a commit detaches HEAD |
-| `git checkout <ref> -- <paths>` | `checkout({ ref, paths })` | ★ ✔ HEAD stays put; absent paths are not pruned |
-| `git checkout -f` | `force` | ✔ otherwise a blocking local change throws `ECHECKOUTFAIL` |
-| `git checkout -b <name> [<start>]` | strict argv composition | ★ ✔ atomically creates and checks out the branch and selected tree; a remote-tracking start point records the upstream as `git branch` does |
+| `git checkout <ref>` | `checkout({ ref })` | ★ ✔ a local branch name attaches HEAD, and wins over a same-named tag; a tag, full ref name, revision such as `main~1`, or commit detaches HEAD |
+| `git checkout <ref> -- <paths>` | `checkout({ ref, paths })` | ★ ✔ HEAD stays put; absent paths are not pruned; staged and unstaged changes are overwritten, as in Git; kompjutr refuses to delete untracked content that blocks a path checkout (`ECHECKOUTFAIL`, nothing changed); Git deletes it; a pathspec that matches nothing in `<ref>`'s tree throws `EPATHSPEC` and changes nothing |
+| `git checkout -f` | `force` | ✔ otherwise a blocking local change throws `ECHECKOUTFAIL`; path checkout blocks only on untracked content |
+| `git checkout -b <name> [<start>]` | strict argv composition | ★ ✔ atomically creates and checks out the branch and selected tree; a remote-tracking start point records the upstream as `git branch` does; on an unborn branch without `<start>` it only renames the unborn branch |
 | `git switch <branch>` / `git switch -c <name>` | strict argv aliases | ✔ switches only to an existing local branch, or creates one with `-c` |
 | `git restore [--source=<ref>] <paths>...` | strict argv alias | ✔ restores only worktree bytes from stage-0 index by default or the selected tree; the index stays unchanged |
 | `--orphan`, `--track`, `--merge`, `--patch` | — | ✘ |
@@ -412,6 +414,9 @@ selected tracked worktree path that is absent from that source.
 Checkout, merge, cherry-pick, and rebase replace ignored untracked files and
 directories when writing tracked paths, as Git does. Non-ignored untracked
 content and tracked changes that would be overwritten still block the operation.
+Path checkout overwrites tracked changes, as Git does. Its refusal over
+non-ignored untracked content is a deliberate difference: Git deletes that
+content.
 
 ### `git clean` — `clean()`
 

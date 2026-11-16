@@ -5,10 +5,11 @@ import { type GitContext, openRepository } from "../../ops/core/context.js";
 import { requireSharedMutationScope } from "../../ops/core/mutation-scope.js";
 import { operationRefLogMetadata } from "../../ops/core/ref-log.js";
 import { withPromisorHydratedMutation } from "../../ops/network/network.js";
+import { checkoutCommit } from "../../ops/refs/refs.js";
 import type { Repository } from "../../ops/repository/repository.js";
 import { repositoryMutations } from "../../ops/repository/repository.js";
 import { treeStream } from "../../ops/tree/tree-stream.js";
-import { compilePathspecs } from "../../ops/worktree/worktree-io.js";
+import { requirePathspecsMatched } from "../../ops/worktree/worktree-io.js";
 import { promisorFetchFailure } from "../network/network-output.js";
 import { boundedPublishedGitCliResult, gitCliResult } from "../result.js";
 import type { GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
@@ -95,47 +96,19 @@ export function requireTreePaths(
   ref: string,
   paths: readonly ResolvedAddPath[],
 ): string {
-  const commit = repo.peel(repo.revParse(ref));
-  const tree = repo.readCommit(commit).tree;
-  requirePathsInSources(paths, treeStream(repo, tree), repo.checkout.indexScan());
+  const tree = repo.readCommit(checkoutCommit(repo, ref)).tree;
+  requirePathspecsMatched(
+    paths.map((path) => path.path),
+    [treeStream(repo, tree), repo.checkout.indexScan()],
+  );
   return tree;
 }
 
 export function requireIndexPaths(repo: Repository, paths: readonly ResolvedAddPath[]): void {
-  requirePathsInSources(paths, stageZero(repo.checkout.indexScan()), []);
-}
-
-export function requireResetPaths(
-  repo: Repository,
-  ref: string | undefined,
-  paths: readonly ResolvedAddPath[],
-): void {
-  const head =
-    ref === undefined || ref === "HEAD" ? repo.head().oid : repo.peel(repo.revParse(ref));
-  const tree = head === null ? null : repo.readCommit(repo.peel(head)).tree;
-  requirePathsInSources(paths, treeStream(repo, tree), repo.checkout.indexScan());
-}
-
-function requirePathsInSources(
-  paths: readonly ResolvedAddPath[],
-  first: Iterable<{ path: string }>,
-  second: Iterable<{ path: string }>,
-): void {
-  const matched = paths.map(() => false);
-  const pathspecs = paths.map((requested) => compilePathspecs([requested.path]));
-  const visit = (path: string): void => {
-    for (let index = 0; index < paths.length; index++) {
-      if (matched[index] !== true && pathspecs[index]?.matches(path)) matched[index] = true;
-    }
-  };
-  for (const entry of first) visit(entry.path);
-  for (const entry of second) visit(entry.path);
-  for (let index = 0; index < paths.length; index++) {
-    const requested = paths[index];
-    if (requested !== undefined && matched[index] !== true) {
-      throw new GitError("EPATHSPEC", `pathspec '${requested.path}' did not match any files`);
-    }
-  }
+  requirePathspecsMatched(
+    paths.map((path) => path.path),
+    [stageZero(repo.checkout.indexScan())],
+  );
 }
 
 export function moveResetHead(context: GitContext, repo: Repository, ref: string): void {
