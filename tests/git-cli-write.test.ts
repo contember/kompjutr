@@ -1558,7 +1558,7 @@ describe("mutating git CLI handlers", () => {
     const target = await mixedIgnoredAddBackend();
     const before = repositoryState(target.context, target.repo);
     const formatting = new Error("formatting failed");
-    expect(() =>
+    await expect(
       runMutation(
         target.context,
         target.repo,
@@ -1576,7 +1576,7 @@ describe("mutating git CLI handlers", () => {
         },
         () => undefined,
       ),
-    ).toThrow(formatting);
+    ).rejects.toThrow(formatting);
     expect(target.repo.checkout.indexGet("good.txt", 0)).toBeNull();
     const reopened = target.reopen();
     expect(repositoryState(reopened.context, reopened.repo)).toEqual(before);
