@@ -3,7 +3,11 @@ import { type GitContext, nestedRoots } from "../../ops/core/context.js";
 import type { Repository } from "../../ops/repository/repository.js";
 import type { AddLiteralPathsResult } from "../../ops/staging/staging.js";
 import { eagerStatus } from "../../ops/status/status.js";
-import { formatCommitRefusalStatus, statusFormatOptions } from "../../ops/status/status-format.js";
+import {
+  type CommitRefusalBase,
+  formatCommitRefusalStatus,
+  statusFormatOptions,
+} from "../../ops/status/status-format.js";
 import { type GitCliOutputContext, gitCliDiagnosticResult, gitCliResult } from "../result.js";
 import type { GitCliEnvironment, GitCliResult, ResolvedGitCliRunOptions } from "../types.js";
 import {
@@ -78,12 +82,21 @@ export function mapCommitFailure(
   repo: Repository,
   error: unknown,
   options: ResolvedGitCliRunOptions,
+  amend: boolean,
 ): GitCliResult | undefined {
   if (hasErrorCode(error, "EMSG")) {
     return gitCliResult("", "Aborting commit due to empty commit message.\n", 1);
   }
   if (hasErrorCode(error, "EEMPTYCOMMIT")) {
-    return gitCliResult(cleanCommitRefusal(context, repo), "", 1);
+    return gitCliResult(
+      cleanCommitRefusal(context, repo, amend),
+      amend
+        ? "You asked to amend the most recent commit, but doing so would make\n" +
+            "it empty. You can repeat your command with --allow-empty, or you can\n" +
+            'remove the commit entirely with "git reset HEAD^".\n'
+        : "",
+      1,
+    );
   }
   if (hasErrorCode(error, "EUNMERGED")) {
     const stderr = stderrOutput(options);
@@ -248,15 +261,27 @@ export function environmentRecord(environment: GitCliEnvironment): Record<string
   return record;
 }
 
-function cleanCommitRefusal(context: GitContext, repo: Repository): string {
-  const branch = branchLabel(repo.head().ref);
+function cleanCommitRefusal(context: GitContext, repo: Repository, amend: boolean): string {
+  const head = repo.head();
   const rows = eagerStatus(
     repo,
     context.worktree,
     { excludeRoots: nestedRoots(context, repo.root) },
     context,
   );
-  return formatCommitRefusalStatus(rows, branch, statusFormatOptions(repo));
+  return formatCommitRefusalStatus(
+    rows,
+    branchLabel(head.ref),
+    amend && head.oid !== null ? amendRefusalBase(repo, head.oid) : "head",
+    statusFormatOptions(repo),
+  );
+}
+
+/** git shows an amended root or shallow commit as the initial commit. */
+function amendRefusalBase(repo: Repository, oid: string): CommitRefusalBase {
+  return repo.readCommit(oid).parent.length === 0 || repo.shallow().has(oid)
+    ? "amend-root"
+    : "amend-parent";
 }
 
 function unmergedPaths(repo: Repository, options: ResolvedGitCliRunOptions): TruncatingOutput {

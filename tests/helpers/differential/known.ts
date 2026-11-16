@@ -280,17 +280,6 @@ export const KNOWN: KnownDivergence[] = [
       push.op === "push" && before.some((op) => op.op === "branchRename" && op.to === push.ref),
   },
   {
-    id: "amend-empty",
-    reason: "open: amend accepts a result whose tree equals its parent's",
-    fields: ["outcome"],
-    matches: (d) =>
-      d.op.op === "commit" &&
-      d.op.amend === true &&
-      d.field === "outcome" &&
-      d.outcomes.kompjutr.kind === "clean" &&
-      d.outcomes.git.kind === "failed",
-  },
-  {
     id: "reset-unborn-head",
     reason: "open: `reset HEAD` on an unborn branch succeeds where git cannot resolve HEAD",
     fields: ["outcome"],

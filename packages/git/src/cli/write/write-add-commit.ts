@@ -121,7 +121,8 @@ export function createGitCliAddCommitHandlers(context: GitContext): AddCommitHan
             formatCommitSummary(repo, mutation, stdout);
             return truncatedResult(stdout, undefined, 0);
           },
-          (error) => mapCommitFailure(context, repo, error, options),
+          (error) =>
+            mapCommitFailure(context, repo, error, options, invocation.command.amend === true),
         ),
       );
     },

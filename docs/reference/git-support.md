@@ -476,8 +476,11 @@ wins only when it supplies both name and email; none left throws
 
 An ordinary commit refuses a tree identical to its first parent with
 `EEMPTYCOMMIT` unless the native caller sets `allowEmpty`. The same default
-refuses an empty root commit; a non-empty root commit succeeds. Amend and
-integration continuation keep their own semantics and may create a commit
+refuses an empty root commit; a non-empty root commit succeeds. An amend, as in
+Git, refuses a tree identical to the amended commit's first parent (the empty
+tree for a root or shallow commit) unless `allowEmpty` is set; amending a merge
+is exempt.
+Integration continuation keeps its own semantics and may create a commit
 without an ordinary tree change.
 
 ### `git log` — `log()`

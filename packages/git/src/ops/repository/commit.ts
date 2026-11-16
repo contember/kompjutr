@@ -80,7 +80,11 @@ export function commit(
     const headTree =
       amended?.tree ?? (head.oid === null ? null : readCommitOwned(repo, head.oid).tree);
     const baselineTree =
-      amended !== undefined ? undefined : headTree === null ? EMPTY_TREE_OID : headTree;
+      amended !== undefined && head.oid !== null
+        ? amendBaselineTree(repo, head.oid, amended)
+        : headTree === null
+          ? EMPTY_TREE_OID
+          : headTree;
     const identities = resolveIdentity(context, repo, options, amended);
     const result = writeCommitObjects(
       repo,
@@ -90,7 +94,12 @@ export function commit(
       headTree,
     );
     if (baselineTree !== undefined && options.allowEmpty !== true && result.tree === baselineTree) {
-      throw new GitError("EEMPTYCOMMIT", "cannot commit: the index tree is unchanged");
+      throw new GitError(
+        "EEMPTYCOMMIT",
+        amended === undefined
+          ? "cannot commit: the index tree is unchanged"
+          : "cannot amend: the commit would become empty",
+      );
     }
     const reason: RefLogReason =
       options.amend === true ? "commit (amend)" : head.oid === null ? "commit (initial)" : "commit";
@@ -345,6 +354,17 @@ function readAmended(repo: Repository, head: ResolvedHead): Commit {
     throw new GitError("ENOCOMMIT", "cannot amend: HEAD does not point at a commit yet");
   }
   return readCommitOwned(repo, head.oid);
+}
+
+/**
+ * git refuses an amend that leaves the first parent's tree; merges are exempt,
+ * and a root or shallow commit compares with the empty tree, as git sees it.
+ */
+function amendBaselineTree(repo: Repository, oid: string, amended: Commit): string | undefined {
+  if (amended.parent.length > 1) return undefined;
+  const first = amended.parent[0];
+  if (first === undefined || repo.store.readShallowOwned().has(oid)) return EMPTY_TREE_OID;
+  return readCommitOwned(repo, first).tree;
 }
 
 /** A source only wins when it supplies both halves of an identity. */

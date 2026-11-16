@@ -16,7 +16,7 @@ import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
 import { initRepository } from "../packages/git/src/ops/repository/init.js";
 import type { Repository } from "../packages/git/src/ops/repository/repository.js";
-import { addLiteralPaths } from "../packages/git/src/ops/staging/staging.js";
+import { addLiteralPaths, rm } from "../packages/git/src/ops/staging/staging.js";
 import { dirtyPathStream } from "../packages/git/src/ops/worktree/worktree-io.js";
 import {
   PACK_BLOB_BATCH_TARGET_BYTES,
@@ -625,6 +625,31 @@ describe("mutating git CLI handlers", () => {
       }),
     ).toEqual(cliResult(expected));
     expect(workspace.repo.head().oid).toBe(source.git("rev-parse", "HEAD"));
+  });
+  it("matches the refusal of an amend that would become empty", async () => {
+    const amend = ["commit", "--amend", "-m", "amended"];
+    const root = fixture();
+    const rootWorkspace = await importedPair(root, [{ path: "a.txt", content: "a\n" }]);
+    root.git("rm", "-q", "a.txt");
+    rm(rootWorkspace.repo, rootWorkspace.worktree, { paths: ["a.txt"] });
+    expect(
+      await runner(rootWorkspace.context).runCli({ argv: amend, cwd: "/repo", env: IDENTITY_ENV }),
+    ).toEqual(cliResult(gitResult(root, amend)));
+
+    const source = fixture();
+    source.write("a.txt", "a\n").commit("first");
+    const workspace = await importedPair(source, [{ path: "b.txt", content: "b\n" }]);
+    source.git("rm", "-q", "b.txt");
+    rm(workspace.repo, workspace.worktree, { paths: ["b.txt"] });
+    writeBoth(source, workspace, [
+      { path: "a.txt", content: "changed\n" },
+      { path: "untracked.txt", content: "u\n" },
+    ]);
+    const before = repositoryState(workspace.context, workspace.repo);
+    expect(
+      await runner(workspace.context).runCli({ argv: amend, cwd: "/repo", env: IDENTITY_ENV }),
+    ).toEqual(cliResult(gitResult(source, amend)));
+    expect(repositoryState(workspace.context, workspace.repo)).toEqual(before);
   });
   it("rolls back commit-all staging when identity resolution fails", async () => {
     const source = fixture();
