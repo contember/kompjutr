@@ -87,17 +87,19 @@ function untrackedPaths(status: string): string[] {
     .map((line) => unquote(line.slice(2)).replace(/\/$/, ""));
 }
 
+/** The typed API's code, or the argv runner's rendering of it. */
 const UNTRACKED_BLOCKERS =
-  "ECHECKOUTFAIL: untracked working tree files would be overwritten by checkout: ";
+  /^(?:ECHECKOUTFAIL|exit 128: fatal): untracked working tree files would be overwritten by checkout: (.+)$/s;
 
-/** The blockers kompjutr's untracked refusal names; a truncated list yields its named part. */
+/** The blockers kompjutr's untracked refusal names, when it names them all. */
 function untrackedBlockers(d: Divergence): string[] | undefined {
-  const detail = d.outcomes.kompjutr.detail ?? "";
-  if (!refused(d, /^ECHECKOUTFAIL:/) || !detail.startsWith(UNTRACKED_BLOCKERS)) return undefined;
-  return detail
-    .slice(UNTRACKED_BLOCKERS.length)
-    .replace(/, and \d+ more$/, "")
-    .split(", ");
+  const match = UNTRACKED_BLOCKERS.exec(d.outcomes.kompjutr.detail ?? "");
+  if (d.field !== "outcome" || d.outcomes.kompjutr.kind !== "failed" || !match?.[1]) {
+    return undefined;
+  }
+  // A truncated list hides blockers no matcher could check.
+  if (/, and \d+ more$/.test(match[1])) return undefined;
+  return match[1].split(", ");
 }
 
 /**

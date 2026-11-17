@@ -30,6 +30,9 @@ decided work or status.
 - [`measure-eager-status-result-memory.md`](measure-eager-status-result-memory.md)
   — `status()` materializes its whole result; measure it before deciding on an
   API or count boundary.
+- [`guard-index-and-drive-contracts.md`](guard-index-and-drive-contracts.md)
+  — reject an index that holds a file and a path below it, and name one default
+  for the drive's `removeFiles` `force`; neither is a reproduced defect yet.
 - Git parity without a caller — each graduates to `../backlog/` when a consumer
   issues it:
   [`stash-operations.md`](stash-operations.md) ·
