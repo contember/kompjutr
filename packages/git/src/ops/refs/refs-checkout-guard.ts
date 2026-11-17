@@ -64,9 +64,18 @@ export interface CheckoutGuard {
   /**
    * Git's two-way merge, for a checkout applied with the same `baselineTree`:
    * a path the baseline and target agree on keeps its staged state, and a
-   * staged deletion the target would change refuses.
+   * staged deletion the target would change refuses. The guard records what
+   * that checkout needs here.
    */
-  carryStaged?: boolean;
+  carry?: CarryFindings;
+}
+
+/** What the guard learns for the two-way merge its checkout then applies. */
+export interface CarryFindings {
+  /** The index differs from the baseline; otherwise the carry is the target itself. */
+  staged: boolean;
+  /** Kept staged files a taken path below replaces; one per such collision. */
+  replaced: Set<string>;
 }
 
 /**
@@ -95,7 +104,7 @@ export function checkoutBlockers(
   const pendingTrackedPaths: PendingTarget[] = [];
   const untrackedAncestors: PendingTarget[] = [];
   const hashCursor = createWorktreeHashCursor(excludeRoots);
-  const carry = guard.carryStaged === true ? new CarryCollisions() : undefined;
+  const carry = guard.carry === undefined ? undefined : new CarryCollisions(guard.carry);
   let ignores: IgnoreMatcher | undefined;
   const isIgnored = (path: string): boolean => {
     ignores ??= loadIgnoreMatcher(worktree, repo.root, { excludeRoots });
@@ -148,6 +157,12 @@ export function checkoutBlockers(
     if (!selected) continue;
 
     if (carry !== undefined) {
+      if (
+        row.unmerged ||
+        (existing === undefined ? row.head !== undefined : differsFromHead(existing, row.head))
+      ) {
+        carry.findings.staged = true;
+      }
       if (sameTreeEntry(target, row.head)) {
         if (existing === undefined) continue;
         if (!carry.replacedByTaken(row.path)) {
@@ -347,6 +362,8 @@ class CarryCollisions {
   readonly #taken: PendingTarget[] = [];
   readonly #kept: KeptLeaf[] = [];
 
+  constructor(readonly findings: CarryFindings) {}
+
   expire(path: string): void {
     expireRanges(this.#taken, path);
     expireRanges(this.#kept, path);
@@ -366,6 +383,7 @@ class CarryCollisions {
     const kept = findAncestor(this.#kept, path);
     if (kept === undefined) return undefined;
     this.#kept.splice(this.#kept.indexOf(kept), 1);
+    this.findings.replaced.add(kept.path);
     return kept.onDisk ? kept.path : undefined;
   }
 }

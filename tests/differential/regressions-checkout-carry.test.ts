@@ -159,12 +159,20 @@ describe("differential regressions: checkout carries staged changes", () => {
   });
 });
 
-/** `side` adds `path`; back on `main`, `staged` runs, then `side` is checked out. */
-function switchOver(path: string, staged: Op[]): Scenario {
+/**
+ * `base` is committed and `side` adds `path`; back on `main`, `staged` runs,
+ * then `to` switches away and a commit writes the resulting index.
+ */
+function switchOver(
+  path: string,
+  staged: Op[],
+  base: string[] = ["keep"],
+  to: Op = { op: "checkout", ref: "side" },
+): Scenario {
   return {
     start: "init",
     ops: [
-      { op: "write", path: "keep", content: { text: "k\n" } },
+      ...base.map((file): Op => ({ op: "write", path: file, content: { text: "k\n" } })),
       { op: "addAll" },
       { op: "commit", message: "base" },
       { op: "checkoutNew", name: "side" },
@@ -173,10 +181,15 @@ function switchOver(path: string, staged: Op[]): Scenario {
       { op: "commit", message: "side" },
       { op: "checkout", ref: "main" },
       ...staged,
-      { op: "checkout", ref: "side" },
+      to,
       { op: "commit", message: "after", allowEmpty: true },
     ],
   };
+}
+
+/** A staged new file deleted from disk again. */
+function stageGone(path: string): Op[] {
+  return [...stage(path), { op: "remove", path }];
 }
 
 function stage(path: string): Op[] {
@@ -217,5 +230,33 @@ describe("differential regressions: carried entries never collide as file and di
 
   it("drops a nested staged file gone from disk below the target's new directory", async () => {
     await expectAgreement(switchOver("a/b/c", [...stage("a/b"), { op: "remove", path: "a" }]));
+  });
+
+  // A kept path that the staged one extends sorts between the staged file and
+  // the target's path below it.
+  it("drops a staged file past a kept sibling that sorts before it", async () => {
+    await expectAgreement(switchOver("a.txt/x", stageGone("a.txt"), ["a", "keep"]));
+  });
+
+  it("drops a staged file past a kept sibling joined by a dash", async () => {
+    await expectAgreement(switchOver("a-b/x", stageGone("a-b"), ["a", "keep"]));
+  });
+
+  it("keeps one staged new file and drops the next one the target replaces", async () => {
+    await expectAgreement(switchOver("a.txt/x", [...stage("a"), ...stageGone("a.txt")]));
+  });
+
+  it("drops a nested staged file past a kept file in the same directory", async () => {
+    await expectAgreement(switchOver("a/b.c/d/e", stageGone("a/b.c"), ["a/b", "keep"]));
+  });
+
+  it("drops a staged file past a kept sibling for a new branch at the target", async () => {
+    await expectAgreement(
+      switchOver("a.txt/x", stageGone("a.txt"), ["a", "keep"], {
+        op: "checkoutNew",
+        name: "other",
+        startPoint: "side",
+      }),
+    );
   });
 });

@@ -14,6 +14,7 @@ import type { Worktree } from "../worktree/worktree.js";
 import { compilePathspecs, requirePathspecsMatched } from "../worktree/worktree-io.js";
 import { branch } from "./refs-branches.js";
 import {
+  type CarryFindings,
   type CheckoutBlockers,
   checkoutBlockers,
   describeBlockers,
@@ -42,6 +43,7 @@ export {
   tagList,
 } from "./refs-branches.js";
 export type {
+  CarryFindings,
   CheckoutBlockerLimits,
   CheckoutBlockers,
   CheckoutGuard,
@@ -151,12 +153,17 @@ function checkoutLegacy(
   const force = options.force === true;
   // An empty index is git's initial checkout: a repository fetched into but
   // never checked out would otherwise keep its whole tree staged as deleted.
-  const baselineTree = force || !hasIndexEntries(repo) ? undefined : repo.headTree();
-  requireCheckoutAllowed(repo, worktree, tree, force, excludeRoots, baselineTree !== undefined);
+  const carry: CarryFindings | undefined =
+    force || !hasIndexEntries(repo) ? undefined : { staged: false, replaced: new Set() };
+  requireCheckoutAllowed(repo, worktree, tree, force, excludeRoots, carry);
   checkoutTreeExcluding(repo, worktree, tree, excludeRoots, {
     preserveMatchingIndex: !force,
     restoreStructure: true,
-    baselineTree,
+    // An index at HEAD carries nothing, so the plain target checkout applies.
+    carry:
+      carry?.staged === true
+        ? { baselineTree: repo.headTree(), replaced: carry.replaced }
+        : undefined,
   });
   moveHead(context, repo, head);
 }
@@ -172,7 +179,7 @@ function requireCheckoutAllowed(
   tree: string | null,
   force: boolean,
   excludeRoots: readonly string[],
-  carryStaged: boolean,
+  carry: CarryFindings | undefined,
 ): void {
   if (force) return;
   const blocked = checkoutBlockers(repo, worktree, {
@@ -180,7 +187,7 @@ function requireCheckoutAllowed(
     prune: true,
     excludeRoots: [...excludeRoots],
     mode: "checkout",
-    carryStaged,
+    carry,
   });
   if (blocked.tracked.length > 0) {
     throw new GitError(
