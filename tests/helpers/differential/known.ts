@@ -173,6 +173,49 @@ function restoredDeletionsOnly(d: Divergence): boolean {
   return differsOnlyOn(d, new Set(restored.map(indexPath)));
 }
 
+const TRACKED_BLOCKERS = /^ECHECKOUTFAIL: local changes to (.+) would be overwritten by checkout$/s;
+
+/**
+ * kompjutr refused over files staged as new before the op, each below a
+ * directory that an indexed sibling sorts between (`a` < `a!` < `a/`); git switched.
+ */
+function refusedOverNestedAdditions(d: Divergence): boolean {
+  const match = TRACKED_BLOCKERS.exec(d.outcomes.kompjutr.detail ?? "");
+  if (!refused(d, /^ECHECKOUTFAIL:/) || d.outcomes.git.kind !== "clean" || !match?.[1]) {
+    return false;
+  }
+  const added = stagedAdditions(d.prior.status);
+  const indexed = d.prior.index.map(indexPath);
+  return match[1]
+    .replace(/, and \d+ more$/, "")
+    .split(", ")
+    .every((path) => added.has(path) && hasSiblingBetween(path, indexed));
+}
+
+const SLASH = 0x2f;
+
+/** Some indexed path sorts between an ancestor directory of `path` and its contents. */
+function hasSiblingBetween(path: string, indexed: string[]): boolean {
+  for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+    const dir = path.slice(0, slash);
+    if (indexed.some((other) => other.startsWith(dir) && other.charCodeAt(slash) < SLASH))
+      return true;
+  }
+  return false;
+}
+
+/** Paths git's status reports as staged additions. */
+function stagedAdditions(status: string): Set<string> {
+  const paths = new Set<string>();
+  for (const line of status.split("\n")) {
+    const fields = line.split(" ");
+    if (fields[0] === "1" && fields[1]?.startsWith("A")) {
+      paths.add(unquote(fields.slice(8).join(" ")));
+    }
+  }
+  return paths;
+}
+
 /** kompjutr's index holds a file where git kept the staged entries below it. */
 function keptBelowTaken(d: Divergence): boolean {
   if (d.after === null) return false;
@@ -232,14 +275,14 @@ export const KNOWN: KnownDivergence[] = [
   {
     id: "checkout-kept-below-taken",
     reason:
-      "open: a switch that takes a file over staged entries below it writes the file where " +
-      "git keeps the staged entries when the directory is gone or a sibling sorts between them",
-    fields: ["index", "status", "worktree"],
+      "intentional: git keeps staged entries below a file the target adds only when their " +
+      "directory is gone or a sibling sorts between them, an artifact of its walk order; " +
+      "kompjutr replaces clean ones and refuses over changed ones in every order " +
+      "(git-support.md, checkout)",
+    fields: ["outcome", "index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "checkout", "checkoutNew") &&
-      d.fields.includes("index") &&
-      d.after !== null &&
-      keptBelowTaken(d),
+      ((d.fields.includes("index") && keptBelowTaken(d)) || refusedOverNestedAdditions(d)),
   },
   {
     id: "operation-active",

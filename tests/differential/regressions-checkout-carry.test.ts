@@ -2,9 +2,10 @@
 // keeps its staged state; a staged path the switch would change is refused; a
 // path the switch takes replaces a kept entry it collides with.
 
-import { describe, it } from "vitest";
+import { describe, expect, it } from "vitest";
+import { knownDivergence } from "../helpers/differential/known.js";
 import type { Op, Scenario } from "../helpers/differential/ops.js";
-import { expectAgreement } from "../helpers/differential/run.js";
+import { expectAgreement, play } from "../helpers/differential/run.js";
 
 describe("differential regressions: checkout carries staged changes", () => {
   it("carries a staged new file absent from both trees", async () => {
@@ -257,6 +258,35 @@ describe("differential regressions: carried entries never collide as file and di
         name: "other",
         startPoint: "side",
       }),
+    );
+  });
+});
+
+/** The switch hits the documented `checkout-kept-below-taken` difference. */
+async function expectKeptBelowTaken(scenario: Scenario): Promise<void> {
+  const divergence = await play(scenario);
+  expect(divergence?.step).toBe(scenario.ops.length - 2);
+  expect(divergence === null ? undefined : knownDivergence(divergence)?.id).toBe(
+    "checkout-kept-below-taken",
+  );
+}
+
+describe("differential regressions: git's walk order keeps staged entries below a taken file", () => {
+  it("replaces a staged file whose directory is gone from disk", async () => {
+    await expectKeptBelowTaken(switchOver("a", [...stage("a/b"), { op: "remove", path: "a" }]));
+  });
+
+  it("replaces a staged file past a sibling that sorts between", async () => {
+    await expectKeptBelowTaken(switchOver("a", stage("a/b"), ["a!", "keep"]));
+  });
+
+  it("refuses over a changed staged file past a sibling that sorts between", async () => {
+    await expectKeptBelowTaken(
+      switchOver(
+        "a",
+        [...stage("a/b"), { op: "write", path: "a/b", content: { text: "x\n" } }],
+        ["a!", "keep"],
+      ),
     );
   });
 });
