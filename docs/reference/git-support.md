@@ -418,6 +418,20 @@ content and tracked changes that would be overwritten still block the operation.
 Path checkout overwrites tracked changes, as Git does. Its refusal over
 non-ignored untracked content is a deliberate difference: Git deletes that
 content.
+A branch checkout keeps staged changes on paths the current and target trees
+agree on, as Git's two-way merge does; a path it takes from the target replaces
+a kept entry that collides with it as file versus directory, and a changed
+kept entry below a file it takes refuses the switch. Git keeps staged entries
+below a file it takes only when their directory is gone from disk or a sibling
+path sorts between them, an artifact of its walk order. kompjutr applies the
+same rule in every order on purpose (`checkout-kept-below-taken`). With an
+empty index it writes the whole target, as Git's initial checkout does when no
+index exists yet: after `init`, `fetch` and `updateRef`, `checkout` must
+populate the worktree rather than keep every path staged as deleted. An index
+emptied by `rm --cached` looks the same, so there kompjutr writes the target
+where Git keeps the deletions or refuses, and refuses over a removed file still
+on disk, as untracked content the target would overwrite, where Git switches
+and keeps the deletion.
 
 ### `git clean` — `clean()`
 

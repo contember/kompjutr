@@ -52,32 +52,11 @@ function unquote(path: string): string {
   return Buffer.from(bytes).toString("utf8");
 }
 
-/** Paths with a staged change against HEAD in porcelain v2 `status`. */
-function stagedPaths(status: string): Set<string> {
-  const paths = new Set<string>();
-  for (const line of status.split("\n")) {
-    const fields = line.split(" ");
-    if (fields[0] === "1" && !fields[1]?.startsWith(".")) {
-      paths.add(unquote(fields.slice(8).join(" ")));
-    }
-    if (fields[0] === "2" && !fields[1]?.startsWith(".")) {
-      paths.add(unquote(fields.slice(9).join(" ").split("\t")[0] ?? ""));
-    }
-  }
-  return paths;
-}
-
-/** Before the op, the index held a change against HEAD. */
-function hadStagedChange(d: Divergence): boolean {
-  return stagedPaths(d.prior.status).size > 0;
-}
-
 /** Paths whose index entry or worktree file the two sides disagree on. */
 function differingPaths(d: Divergence): string[] {
   if (d.after === null) return [];
   const { kompjutr, git } = d.after;
   const paths: string[] = [];
-  const indexPath = (entry: string): string => entry.slice(entry.indexOf("\t") + 1);
   const leftIndex = new Set(kompjutr.index);
   const rightIndex = new Set(git.index);
   for (const entry of kompjutr.index) if (!rightIndex.has(entry)) paths.push(indexPath(entry));
@@ -111,21 +90,144 @@ function untrackedPaths(status: string): string[] {
 const UNTRACKED_BLOCKERS =
   "ECHECKOUTFAIL: untracked working tree files would be overwritten by checkout: ";
 
-/**
- * kompjutr refused naming blockers that were each untracked before the op,
- * or inside an untracked directory. A truncated list counts its named part.
- */
-function refusedOnlyForUntracked(d: Divergence): boolean {
+/** The blockers kompjutr's untracked refusal names; a truncated list yields its named part. */
+function untrackedBlockers(d: Divergence): string[] | undefined {
   const detail = d.outcomes.kompjutr.detail ?? "";
-  if (!refused(d, /^ECHECKOUTFAIL:/) || !detail.startsWith(UNTRACKED_BLOCKERS)) return false;
-  const named = detail
+  if (!refused(d, /^ECHECKOUTFAIL:/) || !detail.startsWith(UNTRACKED_BLOCKERS)) return undefined;
+  return detail
     .slice(UNTRACKED_BLOCKERS.length)
     .replace(/, and \d+ more$/, "")
     .split(", ");
+}
+
+/**
+ * kompjutr refused naming blockers that were each untracked before the op,
+ * or inside an untracked directory.
+ */
+function refusedOnlyForUntracked(d: Divergence): boolean {
+  const named = untrackedBlockers(d);
+  if (named === undefined) return false;
   const untracked = untrackedPaths(d.prior.status);
   return named.every((path) =>
     untracked.some((root) => path === root || path.startsWith(`${root}/`)),
   );
+}
+
+/** The path of an `ls-files -s` line. */
+function indexPath(entry: string): string {
+  return entry.slice(entry.indexOf("\t") + 1);
+}
+
+/** Paths staged as deleted before the op. */
+function priorDeletions(d: Divergence): Set<string> {
+  return new Set([...stagedDeletions(d.prior.status)].map(indexPath));
+}
+
+/** git refused naming only paths staged as deleted before the op; kompjutr wrote them. */
+function gitRefusedOverDeletions(d: Divergence): boolean {
+  const { kompjutr, git } = d.outcomes;
+  if (d.field !== "outcome" || kompjutr.kind !== "clean" || git.kind !== "failed") return false;
+  const detail = git.detail ?? "";
+  if (!/would be overwritten by checkout/.test(detail)) return false;
+  const named = detail
+    .split("\n")
+    .filter((line) => line.startsWith("\t"))
+    .map((line) => unquote(line.slice(1)));
+  const deleted = priorDeletions(d);
+  return named.length > 0 && named.every((path) => deleted.has(path));
+}
+
+/** kompjutr refused over untracked files each staged as deleted before the op; git switched. */
+function refusedOverDeletions(d: Divergence): boolean {
+  const named = untrackedBlockers(d);
+  if (d.outcomes.git.kind !== "clean" || named === undefined) return false;
+  const deleted = priorDeletions(d);
+  return named.every((path) => deleted.has(path));
+}
+
+/** HEAD's entries git's status reports as staged deletions, as `ls-files -s` lines. */
+function stagedDeletions(status: string): Set<string> {
+  const entries = new Set<string>();
+  for (const line of status.split("\n")) {
+    const fields = line.split(" ");
+    if (fields[0] === "1" && fields[1]?.startsWith("D")) {
+      entries.add(`${fields[3]} ${fields[6]} 0\t${unquote(fields.slice(8).join(" "))}`);
+    }
+  }
+  return entries;
+}
+
+/**
+ * kompjutr's index is git's plus target entries git kept staged as deleted,
+ * and the sides differ on no other path.
+ */
+function restoredDeletionsOnly(d: Divergence): boolean {
+  if (d.after === null) return false;
+  const { kompjutr, git } = d.after;
+  const left = new Set(kompjutr.index);
+  const right = new Set(git.index);
+  if (!git.index.every((entry) => left.has(entry))) return false;
+  const deleted = stagedDeletions(git.status);
+  const restored = kompjutr.index.filter((entry) => !right.has(entry));
+  if (!restored.every((entry) => deleted.has(entry))) return false;
+  return differsOnlyOn(d, new Set(restored.map(indexPath)));
+}
+
+const TRACKED_BLOCKERS = /^ECHECKOUTFAIL: local changes to (.+) would be overwritten by checkout$/s;
+
+/**
+ * kompjutr refused over files staged as new before the op, each below a
+ * directory that an indexed sibling sorts between (`a` < `a!` < `a/`); git switched.
+ */
+function refusedOverNestedAdditions(d: Divergence): boolean {
+  const match = TRACKED_BLOCKERS.exec(d.outcomes.kompjutr.detail ?? "");
+  if (!refused(d, /^ECHECKOUTFAIL:/) || d.outcomes.git.kind !== "clean" || !match?.[1]) {
+    return false;
+  }
+  const added = stagedAdditions(d.prior.status);
+  const indexed = d.prior.index.map(indexPath);
+  return match[1]
+    .replace(/, and \d+ more$/, "")
+    .split(", ")
+    .every((path) => added.has(path) && hasSiblingBetween(path, indexed));
+}
+
+const SLASH = 0x2f;
+
+/** Some indexed path sorts between an ancestor directory of `path` and its contents. */
+function hasSiblingBetween(path: string, indexed: string[]): boolean {
+  for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+    const dir = path.slice(0, slash);
+    if (indexed.some((other) => other.startsWith(dir) && other.charCodeAt(slash) < SLASH))
+      return true;
+  }
+  return false;
+}
+
+/** Paths git's status reports as staged additions. */
+function stagedAdditions(status: string): Set<string> {
+  const paths = new Set<string>();
+  for (const line of status.split("\n")) {
+    const fields = line.split(" ");
+    if (fields[0] === "1" && fields[1]?.startsWith("A")) {
+      paths.add(unquote(fields.slice(8).join(" ")));
+    }
+  }
+  return paths;
+}
+
+/** kompjutr's index holds a file where git kept the staged entries below it. */
+function keptBelowTaken(d: Divergence): boolean {
+  if (d.after === null) return false;
+  const prior = new Set(d.prior.index);
+  const left = new Set(d.after.kompjutr.index);
+  const kept = d.after.git.index
+    .filter((entry) => prior.has(entry) && !left.has(entry))
+    .map(indexPath);
+  const taken = d.after.kompjutr.index
+    .map(indexPath)
+    .filter((path) => kept.some((below) => below.startsWith(`${path}/`)));
+  return taken.length > 0 && differsOnlyOn(d, new Set([...taken, ...kept]));
 }
 
 const INTEGRATIONS: Op["op"][] = ["merge", "pull", "cherryPick", "revert", "rebase"];
@@ -155,13 +257,32 @@ export const KNOWN: KnownDivergence[] = [
     matches: (d) => opIs(d, ...INTEGRATIONS) && refused(d, /EDETACHED/),
   },
   {
-    id: "checkout-carry",
-    reason: "open: checkout drops or refuses staged changes git carries to the target",
+    id: "checkout-empty-index",
+    reason:
+      "intentional: an empty index is git's initial checkout, so init, fetch, updateRef and " +
+      "checkout populate the worktree; an index emptied by `rm` looks the same, where git " +
+      "keeps the deletions, refuses, or switches over files kompjutr sees as untracked " +
+      "(git-support.md, checkout)",
     fields: ["outcome", "index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "checkout", "checkoutNew") &&
-      ((hadStagedChange(d) && refused(d, /would be overwritten by checkout/)) ||
-        (d.fields.includes("index") && differsOnlyOn(d, stagedPaths(d.prior.status)))),
+      d.prior.head !== null &&
+      d.prior.index.length === 0 &&
+      (gitRefusedOverDeletions(d) ||
+        refusedOverDeletions(d) ||
+        (d.fields.includes("index") && restoredDeletionsOnly(d))),
+  },
+  {
+    id: "checkout-kept-below-taken",
+    reason:
+      "intentional: git keeps staged entries below a file the target adds only when their " +
+      "directory is gone or a sibling sorts between them, an artifact of its walk order; " +
+      "kompjutr replaces clean ones and refuses over changed ones in every order " +
+      "(git-support.md, checkout)",
+    fields: ["outcome", "index", "status", "worktree"],
+    matches: (d) =>
+      opIs(d, "checkout", "checkoutNew") &&
+      ((d.fields.includes("index") && keptBelowTaken(d)) || refusedOverNestedAdditions(d)),
   },
   {
     id: "operation-active",
