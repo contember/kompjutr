@@ -57,7 +57,6 @@ function differingPaths(d: Divergence): string[] {
   if (d.after === null) return [];
   const { kompjutr, git } = d.after;
   const paths: string[] = [];
-  const indexPath = (entry: string): string => entry.slice(entry.indexOf("\t") + 1);
   const leftIndex = new Set(kompjutr.index);
   const rightIndex = new Set(git.index);
   for (const entry of kompjutr.index) if (!rightIndex.has(entry)) paths.push(indexPath(entry));
@@ -91,21 +90,59 @@ function untrackedPaths(status: string): string[] {
 const UNTRACKED_BLOCKERS =
   "ECHECKOUTFAIL: untracked working tree files would be overwritten by checkout: ";
 
-/**
- * kompjutr refused naming blockers that were each untracked before the op,
- * or inside an untracked directory. A truncated list counts its named part.
- */
-function refusedOnlyForUntracked(d: Divergence): boolean {
+/** The blockers kompjutr's untracked refusal names; a truncated list yields its named part. */
+function untrackedBlockers(d: Divergence): string[] | undefined {
   const detail = d.outcomes.kompjutr.detail ?? "";
-  if (!refused(d, /^ECHECKOUTFAIL:/) || !detail.startsWith(UNTRACKED_BLOCKERS)) return false;
-  const named = detail
+  if (!refused(d, /^ECHECKOUTFAIL:/) || !detail.startsWith(UNTRACKED_BLOCKERS)) return undefined;
+  return detail
     .slice(UNTRACKED_BLOCKERS.length)
     .replace(/, and \d+ more$/, "")
     .split(", ");
+}
+
+/**
+ * kompjutr refused naming blockers that were each untracked before the op,
+ * or inside an untracked directory.
+ */
+function refusedOnlyForUntracked(d: Divergence): boolean {
+  const named = untrackedBlockers(d);
+  if (named === undefined) return false;
   const untracked = untrackedPaths(d.prior.status);
   return named.every((path) =>
     untracked.some((root) => path === root || path.startsWith(`${root}/`)),
   );
+}
+
+/** The path of an `ls-files -s` line. */
+function indexPath(entry: string): string {
+  return entry.slice(entry.indexOf("\t") + 1);
+}
+
+/** Paths staged as deleted before the op. */
+function priorDeletions(d: Divergence): Set<string> {
+  return new Set([...stagedDeletions(d.prior.status)].map(indexPath));
+}
+
+/** git refused naming only paths staged as deleted before the op; kompjutr wrote them. */
+function gitRefusedOverDeletions(d: Divergence): boolean {
+  const { kompjutr, git } = d.outcomes;
+  if (d.field !== "outcome" || kompjutr.kind !== "clean" || git.kind !== "failed") return false;
+  const detail = git.detail ?? "";
+  if (!/would be overwritten by checkout/.test(detail)) return false;
+  const named = detail
+    .split("\n")
+    .filter((line) => line.startsWith("\t"))
+    .map((line) => unquote(line.slice(1)));
+  const deleted = priorDeletions(d);
+  return named.length > 0 && named.every((path) => deleted.has(path));
+}
+
+/** kompjutr refused over untracked files each staged as deleted before the op; git switched. */
+function refusedOverDeletions(d: Divergence): boolean {
+  const named = untrackedBlockers(d);
+  if (d.outcomes.git.kind !== "clean" || named === undefined) return false;
+  const deleted = priorDeletions(d);
+  return named.every((path) => deleted.has(path));
 }
 
 /** HEAD's entries git's status reports as staged deletions, as `ls-files -s` lines. */
@@ -133,20 +170,19 @@ function restoredDeletionsOnly(d: Divergence): boolean {
   const deleted = stagedDeletions(git.status);
   const restored = kompjutr.index.filter((entry) => !right.has(entry));
   if (!restored.every((entry) => deleted.has(entry))) return false;
-  return differsOnlyOn(d, new Set(restored.map((entry) => entry.slice(entry.indexOf("\t") + 1))));
+  return differsOnlyOn(d, new Set(restored.map(indexPath)));
 }
 
 /** kompjutr's index holds a file where git kept the staged entries below it. */
 function keptBelowTaken(d: Divergence): boolean {
   if (d.after === null) return false;
-  const pathOf = (entry: string): string => entry.slice(entry.indexOf("\t") + 1);
   const prior = new Set(d.prior.index);
   const left = new Set(d.after.kompjutr.index);
   const kept = d.after.git.index
     .filter((entry) => prior.has(entry) && !left.has(entry))
-    .map(pathOf);
+    .map(indexPath);
   const taken = d.after.kompjutr.index
-    .map(pathOf)
+    .map(indexPath)
     .filter((path) => kept.some((below) => below.startsWith(`${path}/`)));
   return taken.length > 0 && differsOnlyOn(d, new Set([...taken, ...kept]));
 }
@@ -182,16 +218,15 @@ export const KNOWN: KnownDivergence[] = [
     reason:
       "intentional: an empty index is git's initial checkout, so init, fetch, updateRef and " +
       "checkout populate the worktree; an index emptied by `rm` looks the same, where git " +
-      "keeps the deletions or refuses (git-support.md, checkout)",
+      "keeps the deletions, refuses, or switches over files kompjutr sees as untracked " +
+      "(git-support.md, checkout)",
     fields: ["outcome", "index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "checkout", "checkoutNew") &&
       d.prior.head !== null &&
       d.prior.index.length === 0 &&
-      ((d.field === "outcome" &&
-        d.outcomes.kompjutr.kind === "clean" &&
-        d.outcomes.git.kind === "failed" &&
-        /would be overwritten by checkout/.test(d.outcomes.git.detail ?? "")) ||
+      (gitRefusedOverDeletions(d) ||
+        refusedOverDeletions(d) ||
         (d.fields.includes("index") && restoredDeletionsOnly(d))),
   },
   {
