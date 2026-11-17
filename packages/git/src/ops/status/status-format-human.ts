@@ -154,10 +154,13 @@ function humanUnstaged(entry: StatusDetail): boolean {
   );
 }
 
-function stagedLabel(entry: StatusDetail): "new file" | "modified" | "deleted" | "renamed" {
+function stagedLabel(
+  entry: StatusDetail,
+): "new file" | "modified" | "deleted" | "renamed" | "typechange" {
   if (entry.renamed === true) return "renamed";
   if (entry.index === "A") return "new file";
   if (entry.index === "D") return "deleted";
+  if (entry.index === "T") return "typechange";
   return "modified";
 }
 
@@ -185,10 +188,14 @@ function appendHumanEntry(
   out.append(`\t${`${label}:`.padEnd(12, " ")}${path}\n`);
 }
 
+/** What a refused commit compared with: HEAD, or for `--amend` its parent or, at a root, nothing. */
+export type CommitRefusalBase = "head" | "amend-parent" | "amend-root";
+
 /** Long status text used when `git commit` finds an unchanged index tree. */
 export function formatCommitRefusalStatus(
   entries: StatusDetail[],
   branch: string,
+  base: CommitRefusalBase,
   options: StatusFormatOptions = {},
   maxOutputBytes = STATUS_FORMAT_MAX_OUTPUT_BYTES,
 ): string {
@@ -196,6 +203,7 @@ export function formatCommitRefusalStatus(
   validateStatusPaths(entries);
   const out = new StatusTextOutput(maxOutputBytes);
   out.append(`On branch ${branch}\n`);
+  if (base === "amend-root") out.append("\nInitial commit\n\n");
   let unstaged = false;
   let untracked = false;
   for (const entry of entries) {
@@ -205,7 +213,7 @@ export function formatCommitRefusalStatus(
     }
   }
   if (!unstaged && !untracked) {
-    out.append("nothing to commit, working tree clean\n");
+    out.append(base !== "head" ? "No changes\n" : "nothing to commit, working tree clean\n");
     return out.finish();
   }
   if (unstaged) {
@@ -239,23 +247,17 @@ export function formatCommitRefusalStatus(
     out.append("\n");
   }
   out.append(
-    unstaged
-      ? 'no changes added to commit (use "git add" and/or "git commit -a")\n'
-      : 'nothing added to commit but untracked files present (use "git add" to track)\n',
+    base !== "head"
+      ? "No changes\n"
+      : unstaged
+        ? 'no changes added to commit (use "git add" and/or "git commit -a")\n'
+        : 'nothing added to commit but untracked files present (use "git add" to track)\n',
   );
   return out.finish();
 }
 
 function commitWorktreeLabel(entry: StatusDetail): "deleted" | "modified" | "typechange" {
   if (entry.worktree === "D") return "deleted";
-  if (
-    entry.unmerged !== true &&
-    entry.ignored !== true &&
-    "indexMode" in entry &&
-    "worktreeMode" in entry &&
-    entry.indexMode.slice(0, 3) !== entry.worktreeMode.slice(0, 3)
-  ) {
-    return "typechange";
-  }
+  if (entry.worktree === "T") return "typechange";
   return "modified";
 }

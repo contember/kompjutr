@@ -20,12 +20,14 @@ not effort: a wrong answer outranks a missing one.
 
 - **S — silent divergence.** kompjutr returns a plausible result where Git
   returns a different one or refuses. Nothing warns the caller.
-  [116](116-add-update-follows-the-index.md),
-  [117](117-report-type-changes-as-t.md),
-  [109](109-keep-parent-directory-when-replacing-its-only-child.md).
-- **A — blocks a common workflow, loudly.**
-  [108](108-local-checkout-removes-missing-paths.md).
-- **B — real gap, narrower audience or a workaround exists.** None filed.
+  [109](109-keep-parent-directory-when-replacing-its-only-child.md); most of
+  [124](124-match-git-commit-message-text.md),
+  [125](125-match-git-ref-and-push-edges.md) and
+  [126](126-match-git-worktree-index-and-status-edges.md).
+- **A — blocks a common workflow, loudly.** None filed.
+- **B — real gap, narrower audience or a workaround exists.** The empty-message
+  cherry-pick in 124, the push lease and the tracking message in 125, and abort
+  in 126.
 - **No caller yet.** Stash, plumbing reads, branch and remote management,
   rebase extensions, interactive rebase, rebase merges, gitlink
   conflicts, outbound delta compression and byte-preserving paths live in
@@ -111,13 +113,18 @@ The Smart HTTP server sprint closes 122 with a checked kernel reset and a
 post-reset HWM/RSS snapshot. It files 123 for the separate question of large
 server production capacity; local qualification does not establish that limit.
 
+On 2026-11-17 the residual divergences that reviews of the differential tester's
+fixes had reported were re-checked against git 2.54. The ones still divergent
+are filed as 124–126, grouped by area; each case within them is independent.
+Two contract gaps that are not reproduced defects went to
+[`../ideas/guard-index-and-drive-contracts.md`](../ideas/guard-index-and-drive-contracts.md).
+
 | Order | Items | Why |
 |---|---|---|
-| 0 | [116](116-add-update-follows-the-index.md), [117](117-report-type-changes-as-t.md) | Tier S: `add -u` ignores index-only paths; status shows a type change as `M`. |
 | 0 | [119](119-slice-the-clone-under-the-request-cpu-limit.md) | Production blocker: a full-history clone needs ~47 s of CPU in one request; a Durable Object request allows 30 s. |
 | 1 | [121](121-prune-the-parent-closure-walk-in-incremental-fetch.md) | Cost: an incremental fetch walks its parent's whole tree. |
-| 1 | [108](108-local-checkout-removes-missing-paths.md) | Tier A: local `reset --hard` fails with `ENOENT` when a tracked path is already gone. It blocks a common workflow. |
 | 2 | [109](109-keep-parent-directory-when-replacing-its-only-child.md) | Tier S, but narrow: only a directory's mode changes when its only child changes type. |
+| 2 | [126](126-match-git-worktree-index-and-status-edges.md), [124](124-match-git-commit-message-text.md), [125](125-match-git-ref-and-push-edges.md) | Tier S parts of the differential tester residuals: worktree effects first, then stored messages, then ref and push edges. |
 | 3 | [107](107-bound-shared-integration-step-passes.md) | Cost: the shared integration step still makes full-tree passes for every rebase, merge, cherry-pick and revert step. |
 | 4 | [106](106-reduce-the-workerd-clone-external-memory.md) | Memory: the workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it first, then decide whether a production probe is needed. |
 | 4 | [123](123-qualify-large-git-server-production-capacity.md) | Memory: large bare-server GC samples exceed 128 MiB locally; production capacity remains unqualified. |
@@ -128,15 +135,15 @@ server production capacity; local qualification does not establish that limit.
 
 - [106 — Reduce the workerd clone's external memory](106-reduce-the-workerd-clone-external-memory.md)
 - [107 — Bound the shared integration step's full-tree passes](107-bound-shared-integration-step-passes.md)
-- [108 — Let local checkout remove paths that are already gone](108-local-checkout-removes-missing-paths.md)
 - [109 — Keep a directory whose only child changes type](109-keep-parent-directory-when-replacing-its-only-child.md)
 - [111 — Bound interpreter CPU and regex backtracking in the shell](111-bound-interpreter-cpu-and-regex-backtracking.md)
 - [112 — Give invoked commands stdin and their own diagnostic name](112-give-invoked-commands-stdin-and-their-own-name.md)
 - [113 — Close small shell parity gaps found in the 2026-09-28 sprint](113-close-small-shell-parity-gaps.md)
 - [114 — Share one uutils argument parser across shell commands](114-share-one-uutils-argument-parser.md)
 - [115 — Change modes in bulk without touching mtime](115-bulk-chmod-without-mtime.md)
-- [116 — Make `add -u` follow the index, not HEAD](116-add-update-follows-the-index.md)
-- [117 — Report a pending type change as `T` in status](117-report-type-changes-as-t.md)
 - [119 — Slice the clone under the Durable Object request CPU limit](119-slice-the-clone-under-the-request-cpu-limit.md)
 - [121 — Prune the parent closure walk in incremental fetch connectivity](121-prune-the-parent-closure-walk-in-incremental-fetch.md)
 - [123 — Qualify large Git server production capacity](123-qualify-large-git-server-production-capacity.md)
+- [124 — Match Git's commit message text in merge, rebase and cherry-pick](124-match-git-commit-message-text.md)
+- [125 — Match Git on branch, reflog and push edge cases](125-match-git-ref-and-push-edges.md)
+- [126 — Match Git on abort, rm through a symlink, and ignored status](126-match-git-worktree-index-and-status-edges.md)

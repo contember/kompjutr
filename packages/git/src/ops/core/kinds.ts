@@ -17,8 +17,8 @@ export type { ReplayEmptyReason } from "../../store/operations/operations.js";
  * formatting a commit date has to negate.
  */
 
-export type OrdinaryStatusIndexCode = " " | "A" | "M" | "D";
-export type OrdinaryStatusWorktreeCode = " " | "A" | "M" | "D" | "?";
+export type OrdinaryStatusIndexCode = " " | "A" | "M" | "T" | "D";
+export type OrdinaryStatusWorktreeCode = " " | "A" | "M" | "T" | "D" | "?";
 export type UnmergedStatusCode = "A" | "D" | "U";
 export type IgnoredStatusCode = "!";
 export type RenameStatusCode = "R";

@@ -60,22 +60,29 @@ export class CheckoutRemovalStream {
     this.#flushIndex();
     if (this.#directories.size === 0) return undefined;
     for (const root of this.#scope.relativeExcludeRoots) this.#markContents(root);
+    // Only a directory the walk saw can be pruned: a planned one may already
+    // be gone, or stand as a file.
+    const present = new Set<string>();
     for (const entry of walkWorktreeEntriesStream(this.#worktree, this.#repo.root, {
       excludeRoots: this.#scope.excludeRoots,
       includeIgnored: true,
       includeDirectories: true,
       maxScanRows: this.#scope.maxWorktreeRows,
     })) {
-      if (entry.stat.type === "dir" && this.#directories.has(entry.path)) continue;
+      if (entry.stat.type === "dir" && this.#directories.has(entry.path)) {
+        present.add(entry.path);
+        continue;
+      }
       this.#markContents(entry.path);
     }
 
     const roots: string[] = [];
-    for (const [directory, hasContents] of this.#directories) {
-      if (hasContents) continue;
+    const prunes = (directory: string): boolean =>
+      present.has(directory) && this.#directories.get(directory) === false;
+    for (const directory of this.#directories.keys()) {
+      if (!prunes(directory)) continue;
       const slash = directory.lastIndexOf("/");
-      const parent = slash < 0 ? undefined : directory.slice(0, slash);
-      if (parent !== undefined && this.#directories.get(parent) === false) continue;
+      if (slash >= 0 && prunes(directory.slice(0, slash))) continue;
       roots.push(directory);
     }
     roots.sort(comparePaths);
@@ -109,7 +116,8 @@ export class CheckoutRemovalStream {
 
   #removeFiles(batch: string[] | undefined): void {
     if (batch === undefined) return;
-    this.#worktree.removeFiles(batch);
+    // A tracked file already deleted from disk is already where checkout wants it.
+    this.#worktree.removeFiles(batch, { force: true });
   }
 
   #flushIndex(): void {

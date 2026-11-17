@@ -403,6 +403,35 @@ describe("push", () => {
     }
   });
 
+  it("refuses a short legacy deletion the remote lacks before POST, but not a full or mapped one", async () => {
+    const fixture = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    try {
+      const ws = workspace(new SqliteTestStorage());
+      await ws.git.clone({ url: server.url, dir: "/" });
+      const posts = () => server.requests.filter((request) => request.method === "POST").length;
+      const before = posts();
+
+      await expect(ws.git.push({ ref: "nosuch", delete: true })).rejects.toMatchObject({
+        code: "EDELETEMISSING",
+        message: "unable to delete 'nosuch': remote ref does not exist",
+      });
+      await expect(ws.git.push({ remoteRef: "nosuch", delete: true })).rejects.toMatchObject({
+        code: "EDELETEMISSING",
+      });
+      const absent = { ok: true, refs: [{ ref: "refs/heads/nosuch", ok: true }] };
+      await expect(ws.git.push({ ref: "refs/heads/nosuch", delete: true })).resolves.toMatchObject(
+        absent,
+      );
+      await expect(
+        ws.git.push({ refspecs: [{ source: null, destination: "refs/heads/nosuch" }] }),
+      ).resolves.toMatchObject(absent);
+      expect(posts()).toBe(before);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("keeps tracking state unchanged when the success response is lost", async () => {
     const fixture = remoteFixture();
     const old = fixture.git("rev-parse", "main");

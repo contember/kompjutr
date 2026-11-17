@@ -1,12 +1,11 @@
 import { GitError, PathspecNotFoundError } from "../../common/errors.js";
 import { comparePaths, isExcluded, joinPath, relativeExcludeRoots } from "../../common/paths.js";
-import { joinSorted3 } from "../../common/streams.js";
+import { joinSorted } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { applyIndexOwned } from "../../store/checkout/checkout.js";
 import { type IndexEntry, type IndexStore, indexScanOwned } from "../../store/index.js";
 import type { GitContext } from "../core/context.js";
 import type { Repository } from "../repository/repository.js";
-import { type TargetEntry, treeStream } from "../tree/tree-stream.js";
 import type { Worktree } from "../worktree/worktree.js";
 import {
   type CompiledPathspecMatcher,
@@ -20,7 +19,6 @@ import {
   type AddIndexSnapshot,
   type AddOperationLimits,
   addIndexSource,
-  boundedAddHeadRows,
   boundedAddWorktreeRows,
   retainStageCandidate,
   type StageCandidateBatch,
@@ -41,7 +39,7 @@ export interface AddOptions {
   paths: string[];
   /** Stage every change under the repository, ignoring `paths`. */
   all?: boolean;
-  /** Restrict `all` to paths already in HEAD — the `commit -a` semantics. */
+  /** Restrict `all` to paths already in the index — `add -u` and `commit -a`. */
   trackedOnly?: boolean;
   /** Stage a path even when `.gitignore` matches it. */
   force?: boolean;
@@ -52,11 +50,10 @@ export interface AddOptions {
   excludeRoots?: string[];
 }
 
-/** The three sorted inputs one add merges; `head` is present only for `trackedOnly`. */
+/** The two sorted inputs one add merges. */
 interface AddSources {
   index: AddIndexSnapshot;
   worktree: Iterable<WorktreePath>;
-  head?: Iterable<TargetEntry>;
 }
 
 export type AddLiteralPathsResult =
@@ -119,10 +116,8 @@ function runAdd(
 
   const limits: AddOperationLimits = {
     worktreeRows: 0,
-    headRows: 0,
   };
   const force = options.force === true;
-  const trackedOnly = all && options.trackedOnly === true;
   let pathspec: CompiledPathspecMatcher | undefined;
   pathspec = all ? undefined : compilePathspecs(specs);
   if (!all && pathspec !== undefined) {
@@ -130,6 +125,8 @@ function runAdd(
       index === repo.checkout && !specs.some(hasGlobSyntax)
         ? selectAddPaths(repo, specs, context)
         : null;
+    // A selection is unavailable when a spec has a symlink ancestor, so that
+    // case always reaches the check below.
     if (selected !== null) {
       assertSelectedPathspecsMatch(specs, selected);
       applyAdd(
@@ -148,6 +145,7 @@ function runAdd(
       );
       return;
     }
+    assertNoSymlinkLeadingPath(repo, worktree, specs);
     assertPathspecsMatch(repo, worktree, specs, index, options.excludeRoots);
   }
 
@@ -163,7 +161,6 @@ function runAdd(
         {
           index: addIndexSource(tracked.index, pathspec),
           worktree: tracked.worktree,
-          head: trackedOnly ? tracked.head : undefined,
         },
         pathspec,
         force,
@@ -188,8 +185,6 @@ function runAdd(
     {
       index: addIndexSource(indexScanOwned(index), pathspec),
       worktree: walked,
-      // `commit -a` never adds a path HEAD does not already have.
-      head: trackedOnly ? treeStream(repo, repo.headTree()) : undefined,
     },
     pathspec,
     force,
@@ -217,36 +212,32 @@ function applyAdd(
     return ignores.ignores(path, false);
   };
   const excluded = relativeExcludeRoots(repo.root, options.excludeRoots);
-  const trackedOnly = sources.head !== undefined;
+  const trackedOnly = options.all === true && options.trackedOnly === true;
   const pending: StageCandidateBatch = {
     rows: [],
   };
   applyIndexOwned(index, (sink) => {
     const flush = (): void => stageCandidates(repo, worktree, pending, sink);
-    for (const row of joinSorted3(
+    for (const row of joinSorted(
       boundedAddWorktreeRows(sources.worktree, limits),
       sources.index.paths,
-      boundedAddHeadRows(sources.head ?? [], limits),
-      {
-        a: (entry) => entry.path,
-        b: (entry) => entry.path,
-        c: (entry) => entry.path,
-      },
+      { left: (entry) => entry.path, right: (entry) => entry.path },
     )) {
-      if (trackedOnly && row.c === undefined) continue;
-      const existing = row.b?.entry;
+      // `add -u` stages only what the index holds, staged-new paths included.
+      if (trackedOnly && row.right === undefined) continue;
+      const existing = row.right?.entry;
 
-      if (row.a !== undefined) {
-        if (row.b === undefined && isExcluded(row.path, excluded)) continue;
-        if (row.b === undefined && isIgnored(row.path)) continue;
-        const conflicted = row.b?.conflicted ?? false;
-        if (!conflicted && existing !== undefined && indexMatchesStat(existing, row.a.stat)) {
+      if (row.left !== undefined) {
+        if (row.right === undefined && isExcluded(row.path, excluded)) continue;
+        if (row.right === undefined && isIgnored(row.path)) continue;
+        const conflicted = row.right?.conflicted ?? false;
+        if (!conflicted && existing !== undefined && indexMatchesStat(existing, row.left.stat)) {
           continue;
         }
         retainStageCandidate(pending, {
           path: row.path,
           existing,
-          worktree: row.a,
+          worktree: row.left,
           conflicted,
         });
         if (pending.rows.length >= ADD_WINDOW_ROWS) flush();
@@ -254,7 +245,7 @@ function applyAdd(
       }
 
       // A conflict-only path has no stage-zero row but still needs removal.
-      if (row.b === undefined) continue;
+      if (row.right === undefined) continue;
       if (pathspec !== undefined && !pathspec.matches(row.path)) continue;
       flush();
       sink.remove(row.path);
@@ -324,6 +315,27 @@ function literalSelectionIsExactTracked(repo: Repository, spec: string): boolean
     return exact.done !== true && exact.value.path === spec;
   } finally {
     entries.return?.();
+  }
+}
+
+/**
+ * Git refuses a pathspec whose leading directory is a symlink instead of
+ * staging through it. The walk stops at the first component that is not a
+ * directory, as Git's `has_symlink_leading_path` does.
+ */
+function assertNoSymlinkLeadingPath(
+  repo: Repository,
+  worktree: Worktree,
+  specs: readonly string[],
+): void {
+  for (const spec of specs) {
+    for (let at = spec.indexOf("/"); at > 0; at = spec.indexOf("/", at + 1)) {
+      const stat = worktree.stat(joinPath(repo.root, spec.slice(0, at)));
+      if (stat?.type === "symlink") {
+        throw new GitError("EPATHSPEC", `pathspec '${spec}' is beyond a symbolic link`);
+      }
+      if (stat?.type !== "dir") break;
+    }
   }
 }
 

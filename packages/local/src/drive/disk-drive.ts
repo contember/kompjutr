@@ -125,7 +125,14 @@ export class DiskDrive implements GitDrive {
 
   stat(path: string) {
     this.#open();
-    const canonical = this.#mapper.resolve(path, false);
+    let canonical: RealPath;
+    try {
+      canonical = this.#mapper.resolve(path, false);
+    } catch (error) {
+      // A path through a regular file is absent, as the Durable Object drive reports it.
+      if (errorCode(error) === "ENOTDIR") return null;
+      throw error;
+    }
     return statAt(this.#mapper.lexicalHost(canonical), this.#observations.next());
   }
 

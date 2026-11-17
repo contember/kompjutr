@@ -258,8 +258,10 @@ checkout; another attachment fails with `EBRANCHINUSE` and has no force bypass.
 
 `status()` and `Git.status()` remain array-returning APIs. `statusReport()` and
 `Git.statusReport()` add an object result only when callers need branch
-metadata. `StatusEntry` uses `" " A M D ? ! U R`. An exact rename row uses the
-destination as `path`, carries the source as `originalPath`, and reports
+metadata. `StatusEntry` uses `" " A M T D ? ! U R`. `T` marks a change between
+regular file, symlink, and gitlink; an executable-bit change alone is `M`. An
+exact rename row uses the destination as `path`, carries the source as
+`originalPath`, and reports
 `similarity: 100`. `StatusDetail` adds the modes and OIDs required by ordinary,
 unmerged, and rename porcelain v2 rows. Exact detection pairs equal authoritative
 blob OIDs within compatible regular-file or symlink mode classes. It honours an
@@ -337,14 +339,15 @@ nothing; ordinary checkout and the local drive store NULL stat data.
 |---|---|---|
 | `<pathspec>...` | `paths` | ★ ~ exact path, directory prefix, or default globs; no `:(exclude)` magic |
 | `-A`, `--all` | `all` | ★ ✔ |
-| `-u`, `--update` | `trackedOnly` (with `all`) | ✔ this is the `commit -a` shape |
+| `-u`, `--update` | `trackedOnly` (with `all`) | ✔ stages modifications and deletions of every indexed path, staged-new ones included; the `commit -a` shape |
 | `-f`, `--force` | `force` | ★ ✔ stage an ignored path |
 | explicitly named ignored path without `--force` | default | ★ ~ succeeds without changing the index, matching isomorphic-git and the Computer contract; the Git CLI fails |
 | `-p`, `-i`, `-N`, `--renormalize` | — | ✘ |
 
 A pathspec that matches nothing throws `PathspecNotFoundError`. An ignored path
 exists and therefore counts as a match even when it is skipped; `force: true`
-stages it.
+stages it. A pathspec with a symlink as a leading directory fails with
+`EPATHSPEC` (`is beyond a symbolic link`) before the index changes, as Git does.
 
 ### `git rm` — `rm()`
 
@@ -383,11 +386,13 @@ before removal.
 | `--mixed` (default) | default | ★ ✔ replaces the index from `ref` |
 | `--hard` | `hard` | ★ ✔ rewrites index and working tree, and clears any pending merge/replay state |
 | `<commit>` | `ref` (default HEAD) | ★ ✔ |
-| `-- <paths>` | `paths` | ✔ unstage those paths; clears their conflict stages |
+| `-- <paths>` | `paths` | ✔ unstage those paths; clears their conflict stages; an unmatched pathspec is a no-op, as in Git |
 | `--soft`, `--merge`, `--keep` | — | ✘ |
 
 The strict argv runner also moves the current symbolic branch or detached HEAD
-for whole-tree mixed and hard resets, matching Git. Path reset leaves HEAD and
+for whole-tree mixed and hard resets, matching Git; as in Git, an explicit
+`HEAD` there fails on an unborn branch, while `reset [--hard]` without a ref and
+`reset HEAD -- <paths>` succeed. Path reset leaves HEAD and
 the worktree unchanged. Registered nested repository roots are excluded from
 hard-reset worktree changes.
 
@@ -395,10 +400,10 @@ hard-reset worktree changes.
 
 | Git | kompjutr | |
 |---|---|---|
-| `git checkout <ref>` | `checkout({ ref })` | ★ ✔ branch, tag or commit; a commit detaches HEAD |
-| `git checkout <ref> -- <paths>` | `checkout({ ref, paths })` | ★ ✔ HEAD stays put; absent paths are not pruned |
-| `git checkout -f` | `force` | ✔ otherwise a blocking local change throws `ECHECKOUTFAIL` |
-| `git checkout -b <name> [<start>]` | strict argv composition | ★ ✔ atomically creates and checks out the branch and selected tree |
+| `git checkout <ref>` | `checkout({ ref })` | ★ ✔ a local branch name attaches HEAD, and wins over a same-named tag; a tag, full ref name, revision such as `main~1`, or commit detaches HEAD |
+| `git checkout <ref> -- <paths>` | `checkout({ ref, paths })` | ★ ✔ HEAD stays put; absent paths are not pruned; staged and unstaged changes are overwritten, as in Git; kompjutr refuses to delete untracked content that blocks a path checkout (`ECHECKOUTFAIL`, nothing changed); Git deletes it; a pathspec that matches nothing in `<ref>`'s tree throws `EPATHSPEC` and changes nothing |
+| `git checkout -f` | `force` | ✔ otherwise a blocking local change throws `ECHECKOUTFAIL`; path checkout blocks only on untracked content |
+| `git checkout -b <name> [<start>]` | strict argv composition | ★ ✔ atomically creates and checks out the branch and selected tree; a remote-tracking start point records the upstream as `git branch` does; on an unborn branch without `<start>` it only renames the unborn branch |
 | `git switch <branch>` / `git switch -c <name>` | strict argv aliases | ✔ switches only to an existing local branch, or creates one with `-c` |
 | `git restore [--source=<ref>] <paths>...` | strict argv alias | ✔ restores only worktree bytes from stage-0 index by default or the selected tree; the index stays unchanged |
 | `--orphan`, `--track`, `--merge`, `--patch` | — | ✘ |
@@ -410,6 +415,23 @@ selected tracked worktree path that is absent from that source.
 Checkout, merge, cherry-pick, and rebase replace ignored untracked files and
 directories when writing tracked paths, as Git does. Non-ignored untracked
 content and tracked changes that would be overwritten still block the operation.
+Path checkout overwrites tracked changes, as Git does. Its refusal over
+non-ignored untracked content is a deliberate difference: Git deletes that
+content.
+A branch checkout keeps staged changes on paths the current and target trees
+agree on, as Git's two-way merge does; a path it takes from the target replaces
+a kept entry that collides with it as file versus directory, and a changed
+kept entry below a file it takes refuses the switch. Git keeps staged entries
+below a file it takes only when their directory is gone from disk or a sibling
+path sorts between them, an artifact of its walk order. kompjutr applies the
+same rule in every order on purpose (`checkout-kept-below-taken`). With an
+empty index it writes the whole target, as Git's initial checkout does when no
+index exists yet: after `init`, `fetch` and `updateRef`, `checkout` must
+populate the worktree rather than keep every path staged as deleted. An index
+emptied by `rm --cached` looks the same, so there kompjutr writes the target
+where Git keeps the deletions or refuses, and refuses over a removed file still
+on disk, as untracked content the target would overwrite, where Git switches
+and keeps the deletion.
 
 ### `git clean` — `clean()`
 
@@ -457,12 +479,12 @@ returns the complete add/delete output.
 
 | Git | kompjutr | |
 |---|---|---|
-| `-m <msg>` | `message` | ★ ~ **required**; an empty message throws `EMSG` |
+| `-m <msg>` | `message` | ★ ~ **required**; an empty message throws `EMSG`; stored after Git's whitespace cleanup, as are merge messages |
 | `--amend` | `amend` | ✔ |
 | `--author` | `author` | ✔ |
 | committer override | `committer` | ✔ |
 | `GIT_AUTHOR_*` / `GIT_COMMITTER_*` | `env` | ~ read from the passed record only, never from `process.env` |
-| `-a` | `add({ all: true, trackedOnly: true })` first | ✔ the argv runner composes staging and commit in one transaction |
+| `-a` | `add({ all: true, trackedOnly: true })` first | ✔ the argv runner composes staging and the commit, or a pending merge's continuation, in one transaction |
 | `--allow-empty` | `allowEmpty: true` | ★ ✔ |
 | continue a merge | `commit()` during a pending merge finalizes it | ✔ `--amend` is rejected there |
 | `-F <file>`, `-S`, `--fixup`, `--squash`, `--no-verify` | — | ✘ (no hooks and no signing exist) |
@@ -474,8 +496,11 @@ wins only when it supplies both name and email; none left throws
 
 An ordinary commit refuses a tree identical to its first parent with
 `EEMPTYCOMMIT` unless the native caller sets `allowEmpty`. The same default
-refuses an empty root commit; a non-empty root commit succeeds. Amend and
-integration continuation keep their own semantics and may create a commit
+refuses an empty root commit; a non-empty root commit succeeds. An amend, as in
+Git, refuses a tree identical to the amended commit's first parent (the empty
+tree for a root or shallow commit) unless `allowEmpty` is set; amending a merge
+is exempt.
+Integration continuation keeps its own semantics and may create a commit
 without an ordinary tree change.
 
 ### `git log` — `log()`
@@ -560,9 +585,9 @@ selection.
 
 | Git | kompjutr | |
 |---|---|---|
-| `git branch <name> [<start>]` | `name`, `startPoint` | ★ ✔ start point peels annotated tags |
+| `git branch <name> [<start>]` | `name`, `startPoint` | ★ ✔ start point peels annotated tags; a remote-tracking start point records `branch.<name>.remote`/`merge` in the same transaction, as Git's default `branch.autoSetupMerge=true` does |
 | `-f`, `--force` | `force` | ✔ typed API only; the strict argv runner rejects force-create/reset |
-| `-d` | `branchDelete({ name })` | ★ ✔ deletes only when the tip is provably reachable from the comparison commit; retains bounded recovery history |
+| `-d` | `branchDelete({ name })` | ★ ✔ deletes only when the tip is provably reachable from the comparison commit; removes the `branch.<name>.*` config section in the same transaction; retains bounded recovery history |
 | `-D` | `branchDelete({ name, force: true })` | ✔ bypasses only the reachability proof |
 | `-m <new>` / `-m <old> <new>` | `branchRename({ newName })` / `branchRename({ oldName, newName })` | ★ ✔ atomically moves the direct ref, selected symbolic `HEAD`, and bounded `branch.<name>.*` config |
 | `--list` | `branchList()` | ✔ names only |
@@ -582,8 +607,11 @@ transactional expected-tip guard that prevents deleting a concurrently moved
 
 Rename has no force mode. It rejects an occupied destination, a detached
 selected checkout, a source attached to another checkout, destination branch
-config, and an active operation. Upstream management and remote rename remain
-separate, unsupported operations.
+config, and an active operation. As in Git, renaming the selected checkout's
+unborn branch moves only `HEAD` and its `branch.<name>.*` config, and a rename
+onto the same name succeeds without moving a ref or config; unlike Git, neither
+writes a reflog entry. Explicit upstream management (`--track`,
+`--set-upstream-to`) and remote rename remain separate, unsupported operations.
 
 The strict argv runner exposes normal create, safe and force delete, rename,
 list, and show-current through the exact spellings in [Strict local argv
@@ -849,11 +877,11 @@ visible even if the integration afterwards refuses (`ESTALEHEAD`,
 
 | Git | kompjutr | |
 |---|---|---|
-| one legacy branch | `remote`, `ref`, `remoteRef` | ✔ translated through the structured operation |
+| one legacy branch | `remote`, `ref`, `remoteRef` | ~ translated through the structured operation; a named `ref` updates the remote branch of the same name, as Git does. An omitted `ref` pushes in upstream mode: the current branch goes to its upstream on that remote, or to the same name when it has none. Git's default `push.default=simple` instead exits 128 when the upstream's name differs from the branch's or no upstream is set |
 | `<src>:<dst>` mappings | `refspecs: [{ source, destination, force? }]` | ★ ✔ exact refs, one-star wildcards, full-OID sources, and custom namespaces |
 | explicit URL | `url` | ✔ also honours `remote.<n>.pushurl` |
 | `--force` | legacy `force`, or per-mapping `force` | ★ ✔ |
-| `--delete` | legacy `delete`, or `{ source: null, destination }` | ★ ✔ several explicit deletions may share one request |
+| `--delete` | legacy `delete`, or `{ source: null, destination }` | ★ ~ several explicit deletions may share one request; a legacy deletion of a short branch name the remote lacks throws `EDELETEMISSING` before POST, as Git refuses it; a full `refs/` name the remote lacks is a no-op, where Git sends it and the remote warns. A mapped deletion of an absent ref is a no-op, where Git refuses a short `:<dst>` |
 | `--force-with-lease=<ref>:<expect>` | `leases: { [destination]: { expected: oidOrNull } }` | ✔ partial per-destination map; `null` expects absence |
 | tracking-derived lease | `leases: { [branch]: { tracking: true } }` | ✔ named remotes and branch destinations only; snapshots the tracking OID before discovery |
 | `--atomic` | `atomic` | ★ ✔ requires the advertised capability |
@@ -923,15 +951,20 @@ Two restrictions are deliberate:
   detached HEAD each fails with `EDETACHED` before it starts; Git integrates
   into the detached HEAD.
 
-Merge abort and cherry-pick or revert skip and abort follow Git's
-`reset --merge`. They fail with `ECHECKOUTFAIL` and change nothing when a
-restored path that is present in the worktree differs from its stage-0 index
-entry (`Entry '<path>' not uptodate`), or when an untracked file stands where
-the restore writes one (`Untracked working tree file '<path>' would be
-overwritten`). Conflicted paths are reset regardless, and a path the user
-removed is restored. One narrow divergence: Git keeps an unstaged edit to a
-touched path whose staged entry the user set back to the pre-operation entry;
-kompjutr refuses. Rebase abort restores unconditionally, as Git's does.
+Merge abort and cherry-pick or revert skip and abort run Git's
+`reset --merge` to HEAD over every path, not only the paths the operation
+touched. An index entry that matches HEAD keeps its worktree file, edited or
+deleted. Every other entry, whether the operation or the user staged it,
+returns to HEAD in the index and the worktree, even when its file was already
+missing before the operation started; a staged new file is removed, and a path
+the index lacks but HEAD has is written back. They fail with
+`ECHECKOUTFAIL` and change nothing when such an entry's file is present and
+differs from the entry (`Entry '<path>' not uptodate`), or when an untracked
+file, including one `rm --cached` untracked, stands where HEAD's tree writes
+one (`Untracked working tree file '<path>' would be overwritten`). Conflicted
+paths are reset regardless. Rebase skip and abort are Git's `reset --hard`:
+they discard staged and unstaged edits alike and refuse only over such an
+untracked file.
 
 When the two sides put a regular or executable file and a symlink at the same
 path, the symlink stays at the logical path and the regular side is materialised
@@ -952,7 +985,7 @@ cannot be materialised and fails atomically with `EUNSUPPORTED`.
 | `-m <msg>` | `message` | ✔ |
 | `--no-commit` | `commit: false` | ✔ leaves a resumable pending merge |
 | `--continue` | `mergeContinue()` or plain `commit()` | ✔ |
-| `--abort` | `mergeAbort()` | ✔ restores only merge-owned paths; refuses over unstaged edits as Git does |
+| `--abort` | `mergeAbort()` | ✔ `reset --merge` to HEAD; refuses over an unstaged edit to a reset path as Git does |
 | `--squash` | — | ✘ |
 | `-s <strategy>`, `-X ours\|theirs\|patience`, `--conflict-style` | — | ✘ one built-in three-way strategy, default markers |
 | rename detection | — | ✘ a path renamed on one side and edited on the other conflicts as modify/delete; Git follows the rename and merges cleanly |
@@ -970,7 +1003,7 @@ start remains available only through the typed API and pull orchestration.
 |---|---|---|
 | `git cherry-pick <commit>` | `source` | ~ **one commit per call**; no ranges, no lists |
 | `-m <parent>` | `mainline` | ✔ required for a merge commit |
-| message / committer override | `message`, `committer` | ~ kompjutr extension; author and message are inherited by default |
+| message / committer override | `message`, `committer` | ~ kompjutr extension; author and message are inherited by default. As in Git, an uninterrupted pick keeps the inherited message verbatim from its first non-blank line; a continued pick cleans it as Git's editor does (whitespace, and lines starting with `#` dropped); a given message gets the whitespace cleanup of `-m` |
 | `--continue` / `--skip` / `--abort` | `cherryPickContinue()` / `…Skip()` / `…Abort()` | ✔ |
 | `-n`, `-x`, `-e`, `-s` | — | ✘ |
 
@@ -978,11 +1011,16 @@ start remains available only through the typed API and pull orchestration.
 
 Same shape: one `source` per call, `mainline` for merge commits, `message` /
 `author` / `committer` overrides, and continue/skip/abort. ✘ ranges, ✘ `-n`.
+The default message follows Git 2.43 and later: reverting a commit titled
+`Revert "X"` writes `Reapply "X"`; deeper chains stay nested.
 
 `ReplayResult` is `committed`, `conflicted`, or `empty` with reason `source`
 (the source changed nothing) or `result` (the result equals the current tree).
-Cherry-pick suspends both empty outcomes for explicit cancellation, as Git
-does; revert completes an empty operation immediately.
+An empty start suspends a cherry-pick for explicit cancellation, as Git does;
+an empty revert start completes immediately and leaves no operation. A
+`…Continue()` whose index equals the current tree returns `empty` and keeps
+either operation pending, as Git does; once changes are staged, continue
+commits them with the operation's message and identities.
 
 ### `git rebase` — `rebase()` + `…Continue/Skip/Abort()`
 

@@ -168,6 +168,22 @@ describe.each<TrackerMode>(["sealed", "invalid"])("whole-tree add, tracker %s", 
     );
   });
 
+  it("-u stages every indexed path, including staged-new ones, and nothing else", async () => {
+    world = await createWorld({ seed: { "a.txt": "a\n", "b.txt": "b\n" } });
+    await world.run(
+      track(mode),
+      { op: "write", path: "new.txt", content: "new\n" },
+      { op: "write", path: "gone.txt", content: "gone\n" },
+      { op: "add", paths: ["new.txt", "gone.txt"] },
+      { op: "rm", paths: ["b.txt"], cached: true },
+      { op: "write", path: "new.txt", content: "changed\n" },
+      { op: "remove", path: "gone.txt" },
+      { op: "write", path: "untracked.txt", content: "u\n" },
+      expectTracker(mode),
+      { op: "add", all: true, trackedOnly: true },
+    );
+  });
+
   it("keeps ignored files out unless forced, even when they predate the seal", async () => {
     world = await createWorld({ seed: { ".gitignore": "*.log\n", "README.md": "seed\n" } });
     await world.run(
@@ -250,35 +266,20 @@ describe.each<TrackerMode>(["sealed", "invalid"])("whole-tree add, tracker %s", 
     world = await createWorld({
       seed: { "README.md": "seed\n", "run.sh": "echo\n", "link.txt": "file\n" },
     });
-    // kompjutr's porcelain v2 reports a pending type change as `M` where git
-    // says `T`, so each type change is compared once its commit lands.
-    const typeChange = (toSymlink: boolean, message: string): E2EStep => ({
-      op: "custom",
-      async local(_git, target) {
-        await target.runLocal(
-          { op: "remove", path: "link.txt" },
-          toSymlink
-            ? { op: "symlink", path: "link.txt", target: "README.md" }
-            : { op: "write", path: "link.txt", content: "file again\n" },
-          expectTracker(mode),
-          toSymlink ? { op: "add", paths: ["."] } : { op: "add", all: true },
-          { op: "commit", message },
-        );
-      },
-      mirror(fixture) {
-        fixture.remove("link.txt");
-        if (toSymlink) fixture.symlink("README.md", "link.txt");
-        else fixture.write("link.txt", "file again\n");
-        fixture.git("add", ...(toSymlink ? ["--", "."] : ["--all"]));
-        fixture.git("commit", "-q", "-m", message);
-      },
-    });
     await world.run(
       track(mode),
       { op: "chmod", path: "run.sh", mode: 0o755 },
-      typeChange(true, "to symlink"),
+      { op: "remove", path: "link.txt" },
+      { op: "symlink", path: "link.txt", target: "README.md" },
+      expectTracker(mode),
+      { op: "add", paths: ["."] },
+      { op: "commit", message: "to symlink" },
       { op: "chmod", path: "run.sh", mode: 0o644 },
-      typeChange(false, "to file"),
+      { op: "remove", path: "link.txt" },
+      { op: "write", path: "link.txt", content: "file again\n" },
+      expectTracker(mode),
+      { op: "add", all: true },
+      { op: "commit", message: "to file" },
     );
   });
 

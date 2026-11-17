@@ -12,7 +12,7 @@ import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import { operationRefLogMetadata, type RefLogReason } from "../core/ref-log.js";
 import { applyIntegrationOwned } from "../integration/integration-apply-owned.js";
 import { planIntegrationOwned } from "../integration/integration-plan-owned.js";
-import { restoreIntegrationOwned } from "../integration/integration-restore-owned.js";
+import { resetIntegrationOwned } from "../integration/integration-restore-owned.js";
 import { projectIntegrationStepOwned } from "../integration/integration-step.js";
 import {
   requireBoundedIntegrationIndex,
@@ -27,7 +27,6 @@ import { requireMergeJournalOwned } from "./merge-journal.js";
 import type { MergeOrigin, MergeStateMetadata } from "./merge-state.js";
 import { commitTree, selectedBaseTreeOwned, type VirtualState } from "./merge-virtual-base.js";
 
-const HEADS = "refs/heads/";
 const MAX_MERGE_REVISION_CODE_UNITS = 1_024;
 
 export interface MergeOptions {
@@ -92,16 +91,6 @@ function requireCurrentHead(repo: Repository, ours: string | undefined): Resolve
     throw new GitError("EWRONGHEAD", `merge target ${ours} is not the checked-out branch`);
   }
   return head;
-}
-
-function shortRef(ref: string): string {
-  return ref.startsWith(HEADS) ? ref.slice(HEADS.length) : ref;
-}
-
-function incomingLabel(repo: Repository, theirs: string, oid: string): string {
-  const expanded = repo.expandRef(theirs);
-  if (expanded !== null && expanded !== "HEAD") return shortRef(expanded);
-  return oid.slice(0, 12);
 }
 
 function defaultMessage(label: string): string {
@@ -220,9 +209,10 @@ function mergeInTransaction(
 
   const currentTree = commitTree(repo, head.oid);
   const nextTree = commitTree(repo, incomingOid);
+  // Git labels the incoming side with the revision as spelled, never its expansion.
   const nextLabel =
     behavior.incomingLabel === undefined
-      ? incomingLabel(repo, theirs, incomingOid)
+      ? theirs
       : requireMergeRevision(behavior.incomingLabel, "incoming label");
   const currentLabel = "HEAD";
   const isFastForward = selection.kind === "fast-forward" && options.fastForward !== false;
@@ -317,7 +307,7 @@ function mergeInTransaction(
     return commitIndex(
       repo,
       {
-        message: mergeMetadata.message,
+        message: { mode: "clean", value: mergeMetadata.message },
         parent: [head.oid, incomingOid],
         identities,
         expectedHead: head,
@@ -360,7 +350,7 @@ export function mergeContinue(
     const result = commitIndex(
       repo,
       {
-        message: options.message ?? journal.state.message,
+        message: { mode: "clean", value: options.message ?? journal.state.message },
         parent: [journal.state.currentParentOid, journal.state.incomingParentOid],
         identities,
         expectedHead: head,
@@ -373,14 +363,14 @@ export function mergeContinue(
   });
 }
 
-/** Restore only paths owned by the active merge and clear its durable state. */
+/** Reset the checkout to HEAD as `git reset --merge` does and clear the merge's durable state. */
 export function mergeAbort(repo: Repository, worktree: Worktree): void {
   requireSharedMutationScope(repo.store.db, worktree);
   repo.store.db.transactionSync(() => {
     const journal = requireMergeJournalOwned(repo);
     requireOriginalHead(repo, journal.state);
     withIntegrationWorkspaceOwned(repo.store, (workspace) => {
-      restoreIntegrationOwned(workspace, repo, worktree, journal.touched);
+      resetIntegrationOwned(workspace, repo, worktree, journal.touched);
       checkoutStoreMutations(repo.checkout).clearMergeStateOwned();
     });
   });

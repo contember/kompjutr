@@ -16,7 +16,7 @@ import { rebase } from "../packages/git/src/ops/rebase/rebase.js";
 import { commit } from "../packages/git/src/ops/repository/commit.js";
 import { initRepository } from "../packages/git/src/ops/repository/init.js";
 import type { Repository } from "../packages/git/src/ops/repository/repository.js";
-import { addLiteralPaths } from "../packages/git/src/ops/staging/staging.js";
+import { addLiteralPaths, rm } from "../packages/git/src/ops/staging/staging.js";
 import { dirtyPathStream } from "../packages/git/src/ops/worktree/worktree-io.js";
 import {
   PACK_BLOB_BATCH_TARGET_BYTES,
@@ -626,6 +626,50 @@ describe("mutating git CLI handlers", () => {
     ).toEqual(cliResult(expected));
     expect(workspace.repo.head().oid).toBe(source.git("rev-parse", "HEAD"));
   });
+  it("matches the refusal of an amend that would become empty", async () => {
+    const amend = ["commit", "--amend", "-m", "amended"];
+    const root = fixture();
+    const rootWorkspace = await importedPair(root, [{ path: "a.txt", content: "a\n" }]);
+    root.git("rm", "-q", "a.txt");
+    rm(rootWorkspace.repo, rootWorkspace.worktree, { paths: ["a.txt"] });
+    expect(
+      await runner(rootWorkspace.context).runCli({ argv: amend, cwd: "/repo", env: IDENTITY_ENV }),
+    ).toEqual(cliResult(gitResult(root, amend)));
+
+    const source = fixture();
+    source.write("a.txt", "a\n").commit("first");
+    const workspace = await importedPair(source, [{ path: "b.txt", content: "b\n" }]);
+    source.git("rm", "-q", "b.txt");
+    rm(workspace.repo, workspace.worktree, { paths: ["b.txt"] });
+    writeBoth(source, workspace, [
+      { path: "a.txt", content: "changed\n" },
+      { path: "untracked.txt", content: "u\n" },
+    ]);
+    const before = repositoryState(workspace.context, workspace.repo);
+    expect(
+      await runner(workspace.context).runCli({ argv: amend, cwd: "/repo", env: IDENTITY_ENV }),
+    ).toEqual(cliResult(gitResult(source, amend)));
+    expect(repositoryState(workspace.context, workspace.repo)).toEqual(before);
+  });
+  it("matches the refusal of a commit-all amend that would become empty", async () => {
+    const amend = ["commit", "-a", "--amend", "-m", "amended"];
+    const source = fixture();
+    source.write("a.txt", "a\n").commit("first");
+    const workspace = await importedPair(source, [
+      { path: "a.txt", content: "two\n" },
+      { path: "b.txt", content: "b\n" },
+    ]);
+    removeBoth(source, workspace, [{ path: "b.txt", content: "" }]);
+    writeBoth(source, workspace, [
+      { path: "a.txt", content: "a\n" },
+      { path: "untracked.txt", content: "u\n" },
+    ]);
+    const before = repositoryState(workspace.context, workspace.repo);
+    expect(
+      await runner(workspace.context).runCli({ argv: amend, cwd: "/repo", env: IDENTITY_ENV }),
+    ).toEqual(cliResult(gitResult(source, amend)));
+    expect(repositoryState(workspace.context, workspace.repo)).toEqual(before);
+  });
   it("rolls back commit-all staging when identity resolution fails", async () => {
     const source = fixture();
     source.write("tracked.txt", "one\n");
@@ -644,6 +688,36 @@ describe("mutating git CLI handlers", () => {
     expect(result).toMatchObject({ stdout: "", exitCode: 128, truncated: false });
     expect(result.stderr).toContain("Author identity unknown");
     expect(repositoryState(workspace.context, workspace.repo)).toEqual(before);
+  });
+  it("rolls back commit-all staging when a merge continuation fails", async () => {
+    const source = fixture();
+    source.write("s.txt", "base\n").write("tracked.txt", "one\n");
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("s.txt", "topic\n");
+    source.commit("topic");
+    source.git("checkout", "-q", "main");
+    source.write("s.txt", "main\n");
+    source.commit("main");
+    const workspace = nativeRepository();
+    await importFixture(source, workspace.repo.checkout);
+    checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+    expect(
+      merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
+    ).toMatchObject({ conflicted: true });
+    workspace.context.defaultIdentity = undefined;
+    writeWorkFile(workspace, "/repo/s.txt", "resolved\n");
+    writeWorkFile(workspace, "/repo/tracked.txt", "two\n");
+    const before = repositoryState(workspace.context, workspace.repo);
+
+    const result = await runner(workspace.context).runCli({
+      argv: ["commit", "-a", "-m", "missing identity"],
+      cwd: "/repo",
+    });
+    expect(result).toMatchObject({ stdout: "", exitCode: 128, truncated: false });
+    expect(result.stderr).toContain("Author identity unknown");
+    expect(repositoryState(workspace.context, workspace.repo)).toEqual(before);
+    expect(workspace.repo.checkout.readOperationState()?.state.kind).toBe("merge");
   });
   it("summarizes a root blob above the repository batching target", async () => {
     const workspace = nativeRepository();
@@ -682,6 +756,19 @@ describe("mutating git CLI handlers", () => {
     expect(await native.runCli({ argv: ["add", "../../outside"], cwd: "/repo/sub" })).toEqual({
       stdout: "",
       stderr: "fatal: ../../outside: '../../outside' is outside repository at '/repo'\n",
+      exitCode: 128,
+      truncated: false,
+    });
+    workspace.worktree.writeFiles([
+      { path: "/repo/sub/keep.txt", bytes: new TextEncoder().encode("keep\n") },
+      { path: "/repo/target/x", bytes: new TextEncoder().encode("x\n") },
+    ]);
+    workspace.worktree.symlink("target", "/repo/link");
+    expect(
+      await native.runCli({ argv: ["add", "keep.txt", "../link/x"], cwd: "/repo/sub" }),
+    ).toEqual({
+      stdout: "",
+      stderr: "fatal: pathspec '../link/x' is beyond a symbolic link\n",
       exitCode: 128,
       truncated: false,
     });
@@ -1135,6 +1222,32 @@ describe("mutating git CLI handlers", () => {
     expect(workspace.worktree.scan("/repo/foreign", { limit: 100 })).toEqual(nested);
     expect(new TextDecoder().decode(workspace.worktree.readFile("/repo/foreign/marker.txt"))).toBe(
       "foreign\n",
+    );
+    await expectPublicGitState(source, workspace);
+  });
+  it("restores from a local branch over a tag of the same name", async () => {
+    const source = fixture();
+    source.write("file.txt", "branch\n");
+    const base = source.commit("base");
+    source.git("branch", "side", base);
+    source.write("file.txt", "tag\n");
+    source.commit("tagged");
+    source.git("tag", "side");
+    source.write("file.txt", "main\n");
+    source.commit("main");
+
+    const workspace = nativeRepository();
+    await importFixture(source, workspace.repo.checkout);
+    checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+    const native = runner(workspace.context);
+
+    expect(gitResult(source, ["restore", "--source=side", "file.txt"]).status).toBe(0);
+    expect(
+      (await native.runCli({ argv: ["restore", "--source=side", "file.txt"], cwd: "/repo" }))
+        .exitCode,
+    ).toBe(0);
+    expect(new TextDecoder().decode(workspace.worktree.readFile("/repo/file.txt"))).toBe(
+      "branch\n",
     );
     await expectPublicGitState(source, workspace);
   });

@@ -28,7 +28,7 @@ const TRUE_CONFIG_VALUES = new Set(["1", "true", "yes", "on"]);
 const FALSE_CONFIG_VALUES = new Set(["", "0", "false", "no", "off"]);
 const NUMERIC_CONFIG_VALUE = /^[+-]?(?:[0-9]+|0[xX][0-9a-fA-F]+)$/;
 
-export { formatCommitRefusalStatus } from "./status-format-human.js";
+export { type CommitRefusalBase, formatCommitRefusalStatus } from "./status-format-human.js";
 export {
   STATUS_FORMAT_MAX_OUTPUT_BYTES,
   STATUS_FORMAT_MAX_RECORDS,

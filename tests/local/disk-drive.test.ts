@@ -65,6 +65,7 @@ describe("DiskDrive", () => {
     try {
       expect(workspace.drive.readFile("/input.txt")).toEqual(encoder.encode("input"));
       expect(workspace.drive.stat("/link")?.type).toBe("symlink");
+      expect(workspace.drive.stat("/input.txt/child")).toBeNull();
       expect(workspace.drive.readlink("/link")).toBe("input.txt");
       workspace.database.transactionSync(() => {
         workspace.drive.makeDirectories(["/dir"]);

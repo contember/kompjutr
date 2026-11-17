@@ -27,7 +27,7 @@ import {
   type RevertJournal,
 } from "../core/operation-state.js";
 import { applyIntegrationOwned } from "../integration/integration-apply-owned.js";
-import { restoreIntegrationOwned } from "../integration/integration-restore-owned.js";
+import { resetIntegrationOwned } from "../integration/integration-restore-owned.js";
 import { projectIntegrationStepOwned } from "../integration/integration-step.js";
 import {
   integrationIndexMatchesTree,
@@ -234,7 +234,11 @@ export function startReplay(
     const result = commitIndex(
       repo,
       {
-        message,
+        // git commits an uninterrupted pick's own message verbatim; a given one is cleaned like `-m`.
+        message:
+          input.message === undefined
+            ? { mode: "exact", value: message }
+            : { mode: "clean", value: message },
         parent: [head.oid],
         identities,
         expectedHead: head,
@@ -256,11 +260,6 @@ export function continueReplay(
   return repo.store.db.transactionSync(() => {
     const journal = requireReplayJournal(repo, policy.kind);
     const head = requireOriginalHead(repo, journal.state);
-    if (journal.state.phase === "empty") {
-      const reason = journal.state.emptyReason;
-      if (reason === null) throw new GitError("ECORRUPT", "empty replay lost its reason");
-      return { outcome: "empty", reason };
-    }
     if (repo.checkout.hasConflicts()) {
       throw new GitError(
         "EUNMERGED",
@@ -268,13 +267,16 @@ export function continueReplay(
       );
     }
     requireBoundedIntegrationIndex(repo);
+    // Git commits whatever is staged by now; with nothing staged it stays
+    // stopped, for revert too, although a revert that starts empty does not.
     if (integrationIndexMatchesTree(repo, repo.readCommit(journal.state.originalHeadOid).tree)) {
-      const reason: ReplayEmptyReason = "result";
-      if (policy.suspendEmpty) {
-        markReplayEmptyOwned(repo.checkout, policy.kind, reason);
-      } else {
-        checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
+      if (journal.state.phase === "empty") {
+        const reason = journal.state.emptyReason;
+        if (reason === null) throw new GitError("ECORRUPT", "empty replay lost its reason");
+        return { outcome: "empty", reason };
       }
+      const reason: ReplayEmptyReason = "result";
+      markReplayEmptyOwned(repo.checkout, policy.kind, reason);
       return { outcome: "empty", reason };
     }
     const source = repo.readCommit(journal.state.sourceOid);
@@ -287,7 +289,11 @@ export function continueReplay(
     const result = commitIndex(
       repo,
       {
-        message: input.message ?? journal.state.message,
+        // git concludes a stopped pick through the editor, which also strips `#` lines.
+        message:
+          input.message === undefined
+            ? { mode: "strip", value: journal.state.message }
+            : { mode: "clean", value: input.message },
         parent: [journal.state.originalHeadOid],
         identities,
         expectedHead: head,
@@ -305,9 +311,12 @@ export function cancelReplay(repo: Repository, worktree: Worktree, kind: ReplayK
   withIntegrationWorkspaceOwned(repo.store, (workspace) => {
     const journal = requireReplayJournal(repo, kind);
     requireOriginalHead(repo, journal.state);
-    if (journal.state.phase !== "empty" && journal.touched.length > 0) {
-      restoreIntegrationOwned(workspace, repo, worktree, journal.touched);
-    }
+    resetIntegrationOwned(
+      workspace,
+      repo,
+      worktree,
+      journal.state.phase === "empty" ? null : journal.touched,
+    );
     checkoutStoreMutations(repo.checkout).clearOperationStateOwned();
   });
 }

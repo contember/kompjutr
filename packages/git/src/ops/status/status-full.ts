@@ -37,6 +37,7 @@ import { STATUS_MAX_DIRECTORIES, STATUS_MAX_PATHS, STATUS_WINDOW_ROWS } from "./
 
 interface StatusIndexSnapshot {
   trackedDirs: Set<string>;
+  /** Index paths only; a path left in HEAD alone is not tracked here. */
   trackedPaths: Set<string>;
   /** Prepass index paths in scan order, kept only when `trackedDirs` is not. */
   orderedIndexPaths: string[] | null;
@@ -179,7 +180,8 @@ export function* statusStreamInternal(
     }
     if (
       (matchesStatusPath(path, options) || matchesStatusPath(candidate, options)) &&
-      // A tracked file replaced by a directory is a deletion, not a new directory.
+      // git hides a directory standing where the index still has a file; a staged
+      // deletion (HEAD only) does not hide it.
       (!collapse || !path.endsWith("/") || !snapshot.trackedPaths.has(stripSlash(path)))
     ) {
       buffered.push({ kind: "ready", detail: ignored ? ignoredRow(path) : untrackedRow(path) });
@@ -194,7 +196,6 @@ export function* statusStreamInternal(
   )) {
     sourceRows++;
     if (row.a !== undefined || row.b !== undefined) {
-      if (snapshot.retainsTrackedPaths) retainTrackedPath(snapshot, row.path);
       const matches = matchesStatusPath(row.path, options);
       if (matches || seed !== undefined) {
         if (matches && row.a !== undefined) requireStatusWorktreePath(row.path);
@@ -345,13 +346,6 @@ function retainStatusIndexPath(
     requireStatusCapacity(snapshot.trackedDirs.size, STATUS_MAX_DIRECTORIES, "tracked directories");
     snapshot.trackedDirs.add(directory);
   }
-}
-
-function retainTrackedPath(snapshot: StatusIndexSnapshot, path: string): void {
-  if (snapshot.trackedPaths.has(path)) return;
-  requireStatusWorktreePath(path);
-  requireStatusCapacity(snapshot.trackedPaths.size, STATUS_MAX_PATHS, "tracked paths");
-  snapshot.trackedPaths.add(path);
 }
 
 export function requireStatusCapacity(size: number, limit: number, label: string): void {

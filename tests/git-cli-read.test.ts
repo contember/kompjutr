@@ -598,6 +598,30 @@ describe("everyday read argv parity", () => {
     expect(await nativeRun(workspace, ["status"])).toEqual(gitResultAt(fixture, ["status"]));
   });
 
+  it("labels staged and unstaged file-symlink swaps as typechange", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("a.txt", "a\n");
+    fixture.write("b.txt", "b\n");
+    fixture.symlink("a.txt", "link");
+    fixture.commit("base");
+    const workspace = await importAt(fixture);
+
+    fixture.symlink("a.txt", "b.txt");
+    fixture.remove("link");
+    fixture.write("link", "file\n");
+    fixture.git("add", "--", "link");
+    workspace.worktree.unlink("/repo/b.txt");
+    workspace.worktree.symlink("a.txt", "/repo/b.txt");
+    workspace.worktree.unlink("/repo/link");
+    writeWorkFile(workspace, "/repo/link", "file\n");
+    add(workspace.repo, workspace.worktree, { paths: ["link"] }, workspace.context);
+
+    for (const argv of [["status"], ["status", "--short"], ["status", "--porcelain=v2"]]) {
+      expect(await nativeRun(workspace, argv), argv.join(" ")).toEqual(gitResultAt(fixture, argv));
+    }
+  });
+
   it("matches exact and first-excess output ceilings for each read family", async () => {
     const { fixture, workspace } = await everydayFixture();
     const handlers = createGitCliReadHandlers(workspace.context);

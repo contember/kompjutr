@@ -19,6 +19,14 @@ export interface SnapshotDraft {
   stat: WorktreeStat | null;
 }
 
+/** A file or symlink an abort writes back from a blob. */
+export interface RestoredFile {
+  path: string;
+  kind: "file" | "symlink";
+  mode: number;
+  oid: string;
+}
+
 export interface AdmittedBlobBatch {
   end: number;
   blobs: ReadonlyMap<string, Uint8Array>;

@@ -77,11 +77,24 @@ export function createGitCliAddCommitHandlers(context: GitContext): AddCommitHan
           repo,
           options,
           () => {
+            const stageTracked = (): void =>
+              addOp(
+                repo,
+                context.worktree,
+                {
+                  paths: [],
+                  all: true,
+                  trackedOnly: true,
+                  excludeRoots: nestedRoots(context, repo.root),
+                },
+                context,
+              );
             const operation = readOperationHeaderOwned(repo.checkout);
             if (operation?.state.kind === "merge") {
               if (invocation.command.amend === true) {
                 throw new GitError("EINVAL", "cannot amend while continuing a merge");
               }
+              if (invocation.command.all) stageTracked();
               const previousHead = repo.head();
               const result = mergeContinue(context, repo, {
                 message: invocation.command.message,
@@ -94,19 +107,7 @@ export function createGitCliAddCommitHandlers(context: GitContext): AddCommitHan
             }
             const hasConflicts = repo.checkout.hasConflicts();
             if (!hasConflicts) repo.checkout.requireNoOperationState();
-            if (invocation.command.all && !hasConflicts) {
-              addOp(
-                repo,
-                context.worktree,
-                {
-                  paths: [],
-                  all: true,
-                  trackedOnly: true,
-                  excludeRoots: nestedRoots(context, repo.root),
-                },
-                context,
-              );
-            }
+            if (invocation.command.all && !hasConflicts) stageTracked();
             const previousHead = repo.head();
             const result = commitOp(context, repo, {
               message: invocation.command.message,
@@ -121,7 +122,7 @@ export function createGitCliAddCommitHandlers(context: GitContext): AddCommitHan
             formatCommitSummary(repo, mutation, stdout);
             return truncatedResult(stdout, undefined, 0);
           },
-          (error) => mapCommitFailure(context, repo, error, options),
+          (error) => mapCommitFailure(context, repo, error, options, invocation.command),
         ),
       );
     },

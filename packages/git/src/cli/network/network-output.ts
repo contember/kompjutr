@@ -16,6 +16,17 @@ export function networkFailure(error: unknown, output: NetworkOutput): GitCliRes
   return output.result(mapped.exitCode);
 }
 
+/** A deletion Git refuses before POST: `error:` lines and exit 1, as a failed push. */
+export function pushDeletionRefusal(
+  error: unknown,
+  options: ResolvedGitCliRunOptions,
+  target: string,
+): GitCliResult {
+  const output = new NetworkOutput(options, `error: ${errorMessage(error)}\n`);
+  output.append(`error: failed to push some refs to '${target}'\n`);
+  return output.result(1);
+}
+
 export class GitCliPushUncertainError extends GitError {
   constructor(
     cause: unknown,

@@ -5,7 +5,7 @@ import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { requireSharedMutationScope } from "../core/mutation-scope.js";
 import type { Repository } from "../repository/repository.js";
 import type { Worktree } from "../worktree/worktree.js";
-import { compilePathspecs, walkWorktree } from "../worktree/worktree-io.js";
+import { compilePathspecs, walkWorktreeEntriesStream } from "../worktree/worktree-io.js";
 import { statusStream } from "./status-core.js";
 import { requireStatusCapacity, requireStatusWorktreePath } from "./status-full.js";
 import { stagedIndex } from "./status-matrix.js";
@@ -227,17 +227,18 @@ function stripSlash(path: string): string {
 }
 
 function removeDirectory(repo: Repository, worktree: Worktree, directory: string): void {
-  const contents = walkWorktree(worktree, repo.root, {
-    paths: [directory],
-    includeIgnored: true,
-  });
+  const contents = [
+    ...walkWorktreeEntriesStream(worktree, repo.root, {
+      paths: [directory],
+      includeIgnored: true,
+      includeDirectories: true,
+    }),
+  ];
+  // Directory rows matter on their own: a subtree may hold no file at all.
   const directories = new Set<string>([directory]);
-  const rootDepth = directory.split("/").length;
-  for (const path of contents) {
-    worktree.unlink(joinPath(repo.root, path));
-    const parts = path.split("/");
-    for (let depth = rootDepth; depth < parts.length; depth++)
-      directories.add(parts.slice(0, depth).join("/"));
+  for (const { path, stat } of contents) {
+    if (stat.type !== "dir") worktree.unlink(joinPath(repo.root, path));
+    else if (path.startsWith(`${directory}/`)) directories.add(path);
   }
   const deepestFirst = [...directories].sort((a, b) => {
     const depth = b.split("/").length - a.split("/").length;

@@ -372,6 +372,28 @@ describe("branch", () => {
     expect(gitRawRefTarget("refs/heads/side")).toEqual({ kind: "absent" });
   });
 
+  it("removes exactly the deleted branch's config section, as git does", () => {
+    const config: [string, string][] = [
+      ["branch.side.remote", "origin"],
+      ["branch.side.merge", "refs/heads/side"],
+      ["branch.side.description", "kept nowhere"],
+      ["branch.side.x.remote", "nested"],
+      ["branch.sidecar.remote", "sibling"],
+    ];
+    for (const [path, value] of config) {
+      ws.repo.store.configSet(path, value);
+      fixture.git("config", path, value);
+    }
+
+    branchDelete(ws.context, ws.repo, { name: "side", force: true });
+    fixture.git("branch", "-D", "side");
+
+    for (const [path] of config) {
+      const native = runGit("config", "--get", path);
+      expect(ws.repo.store.configGet(path)).toBe(native.ok ? native.output.trim() : undefined);
+    }
+  });
+
   it("rolls back a branch-level stale delete interleaving", () => {
     branch(ws.context, ws.repo, { name: "raced", startPoint: "side" });
     const name = "refs/heads/raced";
@@ -700,6 +722,64 @@ describe("branch", () => {
     );
     expect(ws.repo.store.configGet("branch.foo.remote")).toBeUndefined();
     expect(runGit("config", "--get", "branch.foo.remote").ok).toBe(false);
+  });
+
+  it("branch rename moves an unborn current branch's HEAD and config like Git", () => {
+    ws.repo.checkout.setHead("ref: refs/heads/unborn");
+    fixture.git("symbolic-ref", "HEAD", "refs/heads/unborn");
+    ws.repo.store.configSet("branch.unborn.remote", "origin");
+    fixture.git("config", "branch.unborn.remote", "origin");
+    const directReflogs = () =>
+      ws.repo.store.db.scalar<number>(
+        "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+        ws.repo.store.repoId,
+      );
+    const reflogsBefore = directReflogs();
+
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "unborn", newName: "side" }),
+    ).toThrowError(expect.objectContaining({ code: "EBRANCHFAIL" }));
+    expect(runGit("branch", "-m", "unborn", "side").ok).toBe(false);
+
+    branchRename(ws.context, ws.repo, { newName: "fresh" });
+    fixture.git("branch", "-m", "fresh");
+
+    expect(ws.repo.checkout.head()).toBe(`ref: ${fixture.git("symbolic-ref", "HEAD")}`);
+    expect(branchList(ws.repo)).toEqual(lines(fixture.git("branch", "--format=%(refname:short)")));
+    expect(ws.repo.store.configGet("branch.fresh.remote")).toBe(
+      fixture.git("config", "--get", "branch.fresh.remote"),
+    );
+    expect(ws.repo.store.configPaths("branch.unborn.")).toEqual([]);
+    expect(directReflogs()).toBe(reflogsBefore);
+  });
+
+  it("branch rename onto itself leaves the ref, HEAD, and config as Git does", () => {
+    ws.repo.store.configSet("branch.main.remote", "origin");
+    ws.repo.store.configSet("branch.side.remote", "origin");
+    fixture.git("config", "branch.main.remote", "origin");
+    fixture.git("config", "branch.side.remote", "origin");
+    const refsBefore = branchList(ws.repo).map((name) => ws.repo.resolveRef(name));
+
+    branchRename(ws.context, ws.repo, { newName: "main" });
+    branchRename(ws.context, ws.repo, { oldName: "side", newName: "side" });
+    fixture.git("branch", "-m", "main");
+    fixture.git("branch", "-m", "side", "side");
+
+    expect(currentBranch(ws.repo)).toBe(fixture.git("branch", "--show-current"));
+    expect(branchList(ws.repo).map((name) => ws.repo.resolveRef(name))).toEqual(refsBefore);
+    expect(ws.repo.store.configGet("branch.main.remote")).toBe(
+      fixture.git("config", "--get", "branch.main.remote"),
+    );
+    expect(ws.repo.store.configGet("branch.side.remote")).toBe(
+      fixture.git("config", "--get", "branch.side.remote"),
+    );
+
+    ws.repo.checkout.setHead("ref: refs/heads/unborn");
+    branchRename(ws.context, ws.repo, { newName: "unborn" });
+    expect(ws.repo.checkout.head()).toBe("ref: refs/heads/unborn");
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "missing", newName: "missing" }),
+    ).toThrowError(expect.objectContaining({ code: "EBRANCHFAIL" }));
   });
 
   it("branch rename rejects exact config conflicts in both dotted directions", () => {

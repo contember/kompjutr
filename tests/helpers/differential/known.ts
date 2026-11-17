@@ -52,42 +52,11 @@ function unquote(path: string): string {
   return Buffer.from(bytes).toString("utf8");
 }
 
-/** Paths with a staged change against HEAD in porcelain v2 `status`. */
-function stagedPaths(status: string): Set<string> {
-  const paths = new Set<string>();
-  for (const line of status.split("\n")) {
-    const fields = line.split(" ");
-    if (fields[0] === "1" && !fields[1]?.startsWith(".")) {
-      paths.add(unquote(fields.slice(8).join(" ")));
-    }
-    if (fields[0] === "2" && !fields[1]?.startsWith(".")) {
-      paths.add(unquote(fields.slice(9).join(" ").split("\t")[0] ?? ""));
-    }
-  }
-  return paths;
-}
-
-/** Before the op, the index held a change against HEAD. */
-function hadStagedChange(d: Divergence): boolean {
-  return stagedPaths(d.prior.status).size > 0;
-}
-
-/** Unmerged paths in porcelain v2 `status`. */
-function unmergedPaths(status: string): Set<string> {
-  const paths = new Set<string>();
-  for (const line of status.split("\n")) {
-    const fields = line.split(" ");
-    if (fields[0] === "u") paths.add(unquote(fields.slice(10).join(" ")));
-  }
-  return paths;
-}
-
 /** Paths whose index entry or worktree file the two sides disagree on. */
 function differingPaths(d: Divergence): string[] {
   if (d.after === null) return [];
   const { kompjutr, git } = d.after;
   const paths: string[] = [];
-  const indexPath = (entry: string): string => entry.slice(entry.indexOf("\t") + 1);
   const leftIndex = new Set(kompjutr.index);
   const rightIndex = new Set(git.index);
   for (const entry of kompjutr.index) if (!rightIndex.has(entry)) paths.push(indexPath(entry));
@@ -110,72 +79,157 @@ function differsOnlyOn(d: Divergence, allowed: Set<string>): boolean {
   return paths.length > 0 && paths.every((path) => allowed.has(path));
 }
 
-/** Paths the user staged during the pending integration, not the integration itself. */
-function userStagedDuringIntegration(d: Divergence): Set<string> {
-  const staged = stagedPaths(d.prior.status);
-  for (let index = d.before.length - 1; index >= 0; index--) {
-    const op = d.before[index];
-    if (op === undefined || !INTEGRATIONS.includes(op.op)) continue;
-    const stop = d.history[index + 1];
-    if (stop === undefined) return new Set();
-    const owned = new Set([...stagedPaths(stop.status), ...unmergedPaths(stop.status)]);
-    return new Set([...staged].filter((path) => !owned.has(path)));
-  }
-  return new Set();
+/** Untracked paths in porcelain v2 `status`, a directory without its trailing slash. */
+function untrackedPaths(status: string): string[] {
+  return status
+    .split("\n")
+    .filter((line) => line.startsWith("? "))
+    .map((line) => unquote(line.slice(2)).replace(/\/$/, ""));
 }
 
-/** The last cherry-pick or revert before the op stopped with nothing to resolve. */
-function stoppedEmpty(d: Divergence): boolean {
-  for (let index = d.before.length - 1; index >= 0; index--) {
-    const op = d.before[index];
-    if (op?.op !== "cherryPick" && op?.op !== "revert") continue;
-    const stopped = d.history[index + 1];
-    return (
-      stopped !== undefined &&
-      stopped.operation !== null &&
-      !/^u /m.test(stopped.status) &&
-      stagedPaths(stopped.status).size === 0
-    );
+/** The typed API's code, or the argv runner's rendering of it. */
+const UNTRACKED_BLOCKERS =
+  /^(?:ECHECKOUTFAIL|exit 128: fatal): untracked working tree files would be overwritten by checkout: (.+)$/s;
+
+/** The blockers kompjutr's untracked refusal names, when it names them all. */
+function untrackedBlockers(d: Divergence): string[] | undefined {
+  const match = UNTRACKED_BLOCKERS.exec(d.outcomes.kompjutr.detail ?? "");
+  if (d.field !== "outcome" || d.outcomes.kompjutr.kind !== "failed" || !match?.[1]) {
+    return undefined;
+  }
+  // A truncated list hides blockers no matcher could check.
+  if (/, and \d+ more$/.test(match[1])) return undefined;
+  return match[1].split(", ");
+}
+
+/**
+ * kompjutr refused naming blockers that were each untracked before the op,
+ * or inside an untracked directory.
+ */
+function refusedOnlyForUntracked(d: Divergence): boolean {
+  const named = untrackedBlockers(d);
+  if (named === undefined) return false;
+  const untracked = untrackedPaths(d.prior.status);
+  return named.every((path) =>
+    untracked.some((root) => path === root || path.startsWith(`${root}/`)),
+  );
+}
+
+/** The path of an `ls-files -s` line. */
+function indexPath(entry: string): string {
+  return entry.slice(entry.indexOf("\t") + 1);
+}
+
+/** Paths staged as deleted before the op. */
+function priorDeletions(d: Divergence): Set<string> {
+  return new Set([...stagedDeletions(d.prior.status)].map(indexPath));
+}
+
+/** git refused naming only paths staged as deleted before the op; kompjutr wrote them. */
+function gitRefusedOverDeletions(d: Divergence): boolean {
+  const { kompjutr, git } = d.outcomes;
+  if (d.field !== "outcome" || kompjutr.kind !== "clean" || git.kind !== "failed") return false;
+  const detail = git.detail ?? "";
+  if (!/would be overwritten by checkout/.test(detail)) return false;
+  const named = detail
+    .split("\n")
+    .filter((line) => line.startsWith("\t"))
+    .map((line) => unquote(line.slice(1)));
+  const deleted = priorDeletions(d);
+  return named.length > 0 && named.every((path) => deleted.has(path));
+}
+
+/** kompjutr refused over untracked files each staged as deleted before the op; git switched. */
+function refusedOverDeletions(d: Divergence): boolean {
+  const named = untrackedBlockers(d);
+  if (d.outcomes.git.kind !== "clean" || named === undefined) return false;
+  const deleted = priorDeletions(d);
+  return named.every((path) => deleted.has(path));
+}
+
+/** HEAD's entries git's status reports as staged deletions, as `ls-files -s` lines. */
+function stagedDeletions(status: string): Set<string> {
+  const entries = new Set<string>();
+  for (const line of status.split("\n")) {
+    const fields = line.split(" ");
+    if (fields[0] === "1" && fields[1]?.startsWith("D")) {
+      entries.add(`${fields[3]} ${fields[6]} 0\t${unquote(fields.slice(8).join(" "))}`);
+    }
+  }
+  return entries;
+}
+
+/**
+ * kompjutr's index is git's plus target entries git kept staged as deleted,
+ * and the sides differ on no other path.
+ */
+function restoredDeletionsOnly(d: Divergence): boolean {
+  if (d.after === null) return false;
+  const { kompjutr, git } = d.after;
+  const left = new Set(kompjutr.index);
+  const right = new Set(git.index);
+  if (!git.index.every((entry) => left.has(entry))) return false;
+  const deleted = stagedDeletions(git.status);
+  const restored = kompjutr.index.filter((entry) => !right.has(entry));
+  if (!restored.every((entry) => deleted.has(entry))) return false;
+  return differsOnlyOn(d, new Set(restored.map(indexPath)));
+}
+
+const TRACKED_BLOCKERS = /^ECHECKOUTFAIL: local changes to (.+) would be overwritten by checkout$/s;
+
+/**
+ * kompjutr refused over files staged as new before the op, each below a
+ * directory that an indexed sibling sorts between (`a` < `a!` < `a/`); git switched.
+ */
+function refusedOverNestedAdditions(d: Divergence): boolean {
+  const match = TRACKED_BLOCKERS.exec(d.outcomes.kompjutr.detail ?? "");
+  if (!refused(d, /^ECHECKOUTFAIL:/) || d.outcomes.git.kind !== "clean" || !match?.[1]) {
+    return false;
+  }
+  const added = stagedAdditions(d.prior.status);
+  const indexed = d.prior.index.map(indexPath);
+  return match[1]
+    .replace(/, and \d+ more$/, "")
+    .split(", ")
+    .every((path) => added.has(path) && hasSiblingBetween(path, indexed));
+}
+
+const SLASH = 0x2f;
+
+/** Some indexed path sorts between an ancestor directory of `path` and its contents. */
+function hasSiblingBetween(path: string, indexed: string[]): boolean {
+  for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+    const dir = path.slice(0, slash);
+    if (indexed.some((other) => other.startsWith(dir) && other.charCodeAt(slash) < SLASH))
+      return true;
   }
   return false;
 }
 
-/** Before the op, an indexed path absent from HEAD had an unstaged change. */
-function hadAddedPathChanged(d: Divergence): boolean {
-  return /^1 A[MDT]/m.test(d.prior.status);
+/** Paths git's status reports as staged additions. */
+function stagedAdditions(status: string): Set<string> {
+  const paths = new Set<string>();
+  for (const line of status.split("\n")) {
+    const fields = line.split(" ");
+    if (fields[0] === "1" && fields[1]?.startsWith("A")) {
+      paths.add(unquote(fields.slice(8).join(" ")));
+    }
+  }
+  return paths;
 }
 
-function worktrees(d: Divergence, normalize: (entry: DiskEntry) => DiskEntry): [string, string] {
-  const show = (entries: DiskEntry[]): string => JSON.stringify(entries.map(normalize));
-  return d.after === null
-    ? ["", ""]
-    : [show(d.after.kompjutr.worktree), show(d.after.git.worktree)];
-}
-
-/** The worktrees differ only by directories kompjutr left behind. */
-function onlyLeftoverDirectories(d: Divergence): boolean {
+/** kompjutr's index holds a file where git kept the staged entries below it. */
+function keptBelowTaken(d: Divergence): boolean {
   if (d.after === null) return false;
-  const files = (entries: DiskEntry[]): string =>
-    JSON.stringify(entries.filter((entry) => entry.type !== "dir"));
-  const kompjutr = new Set(d.after.kompjutr.worktree.map((entry) => entry.path));
-  return (
-    d.after.kompjutr.worktree.length > d.after.git.worktree.length &&
-    files(d.after.kompjutr.worktree) === files(d.after.git.worktree) &&
-    d.after.git.worktree.every((entry) => kompjutr.has(entry.path))
-  );
-}
-
-/** Conflict marker lines with their labels dropped. */
-function unlabeled(entry: DiskEntry): DiskEntry {
-  if (entry.content === undefined) return entry;
-  const text = Buffer.from(entry.content, "hex").toString("latin1");
-  const bare = text.replace(/^(<<<<<<<|>>>>>>>) .*$/gm, "$1");
-  return { ...entry, content: Buffer.from(bare, "latin1").toString("hex") };
-}
-
-/** Git's stripspace changes this message: trailing blanks or blank edge lines. */
-function needsCleanup(message: string): boolean {
-  return /[ \t\r]\n|[ \t\r]$|\n\n$|^\n/.test(message);
+  const prior = new Set(d.prior.index);
+  const left = new Set(d.after.kompjutr.index);
+  const kept = d.after.git.index
+    .filter((entry) => prior.has(entry) && !left.has(entry))
+    .map(indexPath);
+  const taken = d.after.kompjutr.index
+    .map(indexPath)
+    .filter((path) => kept.some((below) => below.startsWith(`${path}/`)));
+  return taken.length > 0 && differsOnlyOn(d, new Set([...taken, ...kept]));
 }
 
 const INTEGRATIONS: Op["op"][] = ["merge", "pull", "cherryPick", "revert", "rebase"];
@@ -199,71 +253,38 @@ const REFUSED_WHILE_PENDING: Op["op"][] = [
 
 export const KNOWN: KnownDivergence[] = [
   {
-    id: "unborn-checkout-b",
-    reason: "open: `checkout -b` on an unborn branch fails to resolve HEAD",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "checkoutNew") && refused(d, /unknown revision: HEAD/),
-  },
-  {
-    id: "message-cleanup",
-    reason: "open: commit messages are stored without git's whitespace cleanup",
-    fields: ["refs", "head"],
-    matches: (d) => "message" in d.op && needsCleanup(d.op.message),
-  },
-  {
     id: "detached-integration",
     reason: "intentional: integrations need a checked-out branch (git-support.md, Integration)",
     fields: ["outcome"],
     matches: (d) => opIs(d, ...INTEGRATIONS) && refused(d, /EDETACHED/),
   },
   {
-    id: "checkout-carry",
-    reason: "open: checkout drops or refuses staged changes git carries to the target",
+    id: "checkout-empty-index",
+    reason:
+      "intentional: an empty index is git's initial checkout, so init, fetch, updateRef and " +
+      "checkout populate the worktree; an index emptied by `rm` looks the same, where git " +
+      "keeps the deletions, refuses, or switches over files kompjutr sees as untracked " +
+      "(git-support.md, checkout)",
     fields: ["outcome", "index", "status", "worktree"],
     matches: (d) =>
       opIs(d, "checkout", "checkoutNew") &&
-      ((hadStagedChange(d) && refused(d, /would be overwritten by checkout/)) ||
-        (d.fields.includes("index") && differsOnlyOn(d, stagedPaths(d.prior.status)))),
+      d.prior.head !== null &&
+      d.prior.index.length === 0 &&
+      (gitRefusedOverDeletions(d) ||
+        refusedOverDeletions(d) ||
+        (d.fields.includes("index") && restoredDeletionsOnly(d))),
   },
   {
-    id: "reset-unmatched-path",
-    reason: "open: path reset fails on a pathspec git accepts silently",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "reset") && refused(d, /did not match any file/),
-  },
-  {
-    id: "checkout-ancestor-ref",
-    reason: "open: checkout of `<ref>~<n>` fails with EINVAL",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "checkout") && refused(d, /ref name is invalid/),
-  },
-  {
-    id: "abort-resets-index",
-    reason: "open: cherry-pick/revert/merge abort leaves staged changes git's reset --merge drops",
-    fields: ["index", "status", "worktree"],
+    id: "checkout-kept-below-taken",
+    reason:
+      "intentional: git keeps staged entries below a file the target adds only when their " +
+      "directory is gone or a sibling sorts between them, an artifact of its walk order; " +
+      "kompjutr replaces clean ones and refuses over changed ones in every order " +
+      "(git-support.md, checkout)",
+    fields: ["outcome", "index", "status", "worktree"],
     matches: (d) =>
-      opIs(d, "mergeAbort", "cherryPickAbort", "cherryPickSkip", "revertAbort", "revertSkip") &&
-      d.fields.includes("index") &&
-      differsOnlyOn(d, userStagedDuringIntegration(d)),
-  },
-  {
-    id: "add-update-index",
-    reason: "open: `add -u` stages only paths in HEAD, git stages every indexed path",
-    fields: ["outcome", "refs", "head", "index", "status"],
-    matches: (d) =>
-      d.prior.operation === null &&
-      hadAddedPathChanged(d) &&
-      ((d.op.op === "addAll" && d.op.update === true) ||
-        (d.op.op === "commit" && d.op.all === true)),
-  },
-  {
-    id: "checkout-paths-unmatched",
-    reason: "open: path checkout accepts a pathspec that matches nothing",
-    fields: ["outcome"],
-    matches: (d) =>
-      opIs(d, "checkoutPaths") &&
-      d.field === "outcome" &&
-      /did not match any file/.test(d.outcomes.git.detail ?? ""),
+      opIs(d, "checkout", "checkoutNew") &&
+      ((d.fields.includes("index") && keptBelowTaken(d)) || refusedOverNestedAdditions(d)),
   },
   {
     id: "operation-active",
@@ -284,120 +305,19 @@ export const KNOWN: KnownDivergence[] = [
       ),
   },
   {
-    id: "branch-rename-edges",
-    reason: "open: branch rename refuses an unborn branch and a rename onto itself",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "branchRename") && refused(d, /EBRANCHFAIL/),
-  },
-  {
-    id: "replay-worktree",
-    reason:
-      "open: revert/cherry-pick trip on a missing worktree file, keep emptied directories, " +
-      "and mishandle continue after an empty stop",
-    fields: ["outcome", "worktree"],
-    matches: (d) =>
-      (opIs(d, "revert", "cherryPick", "revertContinue", "cherryPickContinue") &&
-        refused(d, /ENOENT/)) ||
-      (opIs(d, ...INTEGRATIONS, "revertContinue", "cherryPickContinue", "rebaseContinue") &&
-        onlyLeftoverDirectories(d)) ||
-      (opIs(d, "revertContinue", "cherryPickContinue") && d.field === "outcome" && stoppedEmpty(d)),
-  },
-  {
-    id: "merge-marker-label",
-    reason: "open: conflict markers name the expanded ref instead of the name as given",
-    fields: ["worktree"],
-    matches: (d) => {
-      if (!opIs(d, "merge", "pull")) return false;
-      const [kompjutr, git] = worktrees(d, unlabeled);
-      return kompjutr !== "" && kompjutr === git;
-    },
-  },
-  {
-    id: "push-after-rename",
-    reason:
-      "open: push of a renamed branch targets its moved upstream instead of its own name " +
-      "and does not create its remote-tracking ref",
-    fields: ["outcome", "refs", "originRefs"],
-    matches: ({ op: push, before }) =>
-      push.op === "push" && before.some((op) => op.op === "branchRename" && op.to === push.ref),
-  },
-  {
-    id: "amend-empty",
-    reason: "open: amend accepts a result whose tree equals its parent's",
-    fields: ["outcome"],
-    matches: (d) =>
-      d.op.op === "commit" &&
-      d.op.amend === true &&
-      d.field === "outcome" &&
-      d.outcomes.kompjutr.kind === "clean" &&
-      d.outcomes.git.kind === "failed",
-  },
-  {
-    id: "reset-unborn-head",
-    reason: "open: `reset HEAD` on an unborn branch succeeds where git cannot resolve HEAD",
-    fields: ["outcome"],
-    matches: (d) =>
-      d.op.op === "reset" &&
-      d.op.ref === "HEAD" &&
-      d.prior.head === null &&
-      d.field === "outcome" &&
-      d.outcomes.kompjutr.kind === "clean" &&
-      d.outcomes.git.kind === "failed",
-  },
-  {
-    id: "checkout-paths-staged",
-    reason: "open: path checkout refuses staged changes git overwrites",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "checkoutPaths") && refused(d, /would be overwritten by checkout/),
-  },
-  {
     id: "rebase-unrelated",
     reason: "intentional: rebase refuses unrelated histories (git-support.md, git rebase)",
     fields: ["outcome"],
     matches: (d) => opIs(d, "rebase") && refused(d, /EUNRELATED/),
   },
   {
-    id: "abort-refuses-unmerged-entry",
-    reason: "open: abort proceeds where git's reset --merge refuses an entry that is not uptodate",
+    id: "path-checkout-untracked-blocker",
+    reason:
+      "intentional: path checkout refuses to delete untracked content in the way; " +
+      "git deletes it (git-support.md, git checkout)",
     fields: ["outcome"],
     matches: (d) =>
-      opIs(d, "mergeAbort", "cherryPickAbort", "revertAbort") &&
-      d.field === "outcome" &&
-      /not uptodate/.test(d.outcomes.git.detail ?? ""),
-  },
-  {
-    id: "missing-worktree-path",
-    reason: "open: add and forced checkout leak ENOENT/ENOTDIR for a staged path missing on disk",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "add", "addAll", "checkout") && refused(d, /ENOENT|ENOTDIR/),
-  },
-  {
-    id: "reset-ref-resolved-twice",
-    reason: "open: argv reset resolves a relative ref again after moving HEAD",
-    fields: ["index", "status", "worktree"],
-    matches: (d) =>
-      d.op.op === "reset" && /[~^]/.test(d.op.ref ?? "") && d.fields.includes("index"),
-  },
-  {
-    id: "status-typechange",
-    reason: "open: status reports a file/symlink type change as M instead of T",
-    fields: ["status"],
-    matches: (d) => d.after !== null && /^1 (\.T|T\.)/m.test(d.after.git.status),
-  },
-  {
-    id: "clean-empty-directories",
-    reason: "open: clean -d fails on a tree of empty directories",
-    fields: ["outcome"],
-    matches: (d) => opIs(d, "clean") && refused(d, /ENOTEMPTY/),
-  },
-  {
-    id: "branch-auto-upstream",
-    reason: "open: a branch started from a remote-tracking ref gets no upstream config",
-    fields: ["upstreams"],
-    matches: ({ op, after }) =>
-      (op.op === "branch" || op.op === "checkoutNew") &&
-      (op.startPoint ?? "").startsWith("origin/") &&
-      after?.kompjutr.upstreams.includes(`${op.name} - -`) === true,
+      opIs(d, "checkoutPaths") && d.outcomes.git.kind === "clean" && refusedOnlyForUntracked(d),
   },
 ];
 

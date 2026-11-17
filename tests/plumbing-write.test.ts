@@ -1308,20 +1308,18 @@ describe("tree and index write plumbing", () => {
       (_, index) => `d${index.toString().padStart(5, "0")}-${suffix}`,
     );
     const recursiveBatches: string[][] = [];
+    // The tracked files are already gone from disk; only their directories
+    // remain, which is what checkout's ordered walk must see to prune them.
     const synthetic: Worktree = {
       ...workspace.worktree,
-      scan(_root, options): ScanEntry[] {
-        const after = options.after;
+      *scanStream(_root, options): Generator<ScanEntry> {
+        if (options?.filesOnly === true) return;
+        const after = options?.after;
         const start = after === undefined ? 0 : Number.parseInt(after.slice(2, 7), 10) + 1;
-        const rows: ScanEntry[] = [];
-        for (
-          let index = start;
-          index < directories.length && rows.length < options.limit;
-          index++
-        ) {
+        for (let index = start; index < directories.length; index++) {
           const directory = directories[index];
           if (directory === undefined) continue;
-          rows.push({
+          yield {
             path: `/${directory}`,
             type: "dir",
             mode: 0o40755,
@@ -1332,9 +1330,8 @@ describe("tree and index write plumbing", () => {
             rev: 1,
             target: null,
             contentId: null,
-          });
+          };
         }
-        return rows;
       },
       removeFiles(paths, options) {
         if (options?.recursive === true) recursiveBatches.push([...paths]);

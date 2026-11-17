@@ -355,6 +355,23 @@ const SCENARIOS: Scenario[] = [
     mutate: [{ op: "symlink", path: "link", target: "keep.txt" }],
   },
   {
+    name: "type changes between file and symlink",
+    commits: [[...BASE, { op: "symlink", path: "link", target: "base.txt" }]],
+    mutate: [
+      { op: "symlink", path: "base.txt", target: "keep.txt" },
+      { op: "remove", path: "link" },
+      { op: "write", path: "link", content: "file\n" },
+      { op: "stage", path: "link" },
+      { op: "symlink", path: "keep.txt", target: "link" },
+      { op: "stage", path: "keep.txt" },
+      { op: "remove", path: "keep.txt" },
+      { op: "write", path: "keep.txt", content: "keep\n" },
+      { op: "write", path: "added.txt", content: "added\n" },
+      { op: "stage", path: "added.txt" },
+      { op: "symlink", path: "added.txt", target: "link" },
+    ],
+  },
+  {
     name: "file replaced by directory",
     commits: [BASE],
     mutate: [
@@ -656,6 +673,47 @@ describe("status", () => {
     });
     const entries = status(workspace.repo, workspace.worktree, { untrackedFiles: "all" });
     expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2", "-uall"));
+  });
+
+  it("lists a directory standing where a staged deletion was, in every untracked mode", async () => {
+    const { fixture, workspace } = await build({
+      name: "staged deletion replaced by a directory",
+      commits: [
+        [
+          { op: "write", path: "b.txt", content: "b\n" },
+          { op: "write", path: "d/c.txt", content: "c\n" },
+          { op: "write", path: "kept.txt", content: "kept\n" },
+        ],
+      ],
+      mutate: [
+        { op: "gitRemoveCached", path: "b.txt" },
+        { op: "remove", path: "b.txt" },
+        { op: "write", path: "b.txt/f", content: "f\n" },
+        { op: "write", path: "b.txt/sub/g", content: "g\n" },
+        { op: "gitRemoveCached", path: "d/c.txt" },
+        { op: "remove", path: "d/c.txt" },
+        { op: "write", path: "d/c.txt/h", content: "h\n" },
+        { op: "remove", path: "kept.txt" },
+        { op: "write", path: "kept.txt/f", content: "f\n" },
+      ],
+    });
+    const witnesses: Array<{ options: StatusOptions; flags: string[] }> = [
+      { options: {}, flags: [] },
+      { options: { untrackedFiles: "all" }, flags: ["-uall"] },
+      { options: { untrackedFiles: "no" }, flags: ["-uno"] },
+      { options: { includeIgnored: true }, flags: ["--ignored"] },
+    ];
+    for (const { options, flags } of witnesses) {
+      const entries = status(workspace.repo, workspace.worktree, options);
+      const label = flags.join(" ");
+      expect(formatPorcelainV2(entries), label).toBe(
+        gitStatus(fixture, "--porcelain=v2", ...flags),
+      );
+      expect(formatPorcelainV1(entries), label).toBe(
+        gitStatus(fixture, "--porcelain=v1", ...flags),
+      );
+      expect(formatShort(entries), label).toBe(gitStatus(fixture, "--short", ...flags));
+    }
   });
 
   it("matches Git when cached removal leaves an independently untracked path", async () => {

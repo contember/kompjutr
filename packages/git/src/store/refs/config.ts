@@ -154,6 +154,23 @@ export class ConfigTable {
       .map((row) => expectText(row.path, "stored config path"));
   }
 
+  /**
+   * Remove one exact dotted config section, as `git config --remove-section`
+   * does; deeper subsections such as `branch.a.b.*` belong to another section.
+   */
+  removeSection(prefix: string): void {
+    const section = requireConfigSectionPrefix(prefix, "to remove");
+    this.db.run(
+      `DELETE FROM git_config
+        WHERE repo_id = ? AND path >= ? AND path < ?
+          AND instr(substr(path, length(?) + 1), '.') = 0`,
+      this.repoId,
+      section,
+      nextPrefix(section),
+      section,
+    );
+  }
+
   /** Validate and move one exact dotted config section without changing value order. */
   moveSection(sourcePrefix: string, destinationPrefix: string): void {
     const [source, destination] = requireConfigSectionMove(sourcePrefix, destinationPrefix);

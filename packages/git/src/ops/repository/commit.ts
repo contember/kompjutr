@@ -41,7 +41,7 @@ export interface CommitIdentities {
 }
 
 export interface IndexedCommitOptions {
-  message: string;
+  message: CommitMessage;
   parent: readonly string[];
   identities: CommitIdentities;
   expectedHead: ResolvedHead;
@@ -59,7 +59,14 @@ export interface UnpublishedCommitResult {
   tree: string;
 }
 
-type CommitMessage = { mode: "clean"; value: string } | { mode: "exact"; value: string };
+/**
+ * `clean` stores the message as `git commit -m` does, `strip` as an edited
+ * commit does (also without `#` lines), and `exact` verbatim.
+ */
+export interface CommitMessage {
+  mode: "clean" | "strip" | "exact";
+  value: string;
+}
 type PublishedCommitContext = Pick<GitContext, "commitTrees" | "indexTracker">;
 
 export function commit(
@@ -67,7 +74,7 @@ export function commit(
   repo: Repository,
   options: CommitOptions,
 ): CommitResult {
-  validatePublishedMessage(options.message);
+  const message = storedMessage({ mode: "clean", value: options.message });
   return repo.store.db.transactionSync(() => {
     if (repo.checkout.hasConflicts()) {
       throw new GitError("EUNMERGED", "cannot commit: the index has unmerged paths");
@@ -79,18 +86,20 @@ export function commit(
     const headTree =
       amended?.tree ?? (head.oid === null ? null : readCommitOwned(repo, head.oid).tree);
     const baselineTree =
-      amended !== undefined ? undefined : headTree === null ? EMPTY_TREE_OID : headTree;
+      amended !== undefined && head.oid !== null
+        ? amendBaselineTree(repo, head.oid, amended)
+        : headTree === null
+          ? EMPTY_TREE_OID
+          : headTree;
     const identities = resolveIdentity(context, repo, options, amended);
-    const message = cleanPublishedMessage(options.message);
-    const result = writeCommitObjects(
-      repo,
-      { parent, identities },
-      { mode: "exact", value: message },
-      context,
-      headTree,
-    );
+    const result = writeCommitObjects(repo, { parent, identities }, message, context, headTree);
     if (baselineTree !== undefined && options.allowEmpty !== true && result.tree === baselineTree) {
-      throw new GitError("EEMPTYCOMMIT", "cannot commit: the index tree is unchanged");
+      throw new GitError(
+        "EEMPTYCOMMIT",
+        amended === undefined
+          ? "cannot commit: the index tree is unchanged"
+          : "cannot amend: the commit would become empty",
+      );
     }
     const reason: RefLogReason =
       options.amend === true ? "commit (amend)" : head.oid === null ? "commit (initial)" : "commit";
@@ -110,14 +119,14 @@ export function commitIndex(
   options: IndexedCommitOptions,
   context?: PublishedCommitContext,
 ): CommitResult {
-  validatePublishedMessage(options.message);
+  const message = storedMessage(options.message);
   return repo.store.db.transactionSync(() => {
     const head = resolveHeadOwned(repo);
     if (head.ref !== options.expectedHead.ref || head.oid !== options.expectedHead.oid) {
       throw new GitError("ESTALEHEAD", "HEAD changed while the commit was being prepared");
     }
     const headTree = head.oid === null ? null : readCommitOwned(repo, head.oid).tree;
-    return publishCommit(repo, options, context, headTree);
+    return publishCommit(repo, options, message, context, headTree);
   });
 }
 
@@ -126,7 +135,7 @@ export function writeUnpublishedCommit(
   repo: Repository,
   options: UnpublishedCommitOptions,
 ): UnpublishedCommitResult {
-  return writeCommitObjects(repo, options, { mode: "exact", value: options.message });
+  return writeCommitObjects(repo, options, options.message);
 }
 
 /** Caller owns the transaction and has authenticated the explicit tree and parents. */
@@ -136,7 +145,7 @@ export function writeUnpublishedCommitFromTree(
   options: UnpublishedCommitOptions,
 ): string {
   return writeObjectsOwned(repo.store, (batch) =>
-    writeSerializedCommit(batch.write, options, { mode: "exact", value: options.message }, tree),
+    writeSerializedCommit(batch.write, options, options.message, tree),
   );
 }
 
@@ -144,7 +153,7 @@ export function writeUnpublishedCommitFromTree(
 function writeCommitObjects(
   repo: Repository,
   options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
-  message: CommitMessage,
+  message: string,
   context?: PublishedCommitContext,
   baselineTreeOid?: string | null,
 ): UnpublishedCommitResult {
@@ -170,7 +179,7 @@ function writeCommitObjects(
 function writeSerializedCommit(
   write: (type: "commit", data: Uint8Array) => string,
   options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
-  message: CommitMessage,
+  message: string,
   tree: string,
 ): string {
   return write("commit", serializedCommit(options, message, tree));
@@ -178,7 +187,7 @@ function writeSerializedCommit(
 
 function serializedCommit(
   options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
-  message: CommitMessage,
+  message: string,
   tree: string,
 ): Uint8Array {
   return serializeCommit({
@@ -186,7 +195,7 @@ function serializedCommit(
     parent: [...options.parent],
     author: options.identities.author,
     committer: options.identities.committer,
-    message: message.mode === "clean" ? cleanMessage(message.value) : message.value,
+    message,
   });
 }
 
@@ -217,17 +226,11 @@ function sparseTreePlan(
 function publishCommit(
   repo: Repository,
   options: IndexedCommitOptions,
+  message: string,
   context: PublishedCommitContext | undefined,
   baselineTreeOid: string | null,
 ): CommitResult {
-  const message = cleanPublishedMessage(options.message);
-  const result = writeCommitObjects(
-    repo,
-    options,
-    { mode: "exact", value: message },
-    context,
-    baselineTreeOid,
-  );
+  const result = writeCommitObjects(repo, options, message, context, baselineTreeOid);
   return publishCommitResult(
     repo,
     options.expectedHead,
@@ -256,14 +259,6 @@ function publishCommitResult(
   // A false result leaves the prior baseline mismatched, so sparse readers safely use full scans.
   context?.indexTracker?.advanceBaseline(repo.checkout.checkoutId, result.tree);
   return { oid: result.oid };
-}
-
-function validatePublishedMessage(message: string): void {
-  if (message.trim() === "") throw new GitError("EMSG", "commit message is required");
-}
-
-function cleanPublishedMessage(message: string): string {
-  return cleanMessage(message);
 }
 
 function readCommitOwned(repo: Repository, oid: string): Commit {
@@ -358,6 +353,17 @@ function readAmended(repo: Repository, head: ResolvedHead): Commit {
   return readCommitOwned(repo, head.oid);
 }
 
+/**
+ * git refuses an amend that leaves the first parent's tree; merges are exempt,
+ * and a root or shallow commit compares with the empty tree, as git sees it.
+ */
+function amendBaselineTree(repo: Repository, oid: string, amended: Commit): string | undefined {
+  if (amended.parent.length > 1) return undefined;
+  const first = amended.parent[0];
+  if (first === undefined || repo.store.readShallowOwned().has(oid)) return EMPTY_TREE_OID;
+  return readCommitOwned(repo, first).tree;
+}
+
 /** A source only wins when it supplies both halves of an identity. */
 function identityOf(name: string | undefined, email: string | undefined): GitIdentity | null {
   if (name === undefined || name === "" || email === undefined || email === "") return null;
@@ -371,7 +377,46 @@ function stamp(context: GitContext): { timestamp: number; timezoneOffset: number
   };
 }
 
-/** git's message cleanup: no CRs, no surrounding blank lines, exactly one trailing newline. */
-function cleanMessage(message: string): string {
-  return `${message.replace(/\r/g, "").replace(/^\n+/, "").replace(/\n+$/, "")}\n`;
+/** The message as stored; one that is blank once cleaned is refused like git. */
+function storedMessage(message: CommitMessage): string {
+  const stored =
+    message.mode === "exact"
+      ? message.value
+      : cleanMessage(message.value, message.mode === "strip");
+  for (let index = 0; index < stored.length; index++) {
+    if (!isMessageWhitespace(stored.charCodeAt(index))) return stored;
+  }
+  throw new GitError("EMSG", "commit message is required");
+}
+
+/**
+ * git's whitespace cleanup: trailing whitespace off every line, no leading or
+ * trailing blank lines, inner blank runs collapsed to one, one LF per line.
+ * `strip` also drops lines that start with `#`, leaving no blank line behind.
+ */
+function cleanMessage(message: string, strip: boolean): string {
+  let cleaned = "";
+  let blankPending = false;
+  let start = 0;
+  while (start <= message.length) {
+    const newline = message.indexOf("\n", start);
+    const lineEnd = newline < 0 ? message.length : newline;
+    let end = lineEnd;
+    while (end > start && isMessageWhitespace(message.charCodeAt(end - 1))) end--;
+    const comment = strip && message.charCodeAt(start) === 0x23;
+    if (end === start) {
+      blankPending = cleaned !== "";
+    } else if (!comment) {
+      if (blankPending) cleaned += "\n";
+      cleaned += `${message.slice(start, end)}\n`;
+      blankPending = false;
+    }
+    start = lineEnd + 1;
+  }
+  return cleaned;
+}
+
+/** Git's whitespace is space, tab, CR, and LF; `\v`, `\f`, and NBSP are content. */
+export function isMessageWhitespace(code: number): boolean {
+  return code === 0x20 || code === 0x09 || code === 0x0d || code === 0x0a;
 }

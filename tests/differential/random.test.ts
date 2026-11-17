@@ -24,7 +24,7 @@ const SHRINK_MS = 40_000;
  * A known divergence ends its seed early, so the fixed CI set must still play
  * this share of its ops; otherwise known entries silently hollow it out.
  */
-const COVERAGE_FLOOR = 0.6;
+const COVERAGE_FLOOR = 0.9;
 const CI_SET = FIRST === 1 && SEEDS === 40 && STEPS === 30;
 
 describe("differential: kompjutr local vs git", () => {

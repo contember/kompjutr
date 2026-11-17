@@ -20,6 +20,7 @@ export {
   compilePathspecs,
   hasGlobSyntax,
   MAX_COMPILED_PATHS,
+  requirePathspecsMatched,
 } from "./worktree-io-pathspec.js";
 export {
   type WorktreePath,

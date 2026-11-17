@@ -2,7 +2,7 @@ import { GitError } from "../../common/errors.js";
 import { comparePaths, joinSorted } from "../../common/streams.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../../ignore/index.js";
 import { contentIdKey, type IndexEntry, indexScanOwned } from "../../store/index.js";
-import { matchesPaths, stageZero, type TargetEntry } from "../checkout/checkout.js";
+import { matchesPaths, sameTreeEntry, type TargetEntry } from "../checkout/checkout.js";
 import type { Repository } from "../repository/repository.js";
 import { treeStream } from "../tree/tree-stream.js";
 import { gitModeFor, type Worktree } from "../worktree/worktree.js";
@@ -55,8 +55,27 @@ export interface CheckoutGuard {
   prune: boolean;
   limits?: CheckoutBlockerLimits;
   excludeRoots?: string[];
-  /** `hard-reset` intentionally discards tracked edits, as a sequencer reset does. */
-  mode: "checkout" | "hard-reset";
+  /**
+   * `hard-reset` intentionally discards tracked edits, as a sequencer reset does.
+   * `merge` is Git's one-way `reset --merge`: a changed index entry needs a
+   * worktree file that matches it or is gone, and unmerged paths reset regardless.
+   */
+  mode: "checkout" | "merge" | "hard-reset";
+  /**
+   * Git's two-way merge, for a checkout applied with the same `baselineTree`:
+   * a path the baseline and target agree on keeps its staged state, and a
+   * staged deletion the target would change refuses. The guard records what
+   * that checkout needs here.
+   */
+  carry?: CarryFindings;
+}
+
+/** What the guard learns for the two-way merge its checkout then applies. */
+export interface CarryFindings {
+  /** The index differs from the baseline; otherwise the carry is the target itself. */
+  staged: boolean;
+  /** Kept staged files a taken path below replaces; one per such collision. */
+  replaced: Set<string>;
 }
 
 /**
@@ -77,6 +96,7 @@ export function checkoutBlockers(
   const { tree, paths, prune, limits } = guard;
   const excludeRoots = guard.excludeRoots ?? [];
   const discardTrackedChanges = guard.mode === "hard-reset";
+  const resetMerge = guard.mode === "merge";
   const tracked = new BlockerList();
   const untracked = new BlockerList();
   const dirtyCandidates: GuardCandidate[] = [];
@@ -84,6 +104,7 @@ export function checkoutBlockers(
   const pendingTrackedPaths: PendingTarget[] = [];
   const untrackedAncestors: PendingTarget[] = [];
   const hashCursor = createWorktreeHashCursor(excludeRoots);
+  const carry = guard.carry === undefined ? undefined : new CarryCollisions(guard.carry);
   let ignores: IgnoreMatcher | undefined;
   const isIgnored = (path: string): boolean => {
     ignores ??= loadIgnoreMatcher(worktree, repo.root, { excludeRoots });
@@ -103,11 +124,9 @@ export function checkoutBlockers(
     expireRanges(pendingTargets, row.path);
     expireRanges(pendingTrackedPaths, row.path);
     expireRanges(untrackedAncestors, row.path);
-    if (
-      row.worktree !== undefined &&
-      row.index === undefined &&
-      (!discardTrackedChanges || row.head === undefined)
-    ) {
+    carry?.expire(row.path);
+    // A path with conflict stages is tracked; Git protects only paths the index lacks.
+    if (row.worktree !== undefined && row.index === undefined && !row.unmerged) {
       for (let index = pendingTargets.length - 1; index >= 0; index--) {
         const pending = pendingTargets[index]!;
         if (!row.path.startsWith(`${pending.path}/`)) continue;
@@ -137,11 +156,41 @@ export function checkoutBlockers(
         : paths.matches(row.path);
     if (!selected) continue;
 
+    if (carry !== undefined) {
+      if (
+        row.unmerged ||
+        (existing === undefined ? row.head !== undefined : differsFromHead(existing, row.head))
+      ) {
+        carry.findings.staged = true;
+      }
+      if (sameTreeEntry(target, row.head)) {
+        if (existing === undefined) continue;
+        if (!carry.replacedByTaken(row.path)) {
+          carry.keep(row.path, row.worktree !== undefined);
+          continue;
+        }
+        // A taken file replaces this kept entry; git allows it only without local changes.
+        if (row.worktree === undefined || indexMatchesStat(existing, row.worktree.stat)) continue;
+        dirtyCandidates.push({ entry: existing, worktree: row.worktree });
+        if (dirtyCandidates.length >= CHECKOUT_GUARD_BATCH) {
+          flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, limits, hashCursor);
+        }
+        continue;
+      }
+      if (target !== undefined) {
+        const keptOnDisk = carry.take(row.path);
+        if (keptOnDisk !== undefined) retainBlocker(untracked, keptOnDisk);
+      }
+      if (existing === undefined && target !== undefined && row.head !== undefined) {
+        retainBlocker(tracked, row.path);
+        continue;
+      }
+    }
     if (target === undefined) {
       // Only the checkout that prunes would remove this path.
       if (!prune || existing === undefined) continue;
     } else if (existing === undefined) {
-      if (discardTrackedChanges && row.head !== undefined) {
+      if (row.unmerged) {
         if (row.worktree === undefined) retainRange(pendingTrackedPaths, row.path);
         continue;
       }
@@ -175,7 +224,7 @@ export function checkoutBlockers(
       }
       continue;
     }
-    if (changesIndex && differsFromHead(existing, row.head)) {
+    if (changesIndex && !resetMerge && differsFromHead(existing, row.head)) {
       retainBlocker(tracked, row.path);
       continue;
     }
@@ -228,7 +277,30 @@ interface CheckoutGuardRow {
   target: TargetEntry | undefined;
   head: TargetEntry | undefined;
   index: IndexEntry | undefined;
+  /** The index holds conflict stages for this path. */
+  unmerged: boolean;
   worktree: WorktreePath | undefined;
+}
+
+interface GuardIndexRow {
+  path: string;
+  stageZero: IndexEntry | undefined;
+  unmerged: boolean;
+}
+
+/** One row per indexed path: its stage-0 entry and whether conflict stages exist. */
+function* guardIndexRows(entries: Iterable<IndexEntry>): Generator<GuardIndexRow> {
+  let pending: GuardIndexRow | undefined;
+  for (const entry of entries) {
+    if (pending !== undefined && pending.path !== entry.path) {
+      yield pending;
+      pending = undefined;
+    }
+    pending ??= { path: entry.path, stageZero: undefined, unmerged: false };
+    if (entry.stage === 0) pending.stageZero = entry;
+    else pending.unmerged = true;
+  }
+  if (pending !== undefined) yield pending;
 }
 
 function* checkoutGuardRows(
@@ -243,7 +315,7 @@ function* checkoutGuardRows(
     right: (entry) => entry.path,
   });
   const current = joinSorted(
-    stageZero(indexScanOwned(repo.checkout)),
+    guardIndexRows(indexScanOwned(repo.checkout)),
     walkWorktreeEntriesStream(worktree, repo.root, { excludeRoots }),
     { left: (entry) => entry.path, right: (entry) => entry.path },
   );
@@ -259,7 +331,8 @@ function* checkoutGuardRows(
       path: row.path,
       target,
       head,
-      index,
+      index: index?.stageZero,
+      unmerged: index?.unmerged === true,
       worktree: worktreeEntry,
     };
   }
@@ -273,6 +346,46 @@ interface GuardCandidate {
 interface PendingTarget {
   path: string;
   upper: string;
+}
+
+interface KeptLeaf extends PendingTarget {
+  onDisk: boolean;
+}
+
+/**
+ * File/directory collisions between staged entries a switch keeps and paths it
+ * takes from the target. A taken file replaces kept entries below it; a taken
+ * path below a kept file replaces that file, which git refuses while the file
+ * is still on disk.
+ */
+class CarryCollisions {
+  readonly #taken: PendingTarget[] = [];
+  readonly #kept: KeptLeaf[] = [];
+
+  constructor(readonly findings: CarryFindings) {}
+
+  expire(path: string): void {
+    expireRanges(this.#taken, path);
+    expireRanges(this.#kept, path);
+  }
+
+  replacedByTaken(path: string): boolean {
+    return findAncestor(this.#taken, path) !== undefined;
+  }
+
+  keep(path: string, onDisk: boolean): void {
+    this.#kept.push({ path, upper: `${path}0`, onDisk });
+  }
+
+  /** Record a taken path; returns the kept file it replaces when that file is on disk. */
+  take(path: string): string | undefined {
+    retainRange(this.#taken, path);
+    const kept = findAncestor(this.#kept, path);
+    if (kept === undefined) return undefined;
+    this.#kept.splice(this.#kept.indexOf(kept), 1);
+    this.findings.replaced.add(kept.path);
+    return kept.onDisk ? kept.path : undefined;
+  }
 }
 
 function retainBlocker(paths: BlockerList, path: string): void {
@@ -289,7 +402,7 @@ function expireRanges(ranges: PendingTarget[], path: string): void {
   }
 }
 
-function findAncestor(ranges: PendingTarget[], path: string): PendingTarget | undefined {
+function findAncestor<T extends PendingTarget>(ranges: T[], path: string): T | undefined {
   for (let index = ranges.length - 1; index >= 0; index--) {
     const range = ranges[index]!;
     if (path.startsWith(`${range.path}/`)) return range;

@@ -1,4 +1,4 @@
-import { GitError } from "../../common/errors.js";
+import { GitError, PathspecNotFoundError } from "../../common/errors.js";
 import { comparePaths, lowerBoundPath } from "../../common/paths.js";
 import { type CompiledReadPathspec, compileReadPathspec } from "./pathspec.js";
 
@@ -86,6 +86,29 @@ class ByteOrderedPathspecMatcher implements CompiledPathspecMatcher {
 export function compilePathspecs(paths: readonly string[] | undefined): CompiledPathspecMatcher {
   validateCompiledPathspecs(paths);
   return new ByteOrderedPathspecMatcher(paths);
+}
+
+/** Fail on the first pathspec that matches no path in any of the sources. */
+export function requirePathspecsMatched(
+  specs: readonly string[],
+  sources: readonly Iterable<{ readonly path: string }>[],
+): void {
+  const matchers = specs.map((spec) => compilePathspecs([spec]));
+  const matched = specs.map(() => false);
+  let unmatched = specs.length;
+  for (const source of sources) {
+    for (const entry of source) {
+      for (let index = 0; index < specs.length; index++) {
+        if (matched[index] !== true && matchers[index]?.matches(entry.path) === true) {
+          matched[index] = true;
+          unmatched--;
+        }
+      }
+      if (unmatched === 0) return;
+    }
+  }
+  const first = specs.find((_, index) => matched[index] !== true);
+  if (first !== undefined) throw new PathspecNotFoundError(first);
 }
 
 function validateCompiledPathspecs(paths: readonly string[] | undefined): void {

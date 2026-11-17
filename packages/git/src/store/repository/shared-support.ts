@@ -50,6 +50,7 @@ export interface SharedRepoStoreMutations {
   configAddOwned(path: string, value: string): void;
   configUnsetOwned(path: string): void;
   configMoveSectionOwned(sourcePrefix: string, destinationPrefix: string): void;
+  configRemoveSectionOwned(prefix: string): void;
   setShallowOwned(add: Iterable<string>, remove?: Iterable<string>): void;
   destroyOwned(): void;
 }

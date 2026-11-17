@@ -47,11 +47,25 @@ function shortOid(oid: string | null): string {
   return oid === null ? "empty tree" : oid.slice(0, 12);
 }
 
-function sourceSubject(message: string): string {
+/**
+ * The first line that is not blank, as Git's `find_commit_subject` reads it:
+ * only space, tab and CR count as blank, and the line keeps its CR.
+ */
+export function sourceSubject(message: string): string {
   let start = 0;
-  while (message.charCodeAt(start) === 0x0a) start++;
-  const newline = message.indexOf("\n", start);
-  return (newline < 0 ? message.slice(start) : message.slice(start, newline)).replace(/\r$/, "");
+  for (;;) {
+    const newline = message.indexOf("\n", start);
+    const line = newline < 0 ? message.slice(start) : message.slice(start, newline);
+    if (!/^[ \t\r]*$/.test(line)) return line;
+    if (newline < 0) return "";
+    start = newline + 1;
+  }
+}
+
+// Git keeps a trailing CR in the marker label; the text merge refuses a CR in
+// any label, so the label drops it.
+function labelSubject(message: string): string {
+  return sourceSubject(message).replace(/\r$/, "");
 }
 
 function incomingLabel(
@@ -62,10 +76,10 @@ function incomingLabel(
   sourceMessage: string,
 ): string {
   if (style === "source-subject") {
-    return `${sourceOid.slice(0, 7)} (${sourceSubject(sourceMessage)})`;
+    return `${sourceOid.slice(0, 7)} (${labelSubject(sourceMessage)})`;
   }
   if (style === "parent-of-source-subject") {
-    return `parent of ${sourceOid.slice(0, 7)} (${sourceSubject(sourceMessage)})`;
+    return `parent of ${sourceOid.slice(0, 7)} (${labelSubject(sourceMessage)})`;
   }
   return shortOid(kind === "cherry-pick" ? sourceOid : selectedParentOid);
 }
