@@ -6,10 +6,10 @@ blocked-by: []
 
 # 125 — Match Git on branch, reflog and push edge cases
 
-**Summary.** Five ref and push cases where kompjutr answers differently from Git.
-Tier S for the silent ones (reflog, upstream push, ambiguous start point); B for
-the push lease, which fails loudly, and the tracking message, which changes no
-state.
+**Summary.** Six ref and push cases where kompjutr answers differently from Git.
+Tier S for the silent ones (rename and rebase reflogs, upstream push, ambiguous
+start point); B for the push lease, which fails loudly, and the tracking
+message, which changes no state.
 
 ## Problem
 
@@ -28,6 +28,11 @@ Reproduced against git 2.54 with the differential worlds
   `branchRenameOwned()` in `ops/refs/refs-branches.ts` (the early return for
   `source === destination`; `mutateRefsOwned` with only `head` for an unborn
   source). Silent.
+- **Reflog of a rebase.** Git writes `rebase (start)` and `rebase (finish)`
+  rows to the HEAD reflog; kompjutr writes one row, also on its fast-forward
+  path. A later `reset HEAD@{1}` lands on a different commit. Found in review
+  of the rebase range fix; the differential ops have no `@{n}`. Owner: the
+  completion paths in `ops/rebase/rebase.ts`. Silent.
 - **Push without a ref to a differently named upstream.** `checkout -b topic
   origin/feature`, commit, `push`. Git (`push.default=simple`) exits 128:
   `fatal: The upstream branch of your current branch does not match the name of
@@ -63,6 +68,8 @@ Reproduced against git 2.54 with the differential worlds
 
 - reflog: decide whether (a) stays intentional; either way make (b) and the doc
   agree. A parity case compares which reflogs gain a row, and its endpoints.
+- rebase reflog: a parity case comparing the HEAD reflog rows after a replayed
+  and a fast-forward rebase.
 - upstream push and push lease: parity cases against the `git` binary; the
   `push` op always names a ref and has no lease.
 - tracking message: a parity case on the strict argv runner's stdout.
@@ -73,6 +80,7 @@ Reproduced against git 2.54 with the differential worlds
 ## Touch points
 
 `packages/git/src/ops/refs/refs-branches.ts`,
+`packages/git/src/ops/rebase/rebase.ts`,
 `packages/git/src/ops/refs/branch-upstream.ts`,
 `packages/git/src/ops/push/push-options.ts`,
 `packages/git/src/cli/write/write-refs.ts`,
