@@ -1011,6 +1011,8 @@ start remains available only through the typed API and pull orchestration.
 
 Same shape: one `source` per call, `mainline` for merge commits, `message` /
 `author` / `committer` overrides, and continue/skip/abort. ✘ ranges, ✘ `-n`.
+The default message follows Git 2.43 and later: reverting a commit titled
+`Revert "X"` writes `Reapply "X"`; deeper chains stay nested.
 
 `ReplayResult` is `committed`, `conflicted`, or `empty` with reason `source`
 (the source changed nothing) or `result` (the result equals the current tree).

@@ -40,16 +40,24 @@ function sourceSubject(message: string): string {
   return (newline < 0 ? message.slice(start) : message.slice(start, newline)).replace(/\r$/, "");
 }
 
+// Git reapplies a single revert instead of nesting; deeper chains stay nested.
+function revertTitle(subject: string): string {
+  const reverted = subject.startsWith('Revert "') ? subject.slice('Revert "'.length) : null;
+  return reverted !== null && !reverted.startsWith('Revert "')
+    ? `Reapply "${reverted}`
+    : `Revert "${subject}"`;
+}
+
 function defaultMessage(plan: ReplayPlan): string {
-  const subject = sourceSubject(plan.sourceCommit.message);
+  const title = revertTitle(sourceSubject(plan.sourceCommit.message));
   if (plan.sourceCommit.parent.length > 1) {
     const selectedParent = plan.selectedParentOid;
     if (selectedParent === null) {
       throw new GitError("ECORRUPT", "revert merge plan has no selected parent");
     }
-    return `Revert "${subject}"\n\nThis reverts commit ${plan.sourceOid}, reversing\nchanges made to ${selectedParent}.\n`;
+    return `${title}\n\nThis reverts commit ${plan.sourceOid}, reversing\nchanges made to ${selectedParent}.\n`;
   }
-  return `Revert "${subject}"\n\nThis reverts commit ${plan.sourceOid}.\n`;
+  return `${title}\n\nThis reverts commit ${plan.sourceOid}.\n`;
 }
 
 const POLICY: ReplayPolicy = {
