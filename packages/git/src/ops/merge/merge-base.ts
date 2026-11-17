@@ -303,25 +303,53 @@ export function mergeBase(repo: Repository, options: MergeBaseOptions): MergeBas
   return { kind, bases };
 }
 
+function classify(
+  input: MergeBaseInput,
+  state: GraphState,
+  limits: ResolvedLimits,
+): MergeBaseSelection {
+  if (state.nodes.get(input.incomingOid)?.sides === BOTH) {
+    return result("already-merged", [input.incomingOid], state);
+  }
+  if (state.nodes.get(input.currentOid)?.sides === BOTH) {
+    return result("fast-forward", [input.currentOid], state);
+  }
+
+  for (const oid of state.shallow) {
+    const node = state.nodes.get(oid);
+    if (node !== undefined && node.sides !== BOTH) return result("shallow", [], state);
+  }
+  const bases = bestCommonAncestors(state.nodes, state.shallow);
+  if (bases.length === 0) return result("unrelated", [], state);
+  if (bases.length > limits.maxBases) {
+    throw new GitError("E2BIG", `merge-base result exceeds ${limits.maxBases} best bases`);
+  }
+  return result("divergent", bases, state);
+}
+
 /** Select ancestry mode and all best common ancestors without mutating repository state. */
 export function selectMergeBases(repo: Repository, input: MergeBaseInput): MergeBaseSelection {
-  return withReachableGraph(repo, input, (state, limits) => {
-    if (state.nodes.get(input.incomingOid)?.sides === BOTH) {
-      return result("already-merged", [input.incomingOid], state);
-    }
-    if (state.nodes.get(input.currentOid)?.sides === BOTH) {
-      return result("fast-forward", [input.currentOid], state);
-    }
+  return withReachableGraph(repo, input, (state, limits) => classify(input, state, limits));
+}
 
-    for (const oid of state.shallow) {
-      const node = state.nodes.get(oid);
-      if (node !== undefined && node.sides !== BOTH) return result("shallow", [], state);
-    }
-    const bases = bestCommonAncestors(state.nodes, state.shallow);
-    if (bases.length === 0) return result("unrelated", [], state);
-    if (bases.length > limits.maxBases) {
-      throw new GitError("E2BIG", `merge-base result exceeds ${limits.maxBases} best bases`);
-    }
-    return result("divergent", bases, state);
-  });
+/** The bounded graph a selection walked, read back without another query. */
+export interface MergeBaseGraph {
+  /** The commit at `oid`, or undefined beyond a shallow boundary. */
+  commit(oid: string): Commit | undefined;
+  /** Whether `oid` is the incoming commit or one of its ancestors. */
+  incomingReaches(oid: string): boolean;
+}
+
+/** `selectMergeBases`, also exposing the graph it walked to compute a revision range. */
+export function selectMergeBaseGraph(
+  repo: Repository,
+  input: MergeBaseInput,
+): { selection: MergeBaseSelection; graph: MergeBaseGraph } {
+  return withReachableGraph(repo, input, (state, limits) => ({
+    selection: classify(input, state, limits),
+    graph: {
+      commit: (oid) => state.nodes.get(oid)?.commit,
+      incomingReaches: (oid) => ((state.nodes.get(oid)?.sides ?? 0) & INCOMING) !== 0,
+    },
+  }));
 }

@@ -311,6 +311,15 @@ export const KNOWN: KnownDivergence[] = [
     matches: (d) => opIs(d, "rebase") && refused(d, /EUNRELATED/),
   },
   {
+    id: "rebase-merge-side-commits",
+    reason:
+      "intentional: rebase refuses a merge in the range whose other parents bring in commits " +
+      "the upstream lacks; git replays them in its topological order (git-support.md, git rebase)",
+    fields: ["outcome"],
+    matches: (d) =>
+      opIs(d, "rebase") && refused(d, /^EUNSUPPORTED: rebase selected range merges unreplayable/),
+  },
+  {
     id: "path-checkout-untracked-blocker",
     reason:
       "intentional: path checkout refuses to delete untracked content in the way; " +

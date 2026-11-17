@@ -48,6 +48,11 @@ export type {
   RebaseStartOptions,
 } from "./rebase-lifecycle-types.js";
 
+type RebaseStart =
+  | { relation: "up-to-date"; oid: string }
+  | { relation: "published"; oid: string; fastForward: boolean }
+  | { relation: "replay"; oid: string; proof: RebaseBaselineProof };
+
 /** `excludeRoots` are absolute roots of nested checkouts that the rebase must not touch. */
 export function rebase(
   context: GitContext,
@@ -59,7 +64,7 @@ export function rebase(
   requireJournalIdentity(options.committer, "committer", "rebase");
   const exclusions = rebaseExclusions(repo, excludeRoots);
   requireSharedMutationScope(repo.store.db, worktree);
-  const started = repo.store.db.transactionSync(() => {
+  const started = repo.store.db.transactionSync((): RebaseStart => {
     repo.checkout.requireNoOperationState();
     const head = requireHead(repo);
     const originalTree = repo.readCommit(head.oid).tree;
@@ -86,20 +91,24 @@ export function rebase(
     if (observed.ref !== head.ref || observed.oid !== head.oid) {
       throw new GitError("ESTALEHEAD", "HEAD changed while rebase was being prepared");
     }
-    if (plan.relation === "fast-forward") {
+    // A replay of only dropped merges has no step to journal: git resets to the upstream.
+    if (plan.relation === "fast-forward" || plan.steps.length === 0) {
+      const fastForward = plan.relation === "fast-forward";
       repositoryMutations(repo).mutateRefsOwned(
         {
           expected: { name: head.ref, target: head.oid },
           puts: [{ name: head.ref, target: plan.upstreamOid }],
         },
-        operationRefLogMetadata(context, repo, "rebase: fast-forward", {
-          identity: options.committer,
-          env: options.env,
-        }),
+        operationRefLogMetadata(
+          context,
+          repo,
+          fastForward ? "rebase: fast-forward" : "rebase: replay",
+          { identity: options.committer, env: options.env },
+        ),
       );
       // False leaves the old baseline mismatched, so later sparse reads fall back safely.
       context.indexTracker?.advanceBaseline(repo.checkout.checkoutId, upstreamTree);
-      return { relation: plan.relation, oid: plan.upstreamOid };
+      return { relation: "published", oid: plan.upstreamOid, fastForward };
     }
     const actor = operationRefLogMetadata(context, repo, "rebase: replay", {
       identity: options.committer,
@@ -111,13 +120,13 @@ export function rebase(
     return { relation: plan.relation, oid: plan.upstreamOid, proof };
   });
   if (started.relation === "up-to-date") return { outcome: "up-to-date", oid: started.oid };
-  if (started.relation === "fast-forward") {
+  if (started.relation === "published") {
     return {
       outcome: "completed",
       oid: started.oid,
       replayed: 0,
       skipped: 0,
-      fastForward: true,
+      fastForward: started.fastForward,
     };
   }
   return driveRebase(context, repo, worktree, options, exclusions, started.proof);

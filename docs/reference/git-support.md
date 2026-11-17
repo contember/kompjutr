@@ -1032,7 +1032,7 @@ commits them with the operation's message and identities.
 | conflicts | `add()` / `rm()`, then `rebaseContinue()` | ★ ✔ index stages 1–3; survives reopen |
 | `--onto <newbase> [upstream] [branch]`, `--root [branch]` | — | ✘ |
 | `-i`, edit/reword/squash/fixup/drop, `--autosquash`, `--exec` | — | ✘ |
-| `--rebase-merges` | — | ✘ selected merge commits are rejected |
+| `--rebase-merges` | — | ✘ merge commits are dropped, as without it |
 | `--update-refs` | — | ✘ only the checked-out branch is published |
 | `--keep-empty`, `--no-ff` | — | ✘ fixed empty-commit and fast-forward policy |
 | `-X <strategy-option>` | — | ✘ one built-in three-way strategy |
@@ -1040,7 +1040,11 @@ commits them with the operation's message and identities.
 
 Restrictions, each a stable error rather than a fallback:
 
-- the replayed range must be **linear** — a merge commit in it throws `EUNSUPPORTED`;
+- a merge commit in the replayed range is dropped, as Git does without
+  `--rebase-merges`, when the upstream already reaches its other parents; a
+  merge that brings in commits the upstream lacks throws `EUNSUPPORTED`,
+  where Git replays them in its topological order, and so does a root commit
+  in the range;
 - exactly one merge base is required (`EUNSUPPORTED` otherwise);
 - a shallow boundary throws `ESHALLOW`, unrelated histories throw `EUNRELATED`;
 - at most 4,096 replayed commits (`E2BIG`);
@@ -1062,7 +1066,12 @@ transition updates only the mutable journal fields listed above; it does not
 replace or re-authenticate the complete plan. Completion publishes the branch
 once; continue, skip, and abort work after a cold reopen. Source-empty commits
 are retained, while commits whose patch becomes empty on the new parent are
-skipped.
+skipped. No patch-id is computed: a commit already upstream is skipped only when its
+replay becomes empty, so where the upstream later changed the same lines Git
+skips it and kompjutr stops on a conflict. A rebase onto an upstream HEAD
+already contains is `up-to-date` only when HEAD's first-parent chain down to
+it holds no merge, as in Git; otherwise the range is replayed, and a range of
+only dropped merges completes at the upstream with nothing replayed.
 The strict argv runner exposes start, continue, skip, and abort. Its worktree
 materialization excludes registered nested repository roots, including after a
 cold reopen.
