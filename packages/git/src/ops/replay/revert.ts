@@ -15,6 +15,7 @@ import {
   type ReplayStartOptions,
   startReplay,
 } from "./replay-lifecycle.js";
+import { sourceSubject } from "./replay-planning.js";
 import type { ReplayPlan } from "./replay-types.js";
 
 export interface RevertOptions {
@@ -31,13 +32,6 @@ export interface RevertContinueOptions {
   author?: GitIdentity;
   committer?: GitIdentity;
   env?: Record<string, string>;
-}
-
-function sourceSubject(message: string): string {
-  let start = 0;
-  while (message.charCodeAt(start) === 0x0a) start++;
-  const newline = message.indexOf("\n", start);
-  return (newline < 0 ? message.slice(start) : message.slice(start, newline)).replace(/\r$/, "");
 }
 
 // Git reapplies a single revert instead of nesting; deeper chains stay nested.

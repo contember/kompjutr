@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { afterEach, describe, expect, it } from "vitest";
 
 import { utf8Decoder } from "../packages/git/src/common/bytes.js";
@@ -83,6 +86,47 @@ function fixtureCommitMessage(source: GitFixture, oid: string): string {
   if (separator < 0) throw new Error("fixture commit has no message separator");
   return commit.slice(separator + 2);
 }
+
+describe("revert subject line", () => {
+  for (const message of [
+    "   ",
+    "\n\n",
+    ' \t \nRevert "x"\n',
+    "\v\nx\n",
+    "x\r\n",
+    '\r\n\nRevert "y"\r\nbody\n',
+  ]) {
+    it(`titles and labels a revert of ${JSON.stringify(message)} as git does`, async () => {
+      const source = fixture();
+      source.write("a.txt", "base\n").commit("base");
+      source.write("a.txt", "source\n").git("add", "a.txt");
+      const tree = source.git("write-tree");
+      const reverted = source.gitInput(message, "commit-tree", tree, "-p", "HEAD");
+      source.git("reset", "-q", "--hard", reverted);
+      source.write("a.txt", "later\n").commit("later");
+      const workspace = await imported(source);
+
+      expect(source.gitResult("revert", "--no-edit", reverted).status).not.toBe(0);
+      expect(
+        revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted }),
+      ).toEqual({ outcome: "conflicted" });
+      // The marker label drops a trailing CR that git keeps (replay-planning.ts).
+      expect(textAt(workspace, "a.txt")).toBe(
+        readFileSync(join(source.dir, "a.txt"), "utf8").replace("\r)\n", ")\n"),
+      );
+
+      source.write("a.txt", "resolved\n").git("add", "a.txt");
+      source.gitWithEnv({ GIT_EDITOR: "true" }, "revert", "--continue");
+      writeWorkFile(workspace, "/a.txt", "resolved\n");
+      add(workspace.repo, workspace.worktree, { paths: ["a.txt"], excludeRoots: [] });
+      const continued = revertContinue(workspace.context, workspace.repo);
+      if (continued.outcome !== "committed") throw new Error("continuation did not commit");
+      expect(workspace.repo.readCommit(continued.oid).message).toBe(
+        fixtureCommitMessage(source, source.git("rev-parse", "HEAD")),
+      );
+    });
+  }
+});
 
 describe("revert lifecycle", () => {
   it("creates a one-parent commit with Git's exact default message and two new identities", async () => {
