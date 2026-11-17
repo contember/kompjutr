@@ -290,3 +290,23 @@ describe("differential regressions: git's walk order keeps staged entries below 
     );
   });
 });
+
+describe("differential regressions: an emptied index checks out like git's initial checkout", () => {
+  it("refuses a new branch over a file removed with rm --cached", async () => {
+    const scenario: Scenario = {
+      start: "init",
+      ops: [
+        { op: "write", path: "dir/y.txt", content: { text: "x\n" } },
+        { op: "add", paths: ["dir/y.txt"] },
+        { op: "commit", message: "m" },
+        { op: "rm", paths: ["dir/y.txt"], cached: true },
+        { op: "checkoutNew", name: "topic" },
+      ],
+    };
+    const divergence = await play(scenario);
+    expect(divergence?.step).toBe(scenario.ops.length - 1);
+    expect(divergence === null ? undefined : knownDivergence(divergence)?.id).toBe(
+      "checkout-empty-index",
+    );
+  });
+});
