@@ -837,7 +837,7 @@ after its first filtered fetch, fails with `EPROMISORREMOTE` before discovery.
 | `--ff-only` | `fastForwardOnly` | ✔ |
 | `--no-commit` | `commit: false` | ~ native only |
 | `-m <msg>` | `message` | ~ native only |
-| `--rebase` / `pull.rebase=true` | `rebase: true` | ✔ non-interactive linear replay; `merges`/`m` and `interactive`/`i` are unsupported |
+| `--rebase` / `pull.rebase=true` | `rebase: true` | ✔ non-interactive linear replay; a merge of local side commits throws `EUNSUPPORTED`, even when the upstream is already contained; `merges`/`m` and `interactive`/`i` are unsupported |
 | local-path remote | — | ✘ throws `UnsupportedOperationError` |
 | `--autostash`, `--recurse-submodules` | — | ✘ |
 
@@ -1032,7 +1032,7 @@ commits them with the operation's message and identities.
 | conflicts | `add()` / `rm()`, then `rebaseContinue()` | ★ ✔ index stages 1–3; survives reopen |
 | `--onto <newbase> [upstream] [branch]`, `--root [branch]` | — | ✘ |
 | `-i`, edit/reword/squash/fixup/drop, `--autosquash`, `--exec` | — | ✘ |
-| `--rebase-merges` | — | ✘ merge commits are dropped, as without it |
+| `--rebase-merges` | — | ✘ merges are dropped when the upstream holds their other parents; otherwise `EUNSUPPORTED` |
 | `--update-refs` | — | ✘ only the checked-out branch is published |
 | `--keep-empty`, `--no-ff` | — | ✘ fixed empty-commit and fast-forward policy |
 | `-X <strategy-option>` | — | ✘ one built-in three-way strategy |

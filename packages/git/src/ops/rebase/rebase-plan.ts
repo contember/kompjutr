@@ -94,6 +94,7 @@ function requireUniqueBase(selection: MergeBaseSelection): string {
 interface RangeCommit {
   oid: string;
   commit: Commit;
+  parentOid: string;
 }
 
 /**
@@ -112,7 +113,7 @@ function* firstParentRange(graph: MergeBaseGraph, currentOid: string): Generator
     if (parentOid === undefined) {
       throw new GitError("EUNSUPPORTED", "rebase selected range contains a root commit");
     }
-    yield { oid, commit };
+    yield { oid, commit, parentOid };
     oid = parentOid;
   }
 }
@@ -131,11 +132,8 @@ function selectSteps(
   limits: ResolvedLimits,
 ): readonly OperationStepMetadata[] {
   const newestFirst: OperationStepMetadata[] = [];
-  for (const { oid, commit } of firstParentRange(graph, currentOid)) {
-    const [selectedParentOid, ...merged] = commit.parent;
-    if (selectedParentOid === undefined) {
-      throw new CorruptError(`rebase commit ${oid} lost its selected parent`);
-    }
+  for (const { oid, commit, parentOid: selectedParentOid } of firstParentRange(graph, currentOid)) {
+    const merged = commit.parent.slice(1);
     if (merged.length > 0) {
       // git drops the merge itself; commits it brings in beside the upstream
       // would be replayed in git's topological order, which is not modelled.
