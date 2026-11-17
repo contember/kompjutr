@@ -91,13 +91,15 @@ function untrackedPaths(status: string): string[] {
 const UNTRACKED_BLOCKERS =
   /^(?:ECHECKOUTFAIL|exit 128: fatal): untracked working tree files would be overwritten by checkout: (.+)$/s;
 
-/** The blockers kompjutr's untracked refusal names; a truncated list yields its named part. */
+/** The blockers kompjutr's untracked refusal names, when it names them all. */
 function untrackedBlockers(d: Divergence): string[] | undefined {
   const match = UNTRACKED_BLOCKERS.exec(d.outcomes.kompjutr.detail ?? "");
   if (d.field !== "outcome" || d.outcomes.kompjutr.kind !== "failed" || !match?.[1]) {
     return undefined;
   }
-  return match[1].replace(/, and \d+ more$/, "").split(", ");
+  // A truncated list hides blockers no matcher could check.
+  if (/, and \d+ more$/.test(match[1])) return undefined;
+  return match[1].split(", ");
 }
 
 /**

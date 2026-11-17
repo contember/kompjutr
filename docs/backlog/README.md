@@ -26,8 +26,8 @@ not effort: a wrong answer outranks a missing one.
   [126](126-match-git-worktree-index-and-status-edges.md).
 - **A — blocks a common workflow, loudly.** None filed.
 - **B — real gap, narrower audience or a workaround exists.** The empty-message
-  cherry-pick in 124, the push lease in 125, and abort, the drive default and
-  the index check in 126.
+  cherry-pick in 124, the push lease and the tracking message in 125, and abort
+  in 126.
 - **No caller yet.** Stash, plumbing reads, branch and remote management,
   rebase extensions, interactive rebase, rebase merges, gitlink
   conflicts, outbound delta compression and byte-preserving paths live in
@@ -115,14 +115,16 @@ server production capacity; local qualification does not establish that limit.
 
 On 2026-11-17 the residual divergences that reviews of the differential tester's
 fixes had reported were re-checked against git 2.54. The ones still divergent
-are filed as 124–126, grouped by area; each item there is independent.
+are filed as 124–126, grouped by area; each case within them is independent.
+Two contract gaps that are not reproduced defects went to
+[`../ideas/guard-index-and-drive-contracts.md`](../ideas/guard-index-and-drive-contracts.md).
 
 | Order | Items | Why |
 |---|---|---|
 | 0 | [119](119-slice-the-clone-under-the-request-cpu-limit.md) | Production blocker: a full-history clone needs ~47 s of CPU in one request; a Durable Object request allows 30 s. |
 | 1 | [121](121-prune-the-parent-closure-walk-in-incremental-fetch.md) | Cost: an incremental fetch walks its parent's whole tree. |
 | 2 | [109](109-keep-parent-directory-when-replacing-its-only-child.md) | Tier S, but narrow: only a directory's mode changes when its only child changes type. |
-| 2 | [126](126-match-git-worktree-index-and-status-edges.md), [124](124-match-git-commit-message-text.md), [125](125-match-git-ref-and-push-edges.md) | Tier S residuals from the differential tester: worktree effects first, then stored messages, then ref and push edges. |
+| 2 | [126](126-match-git-worktree-index-and-status-edges.md), [124](124-match-git-commit-message-text.md), [125](125-match-git-ref-and-push-edges.md) | Tier S parts of the differential tester residuals: worktree effects first, then stored messages, then ref and push edges. |
 | 3 | [107](107-bound-shared-integration-step-passes.md) | Cost: the shared integration step still makes full-tree passes for every rebase, merge, cherry-pick and revert step. |
 | 4 | [106](106-reduce-the-workerd-clone-external-memory.md) | Memory: the workerd clone holds 4.5–7.7× its pack in V8 external memory. Attribute it first, then decide whether a production probe is needed. |
 | 4 | [123](123-qualify-large-git-server-production-capacity.md) | Memory: large bare-server GC samples exceed 128 MiB locally; production capacity remains unqualified. |
@@ -144,4 +146,4 @@ are filed as 124–126, grouped by area; each item there is independent.
 - [123 — Qualify large Git server production capacity](123-qualify-large-git-server-production-capacity.md)
 - [124 — Match Git's commit message text in merge, rebase and cherry-pick](124-match-git-commit-message-text.md)
 - [125 — Match Git on branch, reflog and push edge cases](125-match-git-ref-and-push-edges.md)
-- [126 — Match Git on abort, rm, ignored status, and guard the index and drive contracts](126-match-git-worktree-index-and-status-edges.md)
+- [126 — Match Git on abort, rm through a symlink, and ignored status](126-match-git-worktree-index-and-status-edges.md)

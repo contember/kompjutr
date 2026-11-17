@@ -7,8 +7,9 @@ blocked-by: []
 # 125 — Match Git on branch, reflog and push edge cases
 
 **Summary.** Five ref and push cases where kompjutr answers differently from Git.
-Tier S for the silent ones (reflog, upstream push, tracking message, ambiguous
-start point); B for the push lease, which fails loudly.
+Tier S for the silent ones (reflog, upstream push, ambiguous start point); B for
+the push lease, which fails loudly, and the tracking message, which changes no
+state.
 
 ## Problem
 
@@ -48,7 +49,7 @@ Reproduced against git 2.54 with the differential worlds
   nothing there, though it records the same upstream. Owner: the `branch` and
   `checkout -b` handlers in `cli/write/write-refs.ts`; `startPointUpstream()` in
   `ops/refs/branch-upstream.ts` decides the upstream but does not report it.
-  Silent.
+  Output only: the recorded state is the same.
 - **Ambiguous start point.** `branch origin/main origin/feature`, then
   `branch x origin/main`. Git exits 128:
   `warning: refname 'origin/main' is ambiguous.` /
