@@ -60,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        job: [1, 2, 3]
+        job: [1, 2, 3, 4]
     steps:
       - name: Install parity reference binaries
         run: |

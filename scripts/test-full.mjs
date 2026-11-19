@@ -13,7 +13,7 @@ const rootExcludes = [
   "--exclude=tests/pack.test.ts",
   "--exclude=tests/protocol.test.ts",
 ];
-const rootShardCount = 8;
+const rootShardCount = 16;
 const packSlices = [
   "full-object pack stream|delta|real git packs",
   "synthetic pack ingest",
@@ -30,7 +30,7 @@ const slices = [
     // threads pool: the forks pool trips vitest's fixed 60 s onTaskUpdate RPC
     // timeout after long store batches even when every test passes.
     args: [...rootExcludes, "--pool=threads", `--shard=${index + 1}/${rootShardCount}`],
-    weight: 110,
+    weight: 55,
   })),
   {
     name: "protocol",

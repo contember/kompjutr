@@ -19,7 +19,7 @@ Pull requests and pushes to `main` run two kinds of jobs in parallel on
 
 - `validate`: `npm ci`, `npm run check`, `npm run typecheck`, `npm run build`,
   `npm run package:smoke`.
-- `test (1/3)` to `test (3/3)`: `npm ci` and `npm run test:full -- --job=<i>/3`
+- `test (1/4)` to `test (4/4)`: `npm ci` and `npm run test:full -- --job=<i>/4`
   in an Ubuntu 25.10 container with the parity reference binaries.
 
 The package smoke command rebuilds all package projects and runs `npm pack --json`
