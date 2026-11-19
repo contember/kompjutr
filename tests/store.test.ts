@@ -47,6 +47,14 @@ function open(options: StoreOptions = {}) {
   return { db, database, store: database.openCheckout(repository) };
 }
 
+// Identity by type, length and hash: a megabyte-scale deep compare costs more
+// than the whole rest of this file (a test with four reached 67 s on CI).
+function expectSameBytes(actual: Uint8Array | undefined, expected: Uint8Array): void {
+  expect(actual?.constructor).toBe(expected.constructor);
+  expect(actual?.length).toBe(expected.length);
+  expect(hashObject("blob", actual ?? new Uint8Array(0))).toBe(hashObject("blob", expected));
+}
+
 function insertLooseBlob(db: TestDatabase, repoId: number, data: Uint8Array): string {
   const oid = hashObject("blob", data);
   db.run(
@@ -916,14 +924,14 @@ describe("loose objects", () => {
 
     const scalar = open();
     expect(scalar.store.write("commit", data)).toBe(expectedOid);
-    expect(scalar.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
+    expectSameBytes(scalar.store.readAuthenticatedObject(expectedOid, "commit")?.data, data);
     expect(
       scalar.db.all("SELECT message IS NULL AS omitted, object_size FROM git_commits"),
     ).toEqual([{ omitted: 1, object_size: data.length }]);
 
     const batch = open();
     expect(batch.store.writeObjects((writer) => writer.write("commit", data))).toBe(expectedOid);
-    expect(batch.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
+    expectSameBytes(batch.store.readAuthenticatedObject(expectedOid, "commit")?.data, data);
     expect(batch.db.all("SELECT message IS NULL AS omitted, object_size FROM git_commits")).toEqual(
       [{ omitted: 1, object_size: data.length }],
     );
@@ -936,7 +944,7 @@ describe("loose objects", () => {
         }
       }),
     ).toBe(expectedOid);
-    expect(streamed.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
+    expectSameBytes(streamed.store.readAuthenticatedObject(expectedOid, "commit")?.data, data);
     expect(
       streamed.db.all("SELECT message IS NULL AS omitted, object_size FROM git_commits"),
     ).toEqual([{ omitted: 1, object_size: data.length }]);
@@ -992,11 +1000,11 @@ describe("loose objects", () => {
     const data = new Uint8Array(randomBytes(PACK_BLOB_BATCH_TARGET_BYTES + 1));
     const oid = store.write("blob", data);
 
-    expect(store.readBlobs([oid], { budgetBytes: 1 })).toEqual({
-      blobs: new Map([[oid, data]]),
-      remaining: [],
-      bytes: data.length,
-    });
+    const read = store.readBlobs([oid], { budgetBytes: 1 });
+    expect([...read.blobs.keys()]).toEqual([oid]);
+    expectSameBytes(read.blobs.get(oid), data);
+    expect(read.remaining).toEqual([]);
+    expect(read.bytes).toBe(data.length);
   });
 
   it("reads two packed 2.2 MiB objects under an 8 MiB caller target", async () => {
@@ -1015,8 +1023,10 @@ describe("loose objects", () => {
 
     const objects = store.readObjects([firstOid, secondOid], { budgetBytes: 8 * 1024 * 1024 });
     expect([...objects.objects.keys()]).toEqual([firstOid, secondOid]);
-    expect(objects.objects.get(firstOid)).toEqual({ type: "blob", data: first });
-    expect(objects.objects.get(secondOid)).toEqual({ type: "blob", data: second });
+    expect(objects.objects.get(firstOid)?.type).toBe("blob");
+    expectSameBytes(objects.objects.get(firstOid)?.data, first);
+    expect(objects.objects.get(secondOid)?.type).toBe("blob");
+    expectSameBytes(objects.objects.get(secondOid)?.data, second);
     expect(objects.remaining).toEqual([]);
     expect(objects.bytes).toBe(first.length + second.length);
 
@@ -1024,8 +1034,8 @@ describe("loose objects", () => {
       budgetBytes: 8 * 1024 * 1024,
     });
     expect([...blobs.blobs.keys()]).toEqual([secondOid, firstOid]);
-    expect(blobs.blobs.get(secondOid)).toEqual(second);
-    expect(blobs.blobs.get(firstOid)).toEqual(first);
+    expectSameBytes(blobs.blobs.get(secondOid), second);
+    expectSameBytes(blobs.blobs.get(firstOid), first);
     expect(blobs.remaining).toEqual([]);
     expect(blobs.bytes).toBe(first.length + second.length);
   });
@@ -1148,19 +1158,13 @@ describe("object batches", () => {
       new Uint8Array(randomBytes(200_000)),
     ];
     const oids = store.writeObjects((batch) => shapes.map((data) => batch.write("blob", data)));
-    // Identity by length plus hash: a megabyte-scale deep compare costs
-    // more than the whole rest of this file.
-    const same = (actual: Uint8Array, expected: Uint8Array) => {
-      expect(actual.length).toBe(expected.length);
-      expect(hashObject("blob", actual)).toBe(hashObject("blob", expected));
-    };
     shapes.forEach((data, at) => {
       const oid = oids[at]!;
       expect(oid).toBe(hashObject("blob", data));
       expect(store.has(oid)).toBe(true);
       expect(store.typeAndSize(oid)).toEqual({ type: "blob", size: data.length });
-      same(store.read(oid)?.data ?? new Uint8Array(1), data);
-      same(concat([...(store.readChunks(oid) ?? [])]), data);
+      expectSameBytes(store.read(oid)?.data, data);
+      expectSameBytes(concat([...(store.readChunks(oid) ?? [])]), data);
     });
     expect(chunkCount(store, oids[4]!)).toBeGreaterThan(1);
   });
