@@ -12,21 +12,7 @@
 
 import type { SqlDatabase } from "../db/db.js";
 
-export const SHELL_SCHEMA_VERSION = 1;
-
 export const DEFAULT_CWD = "/";
-
-const STATEMENTS = [
-  `CREATE TABLE IF NOT EXISTS shell_sessions (
-     session_id TEXT NOT NULL PRIMARY KEY,
-     cwd TEXT NOT NULL,
-     rev INTEGER NOT NULL DEFAULT 0
-   ) WITHOUT ROWID`,
-];
-
-export function initializeShellSchema(db: SqlDatabase): void {
-  for (const statement of STATEMENTS) db.run(statement);
-}
 
 interface SessionRow {
   cwd: string;

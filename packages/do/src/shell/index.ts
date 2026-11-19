@@ -12,7 +12,8 @@ import { type ExecResult, execute } from "./exec/execute.js";
 import { ShellSyntaxError } from "./parse/ast.js";
 import { parse } from "./parse/parser.js";
 import { planScript } from "./plan/plan.js";
-import { DEFAULT_CWD, initializeShellSchema, ShellSession } from "./session.js";
+import { initializeShellSchema } from "./schema.js";
+import { DEFAULT_CWD, ShellSession } from "./session.js";
 
 export interface ShellOptions {
   readonly fs: Filesystem;
