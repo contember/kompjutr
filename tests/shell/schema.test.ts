@@ -76,6 +76,33 @@ describe("shell schema", () => {
     );
   });
 
+  it("refuses a newer version as a version, before its tables", () => {
+    const db = new TestDatabase();
+    const fs = withRepo(db);
+    createShell({ fs });
+    db.run("ALTER TABLE shell_sessions ADD COLUMN shell TEXT");
+    db.run("UPDATE shell_meta SET v = ? WHERE k = 'schema_version'", SHELL_SCHEMA_VERSION + 1);
+    expect(() => createShell({ fs })).toThrow(/version \d+ is unsupported/);
+  });
+
+  it("refuses a version table without its version row", () => {
+    const db = new TestDatabase();
+    const fs = withRepo(db);
+    createShell({ fs });
+    db.run("DELETE FROM shell_meta");
+    expect(() => createShell({ fs })).toThrow(
+      expect.objectContaining({ code: "EIO", message: expect.stringMatching(/missing/) }),
+    );
+  });
+
+  it("leaves a host's own shell_ tables alone", async () => {
+    const db = versionOneDatabase();
+    db.run("CREATE TABLE shell_history (line TEXT)");
+    const shell = createShell({ fs: withRepo(db), sessionId: "agent-1" });
+    expect(shell.cwd()).toBe("/repo/src");
+    expect(storedVersion(db)).toBe(SHELL_SCHEMA_VERSION);
+  });
+
   it("refuses an unversioned table that is not version 1", () => {
     const db = new TestDatabase();
     db.run("CREATE TABLE shell_sessions (session_id TEXT PRIMARY KEY, cwd TEXT)");

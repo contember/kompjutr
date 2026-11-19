@@ -30,12 +30,12 @@ function schemaError(message: string): Error {
   return filesystemError("EIO", message);
 }
 
+// Only the shell's own tables: a host may keep other `shell_*` tables in the
+// same database, and a newer schema is recognised by its version row.
 function readSchemaObjects(db: SqlDatabase): Map<string, string> {
   const objects = new Map<string, string>();
   for (const row of db.iterate(
-    `SELECT name, sql FROM sqlite_schema
-      WHERE substr(name, 1, 6) COLLATE NOCASE = 'shell_'
-      LIMIT ${EXPECTED_SCHEMA_OBJECTS.size + 1}`,
+    "SELECT name, sql FROM sqlite_schema WHERE name IN ('shell_sessions', 'shell_meta')",
   )) {
     if (typeof row.name !== "string" || typeof row.sql !== "string") {
       throw schemaError("shell schema object probe is invalid");
@@ -45,21 +45,11 @@ function readSchemaObjects(db: SqlDatabase): Map<string, string> {
   return objects;
 }
 
-function requireSchemaObjects(
-  objects: ReadonlyMap<string, string>,
-  expected: readonly string[],
-): void {
-  for (const name of objects.keys()) {
-    if (!expected.includes(name)) {
-      throw schemaError(`shell schema contains unexpected object ${name}`);
-    }
-  }
-  for (const name of expected) {
-    const actual = objects.get(name);
-    if (actual === undefined) throw schemaError(`shell schema is missing required table ${name}`);
-    if (actual !== EXPECTED_SCHEMA_OBJECTS.get(name)) {
-      throw schemaError(`shell schema object ${name} does not match its current definition`);
-    }
+function requireCurrentTable(objects: ReadonlyMap<string, string>, name: string): void {
+  const actual = objects.get(name);
+  if (actual === undefined) throw schemaError(`shell schema is missing required table ${name}`);
+  if (actual !== EXPECTED_SCHEMA_OBJECTS.get(name)) {
+    throw schemaError(`shell schema object ${name} does not match its current definition`);
   }
 }
 
@@ -93,16 +83,18 @@ export function initializeShellSchema(db: SqlDatabase): void {
       return;
     }
     if (!objects.has("shell_meta")) {
-      requireSchemaObjects(objects, ["shell_sessions"]);
+      requireCurrentTable(objects, "shell_sessions");
       recordVersion(db);
       return;
     }
-    requireSchemaObjects(objects, [...EXPECTED_SCHEMA_OBJECTS.keys()]);
+    // The version first, so a newer schema is refused as a version.
+    requireCurrentTable(objects, "shell_meta");
     const version = readVersion(db);
     if (version !== SHELL_SCHEMA_VERSION) {
       throw schemaError(
         `shell schema version ${version} is unsupported; expected ${SHELL_SCHEMA_VERSION}`,
       );
     }
+    requireCurrentTable(objects, "shell_sessions");
   });
 }
