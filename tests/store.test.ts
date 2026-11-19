@@ -47,9 +47,10 @@ function open(options: StoreOptions = {}) {
   return { db, database, store: database.openCheckout(repository) };
 }
 
-// Identity by length plus hash: a megabyte-scale deep compare costs more than
-// the whole rest of this file (one toEqual reached 67 s on a CI runner).
+// Identity by type, length and hash: a megabyte-scale deep compare costs more
+// than the whole rest of this file (a test with four reached 67 s on CI).
 function expectSameBytes(actual: Uint8Array | undefined, expected: Uint8Array): void {
+  expect(actual?.constructor).toBe(expected.constructor);
   expect(actual?.length).toBe(expected.length);
   expect(hashObject("blob", actual ?? new Uint8Array(0))).toBe(hashObject("blob", expected));
 }
