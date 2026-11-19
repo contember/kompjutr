@@ -30,7 +30,7 @@ jobs:
       - run: npm run package:smoke
 
   test:
-    name: test (${{ matrix.job }}/3)
+    name: test (${{ matrix.job }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
     # Match the shell parity oracles; Ubuntu 24.04's rev hangs on UTF-8 in LC_ALL=C.
     container: ubuntu:25.10
@@ -59,4 +59,4 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - run: npm run test:full -- --job=${{ matrix.job }}/3
+      - run: npm run test:full -- --job=${{ matrix.job }}/${{ strategy.job-total }}
