@@ -14,15 +14,13 @@ requires Node.js 24. There is no unscoped `kompjutr` package.
 
 ## Continuous integration
 
-Pull requests and pushes to `main` run these gates in an Ubuntu 25.10 container
-on `ubuntu-latest`:
+Pull requests and pushes to `main` run two kinds of jobs in parallel on
+`ubuntu-latest`, each capped at 10 minutes:
 
-1. `npm ci`
-2. `npm run check`
-3. `npm run typecheck`
-4. `npm run test:full`
-5. `npm run build`
-6. `npm run package:smoke`
+- `validate`: `npm ci`, `npm run check`, `npm run typecheck`, `npm run build`,
+  `npm run package:smoke`.
+- `test (1/4)` to `test (4/4)`: `npm ci` and `npm run test:full -- --job=<i>/4`
+  in an Ubuntu 25.10 container with the parity reference binaries.
 
 The package smoke command rebuilds all package projects and runs `npm pack --json`
 for each package. It rejects version drift, mismatched internal
@@ -38,7 +36,8 @@ fails.
 filesystem, shell, and end-to-end slices. This keeps each worker pool short-lived
 without weakening the exhaustive CI and release gate. The slices run
 concurrently in a core-budgeted lane pool; `TEST_FULL_LANES` overrides the cap
-on a busy or a larger machine.
+on a busy or a larger machine. `--job=<i>/<n>` runs one of `n` weight-balanced
+partitions of the slices; the `n` jobs together run every slice.
 
 Benchmarks are not CI gates. Run and report them only under the CPU lease defined
 in `bench/CLAUDE.md`.

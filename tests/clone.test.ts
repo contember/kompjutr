@@ -20,7 +20,7 @@ import {
   type GitHttpClient,
   type GitHttpRequest,
 } from "../packages/git/src/protocol/transport.js";
-import { GitFixture } from "./helpers/git.js";
+import { GitFixture, NO_AUTO_MAINTENANCE } from "./helpers/git.js";
 import { type GitServerOptions, startGitServer, startStubServer } from "./helpers/http-backend.js";
 import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
 
@@ -180,6 +180,7 @@ async function nativeGit(cwd: string, ...args: string[]): Promise<string> {
     cwd,
     env: {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
+      ...NO_AUTO_MAINTENANCE,
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_SYSTEM: "/dev/null",
       GIT_TERMINAL_PROMPT: "0",
