@@ -7,8 +7,11 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Socket } from "node:net";
 import { basename, dirname, join } from "node:path";
 
+import { NO_AUTO_MAINTENANCE } from "./git.js";
+
 const CGI_ENV = {
   PATH: process.env.PATH ?? "/usr/bin:/bin",
+  ...NO_AUTO_MAINTENANCE,
   GIT_HTTP_EXPORT_ALL: "1",
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_SYSTEM: "/dev/null",

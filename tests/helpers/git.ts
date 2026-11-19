@@ -15,8 +15,18 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
+// Git 2.54's commit, fetch and receive-pack start a detached `maintenance run
+// --auto`, which packs objects while a fixture is still asserting on it or
+// being removed. Every git a test spawns runs with it off.
+export const NO_AUTO_MAINTENANCE = {
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "maintenance.auto",
+  GIT_CONFIG_VALUE_0: "false",
+};
+
 const ENV = {
   ...process.env,
+  ...NO_AUTO_MAINTENANCE,
   GIT_AUTHOR_NAME: "Fixture",
   GIT_AUTHOR_EMAIL: "fixture@example.com",
   GIT_COMMITTER_NAME: "Fixture",

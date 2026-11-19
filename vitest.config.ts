@@ -35,6 +35,7 @@ export default defineConfig({
     include: ["tests/**/*.test.ts"],
     testTimeout: 60_000,
     hookTimeout: 60_000,
+    setupFiles: ["tests/helpers/setup-git.ts"],
     // The alias above only applies to modules vite transforms, and
     // dependencies are externalised by default.
     server: { deps: { inline: ["@cloudflare/computer"] } },
