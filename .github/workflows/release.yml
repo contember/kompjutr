@@ -11,23 +11,8 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    # Match the shell parity oracles; Ubuntu 24.04's rev hangs on UTF-8 in LC_ALL=C.
-    container: ubuntu:25.10
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
-      - name: Install parity reference binaries
-        run: |
-          apt-get update
-          apt-get install --yes ca-certificates software-properties-common
-          add-apt-repository --yes ppa:git-core/ppa
-          apt-get install --yes ca-certificates curl git jq tree patch mawk diffutils findutils grep sed util-linux coreutils-from-uutils
-          # rg 15 fixed the --json summary statistics; Ubuntu still ships 14.
-          rg_archive=ripgrep-15.1.0-x86_64-unknown-linux-musl
-          cd "$(mktemp -d)"
-          curl -fsSLO "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/${rg_archive}.tar.gz"
-          echo "1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599  ${rg_archive}.tar.gz" | sha256sum --check -
-          tar -xzf "${rg_archive}.tar.gz" -C /usr/local/bin --strip-components=1 "${rg_archive}/rg"
-          rg --version
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -56,7 +41,6 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run typecheck
-      - run: npm run test:full
       - run: npm run build
       - name: Build and test the release artifact
         run: npm run package:smoke -- --pack-destination release-artifacts/npm-package
@@ -67,8 +51,40 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  test:
+    name: test (${{ matrix.job }}/3)
+    runs-on: ubuntu-latest
+    # Match the shell parity oracles; Ubuntu 24.04's rev hangs on UTF-8 in LC_ALL=C.
+    container: ubuntu:25.10
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [1, 2, 3]
+    steps:
+      - name: Install parity reference binaries
+        run: |
+          apt-get update
+          apt-get install --yes ca-certificates software-properties-common
+          add-apt-repository --yes ppa:git-core/ppa
+          apt-get install --yes ca-certificates curl git jq tree patch mawk diffutils findutils grep sed util-linux coreutils-from-uutils
+          # rg 15 fixed the --json summary statistics; Ubuntu still ships 14.
+          rg_archive=ripgrep-15.1.0-x86_64-unknown-linux-musl
+          cd "$(mktemp -d)"
+          curl -fsSLO "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/${rg_archive}.tar.gz"
+          echo "1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599  ${rg_archive}.tar.gz" | sha256sum --check -
+          tar -xzf "${rg_archive}.tar.gz" -C /usr/local/bin --strip-components=1 "${rg_archive}/rg"
+          rg --version
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test:full -- --job=${{ matrix.job }}/3
+
   publish:
-    needs: verify
+    needs: [verify, test]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: npm

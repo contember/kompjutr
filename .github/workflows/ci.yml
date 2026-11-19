@@ -16,9 +16,29 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm run package:smoke
+
+  test:
+    name: test (${{ matrix.job }}/3)
+    runs-on: ubuntu-latest
     # Match the shell parity oracles; Ubuntu 24.04's rev hangs on UTF-8 in LC_ALL=C.
     container: ubuntu:25.10
-    timeout-minutes: 30
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [1, 2, 3]
     steps:
       - name: Install parity reference binaries
         run: |
@@ -39,8 +59,4 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - run: npm run check
-      - run: npm run typecheck
-      - run: npm run test:full
-      - run: npm run build
-      - run: npm run package:smoke
+      - run: npm run test:full -- --job=${{ matrix.job }}/3

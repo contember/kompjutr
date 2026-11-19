@@ -22,7 +22,7 @@ const packSlices = [
   "pack publication and deletion",
 ];
 
-// `weight` is a start-order hint in rough measured seconds, nothing else.
+// `weight` is rough measured seconds: it orders the lanes and splits `--job`.
 // Longest-first keeps the tail from landing after every lane has drained.
 const slices = [
   ...Array.from({ length: rootShardCount }, (_, index) => ({
@@ -87,7 +87,31 @@ function run(slice) {
   });
 }
 
-const queue = [...slices].sort((left, right) => right.weight - left.weight);
+// `--job=<i>/<n>` runs the i-th of n weight-balanced partitions, so CI can
+// spread the suite over parallel jobs; together the n jobs run every slice.
+function selectJob(argv) {
+  const flag = argv.find((arg) => arg.startsWith("--job="));
+  if (argv.some((arg) => arg !== flag)) throw new Error(`Usage: test-full.mjs [--job=<i>/<n>]`);
+  if (flag === undefined) return slices;
+  const match = /^--job=([1-9][0-9]*)\/([1-9][0-9]*)$/.exec(flag);
+  const index = Number(match?.[1]);
+  const count = Number(match?.[2]);
+  if (match === null || index > count || count > slices.length) {
+    throw new Error(`${flag} must be <i>/<n> with 1 <= i <= n <= ${slices.length}`);
+  }
+  // Longest-processing-time first: each slice goes to the lightest job so far.
+  const loads = Array.from({ length: count }, () => ({ weight: 0, slices: [] }));
+  for (const slice of [...slices].sort((left, right) => right.weight - left.weight)) {
+    const lightest = loads.reduce((min, load) => (load.weight < min.weight ? load : min));
+    lightest.weight += slice.weight;
+    lightest.slices.push(slice);
+  }
+  return loads[index - 1].slices;
+}
+
+const selected = selectJob(process.argv.slice(2));
+process.stdout.write(`slices: ${selected.map((slice) => slice.name).join(", ")}\n`);
+const queue = [...selected].sort((left, right) => right.weight - left.weight);
 const results = [];
 const started = Date.now();
 
@@ -97,7 +121,7 @@ async function lane() {
   }
 }
 
-await Promise.all(Array.from({ length: Math.min(laneCap, slices.length) }, lane));
+await Promise.all(Array.from({ length: Math.min(laneCap, selected.length) }, lane));
 
 const wall = (Date.now() - started) / 1000;
 const serial = results.reduce((total, result) => total + result.seconds, 0);
